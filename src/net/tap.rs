@@ -1,13 +1,18 @@
 use crate::error::{Error, Result};
 use std::process::Command;
 
+/// Network namespace management for privileged VMs.
 pub struct NetNamespace {
+    /// The name of the netns.
     pub name: String,
+    /// The name of the TAP interface.
     pub tap_name: String,
+    /// The VM ID associated with this netns.
     pub vmid: u32,
 }
 
 impl NetNamespace {
+    /// Creates a new network namespace and TAP interface for the given VM ID.
     pub fn create(vmid: u32) -> Result<Self> {
         let name = format!("imp-net-{}", vmid);
         let tap_name = format!("imp-tap-{}", vmid);
@@ -46,6 +51,7 @@ impl NetNamespace {
         })
     }
 
+    /// Deletes the network namespace and associated interfaces.
     pub fn delete(&self) -> Result<()> {
         let _ = Command::new("ip")
             .args(["netns", "delete", &self.name])
@@ -53,10 +59,12 @@ impl NetNamespace {
         Ok(())
     }
 
+    /// Returns the host IP address in this namespace.
     pub fn host_ip(&self) -> String {
         format!("10.200.{}.1", self.vmid)
     }
 
+    /// Configures iptables rules to forward traffic to the proxy.
     pub fn emit_proxy_rules(&self, proxy_port: u16) -> Result<()> {
         let status = Command::new("ip")
             .args([

@@ -12,16 +12,26 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static VMID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
+/// Represents a fully managed test VM, including its associated resources and VMM instance.
 pub struct TestVm<V: Vmm> {
+    /// The internal unique ID assigned to this VM.
     pub vmid: u32,
+    /// The underlying VMM instance running the VM.
     pub instance: V::Instance,
+    /// The network namespace associated with this VM, if any.
     pub netns: Option<NetNamespace>,
     #[cfg(feature = "experiment-smoltcp")]
+    /// The smoltcp userspace networking process associated with this VM, if any.
     pub smoltcp: Option<SmoltcpProcess>,
+    /// The egress proxy associated with this VM, if any.
     pub proxy: Option<EgressProxy>,
 }
 
 impl<V: Vmm> TestVm<V> {
+    /// Starts a new test VM using the provided VMM and configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the VM cannot be started or resources cannot be allocated.
     pub async fn start(vmm: &V, cfg: VmConfig) -> Result<Self> {
         let pid = std::process::id() % 25;
         let c = VMID_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -33,6 +43,7 @@ impl<V: Vmm> TestVm<V> {
         let mut proxy = None;
         let mut tap_name = None;
         let mut netns_name = None;
+        #[allow(unused_mut)]
         let mut vhost_user_socket = None;
 
         match &cfg.net {
@@ -131,6 +142,10 @@ impl<V: Vmm> TestVm<V> {
         })
     }
 
+    /// Connects to the guest agent running inside the VM and returns an API client.
+    ///
+    /// # Errors
+    /// Returns an error if the connection cannot be established.
     pub async fn agent(&mut self) -> Result<AgentClient> {
         // Retry connecting since the VM might take a second to boot and bind vsock
         for _ in 0..50 {
@@ -142,10 +157,18 @@ impl<V: Vmm> TestVm<V> {
         AgentClient::connect(self.instance.vsock_path(), 5000).await
     }
 
+    /// Retrieves resource usage statistics for the VM.
+    ///
+    /// # Errors
+    /// Returns an error if the stats cannot be collected.
     pub async fn usage(&self) -> Result<ResourceUsage> {
         self.instance.stats().await
     }
 
+    /// Gracefully shuts down the VM, cleaning up all associated resources.
+    ///
+    /// # Errors
+    /// Returns an error if the shutdown times out or fails.
     pub async fn shutdown(mut self) -> Result<()> {
         self.instance.request_shutdown().await?;
         if let Some(ns) = &self.netns {

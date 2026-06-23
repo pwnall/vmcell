@@ -56,7 +56,7 @@ rtnetlink = { version = "0.14", optional = true }
 netns-rs = { version = "0.1", optional = true }
 tun-tap = { version = "0.1", optional = true }
 ipnet = { version = "2", optional = true }
-rustables = { version = "0.8", optional = true }
+
 
 # Proxy
 rustls = { version = "0.23", optional = true }
@@ -130,7 +130,7 @@ cloud-hypervisor = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body
 firecracker = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyperlocal", "dep:serde_json"]
 qemu = ["host-common", "dep:qapi", "dep:serde_json"]
 
-net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:tun-tap", "dep:ipnet", "dep:rustables"]
+net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:tun-tap", "dep:ipnet"]
 experiment-nftables = ["net-privileged", "dep:jip-nftables"]
 experiment-erofs = ["dep:am-fs-erofs", "dep:tar"]
 net-rootless = ["host-common"]

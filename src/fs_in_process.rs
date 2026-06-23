@@ -42,8 +42,7 @@ pub mod backend {
             let guest_mem: &GuestMemoryAtomic<GuestMemoryMmap> = match &self.mem {
                 Some(m) => m,
                 None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "QueueMemoryUnset",
                     ));
                 }
@@ -54,7 +53,7 @@ pub mod backend {
                 vring_state
                     .get_queue_mut()
                     .iter(mem_obj.clone())
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "IterateQueue"))?
+                    .map_err(|_| std::io::Error::other("IterateQueue"))?
                     .collect();
 
             for chain in avail_chains {
@@ -63,10 +62,10 @@ pub mod backend {
                 let head_index = chain.head_index();
 
                 let reader = Reader::from_descriptor_chain(&*mem_obj, chain.clone())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 let writer = VirtioFsWriter::new(&*mem_obj, chain.clone())
                     .map(|w| w.into())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 self.server
                     .handle_message(
@@ -75,7 +74,7 @@ pub mod backend {
                         None as Option<&mut dyn FsCacheReqHandler>,
                         None,
                     )
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 if self.event_idx {
                     if vring_state.add_used(head_index, 0).is_err() {
@@ -180,8 +179,7 @@ pub mod backend {
             _thread_id: usize,
         ) -> std::io::Result<()> {
             if evset != EventSet::IN {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "HandleEventNotEpollIn",
                 ));
             }
@@ -190,8 +188,7 @@ pub mod backend {
                 HIPRIO_QUEUE_EVENT => vrings[0].get_mut(),
                 REQ_QUEUE_EVENT => vrings[1].get_mut(),
                 _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "HandleEventUnknownEvent",
                     ));
                 }
@@ -230,20 +227,22 @@ pub mod backend {
             ..Default::default()
         });
 
-        let mut cfg = Config::default();
-        cfg.root_dir = host_path.to_string_lossy().to_string();
-        cfg.do_import = false;
+        let cfg = Config {
+            root_dir: host_path.to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        };
 
         let fs = PassthroughFs::<()>::new(cfg)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         fs.import()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         vfs.mount(Box::new(fs), "/")
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let backend = Arc::new(RwLock::new(VhostUserFsBackendHandler::new(Arc::new(vfs))?));
         let mut listener = Listener::new(socket_path, true)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let socket_path_str = socket_path.to_string_lossy().into_owned();
         let handle = std::thread::spawn(move || {

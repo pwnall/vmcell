@@ -7,6 +7,7 @@ use crate::vmm::VmInstance;
 use crate::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::Path;
 
+/// A pipeline stage that creates a base VM snapshot for fast booting.
 pub struct SnapshotStage {}
 
 use async_trait::async_trait;

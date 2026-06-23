@@ -44,7 +44,7 @@ async fn test_shares_ro_rw() {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let mut client = imp_testing::agent::AgentClient::connect(&vmm.instance.vsock_path(), 5000)
+    let mut client = imp_testing::agent::AgentClient::connect(vmm.instance.vsock_path(), 5000)
         .await
         .expect("Failed to connect to agent");
 

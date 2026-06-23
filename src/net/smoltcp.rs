@@ -1,4 +1,5 @@
 #[cfg(feature = "experiment-smoltcp")]
+/// Low-level backend networking types and state for `smoltcp`.
 pub mod backend {
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -31,14 +32,21 @@ pub mod backend {
     // virtio-net header size is 12 bytes
     const VIRTIO_NET_HDR_SIZE: usize = 12;
 
+    /// Shared state across the smoltcp background thread and API interfaces.
     pub struct SharedState {
-        pub tx_queue: VecDeque<Vec<u8>>, // packets guest wants to send (received by smoltcp)
-        pub rx_queue: VecDeque<Vec<u8>>, // packets host wants to send to guest (transmitted by smoltcp)
+        /// Packets the guest wants to send (received from guest virtio-net).
+        pub tx_queue: VecDeque<Vec<u8>>, 
+        /// Packets the host wants to send to the guest virtio-net.
+        pub rx_queue: VecDeque<Vec<u8>>, 
+        /// Shared memory between host and guest.
         pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+        /// Virtio rings for RX and TX queues.
         pub vrings: Option<Vec<VringMutex>>,
     }
 
+    /// A `smoltcp` device implementation wrapping the `SharedState`.
     pub struct SmoltcpDevice<'a> {
+        /// Mutex guard over the shared network state.
         pub state: std::sync::MutexGuard<'a, SharedState>,
     }
 
@@ -75,6 +83,7 @@ pub mod backend {
         }
     }
 
+    /// Token for receiving packets in the `smoltcp` stack.
     pub struct RxTokenImpl(Vec<u8>);
     impl RxToken for RxTokenImpl {
         fn consume<R, F>(mut self, f: F) -> R
@@ -85,6 +94,7 @@ pub mod backend {
         }
     }
 
+    /// Token for transmitting packets in the `smoltcp` stack.
     pub struct TxTokenImpl<'a>(&'a mut VecDeque<Vec<u8>>);
     impl<'a> TxToken for TxTokenImpl<'a> {
         fn consume<R, F>(self, len: usize, f: F) -> R
@@ -121,7 +131,7 @@ pub mod backend {
                 vring_state
                     .get_queue_mut()
                     .iter(mem_obj.clone())
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "IterateQueue"))?
+                    .map_err(|_| std::io::Error::other("IterateQueue"))?
                     .collect();
 
             for chain in avail_chains {
@@ -208,7 +218,7 @@ pub mod backend {
             _thread_id: usize,
         ) -> std::io::Result<()> {
             if evset != EventSet::IN {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "NotEpollIn"));
+                return Err(std::io::Error::other("NotEpollIn"));
             }
 
             let mut state = self.state.lock().unwrap();
@@ -236,9 +246,11 @@ pub mod backend {
         }
     }
 
+    /// Background process managing `smoltcp` networking state.
     pub struct SmoltcpProcess;
 
     impl SmoltcpProcess {
+        /// Starts the background network thread to process packets and manage connections.
         pub fn start(vmid: u32, forward_ports: Vec<u16>, socket_path: PathBuf) -> Self {
             let state = Arc::new(Mutex::new(SharedState {
                 tx_queue: VecDeque::new(),
@@ -316,64 +328,65 @@ pub mod backend {
             }
 
             loop {
-                let mut state_guard = state.lock().unwrap();
+                {
+                    let mut state_guard = state.lock().unwrap();
 
-                // Process receiveq (host -> guest)
-                let (mem_opt, vrings_opt) = (state_guard.mem.clone(), state_guard.vrings.clone());
-                if let (Some(mem), Some(vrings)) = (mem_opt, vrings_opt) {
-                    let mut vring_state = vrings[0].get_mut();
-                    let mem_obj = mem.memory();
-                    let mut used_any = false;
+                    // Process receiveq (host -> guest)
+                    let (mem_opt, vrings_opt) = (state_guard.mem.clone(), state_guard.vrings.clone());
+                    if let (Some(mem), Some(vrings)) = (mem_opt, vrings_opt) {
+                        let mut vring_state = vrings[0].get_mut();
+                        let mem_obj = mem.memory();
+                        let mut used_any = false;
 
-                    while let Some(packet) = state_guard.rx_queue.pop_front() {
-                        let avail_chains = vring_state.get_queue_mut().iter(mem_obj.clone());
-                        if let Ok(mut chains) = avail_chains {
-                            if let Some(chain) = chains.next() {
-                                log::trace!("process_rx_queue: Sending packet of length {} to guest", packet.len());
-                                let head_index = chain.head_index();
+                        while let Some(packet) = state_guard.rx_queue.pop_front() {
+                            let avail_chains = vring_state.get_queue_mut().iter(mem_obj.clone());
+                            if let Ok(mut chains) = avail_chains {
+                                if let Some(chain) = chains.next() {
+                                    log::trace!("process_rx_queue: Sending packet of length {} to guest", packet.len());
+                                    let head_index = chain.head_index();
 
-                                let mut full_packet = vec![0; VIRTIO_NET_HDR_SIZE];
-                                full_packet.extend_from_slice(&packet);
+                                    let mut full_packet = vec![0; VIRTIO_NET_HDR_SIZE];
+                                    full_packet.extend_from_slice(&packet);
 
-                                let mut offset = 0;
-                                let mut written = 0;
-                                for desc in chain.writable() {
-                                    let to_write = std::cmp::min(
-                                        full_packet.len() - offset,
-                                        desc.len() as usize,
-                                    );
-                                    if to_write > 0 {
-                                        if mem_obj
-                                            .write_slice(
-                                                &full_packet[offset..offset + to_write],
-                                                desc.addr(),
-                                            )
-                                            .is_ok()
+                                    let mut offset = 0;
+                                    let mut written = 0;
+                                    for desc in chain.writable() {
+                                        let to_write = std::cmp::min(
+                                            full_packet.len() - offset,
+                                            desc.len() as usize,
+                                        );
+                                        if to_write > 0
+                                            && mem_obj
+                                                .write_slice(
+                                                    &full_packet[offset..offset + to_write],
+                                                    desc.addr(),
+                                                )
+                                                .is_ok()
                                         {
                                             offset += to_write;
                                             written += to_write;
                                         }
                                     }
+                                    vring_state.add_used(head_index, written as u32).unwrap();
+                                    used_any = true;
+                                } else {
+                                    state_guard.rx_queue.push_front(packet);
+                                    break;
                                 }
-                                vring_state.add_used(head_index, written as u32).unwrap();
-                                used_any = true;
                             } else {
                                 state_guard.rx_queue.push_front(packet);
                                 break;
                             }
-                        } else {
-                            state_guard.rx_queue.push_front(packet);
-                            break;
+                        }
+                        if used_any {
+                            vring_state.signal_used_queue().unwrap();
                         }
                     }
-                    if used_any {
-                        vring_state.signal_used_queue().unwrap();
-                    }
-                }
 
-                let mut device = SmoltcpDevice { state: state_guard };
-                iface.poll(Instant::now(), &mut device, &mut sockets);
-                drop(device); // releases state_guard
+                    let mut device = SmoltcpDevice { state: state_guard };
+                    iface.poll(Instant::now(), &mut device, &mut sockets);
+                    drop(device); // releases state_guard
+                }
 
                 for (port, handle, tcp_stream) in port_mappings.iter_mut() {
                     let socket = sockets.get_mut::<TcpSocket>(*handle);

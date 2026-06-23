@@ -9,11 +9,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
+/// The Cloud Hypervisor VMM backend.
 pub struct CloudHypervisor {
+    /// Path to the `cloud-hypervisor` executable.
     pub binary_path: PathBuf,
 }
 
 impl CloudHypervisor {
+    /// Creates a new `CloudHypervisor` using the specified executable path.
     pub fn new(binary_path: impl Into<PathBuf>) -> Self {
         Self {
             binary_path: binary_path.into(),
@@ -21,6 +24,7 @@ impl CloudHypervisor {
     }
 }
 
+/// A running instance of a Cloud Hypervisor VM.
 pub struct ChInstance {
     process: Child,
     api_socket: PathBuf,
@@ -29,6 +33,7 @@ pub struct ChInstance {
     _fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
     cgroup_name: Option<String>,
     restored: bool,
+    cid: u32,
 }
 
 #[derive(Serialize)]
@@ -209,6 +214,8 @@ impl Vmm for CloudHypervisor {
             fs_daemons.push(daemon);
         }
 
+        let cid = crate::vmm::CidAllocator::allocate();
+
         let instance = ChInstance {
             process,
             api_socket,
@@ -217,6 +224,7 @@ impl Vmm for CloudHypervisor {
             _fs_daemons: fs_daemons,
             cgroup_name: Some(_res.cgroup_name.clone()),
             restored: cfg.snapshot_dir.is_some(),
+            cid,
         };
 
         let mut ch_cfg = ChVmConfig {
@@ -251,7 +259,7 @@ impl Vmm for CloudHypervisor {
                 file: serial_path,
             },
             vsock: ChVsock {
-                cid: 3,
+                cid,
                 socket: vsock_path,
             },
         };
@@ -324,6 +332,16 @@ impl VmInstance for ChInstance {
         Ok(())
     }
 
+    async fn pause(&mut self) -> Result<()> {
+        self.api_request("PUT", "/api/v1/vm.pause", None::<&()>)
+            .await
+    }
+
+    async fn resume(&mut self) -> Result<()> {
+        self.api_request("PUT", "/api/v1/vm.resume", None::<&()>)
+            .await
+    }
+
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
         #[derive(Serialize)]
         struct SnapshotReq {
@@ -375,6 +393,10 @@ impl VmInstance for ChInstance {
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path
+    }
+
+    fn guest_cid(&self) -> u32 {
+        self.cid
     }
 
     fn serial_log(&self) -> &Path {

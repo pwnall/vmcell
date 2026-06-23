@@ -3,6 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Converts a tar archive into an EROFS filesystem image.
+///
+/// # Errors
+/// Returns an error if the archive is invalid or conversion fails.
 #[cfg(feature = "experiment-erofs")]
 pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Result<Vec<u8>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();

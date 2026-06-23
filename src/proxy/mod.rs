@@ -9,16 +9,25 @@ use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use tokio::net::TcpListener;
 
+/// Configuration for an egress proxy.
 pub struct ProxyConfig {
+    /// The port to listen on.
     pub port: u16,
+    /// The network namespace name to enter before listening.
     pub netns: Option<String>,
 }
 
+/// A running egress proxy instance.
 pub struct EgressProxy {
+    /// The port the proxy is listening on.
     pub port: u16,
 }
 
 impl EgressProxy {
+    /// Starts the egress proxy with the specified configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the proxy fails to start.
     pub async fn start(cfg: ProxyConfig) -> Result<Self> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 

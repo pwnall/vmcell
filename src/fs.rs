@@ -9,7 +9,9 @@ use tokio::process::{Child, Command};
 #[path = "fs_in_process.rs"]
 mod fs_in_process;
 
+/// A running virtiofs daemon instance.
 pub struct VirtioFsDaemon {
+    /// The path to the vhost-user socket.
     pub socket_path: PathBuf,
     #[cfg(not(feature = "experiment-fuse"))]
     process: Child,
@@ -18,6 +20,7 @@ pub struct VirtioFsDaemon {
 }
 
 impl VirtioFsDaemon {
+    /// Starts a virtiofs daemon (using the standalone `virtiofsd` binary) for the given share.
     #[cfg(not(feature = "experiment-fuse"))]
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
@@ -63,6 +66,7 @@ impl VirtioFsDaemon {
     }
 
     #[cfg(feature = "experiment-fuse")]
+    /// Starts a virtiofs daemon for the given share and returns its handler.
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);

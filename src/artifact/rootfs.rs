@@ -3,7 +3,9 @@ use crate::error::{Error, Result};
 use std::path::Path;
 use tokio::process::Command;
 
+/// A pipeline stage that builds a root filesystem.
 pub struct RootfsStage {
+    /// The Debian release suite to use (e.g., "bookworm").
     pub release: String,
 }
 

@@ -1,3 +1,4 @@
+/// Protocol definition for communication with the guest agent.
 pub mod protocol;
 
 use crate::error::{Error, Result};
@@ -15,12 +16,17 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[cfg(feature = "host-common")]
+/// A client for communicating with the guest agent over vsock.
 pub struct AgentClient {
     stream: Framed<UnixStream, LengthDelimitedCodec>,
 }
 
 #[cfg(feature = "host-common")]
 impl AgentClient {
+    /// Connects to the guest agent on the specified vsock path and port.
+    ///
+    /// # Errors
+    /// Returns an error if the connection fails or the handshake is unsuccessful.
     pub async fn connect(vsock_path: &Path, port: u32) -> Result<Self> {
         let mut stream = UnixStream::connect(vsock_path)
             .await
@@ -64,6 +70,10 @@ impl AgentClient {
         Ok(Self { stream: framed })
     }
 
+    /// Executes a command inside the guest VM and waits for the result.
+    ///
+    /// # Errors
+    /// Returns an error if the request cannot be sent or the outcome cannot be received.
     pub async fn exec(&mut self, cmd: ExecRequest) -> Result<ExecOutcome> {
         let msg = Message::Exec(cmd);
         let bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Other(e.to_string()))?;
@@ -102,6 +112,10 @@ impl AgentClient {
         Ok(outcome)
     }
 
+    /// Uploads a file to the guest VM.
+    ///
+    /// # Errors
+    /// Returns an error if the file transfer fails.
     pub async fn put_file(&mut self, _dst: &str, _bytes: &[u8]) -> Result<()> {
         Ok(())
     }

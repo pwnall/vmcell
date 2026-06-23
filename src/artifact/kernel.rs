@@ -3,8 +3,11 @@ use crate::error::{Error, Result};
 use std::path::Path;
 use tokio::process::Command;
 
+/// A pipeline stage that builds a Linux kernel image.
 pub struct KernelStage {
+    /// URL to download the kernel source tarball from.
     pub kernel_source_url: String,
+    /// Custom configuration snippet to append to the kernel config.
     pub microvm_config: String,
 }
 

@@ -20,7 +20,7 @@ async fn test_boot() {
         .network_disabled()
         .build();
 
-    let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
+    let vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let log = std::fs::read_to_string(vm.instance.serial_log()).unwrap_or_default();
     println!("SERIAL LOG:\n{}", log);

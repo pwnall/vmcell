@@ -1,3 +1,6 @@
+//! Guest agent running as PID 1 inside the microvm.
+#![deny(missing_docs)]
+#![deny(clippy::missing_errors_doc)]
 use imp_testing::agent::protocol::{ExecRequest, Message};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
@@ -17,40 +20,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::create_dir_all("/proc");
     let _ = std::fs::create_dir_all("/mnt");
 
-    unsafe {
-        // Setup tmpfs overlay over the read-only erofs root via pivot_root
-        let _ = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "");
-        let _ = std::fs::create_dir_all("/mnt/upper");
-        let _ = std::fs::create_dir_all("/mnt/work");
-        let _ = std::fs::create_dir_all("/mnt/rootfs");
+    // Setup tmpfs overlay over the read-only erofs root via pivot_root
+    let _ = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "");
+    let _ = std::fs::create_dir_all("/mnt/upper");
+    let _ = std::fs::create_dir_all("/mnt/work");
+    let _ = std::fs::create_dir_all("/mnt/rootfs");
 
-        let _ = mount(
-            "overlay",
-            "/mnt/rootfs",
-            "overlay",
-            MountFlags::empty(),
-            "lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work",
+    let _ = mount(
+        "overlay",
+        "/mnt/rootfs",
+        "overlay",
+        MountFlags::empty(),
+        "lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work",
+    );
+
+    std::env::set_current_dir("/mnt/rootfs").unwrap();
+    let _ = std::fs::create_dir_all("oldroot");
+
+    if pivot_root(".", "oldroot").is_ok() {
+        let _ = mount_change(
+            "/",
+            MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
         );
-
-        std::env::set_current_dir("/mnt/rootfs").unwrap();
-        let _ = std::fs::create_dir_all("oldroot");
-
-        if pivot_root(".", "oldroot").is_ok() {
-            let _ = mount_change(
-                "/",
-                MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
-            );
-            let _ = unmount("oldroot", UnmountFlags::DETACH);
-            let _ = std::fs::remove_dir_all("oldroot");
-        } else {
-            println!("imp-guest-agent: pivot_root failed");
-        }
-
-        // Mount essential filesystems
-        let _ = mount("sysfs", "/sys", "sysfs", MountFlags::empty(), "");
-        let _ = mount("proc", "/proc", "proc", MountFlags::empty(), "");
-        let _ = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "");
+        let _ = unmount("oldroot", UnmountFlags::DETACH);
+        let _ = std::fs::remove_dir_all("oldroot");
+    } else {
+        println!("imp-guest-agent: pivot_root failed");
     }
+
+    // Mount essential filesystems
+    let _ = mount("sysfs", "/sys", "sysfs", MountFlags::empty(), "");
+    let _ = mount("proc", "/proc", "proc", MountFlags::empty(), "");
+    let _ = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "");
 
     for tag_str in ["imp-in", "imp-out", "imp-bin"] {
         let mount_point = format!("/{}", tag_str);
@@ -62,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             MountFlags::empty()
         };
         if mount(
-            &tag_str as &str,
+            tag_str,
             &mount_point as &str,
             "virtiofs",
             flags,
