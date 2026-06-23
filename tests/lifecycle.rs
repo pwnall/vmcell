@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 #[tokio::test]
 async fn test_lifecycle_force_kill() {
-
     let ch = CloudHypervisor::new("cloud-hypervisor");
 
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
@@ -17,13 +16,9 @@ async fn test_lifecycle_force_kill() {
         return;
     }
 
-    let cfg = VmConfig::builder(
-        vmlinux,
-        RootfsSource::Erofs {
-            image: rootfs,
-        },
-    )
-    .network_disabled().build();
+    let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
+        .network_disabled()
+        .build();
 
     let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
 

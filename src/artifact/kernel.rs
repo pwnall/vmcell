@@ -66,7 +66,9 @@ impl Stage for KernelStage {
             .status()
             .await?;
         if !status.success() {
-            return Err(Error::Other("make defconfig kvm_guest.config failed".into()));
+            return Err(Error::Other(
+                "make defconfig kvm_guest.config failed".into(),
+            ));
         }
 
         let config_path = workdir.join(".config");

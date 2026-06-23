@@ -1,9 +1,11 @@
 #[cfg(feature = "experiment-fuse")]
 pub mod backend {
-    use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
+    use fuse_backend_rs::api::{Vfs, VfsOptions, server::Server};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{FsCacheReqHandler, Reader, VirtioFsWriter};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
+    use virtio_queue::DescriptorChain;
+    use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap};
     use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
     use vhost::vhost_user::{Backend, Listener};
     use vhost_user_backend::{
@@ -13,7 +15,6 @@ pub mod backend {
         VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
     };
     use virtio_queue::QueueOwnedT;
-    use vm_memory::{GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap};
     use vmm_sys_util::epoll::EventSet;
     use vmm_sys_util::event::{EventConsumer, EventNotifier};
 
@@ -33,21 +34,30 @@ pub mod backend {
     }
 
     impl VhostUserFsBackend {
-        fn process_queue(&mut self, vring_state: &mut std::sync::MutexGuard<VringState>) -> std::io::Result<bool> {
+        fn process_queue(
+            &mut self,
+            vring_state: &mut std::sync::MutexGuard<VringState>,
+        ) -> std::io::Result<bool> {
             let mut used_any = false;
             let guest_mem: &GuestMemoryAtomic<GuestMemoryMmap> = match &self.mem {
                 Some(m) => m,
-                None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "QueueMemoryUnset")),
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "QueueMemoryUnset",
+                    ));
+                }
             };
 
             let mem_obj = guest_mem.memory();
-            let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>> = vring_state
-                .get_queue_mut()
-                .iter(mem_obj.clone())
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "IterateQueue"))?
-                .collect();
+            let avail_chains: Vec<DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>> =
+                vring_state
+                    .get_queue_mut()
+                    .iter(mem_obj.clone())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "IterateQueue"))?
+                    .collect();
 
-            for mut chain in avail_chains {
+            for chain in avail_chains {
                 used_any = true;
 
                 let head_index = chain.head_index();
@@ -170,13 +180,21 @@ pub mod backend {
             _thread_id: usize,
         ) -> std::io::Result<()> {
             if evset != EventSet::IN {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "HandleEventNotEpollIn"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "HandleEventNotEpollIn",
+                ));
             }
 
             let mut vring_state = match device_event {
                 HIPRIO_QUEUE_EVENT => vrings[0].get_mut(),
                 REQ_QUEUE_EVENT => vrings[1].get_mut(),
-                _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "HandleEventUnknownEvent")),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "HandleEventUnknownEvent",
+                    ));
+                }
             };
 
             if self.backend.lock().unwrap().event_idx {
@@ -204,7 +222,7 @@ pub mod backend {
     pub fn start_in_process_virtiofsd(
         socket_path: &std::path::Path,
         host_path: &std::path::Path,
-        read_only: bool,
+        _read_only: bool,
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
@@ -216,27 +234,33 @@ pub mod backend {
         cfg.root_dir = host_path.to_string_lossy().to_string();
         cfg.do_import = false;
 
-        let fs = PassthroughFs::<()>::new(cfg).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        fs.import().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        vfs.mount(Box::new(fs), "/").map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let fs = PassthroughFs::<()>::new(cfg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        fs.import()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        vfs.mount(Box::new(fs), "/")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let backend = Arc::new(RwLock::new(VhostUserFsBackendHandler::new(Arc::new(vfs))?));
-        let mut listener = Listener::new(socket_path, true).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let mut listener = Listener::new(socket_path, true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let socket_path_str = socket_path.to_string_lossy().into_owned();
         let handle = std::thread::spawn(move || {
-            eprintln!("in-process virtiofsd: thread started, listening on {:?}", socket_path_str);
+            eprintln!(
+                "in-process virtiofsd: thread started, listening on {:?}",
+                socket_path_str
+            );
             let mut vu_daemon = VhostUserDaemon::new(
                 String::from("in-process-virtiofsd"),
                 backend,
                 GuestMemoryAtomic::new(GuestMemoryMmap::new()),
-            ).unwrap();
-            vu_daemon
-                .start(&mut listener)
-                .unwrap_or_else(|e| {
-                    eprintln!("in-process virtiofsd panic: {:?}", e);
-                    panic!("{:?}", e)
-                });
+            )
+            .unwrap();
+            vu_daemon.start(&mut listener).unwrap_or_else(|e| {
+                eprintln!("in-process virtiofsd panic: {:?}", e);
+                panic!("{:?}", e)
+            });
         });
 
         Ok(handle)

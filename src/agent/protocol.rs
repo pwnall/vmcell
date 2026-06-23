@@ -40,7 +40,7 @@ mod tests {
 
         let bytes = postcard::to_stdvec(&msg).unwrap();
         let decoded: Message = postcard::from_bytes(&bytes).unwrap();
-        
+
         match decoded {
             Message::Exec(req) => {
                 assert_eq!(req.argv, vec!["ls", "-l"]);

@@ -1,5 +1,9 @@
 pub mod tap;
-pub mod passt;
+
+#[cfg(feature = "experiment-smoltcp")]
+pub mod smoltcp;
 
 pub use tap::NetNamespace;
-pub use passt::PasstProcess;
+
+#[cfg(feature = "experiment-smoltcp")]
+pub use smoltcp::backend::SmoltcpProcess;

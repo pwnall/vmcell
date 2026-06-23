@@ -7,10 +7,12 @@ use std::path::PathBuf;
 
 #[tokio::test]
 async fn test_snapshot_restore() {
-    let kernel =
-        PathBuf::from(std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()));
-    let rootfs_image =
-        PathBuf::from(std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()));
+    let kernel = PathBuf::from(
+        std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
+    );
+    let rootfs_image = PathBuf::from(
+        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()),
+    );
 
     let snapshot_dir = std::env::temp_dir().join("imp-test-snapshot-restore");
     if snapshot_dir.exists() {
@@ -29,7 +31,8 @@ async fn test_snapshot_restore() {
                 image: rootfs_image.clone(),
             },
         )
-        .network_disabled().build();
+        .network_disabled()
+        .build();
 
         let mut vm = TestVm::start(&vmm, cfg).await.expect("Failed to start VM");
 
@@ -67,7 +70,8 @@ async fn test_snapshot_restore() {
                 image: rootfs_image.clone(),
             },
         )
-        .network_disabled().build();
+        .network_disabled()
+        .build();
 
         cfg.snapshot_dir = Some(snapshot_dir.clone());
 

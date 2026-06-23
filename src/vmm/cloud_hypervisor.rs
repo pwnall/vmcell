@@ -165,7 +165,8 @@ impl Vmm for CloudHypervisor {
         };
 
         if let Some(snapshot_dir) = &cfg.snapshot_dir {
-            cmd.arg("--restore").arg(format!("source_url=file://{}", snapshot_dir.display()));
+            cmd.arg("--restore")
+                .arg(format!("source_url=file://{}", snapshot_dir.display()));
         }
 
         let process = cmd
@@ -177,11 +178,14 @@ impl Vmm for CloudHypervisor {
             .spawn()?;
 
         if let Some(pid) = process.id() {
-            let cg = cgroups_rs::Cgroup::load(
-                Box::new(cgroups_rs::hierarchies::V2::new()),
-                &_res.cgroup_name,
-            );
-            let _ = cg.add_task(cgroups_rs::CgroupPid::from(pid as u64));
+            if !_res.cgroup_name.is_empty() {
+                let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", _res.cgroup_name);
+                if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
+                    eprintln!("WARNING: failed to write process {} to {}: {:?}", pid, procs_path, e);
+                } else {
+                    println!("Added process {} to cgroup {}", pid, _res.cgroup_name);
+                }
+            }
         }
 
         for _ in 0..50 {
@@ -230,11 +234,11 @@ impl Vmm for CloudHypervisor {
                     "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/sbin/imp-guest-agent imp_vmid={}",
                     match &cfg.rootfs {
                         crate::config::RootfsSource::Erofs { .. } => "erofs",
-                        _ => "ext4"
+                        _ => "ext4",
                     },
                     match &cfg.rootfs {
                         crate::config::RootfsSource::Erofs { .. } => "",
-                        _ => "rootflags=noload"
+                        _ => "rootflags=noload",
                     },
                     _res.vmid
                 ),
@@ -259,14 +263,6 @@ impl Vmm for CloudHypervisor {
                 vhost_user: None,
                 vhost_mode: None,
                 vhost_socket: None,
-            });
-        } else if let Some(socket) = &_res.passt_socket {
-            ch_cfg.net.push(ChNet {
-                tap: None,
-                mac: Some(format!("02:00:00:00:00:{:02x}", _res.vmid)),
-                vhost_user: Some(true),
-                vhost_mode: Some("Client".to_string()),
-                vhost_socket: Some(socket.clone()),
             });
         }
 
@@ -302,9 +298,11 @@ impl Vmm for CloudHypervisor {
 impl VmInstance for ChInstance {
     async fn boot(&mut self) -> Result<()> {
         if self.restored {
-            self.api_request("PUT", "/api/v1/vm.resume", None::<&()>).await
+            self.api_request("PUT", "/api/v1/vm.resume", None::<&()>)
+                .await
         } else {
-            self.api_request("PUT", "/api/v1/vm.boot", None::<&()>).await
+            self.api_request("PUT", "/api/v1/vm.boot", None::<&()>)
+                .await
         }
     }
 
@@ -326,9 +324,14 @@ impl VmInstance for ChInstance {
         let req = SnapshotReq {
             destination_url: format!("file://{}", dir.display()),
         };
-        self.api_request("PUT", "/api/v1/vm.pause", None::<&()>).await?;
-        let res = self.api_request("PUT", "/api/v1/vm.snapshot", Some(&req)).await;
-        let _ = self.api_request("PUT", "/api/v1/vm.resume", None::<&()>).await;
+        self.api_request("PUT", "/api/v1/vm.pause", None::<&()>)
+            .await?;
+        let res = self
+            .api_request("PUT", "/api/v1/vm.snapshot", Some(&req))
+            .await;
+        let _ = self
+            .api_request("PUT", "/api/v1/vm.resume", None::<&()>)
+            .await;
         res
     }
 

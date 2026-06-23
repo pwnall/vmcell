@@ -6,18 +6,21 @@ use tokio::time::{Duration, sleep};
 
 #[tokio::test]
 async fn test_metrics_and_limits() {
-    let kernel =
-        PathBuf::from(std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()));
-    let rootfs_image =
-        PathBuf::from(std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()));
+    let kernel = PathBuf::from(
+        std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
+    );
+    let rootfs_image = PathBuf::from(
+        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()),
+    );
 
     let mut cfg = VmConfig::builder(
         kernel,
         RootfsSource::Erofs {
-                image: rootfs_image,
-            },
+            image: rootfs_image,
+        },
     )
-    .network_disabled().build();
+    .network_disabled()
+    .build();
 
     // Set memory limit to 256 MiB
     cfg.limits.mem_max_mib = Some(256);

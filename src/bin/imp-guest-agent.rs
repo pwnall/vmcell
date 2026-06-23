@@ -1,11 +1,13 @@
 use imp_testing::agent::protocol::{ExecRequest, Message};
+use rustix::mount::{
+    MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
+};
+use rustix::process::{WaitOptions, pivot_root, waitpid};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use vsock::{VsockAddr, VsockListener, VsockStream};
-use rustix::mount::{mount, mount_change, unmount, MountFlags, MountPropagationFlags, UnmountFlags};
-use rustix::process::{pivot_root, waitpid, WaitOptions};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use vsock::{VsockAddr, VsockListener, VsockStream};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("imp-guest-agent: starting");
@@ -34,7 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::create_dir_all("oldroot");
 
         if pivot_root(".", "oldroot").is_ok() {
-            let _ = mount_change("/", MountPropagationFlags::PRIVATE | MountPropagationFlags::REC);
+            let _ = mount_change(
+                "/",
+                MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+            );
             let _ = unmount("oldroot", UnmountFlags::DETACH);
             let _ = std::fs::remove_dir_all("oldroot");
         } else {
@@ -56,8 +61,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             MountFlags::empty()
         };
-        if mount(&tag_str as &str, &mount_point as &str, "virtiofs", flags, "").is_ok() {
-            println!("imp-guest-agent: mounted virtiofs {} at {}", tag_str, mount_point);
+        if mount(
+            &tag_str as &str,
+            &mount_point as &str,
+            "virtiofs",
+            flags,
+            "",
+        )
+        .is_ok()
+        {
+            println!(
+                "imp-guest-agent: mounted virtiofs {} at {}",
+                tag_str, mount_point
+            );
         } else {
             println!("imp-guest-agent: failed to mount virtiofs {}", tag_str);
         }
@@ -75,10 +91,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guest_ip = format!("10.200.{}.2/30", vmid);
     let host_ip = format!("10.200.{}.1", vmid);
 
-    let _ = Command::new("ip").args(["link", "set", "lo", "up"]).status();
-    let _ = Command::new("ip").args(["addr", "add", &guest_ip, "dev", "eth0"]).status();
-    let _ = Command::new("ip").args(["link", "set", "eth0", "up"]).status();
-    let _ = Command::new("ip").args(["route", "add", "default", "via", &host_ip]).status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status();
+    let _ = Command::new("ip")
+        .args(["addr", "add", &guest_ip, "dev", "eth0"])
+        .status();
+    let _ = Command::new("ip")
+        .args(["link", "set", "eth0", "up"])
+        .status();
+    let _ = Command::new("ip")
+        .args(["route", "add", "default", "via", &host_ip])
+        .status();
 
     // Spawn vsock listener thread
     std::thread::spawn(move || {
@@ -108,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Main thread acts as PID 1 zombie reaper
     let term = Arc::new(AtomicBool::new(false));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term));
-    
+
     loop {
         // Wait for any child with WNOHANG
         match waitpid(None, WaitOptions::NOHANG) {
@@ -157,7 +181,10 @@ fn read_framed(stream: &mut VsockStream) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn handle_exec(req: ExecRequest, stream: &mut VsockStream) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_exec(
+    req: ExecRequest,
+    stream: &mut VsockStream,
+) -> Result<(), Box<dyn std::error::Error>> {
     if req.argv.is_empty() {
         let exit_msg = postcard::to_stdvec(&Message::Exit(1))?;
         send_framed(stream, &exit_msg)?;
@@ -190,7 +217,9 @@ fn handle_exec(req: ExecRequest, stream: &mut VsockStream) -> Result<(), Box<dyn
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 while let Ok(n) = stdout.read(&mut buf) {
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     let _ = tx_out.send(Message::Stdout(buf[..n].to_vec()));
                 }
             });
@@ -198,7 +227,9 @@ fn handle_exec(req: ExecRequest, stream: &mut VsockStream) -> Result<(), Box<dyn
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 while let Ok(n) = stderr.read(&mut buf) {
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     let _ = tx_err.send(Message::Stderr(buf[..n].to_vec()));
                 }
             });

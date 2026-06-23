@@ -6,18 +6,21 @@ use std::path::PathBuf;
 
 #[tokio::test]
 async fn test_nested_virt() {
-    let kernel =
-        PathBuf::from(std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()));
-    let rootfs_image =
-        PathBuf::from(std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()));
+    let kernel = PathBuf::from(
+        std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
+    );
+    let rootfs_image = PathBuf::from(
+        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()),
+    );
 
     let mut cfg = VmConfig::builder(
         kernel,
         RootfsSource::Erofs {
-                image: rootfs_image,
-            },
+            image: rootfs_image,
+        },
     )
-    .network_disabled().build();
+    .network_disabled()
+    .build();
 
     // Enable nested virtualization
     cfg.nested_virt = true;
@@ -32,7 +35,9 @@ async fn test_nested_virt() {
         Ok(a) => a,
         Err(e) => {
             use imp_testing::vmm::VmInstance;
-            let log = tokio::fs::read_to_string(vm.instance.serial_log()).await.unwrap_or_default();
+            let log = tokio::fs::read_to_string(vm.instance.serial_log())
+                .await
+                .unwrap_or_default();
             panic!("Failed to connect to agent: {}\nSerial log:\n{}", e, log);
         }
     };

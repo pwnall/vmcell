@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 #[tokio::test]
 async fn test_boot() {
-
     let ch = CloudHypervisor::new("cloud-hypervisor");
 
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
@@ -17,13 +16,9 @@ async fn test_boot() {
         return;
     }
 
-    let cfg = VmConfig::builder(
-        vmlinux,
-        RootfsSource::Erofs {
-                image: rootfs,
-            },
-    )
-    .network_disabled().build();
+    let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
+        .network_disabled()
+        .build();
 
     let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

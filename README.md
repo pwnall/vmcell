@@ -1,0 +1,43 @@
+# Imp Testing
+
+An end-to-end integration-testing and evaluation platform for the Imp agentic harness.
+Each test runs in a fresh micro-VM for structural isolation, hermetic state, and production fidelity.
+Driven entirely from a single Rust library.
+
+## Development
+
+Required external tools for the host are split into system packages and Rust subprocess binaries.
+
+### 1. System Packages (Debian / Ubuntu)
+
+Install the required system utilities and build dependencies:
+
+```sh
+sudo apt update
+sudo apt install -y bash mmdebstrap linux-source build-essential iproute2 iptables pkg-config libseccomp-dev libcap-ng-dev libelf-dev libssl-dev debian-archive-keyring
+```
+
+**Important Note for Ubuntu Users:** 
+Building the test rootfs uses `mmdebstrap`, which has a hard-coded assumption that `/bin/sh` points to `bash`. On Ubuntu systems where `/bin/sh` defaults to `dash`, this will cause the build to fail with a `Syntax error: Bad fd number` error. 
+
+You must reconfigure your system to use `bash` as the default system shell:
+```sh
+sudo dpkg-reconfigure dash
+```
+*(When prompted "Use dash as the default system shell?", please select **No**)*
+
+If `dpkg-reconfigure` does not work or prompt you, you can manually update the symlink:
+```sh
+sudo ln -sf bash /bin/sh
+```
+
+### 2. Rust Subprocess Binaries
+
+We install `cloud-hypervisor` and `virtiofsd` via Cargo. By separating these into a Cargo installation group, we ensure they are built and run as highly-optimized Release binaries, providing maximum performance when spawned as subprocesses by the orchestration layer.
+
+```sh
+cargo install --git https://github.com/cloud-hypervisor/cloud-hypervisor.git cloud-hypervisor
+cargo install virtiofsd --locked
+```
+
+Ensure that `~/.cargo/bin` is in your `$PATH` so the test suite can discover these executables.

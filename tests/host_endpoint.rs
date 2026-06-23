@@ -7,35 +7,23 @@ use std::process::Command;
 
 #[tokio::test]
 async fn test_host_endpoint() {
-
+    let _ = env_logger::builder().is_test(true).try_init();
     let ch = CloudHypervisor::new("cloud-hypervisor");
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.ext4");
 
-    let mut cfg = VmConfig::builder(
-        vmlinux,
-        RootfsSource::Erofs {
-                image: rootfs,
-            },
-    )
-    .build();
-    cfg.net = imp_testing::config::NetConfig::Privileged { egress: imp_testing::config::Egress::Open, host_services: true };
+    let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs }).build();
+    cfg.net = imp_testing::config::NetConfig::Rootless {
+        egress: imp_testing::config::Egress::Open,
+        host_services: true,
+    };
 
     let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
 
-    let netns_name = vm.netns.as_ref().unwrap().name.clone();
-    let host_ip = vm.netns.as_ref().unwrap().host_ip();
+    let host_ip = format!("10.200.{}.1", vm.vmid);
 
-    let mut child = Command::new("ip")
-        .args([
-            "netns",
-            "exec",
-            &netns_name,
-            "python3",
-            "-m",
-            "http.server",
-            "8080",
-        ])
+    let mut child = Command::new("python3")
+        .args(["-m", "http.server", "8080", "--bind", "127.0.0.1"])
         .spawn()
         .expect("Failed to start http.server");
 
@@ -46,11 +34,18 @@ async fn test_host_endpoint() {
     // Give network time to come up in guest
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+    let ip_a = agent.exec(ExecRequest { argv: vec!["ip".into(), "a".into()], env: vec![], cwd: None }).await.unwrap();
+    println!("Guest IP A:\n{}", String::from_utf8_lossy(&ip_a.stdout));
+    let ip_r = agent.exec(ExecRequest { argv: vec!["ip".into(), "route".into()], env: vec![], cwd: None }).await.unwrap();
+    println!("Guest IP Route:\n{}", String::from_utf8_lossy(&ip_r.stdout));
+    let ip_n = agent.exec(ExecRequest { argv: vec!["ip".into(), "neigh".into()], env: vec![], cwd: None }).await.unwrap();
+    println!("Guest IP Neigh:\n{}", String::from_utf8_lossy(&ip_n.stdout));
+
     let outcome = agent
         .exec(ExecRequest {
             argv: vec![
                 "curl".into(),
-                "-s".into(),
+                "-v".into(),
                 format!("http://{}:8080/", host_ip),
             ],
             env: vec![],

@@ -68,7 +68,10 @@ impl AgentClient {
         let msg = Message::Exec(cmd);
         let bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Other(e.to_string()))?;
 
-        self.stream.send(bytes::Bytes::from(bytes)).await.map_err(Error::Io)?;
+        self.stream
+            .send(bytes::Bytes::from(bytes))
+            .await
+            .map_err(Error::Io)?;
 
         let mut outcome = ExecOutcome {
             code: -1,

@@ -22,7 +22,10 @@ impl Stage for RootfsStage {
     async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
         let sh_target = std::fs::read_link("/bin/sh").unwrap_or_default();
         if !sh_target.to_string_lossy().ends_with("bash") {
-            return Err(Error::Other(format!("Rootfs building uses mmdebstrap, which has a hard-coded assumption that /bin/sh points to bash. Currently, /bin/sh points to {:?}. Please reconfigure your system (e.g., via `sudo dpkg-reconfigure dash` on Ubuntu) to use bash as the default system shell.", sh_target)));
+            return Err(Error::Other(format!(
+                "Rootfs building uses mmdebstrap, which has a hard-coded assumption that /bin/sh points to bash. Currently, /bin/sh points to {:?}. Please reconfigure your system (e.g., via `sudo dpkg-reconfigure dash` on Ubuntu) to use bash as the default system shell.",
+                sh_target
+            )));
         }
 
         let build_status = Command::new("cargo")
@@ -41,7 +44,7 @@ impl Stage for RootfsStage {
         // Generate rootfs tarball and pipe to mkfs.erofs
         let mut mmdebstrap = Command::new("mmdebstrap")
             .arg("--variant=minbase")
-            .arg("--include=systemd-sysv,iproute2")
+            .arg("--include=systemd-sysv,iproute2,curl,python3")
             .arg("--customize-hook=copy-in target/release/imp-guest-agent /sbin/")
             .arg(&self.release)
             .arg("-")
@@ -49,7 +52,8 @@ impl Stage for RootfsStage {
             .stderr(std::process::Stdio::piped())
             .spawn()?;
 
-        let mmdebstrap_stdout: std::process::Stdio = mmdebstrap.stdout.take().unwrap().try_into().unwrap();
+        let mmdebstrap_stdout: std::process::Stdio =
+            mmdebstrap.stdout.take().unwrap().try_into().unwrap();
 
         let mut mkfs = Command::new("mkfs.erofs")
             .arg("--tar=f")

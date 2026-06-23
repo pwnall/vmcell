@@ -1,6 +1,8 @@
 use crate::config::{Access, Share};
 use std::path::{Path, PathBuf};
 #[cfg(not(feature = "experiment-fuse"))]
+use std::process::Stdio;
+#[cfg(not(feature = "experiment-fuse"))]
 use tokio::process::{Child, Command};
 
 #[cfg(feature = "experiment-fuse")]
@@ -29,23 +31,28 @@ impl VirtioFsDaemon {
             .arg("--sandbox=none");
 
         if let Access::ReadOnly = share.access {
-            cmd.arg("--read-only");
+            cmd.arg("--readonly");
         }
 
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
 
         let process = cmd
             .spawn()
             .map_err(|e| crate::error::Error::Other(format!("failed to spawn virtiofsd: {}", e)))?;
 
         // Wait for socket to be created
+        let mut ready = false;
         for _ in 0..50 {
             if socket_path.exists() {
+                ready = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if !ready {
+            return Err(crate::error::Error::Other("virtiofsd failed to create socket".to_string()));
         }
 
         Ok(Self {
@@ -62,8 +69,11 @@ impl VirtioFsDaemon {
         let handle = fs_in_process::backend::start_in_process_virtiofsd(
             &socket_path,
             &share.host_path,
-            read_only
-        ).map_err(|e| crate::error::Error::Other(format!("failed to start in-process virtiofsd: {}", e)))?;
+            read_only,
+        )
+        .map_err(|e| {
+            crate::error::Error::Other(format!("failed to start in-process virtiofsd: {}", e))
+        })?;
 
         // Wait for socket to be created
         for _ in 0..50 {

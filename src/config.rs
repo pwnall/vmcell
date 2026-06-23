@@ -69,8 +69,14 @@ pub enum CachePolicy {
 
 #[derive(Clone, Debug, Default)]
 pub enum NetConfig {
-    Privileged { egress: Egress, host_services: bool },
-    Rootless { egress: Egress, host_services: bool },
+    Privileged {
+        egress: Egress,
+        host_services: bool,
+    },
+    Rootless {
+        egress: Egress,
+        host_services: bool,
+    },
     #[default]
     None,
 }

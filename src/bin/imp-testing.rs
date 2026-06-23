@@ -19,7 +19,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> imp_testing::Result<()> {
-    unsafe { std::env::set_var("SHELL", "/bin/bash"); }
+    unsafe {
+        std::env::set_var("SHELL", "/bin/bash");
+    }
     let cli = Cli::parse();
 
     match &cli.command {
@@ -38,7 +40,7 @@ async fn main() -> imp_testing::Result<()> {
             };
             pipeline.build(&imp_testing::artifact::Cache {}).await?;
             println!("Artifacts built successfully.");
-        },
+        }
         Commands::Run => println!("Running VM..."),
         Commands::Exec => println!("Executing command..."),
         Commands::Ls => println!("Listing VMs..."),

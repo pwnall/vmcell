@@ -2,7 +2,9 @@ use crate::agent::AgentClient;
 use crate::config::VmConfig;
 use crate::error::Result;
 use crate::metrics::ResourceUsage;
-use crate::net::{NetNamespace, PasstProcess};
+use crate::net::NetNamespace;
+#[cfg(feature = "experiment-smoltcp")]
+use crate::net::SmoltcpProcess;
 use crate::proxy::{EgressProxy, ProxyConfig};
 use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use cgroups_rs::{cgroup_builder::CgroupBuilder, hierarchies};
@@ -14,7 +16,8 @@ pub struct TestVm<V: Vmm> {
     pub vmid: u32,
     pub instance: V::Instance,
     pub netns: Option<NetNamespace>,
-    pub passt: Option<PasstProcess>,
+    #[cfg(feature = "experiment-smoltcp")]
+    pub smoltcp: Option<SmoltcpProcess>,
     pub proxy: Option<EgressProxy>,
 }
 
@@ -25,14 +28,17 @@ impl<V: Vmm> TestVm<V> {
         let vmid = pid * 10 + c;
 
         let mut netns = None;
-        let mut passt = None;
+        #[cfg(feature = "experiment-smoltcp")]
+        let mut smoltcp = None;
         let mut proxy = None;
         let mut tap_name = None;
         let mut netns_name = None;
-        let mut passt_socket = None;
 
         match &cfg.net {
-            crate::config::NetConfig::Privileged { egress, host_services } => {
+            crate::config::NetConfig::Privileged {
+                egress,
+                host_services,
+            } => {
                 let _ = egress;
                 let _ = host_services;
                 let ns = NetNamespace::create(vmid)?;
@@ -49,22 +55,49 @@ impl<V: Vmm> TestVm<V> {
                 proxy = Some(px);
                 netns = Some(ns);
             }
-            crate::config::NetConfig::Rootless { egress, host_services } => {
+            crate::config::NetConfig::Rootless {
+                egress,
+                host_services,
+            } => {
                 let _ = egress;
                 let _ = host_services;
                 let px = EgressProxy::start(ProxyConfig {
                     port: 0,
                     netns: None,
-                }).await?;
-                let p = PasstProcess::start(vmid)?;
-                passt_socket = Some(p.socket_path.clone());
-                passt = Some(p);
+                })
+                .await?;
+                
+                #[cfg(feature = "experiment-smoltcp")]
+                {
+                    let socket_path = std::path::PathBuf::from(format!("/tmp/imp-smoltcp-{}.sock", vmid));
+                    let mut ports = vec![px.port];
+                    if *host_services {
+                        ports.push(8080);
+                    }
+                    let p = SmoltcpProcess::start(vmid, ports, socket_path);
+                    smoltcp = Some(p);
+                }
                 proxy = Some(px);
             }
             crate::config::NetConfig::None => {}
         }
 
-        let cgroup_name = format!("imp-vm-{}", vmid);
+        let mut cgroup_name = format!("imp-vm-{}", vmid);
+        // Try to nest inside our current cgroup slice if possible
+        if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
+            if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
+                let mut base = path.trim_start_matches('/');
+                // If running under a "supervisor" cgroup to satisfy the "no internal processes" rule,
+                // create the VM cgroup as a sibling rather than a child.
+                if base.ends_with("/supervisor") {
+                    base = base.trim_end_matches("/supervisor");
+                }
+                if !base.is_empty() {
+                    cgroup_name = format!("{}/imp-vm-{}", base, vmid);
+                }
+            }
+        }
+
         let mut builder = CgroupBuilder::new(&cgroup_name);
         if let Some(mem) = cfg.limits.mem_max_mib {
             builder = builder
@@ -78,7 +111,6 @@ impl<V: Vmm> TestVm<V> {
             cgroup_name: cgroup_name.clone(),
             tap_name,
             netns_name,
-            passt_socket,
             vmid,
         };
         println!("Creating instance...");
@@ -90,7 +122,8 @@ impl<V: Vmm> TestVm<V> {
             vmid,
             instance,
             netns,
-            passt,
+            #[cfg(feature = "experiment-smoltcp")]
+            smoltcp,
             proxy,
         })
     }
