@@ -2,6 +2,8 @@ use crate::error::Result;
 pub mod kernel;
 pub mod rootfs;
 pub mod snapshot;
+#[cfg(feature = "experiment-erofs")]
+pub mod tar2erofs;
 
 use std::path::Path;
 

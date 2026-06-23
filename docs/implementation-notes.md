@@ -40,3 +40,8 @@
 ## Rootfs and EROFS
 - `mkfs.erofs` is used to build the root filesystem. The kernel needs `CONFIG_EROFS_FS=y` built-in, otherwise it panics when attempting to mount the rootfs.
 - If `imp-guest-agent` is dynamically linked in the EROFS image, it will work because `mmdebstrap` via `minbase` installs `libc6`. Attempting to statically link against `musl` requires `musl-tools` installed on the host, which is not available without root on some test environments.
+
+## Architectural Experiments
+- **Experiment 2 (Pure-Rust Nftables):** Skipped. The goal was to replace the `iptables` / `nft` CLI invocations with a pure-Rust implementation using permissive crates. `jip-nftables` was evaluated but only provides read capabilities. `rustables` provides write capabilities but is GPLv3 licensed, disqualifying it. Writing complex netlink payloads from scratch for a tiny ruleset was deemed unjustified.
+- **Experiment 3 (Pure-Rust EROFS Build):** Successfully implemented. Replaced the `mkfs.erofs` shell-out with the `am-fs-erofs` crate. The `mmdebstrap` output is streamed directly into a custom `tar_to_erofs` in-memory parser, which converts the tar entries into an `am-fs-erofs` `Node` tree and compiles the image. This bypasses the host filesystem entirely, avoiding permission issues with creating device nodes or setting root uids as a non-root user.
+- **Experiment 4 (OCI-image rootfs):** Skipped. Postponed to preserve the `apt` signing chain verification provided by Debian's `mmdebstrap`.

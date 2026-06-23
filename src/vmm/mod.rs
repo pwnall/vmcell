@@ -10,6 +10,7 @@ pub struct PerVmResources {
     pub cgroup_name: String,
     pub tap_name: Option<String>,
     pub netns_name: Option<String>,
+    pub vhost_user_socket: Option<PathBuf>,
     pub vmid: u32,
 }
 

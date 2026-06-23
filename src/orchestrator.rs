@@ -33,6 +33,7 @@ impl<V: Vmm> TestVm<V> {
         let mut proxy = None;
         let mut tap_name = None;
         let mut netns_name = None;
+        let mut vhost_user_socket = None;
 
         match &cfg.net {
             crate::config::NetConfig::Privileged {
@@ -74,7 +75,8 @@ impl<V: Vmm> TestVm<V> {
                     if *host_services {
                         ports.push(8080);
                     }
-                    let p = SmoltcpProcess::start(vmid, ports, socket_path);
+                    let p = SmoltcpProcess::start(vmid, ports, socket_path.clone());
+                    vhost_user_socket = Some(socket_path);
                     smoltcp = Some(p);
                 }
                 proxy = Some(px);
@@ -111,6 +113,7 @@ impl<V: Vmm> TestVm<V> {
             cgroup_name: cgroup_name.clone(),
             tap_name,
             netns_name,
+            vhost_user_socket,
             vmid,
         };
         println!("Creating instance...");

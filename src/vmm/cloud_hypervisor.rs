@@ -264,6 +264,14 @@ impl Vmm for CloudHypervisor {
                 vhost_mode: None,
                 vhost_socket: None,
             });
+        } else if let Some(socket) = &_res.vhost_user_socket {
+            ch_cfg.net.push(ChNet {
+                tap: None,
+                mac: Some(format!("02:00:00:00:00:{:02x}", _res.vmid)),
+                vhost_user: Some(true),
+                vhost_mode: Some("Client".to_string()),
+                vhost_socket: Some(socket.clone()),
+            });
         }
 
         match &cfg.rootfs {
