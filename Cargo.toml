@@ -21,6 +21,11 @@ name = "imp-guest-agent"
 path = "src/bin/imp-guest-agent.rs"
 required-features = ["agent"]
 
+[[bin]]
+name = "imp-test-runner"
+path = "src/bin/imp-test-runner.rs"
+required-features = ["test-runner"]
+
 [dependencies]
 # unconditional shared core
 serde = { version = "1", features = ["derive"] }
@@ -89,6 +94,7 @@ anyhow = { version = "1", optional = true }
 # Guest agent
 vsock = { version = "0.5", optional = true }
 rustix = { version = "0.38", optional = true, features = ["fs", "mount", "process"] }
+capctl = { version = "0.2.4", optional = true }
 signal-hook = { version = "0.3", optional = true }
 fuse-backend-rs = { version = "0.14.0", optional = true }
 vhost = { version = "0.16.0", optional = true }
@@ -117,7 +123,7 @@ env_logger = "0.11"
 
 [features]
 experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
-default = ["cloud-hypervisor", "net-privileged", "proxy", "metrics", "pipeline", "cli"]
+default = ["cloud-hypervisor", "net-privileged", "net-rootless", "proxy", "metrics", "pipeline", "cli"]
 
 host-common = [
     "dep:tokio", "dep:futures", "dep:bytes",
@@ -150,6 +156,7 @@ pipeline = [
 cli = ["host-common", "dep:clap", "dep:anyhow", "dep:serde_json"]
 
 agent = ["dep:vsock", "dep:rustix", "dep:signal-hook"]
+test-runner = ["dep:rustix", "dep:capctl", "dep:libc"]
 fuse-backend-rs = ["dep:fuse-backend-rs"]
 vhost = ["dep:vhost"]
 vhost-user-backend = ["dep:vhost-user-backend"]

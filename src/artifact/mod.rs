@@ -35,7 +35,6 @@ pub struct StageOutputs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheKey(pub String);
 
-
 use async_trait::async_trait;
 
 #[async_trait]
@@ -53,8 +52,7 @@ pub trait Stage: Send + Sync {
 }
 
 /// Cache for previously built artifacts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cache {}
 /// Artifacts resulting from a pipeline build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,10 +113,14 @@ impl Pipeline {
                 tracing::info!("Running stage {}", stage.name());
                 let _outputs = stage.run(&inputs, &out_path).await?;
                 if let Err(e) = std::fs::write(&key_path, &key.0) {
-                    tracing::warn!("Failed to write cache key for stage {}: {}", stage.name(), e);
+                    tracing::warn!(
+                        "Failed to write cache key for stage {}: {}",
+                        stage.name(),
+                        e
+                    );
                 }
             }
-            
+
             inputs.artifacts.insert(stage.name().to_string(), out_path);
         }
 

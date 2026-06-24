@@ -62,15 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             MountFlags::empty()
         };
-        if mount(
-            tag_str,
-            &mount_point as &str,
-            "virtiofs",
-            flags,
-            "",
-        )
-        .is_ok()
-        {
+        if mount(tag_str, &mount_point as &str, "virtiofs", flags, "").is_ok() {
             println!(
                 "imp-guest-agent: mounted virtiofs {} at {}",
                 tag_str, mount_point
@@ -185,7 +177,7 @@ fn handle_put_file(
         std::fs::write(dst, bytes)?;
         Ok(())
     })();
-    
+
     let code = if result.is_ok() { 0 } else { 1 };
     let exit_msg = postcard::to_stdvec(&Message::Exit(code))?;
     send_framed(stream, &exit_msg)?;

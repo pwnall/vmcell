@@ -285,19 +285,26 @@ impl VmConfigBuilder {
             return Err(crate::error::Error::Config("mem_mib must be >= 64".into()));
         }
         if self.kernel.as_os_str().is_empty() {
-            return Err(crate::error::Error::Config("kernel path cannot be empty".into()));
+            return Err(crate::error::Error::Config(
+                "kernel path cannot be empty".into(),
+            ));
         }
 
         let mut tags = std::collections::HashSet::new();
         for share in &self.shares {
             if share.tag.is_empty() {
-                return Err(crate::error::Error::Config("share tag cannot be empty".into()));
+                return Err(crate::error::Error::Config(
+                    "share tag cannot be empty".into(),
+                ));
             }
             if !tags.insert(share.tag.clone()) {
-                return Err(crate::error::Error::Config(format!("duplicate share tag: {}", share.tag)));
+                return Err(crate::error::Error::Config(format!(
+                    "duplicate share tag: {}",
+                    share.tag
+                )));
             }
         }
-        
+
         Ok(VmConfig {
             kernel: self.kernel,
             rootfs: self.rootfs,
@@ -324,7 +331,8 @@ mod tests {
                 dir: PathBuf::from("/rootfs"),
             },
         )
-        .build().unwrap();
+        .build()
+        .unwrap();
         assert_eq!(cfg.vcpus, 1);
         assert_eq!(cfg.mem_mib, 128);
         assert!(!cfg.nested_virt);
@@ -338,14 +346,18 @@ mod tests {
                 dir: PathBuf::from("/rootfs"),
             },
         )
-        .with_share(Share::new("test", "/tmp/test", Access::ReadOnly, CachePolicy::Auto))
+        .with_share(Share::new(
+            "test",
+            "/tmp/test",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
         .network_disabled()
-        .build().unwrap();
-        
+        .build()
+        .unwrap();
+
         assert_eq!(cfg.shares.len(), 1);
         assert_eq!(cfg.shares[0].tag, "test");
         assert!(matches!(cfg.net, NetConfig::None));
     }
 }
-
-

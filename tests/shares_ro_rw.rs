@@ -37,7 +37,8 @@ async fn test_shares_ro_rw() {
             CachePolicy::Never,
         ))
         .network_disabled()
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
@@ -53,7 +54,10 @@ async fn test_shares_ro_rw() {
 
     // Verify read from RO share
     let res = client
-        .exec(imp_testing::agent::protocol::ExecRequest::new(vec!["cat".into(), "/imp-in/input.txt".into()]))
+        .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
+            "cat".into(),
+            "/imp-in/input.txt".into(),
+        ]))
         .await
         .expect("Exec failed");
     if res.code != 0 {
@@ -69,10 +73,10 @@ async fn test_shares_ro_rw() {
     // Verify write to RO share fails
     let res = client
         .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
-                "sh".into(),
-                "-c".into(),
-                "echo fail > /imp-in/test.txt".into(),
-            ]))
+            "sh".into(),
+            "-c".into(),
+            "echo fail > /imp-in/test.txt".into(),
+        ]))
         .await
         .expect("Exec failed");
     assert_ne!(res.code, 0);
@@ -80,10 +84,10 @@ async fn test_shares_ro_rw() {
     // Verify write to RW share succeeds
     let res = client
         .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
-                "sh".into(),
-                "-c".into(),
-                "echo success > /imp-out/output.txt".into(),
-            ]))
+            "sh".into(),
+            "-c".into(),
+            "echo success > /imp-out/output.txt".into(),
+        ]))
         .await
         .expect("Exec failed");
     assert_eq!(res.code, 0);

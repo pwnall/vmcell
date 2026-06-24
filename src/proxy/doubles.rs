@@ -5,7 +5,8 @@ use std::sync::Arc;
 /// A type alias for a test double matching function.
 pub type Matcher = Box<dyn Fn(&Request<hudsucker::Body>) -> bool + Send + Sync>;
 /// A type alias for a test double responder function.
-pub type Responder = Box<dyn Fn(&Request<hudsucker::Body>) -> Response<hudsucker::Body> + Send + Sync>;
+pub type Responder =
+    Box<dyn Fn(&Request<hudsucker::Body>) -> Response<hudsucker::Body> + Send + Sync>;
 
 /// Represents a single mock route.
 pub struct TestDouble {
@@ -31,7 +32,7 @@ impl HttpHandler for ProxyHandler {
         req: Request<hudsucker::Body>,
     ) -> RequestOrResponse {
         tracing::info!("Proxy intercepted request to: {}", req.uri());
-        
+
         for double in self.doubles.iter() {
             if (double.matcher)(&req) {
                 tracing::info!("Proxy matched request, returning test double response");
@@ -47,7 +48,10 @@ impl HttpHandler for ProxyHandler {
                     tracing::info!("Proxy blocking request to {}", host);
                     let response = Response::builder()
                         .status(403)
-                        .body(hudsucker::Body::from(format!("Blocked by Imp Proxy: {}\n", blocked)))
+                        .body(hudsucker::Body::from(format!(
+                            "Blocked by Imp Proxy: {}\n",
+                            blocked
+                        )))
                         .expect("Valid response builder");
                     return RequestOrResponse::Response(response);
                 }

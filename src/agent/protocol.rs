@@ -22,11 +22,11 @@ pub enum Message {
     /// Exit code of a completed command.
     Exit(i32),
     /// Request to place a file at a destination path.
-    PutFile { 
+    PutFile {
         /// Destination path in the guest.
-        dst: String, 
+        dst: String,
         /// File contents.
-        bytes: Vec<u8> 
+        bytes: Vec<u8>,
     },
     /// Ping message to check agent liveness.
     Ping,
@@ -140,11 +140,11 @@ mod tests {
     fn test_framing_multiple_messages() {
         let msg1 = Message::Hello;
         let msg2 = Message::Ready;
-        
+
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&postcard::to_stdvec(&msg1).unwrap());
         bytes.extend_from_slice(&postcard::to_stdvec(&msg2).unwrap());
-        
+
         let (decoded1, rest) = postcard::take_from_bytes::<Message>(&bytes).unwrap();
         assert_eq!(decoded1, Message::Hello);
         let (decoded2, rest2) = postcard::take_from_bytes::<Message>(rest).unwrap();
@@ -161,11 +161,15 @@ mod tests {
             any::<Vec<u8>>().prop_map(Message::Stdout),
             any::<Vec<u8>>().prop_map(Message::Stderr),
             any::<i32>().prop_map(Message::Exit),
-            (any::<String>(), any::<Vec<u8>>()).prop_map(|(dst, bytes)| Message::PutFile { dst, bytes }),
+            (any::<String>(), any::<Vec<u8>>())
+                .prop_map(|(dst, bytes)| Message::PutFile { dst, bytes }),
             Just(Message::Ping),
-            (any::<Vec<String>>(), any::<Vec<(String, String)>>(), any::<Option<String>>()).prop_map(|(argv, env, cwd)| {
-                Message::Exec(ExecRequest { argv, env, cwd })
-            }),
+            (
+                any::<Vec<String>>(),
+                any::<Vec<(String, String)>>(),
+                any::<Option<String>>()
+            )
+                .prop_map(|(argv, env, cwd)| { Message::Exec(ExecRequest { argv, env, cwd }) }),
         ]
     }
 

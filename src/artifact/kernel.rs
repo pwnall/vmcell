@@ -17,8 +17,6 @@ pub struct KernelStage {
     pub microvm_config: String,
 }
 
-
-
 use async_trait::async_trait;
 
 #[async_trait]

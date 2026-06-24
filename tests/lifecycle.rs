@@ -19,11 +19,14 @@ async fn test_lifecycle_force_kill() {
 
     let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .network_disabled()
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc)
+        .await
+        .expect("Failed to start VM");
 
     vm.instance_mut().kill().await.expect("Failed to kill VM");
 }
@@ -32,16 +35,24 @@ async fn test_lifecycle_force_kill() {
 async fn test_lifecycle_fake_vmm() {
     use imp_testing::vmm::FakeVmm;
     let fake = FakeVmm::default();
-    
-    let cfg = VmConfig::builder("/fake/kernel", RootfsSource::Erofs { image: PathBuf::from("/fake/rootfs") })
-        .network_disabled()
-        .build().unwrap();
+
+    let cfg = VmConfig::builder(
+        "/fake/kernel",
+        RootfsSource::Erofs {
+            image: PathBuf::from("/fake/rootfs"),
+        },
+    )
+    .network_disabled()
+    .build()
+    .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    
-    let vm = TestVm::start(&fake, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start fake VM");
-    
+
+    let vm = TestVm::start(&fake, cfg, &cid_alloc, vmid_alloc)
+        .await
+        .expect("Failed to start fake VM");
+
     // Check that create and boot were called
     {
         let calls = fake.calls.lock().unwrap();

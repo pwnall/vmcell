@@ -1,15 +1,15 @@
 use imp_testing::TestVm;
-use imp_testing::vmm::VmInstance;
 use imp_testing::config::{RootfsSource, VmConfig};
+use imp_testing::vmm::VmInstance;
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::PathBuf;
 
 mod common;
 
 #[tokio::test]
 #[ignore]
 async fn test_concurrency() {
-    let ch_binary = std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
+    let ch_binary =
+        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
     let vmm = CloudHypervisor::new(ch_binary);
 
     let vmlinux = common::get_vmlinux();
@@ -20,19 +20,27 @@ async fn test_concurrency() {
         return;
     }
 
-    let cfg = VmConfig::builder(vmlinux.unwrap(), RootfsSource::Erofs { image: rootfs.unwrap() })
-        .network_disabled()
-        .build().unwrap();
+    let cfg = VmConfig::builder(
+        vmlinux.unwrap(),
+        RootfsSource::Erofs {
+            image: rootfs.unwrap(),
+        },
+    )
+    .network_disabled()
+    .build()
+    .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    
+
     let mut vms = Vec::new();
     for _ in 0..5 {
-        let vm = TestVm::start(&vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone()).await.expect("Failed to start VM");
+        let vm = TestVm::start(&vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone())
+            .await
+            .expect("Failed to start VM");
         vms.push(vm);
     }
-    
+
     // Assert all 5 booted successfully and have distinct VMIDs and vsock paths
     let mut vmids = std::collections::HashSet::new();
     let mut vsocks = std::collections::HashSet::new();
@@ -40,10 +48,15 @@ async fn test_concurrency() {
         assert!(vmids.insert(vm.vmid()));
         assert!(vsocks.insert(vm.instance().vsock_path().to_path_buf()));
     }
-    
+
     for mut vm in vms {
-        let mut agent = vm.agent().await.expect("Failed to connect to agent");
-        let outcome = agent.exec(imp_testing::agent::ExecRequest::new(vec!["true".to_string()])).await.expect("exec failed");
+        let agent = vm.agent().await.expect("Failed to connect to agent");
+        let outcome = agent
+            .exec(imp_testing::agent::ExecRequest::new(vec![
+                "true".to_string(),
+            ]))
+            .await
+            .expect("exec failed");
         assert_eq!(outcome.code, 0, "Execution should succeed");
         vm.shutdown().await.expect("Failed to shut down VM");
     }

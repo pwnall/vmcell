@@ -7,15 +7,15 @@
 pub mod protocol;
 
 use crate::error::{Error, Result};
-pub use protocol::{ExecOutcome, ExecRequest};
 use protocol::Message;
+pub use protocol::{ExecOutcome, ExecRequest};
 
 #[cfg(feature = "host-common")]
 use futures::{SinkExt, StreamExt};
 #[cfg(feature = "host-common")]
 use std::path::Path;
 #[cfg(feature = "host-common")]
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[cfg(feature = "host-common")]
 use tokio::net::UnixStream;
 #[cfg(feature = "host-common")]
@@ -46,7 +46,7 @@ impl AgentClient {
     pub async fn connect(vsock_path: &Path, port: u32) -> Result<Self> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut backoff = std::time::Duration::from_millis(50);
-        
+
         loop {
             if tokio::time::Instant::now() > deadline {
                 return Err(Error::Timeout("Agent connection timed out".into()));
@@ -75,16 +75,18 @@ impl AgentClient {
 
             let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
 
-            let ready = match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await {
+            let ready = match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
+                .await
+            {
                 Ok(Some(Ok(bytes))) => bytes,
                 _ => continue,
             };
-            
+
             let msg: Message = match postcard::from_bytes(&ready) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            
+
             match msg {
                 Message::Ready => return Ok(Self { stream: framed }),
                 _ => continue,
@@ -139,7 +141,9 @@ impl AgentClient {
             }
 
             Ok(outcome)
-        }).await.map_err(|_| Error::Timeout("Agent exec timed out".into()))?
+        })
+        .await
+        .map_err(|_| Error::Timeout("Agent exec timed out".into()))?
     }
 
     /// Uploads a file to the guest VM.
@@ -148,10 +152,17 @@ impl AgentClient {
     /// Returns an error if the file transfer fails.
     pub async fn put_file(&mut self, dst: &str, bytes: &[u8]) -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let msg = Message::PutFile { dst: dst.to_string(), bytes: bytes.to_vec() };
-            let msg_bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
-            self.stream.send(::bytes::Bytes::from(msg_bytes)).await.map_err(Error::Io)?;
-            
+            let msg = Message::PutFile {
+                dst: dst.to_string(),
+                bytes: bytes.to_vec(),
+            };
+            let msg_bytes =
+                postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
+            self.stream
+                .send(::bytes::Bytes::from(msg_bytes))
+                .await
+                .map_err(Error::Io)?;
+
             // Wait for ack
             if let Some(res) = self.stream.next().await {
                 let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
@@ -159,12 +170,16 @@ impl AgentClient {
                     .map_err(|e| Error::Serialize(e.to_string()))?;
                 match resp_msg {
                     Message::Exit(0) => Ok(()),
-                    Message::Exit(c) => Err(Error::Agent(format!("put_file failed with code {}", c))),
+                    Message::Exit(c) => {
+                        Err(Error::Agent(format!("put_file failed with code {}", c)))
+                    }
                     _ => Err(Error::Agent("unexpected response to put_file".into())),
                 }
             } else {
                 Err(Error::Agent("connection closed during put_file".into()))
             }
-        }).await.map_err(|_| Error::Timeout("put_file timed out".into()))?
+        })
+        .await
+        .map_err(|_| Error::Timeout("put_file timed out".into()))?
     }
 }

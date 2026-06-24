@@ -39,7 +39,9 @@ impl VmidAllocator {
                 return Ok(i);
             }
         }
-        Err(crate::error::Error::Exhaustion("No available VMIDs (limit 254)".to_string()))
+        Err(crate::error::Error::Exhaustion(
+            "No available VMIDs (limit 254)".to_string(),
+        ))
     }
 
     /// Releases a previously allocated VMID.
@@ -110,7 +112,11 @@ impl<V: Vmm> TestVm<V> {
         self.proxy.as_ref()
     }
 
-    async fn setup_env(vmid: u32, cfg: &VmConfig, cid_alloc: &crate::vmm::CidAllocator) -> Result<EnvSetup> {
+    async fn setup_env(
+        vmid: u32,
+        cfg: &VmConfig,
+        cid_alloc: &crate::vmm::CidAllocator,
+    ) -> Result<EnvSetup> {
         let mut netns = None;
         #[cfg(feature = "net-rootless")]
         let mut smoltcp = None;
@@ -153,7 +159,7 @@ impl<V: Vmm> TestVm<V> {
                 host_services,
             } => {
                 let _ = host_services;
-                let mut proxy_port = 0;
+                let mut _proxy_port = 0;
 
                 if let crate::config::Egress::Filtered(proxy_cfg) = egress {
                     #[cfg(feature = "proxy")]
@@ -165,16 +171,17 @@ impl<V: Vmm> TestVm<V> {
                             blocked_domains: proxy_cfg.blocked_domains.clone(),
                         })
                         .await?;
-                        proxy_port = px.port;
+                        _proxy_port = px.port;
                         proxy = Some(px);
                     }
                 }
                 #[cfg(feature = "net-rootless")]
                 {
-                    let socket_path = std::path::PathBuf::from(format!("/tmp/imp-smoltcp-{}.sock", vmid));
+                    let socket_path =
+                        std::path::PathBuf::from(format!("/tmp/imp-smoltcp-{}.sock", vmid));
                     let mut ports = vec![];
-                    if proxy_port > 0 {
-                        ports.push(proxy_port);
+                    if _proxy_port > 0 {
+                        ports.push(_proxy_port);
                     }
                     if *host_services {
                         ports.push(8080);
@@ -255,7 +262,12 @@ impl<V: Vmm> TestVm<V> {
     /// let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await.unwrap();
     /// # }
     /// ```
-    pub async fn start(vmm: &V, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator, vmid_alloc: Arc<VmidAllocator>) -> Result<Self> {
+    pub async fn start(
+        vmm: &V,
+        cfg: VmConfig,
+        cid_alloc: &crate::vmm::CidAllocator,
+        vmid_alloc: Arc<VmidAllocator>,
+    ) -> Result<Self> {
         let vmid = vmid_alloc.allocate()?;
         let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
 
@@ -297,7 +309,19 @@ impl<V: Vmm> TestVm<V> {
     /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, &cid_alloc, vmid_alloc).await.unwrap();
     /// # }
     /// ```
-    pub async fn restore(vmm: &V, snapshot_dir: &std::path::Path, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator, vmid_alloc: Arc<VmidAllocator>) -> Result<Self> {
+    pub async fn restore(
+        vmm: &V,
+        snapshot_dir: &std::path::Path,
+        cfg: VmConfig,
+        cid_alloc: &crate::vmm::CidAllocator,
+        vmid_alloc: Arc<VmidAllocator>,
+    ) -> Result<Self> {
+        if matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
+            return Err(crate::error::Error::Config(
+                "virtio-fs rootfs cannot be used with snapshot restore".into(),
+            ));
+        }
+
         let vmid = vmid_alloc.allocate()?;
         let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
 
@@ -342,7 +366,9 @@ impl<V: Vmm> TestVm<V> {
             }
             self.agent_client = client;
         }
-        self.agent_client.as_mut().ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))
+        self.agent_client
+            .as_mut()
+            .ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))
     }
 
     /// Retrieves resource usage metrics for the VM.
@@ -373,8 +399,6 @@ impl<V: Vmm> Drop for TestVm<V> {
         self.vmid_alloc.release(self.vmid);
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

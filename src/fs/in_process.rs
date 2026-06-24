@@ -7,8 +7,6 @@ pub mod backend {
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{FsCacheReqHandler, Reader, VirtioFsWriter};
     use std::sync::{Arc, Mutex, RwLock};
-    use virtio_queue::DescriptorChain;
-    use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap};
     use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
     use vhost::vhost_user::{Backend, Listener};
     use vhost_user_backend::{
@@ -17,7 +15,9 @@ pub mod backend {
     use virtio_bindings::bindings::virtio_ring::{
         VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
     };
+    use virtio_queue::DescriptorChain;
     use virtio_queue::QueueOwnedT;
+    use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap};
     use vmm_sys_util::epoll::EventSet;
     use vmm_sys_util::event::{EventConsumer, EventNotifier};
 
@@ -45,9 +45,7 @@ pub mod backend {
             let guest_mem: &GuestMemoryAtomic<GuestMemoryMmap> = match &self.mem {
                 Some(m) => m,
                 None => {
-                    return Err(std::io::Error::other(
-                        "QueueMemoryUnset",
-                    ));
+                    return Err(std::io::Error::other("QueueMemoryUnset"));
                 }
             };
 
@@ -182,18 +180,14 @@ pub mod backend {
             _thread_id: usize,
         ) -> std::io::Result<()> {
             if evset != EventSet::IN {
-                return Err(std::io::Error::other(
-                    "HandleEventNotEpollIn",
-                ));
+                return Err(std::io::Error::other("HandleEventNotEpollIn"));
             }
 
             let mut vring_state = match device_event {
                 HIPRIO_QUEUE_EVENT => vrings.get(0).expect("invariant").get_mut(),
                 REQ_QUEUE_EVENT => vrings.get(1).expect("invariant").get_mut(),
                 _ => {
-                    return Err(std::io::Error::other(
-                        "HandleEventUnknownEvent",
-                    ));
+                    return Err(std::io::Error::other("HandleEventUnknownEvent"));
                 }
             };
 
@@ -234,7 +228,9 @@ pub mod backend {
         // so we must handle it manually or acknowledge it.
         // TODO: Enforce read_only flag inside the VFS layer or via bind mounts.
         if read_only {
-            tracing::warn!("Read-only mode requested but in-process virtiofsd does not fully support it natively yet.");
+            tracing::warn!(
+                "Read-only mode requested but in-process virtiofsd does not fully support it natively yet."
+            );
         }
 
         let cfg = Config {
@@ -243,16 +239,15 @@ pub mod backend {
             ..Default::default()
         };
 
-        let fs = PassthroughFs::<()>::new(cfg)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let fs = PassthroughFs::<()>::new(cfg).map_err(|e| std::io::Error::other(e.to_string()))?;
         fs.import()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         vfs.mount(Box::new(fs), "/")
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let backend = Arc::new(RwLock::new(VhostUserFsBackendHandler::new(Arc::new(vfs))?));
-        let mut listener = Listener::new(socket_path, true)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut listener =
+            Listener::new(socket_path, true).map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let socket_path_str = socket_path.to_string_lossy().into_owned();
         let handle = std::thread::spawn(move || {

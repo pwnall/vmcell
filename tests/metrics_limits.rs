@@ -21,7 +21,8 @@ async fn test_metrics_and_limits() {
         },
     )
     .network_disabled()
-    .build().unwrap();
+    .build()
+    .unwrap();
 
     // Set memory limit to 256 MiB
     cfg.limits.mem_max_mib = Some(256);
@@ -32,16 +33,18 @@ async fn test_metrics_and_limits() {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
+    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc)
+        .await
+        .expect("Failed to start VM");
 
     // Wait a bit for the VM to boot and consume some memory
     sleep(Duration::from_secs(2)).await;
 
-    let stats = vm.usage().await.expect("Failed to get VM stats");
+    let stats_before = vm.usage().await.expect("Failed to get VM stats");
 
     // Verify non-zero values if controller is enabled
-    if stats.mem_current_mib > 0 {
-        assert!(stats.mem_peak_mib > 0, "Peak memory should be > 0");
+    if stats_before.mem_current_mib > 0 {
+        assert!(stats_before.mem_peak_mib > 0, "Peak memory should be > 0");
 
         // Assert memory limits were applied to cgroup
         let mut cgroup_name = format!("imp-vm-{}", vm.vmid());
@@ -65,12 +68,63 @@ async fn test_metrics_and_limits() {
     } else {
         println!("Memory controller not delegated, skipping memory metrics assertion");
     }
+
     // CPU usage might also be absent if cpu controller isn't delegated, check it:
-    if stats.cpu_usec > 0 {
-        println!("CPU usage: {}", stats.cpu_usec);
+    if stats_before.cpu_usec > 0 {
+        println!("CPU usage: {}", stats_before.cpu_usec);
     } else {
         println!("CPU controller not delegated, skipping cpu metrics assertion");
     }
+
+    // Test CPU average computation
+    let cpu_test_outcome = vm
+        .agent()
+        .await
+        .unwrap()
+        .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
+            "sh".into(),
+            "-c".into(),
+            "timeout 2 md5sum /dev/zero || true".into(),
+        ]))
+        .await
+        .expect("Failed to run cpu load");
+
+    let stats_after_cpu = vm
+        .usage()
+        .await
+        .expect("Failed to get VM stats after cpu load");
+    if stats_before.cpu_usec > 0 {
+        let diff_usec = stats_after_cpu
+            .cpu_usec
+            .saturating_sub(stats_before.cpu_usec);
+        // timeout 2 should consume ~2 seconds of cpu time, so > 1,000,000 usec
+        assert!(
+            diff_usec > 1_000_000,
+            "CPU usage should have increased by >1s (got {} usec)",
+            diff_usec
+        );
+    }
+
+    // Test OOM-kill
+    // memory.max is 256 MiB. We try to allocate 300 MiB.
+    let oom_outcome = vm
+        .agent()
+        .await
+        .unwrap()
+        .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
+            "dd".into(),
+            "if=/dev/zero".into(),
+            "of=/dev/shm/bloat".into(),
+            "bs=1M".into(),
+            "count=300".into(),
+        ]))
+        .await
+        .expect("Failed to run memory bloat");
+
+    assert_ne!(
+        oom_outcome.code, 0,
+        "dd should be killed by OOM killer, but exited with 0"
+    );
 
     vm.shutdown().await.expect("Failed to shutdown VM");
 }

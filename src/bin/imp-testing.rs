@@ -47,7 +47,9 @@ async fn async_main() -> imp_testing::Result<()> {
                     }),
                 ],
             };
-            pipeline.build(&imp_testing::artifact::Cache::default()).await?;
+            pipeline
+                .build(&imp_testing::artifact::Cache::default())
+                .await?;
             println!("Artifacts built successfully.");
         }
         Commands::Run => println!("Running VM..."),

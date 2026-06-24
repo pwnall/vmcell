@@ -2,14 +2,13 @@ use imp_testing::TestVm;
 use imp_testing::config::{RootfsSource, VmConfig};
 use imp_testing::vmm::VmInstance;
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::PathBuf;
 
 mod common;
 
 #[tokio::test]
 #[ignore]
 async fn test_boot() {
-    let ch = CloudHypervisor::new(&common::ch_bin());
+    let ch = CloudHypervisor::new(common::ch_bin());
 
     let vmlinux = match common::get_vmlinux() {
         Some(p) => p,
@@ -25,11 +24,14 @@ async fn test_boot() {
 
     let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .network_disabled()
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
+    let vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc)
+        .await
+        .expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
     println!("SERIAL LOG:\n{}", log);

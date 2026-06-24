@@ -16,8 +16,6 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotStage {}
 
-
-
 use async_trait::async_trait;
 
 #[async_trait]

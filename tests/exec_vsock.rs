@@ -95,9 +95,13 @@ async fn test_put_file_mock() {
         loop {
             let mut byte = [0; 1];
             let n = stream.read(&mut byte).await.unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             resp.push(byte[0] as char);
-            if byte[0] == b'\n' { break; }
+            if byte[0] == b'\n' {
+                break;
+            }
         }
         assert_eq!(resp, "CONNECT 5000\n");
 
@@ -126,7 +130,8 @@ async fn test_put_file_mock() {
         .await
         .expect("Failed to connect");
 
-    client.put_file("/tmp/hello.txt", b"hello world")
+    client
+        .put_file("/tmp/hello.txt", b"hello world")
         .await
         .expect("put_file failed");
 

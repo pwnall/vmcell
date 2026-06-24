@@ -27,6 +27,9 @@ pub struct VirtioFsDaemon {
 
 impl VirtioFsDaemon {
     /// Starts a virtiofs daemon (using the standalone `virtiofsd` binary) for the given share.
+    ///
+    /// # Errors
+    /// Returns an error if the daemon fails to spawn or create the socket.
     #[cfg(not(feature = "experiment-fuse"))]
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
@@ -53,9 +56,9 @@ impl VirtioFsDaemon {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
 
-        let process = cmd
-            .spawn()
-            .map_err(|e| crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {}", e)))?;
+        let process = cmd.spawn().map_err(|e| {
+            crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {}", e))
+        })?;
 
         // Wait for socket to be created
         let mut ready = false;
@@ -67,7 +70,9 @@ impl VirtioFsDaemon {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         if !ready {
-            return Err(crate::error::Error::Subprocess("virtiofsd failed to create socket".to_string()));
+            return Err(crate::error::Error::Subprocess(
+                "virtiofsd failed to create socket".to_string(),
+            ));
         }
 
         Ok(Self {
@@ -104,7 +109,9 @@ impl VirtioFsDaemon {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         if !ready {
-            return Err(crate::error::Error::Subprocess("in-process virtiofsd failed to create socket".to_string()));
+            return Err(crate::error::Error::Subprocess(
+                "in-process virtiofsd failed to create socket".to_string(),
+            ));
         }
 
         Ok(Self {

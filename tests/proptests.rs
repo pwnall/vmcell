@@ -1,8 +1,7 @@
-use proptest::prelude::*;
-use imp_testing::config::VmConfig;
-use imp_testing::vmm::CidAllocator;
-use imp_testing::agent::{ExecRequest, ExecOutcome};
+use imp_testing::agent::ExecRequest;
 use imp_testing::agent::protocol::Message;
+use imp_testing::vmm::CidAllocator;
+use proptest::prelude::*;
 
 proptest! {
     #[test]
@@ -10,7 +9,7 @@ proptest! {
         let alloc = CidAllocator::new();
         let cid1 = alloc.allocate().unwrap();
         assert!(cid1 >= 3);
-        
+
         let mut active = vec![cid1];
         // Allocate up to 200 random CIDs
         let limit = (seed % 200) as usize;
@@ -21,12 +20,12 @@ proptest! {
                 active.push(cid);
             }
         }
-        
+
         // Release half of them
-        for i in 0..(active.len()/2) {
-            alloc.release(active[i]);
+        for i in active.iter().take(active.len() / 2) {
+            alloc.release(*i);
         }
-        
+
         // Re-allocate
         if let Ok(cid) = alloc.allocate() {
             assert!(cid >= 3);
@@ -40,7 +39,7 @@ proptest! {
         let msg_req = Message::Exec(req);
         let bytes_req = postcard::to_stdvec(&msg_req).unwrap();
         let decoded_req: Message = postcard::from_bytes(&bytes_req).unwrap();
-        
+
         match decoded_req {
             Message::Exec(r) => assert_eq!(r.argv, argv),
             _ => panic!("Expected Exec"),
@@ -61,10 +60,10 @@ proptest! {
         use imp_testing::config::ProxyConfig;
         let mut p1 = ProxyConfig::default();
         p1.blocked_domains = domains.clone();
-        
+
         let mut p2 = ProxyConfig::default();
         p2.blocked_domains = domains.clone();
-        
+
         #[cfg(feature = "proxy")]
         {
             // Even with same contents, different Arc allocation means not equal for ProxyConfig
@@ -72,12 +71,12 @@ proptest! {
             p2.doubles = p1.doubles.clone();
         }
         assert_eq!(p1, p2);
-        
+
         let mut p3 = ProxyConfig::default();
         #[cfg(feature = "proxy")]
         { p3.doubles = p1.doubles.clone(); }
         p3.blocked_domains = vec!["blocked.com".to_string()];
-        
+
         assert_ne!(p1, p3);
     }
 }

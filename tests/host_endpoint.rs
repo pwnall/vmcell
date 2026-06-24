@@ -13,7 +13,9 @@ async fn test_host_endpoint() {
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
 
-    let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs }).build().unwrap();
+    let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
+        .build()
+        .unwrap();
     cfg.net = imp_testing::config::NetConfig::Rootless {
         egress: imp_testing::config::Egress::Open,
         host_services: true,
@@ -21,7 +23,9 @@ async fn test_host_endpoint() {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc)
+        .await
+        .expect("Failed to start VM");
 
     let host_ip = format!("10.200.{}.1", vm.vmid());
 
@@ -32,24 +36,33 @@ async fn test_host_endpoint() {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let mut agent = vm.agent().await.expect("Failed to connect to agent");
+    let agent = vm.agent().await.expect("Failed to connect to agent");
 
     // Give network time to come up in guest
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let ip_a = agent.exec(ExecRequest::new(vec!["ip".into(), "a".into()])).await.unwrap();
+    let ip_a = agent
+        .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
+        .await
+        .unwrap();
     println!("Guest IP A:\n{}", String::from_utf8_lossy(&ip_a.stdout));
-    let ip_r = agent.exec(ExecRequest::new(vec!["ip".into(), "route".into()])).await.unwrap();
+    let ip_r = agent
+        .exec(ExecRequest::new(vec!["ip".into(), "route".into()]))
+        .await
+        .unwrap();
     println!("Guest IP Route:\n{}", String::from_utf8_lossy(&ip_r.stdout));
-    let ip_n = agent.exec(ExecRequest::new(vec!["ip".into(), "neigh".into()])).await.unwrap();
+    let ip_n = agent
+        .exec(ExecRequest::new(vec!["ip".into(), "neigh".into()]))
+        .await
+        .unwrap();
     println!("Guest IP Neigh:\n{}", String::from_utf8_lossy(&ip_n.stdout));
 
     let outcome = agent
         .exec(ExecRequest::new(vec![
-                "curl".into(),
-                "-v".into(),
-                format!("http://{}:8080/", host_ip),
-            ]))
+            "curl".into(),
+            "-v".into(),
+            format!("http://{}:8080/", host_ip),
+        ]))
         .await
         .expect("Exec failed");
 

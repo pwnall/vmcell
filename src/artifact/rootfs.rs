@@ -15,8 +15,6 @@ pub struct RootfsStage {
     pub release: String,
 }
 
-
-
 use async_trait::async_trait;
 
 #[async_trait]
@@ -62,13 +60,16 @@ impl Stage for RootfsStage {
             cmd.arg("--variant=minbase")
                 .arg("--include=systemd-sysv,iproute2,curl,python3,ca-certificates")
                 .arg("--customize-hook=copy-in target/release/imp-guest-agent /sbin/");
-            
+
             #[cfg(feature = "proxy")]
             {
-                cmd.arg(format!("--customize-hook=upload {} /usr/local/share/ca-certificates/imp-ca.crt", ca_path))
-                   .arg("--customize-hook=chroot \"$1\" update-ca-certificates");
+                cmd.arg(format!(
+                    "--customize-hook=upload {} /usr/local/share/ca-certificates/imp-ca.crt",
+                    ca_path
+                ))
+                .arg("--customize-hook=chroot \"$1\" update-ca-certificates");
             }
-            
+
             let mut mmdebstrap = cmd
                 .arg(&self.release)
                 .arg("-")
@@ -76,8 +77,12 @@ impl Stage for RootfsStage {
                 .stderr(std::process::Stdio::piped())
                 .spawn()?;
 
-            let mmdebstrap_stdout: std::process::Stdio =
-                mmdebstrap.stdout.take().unwrap().try_into().unwrap();
+            let mmdebstrap_stdout: std::process::Stdio = mmdebstrap
+                .stdout
+                .take()
+                .ok_or_else(|| Error::Artifact("No stdout from mmdebstrap".into()))?
+                .try_into()
+                .map_err(|_| Error::Artifact("Failed to convert ChildStdout to Stdio".into()))?;
 
             let mut mkfs = Command::new("mkfs.erofs")
                 .arg("--tar=f")
@@ -104,11 +109,14 @@ impl Stage for RootfsStage {
                 cmd.arg("--variant=minbase")
                     .arg("--include=systemd-sysv,iproute2,curl,python3,ca-certificates")
                     .arg("--customize-hook=copy-in target/release/imp-guest-agent /sbin/");
-                
+
                 #[cfg(feature = "proxy")]
                 {
-                    cmd.arg(format!("--customize-hook=upload {} /usr/local/share/ca-certificates/imp-ca.crt", ca_path))
-                       .arg("--customize-hook=chroot \"$1\" update-ca-certificates");
+                    cmd.arg(format!(
+                        "--customize-hook=upload {} /usr/local/share/ca-certificates/imp-ca.crt",
+                        ca_path
+                    ))
+                    .arg("--customize-hook=chroot \"$1\" update-ca-certificates");
                 }
 
                 let mut mmdebstrap = cmd
@@ -119,11 +127,14 @@ impl Stage for RootfsStage {
                     .spawn()
                     .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
-                let stdout = mmdebstrap.stdout.take().ok_or_else(|| crate::error::Error::Artifact("No stdout from mmdebstrap".into()))?;
-                
+                let stdout = mmdebstrap.stdout.take().ok_or_else(|| {
+                    crate::error::Error::Artifact("No stdout from mmdebstrap".into())
+                })?;
+
                 let archive = tar::Archive::new(stdout);
                 let image = crate::artifact::tar2erofs::tar_to_erofs(archive)?;
-                std::fs::write(out, image).map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+                std::fs::write(out, image)
+                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
                 let mut stderr_str = String::new();
                 if let Some(mut stderr) = mmdebstrap.stderr.take() {
@@ -131,10 +142,16 @@ impl Stage for RootfsStage {
                     stderr.read_to_string(&mut stderr_str).ok();
                 }
 
-                let status = mmdebstrap.wait().map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
-                let mkfs_status = std::process::Command::new("true").status().map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+                let status = mmdebstrap
+                    .wait()
+                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+                let mkfs_status = std::process::Command::new("true")
+                    .status()
+                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
                 Ok((status, mkfs_status, stderr_str))
-            }).await.map_err(|e| crate::error::Error::Artifact(e.to_string()))??
+            })
+            .await
+            .map_err(|e| crate::error::Error::Artifact(e.to_string()))??
         };
 
         if !status.success() || !mkfs_status.success() {

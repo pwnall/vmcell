@@ -153,34 +153,47 @@ impl ChInstance {
             .uri(format!("http://localhost{}", path))
             .header("Host", "localhost")
             .header("Content-Type", "application/json")
-            .body(http_body_util::Full::new(hyper::body::Bytes::from(body_bytes)))
+            .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                body_bytes,
+            )))
             .map_err(|e| Error::Vmm(format!("request builder error: {}", e)))?;
 
-        let res = sender.send_request(req)
+        let res = sender
+            .send_request(req)
             .await
             .map_err(|e| Error::Vmm(format!("send_request error: {}", e)))?;
 
         if !res.status().is_success() {
             let status = res.status();
             use http_body_util::BodyExt;
-            let bytes = res.into_body().collect().await
+            let bytes = res
+                .into_body()
+                .collect()
+                .await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
-            return Err(Error::VmmApi { status: status.as_u16(), body: String::from_utf8_lossy(&bytes).into_owned() });
+            return Err(Error::VmmApi {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
         }
 
         Ok(())
     }
 }
 
-
-
 impl CloudHypervisor {
     async fn spawn_ch(
         &self,
         res: &PerVmResources,
         snapshot_dir: Option<&Path>,
-    ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, tokio::process::Child)> {
+    ) -> Result<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio::process::Child,
+    )> {
         let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), res.vmid));
         tokio::fs::create_dir_all(&tmp).await?;
 
@@ -198,7 +211,7 @@ impl CloudHypervisor {
 
         if let Some(dir) = snapshot_dir {
             cmd.arg("--restore")
-               .arg(format!("source_url=file://{}", dir.display()));
+                .arg(format!("source_url=file://{}", dir.display()));
         }
 
         let process = cmd
@@ -213,7 +226,12 @@ impl CloudHypervisor {
             if !res.cgroup_name.is_empty() {
                 let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", res.cgroup_name);
                 if let Err(e) = tokio::fs::write(&procs_path, pid.to_string()).await {
-                    tracing::error!("WARNING: failed to write process {} to {}: {:?}", pid, procs_path, e);
+                    tracing::error!(
+                        "WARNING: failed to write process {} to {}: {:?}",
+                        pid,
+                        procs_path,
+                        e
+                    );
                 } else {
                     tracing::info!("Added process {} to cgroup {}", pid, res.cgroup_name);
                 }
@@ -228,15 +246,14 @@ impl CloudHypervisor {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        
+
         if !socket_ready {
             return Err(Error::Vmm("API socket failed to appear".into()));
         }
-        
+
         Ok((tmp, api_socket, vsock_path, serial_path, process))
     }
 }
-
 
 impl Vmm for CloudHypervisor {
     type Instance = ChInstance;
@@ -296,7 +313,10 @@ impl Vmm for CloudHypervisor {
                         res.vmid
                     );
                     if !matches!(cfg.net, crate::config::NetConfig::None) {
-                        s.push_str(&format!(" ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off", res.vmid, res.vmid));
+                        s.push_str(&format!(
+                            " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
+                            res.vmid, res.vmid
+                        ));
                     }
                     s
                 },
@@ -363,8 +383,14 @@ impl Vmm for CloudHypervisor {
         Ok(instance)
     }
 
-    async fn restore(&self, snapshot_dir: &Path, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
-        let (tmp, api_socket, vsock_path, serial_path, process) = self.spawn_ch(res, Some(snapshot_dir)).await?;
+    async fn restore(
+        &self,
+        snapshot_dir: &Path,
+        cfg: &VmConfig,
+        res: &PerVmResources,
+    ) -> Result<Self::Instance> {
+        let (tmp, api_socket, vsock_path, serial_path, process) =
+            self.spawn_ch(res, Some(snapshot_dir)).await?;
 
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
@@ -388,7 +414,6 @@ impl Vmm for CloudHypervisor {
         Ok(instance)
     }
 }
-
 
 impl VmInstance for ChInstance {
     async fn boot(&mut self) -> Result<()> {
@@ -438,7 +463,8 @@ impl VmInstance for ChInstance {
             .await;
         if let Err(e) = self
             .api_request("PUT", "/api/v1/vm.resume", None::<&()>)
-            .await {
+            .await
+        {
             tracing::warn!("Failed to resume VM after snapshot: {}", e);
         }
         res
@@ -455,12 +481,16 @@ impl VmInstance for ChInstance {
                     match sub {
                         cgroups_rs::Subsystem::Mem(_) => {
                             let base_path = format!("/sys/fs/cgroup/{}", cg_name);
-                            if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
+                            if let Ok(s) =
+                                std::fs::read_to_string(format!("{}/memory.current", base_path))
+                            {
                                 if let Ok(val) = s.trim().parse::<u64>() {
                                     usage.mem_current_mib = val / 1024 / 1024;
                                 }
                             }
-                            if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
+                            if let Ok(s) =
+                                std::fs::read_to_string(format!("{}/memory.peak", base_path))
+                            {
                                 if let Ok(val) = s.trim().parse::<u64>() {
                                     usage.mem_peak_mib = val / 1024 / 1024;
                                 }
@@ -519,19 +549,35 @@ mod tests {
     #[test]
     fn test_ch_vm_config_serialization() {
         let cfg = ChVmConfig {
-            cpus: ChCpus { boot_vcpus: 2, max_vcpus: 2 },
-            memory: ChMemory { size: 1024, shared: true },
-            payload: ChPayload { kernel: PathBuf::from("/vmlinux"), cmdline: "console=ttyS0".into() },
+            cpus: ChCpus {
+                boot_vcpus: 2,
+                max_vcpus: 2,
+            },
+            memory: ChMemory {
+                size: 1024,
+                shared: true,
+            },
+            payload: ChPayload {
+                kernel: PathBuf::from("/vmlinux"),
+                cmdline: "console=ttyS0".into(),
+            },
             disks: vec![],
             fs: vec![],
             net: vec![],
-            serial: ChSerial { mode: "File".into(), file: PathBuf::from("/serial.log") },
-            vsock: ChVsock { cid: 3, socket: PathBuf::from("/vsock.sock") },
+            serial: ChSerial {
+                mode: "File".into(),
+                file: PathBuf::from("/serial.log"),
+            },
+            vsock: ChVsock {
+                cid: 3,
+                socket: PathBuf::from("/vsock.sock"),
+            },
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"boot_vcpus\":2"));
         assert!(!json.contains("\"disks\"")); // skip_serializing_if empty
-        assert!(json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}"));
+        assert!(
+            json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}")
+        );
     }
-
 }

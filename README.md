@@ -41,3 +41,23 @@ cargo install virtiofsd --locked
 ```
 
 Ensure that `~/.cargo/bin` is in your `$PATH` so the test suite can discover these executables.
+
+### 3. Privileged Test Runner
+
+To run privileged networking tests (like those requiring TAP interfaces or transparent proxying) without running the entire `cargo test` suite as `root`, we use a lightweight capability-granting runner.
+
+Build the `imp-test-runner` for both `debug` and `release` configurations, then grant it the necessary capabilities:
+
+```sh
+# Build the runner
+cargo build --bin imp-test-runner --features test-runner
+cargo build --release --bin imp-test-runner --features test-runner
+
+# Bless the binaries with network and system admin capabilities
+sudo setcap cap_net_admin,cap_sys_admin+p target/debug/imp-test-runner
+sudo setcap cap_net_admin,cap_sys_admin+p target/release/imp-test-runner
+```
+
+*Note: You must re-run the `setcap` commands anytime the `imp-test-runner` binary is recompiled, as rebuilding strips file capabilities.*
+
+To use the runner during local development, either execute your test binaries through it directly or configure your cargo test runner (e.g., in `.cargo/config.toml`) to use it for the privileged suite.

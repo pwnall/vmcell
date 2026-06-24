@@ -4,18 +4,18 @@
 //! machine to access external networks while giving the host visibility,
 //! control over egress traffic, and test double capabilities.
 
-/// Module for generating and managing the MITM Root CA
-pub mod tls;
 /// Module for test doubles and request interception
 pub mod doubles;
+/// Module for generating and managing the MITM Root CA
+pub mod tls;
 
 use crate::error::{Error, Result};
+use crate::proxy::doubles::{ProxyHandler, TestDouble};
+use hudsucker::builder::ProxyBuilder;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
-use tokio::net::TcpListener;
-use hudsucker::builder::ProxyBuilder;
-use crate::proxy::doubles::{ProxyHandler, TestDouble};
 use std::sync::Arc;
+use tokio::net::TcpListener;
 
 /// Configuration for an egress proxy.
 pub struct ProxyConfig {
@@ -87,7 +87,10 @@ impl EgressProxy {
                     // SAFETY: Thread isolation for network namespace
                     let ret = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
                     if ret != 0 {
-                        let _ = tx.send(Err(format!("Failed to setns: {}", std::io::Error::last_os_error())));
+                        let _ = tx.send(Err(format!(
+                            "Failed to setns: {}",
+                            std::io::Error::last_os_error()
+                        )));
                         return;
                     }
                 }
@@ -103,7 +106,7 @@ impl EgressProxy {
                     return;
                 }
             };
-            
+
             rt.block_on(async move {
                 let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
                 let listener = match TcpListener::bind(addr).await {
@@ -113,7 +116,7 @@ impl EgressProxy {
                         return;
                     }
                 };
-                
+
                 let port = match listener.local_addr() {
                     Ok(addr) => addr.port(),
                     Err(e) => {
@@ -130,7 +133,7 @@ impl EgressProxy {
                         return;
                     }
                 };
-                
+
                 let authority = match ca_manager.authority() {
                     Ok(auth) => auth,
                     Err(e) => {
@@ -172,7 +175,7 @@ impl EgressProxy {
 
         let port_res = rx.await.map_err(|e| Error::Proxy(e.to_string()))?;
         let port = port_res.map_err(|e| Error::Proxy(e.to_string()))?;
-        Ok(Self { 
+        Ok(Self {
             port,
             kill_tx: Some(kill_tx),
             thread: Some(thread),

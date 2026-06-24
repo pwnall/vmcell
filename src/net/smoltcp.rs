@@ -35,9 +35,9 @@ pub mod backend {
     /// Shared state across the smoltcp background thread and API interfaces.
     pub struct SharedState {
         /// Packets the guest wants to send (received from guest virtio-net).
-        pub tx_queue: VecDeque<Vec<u8>>, 
+        pub tx_queue: VecDeque<Vec<u8>>,
         /// Packets the host wants to send to the guest virtio-net.
-        pub rx_queue: VecDeque<Vec<u8>>, 
+        pub rx_queue: VecDeque<Vec<u8>>,
         /// Shared memory between host and guest.
         pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
         /// Virtio rings for RX and TX queues.
@@ -147,10 +147,17 @@ pub mod backend {
                 }
 
                 if packet.len() >= VIRTIO_NET_HDR_SIZE {
-                    log::trace!("process_tx_queue: Read packet of length {} from vring: {:?}", packet.len(), packet.get(VIRTIO_NET_HDR_SIZE..).expect("invariant"));
-                    state
-                        .tx_queue
-                        .push_back(packet.get(VIRTIO_NET_HDR_SIZE..).expect("invariant").to_vec());
+                    log::trace!(
+                        "process_tx_queue: Read packet of length {} from vring: {:?}",
+                        packet.len(),
+                        packet.get(VIRTIO_NET_HDR_SIZE..).expect("invariant")
+                    );
+                    state.tx_queue.push_back(
+                        packet
+                            .get(VIRTIO_NET_HDR_SIZE..)
+                            .expect("invariant")
+                            .to_vec(),
+                    );
                 } else {
                     log::trace!("process_tx_queue: packet too short: {}", packet.len());
                 }
@@ -258,7 +265,8 @@ pub mod backend {
     impl Drop for SmoltcpProcess {
         fn drop(&mut self) {
             tracing::info!("SmoltcpProcess dropping!");
-            self.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.stop_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = self.kill_notifier.notify();
             if let Some(h) = self.vhost_thread.take() {
                 let _ = h.join();
@@ -285,11 +293,15 @@ pub mod backend {
 
             let state_clone = state.clone();
 
-            let (kill_evt_consumer, kill_evt_notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
-                vmm_sys_util::event::EventFlag::NONBLOCK,
-            )
-            .expect("invariant");
-            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().expect("invariant"));
+            let (kill_evt_consumer, kill_evt_notifier) =
+                vmm_sys_util::event::new_event_consumer_and_notifier(
+                    vmm_sys_util::event::EventFlag::NONBLOCK,
+                )
+                .expect("invariant");
+            let kill_evt = (
+                kill_evt_consumer,
+                kill_evt_notifier.try_clone().expect("invariant"),
+            );
 
             let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
                 event_idx: false,
@@ -327,7 +339,12 @@ pub mod backend {
             }
         }
 
-        async fn run_network(vmid: u32, forward_ports: Vec<u16>, state: Arc<Mutex<SharedState>>, stop_flag: Arc<std::sync::atomic::AtomicBool>) {
+        async fn run_network(
+            vmid: u32,
+            forward_ports: Vec<u16>,
+            state: Arc<Mutex<SharedState>>,
+            stop_flag: Arc<std::sync::atomic::AtomicBool>,
+        ) {
             let host_gw = Ipv4Address::new(10, 200, (vmid % 256) as u8, 1);
             // Use a different MAC for the host to avoid dropping packets from the guest.
             let mac_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0xfe]);
@@ -346,18 +363,23 @@ pub mod backend {
                     .push(IpCidr::new(IpAddress::Ipv4(host_gw), 30))
                     .expect("invariant");
             });
-            iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 200, (vmid % 256) as u8, 2)).expect("invariant");
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(Ipv4Address::new(10, 200, (vmid % 256) as u8, 2))
+                .expect("invariant");
             log::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
 
             let mut sockets = SocketSet::new(vec![]);
 
             let mut port_mappings = Vec::new();
             for port in forward_ports {
-                let rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
-                let tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
-                let socket = TcpSocket::new(rx_buffer, tx_buffer);
-                let handle = sockets.add(socket);
-                port_mappings.push((port, handle, None::<tokio::net::TcpStream>));
+                for _ in 0..16 {
+                    let rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+                    let tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+                    let socket = TcpSocket::new(rx_buffer, tx_buffer);
+                    let handle = sockets.add(socket);
+                    port_mappings.push((port, handle, None::<tokio::net::TcpStream>));
+                }
             }
 
             loop {
@@ -368,7 +390,8 @@ pub mod backend {
                     let mut state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
                     // Process receiveq (host -> guest)
-                    let (mem_opt, vrings_opt) = (state_guard.mem.clone(), state_guard.vrings.clone());
+                    let (mem_opt, vrings_opt) =
+                        (state_guard.mem.clone(), state_guard.vrings.clone());
                     if let (Some(mem), Some(vrings)) = (mem_opt, vrings_opt) {
                         let mut vring_state = vrings.first().expect("invariant").get_mut();
                         let mem_obj = mem.memory();
@@ -378,7 +401,10 @@ pub mod backend {
                             let avail_chains = vring_state.get_queue_mut().iter(mem_obj.clone());
                             if let Ok(mut chains) = avail_chains {
                                 if let Some(chain) = chains.next() {
-                                    log::trace!("process_rx_queue: Sending packet of length {} to guest", packet.len());
+                                    log::trace!(
+                                        "process_rx_queue: Sending packet of length {} to guest",
+                                        packet.len()
+                                    );
                                     let head_index = chain.head_index();
 
                                     let mut full_packet = vec![0; VIRTIO_NET_HDR_SIZE];
@@ -394,7 +420,9 @@ pub mod backend {
                                         if to_write > 0
                                             && mem_obj
                                                 .write_slice(
-                                                    full_packet.get(offset..offset + to_write).expect("invariant"),
+                                                    full_packet
+                                                        .get(offset..offset + to_write)
+                                                        .expect("invariant"),
                                                     desc.addr(),
                                                 )
                                                 .is_ok()
@@ -403,7 +431,9 @@ pub mod backend {
                                             written += to_write;
                                         }
                                     }
-                                    vring_state.add_used(head_index, written as u32).expect("invariant");
+                                    vring_state
+                                        .add_used(head_index, written as u32)
+                                        .expect("invariant");
                                     used_any = true;
                                 } else {
                                     state_guard.rx_queue.push_front(packet);
@@ -449,7 +479,9 @@ pub mod backend {
                                         closed = true;
                                     }
                                     Ok(n) => {
-                                        socket.send_slice(buf.get(..n).expect("invariant")).expect("invariant");
+                                        socket
+                                            .send_slice(buf.get(..n).expect("invariant"))
+                                            .expect("invariant");
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => {

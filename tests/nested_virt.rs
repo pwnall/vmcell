@@ -21,7 +21,8 @@ async fn test_nested_virt() {
         },
     )
     .network_disabled()
-    .build().unwrap();
+    .build()
+    .unwrap();
 
     // Enable nested virtualization
     cfg.nested_virt = true;
@@ -32,9 +33,11 @@ async fn test_nested_virt() {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
+    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc)
+        .await
+        .expect("Failed to start VM");
 
-    let mut agent = match vm.agent().await {
+    let agent = match vm.agent().await {
         Ok(a) => a,
         Err(e) => {
             use imp_testing::vmm::VmInstance;

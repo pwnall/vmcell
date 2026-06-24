@@ -4,17 +4,26 @@
 //! Linux network namespaces and TAP interfaces used by virtual machines.
 
 use crate::error::{Error, Result};
-use std::process::Command;
 use futures::stream::TryStreamExt;
 use std::net::Ipv4Addr;
+use std::process::Command;
 
 /// Interface for executing netlink operations.
 pub trait Netlink: Send + Sync {
     /// Creates a network namespace.
+    ///
+    /// # Errors
+    /// Returns an error if the namespace creation fails.
     fn add_netns(&self, name: &str) -> Result<()>;
     /// Sets up the TAP interface and IP address inside the namespace.
+    ///
+    /// # Errors
+    /// Returns an error if setting up the TAP interface or assigning the IP fails.
     fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<Option<tun_tap::Iface>>;
     /// Deletes a network namespace.
+    ///
+    /// # Errors
+    /// Returns an error if deleting the namespace fails.
     fn delete_netns(&self, name: &str) -> Result<()>;
 }
 
@@ -32,46 +41,84 @@ pub struct RtNetlink;
 
 impl Netlink for RtNetlink {
     fn add_netns(&self, name: &str) -> Result<()> {
-        netns_rs::NetNs::new(name).map_err(|e| Error::Network(format!("netns add failed: {}", e)))?;
+        netns_rs::NetNs::new(name)
+            .map_err(|e| Error::Network(format!("netns add failed: {}", e)))?;
         Ok(())
     }
 
     fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<Option<tun_tap::Iface>> {
-        let ns = netns_rs::NetNs::get(netns).map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
+        let ns = netns_rs::NetNs::get(netns)
+            .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
         let tn = tap_name.to_string();
-        
-        let tap = ns.run(move |_| {
-            tun_tap::Iface::without_packet_info(&tn, tun_tap::Mode::Tap)
-        }).map_err(|e| Error::Network(format!("ns run tap fail: {:?}", e)))?
-          .map_err(|e| Error::Network(format!("tap create fail: {}", e)))?;
+
+        let tap = ns
+            .run(move |_| tun_tap::Iface::without_packet_info(&tn, tun_tap::Mode::Tap))
+            .map_err(|e| Error::Network(format!("ns run tap fail: {:?}", e)))?
+            .map_err(|e| Error::Network(format!("tap create fail: {}", e)))?;
 
         let tap_name = tap_name.to_string();
-        let ip: Ipv4Addr = format!("10.200.{}.1", vmid).parse().unwrap();
+        let ip: Ipv4Addr = format!("10.200.{}.1", vmid)
+            .parse()
+            .map_err(|e| Error::Network(format!("invalid IP: {}", e)))?;
 
         let res = ns.run(move |_| {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => return Err(format!("tokio build failed: {}", e)),
             };
             rt.block_on(async {
-                let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| format!("rtnetlink connect failed: {}", e))?;
+                let (connection, handle, _) = rtnetlink::new_connection()
+                    .map_err(|e| format!("rtnetlink connect failed: {}", e))?;
                 tokio::spawn(connection);
 
-                let link_idx = handle.link().get().match_name(tap_name.clone()).execute().try_next().await
+                let link_idx = handle
+                    .link()
+                    .get()
+                    .match_name(tap_name.clone())
+                    .execute()
+                    .try_next()
+                    .await
                     .map_err(|e| format!("get link err: {}", e))?
-                    .ok_or_else(|| format!("link {} not found", tap_name))?.header.index;
+                    .ok_or_else(|| format!("link {} not found", tap_name))?
+                    .header
+                    .index;
 
-                handle.address().add(link_idx, std::net::IpAddr::V4(ip), 30).execute().await
+                handle
+                    .address()
+                    .add(link_idx, std::net::IpAddr::V4(ip), 30)
+                    .execute()
+                    .await
                     .map_err(|e| format!("addr add err: {}", e))?;
 
-                handle.link().set(link_idx).up().execute().await
+                handle
+                    .link()
+                    .set(link_idx)
+                    .up()
+                    .execute()
+                    .await
                     .map_err(|e| format!("link up err: {}", e))?;
 
-                let lo_idx = handle.link().get().match_name("lo".to_string()).execute().try_next().await
+                let lo_idx = handle
+                    .link()
+                    .get()
+                    .match_name("lo".to_string())
+                    .execute()
+                    .try_next()
+                    .await
                     .map_err(|e| format!("get lo err: {}", e))?
-                    .ok_or_else(|| "lo not found".to_string())?.header.index;
+                    .ok_or_else(|| "lo not found".to_string())?
+                    .header
+                    .index;
 
-                handle.link().set(lo_idx).up().execute().await
+                handle
+                    .link()
+                    .set(lo_idx)
+                    .up()
+                    .execute()
+                    .await
                     .map_err(|e| format!("lo up err: {}", e))?;
 
                 Ok(())
@@ -86,8 +133,10 @@ impl Netlink for RtNetlink {
     }
 
     fn delete_netns(&self, name: &str) -> Result<()> {
-        let ns = netns_rs::NetNs::get(name).map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
-        ns.remove().map_err(|e| Error::Network(format!("netns remove failed: {}", e)))?;
+        let ns = netns_rs::NetNs::get(name)
+            .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
+        ns.remove()
+            .map_err(|e| Error::Network(format!("netns remove failed: {}", e)))?;
         Ok(())
     }
 }
@@ -102,14 +151,20 @@ impl NftApplier for DefaultNftApplier {
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| Error::Subprocess(format!("nft spawn failed: {}", e)))?;
-        
+
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(rules.as_bytes()).map_err(|e| Error::Subprocess(format!("nft write failed: {}", e)))?;
+            stdin
+                .write_all(rules.as_bytes())
+                .map_err(|e| Error::Subprocess(format!("nft write failed: {}", e)))?;
         }
-        
-        let status = child.wait().map_err(|e| Error::Subprocess(format!("nft wait failed: {}", e)))?;
+
+        let status = child
+            .wait()
+            .map_err(|e| Error::Subprocess(format!("nft wait failed: {}", e)))?;
         if !status.success() {
-            return Err(Error::Subprocess("nft rules application failed".to_string()));
+            return Err(Error::Subprocess(
+                "nft rules application failed".to_string(),
+            ));
         }
         Ok(())
     }
@@ -149,7 +204,7 @@ impl NetNamespace {
         let tap_name = format!("imp-tap-{}", vmid);
 
         netlink.add_netns(&name)?;
-        
+
         let tap = netlink.setup_tap(&name, &tap_name, vmid)?;
 
         Ok(Self {
@@ -215,7 +270,12 @@ mod tests {
         fn add_netns(&self, _name: &str) -> Result<()> {
             Ok(())
         }
-        fn setup_tap(&self, _netns: &str, _tap_name: &str, _vmid: u32) -> Result<Option<tun_tap::Iface>> {
+        fn setup_tap(
+            &self,
+            _netns: &str,
+            _tap_name: &str,
+            _vmid: u32,
+        ) -> Result<Option<tun_tap::Iface>> {
             Ok(None)
         }
         fn delete_netns(&self, _name: &str) -> Result<()> {
@@ -229,7 +289,7 @@ mod tests {
             prop_assume!(vmid1 != vmid2);
             let ns1 = NetNamespace::create(vmid1, Box::new(MockNetlink)).unwrap();
             let ns2 = NetNamespace::create(vmid2, Box::new(MockNetlink)).unwrap();
-            
+
             assert_ne!(ns1.name, ns2.name);
             assert_ne!(ns1.tap_name, ns2.tap_name);
             assert_ne!(ns1.host_ip(), ns2.host_ip());
