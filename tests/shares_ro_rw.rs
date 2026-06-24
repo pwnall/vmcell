@@ -40,7 +40,8 @@ async fn test_shares_ro_rw() {
         .build().unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let mut vmm = imp_testing::TestVm::start(&_vmm, _cfg, &cid_alloc)
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let mut vmm = imp_testing::TestVm::start(&_vmm, _cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
 

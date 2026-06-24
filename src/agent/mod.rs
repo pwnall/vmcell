@@ -97,19 +97,19 @@ impl AgentClient {
     pub async fn exec(&mut self, cmd: ExecRequest) -> Result<ExecOutcome> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let msg = Message::Exec(cmd);
-            let bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Other(e.to_string()))?;
+            let bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
 
             self.stream
-                .send(bytes::Bytes::from(bytes))
+                .send(::bytes::Bytes::from(bytes))
                 .await
                 .map_err(Error::Io)?;
 
             let mut outcome = ExecOutcome::default();
 
             while let Some(res) = self.stream.next().await {
-                let bytes: bytes::BytesMut = res.map_err(Error::Io)?;
+                let bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
                 let msg: Message =
-                    postcard::from_bytes(&bytes).map_err(|e| Error::Other(e.to_string()))?;
+                    postcard::from_bytes(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
 
                 match msg {
                     Message::Stdout(data) => {
@@ -137,14 +137,14 @@ impl AgentClient {
     pub async fn put_file(&mut self, dst: &str, bytes: &[u8]) -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let msg = Message::PutFile { dst: dst.to_string(), bytes: bytes.to_vec() };
-            let msg_bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Other(e.to_string()))?;
-            self.stream.send(bytes::Bytes::from(msg_bytes)).await.map_err(Error::Io)?;
+            let msg_bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
+            self.stream.send(::bytes::Bytes::from(msg_bytes)).await.map_err(Error::Io)?;
             
             // Wait for ack
             if let Some(res) = self.stream.next().await {
-                let res_bytes: bytes::BytesMut = res.map_err(Error::Io)?;
+                let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
                 let resp_msg: Message = postcard::from_bytes(&res_bytes)
-                    .map_err(|e| Error::Other(e.to_string()))?;
+                    .map_err(|e| Error::Serialize(e.to_string()))?;
                 match resp_msg {
                     Message::Exit(0) => Ok(()),
                     Message::Exit(c) => Err(Error::Agent(format!("put_file failed with code {}", c))),

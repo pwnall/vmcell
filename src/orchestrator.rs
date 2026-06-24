@@ -9,10 +9,45 @@ use crate::proxy::{EgressProxy, ProxyConfig};
 use crate::vmm::{PerVmResources, VmInstance, Vmm};
 #[cfg(feature = "metrics")]
 use cgroups_rs::{cgroup_builder::CgroupBuilder, hierarchies};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
-static ACTIVE_VMIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Allocates unique VM IDs for the orchestrator.
+#[derive(Debug, Default)]
+pub struct VmidAllocator {
+    active: Mutex<Vec<u32>>,
+}
+
+impl VmidAllocator {
+    /// Creates a new VMID allocator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            active: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Allocates and returns the next available unique VMID.
+    ///
+    /// # Errors
+    /// Returns an error if all 254 VMIDs are currently in use.
+    pub fn allocate(&self) -> Result<u32> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        for i in 1..=254 {
+            if !active.contains(&i) {
+                active.push(i);
+                return Ok(i);
+            }
+        }
+        Err(crate::error::Error::Exhaustion("No available VMIDs (limit 254)".to_string()))
+    }
+
+    /// Releases a previously allocated VMID.
+    pub fn release(&self, vmid: u32) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.retain(|&id| id != vmid);
+    }
+}
 
 /// Represents a fully managed test VM, including its associated resources and VMM instance.
 #[derive(Debug)]
@@ -29,6 +64,10 @@ pub struct TestVm<V: Vmm> {
     smoltcp: Option<SmoltcpProcess>,
     /// The egress proxy associated with this VM, if any.
     proxy: Option<EgressProxy>,
+    /// The allocator used to assign the VMID, retained for release on drop.
+    vmid_alloc: Arc<VmidAllocator>,
+    /// The cached agent client connection, if any.
+    agent_client: Option<AgentClient>,
 }
 
 struct EnvSetup {
@@ -99,6 +138,7 @@ impl<V: Vmm> TestVm<V> {
                             port: 0,
                             netns: Some(format!("imp-net-{}", vmid)),
                             doubles: proxy_cfg.doubles.clone(),
+                            blocked_domains: proxy_cfg.blocked_domains.clone(),
                         })
                         .await?;
                         ns.emit_proxy_rules(px.port, &crate::net::tap::DefaultNftApplier)?;
@@ -122,6 +162,7 @@ impl<V: Vmm> TestVm<V> {
                             port: 0,
                             netns: None,
                             doubles: proxy_cfg.doubles.clone(),
+                            blocked_domains: proxy_cfg.blocked_domains.clone(),
                         })
                         .await?;
                         proxy_port = px.port;
@@ -193,12 +234,12 @@ impl<V: Vmm> TestVm<V> {
         })
     }
 
-    /// Starts a new test VM using the provided VMM and configuration.
+    /// Starts a new VM with the given configuration.
     ///
     /// # Errors
-    /// Returns an error if the VM cannot be started or resources cannot be allocated.
-    pub async fn start(vmm: &V, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator) -> Result<Self> {
-        let vmid = allocate_vmid()?;
+    /// Returns an error if network setup, proxy start, or VM boot fails.
+    pub async fn start(vmm: &V, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator, vmid_alloc: Arc<VmidAllocator>) -> Result<Self> {
+        let vmid = vmid_alloc.allocate()?;
         let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
 
         let mut instance = vmm.create(&cfg, &env.res).await?;
@@ -212,15 +253,17 @@ impl<V: Vmm> TestVm<V> {
             #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
+            vmid_alloc,
+            agent_client: None,
         })
     }
 
-    /// Restores a test VM from a snapshot directory.
+    /// Restores a VM from a snapshot directory with the given configuration.
     ///
     /// # Errors
-    /// Returns an error if the VM cannot be restored or resources cannot be allocated.
-    pub async fn restore(vmm: &V, snapshot_dir: &std::path::Path, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator) -> Result<Self> {
-        let vmid = allocate_vmid()?;
+    /// Returns an error if network setup, proxy start, or VM restore fails.
+    pub async fn restore(vmm: &V, snapshot_dir: &std::path::Path, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator, vmid_alloc: Arc<VmidAllocator>) -> Result<Self> {
+        let vmid = vmid_alloc.allocate()?;
         let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
 
         info!("Restoring instance...");
@@ -235,36 +278,46 @@ impl<V: Vmm> TestVm<V> {
             #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
+            vmid_alloc,
+            agent_client: None,
         })
     }
 
-    /// Connects to the guest agent running inside the VM and returns an API client.
+    /// Connects to the VM agent, returning a mutable reference to the client.
     ///
     /// # Errors
-    /// Returns an error if the connection cannot be established.
-    pub async fn agent(&mut self) -> Result<AgentClient> {
-        // Retry connecting since the VM might take a second to boot and bind vsock
-        for _ in 0..50 {
-            if let Ok(client) = AgentClient::connect(self.instance.vsock_path(), 5000).await {
-                return Ok(client);
+    /// Returns an error if the agent connection or handshake fails.
+    pub async fn agent(&mut self) -> Result<&mut AgentClient> {
+        if self.agent_client.is_none() {
+            // Retry connecting since the VM might take a second to boot and bind vsock
+            let mut client = None;
+            for _ in 0..50 {
+                if let Ok(c) = AgentClient::connect(self.instance.vsock_path(), 5000).await {
+                    client = Some(c);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if client.is_none() {
+                client = Some(AgentClient::connect(self.instance.vsock_path(), 5000).await?);
+            }
+            self.agent_client = client;
         }
-        AgentClient::connect(self.instance.vsock_path(), 5000).await
+        Ok(self.agent_client.as_mut().unwrap())
     }
 
-    /// Retrieves resource usage statistics for the VM.
+    /// Retrieves resource usage metrics for the VM.
     ///
     /// # Errors
-    /// Returns an error if the stats cannot be collected.
+    /// Returns an error if metrics collection fails.
     pub async fn usage(&self) -> Result<ResourceUsage> {
         self.instance.stats().await
     }
 
-    /// Gracefully shuts down the VM, cleaning up all associated resources.
+    /// Shuts down the VM and cleans up associated resources.
     ///
     /// # Errors
-    /// Returns an error if the shutdown times out or fails.
+    /// Returns an error if shutting down the VM or proxy fails.
     pub async fn shutdown(mut self) -> Result<()> {
         self.instance.request_shutdown().await?;
         if let Some(ns) = &self.netns {
@@ -278,27 +331,11 @@ impl<V: Vmm> TestVm<V> {
 
 impl<V: Vmm> Drop for TestVm<V> {
     fn drop(&mut self) {
-        release_vmid(self.vmid);
+        self.vmid_alloc.release(self.vmid);
     }
 }
 
-/// Allocates a unique VM ID for this process.
-fn allocate_vmid() -> Result<u32> {
-    let mut active = ACTIVE_VMIDS.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 1..=254 {
-        if !active.contains(&i) {
-            active.push(i);
-            return Ok(i);
-        }
-    }
-    Err(crate::error::Error::Other("No available VMIDs (limit 254)".to_string()))
-}
 
-/// Releases a previously allocated VM ID.
-fn release_vmid(vmid: u32) {
-    let mut active = ACTIVE_VMIDS.lock().unwrap_or_else(|e| e.into_inner());
-    active.retain(|&id| id != vmid);
-}
 
 #[cfg(test)]
 mod tests {
@@ -306,23 +343,25 @@ mod tests {
 
     #[test]
     fn test_allocate_vmid() {
-        let vmid1 = allocate_vmid().unwrap();
-        let vmid2 = allocate_vmid().unwrap();
+        let alloc = VmidAllocator::new();
+        let vmid1 = alloc.allocate().unwrap();
+        let vmid2 = alloc.allocate().unwrap();
         assert_ne!(vmid1, vmid2);
         assert!(vmid1 >= 1 && vmid1 <= 254);
-        release_vmid(vmid1);
-        release_vmid(vmid2);
+        alloc.release(vmid1);
+        alloc.release(vmid2);
     }
 
     #[test]
     fn test_allocate_vmid_exhaustion() {
+        let alloc = VmidAllocator::new();
         let mut vmids = Vec::new();
         for _ in 1..=254 {
-            vmids.push(allocate_vmid().unwrap());
+            vmids.push(alloc.allocate().unwrap());
         }
-        assert!(allocate_vmid().is_err());
+        assert!(alloc.allocate().is_err());
         for id in vmids {
-            release_vmid(id);
+            alloc.release(id);
         }
     }
 

@@ -28,7 +28,8 @@ async fn test_boot() {
         .build().unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
     println!("SERIAL LOG:\n{}", log);

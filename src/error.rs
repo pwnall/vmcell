@@ -4,7 +4,7 @@
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// An error related to the Virtual Machine Monitor.
+    /// An error related to the Virtual Machine Monitor (VMM).
     #[error("VMM error: {0}")]
     Vmm(String),
     /// An error related to the guest agent.
@@ -28,12 +28,18 @@ pub enum Error {
     /// A timeout error.
     #[error("Timeout error: {0}")]
     Timeout(String),
+    /// An error related to serialization/deserialization (e.g. JSON, Postcard).
+    #[error("Serialization error: {0}")]
+    Serialize(String),
+    /// A subprocess execution error.
+    #[error("Subprocess error: {0}")]
+    Subprocess(String),
+    /// Resource exhaustion (e.g., CIDs, VMIDs).
+    #[error("Resource exhaustion: {0}")]
+    Exhaustion(String),
     /// An I/O error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    /// Catch-all for other errors.
-    #[error("Other error: {0}")]
-    Other(String),
 }
 
 /// A specialized Result type for imp-testing.
@@ -55,8 +61,8 @@ mod tests {
             "Agent error: connection failed"
         );
         assert_eq!(
-            Error::Other("unknown error".to_string()).to_string(),
-            "Other error: unknown error"
+            Error::Serialize("unknown error".to_string()).to_string(),
+            "Serialization error: unknown error"
         );
     }
 

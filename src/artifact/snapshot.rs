@@ -16,6 +16,8 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotStage {}
 
+
+
 use async_trait::async_trait;
 
 #[async_trait]
@@ -52,7 +54,8 @@ impl Stage for SnapshotStage {
         let vmm = CloudHypervisor::new(ch_binary);
 
         let cid_alloc = crate::vmm::CidAllocator::new();
-        let mut vm = TestVm::start(&vmm, cfg, &cid_alloc).await?;
+        let vmid_alloc = std::sync::Arc::new(crate::orchestrator::VmidAllocator::new());
+        let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await?;
 
         // Wait for VM to boot fully via vsock agent
         let mut agent = vm.agent().await?;
@@ -71,6 +74,6 @@ impl Stage for SnapshotStage {
 
         vm.shutdown().await?;
 
-        Ok(StageOutputs {})
+        Ok(StageOutputs::default())
     }
 }

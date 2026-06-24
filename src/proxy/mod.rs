@@ -25,6 +25,8 @@ pub struct ProxyConfig {
     pub netns: Option<String>,
     /// Test doubles to inject responses.
     pub doubles: Arc<Vec<TestDouble>>,
+    /// Domains to block.
+    pub blocked_domains: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -33,6 +35,7 @@ impl Default for ProxyConfig {
             port: 0,
             netns: None,
             doubles: Arc::new(vec![]),
+            blocked_domains: vec![],
         }
     }
 }
@@ -60,6 +63,9 @@ impl Drop for EgressProxy {
 
 impl EgressProxy {
     /// Starts the egress proxy with the specified configuration.
+    ///
+    /// # Errors
+    /// Returns an error if binding to the port or initializing the CA fails.
     pub async fn start(cfg: ProxyConfig) -> Result<Self> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<u16, String>>();
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
@@ -126,24 +132,16 @@ impl EgressProxy {
 
                 let handler = ProxyHandler {
                     doubles: cfg.doubles.clone(),
+                    blocked_domains: cfg.blocked_domains.clone(),
                 };
-                // We only needed the listener to find a free port. 
-                // Since hudsucker doesn't natively accept a pre-bound listener with easy access to its port,
-                // we drop it and bind again on the known free port.
-                
-                // hudsucker builder currently does not take a bound listener directly in an easy way without `with_addr` logic overriding.
-                // However, since `Proxy::start` takes a shutdown signal, we can drop our dummy listener and bind again.
-                // Wait, if port is 0, we must find out which port hudsucker bound to.
-                // But hudsucker's `Proxy::start` doesn't return the bound port easily.
-                // Actually, hudsucker uses hyper under the hood. Let's just pass `addr` with the exact `port` we discovered.
-                drop(listener);
-                let proxy_addr = SocketAddr::from(([0, 0, 0, 0], port));
+                // Use `with_listener` directly instead of dropping and binding again.
+                // hudsucker takes ownership of the listener and uses it.
                 let shutdown_signal = async {
                     let _ = kill_rx.await;
                 };
 
                 let proxy = ProxyBuilder::new()
-                    .with_addr(proxy_addr)
+                    .with_listener(listener)
                     .with_ca(authority)
                     .with_rustls_client(rustls::crypto::aws_lc_rs::default_provider().into())
                     .with_http_handler(handler)
@@ -163,8 +161,8 @@ impl EgressProxy {
             });
         });
 
-        let port_res = rx.await.map_err(|e| Error::Other(e.to_string()))?;
-        let port = port_res.map_err(|e| Error::Other(e.to_string()))?;
+        let port_res = rx.await.map_err(|e| Error::Proxy(e.to_string()))?;
+        let port = port_res.map_err(|e| Error::Proxy(e.to_string()))?;
         Ok(Self { 
             port,
             kill_tx: Some(kill_tx),

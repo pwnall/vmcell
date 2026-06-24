@@ -22,7 +22,40 @@ async fn test_lifecycle_force_kill() {
         .build().unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let mut vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
 
     vm.instance_mut().kill().await.expect("Failed to kill VM");
+}
+
+#[tokio::test]
+async fn test_lifecycle_fake_vmm() {
+    use imp_testing::vmm::FakeVmm;
+    let fake = FakeVmm::default();
+    
+    let cfg = VmConfig::builder("/fake/kernel", RootfsSource::Erofs { image: PathBuf::from("/fake/rootfs") })
+        .network_disabled()
+        .build().unwrap();
+
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    
+    let vm = TestVm::start(&fake, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start fake VM");
+    
+    // Check that create and boot were called
+    {
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "create");
+        assert_eq!(calls[1], "boot");
+    }
+
+    // Shutdown should call request_shutdown
+    vm.shutdown().await.expect("Failed to shutdown");
+
+    // The FakeVmInstance records calls in the same shared vector
+    {
+        let calls = fake.calls.lock().unwrap();
+        assert!(calls.contains(&"request_shutdown".to_string()));
+    }
 }

@@ -46,6 +46,7 @@ pub struct ExecRequest {
 
 impl ExecRequest {
     /// Creates a new `ExecRequest` with the given arguments.
+    #[must_use]
     pub fn new(argv: Vec<String>) -> Self {
         Self {
             argv,

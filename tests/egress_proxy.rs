@@ -39,13 +39,15 @@ async fn test_egress_proxy() {
         host_services: false,
     };
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let mut vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
-
-    println!("Connecting agent...");
-    let mut agent = vm.agent().await.unwrap();
-    println!("Agent connected.");
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
 
     let proxy_port = vm.proxy().as_ref().unwrap().port;
+    let vmid = vm.vmid();
+
+    println!("Connecting agent...");
+    let agent = vm.agent().await.unwrap();
+    println!("Agent connected.");
 
     let _ = agent
         .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
@@ -70,11 +72,11 @@ async fn test_egress_proxy() {
             ]).with_env(vec![
                 (
                     "http_proxy".to_string(),
-                    format!("http://10.200.{}.1:{}", vm.vmid(), proxy_port),
+                    format!("http://10.200.{}.1:{}", vmid, proxy_port),
                 ),
                 (
                     "https_proxy".to_string(),
-                    format!("http://10.200.{}.1:{}", vm.vmid(), proxy_port),
+                    format!("http://10.200.{}.1:{}", vmid, proxy_port),
                 ),
             ]))
         .await

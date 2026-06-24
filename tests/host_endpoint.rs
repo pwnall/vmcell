@@ -20,7 +20,8 @@ async fn test_host_endpoint() {
     };
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let mut vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
 
     let host_ip = format!("10.200.{}.1", vm.vmid());
 

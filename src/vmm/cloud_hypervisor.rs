@@ -10,7 +10,7 @@ use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
@@ -24,6 +24,7 @@ pub struct CloudHypervisor {
 
 impl CloudHypervisor {
     /// Creates a new `CloudHypervisor` using the specified executable path.
+    #[must_use]
     pub fn new(binary_path: impl Into<PathBuf>) -> Self {
         Self {
             binary_path: binary_path.into(),
@@ -126,54 +127,53 @@ impl ChInstance {
         path: &str,
         body: Option<&impl Serialize>,
     ) -> Result<()> {
-        let mut stream = UnixStream::connect(&self.api_socket)
+        let stream = UnixStream::connect(&self.api_socket)
             .await
             .map_err(|e| Error::Vmm(format!("socket connect: {}", e)))?;
 
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| Error::Vmm(format!("handshake error: {}", e)))?;
+
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                tracing::warn!("HTTP connection failed: {:?}", err);
+            }
+        });
+
         let body_bytes = if let Some(b) = body {
-            serde_json::to_vec(b).map_err(|e| Error::Other(format!("serialize: {}", e)))?
+            serde_json::to_vec(b).map_err(|e| Error::Serialize(format!("serialize: {}", e)))?
         } else {
             Vec::new()
         };
 
-        let req = format!(
-            "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            method,
-            path,
-            body_bytes.len()
-        );
+        let req = hyper::Request::builder()
+            .method(method)
+            .uri(format!("http://localhost{}", path))
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .body(http_body_util::Full::new(hyper::body::Bytes::from(body_bytes)))
+            .map_err(|e| Error::Vmm(format!("request builder error: {}", e)))?;
 
-        stream.write_all(req.as_bytes()).await?;
-        stream.write_all(&body_bytes).await?;
+        let res = sender.send_request(req)
+            .await
+            .map_err(|e| Error::Vmm(format!("send_request error: {}", e)))?;
 
-        let mut resp = Vec::new();
-        let mut buf = [0; 4096];
-        loop {
-            let n = stream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            resp.extend_from_slice(&buf[..n]);
-            if resp.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
+        if !res.status().is_success() {
+            let status = res.status();
+            use http_body_util::BodyExt;
+            let bytes = res.into_body().collect().await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            return Err(Error::Vmm(format!("API error ({}): {}", status, String::from_utf8_lossy(&bytes))));
         }
-        
-        let resp_str = String::from_utf8_lossy(&resp);
-        let status_line = resp_str.lines().next().unwrap_or("");
-        let is_success = status_line.contains(" 200 ") 
-            || status_line.contains(" 201 ") 
-            || status_line.contains(" 202 ") 
-            || status_line.contains(" 204 ");
-            
-        if !is_success {
-            return Err(Error::Vmm(format!("API error: {}", resp_str)));
-        }
+
         Ok(())
     }
 }
 
-use async_trait::async_trait;
+
 
 impl CloudHypervisor {
     async fn spawn_ch(
@@ -237,7 +237,7 @@ impl CloudHypervisor {
     }
 }
 
-#[async_trait]
+
 impl Vmm for CloudHypervisor {
     type Instance = ChInstance;
 
@@ -389,7 +389,7 @@ impl Vmm for CloudHypervisor {
     }
 }
 
-#[async_trait]
+
 impl VmInstance for ChInstance {
     async fn boot(&mut self) -> Result<()> {
         if self.restored {
@@ -534,13 +534,4 @@ mod tests {
         assert!(json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}"));
     }
 
-    #[test]
-    fn test_ch_response_parser() {
-        // Just verify basic assumption of HTTP/1.1 response string check logic.
-        let resp1 = "HTTP/1.1 204 No Content\r\n\r\n";
-        assert!(resp1.starts_with("HTTP/1.1 200") || resp1.starts_with("HTTP/1.1 204"));
-        
-        let resp2 = "HTTP/1.1 400 Bad Request\r\n\r\n";
-        assert!(!(resp2.starts_with("HTTP/1.1 200") || resp2.starts_with("HTTP/1.1 204")));
-    }
 }

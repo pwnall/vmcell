@@ -17,6 +17,8 @@ pub struct KernelStage {
     pub microvm_config: String,
 }
 
+
+
 use async_trait::async_trait;
 
 #[async_trait]
@@ -46,7 +48,7 @@ impl Stage for KernelStage {
                 .status()
                 .await?;
             if !status.success() {
-                return Err(Error::Other("Failed to download kernel source".into()));
+                return Err(Error::Subprocess("Failed to download kernel source".into()));
             }
         }
 
@@ -61,7 +63,7 @@ impl Stage for KernelStage {
                 .status()
                 .await?;
             if !status.success() {
-                return Err(Error::Other("Failed to extract kernel source".into()));
+                return Err(Error::Subprocess("Failed to extract kernel source".into()));
             }
         }
 
@@ -73,8 +75,8 @@ impl Stage for KernelStage {
             .status()
             .await?;
         if !status.success() {
-            return Err(Error::Other(
-                "make defconfig kvm_guest.config failed".into(),
+            return Err(Error::Subprocess(
+                "Failed to write kernel config fragment".into(),
             ));
         }
 
@@ -92,7 +94,7 @@ impl Stage for KernelStage {
             .status()
             .await?;
         if !status.success() {
-            return Err(Error::Other("make olddefconfig failed".into()));
+            return Err(Error::Subprocess("make olddefconfig failed".into()));
         }
 
         let nproc = std::thread::available_parallelism()
@@ -108,12 +110,12 @@ impl Stage for KernelStage {
             .status()
             .await?;
         if !status.success() {
-            return Err(Error::Other("make vmlinux failed".into()));
+            return Err(Error::Subprocess("make vmlinux failed".into()));
         }
 
         tokio::fs::copy(workdir.join("vmlinux"), out).await?;
 
-        Ok(StageOutputs {})
+        Ok(StageOutputs::default())
     }
 }
 
@@ -131,7 +133,7 @@ mod tests {
         let mut stage2 = stage1.clone();
         stage2.microvm_config = "CONFIG_FOO=n\n".to_string();
 
-        let inputs = StageInputs {};
+        let inputs = StageInputs::default();
         assert_ne!(stage1.cache_key(&inputs), stage2.cache_key(&inputs));
         assert_eq!(stage1.cache_key(&inputs), stage1.cache_key(&inputs));
     }

@@ -20,6 +20,8 @@ pub struct TestDouble {
 pub struct ProxyHandler {
     /// The configured test doubles.
     pub doubles: Arc<Vec<TestDouble>>,
+    /// Domains to block.
+    pub blocked_domains: Vec<String>,
 }
 
 impl HttpHandler for ProxyHandler {
@@ -38,15 +40,17 @@ impl HttpHandler for ProxyHandler {
             }
         }
 
-        // Apply a filter rule blocking example.net
+        // Apply filter rules
         if let Some(host) = req.uri().host() {
-            if host.ends_with("example.net") {
-                tracing::info!("Proxy blocking request to {}", host);
-                let response = Response::builder()
-                    .status(403)
-                    .body(hudsucker::Body::from("Blocked by Imp Proxy\n"))
-                    .unwrap();
-                return RequestOrResponse::Response(response);
+            for blocked in &self.blocked_domains {
+                if host.ends_with(blocked) {
+                    tracing::info!("Proxy blocking request to {}", host);
+                    let response = Response::builder()
+                        .status(403)
+                        .body(hudsucker::Body::from(format!("Blocked by Imp Proxy: {}\n", blocked)))
+                        .unwrap();
+                    return RequestOrResponse::Response(response);
+                }
             }
         }
 

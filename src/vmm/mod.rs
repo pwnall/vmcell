@@ -11,7 +11,7 @@ pub mod cloud_hypervisor;
 
 pub use cloud_hypervisor::CloudHypervisor;
 
-use async_trait::async_trait;
+
 use std::path::{Path, PathBuf};
 
 /// Allocates unique Context IDs (CIDs) for vsock connections.
@@ -29,10 +29,10 @@ impl CidAllocator {
         }
     }
 
-    /// Allocates and returns the next available unique CID.
+    /// Allocates and returns a unique Context ID (CID) for VSOCK communication.
     ///
     /// # Errors
-    /// Returns an error if all 254 CIDs are exhausted.
+    /// Returns an error if all available CIDs are currently in use.
     pub fn allocate(&self) -> Result<u32> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         for i in 3..=254 {
@@ -70,7 +70,7 @@ pub struct PerVmResources {
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
-#[async_trait]
+
 pub trait Vmm: Send + Sync {
     /// The associated instance type representing a running VM.
     type Instance: VmInstance;
@@ -89,7 +89,7 @@ pub trait Vmm: Send + Sync {
 }
 
 /// Represents a running or created VM instance.
-#[async_trait]
+
 pub trait VmInstance: Send {
     /// Boots the VM from a created state.
     ///
@@ -135,55 +135,72 @@ pub trait VmInstance: Send {
 }
 
 /// A fake VMM for testing without booting a real VM.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub struct FakeVmm {}
-
-/// A fake VM instance for testing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub struct FakeVmInstance {
-    vsock: PathBuf,
-    serial: PathBuf,
+pub struct FakeVmm {
+    /// Records calls made to the fake VMM.
+    pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-#[async_trait]
+/// A fake VM instance for testing.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FakeVmInstance {
+    /// Simulates a vsock path.
+    pub vsock_path: PathBuf,
+    /// Simulates a serial path.
+    pub serial: PathBuf,
+    /// Records calls made to the fake instance.
+    pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+
 impl Vmm for FakeVmm {
     type Instance = FakeVmInstance;
 
     async fn create(&self, _cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
+        self.calls.lock().unwrap().push("create".to_string());
         Ok(FakeVmInstance {
-            vsock: PathBuf::from("/tmp/fake-vsock"),
+            vsock_path: PathBuf::from("/tmp/fake-vsock"),
             serial: PathBuf::from("/tmp/fake-serial"),
+            calls: self.calls.clone(),
         })
     }
 
     async fn restore(&self, _snapshot_dir: &Path, _cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
+        self.calls.lock().unwrap().push("restore".to_string());
         Ok(FakeVmInstance {
-            vsock: PathBuf::from("/tmp/fake-vsock"),
+            vsock_path: PathBuf::from("/tmp/fake-vsock"),
             serial: PathBuf::from("/tmp/fake-serial"),
+            calls: self.calls.clone(),
         })
     }
 }
 
-#[async_trait]
+
 impl VmInstance for FakeVmInstance {
     async fn boot(&mut self) -> Result<()> {
+        self.calls.lock().unwrap().push("boot".to_string());
         Ok(())
     }
     async fn request_shutdown(&mut self) -> Result<()> {
+        self.calls.lock().unwrap().push("request_shutdown".to_string());
         Ok(())
     }
     async fn kill(&mut self) -> Result<()> {
+        self.calls.lock().unwrap().push("kill".to_string());
         Ok(())
     }
     async fn pause(&mut self) -> Result<()> {
+        self.calls.lock().unwrap().push("pause".to_string());
         Ok(())
     }
     async fn resume(&mut self) -> Result<()> {
+        self.calls.lock().unwrap().push("resume".to_string());
         Ok(())
     }
     async fn snapshot(&mut self, _dir: &Path) -> Result<()> {
+        self.calls.lock().unwrap().push("snapshot".to_string());
         Ok(())
     }
     async fn stats(&self) -> Result<ResourceUsage> {
@@ -198,7 +215,7 @@ impl VmInstance for FakeVmInstance {
         })
     }
     fn vsock_path(&self) -> &Path {
-        &self.vsock
+        &self.vsock_path
     }
     fn guest_cid(&self) -> u32 {
         3
@@ -211,6 +228,7 @@ impl VmInstance for FakeVmInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_cid_allocator() {
@@ -223,4 +241,15 @@ mod tests {
         let cid3 = alloc.allocate().unwrap();
         assert_eq!(cid1, cid3);
     }
+
+    proptest! {
+        #[test]
+        fn test_cid_allocator_prop(cid_sequence in proptest::collection::vec(3u32..255u32, 0..100)) {
+            let alloc = CidAllocator::new();
+            for _ in &cid_sequence {
+                let _ = alloc.allocate();
+            }
+        }
+    }
 }
+

@@ -28,9 +28,9 @@ impl Netlink for DefaultNetlink {
         let status = Command::new("ip")
             .args(args)
             .status()
-            .map_err(|e| Error::Other(format!("ip command failed: {}", e)))?;
+            .map_err(|e| Error::Subprocess(format!("ip command failed: {}", e)))?;
         if !status.success() {
-            return Err(Error::Other(format!("ip {} failed", args.join(" "))));
+            return Err(Error::Subprocess(format!("ip {} failed", args.join(" "))));
         }
         Ok(())
     }
@@ -45,15 +45,15 @@ impl NftApplier for DefaultNftApplier {
             .args(["netns", "exec", netns, "nft", "-f", "-"])
             .stdin(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| Error::Other(format!("nft spawn failed: {}", e)))?;
+            .map_err(|e| Error::Subprocess(format!("nft spawn failed: {}", e)))?;
         
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(rules.as_bytes()).map_err(|e| Error::Other(format!("nft write failed: {}", e)))?;
+            stdin.write_all(rules.as_bytes()).map_err(|e| Error::Subprocess(format!("nft write failed: {}", e)))?;
         }
         
-        let status = child.wait().map_err(|e| Error::Other(format!("nft wait failed: {}", e)))?;
+        let status = child.wait().map_err(|e| Error::Subprocess(format!("nft wait failed: {}", e)))?;
         if !status.success() {
-            return Err(Error::Other("nft rules application failed".to_string()));
+            return Err(Error::Subprocess("nft rules application failed".to_string()));
         }
         Ok(())
     }
@@ -83,6 +83,9 @@ impl std::fmt::Debug for NetNamespace {
 
 impl NetNamespace {
     /// Creates a new network namespace and TAP interface for the given VM ID.
+    ///
+    /// # Errors
+    /// Returns an error if the `ip` commands fail.
     pub fn create(vmid: u32, netlink: Box<dyn Netlink>) -> Result<Self> {
         let name = format!("imp-net-{}", vmid);
         let tap_name = format!("imp-tap-{}", vmid);
@@ -112,6 +115,9 @@ impl NetNamespace {
     }
 
     /// Deletes the network namespace and associated interfaces.
+    ///
+    /// # Errors
+    /// Returns an error if the `ip netns delete` command fails.
     pub fn delete(&self) -> Result<()> {
         let _ = self.netlink.run(&["netns", "delete", &self.name]);
         Ok(())
@@ -136,6 +142,9 @@ impl NetNamespace {
     }
 
     /// Configures nftables rules to forward traffic to the proxy using TPROXY.
+    ///
+    /// # Errors
+    /// Returns an error if the nftables rules fail to apply.
     pub fn emit_proxy_rules(&self, proxy_port: u16, applier: &dyn NftApplier) -> Result<()> {
         let rules = self.render_tproxy_rules(proxy_port);
         applier.apply_rules(&self.name, &rules)
@@ -151,15 +160,36 @@ impl Drop for NetNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    struct MockNetlink;
+    impl Netlink for MockNetlink {
+        fn run(&self, _args: &[&str]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn test_path_injectivity(vmid1 in 1u32..255, vmid2 in 1u32..255) {
+            prop_assume!(vmid1 != vmid2);
+            let ns1 = NetNamespace::create(vmid1, Box::new(MockNetlink)).unwrap();
+            let ns2 = NetNamespace::create(vmid2, Box::new(MockNetlink)).unwrap();
+            
+            assert_ne!(ns1.name, ns2.name);
+            assert_ne!(ns1.tap_name, ns2.tap_name);
+            assert_ne!(ns1.host_ip(), ns2.host_ip());
+        }
+    }
 
     #[test]
     fn test_host_ip_math() {
         let ns = NetNamespace {
-            name: "imp-net-5".to_string(),
-            tap_name: "imp-tap-5".to_string(),
-            vmid: 5,
-            netlink: Box::new(DefaultNetlink),
+            name: "test".into(),
+            tap_name: "test".into(),
+            vmid: 42,
+            netlink: Box::new(MockNetlink),
         };
-        assert_eq!(ns.host_ip(), "10.200.5.1");
+        assert_eq!(ns.host_ip(), "10.200.42.1");
     }
 }

@@ -10,8 +10,7 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 
 #[cfg(feature = "experiment-fuse")]
-#[path = "fs_in_process.rs"]
-mod fs_in_process;
+mod in_process;
 
 /// A running virtiofs daemon instance.
 #[derive(Debug)]
@@ -56,7 +55,7 @@ impl VirtioFsDaemon {
 
         let process = cmd
             .spawn()
-            .map_err(|e| crate::error::Error::Other(format!("failed to spawn virtiofsd: {}", e)))?;
+            .map_err(|e| crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {}", e)))?;
 
         // Wait for socket to be created
         let mut ready = false;
@@ -68,7 +67,7 @@ impl VirtioFsDaemon {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         if !ready {
-            return Err(crate::error::Error::Other("virtiofsd failed to create socket".to_string()));
+            return Err(crate::error::Error::Subprocess("virtiofsd failed to create socket".to_string()));
         }
 
         Ok(Self {
@@ -86,13 +85,13 @@ impl VirtioFsDaemon {
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);
-        let handle = fs_in_process::backend::start_in_process_virtiofsd(
+        let handle = in_process::backend::start_in_process_virtiofsd(
             &socket_path,
             &share.host_path,
             read_only,
         )
         .map_err(|e| {
-            crate::error::Error::Other(format!("failed to start in-process virtiofsd: {}", e))
+            crate::error::Error::Subprocess(format!("failed to start in-process virtiofsd: {}", e))
         })?;
 
         // Wait for socket to be created
@@ -105,7 +104,7 @@ impl VirtioFsDaemon {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         if !ready {
-            return Err(crate::error::Error::Other("in-process virtiofsd failed to create socket".to_string()));
+            return Err(crate::error::Error::Subprocess("in-process virtiofsd failed to create socket".to_string()));
         }
 
         Ok(Self {

@@ -31,7 +31,8 @@ async fn test_metrics_and_limits() {
     let vmm = CloudHypervisor::new(ch_binary);
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vm = TestVm::start(&vmm, cfg, &cid_alloc).await.expect("Failed to start VM");
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await.expect("Failed to start VM");
 
     // Wait a bit for the VM to boot and consume some memory
     sleep(Duration::from_secs(2)).await;

@@ -24,10 +24,11 @@ async fn test_concurrency() {
         .build().unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
     
     let mut vms = Vec::new();
     for _ in 0..5 {
-        let vm = TestVm::start(&vmm, cfg.clone(), &cid_alloc).await.expect("Failed to start VM");
+        let vm = TestVm::start(&vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone()).await.expect("Failed to start VM");
         vms.push(vm);
     }
     

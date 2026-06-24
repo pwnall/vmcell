@@ -15,6 +15,8 @@ pub struct RootfsStage {
     pub release: String,
 }
 
+
+
 use async_trait::async_trait;
 
 #[async_trait]
@@ -30,7 +32,7 @@ impl Stage for RootfsStage {
     async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
         let sh_target = std::fs::read_link("/bin/sh").unwrap_or_default();
         if !sh_target.to_string_lossy().ends_with("bash") {
-            return Err(Error::Other(format!(
+            return Err(Error::Subprocess(format!(
                 "Rootfs building uses mmdebstrap, which has a hard-coded assumption that /bin/sh points to bash. Currently, /bin/sh points to {:?}. Please reconfigure your system (e.g., via `sudo dpkg-reconfigure dash` on Ubuntu) to use bash as the default system shell.",
                 sh_target
             )));
@@ -46,7 +48,7 @@ impl Stage for RootfsStage {
             .status()
             .await?;
         if !build_status.success() {
-            return Err(Error::Other("Failed to build imp-guest-agent".into()));
+            return Err(Error::Subprocess("Failed to build imp-guest-agent".into()));
         }
 
         #[cfg(feature = "proxy")]
@@ -137,9 +139,9 @@ impl Stage for RootfsStage {
 
         if !status.success() || !mkfs_status.success() {
             tracing::error!("mmdebstrap stderr:\n{}", stderr_str);
-            return Err(Error::Other("mmdebstrap or mkfs.erofs failed".into()));
+            return Err(Error::Subprocess("mmdebstrap or mkfs.erofs failed".into()));
         }
 
-        Ok(StageOutputs {})
+        Ok(StageOutputs::default())
     }
 }

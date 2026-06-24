@@ -1,6 +1,6 @@
 //! Configuration models and builder for virtual machine instances.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Configuration for a virtual machine instance.
 #[derive(Clone, Debug)]
@@ -63,6 +63,7 @@ pub struct Share {
 
 impl Share {
     /// Creates a new `Share` configuration.
+    #[must_use]
     pub fn new(
         tag: impl Into<String>,
         host_path: impl Into<PathBuf>,
@@ -143,6 +144,8 @@ pub struct ProxyConfig {
     /// Test doubles to intercept and mock requests.
     #[cfg(feature = "proxy")]
     pub doubles: std::sync::Arc<Vec<crate::proxy::doubles::TestDouble>>,
+    /// Domains that should be blocked.
+    pub blocked_domains: Vec<String>,
 }
 
 impl std::fmt::Debug for ProxyConfig {
@@ -153,12 +156,15 @@ impl std::fmt::Debug for ProxyConfig {
 
 impl PartialEq for ProxyConfig {
     fn eq(&self, _other: &Self) -> bool {
+        let same_blocked = self.blocked_domains == _other.blocked_domains;
         #[cfg(feature = "proxy")]
         {
-            std::sync::Arc::ptr_eq(&self.doubles, &_other.doubles)
+            same_blocked && std::sync::Arc::ptr_eq(&self.doubles, &_other.doubles)
         }
         #[cfg(not(feature = "proxy"))]
-        true
+        {
+            same_blocked
+        }
     }
 }
 
@@ -187,6 +193,7 @@ pub struct IoMax {
 
 impl VmConfig {
     /// Creates a builder for `VmConfig` with required parameters.
+    #[must_use]
     pub fn builder(kernel: impl Into<PathBuf>, rootfs: RootfsSource) -> VmConfigBuilder {
         VmConfigBuilder {
             kernel: kernel.into(),
@@ -256,7 +263,20 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Builds the `VmConfig`.
+    /// Builds the final `VmConfig`.
+    ///
+    /// # Errors
+    /// Returns an error if the kernel or rootfs paths do not exist.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use imp_testing::config::{VmConfig, RootfsSource};
+    /// let cfg = VmConfig::builder("/path/to/kernel", RootfsSource::Erofs("/path/to/rootfs".into()))
+    ///     .vcpus(4)
+    ///     .mem_mib(2048)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
     pub fn build(self) -> Result<VmConfig, crate::error::Error> {
         if self.vcpus == 0 {
             return Err(crate::error::Error::Config("vcpus must be > 0".into()));

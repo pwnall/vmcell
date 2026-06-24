@@ -13,6 +13,7 @@
     unsafe_op_in_unsafe_fn,
     rustdoc::broken_intra_doc_links
 )]
+#![allow(async_fn_in_trait)]
 #![cfg_attr(
     not(test),
     deny(
@@ -32,29 +33,29 @@ pub mod agent;
 /// Error and Result types.
 pub mod error;
 
+#[cfg(feature = "host-common")]
 /// Artifact building stages and pipeline.
-#[cfg(feature = "host-common")]
 pub mod artifact;
+#[cfg(feature = "host-common")]
 /// VM configuration models.
-#[cfg(feature = "host-common")]
 pub mod config;
+#[cfg(feature = "host-common")]
 /// virtio-fs daemon implementation.
-#[cfg(feature = "host-common")]
 pub mod fs;
+#[cfg(feature = "host-common")]
 /// Resource usage metrics collection.
-#[cfg(feature = "host-common")]
 pub mod metrics;
+#[cfg(feature = "host-common")]
 /// Networking models and implementations (tap, smoltcp).
-#[cfg(feature = "host-common")]
 pub mod net;
+#[cfg(feature = "host-common")]
 /// VM orchestration and management.
-#[cfg(feature = "host-common")]
 pub mod orchestrator;
+#[cfg(feature = "host-common")]
 /// Egress proxy implementation.
-#[cfg(feature = "host-common")]
 pub mod proxy;
-/// VMM interface and backend implementations.
 #[cfg(feature = "host-common")]
+/// VMM interface and backend implementations.
 pub mod vmm;
 
 pub use agent::{AgentClient, ExecOutcome, ExecRequest};
