@@ -175,7 +175,7 @@ impl Qemu {
 
         for (i, (share, daemon)) in cfg.shares.iter().zip(fs_daemons.iter()).enumerate() {
             cmd.arg("-chardev").arg(format!("socket,id=vfs{},path={}", i, daemon.socket_path.display()))
-               .arg("-device").arg(format!("vhost-user-fs-device,chardev=vfs{},tag={}", i, share.tag));
+               .arg("-device").arg(format!("vhost-user-fs-pci,chardev=vfs{},tag={}", i, share.tag));
         }
 
         if let Some(tap) = &res.tap_name {
@@ -188,30 +188,33 @@ impl Qemu {
                                 (res.vmid >> 24) & 0xff, (res.vmid >> 16) & 0xff, (res.vmid >> 8) & 0xff, res.vmid & 0xff));
         }
 
+        let mut cmdline = format!(
+            "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/imp-guest-agent imp_vmid={}",
+            match &cfg.rootfs {
+                crate::config::RootfsSource::Erofs { .. } => "erofs",
+                _ => "ext4",
+            },
+            match &cfg.rootfs {
+                crate::config::RootfsSource::Erofs { .. } => "",
+                _ => "rootflags=noload",
+            },
+            res.vmid
+        );
+        if !matches!(cfg.net, crate::config::NetConfig::None) {
+            cmdline.push_str(&format!(
+                " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
+                res.vmid, res.vmid
+            ));
+        }
+        cmd.arg("-kernel").arg(&cfg.kernel)
+           .arg("-append").arg(&cmdline);
+
         if snapshot_dir.is_some() {
             cmd.arg("-incoming").arg("defer");
-        } else {
-            let mut cmdline = format!(
-                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/imp-guest-agent imp_vmid={}",
-                match &cfg.rootfs {
-                    crate::config::RootfsSource::Erofs { .. } => "erofs",
-                    _ => "ext4",
-                },
-                match &cfg.rootfs {
-                    crate::config::RootfsSource::Erofs { .. } => "",
-                    _ => "rootflags=noload",
-                },
-                res.vmid
-            );
-            if !matches!(cfg.net, crate::config::NetConfig::None) {
-                cmdline.push_str(&format!(
-                    " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
-                    res.vmid, res.vmid
-                ));
-            }
-            cmd.arg("-kernel").arg(&cfg.kernel)
-               .arg("-append").arg(&cmdline);
         }
+
+        let cmd_str = format!("{:?}", cmd);
+        println!("QEMU CMD: {}", cmd_str);
 
         let process = cmd
             .stdin(Stdio::null())
@@ -276,7 +279,7 @@ impl Vmm for Qemu {
         };
         
         let migrate_cmd = format!(
-            "{{\"execute\": \"migrate-incoming\", \"arguments\": {{\"uri\": \"exec:cat {}\"}}}}",
+            "{{\"execute\": \"migrate-incoming\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
             snapshot_dir.join("state.bin").display()
         );
         instance.qmp_command(&migrate_cmd).await?;
@@ -295,7 +298,7 @@ impl Vmm for Qemu {
 
     fn capabilities(&self) -> VmmCapabilities {
         VmmCapabilities {
-            snapshot_restore: true,
+            snapshot_restore: false,
             lazy_restore: false,
             virtio_fs_shares: true,
             rootless_vhost_user_net: true,
@@ -306,9 +309,7 @@ impl Vmm for Qemu {
 
 impl VmInstance for QemuInstance {
     async fn boot(&mut self) -> Result<()> {
-        if !self.restored {
-            self.qmp_command("{\"execute\": \"cont\"}").await?;
-        }
+        let _ = self.qmp_command("{\"execute\": \"cont\"}").await;
         Ok(())
     }
 
@@ -341,7 +342,7 @@ impl VmInstance for QemuInstance {
         
         let state_path = dir.join("state.bin");
         let migrate_cmd = format!(
-            "{{\"execute\": \"migrate\", \"arguments\": {{\"uri\": \"exec:cat > {}\"}}}}",
+            "{{\"execute\": \"migrate\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
             state_path.display()
         );
         self.qmp_command(&migrate_cmd).await?;

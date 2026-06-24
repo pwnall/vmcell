@@ -220,7 +220,7 @@ impl Vmm for Firecracker {
         
         let cmdline = {
             let mut s = format!(
-                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/imp-guest-agent imp_vmid={}",
+                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 noxsave init=/usr/sbin/imp-guest-agent imp_vmid={}",
                 match &cfg.rootfs {
                     crate::config::RootfsSource::Erofs { .. } => "erofs",
                     _ => "ext4",
@@ -388,7 +388,7 @@ impl Vmm for Firecracker {
 
     fn capabilities(&self) -> VmmCapabilities {
         VmmCapabilities {
-            snapshot_restore: false,
+            snapshot_restore: true,
             lazy_restore: true, // Firecracker supports UFFD lazy restore
             virtio_fs_shares: false,
             rootless_vhost_user_net: false,

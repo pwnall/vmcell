@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use std::io::Read;
 
 /// mmdebstrap micro-VM builder source.
-pub mod mmdebstrap_vm;
+pub mod mmdebstrap;
 /// OCI registry pull source.
 pub mod oci;
 
@@ -25,8 +25,8 @@ pub enum RootfsBuildSource {
         /// The pinned digest of the image.
         digest: String,
     },
-    /// Full-apt source running mmdebstrap inside a micro-VM.
-    MmdebstrapVm {
+    /// Full-apt source running mmdebstrap on the host.
+    Mmdebstrap {
         /// The Debian release suite to use (e.g., "bookworm").
         release: String,
     },
@@ -50,7 +50,7 @@ impl Stage for RootfsStage {
             RootfsBuildSource::Oci { image, digest } => {
                 CacheKey(format!("rootfs-oci-{}-{}", image, digest))
             }
-            RootfsBuildSource::MmdebstrapVm { release } => {
+            RootfsBuildSource::Mmdebstrap { release } => {
                 CacheKey(format!("rootfs-mmdebstrap-{}-{}", release, inputs.artifacts.len()))
             }
         }
@@ -58,8 +58,11 @@ impl Stage for RootfsStage {
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
         let build_status = tokio::process::Command::new("cargo")
+            .env("RUSTFLAGS", "-C target-feature=+crt-static")
             .arg("build")
             .arg("--release")
+            .arg("--target")
+            .arg("x86_64-unknown-linux-gnu")
             .arg("--bin")
             .arg("imp-guest-agent")
             .arg("--features")
@@ -74,8 +77,8 @@ impl Stage for RootfsStage {
             RootfsBuildSource::Oci { image, digest } => {
                 oci::build_rootfs(image, digest, out).await
             }
-            RootfsBuildSource::MmdebstrapVm { release } => {
-                mmdebstrap_vm::build_rootfs(release, inputs, out).await
+            RootfsBuildSource::Mmdebstrap { release } => {
+                mmdebstrap::build_rootfs(release, inputs, out).await
             }
         }
     }
@@ -103,7 +106,9 @@ pub async fn pack_erofs_with_injection(
         let archives: Vec<tar::Archive<Box<dyn Read + Send>>> = tar_streams.into_iter().map(tar::Archive::new).collect();
         let image = crate::artifact::tar2erofs::tar_to_erofs(archives, injected_files)?;
         std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;
-        Ok(StageOutputs::default())
+        let mut outputs = StageOutputs::default();
+        outputs.artifacts.insert("rootfs".into(), out_buf);
+        Ok(outputs)
     }).await.map_err(|e| Error::Artifact(e.to_string()))?
 }
 

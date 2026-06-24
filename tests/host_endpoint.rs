@@ -46,9 +46,11 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .build()
         .unwrap();
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(8000);
+    let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cfg.net = imp_testing::config::NetConfig::Rootless {
         egress: imp_testing::config::Egress::Open,
-        host_services: true,
+        host_services_port: Some(port),
     };
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
@@ -60,7 +62,7 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let host_ip = format!("10.200.{}.1", vm.vmid());
 
     let mut child = Command::new("python3")
-        .args(["-m", "http.server", "8080", "--bind", "127.0.0.1"])
+        .args(["-m", "http.server", &port.to_string(), "--bind", "127.0.0.1"])
         .spawn()
         .expect("Failed to start http.server");
 
@@ -90,8 +92,10 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let outcome = agent
         .exec(ExecRequest::new(vec![
             "curl".into(),
+            "--max-time".into(),
+            "5".into(),
             "-v".into(),
-            format!("http://{}:8080/", host_ip),
+            format!("http://{}:{}/", host_ip, port),
         ]))
         .await
         .expect("Exec failed");

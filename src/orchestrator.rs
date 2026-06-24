@@ -127,10 +127,10 @@ impl<V: Vmm> TestVm<V> {
         match &cfg.net {
             crate::config::NetConfig::Privileged {
                 egress,
-                host_services,
+                host_services_port,
             } => {
                 let _ = egress;
-                let _ = host_services;
+                let _ = host_services_port;
                 let ns = NetNamespace::create(vmid, Box::new(crate::net::tap::RtNetlink))?;
                 tap_name = Some(ns.tap_name.clone());
                 netns_name = Some(ns.name.clone());
@@ -154,9 +154,9 @@ impl<V: Vmm> TestVm<V> {
             }
             crate::config::NetConfig::Rootless {
                 egress,
-                host_services,
+                host_services_port,
             } => {
-                let _ = host_services;
+                let _ = host_services_port;
                 let mut _proxy_port = 0;
 
                 if let crate::config::Egress::Filtered(proxy_cfg) = egress {
@@ -181,8 +181,8 @@ impl<V: Vmm> TestVm<V> {
                     if _proxy_port > 0 {
                         ports.push(_proxy_port);
                     }
-                    if *host_services {
-                        ports.push(8080);
+                    if let Some(p) = host_services_port {
+                        ports.push(*p);
                     }
                     let p = SmoltcpProcess::start(vmid, ports, socket_path.clone());
                     vhost_user_socket = Some(socket_path);

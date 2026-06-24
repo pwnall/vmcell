@@ -262,6 +262,7 @@ pub mod backend {
         stop_flag: Arc<std::sync::atomic::AtomicBool>,
         vhost_thread: Option<std::thread::JoinHandle<()>>,
         net_thread: Option<std::thread::JoinHandle<()>>,
+        socket_path: PathBuf,
     }
 
     impl Drop for SmoltcpProcess {
@@ -270,6 +271,8 @@ pub mod backend {
             self.stop_flag
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = self.kill_notifier.notify();
+            // Connect to the socket to unblock listener.accept() if it's stuck
+            let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
             if let Some(h) = self.vhost_thread.take() {
                 let _ = h.join();
             }
@@ -313,6 +316,7 @@ pub mod backend {
 
             let mut listener = Listener::new(&socket_path, true).expect("invariant");
 
+            let socket_path_clone = socket_path.clone();
             let vhost_thread = std::thread::spawn(move || {
                 let mut vu_daemon = VhostUserDaemon::new(
                     String::from("vhost-user-net"),
@@ -321,7 +325,7 @@ pub mod backend {
                 )
                 .expect("invariant");
 
-                eprintln!("vhost-user-net daemon starting on {:?}", socket_path);
+                eprintln!("vhost-user-net daemon starting on {:?}", socket_path_clone);
                 let res = vu_daemon.start(&mut listener);
                 eprintln!("vhost-user-net daemon start returned {:?}", res);
                 let wait_res = vu_daemon.wait();
@@ -342,6 +346,7 @@ pub mod backend {
                 stop_flag,
                 vhost_thread: Some(vhost_thread),
                 net_thread: Some(net_thread),
+                socket_path: socket_path.clone(),
             }
         }
 

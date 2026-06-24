@@ -37,7 +37,9 @@ async fn test_shares_ro_rw_qemu() {
 }
 
 async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
-    let tmp = std::env::temp_dir().join(format!("imp-test-shares-{}", std::process::id()));
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("imp-test-shares-{}-{}", std::process::id(), id));
     let in_dir = tmp.join("in");
     let out_dir = tmp.join("out");
     std::fs::create_dir_all(&in_dir).unwrap();

@@ -109,15 +109,15 @@ pub enum NetConfig {
     Privileged {
         /// Egress proxy configuration.
         egress: Egress,
-        /// Whether host services are accessible from the guest.
-        host_services: bool,
+        /// Optional port for host services accessible from the guest.
+        host_services_port: Option<u16>,
     },
     /// Rootless mode using passt or userspace networking.
     Rootless {
         /// Egress proxy configuration.
         egress: Egress,
-        /// Whether host services are accessible from the guest.
-        host_services: bool,
+        /// Optional port for host services accessible from the guest.
+        host_services_port: Option<u16>,
     },
     /// No networking configuration.
     #[default]

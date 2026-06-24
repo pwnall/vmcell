@@ -30,6 +30,12 @@ proptest! {
         if let Ok(cid) = alloc.allocate() {
             assert!(cid >= 3);
             assert!(!active[active.len()/2..].contains(&cid));
+            active.push(cid);
+        }
+        
+        // Release the remaining allocated CIDs to prevent leaking into the global allocator
+        for i in active[active.len()/2..].iter() {
+            alloc.release(*i);
         }
     }
 

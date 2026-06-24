@@ -69,7 +69,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     cfg.net = imp_testing::config::NetConfig::Rootless {
         egress: Egress::Filtered(proxy_cfg),
-        host_services: false,
+        host_services_port: None,
     };
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
@@ -84,46 +84,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let agent = vm.agent().await.unwrap();
     println!("Agent connected.");
     
-    let out1 = agent
-        .exec(ExecRequest::new(vec![
-            "/sbin/ip".into(),
-            "link".into(),
-            "set".into(),
-            "eth0".into(),
-            "up".into(),
-        ]))
-        .await
-        .unwrap();
-    println!(
-        "ip link set eth0 up: {}",
-        String::from_utf8_lossy(&out1.stderr)
-    );
 
-    let out2 = agent
-        .exec(ExecRequest::new(vec![
-            "/sbin/ip".into(),
-            "addr".into(),
-            "add".into(),
-            format!("10.200.{}.2/30", vmid),
-            "dev".into(),
-            "eth0".into(),
-        ]))
-        .await
-        .unwrap();
-    println!("ip addr add: {}", String::from_utf8_lossy(&out2.stderr));
-
-    let out3 = agent
-        .exec(ExecRequest::new(vec![
-            "/sbin/ip".into(),
-            "route".into(),
-            "add".into(),
-            "default".into(),
-            "via".into(),
-            format!("10.200.{}.1", vmid),
-        ]))
-        .await
-        .unwrap();
-    println!("ip route add: {}", String::from_utf8_lossy(&out3.stderr));
 
     let out_a = agent
         .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))

@@ -18,10 +18,6 @@ enum Commands {
 }
 
 fn main() -> imp_testing::Result<()> {
-    // SAFETY: Called before tokio runtime starts; no other threads exist yet.
-    unsafe {
-        std::env::set_var("SHELL", "/bin/bash");
-    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -43,9 +39,8 @@ async fn async_main() -> imp_testing::Result<()> {
                         microvm_config: "CONFIG_PVH=y\nCONFIG_SYSTEM_TRUSTED_KEYS=\"\"\nCONFIG_SYSTEM_REVOCATION_KEYS=\"\"\nCONFIG_MODULE_SIG=n\nCONFIG_PCI=y\nCONFIG_VIRTIO=y\nCONFIG_VIRTIO_PCI=y\nCONFIG_VIRTIO_MMIO=y\nCONFIG_VIRTIO_BLK=y\nCONFIG_VIRTIO_NET=y\nCONFIG_VIRTIO_CONSOLE=y\nCONFIG_HW_RANDOM_VIRTIO=y\nCONFIG_VIRTIO_BALLOON=y\nCONFIG_VSOCKETS=y\nCONFIG_VIRTIO_VSOCKETS=y\nCONFIG_VHOST_VSOCK=y\nCONFIG_FUSE_FS=y\nCONFIG_VIRTIO_FS=y\nCONFIG_EROFS_FS=y\nCONFIG_EROFS_FS_ZIP=y\nCONFIG_OVERLAY_FS=y\nCONFIG_TMPFS=y\nCONFIG_EXT4_FS=y\nCONFIG_SERIAL_8250=y\nCONFIG_SERIAL_8250_CONSOLE=y\nCONFIG_DEVTMPFS=y\nCONFIG_DEVTMPFS_MOUNT=y\nCONFIG_PARAVIRT=y\nCONFIG_KVM_GUEST=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\nCONFIG_KVM_AMD=y\n".into(),
                     }),
                     Box::new(imp_testing::artifact::rootfs::RootfsStage {
-                        source: imp_testing::artifact::rootfs::RootfsBuildSource::Oci {
-                            image: "docker.io/nicolaka/netshoot".into(),
-                            digest: "latest".into(),
+                        source: imp_testing::artifact::rootfs::RootfsBuildSource::Mmdebstrap {
+                            release: "bookworm".into(),
                         },
                     }),
                 ],

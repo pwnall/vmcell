@@ -44,7 +44,9 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.erofs".into()),
     );
 
-    let snapshot_dir = std::env::temp_dir().join("imp-test-snapshot-restore");
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let snapshot_dir = std::env::temp_dir().join(format!("imp-test-snapshot-restore-{}-{}", std::process::id(), id));
     if snapshot_dir.exists() {
         std::fs::remove_dir_all(&snapshot_dir).unwrap();
     }
@@ -138,10 +140,14 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
         // This implicitly tests vsock reconnect and CID rotation because the agent
         // client connects using the restored VM's newly allocated CID.
-        let result = vm
-            .agent()
-            .await
-            .unwrap()
+        let log_path = vm.instance().serial_log().to_path_buf();
+        let agent_res = vm.agent().await;
+        if agent_res.is_err() {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            println!("SERIAL LOG ON ERROR:\n{}", log);
+            panic!("Failed to connect to agent: {:?}", agent_res.err().unwrap());
+        }
+        let result = agent_res.unwrap()
             .exec(ExecRequest::new(vec![
                 "echo".to_string(),
                 "restored".to_string(),
