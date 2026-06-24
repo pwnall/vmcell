@@ -51,7 +51,8 @@ impl Stage for SnapshotStage {
             std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
         let vmm = CloudHypervisor::new(ch_binary);
 
-        let mut vm = TestVm::start(&vmm, cfg).await?;
+        let cid_alloc = crate::vmm::CidAllocator::new();
+        let mut vm = TestVm::start(&vmm, cfg, &cid_alloc).await?;
 
         // Wait for VM to boot fully via vsock agent
         let mut agent = vm.agent().await?;

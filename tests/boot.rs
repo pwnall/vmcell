@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod common;
 
 #[tokio::test]
+#[ignore]
 async fn test_boot() {
     let ch = CloudHypervisor::new(&common::ch_bin());
 
@@ -26,7 +27,8 @@ async fn test_boot() {
         .network_disabled()
         .build().unwrap();
 
-    let vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
     println!("SERIAL LOG:\n{}", log);

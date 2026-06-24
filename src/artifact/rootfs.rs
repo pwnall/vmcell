@@ -49,12 +49,25 @@ impl Stage for RootfsStage {
             return Err(Error::Other("Failed to build imp-guest-agent".into()));
         }
 
-        #[cfg(not(feature = "experiment-erofs"))]
+        #[cfg(feature = "proxy")]
+        let _ca_mgr = crate::proxy::tls::CaManager::new()?;
+        #[cfg(feature = "proxy")]
+        let ca_path = "/tmp/imp-artifacts/ca.pem";
+
+        #[cfg(not(feature = "am-fs-erofs"))]
         let (status, mkfs_status, stderr_str) = {
-            let mut mmdebstrap = Command::new("mmdebstrap")
-                .arg("--variant=minbase")
-                .arg("--include=systemd-sysv,iproute2,curl,python3")
-                .arg("--customize-hook=copy-in target/release/imp-guest-agent /sbin/")
+            let mut cmd = Command::new("mmdebstrap");
+            cmd.arg("--variant=minbase")
+                .arg("--include=systemd-sysv,iproute2,curl,python3,ca-certificates")
+                .arg("--customize-hook=copy-in target/release/imp-guest-agent /sbin/");
+            
+            #[cfg(feature = "proxy")]
+            {
+                cmd.arg(format!("--customize-hook=upload {} /usr/local/share/ca-certificates/imp-ca.crt", ca_path))
+                   .arg("--customize-hook=chroot \"$1\" update-ca-certificates");
+            }
+            
+            let mut mmdebstrap = cmd
                 .arg(&self.release)
                 .arg("-")
                 .stdout(std::process::Stdio::piped())
@@ -80,15 +93,23 @@ impl Stage for RootfsStage {
             (status, mkfs_status, stderr_str)
         };
 
-        #[cfg(feature = "experiment-erofs")]
+        #[cfg(feature = "am-fs-erofs")]
         let (status, mkfs_status, stderr_str) = {
             let release = self.release.clone();
             let out = out.to_path_buf();
             tokio::task::spawn_blocking(move || -> crate::error::Result<_> {
-                let mut mmdebstrap = std::process::Command::new("mmdebstrap")
-                    .arg("--variant=minbase")
-                    .arg("--include=systemd-sysv,iproute2,curl,python3")
-                    .arg("--customize-hook=copy-in target/release/imp-guest-agent /sbin/")
+                let mut cmd = std::process::Command::new("mmdebstrap");
+                cmd.arg("--variant=minbase")
+                    .arg("--include=systemd-sysv,iproute2,curl,python3,ca-certificates")
+                    .arg("--customize-hook=copy-in target/release/imp-guest-agent /sbin/");
+                
+                #[cfg(feature = "proxy")]
+                {
+                    cmd.arg(format!("--customize-hook=upload {} /usr/local/share/ca-certificates/imp-ca.crt", ca_path))
+                       .arg("--customize-hook=chroot \"$1\" update-ca-certificates");
+                }
+
+                let mut mmdebstrap = cmd
                     .arg(&release)
                     .arg("-")
                     .stdout(std::process::Stdio::piped())
@@ -115,7 +136,7 @@ impl Stage for RootfsStage {
         };
 
         if !status.success() || !mkfs_status.success() {
-            eprintln!("mmdebstrap stderr:\n{}", stderr_str);
+            tracing::error!("mmdebstrap stderr:\n{}", stderr_str);
             return Err(Error::Other("mmdebstrap or mkfs.erofs failed".into()));
         }
 

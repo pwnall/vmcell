@@ -1,27 +1,40 @@
 //! Egress networking proxy.
 //!
-//! This module provides a simple HTTP proxy that allows the guest virtual
-//! machine to access external networks while giving the host visibility and
-//! control over egress traffic.
+//! This module provides a MITM HTTP/HTTPS proxy that allows the guest virtual
+//! machine to access external networks while giving the host visibility,
+//! control over egress traffic, and test double capabilities.
+
+/// Module for generating and managing the MITM Root CA
+pub mod tls;
+/// Module for test doubles and request interception
+pub mod doubles;
 
 use crate::error::{Error, Result};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, body::Incoming};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use tokio::net::TcpListener;
+use hudsucker::builder::ProxyBuilder;
+use crate::proxy::doubles::{ProxyHandler, TestDouble};
+use std::sync::Arc;
 
 /// Configuration for an egress proxy.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProxyConfig {
     /// The port to listen on.
     pub port: u16,
     /// The network namespace name to enter before listening.
     pub netns: Option<String>,
+    /// Test doubles to inject responses.
+    pub doubles: Arc<Vec<TestDouble>>,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            port: 0,
+            netns: None,
+            doubles: Arc::new(vec![]),
+        }
+    }
 }
 
 /// A running egress proxy instance.
@@ -35,7 +48,7 @@ pub struct EgressProxy {
 
 impl Drop for EgressProxy {
     fn drop(&mut self) {
-        println!("EgressProxy dropping!");
+        tracing::info!("EgressProxy dropping!");
         if let Some(tx) = self.kill_tx.take() {
             let _ = tx.send(());
         }
@@ -47,18 +60,16 @@ impl Drop for EgressProxy {
 
 impl EgressProxy {
     /// Starts the egress proxy with the specified configuration.
-    ///
-    /// # Errors
-    /// Returns an error if the proxy fails to start.
     pub async fn start(cfg: ProxyConfig) -> Result<Self> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<u16, String>>();
-        let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // We run the proxy in its own thread to apply `setns` if needed
         let thread = std::thread::spawn(move || {
             #[allow(clippy::collapsible_if)]
             if let Some(ref netns) = cfg.netns {
                 if let Ok(file) = std::fs::File::open(format!("/var/run/netns/{}", netns)) {
-                    // SAFETY: Entering a network namespace requires CAP_SYS_ADMIN. It is safe here because this thread is newly spawned and dedicated entirely to the proxy in this namespace, so it won't affect other threads' networking.
+                    // SAFETY: Thread isolation for network namespace
                     let ret = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
                     if ret != 0 {
                         let _ = tx.send(Err(format!("Failed to setns: {}", std::io::Error::last_os_error())));
@@ -96,55 +107,58 @@ impl EgressProxy {
                     }
                 };
 
+                // Initialize the CA manager
+                let ca_manager = match tls::CaManager::new() {
+                    Ok(cm) => cm,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Failed to initialize CA: {:?}", e)));
+                        return;
+                    }
+                };
+                
+                let authority = match ca_manager.authority() {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Failed to build CA authority: {:?}", e)));
+                        return;
+                    }
+                };
+
+                let handler = ProxyHandler {
+                    doubles: cfg.doubles.clone(),
+                };
+                // We only needed the listener to find a free port. 
+                // Since hudsucker doesn't natively accept a pre-bound listener with easy access to its port,
+                // we drop it and bind again on the known free port.
+                
+                // hudsucker builder currently does not take a bound listener directly in an easy way without `with_addr` logic overriding.
+                // However, since `Proxy::start` takes a shutdown signal, we can drop our dummy listener and bind again.
+                // Wait, if port is 0, we must find out which port hudsucker bound to.
+                // But hudsucker's `Proxy::start` doesn't return the bound port easily.
+                // Actually, hudsucker uses hyper under the hood. Let's just pass `addr` with the exact `port` we discovered.
+                drop(listener);
+                let proxy_addr = SocketAddr::from(([0, 0, 0, 0], port));
+                let shutdown_signal = async {
+                    let _ = kill_rx.await;
+                };
+
+                let proxy = ProxyBuilder::new()
+                    .with_addr(proxy_addr)
+                    .with_ca(authority)
+                    .with_rustls_client(rustls::crypto::aws_lc_rs::default_provider().into())
+                    .with_http_handler(handler)
+                    .with_graceful_shutdown(shutdown_signal)
+                    .build()
+                    .map_err(|e| format!("Proxy builder failed: {:?}", e));
+
                 let _ = tx.send(Ok(port));
 
-                loop {
-                    tokio::select! {
-                        accept_res = listener.accept() => {
-                            if let Ok((stream, _)) = accept_res {
-                                let io = TokioIo::new(stream);
-                                tokio::spawn(async move {
-                                    let client = Client::builder(hyper_util::rt::TokioExecutor::new())
-                                        .build(HttpConnector::new());
-                                    let svc = service_fn(move |mut req: Request<Incoming>| {
-                                        let client = client.clone();
-                                        async move {
-                                            println!("Proxy received request for URI: {}", req.uri());
-                                            #[allow(clippy::collapsible_if)]
-                                            if req.uri().host().is_none() {
-                                                if let Some(host) = req.headers().get("host") {
-                                                    let host_str = host.to_str().unwrap_or("");
-                                                    let uri = format!(
-                                                        "http://{}{}",
-                                                        host_str,
-                                                        req.uri()
-                                                            .path_and_query()
-                                                            .map(|x| x.as_str())
-                                                            .unwrap_or("/")
-                                                    );
-                                                    if let Ok(parsed) = uri.parse() {
-                                                        *req.uri_mut() = parsed;
-                                                    }
-                                                }
-                                            }
-                                            println!("Proxy forwarding request to: {}", req.uri());
-                                            let res = client.request(req).await;
-                                            println!("Proxy response: {:?}", res.as_ref().map(|r| r.status()));
-                                            res
-                                        }
-                                    });
-
-                                    if let Err(err) = http1::Builder::new().serve_connection(io, svc).await
-                                    {
-                                        eprintln!("Error serving connection: {:?}", err);
-                                    }
-                                });
-                            }
-                        }
-                        _ = &mut kill_rx => {
-                            break;
-                        }
+                if let Ok(proxy) = proxy {
+                    if let Err(e) = proxy.start().await {
+                        tracing::error!("Proxy failed: {:?}", e);
                     }
+                } else if let Err(e) = proxy {
+                    tracing::error!("Failed to build proxy: {:?}", e);
                 }
             });
         });

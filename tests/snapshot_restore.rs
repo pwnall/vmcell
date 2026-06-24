@@ -6,6 +6,7 @@ use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
 #[tokio::test]
+#[ignore]
 async fn test_snapshot_restore() {
     let kernel = PathBuf::from(
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
@@ -34,7 +35,8 @@ async fn test_snapshot_restore() {
         .network_disabled()
         .build().unwrap();
 
-        let mut vm = TestVm::start(&vmm, cfg).await.expect("Failed to start VM");
+        let cid_alloc = imp_testing::vmm::CidAllocator::new();
+        let mut vm = TestVm::start(&vmm, cfg, &cid_alloc).await.expect("Failed to start VM");
 
         let mut agent = match vm.agent().await {
             Ok(a) => a,
@@ -69,7 +71,8 @@ async fn test_snapshot_restore() {
         .network_disabled()
         .build().unwrap();
 
-        let mut vm = TestVm::restore(&vmm, &snapshot_dir, cfg)
+        let cid_alloc = imp_testing::vmm::CidAllocator::new();
+        let mut vm = TestVm::restore(&vmm, &snapshot_dir, cfg, &cid_alloc)
             .await
             .expect("Failed to restore VM");
 

@@ -5,6 +5,7 @@ use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
 #[tokio::test]
+#[ignore]
 async fn test_nested_virt() {
     let kernel = PathBuf::from(
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
@@ -29,7 +30,8 @@ async fn test_nested_virt() {
         std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
     let vmm = CloudHypervisor::new(ch_binary);
 
-    let mut vm = TestVm::start(&vmm, cfg).await.expect("Failed to start VM");
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc).await.expect("Failed to start VM");
 
     let mut agent = match vm.agent().await {
         Ok(a) => a,

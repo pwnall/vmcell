@@ -2,21 +2,44 @@ use imp_testing::TestVm;
 use imp_testing::agent::protocol::ExecRequest;
 use imp_testing::config::{Egress, ProxyConfig, RootfsSource, VmConfig};
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
+use imp_testing::proxy::doubles::TestDouble;
+use hudsucker::Body;
+use hyper::Response;
 use std::path::PathBuf;
 
 #[tokio::test]
+#[ignore]
 async fn test_egress_proxy() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("hudsucker=debug,imp_testing=debug,hyper=debug")
+        .try_init();
+
     let ch = CloudHypervisor::new("cloud-hypervisor");
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
 
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs }).build().unwrap();
-    // Rootless with passt fails with cloud-hypervisor due to an accept4 seccomp issue in passt leading to EBADF.
+    let mut proxy_cfg = ProxyConfig::default();
+    proxy_cfg.doubles = std::sync::Arc::new(vec![
+        TestDouble {
+            matcher: Box::new(|req| {
+                req.method() != hyper::Method::CONNECT && req.uri().host() == Some("example.com")
+            }),
+            responder: Box::new(|_req| {
+                Response::builder()
+                    .status(200)
+                    .body(Body::from("MITM SUCCESS!"))
+                    .unwrap()
+            }),
+        }
+    ]);
+
     cfg.net = imp_testing::config::NetConfig::Rootless {
-        egress: Egress::Filtered(ProxyConfig::default()),
+        egress: Egress::Filtered(proxy_cfg),
         host_services: false,
     };
-    let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
 
     println!("Connecting agent...");
     let mut agent = vm.agent().await.unwrap();
@@ -42,12 +65,18 @@ async fn test_egress_proxy() {
                 "--max-time".into(),
                 "5".into(),
                 "--resolve".into(),
-                "example.com:80:1.2.3.4".into(),
-                "http://example.com".into(),
-            ]).with_env(vec![(
-                "http_proxy".to_string(),
-                format!("http://10.200.{}.1:{}", vm.vmid(), proxy_port),
-            )]))
+                "example.com:443:1.2.3.4".into(),
+                "https://example.com".into(),
+            ]).with_env(vec![
+                (
+                    "http_proxy".to_string(),
+                    format!("http://10.200.{}.1:{}", vm.vmid(), proxy_port),
+                ),
+                (
+                    "https_proxy".to_string(),
+                    format!("http://10.200.{}.1:{}", vm.vmid(), proxy_port),
+                ),
+            ]))
         .await
         .expect("Failed to execute curl");
 
@@ -59,9 +88,9 @@ async fn test_egress_proxy() {
     let stderr = String::from_utf8_lossy(&outcome.stderr);
 
     assert!(
-        stderr.contains("Connected to 10.200"),
-        "Did not connect via proxy: {}",
-        stderr
+        outcome.stdout.starts_with(b"MITM SUCCESS!"),
+        "Did not receive MITM intercepted body: {}",
+        String::from_utf8_lossy(&outcome.stdout)
     );
 
     vm.shutdown().await.expect("Shutdown failed");

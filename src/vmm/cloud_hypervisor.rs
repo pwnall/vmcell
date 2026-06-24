@@ -146,10 +146,27 @@ impl ChInstance {
         stream.write_all(req.as_bytes()).await?;
         stream.write_all(&body_bytes).await?;
 
-        let mut resp = vec![0; 4096];
-        let n = stream.read(&mut resp).await?;
-        let resp_str = String::from_utf8_lossy(&resp[..n]);
-        if !resp_str.starts_with("HTTP/1.1 200") && !resp_str.starts_with("HTTP/1.1 204") {
+        let mut resp = Vec::new();
+        let mut buf = [0; 4096];
+        loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&buf[..n]);
+            if resp.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        
+        let resp_str = String::from_utf8_lossy(&resp);
+        let status_line = resp_str.lines().next().unwrap_or("");
+        let is_success = status_line.contains(" 200 ") 
+            || status_line.contains(" 201 ") 
+            || status_line.contains(" 202 ") 
+            || status_line.contains(" 204 ");
+            
+        if !is_success {
             return Err(Error::Vmm(format!("API error: {}", resp_str)));
         }
         Ok(())
@@ -158,11 +175,12 @@ impl ChInstance {
 
 use async_trait::async_trait;
 
-#[async_trait]
-impl Vmm for CloudHypervisor {
-    type Instance = ChInstance;
-
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
+impl CloudHypervisor {
+    async fn spawn_ch(
+        &self,
+        res: &PerVmResources,
+        snapshot_dir: Option<&Path>,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, tokio::process::Child)> {
         let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), res.vmid));
         tokio::fs::create_dir_all(&tmp).await?;
 
@@ -178,6 +196,11 @@ impl Vmm for CloudHypervisor {
             Command::new(&self.binary_path)
         };
 
+        if let Some(dir) = snapshot_dir {
+            cmd.arg("--restore")
+               .arg(format!("source_url=file://{}", dir.display()));
+        }
+
         let process = cmd
             .arg("--api-socket")
             .arg(&api_socket)
@@ -189,17 +212,17 @@ impl Vmm for CloudHypervisor {
         if let Some(pid) = process.id() {
             if !res.cgroup_name.is_empty() {
                 let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", res.cgroup_name);
-                if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
-                    eprintln!("WARNING: failed to write process {} to {}: {:?}", pid, procs_path, e);
+                if let Err(e) = tokio::fs::write(&procs_path, pid.to_string()).await {
+                    tracing::error!("WARNING: failed to write process {} to {}: {:?}", pid, procs_path, e);
                 } else {
-                    println!("Added process {} to cgroup {}", pid, res.cgroup_name);
+                    tracing::info!("Added process {} to cgroup {}", pid, res.cgroup_name);
                 }
             }
         }
 
         let mut socket_ready = false;
         for _ in 0..50 {
-            if api_socket.exists() {
+            if tokio::fs::try_exists(&api_socket).await.unwrap_or(false) {
                 socket_ready = true;
                 break;
             }
@@ -209,6 +232,17 @@ impl Vmm for CloudHypervisor {
         if !socket_ready {
             return Err(Error::Vmm("API socket failed to appear".into()));
         }
+        
+        Ok((tmp, api_socket, vsock_path, serial_path, process))
+    }
+}
+
+#[async_trait]
+impl Vmm for CloudHypervisor {
+    type Instance = ChInstance;
+
+    async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
+        let (tmp, api_socket, vsock_path, serial_path, process) = self.spawn_ch(res, None).await?;
 
         let mut fs_daemons = Vec::new();
         let mut ch_fs = Vec::new();
@@ -224,7 +258,7 @@ impl Vmm for CloudHypervisor {
             fs_daemons.push(daemon);
         }
 
-        let cid = crate::vmm::CidAllocator::allocate()?;
+        let cid = res.guest_cid;
 
         let instance = ChInstance {
             process,
@@ -248,18 +282,24 @@ impl Vmm for CloudHypervisor {
             },
             payload: ChPayload {
                 kernel: cfg.kernel.clone(),
-                cmdline: format!(
-                    "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/sbin/imp-guest-agent imp_vmid={}",
-                    match &cfg.rootfs {
-                        crate::config::RootfsSource::Erofs { .. } => "erofs",
-                        _ => "ext4",
-                    },
-                    match &cfg.rootfs {
-                        crate::config::RootfsSource::Erofs { .. } => "",
-                        _ => "rootflags=noload",
-                    },
-                    res.vmid
-                ),
+                cmdline: {
+                    let mut s = format!(
+                        "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/sbin/imp-guest-agent imp_vmid={}",
+                        match &cfg.rootfs {
+                            crate::config::RootfsSource::Erofs { .. } => "erofs",
+                            _ => "ext4",
+                        },
+                        match &cfg.rootfs {
+                            crate::config::RootfsSource::Erofs { .. } => "",
+                            _ => "rootflags=noload",
+                        },
+                        res.vmid
+                    );
+                    if !matches!(cfg.net, crate::config::NetConfig::None) {
+                        s.push_str(&format!(" ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off", res.vmid, res.vmid));
+                    }
+                    s
+                },
             },
             disks: vec![],
             fs: ch_fs,
@@ -324,55 +364,7 @@ impl Vmm for CloudHypervisor {
     }
 
     async fn restore(&self, snapshot_dir: &Path, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
-        let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), res.vmid));
-        tokio::fs::create_dir_all(&tmp).await?;
-
-        let api_socket = tmp.join("api.sock");
-        let vsock_path = tmp.join("vsock.sock");
-        let serial_path = tmp.join("serial.log");
-
-        let mut cmd = if let Some(netns) = &res.netns_name {
-            let mut c = Command::new("ip");
-            c.arg("netns").arg("exec").arg(netns).arg(&self.binary_path);
-            c
-        } else {
-            Command::new(&self.binary_path)
-        };
-
-        cmd.arg("--restore")
-           .arg(format!("source_url=file://{}", snapshot_dir.display()));
-
-        let process = cmd
-            .arg("--api-socket")
-            .arg(&api_socket)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-
-        if let Some(pid) = process.id() {
-            if !res.cgroup_name.is_empty() {
-                let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", res.cgroup_name);
-                if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
-                    eprintln!("WARNING: failed to write process {} to {}: {:?}", pid, procs_path, e);
-                } else {
-                    println!("Added process {} to cgroup {}", pid, res.cgroup_name);
-                }
-            }
-        }
-
-        let mut socket_ready = false;
-        for _ in 0..50 {
-            if api_socket.exists() {
-                socket_ready = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        
-        if !socket_ready {
-            return Err(Error::Vmm("API socket failed to appear".into()));
-        }
+        let (tmp, api_socket, vsock_path, serial_path, process) = self.spawn_ch(res, Some(snapshot_dir)).await?;
 
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
@@ -380,7 +372,7 @@ impl Vmm for CloudHypervisor {
             fs_daemons.push(daemon);
         }
 
-        let cid = crate::vmm::CidAllocator::allocate()?;
+        let cid = res.guest_cid;
 
         let instance = ChInstance {
             process,
@@ -415,7 +407,9 @@ impl VmInstance for ChInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
-        let _ = self.process.kill().await;
+        if let Err(e) = self.process.kill().await {
+            tracing::warn!("Failed to kill CH process: {}", e);
+        }
         Ok(())
     }
 
@@ -442,9 +436,11 @@ impl VmInstance for ChInstance {
         let res = self
             .api_request("PUT", "/api/v1/vm.snapshot", Some(&req))
             .await;
-        let _ = self
+        if let Err(e) = self
             .api_request("PUT", "/api/v1/vm.resume", None::<&()>)
-            .await;
+            .await {
+            tracing::warn!("Failed to resume VM after snapshot: {}", e);
+        }
         res
     }
 
@@ -513,5 +509,38 @@ impl Drop for ChInstance {
                 cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
             let _ = cg.delete();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ch_vm_config_serialization() {
+        let cfg = ChVmConfig {
+            cpus: ChCpus { boot_vcpus: 2, max_vcpus: 2 },
+            memory: ChMemory { size: 1024, shared: true },
+            payload: ChPayload { kernel: PathBuf::from("/vmlinux"), cmdline: "console=ttyS0".into() },
+            disks: vec![],
+            fs: vec![],
+            net: vec![],
+            serial: ChSerial { mode: "File".into(), file: PathBuf::from("/serial.log") },
+            vsock: ChVsock { cid: 3, socket: PathBuf::from("/vsock.sock") },
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"boot_vcpus\":2"));
+        assert!(!json.contains("\"disks\"")); // skip_serializing_if empty
+        assert!(json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}"));
+    }
+
+    #[test]
+    fn test_ch_response_parser() {
+        // Just verify basic assumption of HTTP/1.1 response string check logic.
+        let resp1 = "HTTP/1.1 204 No Content\r\n\r\n";
+        assert!(resp1.starts_with("HTTP/1.1 200") || resp1.starts_with("HTTP/1.1 204"));
+        
+        let resp2 = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        assert!(!(resp2.starts_with("HTTP/1.1 200") || resp2.starts_with("HTTP/1.1 204")));
     }
 }

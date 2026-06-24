@@ -3,7 +3,7 @@ use crate::config::VmConfig;
 use crate::error::Result;
 use crate::metrics::ResourceUsage;
 use crate::net::NetNamespace;
-#[cfg(feature = "experiment-smoltcp")]
+#[cfg(feature = "net-rootless")]
 use crate::net::SmoltcpProcess;
 use crate::proxy::{EgressProxy, ProxyConfig};
 use crate::vmm::{PerVmResources, VmInstance, Vmm};
@@ -24,7 +24,7 @@ pub struct TestVm<V: Vmm> {
     instance: V::Instance,
     /// The network namespace associated with this VM, if any.
     netns: Option<NetNamespace>,
-    #[cfg(feature = "experiment-smoltcp")]
+    #[cfg(feature = "net-rootless")]
     /// The smoltcp userspace networking process associated with this VM, if any.
     smoltcp: Option<SmoltcpProcess>,
     /// The egress proxy associated with this VM, if any.
@@ -34,7 +34,7 @@ pub struct TestVm<V: Vmm> {
 struct EnvSetup {
     res: PerVmResources,
     netns: Option<NetNamespace>,
-    #[cfg(feature = "experiment-smoltcp")]
+    #[cfg(feature = "net-rootless")]
     smoltcp: Option<SmoltcpProcess>,
     proxy: Option<EgressProxy>,
 }
@@ -60,7 +60,7 @@ impl<V: Vmm> TestVm<V> {
         self.netns.as_ref()
     }
 
-    #[cfg(feature = "experiment-smoltcp")]
+    #[cfg(feature = "net-rootless")]
     /// Gets the smoltcp userspace networking process associated with this VM, if any.
     pub fn smoltcp(&self) -> Option<&SmoltcpProcess> {
         self.smoltcp.as_ref()
@@ -71,9 +71,9 @@ impl<V: Vmm> TestVm<V> {
         self.proxy.as_ref()
     }
 
-    async fn setup_env(vmid: u32, cfg: &VmConfig) -> Result<EnvSetup> {
+    async fn setup_env(vmid: u32, cfg: &VmConfig, cid_alloc: &crate::vmm::CidAllocator) -> Result<EnvSetup> {
         let mut netns = None;
-        #[cfg(feature = "experiment-smoltcp")]
+        #[cfg(feature = "net-rootless")]
         let mut smoltcp = None;
         let mut proxy = None;
         let mut tap_name = None;
@@ -88,36 +88,53 @@ impl<V: Vmm> TestVm<V> {
             } => {
                 let _ = egress;
                 let _ = host_services;
-                let ns = NetNamespace::create(vmid)?;
+                let ns = NetNamespace::create(vmid, Box::new(crate::net::tap::DefaultNetlink))?;
                 tap_name = Some(ns.tap_name.clone());
                 netns_name = Some(ns.name.clone());
 
-                let px = EgressProxy::start(ProxyConfig {
-                    port: 0,
-                    netns: Some(ns.name.clone()),
-                })
-                .await?;
-                ns.emit_proxy_rules(px.port)?;
+                if let crate::config::Egress::Filtered(proxy_cfg) = egress {
+                    #[cfg(feature = "proxy")]
+                    {
+                        let px = EgressProxy::start(crate::proxy::ProxyConfig {
+                            port: 0,
+                            netns: Some(format!("imp-net-{}", vmid)),
+                            doubles: proxy_cfg.doubles.clone(),
+                        })
+                        .await?;
+                        ns.emit_proxy_rules(px.port, &crate::net::tap::DefaultNftApplier)?;
+                        proxy = Some(px);
+                    }
+                }
 
-                proxy = Some(px);
                 netns = Some(ns);
             }
             crate::config::NetConfig::Rootless {
                 egress,
                 host_services,
             } => {
-                let _ = egress;
                 let _ = host_services;
-                let px = EgressProxy::start(ProxyConfig {
-                    port: 0,
-                    netns: None,
-                })
-                .await?;
-                
-                #[cfg(feature = "experiment-smoltcp")]
+                let mut proxy_port = 0;
+
+                if let crate::config::Egress::Filtered(proxy_cfg) = egress {
+                    #[cfg(feature = "proxy")]
+                    {
+                        let px = EgressProxy::start(ProxyConfig {
+                            port: 0,
+                            netns: None,
+                            doubles: proxy_cfg.doubles.clone(),
+                        })
+                        .await?;
+                        proxy_port = px.port;
+                        proxy = Some(px);
+                    }
+                }
+                #[cfg(feature = "net-rootless")]
                 {
                     let socket_path = std::path::PathBuf::from(format!("/tmp/imp-smoltcp-{}.sock", vmid));
-                    let mut ports = vec![px.port];
+                    let mut ports = vec![];
+                    if proxy_port > 0 {
+                        ports.push(proxy_port);
+                    }
                     if *host_services {
                         ports.push(8080);
                     }
@@ -125,7 +142,6 @@ impl<V: Vmm> TestVm<V> {
                     vhost_user_socket = Some(socket_path);
                     smoltcp = Some(p);
                 }
-                proxy = Some(px);
             }
             crate::config::NetConfig::None => {}
         }
@@ -157,18 +173,21 @@ impl<V: Vmm> TestVm<V> {
             }
         }
 
+        let guest_cid = cid_alloc.allocate()?;
+
         let res = PerVmResources {
             cgroup_name,
             tap_name,
             netns_name,
             vhost_user_socket,
             vmid,
+            guest_cid,
         };
 
         Ok(EnvSetup {
             res,
             netns,
-            #[cfg(feature = "experiment-smoltcp")]
+            #[cfg(feature = "net-rootless")]
             smoltcp,
             proxy,
         })
@@ -178,9 +197,9 @@ impl<V: Vmm> TestVm<V> {
     ///
     /// # Errors
     /// Returns an error if the VM cannot be started or resources cannot be allocated.
-    pub async fn start(vmm: &V, cfg: VmConfig) -> Result<Self> {
+    pub async fn start(vmm: &V, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator) -> Result<Self> {
         let vmid = allocate_vmid()?;
-        let env = Self::setup_env(vmid, &cfg).await?;
+        let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
 
         let mut instance = vmm.create(&cfg, &env.res).await?;
         info!("Booting instance...");
@@ -190,7 +209,7 @@ impl<V: Vmm> TestVm<V> {
             vmid,
             instance,
             netns: env.netns,
-            #[cfg(feature = "experiment-smoltcp")]
+            #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
         })
@@ -200,9 +219,9 @@ impl<V: Vmm> TestVm<V> {
     ///
     /// # Errors
     /// Returns an error if the VM cannot be restored or resources cannot be allocated.
-    pub async fn restore(vmm: &V, snapshot_dir: &std::path::Path, cfg: VmConfig) -> Result<Self> {
+    pub async fn restore(vmm: &V, snapshot_dir: &std::path::Path, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator) -> Result<Self> {
         let vmid = allocate_vmid()?;
-        let env = Self::setup_env(vmid, &cfg).await?;
+        let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
 
         info!("Restoring instance...");
         let mut instance = vmm.restore(snapshot_dir, &cfg, &env.res).await?;
@@ -213,7 +232,7 @@ impl<V: Vmm> TestVm<V> {
             vmid,
             instance,
             netns: env.netns,
-            #[cfg(feature = "experiment-smoltcp")]
+            #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
         })
@@ -293,5 +312,30 @@ mod tests {
         assert!(vmid1 >= 1 && vmid1 <= 254);
         release_vmid(vmid1);
         release_vmid(vmid2);
+    }
+
+    #[test]
+    fn test_allocate_vmid_exhaustion() {
+        let mut vmids = Vec::new();
+        for _ in 1..=254 {
+            vmids.push(allocate_vmid().unwrap());
+        }
+        assert!(allocate_vmid().is_err());
+        for id in vmids {
+            release_vmid(id);
+        }
+    }
+
+    #[test]
+    fn test_per_vm_path_injectivity() {
+        // Test that path construction uses vmid uniquely
+        let vmid1 = 1;
+        let vmid2 = 2;
+        let cg1 = format!("imp-vm-{}", vmid1);
+        let cg2 = format!("imp-vm-{}", vmid2);
+        assert_ne!(cg1, cg2);
+        let sock1 = format!("/tmp/imp-smoltcp-{}.sock", vmid1);
+        let sock2 = format!("/tmp/imp-smoltcp-{}.sock", vmid2);
+        assert_ne!(sock1, sock2);
     }
 }

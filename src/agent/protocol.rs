@@ -134,4 +134,20 @@ mod tests {
             assert_eq!(msg, decoded);
         }
     }
+
+    #[test]
+    fn test_framing_multiple_messages() {
+        let msg1 = Message::Hello;
+        let msg2 = Message::Ready;
+        
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&postcard::to_stdvec(&msg1).unwrap());
+        bytes.extend_from_slice(&postcard::to_stdvec(&msg2).unwrap());
+        
+        let (decoded1, rest) = postcard::take_from_bytes::<Message>(&bytes).unwrap();
+        assert_eq!(decoded1, Message::Hello);
+        let (decoded2, rest2) = postcard::take_from_bytes::<Message>(rest).unwrap();
+        assert_eq!(decoded2, Message::Ready);
+        assert!(rest2.is_empty());
+    }
 }

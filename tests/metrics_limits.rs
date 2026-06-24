@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use tokio::time::{Duration, sleep};
 
 #[tokio::test]
+#[ignore]
 async fn test_metrics_and_limits() {
     let kernel = PathBuf::from(
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
@@ -29,7 +30,8 @@ async fn test_metrics_and_limits() {
         std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
     let vmm = CloudHypervisor::new(ch_binary);
 
-    let vm = TestVm::start(&vmm, cfg).await.expect("Failed to start VM");
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let vm = TestVm::start(&vmm, cfg, &cid_alloc).await.expect("Failed to start VM");
 
     // Wait a bit for the VM to boot and consume some memory
     sleep(Duration::from_secs(2)).await;

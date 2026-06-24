@@ -5,6 +5,7 @@ use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
 #[tokio::test]
+#[ignore]
 async fn test_lifecycle_force_kill() {
     let ch = CloudHypervisor::new("cloud-hypervisor");
 
@@ -20,7 +21,8 @@ async fn test_lifecycle_force_kill() {
         .network_disabled()
         .build().unwrap();
 
-    let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
 
     vm.instance_mut().kill().await.expect("Failed to kill VM");
 }

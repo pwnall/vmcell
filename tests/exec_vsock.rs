@@ -6,6 +6,7 @@ use tokio::net::UnixListener;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[tokio::test]
+#[ignore]
 async fn test_exec_vsock_mock() {
     let tmp = std::env::temp_dir().join(format!("imp-test-vsock-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);

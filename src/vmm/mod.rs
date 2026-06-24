@@ -13,20 +13,41 @@ pub use cloud_hypervisor::CloudHypervisor;
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static NEXT_CID: AtomicU32 = AtomicU32::new(3);
 
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
-pub struct CidAllocator;
+pub struct CidAllocator {
+    active: std::sync::Mutex<std::collections::BTreeSet<u32>>,
+}
 
 impl CidAllocator {
+    /// Creates a new CID allocator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            active: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        }
+    }
+
     /// Allocates and returns the next available unique CID.
-    pub fn allocate() -> Result<u32> {
-        NEXT_CID.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cid| {
-            if cid == u32::MAX { None } else { Some(cid + 1) }
-        }).map_err(|_| crate::error::Error::Vmm("CID allocator exhausted".to_string()))
+    ///
+    /// # Errors
+    /// Returns an error if all 254 CIDs are exhausted.
+    pub fn allocate(&self) -> Result<u32> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        for i in 3..=254 {
+            if !active.contains(&i) {
+                active.insert(i);
+                return Ok(i);
+            }
+        }
+        Err(crate::error::Error::Vmm("CID allocator exhausted".to_string()))
+    }
+
+    /// Releases a previously allocated CID.
+    pub fn release(&self, cid: u32) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.remove(&cid);
     }
 }
 
@@ -44,6 +65,8 @@ pub struct PerVmResources {
     pub vhost_user_socket: Option<PathBuf>,
     /// Unique internal VM ID.
     pub vmid: u32,
+    /// Context ID for vsock communication.
+    pub guest_cid: u32,
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
@@ -191,9 +214,13 @@ mod tests {
 
     #[test]
     fn test_cid_allocator() {
-        let cid1 = CidAllocator::allocate().unwrap();
-        let cid2 = CidAllocator::allocate().unwrap();
+        let alloc = CidAllocator::new();
+        let cid1 = alloc.allocate().unwrap();
+        let cid2 = alloc.allocate().unwrap();
         assert!(cid1 >= 3);
         assert!(cid2 > cid1);
+        alloc.release(cid1);
+        let cid3 = alloc.allocate().unwrap();
+        assert_eq!(cid1, cid3);
     }
 }

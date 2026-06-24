@@ -1,6 +1,6 @@
 //! Configuration models and builder for virtual machine instances.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Configuration for a virtual machine instance.
 #[derive(Clone, Debug)]
@@ -137,11 +137,32 @@ pub enum Egress {
 }
 
 /// Configuration for the transparent proxy.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ProxyConfig {
-    // Additional proxy config can go here
+    /// Test doubles to intercept and mock requests.
+    #[cfg(feature = "proxy")]
+    pub doubles: std::sync::Arc<Vec<crate::proxy::doubles::TestDouble>>,
 }
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ProxyConfig {
+    fn eq(&self, _other: &Self) -> bool {
+        #[cfg(feature = "proxy")]
+        {
+            std::sync::Arc::ptr_eq(&self.doubles, &_other.doubles)
+        }
+        #[cfg(not(feature = "proxy"))]
+        true
+    }
+}
+
+impl Eq for ProxyConfig {}
 
 /// Resource limits enforced via cgroup v2.
 #[derive(Clone, Debug, Default)]
@@ -243,9 +264,17 @@ impl VmConfigBuilder {
         if self.mem_mib < 64 {
             return Err(crate::error::Error::Config("mem_mib must be >= 64".into()));
         }
+        if self.kernel.as_os_str().is_empty() {
+            return Err(crate::error::Error::Config("kernel path cannot be empty".into()));
+        }
+
+        let mut tags = std::collections::HashSet::new();
         for share in &self.shares {
             if share.tag.is_empty() {
                 return Err(crate::error::Error::Config("share tag cannot be empty".into()));
+            }
+            if !tags.insert(share.tag.clone()) {
+                return Err(crate::error::Error::Config(format!("duplicate share tag: {}", share.tag)));
             }
         }
         

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 ///
 /// # Errors
 /// Returns an error if the archive is invalid or conversion fails.
-#[cfg(feature = "experiment-erofs")]
+#[cfg(feature = "am-fs-erofs")]
 pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Result<Vec<u8>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
@@ -141,7 +141,7 @@ pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Resul
     Ok(image)
 }
 
-#[cfg(feature = "experiment-erofs")]
+#[cfg(feature = "am-fs-erofs")]
 fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {

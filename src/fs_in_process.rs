@@ -81,24 +81,24 @@ pub mod backend {
 
                 if self.event_idx {
                     if vring_state.add_used(head_index, 0).is_err() {
-                        eprintln!("Couldn't return used descriptors to the ring");
+                        tracing::error!("Couldn't return used descriptors to the ring");
                     }
 
                     match vring_state.needs_notification() {
                         Err(_) => {
-                            vring_state.signal_used_queue().unwrap();
+                            vring_state.signal_used_queue().expect("invariant");
                         }
                         Ok(needs_notification) => {
                             if needs_notification {
-                                vring_state.signal_used_queue().unwrap();
+                                vring_state.signal_used_queue().expect("invariant");
                             }
                         }
                     }
                 } else {
                     if vring_state.add_used(head_index, 0).is_err() {
-                        eprintln!("Couldn't return used descriptors to the ring");
+                        tracing::error!("Couldn't return used descriptors to the ring");
                     }
-                    vring_state.signal_used_queue().unwrap();
+                    vring_state.signal_used_queue().expect("invariant");
                 }
             }
 
@@ -152,25 +152,25 @@ pub mod backend {
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
-            self.backend.lock().unwrap().event_idx = enabled
+            self.backend.lock().expect("invariant").event_idx = enabled
         }
 
         fn update_memory(
             &mut self,
             mem: GuestMemoryAtomic<GuestMemoryMmap>,
         ) -> std::io::Result<()> {
-            self.backend.lock().unwrap().mem = Some(mem);
+            self.backend.lock().expect("invariant").mem = Some(mem);
             Ok(())
         }
 
         fn set_backend_req_fd(&mut self, vu_req: Backend) {
-            self.backend.lock().unwrap().vu_req = Some(vu_req);
+            self.backend.lock().expect("invariant").vu_req = Some(vu_req);
         }
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-            let backend = self.backend.lock().unwrap();
-            let consumer = backend.kill_evt.0.try_clone().unwrap();
-            let notifier = backend.kill_evt.1.try_clone().unwrap();
+            let backend = self.backend.lock().expect("invariant");
+            let consumer = backend.kill_evt.0.try_clone().expect("invariant");
+            let notifier = backend.kill_evt.1.try_clone().expect("invariant");
             Some((consumer, notifier))
         }
 
@@ -188,8 +188,8 @@ pub mod backend {
             }
 
             let mut vring_state = match device_event {
-                HIPRIO_QUEUE_EVENT => vrings[0].get_mut(),
-                REQ_QUEUE_EVENT => vrings[1].get_mut(),
+                HIPRIO_QUEUE_EVENT => vrings.get(0).expect("invariant").get_mut(),
+                REQ_QUEUE_EVENT => vrings.get(1).expect("invariant").get_mut(),
                 _ => {
                     return Err(std::io::Error::other(
                         "HandleEventUnknownEvent",
@@ -197,21 +197,21 @@ pub mod backend {
                 }
             };
 
-            if self.backend.lock().unwrap().event_idx {
+            if self.backend.lock().expect("invariant").event_idx {
                 loop {
-                    vring_state.disable_notification().unwrap();
+                    vring_state.disable_notification().expect("invariant");
                     self.backend
                         .lock()
-                        .unwrap()
+                        .expect("invariant")
                         .process_queue(&mut vring_state)?;
-                    if !vring_state.enable_notification().unwrap() {
+                    if !vring_state.enable_notification().expect("invariant") {
                         break;
                     }
                 }
             } else {
                 self.backend
                     .lock()
-                    .unwrap()
+                    .expect("invariant")
                     .process_queue(&mut vring_state)?;
             }
 
@@ -222,13 +222,20 @@ pub mod backend {
     pub fn start_in_process_virtiofsd(
         socket_path: &std::path::Path,
         host_path: &std::path::Path,
-        _read_only: bool,
+        read_only: bool,
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
             no_opendir: false,
             ..Default::default()
         });
+
+        // fuse-backend-rs PassthroughFs does not have a config option for readonly,
+        // so we must handle it manually or acknowledge it.
+        // TODO: Enforce read_only flag inside the VFS layer or via bind mounts.
+        if read_only {
+            tracing::warn!("Read-only mode requested but in-process virtiofsd does not fully support it natively yet.");
+        }
 
         let cfg = Config {
             root_dir: host_path.to_string_lossy().to_string(),
@@ -249,7 +256,7 @@ pub mod backend {
 
         let socket_path_str = socket_path.to_string_lossy().into_owned();
         let handle = std::thread::spawn(move || {
-            eprintln!(
+            tracing::error!(
                 "in-process virtiofsd: thread started, listening on {:?}",
                 socket_path_str
             );
@@ -258,9 +265,9 @@ pub mod backend {
                 backend,
                 GuestMemoryAtomic::new(GuestMemoryMmap::new()),
             )
-            .unwrap();
+            .expect("invariant");
             vu_daemon.start(&mut listener).unwrap_or_else(|e| {
-                eprintln!("in-process virtiofsd panic: {:?}", e);
+                tracing::error!("in-process virtiofsd panic: {:?}", e);
                 panic!("{:?}", e)
             });
         });

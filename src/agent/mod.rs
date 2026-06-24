@@ -15,7 +15,7 @@ use futures::{SinkExt, StreamExt};
 #[cfg(feature = "host-common")]
 use std::path::Path;
 #[cfg(feature = "host-common")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, AsyncBufReadExt};
 #[cfg(feature = "host-common")]
 use tokio::net::UnixStream;
 #[cfg(feature = "host-common")]
@@ -35,48 +35,52 @@ impl AgentClient {
     /// # Errors
     /// Returns an error if the connection fails or the handshake is unsuccessful.
     pub async fn connect(vsock_path: &Path, port: u32) -> Result<Self> {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let mut stream = UnixStream::connect(vsock_path)
-                .await
-                .map_err(|e| Error::Vmm(format!("Failed to connect to vsock UDS: {}", e)))?;
-
-            let connect_msg = format!("CONNECT {}\n", port);
-            stream.write_all(connect_msg.as_bytes()).await?;
-
-            let mut resp = String::new();
-            loop {
-                let mut byte = [0; 1];
-                let n = stream.read(&mut byte).await?;
-                if n == 0 {
-                    return Err(Error::Vmm("Vsock connection closed before OK".into()));
-                }
-                resp.push(byte[0] as char);
-                if byte[0] == b'\n' {
-                    break;
-                }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut backoff = std::time::Duration::from_millis(50);
+        
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                return Err(Error::Timeout("Agent connection timed out".into()));
             }
 
-            if !resp.starts_with("OK ") {
-                return Err(Error::Vmm(format!("Vsock connection failed: {}", resp)));
+            let mut stream = match UnixStream::connect(vsock_path).await {
+                Ok(s) => s,
+                Err(_) => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_millis(500));
+                    continue;
+                }
+            };
+
+            let connect_msg = format!("CONNECT {}\n", port);
+            if stream.write_all(connect_msg.as_bytes()).await.is_err() {
+                continue;
+            }
+
+            let mut reader = tokio::io::BufReader::new(&mut stream);
+            let mut resp = String::new();
+            if reader.read_line(&mut resp).await.is_err() || !resp.starts_with("OK ") {
+                tokio::time::sleep(backoff).await;
+                continue;
             }
 
             let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
 
-            // Wait for Ready
-            if let Some(res) = framed.next().await {
-                let bytes: bytes::BytesMut = res.map_err(Error::Io)?;
-                let msg: Message = postcard::from_bytes(&bytes)
-                    .map_err(|e| Error::Other(format!("Failed to parse Ready message: {}", e)))?;
-                match msg {
-                    Message::Ready => {}
-                    _ => return Err(Error::Other("Expected Ready message".into())),
-                }
-            } else {
-                return Err(Error::Other("Connection closed waiting for Ready".into()));
+            let ready = match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await {
+                Ok(Some(Ok(bytes))) => bytes,
+                _ => continue,
+            };
+            
+            let msg: Message = match postcard::from_bytes(&ready) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            
+            match msg {
+                Message::Ready => return Ok(Self { stream: framed }),
+                _ => continue,
             }
-
-            Ok(Self { stream: framed })
-        }).await.map_err(|_| Error::Timeout("Agent connection timed out".into()))?
+        }
     }
 
     /// Reconnects to the guest agent.

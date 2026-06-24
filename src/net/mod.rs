@@ -6,11 +6,11 @@
 /// TAP interface and network namespace management.
 pub mod tap;
 
-#[cfg(feature = "experiment-smoltcp")]
+#[cfg(feature = "net-rootless")]
 /// rootless userspace networking with smoltcp.
 pub mod smoltcp;
 
 pub use tap::NetNamespace;
 
-#[cfg(feature = "experiment-smoltcp")]
+#[cfg(feature = "net-rootless")]
 pub use smoltcp::backend::SmoltcpProcess;

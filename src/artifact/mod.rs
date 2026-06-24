@@ -11,10 +11,10 @@ pub mod rootfs;
 /// Snapshot building stage.
 pub mod snapshot;
 /// Tar to EROFS conversion utility.
-#[cfg(feature = "experiment-erofs")]
+#[cfg(feature = "am-fs-erofs")]
 pub mod tar2erofs;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Inputs for an artifact building stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,26 +71,29 @@ impl Pipeline {
     /// # Errors
     /// Returns an error if any stage fails.
     pub async fn build(&self, _cache: &Cache) -> Result<Artifacts> {
-        let out_dir = Path::new("/tmp/imp-artifacts");
-        tokio::fs::create_dir_all(out_dir)
-            .await
-            .map_err(crate::error::Error::Io)?;
+        let dir = std::env::var("IMP_ARTIFACTS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts"));
+        match tokio::fs::create_dir_all(&dir).await {
+            Ok(_) => {}
+            Err(e) => return Err(crate::error::Error::Io(e)),
+        }
 
         for stage in &self.stages {
             let out_path = if stage.name() == "kernel" {
-                out_dir.join("vmlinux")
+                dir.join("vmlinux")
             } else if stage.name() == "rootfs" {
-                out_dir.join("rootfs.erofs")
+                dir.join("rootfs.erofs")
             } else {
-                out_dir.join(stage.name())
+                dir.join(stage.name())
             };
 
             if out_path.exists() {
-                println!("Skipping stage {} (cached)", stage.name());
+                tracing::info!("Skipping stage {} (cached)", stage.name());
                 continue;
             }
 
-            println!("Running stage {}", stage.name());
+            tracing::info!("Running stage {}", stage.name());
             stage.run(&StageInputs {}, &out_path).await?;
         }
 
@@ -101,7 +104,22 @@ impl Pipeline {
     ///
     /// # Errors
     /// Returns an error if the reset fails.
-    pub fn reset_to(&self, _stage: &str, _cache: &Cache) -> Result<()> {
+    pub fn reset_to(&self, stage: &str, _cache: &Cache) -> Result<()> {
+        let dir = std::env::var("IMP_ARTIFACTS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts"));
+            
+        let out_path = if stage == "kernel" {
+            dir.join("vmlinux")
+        } else if stage == "rootfs" {
+            dir.join("rootfs.erofs")
+        } else {
+            dir.join(stage)
+        };
+        
+        if out_path.exists() {
+            let _ = std::fs::remove_file(out_path);
+        }
         Ok(())
     }
 }

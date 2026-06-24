@@ -4,36 +4,57 @@
 //! It includes abstractions for networking, virtual machine monitors (like Cloud Hypervisor),
 //! and an agent protocol for executing commands inside the guest.
 
-#![warn(missing_docs)]
-#![deny(clippy::missing_errors_doc)]
+#![deny(missing_docs)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    unsafe_op_in_unsafe_fn,
+    rustdoc::broken_intra_doc_links
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::dbg_macro
+    )
+)]
 /// Agent protocol and client implementation.
 pub mod agent;
 /// Error and Result types.
 pub mod error;
 
-#[cfg(feature = "host-common")]
 /// Artifact building stages and pipeline.
+#[cfg(feature = "host-common")]
 pub mod artifact;
-#[cfg(feature = "host-common")]
 /// VM configuration models.
+#[cfg(feature = "host-common")]
 pub mod config;
-#[cfg(feature = "host-common")]
 /// virtio-fs daemon implementation.
+#[cfg(feature = "host-common")]
 pub mod fs;
-#[cfg(feature = "host-common")]
 /// Resource usage metrics collection.
+#[cfg(feature = "host-common")]
 pub mod metrics;
-#[cfg(feature = "host-common")]
 /// Networking models and implementations (tap, smoltcp).
+#[cfg(feature = "host-common")]
 pub mod net;
-#[cfg(feature = "host-common")]
 /// VM orchestration and management.
+#[cfg(feature = "host-common")]
 pub mod orchestrator;
-#[cfg(feature = "host-common")]
 /// Egress proxy implementation.
-pub mod proxy;
 #[cfg(feature = "host-common")]
+pub mod proxy;
 /// VMM interface and backend implementations.
+#[cfg(feature = "host-common")]
 pub mod vmm;
 
 pub use agent::{AgentClient, ExecOutcome, ExecRequest};

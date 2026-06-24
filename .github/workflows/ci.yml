@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Rust
+      run: rustup update stable && rustup component add clippy rustfmt
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+    - name: Check Formatting
+      run: cargo fmt --check
+    - name: Clippy Powerset
+      # Build all targets/features, treating warnings as errors
+      run: cargo hack --feature-powerset --depth 2 clippy --all-targets -- -D warnings
+    - name: Run Tests
+      # Run the non-ignored tests
+      run: cargo test
+
+  lean_agent:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Rust
+      run: rustup update stable
+    - name: Verify Lean Agent
+      # Verify that the guest agent compilation doesn't pull in heavy host dependencies
+      run: |
+        DEPS=$(cargo tree -e no-dev --no-default-features --features agent)
+        if echo "$DEPS" | grep -q "tokio"; then echo "Error: tokio found in agent deps"; exit 1; fi
+        if echo "$DEPS" | grep -q "hyper"; then echo "Error: hyper found in agent deps"; exit 1; fi
+        if echo "$DEPS" | grep -q "rtnetlink"; then echo "Error: rtnetlink found in agent deps"; exit 1; fi
+        echo "Agent dependencies verified clean."
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo-deny
+      uses: EmbarkStudios/cargo-deny-action@v2
+    - name: Check licenses and advisories
+      run: cargo deny check

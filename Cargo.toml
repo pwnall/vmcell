@@ -112,12 +112,12 @@ predicates = "3"
 serial_test = "3"
 tempfile = "3"
 tracing-test = "0.2"
+proptest = "1"
 env_logger = "0.11"
 
 [features]
 experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
-experiment-smoltcp = ["dep:smoltcp", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
-default = ["cloud-hypervisor", "net-privileged", "proxy", "metrics", "pipeline", "cli", "experiment-fuse", "experiment-smoltcp"]
+default = ["cloud-hypervisor", "net-privileged", "proxy", "metrics", "pipeline", "cli"]
 
 host-common = [
     "dep:tokio", "dep:futures", "dep:bytes",
@@ -132,11 +132,10 @@ qemu = ["host-common", "dep:qapi", "dep:serde_json"]
 
 net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:tun-tap", "dep:ipnet"]
 experiment-nftables = ["net-privileged", "dep:jip-nftables"]
-experiment-erofs = ["dep:am-fs-erofs", "dep:tar"]
-net-rootless = ["host-common"]
+net-rootless = ["host-common", "dep:smoltcp", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
 
-proxy = ["host-common", "dep:rustls", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile"]
-proxy-hudsucker = ["host-common", "dep:hudsucker"]
+proxy = ["host-common", "dep:rustls", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile", "dep:hudsucker"]
+proxy-hudsucker = ["proxy"]
 
 metrics = ["host-common", "dep:cgroups-rs", "dep:procfs"]
 
@@ -145,6 +144,7 @@ pipeline = [
     "dep:reqwest", "dep:pgp", "dep:sha2", "dep:blake3",
     "dep:tar", "dep:flate2", "dep:lzma-rs", "dep:zstd",
     "dep:reflink-copy", "dep:walkdir", "dep:toml", "dep:tempfile",
+    "dep:am-fs-erofs",
 ]
 
 cli = ["host-common", "dep:clap", "dep:anyhow", "dep:serde_json"]

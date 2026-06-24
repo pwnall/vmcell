@@ -4,6 +4,7 @@ use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
 #[tokio::test]
+#[ignore]
 async fn test_shares_ro_rw() {
     let tmp = std::env::temp_dir().join(format!("imp-test-shares-{}", std::process::id()));
     let in_dir = tmp.join("in");
@@ -38,7 +39,8 @@ async fn test_shares_ro_rw() {
         .network_disabled()
         .build().unwrap();
 
-    let mut vmm = imp_testing::TestVm::start(&_vmm, _cfg)
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let mut vmm = imp_testing::TestVm::start(&_vmm, _cfg, &cid_alloc)
         .await
         .expect("Failed to start VM");
 

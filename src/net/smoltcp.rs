@@ -1,4 +1,4 @@
-#[cfg(feature = "experiment-smoltcp")]
+#[cfg(feature = "net-rootless")]
 /// Low-level backend networking types and state for `smoltcp`.
 pub mod backend {
     use std::collections::VecDeque;
@@ -147,21 +147,21 @@ pub mod backend {
                 }
 
                 if packet.len() >= VIRTIO_NET_HDR_SIZE {
-                    log::trace!("process_tx_queue: Read packet of length {} from vring: {:?}", packet.len(), &packet[VIRTIO_NET_HDR_SIZE..]);
+                    log::trace!("process_tx_queue: Read packet of length {} from vring: {:?}", packet.len(), packet.get(VIRTIO_NET_HDR_SIZE..).expect("invariant"));
                     state
                         .tx_queue
-                        .push_back(packet[VIRTIO_NET_HDR_SIZE..].to_vec());
+                        .push_back(packet.get(VIRTIO_NET_HDR_SIZE..).expect("invariant").to_vec());
                 } else {
                     log::trace!("process_tx_queue: packet too short: {}", packet.len());
                 }
 
                 if vring_state.add_used(head_index, 0).is_err() {
-                    eprintln!("Couldn't return used descriptors");
+                    tracing::error!("Couldn't return used descriptors");
                 }
             }
 
             if used_any {
-                vring_state.signal_used_queue().unwrap();
+                vring_state.signal_used_queue().expect("invariant");
             }
 
             Ok(used_any)
@@ -205,8 +205,8 @@ pub mod backend {
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
             Some((
-                self.kill_evt.0.try_clone().unwrap(),
-                self.kill_evt.1.try_clone().unwrap(),
+                self.kill_evt.0.try_clone().expect("invariant"),
+                self.kill_evt.1.try_clone().expect("invariant"),
             ))
         }
 
@@ -228,12 +228,12 @@ pub mod backend {
 
             if device_event == 1 {
                 // transmitq (guest -> host)
-                let mut vring_state = vrings[1].get_mut();
+                let mut vring_state = vrings.get(1).expect("invariant").get_mut();
                 if self.event_idx {
                     loop {
-                        vring_state.disable_notification().unwrap();
+                        vring_state.disable_notification().expect("invariant");
                         Self::process_tx_queue(&mut state, &mut vring_state)?;
-                        if !vring_state.enable_notification().unwrap() {
+                        if !vring_state.enable_notification().expect("invariant") {
                             break;
                         }
                     }
@@ -257,7 +257,7 @@ pub mod backend {
 
     impl Drop for SmoltcpProcess {
         fn drop(&mut self) {
-            println!("SmoltcpProcess dropping!");
+            tracing::info!("SmoltcpProcess dropping!");
             self.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = self.kill_notifier.notify();
             if let Some(h) = self.vhost_thread.take() {
@@ -271,6 +271,10 @@ pub mod backend {
 
     impl SmoltcpProcess {
         /// Starts the background network thread to process packets and manage connections.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the underlying system resources or background threads fail to start.
         pub fn start(vmid: u32, forward_ports: Vec<u16>, socket_path: PathBuf) -> Self {
             let state = Arc::new(Mutex::new(SharedState {
                 tx_queue: VecDeque::new(),
@@ -284,8 +288,8 @@ pub mod backend {
             let (kill_evt_consumer, kill_evt_notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
                 vmm_sys_util::event::EventFlag::NONBLOCK,
             )
-            .unwrap();
-            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().unwrap());
+            .expect("invariant");
+            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().expect("invariant"));
 
             let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
                 event_idx: false,
@@ -293,7 +297,7 @@ pub mod backend {
                 state: state_clone,
             }));
 
-            let mut listener = Listener::new(&socket_path, true).unwrap();
+            let mut listener = Listener::new(&socket_path, true).expect("invariant");
 
             let vhost_thread = std::thread::spawn(move || {
                 let mut vu_daemon = VhostUserDaemon::new(
@@ -301,7 +305,7 @@ pub mod backend {
                     backend,
                     GuestMemoryAtomic::new(GuestMemoryMmap::new()),
                 )
-                .unwrap();
+                .expect("invariant");
 
                 let _ = vu_daemon.start(&mut listener);
             });
@@ -309,7 +313,7 @@ pub mod backend {
             let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_flag_clone = stop_flag.clone();
             let net_thread = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
+                let rt = tokio::runtime::Runtime::new().expect("invariant");
                 rt.block_on(async move {
                     Self::run_network(vmid, forward_ports, state, stop_flag_clone).await;
                 });
@@ -340,9 +344,9 @@ pub mod backend {
             iface.update_ip_addrs(|ip_addrs| {
                 ip_addrs
                     .push(IpCidr::new(IpAddress::Ipv4(host_gw), 30))
-                    .unwrap();
+                    .expect("invariant");
             });
-            iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 200, (vmid % 256) as u8, 2)).unwrap();
+            iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 200, (vmid % 256) as u8, 2)).expect("invariant");
             log::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
 
             let mut sockets = SocketSet::new(vec![]);
@@ -366,7 +370,7 @@ pub mod backend {
                     // Process receiveq (host -> guest)
                     let (mem_opt, vrings_opt) = (state_guard.mem.clone(), state_guard.vrings.clone());
                     if let (Some(mem), Some(vrings)) = (mem_opt, vrings_opt) {
-                        let mut vring_state = vrings[0].get_mut();
+                        let mut vring_state = vrings.get(0).expect("invariant").get_mut();
                         let mem_obj = mem.memory();
                         let mut used_any = false;
 
@@ -390,7 +394,7 @@ pub mod backend {
                                         if to_write > 0
                                             && mem_obj
                                                 .write_slice(
-                                                    &full_packet[offset..offset + to_write],
+                                                    full_packet.get(offset..offset + to_write).expect("invariant"),
                                                     desc.addr(),
                                                 )
                                                 .is_ok()
@@ -399,7 +403,7 @@ pub mod backend {
                                             written += to_write;
                                         }
                                     }
-                                    vring_state.add_used(head_index, written as u32).unwrap();
+                                    vring_state.add_used(head_index, written as u32).expect("invariant");
                                     used_any = true;
                                 } else {
                                     state_guard.rx_queue.push_front(packet);
@@ -411,7 +415,7 @@ pub mod backend {
                             }
                         }
                         if used_any {
-                            vring_state.signal_used_queue().unwrap();
+                            vring_state.signal_used_queue().expect("invariant");
                         }
                     }
 
@@ -423,7 +427,7 @@ pub mod backend {
                 for (port, handle, tcp_stream) in port_mappings.iter_mut() {
                     let socket = sockets.get_mut::<TcpSocket>(*handle);
                     if !socket.is_open() {
-                        socket.listen(*port).unwrap();
+                        socket.listen(*port).expect("invariant");
                     }
 
                     if socket.can_send() || socket.can_recv() {
@@ -431,7 +435,7 @@ pub mod backend {
                             if let Ok(stream) =
                                 tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await
                             {
-                                stream.set_nodelay(true).unwrap();
+                                stream.set_nodelay(true).expect("invariant");
                                 *tcp_stream = Some(stream);
                             }
                         }
@@ -445,7 +449,7 @@ pub mod backend {
                                         closed = true;
                                     }
                                     Ok(n) => {
-                                        socket.send_slice(&buf[..n]).unwrap();
+                                        socket.send_slice(buf.get(..n).expect("invariant")).expect("invariant");
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => {
@@ -458,9 +462,9 @@ pub mod backend {
                                 let mut buf = [0; 8192];
                                 if let Ok(n) = socket.peek_slice(&mut buf) {
                                     if n > 0 {
-                                        match stream.try_write(&buf[..n]) {
+                                        match stream.try_write(buf.get(..n).expect("invariant")) {
                                             Ok(written) => {
-                                                socket.recv(|_| (written, ())).unwrap();
+                                                socket.recv(|_| (written, ())).expect("invariant");
                                             }
                                             Err(ref e)
                                                 if e.kind() == std::io::ErrorKind::WouldBlock => {}

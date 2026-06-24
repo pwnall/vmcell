@@ -80,29 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let mut vmid = "1".to_string();
-    for token in cmdline.split_whitespace() {
-        if let Some(val) = token.strip_prefix("imp_vmid=") {
-            vmid = val.to_string();
-            break;
-        }
-    }
-
-    let guest_ip = format!("10.200.{}.2/30", vmid);
-    let host_ip = format!("10.200.{}.1", vmid);
-
     let _ = Command::new("ip")
         .args(["link", "set", "lo", "up"])
-        .status();
-    let _ = Command::new("ip")
-        .args(["addr", "add", &guest_ip, "dev", "eth0"])
-        .status();
-    let _ = Command::new("ip")
-        .args(["link", "set", "eth0", "up"])
-        .status();
-    let _ = Command::new("ip")
-        .args(["route", "add", "default", "via", &host_ip])
         .status();
 
     // Spawn vsock listener thread

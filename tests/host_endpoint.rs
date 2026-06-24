@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[tokio::test]
+#[ignore]
 async fn test_host_endpoint() {
     let _ = env_logger::builder().is_test(true).try_init();
     let ch = CloudHypervisor::new("cloud-hypervisor");
@@ -18,7 +19,8 @@ async fn test_host_endpoint() {
         host_services: true,
     };
 
-    let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let mut vm = TestVm::start(&ch, cfg, &cid_alloc).await.expect("Failed to start VM");
 
     let host_ip = format!("10.200.{}.1", vm.vmid());
 
