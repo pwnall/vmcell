@@ -1,7 +1,13 @@
+//! Protocol definitions for guest-host communication.
+//!
+//! This module defines the messages exchanged between the host VMM and the
+//! guest agent over the vsock connection.
+
 use serde::{Deserialize, Serialize};
 
 /// A message exchanged between the host and the guest agent.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Message {
     /// Hello handshake from the guest.
     Hello,
@@ -27,7 +33,8 @@ pub enum Message {
 }
 
 /// A request to execute a command inside the guest VM.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExecRequest {
     /// The command line arguments (e.g., `["ls", "-l"]`).
     pub argv: Vec<String>,
@@ -37,8 +44,32 @@ pub struct ExecRequest {
     pub cwd: Option<String>,
 }
 
+impl ExecRequest {
+    /// Creates a new `ExecRequest` with the given arguments.
+    pub fn new(argv: Vec<String>) -> Self {
+        Self {
+            argv,
+            env: vec![],
+            cwd: None,
+        }
+    }
+
+    /// Sets the environment variables.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Sets the working directory.
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+}
+
 /// The result of executing a command inside the guest VM.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExecOutcome {
     /// The exit code of the process.
     pub code: i32,
@@ -46,6 +77,16 @@ pub struct ExecOutcome {
     pub stdout: Vec<u8>,
     /// Standard error of the process.
     pub stderr: Vec<u8>,
+}
+
+impl Default for ExecOutcome {
+    fn default() -> Self {
+        Self {
+            code: -1,
+            stdout: vec![],
+            stderr: vec![],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -69,6 +110,28 @@ mod tests {
                 assert_eq!(req.cwd, Some("/root".to_string()));
             }
             _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn test_serialization_all_variants() {
+        let msgs = vec![
+            Message::Hello,
+            Message::Ready,
+            Message::Stdout(vec![1, 2, 3]),
+            Message::Stderr(vec![4, 5, 6]),
+            Message::Exit(42),
+            Message::PutFile {
+                dst: "/tmp/test".to_string(),
+                bytes: vec![7, 8, 9],
+            },
+            Message::Ping,
+        ];
+
+        for msg in msgs {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            let decoded: Message = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(msg, decoded);
         }
     }
 }

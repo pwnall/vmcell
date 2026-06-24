@@ -1,8 +1,15 @@
+//! Virtual Machine Monitor (VMM) abstraction and management.
+//!
+//! This module provides a generic abstraction for different VMM backends
+//! (like Cloud Hypervisor), as well as fake implementations for testing.
+
 use crate::config::VmConfig;
 use crate::error::Result;
 use crate::metrics::ResourceUsage;
 /// Cloud Hypervisor VMM backend implementation.
 pub mod cloud_hypervisor;
+
+pub use cloud_hypervisor::CloudHypervisor;
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -16,12 +23,16 @@ pub struct CidAllocator;
 
 impl CidAllocator {
     /// Allocates and returns the next available unique CID.
-    pub fn allocate() -> u32 {
-        NEXT_CID.fetch_add(1, Ordering::SeqCst)
+    pub fn allocate() -> Result<u32> {
+        NEXT_CID.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cid| {
+            if cid == u32::MAX { None } else { Some(cid + 1) }
+        }).map_err(|_| crate::error::Error::Vmm("CID allocator exhausted".to_string()))
     }
 }
 
 /// Per-VM resources allocated by the orchestrator before VM creation.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PerVmResources {
     /// Name of the cgroup v2 slice for the VM.
     pub cgroup_name: String,
@@ -46,6 +57,12 @@ pub trait Vmm: Send + Sync {
     /// # Errors
     /// Returns an error if the VMM process fails to start or configuration is invalid.
     async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance>;
+
+    /// Restores a VM instance from a snapshot directory with the given resources.
+    ///
+    /// # Errors
+    /// Returns an error if the VMM process fails to start from the snapshot.
+    async fn restore(&self, snapshot_dir: &Path, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance>;
 }
 
 /// Represents a running or created VM instance.
@@ -95,10 +112,13 @@ pub trait VmInstance: Send {
 }
 
 /// A fake VMM for testing without booting a real VM.
-#[derive(Default)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct FakeVmm {}
 
 /// A fake VM instance for testing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct FakeVmInstance {
     vsock: PathBuf,
     serial: PathBuf,
@@ -109,6 +129,13 @@ impl Vmm for FakeVmm {
     type Instance = FakeVmInstance;
 
     async fn create(&self, _cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
+        Ok(FakeVmInstance {
+            vsock: PathBuf::from("/tmp/fake-vsock"),
+            serial: PathBuf::from("/tmp/fake-serial"),
+        })
+    }
+
+    async fn restore(&self, _snapshot_dir: &Path, _cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
         Ok(FakeVmInstance {
             vsock: PathBuf::from("/tmp/fake-vsock"),
             serial: PathBuf::from("/tmp/fake-serial"),
@@ -164,8 +191,8 @@ mod tests {
 
     #[test]
     fn test_cid_allocator() {
-        let cid1 = CidAllocator::allocate();
-        let cid2 = CidAllocator::allocate();
+        let cid1 = CidAllocator::allocate().unwrap();
+        let cid2 = CidAllocator::allocate().unwrap();
         assert!(cid1 >= 3);
         assert!(cid2 > cid1);
     }

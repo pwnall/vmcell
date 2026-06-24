@@ -1,3 +1,8 @@
+//! Conversion of tar archives to EROFS images.
+//!
+//! This module provides an experimental utility for building an EROFS
+//! filesystem directly from a tar archive for use as a root filesystem.
+
 use fs_erofs::mkfs::{build_image, Node, NodeMeta};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -53,8 +58,8 @@ pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Resul
                 }
             },
             tar::EntryType::Char => {
-                let major = file.header().device_major().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0) as u32;
-                let minor = file.header().device_minor().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0) as u32;
+                let major = file.header().device_major().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0);
+                let minor = file.header().device_minor().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0);
                 Node::Device {
                     mode: mode | fs_erofs::inode::S_IFCHR,
                     rdev: (major << 8) | minor,
@@ -63,8 +68,8 @@ pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Resul
                 }
             },
             tar::EntryType::Block => {
-                let major = file.header().device_major().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0) as u32;
-                let minor = file.header().device_minor().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0) as u32;
+                let major = file.header().device_major().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0);
+                let minor = file.header().device_minor().map_err(|e| crate::error::Error::Other(e.to_string()))?.unwrap_or(0);
                 Node::Device {
                     mode: mode | fs_erofs::inode::S_IFBLK,
                     rdev: (major << 8) | minor,

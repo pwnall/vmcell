@@ -17,8 +17,8 @@ sudo apt update
 sudo apt install -y bash mmdebstrap linux-source build-essential iproute2 iptables pkg-config libseccomp-dev libcap-ng-dev libelf-dev libssl-dev debian-archive-keyring
 ```
 
-**Important Note for Ubuntu Users:** 
-Building the test rootfs uses `mmdebstrap`, which has a hard-coded assumption that `/bin/sh` points to `bash`. On Ubuntu systems where `/bin/sh` defaults to `dash`, this will cause the build to fail with a `Syntax error: Bad fd number` error. 
+**Important Note for Ubuntu Users:**
+Building the test rootfs uses `mmdebstrap`, which has a hard-coded assumption that `/bin/sh` points to `bash`. On Ubuntu systems where `/bin/sh` defaults to `dash`, this will cause the build to fail with a `Syntax error: Bad fd number` error.
 
 You must reconfigure your system to use `bash` as the default system shell:
 ```sh

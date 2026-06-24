@@ -1,3 +1,5 @@
+//! Configuration models and builder for virtual machine instances.
+
 use std::path::PathBuf;
 
 /// Configuration for a virtual machine instance.
@@ -20,8 +22,6 @@ pub struct VmConfig {
     pub nested_virt: bool,
     /// Cgroup resource limits for the VM and its processes.
     pub limits: ResourceLimits,
-    /// Optional directory to restore state from a snapshot.
-    pub snapshot_dir: Option<PathBuf>,
 }
 
 /// Options for the root filesystem backing the VM.
@@ -79,7 +79,8 @@ impl Share {
 }
 
 /// Access level for a shared directory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Access {
     /// Share is read-only.
     ReadOnly,
@@ -88,7 +89,8 @@ pub enum Access {
 }
 
 /// Cache policy for virtio-fs shares.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CachePolicy {
     /// Never cache file contents in the guest.
     Never,
@@ -99,7 +101,8 @@ pub enum CachePolicy {
 }
 
 /// Networking mode and configuration for the VM.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NetConfig {
     /// Privileged mode using TAP and netns (requires root/CAP_NET_ADMIN).
     Privileged {
@@ -121,7 +124,8 @@ pub enum NetConfig {
 }
 
 /// Egress filtering strategy for outbound network traffic.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Egress {
     /// Traffic is transparently routed through a proxy.
     Filtered(ProxyConfig),
@@ -133,7 +137,8 @@ pub enum Egress {
 }
 
 /// Configuration for the transparent proxy.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProxyConfig {
     // Additional proxy config can go here
 }
@@ -153,7 +158,8 @@ pub struct ResourceLimits {
 }
 
 /// I/O maximum limits mapping to `io.max`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IoMax {
     // TODO
 }
@@ -170,7 +176,6 @@ impl VmConfig {
             net: NetConfig::default(),
             nested_virt: false,
             limits: ResourceLimits::default(),
-            snapshot_dir: None,
         }
     }
 }
@@ -185,13 +190,42 @@ pub struct VmConfigBuilder {
     net: NetConfig,
     nested_virt: bool,
     limits: ResourceLimits,
-    snapshot_dir: Option<PathBuf>,
 }
 
 impl VmConfigBuilder {
     /// Adds a shared directory.
     pub fn with_share(mut self, share: Share) -> Self {
         self.shares.push(share);
+        self
+    }
+
+    /// Sets the number of virtual CPUs.
+    pub fn vcpus(mut self, vcpus: u8) -> Self {
+        self.vcpus = vcpus;
+        self
+    }
+
+    /// Sets the memory size in MiB.
+    pub fn mem_mib(mut self, mem_mib: u32) -> Self {
+        self.mem_mib = mem_mib;
+        self
+    }
+
+    /// Sets the networking configuration.
+    pub fn net(mut self, net: NetConfig) -> Self {
+        self.net = net;
+        self
+    }
+
+    /// Enables or disables nested virtualization.
+    pub fn nested_virt(mut self, nested_virt: bool) -> Self {
+        self.nested_virt = nested_virt;
+        self
+    }
+
+    /// Sets the cgroup resource limits.
+    pub fn limits(mut self, limits: ResourceLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -202,8 +236,20 @@ impl VmConfigBuilder {
     }
 
     /// Builds the `VmConfig`.
-    pub fn build(self) -> VmConfig {
-        VmConfig {
+    pub fn build(self) -> Result<VmConfig, crate::error::Error> {
+        if self.vcpus == 0 {
+            return Err(crate::error::Error::Config("vcpus must be > 0".into()));
+        }
+        if self.mem_mib < 64 {
+            return Err(crate::error::Error::Config("mem_mib must be >= 64".into()));
+        }
+        for share in &self.shares {
+            if share.tag.is_empty() {
+                return Err(crate::error::Error::Config("share tag cannot be empty".into()));
+            }
+        }
+        
+        Ok(VmConfig {
             kernel: self.kernel,
             rootfs: self.rootfs,
             vcpus: self.vcpus,
@@ -212,8 +258,7 @@ impl VmConfigBuilder {
             net: self.net,
             nested_virt: self.nested_virt,
             limits: self.limits,
-            snapshot_dir: self.snapshot_dir,
-        }
+        })
     }
 }
 
@@ -230,7 +275,7 @@ mod tests {
                 dir: PathBuf::from("/rootfs"),
             },
         )
-        .build();
+        .build().unwrap();
         assert_eq!(cfg.vcpus, 1);
         assert_eq!(cfg.mem_mib, 128);
         assert!(!cfg.nested_virt);
@@ -246,10 +291,12 @@ mod tests {
         )
         .with_share(Share::new("test", "/tmp/test", Access::ReadOnly, CachePolicy::Auto))
         .network_disabled()
-        .build();
+        .build().unwrap();
         
         assert_eq!(cfg.shares.len(), 1);
         assert_eq!(cfg.shares[0].tag, "test");
         assert!(matches!(cfg.net, NetConfig::None));
     }
 }
+
+

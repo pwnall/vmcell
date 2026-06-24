@@ -1,3 +1,6 @@
+//!
+//! In-process virtio-fs daemon implementation using vhost-user.
+//!
 #[cfg(feature = "experiment-fuse")]
 pub mod backend {
     use fuse_backend_rs::api::{Vfs, VfsOptions, server::Server};
@@ -148,8 +151,8 @@ pub mod backend {
             VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::BACKEND_REQ
         }
 
-        fn set_event_idx(&mut self, _enabled: bool) {
-            self.backend.lock().unwrap().event_idx = true
+        fn set_event_idx(&mut self, enabled: bool) {
+            self.backend.lock().unwrap().event_idx = enabled
         }
 
         fn update_memory(

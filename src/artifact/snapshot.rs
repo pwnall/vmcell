@@ -1,3 +1,8 @@
+//! Virtual machine snapshot artifact building.
+//!
+//! This module provides the `SnapshotStage` pipeline step, which boots a VM
+//! to its ready state and takes a memory snapshot to enable fast booting later.
+
 use crate::agent::protocol::ExecRequest;
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::config::{RootfsSource, VmConfig};
@@ -8,6 +13,7 @@ use crate::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::Path;
 
 /// A pipeline stage that creates a base VM snapshot for fast booting.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotStage {}
 
 use async_trait::async_trait;
@@ -37,7 +43,9 @@ impl Stage for SnapshotStage {
                 overlay: None,
             },
         )
-        .build();
+        .network_disabled()
+        .build()
+        .unwrap();
 
         let ch_binary =
             std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
@@ -58,7 +66,7 @@ impl Stage for SnapshotStage {
         tokio::fs::create_dir_all(out)
             .await
             .map_err(crate::error::Error::Io)?;
-        vm.instance.snapshot(out).await?;
+        vm.instance_mut().snapshot(out).await?;
 
         vm.shutdown().await?;
 

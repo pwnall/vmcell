@@ -1,3 +1,8 @@
+//! Network management and namespaces.
+//!
+//! This module provides functionality for setting up network interfaces,
+//! network namespaces, and userspace networking for the virtual machines.
+
 /// TAP interface and network namespace management.
 pub mod tap;
 

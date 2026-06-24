@@ -1,9 +1,15 @@
+//! Kernel artifact building.
+//!
+//! This module provides the `KernelStage` pipeline step, which downloads
+//! and compiles a custom Linux kernel for the virtual machines.
+
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::error::{Error, Result};
 use std::path::Path;
 use tokio::process::Command;
 
 /// A pipeline stage that builds a Linux kernel image.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelStage {
     /// URL to download the kernel source tarball from.
     pub kernel_source_url: String,
@@ -20,12 +26,10 @@ impl Stage for KernelStage {
     }
 
     fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        self.kernel_source_url.hash(&mut hasher);
-        self.microvm_config.hash(&mut hasher);
-        CacheKey(format!("kernel-{:x}", hasher.finish()))
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.kernel_source_url.as_bytes());
+        hasher.update(self.microvm_config.as_bytes());
+        CacheKey(format!("kernel-{}", hasher.finalize().to_hex()))
     }
 
     async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
@@ -77,7 +81,7 @@ impl Stage for KernelStage {
         let config_path = workdir.join(".config");
         // Append our specific config on top
         let mut current_config = tokio::fs::read_to_string(&config_path).await?;
-        current_config.push_str("\n");
+        current_config.push('\n');
         current_config.push_str(&self.microvm_config);
         tokio::fs::write(&config_path, current_config).await?;
 
@@ -110,5 +114,25 @@ impl Stage for KernelStage {
         tokio::fs::copy(workdir.join("vmlinux"), out).await?;
 
         Ok(StageOutputs {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kernel_cache_key() {
+        let stage1 = KernelStage {
+            kernel_source_url: "https://example.com/kernel".to_string(),
+            microvm_config: "CONFIG_FOO=y\n".to_string(),
+        };
+
+        let mut stage2 = stage1.clone();
+        stage2.microvm_config = "CONFIG_FOO=n\n".to_string();
+
+        let inputs = StageInputs {};
+        assert_ne!(stage1.cache_key(&inputs), stage2.cache_key(&inputs));
+        assert_eq!(stage1.cache_key(&inputs), stage1.cache_key(&inputs));
     }
 }

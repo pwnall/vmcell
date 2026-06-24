@@ -4,28 +4,34 @@ use imp_testing::vmm::VmInstance;
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
+mod common;
+
 #[tokio::test]
 async fn test_boot() {
-    let ch = CloudHypervisor::new("cloud-hypervisor");
+    let ch = CloudHypervisor::new(&common::ch_bin());
 
-    let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
-    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.ext4");
-
-    if !vmlinux.exists() || !rootfs.exists() {
-        println!("Artifacts not found, skipping boot test");
-        return;
-    }
+    let vmlinux = match common::get_vmlinux() {
+        Some(p) => p,
+        None => {
+            println!("Artifacts not found, skipping boot test");
+            return;
+        }
+    };
+    let rootfs = match common::get_rootfs() {
+        Some(p) => p,
+        None => return,
+    };
 
     let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .network_disabled()
-        .build();
+        .build().unwrap();
 
     let vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let log = std::fs::read_to_string(vm.instance.serial_log()).unwrap_or_default();
+    let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
     println!("SERIAL LOG:\n{}", log);
 
-    let serial_log = vm.instance.serial_log().to_path_buf();
+    let serial_log = vm.instance().serial_log().to_path_buf();
 
     let mut booted = false;
     for _ in 0..100 {

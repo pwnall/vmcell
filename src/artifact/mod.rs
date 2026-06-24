@@ -1,3 +1,8 @@
+//! VM artifact building and pipeline management.
+//!
+//! This module coordinates the building of artifacts required to boot and run
+//! virtual machines, such as the kernel, root filesystem, and snapshots.
+
 use crate::error::Result;
 /// Kernel building stage.
 pub mod kernel;
@@ -12,14 +17,17 @@ pub mod tar2erofs;
 use std::path::Path;
 
 /// Inputs for an artifact building stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageInputs {}
 
 /// Outputs from an artifact building stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageOutputs {}
 
 /// A cache key that uniquely identifies the inputs to a stage.
 #[allow(dead_code)]
-pub struct CacheKey(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheKey(pub String);
 
 use async_trait::async_trait;
 
@@ -38,14 +46,23 @@ pub trait Stage: Send + Sync {
 }
 
 /// Cache for previously built artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct Cache {}
 /// Artifacts resulting from a pipeline build.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifacts {}
 
 /// A pipeline of stages to build all necessary test VM artifacts.
 pub struct Pipeline {
     /// The sequence of stages to run.
     pub stages: Vec<Box<dyn Stage>>,
+}
+
+impl std::fmt::Debug for Pipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pipeline {{ {} stages }}", self.stages.len())
+    }
 }
 
 impl Pipeline {
@@ -63,7 +80,7 @@ impl Pipeline {
             let out_path = if stage.name() == "kernel" {
                 out_dir.join("vmlinux")
             } else if stage.name() == "rootfs" {
-                out_dir.join("rootfs.ext4")
+                out_dir.join("rootfs.erofs")
             } else {
                 out_dir.join(stage.name())
             };

@@ -67,11 +67,7 @@ async fn test_exec_vsock_mock() {
         .expect("Failed to connect");
 
     let outcome = client
-        .exec(ExecRequest {
-            argv: vec!["echo".into(), "hello".into()],
-            env: vec![],
-            cwd: None,
-        })
+        .exec(ExecRequest::new(vec!["echo".into(), "hello".into()]))
         .await
         .expect("Exec failed");
 

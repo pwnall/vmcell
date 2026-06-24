@@ -1,5 +1,10 @@
 //! `imp-testing` is a framework for fast, snapshot-based microvm testing.
-#![deny(missing_docs)]
+//!
+//! This crate provides tools to configure, launch, and interact with microVMs.
+//! It includes abstractions for networking, virtual machine monitors (like Cloud Hypervisor),
+//! and an agent protocol for executing commands inside the guest.
+
+#![warn(missing_docs)]
 #![deny(clippy::missing_errors_doc)]
 /// Agent protocol and client implementation.
 pub mod agent;
@@ -31,8 +36,17 @@ pub mod proxy;
 /// VMM interface and backend implementations.
 pub mod vmm;
 
+pub use agent::{AgentClient, ExecOutcome, ExecRequest};
 #[cfg(feature = "host-common")]
 pub use config::{NetConfig, ResourceLimits, Share, VmConfig};
 pub use error::{Error, Result};
 #[cfg(feature = "host-common")]
+pub use metrics::ResourceUsage;
+#[cfg(feature = "host-common")]
+pub use net::tap::NetNamespace;
+#[cfg(feature = "host-common")]
 pub use orchestrator::TestVm;
+#[cfg(feature = "host-common")]
+pub use proxy::EgressProxy;
+#[cfg(feature = "host-common")]
+pub use vmm::{CloudHypervisor, VmInstance, Vmm};

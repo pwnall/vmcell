@@ -1,5 +1,8 @@
-#[derive(Clone, Debug, Default)]
+//! Resource usage tracking and metrics collection.
+
 /// Resource usage statistics for a VM instance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResourceUsage {
     /// Peak memory usage in MiB.
     pub mem_peak_mib: u64,

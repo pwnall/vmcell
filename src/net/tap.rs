@@ -1,7 +1,13 @@
+//! TAP interface and network namespace management.
+//!
+//! This module provides the `NetNamespace` struct for creating and managing
+//! Linux network namespaces and TAP interfaces used by virtual machines.
+
 use crate::error::{Error, Result};
 use std::process::Command;
 
 /// Network namespace management for privileged VMs.
+#[derive(Debug)]
 pub struct NetNamespace {
     /// The name of the netns.
     pub name: String,
@@ -13,6 +19,9 @@ pub struct NetNamespace {
 
 impl NetNamespace {
     /// Creates a new network namespace and TAP interface for the given VM ID.
+    ///
+    /// # Errors
+    /// Returns an error if the `ip` commands fail.
     pub fn create(vmid: u32) -> Result<Self> {
         let name = format!("imp-net-{}", vmid);
         let tap_name = format!("imp-tap-{}", vmid);
@@ -52,6 +61,9 @@ impl NetNamespace {
     }
 
     /// Deletes the network namespace and associated interfaces.
+    ///
+    /// # Errors
+    /// Returns an error if the network namespace cannot be deleted, though currently ignoring failure.
     pub fn delete(&self) -> Result<()> {
         let _ = Command::new("ip")
             .args(["netns", "delete", &self.name])
@@ -65,6 +77,9 @@ impl NetNamespace {
     }
 
     /// Configures iptables rules to forward traffic to the proxy.
+    ///
+    /// # Errors
+    /// Returns an error if the `iptables` command fails.
     pub fn emit_proxy_rules(&self, proxy_port: u16) -> Result<()> {
         let status = Command::new("ip")
             .args([
@@ -91,5 +106,26 @@ impl NetNamespace {
             return Err(Error::Other("iptables command failed".to_string()));
         }
         Ok(())
+    }
+}
+
+impl Drop for NetNamespace {
+    fn drop(&mut self) {
+        let _ = self.delete();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_host_ip_math() {
+        let ns = NetNamespace {
+            name: "imp-net-5".to_string(),
+            tap_name: "imp-tap-5".to_string(),
+            vmid: 5,
+        };
+        assert_eq!(ns.host_ip(), "10.200.5.1");
     }
 }

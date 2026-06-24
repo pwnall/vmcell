@@ -117,7 +117,7 @@ env_logger = "0.11"
 [features]
 experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
 experiment-smoltcp = ["dep:smoltcp", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
-default = ["cloud-hypervisor", "net-privileged", "proxy", "metrics", "pipeline", "cli"]
+default = ["cloud-hypervisor", "net-privileged", "proxy", "metrics", "pipeline", "cli", "experiment-fuse", "experiment-smoltcp"]
 
 host-common = [
     "dep:tokio", "dep:futures", "dep:bytes",

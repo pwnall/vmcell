@@ -1,9 +1,15 @@
+//! Root filesystem artifact building.
+//!
+//! This module provides the `RootfsStage` pipeline step, which creates a
+//! minimal root filesystem for the virtual machines using `mmdebstrap`.
+
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::error::{Error, Result};
 use std::path::Path;
 use tokio::process::Command;
 
 /// A pipeline stage that builds a root filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootfsStage {
     /// The Debian release suite to use (e.g., "bookworm").
     pub release: String,

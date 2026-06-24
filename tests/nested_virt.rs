@@ -10,7 +10,7 @@ async fn test_nested_virt() {
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
     );
     let rootfs_image = PathBuf::from(
-        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()),
+        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.erofs".into()),
     );
 
     let mut cfg = VmConfig::builder(
@@ -20,7 +20,7 @@ async fn test_nested_virt() {
         },
     )
     .network_disabled()
-    .build();
+    .build().unwrap();
 
     // Enable nested virtualization
     cfg.nested_virt = true;
@@ -35,7 +35,7 @@ async fn test_nested_virt() {
         Ok(a) => a,
         Err(e) => {
             use imp_testing::vmm::VmInstance;
-            let log = tokio::fs::read_to_string(vm.instance.serial_log())
+            let log = tokio::fs::read_to_string(vm.instance().serial_log())
                 .await
                 .unwrap_or_default();
             panic!("Failed to connect to agent: {}\nSerial log:\n{}", e, log);
@@ -44,11 +44,7 @@ async fn test_nested_virt() {
 
     // Check if nested virtualization is available inside the VM
     let result = agent
-        .exec(ExecRequest {
-            argv: vec!["kvm-ok".to_string()],
-            env: vec![],
-            cwd: None,
-        })
+        .exec(ExecRequest::new(vec!["kvm-ok".to_string()]))
         .await
         .expect("Failed to run kvm-ok");
 

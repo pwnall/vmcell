@@ -17,11 +17,20 @@ enum Commands {
     Stats,
 }
 
-#[tokio::main]
-async fn main() -> imp_testing::Result<()> {
+fn main() -> imp_testing::Result<()> {
+    // SAFETY: Called before tokio runtime starts; no other threads exist yet.
     unsafe {
         std::env::set_var("SHELL", "/bin/bash");
     }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main())
+}
+
+async fn async_main() -> imp_testing::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
@@ -38,7 +47,7 @@ async fn main() -> imp_testing::Result<()> {
                     }),
                 ],
             };
-            pipeline.build(&imp_testing::artifact::Cache {}).await?;
+            pipeline.build(&imp_testing::artifact::Cache::default()).await?;
             println!("Artifacts built successfully.");
         }
         Commands::Run => println!("Running VM..."),

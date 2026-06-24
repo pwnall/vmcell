@@ -11,7 +11,7 @@ async fn test_snapshot_restore() {
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
     );
     let rootfs_image = PathBuf::from(
-        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.ext4".into()),
+        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.erofs".into()),
     );
 
     let snapshot_dir = std::env::temp_dir().join("imp-test-snapshot-restore");
@@ -32,29 +32,25 @@ async fn test_snapshot_restore() {
             },
         )
         .network_disabled()
-        .build();
+        .build().unwrap();
 
         let mut vm = TestVm::start(&vmm, cfg).await.expect("Failed to start VM");
 
         let mut agent = match vm.agent().await {
             Ok(a) => a,
             Err(e) => {
-                let log = std::fs::read_to_string(vm.instance.serial_log()).unwrap_or_default();
+                let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
                 println!("SERIAL LOG:\n{}", log);
                 panic!("Failed to connect to agent: {}", e);
             }
         };
         let _ = agent
-            .exec(ExecRequest {
-                argv: vec!["true".to_string()],
-                env: vec![],
-                cwd: None,
-            })
+            .exec(ExecRequest::new(vec!["true".to_string()]))
             .await
             .unwrap();
 
         std::fs::create_dir_all(&snapshot_dir).unwrap();
-        vm.instance
+        vm.instance_mut()
             .snapshot(&snapshot_dir)
             .await
             .expect("Failed to create snapshot");
@@ -71,11 +67,9 @@ async fn test_snapshot_restore() {
             },
         )
         .network_disabled()
-        .build();
+        .build().unwrap();
 
-        cfg.snapshot_dir = Some(snapshot_dir.clone());
-
-        let mut vm = TestVm::start(&vmm, cfg)
+        let mut vm = TestVm::restore(&vmm, &snapshot_dir, cfg)
             .await
             .expect("Failed to restore VM");
 
@@ -84,15 +78,11 @@ async fn test_snapshot_restore() {
             .await
             .expect("Failed to connect to agent after restore");
         let result = agent
-            .exec(ExecRequest {
-                argv: vec!["echo".to_string(), "restored".to_string()],
-                env: vec![],
-                cwd: None,
-            })
+            .exec(ExecRequest::new(vec!["echo".to_string(), "restored".to_string()]))
             .await
             .unwrap();
         if String::from_utf8_lossy(&result.stdout).trim() != "restored" {
-            let log = std::fs::read_to_string(vm.instance.serial_log()).unwrap();
+            let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap();
             println!("SERIAL LOG:\n{}", log);
             panic!("Exec failed. Outcome: {:?}", result);
         }

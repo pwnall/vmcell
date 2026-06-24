@@ -1,3 +1,7 @@
+//! Filesystem and storage management.
+//!
+//! Provides the virtiofs daemon implementation for sharing host directories with the VM.
+
 use crate::config::{Access, Share};
 use std::path::{Path, PathBuf};
 #[cfg(not(feature = "experiment-fuse"))]
@@ -10,12 +14,15 @@ use tokio::process::{Child, Command};
 mod fs_in_process;
 
 /// A running virtiofs daemon instance.
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct VirtioFsDaemon {
     /// The path to the vhost-user socket.
     pub socket_path: PathBuf,
     #[cfg(not(feature = "experiment-fuse"))]
     process: Child,
     #[cfg(feature = "experiment-fuse")]
+    #[allow(dead_code)]
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -25,12 +32,18 @@ impl VirtioFsDaemon {
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
 
+        let cache_arg = match share.cache {
+            crate::config::CachePolicy::Never => "--cache=never",
+            crate::config::CachePolicy::Auto => "--cache=auto",
+            crate::config::CachePolicy::Always => "--cache=always",
+        };
+
         let mut cmd = Command::new("virtiofsd");
         cmd.arg("--socket-path")
             .arg(&socket_path)
             .arg("--shared-dir")
             .arg(&share.host_path)
-            .arg("--cache=never")
+            .arg(cache_arg)
             .arg("--sandbox=none");
 
         if let Access::ReadOnly = share.access {
@@ -67,6 +80,9 @@ impl VirtioFsDaemon {
 
     #[cfg(feature = "experiment-fuse")]
     /// Starts a virtiofs daemon for the given share and returns its handler.
+    ///
+    /// # Errors
+    /// Returns an error if the virtiofs daemon fails to start or bind to the socket.
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);
@@ -80,11 +96,16 @@ impl VirtioFsDaemon {
         })?;
 
         // Wait for socket to be created
+        let mut ready = false;
         for _ in 0..50 {
             if socket_path.exists() {
+                ready = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if !ready {
+            return Err(crate::error::Error::Other("in-process virtiofsd failed to create socket".to_string()));
         }
 
         Ok(Self {

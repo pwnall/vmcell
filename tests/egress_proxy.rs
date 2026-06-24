@@ -8,12 +8,12 @@ use std::path::PathBuf;
 async fn test_egress_proxy() {
     let ch = CloudHypervisor::new("cloud-hypervisor");
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
-    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.ext4");
+    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
 
-    let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs }).build();
+    let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs }).build().unwrap();
     // Rootless with passt fails with cloud-hypervisor due to an accept4 seccomp issue in passt leading to EBADF.
     cfg.net = imp_testing::config::NetConfig::Rootless {
-        egress: Egress::Filtered(ProxyConfig {}),
+        egress: Egress::Filtered(ProxyConfig::default()),
         host_services: false,
     };
     let mut vm = TestVm::start(&ch, cfg).await.expect("Failed to start VM");
@@ -22,26 +22,20 @@ async fn test_egress_proxy() {
     let mut agent = vm.agent().await.unwrap();
     println!("Agent connected.");
 
-    let proxy_port = vm.proxy.as_ref().unwrap().port;
+    let proxy_port = vm.proxy().as_ref().unwrap().port;
 
     let _ = agent
-        .exec(ExecRequest {
-            argv: vec!["ip".into(), "a".into()],
-            env: vec![],
-            cwd: None,
-        })
+        .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
         .await;
     let _ = agent
-        .exec(ExecRequest {
-            argv: vec!["ip".into(), "route".into()],
-            env: vec![],
-            cwd: None,
-        })
+        .exec(ExecRequest::new(vec!["ip".into(), "route".into()]))
         .await;
+
+    // Give the network some time to come up
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let outcome = agent
-        .exec(ExecRequest {
-            argv: vec![
+        .exec(ExecRequest::new(vec![
                 "curl".into(),
                 "-4".into(),
                 "-v".into(),
@@ -50,13 +44,10 @@ async fn test_egress_proxy() {
                 "--resolve".into(),
                 "example.com:80:1.2.3.4".into(),
                 "http://example.com".into(),
-            ],
-            env: vec![(
+            ]).with_env(vec![(
                 "http_proxy".to_string(),
-                format!("http://10.200.{}.1:{}", vm.vmid, proxy_port),
-            )],
-            cwd: None,
-        })
+                format!("http://10.200.{}.1:{}", vm.vmid(), proxy_port),
+            )]))
         .await
         .expect("Failed to execute curl");
 

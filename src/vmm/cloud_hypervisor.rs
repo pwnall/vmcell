@@ -1,3 +1,8 @@
+//! Cloud Hypervisor VMM backend.
+//!
+//! Provides the [`CloudHypervisor`] implementation of the `Vmm` trait,
+//! along with the `ChInstance` running VM instance.
+
 use crate::config::VmConfig;
 use crate::error::{Error, Result};
 use crate::metrics::ResourceUsage;
@@ -10,6 +15,8 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
 /// The Cloud Hypervisor VMM backend.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CloudHypervisor {
     /// Path to the `cloud-hypervisor` executable.
     pub binary_path: PathBuf,
@@ -25,6 +32,8 @@ impl CloudHypervisor {
 }
 
 /// A running instance of a Cloud Hypervisor VM.
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct ChInstance {
     process: Child,
     api_socket: PathBuf,
@@ -153,26 +162,21 @@ use async_trait::async_trait;
 impl Vmm for CloudHypervisor {
     type Instance = ChInstance;
 
-    async fn create(&self, cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
-        let tmp = std::env::temp_dir().join(format!("imp-vm-{}", std::process::id()));
+    async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
+        let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), res.vmid));
         tokio::fs::create_dir_all(&tmp).await?;
 
         let api_socket = tmp.join("api.sock");
         let vsock_path = tmp.join("vsock.sock");
         let serial_path = tmp.join("serial.log");
 
-        let mut cmd = if let Some(netns) = &_res.netns_name {
+        let mut cmd = if let Some(netns) = &res.netns_name {
             let mut c = Command::new("ip");
             c.arg("netns").arg("exec").arg(netns).arg(&self.binary_path);
             c
         } else {
             Command::new(&self.binary_path)
         };
-
-        if let Some(snapshot_dir) = &cfg.snapshot_dir {
-            cmd.arg("--restore")
-                .arg(format!("source_url=file://{}", snapshot_dir.display()));
-        }
 
         let process = cmd
             .arg("--api-socket")
@@ -183,21 +187,27 @@ impl Vmm for CloudHypervisor {
             .spawn()?;
 
         if let Some(pid) = process.id() {
-            if !_res.cgroup_name.is_empty() {
-                let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", _res.cgroup_name);
+            if !res.cgroup_name.is_empty() {
+                let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", res.cgroup_name);
                 if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
                     eprintln!("WARNING: failed to write process {} to {}: {:?}", pid, procs_path, e);
                 } else {
-                    println!("Added process {} to cgroup {}", pid, _res.cgroup_name);
+                    println!("Added process {} to cgroup {}", pid, res.cgroup_name);
                 }
             }
         }
 
+        let mut socket_ready = false;
         for _ in 0..50 {
             if api_socket.exists() {
+                socket_ready = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        
+        if !socket_ready {
+            return Err(Error::Vmm("API socket failed to appear".into()));
         }
 
         let mut fs_daemons = Vec::new();
@@ -214,7 +224,7 @@ impl Vmm for CloudHypervisor {
             fs_daemons.push(daemon);
         }
 
-        let cid = crate::vmm::CidAllocator::allocate();
+        let cid = crate::vmm::CidAllocator::allocate()?;
 
         let instance = ChInstance {
             process,
@@ -222,8 +232,8 @@ impl Vmm for CloudHypervisor {
             vsock_path: vsock_path.clone(),
             serial_path: serial_path.clone(),
             _fs_daemons: fs_daemons,
-            cgroup_name: Some(_res.cgroup_name.clone()),
-            restored: cfg.snapshot_dir.is_some(),
+            cgroup_name: Some(res.cgroup_name.clone()),
+            restored: false,
             cid,
         };
 
@@ -248,7 +258,7 @@ impl Vmm for CloudHypervisor {
                         crate::config::RootfsSource::Erofs { .. } => "",
                         _ => "rootflags=noload",
                     },
-                    _res.vmid
+                    res.vmid
                 ),
             },
             disks: vec![],
@@ -264,7 +274,7 @@ impl Vmm for CloudHypervisor {
             },
         };
 
-        if let Some(tap) = &_res.tap_name {
+        if let Some(tap) = &res.tap_name {
             ch_cfg.net.push(ChNet {
                 tap: Some(tap.clone()),
                 mac: None,
@@ -272,10 +282,16 @@ impl Vmm for CloudHypervisor {
                 vhost_mode: None,
                 vhost_socket: None,
             });
-        } else if let Some(socket) = &_res.vhost_user_socket {
+        } else if let Some(socket) = &res.vhost_user_socket {
             ch_cfg.net.push(ChNet {
                 tap: None,
-                mac: Some(format!("02:00:00:00:00:{:02x}", _res.vmid)),
+                mac: Some(format!(
+                    "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
+                    (res.vmid >> 24) & 0xff,
+                    (res.vmid >> 16) & 0xff,
+                    (res.vmid >> 8) & 0xff,
+                    res.vmid & 0xff
+                )),
                 vhost_user: Some(true),
                 vhost_mode: Some("Client".to_string()),
                 vhost_socket: Some(socket.clone()),
@@ -300,11 +316,82 @@ impl Vmm for CloudHypervisor {
             crate::config::RootfsSource::VirtioFs { .. } => {}
         }
 
-        if cfg.snapshot_dir.is_none() {
-            instance
-                .api_request("PUT", "/api/v1/vm.create", Some(&ch_cfg))
-                .await?;
+        instance
+            .api_request("PUT", "/api/v1/vm.create", Some(&ch_cfg))
+            .await?;
+
+        Ok(instance)
+    }
+
+    async fn restore(&self, snapshot_dir: &Path, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
+        let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), res.vmid));
+        tokio::fs::create_dir_all(&tmp).await?;
+
+        let api_socket = tmp.join("api.sock");
+        let vsock_path = tmp.join("vsock.sock");
+        let serial_path = tmp.join("serial.log");
+
+        let mut cmd = if let Some(netns) = &res.netns_name {
+            let mut c = Command::new("ip");
+            c.arg("netns").arg("exec").arg(netns).arg(&self.binary_path);
+            c
+        } else {
+            Command::new(&self.binary_path)
+        };
+
+        cmd.arg("--restore")
+           .arg(format!("source_url=file://{}", snapshot_dir.display()));
+
+        let process = cmd
+            .arg("--api-socket")
+            .arg(&api_socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        if let Some(pid) = process.id() {
+            if !res.cgroup_name.is_empty() {
+                let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", res.cgroup_name);
+                if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
+                    eprintln!("WARNING: failed to write process {} to {}: {:?}", pid, procs_path, e);
+                } else {
+                    println!("Added process {} to cgroup {}", pid, res.cgroup_name);
+                }
+            }
         }
+
+        let mut socket_ready = false;
+        for _ in 0..50 {
+            if api_socket.exists() {
+                socket_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        
+        if !socket_ready {
+            return Err(Error::Vmm("API socket failed to appear".into()));
+        }
+
+        let mut fs_daemons = Vec::new();
+        for share in &cfg.shares {
+            let daemon = crate::fs::VirtioFsDaemon::start(share, &tmp).await?;
+            fs_daemons.push(daemon);
+        }
+
+        let cid = crate::vmm::CidAllocator::allocate()?;
+
+        let instance = ChInstance {
+            process,
+            api_socket,
+            vsock_path,
+            serial_path,
+            _fs_daemons: fs_daemons,
+            cgroup_name: Some(res.cgroup_name.clone()),
+            restored: true,
+            cid,
+        };
 
         Ok(instance)
     }
@@ -363,28 +450,39 @@ impl VmInstance for ChInstance {
 
     async fn stats(&self) -> Result<ResourceUsage> {
         let mut usage = ResourceUsage::default();
-        if let Some(cg_name) = &self.cgroup_name {
-            let cg =
-                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
-            for sub in cg.subsystems() {
-                match sub {
-                    cgroups_rs::Subsystem::Mem(m) => {
-                        let stat = m.memory_stat();
-                        usage.mem_current_mib = stat.usage_in_bytes / 1024 / 1024;
-                        usage.mem_peak_mib = stat.max_usage_in_bytes / 1024 / 1024;
-                    }
-                    cgroups_rs::Subsystem::Cpu(c) => {
-                        let stat = c.cpu().stat;
-                        for line in stat.lines() {
-                            if let Some(val) = line
-                                .strip_prefix("usage_usec ")
-                                .and_then(|s| s.parse::<u64>().ok())
-                            {
-                                usage.cpu_usec = val;
+        #[cfg(feature = "metrics")]
+        {
+            if let Some(cg_name) = &self.cgroup_name {
+                let cg =
+                    cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
+                for sub in cg.subsystems() {
+                    match sub {
+                        cgroups_rs::Subsystem::Mem(_) => {
+                            let base_path = format!("/sys/fs/cgroup/{}", cg_name);
+                            if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
+                                if let Ok(val) = s.trim().parse::<u64>() {
+                                    usage.mem_current_mib = val / 1024 / 1024;
+                                }
+                            }
+                            if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
+                                if let Ok(val) = s.trim().parse::<u64>() {
+                                    usage.mem_peak_mib = val / 1024 / 1024;
+                                }
                             }
                         }
+                        cgroups_rs::Subsystem::Cpu(c) => {
+                            let stat = c.cpu().stat;
+                            for line in stat.lines() {
+                                if let Some(val) = line
+                                    .strip_prefix("usage_usec ")
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    usage.cpu_usec = val;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -409,6 +507,7 @@ impl Drop for ChInstance {
         let _ = self.process.start_kill();
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
+        #[cfg(feature = "metrics")]
         if let Some(cg_name) = &self.cgroup_name {
             let cg =
                 cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);

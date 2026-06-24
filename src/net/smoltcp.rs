@@ -199,7 +199,7 @@ pub mod backend {
             &mut self,
             mem: GuestMemoryAtomic<GuestMemoryMmap>,
         ) -> std::io::Result<()> {
-            self.state.lock().unwrap().mem = Some(mem);
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).mem = Some(mem);
             Ok(())
         }
 
@@ -221,7 +221,7 @@ pub mod backend {
                 return Err(std::io::Error::other("NotEpollIn"));
             }
 
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.vrings.is_none() {
                 state.vrings = Some(vrings.to_vec());
             }
@@ -247,7 +247,27 @@ pub mod backend {
     }
 
     /// Background process managing `smoltcp` networking state.
-    pub struct SmoltcpProcess;
+    #[derive(Debug)]
+    pub struct SmoltcpProcess {
+        kill_notifier: EventNotifier,
+        stop_flag: Arc<std::sync::atomic::AtomicBool>,
+        vhost_thread: Option<std::thread::JoinHandle<()>>,
+        net_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for SmoltcpProcess {
+        fn drop(&mut self) {
+            println!("SmoltcpProcess dropping!");
+            self.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.kill_notifier.notify();
+            if let Some(h) = self.vhost_thread.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = self.net_thread.take() {
+                let _ = h.join();
+            }
+        }
+    }
 
     impl SmoltcpProcess {
         /// Starts the background network thread to process packets and manage connections.
@@ -261,20 +281,21 @@ pub mod backend {
 
             let state_clone = state.clone();
 
-            std::thread::spawn(move || {
-                let kill_evt = vmm_sys_util::event::new_event_consumer_and_notifier(
-                    vmm_sys_util::event::EventFlag::NONBLOCK,
-                )
-                .unwrap();
+            let (kill_evt_consumer, kill_evt_notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
+                vmm_sys_util::event::EventFlag::NONBLOCK,
+            )
+            .unwrap();
+            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().unwrap());
 
-                let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
-                    event_idx: false,
-                    kill_evt,
-                    state: state_clone,
-                }));
+            let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
+                event_idx: false,
+                kill_evt,
+                state: state_clone,
+            }));
 
-                let mut listener = Listener::new(&socket_path, true).unwrap();
+            let mut listener = Listener::new(&socket_path, true).unwrap();
 
+            let vhost_thread = std::thread::spawn(move || {
                 let mut vu_daemon = VhostUserDaemon::new(
                     String::from("vhost-user-net"),
                     backend,
@@ -282,19 +303,27 @@ pub mod backend {
                 )
                 .unwrap();
 
-                vu_daemon.start(&mut listener).unwrap();
+                let _ = vu_daemon.start(&mut listener);
             });
 
-            std::thread::spawn(move || {
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_flag_clone = stop_flag.clone();
+            let net_thread = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move {
-                    Self::run_network(vmid, forward_ports, state).await;
+                    Self::run_network(vmid, forward_ports, state, stop_flag_clone).await;
                 });
             });
-            SmoltcpProcess
+
+            SmoltcpProcess {
+                kill_notifier: kill_evt_notifier,
+                stop_flag,
+                vhost_thread: Some(vhost_thread),
+                net_thread: Some(net_thread),
+            }
         }
 
-        async fn run_network(vmid: u32, forward_ports: Vec<u16>, state: Arc<Mutex<SharedState>>) {
+        async fn run_network(vmid: u32, forward_ports: Vec<u16>, state: Arc<Mutex<SharedState>>, stop_flag: Arc<std::sync::atomic::AtomicBool>) {
             let host_gw = Ipv4Address::new(10, 200, (vmid % 256) as u8, 1);
             // Use a different MAC for the host to avoid dropping packets from the guest.
             let mac_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0xfe]);
@@ -304,7 +333,7 @@ pub mod backend {
             let mut iface = Interface::new(
                 config,
                 &mut SmoltcpDevice {
-                    state: state.lock().unwrap(),
+                    state: state.lock().unwrap_or_else(|e| e.into_inner()),
                 },
                 Instant::now(),
             );
@@ -328,8 +357,11 @@ pub mod backend {
             }
 
             loop {
+                if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 {
-                    let mut state_guard = state.lock().unwrap();
+                    let mut state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
                     // Process receiveq (host -> guest)
                     let (mem_opt, vrings_opt) = (state_guard.mem.clone(), state_guard.vrings.clone());
