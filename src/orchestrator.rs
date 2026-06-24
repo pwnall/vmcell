@@ -127,7 +127,7 @@ impl<V: Vmm> TestVm<V> {
             } => {
                 let _ = egress;
                 let _ = host_services;
-                let ns = NetNamespace::create(vmid, Box::new(crate::net::tap::DefaultNetlink))?;
+                let ns = NetNamespace::create(vmid, Box::new(crate::net::tap::RtNetlink))?;
                 tap_name = Some(ns.tap_name.clone());
                 netns_name = Some(ns.name.clone());
 
@@ -238,6 +238,23 @@ impl<V: Vmm> TestVm<V> {
     ///
     /// # Errors
     /// Returns an error if network setup, proxy start, or VM boot fails.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use std::path::PathBuf;
+    /// # use imp_testing::orchestrator::{TestVm, VmidAllocator};
+    /// # use imp_testing::config::{VmConfig, RootfsSource};
+    /// # use imp_testing::vmm::CidAllocator;
+    /// # use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
+    /// # async fn run() {
+    /// let vmm = CloudHypervisor::new("cloud-hypervisor");
+    /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::VirtioFs { dir: PathBuf::from("/rootfs") }).build().unwrap();
+    /// let cid_alloc = CidAllocator::new();
+    /// let vmid_alloc = Arc::new(VmidAllocator::new());
+    /// let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await.unwrap();
+    /// # }
+    /// ```
     pub async fn start(vmm: &V, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator, vmid_alloc: Arc<VmidAllocator>) -> Result<Self> {
         let vmid = vmid_alloc.allocate()?;
         let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
@@ -262,6 +279,24 @@ impl<V: Vmm> TestVm<V> {
     ///
     /// # Errors
     /// Returns an error if network setup, proxy start, or VM restore fails.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use std::path::PathBuf;
+    /// # use imp_testing::orchestrator::{TestVm, VmidAllocator};
+    /// # use imp_testing::config::{VmConfig, RootfsSource};
+    /// # use imp_testing::vmm::CidAllocator;
+    /// # use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
+    /// # async fn run() {
+    /// let vmm = CloudHypervisor::new("cloud-hypervisor");
+    /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
+    /// let cid_alloc = CidAllocator::new();
+    /// let vmid_alloc = Arc::new(VmidAllocator::new());
+    /// let snap_dir = PathBuf::from("/tmp/snap");
+    /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, &cid_alloc, vmid_alloc).await.unwrap();
+    /// # }
+    /// ```
     pub async fn restore(vmm: &V, snapshot_dir: &std::path::Path, cfg: VmConfig, cid_alloc: &crate::vmm::CidAllocator, vmid_alloc: Arc<VmidAllocator>) -> Result<Self> {
         let vmid = vmid_alloc.allocate()?;
         let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
@@ -287,6 +322,10 @@ impl<V: Vmm> TestVm<V> {
     ///
     /// # Errors
     /// Returns an error if the agent connection or handshake fails.
+    /// Gets the agent client, waiting for the connection if necessary.
+    ///
+    /// # Errors
+    /// Returns an error if the connection fails or times out.
     pub async fn agent(&mut self) -> Result<&mut AgentClient> {
         if self.agent_client.is_none() {
             // Retry connecting since the VM might take a second to boot and bind vsock
@@ -303,7 +342,7 @@ impl<V: Vmm> TestVm<V> {
             }
             self.agent_client = client;
         }
-        Ok(self.agent_client.as_mut().unwrap())
+        self.agent_client.as_mut().ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))
     }
 
     /// Retrieves resource usage metrics for the VM.
@@ -320,7 +359,7 @@ impl<V: Vmm> TestVm<V> {
     /// Returns an error if shutting down the VM or proxy fails.
     pub async fn shutdown(mut self) -> Result<()> {
         self.instance.request_shutdown().await?;
-        if let Some(ns) = &self.netns {
+        if let Some(mut ns) = self.netns.take() {
             let _ = ns.delete();
         }
         // Actually wait for it to stop then delete cgroup
@@ -347,7 +386,7 @@ mod tests {
         let vmid1 = alloc.allocate().unwrap();
         let vmid2 = alloc.allocate().unwrap();
         assert_ne!(vmid1, vmid2);
-        assert!(vmid1 >= 1 && vmid1 <= 254);
+        assert!((1..=254).contains(&vmid1));
         alloc.release(vmid1);
         alloc.release(vmid2);
     }

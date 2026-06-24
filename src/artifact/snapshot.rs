@@ -47,7 +47,7 @@ impl Stage for SnapshotStage {
         )
         .network_disabled()
         .build()
-        .unwrap();
+        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
         let ch_binary =
             std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
@@ -58,7 +58,7 @@ impl Stage for SnapshotStage {
         let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await?;
 
         // Wait for VM to boot fully via vsock agent
-        let mut agent = vm.agent().await?;
+        let agent = vm.agent().await?;
         let _ = agent
             .exec(ExecRequest {
                 argv: vec!["true".to_string()],

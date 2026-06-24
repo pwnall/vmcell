@@ -269,9 +269,9 @@ impl VmConfigBuilder {
     /// Returns an error if the kernel or rootfs paths do not exist.
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```rust
     /// use imp_testing::config::{VmConfig, RootfsSource};
-    /// let cfg = VmConfig::builder("/path/to/kernel", RootfsSource::Erofs("/path/to/rootfs".into()))
+    /// let cfg = VmConfig::builder("/path/to/kernel", RootfsSource::Erofs { image: "/path/to/rootfs".into() })
     ///     .vcpus(4)
     ///     .mem_mib(2048)
     ///     .build()

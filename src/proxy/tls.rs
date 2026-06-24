@@ -15,7 +15,6 @@ impl CaManager {
     ///
     /// # Errors
     /// Returns an error if filesystem operations or key generation fail.
-    #[must_use]
     pub fn new() -> Result<Self> {
         let dir = std::env::var("IMP_ARTIFACTS_DIR")
             .map(PathBuf::from)

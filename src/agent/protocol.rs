@@ -151,4 +151,30 @@ mod tests {
         assert_eq!(decoded2, Message::Ready);
         assert!(rest2.is_empty());
     }
+
+    use proptest::prelude::*;
+
+    fn arb_message() -> impl Strategy<Value = Message> {
+        prop_oneof![
+            Just(Message::Hello),
+            Just(Message::Ready),
+            any::<Vec<u8>>().prop_map(Message::Stdout),
+            any::<Vec<u8>>().prop_map(Message::Stderr),
+            any::<i32>().prop_map(Message::Exit),
+            (any::<String>(), any::<Vec<u8>>()).prop_map(|(dst, bytes)| Message::PutFile { dst, bytes }),
+            Just(Message::Ping),
+            (any::<Vec<String>>(), any::<Vec<(String, String)>>(), any::<Option<String>>()).prop_map(|(argv, env, cwd)| {
+                Message::Exec(ExecRequest { argv, env, cwd })
+            }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn test_message_roundtrip(msg in arb_message()) {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            let decoded: Message = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
 }

@@ -66,6 +66,15 @@ impl EgressProxy {
     ///
     /// # Errors
     /// Returns an error if binding to the port or initializing the CA fails.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use imp_testing::proxy::{EgressProxy, ProxyConfig};
+    /// # async fn run() {
+    /// let proxy = EgressProxy::start(ProxyConfig::default()).await.unwrap();
+    /// println!("Proxy listening on port {}", proxy.port);
+    /// # }
+    /// ```
     pub async fn start(cfg: ProxyConfig) -> Result<Self> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<u16, String>>();
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
@@ -143,7 +152,7 @@ impl EgressProxy {
                 let proxy = ProxyBuilder::new()
                     .with_listener(listener)
                     .with_ca(authority)
-                    .with_rustls_client(rustls::crypto::aws_lc_rs::default_provider().into())
+                    .with_rustls_client(rustls::crypto::aws_lc_rs::default_provider())
                     .with_http_handler(handler)
                     .with_graceful_shutdown(shutdown_signal)
                     .build()

@@ -266,9 +266,8 @@ pub mod backend {
                 GuestMemoryAtomic::new(GuestMemoryMmap::new()),
             )
             .expect("invariant");
-            vu_daemon.start(&mut listener).unwrap_or_else(|e| {
+            let _ = vu_daemon.start(&mut listener).map_err(|e| {
                 tracing::error!("in-process virtiofsd panic: {:?}", e);
-                panic!("{:?}", e)
             });
         });
 

@@ -370,7 +370,7 @@ pub mod backend {
                     // Process receiveq (host -> guest)
                     let (mem_opt, vrings_opt) = (state_guard.mem.clone(), state_guard.vrings.clone());
                     if let (Some(mem), Some(vrings)) = (mem_opt, vrings_opt) {
-                        let mut vring_state = vrings.get(0).expect("invariant").get_mut();
+                        let mut vring_state = vrings.first().expect("invariant").get_mut();
                         let mem_obj = mem.memory();
                         let mut used_any = false;
 

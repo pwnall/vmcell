@@ -56,6 +56,7 @@ async fn test_lifecycle_fake_vmm() {
     // The FakeVmInstance records calls in the same shared vector
     {
         let calls = fake.calls.lock().unwrap();
-        assert!(calls.contains(&"request_shutdown".to_string()));
+        assert_eq!(calls[2], "request_shutdown");
+        assert_eq!(calls[3], "kill");
     }
 }

@@ -4,9 +4,24 @@
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// An error related to the Virtual Machine Monitor (VMM).
+    /// An error communicating with the Virtual Machine Monitor (VMM) API.
+    #[error("VMM API error (status {status}): {body}")]
+    VmmApi {
+        /// HTTP status code from the VMM.
+        status: u16,
+        /// Response body.
+        body: String,
+    },
+    /// A general VMM error.
     #[error("VMM error: {0}")]
     Vmm(String),
+    /// A subprocess execution error specifically for the VMM.
+    #[error("VMM spawn error: {source}")]
+    VmmSpawn {
+        /// The underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
     /// An error related to the guest agent.
     #[error("Agent error: {0}")]
     Agent(String),

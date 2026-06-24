@@ -28,6 +28,15 @@ impl CidAllocator {
             active: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
+}
+
+impl Default for CidAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CidAllocator {
 
     /// Allocates and returns a unique Context ID (CID) for VSOCK communication.
     ///
@@ -70,7 +79,6 @@ pub struct PerVmResources {
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
-
 pub trait Vmm: Send + Sync {
     /// The associated instance type representing a running VM.
     type Instance: VmInstance;
@@ -89,7 +97,6 @@ pub trait Vmm: Send + Sync {
 }
 
 /// Represents a running or created VM instance.
-
 pub trait VmInstance: Send {
     /// Boots the VM from a created state.
     ///
@@ -159,7 +166,7 @@ impl Vmm for FakeVmm {
     type Instance = FakeVmInstance;
 
     async fn create(&self, _cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
-        self.calls.lock().unwrap().push("create".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("create".to_string()); }
         Ok(FakeVmInstance {
             vsock_path: PathBuf::from("/tmp/fake-vsock"),
             serial: PathBuf::from("/tmp/fake-serial"),
@@ -168,7 +175,7 @@ impl Vmm for FakeVmm {
     }
 
     async fn restore(&self, _snapshot_dir: &Path, _cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
-        self.calls.lock().unwrap().push("restore".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("restore".to_string()); }
         Ok(FakeVmInstance {
             vsock_path: PathBuf::from("/tmp/fake-vsock"),
             serial: PathBuf::from("/tmp/fake-serial"),
@@ -180,27 +187,27 @@ impl Vmm for FakeVmm {
 
 impl VmInstance for FakeVmInstance {
     async fn boot(&mut self) -> Result<()> {
-        self.calls.lock().unwrap().push("boot".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("boot".to_string()); }
         Ok(())
     }
     async fn request_shutdown(&mut self) -> Result<()> {
-        self.calls.lock().unwrap().push("request_shutdown".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("request_shutdown".to_string()); }
         Ok(())
     }
     async fn kill(&mut self) -> Result<()> {
-        self.calls.lock().unwrap().push("kill".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("kill".to_string()); }
         Ok(())
     }
     async fn pause(&mut self) -> Result<()> {
-        self.calls.lock().unwrap().push("pause".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("pause".to_string()); }
         Ok(())
     }
     async fn resume(&mut self) -> Result<()> {
-        self.calls.lock().unwrap().push("resume".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("resume".to_string()); }
         Ok(())
     }
     async fn snapshot(&mut self, _dir: &Path) -> Result<()> {
-        self.calls.lock().unwrap().push("snapshot".to_string());
+        if let Ok(mut lock) = self.calls.lock() { lock.push("snapshot".to_string()); }
         Ok(())
     }
     async fn stats(&self) -> Result<ResourceUsage> {

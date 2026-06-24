@@ -117,13 +117,13 @@ impl Stage for RootfsStage {
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
-                    .map_err(|e| crate::error::Error::Other(e.to_string()))?;
+                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
-                let stdout = mmdebstrap.stdout.take().unwrap();
+                let stdout = mmdebstrap.stdout.take().ok_or_else(|| crate::error::Error::Artifact("No stdout from mmdebstrap".into()))?;
                 
                 let archive = tar::Archive::new(stdout);
                 let image = crate::artifact::tar2erofs::tar_to_erofs(archive)?;
-                std::fs::write(out, image).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+                std::fs::write(out, image).map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
                 let mut stderr_str = String::new();
                 if let Some(mut stderr) = mmdebstrap.stderr.take() {
@@ -131,10 +131,10 @@ impl Stage for RootfsStage {
                     stderr.read_to_string(&mut stderr_str).ok();
                 }
 
-                let status = mmdebstrap.wait().map_err(|e| crate::error::Error::Other(e.to_string()))?;
-                let mkfs_status = std::process::Command::new("true").status().unwrap();
+                let status = mmdebstrap.wait().map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+                let mkfs_status = std::process::Command::new("true").status().map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
                 Ok((status, mkfs_status, stderr_str))
-            }).await.map_err(|e| crate::error::Error::Other(e.to_string()))??
+            }).await.map_err(|e| crate::error::Error::Artifact(e.to_string()))??
         };
 
         if !status.success() || !mkfs_status.success() {

@@ -97,13 +97,26 @@ impl Pipeline {
                 dir.join(stage.name())
             };
 
-            let _key = stage.cache_key(&inputs);
-            
-            if out_path.exists() {
+            let key = stage.cache_key(&inputs);
+            let key_path = out_path.with_extension("cache_key");
+
+            let mut cached = false;
+            if out_path.exists() && key_path.exists() {
+                if let Ok(saved_key) = std::fs::read_to_string(&key_path) {
+                    if saved_key == key.0 {
+                        cached = true;
+                    }
+                }
+            }
+
+            if cached {
                 tracing::info!("Skipping stage {} (cached)", stage.name());
             } else {
                 tracing::info!("Running stage {}", stage.name());
                 let _outputs = stage.run(&inputs, &out_path).await?;
+                if let Err(e) = std::fs::write(&key_path, &key.0) {
+                    tracing::warn!("Failed to write cache key for stage {}: {}", stage.name(), e);
+                }
             }
             
             inputs.artifacts.insert(stage.name().to_string(), out_path);
@@ -133,8 +146,12 @@ impl Pipeline {
                 } else {
                     dir.join(s.name())
                 };
+                let key_path = out_path.with_extension("cache_key");
                 if out_path.exists() {
-                    let _ = std::fs::remove_file(out_path);
+                    let _ = std::fs::remove_file(&out_path);
+                }
+                if key_path.exists() {
+                    let _ = std::fs::remove_file(&key_path);
                 }
             }
         }

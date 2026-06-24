@@ -104,6 +104,7 @@ am-fs-erofs = { version = "0.1.1", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 log = "0.4"
 axum = "0.7"
 assert_cmd = "2"

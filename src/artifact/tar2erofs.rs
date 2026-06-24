@@ -128,14 +128,14 @@ pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Resul
         if path.as_os_str().is_empty() {
             continue;
         }
-        let node = entries.remove(&path).unwrap();
-        let parent_path = path.parent().unwrap();
+        let node = entries.remove(&path).ok_or_else(|| crate::error::Error::Artifact("Missing node".into()))?;
+        let parent_path = path.parent().ok_or_else(|| crate::error::Error::Artifact("No parent".into()))?;
         if let Some(Node::Dir { entries: dir_entries, .. }) = entries.get_mut(parent_path) {
-            dir_entries.insert(path.file_name().unwrap().to_string_lossy().into_owned(), node);
+            dir_entries.insert(path.file_name().ok_or_else(|| crate::error::Error::Artifact("No filename".into()))?.to_string_lossy().into_owned(), node);
         }
     }
 
-    let root_node = entries.remove(Path::new("")).unwrap();
+    let root_node = entries.remove(Path::new("")).ok_or_else(|| crate::error::Error::Artifact("Missing root".into()))?;
     let image = build_image(root_node, 12).map_err(|e: fs_erofs::error::Error| crate::error::Error::Artifact(e.to_string()))?;
     
     Ok(image)

@@ -78,3 +78,58 @@ async fn test_exec_vsock_mock() {
     server_task.await.unwrap();
     let _ = std::fs::remove_file(&tmp);
 }
+
+#[tokio::test]
+#[ignore]
+async fn test_put_file_mock() {
+    let tmp = std::env::temp_dir().join(format!("imp-test-vsock-put-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = UnixListener::bind(&tmp).expect("Failed to bind UDS");
+
+    let vsock_path = tmp.clone();
+
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let mut resp = String::new();
+        loop {
+            let mut byte = [0; 1];
+            let n = stream.read(&mut byte).await.unwrap();
+            if n == 0 { break; }
+            resp.push(byte[0] as char);
+            if byte[0] == b'\n' { break; }
+        }
+        assert_eq!(resp, "CONNECT 5000\n");
+
+        stream.write_all(b"OK 5000\n").await.unwrap();
+
+        let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+
+        let ready_msg = postcard::to_stdvec(&Message::Ready).unwrap();
+        framed.send(ready_msg.into()).await.unwrap();
+
+        let msg_bytes = framed.next().await.unwrap().unwrap();
+        let msg: Message = postcard::from_bytes(&msg_bytes).unwrap();
+        match msg {
+            Message::PutFile { dst, bytes } => {
+                assert_eq!(dst, "/tmp/hello.txt");
+                assert_eq!(bytes, b"hello world");
+            }
+            _ => panic!("Expected PutFile message"),
+        }
+
+        let exit_msg = postcard::to_stdvec(&Message::Exit(0)).unwrap();
+        framed.send(exit_msg.into()).await.unwrap();
+    });
+
+    let mut client = AgentClient::connect(&vsock_path, 5000)
+        .await
+        .expect("Failed to connect");
+
+    client.put_file("/tmp/hello.txt", b"hello world")
+        .await
+        .expect("put_file failed");
+
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+}

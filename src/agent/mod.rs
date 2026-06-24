@@ -34,6 +34,15 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns an error if the connection fails or the handshake is unsuccessful.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use imp_testing::agent::AgentClient;
+    /// # use std::path::Path;
+    /// # async fn run() {
+    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000).await.unwrap();
+    /// # }
+    /// ```
     pub async fn connect(vsock_path: &Path, port: u32) -> Result<Self> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut backoff = std::time::Duration::from_millis(50);
@@ -84,6 +93,9 @@ impl AgentClient {
     }
 
     /// Reconnects to the guest agent.
+    ///
+    /// # Errors
+    /// Returns an error if the connection fails or times out.
     pub async fn reconnect(&mut self, vsock_path: &Path, port: u32) -> Result<()> {
         let new_client = Self::connect(vsock_path, port).await?;
         self.stream = new_client.stream;

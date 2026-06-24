@@ -42,6 +42,26 @@ async fn test_metrics_and_limits() {
     // Verify non-zero values if controller is enabled
     if stats.mem_current_mib > 0 {
         assert!(stats.mem_peak_mib > 0, "Peak memory should be > 0");
+
+        // Assert memory limits were applied to cgroup
+        let mut cgroup_name = format!("imp-vm-{}", vm.vmid());
+        if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
+            if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
+                let mut base = path.trim_start_matches('/');
+                if base.ends_with("/supervisor") {
+                    base = base.trim_end_matches("/supervisor");
+                }
+                if !base.is_empty() {
+                    cgroup_name = format!("{}/imp-vm-{}", base, vm.vmid());
+                }
+            }
+        }
+        let memory_max_path = format!("/sys/fs/cgroup/{}/memory.max", cgroup_name);
+        if let Ok(content) = std::fs::read_to_string(&memory_max_path) {
+            if let Ok(max_bytes) = content.trim().parse::<usize>() {
+                assert_eq!(max_bytes, 256 << 20, "memory.max should match config");
+            }
+        }
     } else {
         println!("Memory controller not delegated, skipping memory metrics assertion");
     }

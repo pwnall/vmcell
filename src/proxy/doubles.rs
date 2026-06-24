@@ -48,7 +48,7 @@ impl HttpHandler for ProxyHandler {
                     let response = Response::builder()
                         .status(403)
                         .body(hudsucker::Body::from(format!("Blocked by Imp Proxy: {}\n", blocked)))
-                        .unwrap();
+                        .expect("Valid response builder");
                     return RequestOrResponse::Response(response);
                 }
             }

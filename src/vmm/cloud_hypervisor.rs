@@ -166,7 +166,7 @@ impl ChInstance {
             let bytes = res.into_body().collect().await
                 .map(|c| c.to_bytes())
                 .unwrap_or_default();
-            return Err(Error::Vmm(format!("API error ({}): {}", status, String::from_utf8_lossy(&bytes))));
+            return Err(Error::VmmApi { status: status.as_u16(), body: String::from_utf8_lossy(&bytes).into_owned() });
         }
 
         Ok(())
