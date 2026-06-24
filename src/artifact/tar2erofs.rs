@@ -13,13 +13,36 @@ use std::path::{Path, PathBuf};
 /// # Errors
 /// Returns an error if reading the archive or generating the EROFS image fails.
 #[cfg(feature = "am-fs-erofs")]
-pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Result<Vec<u8>> {
+pub fn tar_to_erofs<'a, R: Read + 'a>(
+    archives: impl IntoIterator<Item = tar::Archive<R>>,
+    injected_files: Vec<(&str, &Path)>,
+) -> crate::error::Result<Vec<u8>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
-    for file in archive
-        .entries()
-        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
-    {
+    // Inject extra files
+    for (dest_path, src_path) in injected_files {
+        let content = std::fs::read(src_path).map_err(|e| crate::error::Error::Artifact(format!("Failed to read injected file {:?}: {}", src_path, e)))?;
+        let meta = NodeMeta {
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        let mode = 0o755 | fs_erofs::inode::S_IFREG;
+        let node = Node::File {
+            mode,
+            data: content,
+            meta,
+            xattrs: vec![],
+        };
+        entries.insert(normalize_path(Path::new(dest_path)), node);
+    }
+
+    for mut archive in archives {
+        for file in archive
+            .entries()
+            .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+        {
         let mut file = file.map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
         let path = file
             .path()
@@ -111,8 +134,24 @@ pub fn tar_to_erofs(mut archive: tar::Archive<impl Read>) -> crate::error::Resul
             _ => continue,
         };
 
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+        if file_name.starts_with(".wh.") {
+            if file_name == ".wh..wh..opq" {
+                let parent = path.parent().unwrap_or(Path::new(""));
+                let parent_normalized = normalize_path(parent);
+                entries.retain(|k, _| !k.starts_with(&parent_normalized) || k == &parent_normalized);
+            } else {
+                let target_name = &file_name[4..];
+                let target_path = path.parent().unwrap_or(Path::new("")).join(target_name);
+                let target_normalized = normalize_path(&target_path);
+                entries.retain(|k, _| !k.starts_with(&target_normalized));
+            }
+            continue;
+        }
+
         let normalized_path = normalize_path(&path);
         entries.insert(normalized_path, node);
+    }
     }
 
     // Ensure all parent directories exist

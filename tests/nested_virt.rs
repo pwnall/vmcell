@@ -4,9 +4,30 @@ use imp_testing::orchestrator::TestVm;
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
+mod common;
+
 #[tokio::test]
 #[ignore]
-async fn test_nested_virt() {
+async fn test_nested_virt_ch() {
+    let ch_binary =
+        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
+    let vmm = CloudHypervisor::new(ch_binary);
+    test_nested_virt_impl(&vmm).await;
+}
+
+#[cfg(feature = "firecracker")]
+#[tokio::test]
+#[ignore]
+async fn test_nested_virt_fc() {
+    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).nested_virt {
+        println!("Skipping: nested virtualization not supported");
+        return;
+    }
+    test_nested_virt_impl(&vmm).await;
+}
+
+async fn test_nested_virt_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let kernel = PathBuf::from(
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
     );
@@ -27,13 +48,9 @@ async fn test_nested_virt() {
     // Enable nested virtualization
     cfg.nested_virt = true;
 
-    let ch_binary =
-        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
-    let vmm = CloudHypervisor::new(ch_binary);
-
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc)
+    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
 

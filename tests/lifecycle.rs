@@ -4,11 +4,24 @@ use imp_testing::vmm::VmInstance;
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
+mod common;
+
 #[tokio::test]
 #[ignore]
-async fn test_lifecycle_force_kill() {
-    let ch = CloudHypervisor::new("cloud-hypervisor");
+async fn test_lifecycle_force_kill_ch() {
+    let vmm = CloudHypervisor::new(common::ch_bin());
+    test_lifecycle_force_kill_impl(&vmm).await;
+}
 
+#[cfg(feature = "firecracker")]
+#[tokio::test]
+#[ignore]
+async fn test_lifecycle_force_kill_fc() {
+    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
+    test_lifecycle_force_kill_impl(&vmm).await;
+}
+
+async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
 
@@ -24,7 +37,7 @@ async fn test_lifecycle_force_kill() {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc)
+    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
 

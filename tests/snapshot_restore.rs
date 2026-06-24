@@ -5,9 +5,30 @@ use imp_testing::vmm::VmInstance;
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 
+mod common;
+
 #[tokio::test]
 #[ignore]
-async fn test_snapshot_restore() {
+async fn test_snapshot_restore_ch() {
+    let ch_binary =
+        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
+    let vmm = CloudHypervisor::new(ch_binary);
+    test_snapshot_restore_impl(&vmm).await;
+}
+
+#[cfg(feature = "firecracker")]
+#[tokio::test]
+#[ignore]
+async fn test_snapshot_restore_fc() {
+    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
+    test_snapshot_restore_impl(&vmm).await;
+}
+
+async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+    if !vmm.capabilities().snapshot_restore {
+        println!("Skipping snapshot restore test because VMM does not support it");
+        return;
+    }
     let kernel = PathBuf::from(
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
     );
@@ -19,10 +40,6 @@ async fn test_snapshot_restore() {
     if snapshot_dir.exists() {
         std::fs::remove_dir_all(&snapshot_dir).unwrap();
     }
-
-    let ch_binary =
-        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
-    let vmm = CloudHypervisor::new(ch_binary);
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
@@ -39,7 +56,7 @@ async fn test_snapshot_restore() {
         .build()
         .unwrap();
 
-        let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc.clone())
+        let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc.clone())
             .await
             .expect("Failed to start VM");
 
@@ -107,7 +124,7 @@ async fn test_snapshot_restore() {
         .build()
         .unwrap();
 
-        let mut vm = TestVm::restore(&vmm, &snapshot_dir, cfg, &cid_alloc, vmid_alloc)
+        let mut vm = TestVm::restore(vmm, &snapshot_dir, cfg, &cid_alloc, vmid_alloc)
             .await
             .expect("Failed to restore VM");
 

@@ -6,7 +6,7 @@
 use crate::config::VmConfig;
 use crate::error::{Error, Result};
 use crate::metrics::ResourceUsage;
-use crate::vmm::{PerVmResources, VmInstance, Vmm};
+use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -150,7 +150,7 @@ impl ChInstance {
 
         let req = hyper::Request::builder()
             .method(method)
-            .uri(format!("http://localhost{}", path))
+            .uri(path)
             .header("Host", "localhost")
             .header("Content-Type", "application/json")
             .body(http_body_util::Full::new(hyper::body::Bytes::from(
@@ -412,6 +412,16 @@ impl Vmm for CloudHypervisor {
         };
 
         Ok(instance)
+    }
+
+    fn capabilities(&self) -> VmmCapabilities {
+        VmmCapabilities {
+            snapshot_restore: true,
+            lazy_restore: true, // CH supports memory_restore_mode
+            virtio_fs_shares: true,
+            rootless_vhost_user_net: true,
+            nested_virt: true,
+        }
     }
 }
 

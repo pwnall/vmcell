@@ -7,10 +7,20 @@ mod common;
 
 #[tokio::test]
 #[ignore]
-async fn test_concurrency() {
-    let ch_binary =
-        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
-    let vmm = CloudHypervisor::new(ch_binary);
+async fn test_concurrency_ch() {
+    let vmm = CloudHypervisor::new(common::ch_bin());
+    test_concurrency_impl(&vmm).await;
+}
+
+#[cfg(feature = "firecracker")]
+#[tokio::test]
+#[ignore]
+async fn test_concurrency_fc() {
+    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
+    test_concurrency_impl(&vmm).await;
+}
+
+async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
@@ -35,7 +45,7 @@ async fn test_concurrency() {
 
     let mut vms = Vec::new();
     for _ in 0..5 {
-        let vm = TestVm::start(&vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone())
+        let vm = TestVm::start(vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone())
             .await
             .expect("Failed to start VM");
         vms.push(vm);

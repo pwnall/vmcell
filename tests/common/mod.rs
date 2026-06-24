@@ -18,3 +18,8 @@ pub fn get_rootfs() -> Option<PathBuf> {
 pub fn ch_bin() -> String {
     std::env::var("IMP_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
 }
+
+#[allow(dead_code)]
+pub fn fc_bin() -> String {
+    std::env::var("IMP_FC_BIN").unwrap_or_else(|_| "firecracker".to_string())
+}

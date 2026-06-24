@@ -11,6 +11,13 @@ pub mod cloud_hypervisor;
 
 pub use cloud_hypervisor::CloudHypervisor;
 
+#[cfg(feature = "firecracker")]
+/// Firecracker VMM backend implementation.
+pub mod firecracker;
+
+#[cfg(feature = "firecracker")]
+pub use firecracker::Firecracker;
+
 use std::path::{Path, PathBuf};
 
 /// Allocates unique Context IDs (CIDs) for vsock connections.
@@ -78,6 +85,22 @@ pub struct PerVmResources {
     pub guest_cid: u32,
 }
 
+/// Virtual Machine Monitor (VMM) capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VmmCapabilities {
+    /// True if the VMM supports snapshot and restore.
+    pub snapshot_restore: bool,
+    /// True if the VMM supports lazy userfaultfd-based demand-paged restore.
+    pub lazy_restore: bool,
+    /// True if the VMM supports virtio-fs shared directories.
+    pub virtio_fs_shares: bool,
+    /// True if the VMM supports vhost-user-net for rootless networking.
+    pub rootless_vhost_user_net: bool,
+    /// True if the VMM supports nested virtualization (exposing KVM to guest).
+    pub nested_virt: bool,
+}
+
 /// Abstract Virtual Machine Monitor (VMM) trait.
 pub trait Vmm: Send + Sync {
     /// The associated instance type representing a running VM.
@@ -99,6 +122,9 @@ pub trait Vmm: Send + Sync {
         cfg: &VmConfig,
         res: &PerVmResources,
     ) -> Result<Self::Instance>;
+
+    /// Returns the capabilities of this VMM backend.
+    fn capabilities(&self) -> VmmCapabilities;
 }
 
 /// Represents a running or created VM instance.
@@ -194,6 +220,16 @@ impl Vmm for FakeVmm {
             serial: PathBuf::from("/tmp/fake-serial"),
             calls: self.calls.clone(),
         })
+    }
+
+    fn capabilities(&self) -> VmmCapabilities {
+        VmmCapabilities {
+            snapshot_restore: true,
+            lazy_restore: false,
+            virtio_fs_shares: true,
+            rootless_vhost_user_net: true,
+            nested_virt: true,
+        }
     }
 }
 

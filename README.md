@@ -42,7 +42,21 @@ cargo install virtiofsd --locked
 
 Ensure that `~/.cargo/bin` is in your `$PATH` so the test suite can discover these executables.
 
-### 3. Privileged Test Runner
+### 3. Firecracker Binary
+
+Unlike Cloud Hypervisor, Firecracker uses a custom containerized build process (`tools/devtool`) and is not intended to be built via a standard `cargo install`. Instead, we use the pre-compiled external binaries from their GitHub releases.
+
+Download and install the latest Firecracker release (e.g. v1.16.0) on Debian/Ubuntu:
+
+```sh
+curl -LO https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.0/firecracker-v1.16.0-x86_64.tgz
+tar -xzf firecracker-v1.16.0-x86_64.tgz
+sudo mv release-v1.16.0-x86_64/firecracker-v1.16.0-x86_64 /usr/local/bin/firecracker
+sudo chmod +x /usr/local/bin/firecracker
+rm -rf firecracker-v1.16.0-x86_64.tgz release-v1.16.0-x86_64
+```
+
+### 4. Privileged Test Runner
 
 To run privileged networking tests (like those requiring TAP interfaces or transparent proxying) without running the entire `cargo test` suite as `root`, we use a lightweight capability-granting runner.
 

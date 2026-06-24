@@ -5,11 +5,29 @@ use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 #[tokio::test]
 #[ignore]
-async fn test_host_endpoint() {
+async fn test_host_endpoint_ch() {
+    let vmm = CloudHypervisor::new(common::ch_bin());
+    test_host_endpoint_impl(&vmm).await;
+}
+
+#[cfg(feature = "firecracker")]
+#[tokio::test]
+#[ignore]
+async fn test_host_endpoint_fc() {
+    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).rootless_vhost_user_net {
+        println!("Skipping: vhost-user-net not supported");
+        return;
+    }
+    test_host_endpoint_impl(&vmm).await;
+}
+
+async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let _ = env_logger::builder().is_test(true).try_init();
-    let ch = CloudHypervisor::new("cloud-hypervisor");
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
 
@@ -23,7 +41,7 @@ async fn test_host_endpoint() {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let mut vm = TestVm::start(&ch, cfg, &cid_alloc, vmid_alloc)
+    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
 

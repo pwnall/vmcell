@@ -12,19 +12,17 @@ use cgroups_rs::{cgroup_builder::CgroupBuilder, hierarchies};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+static GLOBAL_VMIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
 /// Allocates unique VM IDs for the orchestrator.
 #[derive(Debug, Default)]
-pub struct VmidAllocator {
-    active: Mutex<Vec<u32>>,
-}
+pub struct VmidAllocator {}
 
 impl VmidAllocator {
     /// Creates a new VMID allocator.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            active: Mutex::new(Vec::new()),
-        }
+        Self {}
     }
 
     /// Allocates and returns the next available unique VMID.
@@ -32,7 +30,7 @@ impl VmidAllocator {
     /// # Errors
     /// Returns an error if all 254 VMIDs are currently in use.
     pub fn allocate(&self) -> Result<u32> {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = GLOBAL_VMIDS.lock().unwrap_or_else(|e| e.into_inner());
         for i in 1..=254 {
             if !active.contains(&i) {
                 active.push(i);
@@ -46,7 +44,7 @@ impl VmidAllocator {
 
     /// Releases a previously allocated VMID.
     pub fn release(&self, vmid: u32) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = GLOBAL_VMIDS.lock().unwrap_or_else(|e| e.into_inner());
         active.retain(|&id| id != vmid);
     }
 }

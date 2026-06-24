@@ -66,9 +66,22 @@ impl AgentClient {
                 continue;
             }
 
-            let mut reader = tokio::io::BufReader::new(&mut stream);
             let mut resp = String::new();
-            if reader.read_line(&mut resp).await.is_err() || !resp.starts_with("OK ") {
+            let mut ok = false;
+            loop {
+                let mut byte = [0; 1];
+                use tokio::io::AsyncReadExt;
+                if let Ok(Ok(1)) = tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut byte)).await {
+                    resp.push(byte[0] as char);
+                    if byte[0] == b'\n' {
+                        ok = resp.starts_with("OK ");
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if !ok {
                 tokio::time::sleep(backoff).await;
                 continue;
             }
@@ -109,7 +122,7 @@ impl AgentClient {
     /// # Errors
     /// Returns an error if the request cannot be sent or the outcome cannot be received.
     pub async fn exec(&mut self, cmd: ExecRequest) -> Result<ExecOutcome> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(std::time::Duration::from_secs(600), async {
             let msg = Message::Exec(cmd);
             let bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
 

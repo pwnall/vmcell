@@ -91,6 +91,9 @@ tempfile = { version = "3", optional = true }
 clap = { version = "4", optional = true, features = ["derive"] }
 anyhow = { version = "1", optional = true }
 
+# OCI
+oci-client = { version = "0.17", optional = true }
+
 # Guest agent
 vsock = { version = "0.5", optional = true }
 rustix = { version = "0.38", optional = true, features = ["fs", "mount", "process"] }
@@ -150,7 +153,7 @@ pipeline = [
     "dep:reqwest", "dep:pgp", "dep:sha2", "dep:blake3",
     "dep:tar", "dep:flate2", "dep:lzma-rs", "dep:zstd",
     "dep:reflink-copy", "dep:walkdir", "dep:toml", "dep:tempfile",
-    "dep:am-fs-erofs",
+    "dep:am-fs-erofs", "dep:oci-client",
 ]
 
 cli = ["host-common", "dep:clap", "dep:anyhow", "dep:serde_json"]
