@@ -78,3 +78,7 @@ pub use orchestrator::TestVm;
 pub use proxy::EgressProxy;
 #[cfg(feature = "host-common")]
 pub use vmm::{CloudHypervisor, VmInstance, Vmm};
+#[cfg(feature = "firecracker")]
+pub use vmm::Firecracker;
+#[cfg(feature = "qemu")]
+pub use vmm::Qemu;

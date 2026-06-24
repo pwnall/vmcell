@@ -301,7 +301,7 @@ impl Vmm for CloudHypervisor {
                 kernel: cfg.kernel.clone(),
                 cmdline: {
                     let mut s = format!(
-                        "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/sbin/imp-guest-agent imp_vmid={}",
+                        "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/imp-guest-agent imp_vmid={}",
                         match &cfg.rootfs {
                             crate::config::RootfsSource::Erofs { .. } => "erofs",
                             _ => "ext4",

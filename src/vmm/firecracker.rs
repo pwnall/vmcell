@@ -133,7 +133,6 @@ impl Firecracker {
 
         let log_file = std::fs::File::create(&serial_path)?;
         let process = cmd
-            .arg("--enable-pci")
             .arg("--api-sock")
             .arg(&api_socket)
             .stdin(Stdio::null())
@@ -221,7 +220,7 @@ impl Vmm for Firecracker {
         
         let cmdline = {
             let mut s = format!(
-                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/sbin/imp-guest-agent imp_vmid={}",
+                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/imp-guest-agent imp_vmid={}",
                 match &cfg.rootfs {
                     crate::config::RootfsSource::Erofs { .. } => "erofs",
                     _ => "ext4",

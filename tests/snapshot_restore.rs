@@ -24,6 +24,14 @@ async fn test_snapshot_restore_fc() {
     test_snapshot_restore_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_snapshot_restore_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    test_snapshot_restore_impl(&vmm).await;
+}
+
 async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     if !vmm.capabilities().snapshot_restore {
         println!("Skipping snapshot restore test because VMM does not support it");

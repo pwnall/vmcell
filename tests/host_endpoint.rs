@@ -26,6 +26,18 @@ async fn test_host_endpoint_fc() {
     test_host_endpoint_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_host_endpoint_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).rootless_vhost_user_net {
+        println!("Skipping: vhost-user-net not supported");
+        return;
+    }
+    test_host_endpoint_impl(&vmm).await;
+}
+
 async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let _ = env_logger::builder().is_test(true).try_init();
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");

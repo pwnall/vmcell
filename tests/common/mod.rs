@@ -23,3 +23,8 @@ pub fn ch_bin() -> String {
 pub fn fc_bin() -> String {
     std::env::var("IMP_FC_BIN").unwrap_or_else(|_| "firecracker".to_string())
 }
+
+#[allow(dead_code)]
+pub fn qemu_bin() -> String {
+    std::env::var("IMP_QEMU_BIN").unwrap_or_else(|_| "qemu-system-x86_64".to_string())
+}

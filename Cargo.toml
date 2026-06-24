@@ -153,7 +153,7 @@ pipeline = [
     "dep:reqwest", "dep:pgp", "dep:sha2", "dep:blake3",
     "dep:tar", "dep:flate2", "dep:lzma-rs", "dep:zstd",
     "dep:reflink-copy", "dep:walkdir", "dep:toml", "dep:tempfile",
-    "dep:am-fs-erofs", "dep:oci-client",
+    "am-fs-erofs", "dep:oci-client",
 ]
 
 cli = ["host-common", "dep:clap", "dep:anyhow", "dep:serde_json"]
@@ -169,3 +169,7 @@ vm-memory = ["dep:vm-memory"]
 virtio-bindings = ["dep:virtio-bindings"]
 jip-nftables = ["dep:jip-nftables"]
 am-fs-erofs = ["dep:am-fs-erofs"]
+
+[patch.crates-io]
+vhost-user-backend = { path = "vendor/vhost-user-backend" }
+vhost = { path = "vendor/vhost" }

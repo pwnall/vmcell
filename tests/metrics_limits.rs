@@ -23,6 +23,14 @@ async fn test_metrics_and_limits_fc() {
     test_metrics_and_limits_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_metrics_and_limits_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    test_metrics_and_limits_impl(&vmm).await;
+}
+
 async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let kernel = PathBuf::from(
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),

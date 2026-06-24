@@ -21,6 +21,14 @@ async fn test_lifecycle_force_kill_fc() {
     test_lifecycle_force_kill_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_lifecycle_force_kill_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    test_lifecycle_force_kill_impl(&vmm).await;
+}
+
 async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");

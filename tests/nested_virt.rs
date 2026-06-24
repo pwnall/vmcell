@@ -27,6 +27,18 @@ async fn test_nested_virt_fc() {
     test_nested_virt_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_nested_virt_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).nested_virt {
+        println!("Skipping: nested virtualization not supported");
+        return;
+    }
+    test_nested_virt_impl(&vmm).await;
+}
+
 async fn test_nested_virt_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let kernel = PathBuf::from(
         std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),

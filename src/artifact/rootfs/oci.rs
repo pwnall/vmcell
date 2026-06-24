@@ -16,7 +16,7 @@ pub async fn build_rootfs(image: &str, digest: &str, out: &Path) -> Result<Stage
         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
     
     // pull image layers.
-    let oci_image = client.pull(&reference, &auth, vec![])
+    let oci_image = client.pull(&reference, &auth, vec!["application/vnd.docker.image.rootfs.diff.tar.gzip", "application/vnd.oci.image.layer.v1.tar+gzip"])
         .await
         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
     

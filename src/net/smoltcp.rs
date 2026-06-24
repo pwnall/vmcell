@@ -191,11 +191,13 @@ pub mod backend {
             1 << VIRTIO_F_VERSION_1
                 | 1 << VIRTIO_RING_F_INDIRECT_DESC
                 | 1 << VIRTIO_RING_F_EVENT_IDX
-                | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+                | vhost::vhost_user::message::VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+                | (1 << 5) // VIRTIO_NET_F_MAC
+                | (1 << 17) // VIRTIO_NET_F_CTRL_VQ
         }
 
         fn protocol_features(&self) -> VhostUserProtocolFeatures {
-            VhostUserProtocolFeatures::MQ
+            VhostUserProtocolFeatures::REPLY_ACK
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
@@ -319,7 +321,11 @@ pub mod backend {
                 )
                 .expect("invariant");
 
-                let _ = vu_daemon.start(&mut listener);
+                eprintln!("vhost-user-net daemon starting on {:?}", socket_path);
+                let res = vu_daemon.start(&mut listener);
+                eprintln!("vhost-user-net daemon start returned {:?}", res);
+                let wait_res = vu_daemon.wait();
+                eprintln!("vhost-user-net daemon exited with {:?}", wait_res);
             });
 
             let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));

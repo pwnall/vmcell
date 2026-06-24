@@ -91,13 +91,13 @@ pub async fn pack_erofs_with_injection(
     
     // Inject agent and CA
     let mut injected_files = vec![
-        ("/sbin/imp-guest-agent", Path::new("target/release/imp-guest-agent")),
+        ("usr/sbin/imp-guest-agent", Path::new("target/x86_64-unknown-linux-gnu/release/imp-guest-agent")),
     ];
     
     #[cfg(feature = "proxy")]
     let _ca_mgr = crate::proxy::tls::CaManager::new()?;
     #[cfg(feature = "proxy")]
-    injected_files.push(("/usr/local/share/ca-certificates/imp-ca.crt", Path::new("/tmp/imp-artifacts/ca.pem")));
+    injected_files.push(("usr/local/share/ca-certificates/imp-ca.crt", Path::new("/tmp/imp-artifacts/ca.pem")));
 
     tokio::task::spawn_blocking(move || -> Result<StageOutputs> {
         let archives: Vec<tar::Archive<Box<dyn Read + Send>>> = tar_streams.into_iter().map(tar::Archive::new).collect();

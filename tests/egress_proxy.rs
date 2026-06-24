@@ -28,9 +28,23 @@ async fn test_egress_proxy_fc() {
     test_egress_proxy_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_egress_proxy_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).rootless_vhost_user_net {
+        println!("Skipping: vhost-user-net not supported");
+        return;
+    }
+    test_egress_proxy_impl(&vmm).await;
+}
+
 async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+    let _ = env_logger::builder().is_test(true).try_init();
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("hudsucker=debug,imp_testing=debug,hyper=debug")
+        .with_env_filter("hudsucker=debug,imp_testing=debug,hyper=debug,vhost_user_backend=trace,vhost=trace,vhost_device_vsock=trace")
+        .with_test_writer()
         .try_init();
 
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
@@ -69,10 +83,10 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     println!("Connecting agent...");
     let agent = vm.agent().await.unwrap();
     println!("Agent connected.");
-
+    
     let out1 = agent
         .exec(ExecRequest::new(vec![
-            "ip".into(),
+            "/sbin/ip".into(),
             "link".into(),
             "set".into(),
             "eth0".into(),
@@ -87,7 +101,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let out2 = agent
         .exec(ExecRequest::new(vec![
-            "ip".into(),
+            "/sbin/ip".into(),
             "addr".into(),
             "add".into(),
             format!("10.200.{}.2/30", vmid),
@@ -100,7 +114,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let out3 = agent
         .exec(ExecRequest::new(vec![
-            "ip".into(),
+            "/sbin/ip".into(),
             "route".into(),
             "add".into(),
             "default".into(),
@@ -129,7 +143,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let outcome = agent
         .exec(
             ExecRequest::new(vec![
-                "curl".into(),
+                "/usr/bin/curl".into(),
                 "-4".into(),
                 "-k".into(), // Accept MITM certificate for transparent TLS interception
                 "-v".into(),
@@ -169,7 +183,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let blocked_outcome = agent
         .exec(
             ExecRequest::new(vec![
-                "curl".into(),
+                "/usr/bin/curl".into(),
                 "-4".into(),
                 "-k".into(),
                 "-v".into(),

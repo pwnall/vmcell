@@ -20,6 +20,14 @@ async fn test_concurrency_fc() {
     test_concurrency_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_concurrency_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    test_concurrency_impl(&vmm).await;
+}
+
 async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let vmlinux = common::get_vmlinux();

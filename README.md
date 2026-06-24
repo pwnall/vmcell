@@ -56,7 +56,15 @@ sudo chmod +x /usr/local/bin/firecracker
 rm -rf firecracker-v1.16.0-x86_64.tgz release-v1.16.0-x86_64
 ```
 
-### 4. Privileged Test Runner
+### 4. QEMU Binary
+
+QEMU serves as the fallback VMM backend and is the most proven platform for nested virtualization. Install the `qemu-system-x86` package which provides the `qemu-system-x86_64` binary.
+
+```sh
+sudo apt install -y qemu-system-x86
+```
+
+### 5. Privileged Test Runner
 
 To run privileged networking tests (like those requiring TAP interfaces or transparent proxying) without running the entire `cargo test` suite as `root`, we use a lightweight capability-granting runner.
 

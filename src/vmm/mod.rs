@@ -18,21 +18,30 @@ pub mod firecracker;
 #[cfg(feature = "firecracker")]
 pub use firecracker::Firecracker;
 
+#[cfg(feature = "qemu")]
+/// QEMU VMM backend implementation.
+pub mod qemu;
+
+#[cfg(feature = "qemu")]
+pub use qemu::{Qemu, QemuInstance};
+
 use std::path::{Path, PathBuf};
+
+static GLOBAL_CIDS: std::sync::Mutex<Option<std::collections::BTreeSet<u32>>> = std::sync::Mutex::new(None);
 
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
-pub struct CidAllocator {
-    active: std::sync::Mutex<std::collections::BTreeSet<u32>>,
-}
+pub struct CidAllocator {}
 
 impl CidAllocator {
     /// Creates a new CID allocator.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            active: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        let mut global = GLOBAL_CIDS.lock().unwrap();
+        if global.is_none() {
+            *global = Some(std::collections::BTreeSet::new());
         }
+        Self {}
     }
 }
 
@@ -48,7 +57,8 @@ impl CidAllocator {
     /// # Errors
     /// Returns an error if all available CIDs are currently in use.
     pub fn allocate(&self) -> Result<u32> {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut global = GLOBAL_CIDS.lock().unwrap();
+        let active = global.as_mut().unwrap();
         for i in 3..=254 {
             if !active.contains(&i) {
                 active.insert(i);
@@ -62,7 +72,8 @@ impl CidAllocator {
 
     /// Releases a previously allocated CID.
     pub fn release(&self, cid: u32) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut global = GLOBAL_CIDS.lock().unwrap();
+        let active = global.as_mut().unwrap();
         active.remove(&cid);
     }
 }

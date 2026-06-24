@@ -24,6 +24,18 @@ async fn test_shares_ro_rw_fc() {
     test_shares_ro_rw_impl(&vmm).await;
 }
 
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore]
+async fn test_shares_ro_rw_qemu() {
+    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).virtio_fs_shares {
+        println!("Skipping: virtio-fs shares not supported");
+        return;
+    }
+    test_shares_ro_rw_impl(&vmm).await;
+}
+
 async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
     let tmp = std::env::temp_dir().join(format!("imp-test-shares-{}", std::process::id()));
     let in_dir = tmp.join("in");
