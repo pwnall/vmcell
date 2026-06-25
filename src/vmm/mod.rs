@@ -29,6 +29,9 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 /// Helper to send an HTTP request over a Unix domain socket.
+///
+/// # Errors
+/// Returns an error if the request cannot be sent or the server returns an error status.
 pub async fn unix_api_request<T: Serialize>(
     api_socket: &Path,
     method: &str,
@@ -92,6 +95,9 @@ pub async fn unix_api_request<T: Serialize>(
 }
 
 /// Creates a temporary directory for a specific VM ID.
+///
+/// # Errors
+/// Returns an error if the directory cannot be created.
 pub async fn create_vm_tmp_dir(vmid: u32) -> Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), vmid));
     tokio::fs::create_dir_all(&tmp).await?;

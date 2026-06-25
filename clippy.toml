@@ -1,0 +1,16 @@
+# Tests may unwrap/expect/print/dbg; production code may not (see the not(test) deny-list in lib.rs).
+allow-unwrap-in-tests  = true
+allow-expect-in-tests  = true
+allow-print-in-tests   = true
+allow-dbg-in-tests     = true
+
+# Cache keys must be reproducible across Rust versions and processes (rubric B4).
+disallowed-types = [
+    { path = "std::collections::hash_map::DefaultHasher", reason = "not stable across Rust versions — use blake3/sha2 for cache keys (B4)" },
+    { path = "std::hash::DefaultHasher", reason = "same as hash_map::DefaultHasher — unstable hash for content addressing (B4)" },
+    { path = "std::collections::hash_map::RandomState", reason = "seeded per process — never for content-addressed keys (B4)" },
+]
+
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "unsafe in 2024 and process-global; if truly needed, call before any threads start with a // SAFETY note" },
+]

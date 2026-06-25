@@ -3,6 +3,7 @@
 //! This module defines the messages exchanged between the host VMM and the
 //! guest agent over the vsock connection.
 
+#![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
 
 /// A message exchanged between the host and the guest agent.

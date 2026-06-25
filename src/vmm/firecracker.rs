@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 /// The Firecracker VMM backend.
 #[derive(Debug, Clone)]
@@ -95,8 +95,8 @@ impl Firecracker {
     }
 }
 
+
 static CPU_TEMPLATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 async fn detect_cpu_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
     if let Some(val) = CPU_TEMPLATE.get() {
@@ -110,7 +110,10 @@ async fn detect_cpu_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String
 
 async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
     let tmp_dir = std::env::temp_dir();
-    let counter = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let counter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let api_socket = tmp_dir.join(format!(
         "imp-fc-probe-{}-{}.socket",
         std::process::id(),

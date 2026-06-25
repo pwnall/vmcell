@@ -154,7 +154,7 @@ pub mod backend {
                     );
                     state
                         .tx_queue
-                        .push_back(packet.get(VIRTIO_NET_HDR_SIZE..).unwrap().to_vec());
+                        .push_back(packet.get(VIRTIO_NET_HDR_SIZE..).expect("packet too short").to_vec());
                 } else {
                     log::trace!("process_tx_queue: packet too short: {}", packet.len());
                 }
@@ -211,8 +211,8 @@ pub mod backend {
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
             Some((
-                self.kill_evt.0.try_clone().unwrap(),
-                self.kill_evt.1.try_clone().unwrap(),
+                self.kill_evt.0.try_clone().expect("clone consumer"),
+                self.kill_evt.1.try_clone().expect("clone notifier"),
             ))
         }
 
@@ -234,7 +234,7 @@ pub mod backend {
 
             if device_event == 1 {
                 // transmitq (guest -> host)
-                let mut vring_state = vrings.get(1).unwrap().get_mut();
+                let mut vring_state = vrings.get(1).expect("vrings too small").get_mut();
                 if self.event_idx {
                     loop {
                         let _ = vring_state.disable_notification();
@@ -302,8 +302,8 @@ pub mod backend {
                 vmm_sys_util::event::new_event_consumer_and_notifier(
                     vmm_sys_util::event::EventFlag::NONBLOCK,
                 )
-                .unwrap();
-            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().unwrap());
+                .expect("event consumer");
+            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().expect("clone notifier"));
 
             let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
                 event_idx: false,
@@ -311,7 +311,7 @@ pub mod backend {
                 state: state_clone,
             }));
 
-            let mut listener = Listener::new(&socket_path, true).unwrap();
+            let mut listener = Listener::new(&socket_path, true).expect("listener new");
 
             let socket_path_clone = socket_path.clone();
             let vhost_thread = std::thread::spawn(move || {
@@ -320,7 +320,7 @@ pub mod backend {
                     backend,
                     GuestMemoryAtomic::new(GuestMemoryMmap::new()),
                 )
-                .unwrap();
+                .expect("vu daemon new");
 
                 tracing::info!("vhost-user-net daemon starting on {:?}", socket_path_clone);
                 let res = vu_daemon.start(&mut listener);
@@ -332,7 +332,7 @@ pub mod backend {
             let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_flag_clone = stop_flag.clone();
             let net_thread = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
+                let rt = tokio::runtime::Runtime::new().expect("runtime new");
                 rt.block_on(async move {
                     Self::run_network(vmid, forward_ports, proxy_port, state, stop_flag_clone)
                         .await;
@@ -373,12 +373,12 @@ pub mod backend {
             iface.update_ip_addrs(|ip_addrs| {
                 ip_addrs
                     .push(IpCidr::new(IpAddress::Ipv4(host_gw), 30))
-                    .unwrap();
+                    .expect("push ip");
             });
             iface
                 .routes_mut()
                 .add_default_ipv4_route(Ipv4Address::new(10, 200, (vmid % 256) as u8, 2))
-                .unwrap();
+                .expect("add route");
             log::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
 
             let mut sockets = SocketSet::new(vec![]);
@@ -405,7 +405,7 @@ pub mod backend {
                     let (mem_opt, vrings_opt) =
                         (state_guard.mem.clone(), state_guard.vrings.clone());
                     if let (Some(mem), Some(vrings)) = (mem_opt, vrings_opt) {
-                        let mut vring_state = vrings.first().unwrap().get_mut();
+                        let mut vring_state = vrings.first().expect("vrings empty").get_mut();
                         let mem_obj = mem.memory();
                         let mut used_any = false;
 
@@ -435,7 +435,7 @@ pub mod backend {
                                                 .write_slice(
                                                     full_packet
                                                         .get(offset..offset + to_write)
-                                                        .unwrap(),
+                                                        .expect("slice bounds"),
                                                     desc.addr(),
                                                 )
                                                 .is_ok()
@@ -452,7 +452,7 @@ pub mod backend {
                             }
                         }
                         for (head_index, written) in used_descs {
-                            vring_state.add_used(head_index, written).unwrap();
+                            vring_state.add_used(head_index, written).expect("add used");
                             used_any = true;
                         }
                         if used_any {
@@ -463,18 +463,18 @@ pub mod backend {
                     if let Some(pxy_port) = proxy_port {
                         for packet in &state_guard.tx_queue {
                             if packet.len() >= 14
-                                && packet[12] == 0x08
-                                && packet[13] == 0x00
-                                && packet[23] == 0x06
+                                && packet.get(12) == Some(&0x08)
+                                && packet.get(13) == Some(&0x00)
+                                && packet.get(23) == Some(&0x06)
                             {
-                                let ipv4_hl = (packet[14] & 0x0f) as usize * 4;
+                                let ipv4_hl = (*packet.get(14).unwrap_or(&0) & 0x0f) as usize * 4;
                                 let tcp_offset = 14 + ipv4_hl;
                                 if packet.len() >= tcp_offset + 14 {
                                     let dst_port = u16::from_be_bytes([
-                                        packet[tcp_offset + 2],
-                                        packet[tcp_offset + 3],
+                                        *packet.get(tcp_offset + 2).unwrap_or(&0),
+                                        *packet.get(tcp_offset + 3).unwrap_or(&0),
                                     ]);
-                                    let flags = packet[tcp_offset + 13];
+                                    let flags = *packet.get(tcp_offset + 13).unwrap_or(&0);
                                     if (flags & 0x02) != 0 && (flags & 0x10) == 0 {
                                         // SYN, !ACK
                                         let has_open = port_mappings.iter().any(|(p, _, h, _)| {
@@ -535,7 +535,7 @@ pub mod backend {
                                         closed = true;
                                     }
                                     Ok(n) => {
-                                        socket.send_slice(buf.get(..n).unwrap_or(&[])).unwrap();
+                                        socket.send_slice(buf.get(..n).unwrap_or(&[])).expect("send slice");
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => {
@@ -550,7 +550,7 @@ pub mod backend {
                                     if n > 0 {
                                         match stream.try_write(buf.get(..n).unwrap_or(&[])) {
                                             Ok(written) => {
-                                                socket.recv(|_| (written, ())).unwrap();
+                                                socket.recv(|_| (written, ())).expect("recv block");
                                             }
                                             Err(ref e)
                                                 if e.kind() == std::io::ErrorKind::WouldBlock => {}

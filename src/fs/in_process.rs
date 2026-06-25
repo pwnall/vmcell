@@ -150,25 +150,25 @@ pub mod backend {
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
-            self.backend.lock().unwrap().event_idx = enabled
+            self.backend.lock().expect("mutex poisoned").event_idx = enabled
         }
 
         fn update_memory(
             &mut self,
             mem: GuestMemoryAtomic<GuestMemoryMmap>,
         ) -> std::io::Result<()> {
-            self.backend.lock().unwrap().mem = Some(mem);
+            self.backend.lock().expect("mutex poisoned").mem = Some(mem);
             Ok(())
         }
 
         fn set_backend_req_fd(&mut self, vu_req: Backend) {
-            self.backend.lock().unwrap().vu_req = Some(vu_req);
+            self.backend.lock().expect("mutex poisoned").vu_req = Some(vu_req);
         }
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-            let backend = self.backend.lock().unwrap();
-            let consumer = backend.kill_evt.0.try_clone().unwrap();
-            let notifier = backend.kill_evt.1.try_clone().unwrap();
+            let backend = self.backend.lock().expect("mutex poisoned");
+            let consumer = backend.kill_evt.0.try_clone().expect("clone consumer");
+            let notifier = backend.kill_evt.1.try_clone().expect("clone notifier");
             Some((consumer, notifier))
         }
 
@@ -184,19 +184,19 @@ pub mod backend {
             }
 
             let mut vring_state = match device_event {
-                HIPRIO_QUEUE_EVENT => vrings.first().unwrap().get_mut(),
-                REQ_QUEUE_EVENT => vrings.get(1).unwrap().get_mut(),
+                HIPRIO_QUEUE_EVENT => vrings.first().expect("vrings empty").get_mut(),
+                REQ_QUEUE_EVENT => vrings.get(1).expect("vrings too small").get_mut(),
                 _ => {
                     return Err(std::io::Error::other("HandleEventUnknownEvent"));
                 }
             };
 
-            if self.backend.lock().unwrap().event_idx {
+            if self.backend.lock().expect("mutex poisoned").event_idx {
                 loop {
                     let _ = vring_state.disable_notification();
                     self.backend
                         .lock()
-                        .unwrap()
+                        .expect("mutex poisoned")
                         .process_queue(&mut vring_state)?;
                     if !vring_state.enable_notification().unwrap_or(false) {
                         break;
@@ -205,7 +205,7 @@ pub mod backend {
             } else {
                 self.backend
                     .lock()
-                    .unwrap()
+                    .expect("mutex poisoned")
                     .process_queue(&mut vring_state)?;
             }
 
@@ -260,7 +260,7 @@ pub mod backend {
                 backend,
                 GuestMemoryAtomic::new(GuestMemoryMmap::new()),
             )
-            .unwrap();
+            .expect("vu daemon new");
             let _ = vu_daemon.start(&mut listener).map_err(|e| {
                 tracing::error!("in-process virtiofsd panic: {:?}", e);
             });

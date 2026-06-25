@@ -1,6 +1,10 @@
+[graph]
+all-features = true
+
 [licenses]
 allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
-         "BSD-3-Clause", "BSD-2-Clause", "ISC", "Zlib", "0BSD", "Unicode-3.0"]
+         "BSD-3-Clause", "BSD-2-Clause", "ISC", "Zlib", "0BSD", "Unicode-3.0", "CDLA-Permissive-2.0"]
+private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"
@@ -9,6 +13,15 @@ wildcards = "deny"
 [advisories]
 yanked = "deny"
 ignore = [
+    "RUSTSEC-2026-0009", # Pending upstream fix
+    "RUSTSEC-2021-0124", # Pending upstream fix
+    "RUSTSEC-2026-0058", # Pending upstream fix
+    "RUSTSEC-2020-0016", # net2 unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2023-0071", # rsa marvin attack
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+    "RUSTSEC-2021-0124", # Pending upstream fix
+    "RUSTSEC-2026-0058", # Pending upstream fix
     "RUSTSEC-2020-0036", # failure is unmaintained
     "RUSTSEC-2026-0057", # Pending upstream fix
     "RUSTSEC-2026-0052", # Pending upstream fix

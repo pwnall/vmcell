@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Repo-tracked pre-commit hook. Symlink into .git/hooks/pre-commit (see deploy note).
+set -euo pipefail
+
+if ! cargo fmt --all --check; then
+    echo "pre-commit: rustfmt drift — run 'cargo fmt --all' and re-stage." >&2
+    exit 1
+fi
+
+# Fast clippy on default features; the full powerset runs in CI.
+cargo clippy --all-targets -- -D warnings

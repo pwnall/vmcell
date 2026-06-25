@@ -1,61 +1,85 @@
-name: CI
+name: ci
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"   # any leftover `warn` (e.g. a regression to warn(missing_docs)) fails CI.
 
 jobs:
-  build_and_test:
+  # ---- Static gates: no KVM, no privileges. Most of the rubric lives here. ----
+  lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Setup Rust
-      run: rustup update stable && rustup component add clippy rustfmt
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Check Formatting
-      run: cargo fmt --check
-    - name: Clippy Powerset
-      # Build all targets/features, treating warnings as errors
-      run: cargo hack --feature-powerset --depth 2 clippy --all-targets -- -D warnings
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
-    - name: Run Tests
-      # Run the non-ignored tests
-      run: cargo nextest run
-    - name: Run Ignored Tests
-      # Run the ignored tests
-      run: cargo nextest run --run-ignored ignored-only
-    - name: Install cargo-semver-checks
-      uses: taiki-e/install-action@cargo-semver-checks
-    - name: Run Semver Checks
-      run: cargo semver-checks
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-hack,cargo-deny,cargo-semver-checks" }
 
-  lean_agent:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - name: Setup Rust
-      run: rustup update stable
-    - name: Verify Lean Agent
-      # Verify that the guest agent compilation doesn't pull in heavy host dependencies
-      run: |
-        DEPS=$(cargo tree -e no-dev --no-default-features --features agent)
-        if echo "$DEPS" | grep -q "tokio"; then echo "Error: tokio found in agent deps"; exit 1; fi
-        if echo "$DEPS" | grep -q "hyper"; then echo "Error: hyper found in agent deps"; exit 1; fi
-        if echo "$DEPS" | grep -q "rtnetlink"; then echo "Error: rtnetlink found in agent deps"; exit 1; fi
-        echo "Agent dependencies verified clean."
+      - name: rustfmt
+        run: cargo fmt --all --check
 
-  licenses:
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features
+
+      - name: clippy feature-powerset      # catches deps imported under a feature gate but used unconditionally
+        run: cargo hack --feature-powerset --depth 2 clippy --all-targets
+
+      - name: cargo-deny
+        run: cargo deny check
+
+      - name: lean-agent invariant         # guest PID-1 binary must omit the host stack
+        run: |
+          if cargo tree -e no-dev --no-default-features --features agent \
+               | grep -E '── (tokio|hyper|rtnetlink) v'; then
+            echo "::error::lean-agent invariant violated — host stack leaked into the agent build"
+            exit 1
+          fi
+
+      - name: ban module-global mutable ID/atomic state
+        run: ./scripts/ban-global-state.sh
+
+      - name: public-API semver (PRs only)
+        if: github.event_name == 'pull_request'
+        run: cargo semver-checks --baseline-rev "${{ github.event.pull_request.base.sha }}"
+
+  # ---- Fast tests: unit, codec, property. No KVM. DEFAULT (non-ignored) set only. ----
+  test-unit:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Install cargo-deny
-      uses: EmbarkStudios/cargo-deny-action@v2
-    - name: Check licenses and advisories
-      run: cargo deny check
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-nextest" }
+      - name: nextest (unit/codec/prop)
+        run: cargo nextest run --all-features
+
+  # ---- Integration matrix: needs /dev/kvm. Runs the #[ignore]'d suite so it is NOT CI-invisible. ----
+  test-integration:
+    # Self-hosted runner labelled `kvm`, with /dev/kvm and the runner user in the `kvm` group.
+    runs-on: [self-hosted, linux, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-nextest" }
+
+      - name: build VM artifacts
+        run: cargo run --bin imp-testing -- build
+
+      - name: rootless suite (no elevation — keeps the rootless path honest)
+        run: cargo nextest run --profile integration --run-ignored all -E 'test(rootless) | test(smoltcp)'
+
+      - name: privileged suite (sudo -E is acceptable on a single-tenant CI runner)
+        run: sudo -E env "PATH=$PATH" cargo nextest run --profile integration --run-ignored all -E 'not (test(rootless) | test(smoltcp))'

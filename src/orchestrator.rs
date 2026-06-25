@@ -119,13 +119,19 @@ impl<V: Vmm> TestVm<V> {
     }
 
     /// Gets a reference to the underlying VMM instance.
+    ///
+    /// # Panics
+    /// Panics if the instance is missing.
     pub fn instance(&self) -> &V::Instance {
-        self.instance.as_ref().unwrap()
+        self.instance.as_ref().expect("instance missing")
     }
 
     /// Gets a mutable reference to the underlying VMM instance.
+    ///
+    /// # Panics
+    /// Panics if the instance is missing.
     pub fn instance_mut(&mut self) -> &mut V::Instance {
-        self.instance.as_mut().unwrap()
+        self.instance.as_mut().expect("instance missing")
     }
 
     /// Gets the network namespace associated with this VM, if any.
@@ -430,6 +436,9 @@ impl<V: Vmm> TestVm<V> {
     /// Returns an error if the agent connection or handshake fails.
     /// Gets the agent client, waiting for the connection if necessary.
     ///
+    /// # Panics
+    /// Panics if the VM instance is missing.
+    ///
     /// # Errors
     /// Returns an error if the connection fails or times out.
     pub async fn agent(
@@ -438,10 +447,10 @@ impl<V: Vmm> TestVm<V> {
     ) -> Result<&mut AgentClient> {
         if self.agent_client.is_none() {
             let client = AgentClient::connect(
-                self.instance.as_ref().unwrap().vsock_path(),
+                self.instance.as_ref().expect("instance missing").vsock_path(),
                 5000,
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
-                self.instance.as_ref().unwrap().serial_log(),
+                self.instance.as_ref().expect("instance missing").serial_log(),
             )
             .await?;
             self.agent_client = Some(client);
@@ -457,9 +466,9 @@ impl<V: Vmm> TestVm<V> {
 
             agent_ref
                 .reconnect(
-                    self.instance.as_ref().unwrap().vsock_path(),
+                    self.instance.as_ref().expect("instance missing").vsock_path(),
                     5000,
-                    self.instance.as_ref().unwrap().serial_log(),
+                    self.instance.as_ref().expect("instance missing").serial_log(),
                     timeout.unwrap_or(std::time::Duration::from_secs(10)),
                 )
                 .await?;
@@ -513,10 +522,13 @@ impl<V: Vmm> TestVm<V> {
 
     /// Retrieves resource usage metrics for the VM.
     ///
+    /// # Panics
+    /// Panics if the VM instance is missing.
+    ///
     /// # Errors
     /// Returns an error if metrics collection fails.
     pub async fn usage(&self) -> Result<ResourceUsage> {
-        self.instance.as_ref().unwrap().stats().await
+        self.instance.as_ref().expect("instance missing").stats().await
     }
 
     /// Shuts down the VM and cleans up associated resources.

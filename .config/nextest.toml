@@ -1,0 +1,24 @@
+[profile.default]
+# Unit/codec/property tests are fast; flag anything that stalls.
+slow-timeout = { period = "30s", terminate-after = 2 }
+fail-fast = false
+
+[profile.integration]
+# VM boot + snapshot restore are slower; the builder-VM mmdebstrap run is the long outlier.
+slow-timeout = { period = "120s", terminate-after = 5 }
+retries = 0
+fail-fast = false
+
+[test-groups]
+# Mechanical equivalent of #[serial]: run host-state-mutating tests one at a time so parallel
+# --ignored runs don't race on netns / cgroups / nft.
+serial-host = { max-threads = 1 }
+
+[[profile.integration.overrides]]
+# List the suites that create a VM or touch netns/cgroups/nft.
+filter = '''
+    binary(boot) | binary(lifecycle) | binary(concurrency) | binary(snapshot_restore)
+  | binary(egress_proxy) | binary(host_endpoint) | binary(metrics_limits)
+  | binary(nested_virt) | binary(shares_ro_rw) | binary(pipeline) | binary(proptests) | binary(benchmark) | binary(exec_vsock)
+'''
+test-group = 'serial-host'
