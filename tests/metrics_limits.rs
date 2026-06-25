@@ -156,7 +156,10 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .expect("Failed to run memory bloat");
 
     assert!(
-        oom_outcome.code == 137 || oom_outcome.code == 137 - 256 || oom_outcome.code == 1 || oom_outcome.code == -1, // sometimes represented as 137, sometimes we just get connection closed, sometimes malloc fails and returns 1
+        oom_outcome.code == 137
+            || oom_outcome.code == 137 - 256
+            || oom_outcome.code == 1
+            || oom_outcome.code == -1, // sometimes represented as 137, sometimes we just get connection closed, sometimes malloc fails and returns 1
         "Process should be killed by OOM killer or exit due to ENOMEM, got code {}, stderr: {}",
         oom_outcome.code,
         String::from_utf8_lossy(&oom_outcome.stderr)

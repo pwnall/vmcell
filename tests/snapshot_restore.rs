@@ -63,23 +63,23 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     // 1. Create a VM and take a snapshot
     {
-    if unsafe { libc::geteuid() } != 0 {
-        println!("Skipping test: requires root privileges for privileged networking");
-        return;
-    }
+        if unsafe { libc::geteuid() } != 0 {
+            println!("Skipping test: requires root privileges for privileged networking");
+            return;
+        }
 
-    let mut cfg = VmConfig::builder(
-        kernel.clone(),
-        RootfsSource::Erofs {
-            image: rootfs_image.clone(),
-        },
-    )
-    .build()
-    .unwrap();
-    cfg.net = imp_testing::config::NetConfig::Privileged {
-        egress: imp_testing::config::Egress::Open,
-        host_services_port: None,
-    };
+        let mut cfg = VmConfig::builder(
+            kernel.clone(),
+            RootfsSource::Erofs {
+                image: rootfs_image.clone(),
+            },
+        )
+        .build()
+        .unwrap();
+        cfg.net = imp_testing::config::NetConfig::Privileged {
+            egress: imp_testing::config::Egress::Open,
+            host_services_port: None,
+        };
 
         let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc.clone())
             .await
@@ -102,6 +102,12 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             ]))
             .await
             .unwrap();
+        assert_eq!(
+            mac_out.code,
+            0,
+            "Failed to get MAC address: {:?}",
+            String::from_utf8_lossy(&mac_out.stderr)
+        );
         let pre_mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
 
         // Capture pre-snapshot time
@@ -109,6 +115,12 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
             .await
             .unwrap();
+        assert_eq!(
+            time_out.code,
+            0,
+            "Failed to get time: {:?}",
+            String::from_utf8_lossy(&time_out.stderr)
+        );
         let pre_time: i64 = String::from_utf8_lossy(&time_out.stdout)
             .trim()
             .parse()
@@ -122,6 +134,12 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             ]))
             .await
             .unwrap();
+        assert_eq!(
+            rng_out.code,
+            0,
+            "Failed to get RNG: {:?}",
+            String::from_utf8_lossy(&rng_out.stderr)
+        );
         let pre_rng = String::from_utf8_lossy(&rng_out.stdout).trim().to_string();
 
         let original_cid = vm.instance().guest_cid();
@@ -218,6 +236,12 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             ]))
             .await
             .unwrap();
+        assert_eq!(
+            mac_out.code,
+            0,
+            "Failed to get post-snapshot MAC address: {:?}",
+            String::from_utf8_lossy(&mac_out.stderr)
+        );
         let post_mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
         assert!(!pre_mac.is_empty(), "MAC address should not be empty");
         assert_ne!(
@@ -236,6 +260,12 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
             .await
             .unwrap();
+        assert_eq!(
+            time_out.code,
+            0,
+            "Failed to get post-snapshot time: {:?}",
+            String::from_utf8_lossy(&time_out.stderr)
+        );
         let post_time: i64 = String::from_utf8_lossy(&time_out.stdout)
             .trim()
             .parse()
@@ -259,6 +289,12 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             ]))
             .await
             .unwrap();
+        assert_eq!(
+            rng_out.code,
+            0,
+            "Failed to get post-snapshot RNG: {:?}",
+            String::from_utf8_lossy(&rng_out.stderr)
+        );
         let post_rng = String::from_utf8_lossy(&rng_out.stdout).trim().to_string();
         assert_ne!(
             pre_rng, post_rng,

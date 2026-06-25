@@ -17,16 +17,15 @@ impl Stage for GuestAgentStage {
         target_dir.join("guest_agent")
     }
 
-    fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
+    fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         let mut hasher = blake3::Hasher::new();
-        // Just hashing the source tree would be proper, but for now we can just
-        // hash something static or the cargo lock file to satisfy the interface,
-        // or actually run cargo build since cargo handles its own caching.
-        // But the review wants it to be covered by the cache_key.
-        // Let's hash the src/bin/imp-guest-agent.rs file.
-        if let Ok(src) = std::fs::read_to_string("src/bin/imp-guest-agent.rs") {
-            hasher.update(src.as_bytes());
-        }
+        hasher.update(
+            inputs
+                .pins
+                .get("guest_agent_src_hash")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
         CacheKey(format!("guest-agent-{}", hasher.finalize().to_hex()))
     }
 

@@ -88,7 +88,7 @@ pub struct TestVm<V: Vmm> {
     /// The internal unique ID assigned to this VM.
     vmid: VmidGuard,
     /// The underlying VMM instance running the VM.
-    instance: V::Instance,
+    instance: Option<V::Instance>,
     /// The network namespace associated with this VM, if any.
     netns: Option<NetNamespace>,
     #[cfg(feature = "net-rootless")]
@@ -120,12 +120,12 @@ impl<V: Vmm> TestVm<V> {
 
     /// Gets a reference to the underlying VMM instance.
     pub fn instance(&self) -> &V::Instance {
-        &self.instance
+        self.instance.as_ref().unwrap()
     }
 
     /// Gets a mutable reference to the underlying VMM instance.
     pub fn instance_mut(&mut self) -> &mut V::Instance {
-        &mut self.instance
+        self.instance.as_mut().unwrap()
     }
 
     /// Gets the network namespace associated with this VM, if any.
@@ -212,13 +212,15 @@ impl<V: Vmm> TestVm<V> {
                     let socket_path =
                         std::path::PathBuf::from(format!("/tmp/imp-smoltcp-{}.sock", vmid));
                     let mut ports = vec![];
-                    if _proxy_port > 0 {
-                        ports.push(_proxy_port);
-                    }
+                    let proxy_port_opt = if _proxy_port > 0 {
+                        Some(_proxy_port)
+                    } else {
+                        None
+                    };
                     if let Some(p) = host_services_port {
                         ports.push(*p);
                     }
-                    let p = SmoltcpProcess::start(vmid, ports, socket_path.clone());
+                    let p = SmoltcpProcess::start(vmid, ports, proxy_port_opt, socket_path.clone());
                     vhost_user_socket = Some(socket_path);
                     smoltcp = Some(p);
                 }
@@ -324,7 +326,7 @@ impl<V: Vmm> TestVm<V> {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::VirtioFs { dir: PathBuf::from("/rootfs") }).build().unwrap();
     /// let cid_alloc = CidAllocator::new();
-    /// let vmid_alloc = Arc::new(VmidAllocator::new());
+    /// let vmid_alloc = VmidAllocator::new();
     /// let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await.unwrap();
     /// # }
     /// ```
@@ -346,7 +348,7 @@ impl<V: Vmm> TestVm<V> {
         info!("Instance booted.");
         Ok(Self {
             vmid,
-            instance,
+            instance: Some(instance),
             netns: env.netns,
             #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
@@ -374,7 +376,7 @@ impl<V: Vmm> TestVm<V> {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
     /// let cid_alloc = CidAllocator::new();
-    /// let vmid_alloc = Arc::new(VmidAllocator::new());
+    /// let vmid_alloc = VmidAllocator::new();
     /// let snap_dir = PathBuf::from("/tmp/snap");
     /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, &cid_alloc, vmid_alloc).await.unwrap();
     /// # }
@@ -411,7 +413,7 @@ impl<V: Vmm> TestVm<V> {
         info!("Instance resumed.");
         Ok(Self {
             vmid,
-            instance,
+            instance: Some(instance),
             netns: env.netns,
             #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
@@ -436,10 +438,10 @@ impl<V: Vmm> TestVm<V> {
     ) -> Result<&mut AgentClient> {
         if self.agent_client.is_none() {
             let client = AgentClient::connect(
-                self.instance.vsock_path(),
+                self.instance.as_ref().unwrap().vsock_path(),
                 5000,
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
-                self.instance.serial_log(),
+                self.instance.as_ref().unwrap().serial_log(),
             )
             .await?;
             self.agent_client = Some(client);
@@ -452,6 +454,16 @@ impl<V: Vmm> TestVm<V> {
 
         if self.restored {
             self.restored = false;
+
+            agent_ref
+                .reconnect(
+                    self.instance.as_ref().unwrap().vsock_path(),
+                    5000,
+                    self.instance.as_ref().unwrap().serial_log(),
+                    timeout.unwrap_or(std::time::Duration::from_secs(10)),
+                )
+                .await?;
+
             // Automatically resync guest clock forward
             let host_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -504,7 +516,7 @@ impl<V: Vmm> TestVm<V> {
     /// # Errors
     /// Returns an error if metrics collection fails.
     pub async fn usage(&self) -> Result<ResourceUsage> {
-        self.instance.stats().await
+        self.instance.as_ref().unwrap().stats().await
     }
 
     /// Shuts down the VM and cleans up associated resources.
@@ -512,10 +524,12 @@ impl<V: Vmm> TestVm<V> {
     /// # Errors
     /// Returns an error if shutting down the VM or proxy fails.
     pub async fn shutdown(mut self) -> Result<()> {
-        let _ = self.instance.request_shutdown().await;
+        if let Some(mut inst) = self.instance.take() {
+            let _ = inst.request_shutdown().await;
 
-        // Actually wait for it to stop to prevent zombie and ebusy
-        let _ = self.instance.kill().await;
+            // Actually wait for it to stop to prevent zombie and ebusy
+            let _ = inst.kill().await;
+        }
 
         if let Some(mut ns) = self.netns.take() {
             let _ = ns.delete();
@@ -535,9 +549,12 @@ impl<V: Vmm> TestVm<V> {
 
 impl<V: Vmm> Drop for TestVm<V> {
     fn drop(&mut self) {
+        // Enforce teardown order: VMM instance -> virtiofsd -> netns/cgroup/overlay/sockets
+        drop(self.instance.take());
+
         #[cfg(feature = "net-rootless")]
-        let _ = self.smoltcp.take();
-        let _ = self.proxy.take();
+        drop(self.smoltcp.take());
+        drop(self.proxy.take());
         if let Some(mut ns) = self.netns.take() {
             let _ = ns.delete();
         }

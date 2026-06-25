@@ -268,11 +268,12 @@ impl NetNamespace {
         format!(
             "table ip proxy {{\n\
             \tchain prerouting {{\n\
-            \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+            \t\ttype filter hook prerouting priority mangle; policy drop;\n\
             \t\tiifname \"{}\" tcp dport {{ 80, 443 }} tproxy to :{} meta mark set 1 accept\n\
+            \t\tiifname \"{}\" log prefix \"imp-drop: \" drop\n\
             \t}}\n\
             }}",
-            self.tap_name, proxy_port
+            self.tap_name, proxy_port, self.tap_name
         )
     }
 

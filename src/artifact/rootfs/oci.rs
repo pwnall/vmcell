@@ -40,6 +40,7 @@ pub async fn build_rootfs(
     let valid_media_types = [
         "application/vnd.docker.image.rootfs.diff.tar.gzip",
         "application/vnd.oci.image.layer.v1.tar+gzip",
+        "application/vnd.oci.image.layer.v1.tar+zstd",
     ];
 
     for layer in manifest.layers {
@@ -74,8 +75,15 @@ pub async fn build_rootfs(
 
         let file = std::fs::File::open(&cache_path)
             .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
-        let decoder = flate2::read::GzDecoder::new(file);
-        streams.push(Box::new(decoder));
+
+        if layer.media_type.ends_with("zstd") {
+            let decoder = zstd::stream::read::Decoder::new(file)
+                .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+            streams.push(Box::new(decoder));
+        } else {
+            let decoder = flate2::read::GzDecoder::new(file);
+            streams.push(Box::new(decoder));
+        }
     }
 
     super::pack_erofs_with_injection(streams, inputs, out).await

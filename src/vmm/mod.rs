@@ -25,7 +25,121 @@ pub mod qemu;
 #[cfg(feature = "qemu")]
 pub use qemu::{Qemu, QemuInstance};
 
+use serde::Serialize;
 use std::path::{Path, PathBuf};
+
+/// Helper to send an HTTP request over a Unix domain socket.
+pub async fn unix_api_request<T: Serialize>(
+    api_socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&T>,
+) -> Result<()> {
+    let stream = tokio::net::UnixStream::connect(api_socket)
+        .await
+        .map_err(|e| crate::error::Error::Vmm(format!("socket connect: {}", e)))?;
+
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| crate::error::Error::Vmm(format!("handshake error: {}", e)))?;
+
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            tracing::warn!("HTTP connection failed: {:?}", err);
+        }
+    });
+
+    let body_bytes = if let Some(b) = body {
+        serde_json::to_vec(b)
+            .map_err(|e| crate::error::Error::Serialize(format!("serialize: {}", e)))?
+    } else {
+        Vec::new()
+    };
+
+    let req = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("Host", "localhost")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+            body_bytes,
+        )))
+        .map_err(|e| crate::error::Error::Vmm(format!("request builder error: {}", e)))?;
+
+    let res = sender
+        .send_request(req)
+        .await
+        .map_err(|e| crate::error::Error::Vmm(format!("send_request error: {}", e)))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        use http_body_util::BodyExt;
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        return Err(crate::error::Error::VmmApi {
+            status: status.as_u16(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Creates a temporary directory for a specific VM ID.
+pub async fn create_vm_tmp_dir(vmid: u32) -> Result<PathBuf> {
+    let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), vmid));
+    tokio::fs::create_dir_all(&tmp).await?;
+    Ok(tmp)
+}
+
+/// Builds a Tokio command for the VMM, handling network namespaces and process groups.
+pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::process::Command {
+    let mut std_cmd = if let Some(netns) = netns_name {
+        let mut c = std::process::Command::new("ip");
+        c.arg("netns").arg("exec").arg(netns).arg(binary_path);
+        c
+    } else {
+        std::process::Command::new(binary_path)
+    };
+    use std::os::unix::process::CommandExt;
+    std_cmd.process_group(0);
+    tokio::process::Command::from(std_cmd)
+}
+
+/// Writes a PID to a cgroup's `cgroup.procs` file.
+pub async fn write_cgroup_procs(cgroup_name: &str, pid: u32) {
+    if !cgroup_name.is_empty() {
+        let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", cgroup_name);
+        if let Err(e) = tokio::fs::write(&procs_path, pid.to_string()).await {
+            tracing::error!(
+                "WARNING: failed to write process {} to {}: {:?}",
+                pid,
+                procs_path,
+                e
+            );
+        } else {
+            tracing::info!("Added process {} to cgroup {}", pid, cgroup_name);
+        }
+    }
+}
+
+/// Waits until the given socket path appears, or times out. Returns true if it exists.
+pub async fn wait_for_socket(socket_path: &Path, timeout_ms: u64, interval_ms: u64) -> bool {
+    let iterations = timeout_ms / interval_ms;
+    for _ in 0..iterations {
+        if tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+    }
+    false
+}
 
 static GLOBAL_CIDS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
     std::sync::OnceLock::new();
@@ -307,6 +421,14 @@ impl VmInstance for FakeVmInstance {
     }
     fn serial_log(&self) -> &Path {
         &self.serial
+    }
+}
+
+impl Drop for FakeVmInstance {
+    fn drop(&mut self) {
+        if let Ok(mut lock) = self.calls.lock() {
+            lock.push("drop".to_string());
+        }
     }
 }
 

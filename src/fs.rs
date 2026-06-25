@@ -2,6 +2,8 @@
 //!
 //! Provides the virtiofs daemon implementation for sharing host directories with the VM.
 
+#![forbid(unsafe_code)]
+
 use crate::config::{Access, Share};
 use std::path::{Path, PathBuf};
 #[cfg(not(feature = "experiment-fuse"))]

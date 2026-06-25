@@ -84,11 +84,11 @@ pub mod backend {
 
                     match vring_state.needs_notification() {
                         Err(_) => {
-                            vring_state.signal_used_queue().expect("invariant");
+                            let _ = vring_state.signal_used_queue();
                         }
                         Ok(needs_notification) => {
                             if needs_notification {
-                                vring_state.signal_used_queue().expect("invariant");
+                                let _ = vring_state.signal_used_queue();
                             }
                         }
                     }
@@ -96,7 +96,7 @@ pub mod backend {
                     if vring_state.add_used(head_index, 0).is_err() {
                         tracing::error!("Couldn't return used descriptors to the ring");
                     }
-                    vring_state.signal_used_queue().expect("invariant");
+                    let _ = vring_state.signal_used_queue();
                 }
             }
 
@@ -150,25 +150,25 @@ pub mod backend {
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
-            self.backend.lock().expect("invariant").event_idx = enabled
+            self.backend.lock().unwrap().event_idx = enabled
         }
 
         fn update_memory(
             &mut self,
             mem: GuestMemoryAtomic<GuestMemoryMmap>,
         ) -> std::io::Result<()> {
-            self.backend.lock().expect("invariant").mem = Some(mem);
+            self.backend.lock().unwrap().mem = Some(mem);
             Ok(())
         }
 
         fn set_backend_req_fd(&mut self, vu_req: Backend) {
-            self.backend.lock().expect("invariant").vu_req = Some(vu_req);
+            self.backend.lock().unwrap().vu_req = Some(vu_req);
         }
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-            let backend = self.backend.lock().expect("invariant");
-            let consumer = backend.kill_evt.0.try_clone().expect("invariant");
-            let notifier = backend.kill_evt.1.try_clone().expect("invariant");
+            let backend = self.backend.lock().unwrap();
+            let consumer = backend.kill_evt.0.try_clone().unwrap();
+            let notifier = backend.kill_evt.1.try_clone().unwrap();
             Some((consumer, notifier))
         }
 
@@ -184,28 +184,28 @@ pub mod backend {
             }
 
             let mut vring_state = match device_event {
-                HIPRIO_QUEUE_EVENT => vrings.first().expect("invariant").get_mut(),
-                REQ_QUEUE_EVENT => vrings.get(1).expect("invariant").get_mut(),
+                HIPRIO_QUEUE_EVENT => vrings.first().unwrap().get_mut(),
+                REQ_QUEUE_EVENT => vrings.get(1).unwrap().get_mut(),
                 _ => {
                     return Err(std::io::Error::other("HandleEventUnknownEvent"));
                 }
             };
 
-            if self.backend.lock().expect("invariant").event_idx {
+            if self.backend.lock().unwrap().event_idx {
                 loop {
-                    vring_state.disable_notification().expect("invariant");
+                    let _ = vring_state.disable_notification();
                     self.backend
                         .lock()
-                        .expect("invariant")
+                        .unwrap()
                         .process_queue(&mut vring_state)?;
-                    if !vring_state.enable_notification().expect("invariant") {
+                    if !vring_state.enable_notification().unwrap_or(false) {
                         break;
                     }
                 }
             } else {
                 self.backend
                     .lock()
-                    .expect("invariant")
+                    .unwrap()
                     .process_queue(&mut vring_state)?;
             }
 
@@ -260,7 +260,7 @@ pub mod backend {
                 backend,
                 GuestMemoryAtomic::new(GuestMemoryMmap::new()),
             )
-            .expect("invariant");
+            .unwrap();
             let _ = vu_daemon.start(&mut listener).map_err(|e| {
                 tracing::error!("in-process virtiofsd panic: {:?}", e);
             });

@@ -150,14 +150,11 @@ pub mod backend {
                     log::trace!(
                         "process_tx_queue: Read packet of length {} from vring: {:?}",
                         packet.len(),
-                        packet.get(VIRTIO_NET_HDR_SIZE..).expect("invariant")
+                        packet.get(VIRTIO_NET_HDR_SIZE..).unwrap_or(&[])
                     );
-                    state.tx_queue.push_back(
-                        packet
-                            .get(VIRTIO_NET_HDR_SIZE..)
-                            .expect("invariant")
-                            .to_vec(),
-                    );
+                    state
+                        .tx_queue
+                        .push_back(packet.get(VIRTIO_NET_HDR_SIZE..).unwrap().to_vec());
                 } else {
                     log::trace!("process_tx_queue: packet too short: {}", packet.len());
                 }
@@ -168,7 +165,7 @@ pub mod backend {
             }
 
             if used_any {
-                vring_state.signal_used_queue().expect("invariant");
+                let _ = vring_state.signal_used_queue();
             }
 
             Ok(used_any)
@@ -214,8 +211,8 @@ pub mod backend {
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
             Some((
-                self.kill_evt.0.try_clone().expect("invariant"),
-                self.kill_evt.1.try_clone().expect("invariant"),
+                self.kill_evt.0.try_clone().unwrap(),
+                self.kill_evt.1.try_clone().unwrap(),
             ))
         }
 
@@ -237,19 +234,19 @@ pub mod backend {
 
             if device_event == 1 {
                 // transmitq (guest -> host)
-                let mut vring_state = vrings.get(1).expect("invariant").get_mut();
+                let mut vring_state = vrings.get(1).unwrap().get_mut();
                 if self.event_idx {
                     loop {
-                        vring_state.disable_notification().expect("invariant");
+                        let _ = vring_state.disable_notification();
                         Self::process_tx_queue(&mut state, &mut vring_state)?;
-                        if !vring_state.enable_notification().expect("invariant") {
+                        if !vring_state.enable_notification().unwrap_or(false) {
                             break;
                         }
                     }
                 } else {
-                    vring_state.disable_notification().expect("invariant");
+                    let _ = vring_state.disable_notification();
                     Self::process_tx_queue(&mut state, &mut vring_state)?;
-                    vring_state.enable_notification().expect("invariant");
+                    vring_state.enable_notification().unwrap_or(false);
                 }
             }
 
@@ -286,7 +283,12 @@ pub mod backend {
         /// # Panics
         ///
         /// Panics if the underlying system resources or background threads fail to start.
-        pub fn start(vmid: u32, forward_ports: Vec<u16>, socket_path: PathBuf) -> Self {
+        pub fn start(
+            vmid: u32,
+            forward_ports: Vec<u16>,
+            proxy_port: Option<u16>,
+            socket_path: PathBuf,
+        ) -> Self {
             let state = Arc::new(Mutex::new(SharedState {
                 tx_queue: VecDeque::new(),
                 rx_queue: VecDeque::new(),
@@ -300,11 +302,8 @@ pub mod backend {
                 vmm_sys_util::event::new_event_consumer_and_notifier(
                     vmm_sys_util::event::EventFlag::NONBLOCK,
                 )
-                .expect("invariant");
-            let kill_evt = (
-                kill_evt_consumer,
-                kill_evt_notifier.try_clone().expect("invariant"),
-            );
+                .unwrap();
+            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().unwrap());
 
             let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
                 event_idx: false,
@@ -312,7 +311,7 @@ pub mod backend {
                 state: state_clone,
             }));
 
-            let mut listener = Listener::new(&socket_path, true).expect("invariant");
+            let mut listener = Listener::new(&socket_path, true).unwrap();
 
             let socket_path_clone = socket_path.clone();
             let vhost_thread = std::thread::spawn(move || {
@@ -321,7 +320,7 @@ pub mod backend {
                     backend,
                     GuestMemoryAtomic::new(GuestMemoryMmap::new()),
                 )
-                .expect("invariant");
+                .unwrap();
 
                 tracing::info!("vhost-user-net daemon starting on {:?}", socket_path_clone);
                 let res = vu_daemon.start(&mut listener);
@@ -333,9 +332,10 @@ pub mod backend {
             let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_flag_clone = stop_flag.clone();
             let net_thread = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("invariant");
+                let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move {
-                    Self::run_network(vmid, forward_ports, state, stop_flag_clone).await;
+                    Self::run_network(vmid, forward_ports, proxy_port, state, stop_flag_clone)
+                        .await;
                 });
             });
 
@@ -351,6 +351,7 @@ pub mod backend {
         async fn run_network(
             vmid: u32,
             forward_ports: Vec<u16>,
+            proxy_port: Option<u16>,
             state: Arc<Mutex<SharedState>>,
             stop_flag: Arc<std::sync::atomic::AtomicBool>,
         ) {
@@ -368,15 +369,16 @@ pub mod backend {
                 },
                 Instant::now(),
             );
+            iface.set_any_ip(true);
             iface.update_ip_addrs(|ip_addrs| {
                 ip_addrs
                     .push(IpCidr::new(IpAddress::Ipv4(host_gw), 30))
-                    .expect("invariant");
+                    .unwrap();
             });
             iface
                 .routes_mut()
                 .add_default_ipv4_route(Ipv4Address::new(10, 200, (vmid % 256) as u8, 2))
-                .expect("invariant");
+                .unwrap();
             log::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
 
             let mut sockets = SocketSet::new(vec![]);
@@ -388,7 +390,7 @@ pub mod backend {
                     let tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
                     let socket = TcpSocket::new(rx_buffer, tx_buffer);
                     let handle = sockets.add(socket);
-                    port_mappings.push((port, handle, None::<tokio::net::TcpStream>));
+                    port_mappings.push((port, port, handle, None::<tokio::net::TcpStream>));
                 }
             }
 
@@ -403,7 +405,7 @@ pub mod backend {
                     let (mem_opt, vrings_opt) =
                         (state_guard.mem.clone(), state_guard.vrings.clone());
                     if let (Some(mem), Some(vrings)) = (mem_opt, vrings_opt) {
-                        let mut vring_state = vrings.first().expect("invariant").get_mut();
+                        let mut vring_state = vrings.first().unwrap().get_mut();
                         let mem_obj = mem.memory();
                         let mut used_any = false;
 
@@ -433,7 +435,7 @@ pub mod backend {
                                                 .write_slice(
                                                     full_packet
                                                         .get(offset..offset + to_write)
-                                                        .expect("invariant"),
+                                                        .unwrap(),
                                                     desc.addr(),
                                                 )
                                                 .is_ok()
@@ -450,13 +452,55 @@ pub mod backend {
                             }
                         }
                         for (head_index, written) in used_descs {
-                            vring_state
-                                .add_used(head_index, written)
-                                .expect("invariant");
+                            vring_state.add_used(head_index, written).unwrap();
                             used_any = true;
                         }
                         if used_any {
-                            vring_state.signal_used_queue().expect("invariant");
+                            let _ = vring_state.signal_used_queue();
+                        }
+                    }
+
+                    if let Some(pxy_port) = proxy_port {
+                        for packet in &state_guard.tx_queue {
+                            if packet.len() >= 14
+                                && packet[12] == 0x08
+                                && packet[13] == 0x00
+                                && packet[23] == 0x06
+                            {
+                                let ipv4_hl = (packet[14] & 0x0f) as usize * 4;
+                                let tcp_offset = 14 + ipv4_hl;
+                                if packet.len() >= tcp_offset + 14 {
+                                    let dst_port = u16::from_be_bytes([
+                                        packet[tcp_offset + 2],
+                                        packet[tcp_offset + 3],
+                                    ]);
+                                    let flags = packet[tcp_offset + 13];
+                                    if (flags & 0x02) != 0 && (flags & 0x10) == 0 {
+                                        // SYN, !ACK
+                                        let has_open = port_mappings.iter().any(|(p, _, h, _)| {
+                                            *p == dst_port && sockets.get::<TcpSocket>(*h).is_open()
+                                        });
+                                        if !has_open {
+                                            for _ in 0..4 {
+                                                let rx_buffer =
+                                                    TcpSocketBuffer::new(vec![0; 65536]);
+                                                let tx_buffer =
+                                                    TcpSocketBuffer::new(vec![0; 65536]);
+                                                let mut socket =
+                                                    TcpSocket::new(rx_buffer, tx_buffer);
+                                                let _ = socket.listen(dst_port);
+                                                let handle = sockets.add(socket);
+                                                port_mappings.push((
+                                                    dst_port,
+                                                    pxy_port,
+                                                    handle,
+                                                    None::<tokio::net::TcpStream>,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -465,18 +509,19 @@ pub mod backend {
                     drop(device); // releases state_guard
                 }
 
-                for (port, handle, tcp_stream) in port_mappings.iter_mut() {
+                for (listen_port, target_port, handle, tcp_stream) in port_mappings.iter_mut() {
                     let socket = sockets.get_mut::<TcpSocket>(*handle);
                     if !socket.is_open() {
-                        socket.listen(*port).expect("invariant");
+                        let _ = socket.listen(*listen_port);
                     }
 
                     if socket.can_send() || socket.can_recv() {
                         if tcp_stream.is_none() {
                             if let Ok(stream) =
-                                tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await
+                                tokio::net::TcpStream::connect(format!("127.0.0.1:{}", target_port))
+                                    .await
                             {
-                                stream.set_nodelay(true).expect("invariant");
+                                let _ = stream.set_nodelay(true);
                                 *tcp_stream = Some(stream);
                             }
                         }
@@ -490,9 +535,7 @@ pub mod backend {
                                         closed = true;
                                     }
                                     Ok(n) => {
-                                        socket
-                                            .send_slice(buf.get(..n).expect("invariant"))
-                                            .expect("invariant");
+                                        socket.send_slice(buf.get(..n).unwrap_or(&[])).unwrap();
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => {
@@ -505,9 +548,9 @@ pub mod backend {
                                 let mut buf = [0; 8192];
                                 if let Ok(n) = socket.peek_slice(&mut buf) {
                                     if n > 0 {
-                                        match stream.try_write(buf.get(..n).expect("invariant")) {
+                                        match stream.try_write(buf.get(..n).unwrap_or(&[])) {
                                             Ok(written) => {
-                                                socket.recv(|_| (written, ())).expect("invariant");
+                                                socket.recv(|_| (written, ())).unwrap();
                                             }
                                             Err(ref e)
                                                 if e.kind() == std::io::ErrorKind::WouldBlock => {}

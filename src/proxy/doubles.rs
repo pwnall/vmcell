@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use hudsucker::{HttpContext, HttpHandler, RequestOrResponse};
 use hyper::{Request, Response};
 use std::sync::Arc;
@@ -78,7 +80,7 @@ impl HttpHandler for ProxyHandler {
         // Apply filter rules
         if let Some(host) = req.uri().host() {
             for blocked in &self.blocked_domains {
-                if host.ends_with(blocked) {
+                if host == blocked || host.ends_with(&format!(".{}", blocked)) {
                     tracing::info!("Proxy blocking request to {}", host);
                     let response = Response::builder()
                         .status(403)

@@ -5,12 +5,27 @@ use imp_testing::agent::protocol::{ExecRequest, Message};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
 };
-use rustix::process::{WaitOptions, pivot_root, waitpid};
+use rustix::process::{WaitOptions, pivot_root, wait, waitpid};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use vsock::{VsockAddr, VsockListener, VsockStream};
+
+struct ReaperState {
+    statuses: Mutex<HashMap<u32, i32>>,
+    cv: Condvar,
+}
+
+static REAPER_STATE: OnceLock<ReaperState> = OnceLock::new();
+
+fn get_reaper_state() -> &'static ReaperState {
+    REAPER_STATE.get_or_init(|| ReaperState {
+        statuses: Mutex::new(HashMap::new()),
+        cv: Condvar::new(),
+    })
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("imp-guest-agent: starting");
@@ -111,19 +126,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break Ok(());
         }
         // Wait for any child with WNOHANG
-        match waitpid(None, WaitOptions::NOHANG) {
-            Ok(Some(_)) => {
-                // Reaped a child
-            }
-            Ok(None) | Err(rustix::io::Errno::CHILD) => {
-                // No more children to reap right now
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(_) => {
-                // Should not happen, but avoid hot loop
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        loop {
+            match wait(WaitOptions::NOHANG) {
+                Ok(Some((pid, status))) => {
+                    let pid = pid.as_raw_nonzero().get() as u32;
+                    let code = if let Some(sig) = status.terminating_signal() {
+                        128 + sig as i32
+                    } else if let Some(c) = status.exit_status() {
+                        c as i32
+                    } else {
+                        1
+                    };
+                    let state = get_reaper_state();
+                    state.statuses.lock().unwrap().insert(pid, code);
+                    state.cv.notify_all();
+                    continue;
+                }
+                Ok(None) | Err(rustix::io::Errno::CHILD) => break,
+                Err(_) => break,
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -265,23 +288,15 @@ fn handle_exec(
             }
 
             std::thread::spawn(move || {
-                let code = match child.wait() {
-                    Ok(status) => {
-                        has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
-                        use std::os::unix::process::ExitStatusExt;
-                        status.code().unwrap_or_else(|| {
-                            if let Some(sig) = status.signal() {
-                                128 + sig
-                            } else {
-                                1
-                            }
-                        })
+                let state = get_reaper_state();
+                let mut statuses = state.statuses.lock().unwrap();
+                let code = loop {
+                    if let Some(c) = statuses.remove(&pid) {
+                        break c;
                     }
-                    Err(_) => {
-                        has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
-                        127
-                    }
+                    statuses = state.cv.wait(statuses).unwrap();
                 };
+                has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = out_handle.join();
                 let _ = err_handle.join();
                 let _ = tx.send(Message::Exit(code));

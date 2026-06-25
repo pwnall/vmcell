@@ -105,8 +105,9 @@ async fn test_lifecycle_fake_vmm() {
 
     {
         let calls = fake.calls.lock().unwrap();
-        assert_eq!(calls[4], "restore");
-        assert_eq!(calls[5], "resume");
+        assert_eq!(calls[4], "drop");
+        assert_eq!(calls[5], "restore");
+        assert_eq!(calls[6], "resume");
     }
 
     restore_vm.shutdown().await.expect("Failed to shutdown");
@@ -166,5 +167,40 @@ async fn test_lifecycle_panic_residue_ch() {
     assert!(
         !std::path::Path::new(&cg_path).exists(),
         "Cgroup should be cleaned up"
+    );
+}
+
+#[tokio::test]
+async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
+    use imp_testing::vmm::FakeVmm;
+    let fake = FakeVmm::default();
+
+    let cfg = imp_testing::config::VmConfig::builder(
+        "/fake/kernel",
+        imp_testing::config::RootfsSource::Erofs {
+            image: std::path::PathBuf::from("/fake/rootfs"),
+        },
+    )
+    .network_disabled()
+    .build()
+    .unwrap();
+
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let calls_clone = fake.calls.clone();
+
+    let _ = tokio::spawn(async move {
+        let _vm = imp_testing::TestVm::start(&fake, cfg, &cid_alloc, vmid_alloc)
+            .await
+            .expect("Failed to start fake VM");
+        panic!("simulate panic inside scope");
+    })
+    .await;
+
+    let calls = calls_clone.lock().unwrap();
+    // Verify drop was called on panic
+    assert!(
+        calls.contains(&"drop".to_string()),
+        "FakeVmInstance drop should have been called on panic"
     );
 }

@@ -1,5 +1,7 @@
 //! Error types and result alias for the imp-testing framework.
 
+#![forbid(unsafe_code)]
+
 /// Represents errors that can occur during testing.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
@@ -64,6 +66,14 @@ pub enum Error {
     /// An I/O error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// An unsupported operation or feature.
+    #[error("Unsupported feature in {vmm}: {feature}")]
+    Unsupported {
+        /// The VMM backend (e.g., "qemu", "cloud-hypervisor").
+        vmm: String,
+        /// The unsupported feature (e.g., "snapshot", "virtio-fs").
+        feature: String,
+    },
 }
 
 /// A specialized Result type for imp-testing.

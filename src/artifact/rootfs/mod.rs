@@ -19,12 +19,7 @@ pub mod oci;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootfsBuildSource {
     /// OCI registry pull source.
-    Oci {
-        /// The image to pull (e.g. `debian`).
-        image: String,
-        /// The pinned digest of the image.
-        digest: String,
-    },
+    Oci,
     /// Full-apt source running mmdebstrap on the host.
     Mmdebstrap {
         /// The Debian release suite to use (e.g., "bookworm").
@@ -52,10 +47,22 @@ impl Stage for RootfsStage {
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         let mut hasher = blake3::Hasher::new();
         match &self.source {
-            RootfsBuildSource::Oci { image, digest } => {
+            RootfsBuildSource::Oci => {
                 hasher.update(b"oci");
-                hasher.update(image.as_bytes());
-                hasher.update(digest.as_bytes());
+                hasher.update(
+                    inputs
+                        .pins
+                        .get("rootfs_image")
+                        .map(|s| s.as_bytes())
+                        .unwrap_or_default(),
+                );
+                hasher.update(
+                    inputs
+                        .pins
+                        .get("rootfs_digest")
+                        .map(|s| s.as_bytes())
+                        .unwrap_or_default(),
+                );
             }
             RootfsBuildSource::Mmdebstrap { release } => {
                 hasher.update(b"mmdebstrap");
@@ -71,7 +78,15 @@ impl Stage for RootfsStage {
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
         match &self.source {
-            RootfsBuildSource::Oci { image, digest } => {
+            RootfsBuildSource::Oci => {
+                let image = inputs
+                    .pins
+                    .get("rootfs_image")
+                    .ok_or_else(|| Error::Artifact("Missing rootfs_image pin".into()))?;
+                let digest = inputs
+                    .pins
+                    .get("rootfs_digest")
+                    .ok_or_else(|| Error::Artifact("Missing rootfs_digest pin".into()))?;
                 oci::build_rootfs(image, digest, inputs, out).await
             }
             RootfsBuildSource::Mmdebstrap { release } => {

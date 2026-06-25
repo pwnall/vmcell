@@ -23,9 +23,18 @@ jobs:
     - name: Clippy Powerset
       # Build all targets/features, treating warnings as errors
       run: cargo hack --feature-powerset --depth 2 clippy --all-targets -- -D warnings
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
     - name: Run Tests
       # Run the non-ignored tests
-      run: cargo test
+      run: cargo nextest run
+    - name: Run Ignored Tests
+      # Run the ignored tests
+      run: cargo nextest run --run-ignored ignored-only
+    - name: Install cargo-semver-checks
+      uses: taiki-e/install-action@cargo-semver-checks
+    - name: Run Semver Checks
+      run: cargo semver-checks
 
   lean_agent:
     runs-on: ubuntu-latest

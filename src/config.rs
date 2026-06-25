@@ -1,5 +1,7 @@
 //! Configuration models and builder for virtual machine instances.
 
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 
 /// Configuration for a virtual machine instance.
@@ -22,6 +24,10 @@ pub struct VmConfig {
     pub nested_virt: bool,
     /// Cgroup resource limits for the VM and its processes.
     pub limits: ResourceLimits,
+    /// Indicates if this VM is configured to be snapshot-eligible.
+    pub snapshotting: bool,
+    /// Optional explicitly-configured VMID.
+    pub vmid: Option<u32>,
 }
 
 /// Options for the root filesystem backing the VM.
@@ -213,6 +219,8 @@ impl VmConfig {
             net: NetConfig::default(),
             nested_virt: false,
             limits: ResourceLimits::default(),
+            snapshotting: false,
+            vmid: None,
         }
     }
 }
@@ -229,6 +237,8 @@ pub struct VmConfigBuilder {
     net: NetConfig,
     nested_virt: bool,
     limits: ResourceLimits,
+    snapshotting: bool,
+    vmid: Option<u32>,
 }
 
 impl VmConfigBuilder {
@@ -268,6 +278,18 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Sets whether the VM is expected to be snapshot-eligible.
+    pub fn snapshotting(mut self, snapshotting: bool) -> Self {
+        self.snapshotting = snapshotting;
+        self
+    }
+
+    /// Explicitly sets the VMID for validation.
+    pub fn vmid(mut self, vmid: u32) -> Self {
+        self.vmid = Some(vmid);
+        self
+    }
+
     /// Disables network access.
     pub fn network_disabled(mut self) -> Self {
         self.net = NetConfig::None;
@@ -301,6 +323,20 @@ impl VmConfigBuilder {
             ));
         }
 
+        if self.snapshotting {
+            if let RootfsSource::VirtioFs { .. } = self.rootfs {
+                return Err(crate::error::Error::Config(
+                    "virtio-fs rootfs cannot be combined with snapshotting".into(),
+                ));
+            }
+        }
+
+        if let Some(vmid) = self.vmid {
+            if vmid > 254 {
+                return Err(crate::error::Error::Config("vmid must be <= 254".into()));
+            }
+        }
+
         let mut tags = std::collections::HashSet::new();
         for share in &self.shares {
             if share.tag.is_empty() {
@@ -325,6 +361,8 @@ impl VmConfigBuilder {
             net: self.net,
             nested_virt: self.nested_virt,
             limits: self.limits,
+            snapshotting: self.snapshotting,
+            vmid: self.vmid,
         })
     }
 }
@@ -370,5 +408,36 @@ mod tests {
         assert_eq!(cfg.shares.len(), 1);
         assert_eq!(cfg.shares[0].tag, "test");
         assert!(matches!(cfg.net, NetConfig::None));
+    }
+
+    #[test]
+    fn test_reject_virtio_fs_snapshot() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::VirtioFs {
+                dir: PathBuf::from("/rootfs"),
+            },
+        )
+        .snapshotting(true)
+        .build()
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("virtio-fs rootfs cannot be combined with snapshotting")
+        );
+    }
+
+    #[test]
+    fn test_reject_out_of_range_vmid() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .vmid(255)
+        .build()
+        .unwrap_err();
+        assert!(err.to_string().contains("vmid must be <= 254"));
     }
 }

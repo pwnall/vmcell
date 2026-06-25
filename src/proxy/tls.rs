@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::error::{Error, Result};
 use hudsucker::certificate_authority::RcgenAuthority;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};

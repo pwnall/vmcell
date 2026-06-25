@@ -43,6 +43,8 @@ pub struct QemuInstance {
     _vsock_daemon: Option<Child>,
     cgroup_name: Option<String>,
     cid: u32,
+    pgid: Option<u32>,
+    vsock_pgid: Option<u32>,
 }
 
 impl QemuInstance {
@@ -104,9 +106,10 @@ impl Qemu {
         Child,
         Option<Child>,
         Vec<crate::fs::VirtioFsDaemon>,
+        Option<u32>,
+        Option<u32>,
     )> {
-        let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), res.vmid));
-        tokio::fs::create_dir_all(&tmp).await?;
+        let tmp = crate::vmm::create_vm_tmp_dir(res.vmid).await?;
 
         let qmp_socket = tmp.join("qmp.sock");
         let vsock_path = tmp.join("vsock.sock"); // host connects here
@@ -131,17 +134,11 @@ impl Qemu {
             .spawn()
             .ok();
 
+        let vsock_pgid = vsock_daemon.as_ref().and_then(|d| d.id());
+
         if vsock_daemon.is_some() {
             // Wait for vhost-vsock socket to appear
-            let mut ready = false;
-            for _ in 0..50 {
-                if tokio::fs::try_exists(&vhost_vsock).await.unwrap_or(false) {
-                    ready = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            if !ready {
+            if !crate::vmm::wait_for_socket(&vhost_vsock, 1000, 20).await {
                 return Err(Error::Vmm("vhost-device-vsock failed to start".into()));
             }
         }
@@ -152,15 +149,7 @@ impl Qemu {
             fs_daemons.push(daemon);
         }
 
-        let mut std_cmd = if let Some(netns) = &res.netns_name {
-            let mut c = std::process::Command::new("ip");
-            c.arg("netns").arg("exec").arg(netns).arg(&self.binary_path);
-            c
-        } else {
-            std::process::Command::new(&self.binary_path)
-        };
-        std_cmd.process_group(0);
-        let mut cmd = tokio::process::Command::from(std_cmd);
+        let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
 
         cmd.arg("-M")
             .arg("q35,memory-backend=mem")
@@ -301,24 +290,14 @@ impl Qemu {
             .spawn()?;
 
         if let Some(pid) = process.id() {
-            if !res.cgroup_name.is_empty() {
-                let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", res.cgroup_name);
-                let _ = tokio::fs::write(&procs_path, pid.to_string()).await;
-            }
+            crate::vmm::write_cgroup_procs(&res.cgroup_name, pid).await;
         }
 
-        let mut socket_ready = false;
-        for _ in 0..50 {
-            if tokio::fs::try_exists(&qmp_socket).await.unwrap_or(false) {
-                socket_ready = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-
-        if !socket_ready {
+        if !crate::vmm::wait_for_socket(&qmp_socket, 1000, 20).await {
             return Err(Error::Vmm("QMP socket failed to appear".into()));
         }
+
+        let pgid = process.id();
 
         Ok((
             tmp,
@@ -328,6 +307,8 @@ impl Qemu {
             process,
             vsock_daemon,
             fs_daemons,
+            pgid,
+            vsock_pgid,
         ))
     }
 }
@@ -336,8 +317,17 @@ impl Vmm for Qemu {
     type Instance = QemuInstance;
 
     async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
-        let (_tmp, qmp_socket, vsock_path, serial_path, process, vsock_daemon, fs_daemons) =
-            self.spawn_qemu(cfg, res, None).await?;
+        let (
+            _tmp,
+            qmp_socket,
+            vsock_path,
+            serial_path,
+            process,
+            vsock_daemon,
+            fs_daemons,
+            pgid,
+            vsock_pgid,
+        ) = self.spawn_qemu(cfg, res, None).await?;
         Ok(QemuInstance {
             process,
             qmp_socket,
@@ -347,52 +337,21 @@ impl Vmm for Qemu {
             _vsock_daemon: vsock_daemon,
             cgroup_name: Some(res.cgroup_name.clone()),
             cid: res.guest_cid,
+            pgid,
+            vsock_pgid,
         })
     }
 
     async fn restore(
         &self,
-        snapshot_dir: &Path,
-        cfg: &VmConfig,
-        res: &PerVmResources,
+        _snapshot_dir: &Path,
+        _cfg: &VmConfig,
+        _res: &PerVmResources,
     ) -> Result<Self::Instance> {
-        let (_tmp, qmp_socket, vsock_path, serial_path, process, vsock_daemon, fs_daemons) =
-            self.spawn_qemu(cfg, res, Some(snapshot_dir)).await?;
-        let instance = QemuInstance {
-            process,
-            qmp_socket,
-            vsock_path,
-            serial_path,
-            _fs_daemons: fs_daemons,
-            _vsock_daemon: vsock_daemon,
-            cgroup_name: Some(res.cgroup_name.clone()),
-            cid: res.guest_cid,
-        };
-
-        let migrate_cmd = format!(
-            "{{\"execute\": \"migrate-incoming\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
-            snapshot_dir.join("state.bin").display()
-        );
-        instance.qmp_command(&migrate_cmd).await?;
-
-        // Wait for migration to complete
-        let mut completed = false;
-        for _ in 0..50 {
-            let res = instance
-                .qmp_command("{\"execute\": \"query-migrate\"}")
-                .await?;
-            if res.contains("\"status\": \"completed\"") {
-                completed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        if !completed {
-            return Err(Error::Vmm("Migration failed to complete in time".into()));
-        }
-
-        Ok(instance)
+        Err(Error::Unsupported {
+            vmm: "qemu".to_string(),
+            feature: "snapshot_restore".to_string(),
+        })
     }
 
     fn capabilities(&self) -> VmmCapabilities {
@@ -434,100 +393,37 @@ impl VmInstance for QemuInstance {
     async fn kill(&mut self) -> Result<()> {
         self.qmp_command("{\"execute\": \"quit\"}").await.ok();
 
-        if let Some(pid) = self.process.id() {
-            let _ = tokio::process::Command::new("kill")
-                .arg("-9")
-                .arg(format!("-{}", pid))
-                .status()
-                .await;
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-(pgid as i32)),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
         let _ = self.process.wait().await;
 
         if let Some(mut d) = self._vsock_daemon.take() {
-            if let Some(pid) = d.id() {
-                let _ = tokio::process::Command::new("kill")
-                    .arg("-9")
-                    .arg(format!("-{}", pid))
-                    .status()
-                    .await;
+            if let Some(v_pgid) = self.vsock_pgid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(v_pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
             }
             let _ = d.wait().await;
         }
         Ok(())
     }
 
-    async fn snapshot(&mut self, dir: &Path) -> Result<()> {
-        self.qmp_command("{\"execute\": \"stop\"}").await?;
-
-        let state_path = dir.join("state.bin");
-        let migrate_cmd = format!(
-            "{{\"execute\": \"migrate\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
-            state_path.display()
-        );
-        self.qmp_command(&migrate_cmd).await?;
-
-        // Wait for migration to complete
-        let mut completed = false;
-        for _ in 0..50 {
-            let res = self.qmp_command("{\"execute\": \"query-migrate\"}").await?;
-            if res.contains("\"status\": \"completed\"") {
-                completed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        if !completed {
-            return Err(Error::Vmm("Snapshot failed to complete in time".into()));
-        }
-
-        self.qmp_command("{\"execute\": \"cont\"}").await?;
-        Ok(())
+    async fn snapshot(&mut self, _dir: &Path) -> Result<()> {
+        Err(Error::Unsupported {
+            vmm: "qemu".to_string(),
+            feature: "snapshot_restore".to_string(),
+        })
     }
 
     async fn stats(&self) -> Result<ResourceUsage> {
-        let mut usage = ResourceUsage::default();
-        #[cfg(feature = "metrics")]
-        {
-            if let Some(cg_name) = &self.cgroup_name {
-                let cg =
-                    cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
-                for sub in cg.subsystems() {
-                    match sub {
-                        cgroups_rs::Subsystem::Mem(_) => {
-                            let base_path = format!("/sys/fs/cgroup/{}", cg_name);
-                            if let Ok(s) =
-                                std::fs::read_to_string(format!("{}/memory.current", base_path))
-                            {
-                                if let Ok(val) = s.trim().parse::<u64>() {
-                                    usage.mem_current_mib = val / 1024 / 1024;
-                                }
-                            }
-                            if let Ok(s) =
-                                std::fs::read_to_string(format!("{}/memory.peak", base_path))
-                            {
-                                if let Ok(val) = s.trim().parse::<u64>() {
-                                    usage.mem_peak_mib = val / 1024 / 1024;
-                                }
-                            }
-                        }
-                        cgroups_rs::Subsystem::Cpu(c) => {
-                            let stat = c.cpu().stat;
-                            for line in stat.lines() {
-                                if let Some(val) = line
-                                    .strip_prefix("usage_usec ")
-                                    .and_then(|s| s.parse::<u64>().ok())
-                                {
-                                    usage.cpu_usec = val;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Ok(usage)
+        Ok(crate::metrics::read_cgroup_stats(
+            self.cgroup_name.as_deref(),
+        ))
     }
 
     fn vsock_path(&self) -> &Path {
@@ -545,9 +441,25 @@ impl VmInstance for QemuInstance {
 
 impl Drop for QemuInstance {
     fn drop(&mut self) {
-        let _ = self.process.start_kill();
-        if let Some(mut d) = self._vsock_daemon.take() {
-            let _ = d.start_kill();
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-(pgid as i32)),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            if let Some(pid) = self.process.id() {
+                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+            }
+        }
+        if let Some(d) = self._vsock_daemon.as_mut() {
+            if let Some(v_pgid) = self.vsock_pgid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(v_pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                if let Some(pid) = d.id() {
+                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+                }
+            }
         }
         let _ = std::fs::remove_file(&self.qmp_socket);
         let _ = std::fs::remove_file(&self.vsock_path);

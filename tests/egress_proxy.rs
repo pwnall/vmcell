@@ -110,12 +110,24 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
         .await
         .unwrap();
+    assert_eq!(
+        out_a.code,
+        0,
+        "ip a failed: {:?}",
+        String::from_utf8_lossy(&out_a.stderr)
+    );
     println!("IP A:\n{}", String::from_utf8_lossy(&out_a.stdout));
 
     let out_r = agent
         .exec(ExecRequest::new(vec!["ip".into(), "route".into()]))
         .await
         .unwrap();
+    assert_eq!(
+        out_r.code,
+        0,
+        "ip route failed: {:?}",
+        String::from_utf8_lossy(&out_r.stderr)
+    );
     println!("IP ROUTE:\n{}", String::from_utf8_lossy(&out_r.stdout));
 
     // Give the network some time to come up

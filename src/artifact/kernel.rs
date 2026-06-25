@@ -10,14 +10,7 @@ use tokio::process::Command;
 
 /// A pipeline stage that builds a Linux kernel image.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelStage {
-    /// URL to download the kernel source tarball from.
-    pub kernel_source_url: String,
-    /// SHA256 digest of the kernel source tarball.
-    pub kernel_source_sha256: String,
-    /// Custom configuration snippet to append to the kernel config.
-    pub microvm_config: String,
-}
+pub struct KernelStage {}
 
 use async_trait::async_trait;
 
@@ -31,21 +24,53 @@ impl Stage for KernelStage {
         target_dir.join("vmlinux")
     }
 
-    fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
+    fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(self.kernel_source_url.as_bytes());
-        hasher.update(self.microvm_config.as_bytes());
+        hasher.update(
+            inputs
+                .pins
+                .get("kernel_source_url")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
+        hasher.update(
+            inputs
+                .pins
+                .get("kernel_source_sha256")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
+        hasher.update(
+            inputs
+                .pins
+                .get("kernel_microvm_config")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
         CacheKey(format!("kernel-{}", hasher.finalize().to_hex()))
     }
 
-    async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+    async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        let kernel_source_url = inputs
+            .pins
+            .get("kernel_source_url")
+            .ok_or_else(|| Error::Artifact("Missing kernel_source_url pin".into()))?;
+        let kernel_source_sha256 = inputs
+            .pins
+            .get("kernel_source_sha256")
+            .ok_or_else(|| Error::Artifact("Missing kernel_source_sha256 pin".into()))?;
+        let microvm_config = inputs
+            .pins
+            .get("kernel_microvm_config")
+            .ok_or_else(|| Error::Artifact("Missing kernel_microvm_config pin".into()))?;
+
         let workdir = out.parent().unwrap_or(Path::new(".")).join("kernel-build");
         tokio::fs::create_dir_all(&workdir).await?;
 
         let tarball = workdir.join("linux.tar.xz");
 
         if !tarball.exists() {
-            let response = reqwest::get(&self.kernel_source_url)
+            let response = reqwest::get(kernel_source_url)
                 .await
                 .map_err(|e| Error::Artifact(format!("Failed to download kernel source: {}", e)))?;
             if !response.status().is_success() {
@@ -67,10 +92,10 @@ impl Stage for KernelStage {
         let mut hasher = sha2::Sha256::new();
         hasher.update(&tarball_bytes);
         let hash = format!("{:x}", hasher.finalize());
-        if hash != self.kernel_source_sha256 {
+        if &hash != kernel_source_sha256 {
             return Err(Error::Artifact(format!(
                 "Kernel source tarball hash mismatch: expected {}, got {}",
-                self.kernel_source_sha256, hash
+                kernel_source_sha256, hash
             )));
         }
 
@@ -137,7 +162,7 @@ impl Stage for KernelStage {
         // Append our specific config on top
         let mut current_config = tokio::fs::read_to_string(&config_path).await?;
         current_config.push('\n');
-        current_config.push_str(&self.microvm_config);
+        current_config.push_str(microvm_config);
         tokio::fs::write(&config_path, current_config).await?;
 
         let status = Command::new("make")
@@ -178,17 +203,32 @@ mod tests {
 
     #[test]
     fn test_kernel_cache_key() {
-        let stage1 = KernelStage {
-            kernel_source_url: "https://example.com/kernel".to_string(),
-            kernel_source_sha256: "dummy".to_string(),
-            microvm_config: "CONFIG_FOO=y\n".to_string(),
-        };
+        let stage = KernelStage {};
 
-        let mut stage2 = stage1.clone();
-        stage2.microvm_config = "CONFIG_FOO=n\n".to_string();
+        let mut inputs1 = StageInputs::default();
+        inputs1.pins.insert(
+            "kernel_source_url".into(),
+            "https://example.com/kernel".into(),
+        );
+        inputs1
+            .pins
+            .insert("kernel_source_sha256".into(), "dummy".into());
+        inputs1
+            .pins
+            .insert("kernel_microvm_config".into(), "CONFIG_FOO=y\n".into());
 
-        let inputs = StageInputs::default();
-        assert_ne!(stage1.cache_key(&inputs), stage2.cache_key(&inputs));
-        assert_eq!(stage1.cache_key(&inputs), stage1.cache_key(&inputs));
+        let mut inputs2 = inputs1.clone();
+        inputs2
+            .pins
+            .insert("kernel_microvm_config".into(), "CONFIG_FOO=n\n".into());
+
+        let mut inputs3 = inputs1.clone();
+        inputs3
+            .pins
+            .insert("kernel_source_sha256".into(), "dummy2".into());
+
+        assert_ne!(stage.cache_key(&inputs1), stage.cache_key(&inputs2));
+        assert_ne!(stage.cache_key(&inputs1), stage.cache_key(&inputs3));
+        assert_eq!(stage.cache_key(&inputs1), stage.cache_key(&inputs1));
     }
 }

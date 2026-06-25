@@ -83,16 +83,34 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
         .await
         .unwrap();
+    assert_eq!(
+        ip_a.code,
+        0,
+        "ip a failed: {:?}",
+        String::from_utf8_lossy(&ip_a.stderr)
+    );
     println!("Guest IP A:\n{}", String::from_utf8_lossy(&ip_a.stdout));
     let ip_r = agent
         .exec(ExecRequest::new(vec!["ip".into(), "route".into()]))
         .await
         .unwrap();
+    assert_eq!(
+        ip_r.code,
+        0,
+        "ip route failed: {:?}",
+        String::from_utf8_lossy(&ip_r.stderr)
+    );
     println!("Guest IP Route:\n{}", String::from_utf8_lossy(&ip_r.stdout));
     let ip_n = agent
         .exec(ExecRequest::new(vec!["ip".into(), "neigh".into()]))
         .await
         .unwrap();
+    assert_eq!(
+        ip_n.code,
+        0,
+        "ip neigh failed: {:?}",
+        String::from_utf8_lossy(&ip_n.stderr)
+    );
     println!("Guest IP Neigh:\n{}", String::from_utf8_lossy(&ip_n.stdout));
 
     let outcome = agent
