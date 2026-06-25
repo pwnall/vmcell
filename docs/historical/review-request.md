@@ -6,7 +6,7 @@ other files in docs/.
 Please review the entire implementation. Please look for divergences from the
 design, correctness issues, gaps in testing coverage, insufficient / incorrect
 documentation, and deviations from Rust best practices.  Please write a code
-review report at `docs/26-claude-code-review.md`. For any justified deviations
+review report at `docs/27-claude-code-review.md`. For any justified deviations
 from the design, please document them in the implementation notes rather than
 reporting them. Please also include code quality improvements that you spot.
 Please delegate work to subagents to avoid overwhelming your context window.

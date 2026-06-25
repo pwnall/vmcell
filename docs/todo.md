@@ -1,24 +1,18 @@
 Designed, need implementing
 
-* Test helper so we can run all tests without `sudo`
-* Add OCI registry image support, use it for low-dependency rootfs build;
-  redesign the `mmdebootstrap` rootfs building process to work in a micro-VM
-  (using our infrastructure); this way, the host doesn't need to be able to
-  run `mmdebootstrap` -- we remove the shell problem and maybe some package
-  dependencies
-* Performance benchmarking
-* Trait implementations for the firecracker backend
-* Trait implementations for the QEMU backend
-* Benchmarks for all backends
 
 Need design
 
+* Benchmarks for learning implications of using musl vs glibc in guest agent
+* Add benchmarks for RAM usage
+* Add measurements for rootfs image size under OCI vs mmdebootstrap methods
+* Add measurements for VM suspend state size on disk
+* Resolve open questions based on benchmarks
+* Migration to Rust 1.96 for cleanup
 * Introduce term "unprivileged operation" instead of "rootless" (with KVM
   access, no additional caps), and its opposite as "privileged" (with
   capabilities). Explicitly spec tests for unprivileged and for privileged
   operation.
-* Resolve open questions based on benchmarks
-* Migration to Rust 1.96 for cleanup
 * README covering CLI capabilities and benchmark results
 * Position as isolated test environment, useful for agentic harnesses and
   generic serverless
