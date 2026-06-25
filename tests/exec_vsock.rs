@@ -6,7 +6,6 @@ use tokio::net::UnixListener;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[tokio::test]
-#[ignore]
 async fn test_exec_vsock_mock() {
     let tmp = std::env::temp_dir().join(format!("imp-test-vsock-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
@@ -63,9 +62,14 @@ async fn test_exec_vsock_mock() {
         framed.send(exit_msg.into()).await.unwrap();
     });
 
-    let mut client = AgentClient::connect(&vsock_path, 5000, std::time::Duration::from_secs(2), std::path::Path::new("/dev/null"))
-        .await
-        .expect("Failed to connect");
+    let mut client = AgentClient::connect(
+        &vsock_path,
+        5000,
+        std::time::Duration::from_secs(2),
+        std::path::Path::new("/dev/null"),
+    )
+    .await
+    .expect("Failed to connect");
 
     let outcome = client
         .exec(ExecRequest::new(vec!["echo".into(), "hello".into()]))
@@ -80,7 +84,6 @@ async fn test_exec_vsock_mock() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_put_file_mock() {
     let tmp = std::env::temp_dir().join(format!("imp-test-vsock-put-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
@@ -126,12 +129,17 @@ async fn test_put_file_mock() {
         framed.send(exit_msg.into()).await.unwrap();
     });
 
-    let mut client = AgentClient::connect(&vsock_path, 5000, std::time::Duration::from_secs(2), std::path::Path::new("/dev/null"))
-        .await
-        .expect("Failed to connect");
+    let mut client = AgentClient::connect(
+        &vsock_path,
+        5000,
+        std::time::Duration::from_secs(2),
+        std::path::Path::new("/dev/null"),
+    )
+    .await
+    .expect("Failed to connect");
 
     client
-        .put_file("/tmp/hello.txt", b"hello world")
+        .put_file("/tmp/hello.txt", b"hello world", None)
         .await
         .expect("put_file failed");
 

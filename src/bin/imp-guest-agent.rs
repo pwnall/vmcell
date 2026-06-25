@@ -139,6 +139,8 @@ fn handle_connection(stream: &mut VsockStream) -> Result<(), Box<dyn std::error:
             handle_exec(req, stream)?;
         } else if let Message::PutFile { dst, bytes } = msg {
             handle_put_file(&dst, &bytes, stream)?;
+        } else if let Message::Ping = msg {
+            // Ignore ping
         }
     }
 }
@@ -253,7 +255,7 @@ fn handle_exec(
                 std::thread::spawn(move || {
                     std::thread::sleep(timeout);
                     if !has_exited_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                        use rustix::process::{kill_process, Pid, Signal};
+                        use rustix::process::{Pid, Signal, kill_process};
                         if let Some(p) = Pid::from_raw(pid as i32) {
                             let _ = kill_process(p, Signal::Kill);
                         }

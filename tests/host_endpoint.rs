@@ -54,7 +54,7 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     };
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
@@ -62,13 +62,19 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let host_ip = format!("10.200.{}.1", vm.vmid());
 
     let mut child = Command::new("python3")
-        .args(["-m", "http.server", &port.to_string(), "--bind", "127.0.0.1"])
+        .args([
+            "-m",
+            "http.server",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+        ])
         .spawn()
         .expect("Failed to start http.server");
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let agent = vm.agent().await.expect("Failed to connect to agent");
+    let agent = vm.agent(None).await.expect("Failed to connect to agent");
 
     // Give network time to come up in guest
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

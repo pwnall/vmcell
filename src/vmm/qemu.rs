@@ -11,7 +11,7 @@ use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 /// The QEMU VMM backend.
 #[derive(Debug, Clone)]
@@ -43,7 +43,6 @@ pub struct QemuInstance {
     _vsock_daemon: Option<Child>,
     cgroup_name: Option<String>,
     cid: u32,
-    restored: bool,
 }
 
 impl QemuInstance {
@@ -51,33 +50,42 @@ impl QemuInstance {
         let mut stream = UnixStream::connect(&self.qmp_socket)
             .await
             .map_err(|e| Error::Vmm(format!("qmp connect: {}", e)))?;
-        
+
         let (r, mut w) = stream.split();
         let mut reader = BufReader::new(r);
         let mut line = String::new();
-        
+
         // Read greeting
-        reader.read_line(&mut line).await
+        reader
+            .read_line(&mut line)
+            .await
             .map_err(|e| Error::Vmm(format!("qmp read greeting: {}", e)))?;
-            
+
         // Send capabilities
-        w.write_all(b"{\"execute\": \"qmp_capabilities\"}\n").await
+        w.write_all(b"{\"execute\": \"qmp_capabilities\"}\n")
+            .await
             .map_err(|e| Error::Vmm(format!("qmp write caps: {}", e)))?;
-            
+
         line.clear();
-        reader.read_line(&mut line).await
+        reader
+            .read_line(&mut line)
+            .await
             .map_err(|e| Error::Vmm(format!("qmp read caps: {}", e)))?;
-            
+
         // Send command
-        w.write_all(cmd.as_bytes()).await
+        w.write_all(cmd.as_bytes())
+            .await
             .map_err(|e| Error::Vmm(format!("qmp write cmd: {}", e)))?;
-        w.write_all(b"\n").await
+        w.write_all(b"\n")
+            .await
             .map_err(|e| Error::Vmm(format!("qmp write nl: {}", e)))?;
-            
+
         line.clear();
-        reader.read_line(&mut line).await
+        reader
+            .read_line(&mut line)
+            .await
             .map_err(|e| Error::Vmm(format!("qmp read response: {}", e)))?;
-            
+
         Ok(line)
     }
 }
@@ -88,7 +96,15 @@ impl Qemu {
         cfg: &VmConfig,
         res: &PerVmResources,
         snapshot_dir: Option<&Path>,
-    ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, Child, Option<Child>, Vec<crate::fs::VirtioFsDaemon>)> {
+    ) -> Result<(
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        Child,
+        Option<Child>,
+        Vec<crate::fs::VirtioFsDaemon>,
+    )> {
         let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), res.vmid));
         tokio::fs::create_dir_all(&tmp).await?;
 
@@ -98,7 +114,8 @@ impl Qemu {
         let serial_path = tmp.join("serial.log");
 
         let mut std_vsock_cmd = std::process::Command::new("vhost-device-vsock");
-        std_vsock_cmd.arg("--guest-cid")
+        std_vsock_cmd
+            .arg("--guest-cid")
             .arg(res.guest_cid.to_string())
             .arg("--socket")
             .arg(&vhost_vsock)
@@ -106,7 +123,7 @@ impl Qemu {
             .arg(&vsock_path);
         use std::os::unix::process::CommandExt;
         std_vsock_cmd.process_group(0);
-        
+
         let vsock_daemon = tokio::process::Command::from(std_vsock_cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -145,52 +162,99 @@ impl Qemu {
         std_cmd.process_group(0);
         let mut cmd = tokio::process::Command::from(std_cmd);
 
-        cmd.arg("-M").arg("q35,memory-backend=mem")
-           .arg("-m").arg(cfg.mem_mib.to_string())
-           .arg("-smp").arg(cfg.vcpus.to_string())
-           .arg("-nodefaults")
-           .arg("-no-user-config")
-           .arg("-nographic")
-           .arg("-cpu").arg("host")
-           .arg("-enable-kvm")
-           .arg("-trace").arg("vhost_user_*")
-           .arg("-object").arg(format!("memory-backend-file,id=mem,size={}M,mem-path=/dev/shm,share=on", cfg.mem_mib))
-           .arg("-qmp").arg(format!("unix:{},server,nowait", qmp_socket.display()))
-           .arg("-serial").arg(format!("file:{}", serial_path.display()));
+        cmd.arg("-M")
+            .arg("q35,memory-backend=mem")
+            .arg("-m")
+            .arg(cfg.mem_mib.to_string())
+            .arg("-smp")
+            .arg(cfg.vcpus.to_string())
+            .arg("-nodefaults")
+            .arg("-no-user-config")
+            .arg("-nographic")
+            .arg("-cpu")
+            .arg("host")
+            .arg("-enable-kvm")
+            .arg("-trace")
+            .arg("vhost_user_*")
+            .arg("-object")
+            .arg(format!(
+                "memory-backend-file,id=mem,size={}M,mem-path=/dev/shm,share=on",
+                cfg.mem_mib
+            ))
+            .arg("-qmp")
+            .arg(format!("unix:{},server,nowait", qmp_socket.display()))
+            .arg("-serial")
+            .arg(format!("file:{}", serial_path.display()));
 
         if vsock_daemon.is_some() {
-            cmd.arg("-chardev").arg(format!("socket,id=vvsock,path={}", vhost_vsock.display()))
-               .arg("-device").arg("vhost-user-vsock-pci,chardev=vvsock");
+            cmd.arg("-chardev")
+                .arg(format!("socket,id=vvsock,path={}", vhost_vsock.display()))
+                .arg("-device")
+                .arg("vhost-user-vsock-pci,chardev=vvsock");
         } else {
             // fallback to internal vsock if module loaded (requires root, usually avoid)
-            cmd.arg("-device").arg(format!("vhost-vsock-pci,guest-cid={}", res.guest_cid));
+            cmd.arg("-device")
+                .arg(format!("vhost-vsock-pci,guest-cid={}", res.guest_cid));
         }
 
         match &cfg.rootfs {
             crate::config::RootfsSource::Erofs { image } => {
-                cmd.arg("-drive").arg(format!("file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off", image.display()))
-                   .arg("-device").arg("virtio-blk-pci,drive=rfs");
+                cmd.arg("-drive")
+                    .arg(format!(
+                        "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
+                        image.display()
+                    ))
+                    .arg("-device")
+                    .arg("virtio-blk-pci,drive=rfs");
             }
             crate::config::RootfsSource::Block { image, overlay } => {
-                cmd.arg("-drive").arg(format!("file={},format=raw,id=rfs,if=none,file.locking=off", overlay.as_ref().unwrap_or(image).display()))
-                   .arg("-device").arg("virtio-blk-pci,drive=rfs");
+                cmd.arg("-drive")
+                    .arg(format!(
+                        "file={},format=raw,id=rfs,if=none,file.locking=off",
+                        overlay.as_ref().unwrap_or(image).display()
+                    ))
+                    .arg("-device")
+                    .arg("virtio-blk-pci,drive=rfs");
             }
             crate::config::RootfsSource::VirtioFs { .. } => {}
         }
 
         for (i, (share, daemon)) in cfg.shares.iter().zip(fs_daemons.iter()).enumerate() {
-            cmd.arg("-chardev").arg(format!("socket,id=vfs{},path={}", i, daemon.socket_path.display()))
-               .arg("-device").arg(format!("vhost-user-fs-pci,chardev=vfs{},tag={}", i, share.tag));
+            cmd.arg("-chardev")
+                .arg(format!(
+                    "socket,id=vfs{},path={}",
+                    i,
+                    daemon.socket_path.display()
+                ))
+                .arg("-device")
+                .arg(format!(
+                    "vhost-user-fs-pci,chardev=vfs{},tag={}",
+                    i, share.tag
+                ));
         }
 
         if let Some(tap) = &res.tap_name {
-            cmd.arg("-netdev").arg(format!("tap,id=net0,ifname={},script=no,downscript=no", tap))
-               .arg("-device").arg("virtio-net-pci,netdev=net0");
+            cmd.arg("-netdev")
+                .arg(format!(
+                    "tap,id=net0,ifname={},script=no,downscript=no",
+                    tap
+                ))
+                .arg("-device")
+                .arg("virtio-net-pci,netdev=net0");
         } else if let Some(socket) = &res.vhost_user_socket {
-            cmd.arg("-chardev").arg(format!("socket,id=net0,path={}", socket.display()))
-               .arg("-netdev").arg("vhost-user,id=vnet0,chardev=net0,vhostforce=on")
-               .arg("-device").arg(format!("virtio-net-pci,netdev=vnet0,mac=02:00:{:02x}:{:02x}:{:02x}:{:02x}", 
-                                (res.vmid >> 24) & 0xff, (res.vmid >> 16) & 0xff, (res.vmid >> 8) & 0xff, res.vmid & 0xff));
+            assert!(res.vmid <= 254, "vmid must be <= 254 for MAC configuration");
+            cmd.arg("-chardev")
+                .arg(format!("socket,id=net0,path={}", socket.display()))
+                .arg("-netdev")
+                .arg("vhost-user,id=vnet0,chardev=net0,vhostforce=on")
+                .arg("-device")
+                .arg(format!(
+                    "virtio-net-pci,netdev=vnet0,mac=02:00:{:02x}:{:02x}:{:02x}:{:02x}",
+                    (res.vmid >> 24) & 0xff,
+                    (res.vmid >> 16) & 0xff,
+                    (res.vmid >> 8) & 0xff,
+                    res.vmid & 0xff
+                ));
         }
 
         let mut cmdline = format!(
@@ -206,6 +270,10 @@ impl Qemu {
             res.vmid
         );
         if !matches!(cfg.net, crate::config::NetConfig::None) {
+            assert!(
+                res.vmid <= 254,
+                "vmid must be <= 254 for network configuration"
+            );
             cmdline.push_str(&format!(
                 " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
                 res.vmid, res.vmid
@@ -214,15 +282,17 @@ impl Qemu {
         if cfg.nested_virt {
             cmdline.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
         }
-        cmd.arg("-kernel").arg(&cfg.kernel)
-           .arg("-append").arg(&cmdline);
+        cmd.arg("-kernel")
+            .arg(&cfg.kernel)
+            .arg("-append")
+            .arg(&cmdline);
 
         if snapshot_dir.is_some() {
             cmd.arg("-incoming").arg("defer");
         }
 
         let cmd_str = format!("{:?}", cmd);
-        println!("QEMU CMD: {}", cmd_str);
+        tracing::info!("QEMU CMD: {}", cmd_str);
 
         let process = cmd
             .stdin(Stdio::null())
@@ -250,7 +320,15 @@ impl Qemu {
             return Err(Error::Vmm("QMP socket failed to appear".into()));
         }
 
-        Ok((tmp, qmp_socket, vsock_path, serial_path, process, vsock_daemon, fs_daemons))
+        Ok((
+            tmp,
+            qmp_socket,
+            vsock_path,
+            serial_path,
+            process,
+            vsock_daemon,
+            fs_daemons,
+        ))
     }
 }
 
@@ -258,7 +336,8 @@ impl Vmm for Qemu {
     type Instance = QemuInstance;
 
     async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
-        let (_tmp, qmp_socket, vsock_path, serial_path, process, vsock_daemon, fs_daemons) = self.spawn_qemu(cfg, res, None).await?;
+        let (_tmp, qmp_socket, vsock_path, serial_path, process, vsock_daemon, fs_daemons) =
+            self.spawn_qemu(cfg, res, None).await?;
         Ok(QemuInstance {
             process,
             qmp_socket,
@@ -268,12 +347,17 @@ impl Vmm for Qemu {
             _vsock_daemon: vsock_daemon,
             cgroup_name: Some(res.cgroup_name.clone()),
             cid: res.guest_cid,
-            restored: false,
         })
     }
 
-    async fn restore(&self, snapshot_dir: &Path, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
-        let (_tmp, qmp_socket, vsock_path, serial_path, process, vsock_daemon, fs_daemons) = self.spawn_qemu(cfg, res, Some(snapshot_dir)).await?;
+    async fn restore(
+        &self,
+        snapshot_dir: &Path,
+        cfg: &VmConfig,
+        res: &PerVmResources,
+    ) -> Result<Self::Instance> {
+        let (_tmp, qmp_socket, vsock_path, serial_path, process, vsock_daemon, fs_daemons) =
+            self.spawn_qemu(cfg, res, Some(snapshot_dir)).await?;
         let instance = QemuInstance {
             process,
             qmp_socket,
@@ -283,24 +367,31 @@ impl Vmm for Qemu {
             _vsock_daemon: vsock_daemon,
             cgroup_name: Some(res.cgroup_name.clone()),
             cid: res.guest_cid,
-            restored: true,
         };
-        
+
         let migrate_cmd = format!(
             "{{\"execute\": \"migrate-incoming\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
             snapshot_dir.join("state.bin").display()
         );
         instance.qmp_command(&migrate_cmd).await?;
-        
+
         // Wait for migration to complete
+        let mut completed = false;
         for _ in 0..50 {
-            let res = instance.qmp_command("{\"execute\": \"query-migrate\"}").await?;
+            let res = instance
+                .qmp_command("{\"execute\": \"query-migrate\"}")
+                .await?;
             if res.contains("\"status\": \"completed\"") {
+                completed = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        
+
+        if !completed {
+            return Err(Error::Vmm("Migration failed to complete in time".into()));
+        }
+
         Ok(instance)
     }
 
@@ -317,7 +408,10 @@ impl Vmm for Qemu {
 
 impl VmInstance for QemuInstance {
     async fn boot(&mut self) -> Result<()> {
-        let _ = self.qmp_command("{\"execute\": \"cont\"}").await;
+        let res = self.qmp_command("{\"execute\": \"cont\"}").await?;
+        if res.contains("\"error\"") {
+            return Err(Error::Vmm(format!("qmp cont error: {}", res)));
+        }
         Ok(())
     }
 
@@ -332,13 +426,14 @@ impl VmInstance for QemuInstance {
     }
 
     async fn request_shutdown(&mut self) -> Result<()> {
-        self.qmp_command("{\"execute\": \"system_powerdown\"}").await?;
+        self.qmp_command("{\"execute\": \"system_powerdown\"}")
+            .await?;
         Ok(())
     }
 
     async fn kill(&mut self) -> Result<()> {
         self.qmp_command("{\"execute\": \"quit\"}").await.ok();
-        
+
         if let Some(pid) = self.process.id() {
             let _ = tokio::process::Command::new("kill")
                 .arg("-9")
@@ -347,7 +442,7 @@ impl VmInstance for QemuInstance {
                 .await;
         }
         let _ = self.process.wait().await;
-        
+
         if let Some(mut d) = self._vsock_daemon.take() {
             if let Some(pid) = d.id() {
                 let _ = tokio::process::Command::new("kill")
@@ -363,23 +458,29 @@ impl VmInstance for QemuInstance {
 
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
         self.qmp_command("{\"execute\": \"stop\"}").await?;
-        
+
         let state_path = dir.join("state.bin");
         let migrate_cmd = format!(
             "{{\"execute\": \"migrate\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
             state_path.display()
         );
         self.qmp_command(&migrate_cmd).await?;
-        
+
         // Wait for migration to complete
+        let mut completed = false;
         for _ in 0..50 {
             let res = self.qmp_command("{\"execute\": \"query-migrate\"}").await?;
             if res.contains("\"status\": \"completed\"") {
+                completed = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        
+
+        if !completed {
+            return Err(Error::Vmm("Snapshot failed to complete in time".into()));
+        }
+
         self.qmp_command("{\"execute\": \"cont\"}").await?;
         Ok(())
     }
@@ -389,17 +490,22 @@ impl VmInstance for QemuInstance {
         #[cfg(feature = "metrics")]
         {
             if let Some(cg_name) = &self.cgroup_name {
-                let cg = cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
+                let cg =
+                    cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
                 for sub in cg.subsystems() {
                     match sub {
                         cgroups_rs::Subsystem::Mem(_) => {
                             let base_path = format!("/sys/fs/cgroup/{}", cg_name);
-                            if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
+                            if let Ok(s) =
+                                std::fs::read_to_string(format!("{}/memory.current", base_path))
+                            {
                                 if let Ok(val) = s.trim().parse::<u64>() {
                                     usage.mem_current_mib = val / 1024 / 1024;
                                 }
                             }
-                            if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
+                            if let Ok(s) =
+                                std::fs::read_to_string(format!("{}/memory.peak", base_path))
+                            {
                                 if let Ok(val) = s.trim().parse::<u64>() {
                                     usage.mem_peak_mib = val / 1024 / 1024;
                                 }
@@ -408,7 +514,10 @@ impl VmInstance for QemuInstance {
                         cgroups_rs::Subsystem::Cpu(c) => {
                             let stat = c.cpu().stat;
                             for line in stat.lines() {
-                                if let Some(val) = line.strip_prefix("usage_usec ").and_then(|s| s.parse::<u64>().ok()) {
+                                if let Some(val) = line
+                                    .strip_prefix("usage_usec ")
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
                                     usage.cpu_usec = val;
                                 }
                             }
@@ -442,10 +551,11 @@ impl Drop for QemuInstance {
         }
         let _ = std::fs::remove_file(&self.qmp_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
-        
+
         #[cfg(feature = "metrics")]
         if let Some(cg_name) = &self.cgroup_name {
-            let cg = cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
+            let cg =
+                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
             let _ = cg.delete();
         }
     }

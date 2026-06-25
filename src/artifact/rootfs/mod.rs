@@ -6,9 +6,9 @@
 
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::error::{Error, Result};
-use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use std::io::Read;
+use std::path::Path;
 
 /// mmdebstrap micro-VM builder source.
 pub mod mmdebstrap;
@@ -45,47 +45,34 @@ impl Stage for RootfsStage {
         "rootfs"
     }
 
+    fn out_path(&self, target_dir: &std::path::Path) -> std::path::PathBuf {
+        target_dir.join("rootfs.erofs")
+    }
+
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = blake3::Hasher::new();
         match &self.source {
             RootfsBuildSource::Oci { image, digest } => {
-                std::hash::Hash::hash(&"oci", &mut hasher);
-                std::hash::Hash::hash(image, &mut hasher);
-                std::hash::Hash::hash(digest, &mut hasher);
+                hasher.update(b"oci");
+                hasher.update(image.as_bytes());
+                hasher.update(digest.as_bytes());
             }
             RootfsBuildSource::Mmdebstrap { release } => {
-                std::hash::Hash::hash(&"mmdebstrap", &mut hasher);
-                std::hash::Hash::hash(release, &mut hasher);
+                hasher.update(b"mmdebstrap");
+                hasher.update(release.as_bytes());
             }
         }
         for (k, v) in &inputs.artifacts {
-            std::hash::Hash::hash(k, &mut hasher);
-            std::hash::Hash::hash(&v.to_string_lossy(), &mut hasher);
+            hasher.update(k.as_bytes());
+            hasher.update(v.to_string_lossy().as_bytes());
         }
-        use std::hash::Hasher;
-        CacheKey(format!("rootfs-{:x}", hasher.finish()))
+        CacheKey(format!("rootfs-{}", hasher.finalize().to_hex()))
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
-        let build_status = tokio::process::Command::new("cargo")
-            .env("RUSTFLAGS", "-C target-feature=+crt-static")
-            .arg("build")
-            .arg("--release")
-            .arg("--target")
-            .arg("x86_64-unknown-linux-gnu")
-            .arg("--bin")
-            .arg("imp-guest-agent")
-            .arg("--features")
-            .arg("agent")
-            .status()
-            .await?;
-        if !build_status.success() {
-            return Err(Error::Subprocess("Failed to build imp-guest-agent".into()));
-        }
-
         match &self.source {
             RootfsBuildSource::Oci { image, digest } => {
-                oci::build_rootfs(image, digest, out).await
+                oci::build_rootfs(image, digest, inputs, out).await
             }
             RootfsBuildSource::Mmdebstrap { release } => {
                 mmdebstrap::build_rootfs(release, inputs, out).await
@@ -95,16 +82,22 @@ impl Stage for RootfsStage {
 }
 
 /// Shared logic to take a list of tar streams, inject the agent and CA, and pack it into erofs.
+///
+/// # Errors
+/// Returns an error if the erofs packing or file injection fails.
 #[cfg(feature = "am-fs-erofs")]
 pub async fn pack_erofs_with_injection(
     tar_streams: Vec<Box<dyn Read + Send>>,
+    inputs: &StageInputs,
     out: &Path,
 ) -> Result<StageOutputs> {
     let out_buf = out.to_path_buf();
-    
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| format!("{}/target", manifest_dir));
-    let agent_path = std::path::PathBuf::from(target_dir).join("x86_64-unknown-linux-gnu/release/imp-guest-agent");
+
+    let agent_path = inputs
+        .artifacts
+        .get("guest_agent")
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/guest_agent"));
 
     #[cfg(feature = "proxy")]
     let _ca_mgr = crate::proxy::tls::CaManager::new()?;
@@ -112,28 +105,35 @@ pub async fn pack_erofs_with_injection(
     let ca_path = out.parent().unwrap_or(Path::new(".")).join("ca.pem");
 
     tokio::task::spawn_blocking(move || -> Result<StageOutputs> {
-        let mut injected_files = vec![
-            ("usr/sbin/imp-guest-agent", agent_path.as_path()),
-        ];
+        let mut injected_files = vec![("usr/sbin/imp-guest-agent", agent_path.as_path())];
         #[cfg(feature = "proxy")]
-        injected_files.push(("usr/local/share/ca-certificates/imp-ca.crt", ca_path.as_path()));
+        injected_files.push((
+            "usr/local/share/ca-certificates/imp-ca.crt",
+            ca_path.as_path(),
+        ));
 
-        let archives: Vec<tar::Archive<Box<dyn Read + Send>>> = tar_streams.into_iter().map(tar::Archive::new).collect();
+        let archives: Vec<tar::Archive<Box<dyn Read + Send>>> =
+            tar_streams.into_iter().map(tar::Archive::new).collect();
         let image = crate::artifact::tar2erofs::tar_to_erofs(archives, injected_files)?;
         std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;
         let mut outputs = StageOutputs::default();
         outputs.artifacts.insert("rootfs".into(), out_buf);
         Ok(outputs)
-    }).await.map_err(|e| Error::Artifact(e.to_string()))?
+    })
+    .await
+    .map_err(|e| Error::Artifact(e.to_string()))?
 }
 
 /// Shared logic to take a tar stream, inject the agent and CA, and pack it into erofs.
 #[cfg(not(feature = "am-fs-erofs"))]
 pub async fn pack_erofs_with_injection(
     _tar_streams: Vec<Box<dyn Read + Send>>,
+    _inputs: &StageInputs,
     _out: &Path,
 ) -> Result<StageOutputs> {
     // mkfs.erofs fallback requires extracting the tar to a directory, adding the files,
     // and running mkfs.erofs. We assume am-fs-erofs is used for now.
-    Err(Error::Artifact("am-fs-erofs feature is required for rootfs building".into()))
+    Err(Error::Artifact(
+        "am-fs-erofs feature is required for rootfs building".into(),
+    ))
 }

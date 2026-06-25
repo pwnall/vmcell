@@ -8,6 +8,7 @@ use std::path::PathBuf;
 mod common;
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_snapshot_restore_ch() {
     let ch_binary =
@@ -18,6 +19,7 @@ async fn test_snapshot_restore_ch() {
 
 #[cfg(feature = "firecracker")]
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_snapshot_restore_fc() {
     let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
@@ -26,6 +28,7 @@ async fn test_snapshot_restore_fc() {
 
 #[cfg(feature = "qemu")]
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_snapshot_restore_qemu() {
     let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
@@ -46,31 +49,43 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let snapshot_dir = std::env::temp_dir().join(format!("imp-test-snapshot-restore-{}-{}", std::process::id(), id));
+    let snapshot_dir = std::env::temp_dir().join(format!(
+        "imp-test-snapshot-restore-{}-{}",
+        std::process::id(),
+        id
+    ));
     if snapshot_dir.exists() {
         std::fs::remove_dir_all(&snapshot_dir).unwrap();
     }
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
     // 1. Create a VM and take a snapshot
     {
-        let cfg = VmConfig::builder(
-            kernel.clone(),
-            RootfsSource::Erofs {
-                image: rootfs_image.clone(),
-            },
-        )
-        .network_disabled()
-        .build()
-        .unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        println!("Skipping test: requires root privileges for privileged networking");
+        return;
+    }
+
+    let mut cfg = VmConfig::builder(
+        kernel.clone(),
+        RootfsSource::Erofs {
+            image: rootfs_image.clone(),
+        },
+    )
+    .build()
+    .unwrap();
+    cfg.net = imp_testing::config::NetConfig::Privileged {
+        egress: imp_testing::config::Egress::Open,
+        host_services_port: None,
+    };
 
         let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc.clone())
             .await
             .expect("Failed to start VM");
 
-        let agent = match vm.agent().await {
+        let agent = match vm.agent(None).await {
             Ok(a) => a,
             Err(e) => {
                 let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
@@ -99,6 +114,16 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .parse()
             .unwrap();
 
+        let rng_out = agent
+            .exec(ExecRequest::new(vec![
+                "sh".into(),
+                "-c".into(),
+                "head -c 32 /dev/urandom | base64".into(),
+            ]))
+            .await
+            .unwrap();
+        let pre_rng = String::from_utf8_lossy(&rng_out.stdout).trim().to_string();
+
         let original_cid = vm.instance().guest_cid();
 
         std::fs::create_dir_all(&snapshot_dir).unwrap();
@@ -107,16 +132,19 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .await
             .expect("Failed to create snapshot");
 
+        let original_vsock = vm.instance().vsock_path().to_str().unwrap().to_string();
         vm.shutdown().await.expect("Failed to shutdown VM");
 
         // Write test state so it can be asserted in block 2
         std::fs::write(snapshot_dir.join("pre_mac.txt"), pre_mac).unwrap();
         std::fs::write(snapshot_dir.join("pre_time.txt"), pre_time.to_string()).unwrap();
+        std::fs::write(snapshot_dir.join("pre_rng.txt"), pre_rng).unwrap();
         std::fs::write(
             snapshot_dir.join("original_cid.txt"),
             original_cid.to_string(),
         )
         .unwrap();
+        std::fs::write(snapshot_dir.join("original_vsock.txt"), original_vsock).unwrap();
     }
 
     // Sleep to ensure the host clock advances past the guest's suspended clock
@@ -124,15 +152,18 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     // 2. Restore from snapshot
     {
-        let cfg = VmConfig::builder(
+        let mut cfg = VmConfig::builder(
             kernel.clone(),
             RootfsSource::Erofs {
                 image: rootfs_image.clone(),
             },
         )
-        .network_disabled()
         .build()
         .unwrap();
+        cfg.net = imp_testing::config::NetConfig::Privileged {
+            egress: imp_testing::config::Egress::Open,
+            host_services_port: None,
+        };
 
         let mut vm = TestVm::restore(vmm, &snapshot_dir, cfg, &cid_alloc, vmid_alloc)
             .await
@@ -141,13 +172,14 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         // This implicitly tests vsock reconnect and CID rotation because the agent
         // client connects using the restored VM's newly allocated CID.
         let log_path = vm.instance().serial_log().to_path_buf();
-        let agent_res = vm.agent().await;
+        let agent_res = vm.agent(None).await;
         if agent_res.is_err() {
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
             println!("SERIAL LOG ON ERROR:\n{}", log);
             panic!("Failed to connect to agent: {:?}", agent_res.err().unwrap());
         }
-        let result = agent_res.unwrap()
+        let result = agent_res
+            .unwrap()
             .exec(ExecRequest::new(vec![
                 "echo".to_string(),
                 "restored".to_string(),
@@ -160,8 +192,6 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             panic!("Exec failed. Outcome: {:?}", result);
         }
 
-
-
         let original_cid: u32 = std::fs::read_to_string(snapshot_dir.join("original_cid.txt"))
             .unwrap()
             .parse()
@@ -169,9 +199,17 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         let new_cid = vm.instance().guest_cid();
         assert_ne!(original_cid, new_cid, "CID should be rotated after restore");
 
+        let original_vsock =
+            std::fs::read_to_string(snapshot_dir.join("original_vsock.txt")).unwrap();
+        let new_vsock = vm.instance().vsock_path().to_str().unwrap();
+        assert_ne!(
+            original_vsock, new_vsock,
+            "Vsock path should be rotated after restore"
+        );
+
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();
         let mac_out = vm
-            .agent()
+            .agent(None)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![
@@ -181,19 +219,18 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .await
             .unwrap();
         let post_mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
-        if !pre_mac.is_empty() {
-            assert_ne!(
-                pre_mac, post_mac,
-                "MAC address should be rotated after restore"
-            );
-        }
+        assert!(!pre_mac.is_empty(), "MAC address should not be empty");
+        assert_ne!(
+            pre_mac, post_mac,
+            "MAC address should be rotated after restore"
+        );
 
         let pre_time: i64 = std::fs::read_to_string(snapshot_dir.join("pre_time.txt"))
             .unwrap()
             .parse()
             .unwrap();
         let time_out = vm
-            .agent()
+            .agent(None)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
@@ -208,6 +245,24 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             "Clock should have resynced forward (pre: {}, post: {})",
             pre_time,
             post_time
+        );
+
+        let pre_rng = std::fs::read_to_string(snapshot_dir.join("pre_rng.txt")).unwrap();
+        let rng_out = vm
+            .agent(None)
+            .await
+            .unwrap()
+            .exec(ExecRequest::new(vec![
+                "sh".into(),
+                "-c".into(),
+                "head -c 32 /dev/urandom | base64".into(),
+            ]))
+            .await
+            .unwrap();
+        let post_rng = String::from_utf8_lossy(&rng_out.stdout).trim().to_string();
+        assert_ne!(
+            pre_rng, post_rng,
+            "RNG entropy should be reseeded after restore"
         );
 
         vm.shutdown().await.expect("Failed to shutdown restored VM");

@@ -61,12 +61,12 @@ async fn test_nested_virt_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     cfg.nested_virt = true;
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
 
-    let agent = match vm.agent().await {
+    let agent = match vm.agent(None).await {
         Ok(a) => a,
         Err(e) => {
             use imp_testing::vmm::VmInstance;

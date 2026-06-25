@@ -10,11 +10,20 @@ wildcards = "deny"
 yanked = "deny"
 ignore = [
     "RUSTSEC-2020-0036", # failure is unmaintained
-    "RUSTSEC-2026-0057", "RUSTSEC-2026-0052", "RUSTSEC-2026-0059",
-    "RUSTSEC-2026-0051", "RUSTSEC-2026-0060", "RUSTSEC-2026-0064",
-    "RUSTSEC-2026-0050", "RUSTSEC-2026-0054", "RUSTSEC-2026-0055",
-    "RUSTSEC-2026-0062", "RUSTSEC-2026-0053", "RUSTSEC-2026-0063",
-    "RUSTSEC-2026-0061", "RUSTSEC-2026-0056"
+    "RUSTSEC-2026-0057", # Pending upstream fix
+    "RUSTSEC-2026-0052", # Pending upstream fix
+    "RUSTSEC-2026-0059", # Pending upstream fix
+    "RUSTSEC-2026-0051", # Pending upstream fix
+    "RUSTSEC-2026-0060", # Pending upstream fix
+    "RUSTSEC-2026-0064", # Pending upstream fix
+    "RUSTSEC-2026-0050", # Pending upstream fix
+    "RUSTSEC-2026-0054", # Pending upstream fix
+    "RUSTSEC-2026-0055", # Pending upstream fix
+    "RUSTSEC-2026-0062", # Pending upstream fix
+    "RUSTSEC-2026-0053", # Pending upstream fix
+    "RUSTSEC-2026-0063", # Pending upstream fix
+    "RUSTSEC-2026-0061", # Pending upstream fix
+    "RUSTSEC-2026-0056", # Pending upstream fix
 ]
 
 [sources]

@@ -7,6 +7,7 @@ use tokio::time::{Duration, sleep};
 mod common;
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_metrics_and_limits_ch() {
     let ch_binary =
@@ -17,6 +18,7 @@ async fn test_metrics_and_limits_ch() {
 
 #[cfg(feature = "firecracker")]
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_metrics_and_limits_fc() {
     let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
@@ -25,6 +27,7 @@ async fn test_metrics_and_limits_fc() {
 
 #[cfg(feature = "qemu")]
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_metrics_and_limits_qemu() {
     let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
@@ -53,7 +56,7 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     cfg.limits.mem_max_mib = Some(256);
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
@@ -98,17 +101,27 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     }
 
     // Test CPU average computation
+    let start_time = std::time::Instant::now();
     let cpu_test_outcome = vm
-        .agent()
+        .agent(None)
         .await
         .unwrap()
         .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
             "sh".into(),
             "-c".into(),
-            "timeout 2 md5sum /dev/zero || true".into(),
+            "timeout 2 md5sum /dev/zero".into(),
         ]))
         .await
         .expect("Failed to run cpu load");
+
+    // We used timeout 2, but md5sum /dev/zero will consume 100% of 1 CPU.
+    // If it is killed by timeout, it might exit with 143 or 124 depending on timeout behavior.
+    assert!(
+        cpu_test_outcome.code != 0,
+        "CPU load should be killed by timeout"
+    );
+
+    let elapsed = start_time.elapsed().as_secs_f64();
 
     let stats_after_cpu = vm
         .usage()
@@ -118,33 +131,35 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         let diff_usec = stats_after_cpu
             .cpu_usec
             .saturating_sub(stats_before.cpu_usec);
-        // timeout 2 should consume ~2 seconds of cpu time, so > 1,000,000 usec
+        let cpu_percent = (diff_usec as f64 / 1_000_000.0) / elapsed * 100.0;
+        // The VM has 1 vcpu by default. So max is ~100%.
         assert!(
-            diff_usec > 1_000_000,
-            "CPU usage should have increased by >1s (got {} usec)",
-            diff_usec
+            cpu_percent > 50.0,
+            "CPU usage should be >50% (got {}%, diff {} usec over {}s)",
+            cpu_percent,
+            diff_usec,
+            elapsed
         );
     }
 
     // Test OOM-kill
-    // memory.max is 256 MiB. We try to allocate 300 MiB.
+    // memory.max is 256 MiB.
     let oom_outcome = vm
-        .agent()
+        .agent(None)
         .await
         .unwrap()
         .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
-            "dd".into(),
-            "if=/dev/zero".into(),
-            "of=/dev/shm/bloat".into(),
-            "bs=1M".into(),
-            "count=300".into(),
+            "tail".into(),
+            "/dev/zero".into(),
         ]))
         .await
         .expect("Failed to run memory bloat");
 
-    assert_ne!(
-        oom_outcome.code, 0,
-        "dd should be killed by OOM killer, but exited with 0"
+    assert!(
+        oom_outcome.code == 137 || oom_outcome.code == 137 - 256 || oom_outcome.code == 1 || oom_outcome.code == -1, // sometimes represented as 137, sometimes we just get connection closed, sometimes malloc fails and returns 1
+        "Process should be killed by OOM killer or exit due to ENOMEM, got code {}, stderr: {}",
+        oom_outcome.code,
+        String::from_utf8_lossy(&oom_outcome.stderr)
     );
 
     vm.shutdown().await.expect("Failed to shutdown VM");

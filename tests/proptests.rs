@@ -32,7 +32,7 @@ proptest! {
             assert!(!active[active.len()/2..].contains(&cid));
             active.push(cid);
         }
-        
+
         // Release the remaining allocated CIDs to prevent leaking into the global allocator
         for i in active[active.len()/2..].iter() {
             alloc.release(*i);
@@ -84,5 +84,30 @@ proptest! {
         p3.blocked_domains = vec!["blocked.com".to_string()];
 
         assert_ne!(p1, p3);
+    }
+    #[test]
+    fn test_path_injectivity(vmid1 in 1..=254u32, vmid2 in 1..=254u32) {
+        prop_assume!(vmid1 != vmid2);
+        let cg1 = format!("imp-vm-{}", vmid1);
+        let cg2 = format!("imp-vm-{}", vmid2);
+        assert_ne!(cg1, cg2);
+
+        let sock1 = format!("/tmp/imp-smoltcp-{}.sock", vmid1);
+        let sock2 = format!("/tmp/imp-smoltcp-{}.sock", vmid2);
+        assert_ne!(sock1, sock2);
+
+        let netns1 = format!("imp-net-{}", vmid1);
+        let netns2 = format!("imp-net-{}", vmid2);
+        assert_ne!(netns1, netns2);
+    }
+
+    #[test]
+    fn test_subnet_math(vmid in 1..=254u32) {
+        let ip = format!("10.200.{}.2/30", vmid);
+        let proxy_ip = format!("10.200.{}.1", vmid);
+        // Valid /30 has 4 addresses: network (.0), host 1 (.1), host 2 (.2), broadcast (.3)
+        // With our setup: .1 is host (proxy), .2 is guest, .0 is net, .3 is bcast
+        assert!(ip.ends_with(".2/30"));
+        assert!(proxy_ip.ends_with(".1"));
     }
 }

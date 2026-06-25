@@ -47,14 +47,18 @@ impl HttpHandler for ProxyHandler {
             return RequestOrResponse::Request(req);
         }
 
-        let req_uri = req.uri().to_string();
+        let req_uri = format!("{} {}", req.method(), req.uri());
         if let Ok(mut reqs) = self.requests.lock() {
             reqs.push(req_uri);
         }
 
         if let Ok(path_opt) = self.record_path.lock() {
             if let Some(path) = path_opt.as_ref() {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
                     use std::io::Write;
                     let _ = writeln!(f, "{} {}", req.method(), req.uri());
                 }

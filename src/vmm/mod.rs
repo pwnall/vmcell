@@ -27,7 +27,12 @@ pub use qemu::{Qemu, QemuInstance};
 
 use std::path::{Path, PathBuf};
 
-static GLOBAL_CIDS: std::sync::Mutex<Option<std::collections::BTreeSet<u32>>> = std::sync::Mutex::new(None);
+static GLOBAL_CIDS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
+    std::sync::OnceLock::new();
+
+fn get_cids() -> &'static std::sync::Mutex<std::collections::BTreeSet<u32>> {
+    GLOBAL_CIDS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
 
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
@@ -37,10 +42,8 @@ impl CidAllocator {
     /// Creates a new CID allocator.
     #[must_use]
     pub fn new() -> Self {
-        let mut global = GLOBAL_CIDS.lock().unwrap();
-        if global.is_none() {
-            *global = Some(std::collections::BTreeSet::new());
-        }
+        // Initialize the global CIDs if it hasn't been already.
+        let _ = get_cids();
         Self {}
     }
 }
@@ -55,10 +58,12 @@ impl CidAllocator {
     /// Allocates and returns a unique Context ID (CID) for VSOCK communication.
     ///
     /// # Errors
-    /// Returns an error if all available CIDs are currently in use.
+    /// Returns an error if all 252 guest CIDs are in use.
+    ///
+    /// # Panics
+    /// Panics if the global CID allocator lock is poisoned.
     pub fn allocate(&self) -> Result<u32> {
-        let mut global = GLOBAL_CIDS.lock().unwrap();
-        let active = global.as_mut().unwrap();
+        let mut active = get_cids().lock().expect("mutex poisoned");
         for i in 3..=254 {
             if !active.contains(&i) {
                 active.insert(i);
@@ -71,9 +76,11 @@ impl CidAllocator {
     }
 
     /// Releases a previously allocated CID.
+    ///
+    /// # Panics
+    /// Panics if the global CID allocator lock is poisoned.
     pub fn release(&self, cid: u32) {
-        let mut global = GLOBAL_CIDS.lock().unwrap();
-        let active = global.as_mut().unwrap();
+        let mut active = get_cids().lock().expect("mutex poisoned");
         active.remove(&cid);
     }
 }

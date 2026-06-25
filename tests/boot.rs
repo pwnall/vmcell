@@ -29,7 +29,6 @@ async fn test_boot_qemu() {
 }
 
 async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
-
     let vmlinux = match common::get_vmlinux() {
         Some(p) => p,
         None => {
@@ -48,8 +47,8 @@ async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
-    let vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -73,6 +72,27 @@ async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     }
 
     assert!(booted, "VM failed to boot (did not see expected log line)");
+
+    let agent = vm
+        .agent(Some(std::time::Duration::from_secs(60)))
+        .await
+        .expect("Failed to connect to agent");
+
+    let outcome = agent
+        .exec(imp_testing::agent::ExecRequest::new(vec![
+            "echo".to_string(),
+            "hello from guest".to_string(),
+        ]))
+        .await
+        .expect("exec failed");
+
+    assert_eq!(outcome.code, 0, "exec returned non-zero code");
+    let stdout = String::from_utf8_lossy(&outcome.stdout);
+    assert!(
+        stdout.contains("hello from guest"),
+        "expected stdout to contain 'hello from guest', got: {}",
+        stdout
+    );
 
     vm.shutdown().await.expect("Failed to shutdown VM");
 }

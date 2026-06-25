@@ -13,6 +13,8 @@ use tokio::process::Command;
 pub struct KernelStage {
     /// URL to download the kernel source tarball from.
     pub kernel_source_url: String,
+    /// SHA256 digest of the kernel source tarball.
+    pub kernel_source_sha256: String,
     /// Custom configuration snippet to append to the kernel config.
     pub microvm_config: String,
 }
@@ -23,6 +25,10 @@ use async_trait::async_trait;
 impl Stage for KernelStage {
     fn name(&self) -> &str {
         "kernel"
+    }
+
+    fn out_path(&self, target_dir: &Path) -> std::path::PathBuf {
+        target_dir.join("vmlinux")
     }
 
     fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
@@ -39,14 +45,33 @@ impl Stage for KernelStage {
         let tarball = workdir.join("linux.tar.xz");
 
         if !tarball.exists() {
-            let response = reqwest::get(&self.kernel_source_url).await
+            let response = reqwest::get(&self.kernel_source_url)
+                .await
                 .map_err(|e| Error::Artifact(format!("Failed to download kernel source: {}", e)))?;
             if !response.status().is_success() {
-                return Err(Error::Artifact(format!("Failed to download kernel source: status {}", response.status())));
+                return Err(Error::Artifact(format!(
+                    "Failed to download kernel source: status {}",
+                    response.status()
+                )));
             }
-            let bytes = response.bytes().await
+            let bytes = response
+                .bytes()
+                .await
                 .map_err(|e| Error::Artifact(format!("Failed to read kernel source: {}", e)))?;
             tokio::fs::write(&tarball, bytes).await?;
+        }
+
+        // Verify SHA256 of the tarball
+        let tarball_bytes = tokio::fs::read(&tarball).await?;
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&tarball_bytes);
+        let hash = format!("{:x}", hasher.finalize());
+        if hash != self.kernel_source_sha256 {
+            return Err(Error::Artifact(format!(
+                "Kernel source tarball hash mismatch: expected {}, got {}",
+                self.kernel_source_sha256, hash
+            )));
         }
 
         // We assume we need to extract if the Makefile doesn't exist
@@ -56,23 +81,27 @@ impl Stage for KernelStage {
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let tar_uncompressed_path = workdir_path.join("linux.tar");
                 if !tar_uncompressed_path.exists() {
-                    let mut xz_file = std::fs::File::open(&tarball_path)?;
+                    let xz_file = std::fs::File::open(&tarball_path)?;
                     let mut tar_file = std::fs::File::create(&tar_uncompressed_path)?;
                     lzma_rs::xz_decompress(&mut std::io::BufReader::new(xz_file), &mut tar_file)
                         .map_err(|e| Error::Artifact(format!("Decompression failed: {:?}", e)))?;
                 }
-                
+
                 let tar_file_read = std::fs::File::open(&tar_uncompressed_path)?;
                 let mut archive = tar::Archive::new(tar_file_read);
                 for entry in archive.entries()? {
                     let mut file = entry?;
                     let path = file.path()?.into_owned();
                     let mut components = path.components();
-                    if components.next().is_none() { continue; } // skip first component
+                    if components.next().is_none() {
+                        continue;
+                    } // skip first component
                     let stripped_path: std::path::PathBuf = components.collect();
-                    if stripped_path.as_os_str().is_empty() { continue; }
+                    if stripped_path.as_os_str().is_empty() {
+                        continue;
+                    }
                     let out_path = workdir_path.join(stripped_path);
-                    
+
                     if file.header().entry_type() == tar::EntryType::Directory {
                         std::fs::create_dir_all(&out_path)?;
                     } else {
@@ -82,16 +111,18 @@ impl Stage for KernelStage {
                         file.unpack(&out_path)?;
                     }
                 }
-                
+
                 let _ = std::fs::remove_file(&tar_uncompressed_path);
-                
+
                 Ok(())
-            }).await.unwrap()?;
+            })
+            .await
+            .expect("spawn_blocking failed")?;
         }
 
         let status = Command::new("make")
             .current_dir(&workdir)
-            .arg("HOSTCC=gcc -std=gnu11")
+            .env("HOSTCC", "gcc")
             .arg("defconfig")
             .arg("kvm_guest.config")
             .status()
@@ -111,7 +142,7 @@ impl Stage for KernelStage {
 
         let status = Command::new("make")
             .current_dir(&workdir)
-            .arg("HOSTCC=gcc -std=gnu11")
+            .env("HOSTCC", "gcc")
             .arg("olddefconfig")
             .status()
             .await?;
@@ -124,8 +155,8 @@ impl Stage for KernelStage {
             .unwrap_or(1);
         let status = Command::new("make")
             .current_dir(&workdir)
-            .arg("CC=gcc -std=gnu11")
-            .arg("HOSTCC=gcc -std=gnu11")
+            .env("CC", "gcc")
+            .env("HOSTCC", "gcc")
             .arg("-j")
             .arg(nproc.to_string())
             .arg("vmlinux")
@@ -149,6 +180,7 @@ mod tests {
     fn test_kernel_cache_key() {
         let stage1 = KernelStage {
             kernel_source_url: "https://example.com/kernel".to_string(),
+            kernel_source_sha256: "dummy".to_string(),
             microvm_config: "CONFIG_FOO=y\n".to_string(),
         };
 

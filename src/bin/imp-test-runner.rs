@@ -15,7 +15,7 @@ fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String> {
     // Check if we have the needed caps in the permitted set (file caps method)
     let mut missing = Vec::new();
     for &c in need {
-        if !caps.permitted.has(c) {
+        if !caps.effective.has(c) {
             missing.push(c);
         }
     }
@@ -77,6 +77,8 @@ fn main() {
         }
 
         let gid = rustix::process::getgid();
+        // SAFETY: We are dropping privileges from root to the original user's UID/GID.
+        // This is safe because we immediately exit on failure, and no threads are spawned yet.
         unsafe {
             if libc::setresgid(gid.as_raw(), gid.as_raw(), gid.as_raw()) != 0 {
                 eprintln!("setresgid failed");
@@ -110,13 +112,6 @@ fn main() {
         exit(1);
     }
 
-    for &c in &need {
-        if let Err(e) = capctl::ambient::raise(c) {
-            eprintln!("Failed to raise ambient capability {:?}: {}", c, e);
-            exit(1);
-        }
-    }
-
     let mut to_drop = Vec::new();
     for c in Cap::probe_supported() {
         if !need.contains(&c) {
@@ -125,6 +120,13 @@ fn main() {
     }
     for c in to_drop {
         let _ = capctl::bounding::drop(c);
+    }
+
+    for &c in &need {
+        if let Err(e) = capctl::ambient::raise(c) {
+            eprintln!("Failed to raise ambient capability {:?}: {}", c, e);
+            exit(1);
+        }
     }
 
     let err = Command::new(target).args(&args[2..]).exec();

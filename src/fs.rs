@@ -46,7 +46,7 @@ impl VirtioFsDaemon {
             .arg("--shared-dir")
             .arg(&share.host_path)
             .arg(cache_arg)
-            .arg("--sandbox=namespace");
+            .arg("--sandbox=none");
 
         if let Access::ReadOnly = share.access {
             cmd.arg("--readonly");
@@ -83,9 +83,15 @@ impl VirtioFsDaemon {
         }
         if !ready {
             let _ = process.start_kill();
-            return Err(crate::error::Error::Subprocess(
-                "virtiofsd failed to create socket".to_string(),
-            ));
+            let mut stderr = String::new();
+            if let Some(mut err_stream) = process.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let _ = err_stream.read_to_string(&mut stderr).await;
+            }
+            return Err(crate::error::Error::Subprocess(format!(
+                "virtiofsd failed to create socket: {}",
+                stderr.trim()
+            )));
         }
 
         Ok(Self {

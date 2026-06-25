@@ -184,7 +184,7 @@ pub mod backend {
             }
 
             let mut vring_state = match device_event {
-                HIPRIO_QUEUE_EVENT => vrings.get(0).expect("invariant").get_mut(),
+                HIPRIO_QUEUE_EVENT => vrings.first().expect("invariant").get_mut(),
                 REQ_QUEUE_EVENT => vrings.get(1).expect("invariant").get_mut(),
                 _ => {
                     return Err(std::io::Error::other("HandleEventUnknownEvent"));
@@ -228,9 +228,9 @@ pub mod backend {
         // so we must handle it manually or acknowledge it.
         // TODO: Enforce read_only flag inside the VFS layer or via bind mounts.
         if read_only {
-            tracing::warn!(
-                "Read-only mode requested but in-process virtiofsd does not fully support it natively yet."
-            );
+            return Err(std::io::Error::other(
+                "Read-only mode requested but in-process virtiofsd does not fully support it natively yet.",
+            ));
         }
 
         let cfg = Config {
@@ -251,7 +251,7 @@ pub mod backend {
 
         let socket_path_str = socket_path.to_string_lossy().into_owned();
         let handle = std::thread::spawn(move || {
-            tracing::error!(
+            tracing::info!(
                 "in-process virtiofsd: thread started, listening on {:?}",
                 socket_path_str
             );

@@ -25,6 +25,11 @@ pub trait Netlink: Send + Sync {
     /// # Errors
     /// Returns an error if deleting the namespace fails.
     fn delete_netns(&self, name: &str) -> Result<()>;
+    /// Sets up TPROXY routing policy in the namespace.
+    ///
+    /// # Errors
+    /// Returns an error if applying the ip commands fails.
+    fn setup_tproxy_routing(&self, netns: &str) -> Result<()>;
 }
 
 /// Interface for applying nftables rules.
@@ -57,6 +62,7 @@ impl Netlink for RtNetlink {
             .map_err(|e| Error::Network(format!("tap create fail: {}", e)))?;
 
         let tap_name = tap_name.to_string();
+        assert!(vmid <= 254, "vmid must be <= 254 for network configuration");
         let ip: Ipv4Addr = format!("10.200.{}.1", vmid)
             .parse()
             .map_err(|e| Error::Network(format!("invalid IP: {}", e)))?;
@@ -137,6 +143,28 @@ impl Netlink for RtNetlink {
             .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
         ns.remove()
             .map_err(|e| Error::Network(format!("netns remove failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn setup_tproxy_routing(&self, netns: &str) -> Result<()> {
+        let ns = netns_rs::NetNs::get(netns)
+            .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
+        let inner_res = ns
+            .run(|_| {
+                let _ = std::process::Command::new("ip")
+                    .args(["rule", "add", "fwmark", "1", "lookup", "100"])
+                    .status();
+                let _ = std::process::Command::new("ip")
+                    .args([
+                        "route", "add", "local", "default", "dev", "lo", "table", "100",
+                    ])
+                    .status();
+                Ok::<(), String>(())
+            })
+            .map_err(|e| Error::Network(format!("ns run err: {:?}", e)))?;
+        if let Err(e) = inner_res {
+            return Err(Error::Network(format!("ip rule add err: {}", e)));
+        }
         Ok(())
     }
 }
@@ -227,7 +255,11 @@ impl NetNamespace {
     }
 
     /// Returns the host IP address in this namespace.
+    ///
+    /// # Panics
+    /// Panics if `vmid` > 254.
     pub fn host_ip(&self) -> String {
+        assert!(self.vmid <= 254, "vmid must be <= 254 for host_ip");
         format!("10.200.{}.1", self.vmid)
     }
 
@@ -250,7 +282,9 @@ impl NetNamespace {
     /// Returns an error if the nftables rules fail to apply.
     pub fn emit_proxy_rules(&self, proxy_port: u16, applier: &dyn NftApplier) -> Result<()> {
         let rules = self.render_tproxy_rules(proxy_port);
-        applier.apply_rules(&self.name, &rules)
+        applier.apply_rules(&self.name, &rules)?;
+        self.netlink.setup_tproxy_routing(&self.name)?;
+        Ok(())
     }
 }
 
@@ -279,6 +313,9 @@ mod tests {
             Ok(None)
         }
         fn delete_netns(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn setup_tproxy_routing(&self, _netns: &str) -> Result<()> {
             Ok(())
         }
     }

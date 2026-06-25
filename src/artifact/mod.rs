@@ -4,10 +4,16 @@
 //! virtual machines, such as the kernel, root filesystem, and snapshots.
 
 use crate::error::Result;
+#[cfg(feature = "pipeline")]
+/// Guest agent building stage.
+pub mod guest_agent;
+#[cfg(feature = "pipeline")]
 /// Kernel building stage.
 pub mod kernel;
+#[cfg(feature = "pipeline")]
 /// Root filesystem building stage.
 pub mod rootfs;
+#[cfg(feature = "pipeline")]
 /// Snapshot building stage.
 pub mod snapshot;
 /// Tar to EROFS conversion utility.
@@ -44,6 +50,8 @@ pub trait Stage: Send + Sync {
     fn name(&self) -> &str;
     /// Computes a cache key based on the stage configuration and inputs.
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey;
+    /// Returns the target path for the artifact.
+    fn out_path(&self, target_dir: &Path) -> PathBuf;
     /// Executes the stage, building the output artifact at the given path.
     ///
     /// # Errors
@@ -56,7 +64,10 @@ pub trait Stage: Send + Sync {
 pub struct Cache {}
 /// Artifacts resulting from a pipeline build.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Artifacts {}
+pub struct Artifacts {
+    /// A mapping from artifact name to its location on disk.
+    pub paths: std::collections::HashMap<String, PathBuf>,
+}
 
 /// A pipeline of stages to build all necessary test VM artifacts.
 pub struct Pipeline {
@@ -87,13 +98,7 @@ impl Pipeline {
         let mut inputs = StageInputs::default();
 
         for stage in &self.stages {
-            let out_path = if stage.name() == "kernel" {
-                dir.join("vmlinux")
-            } else if stage.name() == "rootfs" {
-                dir.join("rootfs.erofs")
-            } else {
-                dir.join(stage.name())
-            };
+            let out_path = stage.out_path(dir);
 
             let key = stage.cache_key(&inputs);
             let key_path = out_path.with_extension("cache_key");
@@ -109,9 +114,10 @@ impl Pipeline {
 
             if cached {
                 tracing::info!("Skipping stage {} (cached)", stage.name());
+                inputs.artifacts.insert(stage.name().to_string(), out_path);
             } else {
                 tracing::info!("Running stage {}", stage.name());
-                let _outputs = stage.run(&inputs, &out_path).await?;
+                let outputs = stage.run(&inputs, &out_path).await?;
                 if let Err(e) = std::fs::write(&key_path, &key.0) {
                     tracing::warn!(
                         "Failed to write cache key for stage {}: {}",
@@ -119,12 +125,15 @@ impl Pipeline {
                         e
                     );
                 }
+                for (k, v) in outputs.artifacts {
+                    inputs.artifacts.insert(k, v);
+                }
             }
-
-            inputs.artifacts.insert(stage.name().to_string(), out_path);
         }
 
-        Ok(Artifacts {})
+        Ok(Artifacts {
+            paths: inputs.artifacts,
+        })
     }
 
     /// Resets the pipeline to run a specific stage again.
@@ -139,13 +148,7 @@ impl Pipeline {
                 found = true;
             }
             if found {
-                let out_path = if s.name() == "kernel" {
-                    dir.join("vmlinux")
-                } else if s.name() == "rootfs" {
-                    dir.join("rootfs.erofs")
-                } else {
-                    dir.join(s.name())
-                };
+                let out_path = s.out_path(dir);
                 let key_path = out_path.with_extension("cache_key");
                 if out_path.exists() {
                     let _ = std::fs::remove_file(&out_path);
@@ -154,6 +157,12 @@ impl Pipeline {
                     let _ = std::fs::remove_file(&key_path);
                 }
             }
+        }
+        if !found {
+            return Err(crate::error::Error::Artifact(format!(
+                "Stage not found: {}",
+                stage
+            )));
         }
         Ok(())
     }

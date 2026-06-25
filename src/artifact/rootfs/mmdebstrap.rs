@@ -1,14 +1,17 @@
-use crate::error::{Error, Result};
-use crate::artifact::{StageInputs, StageOutputs};
-use crate::config::{VmConfig, RootfsSource, Share, Access, CachePolicy, NetConfig, Egress};
-use crate::vmm::{CidAllocator, cloud_hypervisor::CloudHypervisor};
-use crate::orchestrator::{TestVm, VmidAllocator};
 use crate::agent::ExecRequest;
+use crate::artifact::{StageInputs, StageOutputs};
+use crate::config::{Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig};
+use crate::error::{Error, Result};
+use crate::orchestrator::{TestVm, VmidAllocator};
+use crate::vmm::{CidAllocator, cloud_hypervisor::CloudHypervisor};
 use std::path::Path;
-use std::sync::Arc;
+
 use std::time::Duration;
 
 /// Builds a root filesystem using mmdebstrap inside a builder micro-VM.
+///
+/// # Errors
+/// Returns an error if the VM boot or mmdebstrap process fails.
 pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
     let vmlinux_path = inputs
         .artifacts
@@ -20,13 +23,19 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
 
     // 1. Build builder rootfs using OCI source
     tracing::info!("Building builder VM rootfs...");
-    super::oci::build_rootfs("docker.io/library/debian", "trixie-slim", &builder_rootfs_path).await?;
+    super::oci::build_rootfs(
+        "docker.io/library/debian",
+        "sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1",
+        inputs,
+        &builder_rootfs_path,
+    )
+    .await?;
 
     // 2. Start builder VM
     let ch_bin = std::env::var("IMP_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
     let vmm = CloudHypervisor::new(ch_bin);
     let cid_alloc = CidAllocator::new();
-    let vmid_alloc = Arc::new(VmidAllocator::new());
+    let vmid_alloc = VmidAllocator::new();
 
     let host_out_dir = tempfile::TempDir::new().map_err(Error::Io)?;
     let share = Share::new(
@@ -55,7 +64,7 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
     // Use a helper scope to ensure vm is shutdown on error
     let build_res = async {
         tracing::info!("Connecting to builder VM agent...");
-        let agent = vm.agent().await?;
+        let agent = vm.agent(None).await?;
 
         // 3. Install mmdebstrap in VM
         tracing::info!("Installing mmdebstrap inside builder VM...");
@@ -134,11 +143,13 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
     // 5. Pack target EROFS from the generated tarball
     let tar_path = host_out_dir.path().join("rootfs.tar");
     if !tar_path.exists() {
-        return Err(Error::Artifact("mmdebstrap succeeded but rootfs.tar is missing".into()));
+        return Err(Error::Artifact(
+            "mmdebstrap succeeded but rootfs.tar is missing".into(),
+        ));
     }
 
     let tar_file = std::fs::File::open(&tar_path).map_err(Error::Io)?;
     let tar_stream: Box<dyn std::io::Read + Send> = Box::new(tar_file);
 
-    super::pack_erofs_with_injection(vec![tar_stream], out).await
+    super::pack_erofs_with_injection(vec![tar_stream], inputs, out).await
 }

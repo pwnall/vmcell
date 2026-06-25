@@ -24,29 +24,35 @@ impl Stage for SnapshotStage {
         "snapshot"
     }
 
-    fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (k, v) in &inputs.artifacts {
-            std::hash::Hash::hash(k, &mut hasher);
-            std::hash::Hash::hash(&v.to_string_lossy(), &mut hasher);
-        }
-        use std::hash::Hasher;
-        CacheKey(format!("snapshot-{:x}", hasher.finish()))
+    fn out_path(&self, target_dir: &Path) -> std::path::PathBuf {
+        target_dir.join("snapshot")
     }
 
-    async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
-        let kernel = std::path::PathBuf::from(
-            std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/vmlinux".into()),
-        );
-        let rootfs_image = std::path::PathBuf::from(
-            std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/rootfs.ext4".into()),
-        );
+    fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+        let mut hasher = blake3::Hasher::new();
+        for (k, v) in &inputs.artifacts {
+            hasher.update(k.as_bytes());
+            hasher.update(v.to_string_lossy().as_bytes());
+        }
+        CacheKey(format!("snapshot-{}", hasher.finalize().to_hex()))
+    }
+
+    async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        let kernel = inputs
+            .artifacts
+            .get("kernel")
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/vmlinux"));
+        let rootfs_image = inputs
+            .artifacts
+            .get("rootfs")
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/rootfs.erofs"));
 
         let cfg = VmConfig::builder(
             kernel,
-            RootfsSource::Block {
+            RootfsSource::Erofs {
                 image: rootfs_image,
-                overlay: None,
             },
         )
         .network_disabled()
@@ -58,11 +64,11 @@ impl Stage for SnapshotStage {
         let vmm = CloudHypervisor::new(ch_binary);
 
         let cid_alloc = crate::vmm::CidAllocator::new();
-        let vmid_alloc = std::sync::Arc::new(crate::orchestrator::VmidAllocator::new());
+        let vmid_alloc = crate::orchestrator::VmidAllocator::new();
         let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await?;
 
         // Wait for VM to boot fully via vsock agent
-        let agent = vm.agent().await?;
+        let agent = vm.agent(None).await?;
         let _ = agent
             .exec(ExecRequest::new(vec!["true".to_string()]))
             .await?;

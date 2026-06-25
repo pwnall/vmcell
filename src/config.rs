@@ -171,7 +171,7 @@ impl PartialEq for ProxyConfig {
 impl Eq for ProxyConfig {}
 
 /// Resource limits enforced via cgroup v2.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResourceLimits {
     /// Maximum memory in MiB (`memory.max`).
@@ -218,6 +218,8 @@ impl VmConfig {
 }
 
 /// A builder for constructing a `VmConfig`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct VmConfigBuilder {
     kernel: PathBuf,
     rootfs: RootfsSource,

@@ -316,6 +316,10 @@ impl Vmm for CloudHypervisor {
                         res.vmid
                     );
                     if !matches!(cfg.net, crate::config::NetConfig::None) {
+                        assert!(
+                            res.vmid <= 254,
+                            "vmid must be <= 254 for network configuration"
+                        );
                         s.push_str(&format!(
                             " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
                             res.vmid, res.vmid
@@ -349,6 +353,7 @@ impl Vmm for CloudHypervisor {
                 vhost_socket: None,
             });
         } else if let Some(socket) = &res.vhost_user_socket {
+            assert!(res.vmid <= 254, "vmid must be <= 254 for MAC configuration");
             ch_cfg.net.push(ChNet {
                 tap: None,
                 mac: Some(format!(

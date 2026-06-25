@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
-    /// Hello handshake from the guest.
+    /// Reserved for backwards compatibility with older guest agents.
     Hello,
     /// Agent is ready to accept commands.
     Ready,
@@ -67,6 +67,12 @@ impl ExecRequest {
     /// Sets the working directory.
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Sets the timeout for the request.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 }
@@ -142,17 +148,17 @@ mod tests {
 
     #[test]
     fn test_framing_multiple_messages() {
-        let msg1 = Message::Hello;
-        let msg2 = Message::Ready;
+        let msg1 = Message::Ready;
+        let msg2 = Message::Ping;
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&postcard::to_stdvec(&msg1).unwrap());
         bytes.extend_from_slice(&postcard::to_stdvec(&msg2).unwrap());
 
         let (decoded1, rest) = postcard::take_from_bytes::<Message>(&bytes).unwrap();
-        assert_eq!(decoded1, Message::Hello);
+        assert_eq!(decoded1, Message::Ready);
         let (decoded2, rest2) = postcard::take_from_bytes::<Message>(rest).unwrap();
-        assert_eq!(decoded2, Message::Ready);
+        assert_eq!(decoded2, Message::Ping);
         assert!(rest2.is_empty());
     }
 
@@ -174,7 +180,14 @@ mod tests {
                 any::<Option<String>>(),
                 any::<Option<std::time::Duration>>()
             )
-                .prop_map(|(argv, env, cwd, timeout)| { Message::Exec(ExecRequest { argv, env, cwd, timeout }) }),
+                .prop_map(|(argv, env, cwd, timeout)| {
+                    Message::Exec(ExecRequest {
+                        argv,
+                        env,
+                        cwd,
+                        timeout,
+                    })
+                }),
         ]
     }
 

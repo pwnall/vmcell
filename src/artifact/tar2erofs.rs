@@ -21,7 +21,12 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
 
     // Inject extra files
     for (dest_path, src_path) in injected_files {
-        let content = std::fs::read(src_path).map_err(|e| crate::error::Error::Artifact(format!("Failed to read injected file {:?}: {}", src_path, e)))?;
+        let content = std::fs::read(src_path).map_err(|e| {
+            crate::error::Error::Artifact(format!(
+                "Failed to read injected file {:?}: {}",
+                src_path, e
+            ))
+        })?;
         let meta = NodeMeta {
             uid: 0,
             gid: 0,
@@ -43,115 +48,116 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
             .entries()
             .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
         {
-        let mut file = file.map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
-        let path = file
-            .path()
-            .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
-            .into_owned();
+            let mut file = file.map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+            let path = file
+                .path()
+                .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+                .into_owned();
 
-        let meta = NodeMeta {
-            uid: file.header().uid().unwrap_or(0) as u32,
-            gid: file.header().gid().unwrap_or(0) as u32,
-            mtime: file.header().mtime().unwrap_or(0),
-            mtime_nsec: 0,
-        };
+            let meta = NodeMeta {
+                uid: file.header().uid().unwrap_or(0) as u32,
+                gid: file.header().gid().unwrap_or(0) as u32,
+                mtime: file.header().mtime().unwrap_or(0),
+                mtime_nsec: 0,
+            };
 
-        let mode = file.header().mode().unwrap_or(0) as u16;
+            let mode = file.header().mode().unwrap_or(0) as u16;
 
-        let node = match file.header().entry_type() {
-            tar::EntryType::Regular => {
-                let mut data = Vec::new();
-                file.read_to_end(&mut data)
-                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
-                Node::File {
-                    mode: mode | fs_erofs::inode::S_IFREG,
-                    data,
+            let node = match file.header().entry_type() {
+                tar::EntryType::Regular => {
+                    let mut data = Vec::new();
+                    file.read_to_end(&mut data)
+                        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+                    Node::File {
+                        mode: mode | fs_erofs::inode::S_IFREG,
+                        data,
+                        meta,
+                        xattrs: vec![],
+                    }
+                }
+                tar::EntryType::Directory => Node::Dir {
+                    mode: mode | fs_erofs::inode::S_IFDIR,
+                    entries: BTreeMap::new(),
                     meta,
                     xattrs: vec![],
+                },
+                tar::EntryType::Symlink => {
+                    let target = file
+                        .link_name()
+                        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    Node::Symlink {
+                        mode: mode | fs_erofs::inode::S_IFLNK,
+                        target,
+                        meta,
+                        xattrs: vec![],
+                    }
                 }
-            }
-            tar::EntryType::Directory => Node::Dir {
-                mode: mode | fs_erofs::inode::S_IFDIR,
-                entries: BTreeMap::new(),
-                meta,
-                xattrs: vec![],
-            },
-            tar::EntryType::Symlink => {
-                let target = file
-                    .link_name()
-                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                Node::Symlink {
-                    mode: mode | fs_erofs::inode::S_IFLNK,
-                    target,
+                tar::EntryType::Char => {
+                    let major = file
+                        .header()
+                        .device_major()
+                        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+                        .unwrap_or(0);
+                    let minor = file
+                        .header()
+                        .device_minor()
+                        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+                        .unwrap_or(0);
+                    Node::Device {
+                        mode: mode | fs_erofs::inode::S_IFCHR,
+                        rdev: (major << 8) | minor,
+                        meta,
+                        xattrs: vec![],
+                    }
+                }
+                tar::EntryType::Block => {
+                    let major = file
+                        .header()
+                        .device_major()
+                        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+                        .unwrap_or(0);
+                    let minor = file
+                        .header()
+                        .device_minor()
+                        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+                        .unwrap_or(0);
+                    Node::Device {
+                        mode: mode | fs_erofs::inode::S_IFBLK,
+                        rdev: (major << 8) | minor,
+                        meta,
+                        xattrs: vec![],
+                    }
+                }
+                tar::EntryType::Fifo => Node::Special {
+                    mode: mode | fs_erofs::inode::S_IFIFO,
                     meta,
                     xattrs: vec![],
-                }
-            }
-            tar::EntryType::Char => {
-                let major = file
-                    .header()
-                    .device_major()
-                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
-                    .unwrap_or(0);
-                let minor = file
-                    .header()
-                    .device_minor()
-                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
-                    .unwrap_or(0);
-                Node::Device {
-                    mode: mode | fs_erofs::inode::S_IFCHR,
-                    rdev: (major << 8) | minor,
-                    meta,
-                    xattrs: vec![],
-                }
-            }
-            tar::EntryType::Block => {
-                let major = file
-                    .header()
-                    .device_major()
-                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
-                    .unwrap_or(0);
-                let minor = file
-                    .header()
-                    .device_minor()
-                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
-                    .unwrap_or(0);
-                Node::Device {
-                    mode: mode | fs_erofs::inode::S_IFBLK,
-                    rdev: (major << 8) | minor,
-                    meta,
-                    xattrs: vec![],
-                }
-            }
-            tar::EntryType::Fifo => Node::Special {
-                mode: mode | fs_erofs::inode::S_IFIFO,
-                meta,
-                xattrs: vec![],
-            },
-            _ => continue,
-        };
+                },
+                _ => continue,
+            };
 
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-        if file_name.starts_with(".wh.") {
-            if file_name == ".wh..wh..opq" {
-                let parent = path.parent().unwrap_or(Path::new(""));
-                let parent_normalized = normalize_path(parent);
-                entries.retain(|k, _| !k.starts_with(&parent_normalized) || k == &parent_normalized);
-            } else {
-                let target_name = &file_name[4..];
-                let target_path = path.parent().unwrap_or(Path::new("")).join(target_name);
-                let target_normalized = normalize_path(&target_path);
-                entries.retain(|k, _| !k.starts_with(&target_normalized));
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+            if let Some(target_name) = file_name.strip_prefix(".wh.") {
+                if file_name == ".wh..wh..opq" {
+                    let parent = path.parent().unwrap_or(Path::new(""));
+                    let parent_normalized = normalize_path(parent);
+                    entries.retain(|k, _| {
+                        !k.starts_with(&parent_normalized) || k == &parent_normalized
+                    });
+                } else {
+                    let target_path = path.parent().unwrap_or(Path::new("")).join(target_name);
+                    let target_normalized = normalize_path(&target_path);
+                    entries.retain(|k, _| !k.starts_with(&target_normalized));
+                }
+                continue;
             }
-            continue;
+
+            let normalized_path = normalize_path(&path);
+            entries.insert(normalized_path, node);
         }
-
-        let normalized_path = normalize_path(&path);
-        entries.insert(normalized_path, node);
-    }
     }
 
     // Ensure all parent directories exist
@@ -268,7 +274,11 @@ mod tests {
         let reader = std::io::Cursor::new(tar_data);
         let archive = tar::Archive::new(reader);
         let image = tar_to_erofs(vec![archive], vec![]);
-        assert!(image.is_ok(), "Failed to convert empty tar to EROFS: {:?}", image.err());
+        assert!(
+            image.is_ok(),
+            "Failed to convert empty tar to EROFS: {:?}",
+            image.err()
+        );
         let bytes = image.unwrap();
         assert!(!bytes.is_empty(), "EROFS image bytes should not be empty");
     }

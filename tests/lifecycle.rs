@@ -44,7 +44,7 @@ async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
@@ -68,9 +68,9 @@ async fn test_lifecycle_fake_vmm() {
     .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
-    let vm = TestVm::start(&fake, cfg, &cid_alloc, vmid_alloc)
+    let vm = TestVm::start(&fake, cfg.clone(), &cid_alloc, vmid_alloc.clone())
         .await
         .expect("Failed to start fake VM");
 
@@ -91,4 +91,80 @@ async fn test_lifecycle_fake_vmm() {
         assert_eq!(calls[2], "request_shutdown");
         assert_eq!(calls[3], "kill");
     }
+
+    // Now test restore
+    let restore_vm = TestVm::restore(
+        &fake,
+        std::path::Path::new("/fake/snap"),
+        cfg.clone(),
+        &cid_alloc,
+        vmid_alloc.clone(),
+    )
+    .await
+    .expect("Failed to restore fake VM");
+
+    {
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls[4], "restore");
+        assert_eq!(calls[5], "resume");
+    }
+
+    restore_vm.shutdown().await.expect("Failed to shutdown");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore]
+async fn test_lifecycle_panic_residue_ch() {
+    let vmm = CloudHypervisor::new(common::ch_bin());
+    let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
+    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
+
+    if !vmlinux.exists() || !rootfs.exists() {
+        println!("Artifacts not found, skipping panic residue test");
+        return;
+    }
+
+    let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
+        .build()
+        .unwrap();
+    cfg.net = imp_testing::config::NetConfig::Rootless {
+        egress: imp_testing::config::Egress::Open,
+        host_services_port: None,
+    };
+
+    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+
+    let vmid = {
+        let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc)
+            .await
+            .expect("Failed to start VM");
+
+        let vmid = vm.vmid();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("simulate panic inside scope");
+        }));
+
+        // Scope ends, TestVm is dropped
+        vmid
+    };
+
+    // Give drop handlers a moment
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Check socket file
+    let sock_path = format!("/tmp/imp-smoltcp-{}.sock", vmid);
+    assert!(
+        !std::path::Path::new(&sock_path).exists(),
+        "Socket file should be cleaned up"
+    );
+
+    // Check cgroup
+    let cg_path = format!("/sys/fs/cgroup/imp-vm-{}", vmid);
+    assert!(
+        !std::path::Path::new(&cg_path).exists(),
+        "Cgroup should be cleaned up"
+    );
 }

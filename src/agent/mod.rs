@@ -15,7 +15,7 @@ use futures::{SinkExt, StreamExt};
 #[cfg(feature = "host-common")]
 use std::path::Path;
 #[cfg(feature = "host-common")]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 #[cfg(feature = "host-common")]
 use tokio::net::UnixStream;
 #[cfg(feature = "host-common")]
@@ -60,7 +60,7 @@ impl AgentClient {
 
             // Watch serial log for kernel panic
             if serial_log.exists() {
-                if let Ok(log_content) = std::fs::read_to_string(serial_log) {
+                if let Ok(log_content) = tokio::fs::read_to_string(serial_log).await {
                     if log_content.contains("Kernel panic")
                         || log_content.contains("panicked at")
                         || log_content.contains("panic - not syncing")
@@ -72,7 +72,8 @@ impl AgentClient {
 
             let mut stream = match UnixStream::connect(vsock_path).await {
                 Ok(s) => s,
-                Err(_) => {
+                Err(e) => {
+                    tracing::trace!("Agent connect UnixStream::connect failed: {}", e);
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, std::time::Duration::from_millis(500));
                     continue;
@@ -80,7 +81,8 @@ impl AgentClient {
             };
 
             let connect_msg = format!("CONNECT {}\n", port);
-            if stream.write_all(connect_msg.as_bytes()).await.is_err() {
+            if let Err(e) = stream.write_all(connect_msg.as_bytes()).await {
+                tracing::trace!("Agent connect write_all failed: {}", e);
                 continue;
             }
 
@@ -89,7 +91,12 @@ impl AgentClient {
             loop {
                 let mut byte = [0; 1];
                 use tokio::io::AsyncReadExt;
-                if let Ok(Ok(1)) = tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut byte)).await {
+                if let Ok(Ok(1)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    stream.read(&mut byte),
+                )
+                .await
+                {
                     resp.push(byte[0] as char);
                     if byte[0] == b'\n' {
                         ok = resp.starts_with("OK ");
@@ -100,27 +107,37 @@ impl AgentClient {
                 }
             }
             if !ok {
+                tracing::trace!("Agent connect failed! resp was: {:?}", resp);
                 tokio::time::sleep(backoff).await;
                 continue;
             }
 
             let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
 
-            let ready = match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
-                .await
-            {
+            let ready_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await;
+            let ready = match ready_result {
                 Ok(Some(Ok(bytes))) => bytes,
-                _ => continue,
+                other => {
+                    tracing::trace!("Agent connect framed.next() returned: {:?}", other);
+                    continue;
+                }
             };
 
             let msg: Message = match postcard::from_bytes(&ready) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::trace!("Agent connect postcard error: {:?}, bytes: {:?}", e, ready);
+                    continue;
+                }
             };
 
             match msg {
                 Message::Ready => return Ok(Self { stream: framed }),
-                _ => continue,
+                other => {
+                    tracing::trace!("Agent connect received unexpected message: {:?}", other);
+                    continue;
+                }
             }
         }
     }
@@ -129,8 +146,14 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns an error if the connection fails or times out.
-    pub async fn reconnect(&mut self, vsock_path: &Path, port: u32, serial_log: &Path) -> Result<()> {
-        let new_client = Self::connect(vsock_path, port, std::time::Duration::from_secs(10), serial_log).await?;
+    pub async fn reconnect(
+        &mut self,
+        vsock_path: &Path,
+        port: u32,
+        serial_log: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let new_client = Self::connect(vsock_path, port, timeout, serial_log).await?;
         self.stream = new_client.stream;
         Ok(())
     }
@@ -182,35 +205,43 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns an error if the file transfer fails.
-    pub async fn put_file(&mut self, dst: &str, bytes: &[u8]) -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let msg = Message::PutFile {
-                dst: dst.to_string(),
-                bytes: bytes.to_vec(),
-            };
-            let msg_bytes =
-                postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
-            self.stream
-                .send(::bytes::Bytes::from(msg_bytes))
-                .await
-                .map_err(Error::Io)?;
+    pub async fn put_file(
+        &mut self,
+        dst: &str,
+        bytes: &[u8],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        tokio::time::timeout(
+            timeout.unwrap_or(std::time::Duration::from_secs(10)),
+            async {
+                let msg = Message::PutFile {
+                    dst: dst.to_string(),
+                    bytes: bytes.to_vec(),
+                };
+                let msg_bytes =
+                    postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
+                self.stream
+                    .send(::bytes::Bytes::from(msg_bytes))
+                    .await
+                    .map_err(Error::Io)?;
 
-            // Wait for ack
-            if let Some(res) = self.stream.next().await {
-                let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
-                let resp_msg: Message = postcard::from_bytes(&res_bytes)
-                    .map_err(|e| Error::Serialize(e.to_string()))?;
-                match resp_msg {
-                    Message::Exit(0) => Ok(()),
-                    Message::Exit(c) => {
-                        Err(Error::Agent(format!("put_file failed with code {}", c)))
+                // Wait for ack
+                if let Some(res) = self.stream.next().await {
+                    let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
+                    let resp_msg: Message = postcard::from_bytes(&res_bytes)
+                        .map_err(|e| Error::Serialize(e.to_string()))?;
+                    match resp_msg {
+                        Message::Exit(0) => Ok(()),
+                        Message::Exit(c) => {
+                            Err(Error::Agent(format!("put_file failed with code {}", c)))
+                        }
+                        _ => Err(Error::Agent("unexpected response to put_file".into())),
                     }
-                    _ => Err(Error::Agent("unexpected response to put_file".into())),
+                } else {
+                    Err(Error::Agent("connection closed during put_file".into()))
                 }
-            } else {
-                Err(Error::Agent("connection closed during put_file".into()))
-            }
-        })
+            },
+        )
         .await
         .map_err(|_| Error::Timeout("put_file timed out".into()))?
     }

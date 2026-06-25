@@ -15,13 +15,6 @@ pub enum Error {
     /// A general VMM error.
     #[error("VMM error: {0}")]
     Vmm(String),
-    /// A subprocess execution error specifically for the VMM.
-    #[error("VMM spawn error: {source}")]
-    VmmSpawn {
-        /// The underlying IO error.
-        #[source]
-        source: std::io::Error,
-    },
     /// An error related to the guest agent.
     #[error("Agent error: {0}")]
     Agent(String),
@@ -43,9 +36,25 @@ pub enum Error {
     /// A timeout error.
     #[error("Timeout error: {0}")]
     Timeout(String),
-    /// An error related to serialization/deserialization (e.g. JSON, Postcard).
+    /// A custom serialization/deserialization error string.
     #[error("Serialization error: {0}")]
     Serialize(String),
+    /// A JSON serialization error.
+    #[cfg(any(
+        feature = "cloud-hypervisor",
+        feature = "firecracker",
+        feature = "qemu",
+        feature = "cli"
+    ))]
+    #[error("JSON error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+    /// A Postcard serialization error.
+    #[error("Postcard error: {0}")]
+    Postcard(#[from] postcard::Error),
+    /// A Reqwest HTTP error.
+    #[cfg(feature = "pipeline")]
+    #[error("HTTP error: {0}")]
+    Reqwest(#[from] reqwest::Error),
     /// A subprocess execution error.
     #[error("Subprocess error: {0}")]
     Subprocess(String),

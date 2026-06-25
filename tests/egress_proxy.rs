@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod common;
 
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_egress_proxy_ch() {
     let vmm = CloudHypervisor::new(common::ch_bin());
@@ -18,6 +19,7 @@ async fn test_egress_proxy_ch() {
 
 #[cfg(feature = "firecracker")]
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_egress_proxy_fc() {
     let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
@@ -30,6 +32,7 @@ async fn test_egress_proxy_fc() {
 
 #[cfg(feature = "qemu")]
 #[tokio::test]
+#[serial_test::serial]
 #[ignore]
 async fn test_egress_proxy_qemu() {
     let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
@@ -67,12 +70,31 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         }),
     }]));
 
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(9000);
+    let host_port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let python_server = std::process::Command::new("python3")
+        .arg("-m")
+        .arg("http.server")
+        .arg(host_port.to_string())
+        .spawn()
+        .unwrap();
+
+    struct Cleanup(std::process::Child);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _cleanup = Cleanup(python_server);
+
     cfg.net = imp_testing::config::NetConfig::Rootless {
         egress: Egress::Filtered(proxy_cfg),
-        host_services_port: None,
+        host_services_port: Some(host_port),
     };
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");
@@ -81,10 +103,8 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let vmid = vm.vmid();
 
     println!("Connecting agent...");
-    let agent = vm.agent().await.unwrap();
+    let agent = vm.agent(None).await.unwrap();
     println!("Agent connected.");
-    
-
 
     let out_a = agent
         .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
@@ -177,6 +197,44 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             || blocked_stdout.contains("Blocked"),
         "Did not receive 403 Forbidden for blocked domain: {}",
         blocked_stderr
+    );
+
+    // Test that a CONNECT request falls through to the default proxy behavior
+    let connect_outcome = agent
+        .exec(
+            ExecRequest::new(vec![
+                "/usr/bin/curl".into(),
+                "-4".into(),
+                "-v".into(),
+                "--max-time".into(),
+                "5".into(),
+                format!("http://127.0.0.1:{}", host_port), // We use local server to test pass-through
+            ])
+            .with_env(vec![(
+                "http_proxy".to_string(),
+                format!("http://10.200.{}.1:{}", vmid, proxy_port),
+            )]),
+        )
+        .await
+        .expect("Failed to execute curl connect");
+
+    assert_eq!(
+        connect_outcome.code,
+        0,
+        "CONNECT pass-through failed: {}",
+        String::from_utf8_lossy(&connect_outcome.stderr)
+    );
+
+    // Drop agent so we can borrow vm immutably
+    let _ = agent;
+
+    // EgressProxy records requests. Let's see if we can query it.
+    let requests = vm.proxy().unwrap().requests();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.contains("example.com") && r.contains("GET")),
+        "Proxy should observe guest intended destination"
     );
 
     vm.shutdown().await.expect("Shutdown failed");

@@ -47,8 +47,6 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
 
     std::fs::write(in_dir.join("input.txt"), "hello world").unwrap();
 
-
-
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
     if !vmlinux.exists() || !rootfs.exists() {
@@ -74,7 +72,7 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
         .unwrap();
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
-    let vmid_alloc = std::sync::Arc::new(imp_testing::orchestrator::VmidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = imp_testing::TestVm::start(backend, _cfg, &cid_alloc, vmid_alloc)
         .await
         .expect("Failed to start VM");

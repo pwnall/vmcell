@@ -18,7 +18,9 @@ impl CaManager {
     pub fn new() -> Result<Self> {
         let dir = std::env::var("IMP_ARTIFACTS_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts"));
+            .unwrap_or_else(|_| {
+                PathBuf::from(format!("/tmp/imp-artifacts-{}", std::process::id()))
+            });
         std::fs::create_dir_all(&dir)?;
 
         let cert_path = dir.join("ca.pem");
@@ -45,14 +47,20 @@ impl CaManager {
             let ca_cert_pem = cert.pem();
             let ca_key_pem = key_pair.serialize_pem();
 
-            std::fs::write(&cert_path, &ca_cert_pem)?;
+            let cert_tmp = cert_path.with_extension("pem.tmp");
+            let key_tmp = key_path.with_extension("key.tmp");
+            std::fs::write(&cert_tmp, &ca_cert_pem)?;
 
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true).mode(0o600);
-            let mut f = opts.open(&key_path)?;
+            let mut f = opts.open(&key_tmp)?;
             f.write_all(ca_key_pem.as_bytes())?;
+            f.sync_all()?;
+
+            std::fs::rename(&key_tmp, &key_path)?;
+            std::fs::rename(&cert_tmp, &cert_path)?;
 
             Ok(Self {
                 ca_cert_pem,
@@ -73,12 +81,8 @@ impl CaManager {
     pub fn authority(&self) -> Result<RcgenAuthority> {
         let key_pair =
             KeyPair::from_pem(&self.ca_key_pem).map_err(|e| Error::Proxy(e.to_string()))?;
-        let mut params = CertificateParams::default();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::OrganizationName, "Imp Testing Framework");
-        dn.push(DnType::CommonName, "Imp MITM CA");
-        params.distinguished_name = dn;
+        let params = CertificateParams::from_ca_cert_pem(&self.ca_cert_pem)
+            .map_err(|e| Error::Proxy(e.to_string()))?;
         let cert = params
             .self_signed(&key_pair)
             .map_err(|e| Error::Proxy(e.to_string()))?;

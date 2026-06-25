@@ -12,17 +12,19 @@ use cgroups_rs::{cgroup_builder::CgroupBuilder, hierarchies};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-static GLOBAL_VMIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
 /// Allocates unique VM IDs for the orchestrator.
-#[derive(Debug, Default)]
-pub struct VmidAllocator {}
+#[derive(Debug, Clone, Default)]
+pub struct VmidAllocator {
+    active: Arc<Mutex<std::collections::BTreeSet<u32>>>,
+}
 
 impl VmidAllocator {
     /// Creates a new VMID allocator.
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+        }
     }
 
     /// Allocates and returns the next available unique VMID.
@@ -30,11 +32,25 @@ impl VmidAllocator {
     /// # Errors
     /// Returns an error if all 254 VMIDs are currently in use.
     pub fn allocate(&self) -> Result<u32> {
-        let mut active = GLOBAL_VMIDS.lock().unwrap_or_else(|e| e.into_inner());
-        for i in 1..=254 {
-            if !active.contains(&i) {
-                active.push(i);
-                return Ok(i);
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let start = (seed % 254) + 1;
+        for i in 0..254 {
+            let vmid = (start + i - 1) % 254 + 1;
+            if !active.contains(&vmid) {
+                let lock_path = format!("/tmp/imp-vmid-{}.lock", vmid);
+                if std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                    .is_ok()
+                {
+                    active.insert(vmid);
+                    return Ok(vmid);
+                }
             }
         }
         Err(crate::error::Error::Exhaustion(
@@ -44,8 +60,24 @@ impl VmidAllocator {
 
     /// Releases a previously allocated VMID.
     pub fn release(&self, vmid: u32) {
-        let mut active = GLOBAL_VMIDS.lock().unwrap_or_else(|e| e.into_inner());
-        active.retain(|&id| id != vmid);
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.remove(&vmid);
+        let lock_path = format!("/tmp/imp-vmid-{}.lock", vmid);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+}
+
+/// A guard that releases the VMID when dropped.
+#[derive(Debug)]
+pub struct VmidGuard {
+    /// The unique virtual machine ID.
+    pub vmid: u32,
+    allocator: VmidAllocator,
+}
+
+impl Drop for VmidGuard {
+    fn drop(&mut self) {
+        self.allocator.release(self.vmid);
     }
 }
 
@@ -54,7 +86,7 @@ impl VmidAllocator {
 #[non_exhaustive]
 pub struct TestVm<V: Vmm> {
     /// The internal unique ID assigned to this VM.
-    vmid: u32,
+    vmid: VmidGuard,
     /// The underlying VMM instance running the VM.
     instance: V::Instance,
     /// The network namespace associated with this VM, if any.
@@ -64,8 +96,8 @@ pub struct TestVm<V: Vmm> {
     smoltcp: Option<SmoltcpProcess>,
     /// The egress proxy associated with this VM, if any.
     proxy: Option<EgressProxy>,
-    /// The allocator used to assign the VMID, retained for release on drop.
-    vmid_alloc: Arc<VmidAllocator>,
+    /// The name of the cgroup for this VM.
+    cgroup_name: Option<String>,
     /// The cached agent client connection, if any.
     agent_client: Option<AgentClient>,
     /// Whether the VM was restored from a snapshot.
@@ -83,7 +115,7 @@ struct EnvSetup {
 impl<V: Vmm> TestVm<V> {
     /// Gets the internal unique ID assigned to this VM.
     pub fn vmid(&self) -> u32 {
-        self.vmid
+        self.vmid.vmid
     }
 
     /// Gets a reference to the underlying VMM instance.
@@ -219,16 +251,12 @@ impl<V: Vmm> TestVm<V> {
             if let Some(cpu) = cfg.limits.cpu_max_pct {
                 let period = 100_000_u64;
                 let quota = (cpu as u64) * period / 100;
-                builder = builder
-                    .cpu()
-                    .quota(quota as i64)
-                    .period(period)
-                    .done();
+                builder = builder.cpu().quota(quota as i64).period(period).done();
             }
             if let Err(e) = builder.build(Box::new(hierarchies::V2::new())) {
                 tracing::warn!("Failed to create cgroup {}: {}", cgroup_name, e);
             }
-            
+
             if let Some(pids) = cfg.limits.pids_max {
                 let pids_max_path = format!("/sys/fs/cgroup/{}/pids.max", cgroup_name);
                 if let Err(e) = std::fs::write(&pids_max_path, pids.to_string()) {
@@ -238,10 +266,18 @@ impl<V: Vmm> TestVm<V> {
             if let Some(io) = &cfg.limits.io_max {
                 let io_max_path = format!("/sys/fs/cgroup/{}/io.max", cgroup_name);
                 let mut rules = Vec::new();
-                if let Some(rbps) = io.rbps { rules.push(format!("rbps={}", rbps)); }
-                if let Some(wbps) = io.wbps { rules.push(format!("wbps={}", wbps)); }
-                if let Some(riops) = io.riops { rules.push(format!("riops={}", riops)); }
-                if let Some(wiops) = io.wiops { rules.push(format!("wiops={}", wiops)); }
+                if let Some(rbps) = io.rbps {
+                    rules.push(format!("rbps={}", rbps));
+                }
+                if let Some(wbps) = io.wbps {
+                    rules.push(format!("wbps={}", wbps));
+                }
+                if let Some(riops) = io.riops {
+                    rules.push(format!("riops={}", riops));
+                }
+                if let Some(wiops) = io.wiops {
+                    rules.push(format!("wiops={}", wiops));
+                }
                 if !rules.is_empty() {
                     let io_str = format!("{} {}\n", io.device, rules.join(" "));
                     if let Err(e) = std::fs::write(&io_max_path, io_str) {
@@ -296,10 +332,13 @@ impl<V: Vmm> TestVm<V> {
         vmm: &V,
         cfg: VmConfig,
         cid_alloc: &crate::vmm::CidAllocator,
-        vmid_alloc: Arc<VmidAllocator>,
+        vmid_alloc: VmidAllocator,
     ) -> Result<Self> {
-        let vmid = vmid_alloc.allocate()?;
-        let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
+        let vmid = VmidGuard {
+            vmid: vmid_alloc.allocate()?,
+            allocator: vmid_alloc,
+        };
+        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc).await?;
 
         let mut instance = vmm.create(&cfg, &env.res).await?;
         info!("Booting instance...");
@@ -312,7 +351,7 @@ impl<V: Vmm> TestVm<V> {
             #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
-            vmid_alloc,
+            cgroup_name: Some(env.res.cgroup_name.clone()),
             agent_client: None,
             restored: false,
         })
@@ -345,7 +384,7 @@ impl<V: Vmm> TestVm<V> {
         snapshot_dir: &std::path::Path,
         cfg: VmConfig,
         cid_alloc: &crate::vmm::CidAllocator,
-        vmid_alloc: Arc<VmidAllocator>,
+        vmid_alloc: VmidAllocator,
     ) -> Result<Self> {
         if matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
             return Err(crate::error::Error::Config(
@@ -353,8 +392,17 @@ impl<V: Vmm> TestVm<V> {
             ));
         }
 
-        let vmid = vmid_alloc.allocate()?;
-        let env = Self::setup_env(vmid, &cfg, cid_alloc).await?;
+        if matches!(cfg.net, crate::config::NetConfig::Rootless { .. }) {
+            return Err(crate::error::Error::Config(
+                "rootless networking cannot be used with snapshot restore".into(),
+            ));
+        }
+
+        let vmid = VmidGuard {
+            vmid: vmid_alloc.allocate()?,
+            allocator: vmid_alloc,
+        };
+        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc).await?;
 
         info!("Restoring instance...");
         let mut instance = vmm.restore(snapshot_dir, &cfg, &env.res).await?;
@@ -368,7 +416,7 @@ impl<V: Vmm> TestVm<V> {
             #[cfg(feature = "net-rootless")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
-            vmid_alloc,
+            cgroup_name: Some(env.res.cgroup_name.clone()),
             agent_client: None,
             restored: true,
         })
@@ -382,19 +430,23 @@ impl<V: Vmm> TestVm<V> {
     ///
     /// # Errors
     /// Returns an error if the connection fails or times out.
-    pub async fn agent(&mut self) -> Result<&mut AgentClient> {
+    pub async fn agent(
+        &mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<&mut AgentClient> {
         if self.agent_client.is_none() {
             let client = AgentClient::connect(
                 self.instance.vsock_path(),
                 5000,
-                std::time::Duration::from_secs(10),
+                timeout.unwrap_or(std::time::Duration::from_secs(10)),
                 self.instance.serial_log(),
             )
             .await?;
             self.agent_client = Some(client);
         }
 
-        let agent_ref = self.agent_client
+        let agent_ref = self
+            .agent_client
             .as_mut()
             .ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))?;
 
@@ -405,7 +457,10 @@ impl<V: Vmm> TestVm<V> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            tracing::info!("Automatically resyncing guest clock to host time: {}", host_time);
+            tracing::info!(
+                "Automatically resyncing guest clock to host time: {}",
+                host_time
+            );
             let outcome = agent_ref
                 .exec(crate::agent::ExecRequest::new(vec![
                     "date".to_string(),
@@ -419,6 +474,26 @@ impl<V: Vmm> TestVm<V> {
                     String::from_utf8_lossy(&outcome.stderr)
                 );
             }
+
+            let _ = agent_ref
+                .exec(crate::agent::ExecRequest::new(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "head -c 32 /dev/hwrng > /dev/urandom".into(),
+                ]))
+                .await;
+
+            let mac = format!(
+                "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
+                (self.vmid.vmid >> 24) & 0xff,
+                (self.vmid.vmid >> 16) & 0xff,
+                (self.vmid.vmid >> 8) & 0xff,
+                self.vmid.vmid & 0xff
+            );
+            let ip = format!("10.200.{}.2/30", self.vmid.vmid);
+            let _ = agent_ref.exec(crate::agent::ExecRequest::new(vec![
+                "sh".into(), "-c".into(), format!("ip link set eth0 address {} && ip addr flush dev eth0 && ip addr add {} dev eth0", mac, ip)
+            ])).await;
         }
 
         Ok(agent_ref)
@@ -438,20 +513,40 @@ impl<V: Vmm> TestVm<V> {
     /// Returns an error if shutting down the VM or proxy fails.
     pub async fn shutdown(mut self) -> Result<()> {
         let _ = self.instance.request_shutdown().await;
-        
+
         // Actually wait for it to stop to prevent zombie and ebusy
         let _ = self.instance.kill().await;
 
         if let Some(mut ns) = self.netns.take() {
             let _ = ns.delete();
         }
+        #[cfg(feature = "metrics")]
+        if let Some(cg_name) = self.cgroup_name.take() {
+            let cg =
+                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), &cg_name);
+            let _ = cg.delete();
+        }
+        #[cfg(feature = "net-rootless")]
+        let _ = self.smoltcp.take();
+        let _ = self.proxy.take();
         Ok(())
     }
 }
 
 impl<V: Vmm> Drop for TestVm<V> {
     fn drop(&mut self) {
-        self.vmid_alloc.release(self.vmid);
+        #[cfg(feature = "net-rootless")]
+        let _ = self.smoltcp.take();
+        let _ = self.proxy.take();
+        if let Some(mut ns) = self.netns.take() {
+            let _ = ns.delete();
+        }
+        #[cfg(feature = "metrics")]
+        if let Some(cg_name) = self.cgroup_name.take() {
+            let cg =
+                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), &cg_name);
+            let _ = cg.delete();
+        }
     }
 }
 
@@ -460,6 +555,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial]
     fn test_allocate_vmid() {
         let alloc = VmidAllocator::new();
         let vmid1 = alloc.allocate().unwrap();
@@ -471,11 +567,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_allocate_vmid_exhaustion() {
         let alloc = VmidAllocator::new();
         let mut vmids = Vec::new();
-        for _ in 1..=254 {
-            vmids.push(alloc.allocate().unwrap());
+        while let Ok(id) = alloc.allocate() {
+            vmids.push(id);
         }
         assert!(alloc.allocate().is_err());
         for id in vmids {

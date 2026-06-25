@@ -83,7 +83,8 @@ impl EgressProxy {
     /// # }
     /// ```
     pub async fn start(cfg: ProxyConfig) -> Result<Self> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(u16, String), String>>();
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<(u16, String), String>>();
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -96,14 +97,20 @@ impl EgressProxy {
         let thread = std::thread::spawn(move || {
             #[allow(clippy::collapsible_if)]
             if let Some(ref netns) = cfg.netns {
-                if let Ok(file) = std::fs::File::open(format!("/var/run/netns/{}", netns)) {
-                    // SAFETY: Thread isolation for network namespace
-                    let ret = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
-                    if ret != 0 {
-                        let _ = tx.send(Err(format!(
-                            "Failed to setns: {}",
-                            std::io::Error::last_os_error()
-                        )));
+                match std::fs::File::open(format!("/var/run/netns/{}", netns)) {
+                    Ok(file) => {
+                        // SAFETY: Thread isolation for network namespace
+                        let ret = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
+                        if ret != 0 {
+                            let _ = tx.send(Err(format!(
+                                "Failed to setns: {}",
+                                std::io::Error::last_os_error()
+                            )));
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Failed to open netns file: {}", e)));
                         return;
                     }
                 }
@@ -191,8 +198,20 @@ impl EgressProxy {
             });
         });
 
-        let port_res = rx.await.map_err(|e| Error::Proxy(e.to_string()))?;
-        let (port, ca_cert_pem) = port_res.map_err(|e| Error::Proxy(e.to_string()))?;
+        let port_res = match rx.await {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = thread.join();
+                return Err(Error::Proxy(e.to_string()));
+            }
+        };
+        let (port, ca_cert_pem) = match port_res {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = thread.join();
+                return Err(Error::Proxy(e));
+            }
+        };
         Ok(Self {
             port,
             kill_tx: Some(kill_tx),
@@ -210,12 +229,22 @@ impl EgressProxy {
     }
 
     /// Returns the observed requests.
+    ///
+    /// # Panics
+    /// Panics if the requests lock is poisoned.
     pub fn requests(&self) -> RequestLog {
-        self.requests.lock().unwrap().clone()
+        self.requests
+            .lock()
+            .expect("requests lock poisoned")
+            .clone()
     }
 
     /// Installs a new test double dynamically.
-    pub fn install_double(&self, matcher: crate::proxy::doubles::Matcher, responder: crate::proxy::doubles::Responder) {
+    pub fn install_double(
+        &self,
+        matcher: crate::proxy::doubles::Matcher,
+        responder: crate::proxy::doubles::Responder,
+    ) {
         if let Ok(mut doubles) = self.doubles.write() {
             doubles.push(TestDouble { matcher, responder });
         }

@@ -192,13 +192,17 @@ async fn detect_cpu_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String
 async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
     let tmp_dir = std::env::temp_dir();
     let counter = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let api_socket = tmp_dir.join(format!("imp-fc-probe-{}-{}.socket", std::process::id(), counter));
-    
+    let api_socket = tmp_dir.join(format!(
+        "imp-fc-probe-{}-{}.socket",
+        std::process::id(),
+        counter
+    ));
+
     let mut std_cmd = std::process::Command::new(&vmm.binary_path);
     std_cmd.arg("--api-sock").arg(&api_socket);
     use std::os::unix::process::CommandExt;
     std_cmd.process_group(0);
-    
+
     let mut process = match tokio::process::Command::from(std_cmd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -295,10 +299,11 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
 
     let success = match boot_res {
         Ok(_) => true,
-        Err(Error::VmmApi { status: 400, ref body }) if body.contains("template") || body.contains("Template") => {
-            false
-        }
-        Err(_) => true,
+        Err(Error::VmmApi {
+            status: 400,
+            ref body,
+        }) if body.contains("template") || body.contains("Template") => false,
+        Err(_) => false,
     };
 
     if success {
@@ -313,7 +318,9 @@ impl Vmm for Firecracker {
 
     async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
         if !cfg.shares.is_empty() {
-            return Err(Error::Vmm("Firecracker does not support virtio-fs shares".into()));
+            return Err(Error::Vmm(
+                "Firecracker does not support virtio-fs shares".into(),
+            ));
         }
 
         let template = detect_cpu_template(self, cfg).await;
@@ -355,7 +362,7 @@ impl Vmm for Firecracker {
             kernel_image_path: PathBuf,
             boot_args: String,
         }
-        
+
         let cmdline = {
             let mut s = format!(
                 "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 noxsave init=/usr/sbin/imp-guest-agent imp_vmid={}",
@@ -370,6 +377,10 @@ impl Vmm for Firecracker {
                 res.vmid
             );
             if !matches!(cfg.net, crate::config::NetConfig::None) {
+                assert!(
+                    res.vmid <= 254,
+                    "vmid must be <= 254 for network configuration"
+                );
                 s.push_str(&format!(
                     " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
                     res.vmid, res.vmid
@@ -400,21 +411,20 @@ impl Vmm for Firecracker {
             is_root_device: bool,
             is_read_only: bool,
         }
-        
+
         let rootfs_path = match &cfg.rootfs {
             crate::config::RootfsSource::Erofs { image } => image.clone(),
             crate::config::RootfsSource::Block { image, overlay } => {
                 overlay.as_ref().unwrap_or(image).clone()
             }
             crate::config::RootfsSource::VirtioFs { .. } => {
-                return Err(Error::Vmm("Firecracker does not support virtio-fs rootfs".into()));
+                return Err(Error::Vmm(
+                    "Firecracker does not support virtio-fs rootfs".into(),
+                ));
             }
         };
-        
-        let is_ro = match &cfg.rootfs {
-            crate::config::RootfsSource::Erofs { .. } => true,
-            _ => false,
-        };
+
+        let is_ro = matches!(&cfg.rootfs, crate::config::RootfsSource::Erofs { .. });
 
         instance
             .api_request(
@@ -431,6 +441,7 @@ impl Vmm for Firecracker {
 
         // Configure Network
         if let Some(tap) = &res.tap_name {
+            assert!(res.vmid <= 254, "vmid must be <= 254 for MAC configuration");
             #[derive(Serialize)]
             struct NetworkInterface {
                 iface_id: String,
@@ -473,8 +484,6 @@ impl Vmm for Firecracker {
                 }),
             )
             .await?;
-
-
 
         Ok(instance)
     }
@@ -618,7 +627,7 @@ impl VmInstance for FcInstance {
             snapshot_path: PathBuf,
             mem_file_path: PathBuf,
         }
-        
+
         self.pause().await?;
 
         let res = self

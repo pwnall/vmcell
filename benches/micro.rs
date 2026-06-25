@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use imp_testing::agent::protocol::{ExecRequest, Message};
-use imp_testing::artifact::{kernel::KernelStage, Stage, StageInputs};
+use imp_testing::artifact::{Stage, StageInputs, kernel::KernelStage};
 use std::net::Ipv4Addr;
 
 #[cfg(feature = "am-fs-erofs")]
@@ -10,7 +10,7 @@ fn bench_protocol_codec(c: &mut Criterion) {
     let msg = Message::Exec(
         ExecRequest::new(vec!["ls".to_string(), "-l".to_string()])
             .with_env(vec![("PATH".to_string(), "/bin".to_string())])
-            .with_cwd("/root")
+            .with_cwd("/root"),
     );
 
     c.bench_function("protocol_encode", |b| {
@@ -32,6 +32,7 @@ fn bench_protocol_codec(c: &mut Criterion) {
 fn bench_cache_key(c: &mut Criterion) {
     let stage = KernelStage {
         kernel_source_url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz".into(),
+        kernel_source_sha256: "dummy_sha256".into(),
         microvm_config: "CONFIG_KVM=y\nCONFIG_VIRTIO=y\n".into(),
     };
     let inputs = StageInputs::default();
@@ -68,10 +69,7 @@ fn bench_tar_to_erofs(c: &mut Criterion) {
             // tar_to_erofs expects an iterator over archives
             let reader = std::io::Cursor::new(tar_data.clone());
             let archive = tar::Archive::new(reader);
-            let image = tar_to_erofs(
-                vec![archive],
-                vec![]
-            ).unwrap();
+            let image = tar_to_erofs(vec![archive], vec![]).unwrap();
             black_box(image);
         })
     });

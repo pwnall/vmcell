@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 
 pub fn get_vmlinux() -> Option<PathBuf> {

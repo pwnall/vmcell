@@ -5,7 +5,7 @@ pub mod backend {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use vhost::vhost_user::Listener;
-    use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+    use vhost::vhost_user::message::VhostUserProtocolFeatures;
     use vhost_user_backend::{
         VhostUserBackendMut, VhostUserDaemon, VringMutex, VringState, VringT,
     };
@@ -247,7 +247,9 @@ pub mod backend {
                         }
                     }
                 } else {
+                    vring_state.disable_notification().expect("invariant");
                     Self::process_tx_queue(&mut state, &mut vring_state)?;
+                    vring_state.enable_notification().expect("invariant");
                 }
             }
 
@@ -273,12 +275,8 @@ pub mod backend {
             let _ = self.kill_notifier.notify();
             // Connect to the socket to unblock listener.accept() if it's stuck
             let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
-            if let Some(h) = self.vhost_thread.take() {
-                let _ = h.join();
-            }
-            if let Some(h) = self.net_thread.take() {
-                let _ = h.join();
-            }
+            let _ = self.vhost_thread.take();
+            let _ = self.net_thread.take();
         }
     }
 
@@ -325,11 +323,11 @@ pub mod backend {
                 )
                 .expect("invariant");
 
-                eprintln!("vhost-user-net daemon starting on {:?}", socket_path_clone);
+                tracing::info!("vhost-user-net daemon starting on {:?}", socket_path_clone);
                 let res = vu_daemon.start(&mut listener);
-                eprintln!("vhost-user-net daemon start returned {:?}", res);
+                tracing::info!("vhost-user-net daemon start returned {:?}", res);
                 let wait_res = vu_daemon.wait();
-                eprintln!("vhost-user-net daemon exited with {:?}", wait_res);
+                tracing::info!("vhost-user-net daemon exited with {:?}", wait_res);
             });
 
             let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -356,6 +354,7 @@ pub mod backend {
             state: Arc<Mutex<SharedState>>,
             stop_flag: Arc<std::sync::atomic::AtomicBool>,
         ) {
+            assert!(vmid <= 254, "vmid must be <= 254 for network configuration");
             let host_gw = Ipv4Address::new(10, 200, (vmid % 256) as u8, 1);
             // Use a different MAC for the host to avoid dropping packets from the guest.
             let mac_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0xfe]);
@@ -408,9 +407,10 @@ pub mod backend {
                         let mem_obj = mem.memory();
                         let mut used_any = false;
 
-                        while let Some(packet) = state_guard.rx_queue.pop_front() {
-                            let avail_chains = vring_state.get_queue_mut().iter(mem_obj.clone());
-                            if let Ok(mut chains) = avail_chains {
+                        let mut used_descs = Vec::new();
+                        let avail_chains = vring_state.get_queue_mut().iter(mem_obj.clone());
+                        if let Ok(mut chains) = avail_chains {
+                            while let Some(packet) = state_guard.rx_queue.pop_front() {
                                 if let Some(chain) = chains.next() {
                                     log::trace!(
                                         "process_rx_queue: Sending packet of length {} to guest",
@@ -442,18 +442,18 @@ pub mod backend {
                                             written += to_write;
                                         }
                                     }
-                                    vring_state
-                                        .add_used(head_index, written as u32)
-                                        .expect("invariant");
-                                    used_any = true;
+                                    used_descs.push((head_index, written as u32));
                                 } else {
                                     state_guard.rx_queue.push_front(packet);
                                     break;
                                 }
-                            } else {
-                                state_guard.rx_queue.push_front(packet);
-                                break;
                             }
+                        }
+                        for (head_index, written) in used_descs {
+                            vring_state
+                                .add_used(head_index, written)
+                                .expect("invariant");
+                            used_any = true;
                         }
                         if used_any {
                             vring_state.signal_used_queue().expect("invariant");
