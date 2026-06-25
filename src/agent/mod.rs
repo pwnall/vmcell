@@ -39,17 +39,35 @@ impl AgentClient {
     /// ```rust
     /// # use imp_testing::agent::AgentClient;
     /// # use std::path::Path;
+    /// # use std::time::Duration;
     /// # async fn run() {
-    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000).await.unwrap();
+    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), Path::new("/dev/null")).await.unwrap();
     /// # }
     /// ```
-    pub async fn connect(vsock_path: &Path, port: u32) -> Result<Self> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    pub async fn connect(
+        vsock_path: &Path,
+        port: u32,
+        timeout: std::time::Duration,
+        serial_log: &Path,
+    ) -> Result<Self> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut backoff = std::time::Duration::from_millis(50);
 
         loop {
             if tokio::time::Instant::now() > deadline {
                 return Err(Error::Timeout("Agent connection timed out".into()));
+            }
+
+            // Watch serial log for kernel panic
+            if serial_log.exists() {
+                if let Ok(log_content) = std::fs::read_to_string(serial_log) {
+                    if log_content.contains("Kernel panic")
+                        || log_content.contains("panicked at")
+                        || log_content.contains("panic - not syncing")
+                    {
+                        return Err(Error::Agent("Panic detected in serial log".into()));
+                    }
+                }
             }
 
             let mut stream = match UnixStream::connect(vsock_path).await {
@@ -111,8 +129,8 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns an error if the connection fails or times out.
-    pub async fn reconnect(&mut self, vsock_path: &Path, port: u32) -> Result<()> {
-        let new_client = Self::connect(vsock_path, port).await?;
+    pub async fn reconnect(&mut self, vsock_path: &Path, port: u32, serial_log: &Path) -> Result<()> {
+        let new_client = Self::connect(vsock_path, port, std::time::Duration::from_secs(10), serial_log).await?;
         self.stream = new_client.stream;
         Ok(())
     }
@@ -122,7 +140,8 @@ impl AgentClient {
     /// # Errors
     /// Returns an error if the request cannot be sent or the outcome cannot be received.
     pub async fn exec(&mut self, cmd: ExecRequest) -> Result<ExecOutcome> {
-        tokio::time::timeout(std::time::Duration::from_secs(600), async {
+        let timeout = cmd.timeout.unwrap_or(std::time::Duration::from_secs(10));
+        tokio::time::timeout(timeout, async {
             let msg = Message::Exec(cmd);
             let bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
 

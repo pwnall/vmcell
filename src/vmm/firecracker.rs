@@ -192,12 +192,12 @@ impl Vmm for Firecracker {
             cid: res.guest_cid,
         };
 
-        // Configure Machine
         #[derive(Serialize)]
         struct MachineConfig {
             vcpu_count: u8,
             mem_size_mib: u32,
             smt: bool,
+            cpu_template: Option<String>,
         }
         instance
             .api_request(
@@ -207,6 +207,7 @@ impl Vmm for Firecracker {
                     vcpu_count: cfg.vcpus,
                     mem_size_mib: cfg.mem_mib,
                     smt: false,
+                    cpu_template: Some("T2".to_string()),
                 }),
             )
             .await?;

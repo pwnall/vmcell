@@ -58,11 +58,7 @@ impl Stage for SnapshotStage {
         // Wait for VM to boot fully via vsock agent
         let agent = vm.agent().await?;
         let _ = agent
-            .exec(ExecRequest {
-                argv: vec!["true".to_string()],
-                env: vec![],
-                cwd: None,
-            })
+            .exec(ExecRequest::new(vec!["true".to_string()]))
             .await?;
 
         tokio::fs::create_dir_all(out)

@@ -81,9 +81,14 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let mut client = imp_testing::agent::AgentClient::connect(vm.instance().vsock_path(), 5000)
-        .await
-        .expect("Failed to connect to agent");
+    let mut client = imp_testing::agent::AgentClient::connect(
+        vm.instance().vsock_path(),
+        5000,
+        std::time::Duration::from_secs(10),
+        vm.instance().serial_log(),
+    )
+    .await
+    .expect("Failed to connect to agent");
 
     // Verify read from RO share
     let res = client

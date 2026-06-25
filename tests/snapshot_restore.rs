@@ -160,21 +160,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             panic!("Exec failed. Outcome: {:?}", result);
         }
 
-        // Resync the clock manually via agent
-        let host_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        vm.agent()
-            .await
-            .unwrap()
-            .exec(ExecRequest::new(vec![
-                "date".into(),
-                "-s".into(),
-                format!("@{}", host_time),
-            ]))
-            .await
-            .unwrap();
+
 
         let original_cid: u32 = std::fs::read_to_string(snapshot_dir.join("original_cid.txt"))
             .unwrap()

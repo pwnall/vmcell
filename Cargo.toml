@@ -26,6 +26,15 @@ name = "imp-test-runner"
 path = "src/bin/imp-test-runner.rs"
 required-features = ["test-runner"]
 
+[[bin]]
+name = "bench-vm"
+path = "src/bin/bench-vm.rs"
+
+[[bench]]
+name = "micro"
+harness = false
+required-features = ["pipeline"]
+
 [dependencies]
 # unconditional shared core
 serde = { version = "1", features = ["derive"] }
@@ -113,6 +122,7 @@ am-fs-erofs = { version = "0.1.1", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 log = "0.4"
 axum = "0.7"

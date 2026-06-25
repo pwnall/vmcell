@@ -68,6 +68,8 @@ pub struct TestVm<V: Vmm> {
     vmid_alloc: Arc<VmidAllocator>,
     /// The cached agent client connection, if any.
     agent_client: Option<AgentClient>,
+    /// Whether the VM was restored from a snapshot.
+    restored: bool,
 }
 
 struct EnvSetup {
@@ -282,6 +284,7 @@ impl<V: Vmm> TestVm<V> {
             proxy: env.proxy,
             vmid_alloc,
             agent_client: None,
+            restored: false,
         })
     }
 
@@ -337,6 +340,7 @@ impl<V: Vmm> TestVm<V> {
             proxy: env.proxy,
             vmid_alloc,
             agent_client: None,
+            restored: true,
         })
     }
 
@@ -350,23 +354,44 @@ impl<V: Vmm> TestVm<V> {
     /// Returns an error if the connection fails or times out.
     pub async fn agent(&mut self) -> Result<&mut AgentClient> {
         if self.agent_client.is_none() {
-            // Retry connecting since the VM might take a second to boot and bind vsock
-            let mut client = None;
-            for _ in 0..50 {
-                if let Ok(c) = AgentClient::connect(self.instance.vsock_path(), 5000).await {
-                    client = Some(c);
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-            if client.is_none() {
-                client = Some(AgentClient::connect(self.instance.vsock_path(), 5000).await?);
-            }
-            self.agent_client = client;
+            let client = AgentClient::connect(
+                self.instance.vsock_path(),
+                5000,
+                std::time::Duration::from_secs(10),
+                self.instance.serial_log(),
+            )
+            .await?;
+            self.agent_client = Some(client);
         }
-        self.agent_client
+
+        let agent_ref = self.agent_client
             .as_mut()
-            .ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))
+            .ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))?;
+
+        if self.restored {
+            self.restored = false;
+            // Automatically resync guest clock forward
+            let host_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            tracing::info!("Automatically resyncing guest clock to host time: {}", host_time);
+            let outcome = agent_ref
+                .exec(crate::agent::ExecRequest::new(vec![
+                    "date".to_string(),
+                    "-s".to_string(),
+                    format!("@{}", host_time),
+                ]))
+                .await?;
+            if outcome.code != 0 {
+                tracing::warn!(
+                    "Failed to automatically resync guest clock: {}",
+                    String::from_utf8_lossy(&outcome.stderr)
+                );
+            }
+        }
+
+        Ok(agent_ref)
     }
 
     /// Retrieves resource usage metrics for the VM.

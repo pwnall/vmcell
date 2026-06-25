@@ -63,7 +63,7 @@ async fn test_exec_vsock_mock() {
         framed.send(exit_msg.into()).await.unwrap();
     });
 
-    let mut client = AgentClient::connect(&vsock_path, 5000)
+    let mut client = AgentClient::connect(&vsock_path, 5000, std::time::Duration::from_secs(2), std::path::Path::new("/dev/null"))
         .await
         .expect("Failed to connect");
 
@@ -126,7 +126,7 @@ async fn test_put_file_mock() {
         framed.send(exit_msg.into()).await.unwrap();
     });
 
-    let mut client = AgentClient::connect(&vsock_path, 5000)
+    let mut client = AgentClient::connect(&vsock_path, 5000, std::time::Duration::from_secs(2), std::path::Path::new("/dev/null"))
         .await
         .expect("Failed to connect");
 

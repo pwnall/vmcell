@@ -42,6 +42,8 @@ pub struct ExecRequest {
     pub env: Vec<(String, String)>,
     /// Optional working directory.
     pub cwd: Option<String>,
+    /// Per-exec timeout. If None, a sane default is used.
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl ExecRequest {
@@ -52,6 +54,7 @@ impl ExecRequest {
             argv,
             env: vec![],
             cwd: None,
+            timeout: None,
         }
     }
 
@@ -100,6 +103,7 @@ mod tests {
             argv: vec!["ls".to_string(), "-l".to_string()],
             env: vec![("PATH".to_string(), "/bin".to_string())],
             cwd: Some("/root".to_string()),
+            timeout: None,
         });
 
         let bytes = postcard::to_stdvec(&msg).unwrap();
@@ -167,9 +171,10 @@ mod tests {
             (
                 any::<Vec<String>>(),
                 any::<Vec<(String, String)>>(),
-                any::<Option<String>>()
+                any::<Option<String>>(),
+                any::<Option<std::time::Duration>>()
             )
-                .prop_map(|(argv, env, cwd)| { Message::Exec(ExecRequest { argv, env, cwd }) }),
+                .prop_map(|(argv, env, cwd, timeout)| { Message::Exec(ExecRequest { argv, env, cwd, timeout }) }),
         ]
     }
 
