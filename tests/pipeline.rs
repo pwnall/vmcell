@@ -39,11 +39,10 @@ async fn test_pipeline_reset_to() {
 
     let cache = Cache::default();
 
-    unsafe {
-        std::env::set_var("IMP_ARTIFACTS_DIR", tmp_dir.to_str().unwrap());
-    }
-
-    let mut pipeline = Pipeline { stages: vec![] };
+    let mut pipeline = Pipeline {
+        stages: vec![],
+        target_dir: tmp_dir.clone(),
+    };
     pipeline.stages.push(Box::new(DummyStage {
         name: "stage1".to_string(),
         content: "content1".to_string(),

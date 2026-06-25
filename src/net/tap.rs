@@ -222,7 +222,7 @@ impl NetNamespace {
     /// Returns an error if the `ip netns delete` command fails.
     pub fn delete(&mut self) -> Result<()> {
         self._tap.take();
-        let _ = self.netlink.delete_netns(&self.name);
+        self.netlink.delete_netns(&self.name)?;
         Ok(())
     }
 

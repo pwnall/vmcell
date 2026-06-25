@@ -55,7 +55,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .unwrap();
     let mut proxy_cfg = ProxyConfig::default();
     proxy_cfg.blocked_domains = vec!["blocked.com".to_string()];
-    proxy_cfg.doubles = std::sync::Arc::new(vec![TestDouble {
+    proxy_cfg.doubles = std::sync::Arc::new(std::sync::RwLock::new(vec![TestDouble {
         matcher: Box::new(|req| {
             req.method() != hyper::Method::CONNECT && req.uri().host() == Some("example.com")
         }),
@@ -65,7 +65,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
                 .body(Body::from("MITM SUCCESS!"))
                 .unwrap()
         }),
-    }]);
+    }]));
 
     cfg.net = imp_testing::config::NetConfig::Rootless {
         egress: Egress::Filtered(proxy_cfg),

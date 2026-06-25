@@ -244,10 +244,41 @@ fn handle_exec(
                 }
             });
 
+            let pid = child.id();
+            let has_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let has_exited_clone = std::sync::Arc::clone(&has_exited);
+            let tx_timeout = tx.clone();
+
+            if let Some(timeout) = req.timeout {
+                std::thread::spawn(move || {
+                    std::thread::sleep(timeout);
+                    if !has_exited_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        use rustix::process::{kill_process, Pid, Signal};
+                        if let Some(p) = Pid::from_raw(pid as i32) {
+                            let _ = kill_process(p, Signal::Kill);
+                        }
+                        let _ = tx_timeout.send(Message::Stderr(b"Command timed out\n".to_vec()));
+                    }
+                });
+            }
+
             std::thread::spawn(move || {
                 let code = match child.wait() {
-                    Ok(status) => status.code().unwrap_or(1),
-                    Err(_) => 127,
+                    Ok(status) => {
+                        has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                        use std::os::unix::process::ExitStatusExt;
+                        status.code().unwrap_or_else(|| {
+                            if let Some(sig) = status.signal() {
+                                128 + sig
+                            } else {
+                                1
+                            }
+                        })
+                    }
+                    Err(_) => {
+                        has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                        127
+                    }
                 };
                 let _ = out_handle.join();
                 let _ = err_handle.join();

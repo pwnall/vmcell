@@ -26,22 +26,48 @@ fn main() -> imp_testing::Result<()> {
         .block_on(async_main())
 }
 
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Pins {
+    kernel: KernelPins,
+    rootfs: RootfsPins,
+}
+
+#[derive(Deserialize)]
+struct KernelPins {
+    source_url: String,
+    microvm_config: String,
+}
+
+#[derive(Deserialize)]
+struct RootfsPins {
+    image: String,
+    digest: String,
+}
+
 async fn async_main() -> imp_testing::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
         Commands::Build => {
             println!("Building artifacts...");
+            let pins_str = std::fs::read_to_string("pins.json")
+                .unwrap_or_else(|_| panic!("Failed to read pins.json"));
+            let pins: Pins = serde_json::from_str(&pins_str)
+                .expect("Failed to parse pins.json");
+
             let pipeline = imp_testing::artifact::Pipeline {
+                target_dir: std::path::PathBuf::from("target/imp-artifacts"),
                 stages: vec![
                     Box::new(imp_testing::artifact::kernel::KernelStage {
-                        kernel_source_url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.9.tar.xz".into(),
-                        microvm_config: "CONFIG_PVH=y\nCONFIG_SYSTEM_TRUSTED_KEYS=\"\"\nCONFIG_SYSTEM_REVOCATION_KEYS=\"\"\nCONFIG_MODULE_SIG=n\nCONFIG_PCI=y\nCONFIG_VIRTIO=y\nCONFIG_VIRTIO_PCI=y\nCONFIG_VIRTIO_MMIO=y\nCONFIG_VIRTIO_BLK=y\nCONFIG_VIRTIO_NET=y\nCONFIG_VIRTIO_CONSOLE=y\nCONFIG_HW_RANDOM_VIRTIO=y\nCONFIG_VIRTIO_BALLOON=y\nCONFIG_VSOCKETS=y\nCONFIG_VIRTIO_VSOCKETS=y\nCONFIG_VHOST_VSOCK=y\nCONFIG_FUSE_FS=y\nCONFIG_VIRTIO_FS=y\nCONFIG_EROFS_FS=y\nCONFIG_EROFS_FS_ZIP=y\nCONFIG_OVERLAY_FS=y\nCONFIG_TMPFS=y\nCONFIG_EXT4_FS=y\nCONFIG_SERIAL_8250=y\nCONFIG_SERIAL_8250_CONSOLE=y\nCONFIG_DEVTMPFS=y\nCONFIG_DEVTMPFS_MOUNT=y\nCONFIG_PARAVIRT=y\nCONFIG_KVM_GUEST=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\nCONFIG_KVM_AMD=y\n".into(),
+                        kernel_source_url: pins.kernel.source_url,
+                        microvm_config: pins.kernel.microvm_config,
                     }),
                     Box::new(imp_testing::artifact::rootfs::RootfsStage {
                         source: imp_testing::artifact::rootfs::RootfsBuildSource::Oci {
-                            image: "docker.io/library/debian".into(),
-                            digest: "trixie-slim".into(),
+                            image: pins.rootfs.image,
+                            digest: pins.rootfs.digest,
                         },
                     }),
                 ],

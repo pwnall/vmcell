@@ -16,13 +16,23 @@ pub struct TestDouble {
     pub responder: Responder,
 }
 
+impl std::fmt::Debug for TestDouble {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestDouble").finish_non_exhaustive()
+    }
+}
+
 /// The hudsucker HTTP handler that routes proxy requests.
 #[derive(Clone)]
 pub struct ProxyHandler {
     /// The configured test doubles.
-    pub doubles: Arc<Vec<TestDouble>>,
+    pub doubles: Arc<std::sync::RwLock<Vec<TestDouble>>>,
     /// Domains to block.
     pub blocked_domains: Vec<String>,
+    /// Observed requests.
+    pub requests: Arc<std::sync::Mutex<crate::proxy::RequestLog>>,
+    /// Record to path.
+    pub record_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl HttpHandler for ProxyHandler {
@@ -33,11 +43,31 @@ impl HttpHandler for ProxyHandler {
     ) -> RequestOrResponse {
         tracing::info!("Proxy intercepted request to: {}", req.uri());
 
-        for double in self.doubles.iter() {
-            if (double.matcher)(&req) {
-                tracing::info!("Proxy matched request, returning test double response");
-                let res = (double.responder)(&req);
-                return RequestOrResponse::Response(res);
+        if req.method() == hyper::Method::CONNECT {
+            return RequestOrResponse::Request(req);
+        }
+
+        let req_uri = req.uri().to_string();
+        if let Ok(mut reqs) = self.requests.lock() {
+            reqs.push(req_uri);
+        }
+
+        if let Ok(path_opt) = self.record_path.lock() {
+            if let Some(path) = path_opt.as_ref() {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{} {}", req.method(), req.uri());
+                }
+            }
+        }
+
+        if let Ok(doubles) = self.doubles.read() {
+            for double in doubles.iter() {
+                if (double.matcher)(&req) {
+                    tracing::info!("Proxy matched request, returning test double response");
+                    let res = (double.responder)(&req);
+                    return RequestOrResponse::Response(res);
+                }
             }
         }
 

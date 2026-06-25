@@ -123,13 +123,16 @@ impl Firecracker {
         // Firecracker expects the socket to not exist before it creates it.
         let _ = tokio::fs::remove_file(&api_socket).await;
 
-        let mut cmd = if let Some(netns) = &res.netns_name {
-            let mut c = Command::new("ip");
+        let mut std_cmd = if let Some(netns) = &res.netns_name {
+            let mut c = std::process::Command::new("ip");
             c.arg("netns").arg("exec").arg(netns).arg(&self.binary_path);
             c
         } else {
-            Command::new(&self.binary_path)
+            std::process::Command::new(&self.binary_path)
         };
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+        let mut cmd = tokio::process::Command::from(std_cmd);
 
         let log_file = std::fs::File::create(&serial_path)?;
         let process = cmd
@@ -173,6 +176,138 @@ impl Firecracker {
     }
 }
 
+static CPU_TEMPLATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+async fn detect_cpu_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
+    if let Some(val) = CPU_TEMPLATE.get() {
+        return val.clone();
+    }
+
+    let template = probe_t2_template(vmm, cfg).await;
+    let _ = CPU_TEMPLATE.set(template.clone());
+    template
+}
+
+async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
+    let tmp_dir = std::env::temp_dir();
+    let counter = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let api_socket = tmp_dir.join(format!("imp-fc-probe-{}-{}.socket", std::process::id(), counter));
+    
+    let mut std_cmd = std::process::Command::new(&vmm.binary_path);
+    std_cmd.arg("--api-sock").arg(&api_socket);
+    use std::os::unix::process::CommandExt;
+    std_cmd.process_group(0);
+    
+    let mut process = match tokio::process::Command::from(std_cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+
+    let mut socket_ready = false;
+    for _ in 0..50 {
+        if tokio::fs::try_exists(&api_socket).await.unwrap_or(false) {
+            socket_ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    if !socket_ready {
+        let _ = process.kill().await;
+        return None;
+    }
+
+    let instance = FcInstance {
+        process,
+        api_socket: api_socket.clone(),
+        vsock_path: PathBuf::new(),
+        serial_path: PathBuf::new(),
+        cgroup_name: None,
+        cid: 0,
+    };
+
+    #[derive(Serialize)]
+    struct MachineConfig {
+        vcpu_count: u8,
+        mem_size_mib: u32,
+        smt: bool,
+        cpu_template: Option<String>,
+    }
+
+    let mc_res = instance
+        .api_request(
+            "PUT",
+            "/machine-config",
+            Some(&MachineConfig {
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                smt: false,
+                cpu_template: Some("T2".to_string()),
+            }),
+        )
+        .await;
+
+    if mc_res.is_err() {
+        return None;
+    }
+
+    #[derive(Serialize)]
+    struct BootSource {
+        kernel_image_path: PathBuf,
+        boot_args: String,
+    }
+
+    let bs_res = instance
+        .api_request(
+            "PUT",
+            "/boot-source",
+            Some(&BootSource {
+                kernel_image_path: cfg.kernel.clone(),
+                boot_args: "console=ttyS0 panic=1".to_string(),
+            }),
+        )
+        .await;
+
+    if bs_res.is_err() {
+        return None;
+    }
+
+    #[derive(Serialize)]
+    struct Action {
+        action_type: String,
+    }
+
+    let boot_res = instance
+        .api_request(
+            "PUT",
+            "/actions",
+            Some(&Action {
+                action_type: "InstanceStart".to_string(),
+            }),
+        )
+        .await;
+
+    let success = match boot_res {
+        Ok(_) => true,
+        Err(Error::VmmApi { status: 400, ref body }) if body.contains("template") || body.contains("Template") => {
+            false
+        }
+        Err(_) => true,
+    };
+
+    if success {
+        Some("T2".to_string())
+    } else {
+        None
+    }
+}
+
 impl Vmm for Firecracker {
     type Instance = FcInstance;
 
@@ -180,6 +315,8 @@ impl Vmm for Firecracker {
         if !cfg.shares.is_empty() {
             return Err(Error::Vmm("Firecracker does not support virtio-fs shares".into()));
         }
+
+        let template = detect_cpu_template(self, cfg).await;
 
         let (_tmp, api_socket, vsock_path, serial_path, process) = self.spawn_fc(res).await?;
 
@@ -207,7 +344,7 @@ impl Vmm for Firecracker {
                     vcpu_count: cfg.vcpus,
                     mem_size_mib: cfg.mem_mib,
                     smt: false,
-                    cpu_template: Some("T2".to_string()),
+                    cpu_template: template,
                 }),
             )
             .await?;
@@ -237,6 +374,9 @@ impl Vmm for Firecracker {
                     " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
                     res.vmid, res.vmid
                 ));
+            }
+            if cfg.nested_virt {
+                s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
             }
             s
         };
@@ -430,9 +570,14 @@ impl VmInstance for FcInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
-        if let Err(e) = self.process.kill().await {
-            tracing::warn!("Failed to kill Firecracker process: {}", e);
+        if let Some(pid) = self.process.id() {
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(format!("-{}", pid))
+                .status()
+                .await;
         }
+        let _ = self.process.wait().await;
         Ok(())
     }
 

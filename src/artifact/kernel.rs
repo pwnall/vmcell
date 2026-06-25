@@ -39,30 +39,54 @@ impl Stage for KernelStage {
         let tarball = workdir.join("linux.tar.xz");
 
         if !tarball.exists() {
-            let status = Command::new("wget")
-                .arg("-O")
-                .arg(&tarball)
-                .arg(&self.kernel_source_url)
-                .status()
-                .await?;
-            if !status.success() {
-                return Err(Error::Subprocess("Failed to download kernel source".into()));
+            let response = reqwest::get(&self.kernel_source_url).await
+                .map_err(|e| Error::Artifact(format!("Failed to download kernel source: {}", e)))?;
+            if !response.status().is_success() {
+                return Err(Error::Artifact(format!("Failed to download kernel source: status {}", response.status())));
             }
+            let bytes = response.bytes().await
+                .map_err(|e| Error::Artifact(format!("Failed to read kernel source: {}", e)))?;
+            tokio::fs::write(&tarball, bytes).await?;
         }
 
         // We assume we need to extract if the Makefile doesn't exist
         if !workdir.join("Makefile").exists() {
-            let status = Command::new("tar")
-                .arg("xf")
-                .arg(&tarball)
-                .arg("-C")
-                .arg(&workdir)
-                .arg("--strip-components=1")
-                .status()
-                .await?;
-            if !status.success() {
-                return Err(Error::Subprocess("Failed to extract kernel source".into()));
-            }
+            let tarball_path = tarball.clone();
+            let workdir_path = workdir.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let tar_uncompressed_path = workdir_path.join("linux.tar");
+                if !tar_uncompressed_path.exists() {
+                    let mut xz_file = std::fs::File::open(&tarball_path)?;
+                    let mut tar_file = std::fs::File::create(&tar_uncompressed_path)?;
+                    lzma_rs::xz_decompress(&mut std::io::BufReader::new(xz_file), &mut tar_file)
+                        .map_err(|e| Error::Artifact(format!("Decompression failed: {:?}", e)))?;
+                }
+                
+                let tar_file_read = std::fs::File::open(&tar_uncompressed_path)?;
+                let mut archive = tar::Archive::new(tar_file_read);
+                for entry in archive.entries()? {
+                    let mut file = entry?;
+                    let path = file.path()?.into_owned();
+                    let mut components = path.components();
+                    if components.next().is_none() { continue; } // skip first component
+                    let stripped_path: std::path::PathBuf = components.collect();
+                    if stripped_path.as_os_str().is_empty() { continue; }
+                    let out_path = workdir_path.join(stripped_path);
+                    
+                    if file.header().entry_type() == tar::EntryType::Directory {
+                        std::fs::create_dir_all(&out_path)?;
+                    } else {
+                        if let Some(parent) = out_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        file.unpack(&out_path)?;
+                    }
+                }
+                
+                let _ = std::fs::remove_file(&tar_uncompressed_path);
+                
+                Ok(())
+            }).await.unwrap()?;
         }
 
         let status = Command::new("make")

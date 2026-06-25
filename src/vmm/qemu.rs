@@ -97,14 +97,17 @@ impl Qemu {
         let vhost_vsock = tmp.join("vhost-vsock.sock"); // qemu connects here
         let serial_path = tmp.join("serial.log");
 
-        // Spawn vhost-device-vsock
-        let vsock_daemon = Command::new("vhost-device-vsock")
-            .arg("--guest-cid")
+        let mut std_vsock_cmd = std::process::Command::new("vhost-device-vsock");
+        std_vsock_cmd.arg("--guest-cid")
             .arg(res.guest_cid.to_string())
             .arg("--socket")
             .arg(&vhost_vsock)
             .arg("--uds-path")
-            .arg(&vsock_path)
+            .arg(&vsock_path);
+        use std::os::unix::process::CommandExt;
+        std_vsock_cmd.process_group(0);
+        
+        let vsock_daemon = tokio::process::Command::from(std_vsock_cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -132,13 +135,15 @@ impl Qemu {
             fs_daemons.push(daemon);
         }
 
-        let mut cmd = if let Some(netns) = &res.netns_name {
-            let mut c = Command::new("ip");
+        let mut std_cmd = if let Some(netns) = &res.netns_name {
+            let mut c = std::process::Command::new("ip");
             c.arg("netns").arg("exec").arg(netns).arg(&self.binary_path);
             c
         } else {
-            Command::new(&self.binary_path)
+            std::process::Command::new(&self.binary_path)
         };
+        std_cmd.process_group(0);
+        let mut cmd = tokio::process::Command::from(std_cmd);
 
         cmd.arg("-M").arg("q35,memory-backend=mem")
            .arg("-m").arg(cfg.mem_mib.to_string())
@@ -205,6 +210,9 @@ impl Qemu {
                 " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
                 res.vmid, res.vmid
             ));
+        }
+        if cfg.nested_virt {
+            cmdline.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
         }
         cmd.arg("-kernel").arg(&cfg.kernel)
            .arg("-append").arg(&cmdline);
@@ -330,9 +338,25 @@ impl VmInstance for QemuInstance {
 
     async fn kill(&mut self) -> Result<()> {
         self.qmp_command("{\"execute\": \"quit\"}").await.ok();
-        let _ = self.process.start_kill();
+        
+        if let Some(pid) = self.process.id() {
+            let _ = tokio::process::Command::new("kill")
+                .arg("-9")
+                .arg(format!("-{}", pid))
+                .status()
+                .await;
+        }
+        let _ = self.process.wait().await;
+        
         if let Some(mut d) = self._vsock_daemon.take() {
-            let _ = d.start_kill();
+            if let Some(pid) = d.id() {
+                let _ = tokio::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(format!("-{}", pid))
+                    .status()
+                    .await;
+            }
+            let _ = d.wait().await;
         }
         Ok(())
     }

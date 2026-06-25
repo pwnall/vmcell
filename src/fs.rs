@@ -46,7 +46,7 @@ impl VirtioFsDaemon {
             .arg("--shared-dir")
             .arg(&share.host_path)
             .arg(cache_arg)
-            .arg("--sandbox=none");
+            .arg("--sandbox=namespace");
 
         if let Access::ReadOnly = share.access {
             cmd.arg("--readonly");
@@ -54,9 +54,9 @@ impl VirtioFsDaemon {
 
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
-        let process = cmd.spawn().map_err(|e| {
+        let mut process = cmd.spawn().map_err(|e| {
             crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {}", e))
         })?;
 
@@ -67,9 +67,22 @@ impl VirtioFsDaemon {
                 ready = true;
                 break;
             }
+            if let Some(status) = process.try_wait().unwrap_or(None) {
+                let mut stderr = String::new();
+                if let Some(mut err_stream) = process.stderr.take() {
+                    use tokio::io::AsyncReadExt;
+                    let _ = err_stream.read_to_string(&mut stderr).await;
+                }
+                return Err(crate::error::Error::Subprocess(format!(
+                    "virtiofsd exited prematurely with {}: {}",
+                    status,
+                    stderr.trim()
+                )));
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         if !ready {
+            let _ = process.start_kill();
             return Err(crate::error::Error::Subprocess(
                 "virtiofsd failed to create socket".to_string(),
             ));

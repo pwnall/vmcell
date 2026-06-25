@@ -46,14 +46,24 @@ impl Stage for RootfsStage {
     }
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match &self.source {
             RootfsBuildSource::Oci { image, digest } => {
-                CacheKey(format!("rootfs-oci-{}-{}", image, digest))
+                std::hash::Hash::hash(&"oci", &mut hasher);
+                std::hash::Hash::hash(image, &mut hasher);
+                std::hash::Hash::hash(digest, &mut hasher);
             }
             RootfsBuildSource::Mmdebstrap { release } => {
-                CacheKey(format!("rootfs-mmdebstrap-{}-{}", release, inputs.artifacts.len()))
+                std::hash::Hash::hash(&"mmdebstrap", &mut hasher);
+                std::hash::Hash::hash(release, &mut hasher);
             }
         }
+        for (k, v) in &inputs.artifacts {
+            std::hash::Hash::hash(k, &mut hasher);
+            std::hash::Hash::hash(&v.to_string_lossy(), &mut hasher);
+        }
+        use std::hash::Hasher;
+        CacheKey(format!("rootfs-{:x}", hasher.finish()))
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
@@ -92,17 +102,22 @@ pub async fn pack_erofs_with_injection(
 ) -> Result<StageOutputs> {
     let out_buf = out.to_path_buf();
     
-    // Inject agent and CA
-    let mut injected_files = vec![
-        ("usr/sbin/imp-guest-agent", Path::new("target/x86_64-unknown-linux-gnu/release/imp-guest-agent")),
-    ];
-    
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| format!("{}/target", manifest_dir));
+    let agent_path = std::path::PathBuf::from(target_dir).join("x86_64-unknown-linux-gnu/release/imp-guest-agent");
+
     #[cfg(feature = "proxy")]
     let _ca_mgr = crate::proxy::tls::CaManager::new()?;
     #[cfg(feature = "proxy")]
-    injected_files.push(("usr/local/share/ca-certificates/imp-ca.crt", Path::new("/tmp/imp-artifacts/ca.pem")));
+    let ca_path = out.parent().unwrap_or(Path::new(".")).join("ca.pem");
 
     tokio::task::spawn_blocking(move || -> Result<StageOutputs> {
+        let mut injected_files = vec![
+            ("usr/sbin/imp-guest-agent", agent_path.as_path()),
+        ];
+        #[cfg(feature = "proxy")]
+        injected_files.push(("usr/local/share/ca-certificates/imp-ca.crt", ca_path.as_path()));
+
         let archives: Vec<tar::Archive<Box<dyn Read + Send>>> = tar_streams.into_iter().map(tar::Archive::new).collect();
         let image = crate::artifact::tar2erofs::tar_to_erofs(archives, injected_files)?;
         std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;

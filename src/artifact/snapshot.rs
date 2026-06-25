@@ -24,8 +24,14 @@ impl Stage for SnapshotStage {
         "snapshot"
     }
 
-    fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
-        CacheKey("snapshot-v1".to_string())
+    fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (k, v) in &inputs.artifacts {
+            std::hash::Hash::hash(k, &mut hasher);
+            std::hash::Hash::hash(&v.to_string_lossy(), &mut hasher);
+        }
+        use std::hash::Hasher;
+        CacheKey(format!("snapshot-{:x}", hasher.finish()))
     }
 
     async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {

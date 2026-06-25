@@ -216,8 +216,38 @@ impl<V: Vmm> TestVm<V> {
                     .memory_hard_limit((mem as i64) << 20)
                     .done();
             }
+            if let Some(cpu) = cfg.limits.cpu_max_pct {
+                let period = 100_000_u64;
+                let quota = (cpu as u64) * period / 100;
+                builder = builder
+                    .cpu()
+                    .quota(quota as i64)
+                    .period(period)
+                    .done();
+            }
             if let Err(e) = builder.build(Box::new(hierarchies::V2::new())) {
                 tracing::warn!("Failed to create cgroup {}: {}", cgroup_name, e);
+            }
+            
+            if let Some(pids) = cfg.limits.pids_max {
+                let pids_max_path = format!("/sys/fs/cgroup/{}/pids.max", cgroup_name);
+                if let Err(e) = std::fs::write(&pids_max_path, pids.to_string()) {
+                    tracing::warn!("Failed to apply pids.max: {}", e);
+                }
+            }
+            if let Some(io) = &cfg.limits.io_max {
+                let io_max_path = format!("/sys/fs/cgroup/{}/io.max", cgroup_name);
+                let mut rules = Vec::new();
+                if let Some(rbps) = io.rbps { rules.push(format!("rbps={}", rbps)); }
+                if let Some(wbps) = io.wbps { rules.push(format!("wbps={}", wbps)); }
+                if let Some(riops) = io.riops { rules.push(format!("riops={}", riops)); }
+                if let Some(wiops) = io.wiops { rules.push(format!("wiops={}", wiops)); }
+                if !rules.is_empty() {
+                    let io_str = format!("{} {}\n", io.device, rules.join(" "));
+                    if let Err(e) = std::fs::write(&io_max_path, io_str) {
+                        tracing::warn!("Failed to apply io.max: {}", e);
+                    }
+                }
             }
         }
 
@@ -407,12 +437,14 @@ impl<V: Vmm> TestVm<V> {
     /// # Errors
     /// Returns an error if shutting down the VM or proxy fails.
     pub async fn shutdown(mut self) -> Result<()> {
-        self.instance.request_shutdown().await?;
+        let _ = self.instance.request_shutdown().await;
+        
+        // Actually wait for it to stop to prevent zombie and ebusy
+        let _ = self.instance.kill().await;
+
         if let Some(mut ns) = self.netns.take() {
             let _ = ns.delete();
         }
-        // Actually wait for it to stop then delete cgroup
-        let _ = self.instance.kill().await;
         Ok(())
     }
 }

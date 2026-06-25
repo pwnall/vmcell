@@ -143,7 +143,7 @@ pub enum Egress {
 pub struct ProxyConfig {
     /// Test doubles to intercept and mock requests.
     #[cfg(feature = "proxy")]
-    pub doubles: std::sync::Arc<Vec<crate::proxy::doubles::TestDouble>>,
+    pub doubles: std::sync::Arc<std::sync::RwLock<Vec<crate::proxy::doubles::TestDouble>>>,
     /// Domains that should be blocked.
     pub blocked_domains: Vec<String>,
 }
@@ -188,7 +188,16 @@ pub struct ResourceLimits {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IoMax {
-    // TODO
+    /// Device node string, e.g., "8:0" or "254:0"
+    pub device: String,
+    /// Read bandwidth max in bytes per second
+    pub rbps: Option<u64>,
+    /// Write bandwidth max in bytes per second
+    pub wbps: Option<u64>,
+    /// Read IOPS max
+    pub riops: Option<u64>,
+    /// Write IOPS max
+    pub wiops: Option<u64>,
 }
 
 impl VmConfig {

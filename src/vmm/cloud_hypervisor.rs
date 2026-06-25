@@ -201,13 +201,16 @@ impl CloudHypervisor {
         let vsock_path = tmp.join("vsock.sock");
         let serial_path = tmp.join("serial.log");
 
-        let mut cmd = if let Some(netns) = &res.netns_name {
-            let mut c = Command::new("ip");
+        let mut std_cmd = if let Some(netns) = &res.netns_name {
+            let mut c = std::process::Command::new("ip");
             c.arg("netns").arg("exec").arg(netns).arg(&self.binary_path);
             c
         } else {
-            Command::new(&self.binary_path)
+            std::process::Command::new(&self.binary_path)
         };
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+        let mut cmd = tokio::process::Command::from(std_cmd);
 
         if let Some(dir) = snapshot_dir {
             cmd.arg("--restore")
@@ -317,6 +320,9 @@ impl Vmm for CloudHypervisor {
                             " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
                             res.vmid, res.vmid
                         ));
+                    }
+                    if cfg.nested_virt {
+                        s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
                     }
                     s
                 },
@@ -442,9 +448,14 @@ impl VmInstance for ChInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
-        if let Err(e) = self.process.kill().await {
-            tracing::warn!("Failed to kill CH process: {}", e);
+        if let Some(pid) = self.process.id() {
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(format!("-{}", pid))
+                .status()
+                .await;
         }
+        let _ = self.process.wait().await;
         Ok(())
     }
 

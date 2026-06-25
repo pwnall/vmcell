@@ -62,6 +62,8 @@ pub struct Artifacts {}
 pub struct Pipeline {
     /// The sequence of stages to run.
     pub stages: Vec<Box<dyn Stage>>,
+    /// The target directory for built artifacts.
+    pub target_dir: PathBuf,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -76,10 +78,8 @@ impl Pipeline {
     /// # Errors
     /// Returns an error if any stage fails.
     pub async fn build(&self, _cache: &Cache) -> Result<Artifacts> {
-        let dir = std::env::var("IMP_ARTIFACTS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts"));
-        match tokio::fs::create_dir_all(&dir).await {
+        let dir = &self.target_dir;
+        match tokio::fs::create_dir_all(dir).await {
             Ok(_) => {}
             Err(e) => return Err(crate::error::Error::Io(e)),
         }
@@ -132,9 +132,7 @@ impl Pipeline {
     /// # Errors
     /// Returns an error if the reset fails.
     pub fn reset_to(&self, stage: &str, _cache: &Cache) -> Result<()> {
-        let dir = std::env::var("IMP_ARTIFACTS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts"));
+        let dir = &self.target_dir;
         let mut found = false;
         for s in &self.stages {
             if s.name() == stage {

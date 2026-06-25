@@ -26,7 +26,7 @@ This document captures the rationale behind key architectural decisions and non-
   - **MAC Collisions:** `smoltcp` will silently drop packets if the Ethernet destination MAC is Broadcast but the Source MAC happens to equal the `smoltcp` interface's configured MAC. We statically assign the host's `smoltcp` MAC to `02:00:00:00:00:fe` to avoid collisions with the guest's MAC (derived from the `vmid`).
   - **RX Queue Iteration:** The virtio RX queue descriptor chain must *only* be iterated if we actually have packets in the `rx_queue` ready to send to the guest. Iterating `vring_state.get_queue_mut().iter()` automatically consumes and advances the `avail_idx` pointer; doing this when `rx_queue` is empty drops guest buffers, breaking the connection.
   - **Socket Allocation:** We allocate 16 `TcpSocket` instances per forwarded port to prevent socket pool exhaustion during sequential Keep-Alive HTTP requests.
-- **Iptables REDIRECT:** Egress traffic is intercepted using the `iptables` REDIRECT rule (`-j REDIRECT --to-ports`) rather than `nft` TPROXY, as it requires fewer kernel dependencies and is simpler to invoke.
+- **Nftables TPROXY:** Egress traffic is intercepted using an `nftables` TPROXY ruleset (`tproxy to :{} meta mark set 1 accept`), matching the architecture design requirements over older iptables REDIRECT approaches.
 - **HTTPS MITM Proxy:** `hudsucker` is used for full HTTPS interception with a dynamic CA generated at runtime via `rcgen` and injected into the rootfs. To prevent `hudsucker` from crashing on initial `CONNECT` requests, test doubles explicitly ignore `hyper::Method::CONNECT`.
 
 ## Cgroup v2 Delegation (Rootless)
@@ -46,13 +46,15 @@ This document captures the rationale behind key architectural decisions and non-
 - **OCI Whiteouts:** `tar2erofs.rs` takes an iterator of `tar::Archive` streams and correctly parses OCI whiteout files (`.wh.filename` and `.wh..wh..opq`) directly in-memory, mutating the node tree before final EROFS generation.
 - **Builder VM:** The `MmdebstrapVm` source dynamically invokes `oci::build_rootfs` to build its own transient `builder_rootfs.erofs` before booting. The `ExecRequest` protocol includes a `timeout` field to safely support long-running `apt-get install` commands over the vsock connection, defaulting to 10 seconds for standard commands.
 - **External virtiofsd:** When falling back to the external `virtiofsd` binary, the `--readonly` flag is required.
+- **In-process virtiofsd Read-Only Mode:** When using the experimental in-process `fuse-backend-rs`, read-only mode is not strictly enforced natively yet. This is a justifiable difference accepted due to upstream library constraints and is hidden behind the `experiment-fuse` feature flag.
 
 ## Privileged Test Runner (`imp-test-runner`)
 - `imp-test-runner` executes privileged integration tests without invoking `cargo test` under `sudo`. It verifies it has `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` file capabilities, drops its bounding set to the bare minimum, elevates these to the Ambient set, and switches its `euid`, `egid`, and groups to the developer's identity before `execve`ing the test binary.
 
 ## Benchmarking
-- **Micro and Macro Benchmarks:** `criterion` drives micro-benchmarks for hot-path operations (`postcard` protocol encoding, `/30` host IP generation, `cache_key` computation) under `benches/micro.rs`.
+- **Micro and Macro Benchmarks:** `criterion` drives micro-benchmarks for hot-path operations (`postcard` protocol encoding, `/30` host IP generation, `cache_key` computation, and `tar_to_erofs` packing) under `benches/micro.rs`.
 - **Macro-Benchmark Harness:** `bench-vm` (`src/bin/bench-vm.rs`) acts as a custom harness capable of recording detailed lifecycle metrics like cold-boot and restore distributions (p50, p95, p99, max). It catches and reports boot failures gracefully for basic CI dry-runs missing KVM.
+- **Benchmark Coverage Tests:** Added integration tests in `tests/benchmark.rs` to run the `bench-vm` harness with minimal iterations (`--iterations 1 --warmup 0`) across all compiled-in hypervisor backends (Cloud Hypervisor, Firecracker, QEMU), ensuring the benchmarking paths remain fully covered. Also added a dedicated unit test in `src/artifact/tar2erofs.rs` to verify EROFS conversion on empty tar streams.
 
 ## Remaining Divergences from the Design
 - **Concurrency Testing (`loom`):** The design document recommended introducing `loom` for deep concurrency testing. This is skipped in the current phase.

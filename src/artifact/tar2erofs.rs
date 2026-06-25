@@ -252,3 +252,24 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
     out
 }
+
+#[cfg(all(test, feature = "am-fs-erofs"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tar_to_erofs_empty() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            builder.finish().unwrap();
+        }
+
+        let reader = std::io::Cursor::new(tar_data);
+        let archive = tar::Archive::new(reader);
+        let image = tar_to_erofs(vec![archive], vec![]);
+        assert!(image.is_ok(), "Failed to convert empty tar to EROFS: {:?}", image.err());
+        let bytes = image.unwrap();
+        assert!(!bytes.is_empty(), "EROFS image bytes should not be empty");
+    }
+}
