@@ -20,7 +20,7 @@ pub mod oci;
 pub enum RootfsBuildSource {
     /// OCI registry pull source.
     Oci,
-    /// Full-apt source running mmdebstrap on the host.
+    /// Full-apt source running mmdebstrap inside a micro-VM.
     Mmdebstrap {
         /// The Debian release suite to use (e.g., "bookworm").
         release: String,

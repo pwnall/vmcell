@@ -8,7 +8,7 @@ use crate::net::SmoltcpProcess;
 use crate::proxy::{EgressProxy, ProxyConfig};
 use crate::vmm::{PerVmResources, VmInstance, Vmm};
 #[cfg(feature = "metrics")]
-use cgroups_rs::{cgroup_builder::CgroupBuilder, hierarchies};
+
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -98,6 +98,8 @@ pub struct TestVm<V: Vmm> {
     proxy: Option<EgressProxy>,
     /// The name of the cgroup for this VM.
     cgroup_name: Option<String>,
+    /// The cgroup file system implementation.
+    cgroup_fs: Option<Box<dyn crate::metrics::CgroupFs>>,
     /// The cached agent client connection, if any.
     agent_client: Option<AgentClient>,
     /// Whether the VM was restored from a snapshot.
@@ -154,6 +156,7 @@ impl<V: Vmm> TestVm<V> {
         vmid: u32,
         cfg: &VmConfig,
         cid_alloc: &crate::vmm::CidAllocator,
+        cgroup_fs: &dyn crate::metrics::CgroupFs,
     ) -> Result<EnvSetup> {
         let mut netns = None;
         #[cfg(feature = "net-rootless")]
@@ -247,53 +250,7 @@ impl<V: Vmm> TestVm<V> {
             }
         }
 
-        #[cfg(feature = "metrics")]
-        {
-            let mut builder = CgroupBuilder::new(&cgroup_name);
-            if let Some(mem) = cfg.limits.mem_max_mib {
-                builder = builder
-                    .memory()
-                    .memory_hard_limit((mem as i64) << 20)
-                    .done();
-            }
-            if let Some(cpu) = cfg.limits.cpu_max_pct {
-                let period = 100_000_u64;
-                let quota = (cpu as u64) * period / 100;
-                builder = builder.cpu().quota(quota as i64).period(period).done();
-            }
-            if let Err(e) = builder.build(Box::new(hierarchies::V2::new())) {
-                tracing::warn!("Failed to create cgroup {}: {}", cgroup_name, e);
-            }
-
-            if let Some(pids) = cfg.limits.pids_max {
-                let pids_max_path = format!("/sys/fs/cgroup/{}/pids.max", cgroup_name);
-                if let Err(e) = std::fs::write(&pids_max_path, pids.to_string()) {
-                    tracing::warn!("Failed to apply pids.max: {}", e);
-                }
-            }
-            if let Some(io) = &cfg.limits.io_max {
-                let io_max_path = format!("/sys/fs/cgroup/{}/io.max", cgroup_name);
-                let mut rules = Vec::new();
-                if let Some(rbps) = io.rbps {
-                    rules.push(format!("rbps={}", rbps));
-                }
-                if let Some(wbps) = io.wbps {
-                    rules.push(format!("wbps={}", wbps));
-                }
-                if let Some(riops) = io.riops {
-                    rules.push(format!("riops={}", riops));
-                }
-                if let Some(wiops) = io.wiops {
-                    rules.push(format!("wiops={}", wiops));
-                }
-                if !rules.is_empty() {
-                    let io_str = format!("{} {}\n", io.device, rules.join(" "));
-                    if let Err(e) = std::fs::write(&io_max_path, io_str) {
-                        tracing::warn!("Failed to apply io.max: {}", e);
-                    }
-                }
-            }
-        }
+        cgroup_fs.create_slice(&cgroup_name, &cfg.limits)?;
 
         let guest_cid = cid_alloc.allocate()?;
 
@@ -333,7 +290,7 @@ impl<V: Vmm> TestVm<V> {
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::VirtioFs { dir: PathBuf::from("/rootfs") }).build().unwrap();
     /// let cid_alloc = CidAllocator::new();
     /// let vmid_alloc = VmidAllocator::new();
-    /// let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await.unwrap();
+    /// let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
     /// # }
     /// ```
     pub async fn start(
@@ -341,14 +298,15 @@ impl<V: Vmm> TestVm<V> {
         cfg: VmConfig,
         cid_alloc: &crate::vmm::CidAllocator,
         vmid_alloc: VmidAllocator,
+        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
     ) -> Result<Self> {
         let vmid = VmidGuard {
             vmid: vmid_alloc.allocate()?,
             allocator: vmid_alloc,
         };
-        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc).await?;
+        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc, &*cgroup_fs).await?;
 
-        let mut instance = vmm.create(&cfg, &env.res).await?;
+        let mut instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
         info!("Booting instance...");
         instance.boot().await?;
         info!("Instance booted.");
@@ -360,6 +318,7 @@ impl<V: Vmm> TestVm<V> {
             smoltcp: env.smoltcp,
             proxy: env.proxy,
             cgroup_name: Some(env.res.cgroup_name.clone()),
+            cgroup_fs: Some(cgroup_fs),
             agent_client: None,
             restored: false,
         })
@@ -384,7 +343,7 @@ impl<V: Vmm> TestVm<V> {
     /// let cid_alloc = CidAllocator::new();
     /// let vmid_alloc = VmidAllocator::new();
     /// let snap_dir = PathBuf::from("/tmp/snap");
-    /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, &cid_alloc, vmid_alloc).await.unwrap();
+    /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
     /// # }
     /// ```
     pub async fn restore(
@@ -393,6 +352,7 @@ impl<V: Vmm> TestVm<V> {
         cfg: VmConfig,
         cid_alloc: &crate::vmm::CidAllocator,
         vmid_alloc: VmidAllocator,
+        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
     ) -> Result<Self> {
         if matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
             return Err(crate::error::Error::Config(
@@ -410,10 +370,10 @@ impl<V: Vmm> TestVm<V> {
             vmid: vmid_alloc.allocate()?,
             allocator: vmid_alloc,
         };
-        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc).await?;
+        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc, &*cgroup_fs).await?;
 
         info!("Restoring instance...");
-        let mut instance = vmm.restore(snapshot_dir, &cfg, &env.res).await?;
+        let mut instance = vmm.restore(snapshot_dir, &cfg, &env.res, &*cgroup_fs).await?;
         info!("Resuming instance...");
         instance.resume().await?;
         info!("Instance resumed.");
@@ -425,6 +385,7 @@ impl<V: Vmm> TestVm<V> {
             smoltcp: env.smoltcp,
             proxy: env.proxy,
             cgroup_name: Some(env.res.cgroup_name.clone()),
+            cgroup_fs: Some(cgroup_fs),
             agent_client: None,
             restored: true,
         })
@@ -528,7 +489,11 @@ impl<V: Vmm> TestVm<V> {
     /// # Errors
     /// Returns an error if metrics collection fails.
     pub async fn usage(&self) -> Result<ResourceUsage> {
-        self.instance.as_ref().expect("instance missing").stats().await
+        if let (Some(cg_name), Some(fs)) = (&self.cgroup_name, &self.cgroup_fs) {
+            fs.read_stats(cg_name)
+        } else {
+            Ok(ResourceUsage::default())
+        }
     }
 
     /// Shuts down the VM and cleans up associated resources.
@@ -546,11 +511,8 @@ impl<V: Vmm> TestVm<V> {
         if let Some(mut ns) = self.netns.take() {
             let _ = ns.delete();
         }
-        #[cfg(feature = "metrics")]
-        if let Some(cg_name) = self.cgroup_name.take() {
-            let cg =
-                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), &cg_name);
-            let _ = cg.delete();
+        if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
+            let _ = fs.delete_slice(&cg_name);
         }
         #[cfg(feature = "net-rootless")]
         let _ = self.smoltcp.take();
@@ -570,11 +532,8 @@ impl<V: Vmm> Drop for TestVm<V> {
         if let Some(mut ns) = self.netns.take() {
             let _ = ns.delete();
         }
-        #[cfg(feature = "metrics")]
-        if let Some(cg_name) = self.cgroup_name.take() {
-            let cg =
-                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), &cg_name);
-            let _ = cg.delete();
+        if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
+            let _ = fs.delete_slice(&cg_name);
         }
     }
 }

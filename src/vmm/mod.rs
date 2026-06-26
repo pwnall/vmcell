@@ -5,7 +5,6 @@
 
 use crate::config::VmConfig;
 use crate::error::Result;
-use crate::metrics::ResourceUsage;
 /// Cloud Hypervisor VMM backend implementation.
 pub mod cloud_hypervisor;
 
@@ -118,22 +117,6 @@ pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::pro
     tokio::process::Command::from(std_cmd)
 }
 
-/// Writes a PID to a cgroup's `cgroup.procs` file.
-pub async fn write_cgroup_procs(cgroup_name: &str, pid: u32) {
-    if !cgroup_name.is_empty() {
-        let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", cgroup_name);
-        if let Err(e) = tokio::fs::write(&procs_path, pid.to_string()).await {
-            tracing::error!(
-                "WARNING: failed to write process {} to {}: {:?}",
-                pid,
-                procs_path,
-                e
-            );
-        } else {
-            tracing::info!("Added process {} to cgroup {}", pid, cgroup_name);
-        }
-    }
-}
 
 /// Waits until the given socket path appears, or times out. Returns true if it exists.
 pub async fn wait_for_socket(socket_path: &Path, timeout_ms: u64, interval_ms: u64) -> bool {
@@ -248,7 +231,7 @@ pub trait Vmm: Send + Sync {
     ///
     /// # Errors
     /// Returns an error if the VMM process fails to start or configuration is invalid.
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance>;
+    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance>;
 
     /// Restores a VM instance from a snapshot directory with the given resources.
     ///
@@ -259,6 +242,7 @@ pub trait Vmm: Send + Sync {
         snapshot_dir: &Path,
         cfg: &VmConfig,
         res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance>;
 
     /// Returns the capabilities of this VMM backend.
@@ -301,7 +285,6 @@ pub trait VmInstance: Send {
     ///
     /// # Errors
     /// Returns an error if stats cannot be collected.
-    async fn stats(&self) -> Result<ResourceUsage>;
     /// Returns the path to the AF_UNIX socket for vsock communication.
     fn vsock_path(&self) -> &Path;
     /// Returns the unique vsock Context ID (CID) assigned to this VM.
@@ -333,7 +316,7 @@ pub struct FakeVmInstance {
 impl Vmm for FakeVmm {
     type Instance = FakeVmInstance;
 
-    async fn create(&self, _cfg: &VmConfig, _res: &PerVmResources) -> Result<Self::Instance> {
+    async fn create(&self, _cfg: &VmConfig, _res: &PerVmResources, _cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
         if let Ok(mut lock) = self.calls.lock() {
             lock.push("create".to_string());
         }
@@ -349,6 +332,7 @@ impl Vmm for FakeVmm {
         _snapshot_dir: &Path,
         _cfg: &VmConfig,
         _res: &PerVmResources,
+        _cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         if let Ok(mut lock) = self.calls.lock() {
             lock.push("restore".to_string());
@@ -407,17 +391,6 @@ impl VmInstance for FakeVmInstance {
             lock.push("snapshot".to_string());
         }
         Ok(())
-    }
-    async fn stats(&self) -> Result<ResourceUsage> {
-        Ok(ResourceUsage {
-            mem_peak_mib: 0,
-            mem_current_mib: 0,
-            cpu_usec: 0,
-            io_read_bytes: 0,
-            io_write_bytes: 0,
-            net_rx_bytes: 0,
-            net_tx_bytes: 0,
-        })
     }
     fn vsock_path(&self) -> &Path {
         &self.vsock_path

@@ -1,6 +1,5 @@
 use crate::config::VmConfig;
 use crate::error::{Error, Result};
-use crate::metrics::ResourceUsage;
 use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -83,7 +82,7 @@ impl Firecracker {
             .spawn()?;
 
         if let Some(pid) = process.id() {
-            crate::vmm::write_cgroup_procs(&res.cgroup_name, pid).await;
+            cgroups.add_task(&res.cgroup_name, pid)?;
         }
 
         if !crate::vmm::wait_for_socket(&api_socket, 1000, 20).await {
@@ -239,7 +238,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
 impl Vmm for Firecracker {
     type Instance = FcInstance;
 
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
+    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
         if !cfg.shares.is_empty() {
             return Err(Error::Vmm(
                 "Firecracker does not support virtio-fs shares".into(),
@@ -417,6 +416,7 @@ impl Vmm for Firecracker {
         snapshot_dir: &Path,
         _cfg: &VmConfig,
         res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         let (_tmp, api_socket, vsock_path, serial_path, process, pgid) = self.spawn_fc(res).await?;
 
@@ -573,11 +573,6 @@ impl VmInstance for FcInstance {
         res
     }
 
-    async fn stats(&self) -> Result<ResourceUsage> {
-        Ok(crate::metrics::read_cgroup_stats(
-            self.cgroup_name.as_deref(),
-        ))
-    }
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path

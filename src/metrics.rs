@@ -2,6 +2,11 @@
 
 #![forbid(unsafe_code)]
 
+use crate::error::Result;
+#[cfg(feature = "metrics")]
+#[cfg(feature = "metrics")]
+use cgroups_rs::{cgroup_builder::CgroupBuilder, hierarchies};
+
 /// Resource usage statistics for a VM instance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -22,28 +27,106 @@ pub struct ResourceUsage {
     pub net_tx_bytes: u64,
 }
 
-/// Reads resource usage statistics from a given cgroup.
-#[must_use]
-pub fn read_cgroup_stats(cgroup_name: Option<&str>) -> ResourceUsage {
-    let mut usage = ResourceUsage::default();
-    #[cfg(feature = "metrics")]
-    {
-        if let Some(cg_name) = cgroup_name {
-            let cg =
-                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
+/// Interface for managing cgroups.
+pub trait CgroupFs: Send + Sync + std::fmt::Debug {
+    /// Creates a cgroup slice with the given limits.
+    fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()>;
+    /// Deletes a cgroup slice.
+    fn delete_slice(&self, name: &str) -> Result<()>;
+    /// Reads resource usage statistics from a given cgroup.
+    fn read_stats(&self, name: &str) -> Result<ResourceUsage>;
+    /// Adds a task (process ID) to the cgroup.
+    fn add_task(&self, name: &str, pid: u32) -> Result<()>;
+}
+
+/// The default CgroupFs implementation.
+#[derive(Debug, Default, Clone)]
+pub struct DefaultCgroupFs;
+
+impl CgroupFs for DefaultCgroupFs {
+    fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()> {
+        #[cfg(feature = "metrics")]
+        {
+            let mut builder = CgroupBuilder::new(name);
+            if let Some(mem) = limits.mem_max_mib {
+                builder = builder
+                    .memory()
+                    .memory_hard_limit((mem as i64) << 20)
+                    .done();
+            }
+            if let Some(cpu) = limits.cpu_max_pct {
+                let period = 100_000_u64;
+                let quota = (cpu as u64) * period / 100;
+                builder = builder.cpu().quota(quota as i64).period(period).done();
+            }
+            if let Err(e) = builder.build(Box::new(hierarchies::V2::new())) {
+                tracing::warn!("Failed to create cgroup {}: {}", name, e);
+            }
+
+            if let Some(pids) = limits.pids_max {
+                let pids_max_path = format!("/sys/fs/cgroup/{}/pids.max", name);
+                if let Err(e) = std::fs::write(&pids_max_path, pids.to_string()) {
+                    tracing::warn!("Failed to apply pids.max: {}", e);
+                }
+            }
+            if let Some(io) = &limits.io_max {
+                let io_max_path = format!("/sys/fs/cgroup/{}/io.max", name);
+                let mut rules = Vec::new();
+                if let Some(rbps) = io.rbps {
+                    rules.push(format!("rbps={}", rbps));
+                }
+                if let Some(wbps) = io.wbps {
+                    rules.push(format!("wbps={}", wbps));
+                }
+                if let Some(riops) = io.riops {
+                    rules.push(format!("riops={}", riops));
+                }
+                if let Some(wiops) = io.wiops {
+                    rules.push(format!("wiops={}", wiops));
+                }
+                if !rules.is_empty() {
+                    let io_str = format!("{} {}\n", io.device, rules.join(" "));
+                    if let Err(e) = std::fs::write(&io_max_path, io_str) {
+                        tracing::warn!("Failed to apply io.max: {}", e);
+                    }
+                }
+            }
+        }
+        // Silence unused parameter warnings when metrics feature is off
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = name;
+            let _ = limits;
+        }
+        Ok(())
+    }
+
+    fn delete_slice(&self, name: &str) -> Result<()> {
+        #[cfg(feature = "metrics")]
+        {
+            let cg = cgroups_rs::Cgroup::load(Box::new(hierarchies::V2::new()), name);
+            let _ = cg.delete();
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = name;
+        Ok(())
+    }
+
+    fn read_stats(&self, name: &str) -> Result<ResourceUsage> {
+        let mut usage = ResourceUsage::default();
+        #[cfg(feature = "metrics")]
+        {
+            let cg = cgroups_rs::Cgroup::load(Box::new(hierarchies::V2::new()), name);
             for sub in cg.subsystems() {
                 match sub {
                     cgroups_rs::Subsystem::Mem(_) => {
-                        let base_path = format!("/sys/fs/cgroup/{}", cg_name);
-                        if let Ok(s) =
-                            std::fs::read_to_string(format!("{}/memory.current", base_path))
-                        {
+                        let base_path = format!("/sys/fs/cgroup/{}", name);
+                        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
                             if let Ok(val) = s.trim().parse::<u64>() {
                                 usage.mem_current_mib = val / 1024 / 1024;
                             }
                         }
-                        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path))
-                        {
+                        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
                             if let Ok(val) = s.trim().parse::<u64>() {
                                 usage.mem_peak_mib = val / 1024 / 1024;
                             }
@@ -64,6 +147,127 @@ pub fn read_cgroup_stats(cgroup_name: Option<&str>) -> ResourceUsage {
                 }
             }
         }
+        #[cfg(not(feature = "metrics"))]
+        let _ = name;
+        
+        Ok(usage)
     }
-    usage
+
+    fn add_task(&self, name: &str, pid: u32) -> Result<()> {
+        if !name.is_empty() {
+            let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
+            // Write PID directly to bypass `Cgroup::add_task` limitations for nested unprivileged cgroups
+            if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
+                tracing::warn!("Failed to add process {} to cgroup {}: {}", pid, name, e);
+            } else {
+                tracing::info!("Added process {} to cgroup {}", pid, name);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A fake CgroupFs implementation for unit testing.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct FakeCgroupFs {
+    state: std::sync::Arc<std::sync::Mutex<FakeCgroupState>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct FakeCgroupState {
+    pub slices: std::collections::HashMap<String, crate::config::ResourceLimits>,
+    pub tasks: std::collections::HashMap<String, Vec<u32>>,
+}
+
+#[cfg(test)]
+impl FakeCgroupFs {
+        /// Creates a new fake cgroup filesystem.
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(FakeCgroupState::default())),
+        }
+    }
+
+        /// Checks if a slice exists.
+    pub fn has_slice(&self, name: &str) -> bool {
+        self.state.lock().unwrap().slices.contains_key(name)
+    }
+
+        /// Gets limits for a slice.
+    pub fn get_limits(&self, name: &str) -> Option<crate::config::ResourceLimits> {
+        self.state.lock().unwrap().slices.get(name).cloned()
+    }
+
+        /// Checks if a task is added.
+    pub fn has_task(&self, name: &str, pid: u32) -> bool {
+        self.state.lock().unwrap().tasks.get(name).map(|t| t.contains(&pid)).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+impl CgroupFs for FakeCgroupFs {
+    fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.slices.insert(name.to_string(), limits.clone());
+        Ok(())
+    }
+
+    fn delete_slice(&self, name: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.slices.remove(name);
+        state.tasks.remove(name);
+        Ok(())
+    }
+
+    fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
+        Ok(ResourceUsage {
+            mem_peak_mib: 42,
+            mem_current_mib: 21,
+            cpu_usec: 1000,
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
+        })
+    }
+
+    fn add_task(&self, name: &str, pid: u32) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.tasks.entry(name.to_string()).or_default().push(pid);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ResourceLimits;
+
+    #[test]
+    fn test_fake_cgroup_fs() {
+        let fs = FakeCgroupFs::new();
+        let name = "imp-vm-1";
+        let limits = ResourceLimits {
+            mem_max_mib: Some(128),
+            cpu_max_pct: Some(50),
+            pids_max: None,
+            io_max: None,
+        };
+        
+        fs.create_slice(name, &limits).unwrap();
+        assert!(fs.has_slice(name));
+        
+        let stored_limits = fs.get_limits(name).unwrap();
+        assert_eq!(stored_limits.mem_max_mib, Some(128));
+        assert_eq!(stored_limits.cpu_max_pct, Some(50));
+        
+        fs.add_task(name, 1234).unwrap();
+        assert!(fs.has_task(name, 1234));
+        
+        fs.delete_slice(name).unwrap();
+        assert!(!fs.has_slice(name));
+        assert!(!fs.has_task(name, 1234));
+    }
 }

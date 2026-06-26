@@ -59,7 +59,7 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
     .build()?;
 
     tracing::info!("Starting builder VM...");
-    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await?;
+    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc, Box::new(crate::metrics::DefaultCgroupFs::default())).await?;
 
     // Use a helper scope to ensure vm is shutdown on error
     let build_res = async {

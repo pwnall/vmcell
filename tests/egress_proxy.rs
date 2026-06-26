@@ -95,7 +95,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     };
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc)
+    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
         .await
         .expect("Failed to start VM");
 

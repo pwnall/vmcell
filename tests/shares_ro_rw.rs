@@ -73,7 +73,7 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = imp_testing::TestVm::start(backend, _cfg, &cid_alloc, vmid_alloc)
+    let mut vm = imp_testing::TestVm::start(backend, _cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
         .await
         .expect("Failed to start VM");
 

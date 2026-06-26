@@ -78,7 +78,8 @@ async fn run_bench<V: Vmm>(
     if is_restore {
         println!("Creating baseline snapshot for restore benchmark...");
         let mut base_vm =
-            match TestVm::start(vmm, cfg.clone(), &cid_allocator, allocator.clone()).await {
+            match TestVm::start(vmm, cfg.clone(), &cid_allocator, allocator.clone(),
+                Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await {
                 Ok(vm) => vm,
                 Err(e) => {
                     println!("Failed to start base VM for snapshotting: {}", e);
@@ -119,10 +120,12 @@ async fn run_bench<V: Vmm>(
                 cfg.clone(),
                 &cid_allocator,
                 allocator.clone(),
+                Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
             )
             .await
         } else {
-            TestVm::start(vmm, cfg.clone(), &cid_allocator, allocator.clone()).await
+            TestVm::start(vmm, cfg.clone(), &cid_allocator, allocator.clone(),
+                Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await
         };
 
         match vm_res {

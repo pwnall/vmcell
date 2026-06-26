@@ -65,7 +65,7 @@ impl Stage for SnapshotStage {
 
         let cid_alloc = crate::vmm::CidAllocator::new();
         let vmid_alloc = crate::orchestrator::VmidAllocator::new();
-        let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc).await?;
+        let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc, Box::new(crate::metrics::DefaultCgroupFs::default())).await?;
 
         // Wait for VM to boot fully via vsock agent
         let agent = vm.agent(None).await?;

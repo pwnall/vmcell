@@ -55,7 +55,7 @@ async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let mut vms = Vec::new();
     for _ in 0..2 {
-        let vm = TestVm::start(vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone())
+        let vm = TestVm::start(vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone(), Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
             .await
             .expect("Failed to start VM");
         vms.push(vm);

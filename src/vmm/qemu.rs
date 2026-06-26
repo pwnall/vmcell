@@ -4,7 +4,6 @@
 
 use crate::config::VmConfig;
 use crate::error::{Error, Result};
-use crate::metrics::ResourceUsage;
 use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -290,7 +289,7 @@ impl Qemu {
             .spawn()?;
 
         if let Some(pid) = process.id() {
-            crate::vmm::write_cgroup_procs(&res.cgroup_name, pid).await;
+            cgroups.add_task(&res.cgroup_name, pid)?;
         }
 
         if !crate::vmm::wait_for_socket(&qmp_socket, 1000, 20).await {
@@ -316,7 +315,7 @@ impl Qemu {
 impl Vmm for Qemu {
     type Instance = QemuInstance;
 
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
+    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
         let (
             _tmp,
             qmp_socket,
@@ -347,6 +346,7 @@ impl Vmm for Qemu {
         _snapshot_dir: &Path,
         _cfg: &VmConfig,
         _res: &PerVmResources,
+        _cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         Err(Error::Unsupported {
             vmm: "qemu".to_string(),
@@ -420,11 +420,6 @@ impl VmInstance for QemuInstance {
         })
     }
 
-    async fn stats(&self) -> Result<ResourceUsage> {
-        Ok(crate::metrics::read_cgroup_stats(
-            self.cgroup_name.as_deref(),
-        ))
-    }
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path

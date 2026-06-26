@@ -5,7 +5,6 @@
 
 use crate::config::VmConfig;
 use crate::error::{Error, Result};
-use crate::metrics::ResourceUsage;
 use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -136,6 +135,7 @@ impl CloudHypervisor {
         &self,
         res: &PerVmResources,
         snapshot_dir: Option<&Path>,
+        cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<(
         std::path::PathBuf,
         std::path::PathBuf,
@@ -166,7 +166,7 @@ impl CloudHypervisor {
             .spawn()?;
 
         if let Some(pid) = process.id() {
-            crate::vmm::write_cgroup_procs(&res.cgroup_name, pid).await;
+            cgroups.add_task(&res.cgroup_name, pid)?;
         }
 
         if !crate::vmm::wait_for_socket(&api_socket, 1000, 20).await {
@@ -181,9 +181,9 @@ impl CloudHypervisor {
 impl Vmm for CloudHypervisor {
     type Instance = ChInstance;
 
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources) -> Result<Self::Instance> {
+    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
         let (tmp, api_socket, vsock_path, serial_path, process, pgid) =
-            self.spawn_ch(res, None).await?;
+            self.spawn_ch(res, None, cgroups).await?;
 
         let mut fs_daemons = Vec::new();
         let mut ch_fs = Vec::new();
@@ -321,9 +321,10 @@ impl Vmm for CloudHypervisor {
         snapshot_dir: &Path,
         cfg: &VmConfig,
         res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         let (tmp, api_socket, vsock_path, serial_path, process, pgid) =
-            self.spawn_ch(res, Some(snapshot_dir)).await?;
+            self.spawn_ch(res, Some(snapshot_dir), cgroups).await?;
 
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
@@ -418,11 +419,6 @@ impl VmInstance for ChInstance {
         res
     }
 
-    async fn stats(&self) -> Result<ResourceUsage> {
-        Ok(crate::metrics::read_cgroup_stats(
-            self.cgroup_name.as_deref(),
-        ))
-    }
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path

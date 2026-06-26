@@ -81,7 +81,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             host_services_port: None,
         };
 
-        let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc.clone())
+        let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc.clone(), Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
             .await
             .expect("Failed to start VM");
 
@@ -183,7 +183,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             host_services_port: None,
         };
 
-        let mut vm = TestVm::restore(vmm, &snapshot_dir, cfg, &cid_alloc, vmid_alloc)
+        let mut vm = TestVm::restore(vmm, &snapshot_dir, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
             .await
             .expect("Failed to restore VM");
 
