@@ -48,9 +48,15 @@ async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("Failed to start VM");
+    let mut vm = TestVm::start(
+        vmm,
+        cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("Failed to start VM");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
     println!("SERIAL LOG:\n{}", log);
@@ -74,7 +80,10 @@ async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     assert!(booted, "VM failed to boot (did not see expected log line)");
 
     let agent = vm
-        .agent(Some(std::time::Duration::from_secs(60)))
+        .agent(
+            Some(std::time::Duration::from_secs(60)),
+            &imp_testing::orchestrator::RealClock,
+        )
         .await
         .expect("Failed to connect to agent");
 

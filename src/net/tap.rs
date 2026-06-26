@@ -6,7 +6,6 @@
 use crate::error::{Error, Result};
 use futures::stream::TryStreamExt;
 use std::net::Ipv4Addr;
-use std::process::Command;
 
 /// Interface for executing netlink operations.
 pub trait Netlink: Send + Sync {
@@ -151,19 +150,59 @@ impl Netlink for RtNetlink {
             .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
         let inner_res = ns
             .run(|_| {
-                let _ = std::process::Command::new("ip")
-                    .args(["rule", "add", "fwmark", "1", "lookup", "100"])
-                    .status();
-                let _ = std::process::Command::new("ip")
-                    .args([
-                        "route", "add", "local", "default", "dev", "lo", "table", "100",
-                    ])
-                    .status();
-                Ok::<(), String>(())
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => return Err(format!("tokio build failed: {}", e)),
+                };
+                rt.block_on(async {
+                    let (connection, handle, _) = rtnetlink::new_connection()
+                        .map_err(|e| format!("rtnetlink connect failed: {}", e))?;
+                    tokio::spawn(connection);
+
+                    let lo_idx = handle
+                        .link()
+                        .get()
+                        .match_name("lo".to_string())
+                        .execute()
+                        .try_next()
+                        .await
+                        .map_err(|e| format!("get lo err: {}", e))?
+                        .ok_or_else(|| "lo not found".to_string())?
+                        .header
+                        .index;
+
+                    let mut rule = handle.rule().add();
+                    let msg = rule.message_mut();
+                    msg.header.table = 100;
+                    msg.header.action = netlink_packet_route::rule::RuleAction::Other(1); // FR_ACT_TO_TBL
+                    msg.attributes
+                        .push(netlink_packet_route::rule::RuleAttribute::FwMark(1));
+                    rule.execute()
+                        .await
+                        .map_err(|e| format!("rule add err: {}", e))?;
+
+                    let mut route = handle.route().add();
+                    let msg = route.message_mut();
+                    msg.header.table = 100;
+                    msg.header.protocol = netlink_packet_route::route::RouteProtocol::Other(2); // RTPROT_BOOT
+                    msg.header.scope = netlink_packet_route::route::RouteScope::Other(253); // RT_SCOPE_LINK
+                    msg.header.kind = netlink_packet_route::route::RouteType::Other(2); // RTN_LOCAL
+                    msg.attributes
+                        .push(netlink_packet_route::route::RouteAttribute::Oif(lo_idx));
+                    route
+                        .execute()
+                        .await
+                        .map_err(|e| format!("route add err: {}", e))?;
+
+                    Ok(())
+                })
             })
             .map_err(|e| Error::Network(format!("ns run err: {:?}", e)))?;
         if let Err(e) = inner_res {
-            return Err(Error::Network(format!("ip rule add err: {}", e)));
+            return Err(Error::Network(e));
         }
         Ok(())
     }
@@ -173,28 +212,38 @@ impl Netlink for RtNetlink {
 pub struct DefaultNftApplier;
 impl NftApplier for DefaultNftApplier {
     fn apply_rules(&self, netns: &str, rules: &str) -> Result<()> {
-        use std::io::Write;
-        let mut child = Command::new("ip")
-            .args(["netns", "exec", netns, "nft", "-f", "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::Subprocess(format!("nft spawn failed: {}", e)))?;
+        let ns = netns_rs::NetNs::get(netns)
+            .map_err(|e| Error::Subprocess(format!("netns get failed: {}", e)))?;
+        let rules_str = rules.to_string();
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(rules.as_bytes())
-                .map_err(|e| Error::Subprocess(format!("nft write failed: {}", e)))?;
-        }
+        let inner_res = ns.run(move |_| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("nft")
+                .args(["-f", "-"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("nft spawn failed: {}", e))?;
 
-        let status = child
-            .wait()
-            .map_err(|e| Error::Subprocess(format!("nft wait failed: {}", e)))?;
-        if !status.success() {
-            return Err(Error::Subprocess(
-                "nft rules application failed".to_string(),
-            ));
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(rules_str.as_bytes())
+                    .map_err(|e| format!("nft write failed: {}", e))?;
+            }
+
+            let status = child
+                .wait()
+                .map_err(|e| format!("nft wait failed: {}", e))?;
+            if !status.success() {
+                return Err("nft rules application failed".to_string());
+            }
+            Ok::<(), String>(())
+        });
+
+        match inner_res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Error::Subprocess(e)),
+            Err(e) => Err(Error::Subprocess(format!("ns run err: {}", e))),
         }
-        Ok(())
     }
 }
 
@@ -300,23 +349,72 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    struct MockNetlink;
-    impl Netlink for MockNetlink {
-        fn add_netns(&self, _name: &str) -> Result<()> {
+    pub struct FakeNetlink {
+        pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeNetlink {
+        pub fn new() -> Self {
+            Self {
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Netlink for FakeNetlink {
+        fn add_netns(&self, name: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("add_netns({})", name));
             Ok(())
         }
         fn setup_tap(
             &self,
-            _netns: &str,
-            _tap_name: &str,
+            netns: &str,
+            tap_name: &str,
             _vmid: u32,
         ) -> Result<Option<tun_tap::Iface>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("setup_tap({}, {})", netns, tap_name));
             Ok(None)
         }
-        fn delete_netns(&self, _name: &str) -> Result<()> {
+        fn delete_netns(&self, name: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("delete_netns({})", name));
             Ok(())
         }
-        fn setup_tproxy_routing(&self, _netns: &str) -> Result<()> {
+        fn setup_tproxy_routing(&self, netns: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("setup_tproxy_routing({})", netns));
+            Ok(())
+        }
+    }
+
+    pub struct FakeNftApplier {
+        pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeNftApplier {
+        pub fn new() -> Self {
+            Self {
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl NftApplier for FakeNftApplier {
+        fn apply_rules(&self, netns: &str, _rules: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("apply_rules({})", netns));
             Ok(())
         }
     }
@@ -325,8 +423,8 @@ mod tests {
         #[test]
         fn test_path_injectivity(vmid1 in 1u32..255, vmid2 in 1u32..255) {
             prop_assume!(vmid1 != vmid2);
-            let ns1 = NetNamespace::create(vmid1, Box::new(MockNetlink)).unwrap();
-            let ns2 = NetNamespace::create(vmid2, Box::new(MockNetlink)).unwrap();
+            let ns1 = NetNamespace::create(vmid1, Box::new(FakeNetlink::new())).unwrap();
+            let ns2 = NetNamespace::create(vmid2, Box::new(FakeNetlink::new())).unwrap();
 
             assert_ne!(ns1.name, ns2.name);
             assert_ne!(ns1.tap_name, ns2.tap_name);
@@ -340,7 +438,7 @@ mod tests {
             name: "test".into(),
             tap_name: "test".into(),
             vmid: 42,
-            netlink: Box::new(MockNetlink),
+            netlink: Box::new(FakeNetlink::new()),
             _tap: None,
         };
         assert_eq!(ns.host_ip(), "10.200.42.1");

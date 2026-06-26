@@ -77,16 +77,25 @@ async fn run_bench<V: Vmm>(
 
     if is_restore {
         println!("Creating baseline snapshot for restore benchmark...");
-        let mut base_vm =
-            match TestVm::start(vmm, cfg.clone(), &cid_allocator, allocator.clone(),
-                Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await {
-                Ok(vm) => vm,
-                Err(e) => {
-                    println!("Failed to start base VM for snapshotting: {}", e);
-                    return;
-                }
-            };
-        if let Err(e) = base_vm.agent(None).await {
+        let mut base_vm = match TestVm::start(
+            vmm,
+            cfg.clone(),
+            &cid_allocator,
+            allocator.clone(),
+            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        )
+        .await
+        {
+            Ok(vm) => vm,
+            Err(e) => {
+                println!("Failed to start base VM for snapshotting: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = base_vm
+            .agent(None, &imp_testing::orchestrator::RealClock)
+            .await
+        {
             println!("Failed to connect to base VM agent: {}", e);
             let _ = base_vm.shutdown().await;
             return;
@@ -124,13 +133,19 @@ async fn run_bench<V: Vmm>(
             )
             .await
         } else {
-            TestVm::start(vmm, cfg.clone(), &cid_allocator, allocator.clone(),
-                Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await
+            TestVm::start(
+                vmm,
+                cfg.clone(),
+                &cid_allocator,
+                allocator.clone(),
+                Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+            )
+            .await
         };
 
         match vm_res {
             Ok(mut vm) => {
-                if let Ok(_agent) = vm.agent(None).await {
+                if let Ok(_agent) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
                     let elapsed = start.elapsed().as_millis();
                     if i >= args.warmup {
                         latencies.push(elapsed);

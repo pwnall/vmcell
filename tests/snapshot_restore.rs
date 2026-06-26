@@ -81,11 +81,17 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             host_services_port: None,
         };
 
-        let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc.clone(), Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-            .await
-            .expect("Failed to start VM");
+        let mut vm = TestVm::start(
+            vmm,
+            cfg,
+            &cid_alloc,
+            vmid_alloc.clone(),
+            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        )
+        .await
+        .expect("Failed to start VM");
 
-        let agent = match vm.agent(None).await {
+        let agent = match vm.agent(None, &imp_testing::orchestrator::RealClock).await {
             Ok(a) => a,
             Err(e) => {
                 let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
@@ -183,14 +189,21 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             host_services_port: None,
         };
 
-        let mut vm = TestVm::restore(vmm, &snapshot_dir, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-            .await
-            .expect("Failed to restore VM");
+        let mut vm = TestVm::restore(
+            vmm,
+            &snapshot_dir,
+            cfg,
+            &cid_alloc,
+            vmid_alloc,
+            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        )
+        .await
+        .expect("Failed to restore VM");
 
         // This implicitly tests vsock reconnect and CID rotation because the agent
         // client connects using the restored VM's newly allocated CID.
         let log_path = vm.instance().serial_log().to_path_buf();
-        let agent_res = vm.agent(None).await;
+        let agent_res = vm.agent(None, &imp_testing::orchestrator::RealClock).await;
         if agent_res.is_err() {
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
             println!("SERIAL LOG ON ERROR:\n{}", log);
@@ -227,7 +240,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();
         let mac_out = vm
-            .agent(None)
+            .agent(None, &imp_testing::orchestrator::RealClock)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![
@@ -254,7 +267,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .parse()
             .unwrap();
         let time_out = vm
-            .agent(None)
+            .agent(None, &imp_testing::orchestrator::RealClock)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
@@ -279,7 +292,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
         let pre_rng = std::fs::read_to_string(snapshot_dir.join("pre_rng.txt")).unwrap();
         let rng_out = vm
-            .agent(None)
+            .agent(None, &imp_testing::orchestrator::RealClock)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![

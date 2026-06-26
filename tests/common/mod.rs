@@ -36,9 +36,15 @@ use imp_testing::*;
 pub async fn start_vm<V: Vmm>(vmm: &V, cfg: VmConfig) -> TestVm<V> {
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("start_vm: VM failed to start")
+    TestVm::start(
+        vmm,
+        cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("start_vm: VM failed to start")
 }
 
 #[macro_export]

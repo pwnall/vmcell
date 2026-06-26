@@ -5,7 +5,7 @@ use imp_testing::agent::protocol::{ExecRequest, Message};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
 };
-use rustix::process::{WaitOptions, pivot_root, wait, waitpid};
+use rustix::process::{WaitOptions, pivot_root, wait};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -87,9 +87,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let _ = Command::new("ip")
-        .args(["link", "set", "lo", "up"])
-        .status();
+    // Bring up loopback interface without shelling out to `ip`
+    #[repr(C)]
+    struct ifreq {
+        ifr_name: [std::os::raw::c_char; 16],
+        ifr_flags: std::os::raw::c_short,
+    }
+    let socket = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        None,
+    );
+    if let Ok(fd) = socket {
+        use std::os::fd::AsRawFd;
+        let mut ifr = ifreq {
+            ifr_name: [0; 16],
+            ifr_flags: 0,
+        };
+        ifr.ifr_name[0] = b'l' as std::os::raw::c_char;
+        ifr.ifr_name[1] = b'o' as std::os::raw::c_char;
+        unsafe {
+            let siocgifflags = 0x8913; // SIOCGIFFLAGS
+            let siocsifflags = 0x8914; // SIOCSIFFLAGS
+            if libc::ioctl(fd.as_raw_fd(), siocgifflags, &mut ifr) >= 0 {
+                ifr.ifr_flags |= 0x1 | 0x40; // IFF_UP | IFF_RUNNING
+                let _ = libc::ioctl(fd.as_raw_fd(), siocsifflags, &ifr);
+            }
+        }
+    }
 
     // Spawn vsock listener thread
     std::thread::spawn(move || {

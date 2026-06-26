@@ -66,7 +66,9 @@ async fn test_exec_vsock_mock() {
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
-        std::path::Path::new("/dev/null"),
+        &imp_testing::vmm::RealSerialLog {
+            path: std::path::PathBuf::from("/dev/null"),
+        },
     )
     .await
     .expect("Failed to connect");
@@ -133,7 +135,9 @@ async fn test_put_file_mock() {
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
-        std::path::Path::new("/dev/null"),
+        &imp_testing::vmm::RealSerialLog {
+            path: std::path::PathBuf::from("/dev/null"),
+        },
     )
     .await
     .expect("Failed to connect");

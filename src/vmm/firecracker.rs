@@ -53,6 +53,7 @@ impl Firecracker {
     async fn spawn_fc(
         &self,
         res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<(
         std::path::PathBuf,
         std::path::PathBuf,
@@ -93,7 +94,6 @@ impl Firecracker {
         Ok((tmp, api_socket, vsock_path, serial_path, process, pgid))
     }
 }
-
 
 static CPU_TEMPLATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
@@ -238,7 +238,12 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
 impl Vmm for Firecracker {
     type Instance = FcInstance;
 
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
+    async fn create(
+        &self,
+        cfg: &VmConfig,
+        res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
+    ) -> Result<Self::Instance> {
         if !cfg.shares.is_empty() {
             return Err(Error::Vmm(
                 "Firecracker does not support virtio-fs shares".into(),
@@ -247,7 +252,8 @@ impl Vmm for Firecracker {
 
         let template = detect_cpu_template(self, cfg).await;
 
-        let (_tmp, api_socket, vsock_path, serial_path, process, pgid) = self.spawn_fc(res).await?;
+        let (_tmp, api_socket, vsock_path, serial_path, process, pgid) =
+            self.spawn_fc(res, cgroups).await?;
 
         let instance = FcInstance {
             process,
@@ -418,7 +424,8 @@ impl Vmm for Firecracker {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
-        let (_tmp, api_socket, vsock_path, serial_path, process, pgid) = self.spawn_fc(res).await?;
+        let (_tmp, api_socket, vsock_path, serial_path, process, pgid) =
+            self.spawn_fc(res, cgroups).await?;
 
         let instance = FcInstance {
             process,
@@ -466,7 +473,7 @@ impl Vmm for Firecracker {
             snapshot_restore: true,
             lazy_restore: true, // Firecracker supports UFFD lazy restore
             virtio_fs_shares: false,
-            rootless_vhost_user_net: false,
+            unprivileged_vhost_user_net: false,
             nested_virt: false,
         }
     }
@@ -572,7 +579,6 @@ impl VmInstance for FcInstance {
 
         res
     }
-
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path

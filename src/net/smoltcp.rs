@@ -1,4 +1,4 @@
-#[cfg(feature = "net-rootless")]
+#[cfg(feature = "net-unprivileged")]
 /// Low-level backend networking types and state for `smoltcp`.
 pub mod backend {
     use std::collections::VecDeque;
@@ -152,9 +152,12 @@ pub mod backend {
                         packet.len(),
                         packet.get(VIRTIO_NET_HDR_SIZE..).unwrap_or(&[])
                     );
-                    state
-                        .tx_queue
-                        .push_back(packet.get(VIRTIO_NET_HDR_SIZE..).expect("packet too short").to_vec());
+                    state.tx_queue.push_back(
+                        packet
+                            .get(VIRTIO_NET_HDR_SIZE..)
+                            .expect("packet too short")
+                            .to_vec(),
+                    );
                 } else {
                     log::trace!("process_tx_queue: packet too short: {}", packet.len());
                 }
@@ -303,7 +306,10 @@ pub mod backend {
                     vmm_sys_util::event::EventFlag::NONBLOCK,
                 )
                 .expect("event consumer");
-            let kill_evt = (kill_evt_consumer, kill_evt_notifier.try_clone().expect("clone notifier"));
+            let kill_evt = (
+                kill_evt_consumer,
+                kill_evt_notifier.try_clone().expect("clone notifier"),
+            );
 
             let backend = std::sync::Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
                 event_idx: false,
@@ -535,7 +541,9 @@ pub mod backend {
                                         closed = true;
                                     }
                                     Ok(n) => {
-                                        socket.send_slice(buf.get(..n).unwrap_or(&[])).expect("send slice");
+                                        socket
+                                            .send_slice(buf.get(..n).unwrap_or(&[]))
+                                            .expect("send slice");
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                     Err(_) => {

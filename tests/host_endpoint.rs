@@ -19,7 +19,7 @@ async fn test_host_endpoint_ch() {
 #[ignore]
 async fn test_host_endpoint_fc() {
     let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).rootless_vhost_user_net {
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
         println!("Skipping: vhost-user-net not supported");
         return;
     }
@@ -31,7 +31,7 @@ async fn test_host_endpoint_fc() {
 #[ignore]
 async fn test_host_endpoint_qemu() {
     let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).rootless_vhost_user_net {
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
         println!("Skipping: vhost-user-net not supported");
         return;
     }
@@ -55,9 +55,15 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("Failed to start VM");
+    let mut vm = TestVm::start(
+        vmm,
+        cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("Failed to start VM");
 
     let host_ip = format!("10.200.{}.1", vm.vmid());
 
@@ -74,7 +80,10 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let agent = vm.agent(None).await.expect("Failed to connect to agent");
+    let agent = vm
+        .agent(None, &imp_testing::orchestrator::RealClock)
+        .await
+        .expect("Failed to connect to agent");
 
     // Give network time to come up in guest
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

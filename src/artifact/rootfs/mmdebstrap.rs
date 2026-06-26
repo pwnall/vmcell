@@ -59,12 +59,19 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
     .build()?;
 
     tracing::info!("Starting builder VM...");
-    let mut vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc, Box::new(crate::metrics::DefaultCgroupFs::default())).await?;
+    let mut vm = TestVm::start(
+        &vmm,
+        cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(crate::metrics::DefaultCgroupFs),
+    )
+    .await?;
 
     // Use a helper scope to ensure vm is shutdown on error
     let build_res = async {
         tracing::info!("Connecting to builder VM agent...");
-        let agent = vm.agent(None).await?;
+        let agent = vm.agent(None, &crate::orchestrator::RealClock).await?;
 
         // 3. Install mmdebstrap in VM
         tracing::info!("Installing mmdebstrap inside builder VM...");

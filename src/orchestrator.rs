@@ -3,14 +3,38 @@ use crate::config::VmConfig;
 use crate::error::Result;
 use crate::metrics::ResourceUsage;
 use crate::net::NetNamespace;
-#[cfg(feature = "net-rootless")]
+#[cfg(feature = "net-unprivileged")]
 use crate::net::SmoltcpProcess;
 use crate::proxy::{EgressProxy, ProxyConfig};
 use crate::vmm::{PerVmResources, VmInstance, Vmm};
 #[cfg(feature = "metrics")]
-
 use std::sync::{Arc, Mutex};
 use tracing::info;
+
+/// A trait for providing time.
+pub trait Clock: Send + Sync {
+    /// Returns the current time.
+    fn now(&self) -> std::time::SystemTime;
+}
+
+/// A real clock that uses the system time.
+pub struct RealClock;
+impl Clock for RealClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+}
+
+/// A fake clock for testing.
+pub struct FakeClock {
+    /// The simulated current time.
+    pub time: std::time::SystemTime,
+}
+impl Clock for FakeClock {
+    fn now(&self) -> std::time::SystemTime {
+        self.time
+    }
+}
 
 /// Allocates unique VM IDs for the orchestrator.
 #[derive(Debug, Clone, Default)]
@@ -91,7 +115,7 @@ pub struct TestVm<V: Vmm> {
     instance: Option<V::Instance>,
     /// The network namespace associated with this VM, if any.
     netns: Option<NetNamespace>,
-    #[cfg(feature = "net-rootless")]
+    #[cfg(feature = "net-unprivileged")]
     /// The smoltcp userspace networking process associated with this VM, if any.
     smoltcp: Option<SmoltcpProcess>,
     /// The egress proxy associated with this VM, if any.
@@ -109,7 +133,7 @@ pub struct TestVm<V: Vmm> {
 struct EnvSetup {
     res: PerVmResources,
     netns: Option<NetNamespace>,
-    #[cfg(feature = "net-rootless")]
+    #[cfg(feature = "net-unprivileged")]
     smoltcp: Option<SmoltcpProcess>,
     proxy: Option<EgressProxy>,
 }
@@ -141,7 +165,7 @@ impl<V: Vmm> TestVm<V> {
         self.netns.as_ref()
     }
 
-    #[cfg(feature = "net-rootless")]
+    #[cfg(feature = "net-unprivileged")]
     /// Gets the smoltcp userspace networking process associated with this VM, if any.
     pub fn smoltcp(&self) -> Option<&SmoltcpProcess> {
         self.smoltcp.as_ref()
@@ -159,7 +183,7 @@ impl<V: Vmm> TestVm<V> {
         cgroup_fs: &dyn crate::metrics::CgroupFs,
     ) -> Result<EnvSetup> {
         let mut netns = None;
-        #[cfg(feature = "net-rootless")]
+        #[cfg(feature = "net-unprivileged")]
         let mut smoltcp = None;
         let mut proxy = None;
         let mut tap_name = None;
@@ -216,7 +240,7 @@ impl<V: Vmm> TestVm<V> {
                         proxy = Some(px);
                     }
                 }
-                #[cfg(feature = "net-rootless")]
+                #[cfg(feature = "net-unprivileged")]
                 {
                     let socket_path =
                         std::path::PathBuf::from(format!("/tmp/imp-smoltcp-{}.sock", vmid));
@@ -266,7 +290,7 @@ impl<V: Vmm> TestVm<V> {
         Ok(EnvSetup {
             res,
             netns,
-            #[cfg(feature = "net-rootless")]
+            #[cfg(feature = "net-unprivileged")]
             smoltcp,
             proxy,
         })
@@ -314,7 +338,7 @@ impl<V: Vmm> TestVm<V> {
             vmid,
             instance: Some(instance),
             netns: env.netns,
-            #[cfg(feature = "net-rootless")]
+            #[cfg(feature = "net-unprivileged")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
             cgroup_name: Some(env.res.cgroup_name.clone()),
@@ -373,7 +397,9 @@ impl<V: Vmm> TestVm<V> {
         let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc, &*cgroup_fs).await?;
 
         info!("Restoring instance...");
-        let mut instance = vmm.restore(snapshot_dir, &cfg, &env.res, &*cgroup_fs).await?;
+        let mut instance = vmm
+            .restore(snapshot_dir, &cfg, &env.res, &*cgroup_fs)
+            .await?;
         info!("Resuming instance...");
         instance.resume().await?;
         info!("Instance resumed.");
@@ -381,7 +407,7 @@ impl<V: Vmm> TestVm<V> {
             vmid,
             instance: Some(instance),
             netns: env.netns,
-            #[cfg(feature = "net-rootless")]
+            #[cfg(feature = "net-unprivileged")]
             smoltcp: env.smoltcp,
             proxy: env.proxy,
             cgroup_name: Some(env.res.cgroup_name.clone()),
@@ -405,13 +431,24 @@ impl<V: Vmm> TestVm<V> {
     pub async fn agent(
         &mut self,
         timeout: Option<std::time::Duration>,
+        clock: &dyn Clock,
     ) -> Result<&mut AgentClient> {
         if self.agent_client.is_none() {
             let client = AgentClient::connect(
-                self.instance.as_ref().expect("instance missing").vsock_path(),
+                self.instance
+                    .as_ref()
+                    .expect("instance missing")
+                    .vsock_path(),
                 5000,
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
-                self.instance.as_ref().expect("instance missing").serial_log(),
+                &crate::vmm::RealSerialLog {
+                    path: self
+                        .instance
+                        .as_ref()
+                        .expect("instance missing")
+                        .serial_log()
+                        .to_path_buf(),
+                },
             )
             .await?;
             self.agent_client = Some(client);
@@ -427,15 +464,26 @@ impl<V: Vmm> TestVm<V> {
 
             agent_ref
                 .reconnect(
-                    self.instance.as_ref().expect("instance missing").vsock_path(),
+                    self.instance
+                        .as_ref()
+                        .expect("instance missing")
+                        .vsock_path(),
                     5000,
-                    self.instance.as_ref().expect("instance missing").serial_log(),
+                    &crate::vmm::RealSerialLog {
+                        path: self
+                            .instance
+                            .as_ref()
+                            .expect("instance missing")
+                            .serial_log()
+                            .to_path_buf(),
+                    },
                     timeout.unwrap_or(std::time::Duration::from_secs(10)),
                 )
                 .await?;
 
             // Automatically resync guest clock forward
-            let host_time = std::time::SystemTime::now()
+            let host_time = clock
+                .now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
@@ -514,7 +562,7 @@ impl<V: Vmm> TestVm<V> {
         if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
             let _ = fs.delete_slice(&cg_name);
         }
-        #[cfg(feature = "net-rootless")]
+        #[cfg(feature = "net-unprivileged")]
         let _ = self.smoltcp.take();
         let _ = self.proxy.take();
         Ok(())
@@ -526,7 +574,7 @@ impl<V: Vmm> Drop for TestVm<V> {
         // Enforce teardown order: VMM instance -> virtiofsd -> netns/cgroup/overlay/sockets
         drop(self.instance.take());
 
-        #[cfg(feature = "net-rootless")]
+        #[cfg(feature = "net-unprivileged")]
         drop(self.smoltcp.take());
         drop(self.proxy.take());
         if let Some(mut ns) = self.netns.take() {

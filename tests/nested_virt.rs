@@ -62,11 +62,17 @@ async fn test_nested_virt_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("Failed to start VM");
+    let mut vm = TestVm::start(
+        vmm,
+        cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("Failed to start VM");
 
-    let agent = match vm.agent(None).await {
+    let agent = match vm.agent(None, &imp_testing::orchestrator::RealClock).await {
         Ok(a) => a,
         Err(e) => {
             use imp_testing::vmm::VmInstance;

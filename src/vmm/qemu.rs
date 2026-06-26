@@ -96,6 +96,7 @@ impl Qemu {
         &self,
         cfg: &VmConfig,
         res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
         snapshot_dir: Option<&Path>,
     ) -> Result<(
         PathBuf,
@@ -315,7 +316,12 @@ impl Qemu {
 impl Vmm for Qemu {
     type Instance = QemuInstance;
 
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
+    async fn create(
+        &self,
+        cfg: &VmConfig,
+        res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
+    ) -> Result<Self::Instance> {
         let (
             _tmp,
             qmp_socket,
@@ -326,7 +332,7 @@ impl Vmm for Qemu {
             fs_daemons,
             pgid,
             vsock_pgid,
-        ) = self.spawn_qemu(cfg, res, None).await?;
+        ) = self.spawn_qemu(cfg, res, cgroups, None).await?;
         Ok(QemuInstance {
             process,
             qmp_socket,
@@ -359,7 +365,7 @@ impl Vmm for Qemu {
             snapshot_restore: false,
             lazy_restore: false,
             virtio_fs_shares: true,
-            rootless_vhost_user_net: true,
+            unprivileged_vhost_user_net: true,
             nested_virt: true,
         }
     }
@@ -419,7 +425,6 @@ impl VmInstance for QemuInstance {
             feature: "snapshot_restore".to_string(),
         })
     }
-
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path

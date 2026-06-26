@@ -45,9 +45,15 @@ async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("Failed to start VM");
+    let mut vm = TestVm::start(
+        vmm,
+        cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("Failed to start VM");
 
     vm.instance_mut().kill().await.expect("Failed to kill VM");
 }
@@ -70,10 +76,15 @@ async fn test_lifecycle_fake_vmm() {
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
-    let vm = TestVm::start(&fake, cfg.clone(), &cid_alloc, vmid_alloc.clone(),
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("Failed to start fake VM");
+    let vm = TestVm::start(
+        &fake,
+        cfg.clone(),
+        &cid_alloc,
+        vmid_alloc.clone(),
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("Failed to start fake VM");
 
     // Check that create and boot were called
     {
@@ -140,9 +151,15 @@ async fn test_lifecycle_panic_residue_ch() {
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
     let vmid = {
-        let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-            .await
-            .expect("Failed to start VM");
+        let vm = TestVm::start(
+            &vmm,
+            cfg,
+            &cid_alloc,
+            vmid_alloc,
+            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        )
+        .await
+        .expect("Failed to start VM");
 
         let vmid = vm.vmid();
 
@@ -192,9 +209,15 @@ async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
     let calls_clone = fake.calls.clone();
 
     let _ = tokio::spawn(async move {
-        let _vm = imp_testing::TestVm::start(&fake, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-            .await
-            .expect("Failed to start fake VM");
+        let _vm = imp_testing::TestVm::start(
+            &fake,
+            cfg,
+            &cid_alloc,
+            vmid_alloc,
+            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        )
+        .await
+        .expect("Failed to start fake VM");
         panic!("simulate panic inside scope");
     })
     .await;

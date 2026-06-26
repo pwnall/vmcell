@@ -27,6 +27,43 @@ pub use qemu::{Qemu, QemuInstance};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+/// A trait for reading a serial log.
+pub trait SerialLog: Send + Sync {
+    /// Checks if the log contains a kernel panic.
+    fn contains_panic(&self) -> bool;
+}
+
+/// A real serial log that reads from a file.
+pub struct RealSerialLog {
+    /// The path to the log file.
+    pub path: PathBuf,
+}
+
+impl SerialLog for RealSerialLog {
+    fn contains_panic(&self) -> bool {
+        if self.path.exists() {
+            if let Ok(log_content) = std::fs::read_to_string(&self.path) {
+                return log_content.contains("Kernel panic")
+                    || log_content.contains("panicked at")
+                    || log_content.contains("panic - not syncing");
+            }
+        }
+        false
+    }
+}
+
+/// A fake serial log for testing.
+pub struct FakeSerialLog {
+    /// Whether a panic is simulated.
+    pub panicked: bool,
+}
+
+impl SerialLog for FakeSerialLog {
+    fn contains_panic(&self) -> bool {
+        self.panicked
+    }
+}
+
 /// Helper to send an HTTP request over a Unix domain socket.
 ///
 /// # Errors
@@ -105,18 +142,33 @@ pub async fn create_vm_tmp_dir(vmid: u32) -> Result<PathBuf> {
 
 /// Builds a Tokio command for the VMM, handling network namespaces and process groups.
 pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::process::Command {
-    let mut std_cmd = if let Some(netns) = netns_name {
-        let mut c = std::process::Command::new("ip");
-        c.arg("netns").arg("exec").arg(netns).arg(binary_path);
-        c
-    } else {
-        std::process::Command::new(binary_path)
-    };
+    let mut std_cmd = std::process::Command::new(binary_path);
     use std::os::unix::process::CommandExt;
     std_cmd.process_group(0);
+    if let Some(netns) = netns_name {
+        let netns_path = format!("/var/run/netns/{}\0", netns);
+        // SAFETY: kill is safe to call and only sends a signal to a process.
+        unsafe {
+            std_cmd.pre_exec(move || {
+                let fd = libc::open(
+                    netns_path.as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                );
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(err);
+                }
+                libc::close(fd);
+                Ok(())
+            });
+        }
+    }
     tokio::process::Command::from(std_cmd)
 }
-
 
 /// Waits until the given socket path appears, or times out. Returns true if it exists.
 pub async fn wait_for_socket(socket_path: &Path, timeout_ms: u64, interval_ms: u64) -> bool {
@@ -217,7 +269,7 @@ pub struct VmmCapabilities {
     /// True if the VMM supports virtio-fs shared directories.
     pub virtio_fs_shares: bool,
     /// True if the VMM supports vhost-user-net for rootless networking.
-    pub rootless_vhost_user_net: bool,
+    pub unprivileged_vhost_user_net: bool,
     /// True if the VMM supports nested virtualization (exposing KVM to guest).
     pub nested_virt: bool,
 }
@@ -231,7 +283,12 @@ pub trait Vmm: Send + Sync {
     ///
     /// # Errors
     /// Returns an error if the VMM process fails to start or configuration is invalid.
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance>;
+    async fn create(
+        &self,
+        cfg: &VmConfig,
+        res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
+    ) -> Result<Self::Instance>;
 
     /// Restores a VM instance from a snapshot directory with the given resources.
     ///
@@ -316,7 +373,12 @@ pub struct FakeVmInstance {
 impl Vmm for FakeVmm {
     type Instance = FakeVmInstance;
 
-    async fn create(&self, _cfg: &VmConfig, _res: &PerVmResources, _cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
+    async fn create(
+        &self,
+        _cfg: &VmConfig,
+        _res: &PerVmResources,
+        _cgroups: &dyn crate::metrics::CgroupFs,
+    ) -> Result<Self::Instance> {
         if let Ok(mut lock) = self.calls.lock() {
             lock.push("create".to_string());
         }
@@ -349,7 +411,7 @@ impl Vmm for FakeVmm {
             snapshot_restore: true,
             lazy_restore: false,
             virtio_fs_shares: true,
-            rootless_vhost_user_net: true,
+            unprivileged_vhost_user_net: true,
             nested_virt: true,
         }
     }

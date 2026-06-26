@@ -55,9 +55,15 @@ async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let mut vms = Vec::new();
     for _ in 0..2 {
-        let vm = TestVm::start(vmm, cfg.clone(), &cid_alloc, vmid_alloc.clone(), Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-            .await
-            .expect("Failed to start VM");
+        let vm = TestVm::start(
+            vmm,
+            cfg.clone(),
+            &cid_alloc,
+            vmid_alloc.clone(),
+            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        )
+        .await
+        .expect("Failed to start VM");
         vms.push(vm);
     }
 
@@ -72,7 +78,13 @@ async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     }
 
     for mut vm in vms {
-        let agent = match vm.agent(Some(std::time::Duration::from_secs(180))).await {
+        let agent = match vm
+            .agent(
+                Some(std::time::Duration::from_secs(180)),
+                &imp_testing::orchestrator::RealClock,
+            )
+            .await
+        {
             Ok(a) => a,
             Err(e) => {
                 if let Ok(log) = std::fs::read_to_string(vm.instance().serial_log()) {

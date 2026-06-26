@@ -8,11 +8,11 @@
 /// TAP interface and network namespace management.
 pub mod tap;
 
-#[cfg(feature = "net-rootless")]
+#[cfg(feature = "net-unprivileged")]
 /// rootless userspace networking with smoltcp.
 pub mod smoltcp;
 
 pub use tap::NetNamespace;
 
-#[cfg(feature = "net-rootless")]
+#[cfg(feature = "net-unprivileged")]
 pub use smoltcp::backend::SmoltcpProcess;

@@ -23,7 +23,7 @@ async fn test_egress_proxy_ch() {
 #[ignore]
 async fn test_egress_proxy_fc() {
     let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).rootless_vhost_user_net {
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
         println!("Skipping: vhost-user-net not supported");
         return;
     }
@@ -36,7 +36,7 @@ async fn test_egress_proxy_fc() {
 #[ignore]
 async fn test_egress_proxy_qemu() {
     let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).rootless_vhost_user_net {
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
         println!("Skipping: vhost-user-net not supported");
         return;
     }
@@ -95,15 +95,24 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     };
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("Failed to start VM");
+    let mut vm = TestVm::start(
+        vmm,
+        cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("Failed to start VM");
 
     let proxy_port = vm.proxy().as_ref().unwrap().port;
     let vmid = vm.vmid();
 
     println!("Connecting agent...");
-    let agent = vm.agent(None).await.unwrap();
+    let agent = vm
+        .agent(None, &imp_testing::orchestrator::RealClock)
+        .await
+        .unwrap();
     println!("Agent connected.");
 
     let out_a = agent

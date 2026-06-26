@@ -181,7 +181,12 @@ impl CloudHypervisor {
 impl Vmm for CloudHypervisor {
     type Instance = ChInstance;
 
-    async fn create(&self, cfg: &VmConfig, res: &PerVmResources, cgroups: &dyn crate::metrics::CgroupFs) -> Result<Self::Instance> {
+    async fn create(
+        &self,
+        cfg: &VmConfig,
+        res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
+    ) -> Result<Self::Instance> {
         let (tmp, api_socket, vsock_path, serial_path, process, pgid) =
             self.spawn_ch(res, None, cgroups).await?;
 
@@ -354,7 +359,7 @@ impl Vmm for CloudHypervisor {
             snapshot_restore: true,
             lazy_restore: true, // CH supports memory_restore_mode
             virtio_fs_shares: true,
-            rootless_vhost_user_net: true,
+            unprivileged_vhost_user_net: true,
             nested_virt: true,
         }
     }
@@ -418,7 +423,6 @@ impl VmInstance for ChInstance {
         }
         res
     }
-
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path

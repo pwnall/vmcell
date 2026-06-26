@@ -73,9 +73,15 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
 
     let cid_alloc = imp_testing::vmm::CidAllocator::new();
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = imp_testing::TestVm::start(backend, _cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default()))
-        .await
-        .expect("Failed to start VM");
+    let mut vm = imp_testing::TestVm::start(
+        backend,
+        _cfg,
+        &cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+    )
+    .await
+    .expect("Failed to start VM");
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -83,7 +89,9 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
         vm.instance().vsock_path(),
         5000,
         std::time::Duration::from_secs(10),
-        vm.instance().serial_log(),
+        &imp_testing::vmm::RealSerialLog {
+            path: vm.instance().serial_log().to_path_buf(),
+        },
     )
     .await
     .expect("Failed to connect to agent");

@@ -4,7 +4,6 @@
 
 use crate::error::Result;
 #[cfg(feature = "metrics")]
-#[cfg(feature = "metrics")]
 use cgroups_rs::{cgroup_builder::CgroupBuilder, hierarchies};
 
 /// Resource usage statistics for a VM instance.
@@ -30,12 +29,24 @@ pub struct ResourceUsage {
 /// Interface for managing cgroups.
 pub trait CgroupFs: Send + Sync + std::fmt::Debug {
     /// Creates a cgroup slice with the given limits.
+    ///
+    /// # Errors
+    /// Returns an error if the slice cannot be created or limits applied.
     fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()>;
     /// Deletes a cgroup slice.
+    ///
+    /// # Errors
+    /// Returns an error if the slice cannot be deleted.
     fn delete_slice(&self, name: &str) -> Result<()>;
     /// Reads resource usage statistics from a given cgroup.
+    ///
+    /// # Errors
+    /// Returns an error if reading the stats fails.
     fn read_stats(&self, name: &str) -> Result<ResourceUsage>;
     /// Adds a task (process ID) to the cgroup.
+    ///
+    /// # Errors
+    /// Returns an error if adding the task fails.
     fn add_task(&self, name: &str, pid: u32) -> Result<()>;
 }
 
@@ -121,12 +132,15 @@ impl CgroupFs for DefaultCgroupFs {
                 match sub {
                     cgroups_rs::Subsystem::Mem(_) => {
                         let base_path = format!("/sys/fs/cgroup/{}", name);
-                        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
+                        if let Ok(s) =
+                            std::fs::read_to_string(format!("{}/memory.current", base_path))
+                        {
                             if let Ok(val) = s.trim().parse::<u64>() {
                                 usage.mem_current_mib = val / 1024 / 1024;
                             }
                         }
-                        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
+                        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path))
+                        {
                             if let Ok(val) = s.trim().parse::<u64>() {
                                 usage.mem_peak_mib = val / 1024 / 1024;
                             }
@@ -149,7 +163,7 @@ impl CgroupFs for DefaultCgroupFs {
         }
         #[cfg(not(feature = "metrics"))]
         let _ = name;
-        
+
         Ok(usage)
     }
 
@@ -183,26 +197,32 @@ struct FakeCgroupState {
 
 #[cfg(test)]
 impl FakeCgroupFs {
-        /// Creates a new fake cgroup filesystem.
+    /// Creates a new fake cgroup filesystem.
     pub fn new() -> Self {
         Self {
             state: std::sync::Arc::new(std::sync::Mutex::new(FakeCgroupState::default())),
         }
     }
 
-        /// Checks if a slice exists.
+    /// Checks if a slice exists.
     pub fn has_slice(&self, name: &str) -> bool {
         self.state.lock().unwrap().slices.contains_key(name)
     }
 
-        /// Gets limits for a slice.
+    /// Gets limits for a slice.
     pub fn get_limits(&self, name: &str) -> Option<crate::config::ResourceLimits> {
         self.state.lock().unwrap().slices.get(name).cloned()
     }
 
-        /// Checks if a task is added.
+    /// Checks if a task is added.
     pub fn has_task(&self, name: &str, pid: u32) -> bool {
-        self.state.lock().unwrap().tasks.get(name).map(|t| t.contains(&pid)).unwrap_or(false)
+        self.state
+            .lock()
+            .unwrap()
+            .tasks
+            .get(name)
+            .map(|t| t.contains(&pid))
+            .unwrap_or(false)
     }
 }
 
@@ -255,17 +275,17 @@ mod tests {
             pids_max: None,
             io_max: None,
         };
-        
+
         fs.create_slice(name, &limits).unwrap();
         assert!(fs.has_slice(name));
-        
+
         let stored_limits = fs.get_limits(name).unwrap();
         assert_eq!(stored_limits.mem_max_mib, Some(128));
         assert_eq!(stored_limits.cpu_max_pct, Some(50));
-        
+
         fs.add_task(name, 1234).unwrap();
         assert!(fs.has_task(name, 1234));
-        
+
         fs.delete_slice(name).unwrap();
         assert!(!fs.has_slice(name));
         assert!(!fs.has_task(name, 1234));

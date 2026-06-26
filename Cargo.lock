@@ -2367,6 +2367,7 @@ dependencies = [
  "libc",
  "log",
  "lzma-rs",
+ "netlink-packet-route",
  "netns-rs",
  "nix 0.29.0",
  "oci-client",

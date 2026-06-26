@@ -41,14 +41,15 @@ impl AgentClient {
     /// # use std::path::Path;
     /// # use std::time::Duration;
     /// # async fn run() {
-    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), Path::new("/dev/null")).await.unwrap();
+    /// let serial = imp_testing::vmm::RealSerialLog { path: std::path::PathBuf::from("/dev/null") };
+    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), &serial).await.unwrap();
     /// # }
     /// ```
     pub async fn connect(
         vsock_path: &Path,
         port: u32,
         timeout: std::time::Duration,
-        serial_log: &Path,
+        serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<Self> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut backoff = std::time::Duration::from_millis(50);
@@ -59,15 +60,8 @@ impl AgentClient {
             }
 
             // Watch serial log for kernel panic
-            if serial_log.exists() {
-                if let Ok(log_content) = tokio::fs::read_to_string(serial_log).await {
-                    if log_content.contains("Kernel panic")
-                        || log_content.contains("panicked at")
-                        || log_content.contains("panic - not syncing")
-                    {
-                        return Err(Error::Agent("Panic detected in serial log".into()));
-                    }
-                }
+            if serial_log.contains_panic() {
+                return Err(Error::Agent("Panic detected in serial log".into()));
             }
 
             let mut stream = match UnixStream::connect(vsock_path).await {
@@ -150,7 +144,7 @@ impl AgentClient {
         &mut self,
         vsock_path: &Path,
         port: u32,
-        serial_log: &Path,
+        serial_log: &dyn crate::vmm::SerialLog,
         timeout: std::time::Duration,
     ) -> Result<()> {
         let new_client = Self::connect(vsock_path, port, timeout, serial_log).await?;
