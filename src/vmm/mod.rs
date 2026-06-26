@@ -74,14 +74,10 @@ pub async fn unix_api_request<T: Serialize>(
     path: &str,
     body: Option<&T>,
 ) -> Result<()> {
-    let stream = tokio::net::UnixStream::connect(api_socket)
-        .await
-        .map_err(|e| crate::error::Error::Vmm(format!("socket connect: {}", e)))?;
+    let stream = tokio::net::UnixStream::connect(api_socket).await?;
 
     let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| crate::error::Error::Vmm(format!("handshake error: {}", e)))?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
 
     tokio::task::spawn(async move {
         if let Err(err) = conn.await {
@@ -104,13 +100,9 @@ pub async fn unix_api_request<T: Serialize>(
         .header("Accept", "application/json")
         .body(http_body_util::Full::new(hyper::body::Bytes::from(
             body_bytes,
-        )))
-        .map_err(|e| crate::error::Error::Vmm(format!("request builder error: {}", e)))?;
+        )))?;
 
-    let res = sender
-        .send_request(req)
-        .await
-        .map_err(|e| crate::error::Error::Vmm(format!("send_request error: {}", e)))?;
+    let res = sender.send_request(req).await?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -170,36 +162,52 @@ pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::pro
     tokio::process::Command::from(std_cmd)
 }
 
-/// Waits until the given socket path appears, or times out. Returns true if it exists.
-pub async fn wait_for_socket(socket_path: &Path, timeout_ms: u64, interval_ms: u64) -> bool {
+/// Waits until the given socket path appears, or times out.
+///
+/// Returns true if the socket is found. Returns false if the timeout is reached
+/// or if the provided process exits early.
+///
+/// # Errors
+/// Returns an error if the process exits before the socket appears,
+/// or if the timeout is reached.
+pub async fn wait_for_socket(
+    socket_path: &Path,
+    process: &mut tokio::process::Child,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<()> {
     let iterations = timeout_ms / interval_ms;
     for _ in 0..iterations {
         if tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
-            return true;
+            return Ok(());
+        }
+        if let Some(status) = process.try_wait().unwrap_or(None) {
+            return Err(crate::error::Error::Vmm(format!(
+                "process exited early: {}",
+                status
+            )));
         }
         tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
     }
-    false
-}
-
-static GLOBAL_CIDS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
-    std::sync::OnceLock::new();
-
-fn get_cids() -> &'static std::sync::Mutex<std::collections::BTreeSet<u32>> {
-    GLOBAL_CIDS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+    Err(crate::error::Error::Timeout(
+        "socket failed to appear in time".into(),
+    ))
 }
 
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
-pub struct CidAllocator {}
+#[derive(Debug)]
+pub struct CidAllocator {
+    active: std::sync::Mutex<std::collections::BTreeSet<u32>>,
+}
 
 impl CidAllocator {
     /// Creates a new CID allocator.
     #[must_use]
     pub fn new() -> Self {
-        // Initialize the global CIDs if it hasn't been already.
-        let _ = get_cids();
-        Self {}
+        Self {
+            active: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        }
     }
 }
 
@@ -218,7 +226,7 @@ impl CidAllocator {
     /// # Panics
     /// Panics if the global CID allocator lock is poisoned.
     pub fn allocate(&self) -> Result<u32> {
-        let mut active = get_cids().lock().expect("mutex poisoned");
+        let mut active = self.active.lock().expect("mutex poisoned");
         for i in 3..=254 {
             if !active.contains(&i) {
                 active.insert(i);
@@ -235,7 +243,7 @@ impl CidAllocator {
     /// # Panics
     /// Panics if the global CID allocator lock is poisoned.
     pub fn release(&self, cid: u32) {
-        let mut active = get_cids().lock().expect("mutex poisoned");
+        let mut active = self.active.lock().expect("mutex poisoned");
         active.remove(&cid);
     }
 }
@@ -304,6 +312,9 @@ pub trait Vmm: Send + Sync {
 
     /// Returns the capabilities of this VMM backend.
     fn capabilities(&self) -> VmmCapabilities;
+
+    /// Returns the string identifier of this VMM backend.
+    fn id(&self) -> &str;
 }
 
 /// Represents a running or created VM instance.
@@ -414,6 +425,10 @@ impl Vmm for FakeVmm {
             unprivileged_vhost_user_net: true,
             nested_virt: true,
         }
+    }
+
+    fn id(&self) -> &str {
+        "fake"
     }
 }
 

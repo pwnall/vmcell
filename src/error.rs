@@ -53,6 +53,15 @@ pub enum Error {
     /// A Postcard serialization error.
     #[error("Postcard error: {0}")]
     Postcard(#[from] postcard::Error),
+    /// A Hyper error.
+    #[error("Hyper error: {0}")]
+    Hyper(#[from] hyper::Error),
+    /// An HTTP error.
+    #[error("HTTP error: {0}")]
+    Http(#[from] hyper::http::Error),
+    /// A QMP error.
+    #[error("QMP error: {0}")]
+    Qmp(String),
     /// A Reqwest HTTP error.
     #[cfg(feature = "pipeline")]
     #[error("HTTP error: {0}")]

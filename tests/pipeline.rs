@@ -218,18 +218,10 @@ async fn test_pipeline_tampered_digest_aborts() {
     // Tamper with the artifact
     std::fs::write(tmp_dir.join("stage1"), "tampered").unwrap();
 
-    // Since Pipeline currently does not store digests, tampering with the artifact but leaving
-    // the cache_key alone means the pipeline will skip rebuilding. But the test asks to assert
-    // that it returns an error or rebuilds.
-    // Actually, Pipeline should verify the digest of the output if we want a "hard stop".
-    // For now, if we change the .cache_key file to garbage, it should rebuild.
-    std::fs::write(tmp_dir.join("stage1.cache_key"), "bad_hash").unwrap();
-
-    pipeline.build(&cache).await.unwrap();
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        2,
-        "Tampered cache key should cause rebuild"
+    let res = pipeline.build(&cache).await;
+    assert!(
+        res.is_err(),
+        "Tampered artifact should cause pipeline to abort"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

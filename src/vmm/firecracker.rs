@@ -33,7 +33,6 @@ pub struct FcInstance {
     api_socket: PathBuf,
     vsock_path: PathBuf,
     serial_path: PathBuf,
-    cgroup_name: Option<String>,
     cid: u32,
     pgid: Option<u32>,
 }
@@ -74,7 +73,7 @@ impl Firecracker {
         let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
 
         let log_file = std::fs::File::create(&serial_path)?;
-        let process = cmd
+        let mut process = cmd
             .arg("--api-sock")
             .arg(&api_socket)
             .stdin(Stdio::null())
@@ -86,9 +85,7 @@ impl Firecracker {
             cgroups.add_task(&res.cgroup_name, pid)?;
         }
 
-        if !crate::vmm::wait_for_socket(&api_socket, 1000, 20).await {
-            return Err(Error::Vmm("API socket failed to appear".into()));
-        }
+        crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await?;
 
         let pgid = process.id();
         Ok((tmp, api_socket, vsock_path, serial_path, process, pgid))
@@ -153,7 +150,6 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         api_socket: api_socket.clone(),
         vsock_path: PathBuf::new(),
         serial_path: PathBuf::new(),
-        cgroup_name: None,
         cid: 0,
         pgid: None,
     };
@@ -244,10 +240,27 @@ impl Vmm for Firecracker {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        let caps = self.capabilities();
+        if let crate::config::NetConfig::Rootless { .. } = cfg.net {
+            if !caps.unprivileged_vhost_user_net {
+                return Err(Error::Unsupported {
+                    vmm: "firecracker".to_string(),
+                    feature: "rootless_net".to_string(),
+                });
+            }
+        }
+        if res.vhost_user_socket.is_some() {
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                feature: "vhost_user_socket".to_string(),
+            });
+        }
+
         if !cfg.shares.is_empty() {
-            return Err(Error::Vmm(
-                "Firecracker does not support virtio-fs shares".into(),
-            ));
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                feature: "virtio_fs_shares".to_string(),
+            });
         }
 
         let template = detect_cpu_template(self, cfg).await;
@@ -260,7 +273,6 @@ impl Vmm for Firecracker {
             api_socket,
             vsock_path: vsock_path.clone(),
             serial_path: serial_path.clone(),
-            cgroup_name: Some(res.cgroup_name.clone()),
             cid: res.guest_cid,
             pgid,
         };
@@ -306,13 +318,10 @@ impl Vmm for Firecracker {
                 res.vmid
             );
             if !matches!(cfg.net, crate::config::NetConfig::None) {
-                assert!(
-                    res.vmid <= 254,
-                    "vmid must be <= 254 for network configuration"
-                );
+                let (host_ip, guest_ip, _) = crate::net::ip_math(res.vmid)?;
                 s.push_str(&format!(
-                    " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
-                    res.vmid, res.vmid
+                    " ip={}::{}:255.255.255.252::eth0:off",
+                    guest_ip, host_ip
                 ));
             }
             if cfg.nested_virt {
@@ -347,9 +356,10 @@ impl Vmm for Firecracker {
                 overlay.as_ref().unwrap_or(image).clone()
             }
             crate::config::RootfsSource::VirtioFs { .. } => {
-                return Err(Error::Vmm(
-                    "Firecracker does not support virtio-fs rootfs".into(),
-                ));
+                return Err(Error::Unsupported {
+                    vmm: "firecracker".to_string(),
+                    feature: "virtio_fs_rootfs".to_string(),
+                });
             }
         };
 
@@ -370,20 +380,13 @@ impl Vmm for Firecracker {
 
         // Configure Network
         if let Some(tap) = &res.tap_name {
-            assert!(res.vmid <= 254, "vmid must be <= 254 for MAC configuration");
             #[derive(Serialize)]
             struct NetworkInterface {
                 iface_id: String,
                 host_dev_name: String,
                 guest_mac: String,
             }
-            let mac = format!(
-                "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
-                (res.vmid >> 24) & 0xff,
-                (res.vmid >> 16) & 0xff,
-                (res.vmid >> 8) & 0xff,
-                res.vmid & 0xff
-            );
+            let mac = crate::net::mac_math(res.vmid)?;
             instance
                 .api_request(
                     "PUT",
@@ -432,7 +435,6 @@ impl Vmm for Firecracker {
             api_socket,
             vsock_path,
             serial_path,
-            cgroup_name: Some(res.cgroup_name.clone()),
             cid: res.guest_cid,
             pgid,
         };
@@ -476,6 +478,10 @@ impl Vmm for Firecracker {
             unprivileged_vhost_user_net: false,
             nested_virt: false,
         }
+    }
+
+    fn id(&self) -> &str {
+        "firecracker"
     }
 }
 
@@ -606,11 +612,5 @@ impl Drop for FcInstance {
         }
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
-        #[cfg(feature = "metrics")]
-        if let Some(cg_name) = &self.cgroup_name {
-            let cg =
-                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
-            let _ = cg.delete();
-        }
     }
 }

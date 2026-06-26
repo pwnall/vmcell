@@ -1,56 +1,23 @@
 use imp_testing::TestVm;
 use imp_testing::config::{RootfsSource, VmConfig};
 use imp_testing::vmm::VmInstance;
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 
 mod common;
 
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_concurrency_ch() {
-    let vmm = CloudHypervisor::new(common::ch_bin());
+vmm_matrix_test!(concurrency, |vmm| {
     test_concurrency_impl(&vmm).await;
-}
-
-#[cfg(feature = "firecracker")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_concurrency_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    test_concurrency_impl(&vmm).await;
-}
-
-#[cfg(feature = "qemu")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_concurrency_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    test_concurrency_impl(&vmm).await;
-}
+});
 
 async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
 
-    if vmlinux.is_none() || rootfs.is_none() {
-        println!("Artifacts not found, skipping concurrency test");
-        return;
-    }
+    let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
+        .network_disabled()
+        .build()
+        .unwrap();
 
-    let cfg = VmConfig::builder(
-        vmlinux.unwrap(),
-        RootfsSource::Erofs {
-            image: rootfs.unwrap(),
-        },
-    )
-    .network_disabled()
-    .build()
-    .unwrap();
-
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
     let mut vms = Vec::new();
@@ -58,9 +25,9 @@ async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         let vm = TestVm::start(
             vmm,
             cfg.clone(),
-            &cid_alloc,
+            cid_alloc.clone(),
             vmid_alloc.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+            Box::new(imp_testing::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to start VM");

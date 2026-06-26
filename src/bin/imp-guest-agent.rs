@@ -28,62 +28,86 @@ fn get_reaper_state() -> &'static ReaperState {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("imp-guest-agent: starting");
+    tracing_subscriber::fmt::init();
+    tracing::info!("imp-guest-agent: starting");
 
     // Mount setup
-    let _ = std::fs::create_dir_all("/sys");
-    let _ = std::fs::create_dir_all("/proc");
-    let _ = std::fs::create_dir_all("/mnt");
+    std::fs::create_dir_all("/sys")?;
+    std::fs::create_dir_all("/proc")?;
+    std::fs::create_dir_all("/mnt")?;
 
-    // Setup tmpfs overlay over the read-only erofs root via pivot_root
-    let _ = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "");
-    let _ = std::fs::create_dir_all("/mnt/upper");
-    let _ = std::fs::create_dir_all("/mnt/work");
-    let _ = std::fs::create_dir_all("/mnt/rootfs");
+    if let Err(e) = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "") {
+        tracing::info!("imp-guest-agent: mount tmpfs failed: {}", e);
+        return Err(e.into());
+    }
+    std::fs::create_dir_all("/mnt/upper")?;
+    std::fs::create_dir_all("/mnt/work")?;
+    std::fs::create_dir_all("/mnt/rootfs")?;
 
-    let _ = mount(
+    if let Err(e) = mount(
         "overlay",
         "/mnt/rootfs",
         "overlay",
         MountFlags::empty(),
         "lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work",
-    );
-
-    std::env::set_current_dir("/mnt/rootfs").expect("failed to chdir to /mnt/rootfs");
-    let _ = std::fs::create_dir_all("oldroot");
-
-    if pivot_root(".", "oldroot").is_ok() {
-        let _ = mount_change(
-            "/",
-            MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
-        );
-        let _ = unmount("oldroot", UnmountFlags::DETACH);
-        let _ = std::fs::remove_dir_all("oldroot");
-    } else {
-        println!("imp-guest-agent: pivot_root failed");
+    ) {
+        tracing::info!("imp-guest-agent: overlay failed: {}", e);
+        return Err(e.into());
     }
 
-    // Mount essential filesystems
-    let _ = mount("sysfs", "/sys", "sysfs", MountFlags::empty(), "");
-    let _ = mount("proc", "/proc", "proc", MountFlags::empty(), "");
-    let _ = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "");
+    if let Err(e) = std::env::set_current_dir("/mnt/rootfs") {
+        tracing::error!("imp-guest-agent: failed to chdir to /mnt/rootfs: {}", e);
+        return Err(e.into());
+    }
+    std::fs::create_dir_all("oldroot")?;
+
+    if let Err(e) = pivot_root(".", "oldroot") {
+        tracing::info!("imp-guest-agent: pivot_root failed: {}", e);
+        return Err(e.into());
+    } else {
+        mount_change(
+            "/",
+            MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+        )?;
+        unmount("oldroot", UnmountFlags::DETACH)?;
+        std::fs::remove_dir_all("oldroot")?;
+    }
+
+    if let Err(e) = mount("sysfs", "/sys", "sysfs", MountFlags::empty(), "") {
+        tracing::info!("imp-guest-agent: sysfs failed: {}", e);
+        return Err(e.into());
+    }
+    if let Err(e) = mount("proc", "/proc", "proc", MountFlags::empty(), "") {
+        tracing::info!("imp-guest-agent: proc failed: {}", e);
+        return Err(e.into());
+    }
+    if let Err(e) = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "") {
+        tracing::info!("imp-guest-agent: devtmpfs failed: {}", e);
+        return Err(e.into());
+    }
 
     for tag_str in ["imp-in", "imp-out", "imp-bin"] {
         let mount_point = format!("/{}", tag_str);
-        let _ = std::fs::create_dir_all(&mount_point);
+        std::fs::create_dir_all(&mount_point)?;
 
         let flags = if tag_str == "imp-in" || tag_str == "imp-bin" {
             MountFlags::RDONLY
         } else {
             MountFlags::empty()
         };
-        if mount(tag_str, &mount_point as &str, "virtiofs", flags, "").is_ok() {
-            println!(
-                "imp-guest-agent: mounted virtiofs {} at {}",
-                tag_str, mount_point
+        if let Err(e) = mount(tag_str, &mount_point as &str, "virtiofs", flags, "") {
+            tracing::info!(
+                "imp-guest-agent: failed to mount virtiofs {}: {}",
+                tag_str,
+                e
             );
+            return Err(e.into());
         } else {
-            println!("imp-guest-agent: failed to mount virtiofs {}", tag_str);
+            tracing::info!(
+                "imp-guest-agent: mounted virtiofs {} at {}",
+                tag_str,
+                mount_point
+            );
         }
     }
 
@@ -111,10 +135,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let siocsifflags = 0x8914; // SIOCSIFFLAGS
             if libc::ioctl(fd.as_raw_fd(), siocgifflags, &mut ifr) >= 0 {
                 ifr.ifr_flags |= 0x1 | 0x40; // IFF_UP | IFF_RUNNING
-                let _ = libc::ioctl(fd.as_raw_fd(), siocsifflags, &ifr);
+                if libc::ioctl(fd.as_raw_fd(), siocsifflags, &ifr) < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
             }
         }
     }
+
+    // Boot-time diagnostic checklist
+    let vsock_present =
+        std::fs::metadata("/dev/vsock").is_ok() || std::fs::metadata("/dev/vhost-vsock").is_ok();
+    tracing::info!(
+        "imp-guest-agent: boot-time diagnostic checklist: vsock_present={}",
+        vsock_present
+    );
 
     // Spawn vsock listener thread
     std::thread::spawn(move || {
@@ -122,20 +156,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = match VsockListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {
-                println!("imp-guest-agent: failed to bind vsock: {}", e);
+                tracing::info!("imp-guest-agent: failed to bind vsock: {}", e);
                 return;
             }
         };
-        println!("imp-guest-agent: listening on vsock port 5000");
+        tracing::info!("imp-guest-agent: listening on vsock port 5000");
 
         for stream in listener.incoming() {
             match stream {
                 Ok(mut s) => {
-                    println!("imp-guest-agent: accepted connection");
-                    let _ = handle_connection(&mut s);
+                    tracing::info!("imp-guest-agent: accepted connection");
+                    if let Err(e) = handle_connection(&mut s) {
+                        tracing::error!("imp-guest-agent: handle_connection error: {}", e);
+                    }
                 }
                 Err(e) => {
-                    println!("imp-guest-agent: accept error: {}", e);
+                    tracing::info!("imp-guest-agent: accept error: {}", e);
                 }
             }
         }
@@ -147,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         if term.load(std::sync::atomic::Ordering::Relaxed) {
-            println!("imp-guest-agent: received SIGTERM, exiting");
+            tracing::info!("imp-guest-agent: received SIGTERM, exiting");
             break Ok(());
         }
         // Wait for any child with WNOHANG
@@ -163,7 +199,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         1
                     };
                     let state = get_reaper_state();
-                    state.statuses.lock().unwrap().insert(pid, code);
+                    state
+                        .statuses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(pid, code);
                     state.cv.notify_all();
                     continue;
                 }
@@ -187,8 +227,6 @@ fn handle_connection(stream: &mut VsockStream) -> Result<(), Box<dyn std::error:
             handle_exec(req, stream)?;
         } else if let Message::PutFile { dst, bytes } = msg {
             handle_put_file(&dst, &bytes, stream)?;
-        } else if let Message::Ping = msg {
-            // Ignore ping
         }
     }
 }
@@ -260,8 +298,14 @@ fn handle_exec(
 
     match cmd.spawn() {
         Ok(mut child) => {
-            let mut stdout = child.stdout.take().expect("failed to get stdout");
-            let mut stderr = child.stderr.take().expect("failed to get stderr");
+            let mut stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| std::io::Error::other("failed to get stdout"))?;
+            let mut stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| std::io::Error::other("failed to get stderr"))?;
 
             let (tx, rx) = std::sync::mpsc::channel();
             let tx_out = tx.clone();
@@ -314,12 +358,12 @@ fn handle_exec(
 
             std::thread::spawn(move || {
                 let state = get_reaper_state();
-                let mut statuses = state.statuses.lock().unwrap();
+                let mut statuses = state.statuses.lock().unwrap_or_else(|e| e.into_inner());
                 let code = loop {
                     if let Some(c) = statuses.remove(&pid) {
                         break c;
                     }
-                    statuses = state.cv.wait(statuses).unwrap();
+                    statuses = state.cv.wait(statuses).unwrap_or_else(|e| e.into_inner());
                 };
                 has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = out_handle.join();

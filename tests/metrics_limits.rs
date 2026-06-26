@@ -1,46 +1,17 @@
 use imp_testing::config::{RootfsSource, VmConfig};
 use imp_testing::orchestrator::TestVm;
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::PathBuf;
+
 use tokio::time::{Duration, sleep};
 
 mod common;
 
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_metrics_and_limits_ch() {
-    let ch_binary =
-        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
-    let vmm = CloudHypervisor::new(ch_binary);
+vmm_matrix_test!(metrics_limits, |vmm| {
     test_metrics_and_limits_impl(&vmm).await;
-}
-
-#[cfg(feature = "firecracker")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_metrics_and_limits_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    test_metrics_and_limits_impl(&vmm).await;
-}
-
-#[cfg(feature = "qemu")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_metrics_and_limits_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    test_metrics_and_limits_impl(&vmm).await;
-}
+});
 
 async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
-    let kernel = PathBuf::from(
-        std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
-    );
-    let rootfs_image = PathBuf::from(
-        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.erofs".into()),
-    );
+    let kernel = common::get_vmlinux();
+    let rootfs_image = common::get_rootfs();
 
     let mut cfg = VmConfig::builder(
         kernel,
@@ -55,14 +26,14 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     // Set memory limit to 256 MiB
     cfg.limits.mem_max_mib = Some(256);
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(
         vmm,
         cfg,
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
@@ -123,8 +94,9 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     // We used timeout 2, but md5sum /dev/zero will consume 100% of 1 CPU.
     // If it is killed by timeout, it might exit with 143 or 124 depending on timeout behavior.
     assert!(
-        cpu_test_outcome.code != 0,
-        "CPU load should be killed by timeout"
+        cpu_test_outcome.code == 124 || cpu_test_outcome.code == 143,
+        "CPU load should be killed by timeout (expected 124 or 143), got code {}",
+        cpu_test_outcome.code
     );
 
     let elapsed = start_time.elapsed().as_secs_f64();
@@ -161,12 +133,10 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .await
         .expect("Failed to run memory bloat");
 
-    assert!(
-        oom_outcome.code == 137
-            || oom_outcome.code == 137 - 256
-            || oom_outcome.code == 1
-            || oom_outcome.code == -1, // sometimes represented as 137, sometimes we just get connection closed, sometimes malloc fails and returns 1
-        "Process should be killed by OOM killer or exit due to ENOMEM, got code {}, stderr: {}",
+    assert_eq!(
+        oom_outcome.code,
+        137,
+        "Process should be killed by OOM killer (SIGKILL), got code {}, stderr: {}",
         oom_outcome.code,
         String::from_utf8_lossy(&oom_outcome.stderr)
     );

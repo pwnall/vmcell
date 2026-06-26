@@ -18,7 +18,7 @@ async fn test_shares_ro_rw_ch() {
 async fn test_shares_ro_rw_fc() {
     let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
     if !imp_testing::vmm::Vmm::capabilities(&vmm).virtio_fs_shares {
-        println!("Skipping: virtio-fs shares not supported");
+        println!("SKIP: virtio-fs shares not supported");
         return;
     }
     test_shares_ro_rw_impl(&vmm).await;
@@ -30,15 +30,14 @@ async fn test_shares_ro_rw_fc() {
 async fn test_shares_ro_rw_qemu() {
     let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
     if !imp_testing::vmm::Vmm::capabilities(&vmm).virtio_fs_shares {
-        println!("Skipping: virtio-fs shares not supported");
+        println!("SKIP: virtio-fs shares not supported");
         return;
     }
     test_shares_ro_rw_impl(&vmm).await;
 }
 
 async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = uuid::Uuid::new_v4();
     let tmp = std::env::temp_dir().join(format!("imp-test-shares-{}-{}", std::process::id(), id));
     let in_dir = tmp.join("in");
     let out_dir = tmp.join("out");
@@ -50,8 +49,7 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
     let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
     if !vmlinux.exists() || !rootfs.exists() {
-        println!("Artifacts not found, skipping shares test");
-        return;
+        panic!("Artifacts not found, skipping shares test");
     }
 
     let _cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
@@ -71,14 +69,14 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
         .build()
         .unwrap();
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = imp_testing::TestVm::start(
         backend,
         _cfg,
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");

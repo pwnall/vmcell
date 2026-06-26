@@ -10,8 +10,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
-    /// Reserved for backwards compatibility with older guest agents.
-    Hello,
     /// Agent is ready to accept commands.
     Ready,
     /// Request to execute a command.
@@ -29,8 +27,6 @@ pub enum Message {
         /// File contents.
         bytes: Vec<u8>,
     },
-    /// Ping message to check agent liveness.
-    Ping,
 }
 
 /// A request to execute a command inside the guest VM.
@@ -128,7 +124,6 @@ mod tests {
     #[test]
     fn test_serialization_all_variants() {
         let msgs = vec![
-            Message::Hello,
             Message::Ready,
             Message::Stdout(vec![1, 2, 3]),
             Message::Stderr(vec![4, 5, 6]),
@@ -137,7 +132,6 @@ mod tests {
                 dst: "/tmp/test".to_string(),
                 bytes: vec![7, 8, 9],
             },
-            Message::Ping,
         ];
 
         for msg in msgs {
@@ -150,7 +144,7 @@ mod tests {
     #[test]
     fn test_framing_multiple_messages() {
         let msg1 = Message::Ready;
-        let msg2 = Message::Ping;
+        let msg2 = Message::Exit(1);
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&postcard::to_stdvec(&msg1).unwrap());
@@ -159,7 +153,7 @@ mod tests {
         let (decoded1, rest) = postcard::take_from_bytes::<Message>(&bytes).unwrap();
         assert_eq!(decoded1, Message::Ready);
         let (decoded2, rest2) = postcard::take_from_bytes::<Message>(rest).unwrap();
-        assert_eq!(decoded2, Message::Ping);
+        assert_eq!(decoded2, Message::Exit(1));
         assert!(rest2.is_empty());
     }
 
@@ -167,14 +161,12 @@ mod tests {
 
     fn arb_message() -> impl Strategy<Value = Message> {
         prop_oneof![
-            Just(Message::Hello),
             Just(Message::Ready),
             any::<Vec<u8>>().prop_map(Message::Stdout),
             any::<Vec<u8>>().prop_map(Message::Stderr),
             any::<i32>().prop_map(Message::Exit),
             (any::<String>(), any::<Vec<u8>>())
                 .prop_map(|(dst, bytes)| Message::PutFile { dst, bytes }),
-            Just(Message::Ping),
             (
                 any::<Vec<String>>(),
                 any::<Vec<(String, String)>>(),

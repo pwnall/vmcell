@@ -160,7 +160,7 @@ impl AgentClient {
         let timeout = cmd.timeout.unwrap_or(std::time::Duration::from_secs(10));
         tokio::time::timeout(timeout, async {
             let msg = Message::Exec(cmd);
-            let bytes = postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
+            let bytes = postcard::to_stdvec(&msg)?;
 
             self.stream
                 .send(::bytes::Bytes::from(bytes))
@@ -171,8 +171,7 @@ impl AgentClient {
 
             while let Some(res) = self.stream.next().await {
                 let bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
-                let msg: Message =
-                    postcard::from_bytes(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
+                let msg: Message = postcard::from_bytes(&bytes)?;
 
                 match msg {
                     Message::Stdout(data) => {
@@ -183,13 +182,14 @@ impl AgentClient {
                     }
                     Message::Exit(code) => {
                         outcome.code = code;
-                        break;
+                        return Ok(outcome);
                     }
                     _ => {}
                 }
             }
 
-            Ok(outcome)
+            // If stream ends without Exit, treat it as connection drop
+            Err(Error::Agent("Connection dropped during exec".into()))
         })
         .await
         .map_err(|_| Error::Timeout("Agent exec timed out".into()))?
@@ -212,8 +212,7 @@ impl AgentClient {
                     dst: dst.to_string(),
                     bytes: bytes.to_vec(),
                 };
-                let msg_bytes =
-                    postcard::to_stdvec(&msg).map_err(|e| Error::Serialize(e.to_string()))?;
+                let msg_bytes = postcard::to_stdvec(&msg)?;
                 self.stream
                     .send(::bytes::Bytes::from(msg_bytes))
                     .await
@@ -222,8 +221,7 @@ impl AgentClient {
                 // Wait for ack
                 if let Some(res) = self.stream.next().await {
                     let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
-                    let resp_msg: Message = postcard::from_bytes(&res_bytes)
-                        .map_err(|e| Error::Serialize(e.to_string()))?;
+                    let resp_msg: Message = postcard::from_bytes(&res_bytes)?;
                     match resp_msg {
                         Message::Exit(0) => Ok(()),
                         Message::Exit(c) => {

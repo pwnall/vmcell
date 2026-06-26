@@ -8,10 +8,6 @@ mod common;
 #[serial_test::serial]
 #[ignore]
 fn test_benchmark_ch() {
-    if common::get_vmlinux().is_none() || common::get_rootfs().is_none() {
-        println!("Artifacts not found, skipping benchmark test");
-        return;
-    }
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
     cmd.arg("--backend")
         .arg("cloud-hypervisor")
@@ -30,10 +26,6 @@ fn test_benchmark_ch() {
 #[serial_test::serial]
 #[ignore]
 fn test_benchmark_fc() {
-    if common::get_vmlinux().is_none() || common::get_rootfs().is_none() {
-        println!("Artifacts not found, skipping benchmark test");
-        return;
-    }
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
     cmd.arg("--backend")
         .arg("firecracker")
@@ -51,10 +43,6 @@ fn test_benchmark_fc() {
 #[serial_test::serial]
 #[ignore]
 fn test_benchmark_qemu() {
-    if common::get_vmlinux().is_none() || common::get_rootfs().is_none() {
-        println!("Artifacts not found, skipping benchmark test");
-        return;
-    }
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
     cmd.arg("--backend")
         .arg("qemu")

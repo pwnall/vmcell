@@ -235,7 +235,7 @@ impl EgressProxy {
     pub fn requests(&self) -> RequestLog {
         self.requests
             .lock()
-            .expect("requests lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -245,15 +245,13 @@ impl EgressProxy {
         matcher: crate::proxy::doubles::Matcher,
         responder: crate::proxy::doubles::Responder,
     ) {
-        if let Ok(mut doubles) = self.doubles.write() {
-            doubles.push(TestDouble { matcher, responder });
-        }
+        let mut doubles = self.doubles.write().unwrap_or_else(|e| e.into_inner());
+        doubles.push(TestDouble { matcher, responder });
     }
 
     /// Sets the cassette file path for recording.
     pub fn record_to(&self, cassette: &std::path::Path) {
-        if let Ok(mut rp) = self.record_path.lock() {
-            *rp = Some(cassette.to_path_buf());
-        }
+        let mut rp = self.record_path.lock().unwrap_or_else(|e| e.into_inner());
+        *rp = Some(cassette.to_path_buf());
     }
 }

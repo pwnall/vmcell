@@ -2,18 +2,20 @@
 
 use std::path::PathBuf;
 
-pub fn get_vmlinux() -> Option<PathBuf> {
+pub fn get_vmlinux() -> PathBuf {
     let p = std::env::var("IMP_KERNEL")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts/vmlinux"));
-    if p.exists() { Some(p) } else { None }
+    assert!(p.exists(), "vmlinux artifact missing at {:?}", p);
+    p
 }
 
-pub fn get_rootfs() -> Option<PathBuf> {
+pub fn get_rootfs() -> PathBuf {
     let p = std::env::var("IMP_ROOTFS")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts/rootfs.erofs"));
-    if p.exists() { Some(p) } else { None }
+    assert!(p.exists(), "rootfs artifact missing at {:?}", p);
+    p
 }
 
 #[allow(dead_code)]
@@ -34,14 +36,14 @@ pub fn qemu_bin() -> String {
 use imp_testing::*;
 
 pub async fn start_vm<V: Vmm>(vmm: &V, cfg: VmConfig) -> TestVm<V> {
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     TestVm::start(
         vmm,
         cfg,
-        &cid_alloc,
+        cid_alloc,
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("start_vm: VM failed to start")
@@ -49,10 +51,14 @@ pub async fn start_vm<V: Vmm>(vmm: &V, cfg: VmConfig) -> TestVm<V> {
 
 #[macro_export]
 macro_rules! require_cap {
-    ($caps:expr, $field:ident) => {
+    ($caps:expr, $field:ident, $vmm:expr) => {
         if !$caps.$field {
-            eprintln!("SKIP: backend lacks capability `{}`", stringify!($field));
-            return;
+            if imp_testing::vmm::Vmm::id(&$vmm) == "cloud-hypervisor" {
+                panic!("SKIP == PASS ERROR: Primary backend (cloud-hypervisor) MUST support capability `{}`", stringify!($field));
+            } else {
+                println!("SKIP: backend `{}` lacks capability `{}`", imp_testing::vmm::Vmm::id(&$vmm), stringify!($field));
+                return;
+            }
         }
     };
 }
@@ -68,7 +74,9 @@ macro_rules! vmm_matrix_test {
             #[tokio::test]
             #[ignore = "needs KVM"]
             async fn cloud_hypervisor() {
-                let $vmm = imp_testing::CloudHypervisor::new();
+                let $vmm = imp_testing::vmm::cloud_hypervisor::CloudHypervisor::new(
+                    super::common::ch_bin(),
+                );
                 $body
             }
 
@@ -76,7 +84,7 @@ macro_rules! vmm_matrix_test {
             #[tokio::test]
             #[ignore = "needs KVM"]
             async fn firecracker() {
-                let $vmm = imp_testing::Firecracker::new();
+                let $vmm = imp_testing::vmm::firecracker::Firecracker::new(super::common::fc_bin());
                 $body
             }
 
@@ -84,7 +92,7 @@ macro_rules! vmm_matrix_test {
             #[tokio::test]
             #[ignore = "needs KVM"]
             async fn qemu() {
-                let $vmm = imp_testing::Qemu::new();
+                let $vmm = imp_testing::vmm::qemu::Qemu::new(super::common::qemu_bin());
                 $body
             }
         }

@@ -40,7 +40,6 @@ pub struct QemuInstance {
     serial_path: PathBuf,
     _fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
     _vsock_daemon: Option<Child>,
-    cgroup_name: Option<String>,
     cid: u32,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
@@ -48,46 +47,35 @@ pub struct QemuInstance {
 
 impl QemuInstance {
     async fn qmp_command(&self, cmd: &str) -> Result<String> {
-        let mut stream = UnixStream::connect(&self.qmp_socket)
-            .await
-            .map_err(|e| Error::Vmm(format!("qmp connect: {}", e)))?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut stream = UnixStream::connect(&self.qmp_socket).await?;
 
-        let (r, mut w) = stream.split();
-        let mut reader = BufReader::new(r);
-        let mut line = String::new();
+            let (r, mut w) = stream.split();
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
 
-        // Read greeting
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| Error::Vmm(format!("qmp read greeting: {}", e)))?;
+            // Read greeting
+            reader.read_line(&mut line).await?;
 
-        // Send capabilities
-        w.write_all(b"{\"execute\": \"qmp_capabilities\"}\n")
-            .await
-            .map_err(|e| Error::Vmm(format!("qmp write caps: {}", e)))?;
+            // Send capabilities
+            w.write_all(b"{\"execute\": \"qmp_capabilities\"}\n")
+                .await?;
 
-        line.clear();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| Error::Vmm(format!("qmp read caps: {}", e)))?;
+            line.clear();
+            reader.read_line(&mut line).await?;
 
-        // Send command
-        w.write_all(cmd.as_bytes())
-            .await
-            .map_err(|e| Error::Vmm(format!("qmp write cmd: {}", e)))?;
-        w.write_all(b"\n")
-            .await
-            .map_err(|e| Error::Vmm(format!("qmp write nl: {}", e)))?;
+            // Send command
+            w.write_all(cmd.as_bytes()).await?;
+            w.write_all(b"\n").await?;
 
-        line.clear();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| Error::Vmm(format!("qmp read response: {}", e)))?;
+            line.clear();
+            reader.read_line(&mut line).await?;
 
-        Ok(line)
+            Ok::<String, std::io::Error>(line)
+        })
+        .await
+        .map_err(|_| Error::Qmp("Timeout waiting for QMP response".into()))?
+        .map_err(Error::Io)
     }
 }
 
@@ -127,7 +115,7 @@ impl Qemu {
         use std::os::unix::process::CommandExt;
         std_vsock_cmd.process_group(0);
 
-        let vsock_daemon = tokio::process::Command::from(std_vsock_cmd)
+        let mut vsock_daemon = tokio::process::Command::from(std_vsock_cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -136,10 +124,13 @@ impl Qemu {
 
         let vsock_pgid = vsock_daemon.as_ref().and_then(|d| d.id());
 
-        if vsock_daemon.is_some() {
+        if let Some(daemon) = vsock_daemon.as_mut() {
             // Wait for vhost-vsock socket to appear
-            if !crate::vmm::wait_for_socket(&vhost_vsock, 1000, 20).await {
-                return Err(Error::Vmm("vhost-device-vsock failed to start".into()));
+            if let Err(e) = crate::vmm::wait_for_socket(&vhost_vsock, daemon, 1000, 20).await {
+                return Err(Error::Vmm(format!(
+                    "vhost-device-vsock failed to start: {}",
+                    e
+                )));
             }
         }
 
@@ -231,18 +222,14 @@ impl Qemu {
                 .arg("-device")
                 .arg("virtio-net-pci,netdev=net0");
         } else if let Some(socket) = &res.vhost_user_socket {
-            assert!(res.vmid <= 254, "vmid must be <= 254 for MAC configuration");
             cmd.arg("-chardev")
                 .arg(format!("socket,id=net0,path={}", socket.display()))
                 .arg("-netdev")
                 .arg("vhost-user,id=vnet0,chardev=net0,vhostforce=on")
                 .arg("-device")
                 .arg(format!(
-                    "virtio-net-pci,netdev=vnet0,mac=02:00:{:02x}:{:02x}:{:02x}:{:02x}",
-                    (res.vmid >> 24) & 0xff,
-                    (res.vmid >> 16) & 0xff,
-                    (res.vmid >> 8) & 0xff,
-                    res.vmid & 0xff
+                    "virtio-net-pci,netdev=vnet0,mac={}",
+                    crate::net::mac_math(res.vmid)?
                 ));
         }
 
@@ -259,13 +246,10 @@ impl Qemu {
             res.vmid
         );
         if !matches!(cfg.net, crate::config::NetConfig::None) {
-            assert!(
-                res.vmid <= 254,
-                "vmid must be <= 254 for network configuration"
-            );
+            let (host_ip, guest_ip, _) = crate::net::ip_math(res.vmid)?;
             cmdline.push_str(&format!(
-                " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
-                res.vmid, res.vmid
+                " ip={}::{}:255.255.255.252::eth0:off",
+                guest_ip, host_ip
             ));
         }
         if cfg.nested_virt {
@@ -283,7 +267,7 @@ impl Qemu {
         let cmd_str = format!("{:?}", cmd);
         tracing::info!("QEMU CMD: {}", cmd_str);
 
-        let process = cmd
+        let mut process = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -293,8 +277,8 @@ impl Qemu {
             cgroups.add_task(&res.cgroup_name, pid)?;
         }
 
-        if !crate::vmm::wait_for_socket(&qmp_socket, 1000, 20).await {
-            return Err(Error::Vmm("QMP socket failed to appear".into()));
+        if let Err(e) = crate::vmm::wait_for_socket(&qmp_socket, &mut process, 1000, 20).await {
+            return Err(Error::Vmm(format!("QMP socket failed to appear: {}", e)));
         }
 
         let pgid = process.id();
@@ -340,7 +324,6 @@ impl Vmm for Qemu {
             serial_path,
             _fs_daemons: fs_daemons,
             _vsock_daemon: vsock_daemon,
-            cgroup_name: Some(res.cgroup_name.clone()),
             cid: res.guest_cid,
             pgid,
             vsock_pgid,
@@ -369,13 +352,17 @@ impl Vmm for Qemu {
             nested_virt: true,
         }
     }
+
+    fn id(&self) -> &str {
+        "qemu"
+    }
 }
 
 impl VmInstance for QemuInstance {
     async fn boot(&mut self) -> Result<()> {
         let res = self.qmp_command("{\"execute\": \"cont\"}").await?;
         if res.contains("\"error\"") {
-            return Err(Error::Vmm(format!("qmp cont error: {}", res)));
+            return Err(Error::Qmp(format!("qmp cont error: {}", res)));
         }
         Ok(())
     }
@@ -397,7 +384,11 @@ impl VmInstance for QemuInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
-        self.qmp_command("{\"execute\": \"quit\"}").await.ok();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.qmp_command("{\"execute\": \"quit\"}"),
+        )
+        .await;
 
         if let Some(pgid) = self.pgid {
             let _ = nix::sys::signal::kill(
@@ -463,12 +454,5 @@ impl Drop for QemuInstance {
         }
         let _ = std::fs::remove_file(&self.qmp_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
-
-        #[cfg(feature = "metrics")]
-        if let Some(cg_name) = &self.cgroup_name {
-            let cg =
-                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
-            let _ = cg.delete();
-        }
     }
 }

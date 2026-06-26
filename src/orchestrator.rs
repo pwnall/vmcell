@@ -36,6 +36,20 @@ impl Clock for FakeClock {
     }
 }
 
+/// A guard that releases the CID when dropped.
+#[derive(Debug)]
+pub struct CidGuard {
+    /// The unique guest CID.
+    pub cid: u32,
+    allocator: std::sync::Arc<crate::vmm::CidAllocator>,
+}
+
+impl Drop for CidGuard {
+    fn drop(&mut self) {
+        self.allocator.release(self.cid);
+    }
+}
+
 /// Allocates unique VM IDs for the orchestrator.
 #[derive(Debug, Clone, Default)]
 pub struct VmidAllocator {
@@ -110,7 +124,7 @@ impl Drop for VmidGuard {
 #[non_exhaustive]
 pub struct TestVm<V: Vmm> {
     /// The internal unique ID assigned to this VM.
-    vmid: VmidGuard,
+    vmid: Option<VmidGuard>,
     /// The underlying VMM instance running the VM.
     instance: Option<V::Instance>,
     /// The network namespace associated with this VM, if any.
@@ -128,10 +142,13 @@ pub struct TestVm<V: Vmm> {
     agent_client: Option<AgentClient>,
     /// Whether the VM was restored from a snapshot.
     restored: bool,
+    /// The CID guard.
+    cid: Option<CidGuard>,
 }
 
 struct EnvSetup {
     res: PerVmResources,
+    cid_guard: CidGuard,
     netns: Option<NetNamespace>,
     #[cfg(feature = "net-unprivileged")]
     smoltcp: Option<SmoltcpProcess>,
@@ -140,8 +157,11 @@ struct EnvSetup {
 
 impl<V: Vmm> TestVm<V> {
     /// Gets the internal unique ID assigned to this VM.
+    ///
+    /// # Panics
+    /// Panics if the VMID is missing.
     pub fn vmid(&self) -> u32 {
-        self.vmid.vmid
+        self.vmid.as_ref().expect("vmid missing").vmid
     }
 
     /// Gets a reference to the underlying VMM instance.
@@ -179,7 +199,7 @@ impl<V: Vmm> TestVm<V> {
     async fn setup_env(
         vmid: u32,
         cfg: &VmConfig,
-        cid_alloc: &crate::vmm::CidAllocator,
+        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
         cgroup_fs: &dyn crate::metrics::CgroupFs,
     ) -> Result<EnvSetup> {
         let mut netns = None;
@@ -277,6 +297,10 @@ impl<V: Vmm> TestVm<V> {
         cgroup_fs.create_slice(&cgroup_name, &cfg.limits)?;
 
         let guest_cid = cid_alloc.allocate()?;
+        let cid_guard = CidGuard {
+            cid: guest_cid,
+            allocator: cid_alloc,
+        };
 
         let res = PerVmResources {
             cgroup_name,
@@ -289,6 +313,7 @@ impl<V: Vmm> TestVm<V> {
 
         Ok(EnvSetup {
             res,
+            cid_guard,
             netns,
             #[cfg(feature = "net-unprivileged")]
             smoltcp,
@@ -312,15 +337,15 @@ impl<V: Vmm> TestVm<V> {
     /// # async fn run() {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::VirtioFs { dir: PathBuf::from("/rootfs") }).build().unwrap();
-    /// let cid_alloc = CidAllocator::new();
+    /// let cid_alloc = std::sync::Arc::new(CidAllocator::new());
     /// let vmid_alloc = VmidAllocator::new();
-    /// let vm = TestVm::start(&vmm, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
+    /// let vm = TestVm::start(&vmm, cfg, cid_alloc.clone(), vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
     /// # }
     /// ```
     pub async fn start(
         vmm: &V,
         cfg: VmConfig,
-        cid_alloc: &crate::vmm::CidAllocator,
+        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
         vmid_alloc: VmidAllocator,
         cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
     ) -> Result<Self> {
@@ -328,14 +353,14 @@ impl<V: Vmm> TestVm<V> {
             vmid: vmid_alloc.allocate()?,
             allocator: vmid_alloc,
         };
-        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc, &*cgroup_fs).await?;
+        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc.clone(), &*cgroup_fs).await?;
 
         let mut instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
         info!("Booting instance...");
         instance.boot().await?;
         info!("Instance booted.");
         Ok(Self {
-            vmid,
+            vmid: Some(vmid),
             instance: Some(instance),
             netns: env.netns,
             #[cfg(feature = "net-unprivileged")]
@@ -345,6 +370,7 @@ impl<V: Vmm> TestVm<V> {
             cgroup_fs: Some(cgroup_fs),
             agent_client: None,
             restored: false,
+            cid: Some(env.cid_guard),
         })
     }
 
@@ -364,17 +390,17 @@ impl<V: Vmm> TestVm<V> {
     /// # async fn run() {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
-    /// let cid_alloc = CidAllocator::new();
+    /// let cid_alloc = std::sync::Arc::new(CidAllocator::new());
     /// let vmid_alloc = VmidAllocator::new();
     /// let snap_dir = PathBuf::from("/tmp/snap");
-    /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, &cid_alloc, vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
+    /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, cid_alloc.clone(), vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
     /// # }
     /// ```
     pub async fn restore(
         vmm: &V,
         snapshot_dir: &std::path::Path,
         cfg: VmConfig,
-        cid_alloc: &crate::vmm::CidAllocator,
+        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
         vmid_alloc: VmidAllocator,
         cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
     ) -> Result<Self> {
@@ -394,7 +420,7 @@ impl<V: Vmm> TestVm<V> {
             vmid: vmid_alloc.allocate()?,
             allocator: vmid_alloc,
         };
-        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc, &*cgroup_fs).await?;
+        let env = Self::setup_env(vmid.vmid, &cfg, cid_alloc.clone(), &*cgroup_fs).await?;
 
         info!("Restoring instance...");
         let mut instance = vmm
@@ -404,7 +430,7 @@ impl<V: Vmm> TestVm<V> {
         instance.resume().await?;
         info!("Instance resumed.");
         Ok(Self {
-            vmid,
+            vmid: Some(vmid),
             instance: Some(instance),
             netns: env.netns,
             #[cfg(feature = "net-unprivileged")]
@@ -414,6 +440,7 @@ impl<V: Vmm> TestVm<V> {
             cgroup_fs: Some(cgroup_fs),
             agent_client: None,
             restored: true,
+            cid: Some(env.cid_guard),
         })
     }
 
@@ -513,14 +540,10 @@ impl<V: Vmm> TestVm<V> {
                 ]))
                 .await;
 
-            let mac = format!(
-                "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
-                (self.vmid.vmid >> 24) & 0xff,
-                (self.vmid.vmid >> 16) & 0xff,
-                (self.vmid.vmid >> 8) & 0xff,
-                self.vmid.vmid & 0xff
-            );
-            let ip = format!("10.200.{}.2/30", self.vmid.vmid);
+            let mac = crate::net::mac_math(self.vmid.as_ref().expect("vmid missing").vmid)
+                .map_err(|e| crate::error::Error::Agent(format!("mac math: {}", e)))?;
+            let (_, _, ip) = crate::net::ip_math(self.vmid.as_ref().expect("vmid missing").vmid)
+                .map_err(|e| crate::error::Error::Agent(format!("ip math: {}", e)))?;
             let _ = agent_ref.exec(crate::agent::ExecRequest::new(vec![
                 "sh".into(), "-c".into(), format!("ip link set eth0 address {} && ip addr flush dev eth0 && ip addr add {} dev eth0", mac, ip)
             ])).await;
@@ -583,6 +606,8 @@ impl<V: Vmm> Drop for TestVm<V> {
         if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
             let _ = fs.delete_slice(&cg_name);
         }
+        drop(self.cid.take());
+        drop(self.vmid.take());
     }
 }
 
@@ -591,7 +616,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[serial_test::serial]
     fn test_allocate_vmid() {
         let alloc = VmidAllocator::new();
         let vmid1 = alloc.allocate().unwrap();
@@ -603,7 +627,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_allocate_vmid_exhaustion() {
         let alloc = VmidAllocator::new();
         let mut vmids = Vec::new();
@@ -614,18 +637,5 @@ mod tests {
         for id in vmids {
             alloc.release(id);
         }
-    }
-
-    #[test]
-    fn test_per_vm_path_injectivity() {
-        // Test that path construction uses vmid uniquely
-        let vmid1 = 1;
-        let vmid2 = 2;
-        let cg1 = format!("imp-vm-{}", vmid1);
-        let cg2 = format!("imp-vm-{}", vmid2);
-        assert_ne!(cg1, cg2);
-        let sock1 = format!("/tmp/imp-smoltcp-{}.sock", vmid1);
-        let sock2 = format!("/tmp/imp-smoltcp-{}.sock", vmid2);
-        assert_ne!(sock1, sock2);
     }
 }

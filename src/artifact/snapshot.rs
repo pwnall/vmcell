@@ -13,8 +13,12 @@ use crate::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::Path;
 
 /// A pipeline stage that creates a base VM snapshot for fast booting.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotStage {}
+pub struct SnapshotStage {
+    /// The CID allocator for VMs run by this stage.
+    pub cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
+    /// The VMID allocator for VMs run by this stage.
+    pub vmid_alloc: crate::orchestrator::VmidAllocator,
+}
 
 use async_trait::async_trait;
 
@@ -63,12 +67,12 @@ impl Stage for SnapshotStage {
             std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
         let vmm = CloudHypervisor::new(ch_binary);
 
-        let cid_alloc = crate::vmm::CidAllocator::new();
-        let vmid_alloc = crate::orchestrator::VmidAllocator::new();
+        let cid_alloc = self.cid_alloc.clone();
+        let vmid_alloc = self.vmid_alloc.clone();
         let mut vm = TestVm::start(
             &vmm,
             cfg,
-            &cid_alloc,
+            cid_alloc.clone(),
             vmid_alloc,
             Box::new(crate::metrics::DefaultCgroupFs),
         )

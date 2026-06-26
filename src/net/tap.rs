@@ -5,7 +5,31 @@
 
 use crate::error::{Error, Result};
 use futures::stream::TryStreamExt;
-use std::net::Ipv4Addr;
+
+fn run_in_tokio<F, Fut, T>(f: F) -> std::result::Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, String>>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio build failed: {}", e))?;
+    rt.block_on(f())
+}
+
+fn run_with_rtnetlink<F, Fut, T>(f: F) -> std::result::Result<T, String>
+where
+    F: FnOnce(rtnetlink::Handle) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, String>>,
+{
+    run_in_tokio(|| async {
+        let (connection, handle, _) =
+            rtnetlink::new_connection().map_err(|e| format!("rtnetlink connect failed: {}", e))?;
+        tokio::spawn(connection);
+        f(handle).await
+    })
+}
 
 /// Interface for executing netlink operations.
 pub trait Netlink: Send + Sync {
@@ -61,24 +85,10 @@ impl Netlink for RtNetlink {
             .map_err(|e| Error::Network(format!("tap create fail: {}", e)))?;
 
         let tap_name = tap_name.to_string();
-        assert!(vmid <= 254, "vmid must be <= 254 for network configuration");
-        let ip: Ipv4Addr = format!("10.200.{}.1", vmid)
-            .parse()
-            .map_err(|e| Error::Network(format!("invalid IP: {}", e)))?;
+        let (ip, _, _) = crate::net::ip_math(vmid)?;
 
         let res = ns.run(move |_| {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => return Err(format!("tokio build failed: {}", e)),
-            };
-            rt.block_on(async {
-                let (connection, handle, _) = rtnetlink::new_connection()
-                    .map_err(|e| format!("rtnetlink connect failed: {}", e))?;
-                tokio::spawn(connection);
-
+            run_with_rtnetlink(|handle| async move {
                 let link_idx = handle
                     .link()
                     .get()
@@ -150,18 +160,7 @@ impl Netlink for RtNetlink {
             .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
         let inner_res = ns
             .run(|_| {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => return Err(format!("tokio build failed: {}", e)),
-                };
-                rt.block_on(async {
-                    let (connection, handle, _) = rtnetlink::new_connection()
-                        .map_err(|e| format!("rtnetlink connect failed: {}", e))?;
-                    tokio::spawn(connection);
-
+                run_with_rtnetlink(|handle| async move {
                     let lo_idx = handle
                         .link()
                         .get()
@@ -305,11 +304,11 @@ impl NetNamespace {
 
     /// Returns the host IP address in this namespace.
     ///
-    /// # Panics
-    /// Panics if `vmid` > 254.
-    pub fn host_ip(&self) -> String {
-        assert!(self.vmid <= 254, "vmid must be <= 254 for host_ip");
-        format!("10.200.{}.1", self.vmid)
+    /// # Errors
+    /// Returns an error if the VMID is out of range.
+    pub fn host_ip(&self) -> Result<String> {
+        let (ip, _, _) = crate::net::ip_math(self.vmid)?;
+        Ok(ip.to_string())
     }
 
     /// Render TPROXY ruleset for nftables
@@ -397,10 +396,12 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     pub struct FakeNftApplier {
         pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
+    #[allow(dead_code)]
     impl FakeNftApplier {
         pub fn new() -> Self {
             Self {
@@ -428,7 +429,7 @@ mod tests {
 
             assert_ne!(ns1.name, ns2.name);
             assert_ne!(ns1.tap_name, ns2.tap_name);
-            assert_ne!(ns1.host_ip(), ns2.host_ip());
+            assert_ne!(ns1.host_ip().unwrap(), ns2.host_ip().unwrap());
         }
     }
 
@@ -441,6 +442,6 @@ mod tests {
             netlink: Box::new(FakeNetlink::new()),
             _tap: None,
         };
-        assert_eq!(ns.host_ip(), "10.200.42.1");
+        assert_eq!(ns.host_ip().unwrap(), "10.200.43.1");
     }
 }

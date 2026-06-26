@@ -217,7 +217,7 @@ pub mod backend {
         socket_path: &std::path::Path,
         host_path: &std::path::Path,
         read_only: bool,
-    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    ) -> std::io::Result<(std::thread::JoinHandle<()>, EventNotifier)> {
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
             no_opendir: false,
@@ -245,7 +245,16 @@ pub mod backend {
         vfs.mount(Box::new(fs), "/")
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let backend = Arc::new(RwLock::new(VhostUserFsBackendHandler::new(Arc::new(vfs))?));
+        let backend_handler = VhostUserFsBackendHandler::new(Arc::new(vfs))?;
+        let kill_notifier = backend_handler
+            .backend
+            .lock()
+            .expect("mutex")
+            .kill_evt
+            .1
+            .try_clone()
+            .expect("clone");
+        let backend = Arc::new(RwLock::new(backend_handler));
         let mut listener =
             Listener::new(socket_path, true).map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -264,8 +273,9 @@ pub mod backend {
             let _ = vu_daemon.start(&mut listener).map_err(|e| {
                 tracing::error!("in-process virtiofsd panic: {:?}", e);
             });
+            let _ = vu_daemon.wait();
         });
 
-        Ok(handle)
+        Ok((handle, kill_notifier))
     }
 }

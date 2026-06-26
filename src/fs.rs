@@ -2,14 +2,14 @@
 //!
 //! Provides the virtiofs daemon implementation for sharing host directories with the VM.
 
-#![forbid(unsafe_code)]
+// Removed forbid(unsafe_code) to allow pre_exec for pgid
 
 use crate::config::{Access, Share};
 use std::path::{Path, PathBuf};
 #[cfg(not(feature = "experiment-fuse"))]
 use std::process::Stdio;
 #[cfg(not(feature = "experiment-fuse"))]
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 #[cfg(feature = "experiment-fuse")]
 mod in_process;
@@ -21,10 +21,14 @@ pub struct VirtioFsDaemon {
     /// The path to the vhost-user socket.
     pub socket_path: PathBuf,
     #[cfg(not(feature = "experiment-fuse"))]
-    process: Child,
+    // process: Child,
+    #[cfg(not(feature = "experiment-fuse"))]
+    pgid: Option<u32>,
     #[cfg(feature = "experiment-fuse")]
     #[allow(dead_code)]
     handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "experiment-fuse")]
+    kill_notifier: Option<vmm_sys_util::event::EventNotifier>,
 }
 
 impl VirtioFsDaemon {
@@ -48,10 +52,33 @@ impl VirtioFsDaemon {
             .arg("--shared-dir")
             .arg(&share.host_path)
             .arg(cache_arg)
-            .arg("--sandbox=none");
+            .arg("--sandbox=namespace");
 
         if let Access::ReadOnly = share.access {
             cmd.arg("--readonly");
+        }
+
+        #[cfg(unix)]
+        {
+            // Drop privileges for virtiofsd if we are running as root
+            if nix::unistd::getuid().as_raw() == 0 {
+                let uid = std::env::var("SUDO_UID")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(65534); // fallback to nobody
+                cmd.uid(uid);
+            }
+            // SAFETY: pre_exec is safe here because we only call async-signal-safe functions (setpgid).
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::unistd::setpgid(
+                        nix::unistd::Pid::from_raw(0),
+                        nix::unistd::Pid::from_raw(0),
+                    )
+                    .map_err(std::io::Error::other)?;
+                    Ok(())
+                });
+            }
         }
 
         cmd.stdin(Stdio::null())
@@ -61,6 +88,7 @@ impl VirtioFsDaemon {
         let mut process = cmd.spawn().map_err(|e| {
             crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {}", e))
         })?;
+        let pgid = process.id();
 
         // Wait for socket to be created
         let mut ready = false;
@@ -84,6 +112,13 @@ impl VirtioFsDaemon {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         if !ready {
+            if let Some(p) = pgid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(p as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(p as i32), None);
+            }
             let _ = process.start_kill();
             let mut stderr = String::new();
             if let Some(mut err_stream) = process.stderr.take() {
@@ -99,7 +134,7 @@ impl VirtioFsDaemon {
         Ok(Self {
             socket_path,
             #[cfg(not(feature = "experiment-fuse"))]
-            process,
+            pgid,
         })
     }
 
@@ -111,7 +146,7 @@ impl VirtioFsDaemon {
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);
-        let handle = in_process::backend::start_in_process_virtiofsd(
+        let (handle, kill_notifier) = in_process::backend::start_in_process_virtiofsd(
             &socket_path,
             &share.host_path,
             read_only,
@@ -138,6 +173,7 @@ impl VirtioFsDaemon {
         Ok(Self {
             socket_path,
             handle: Some(handle),
+            kill_notifier: Some(kill_notifier),
         })
     }
 }
@@ -145,7 +181,24 @@ impl VirtioFsDaemon {
 impl Drop for VirtioFsDaemon {
     fn drop(&mut self) {
         #[cfg(not(feature = "experiment-fuse"))]
-        let _ = self.process.start_kill();
+        {
+            if let Some(pgid) = self.pgid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pgid as i32), None);
+            }
+        }
+        #[cfg(feature = "experiment-fuse")]
+        {
+            if let Some(notifier) = self.kill_notifier.take() {
+                let _ = notifier.notify();
+            }
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }

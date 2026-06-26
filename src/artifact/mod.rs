@@ -75,6 +75,30 @@ pub struct Artifacts {
     pub paths: std::collections::HashMap<String, PathBuf>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CacheMetadata {
+    key: String,
+    hash: String,
+    pins: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    artifacts: std::collections::HashMap<String, PathBuf>,
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(crate::error::Error::Io)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = file.read(&mut buf).map_err(crate::error::Error::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(buf.get(..n).expect("valid slice"));
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 /// A pipeline of stages to build all necessary test VM artifacts.
 pub struct Pipeline {
     /// The sequence of stages to run.
@@ -110,27 +134,87 @@ impl Pipeline {
             let key_path = out_path.with_extension("cache_key");
 
             let mut cached = false;
+            let mut cached_pins = std::collections::HashMap::new();
+            let mut cached_artifacts = std::collections::HashMap::new();
+
             if out_path.exists() && key_path.exists() {
-                if let Ok(saved_key) = std::fs::read_to_string(&key_path) {
-                    if saved_key == key.0 {
-                        cached = true;
+                if let Ok(metadata_str) = std::fs::read_to_string(&key_path) {
+                    if let Ok(metadata) = serde_json::from_str::<CacheMetadata>(&metadata_str) {
+                        if metadata.key == key.0 {
+                            if let Ok(actual_hash) = hash_file(&out_path) {
+                                if actual_hash == metadata.hash {
+                                    cached = true;
+                                    cached_pins = metadata.pins;
+                                    cached_artifacts = metadata.artifacts;
+                                } else {
+                                    return Err(crate::error::Error::Artifact(format!(
+                                        "Tampered artifact for stage {}: payload hash mismatch",
+                                        stage.name()
+                                    )));
+                                }
+                            }
+                        }
+                    } else {
+                        // Fallback for old cache key format: just a string
+                        if metadata_str == key.0 {
+                            // Can't verify hash or recover pins. Miss cache to force rebuild and get proper format.
+                            tracing::warn!(
+                                "Cache invalid for stage {}: old cache format",
+                                stage.name()
+                            );
+                        }
                     }
                 }
             }
 
             if cached {
                 tracing::info!("Skipping stage {} (cached)", stage.name());
-                inputs.artifacts.insert(stage.name().to_string(), out_path);
+                if cached_artifacts.is_empty() {
+                    inputs
+                        .artifacts
+                        .insert(stage.name().to_string(), out_path.clone());
+                } else {
+                    for (k, v) in cached_artifacts {
+                        inputs.artifacts.insert(k, v);
+                    }
+                }
+                for (k, v) in cached_pins {
+                    inputs.pins.insert(k, v);
+                }
             } else {
                 tracing::info!("Running stage {}", stage.name());
                 let outputs = stage.run(&inputs, &out_path).await?;
-                if let Err(e) = std::fs::write(&key_path, &key.0) {
-                    tracing::warn!(
-                        "Failed to write cache key for stage {}: {}",
-                        stage.name(),
-                        e
-                    );
+
+                // Hash payload and write metadata
+                if out_path.exists() {
+                    match hash_file(&out_path) {
+                        Ok(hash) => {
+                            let metadata = CacheMetadata {
+                                key: key.0.clone(),
+                                hash,
+                                pins: outputs.pins.clone(),
+                                artifacts: outputs.artifacts.clone(),
+                            };
+                            if let Ok(json) = serde_json::to_string(&metadata) {
+                                if let Err(e) = std::fs::write(&key_path, json) {
+                                    tracing::warn!(
+                                        "Failed to write cache key for stage {}: {}",
+                                        stage.name(),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to hash output for stage {}: {}",
+                                stage.name(),
+                                e
+                            );
+                        }
+                    }
                 }
+
                 for (k, v) in outputs.artifacts {
                     inputs.artifacts.insert(k, v);
                 }

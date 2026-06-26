@@ -37,6 +37,7 @@ ignore = [
     "RUSTSEC-2026-0063", # Pending upstream fix
     "RUSTSEC-2026-0061", # Pending upstream fix
     "RUSTSEC-2026-0056", # Pending upstream fix
+    "RUSTSEC-2023-0089", # atomic-polyfill unmaintained
 ]
 
 [sources]

@@ -4,7 +4,7 @@
 //! along with the `ChInstance` running VM instance.
 
 use crate::config::VmConfig;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -39,7 +39,6 @@ pub struct ChInstance {
     vsock_path: PathBuf,
     serial_path: PathBuf,
     _fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
-    cgroup_name: Option<String>,
     restored: bool,
     cid: u32,
     pgid: Option<u32>,
@@ -157,7 +156,7 @@ impl CloudHypervisor {
                 .arg(format!("source_url=file://{}", dir.display()));
         }
 
-        let process = cmd
+        let mut process = cmd
             .arg("--api-socket")
             .arg(&api_socket)
             .stdin(Stdio::null())
@@ -169,9 +168,7 @@ impl CloudHypervisor {
             cgroups.add_task(&res.cgroup_name, pid)?;
         }
 
-        if !crate::vmm::wait_for_socket(&api_socket, 1000, 20).await {
-            return Err(Error::Vmm("API socket failed to appear".into()));
-        }
+        crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await?;
 
         let pgid = process.id();
         Ok((tmp, api_socket, vsock_path, serial_path, process, pgid))
@@ -212,7 +209,6 @@ impl Vmm for CloudHypervisor {
             vsock_path: vsock_path.clone(),
             serial_path: serial_path.clone(),
             _fs_daemons: fs_daemons,
-            cgroup_name: Some(res.cgroup_name.clone()),
             restored: false,
             cid,
             pgid,
@@ -243,13 +239,10 @@ impl Vmm for CloudHypervisor {
                         res.vmid
                     );
                     if !matches!(cfg.net, crate::config::NetConfig::None) {
-                        assert!(
-                            res.vmid <= 254,
-                            "vmid must be <= 254 for network configuration"
-                        );
+                        let (host_ip, guest_ip, _) = crate::net::ip_math(res.vmid)?;
                         s.push_str(&format!(
-                            " ip=10.200.{}.2::10.200.{}.1:255.255.255.252::eth0:off",
-                            res.vmid, res.vmid
+                            " ip={}::{}:255.255.255.252::eth0:off",
+                            guest_ip, host_ip
                         ));
                     }
                     if cfg.nested_virt {
@@ -280,16 +273,9 @@ impl Vmm for CloudHypervisor {
                 vhost_socket: None,
             });
         } else if let Some(socket) = &res.vhost_user_socket {
-            assert!(res.vmid <= 254, "vmid must be <= 254 for MAC configuration");
             ch_cfg.net.push(ChNet {
                 tap: None,
-                mac: Some(format!(
-                    "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
-                    (res.vmid >> 24) & 0xff,
-                    (res.vmid >> 16) & 0xff,
-                    (res.vmid >> 8) & 0xff,
-                    res.vmid & 0xff
-                )),
+                mac: Some(crate::net::mac_math(res.vmid)?),
                 vhost_user: Some(true),
                 vhost_mode: Some("Client".to_string()),
                 vhost_socket: Some(socket.clone()),
@@ -345,7 +331,6 @@ impl Vmm for CloudHypervisor {
             vsock_path,
             serial_path,
             _fs_daemons: fs_daemons,
-            cgroup_name: Some(res.cgroup_name.clone()),
             restored: true,
             cid,
             pgid,
@@ -362,6 +347,10 @@ impl Vmm for CloudHypervisor {
             unprivileged_vhost_user_net: true,
             nested_virt: true,
         }
+    }
+
+    fn id(&self) -> &str {
+        "cloud-hypervisor"
     }
 }
 
@@ -450,12 +439,6 @@ impl Drop for ChInstance {
         }
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
-        #[cfg(feature = "metrics")]
-        if let Some(cg_name) = &self.cgroup_name {
-            let cg =
-                cgroups_rs::Cgroup::load(Box::new(cgroups_rs::hierarchies::V2::new()), cg_name);
-            let _ = cg.delete();
-        }
     }
 }
 

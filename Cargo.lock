@@ -2357,6 +2357,7 @@ dependencies = [
  "flate2",
  "fuse-backend-rs",
  "futures 0.3.32",
+ "http",
  "http-body-util",
  "hudsucker",
  "hyper",

@@ -8,9 +8,40 @@ use crate::error::{Error, Result};
 use std::path::Path;
 use tokio::process::Command;
 
+/// Interface for HTTP operations.
+#[async_trait]
+pub trait HttpClient: Send + Sync {
+    /// Perform an HTTP GET request.
+    async fn get(&self, url: &str) -> Result<Vec<u8>>;
+}
+
+/// A reqwest-based HTTP client.
+pub struct ReqwestClient;
+#[async_trait]
+impl HttpClient for ReqwestClient {
+    async fn get(&self, url: &str) -> Result<Vec<u8>> {
+        let response = reqwest::get(url)
+            .await
+            .map_err(|e| Error::Artifact(format!("Failed to download: {}", e)))?;
+        if !response.status().is_success() {
+            return Err(Error::Artifact(format!(
+                "Failed to download: status {}",
+                response.status()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Artifact(format!("Failed to read: {}", e)))?;
+        Ok(bytes.to_vec())
+    }
+}
+
 /// A pipeline stage that builds a Linux kernel image.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelStage {}
+pub struct KernelStage {
+    /// The HTTP client to use for downloading the kernel source.
+    pub http_client: std::sync::Arc<dyn HttpClient>,
+}
 
 use async_trait::async_trait;
 
@@ -70,19 +101,7 @@ impl Stage for KernelStage {
         let tarball = workdir.join("linux.tar.xz");
 
         if !tarball.exists() {
-            let response = reqwest::get(kernel_source_url)
-                .await
-                .map_err(|e| Error::Artifact(format!("Failed to download kernel source: {}", e)))?;
-            if !response.status().is_success() {
-                return Err(Error::Artifact(format!(
-                    "Failed to download kernel source: status {}",
-                    response.status()
-                )));
-            }
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| Error::Artifact(format!("Failed to read kernel source: {}", e)))?;
+            let bytes = self.http_client.get(kernel_source_url).await?;
             tokio::fs::write(&tarball, bytes).await?;
         }
 
@@ -203,7 +222,9 @@ mod tests {
 
     #[test]
     fn test_kernel_cache_key() {
-        let stage = KernelStage {};
+        let stage = KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+        };
 
         let mut inputs1 = StageInputs::default();
         inputs1.pins.insert(

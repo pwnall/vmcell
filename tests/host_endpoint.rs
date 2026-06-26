@@ -46,21 +46,23 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .build()
         .unwrap();
-    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(8000);
-    let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
     cfg.net = imp_testing::config::NetConfig::Rootless {
         egress: imp_testing::config::Egress::Open,
         host_services_port: Some(port),
     };
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(
         vmm,
         cfg,
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");

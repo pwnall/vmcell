@@ -1,59 +1,30 @@
 use imp_testing::TestVm;
 use imp_testing::config::{RootfsSource, VmConfig};
 use imp_testing::vmm::VmInstance;
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 
 mod common;
 
-#[tokio::test]
-#[ignore]
-async fn test_boot_ch() {
-    let vmm = CloudHypervisor::new(common::ch_bin());
+vmm_matrix_test!(boot, |vmm| {
     test_boot_impl(&vmm).await;
-}
-
-#[cfg(feature = "firecracker")]
-#[tokio::test]
-#[ignore]
-async fn test_boot_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    test_boot_impl(&vmm).await;
-}
-
-#[cfg(feature = "qemu")]
-#[tokio::test]
-#[ignore]
-async fn test_boot_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    test_boot_impl(&vmm).await;
-}
+});
 
 async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
-    let vmlinux = match common::get_vmlinux() {
-        Some(p) => p,
-        None => {
-            println!("Artifacts not found, skipping boot test");
-            return;
-        }
-    };
-    let rootfs = match common::get_rootfs() {
-        Some(p) => p,
-        None => return,
-    };
+    let vmlinux = common::get_vmlinux();
+    let rootfs = common::get_rootfs();
 
     let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .network_disabled()
         .build()
         .unwrap();
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(
         vmm,
         cfg,
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");

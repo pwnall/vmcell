@@ -45,40 +45,12 @@ impl HttpHandler for ProxyHandler {
     ) -> RequestOrResponse {
         tracing::info!("Proxy intercepted request to: {}", req.uri());
 
-        if req.method() == hyper::Method::CONNECT {
-            return RequestOrResponse::Request(req);
-        }
+        let host_str = req
+            .uri()
+            .host()
+            .or_else(|| req.uri().authority().map(|a| a.host()));
 
-        let req_uri = format!("{} {}", req.method(), req.uri());
-        if let Ok(mut reqs) = self.requests.lock() {
-            reqs.push(req_uri);
-        }
-
-        if let Ok(path_opt) = self.record_path.lock() {
-            if let Some(path) = path_opt.as_ref() {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{} {}", req.method(), req.uri());
-                }
-            }
-        }
-
-        if let Ok(doubles) = self.doubles.read() {
-            for double in doubles.iter() {
-                if (double.matcher)(&req) {
-                    tracing::info!("Proxy matched request, returning test double response");
-                    let res = (double.responder)(&req);
-                    return RequestOrResponse::Response(res);
-                }
-            }
-        }
-
-        // Apply filter rules
-        if let Some(host) = req.uri().host() {
+        if let Some(host) = host_str {
             for blocked in &self.blocked_domains {
                 if host == blocked || host.ends_with(&format!(".{}", blocked)) {
                     tracing::info!("Proxy blocking request to {}", host);
@@ -90,6 +62,38 @@ impl HttpHandler for ProxyHandler {
                         )))
                         .expect("Valid response builder");
                     return RequestOrResponse::Response(response);
+                }
+            }
+        }
+
+        let req_uri = format!("{} {}", req.method(), req.uri());
+        {
+            let mut reqs = self.requests.lock().expect("mutex poisoned");
+            reqs.push(req_uri.clone());
+        }
+
+        if let Some(path) = self.record_path.lock().expect("mutex poisoned").as_ref() {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", req_uri);
+            }
+        }
+
+        if req.method() == hyper::Method::CONNECT {
+            return RequestOrResponse::Request(req);
+        }
+
+        {
+            let doubles = self.doubles.read().expect("rwlock poisoned");
+            for double in doubles.iter() {
+                if (double.matcher)(&req) {
+                    tracing::info!("Proxy matched request, returning test double response");
+                    let res = (double.responder)(&req);
+                    return RequestOrResponse::Response(res);
                 }
             }
         }

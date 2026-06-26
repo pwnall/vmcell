@@ -72,13 +72,14 @@ impl CgroupFs for DefaultCgroupFs {
             }
             if let Err(e) = builder.build(Box::new(hierarchies::V2::new())) {
                 tracing::warn!("Failed to create cgroup {}: {}", name, e);
+                return Err(crate::error::Error::Cgroup(e.to_string()));
             }
 
             if let Some(pids) = limits.pids_max {
                 let pids_max_path = format!("/sys/fs/cgroup/{}/pids.max", name);
-                if let Err(e) = std::fs::write(&pids_max_path, pids.to_string()) {
-                    tracing::warn!("Failed to apply pids.max: {}", e);
-                }
+                std::fs::write(&pids_max_path, pids.to_string()).map_err(|e| {
+                    crate::error::Error::Cgroup(format!("Failed to apply pids.max: {}", e))
+                })?;
             }
             if let Some(io) = &limits.io_max {
                 let io_max_path = format!("/sys/fs/cgroup/{}/io.max", name);
@@ -97,9 +98,9 @@ impl CgroupFs for DefaultCgroupFs {
                 }
                 if !rules.is_empty() {
                     let io_str = format!("{} {}\n", io.device, rules.join(" "));
-                    if let Err(e) = std::fs::write(&io_max_path, io_str) {
-                        tracing::warn!("Failed to apply io.max: {}", e);
-                    }
+                    std::fs::write(&io_max_path, io_str).map_err(|e| {
+                        crate::error::Error::Cgroup(format!("Failed to apply io.max: {}", e))
+                    })?;
                 }
             }
         }
@@ -171,11 +172,13 @@ impl CgroupFs for DefaultCgroupFs {
         if !name.is_empty() {
             let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
             // Write PID directly to bypass `Cgroup::add_task` limitations for nested unprivileged cgroups
-            if let Err(e) = std::fs::write(&procs_path, pid.to_string()) {
-                tracing::warn!("Failed to add process {} to cgroup {}: {}", pid, name, e);
-            } else {
-                tracing::info!("Added process {} to cgroup {}", pid, name);
-            }
+            std::fs::write(&procs_path, pid.to_string()).map_err(|e| {
+                crate::error::Error::Cgroup(format!(
+                    "Failed to add process {} to cgroup {}: {}",
+                    pid, name, e
+                ))
+            })?;
+            tracing::info!("Added process {} to cgroup {}", pid, name);
         }
         Ok(())
     }
@@ -196,8 +199,16 @@ struct FakeCgroupState {
 }
 
 #[cfg(test)]
+impl Default for FakeCgroupFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl FakeCgroupFs {
     /// Creates a new fake cgroup filesystem.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: std::sync::Arc::new(std::sync::Mutex::new(FakeCgroupState::default())),
@@ -205,16 +216,22 @@ impl FakeCgroupFs {
     }
 
     /// Checks if a slice exists.
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
     pub fn has_slice(&self, name: &str) -> bool {
         self.state.lock().unwrap().slices.contains_key(name)
     }
 
     /// Gets limits for a slice.
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
     pub fn get_limits(&self, name: &str) -> Option<crate::config::ResourceLimits> {
         self.state.lock().unwrap().slices.get(name).cloned()
     }
 
     /// Checks if a task is added.
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
     pub fn has_task(&self, name: &str, pid: u32) -> bool {
         self.state
             .lock()

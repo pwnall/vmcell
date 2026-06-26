@@ -31,11 +31,20 @@ fn bench_protocol_codec(c: &mut Criterion) {
 
 fn bench_cache_key(c: &mut Criterion) {
     let stage = KernelStage {
-        kernel_source_url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz".into(),
-        kernel_source_sha256: "dummy_sha256".into(),
-        microvm_config: "CONFIG_KVM=y\nCONFIG_VIRTIO=y\n".into(),
+        http_client: std::sync::Arc::new(imp_testing::artifact::kernel::ReqwestClient),
     };
-    let inputs = StageInputs::default();
+    let mut inputs = StageInputs::default();
+    inputs.pins.insert(
+        "kernel_source_url".into(),
+        "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz".into(),
+    );
+    inputs
+        .pins
+        .insert("kernel_source_sha256".into(), "dummy_sha256".into());
+    inputs.pins.insert(
+        "kernel_microvm_config".into(),
+        "CONFIG_KVM=y\nCONFIG_VIRTIO=y\n".into(),
+    );
 
     c.bench_function("cache_key_generation", |b| {
         b.iter(|| {

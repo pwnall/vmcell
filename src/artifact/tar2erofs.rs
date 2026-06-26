@@ -108,7 +108,7 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
                         .unwrap_or(0);
                     Node::Device {
                         mode: mode | fs_erofs::inode::S_IFCHR,
-                        rdev: (major << 8) | minor,
+                        rdev: libc::makedev(major as libc::c_uint, minor as libc::c_uint) as u32,
                         meta,
                         xattrs: vec![],
                     }
@@ -126,7 +126,7 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
                         .unwrap_or(0);
                     Node::Device {
                         mode: mode | fs_erofs::inode::S_IFBLK,
-                        rdev: (major << 8) | minor,
+                        rdev: libc::makedev(major as libc::c_uint, minor as libc::c_uint) as u32,
                         meta,
                         xattrs: vec![],
                     }

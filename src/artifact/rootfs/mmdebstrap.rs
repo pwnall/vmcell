@@ -3,7 +3,7 @@ use crate::artifact::{StageInputs, StageOutputs};
 use crate::config::{Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig};
 use crate::error::{Error, Result};
 use crate::orchestrator::{TestVm, VmidAllocator};
-use crate::vmm::{CidAllocator, cloud_hypervisor::CloudHypervisor};
+use crate::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::Path;
 
 use std::time::Duration;
@@ -12,7 +12,12 @@ use std::time::Duration;
 ///
 /// # Errors
 /// Returns an error if the VM boot or mmdebstrap process fails.
-pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+pub async fn build_rootfs(
+    release: &str,
+    inputs: &StageInputs,
+    out: &Path,
+    cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
+) -> Result<StageOutputs> {
     let vmlinux_path = inputs
         .artifacts
         .get("kernel")
@@ -34,7 +39,7 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
     // 2. Start builder VM
     let ch_bin = std::env::var("IMP_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
     let vmm = CloudHypervisor::new(ch_bin);
-    let cid_alloc = CidAllocator::new();
+    // cid_alloc is passed in
     let vmid_alloc = VmidAllocator::new();
 
     let host_out_dir = tempfile::TempDir::new().map_err(Error::Io)?;
@@ -62,7 +67,7 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
     let mut vm = TestVm::start(
         &vmm,
         cfg,
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc,
         Box::new(crate::metrics::DefaultCgroupFs),
     )
@@ -115,6 +120,14 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
 
         // 4. Run mmdebstrap inside builder VM
         tracing::info!("Running mmdebstrap inside builder VM...");
+        let timestamp = inputs
+            .pins
+            .get("debian_snapshot_timestamp")
+            .ok_or_else(|| Error::Artifact("Missing debian_snapshot_timestamp pin".into()))?;
+        let mirror = format!(
+            "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/{}/ {} main",
+            timestamp, release
+        );
         let outcome_mmdebstrap = agent
             .exec(ExecRequest {
                 argv: vec![
@@ -123,6 +136,7 @@ pub async fn build_rootfs(release: &str, inputs: &StageInputs, out: &Path) -> Re
                     "--include=curl,ca-certificates".to_string(),
                     release.to_string(),
                     "/imp-out/rootfs.tar".to_string(),
+                    mirror,
                 ],
                 env: vec![],
                 cwd: None,

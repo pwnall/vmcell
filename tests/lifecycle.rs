@@ -34,8 +34,7 @@ async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
 
     if !vmlinux.exists() || !rootfs.exists() {
-        println!("Artifacts not found, skipping lifecycle test");
-        return;
+        panic!("Artifacts not found, skipping lifecycle test");
     }
 
     let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
@@ -43,14 +42,14 @@ async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .build()
         .unwrap();
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(
         vmm,
         cfg,
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
@@ -73,15 +72,15 @@ async fn test_lifecycle_fake_vmm() {
     .build()
     .unwrap();
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
     let vm = TestVm::start(
         &fake,
         cfg.clone(),
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc.clone(),
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start fake VM");
@@ -109,9 +108,9 @@ async fn test_lifecycle_fake_vmm() {
         &fake,
         std::path::Path::new("/fake/snap"),
         cfg.clone(),
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc.clone(),
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to restore fake VM");
@@ -135,8 +134,7 @@ async fn test_lifecycle_panic_residue_ch() {
     let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
 
     if !vmlinux.exists() || !rootfs.exists() {
-        println!("Artifacts not found, skipping panic residue test");
-        return;
+        panic!("Artifacts not found, skipping panic residue test");
     }
 
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
@@ -147,27 +145,28 @@ async fn test_lifecycle_panic_residue_ch() {
         host_services_port: None,
     };
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
     let vmid = {
         let vm = TestVm::start(
             &vmm,
             cfg,
-            &cid_alloc,
+            cid_alloc.clone(),
             vmid_alloc,
-            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+            Box::new(imp_testing::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to start VM");
 
         let vmid = vm.vmid();
 
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _vm = vm;
             panic!("simulate panic inside scope");
         }));
 
-        // Scope ends, TestVm is dropped
+        // Scope ends, but vm was already dropped during panic unwind
         vmid
     };
 
@@ -204,7 +203,7 @@ async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
     .build()
     .unwrap();
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let calls_clone = fake.calls.clone();
 
@@ -212,9 +211,9 @@ async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
         let _vm = imp_testing::TestVm::start(
             &fake,
             cfg,
-            &cid_alloc,
+            cid_alloc.clone(),
             vmid_alloc,
-            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+            Box::new(imp_testing::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to start fake VM");

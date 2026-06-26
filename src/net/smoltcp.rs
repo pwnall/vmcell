@@ -23,7 +23,10 @@ pub mod backend {
     use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
     use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
     use smoltcp::time::Instant;
-    use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+    use smoltcp::wire::{
+        EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
+        IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket,
+    };
 
     const VIRTIO_F_VERSION_1: u32 = 32;
     const QUEUE_SIZE: usize = 1024;
@@ -275,8 +278,12 @@ pub mod backend {
             let _ = self.kill_notifier.notify();
             // Connect to the socket to unblock listener.accept() if it's stuck
             let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
-            let _ = self.vhost_thread.take();
-            let _ = self.net_thread.take();
+            if let Some(t) = self.vhost_thread.take() {
+                let _ = t.join();
+            }
+            if let Some(t) = self.net_thread.take() {
+                let _ = t.join();
+            }
         }
     }
 
@@ -361,8 +368,9 @@ pub mod backend {
             state: Arc<Mutex<SharedState>>,
             stop_flag: Arc<std::sync::atomic::AtomicBool>,
         ) {
-            assert!(vmid <= 254, "vmid must be <= 254 for network configuration");
-            let host_gw = Ipv4Address::new(10, 200, (vmid % 256) as u8, 1);
+            let (host_gw_std, guest_ip_std, _) =
+                crate::net::ip_math(vmid).expect("valid vmid required");
+            let host_gw = Ipv4Address::new(10, 200, host_gw_std.octets()[2], 1);
             // Use a different MAC for the host to avoid dropping packets from the guest.
             let mac_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0xfe]);
 
@@ -383,7 +391,7 @@ pub mod backend {
             });
             iface
                 .routes_mut()
-                .add_default_ipv4_route(Ipv4Address::new(10, 200, (vmid % 256) as u8, 2))
+                .add_default_ipv4_route(Ipv4Address::new(10, 200, guest_ip_std.octets()[2], 2))
                 .expect("add route");
             log::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
 
@@ -468,40 +476,47 @@ pub mod backend {
 
                     if let Some(pxy_port) = proxy_port {
                         for packet in &state_guard.tx_queue {
-                            if packet.len() >= 14
-                                && packet.get(12) == Some(&0x08)
-                                && packet.get(13) == Some(&0x00)
-                                && packet.get(23) == Some(&0x06)
-                            {
-                                let ipv4_hl = (*packet.get(14).unwrap_or(&0) & 0x0f) as usize * 4;
-                                let tcp_offset = 14 + ipv4_hl;
-                                if packet.len() >= tcp_offset + 14 {
-                                    let dst_port = u16::from_be_bytes([
-                                        *packet.get(tcp_offset + 2).unwrap_or(&0),
-                                        *packet.get(tcp_offset + 3).unwrap_or(&0),
-                                    ]);
-                                    let flags = *packet.get(tcp_offset + 13).unwrap_or(&0);
-                                    if (flags & 0x02) != 0 && (flags & 0x10) == 0 {
-                                        // SYN, !ACK
-                                        let has_open = port_mappings.iter().any(|(p, _, h, _)| {
-                                            *p == dst_port && sockets.get::<TcpSocket>(*h).is_open()
-                                        });
-                                        if !has_open {
-                                            for _ in 0..4 {
-                                                let rx_buffer =
-                                                    TcpSocketBuffer::new(vec![0; 65536]);
-                                                let tx_buffer =
-                                                    TcpSocketBuffer::new(vec![0; 65536]);
-                                                let mut socket =
-                                                    TcpSocket::new(rx_buffer, tx_buffer);
-                                                let _ = socket.listen(dst_port);
-                                                let handle = sockets.add(socket);
-                                                port_mappings.push((
-                                                    dst_port,
-                                                    pxy_port,
-                                                    handle,
-                                                    None::<tokio::net::TcpStream>,
-                                                ));
+                            if let Ok(frame) = EthernetFrame::new_checked(&packet[..]) {
+                                if frame.ethertype() == EthernetProtocol::Ipv4 {
+                                    if let Ok(ipv4) = Ipv4Packet::new_checked(frame.payload()) {
+                                        if ipv4.next_header() == IpProtocol::Tcp {
+                                            if let Ok(tcp) = TcpPacket::new_checked(ipv4.payload())
+                                            {
+                                                let dst_port = tcp.dst_port();
+                                                if tcp.syn() && !tcp.ack() {
+                                                    let has_open =
+                                                        port_mappings.iter().any(|(p, _, h, _)| {
+                                                            *p == dst_port
+                                                                && sockets
+                                                                    .get::<TcpSocket>(*h)
+                                                                    .is_open()
+                                                        });
+                                                    if !has_open {
+                                                        for _ in 0..4 {
+                                                            let rx_buffer =
+                                                                TcpSocketBuffer::new(vec![
+                                                                    0;
+                                                                    65536
+                                                                ]);
+                                                            let tx_buffer =
+                                                                TcpSocketBuffer::new(vec![
+                                                                    0;
+                                                                    65536
+                                                                ]);
+                                                            let mut socket = TcpSocket::new(
+                                                                rx_buffer, tx_buffer,
+                                                            );
+                                                            let _ = socket.listen(dst_port);
+                                                            let handle = sockets.add(socket);
+                                                            port_mappings.push((
+                                                                dst_port,
+                                                                pxy_port,
+                                                                handle,
+                                                                None::<tokio::net::TcpStream>,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }

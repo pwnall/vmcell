@@ -28,10 +28,11 @@ pub enum RootfsBuildSource {
 }
 
 /// A pipeline stage that builds a root filesystem.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootfsStage {
     /// The source method to build the root filesystem.
     pub source: RootfsBuildSource,
+    /// The CID allocator for VMs run by this stage.
+    pub cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
 }
 
 #[async_trait]
@@ -67,6 +68,13 @@ impl Stage for RootfsStage {
             RootfsBuildSource::Mmdebstrap { release } => {
                 hasher.update(b"mmdebstrap");
                 hasher.update(release.as_bytes());
+                hasher.update(
+                    inputs
+                        .pins
+                        .get("debian_snapshot_timestamp")
+                        .map(|s| s.as_bytes())
+                        .unwrap_or_default(),
+                );
             }
         }
         for (k, v) in &inputs.artifacts {
@@ -90,7 +98,7 @@ impl Stage for RootfsStage {
                 oci::build_rootfs(image, digest, inputs, out).await
             }
             RootfsBuildSource::Mmdebstrap { release } => {
-                mmdebstrap::build_rootfs(release, inputs, out).await
+                mmdebstrap::build_rootfs(release, inputs, out, self.cid_alloc.clone()).await
             }
         }
     }

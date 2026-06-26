@@ -48,21 +48,22 @@ fn ensure_under_cargo_target_dir(target: &str) -> Result<(), String> {
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: imp-test-runner <test-binary> [args...]");
+        tracing::error!("Usage: imp-test-runner <test-binary> [args...]");
         exit(1);
     }
 
     let need = [Cap::NET_ADMIN, Cap::SYS_ADMIN];
     if let Err(e) = ensure_blessed_or_explain(&need) {
-        eprintln!("{}", e);
+        tracing::error!("{}", e);
         exit(1);
     }
 
     let target = &args[1];
     if let Err(e) = ensure_under_cargo_target_dir(target) {
-        eprintln!("{}", e);
+        tracing::error!("{}", e);
         exit(1);
     }
 
@@ -72,7 +73,7 @@ fn main() {
     if euid.as_raw() == 0 && uid.as_raw() != 0 {
         // prctl(PR_SET_KEEPCAPS, 1)
         if let Err(e) = capctl::prctl::set_keepcaps(true) {
-            eprintln!("Failed to set keepcaps: {}", e);
+            tracing::error!("Failed to set keepcaps: {}", e);
             exit(1);
         }
 
@@ -81,15 +82,15 @@ fn main() {
         // This is safe because we immediately exit on failure, and no threads are spawned yet.
         unsafe {
             if libc::setresgid(gid.as_raw(), gid.as_raw(), gid.as_raw()) != 0 {
-                eprintln!("setresgid failed");
+                tracing::error!("setresgid failed");
                 exit(1);
             }
             if libc::setgroups(1, &gid.as_raw() as *const u32) != 0 {
-                eprintln!("setgroups failed");
+                tracing::error!("setgroups failed");
                 exit(1);
             }
             if libc::setresuid(uid.as_raw(), uid.as_raw(), uid.as_raw()) != 0 {
-                eprintln!("setresuid failed");
+                tracing::error!("setresuid failed");
                 exit(1);
             }
         }
@@ -98,7 +99,7 @@ fn main() {
     let mut caps = match CapState::get_current() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to get current capabilities: {}", e);
+            tracing::error!("Failed to get current capabilities: {}", e);
             exit(1);
         }
     };
@@ -108,10 +109,11 @@ fn main() {
     }
 
     if let Err(e) = caps.set_current() {
-        eprintln!("Failed to set inheritable capabilities: {}", e);
+        tracing::error!("Failed to set inheritable capabilities: {}", e);
         exit(1);
     }
 
+    // Drop bounding set
     let mut to_drop = Vec::new();
     for c in Cap::probe_supported() {
         if !need.contains(&c) {
@@ -122,14 +124,36 @@ fn main() {
         let _ = capctl::bounding::drop(c);
     }
 
-    for &c in &need {
-        if let Err(e) = capctl::ambient::raise(c) {
-            eprintln!("Failed to raise ambient capability {:?}: {}", c, e);
+    // For setuid form, change uid before raising ambient
+    let ruid = rustix::process::getuid();
+    let euid = rustix::process::geteuid();
+    if euid.as_raw() == 0 && ruid.as_raw() != 0 {
+        // Keep caps across setuid
+        unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) };
+        if unsafe { libc::setuid(ruid.as_raw()) } != 0 {
+            tracing::error!("Failed to drop setuid privileges");
             exit(1);
         }
     }
 
+    for &c in &need {
+        if let Err(e) = capctl::ambient::raise(c) {
+            tracing::error!("Failed to raise ambient capability {:?}: {}", c, e);
+            exit(1);
+        }
+    }
+
+    // Trim P/E after
+    let mut final_caps = CapState::get_current().expect("get current caps");
+    final_caps.permitted.clear();
+    final_caps.effective.clear();
+    for &c in &need {
+        final_caps.permitted.add(c);
+        final_caps.effective.add(c);
+    }
+    final_caps.set_current().expect("set current caps");
+
     let err = Command::new(target).args(&args[2..]).exec();
-    eprintln!("Failed to exec {}: {}", target, err);
+    tracing::error!("Failed to exec {}: {}", target, err);
     exit(1);
 }

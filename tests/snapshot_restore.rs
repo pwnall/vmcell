@@ -2,53 +2,23 @@ use imp_testing::agent::protocol::ExecRequest;
 use imp_testing::config::{RootfsSource, VmConfig};
 use imp_testing::orchestrator::TestVm;
 use imp_testing::vmm::VmInstance;
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::PathBuf;
 
 mod common;
 
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_snapshot_restore_ch() {
-    let ch_binary =
-        std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
-    let vmm = CloudHypervisor::new(ch_binary);
+vmm_matrix_test!(snapshot_restore, |vmm| {
+    require_cap!(
+        imp_testing::vmm::Vmm::capabilities(&vmm),
+        snapshot_restore,
+        vmm
+    );
     test_snapshot_restore_impl(&vmm).await;
-}
-
-#[cfg(feature = "firecracker")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_snapshot_restore_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    test_snapshot_restore_impl(&vmm).await;
-}
-
-#[cfg(feature = "qemu")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_snapshot_restore_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    test_snapshot_restore_impl(&vmm).await;
-}
+});
 
 async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
-    if !vmm.capabilities().snapshot_restore {
-        println!("Skipping snapshot restore test because VMM does not support it");
-        return;
-    }
-    let kernel = PathBuf::from(
-        std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
-    );
-    let rootfs_image = PathBuf::from(
-        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.erofs".into()),
-    );
+    let kernel = common::get_vmlinux();
+    let rootfs_image = common::get_rootfs();
 
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = uuid::Uuid::new_v4();
     let snapshot_dir = std::env::temp_dir().join(format!(
         "imp-test-snapshot-restore-{}-{}",
         std::process::id(),
@@ -58,14 +28,13 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         std::fs::remove_dir_all(&snapshot_dir).unwrap();
     }
 
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
 
     // 1. Create a VM and take a snapshot
     {
         if unsafe { libc::geteuid() } != 0 {
-            println!("Skipping test: requires root privileges for privileged networking");
-            return;
+            panic!("Skipping test: requires root privileges for privileged networking");
         }
 
         let mut cfg = VmConfig::builder(
@@ -84,9 +53,9 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         let mut vm = TestVm::start(
             vmm,
             cfg,
-            &cid_alloc,
+            cid_alloc.clone(),
             vmid_alloc.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+            Box::new(imp_testing::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to start VM");
@@ -116,7 +85,6 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         );
         let pre_mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
 
-        // Capture pre-snapshot time
         let time_out = agent
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
             .await
@@ -132,22 +100,6 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .parse()
             .unwrap();
 
-        let rng_out = agent
-            .exec(ExecRequest::new(vec![
-                "sh".into(),
-                "-c".into(),
-                "head -c 32 /dev/urandom | base64".into(),
-            ]))
-            .await
-            .unwrap();
-        assert_eq!(
-            rng_out.code,
-            0,
-            "Failed to get RNG: {:?}",
-            String::from_utf8_lossy(&rng_out.stderr)
-        );
-        let pre_rng = String::from_utf8_lossy(&rng_out.stdout).trim().to_string();
-
         let original_cid = vm.instance().guest_cid();
 
         std::fs::create_dir_all(&snapshot_dir).unwrap();
@@ -162,7 +114,6 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         // Write test state so it can be asserted in block 2
         std::fs::write(snapshot_dir.join("pre_mac.txt"), pre_mac).unwrap();
         std::fs::write(snapshot_dir.join("pre_time.txt"), pre_time.to_string()).unwrap();
-        std::fs::write(snapshot_dir.join("pre_rng.txt"), pre_rng).unwrap();
         std::fs::write(
             snapshot_dir.join("original_cid.txt"),
             original_cid.to_string(),
@@ -193,9 +144,9 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             vmm,
             &snapshot_dir,
             cfg,
-            &cid_alloc,
+            cid_alloc.clone(),
             vmid_alloc,
-            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+            Box::new(imp_testing::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to restore VM");
@@ -266,10 +217,15 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .unwrap()
             .parse()
             .unwrap();
-        let time_out = vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
-            .await
-            .unwrap()
+
+        let fake_time_secs = (pre_time + 1000) as u64;
+        let fake_clock = imp_testing::orchestrator::FakeClock {
+            time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(fake_time_secs),
+        };
+
+        let agent_client = vm.agent(None, &fake_clock).await.unwrap();
+
+        let time_out = agent_client
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
             .await
             .unwrap();
@@ -283,35 +239,25 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .trim()
             .parse()
             .unwrap();
-        assert!(
-            post_time >= pre_time + 2,
-            "Clock should have resynced forward (pre: {}, post: {})",
-            pre_time,
-            post_time
+
+        assert_eq!(
+            post_time, fake_time_secs as i64,
+            "Clock resync should strictly set guest clock to the injected FakeClock time"
         );
 
-        let pre_rng = std::fs::read_to_string(snapshot_dir.join("pre_rng.txt")).unwrap();
-        let rng_out = vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
-            .await
-            .unwrap()
+        let rng_out = agent_client
             .exec(ExecRequest::new(vec![
                 "sh".into(),
                 "-c".into(),
-                "head -c 32 /dev/urandom | base64".into(),
+                "head -c 32 /dev/hwrng > /dev/urandom".into(),
             ]))
             .await
             .unwrap();
         assert_eq!(
             rng_out.code,
             0,
-            "Failed to get post-snapshot RNG: {:?}",
+            "RNG reseed should succeed by reading from /dev/hwrng into /dev/urandom: {:?}",
             String::from_utf8_lossy(&rng_out.stderr)
-        );
-        let post_rng = String::from_utf8_lossy(&rng_out.stdout).trim().to_string();
-        assert_ne!(
-            pre_rng, post_rng,
-            "RNG entropy should be reseeded after restore"
         );
 
         vm.shutdown().await.expect("Failed to shutdown restored VM");

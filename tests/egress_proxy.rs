@@ -4,44 +4,17 @@ use imp_testing::TestVm;
 use imp_testing::agent::protocol::ExecRequest;
 use imp_testing::config::{Egress, ProxyConfig, RootfsSource, VmConfig};
 use imp_testing::proxy::doubles::TestDouble;
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::PathBuf;
 
 mod common;
 
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_egress_proxy_ch() {
-    let vmm = CloudHypervisor::new(common::ch_bin());
+vmm_matrix_test!(egress_proxy, |vmm| {
+    require_cap!(
+        imp_testing::vmm::Vmm::capabilities(&vmm),
+        unprivileged_vhost_user_net,
+        vmm
+    );
     test_egress_proxy_impl(&vmm).await;
-}
-
-#[cfg(feature = "firecracker")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_egress_proxy_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
-        println!("Skipping: vhost-user-net not supported");
-        return;
-    }
-    test_egress_proxy_impl(&vmm).await;
-}
-
-#[cfg(feature = "qemu")]
-#[tokio::test]
-#[serial_test::serial]
-#[ignore]
-async fn test_egress_proxy_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
-        println!("Skipping: vhost-user-net not supported");
-        return;
-    }
-    test_egress_proxy_impl(&vmm).await;
-}
+});
 
 async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -50,8 +23,8 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .with_test_writer()
         .try_init();
 
-    let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
-    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
+    let vmlinux = common::get_vmlinux();
+    let rootfs = common::get_rootfs();
 
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .build()
@@ -70,8 +43,10 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         }),
     }]));
 
-    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(9000);
-    let host_port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let host_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
 
     let python_server = std::process::Command::new("python3")
         .arg("-m")
@@ -93,14 +68,14 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         egress: Egress::Filtered(proxy_cfg),
         host_services_port: Some(host_port),
     };
-    let cid_alloc = imp_testing::vmm::CidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
     let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
     let mut vm = TestVm::start(
         vmm,
         cfg,
-        &cid_alloc,
+        cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
@@ -212,12 +187,10 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let blocked_stderr = String::from_utf8_lossy(&blocked_outcome.stderr);
     let blocked_stdout = String::from_utf8_lossy(&blocked_outcome.stdout);
     assert!(
-        blocked_stderr.contains("403 Forbidden")
-            || blocked_stderr.contains("Blocked")
-            || blocked_stdout.contains("403 Forbidden")
-            || blocked_stdout.contains("Blocked"),
-        "Did not receive 403 Forbidden for blocked domain: {}",
-        blocked_stderr
+        blocked_stderr.contains("403") && blocked_stdout.contains("Blocked by Imp Proxy"),
+        "Did not receive 403 Forbidden for blocked domain: {}\nSTDOUT: {}",
+        blocked_stderr,
+        blocked_stdout
     );
 
     // Test that a CONNECT request falls through to the default proxy behavior

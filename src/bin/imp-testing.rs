@@ -21,7 +21,7 @@ fn main() -> imp_testing::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("valid async runtime config")
         .block_on(async_main())
 }
 
@@ -37,10 +37,15 @@ async fn async_main() -> imp_testing::Result<()> {
                     Box::new(imp_testing::artifact::ResolvePinsStage {
                         pins_file: std::path::PathBuf::from("pins.json"),
                     }),
-                    Box::new(imp_testing::artifact::kernel::KernelStage {}),
+                    Box::new(imp_testing::artifact::kernel::KernelStage {
+                        http_client: std::sync::Arc::new(
+                            imp_testing::artifact::kernel::ReqwestClient,
+                        ),
+                    }),
                     Box::new(imp_testing::artifact::guest_agent::GuestAgentStage {}),
                     Box::new(imp_testing::artifact::rootfs::RootfsStage {
                         source: imp_testing::artifact::rootfs::RootfsBuildSource::Oci,
+                        cid_alloc: std::sync::Arc::new(imp_testing::vmm::CidAllocator::new()),
                     }),
                 ],
             };

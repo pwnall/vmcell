@@ -34,7 +34,9 @@ fn report(name: &str, latencies: &mut [u128]) {
     let p50 = latencies[(count * 0.5).floor() as usize];
     let p95 = latencies[(count * 0.95).floor() as usize];
     let p99 = latencies[(count * 0.99).floor() as usize];
-    let max = latencies.last().unwrap();
+    let max = latencies
+        .last()
+        .expect("latencies should not be empty at this point");
 
     println!(
         "{}: count={} p50={}ms p95={}ms p99={}ms max={}ms",
@@ -69,8 +71,8 @@ async fn run_bench<V: Vmm>(
     .mem_mib(256)
     .network_disabled()
     .build()
-    .unwrap();
-    let cid_allocator = CidAllocator::new();
+    .expect("valid VM configuration benchmark invariant");
+    let cid_allocator = std::sync::Arc::new(CidAllocator::new());
 
     let snap_dir = std::env::temp_dir().join(format!("imp-bench-snap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&snap_dir);
@@ -80,9 +82,9 @@ async fn run_bench<V: Vmm>(
         let mut base_vm = match TestVm::start(
             vmm,
             cfg.clone(),
-            &cid_allocator,
+            cid_allocator.clone(),
             allocator.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+            Box::new(imp_testing::metrics::DefaultCgroupFs),
         )
         .await
         {
@@ -100,7 +102,7 @@ async fn run_bench<V: Vmm>(
             let _ = base_vm.shutdown().await;
             return;
         }
-        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::create_dir_all(&snap_dir).expect("required configuration failed");
         if let Err(e) = base_vm.instance_mut().snapshot(&snap_dir).await {
             println!("Failed to take snapshot of base VM: {}", e);
             let _ = base_vm.shutdown().await;
@@ -127,18 +129,18 @@ async fn run_bench<V: Vmm>(
                 vmm,
                 &snap_dir,
                 cfg.clone(),
-                &cid_allocator,
+                cid_allocator.clone(),
                 allocator.clone(),
-                Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+                Box::new(imp_testing::metrics::DefaultCgroupFs),
             )
             .await
         } else {
             TestVm::start(
                 vmm,
                 cfg.clone(),
-                &cid_allocator,
+                cid_allocator.clone(),
                 allocator.clone(),
-                Box::new(imp_testing::metrics::DefaultCgroupFs::default()),
+                Box::new(imp_testing::metrics::DefaultCgroupFs),
             )
             .await
         };

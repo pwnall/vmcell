@@ -85,68 +85,57 @@ async fn test_exec_vsock_mock() {
     let _ = std::fs::remove_file(&tmp);
 }
 
-#[tokio::test]
-async fn test_put_file_mock() {
-    let tmp = std::env::temp_dir().join(format!("imp-test-vsock-put-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let listener = UnixListener::bind(&tmp).expect("Failed to bind UDS");
+mod common;
 
-    let vsock_path = tmp.clone();
+vmm_matrix_test!(put_file, |vmm| {
+    let kernel = common::get_vmlinux();
+    let rootfs_image = common::get_rootfs();
 
-    let server_task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-
-        let mut resp = String::new();
-        loop {
-            let mut byte = [0; 1];
-            let n = stream.read(&mut byte).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            resp.push(byte[0] as char);
-            if byte[0] == b'\n' {
-                break;
-            }
-        }
-        assert_eq!(resp, "CONNECT 5000\n");
-
-        stream.write_all(b"OK 5000\n").await.unwrap();
-
-        let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
-
-        let ready_msg = postcard::to_stdvec(&Message::Ready).unwrap();
-        framed.send(ready_msg.into()).await.unwrap();
-
-        let msg_bytes = framed.next().await.unwrap().unwrap();
-        let msg: Message = postcard::from_bytes(&msg_bytes).unwrap();
-        match msg {
-            Message::PutFile { dst, bytes } => {
-                assert_eq!(dst, "/tmp/hello.txt");
-                assert_eq!(bytes, b"hello world");
-            }
-            _ => panic!("Expected PutFile message"),
-        }
-
-        let exit_msg = postcard::to_stdvec(&Message::Exit(0)).unwrap();
-        framed.send(exit_msg.into()).await.unwrap();
-    });
-
-    let mut client = AgentClient::connect(
-        &vsock_path,
-        5000,
-        std::time::Duration::from_secs(2),
-        &imp_testing::vmm::RealSerialLog {
-            path: std::path::PathBuf::from("/dev/null"),
+    let cfg = imp_testing::config::VmConfig::builder(
+        kernel,
+        imp_testing::config::RootfsSource::Erofs {
+            image: rootfs_image,
         },
     )
-    .await
-    .expect("Failed to connect");
+    .network_disabled()
+    .build()
+    .unwrap();
 
-    client
-        .put_file("/tmp/hello.txt", b"hello world", None)
+    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
+    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let mut vm = imp_testing::TestVm::start(
+        &vmm,
+        cfg,
+        cid_alloc,
+        vmid_alloc,
+        Box::new(imp_testing::metrics::DefaultCgroupFs),
+    )
+    .await
+    .expect("Failed to start VM");
+
+    let agent = vm
+        .agent(None, &imp_testing::orchestrator::RealClock)
+        .await
+        .expect("Failed to connect to agent");
+
+    agent
+        .put_file("/tmp/hello.txt", b"hello world from test", None)
         .await
         .expect("put_file failed");
 
-    server_task.await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
-}
+    let outcome = agent
+        .exec(ExecRequest::new(vec![
+            "cat".into(),
+            "/tmp/hello.txt".into(),
+        ]))
+        .await
+        .expect("Exec failed");
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(
+        outcome.stdout, b"hello world from test",
+        "Round-trip file contents must match"
+    );
+
+    vm.shutdown().await.expect("Shutdown failed");
+});
