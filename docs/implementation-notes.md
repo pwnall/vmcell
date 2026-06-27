@@ -84,3 +84,48 @@ This document captures the rationale behind key architectural decisions and non-
 - **Top-Level Lint Exclusions:** `src/lib.rs` preserves `#![allow(async_fn_in_trait)]` as it's required by the codebase's existing architecture.
 - **Test Scaffolding:** `tests/common/mod.rs` was augmented with the `start_vm`, `require_cap!`, and `vmm_matrix_test!` macros. Tests will incrementally adopt these rather than applying a mass refactor.
 - **Sub-agent Delegation:** Existing lint failures on `unwrap` usage and missing doc sections, as well as test instantiation arguments due to the new `start_vm` signature, were iteratively resolved by subagents to maintain the `cargo clippy` and `cargo test` gates.
+
+
+## Design Alignment (Review 34)
+
+Code review 34 (`docs/34-claude-code-review.md`) recorded the following **justified** deviations
+from the design here (rather than as findings), and flags two pre-existing rationales that newer
+findings contradict. Unjustified divergences and defects are in the review report, not duplicated here.
+
+### Newly recorded justified deviations
+- **Protocol omits the design's `Hello` and `Ping` message variants.** Design §4.1 lists the enum as
+  `Hello`/`Ready`/…/`Ping`, but `AGENTS.md`/the rubric require removing the dead `Hello` and no-op
+  `Ping`. `src/agent/protocol.rs` defines only `Ready`/`Exec`/`Stdout`/`Stderr`/`Exit`/`PutFile`, the
+  rubric-aligned choice; the enum is `#[non_exhaustive]`, so re-adding later is non-breaking.
+- **`hudsucker` re-self-signs the loaded CA params to obtain an owned `Certificate`.** On the
+  load-from-disk path (`src/proxy/tls.rs:52-63`) the baked-in `ca_cert_pem` is what the guest trusts;
+  `params.self_signed(&key_pair)` only reconstructs the in-memory `Certificate` for `RcgenAuthority::new`
+  from the *same* key pair and parsed params, so leaf certs chain to the same public key/subject. This is
+  the cache-once pattern rubric B4 requires, **not** a per-`authority()`-call re-sign — recorded so it is
+  not mistaken for the re-sign bug.
+- **`TestVm::start`/`restore` inject `CidAllocator`, `VmidAllocator` and `CgroupFs` separately** rather
+  than the single `Arc<VmidAllocator>` of the §10.2 sketch. CID and VMID are distinct ID spaces and
+  `CgroupFs` is an injected `Box<dyn CgroupFs>` providing the recording-fake seam `AGENTS.md` mandates —
+  more injectable seams than the sketch, consistent with the testability mandate.
+- **`deny.toml` allow-list adds `Unicode-3.0` and `CDLA-Permissive-2.0`** beyond the design skeleton.
+  Both are permissive licenses required by transitive deps (e.g. `unicode-ident`); adding them is the
+  sanctioned way to satisfy the allow-only gate (`cargo deny` is the source of truth), not a policy break.
+- **TPROXY ruleset drops UDP/QUIC (`udp dport 443`) instead of intercepting it** (`src/net/tap.rs:315-326`),
+  a deliberate divergence from §6.3's "intercept" language: blocking QUIC forces HTTP/2-over-TCP so all
+  egress stays observable through the transparent proxy, which serves the design's egress-observability
+  goal. (Surfaced as review finding `NET-7`; recorded here as the accepted posture.)
+- **`exec_vsock::test_exec_vsock_mock` runs in the default (non-ignored) suite.** It is a UDS
+  protocol/codec mock exercising the `AgentClient` handshake + `Framed<LengthDelimitedCodec>` exchange —
+  not the `put_file` round-trip (which is covered separately by the `vmm_matrix_test!` that writes via
+  `put_file` then `cat`s the file back *in the guest*). So "mock where round-trip is required" does not
+  apply, and a pure codec/mock test correctly runs without `#[ignore]`.
+
+### Corrections to pre-existing rationales (contradicted by Review 34 findings)
+- The "**`restore()`/`snapshot()` carries `&VmConfig`**" note above cites "reconstruct the same device
+  topology — virtio-fs daemons for the configured shares" as a use. Threading `&VmConfig` is justified, but
+  *attaching virtiofsd (a vhost-user device) on the snapshot/restore path violates the snapshot-eligibility
+  law* — see review finding C1 (`DESIGN-DIVERGENCE-1`/`VMM-1`/`CONFIG-ERROR-ORCH-1`). The signature change
+  is fine; the share-daemon use is the defect, not a justification.
+- The "**smoltcp host NAT MAC pinned to `02:00:00:00:00:fe`**" note claims the pin "avoids collisions with
+  the guest's MAC". This is **wrong for vmid 254** (`mac_math(254)` == `02:00:00:00:00:fe`) — see review
+  finding `NET-2`. The RX-iterate-only-when-queued and 16-socket-pool invariants in that note remain correct.
