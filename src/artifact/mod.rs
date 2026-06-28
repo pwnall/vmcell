@@ -149,6 +149,20 @@ fn parse_pins_json(content: &str) -> std::collections::HashMap<String, String> {
                 pins_map.insert("kernel_microvm_config".to_string(), cfg.to_string());
             }
         }
+        // Flatten the multi-kernel registry: each `kernels.<label>` → keyed pins
+        // (`kernel_<label>_source_url` / `_source_sha256`), so a labelled `KernelStage`
+        // can build `vmlinux-<label>` — the kernel-version benchmark dimension. They
+        // share the default `kernel`'s `microvm_config`.
+        if let Some(kernels) = json.get("kernels").and_then(|v| v.as_object()) {
+            for (label, spec) in kernels {
+                if let Some(url) = spec.get("source_url").and_then(|v| v.as_str()) {
+                    pins_map.insert(format!("kernel_{label}_source_url"), url.to_string());
+                }
+                if let Some(sha) = spec.get("source_sha256").and_then(|v| v.as_str()) {
+                    pins_map.insert(format!("kernel_{label}_source_sha256"), sha.to_string());
+                }
+            }
+        }
         if let Some(r) = json.get("rootfs") {
             if let Some(img) = r.get("image").and_then(|v| v.as_str()) {
                 pins_map.insert("rootfs_image".to_string(), img.to_string());
@@ -446,6 +460,42 @@ mod tests {
         assert_eq!(
             map.get("rootfs_digest").map(String::as_str),
             Some("sha256:abc")
+        );
+    }
+
+    // Guards the multi-kernel dimension: each `kernels.<label>` must flatten to
+    // `kernel_<label>_source_url` / `_source_sha256` so a labelled KernelStage can
+    // build it. A buggy impl that ignores `kernels` returns None for these keys.
+    #[test]
+    fn test_parse_pins_flattens_kernel_registry() {
+        let json = r#"{
+            "kernel": { "source_url": "u-default", "source_sha256": "s-default" },
+            "kernels": {
+                "6.6.143":  { "source_url": "u-66",  "source_sha256": "s-66"  },
+                "6.12.94":  { "source_url": "u-612", "source_sha256": "s-612" }
+            }
+        }"#;
+        let map = parse_pins_json(json);
+        assert_eq!(
+            map.get("kernel_6.6.143_source_url").map(String::as_str),
+            Some("u-66")
+        );
+        assert_eq!(
+            map.get("kernel_6.6.143_source_sha256").map(String::as_str),
+            Some("s-66")
+        );
+        assert_eq!(
+            map.get("kernel_6.12.94_source_url").map(String::as_str),
+            Some("u-612")
+        );
+        assert_eq!(
+            map.get("kernel_6.12.94_source_sha256").map(String::as_str),
+            Some("s-612")
+        );
+        // The default `kernel` pins stay intact alongside the registry.
+        assert_eq!(
+            map.get("kernel_source_url").map(String::as_str),
+            Some("u-default")
         );
     }
 

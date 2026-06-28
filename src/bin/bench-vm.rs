@@ -54,6 +54,12 @@ struct Args {
     /// so the `footprint` mode can measure KSM dedup (§13.5). Off by default.
     #[arg(long, default_value_t = false)]
     ksm_mergeable: bool,
+
+    /// Kernel-version label to benchmark — selects `vmlinux-<label>` from
+    /// `IMP_ARTIFACTS_DIR` (built by `imp-testing build-kernels`). Omit to use the
+    /// default `vmlinux`. This is the kernel-version benchmark dimension.
+    #[arg(long)]
+    kernel: Option<String>,
 }
 
 /// Parses the `--restore-mode` flag into a [`RestoreMode`], rejecting any value
@@ -114,7 +120,7 @@ async fn run_bench<V: Vmm>(
 
     let artifacts_dir =
         std::env::var("IMP_ARTIFACTS_DIR").unwrap_or_else(|_| "/tmp/imp-artifacts".into());
-    let kernel_path = PathBuf::from(&artifacts_dir).join("vmlinux");
+    let kernel_path = PathBuf::from(&artifacts_dir).join(kernel_filename(args.kernel.as_deref()));
     let rootfs_path = PathBuf::from(&artifacts_dir).join("rootfs.erofs");
 
     // Fail fast (and KVM-independently) when the artifacts are absent: attempting a boot would
@@ -253,6 +259,11 @@ fn bench_label(base: &str, is_restore: bool, page_cache_dropped: bool) -> String
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     println!("Running benchmarks with backend: {}", args.backend);
+    println!(
+        "kernel: {} (label={})",
+        kernel_filename(args.kernel.as_deref()),
+        args.kernel.as_deref().unwrap_or("default")
+    );
 
     // Pin CPU frequency for the whole run (design §13.2 noise floor): every online
     // CPU is set to the `performance` governor with turbo disabled, and the prior
@@ -335,10 +346,22 @@ async fn run_mode<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAl
 // Shared helpers for the §13 benchmark modes.
 // ----------------------------------------------------------------------------
 
-/// Resolves the (dir, kernel, rootfs) artifact paths from `IMP_ARTIFACTS_DIR`.
-fn artifact_paths() -> (String, PathBuf, PathBuf) {
+/// The kernel artifact filename for an optional version label (`vmlinux` or
+/// `vmlinux-<sanitized-label>`). `.`→`-` matches the build-side filename
+/// sanitization in `KernelStage::suffix` (the pipeline's cache sidecar uses
+/// `with_extension`, which mangles dotted names).
+fn kernel_filename(label: Option<&str>) -> String {
+    match label {
+        Some(l) => format!("vmlinux-{}", l.replace('.', "-")),
+        None => "vmlinux".to_string(),
+    }
+}
+
+/// Resolves the (dir, kernel, rootfs) artifact paths from `IMP_ARTIFACTS_DIR`,
+/// selecting `vmlinux-<label>` when a kernel-version label is given.
+fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
     let dir = std::env::var("IMP_ARTIFACTS_DIR").unwrap_or_else(|_| "/tmp/imp-artifacts".into());
-    let kernel = PathBuf::from(&dir).join("vmlinux");
+    let kernel = PathBuf::from(&dir).join(kernel_filename(kernel_label));
     let rootfs = PathBuf::from(&dir).join("rootfs.erofs");
     (dir, kernel, rootfs)
 }
@@ -522,7 +545,7 @@ fn mean_u64(v: &[u64]) -> u64 {
 // §13.3 — footprint: per-guest RAM, shared erofs page cache, KSM dedup.
 // ----------------------------------------------------------------------------
 async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
-    let (dir, kernel, rootfs) = artifact_paths();
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("footprint: No successful runs (missing artifacts in {dir})");
         return;
@@ -728,7 +751,7 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
 // §13.6 — suspend-size: snapshot bytes + memory-file share, vs guest RAM.
 // ----------------------------------------------------------------------------
 async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
-    let (dir, kernel, rootfs) = artifact_paths();
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("suspend-size: No successful runs (missing artifacts in {dir})");
         return;
@@ -980,7 +1003,7 @@ async fn phase_budget_path<V: Vmm>(
 }
 
 async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
-    let (dir, kernel, rootfs) = artifact_paths();
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("phase-budget: No successful runs (missing artifacts in {dir})");
         return;
@@ -1034,7 +1057,7 @@ async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
 // §13.5 — vsock-rtt: control-plane exec round-trip latency floor.
 // ----------------------------------------------------------------------------
 async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
-    let (dir, kernel, rootfs) = artifact_paths();
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("vsock-rtt: No successful runs (missing artifacts in {dir})");
         return;

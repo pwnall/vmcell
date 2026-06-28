@@ -32,6 +32,7 @@ fn bench_protocol_codec(c: &mut Criterion) {
 fn bench_cache_key(c: &mut Criterion) {
     let stage = KernelStage {
         http_client: std::sync::Arc::new(imp_testing::artifact::kernel::ReqwestClient),
+        label: None,
     };
     let mut inputs = StageInputs::default();
     inputs.pins.insert(

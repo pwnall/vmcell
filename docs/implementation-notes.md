@@ -891,14 +891,15 @@ matters, `benchmark-results.md` is authoritative. The re-run **reproduced every 
 restore, 176 vs 258 ms; suspend size = guest RAM, flat in rootfs; KSM lever ≈394 MiB dedup'd
 (`pages_sharing`=100,993) vs 0; vsock RTT sub-ms; micro codec tens-of-ns).
 
-**New finding from the re-run — the kernel bump has a real hot-path cost.** 6.12.94 boots ~10–15%
-slower than 6.6.9 and, more importantly, **warm restore is ~2× slower** (≈76 ms pinned on 6.6.9 →
-169 ms on 6.12.94), localized by the phase budget to the **post-restore `connect` phase** (vsock
-reconnect + clock/RNG resync ≈115 ms). The bump is still justified — it is the §6 distribution-aligned
-(Trixie) 6.12 LTS kernel **and** the fix for the gcc-15/C23 from-scratch build break — but if restore
-latency becomes the binding constraint for the "thousands of tests" goal, a **minimal 6.6.143 LTS
-bump** (also gcc-15-fixed) avoids the regression and is the cheaper lever. Worth a focused look at why
-6.12 resume+reconnect costs ~15× more than 6.6 did (kernel size at resume, or the resync path).
+**Apparent finding from the re-run — LATER REFUTED.** The 6.12.94 re-run's warm restore (169 ms)
+looked ~2× slower than the 6.6.9 figure (~76 ms) from an *earlier* session, suggesting a kernel hot-path
+cost. **This turned out to be cross-session host-load noise, not a kernel effect** — see "Kernel version
+as a benchmark dimension" below. Once the kernel became a first-class dimension, a **direct, interleaved
+6.6.143-vs-6.12.94 sweep** (same harness/session, freq-pinned) showed warm restore within ~2% (CH 168 vs
+171 ms; FC 138 vs 134 ms) and the restore-`connect` phase only ~8% higher on 6.12 (109→118 ms), not 2×.
+The ~76 ms vs 169 ms gap was the two figures coming from differently-loaded sessions and was never
+apples-to-apples. Lesson: **never compare absolute latencies across sessions on a shared box** — only
+interleaved, same-session deltas are trustworthy (§13.2 noise-floor discipline, the hard way).
 
 **Operational learning — two artifact dirs.** `imp-testing build` (the CLI) writes to
 `target/imp-artifacts`, while the integration/bench harness reads `/tmp/imp-artifacts` unless
@@ -919,3 +920,71 @@ fail-loud, out of concern that silent/quiet degradation masks errors. That migra
 ops are genuinely best-effort vs must-fail, and the capability-declaration mechanism) is the next
 design task; the benchmark/`cpufreq`/KSM degradations are the intended-best-effort end of that spectrum
 and should stay best-effort, with the warning made unmissable.
+
+## Kernel version as a benchmark dimension (multi-kernel support, 2026-06-28)
+
+The ~2× warm-restore gap between 6.6.9 and 6.12.94 (above) made it clear the **kernel version is a
+real dimension**, not a one-off pin. Added first-class multi-kernel support so versions can be built
+and benchmarked side by side:
+
+- **`pins.json` gains a `kernels` registry** — a map of `<label> → { source_url, source_sha256 }`
+  (currently `6.6.143` and `6.12.94`), alongside the existing default `kernel` (which the normal
+  pipeline still uses). All variants share the default's `microvm_config`. `parse_pins_json` flattens
+  each entry to `kernel_<label>_source_url` / `_source_sha256` (unit-tested).
+- **`KernelStage` is now version-aware** via an optional `label`. `None` builds the default `kernel`
+  pin to `vmlinux` (unchanged); `Some(l)` reads the `kernel_<l>_*` pins and builds **`vmlinux-<l>`**
+  with its **own cache sidecar** (the pipeline already keys cache by `out_path`) **and its own build
+  dir `kernel-build-<l>`** (so the two source trees/tarballs don't collide and thrash). The cache key
+  hashes the label, but an **empty-string hash for `None` is a no-op**, so the default kernel's cache
+  key is byte-identical to before — a normal `imp-testing build` does not rebuild.
+- **`imp-testing build-kernels`** (new CLI subcommand) reads the registry and builds every label to
+  `vmlinux-<label>` (a `ResolvePinsStage` + one labelled `KernelStage` per entry). It does **not**
+  rebuild the rootfs — the erofs is **kernel-independent** (Debian userspace + injected agent), so one
+  `rootfs.erofs` boots under any kernel.
+- **`bench-vm --kernel <label>`** selects `vmlinux-<label>` (vs the default `vmlinux`) and tags the
+  run, so the whole §13 suite can be swept per kernel for an apples-to-apples comparison.
+
+**Provenance lesson, reinforced (hard).** The version-research subagent supplied SHA256s for *both*
+kernels and **both were wrong** (`a6cd115d…` for 6.12.94, `d9c49024…` for 6.6.143). The real,
+kernel.org-`sha256sums.asc`-verified hashes are **`e998a232…` (6.12.94)** and **`dace1f8d…`
+(6.6.143)**. The pipeline's tarball verification caught the first; I verified both against the signed
+sums before pinning. **Treat any LLM-provided hash/digest as unverified until checked against the
+upstream signed source** — this is exactly the "verify everything you ingest, refuse on mismatch" rule,
+and it has now paid off three times this session.
+
+### Cross-kernel sweep result — the kernel version is NOT a material lever (and the earlier "2×" was noise)
+
+Ran the full §13 suite across **both** kernels, **interleaved per metric** (6.6.143 then 6.12.94
+back-to-back, so both see similar host load), freq-pinned, N=20. Side-by-side (full table in
+`benchmark-results.md` "Kernel-version sweep"):
+
+| Metric | 6.6.143 | 6.12.94 |
+|---|---|---|
+| Cold boot p50 CH / FC / QEMU (ms) | 607 / 996 / 1579 | 642 / 1022 / 1411 |
+| **Warm restore p50 CH / FC (ms)** | **168 / 138** | **171 / 134** |
+| Eager / lazy restore p50 CH (ms) | 257 / 170 | 262 / 173 |
+| Footprint per-guest RAM / KSM steady (MiB) | 56 / ~381 | 58 / ~393 |
+| Phase RESTORE connect / total (ms) | 109 / 186 | 118 / 200 |
+| vsock-rtt p50 (µs) | 705 | 718 |
+| suspend-size (256 MiB) | 256.0 MiB | 256.0 MiB |
+
+**Verdict: no material kernel effect.** Warm restore is within ~2% on both backends, the
+restore-`connect` phase (where the earlier session "localized the regression") is only ~8% higher on
+6.12 — not 2× — and per-guest RAM differs by ~2 MiB. So the §6 distribution-aligned 6.12.94 pin carries
+**no measurable hot-path penalty**, and the earlier 6.6.9-vs-6.12.94 gap is confirmed as cross-session
+noise. The payoff of making kernel a dimension was not finding a difference — it was **disproving a
+wrong one** that a non-interleaved comparison had manufactured. (KSM caveat: the 6.12 run inherited
+residual `pages_sharing` from the prior interleaved run, so compare the *steady-state* `pages_sharing
+after`, which is equal, not the per-run delta.)
+
+### Follow-up fix: `with_extension` mangled the per-kernel cache sidecar name
+
+Building `vmlinux-6.6.143` exposed a latent pipeline bug: the cache sidecar is derived via
+`out_path.with_extension("cache_key")`, which treats the trailing `.143` of a dotted version as an
+*extension* and replaces it → `vmlinux-6.6.cache_key`. Harmless for the current 6.6.x-vs-6.12.x pair
+(distinct minors), but **same-minor labels** (e.g. `6.6.143` and `6.6.144`) would collide on one
+sidecar and serve the wrong cached kernel. Fixed locally by **sanitizing `.`→`-` in the on-disk kernel
+filename** (`KernelStage::suffix` and `bench-vm`'s `kernel_filename`): the artifact becomes
+`vmlinux-6-6-143` (no dotted "extension" for `with_extension` to eat), while the pins key, the CLI
+`--kernel` label, and the cache-key *hash* stay the dotted `6.6.143`. Scoped to the kernel filename so
+no other stage's sidecar name (rootfs/resolved-pins) changes — i.e. no collateral cache invalidation.

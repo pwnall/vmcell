@@ -10,6 +10,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Build,
+    /// Build every kernel in the pins `kernels` registry to `vmlinux-<label>`.
+    BuildKernels,
     Run,
     Exec,
     Ls,
@@ -57,6 +59,7 @@ async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
                         http_client: std::sync::Arc::new(
                             imp_testing::artifact::kernel::ReqwestClient,
                         ),
+                        label: None,
                     }),
                     Box::new(imp_testing::artifact::guest_agent::GuestAgentStage {}),
                     Box::new(imp_testing::artifact::guest_tools::GuestToolsStage {}),
@@ -70,6 +73,46 @@ async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
                 .build(&imp_testing::artifact::Cache::default())
                 .await?;
             println!("Artifacts built successfully.");
+            Ok(())
+        }
+        Commands::BuildKernels => {
+            // Build each kernel in the `kernels` registry to its own `vmlinux-<label>`
+            // (the kernel-version dimension), so multiple versions coexist for the
+            // cross-kernel benchmark sweep. Reuses the labelled `KernelStage`; each has
+            // its own cache sidecar and build dir.
+            let pins_file = std::path::PathBuf::from("pins.json");
+            let content = std::fs::read_to_string(&pins_file).map_err(imp_testing::Error::Io)?;
+            let json: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| imp_testing::Error::Artifact(format!("pins.json parse: {e}")))?;
+            let labels: Vec<String> = json
+                .get("kernels")
+                .and_then(|k| k.as_object())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            if labels.is_empty() {
+                return Err(imp_testing::Error::Artifact(
+                    "no `kernels` registry in pins.json".to_string(),
+                ));
+            }
+            println!("Building kernels: {}", labels.join(", "));
+            let mut stages: Vec<Box<dyn imp_testing::artifact::Stage>> =
+                vec![Box::new(imp_testing::artifact::ResolvePinsStage {
+                    pins_file: pins_file.clone(),
+                })];
+            for label in &labels {
+                println!("  - kernel {label} -> vmlinux-{label}");
+                stages.push(Box::new(imp_testing::artifact::kernel::KernelStage {
+                    http_client: std::sync::Arc::new(imp_testing::artifact::kernel::ReqwestClient),
+                    label: Some(label.clone()),
+                }));
+            }
+            imp_testing::artifact::Pipeline {
+                target_dir: std::path::PathBuf::from("target/imp-artifacts"),
+                stages,
+            }
+            .build(&imp_testing::artifact::Cache::default())
+            .await?;
+            println!("Kernels built: {}", labels.join(", "));
             Ok(())
         }
         Commands::Run => Err(not_implemented("run")),

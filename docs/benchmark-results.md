@@ -45,12 +45,38 @@ N=20, warmup=3, mem=256 MiB. Cold = warm-cache (see caveats). All ms.
   holds. **Firecracker now restores (128 ms) and *wins* restore over CH (169 ms)** while losing cold
   boot — exactly the density/snapshot-tier role the design assigns it. (FC warm restore was broken by
   a vsock-UDS `EADDRINUSE` bug, since fixed.)
-- **Kernel-bump cost:** on the prior 6.6.9 pin these were CH ~571 ms cold / ~76 ms restore (pinned).
-  The distro-aligned 6.12.94 boots ~10–15% slower and, notably, **restores ~2× slower** (76→169 ms) —
-  a real cost of the larger 6.12 kernel on the hot path, worth weighing against the §6 distro-kernel
-  preference and the gcc-15 build fix (a minimal 6.6.143 bump would avoid the restore regression).
+- **Kernel version is NOT the lever** (see the kernel-version sweep below). An earlier cross-session
+  comparison suggested 6.12.94 restored ~2× slower than 6.6.9 (≈76 ms), but that was **not
+  apples-to-apples** — the 6.6.9 figure came from a quieter earlier session. A **direct, interleaved
+  6.6.143-vs-6.12.94 sweep** (same harness, same session) shows warm restore within **~2%** (CH 168 vs
+  171 ms; FC 138 vs 134 ms) — so the gap was host-load noise, not a kernel cost. The §6 distro-aligned
+  6.12.94 pin carries no measurable hot-path penalty.
 - **Design §13.1 reference** (research-era figures): CH 324 ms cold / 47 ms restore — hardware- and
   pin-dependent; the *relative* invariants reproduce, the absolute ms do not.
+
+## Macro — Kernel-version sweep (6.6.143 vs 6.12.94)
+
+Direct, **interleaved** comparison (same harness/session, freq-pinned, N=20) built with the
+multi-kernel pipeline (`imp-testing build-kernels`; `bench-vm --kernel <label>`). One shared rootfs.
+
+| Metric | 6.6.143 | 6.12.94 | Δ |
+| --- | --- | --- | --- |
+| Cold boot p50 — CH / FC / QEMU (ms) | 607 / 996 / 1579 | 642 / 1022 / 1411 | +6% / +3% / −11% |
+| **Warm restore p50 — CH / FC (ms)** | **168 / 138** | **171 / 134** | **+2% / −3% (noise)** |
+| Eager / lazy restore p50 — CH (ms) | 257 / 170 | 262 / 173 | +2% / +2% |
+| Footprint per-guest RAM (MiB) | 56 | 58 | +2 |
+| KSM dedup steady-state (MiB) | ~381 | ~393 | ≈ equal |
+| Phase: RESTORE connect / total (ms) | 109 / 186 | 118 / 200 | +8% / +7% |
+| vsock-rtt p50 (µs) | 705 | 718 | +2% |
+| suspend-size (256 MiB guest) | 256.0 MiB | 256.0 MiB | flat |
+
+**Verdict: the guest kernel version does not materially change boot, restore, footprint, or
+datapath.** Warm restore is within ~2% on both backends, the restore-`connect` phase the earlier
+session flagged is only ~8% higher on 6.12 (not 2×), and per-guest RAM differs by ~2 MiB. The
+**earlier 6.6.9-vs-6.12.94 ~2× restore gap was cross-session host-load noise**, not a real kernel
+effect — exactly what making the kernel a first-class dimension was built to settle. The
+distro-aligned (§6) 6.12.94 pin is free of any measurable hot-path cost; 6.6.143 is kept in the
+registry as a tracked alternative.
 
 ## Macro — Eager vs lazy restore (CH, `prefault`)
 
@@ -103,9 +129,10 @@ sparse-snapshot (`SEEK_HOLE`) is the lever for warm-pool density.
 | teardown (reap-VMM-first) | 29 ms / 4% | 27 ms / 14% |
 | **TOTAL** | **≈671 ms** | **≈196 ms** |
 
-Cold is ~89% guest-boot wait (`connect`); restore collapses it ~3.4×. On 6.12.94 the post-restore
-`connect` phase (reconnect + clock/RNG resync) is itself ~115 ms — the bulk of the restore regression
-vs 6.6.9. Teardown is a real ~27 ms (reap-VMM-first no-leak ordering, on the budget by design).
+Cold is ~89% guest-boot wait (`connect`); restore collapses it ~3.4×. The post-restore `connect`
+phase (reconnect + clock/RNG resync) is ~115 ms — and the kernel sweep shows it is essentially the
+same on 6.6.143 (~109 ms) and 6.12.94 (~118 ms), i.e. **not** a kernel regression. Teardown is a real
+~27 ms (reap-VMM-first no-leak ordering, on the budget by design).
 
 ## Macro — Datapath: vsock exec round-trip (CH, 200×)
 

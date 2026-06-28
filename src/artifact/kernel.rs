@@ -41,6 +41,44 @@ impl HttpClient for ReqwestClient {
 pub struct KernelStage {
     /// The HTTP client to use for downloading the kernel source.
     pub http_client: std::sync::Arc<dyn HttpClient>,
+    /// Optional kernel-version label selecting an entry from the pins `kernels`
+    /// registry (e.g. `"6.12.94"`). `None` builds the default `kernel` pin to
+    /// `vmlinux`; a labelled stage builds `vmlinux-<label>` with its own cache and
+    /// build dir, so multiple kernel versions coexist (the kernel-version benchmark
+    /// dimension).
+    pub label: Option<String>,
+}
+
+impl KernelStage {
+    /// The artifact filename suffix for this kernel (`""` or `-<sanitized-label>`).
+    ///
+    /// Sanitizes `.`→`-`: the pipeline derives the cache sidecar via
+    /// `Path::with_extension`, which would treat the trailing `.NNN` of a dotted
+    /// version as an extension and collide same-minor labels' sidecars
+    /// (`vmlinux-6.6.143` → `vmlinux-6.6.cache_key`). The pins key and the cache-key
+    /// *hash* keep the dotted label; only the on-disk filename is sanitized.
+    fn suffix(&self) -> String {
+        self.label
+            .as_ref()
+            .map(|l| format!("-{}", l.replace('.', "-")))
+            .unwrap_or_default()
+    }
+
+    /// The pins key holding this kernel's source URL.
+    fn url_pin_key(&self) -> String {
+        match &self.label {
+            Some(l) => format!("kernel_{l}_source_url"),
+            None => "kernel_source_url".to_string(),
+        }
+    }
+
+    /// The pins key holding this kernel's source SHA256.
+    fn sha_pin_key(&self) -> String {
+        match &self.label {
+            Some(l) => format!("kernel_{l}_source_sha256"),
+            None => "kernel_source_sha256".to_string(),
+        }
+    }
 }
 
 use async_trait::async_trait;
@@ -52,7 +90,7 @@ impl Stage for KernelStage {
     }
 
     fn out_path(&self, target_dir: &Path) -> std::path::PathBuf {
-        target_dir.join("vmlinux")
+        target_dir.join(format!("vmlinux{}", self.suffix()))
     }
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
@@ -60,17 +98,20 @@ impl Stage for KernelStage {
         const STAGE_VERSION: u32 = 1;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
+        // The version label distinguishes coexisting kernel stages. Hashing an empty
+        // string for `None` is a no-op, so the default kernel's key is unchanged.
+        hasher.update(self.label.as_deref().unwrap_or_default().as_bytes());
         hasher.update(
             inputs
                 .pins
-                .get("kernel_source_url")
+                .get(&self.url_pin_key())
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
         hasher.update(
             inputs
                 .pins
-                .get("kernel_source_sha256")
+                .get(&self.sha_pin_key())
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
@@ -85,20 +126,25 @@ impl Stage for KernelStage {
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        let url_key = self.url_pin_key();
+        let sha_key = self.sha_pin_key();
         let kernel_source_url = inputs
             .pins
-            .get("kernel_source_url")
-            .ok_or_else(|| Error::Artifact("Missing kernel_source_url pin".into()))?;
+            .get(&url_key)
+            .ok_or_else(|| Error::Artifact(format!("Missing {url_key} pin")))?;
         let kernel_source_sha256 = inputs
             .pins
-            .get("kernel_source_sha256")
-            .ok_or_else(|| Error::Artifact("Missing kernel_source_sha256 pin".into()))?;
+            .get(&sha_key)
+            .ok_or_else(|| Error::Artifact(format!("Missing {sha_key} pin")))?;
         let microvm_config = inputs
             .pins
             .get("kernel_microvm_config")
             .ok_or_else(|| Error::Artifact("Missing kernel_microvm_config pin".into()))?;
 
-        let workdir = out.parent().unwrap_or(Path::new(".")).join("kernel-build");
+        let workdir = out
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!("kernel-build{}", self.suffix()));
         tokio::fs::create_dir_all(&workdir).await?;
 
         let tarball = workdir.join("linux.tar.xz");
@@ -255,6 +301,7 @@ mod tests {
     fn test_kernel_cache_key() {
         let stage = KernelStage {
             http_client: std::sync::Arc::new(ReqwestClient),
+            label: None,
         };
 
         let mut inputs1 = StageInputs::default();
