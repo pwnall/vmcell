@@ -6,9 +6,146 @@
 /// Protocol definition for communication with the guest agent.
 pub mod protocol;
 
+// Only the host-side `AgentClient` (host-common) uses these; the always-compiled guest-agent
+// path (ReaperCoordinator etc.) must not pull them in, or `--features agent` fails `-D warnings`.
+#[cfg(feature = "host-common")]
 use crate::error::{Error, Result};
+#[cfg(feature = "host-common")]
 use protocol::Message;
 pub use protocol::{ExecOutcome, ExecRequest};
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Condvar, Mutex};
+
+/// Default upper bound on retained child exit statuses in a [`ReaperCoordinator`].
+///
+/// As PID 1, the guest agent reaps re-parented grandchildren that no exec
+/// waiter will ever claim. Their statuses are pruned once this many newer
+/// statuses have been recorded, so the status map cannot grow without bound.
+pub const DEFAULT_MAX_REAPED_STATUSES: usize = 1024;
+
+/// Maps a reaped child's termination into the exit code reported to the host.
+///
+/// A signal-terminated child reports `128 + signal` (shell convention, e.g.
+/// `SIGKILL` (9) → 137), a normally-exited child reports its status, and an
+/// indeterminate termination reports 1. This is the inverse of the
+/// false-127 reaper bug: a process that ran to completion (or was killed)
+/// must never be reported with the spawn-failure code 127.
+#[must_use]
+pub fn exit_code_from_termination(
+    terminating_signal: Option<i32>,
+    exit_status: Option<i32>,
+) -> i32 {
+    if let Some(signal) = terminating_signal {
+        128 + signal
+    } else {
+        exit_status.unwrap_or(1)
+    }
+}
+
+/// Coordinates the PID-1 zombie reaper with per-exec waiter threads.
+///
+/// The reaper thread records each reaped child's exit code keyed by pid via
+/// [`ReaperCoordinator::record_exit`]; an exec waiter blocks in
+/// [`ReaperCoordinator::wait_for`] until the status for its pid is recorded and
+/// then claims it. A single WNOHANG reaper feeds every waiter, so no waiter can
+/// steal another child's status (the false-127 race). Statuses for pids that no
+/// waiter ever claims are bounded by a generation-based prune (see
+/// [`DEFAULT_MAX_REAPED_STATUSES`]).
+#[derive(Debug)]
+pub struct ReaperCoordinator {
+    inner: Mutex<ReaperInner>,
+    available: Condvar,
+    max_statuses: usize,
+}
+
+#[derive(Debug, Default)]
+struct ReaperInner {
+    /// `pid -> (exit code, generation at which it was recorded)`.
+    statuses: HashMap<u32, (i32, u64)>,
+    /// pids an exec waiter is currently blocked on; never pruned out from under
+    /// the waiter.
+    waiting: HashSet<u32>,
+    /// Monotonic record counter used to age out unclaimed statuses.
+    generation: u64,
+}
+
+impl ReaperCoordinator {
+    /// Creates a coordinator with the default status bound.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_max_statuses(DEFAULT_MAX_REAPED_STATUSES)
+    }
+
+    /// Creates a coordinator retaining at most `max_statuses` unclaimed exit
+    /// statuses (clamped to at least 1).
+    #[must_use]
+    pub fn with_max_statuses(max_statuses: usize) -> Self {
+        Self {
+            inner: Mutex::new(ReaperInner::default()),
+            available: Condvar::new(),
+            max_statuses: max_statuses.max(1),
+        }
+    }
+
+    /// Records a reaped child's `code` for `pid` and wakes any waiter.
+    ///
+    /// Unclaimed statuses are pruned once `max_statuses` newer statuses have
+    /// been recorded, so a flood of re-parented grandchildren cannot grow the
+    /// map without bound. A status a waiter is currently blocked on is never
+    /// pruned.
+    pub fn record_exit(&self, pid: u32, code: i32) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.generation = inner.generation.wrapping_add(1);
+        let generation = inner.generation;
+        inner.statuses.insert(pid, (code, generation));
+
+        if inner.statuses.len() > self.max_statuses {
+            let max = self.max_statuses as u64;
+            let ReaperInner {
+                statuses, waiting, ..
+            } = &mut *inner;
+            statuses.retain(|reaped_pid, (_, recorded)| {
+                waiting.contains(reaped_pid) || generation.wrapping_sub(*recorded) < max
+            });
+        }
+        drop(inner);
+        self.available.notify_all();
+    }
+
+    /// Blocks until the exit status for `pid` is recorded, then claims and
+    /// returns it.
+    pub fn wait_for(&self, pid: u32) -> i32 {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.waiting.insert(pid);
+        loop {
+            if let Some((code, _)) = inner.statuses.remove(&pid) {
+                inner.waiting.remove(&pid);
+                return code;
+            }
+            inner = self
+                .available
+                .wait(inner)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Number of recorded-but-unclaimed exit statuses (for diagnostics/tests).
+    #[must_use]
+    pub fn pending_statuses(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .statuses
+            .len()
+    }
+}
+
+impl Default for ReaperCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(feature = "host-common")]
 use futures::{SinkExt, StreamExt};
@@ -26,6 +163,12 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[derive(Debug)]
 pub struct AgentClient {
     stream: Framed<UnixStream, LengthDelimitedCodec>,
+    /// Set when a request times out or the framed stream desynchronizes
+    /// mid-exchange. A desynced stream may still hold a late frame from the
+    /// abandoned request, so reusing it would read stale data and silently
+    /// return a wrong result. Further requests fail loud until
+    /// [`AgentClient::reconnect`] re-establishes the stream.
+    desynced: bool,
 }
 
 #[cfg(feature = "host-common")]
@@ -127,7 +270,12 @@ impl AgentClient {
             };
 
             match msg {
-                Message::Ready => return Ok(Self { stream: framed }),
+                Message::Ready => {
+                    return Ok(Self {
+                        stream: framed,
+                        desynced: false,
+                    });
+                }
                 other => {
                     tracing::trace!("Agent connect received unexpected message: {:?}", other);
                     continue;
@@ -149,6 +297,8 @@ impl AgentClient {
     ) -> Result<()> {
         let new_client = Self::connect(vsock_path, port, timeout, serial_log).await?;
         self.stream = new_client.stream;
+        // A fresh stream is back in sync, so clear any prior desync state.
+        self.desynced = false;
         Ok(())
     }
 
@@ -156,9 +306,19 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns an error if the request cannot be sent or the outcome cannot be received.
-    pub async fn exec(&mut self, cmd: ExecRequest) -> Result<ExecOutcome> {
-        let timeout = cmd.timeout.unwrap_or(std::time::Duration::from_secs(10));
-        tokio::time::timeout(timeout, async {
+    pub async fn exec(&mut self, mut cmd: ExecRequest) -> Result<ExecOutcome> {
+        if self.desynced {
+            return Err(Error::Agent(
+                "agent connection desynchronized by a prior timeout; reconnect required".into(),
+            ));
+        }
+        // Propagate the effective timeout into the request so the guest always
+        // installs a kill thread. A `None` timeout would let the guest child
+        // outlive this abandoned wait and leak.
+        let timeout = cmd.timeout.unwrap_or(protocol::DEFAULT_EXEC_TIMEOUT);
+        cmd.timeout = Some(timeout);
+
+        let result = tokio::time::timeout(timeout, async {
             let msg = Message::Exec(cmd);
             let bytes = postcard::to_stdvec(&msg)?;
 
@@ -191,8 +351,24 @@ impl AgentClient {
             // If stream ends without Exit, treat it as connection drop
             Err(Error::Agent("Connection dropped during exec".into()))
         })
-        .await
-        .map_err(|_| Error::Timeout("Agent exec timed out".into()))?
+        .await;
+
+        match result {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(e)) => {
+                // A send/decode/connection error leaves the framed stream in an
+                // unknown state; force a reconnect before the next request.
+                self.desynced = true;
+                Err(e)
+            }
+            Err(_) => {
+                // Timed out mid-exchange: a late Stdout/Exit frame from this
+                // command may still be in flight, so the stream is desynced and
+                // must not be reused (it would return stale, wrong results).
+                self.desynced = true;
+                Err(Error::Timeout("Agent exec timed out".into()))
+            }
+        }
     }
 
     /// Uploads a file to the guest VM.

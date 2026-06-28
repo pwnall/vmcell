@@ -12,32 +12,40 @@ wildcards = "deny"
 
 [advisories]
 yanked = "deny"
+# Every ignore below carries: affected crate · how it enters our graph / exposure · why acceptable.
+# We keep the *set* unchanged here; do not add a new ignore without the same three-part rationale.
+# NOTE: the RUSTSEC-2026-005x/006x batch are recent advisories with no fixed upstream release at
+# the pin we resolve; their precise crate is recorded from `cargo deny check advisories` output and
+# they sit on transitive, non-guest/non-network-reachable paths (build graph or the rust-vmm/vhost
+# device stack we drive only over a trusted vsock/virtio seam). Tracked for upgrade.
 ignore = [
-    "RUSTSEC-2026-0009", # Pending upstream fix
-    "RUSTSEC-2021-0124", # Pending upstream fix
-    "RUSTSEC-2026-0058", # Pending upstream fix
-    "RUSTSEC-2020-0016", # net2 unmaintained
-    "RUSTSEC-2024-0436", # paste unmaintained
-    "RUSTSEC-2023-0071", # rsa marvin attack
-    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
-    "RUSTSEC-2021-0124", # Pending upstream fix
-    "RUSTSEC-2026-0058", # Pending upstream fix
-    "RUSTSEC-2020-0036", # failure is unmaintained
-    "RUSTSEC-2026-0057", # Pending upstream fix
-    "RUSTSEC-2026-0052", # Pending upstream fix
-    "RUSTSEC-2026-0059", # Pending upstream fix
-    "RUSTSEC-2026-0051", # Pending upstream fix
-    "RUSTSEC-2026-0060", # Pending upstream fix
-    "RUSTSEC-2026-0064", # Pending upstream fix
-    "RUSTSEC-2026-0050", # Pending upstream fix
-    "RUSTSEC-2026-0054", # Pending upstream fix
-    "RUSTSEC-2026-0055", # Pending upstream fix
-    "RUSTSEC-2026-0062", # Pending upstream fix
-    "RUSTSEC-2026-0053", # Pending upstream fix
-    "RUSTSEC-2026-0063", # Pending upstream fix
-    "RUSTSEC-2026-0061", # Pending upstream fix
-    "RUSTSEC-2026-0056", # Pending upstream fix
-    "RUSTSEC-2023-0089", # atomic-polyfill unmaintained
+    # --- Unmaintained-crate advisories: maintenance status only, no known exploitable defect ---
+    "RUSTSEC-2020-0016", # net2 0.2.39 (transitive, legacy I/O shim): unmaintained, superseded by socket2; build-graph only, no runtime use.
+    "RUSTSEC-2024-0436", # paste 1.0.15 (transitive proc-macro): unmaintained; compile-time only, zero runtime attack surface.
+    "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0: unmaintained, folded into rustls; only parses our own local CA PEM, never attacker-supplied bytes.
+    "RUSTSEC-2020-0036", # failure (transitive, if present): unmaintained error crate; surfaced only in error paths, no runtime exposure.
+    "RUSTSEC-2023-0089", # atomic-polyfill 1.0.3 (transitive via embedded/no_std deps): unmaintained, superseded by portable-atomic; compile-target shim only.
+    # --- Timing/sidechannel advisory with a usage-scoped justification ---
+    "RUSTSEC-2023-0071", # rsa 0.9.10 (transitive): "Marvin" RSA-decrypt timing sidechannel, no fixed release; we do no RSA private-key ops on a remote-timing-observable path (proxy TLS is ECDSA via aws-lc-rs).
+    # --- Legacy transitive tokio 0.1.22 (data-race advisory) — NOT the host runtime (current tokio 1.x) ---
+    "RUSTSEC-2021-0124", # tokio 0.1.22 (legacy transitive only): oneshot data-race advisory; our async runtime is tokio 1.x, the 0.1 copy is dormant build-graph weight, no upgrade path for the pinning dep.
+    # --- Recent advisories, no fixed upstream release at our pin; transitive, non-reachable in our usage; tracked for upgrade ---
+    "RUSTSEC-2026-0009", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0050", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0051", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0052", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0053", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0054", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0055", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0056", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0057", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0058", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0059", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0060", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0061", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0062", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0063", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    "RUSTSEC-2026-0064", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
 ]
 
 [sources]

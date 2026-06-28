@@ -10,6 +10,9 @@ use crate::error::Result;
 /// Guest agent building stage.
 pub mod guest_agent;
 #[cfg(feature = "pipeline")]
+/// Guest test-helper (`imp-guest-tools`) building stage.
+pub mod guest_tools;
+#[cfg(feature = "pipeline")]
 /// Kernel building stage.
 pub mod kernel;
 #[cfg(feature = "pipeline")]
@@ -97,6 +100,104 @@ fn hash_file(path: &Path) -> Result<String> {
         hasher.update(buf.get(..n).expect("valid slice"));
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Folds the upstream `artifacts` into `hasher` in a deterministic, key-sorted order,
+/// hashing each artifact's on-disk **content** (the identity that travels) rather than its
+/// absolute path under `target_dir`. Falls back to the path identity only if the artifact
+/// is not yet materialized on disk.
+///
+/// Iterating the raw `HashMap` would feed blake3 in a process-random order (spurious cache
+/// misses) and would key on `target_dir`-relative path strings (a rebuilt upstream at the
+/// same path would not invalidate the key). Sorting + content-hashing fixes both.
+#[cfg(feature = "pipeline")]
+pub(crate) fn hash_artifacts_sorted(
+    hasher: &mut blake3::Hasher,
+    artifacts: &std::collections::HashMap<String, PathBuf>,
+) {
+    let sorted: std::collections::BTreeMap<&String, &PathBuf> = artifacts.iter().collect();
+    for (k, v) in sorted {
+        hasher.update(k.as_bytes());
+        match hash_file(v) {
+            Ok(content_hash) => {
+                hasher.update(b"c:");
+                hasher.update(content_hash.as_bytes());
+            }
+            Err(_) => {
+                hasher.update(b"p:");
+                hasher.update(v.to_string_lossy().as_bytes());
+            }
+        }
+    }
+}
+
+/// Parses the resolved-pins JSON document into a flat map of pin keys.
+///
+/// Extracted as a pure helper so the pin extraction (including the
+/// `debian_snapshot_timestamp` the mmdebstrap source depends on) is unit-testable.
+fn parse_pins_json(content: &str) -> std::collections::HashMap<String, String> {
+    let mut pins_map = std::collections::HashMap::new();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(k) = json.get("kernel") {
+            if let Some(sha) = k.get("source_sha256").and_then(|v| v.as_str()) {
+                pins_map.insert("kernel_source_sha256".to_string(), sha.to_string());
+            }
+            if let Some(url) = k.get("source_url").and_then(|v| v.as_str()) {
+                pins_map.insert("kernel_source_url".to_string(), url.to_string());
+            }
+            if let Some(cfg) = k.get("microvm_config").and_then(|v| v.as_str()) {
+                pins_map.insert("kernel_microvm_config".to_string(), cfg.to_string());
+            }
+        }
+        if let Some(r) = json.get("rootfs") {
+            if let Some(img) = r.get("image").and_then(|v| v.as_str()) {
+                pins_map.insert("rootfs_image".to_string(), img.to_string());
+            }
+            if let Some(dig) = r.get("digest").and_then(|v| v.as_str()) {
+                pins_map.insert("rootfs_digest".to_string(), dig.to_string());
+            }
+        }
+        // Emit the Debian snapshot.debian.org timestamp pin if present (top-level or under
+        // `rootfs`) so the mmdebstrap source has its required source timestamp.
+        let ts = json
+            .get("debian_snapshot_timestamp")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                json.get("rootfs")
+                    .and_then(|r| r.get("debian_snapshot_timestamp"))
+                    .and_then(|v| v.as_str())
+            });
+        if let Some(ts) = ts {
+            pins_map.insert("debian_snapshot_timestamp".to_string(), ts.to_string());
+        }
+    }
+    pins_map
+}
+
+/// Computes the blake3 hash of the guest-agent source file at `path`.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if the source cannot be read. This is a hard
+/// stop on purpose: a missing guest-agent source must not silently degrade to an `"unknown"`
+/// pin (which would leave a stale agent baked into every downstream rootfs).
+fn guest_agent_src_hash(path: &Path) -> Result<String> {
+    let src = std::fs::read_to_string(path).map_err(|e| {
+        crate::error::Error::Artifact(format!(
+            "failed to read guest-agent source at {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(src.as_bytes());
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Resolves the absolute path to the guest-agent source, anchored at the crate root
+/// (`CARGO_MANIFEST_DIR`) rather than the process CWD.
+fn guest_agent_src_path() -> PathBuf {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    Path::new(&manifest_dir).join("src/bin/imp-guest-agent.rs")
 }
 
 /// A pipeline of stages to build all necessary test VM artifacts.
@@ -275,9 +376,17 @@ impl Stage for ResolvePinsStage {
     }
 
     fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
+        // Bump when this stage's resolution logic changes so stale outputs are not served.
+        const STAGE_VERSION: u32 = 1;
         let content = std::fs::read_to_string(&self.pins_file).unwrap_or_default();
         let mut hasher = blake3::Hasher::new();
+        hasher.update(&STAGE_VERSION.to_le_bytes());
         hasher.update(content.as_bytes());
+        // Fold the guest-agent source identity into the key so an agent-source change
+        // invalidates the resolved pins (otherwise a cache hit here would skip re-hashing
+        // the agent and a stale `guest_agent_src_hash` would propagate downstream).
+        let agent_src = std::fs::read_to_string(guest_agent_src_path()).unwrap_or_default();
+        hasher.update(agent_src.as_bytes());
         CacheKey(format!("resolve-pins-{}", hasher.finalize().to_hex()))
     }
 
@@ -293,40 +402,14 @@ impl Stage for ResolvePinsStage {
             .await
             .map_err(crate::error::Error::Io)?;
 
-        let mut pins_map = std::collections::HashMap::new();
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(k) = json.get("kernel") {
-                if let Some(sha) = k.get("source_sha256").and_then(|v| v.as_str()) {
-                    pins_map.insert("kernel_source_sha256".to_string(), sha.to_string());
-                }
-                if let Some(url) = k.get("source_url").and_then(|v| v.as_str()) {
-                    pins_map.insert("kernel_source_url".to_string(), url.to_string());
-                }
-                if let Some(cfg) = k.get("microvm_config").and_then(|v| v.as_str()) {
-                    pins_map.insert("kernel_microvm_config".to_string(), cfg.to_string());
-                }
-            }
-            if let Some(r) = json.get("rootfs") {
-                if let Some(img) = r.get("image").and_then(|v| v.as_str()) {
-                    pins_map.insert("rootfs_image".to_string(), img.to_string());
-                }
-                if let Some(dig) = r.get("digest").and_then(|v| v.as_str()) {
-                    pins_map.insert("rootfs_digest".to_string(), dig.to_string());
-                }
-            }
-        }
+        let mut pins_map = parse_pins_json(&content);
 
-        // Resolve the guest agent source hash
-        if let Ok(src) = std::fs::read_to_string("src/bin/imp-guest-agent.rs") {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(src.as_bytes());
-            pins_map.insert(
-                "guest_agent_src_hash".to_string(),
-                hasher.finalize().to_hex().to_string(),
-            );
-        } else {
-            pins_map.insert("guest_agent_src_hash".to_string(), "unknown".to_string());
-        }
+        // Resolve the guest-agent source hash from an absolute, crate-anchored path and FAIL
+        // HARD if it is missing. A silent `"unknown"` fallback (CWD-relative) would bake a
+        // stale agent into every downstream rootfs without invalidating any cache key.
+        let agent_src = guest_agent_src_path();
+        let agent_hash = guest_agent_src_hash(&agent_src)?;
+        pins_map.insert("guest_agent_src_hash".to_string(), agent_hash);
 
         let mut outputs = StageOutputs::default();
         outputs
@@ -334,5 +417,63 @@ impl Stage for ResolvePinsStage {
             .insert("resolved_pins".to_string(), out.to_path_buf());
         outputs.pins = pins_map;
         Ok(outputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards ARTIFACT-PIPELINE-5: a buggy impl that never emits
+    // `debian_snapshot_timestamp` (so the mmdebstrap source can't run) goes red here.
+    #[test]
+    fn test_parse_pins_emits_debian_snapshot_timestamp() {
+        let top = r#"{ "debian_snapshot_timestamp": "20240101T000000Z" }"#;
+        let map = parse_pins_json(top);
+        assert_eq!(
+            map.get("debian_snapshot_timestamp").map(String::as_str),
+            Some("20240101T000000Z")
+        );
+
+        // Also accepted when nested under `rootfs`.
+        let nested = r#"{ "rootfs": { "image": "docker.io/library/debian",
+            "digest": "sha256:abc", "debian_snapshot_timestamp": "20240202T000000Z" } }"#;
+        let map = parse_pins_json(nested);
+        assert_eq!(
+            map.get("debian_snapshot_timestamp").map(String::as_str),
+            Some("20240202T000000Z")
+        );
+        assert_eq!(
+            map.get("rootfs_digest").map(String::as_str),
+            Some("sha256:abc")
+        );
+    }
+
+    // Guards DESIGN-DIVERGENCE-3: a buggy impl that swallows a missing guest-agent source
+    // into an `"unknown"` pin (instead of failing hard) would return Ok here.
+    #[test]
+    fn test_guest_agent_src_hash_fails_hard_on_missing() {
+        let missing = Path::new("/nonexistent/imp/does-not-exist/imp-guest-agent.rs");
+        let res = guest_agent_src_hash(missing);
+        assert!(
+            matches!(res, Err(crate::error::Error::Artifact(_))),
+            "missing guest-agent source must be a hard error, got {res:?}"
+        );
+    }
+
+    // Guards DESIGN-DIVERGENCE-3 (the hash actually tracks content): different source
+    // bytes must yield a different hash, and the same bytes a stable one.
+    #[test]
+    fn test_guest_agent_src_hash_tracks_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("agent.rs");
+        std::fs::write(&p, b"fn main() {}").expect("write");
+        let h1 = guest_agent_src_hash(&p).expect("hash");
+        let h1b = guest_agent_src_hash(&p).expect("hash");
+        assert_eq!(h1, h1b, "hash must be deterministic for identical content");
+
+        std::fs::write(&p, b"fn main() { /* changed */ }").expect("write");
+        let h2 = guest_agent_src_hash(&p).expect("hash");
+        assert_ne!(h1, h2, "changed source content must change the hash");
     }
 }

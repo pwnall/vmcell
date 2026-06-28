@@ -37,13 +37,16 @@ jobs:
       - name: cargo-deny
         run: cargo deny check
 
-      - name: lean-agent invariant         # guest PID-1 binary must omit the host stack
+      - name: lean-agent invariant         # guest PID-1 binary must omit the host stack AND compile standalone
         run: |
           if cargo tree -e no-dev --no-default-features --features agent \
                | grep -E '── (tokio|hyper|rtnetlink) v'; then
             echo "::error::lean-agent invariant violated — host stack leaked into the agent build"
             exit 1
           fi
+          # Graph inspection is not enough: actually compile the agent-only target so a broken
+          # agent-only build (e.g. an un-gated host dep) is caught here, not on a KVM host.
+          cargo clippy --no-default-features --features agent --bin imp-guest-agent -- -D warnings
 
       - name: ban module-global mutable ID/atomic state
         run: ./scripts/ban-global-state.sh
@@ -73,7 +76,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
-        with: { tool: "cargo-nextest" }
+        with: { tool: "cargo-nextest,just" }
 
       - name: build VM artifacts
         run: cargo run --bin imp-testing -- build
@@ -81,5 +84,12 @@ jobs:
       - name: rootless suite (no elevation — keeps the rootless path honest)
         run: cargo nextest run --profile integration --run-ignored all -E 'test(rootless) | test(smoltcp)'
 
-      - name: privileged suite (sudo -E is acceptable on a single-tenant CI runner)
-        run: sudo -E env "PATH=$PATH" cargo nextest run --profile integration --run-ignored all -E 'not (test(rootless) | test(smoltcp))'
+      # Bless grants the runner cap_net_admin,cap_sys_admin (debug + release) so the privileged
+      # suite runs under the capability wrapper instead of broad `sudo -E` — mirrors `just test-priv`.
+      - name: bless the capability runner
+        run: just bless
+
+      - name: privileged suite (via imp-test-runner capability wrapper, not sudo -E)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/target/debug/imp-test-runner
+        run: cargo nextest run --profile integration --run-ignored all -E 'not (test(rootless) | test(smoltcp))'

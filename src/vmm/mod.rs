@@ -194,6 +194,24 @@ pub async fn wait_for_socket(
     ))
 }
 
+/// Force-kills a just-spawned VMM process *group* (`SIGKILL` to `-pgid`) and reaps
+/// the leader. Use on the error paths between spawning a VMM and constructing the
+/// owning instance (whose `Drop` would otherwise do this): a failure there — e.g. a
+/// cgroup `add_task` or a readiness timeout — must not leak a running VMM, because
+/// `tokio::process::Child` does not kill on drop. No-op when `pgid` is `None`.
+pub(crate) fn reap_process_group(process: &mut tokio::process::Child, pgid: Option<u32>) {
+    let Some(pgid) = pgid else {
+        return;
+    };
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-(pgid as i32)),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    if let Some(pid) = process.id() {
+        let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+    }
+}
+
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
 #[derive(Debug)]
@@ -222,11 +240,12 @@ impl CidAllocator {
     ///
     /// # Errors
     /// Returns an error if all 252 guest CIDs are in use.
-    ///
-    /// # Panics
-    /// Panics if the global CID allocator lock is poisoned.
     pub fn allocate(&self) -> Result<u32> {
-        let mut active = self.active.lock().expect("mutex poisoned");
+        // Recover from a poisoned lock instead of panicking: the guarded value is
+        // a plain `BTreeSet` of live CIDs with no cross-field invariant, so a
+        // panic mid-mutation cannot leave it in an unusable state — adopting the
+        // inner set is sound.
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         for i in 3..=254 {
             if !active.contains(&i) {
                 active.insert(i);
@@ -239,11 +258,11 @@ impl CidAllocator {
     }
 
     /// Releases a previously allocated CID.
-    ///
-    /// # Panics
-    /// Panics if the global CID allocator lock is poisoned.
     pub fn release(&self, cid: u32) {
-        let mut active = self.active.lock().expect("mutex poisoned");
+        // Recover from a poisoned lock instead of panicking: the guarded `BTreeSet`
+        // of live CIDs has no cross-field invariant, so adopting the inner set is
+        // sound.
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         active.remove(&cid);
     }
 }
@@ -505,12 +524,53 @@ mod tests {
         assert_eq!(cid1, cid3);
     }
 
+    // Guards VMM-7: a poisoned mutex must be recovered, not panicked on. The buggy
+    // impl (`.lock().expect("mutex poisoned")`) aborts the test here.
+    #[test]
+    fn test_cid_allocator_recovers_from_poison() {
+        let alloc = std::sync::Arc::new(CidAllocator::new());
+        let poisoner = alloc.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoner.active.lock().expect("fresh lock");
+            panic!("poison the mutex while holding the guard");
+        }));
+        // The lock is now poisoned; both operations must still work.
+        let cid = alloc.allocate().expect("allocate after poison");
+        assert!(cid >= 3);
+        alloc.release(cid);
+    }
+
     proptest! {
+        // Guards VMM-6: the previous version allocated and discarded, asserting
+        // nothing. This asserts the allocator's contract so a broken allocator
+        // (handing out reserved/duplicate/out-of-range CIDs, or failing the
+        // release round-trip) goes red.
         #[test]
-        fn test_cid_allocator_prop(cid_sequence in proptest::collection::vec(3u32..255u32, 0..100)) {
+        fn test_cid_allocator_prop(n in 0usize..260) {
             let alloc = CidAllocator::new();
-            for _ in &cid_sequence {
-                let _ = alloc.allocate();
+            let mut allocated: Vec<u32> = Vec::new();
+            for _ in 0..n {
+                match alloc.allocate() {
+                    Ok(cid) => {
+                        // Reserved CIDs 0/1/2 are never handed out, and the
+                        // ceiling is 254.
+                        prop_assert!(cid >= 3, "cid {} is in the reserved range", cid);
+                        prop_assert!(cid <= 254, "cid {} exceeds the ceiling", cid);
+                        // Uniqueness: a live CID is never handed out twice.
+                        prop_assert!(!allocated.contains(&cid), "duplicate cid {}", cid);
+                        allocated.push(cid);
+                    }
+                    Err(_) => {
+                        // Exhaustion only after all 252 guest CIDs (3..=254) are live.
+                        prop_assert_eq!(allocated.len(), 252);
+                    }
+                }
+            }
+            // release + re-allocate round-trips: a freed CID is handed back.
+            if let Some(&first) = allocated.first() {
+                alloc.release(first);
+                let reused = alloc.allocate().expect("re-allocate after release");
+                prop_assert_eq!(reused, first);
             }
         }
     }

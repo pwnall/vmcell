@@ -33,6 +33,62 @@ pub fn qemu_bin() -> String {
     std::env::var("IMP_QEMU_BIN").unwrap_or_else(|_| "qemu-system-x86_64".to_string())
 }
 
+/// Probes the process's *effective* capability set for `CAP_NET_ADMIN`.
+///
+/// This is the §12.8-consistent way to gate privileged-networking tests: the
+/// capability runner grants `CAP_NET_ADMIN` ambiently without making the test a
+/// full root process, so a `geteuid() == 0` gate both over-demands (refuses a
+/// correctly-capability-granted run) and checks the wrong thing (uid, not the
+/// effective cap). Parsing `CapEff` keeps this dependency-free across features.
+pub fn has_cap_net_admin() -> bool {
+    // CAP_NET_ADMIN is capability bit 12.
+    const CAP_NET_ADMIN_BIT: u32 = 12;
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:") {
+            if let Ok(bits) = u64::from_str_radix(hex.trim(), 16) {
+                return bits & (1u64 << CAP_NET_ADMIN_BIT) != 0;
+            }
+        }
+    }
+    false
+}
+
+/// Recomputes the cgroup-v2 slice name the orchestrator assigns to a VM, so a
+/// residue check can target the *actual* (possibly systemd-/runner-nested) path
+/// `/sys/fs/cgroup/<name>` rather than the un-nested `imp-vm-<vmid>` guess. This
+/// mirrors `orchestrator::TestVm::setup_env` exactly; if the two diverge the
+/// residue assertion silently passes, so they must stay in lockstep.
+pub fn computed_cgroup_name(vmid: u32) -> String {
+    let mut name = format!("imp-vm-{}", vmid);
+    if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
+            let mut base = path.trim_start_matches('/');
+            if base.ends_with("/supervisor") {
+                base = base.trim_end_matches("/supervisor");
+            }
+            if !base.is_empty() {
+                name = format!("{}/imp-vm-{}", base, vmid);
+            }
+        }
+    }
+    name
+}
+
+/// Reaps orphaned `imp-net-*` network namespaces before a privileged/netns test.
+///
+/// Avoids a leaked namespace from a prior aborted run colliding with this run's
+/// vmid. Runs under the capability runner (no `sudo`); safe because the
+/// privileged suite serializes netns tests (`serial-host`). Logs what it removed.
+pub fn clean_imp_netns() {
+    let removed = imp_testing::net::cleanup_orphan_netns("imp-net-");
+    if !removed.is_empty() {
+        println!("clean_imp_netns: reaped orphaned namespaces: {:?}", removed);
+    }
+}
+
 use imp_testing::*;
 
 pub async fn start_vm<V: Vmm>(vmm: &V, cfg: VmConfig) -> TestVm<V> {

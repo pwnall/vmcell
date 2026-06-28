@@ -26,15 +26,23 @@ pub async fn build_rootfs(
     let temp_dir = tempfile::TempDir::new().map_err(Error::Io)?;
     let builder_rootfs_path = temp_dir.path().join("builder_rootfs.erofs");
 
-    // 1. Build builder rootfs using OCI source
-    tracing::info!("Building builder VM rootfs...");
-    super::oci::build_rootfs(
-        "docker.io/library/debian",
-        "sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1",
-        inputs,
-        &builder_rootfs_path,
-    )
-    .await?;
+    // 1. Build builder rootfs using OCI source. Source the builder base image+digest from
+    // the resolved pins (Stage 0 / pins.lock) so it cannot drift from the pinned rootfs; fall
+    // back to a dedicated builder pin, then to the literal only if neither is resolved.
+    let builder_image = inputs
+        .pins
+        .get("builder_base_image")
+        .or_else(|| inputs.pins.get("rootfs_image"))
+        .map(String::as_str)
+        .unwrap_or("docker.io/library/debian");
+    let builder_digest = inputs
+        .pins
+        .get("builder_base_digest")
+        .or_else(|| inputs.pins.get("rootfs_digest"))
+        .map(String::as_str)
+        .unwrap_or("sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1");
+    tracing::info!("Building builder VM rootfs from {}...", builder_image);
+    super::oci::build_rootfs(builder_image, builder_digest, inputs, &builder_rootfs_path).await?;
 
     // 2. Start builder VM
     let ch_bin = std::env::var("IMP_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());

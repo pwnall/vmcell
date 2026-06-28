@@ -1,30 +1,37 @@
 //! Guest agent running as PID 1 inside the microvm.
 #![deny(missing_docs)]
 #![deny(clippy::missing_errors_doc)]
-use imp_testing::agent::protocol::{ExecRequest, Message};
+use imp_testing::agent::protocol::{self, ExecRequest, Message};
+use imp_testing::agent::{ReaperCoordinator, exit_code_from_termination};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
 };
 use rustix::process::{WaitOptions, pivot_root, wait};
-use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use vsock::{VsockAddr, VsockListener, VsockStream};
 
-struct ReaperState {
-    statuses: Mutex<HashMap<u32, i32>>,
-    cv: Condvar,
-}
-
-static REAPER_STATE: OnceLock<ReaperState> = OnceLock::new();
-
-fn get_reaper_state() -> &'static ReaperState {
-    REAPER_STATE.get_or_init(|| ReaperState {
-        statuses: Mutex::new(HashMap::new()),
-        cv: Condvar::new(),
-    })
+/// Reaps every currently-exited child with `WNOHANG`, recording each status in
+/// the shared [`ReaperCoordinator`] so the matching per-exec waiter can claim
+/// it.
+///
+/// Invoked on each `SIGCHLD` wake. Because `SIGCHLD` coalesces, this drains
+/// *all* reapable children in one pass so none is missed; statuses for
+/// re-parented grandchildren that no waiter claims are pruned by the
+/// coordinator, keeping the map bounded.
+fn drain_zombies(reaper: &ReaperCoordinator) {
+    // Stops on `Ok(None)` (no more reapable children) or `Err` (e.g. ECHILD).
+    while let Ok(Some((pid, status))) = wait(WaitOptions::NOHANG) {
+        let pid = pid.as_raw_nonzero().get() as u32;
+        let code = exit_code_from_termination(
+            status.terminating_signal().map(|s| s as i32),
+            status.exit_status().map(|c| c as i32),
+        );
+        reaper.record_exit(pid, code);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -86,9 +93,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
+    // Mount the test shares that are actually attached. A share is optional — a
+    // config may attach none (the benchmark / exec-only paths do), so a missing
+    // virtio-fs tag must be logged and skipped, never propagated: returning Err
+    // from PID 1's main kernel-panics the guest ("Attempted to kill init").
     for tag_str in ["imp-in", "imp-out", "imp-bin"] {
         let mount_point = format!("/{}", tag_str);
-        std::fs::create_dir_all(&mount_point)?;
+        if let Err(e) = std::fs::create_dir_all(&mount_point) {
+            tracing::warn!(
+                "imp-guest-agent: could not create mount point {}: {}; skipping share",
+                mount_point,
+                e
+            );
+            continue;
+        }
 
         let flags = if tag_str == "imp-in" || tag_str == "imp-bin" {
             MountFlags::RDONLY
@@ -96,12 +114,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             MountFlags::empty()
         };
         if let Err(e) = mount(tag_str, &mount_point as &str, "virtiofs", flags, "") {
-            tracing::info!(
-                "imp-guest-agent: failed to mount virtiofs {}: {}",
+            tracing::warn!(
+                "imp-guest-agent: optional virtiofs share {} not attached: {}; continuing",
                 tag_str,
                 e
             );
-            return Err(e.into());
         } else {
             tracing::info!(
                 "imp-guest-agent: mounted virtiofs {} at {}",
@@ -130,92 +147,206 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         ifr.ifr_name[0] = b'l' as std::os::raw::c_char;
         ifr.ifr_name[1] = b'o' as std::os::raw::c_char;
+        // SAFETY: `ifr` is a correctly-sized, zero-initialized `ifreq`; both
+        // ioctls operate solely on that struct through a valid `AF_INET`
+        // socket fd. Loopback bring-up is best-effort and not required for the
+        // vsock control plane, so a failure is logged and tolerated — returning
+        // `Err` from PID 1's `main` would kernel-panic the guest.
         unsafe {
             let siocgifflags = 0x8913; // SIOCGIFFLAGS
             let siocsifflags = 0x8914; // SIOCSIFFLAGS
             if libc::ioctl(fd.as_raw_fd(), siocgifflags, &mut ifr) >= 0 {
                 ifr.ifr_flags |= 0x1 | 0x40; // IFF_UP | IFF_RUNNING
                 if libc::ioctl(fd.as_raw_fd(), siocsifflags, &ifr) < 0 {
-                    return Err(std::io::Error::last_os_error().into());
+                    tracing::warn!(
+                        "imp-guest-agent: loopback bring-up (SIOCSIFFLAGS) failed: {}; continuing without lo",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "imp-guest-agent: loopback query (SIOCGIFFLAGS) failed: {}; continuing without lo",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            "imp-guest-agent: could not open AF_INET socket for loopback bring-up; continuing without lo"
+        );
+    }
+
+    // Boot-time control-plane self-check, run BEFORE binding the listener so a
+    // missing transport yields a clear diagnostic instead of an opaque bind
+    // failure. Probe AF_VSOCK by actually opening a socket; the host-side
+    // `/dev/vhost-vsock` device is irrelevant inside the guest, so it is not
+    // consulted.
+    // SAFETY: `socket(2)`/`close(2)` are invoked with constant, valid
+    // arguments; the returned fd (when non-negative) is closed immediately and
+    // never otherwise used.
+    let vsock_ok = unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd >= 0 {
+            libc::close(fd);
+            true
+        } else {
+            false
+        }
+    };
+    if vsock_ok {
+        tracing::info!("imp-guest-agent: boot self-check: AF_VSOCK transport available");
+    } else {
+        tracing::error!(
+            "imp-guest-agent: boot self-check: AF_VSOCK unavailable ({}); the vsock control plane will not come up",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let virtiofs_supported = std::fs::read_to_string("/proc/filesystems")
+        .is_ok_and(|contents| contents.contains("virtiofs"));
+    if virtiofs_supported {
+        tracing::info!("imp-guest-agent: boot self-check: virtiofs filesystem supported");
+    } else {
+        tracing::warn!(
+            "imp-guest-agent: boot self-check: virtiofs not advertised in /proc/filesystems"
+        );
+    }
+
+    // Shared reaper/exec coordination: a single WNOHANG reaper (this thread)
+    // records every child's exit code; each per-exec waiter blocks until its
+    // pid's status is recorded, then claims it. No `child.wait()` races the
+    // reaper (the false-127 bug it avoids), and unclaimed grandchild statuses
+    // are pruned so the status map stays bounded.
+    let reaper = Arc::new(ReaperCoordinator::new());
+
+    // Spawn vsock listener thread (recoverable across snapshot/restore).
+    let listener_reaper = Arc::clone(&reaper);
+    std::thread::spawn(move || serve_vsock(&listener_reaper));
+
+    // Main thread is the PID 1 zombie reaper. It is woken by SIGCHLD rather
+    // than polling, so an exec's exit is observed immediately instead of up to
+    // ~100 ms late. SIGCHLD coalesces, so each wake drains *all* reapable
+    // children.
+    drain_zombies(&reaper); // catch anything that exited before registration
+    match signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGCHLD,
+        signal_hook::consts::SIGTERM,
+    ]) {
+        Ok(mut signals) => {
+            for signal in signals.forever() {
+                drain_zombies(&reaper);
+                if signal == signal_hook::consts::SIGTERM {
+                    tracing::info!("imp-guest-agent: received SIGTERM, exiting");
+                    break;
                 }
             }
+        }
+        Err(e) => {
+            // Degraded fallback: the signalfd/handler could not be installed, so
+            // reap on a timer instead of leaving zombies unreaped. PID 1 must
+            // never exit on a recoverable condition.
+            tracing::error!(
+                "imp-guest-agent: SIGCHLD registration failed: {}; falling back to a polling reaper",
+                e
+            );
+            let term = Arc::new(AtomicBool::new(false));
+            let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term));
+            while !term.load(std::sync::atomic::Ordering::Relaxed) {
+                drain_zombies(&reaper);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            tracing::info!("imp-guest-agent: received SIGTERM, exiting");
         }
     }
 
-    // Boot-time diagnostic checklist
-    let vsock_present =
-        std::fs::metadata("/dev/vsock").is_ok() || std::fs::metadata("/dev/vhost-vsock").is_ok();
-    tracing::info!(
-        "imp-guest-agent: boot-time diagnostic checklist: vsock_present={}",
-        vsock_present
-    );
+    Ok(())
+}
 
-    // Spawn vsock listener thread
-    std::thread::spawn(move || {
-        let addr = VsockAddr::new(0xFFFFFFFF, 5000); // VMADDR_CID_ANY
-        let listener = match VsockListener::bind(&addr) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::info!("imp-guest-agent: failed to bind vsock: {}", e);
-                return;
+/// vsock control-plane port the host's `AgentClient` connects to.
+const VSOCK_PORT: u32 = 5000;
+/// Poll cadence for the non-blocking accept loop.
+const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Re-bind the listener after this much idle time with no new connection.
+const REBIND_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Binds the `CID_ANY:VSOCK_PORT` listener in non-blocking mode.
+///
+/// Returns `None` on failure so the caller can retry — PID 1 must never give up
+/// the control plane.
+fn bind_vsock_listener() -> Option<VsockListener> {
+    let addr = VsockAddr::new(0xFFFFFFFF, VSOCK_PORT); // VMADDR_CID_ANY
+    match VsockListener::bind(&addr) {
+        Ok(listener) => {
+            if let Err(e) = listener.set_nonblocking(true) {
+                tracing::warn!(
+                    "imp-guest-agent: vsock set_nonblocking failed: {}; cannot poll for re-bind",
+                    e
+                );
             }
-        };
-        tracing::info!("imp-guest-agent: listening on vsock port 5000");
-
-        for stream in listener.incoming() {
-            match stream {
-                Ok(mut s) => {
-                    tracing::info!("imp-guest-agent: accepted connection");
-                    if let Err(e) = handle_connection(&mut s) {
-                        tracing::error!("imp-guest-agent: handle_connection error: {}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::info!("imp-guest-agent: accept error: {}", e);
-                }
-            }
+            Some(listener)
         }
-    });
-
-    // Main thread acts as PID 1 zombie reaper
-    let term = Arc::new(AtomicBool::new(false));
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term));
-
-    loop {
-        if term.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("imp-guest-agent: received SIGTERM, exiting");
-            break Ok(());
+        Err(e) => {
+            tracing::error!("imp-guest-agent: failed to bind vsock: {}", e);
+            None
         }
-        // Wait for any child with WNOHANG
-        loop {
-            match wait(WaitOptions::NOHANG) {
-                Ok(Some((pid, status))) => {
-                    let pid = pid.as_raw_nonzero().get() as u32;
-                    let code = if let Some(sig) = status.terminating_signal() {
-                        128 + sig as i32
-                    } else if let Some(c) = status.exit_status() {
-                        c as i32
-                    } else {
-                        1
-                    };
-                    let state = get_reaper_state();
-                    state
-                        .statuses
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(pid, code);
-                    state.cv.notify_all();
-                    continue;
-                }
-                Ok(None) | Err(rustix::io::Errno::CHILD) => break,
-                Err(_) => break,
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-fn handle_connection(stream: &mut VsockStream) -> Result<(), Box<dyn std::error::Error>> {
+/// Serves the vsock control plane, re-binding the listener across snapshot
+/// restores.
+///
+/// After a CH/Firecracker `--restore` the vhost-vsock device is re-created and
+/// the listener bound before the snapshot goes deaf — it never yields the host's
+/// post-restore reconnect (and the stale connection may never EOF), so a
+/// bound-once listener wedges the warm-restore path forever. We therefore run a
+/// non-blocking accept loop and re-`bind` whenever the listener has been idle for
+/// `REBIND_IDLE`, which re-attaches it to the *current* device. Re-binding is
+/// harmless during normal operation: already-accepted connections keep their own
+/// fds, and the fresh listener re-binds the same `CID_ANY:VSOCK_PORT` on the live
+/// device. Each accepted connection is served on its own thread so a parked stale
+/// connection never blocks new accepts.
+fn serve_vsock(reaper: &Arc<ReaperCoordinator>) {
+    loop {
+        let Some(listener) = bind_vsock_listener() else {
+            std::thread::sleep(ACCEPT_POLL);
+            continue;
+        };
+        tracing::info!("imp-guest-agent: listening on vsock port {}", VSOCK_PORT);
+
+        let mut idle = std::time::Duration::ZERO;
+        loop {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    idle = std::time::Duration::ZERO;
+                    tracing::info!("imp-guest-agent: accepted connection");
+                    let conn_reaper = Arc::clone(reaper);
+                    std::thread::spawn(move || {
+                        if let Err(e) = handle_connection(&mut s, &conn_reaper) {
+                            tracing::error!("imp-guest-agent: handle_connection error: {}", e);
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL);
+                    idle += ACCEPT_POLL;
+                    if idle >= REBIND_IDLE {
+                        // Drop this listener and re-bind on the current device.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::info!("imp-guest-agent: accept error: {}; re-binding", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn handle_connection(
+    stream: &mut VsockStream,
+    reaper: &Arc<ReaperCoordinator>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ready_msg = postcard::to_stdvec(&Message::Ready)?;
     send_framed(stream, &ready_msg)?;
 
@@ -224,7 +355,7 @@ fn handle_connection(stream: &mut VsockStream) -> Result<(), Box<dyn std::error:
         let msg: Message = postcard::from_bytes(&req_bytes)?;
 
         if let Message::Exec(req) = msg {
-            handle_exec(req, stream)?;
+            handle_exec(req, stream, reaper)?;
         } else if let Message::PutFile { dst, bytes } = msg {
             handle_put_file(&dst, &bytes, stream)?;
         }
@@ -275,6 +406,7 @@ fn handle_put_file(
 fn handle_exec(
     req: ExecRequest,
     stream: &mut VsockStream,
+    reaper: &Arc<ReaperCoordinator>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if req.argv.is_empty() {
         let exit_msg = postcard::to_stdvec(&Message::Exit(1))?;
@@ -284,14 +416,36 @@ fn handle_exec(
 
     let mut cmd = Command::new(&req.argv[0]);
     cmd.args(&req.argv[1..]);
+    // Run the child as its own process-group leader so the timeout path can
+    // signal the whole group (`kill(-pgid)`), tearing down any subprocesses it
+    // spawned rather than only the leader.
+    cmd.process_group(0);
 
     if let Some(cwd) = req.cwd {
         cmd.current_dir(cwd);
     }
 
+    let mut req_path: Option<String> = None;
     for (k, v) in req.env {
+        if k == "PATH" {
+            req_path = Some(v.clone());
+        }
         cmd.env(k, v);
     }
+
+    // Surface the `/imp-tools` guest-helper dir (ip/curl/kvm-ok, baked into the
+    // rootfs) on the child's PATH, ahead of the request-provided or inherited
+    // PATH. PID 1 may inherit a minimal/empty PATH, so fall back to the standard
+    // system directories.
+    let base_path = req_path
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let child_path = if base_path.is_empty() {
+        "/imp-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+    } else {
+        format!("/imp-tools:{base_path}")
+    };
+    cmd.env("PATH", child_path);
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -343,28 +497,29 @@ fn handle_exec(
             let has_exited_clone = std::sync::Arc::clone(&has_exited);
             let tx_timeout = tx.clone();
 
-            if let Some(timeout) = req.timeout {
-                std::thread::spawn(move || {
-                    std::thread::sleep(timeout);
-                    if !has_exited_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                        use rustix::process::{Pid, Signal, kill_process};
-                        if let Some(p) = Pid::from_raw(pid as i32) {
-                            let _ = kill_process(p, Signal::Kill);
-                        }
-                        let _ = tx_timeout.send(Message::Stderr(b"Command timed out\n".to_vec()));
-                    }
-                });
-            }
-
+            // Always arm a kill thread, even when the host omits a timeout: the
+            // host now resets its connection on timeout, so an unbounded child
+            // would otherwise leak forever. Default to the host's
+            // `DEFAULT_EXEC_TIMEOUT` (10s). On expiry, kill the child's entire
+            // process group rather than just the leader.
+            let timeout = req.timeout.unwrap_or(protocol::DEFAULT_EXEC_TIMEOUT);
             std::thread::spawn(move || {
-                let state = get_reaper_state();
-                let mut statuses = state.statuses.lock().unwrap_or_else(|e| e.into_inner());
-                let code = loop {
-                    if let Some(c) = statuses.remove(&pid) {
-                        break c;
+                std::thread::sleep(timeout);
+                if !has_exited_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    use rustix::process::{Pid, Signal, kill_process_group};
+                    if let Some(p) = Pid::from_raw(pid as i32) {
+                        let _ = kill_process_group(p, Signal::Kill);
                     }
-                    statuses = state.cv.wait(statuses).unwrap_or_else(|e| e.into_inner());
-                };
+                    let _ = tx_timeout.send(Message::Stderr(b"Command timed out\n".to_vec()));
+                }
+            });
+
+            let waiter_reaper = Arc::clone(reaper);
+            std::thread::spawn(move || {
+                // Claim this pid's exit code from the single shared reaper; no
+                // `child.wait()` here, so the reaper cannot have its status
+                // stolen (the false-127 race).
+                let code = waiter_reaper.wait_for(pid);
                 has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = out_handle.join();
                 let _ = err_handle.join();

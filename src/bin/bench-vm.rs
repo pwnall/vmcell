@@ -61,17 +61,23 @@ async fn run_bench<V: Vmm>(
 
     let artifacts_dir =
         std::env::var("IMP_ARTIFACTS_DIR").unwrap_or_else(|_| "/tmp/imp-artifacts".into());
-    let cfg = VmConfig::builder(
-        PathBuf::from(&artifacts_dir).join("vmlinux"),
-        RootfsSource::Erofs {
-            image: PathBuf::from(&artifacts_dir).join("rootfs.erofs"),
-        },
-    )
-    .vcpus(1)
-    .mem_mib(256)
-    .network_disabled()
-    .build()
-    .expect("valid VM configuration benchmark invariant");
+    let kernel_path = PathBuf::from(&artifacts_dir).join("vmlinux");
+    let rootfs_path = PathBuf::from(&artifacts_dir).join("rootfs.erofs");
+
+    // Fail fast (and KVM-independently) when the artifacts are absent: attempting a boot would
+    // instead hang on the agent-connect timeout (and the restore baseline boots regardless of
+    // `--iterations`). Report zero successful runs and return before booting anything.
+    if !kernel_path.exists() || !rootfs_path.exists() {
+        println!("{name}: No successful runs (missing artifacts in {artifacts_dir})");
+        return;
+    }
+
+    let cfg = VmConfig::builder(kernel_path, RootfsSource::Erofs { image: rootfs_path })
+        .vcpus(1)
+        .mem_mib(256)
+        .network_disabled()
+        .build()
+        .expect("valid VM configuration benchmark invariant");
     let cid_allocator = std::sync::Arc::new(CidAllocator::new());
 
     let snap_dir = std::env::temp_dir().join(format!("imp-bench-snap-{}", std::process::id()));
@@ -112,15 +118,20 @@ async fn run_bench<V: Vmm>(
         let _ = base_vm.shutdown().await;
     }
 
+    // Tracks whether every cold-boot iteration managed to drop the page cache.
+    // If any write fails (we lack CAP_SYS_ADMIN / root), the cold numbers are
+    // actually warm-cache and we say so on the label instead of mislabeling them.
+    let mut page_cache_dropped = true;
+
     for i in 0..(args.iterations + args.warmup) {
         if !is_restore {
-            // Drop page cache for cold boot
-            // Avoid sudo to prevent terminal requirements in tests.
-            // let _ = std::process::Command::new("sudo")
-            //     .arg("sh")
-            //     .arg("-c")
-            //     .arg("echo 3 > /proc/sys/vm/drop_caches")
-            //     .status();
+            // A "cold boot" is only cold if the page cache is cold. Drop it
+            // directly via /proc/sys/vm/drop_caches — no interactive sudo, so it
+            // works under the privileged test-runner / root without a tty prompt.
+            // The write needs CAP_SYS_ADMIN; if we lack it, flag the run as warm.
+            if std::fs::write("/proc/sys/vm/drop_caches", b"3\n").is_err() {
+                page_cache_dropped = false;
+            }
         }
 
         let start = Instant::now();
@@ -166,7 +177,21 @@ async fn run_bench<V: Vmm>(
         let _ = std::fs::remove_dir_all(&snap_dir);
     }
 
-    report(name, &mut latencies);
+    report(
+        &bench_label(name, is_restore, page_cache_dropped),
+        &mut latencies,
+    );
+}
+
+/// Returns the report label, annotating a cold-boot benchmark whose page cache
+/// could not be dropped — those latencies are warm-cache (systematically
+/// optimistic), not cold, so they must not be reported as plain "cold".
+fn bench_label(base: &str, is_restore: bool, page_cache_dropped: bool) -> String {
+    if !is_restore && !page_cache_dropped {
+        format!("{base} (WARM-CACHE: drop_caches unavailable — run as root for cold numbers)")
+    } else {
+        base.to_string()
+    }
 }
 
 #[tokio::main]
@@ -210,4 +235,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Buggy impl this guards: cold-boot latencies were reported under a plain
+    // "Cold Boot" label even when the page cache was never dropped (warm cache),
+    // so warm numbers masqueraded as cold. The label must flag the warm case.
+    #[test]
+    fn cold_label_flags_warm_cache_when_drop_unavailable() {
+        assert!(bench_label("Cold Boot", false, false).contains("WARM-CACHE"));
+        assert_eq!(bench_label("Cold Boot", false, true), "Cold Boot");
+        // Restore is not page-cache sensitive in the same way; never flagged.
+        assert_eq!(bench_label("Warm Restore", true, false), "Warm Restore");
+    }
 }

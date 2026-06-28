@@ -45,6 +45,19 @@ pub struct QemuInstance {
     vsock_pgid: Option<u32>,
 }
 
+/// Inspects a single QMP reply line and fails if it carries an `error` object.
+///
+/// QMP success replies look like `{"return": {...}}`; failures look like
+/// `{"error": {"class": ..., "desc": ...}}`. This is the shared check that
+/// `boot`/`pause`/`resume`/`request_shutdown` apply so a failed command can never
+/// masquerade as success.
+fn check_qmp_reply(reply: &str) -> Result<()> {
+    if reply.contains("\"error\"") {
+        return Err(Error::Qmp(reply.to_string()));
+    }
+    Ok(())
+}
+
 impl QemuInstance {
     async fn qmp_command(&self, cmd: &str) -> Result<String> {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -76,6 +89,12 @@ impl QemuInstance {
         .await
         .map_err(|_| Error::Qmp("Timeout waiting for QMP response".into()))?
         .map_err(Error::Io)
+    }
+
+    /// Sends a QMP command and fails if the reply carries a QMP `error` object.
+    async fn qmp_command_checked(&self, cmd: &str) -> Result<()> {
+        let reply = self.qmp_command(cmd).await?;
+        check_qmp_reply(&reply)
     }
 }
 
@@ -273,15 +292,22 @@ impl Qemu {
             .stderr(Stdio::inherit())
             .spawn()?;
 
+        // Capture the process-group id immediately: from here on any error must reap
+        // the spawned VMM group, or it leaks (the owning instance — whose Drop reaps
+        // — is not constructed until the caller).
+        let pgid = process.id();
+
         if let Some(pid) = process.id() {
-            cgroups.add_task(&res.cgroup_name, pid)?;
+            if let Err(e) = cgroups.add_task(&res.cgroup_name, pid) {
+                crate::vmm::reap_process_group(&mut process, pgid);
+                return Err(e);
+            }
         }
 
         if let Err(e) = crate::vmm::wait_for_socket(&qmp_socket, &mut process, 1000, 20).await {
+            crate::vmm::reap_process_group(&mut process, pgid);
             return Err(Error::Vmm(format!("QMP socket failed to appear: {}", e)));
         }
-
-        let pgid = process.id();
 
         Ok((
             tmp,
@@ -360,27 +386,20 @@ impl Vmm for Qemu {
 
 impl VmInstance for QemuInstance {
     async fn boot(&mut self) -> Result<()> {
-        let res = self.qmp_command("{\"execute\": \"cont\"}").await?;
-        if res.contains("\"error\"") {
-            return Err(Error::Qmp(format!("qmp cont error: {}", res)));
-        }
-        Ok(())
+        self.qmp_command_checked("{\"execute\": \"cont\"}").await
     }
 
     async fn pause(&mut self) -> Result<()> {
-        self.qmp_command("{\"execute\": \"stop\"}").await?;
-        Ok(())
+        self.qmp_command_checked("{\"execute\": \"stop\"}").await
     }
 
     async fn resume(&mut self) -> Result<()> {
-        self.qmp_command("{\"execute\": \"cont\"}").await?;
-        Ok(())
+        self.qmp_command_checked("{\"execute\": \"cont\"}").await
     }
 
     async fn request_shutdown(&mut self) -> Result<()> {
-        self.qmp_command("{\"execute\": \"system_powerdown\"}")
-            .await?;
-        Ok(())
+        self.qmp_command_checked("{\"execute\": \"system_powerdown\"}")
+            .await
     }
 
     async fn kill(&mut self) -> Result<()> {
@@ -454,5 +473,25 @@ impl Drop for QemuInstance {
         }
         let _ = std::fs::remove_file(&self.qmp_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards VMM-3: a QMP reply carrying an `error` object must surface as
+    // Err(Error::Qmp). The buggy impl (discarding the reply / returning Ok) would
+    // let a failed pause/resume/request_shutdown masquerade as success — and
+    // `resume` is on the restore path.
+    #[test]
+    fn qmp_error_reply_is_surfaced() {
+        let err = "{\"error\": {\"class\": \"GenericError\", \"desc\": \"nope\"}}\n";
+        assert!(matches!(check_qmp_reply(err), Err(Error::Qmp(_))));
+    }
+
+    #[test]
+    fn qmp_success_reply_is_ok() {
+        assert!(check_qmp_reply("{\"return\": {}}\n").is_ok());
     }
 }

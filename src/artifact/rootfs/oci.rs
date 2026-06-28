@@ -58,20 +58,17 @@ pub async fn build_rootfs(
                 .await
                 .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
-            use sha2::Digest;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&blob_data);
-            let hash = format!("sha256:{:x}", hasher.finalize());
-            if hash != layer.digest {
-                return Err(crate::error::Error::Artifact(format!(
-                    "blob digest mismatch: expected {}, got {}",
-                    layer.digest, hash
-                )));
-            }
+            // Verify before caching so corrupt network data is never persisted.
+            verify_blob_digest(&blob_data, &layer.digest)?;
             tokio::fs::write(&cache_path, &blob_data)
                 .await
                 .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
         }
+
+        // Re-verify the (possibly cached) blob on EVERY use: a tampered cache file with an
+        // intact digest-derived name must be rejected. Validity is content-addressed, not
+        // existence-based.
+        read_and_verify_cached_blob(&cache_path, &layer.digest)?;
 
         let file = std::fs::File::open(&cache_path)
             .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
@@ -87,4 +84,57 @@ pub async fn build_rootfs(
     }
 
     super::pack_erofs_with_injection(streams, inputs, out).await
+}
+
+/// Verifies `blob` against a `sha256:...` digest string.
+fn verify_blob_digest(blob: &[u8], expected_digest: &str) -> Result<()> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(blob);
+    let hash = format!("sha256:{:x}", hasher.finalize());
+    if hash != expected_digest {
+        return Err(crate::error::Error::Artifact(format!(
+            "blob digest mismatch: expected {}, got {}",
+            expected_digest, hash
+        )));
+    }
+    Ok(())
+}
+
+/// Reads a cached blob from disk and verifies its sha256 digest, rejecting tampered bytes.
+fn read_and_verify_cached_blob(cache_path: &Path, expected_digest: &str) -> Result<()> {
+    let blob_data =
+        std::fs::read(cache_path).map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+    verify_blob_digest(&blob_data, expected_digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards ARTIFACT-PIPELINE-7: the digest was verified only inside `if !cache_path.exists()`,
+    // so a cache hit reused the blob unverified. Re-verifying on every use must reject a
+    // tampered cache file (intact digest-derived name, altered bytes).
+    #[test]
+    fn test_cached_blob_tamper_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob");
+        let good = b"hello oci layer";
+        std::fs::write(&path, good).expect("write");
+
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(good);
+        let digest = format!("sha256:{:x}", h.finalize());
+
+        // Correct cached content verifies.
+        assert!(read_and_verify_cached_blob(&path, &digest).is_ok());
+
+        // A tampered cache file must be rejected on use.
+        std::fs::write(&path, b"tampered bytes").expect("write");
+        assert!(
+            read_and_verify_cached_blob(&path, &digest).is_err(),
+            "tampered cached blob must be rejected on every use"
+        );
+    }
 }

@@ -8,27 +8,76 @@ use futures::stream::TryStreamExt;
 
 fn run_in_tokio<F, Fut, T>(f: F) -> std::result::Result<T, String>
 where
-    F: FnOnce() -> Fut,
+    F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = std::result::Result<T, String>>,
+    T: Send,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("tokio build failed: {}", e))?;
-    rt.block_on(f())
+    // The `Netlink` trait is synchronous, but the orchestrator that drives it is
+    // async — so this may be called from within a tokio runtime, where building
+    // and `block_on`-ing a nested runtime on the current (worker) thread panics
+    // ("Cannot start a runtime from within a runtime"). Run the blocking work on a
+    // dedicated OS thread, which is never a runtime worker, so a fresh
+    // current-thread runtime is always safe.
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("tokio build failed: {}", e))?;
+            rt.block_on(f())
+        })
+        .join()
+        .map_err(|_| "netlink worker thread panicked".to_string())?
+    })
 }
 
 fn run_with_rtnetlink<F, Fut, T>(f: F) -> std::result::Result<T, String>
 where
-    F: FnOnce(rtnetlink::Handle) -> Fut,
+    F: FnOnce(rtnetlink::Handle) -> Fut + Send,
     Fut: std::future::Future<Output = std::result::Result<T, String>>,
+    T: Send,
 {
-    run_in_tokio(|| async {
+    run_in_tokio(move || async move {
         let (connection, handle, _) =
             rtnetlink::new_connection().map_err(|e| format!("rtnetlink connect failed: {}", e))?;
         tokio::spawn(connection);
         f(handle).await
     })
+}
+
+/// Sweeps orphaned network namespaces left behind by killed or failed
+/// privileged test runs.
+///
+/// Enumerates `/var/run/netns` and removes every namespace whose name starts
+/// with `prefix` (e.g. `imp-net-`). Intended to run at the start of a
+/// privileged/netns test so a namespace leaked by a prior aborted run cannot
+/// collide with this run's vmid (`netns add … Operation not permitted`). It runs
+/// under the capability runner's `CAP_SYS_ADMIN`+`CAP_DAC_OVERRIDE`, so it needs
+/// no `sudo`.
+///
+/// Safe only when no live VM owns a matching namespace: the privileged suite
+/// serializes these tests (`serial-host`), and orphans have no live interfaces,
+/// so the removal does not hang. A per-namespace failure is logged and skipped
+/// rather than propagated, so one stuck namespace cannot block the rest. Returns
+/// the names of the namespaces it successfully removed.
+pub fn cleanup_orphan_netns(prefix: &str) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/var/run/netns") else {
+        return removed; // no netns dir → nothing to sweep
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        match netns_rs::NetNs::get(&name).and_then(netns_rs::NetNs::remove) {
+            Ok(()) => removed.push(name),
+            Err(e) => {
+                tracing::warn!("cleanup_orphan_netns: failed to remove {}: {}", name, e);
+            }
+        }
+    }
+    removed
 }
 
 /// Interface for executing netlink operations.
@@ -83,6 +132,19 @@ impl Netlink for RtNetlink {
             .run(move |_| tun_tap::Iface::without_packet_info(&tn, tun_tap::Mode::Tap))
             .map_err(|e| Error::Network(format!("ns run tap fail: {:?}", e)))?
             .map_err(|e| Error::Network(format!("tap create fail: {}", e)))?;
+
+        // Make the tap persistent, then release our fd: a non-multi-queue tap can be
+        // opened by only one process, and the VMM must be the opener (otherwise CH
+        // fails with "Open tap device failed: Device or resource busy"). The
+        // persistent interface lives in the netns until it is torn down. (The
+        // ioctl lives in `crate::net_sys` because this module is
+        // `#![forbid(unsafe_code)]` via `net`.)
+        {
+            use std::os::fd::AsRawFd;
+            crate::net_sys::set_tun_persist(tap.as_raw_fd())
+                .map_err(|e| Error::Network(format!("TUNSETPERSIST on tap failed: {}", e)))?;
+        }
+        drop(tap);
 
         let tap_name = tap_name.to_string();
         let (ip, _, _) = crate::net::ip_math(vmid)?;
@@ -141,7 +203,9 @@ impl Netlink for RtNetlink {
         });
 
         match res {
-            Ok(Ok(())) => Ok(Some(tap)),
+            // The tap is persistent in the netns and our fd is already dropped, so
+            // there is no handle to return — the VMM opens the interface by name.
+            Ok(Ok(())) => Ok(None),
             Ok(Err(e)) => Err(Error::Network(e)),
             Err(e) => Err(Error::Network(format!("ns run err: {:?}", e))),
         }
@@ -220,6 +284,8 @@ impl NftApplier for DefaultNftApplier {
             let mut child = std::process::Command::new("nft")
                 .args(["-f", "-"])
                 .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("nft spawn failed: {}", e))?;
 
@@ -227,13 +293,26 @@ impl NftApplier for DefaultNftApplier {
                 stdin
                     .write_all(rules_str.as_bytes())
                     .map_err(|e| format!("nft write failed: {}", e))?;
+                // `stdin` is dropped here, closing the pipe so nft sees EOF.
             }
 
-            let status = child
-                .wait()
+            // NET-8: capture nft's exit code and stderr so a rule-load failure is
+            // diagnosable instead of an opaque "failed".
+            let output = child
+                .wait_with_output()
                 .map_err(|e| format!("nft wait failed: {}", e))?;
-            if !status.success() {
-                return Err("nft rules application failed".to_string());
+            if !output.status.success() {
+                let code = output
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string());
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "nft rules application failed (exit {}): {}",
+                    code,
+                    stderr.trim()
+                ));
             }
             Ok::<(), String>(())
         });
@@ -256,7 +335,8 @@ pub struct NetNamespace {
     pub vmid: u32,
     /// The Netlink implementation
     netlink: Box<dyn Netlink>,
-    /// The persistent TAP interface handle, keeping it alive.
+    /// Held tap fd. Now always `None`: the tap is made persistent in the netns
+    /// (`TUNSETPERSIST`) and our fd is dropped so the VMM can open the interface.
     _tap: Option<tun_tap::Iface>,
 }
 
@@ -311,7 +391,16 @@ impl NetNamespace {
         Ok(ip.to_string())
     }
 
-    /// Render TPROXY ruleset for nftables
+    /// Render the TPROXY ruleset for nftables.
+    ///
+    /// The prerouting chain defaults to `policy drop` and only TPROXY-redirects
+    /// TCP destined for ports 80 and 443 to the egress proxy; every other packet
+    /// from the guest tap is logged and dropped.
+    ///
+    /// NET-7 (recorded deviation): this deliberately drops UDP/443 (QUIC). QUIC
+    /// cannot be transparently intercepted by the TCP-oriented egress proxy, so
+    /// blocking it forces clients to fall back to interceptable TCP/TLS, keeping
+    /// all egress observable. This is an intentional posture, not an oversight.
     pub fn render_tproxy_rules(&self, proxy_port: u16) -> String {
         format!(
             "table ip proxy {{\n\
@@ -339,7 +428,15 @@ impl NetNamespace {
 
 impl Drop for NetNamespace {
     fn drop(&mut self) {
-        let _ = self.delete();
+        // NET-8: Drop cannot propagate errors; surface a teardown failure as a
+        // warning rather than silently discarding it.
+        if let Err(e) = self.delete() {
+            tracing::warn!(
+                "NetNamespace drop: failed to delete netns {}: {}",
+                self.name,
+                e
+            );
+        }
     }
 }
 
@@ -443,5 +540,80 @@ mod tests {
             _tap: None,
         };
         assert_eq!(ns.host_ip().unwrap(), "10.200.43.1");
+    }
+
+    // NET-6: assert the rendered TPROXY ruleset. Buggy impl guarded: dropping the
+    // default-drop policy or pointing TPROXY at the wrong port would silently let
+    // guest traffic bypass the egress proxy.
+    #[test]
+    fn render_tproxy_rules_intercepts_web_and_drops_rest() {
+        let ns = NetNamespace {
+            name: "imp-net-9".into(),
+            tap_name: "imp-tap-9".into(),
+            vmid: 9,
+            netlink: Box::new(FakeNetlink::new()),
+            _tap: None,
+        };
+        let rules = ns.render_tproxy_rules(5000);
+        assert!(
+            rules.contains("type filter hook prerouting priority mangle; policy drop;"),
+            "ruleset missing default-drop policy: {}",
+            rules
+        );
+        assert!(
+            rules.contains("iifname \"imp-tap-9\" tcp dport { 80, 443 } tproxy to :5000"),
+            "ruleset missing TPROXY redirect: {}",
+            rules
+        );
+        assert!(
+            rules.contains("iifname \"imp-tap-9\" log prefix \"imp-drop: \" drop"),
+            "ruleset missing catch-all drop: {}",
+            rules
+        );
+    }
+
+    // NET-6: drive the recording fakes and assert that emit_proxy_rules applies
+    // the ruleset and sets up the policy route, in dependency order. Buggy impl
+    // guarded: forgetting setup_tproxy_routing leaves the policy route absent
+    // (no TPROXY delivery); reordering would break the inequalities.
+    #[test]
+    fn emit_proxy_rules_applies_ruleset_and_sets_up_routing_in_order() {
+        let netlink = FakeNetlink::new();
+        let netlink_calls = netlink.calls.clone();
+        let ns = NetNamespace::create(7, Box::new(netlink)).unwrap();
+
+        let applier = FakeNftApplier::new();
+        let applier_calls = applier.calls.clone();
+
+        ns.emit_proxy_rules(1234, &applier).unwrap();
+
+        // The nft applier is invoked exactly once, for this VM's netns.
+        let ac = applier_calls.lock().unwrap();
+        assert_eq!(*ac, vec!["apply_rules(imp-net-7)".to_string()]);
+
+        // setup_tproxy_routing is invoked, after the netns and tap exist.
+        let nc = netlink_calls.lock().unwrap();
+        let pos_add = nc
+            .iter()
+            .position(|c| c.starts_with("add_netns"))
+            .expect("add_netns recorded");
+        let pos_tap = nc
+            .iter()
+            .position(|c| c.starts_with("setup_tap"))
+            .expect("setup_tap recorded");
+        let pos_tproxy = nc
+            .iter()
+            .position(|c| c == "setup_tproxy_routing(imp-net-7)")
+            .expect("setup_tproxy_routing recorded");
+        assert!(
+            pos_add < pos_tap,
+            "netns must be created before tap: {:?}",
+            *nc
+        );
+        assert!(
+            pos_tap < pos_tproxy,
+            "tap must exist before tproxy routing: {:?}",
+            *nc
+        );
     }
 }

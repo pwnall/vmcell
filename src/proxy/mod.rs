@@ -228,10 +228,10 @@ impl EgressProxy {
         &self.ca_cert_pem
     }
 
-    /// Returns the observed requests.
+    /// Returns the observed requests, including `403 BLOCKED <host>` entries
+    /// for denied egress.
     ///
-    /// # Panics
-    /// Panics if the requests lock is poisoned.
+    /// Recovers from a poisoned lock rather than panicking.
     pub fn requests(&self) -> RequestLog {
         self.requests
             .lock()

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 pub fn tar_to_erofs<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
     injected_files: Vec<(&str, &Path)>,
+    injected_symlinks: Vec<(&str, &str)>,
 ) -> crate::error::Result<Vec<u8>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
@@ -38,6 +39,22 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
             mode,
             data: content,
             meta,
+            xattrs: vec![],
+        };
+        entries.insert(normalize_path(Path::new(dest_path)), node);
+    }
+
+    // Inject symlinks (e.g. the guest test-helper's ip/curl/kvm-ok multicall links).
+    for (dest_path, target) in injected_symlinks {
+        let node = Node::Symlink {
+            mode: 0o777 | fs_erofs::inode::S_IFLNK,
+            target: target.to_string(),
+            meta: NodeMeta {
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
             xattrs: vec![],
         };
         entries.insert(normalize_path(Path::new(dest_path)), node);
@@ -273,7 +290,7 @@ mod tests {
 
         let reader = std::io::Cursor::new(tar_data);
         let archive = tar::Archive::new(reader);
-        let image = tar_to_erofs(vec![archive], vec![]);
+        let image = tar_to_erofs(vec![archive], vec![], vec![]);
         assert!(
             image.is_ok(),
             "Failed to convert empty tar to EROFS: {:?}",

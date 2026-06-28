@@ -243,54 +243,63 @@ pub struct VmConfigBuilder {
 
 impl VmConfigBuilder {
     /// Adds a shared directory.
+    #[must_use]
     pub fn with_share(mut self, share: Share) -> Self {
         self.shares.push(share);
         self
     }
 
     /// Sets the number of virtual CPUs.
+    #[must_use]
     pub fn vcpus(mut self, vcpus: u8) -> Self {
         self.vcpus = vcpus;
         self
     }
 
     /// Sets the memory size in MiB.
+    #[must_use]
     pub fn mem_mib(mut self, mem_mib: u32) -> Self {
         self.mem_mib = mem_mib;
         self
     }
 
     /// Sets the networking configuration.
+    #[must_use]
     pub fn net(mut self, net: NetConfig) -> Self {
         self.net = net;
         self
     }
 
     /// Enables or disables nested virtualization.
+    #[must_use]
     pub fn nested_virt(mut self, nested_virt: bool) -> Self {
         self.nested_virt = nested_virt;
         self
     }
 
     /// Sets the cgroup resource limits.
+    #[must_use]
     pub fn limits(mut self, limits: ResourceLimits) -> Self {
         self.limits = limits;
         self
     }
 
     /// Sets whether the VM is expected to be snapshot-eligible.
+    #[must_use]
     pub fn snapshotting(mut self, snapshotting: bool) -> Self {
         self.snapshotting = snapshotting;
         self
     }
 
     /// Explicitly sets the VMID for validation.
+    #[must_use]
     pub fn vmid(mut self, vmid: u32) -> Self {
         self.vmid = Some(vmid);
         self
     }
 
     /// Disables network access.
+    #[must_use]
     pub fn network_disabled(mut self) -> Self {
         self.net = NetConfig::None;
         self
@@ -329,9 +338,21 @@ impl VmConfigBuilder {
                     "virtio-fs rootfs cannot be combined with snapshotting".into(),
                 ));
             }
+            // Snapshot-eligibility law: a snapshot-eligible VM must have no
+            // vhost-user device attached. A virtio-fs data `Share` is served
+            // by virtiofsd (a vhost-user device), so reject it here as well as
+            // for the virtio-fs *rootfs* above.
+            if !self.shares.is_empty() {
+                return Err(crate::error::Error::Config(
+                    "virtio-fs data shares cannot be combined with snapshotting".into(),
+                ));
+            }
         }
 
         if let Some(vmid) = self.vmid {
+            if vmid == 0 {
+                return Err(crate::error::Error::Config("vmid must be >= 1".into()));
+            }
             if vmid > 254 {
                 return Err(crate::error::Error::Config("vmid must be <= 254".into()));
             }
@@ -439,5 +460,124 @@ mod tests {
         .build()
         .unwrap_err();
         assert!(err.to_string().contains("vmid must be <= 254"));
+    }
+
+    // Guards C1 / snapshot-eligibility law. Buggy impl: build() only rejects a
+    // virtio-fs *rootfs* + snapshot and lets a data `Share` (served by
+    // virtiofsd, a vhost-user device) through on the snapshot path.
+    #[test]
+    fn test_reject_shares_with_snapshot() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_share(Share::new(
+            "data",
+            "/tmp/data",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
+        .snapshotting(true)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string()
+                .contains("virtio-fs data shares cannot be combined with snapshotting"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Buggy impl: build() accepts vmid == 0, which is out of range for the /30
+    // host-IP math.
+    #[test]
+    fn test_reject_zero_vmid() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .vmid(0)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(err.to_string().contains("vmid must be >= 1"));
+    }
+
+    // Buggy impl: build() does not reject vcpus == 0.
+    #[test]
+    fn test_reject_zero_vcpus() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .vcpus(0)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(err.to_string().contains("vcpus must be > 0"));
+    }
+
+    // Buggy impl: build() does not enforce the memory floor.
+    #[test]
+    fn test_reject_mem_below_floor() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .mem_mib(32)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(err.to_string().contains("mem_mib must be >= 64"));
+    }
+
+    // Buggy impl: build() accepts an empty kernel path.
+    #[test]
+    fn test_reject_empty_kernel() {
+        let err = VmConfig::builder(
+            PathBuf::from(""),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(err.to_string().contains("kernel path cannot be empty"));
+    }
+
+    // Buggy impl: build() does not reject two shares with the same mount tag.
+    #[test]
+    fn test_reject_duplicate_share_tags() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_share(Share::new(
+            "dup",
+            "/tmp/a",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
+        .with_share(Share::new(
+            "dup",
+            "/tmp/b",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(err.to_string().contains("duplicate share tag: dup"));
     }
 }

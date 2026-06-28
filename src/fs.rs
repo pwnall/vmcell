@@ -60,7 +60,16 @@ impl VirtioFsDaemon {
 
         #[cfg(unix)]
         {
-            // Drop privileges for virtiofsd if we are running as root
+            // Drop privileges for virtiofsd if we are running as root.
+            //
+            // METRICS-FS-6: this targets the invoking developer's uid (`SUDO_UID`),
+            // falling back to `nobody` (65534), rather than allocating a *dedicated*
+            // low-privilege service uid per VM. That is the accepted approximation: the
+            // real isolation boundary for the share is `--sandbox=namespace` plus
+            // `--readonly` for RO shares (both applied above), and a per-developer uid
+            // already keeps the daemon off root. A dedicated, unused service uid (e.g.
+            // a reserved range allocated alongside the CID/VMID) would be strictly
+            // better; see cross_file_notes for the seam this would need.
             if nix::unistd::getuid().as_raw() == 0 {
                 let uid = std::env::var("SUDO_UID")
                     .ok()
@@ -81,9 +90,23 @@ impl VirtioFsDaemon {
             }
         }
 
+        // METRICS-FS-5: redirect stderr to a per-VM log file rather than an
+        // `Stdio::piped()` pipe. On the success path the `Child` is dropped (only the
+        // pgid is retained), so a captured-but-undrained pipe would wedge a chatty
+        // daemon once the pipe buffer fills. A file is always drainable and still gives
+        // us the daemon's diagnostics, which we read back on the failure paths below.
+        let stderr_log_path = vm_tmp.join(format!("{}-virtiofsd.log", share.tag));
+        let stderr_file = std::fs::File::create(&stderr_log_path).map_err(|e| {
+            crate::error::Error::Subprocess(format!(
+                "failed to create virtiofsd log {}: {}",
+                stderr_log_path.display(),
+                e
+            ))
+        })?;
+
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::from(stderr_file));
 
         let mut process = cmd.spawn().map_err(|e| {
             crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {}", e))
@@ -98,11 +121,7 @@ impl VirtioFsDaemon {
                 break;
             }
             if let Some(status) = process.try_wait().unwrap_or(None) {
-                let mut stderr = String::new();
-                if let Some(mut err_stream) = process.stderr.take() {
-                    use tokio::io::AsyncReadExt;
-                    let _ = err_stream.read_to_string(&mut stderr).await;
-                }
+                let stderr = std::fs::read_to_string(&stderr_log_path).unwrap_or_default();
                 return Err(crate::error::Error::Subprocess(format!(
                     "virtiofsd exited prematurely with {}: {}",
                     status,
@@ -120,11 +139,7 @@ impl VirtioFsDaemon {
                 let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(p as i32), None);
             }
             let _ = process.start_kill();
-            let mut stderr = String::new();
-            if let Some(mut err_stream) = process.stderr.take() {
-                use tokio::io::AsyncReadExt;
-                let _ = err_stream.read_to_string(&mut stderr).await;
-            }
+            let stderr = std::fs::read_to_string(&stderr_log_path).unwrap_or_default();
             return Err(crate::error::Error::Subprocess(format!(
                 "virtiofsd failed to create socket: {}",
                 stderr.trim()

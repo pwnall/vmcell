@@ -12,7 +12,7 @@ pub mod tap;
 /// rootless userspace networking with smoltcp.
 pub mod smoltcp;
 
-pub use tap::NetNamespace;
+pub use tap::{NetNamespace, cleanup_orphan_netns};
 
 #[cfg(feature = "net-unprivileged")]
 pub use smoltcp::backend::SmoltcpProcess;

@@ -13,6 +13,10 @@ use tokio::process::Child;
 pub struct Firecracker {
     /// Path to the `firecracker` executable.
     pub binary_path: PathBuf,
+    /// Lazily-probed T2 CPU-template support, cached on this instance (shared
+    /// across clones). Replaces the former process-global `OnceLock` so the probe
+    /// result is no longer module-global mutable state.
+    cpu_template: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
 }
 
 impl Firecracker {
@@ -21,7 +25,21 @@ impl Firecracker {
     pub fn new(binary_path: impl Into<PathBuf>) -> Self {
         Self {
             binary_path: binary_path.into(),
+            cpu_template: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Probes the host once for T2 CPU-template support, caching the result on
+    /// this instance instead of in a process-global, so a later `Firecracker`
+    /// with a different binary/config probes independently.
+    async fn detect_cpu_template(&self, cfg: &VmConfig) -> Option<String> {
+        if let Some(val) = self.cpu_template.get() {
+            return val.clone();
+        }
+
+        let template = probe_t2_template(self, cfg).await;
+        let _ = self.cpu_template.set(template.clone());
+        template
     }
 }
 
@@ -81,27 +99,25 @@ impl Firecracker {
             .stderr(Stdio::inherit())
             .spawn()?;
 
+        // Capture the process-group id immediately: from here on any error must reap
+        // the spawned VMM group, or it leaks (the owning FcInstance — whose Drop
+        // reaps — is not constructed until the caller).
+        let pgid = process.id();
+
         if let Some(pid) = process.id() {
-            cgroups.add_task(&res.cgroup_name, pid)?;
+            if let Err(e) = cgroups.add_task(&res.cgroup_name, pid) {
+                crate::vmm::reap_process_group(&mut process, pgid);
+                return Err(e);
+            }
         }
 
-        crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await?;
+        if let Err(e) = crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await {
+            crate::vmm::reap_process_group(&mut process, pgid);
+            return Err(e);
+        }
 
-        let pgid = process.id();
         Ok((tmp, api_socket, vsock_path, serial_path, process, pgid))
     }
-}
-
-static CPU_TEMPLATE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
-async fn detect_cpu_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
-    if let Some(val) = CPU_TEMPLATE.get() {
-        return val.clone();
-    }
-
-    let template = probe_t2_template(vmm, cfg).await;
-    let _ = CPU_TEMPLATE.set(template.clone());
-    template
 }
 
 async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
@@ -145,13 +161,18 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         return None;
     }
 
+    // The probe child is its own process-group leader (`process_group(0)`), so its
+    // pid is the group id. Capture it so `FcInstance::drop` force-kills and reaps
+    // the whole group on every exit path below — never own a live firecracker with
+    // `pgid: None`, which would orphan the process and leak it.
+    let pgid = process.id();
     let instance = FcInstance {
         process,
         api_socket: api_socket.clone(),
         vsock_path: PathBuf::new(),
         serial_path: PathBuf::new(),
         cid: 0,
-        pgid: None,
+        pgid,
     };
 
     #[derive(Serialize)]
@@ -263,7 +284,7 @@ impl Vmm for Firecracker {
             });
         }
 
-        let template = detect_cpu_template(self, cfg).await;
+        let template = self.detect_cpu_template(cfg).await;
 
         let (_tmp, api_socket, vsock_path, serial_path, process, pgid) =
             self.spawn_fc(res, cgroups).await?;
@@ -427,6 +448,14 @@ impl Vmm for Firecracker {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // VMM-5: self-check the capability descriptor rather than assuming the
+        // backend supports restore.
+        if !self.capabilities().snapshot_restore {
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                feature: "snapshot_restore".to_string(),
+            });
+        }
         let (_tmp, api_socket, vsock_path, serial_path, process, pgid) =
             self.spawn_fc(res, cgroups).await?;
 
@@ -612,5 +641,27 @@ impl Drop for FcInstance {
         }
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards VMM-4: the CPU-template cache must live on the instance, not in a
+    // process-global. The buggy impl (a `static OnceLock`) would let one
+    // `Firecracker`'s probe result leak into a second, independently-configured
+    // instance.
+    #[test]
+    fn cpu_template_cache_is_per_instance() {
+        let a = Firecracker::new("/usr/bin/firecracker");
+        let b = Firecracker::new("/usr/bin/firecracker");
+
+        // Seed only `a`'s cache.
+        let _ = a.cpu_template.set(Some("T2".to_string()));
+
+        assert_eq!(a.cpu_template.get(), Some(&Some("T2".to_string())));
+        // `b` has an independent, still-empty cache.
+        assert_eq!(b.cpu_template.get(), None);
     }
 }

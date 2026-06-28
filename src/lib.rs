@@ -52,6 +52,9 @@ pub mod metrics;
 /// Networking models and implementations (tap, smoltcp).
 #[cfg(feature = "host-common")]
 pub mod net;
+/// Privileged-networking syscall helpers (kept out of `net`, which forbids unsafe).
+#[cfg(feature = "net-privileged")]
+mod net_sys;
 /// VM orchestration and management.
 #[cfg(feature = "host-common")]
 pub mod orchestrator;
@@ -64,7 +67,9 @@ pub mod proxy;
 #[cfg(feature = "host-common")]
 pub mod vmm;
 
-pub use agent::{AgentClient, ExecOutcome, ExecRequest};
+#[cfg(feature = "host-common")]
+pub use agent::AgentClient;
+pub use agent::{ExecOutcome, ExecRequest};
 #[cfg(feature = "host-common")]
 pub use config::{NetConfig, ResourceLimits, Share, VmConfig};
 pub use error::{Error, Result};

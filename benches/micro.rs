@@ -78,7 +78,7 @@ fn bench_tar_to_erofs(c: &mut Criterion) {
             // tar_to_erofs expects an iterator over archives
             let reader = std::io::Cursor::new(tar_data.clone());
             let archive = tar::Archive::new(reader);
-            let image = tar_to_erofs(vec![archive], vec![]).unwrap();
+            let image = tar_to_erofs(vec![archive], vec![], vec![]).unwrap();
             black_box(image);
         })
     });

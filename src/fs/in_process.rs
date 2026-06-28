@@ -108,6 +108,15 @@ pub mod backend {
         backend: Mutex<VhostUserFsBackend>,
     }
 
+    // METRICS-FS-4: recover from a poisoned `backend` mutex instead of panicking.
+    // The guarded state is plain device state (event_idx, mem, vu_req, the kill
+    // eventfd) with no enforced cross-field invariant, so continuing with the
+    // last-written value after a panic in another holder is sound and keeps a
+    // guest-driven path from turning a transient poison into a hard crash.
+    fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     impl VhostUserFsBackendHandler {
         fn new(vfs: Arc<Vfs>) -> std::io::Result<Self> {
             let backend = VhostUserFsBackend {
@@ -150,23 +159,23 @@ pub mod backend {
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
-            self.backend.lock().expect("mutex poisoned").event_idx = enabled
+            lock_recover(&self.backend).event_idx = enabled
         }
 
         fn update_memory(
             &mut self,
             mem: GuestMemoryAtomic<GuestMemoryMmap>,
         ) -> std::io::Result<()> {
-            self.backend.lock().expect("mutex poisoned").mem = Some(mem);
+            lock_recover(&self.backend).mem = Some(mem);
             Ok(())
         }
 
         fn set_backend_req_fd(&mut self, vu_req: Backend) {
-            self.backend.lock().expect("mutex poisoned").vu_req = Some(vu_req);
+            lock_recover(&self.backend).vu_req = Some(vu_req);
         }
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-            let backend = self.backend.lock().expect("mutex poisoned");
+            let backend = lock_recover(&self.backend);
             let consumer = backend.kill_evt.0.try_clone().expect("clone consumer");
             let notifier = backend.kill_evt.1.try_clone().expect("clone notifier");
             Some((consumer, notifier))
@@ -191,22 +200,16 @@ pub mod backend {
                 }
             };
 
-            if self.backend.lock().expect("mutex poisoned").event_idx {
+            if lock_recover(&self.backend).event_idx {
                 loop {
                     let _ = vring_state.disable_notification();
-                    self.backend
-                        .lock()
-                        .expect("mutex poisoned")
-                        .process_queue(&mut vring_state)?;
+                    lock_recover(&self.backend).process_queue(&mut vring_state)?;
                     if !vring_state.enable_notification().unwrap_or(false) {
                         break;
                     }
                 }
             } else {
-                self.backend
-                    .lock()
-                    .expect("mutex poisoned")
-                    .process_queue(&mut vring_state)?;
+                lock_recover(&self.backend).process_queue(&mut vring_state)?;
             }
 
             Ok(())
@@ -246,14 +249,11 @@ pub mod backend {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let backend_handler = VhostUserFsBackendHandler::new(Arc::new(vfs))?;
-        let kill_notifier = backend_handler
-            .backend
-            .lock()
-            .expect("mutex")
+        let kill_notifier = lock_recover(&backend_handler.backend)
             .kill_evt
             .1
             .try_clone()
-            .expect("clone");
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let backend = Arc::new(RwLock::new(backend_handler));
         let mut listener =
             Listener::new(socket_path, true).map_err(|e| std::io::Error::other(e.to_string()))?;

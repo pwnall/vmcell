@@ -4,7 +4,7 @@
 //! along with the `ChInstance` running VM instance.
 
 use crate::config::VmConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,17 @@ pub struct ChInstance {
     restored: bool,
     cid: u32,
     pgid: Option<u32>,
+    /// True if a vhost-user-net device is attached (rootless NAT). Such a VM is
+    /// not snapshot-eligible.
+    vhost_user_net: bool,
+}
+
+/// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
+/// because it has a vhost-user device attached (virtio-fs share, rootless net, or
+/// vhost-user-net). The snapshot-eligibility law requires rejecting such a VM on
+/// the `snapshot()`/`restore()` paths instead of attaching/keeping virtiofsd.
+fn has_vhost_user_device(virtio_fs_share: bool, rootless_net: bool, vhost_user_net: bool) -> bool {
+    virtio_fs_share || rootless_net || vhost_user_net
 }
 
 #[derive(Serialize)]
@@ -152,6 +163,29 @@ impl CloudHypervisor {
         let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
 
         if let Some(dir) = snapshot_dir {
+            // CH `--restore` reconstructs every device from the snapshot's
+            // config.json, including the vsock backend's UNIX socket and the serial
+            // file — both recorded as the ORIGINAL instance's temp-dir paths, which
+            // no longer exist. CH (v52) exposes no restore-time override for these,
+            // so rewrite config.json to point at this restore's freshly-minted paths
+            // before launching; otherwise the host connects to a vsock socket CH
+            // never binds (the agent handshake times out) and the serial log stays
+            // empty. In-place rewrite is fine for a single-use snapshot; restoring
+            // many clones from one snapshot would need a copy-on-write of the
+            // snapshot dir first.
+            let config_path = dir.join("config.json");
+            let content = tokio::fs::read_to_string(&config_path).await?;
+            let mut config: serde_json::Value = serde_json::from_str(&content)?;
+            if let Some(vsock) = config.get_mut("vsock") {
+                vsock["socket"] =
+                    serde_json::Value::String(vsock_path.to_string_lossy().into_owned());
+            }
+            if let Some(serial) = config.get_mut("serial") {
+                serial["file"] =
+                    serde_json::Value::String(serial_path.to_string_lossy().into_owned());
+            }
+            tokio::fs::write(&config_path, serde_json::to_string(&config)?).await?;
+
             cmd.arg("--restore")
                 .arg(format!("source_url=file://{}", dir.display()));
         }
@@ -164,13 +198,23 @@ impl CloudHypervisor {
             .stderr(Stdio::inherit())
             .spawn()?;
 
+        // Capture the process-group id immediately: from here on any error must reap
+        // the spawned VMM group, or it leaks (the owning ChInstance — whose Drop
+        // reaps — is not constructed until the caller).
+        let pgid = process.id();
+
         if let Some(pid) = process.id() {
-            cgroups.add_task(&res.cgroup_name, pid)?;
+            if let Err(e) = cgroups.add_task(&res.cgroup_name, pid) {
+                crate::vmm::reap_process_group(&mut process, pgid);
+                return Err(e);
+            }
         }
 
-        crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await?;
+        if let Err(e) = crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await {
+            crate::vmm::reap_process_group(&mut process, pgid);
+            return Err(e);
+        }
 
-        let pgid = process.id();
         Ok((tmp, api_socket, vsock_path, serial_path, process, pgid))
     }
 }
@@ -212,6 +256,7 @@ impl Vmm for CloudHypervisor {
             restored: false,
             cid,
             pgid,
+            vhost_user_net: res.vhost_user_socket.is_some(),
         };
 
         let mut ch_cfg = ChVmConfig {
@@ -314,9 +359,32 @@ impl Vmm for CloudHypervisor {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // VMM-5: self-check the capability descriptor instead of assuming CH
+        // semantics.
+        if !self.capabilities().snapshot_restore {
+            return Err(Error::Unsupported {
+                vmm: "cloud-hypervisor".to_string(),
+                feature: "snapshot_restore".to_string(),
+            });
+        }
+        // C1 / snapshot-eligibility law: a snapshot-eligible VM has no vhost-user
+        // device. Reject any virtio-fs share, rootless net, or external
+        // vhost-user-net *before* we would otherwise start virtiofsd below.
+        if has_vhost_user_device(
+            !cfg.shares.is_empty(),
+            matches!(cfg.net, crate::config::NetConfig::Rootless { .. }),
+            res.vhost_user_socket.is_some(),
+        ) {
+            return Err(Error::Unsupported {
+                vmm: "cloud-hypervisor".to_string(),
+                feature: "snapshot/restore with a vhost-user device".to_string(),
+            });
+        }
         let (tmp, api_socket, vsock_path, serial_path, process, pgid) =
             self.spawn_ch(res, Some(snapshot_dir), cgroups).await?;
 
+        // The guard above guarantees `cfg.shares` is empty here, so this never
+        // starts virtiofsd on a restored VM.
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
             let daemon = crate::fs::VirtioFsDaemon::start(share, &tmp).await?;
@@ -334,6 +402,7 @@ impl Vmm for CloudHypervisor {
             restored: true,
             cid,
             pgid,
+            vhost_user_net: res.vhost_user_socket.is_some(),
         };
 
         Ok(instance)
@@ -392,6 +461,15 @@ impl VmInstance for ChInstance {
     }
 
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
+        // C1 / snapshot-eligibility law: refuse to snapshot a VM that has a
+        // vhost-user device attached (virtiofsd or vhost-user-net) — it is not
+        // snapshot-eligible.
+        if has_vhost_user_device(!self._fs_daemons.is_empty(), false, self.vhost_user_net) {
+            return Err(Error::Unsupported {
+                vmm: "cloud-hypervisor".to_string(),
+                feature: "snapshot with a vhost-user device".to_string(),
+            });
+        }
         #[derive(Serialize)]
         struct SnapshotReq {
             destination_url: String,
@@ -479,5 +557,18 @@ mod tests {
         assert!(
             json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}")
         );
+    }
+
+    // Guards C1/VMM-1: any vhost-user device (virtio-fs share, rootless net, or
+    // vhost-user-net) makes a VM ineligible for snapshot/restore. The buggy impl
+    // (no guard) would attach virtiofsd to a restored VM and snapshot a vhost-user
+    // VM; this predicate backs both the `restore()` and `snapshot()` self-guards.
+    #[test]
+    fn vhost_user_device_guard() {
+        assert!(has_vhost_user_device(true, false, false)); // virtio-fs data share
+        assert!(has_vhost_user_device(false, true, false)); // rootless net
+        assert!(has_vhost_user_device(false, false, true)); // external vhost-user-net
+        // tap (privileged) net + erofs/block rootfs: snapshot-eligible.
+        assert!(!has_vhost_user_device(false, false, false));
     }
 }

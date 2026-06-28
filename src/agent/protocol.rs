@@ -6,6 +6,14 @@
 #![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
 
+/// Default per-exec timeout applied when an [`ExecRequest`] does not set one.
+///
+/// The host applies this as its own wait bound and propagates it into the
+/// request before sending, so the guest always installs a kill thread. Without
+/// this, a `None` timeout would let a runaway guest child outlive the host's
+/// abandoned wait and leak.
+pub const DEFAULT_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A message exchanged between the host and the guest agent.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

@@ -82,6 +82,10 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
     let proxy_port = vm.proxy().as_ref().unwrap().port;
     let vmid = vm.vmid();
+    // Gateway IP uses the centralized (vmid % 254) + 1 octet math, not the raw
+    // vmid (an off-by-one that reaches no host).
+    let (gateway_ip, _g, _c) = imp_testing::net::ip_math(vmid).expect("ip_math");
+    let gateway = gateway_ip.to_string();
 
     println!("Connecting agent...");
     let agent = vm
@@ -120,7 +124,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let outcome = agent
         .exec(
             ExecRequest::new(vec![
-                "/usr/bin/curl".into(),
+                "curl".into(),
                 "-4".into(),
                 "-k".into(), // Accept MITM certificate for transparent TLS interception
                 "-v".into(),
@@ -133,11 +137,11 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .with_env(vec![
                 (
                     "http_proxy".to_string(),
-                    format!("http://10.200.{}.1:{}", vmid, proxy_port),
+                    format!("http://{}:{}", gateway, proxy_port),
                 ),
                 (
                     "https_proxy".to_string(),
-                    format!("http://10.200.{}.1:{}", vmid, proxy_port),
+                    format!("http://{}:{}", gateway, proxy_port),
                 ),
             ]),
         )
@@ -160,7 +164,7 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let blocked_outcome = agent
         .exec(
             ExecRequest::new(vec![
-                "/usr/bin/curl".into(),
+                "curl".into(),
                 "-4".into(),
                 "-k".into(),
                 "-v".into(),
@@ -173,11 +177,11 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .with_env(vec![
                 (
                     "http_proxy".to_string(),
-                    format!("http://10.200.{}.1:{}", vmid, proxy_port),
+                    format!("http://{}:{}", gateway, proxy_port),
                 ),
                 (
                     "https_proxy".to_string(),
-                    format!("http://10.200.{}.1:{}", vmid, proxy_port),
+                    format!("http://{}:{}", gateway, proxy_port),
                 ),
             ]),
         )
@@ -193,30 +197,32 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         blocked_stdout
     );
 
-    // Test that a CONNECT request falls through to the default proxy behavior
-    let connect_outcome = agent
+    // Plain-HTTP host-service proxying (TESTS-FEATURES-6): an absolute-form GET to the local
+    // host service through the proxy. This is NOT a CONNECT — the genuine CONNECT tunnel is
+    // asserted separately, below, via the host-observable request log.
+    let plain_http_outcome = agent
         .exec(
             ExecRequest::new(vec![
-                "/usr/bin/curl".into(),
+                "curl".into(),
                 "-4".into(),
                 "-v".into(),
                 "--max-time".into(),
                 "5".into(),
-                format!("http://127.0.0.1:{}", host_port), // We use local server to test pass-through
+                format!("http://127.0.0.1:{}", host_port), // local server reached via the proxy
             ])
             .with_env(vec![(
                 "http_proxy".to_string(),
-                format!("http://10.200.{}.1:{}", vmid, proxy_port),
+                format!("http://{}:{}", gateway, proxy_port),
             )]),
         )
         .await
-        .expect("Failed to execute curl connect");
+        .expect("Failed to execute plain-HTTP proxied curl");
 
     assert_eq!(
-        connect_outcome.code,
+        plain_http_outcome.code,
         0,
-        "CONNECT pass-through failed: {}",
-        String::from_utf8_lossy(&connect_outcome.stderr)
+        "plain-HTTP host-service proxying failed: {}",
+        String::from_utf8_lossy(&plain_http_outcome.stderr)
     );
 
     // Drop agent so we can borrow vm immutably
@@ -231,5 +237,37 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         "Proxy should observe guest intended destination"
     );
 
+    // Real CONNECT assertion (TESTS-FEATURES-6): the guest's HTTPS request to example.com is
+    // tunneled through the proxy as an HTTP CONNECT, which the handler records and forwards
+    // (returns Request for Method::CONNECT) before MITM'ing it. A handler that stops letting
+    // CONNECT fall through would break the MITM above AND drop this CONNECT log entry.
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.starts_with("CONNECT") && r.contains("example.com")),
+        "Proxy should observe a CONNECT tunnel for the intended HTTPS destination, got: {:?}",
+        requests
+    );
+
     vm.shutdown().await.expect("Shutdown failed");
+}
+
+// ROOTLESS NAMING. A `rootless`-named test exercising the rootless egress path
+// (`NetConfig::Rootless` + the smoltcp NAT + the egress proxy). It needs KVM and CH's
+// unprivileged vhost-user-net, but NO host privilege, so `just test-rootless` (which selects
+// `test(rootless)`) can run it unprivileged. `#[ignore]`d out of the default suite, with a
+// visible capability skip-with-reason rather than a silent skip==pass.
+#[cfg(feature = "cloud-hypervisor")]
+#[tokio::test]
+#[ignore = "rootless egress: needs KVM + unprivileged vhost-user-net; selected by `just test-rootless`"]
+async fn test_egress_proxy_rootless() {
+    let vmm = imp_testing::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
+    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
+        println!(
+            "SKIP: cloud-hypervisor lacks unprivileged_vhost_user_net — cannot exercise the rootless egress path"
+        );
+        return;
+    }
+    // test_egress_proxy_impl configures NetConfig::Rootless + Egress::Filtered internally.
+    test_egress_proxy_impl(&vmm).await;
 }

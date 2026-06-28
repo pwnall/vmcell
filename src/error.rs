@@ -54,9 +54,11 @@ pub enum Error {
     #[error("Postcard error: {0}")]
     Postcard(#[from] postcard::Error),
     /// A Hyper error.
+    #[cfg(any(feature = "cloud-hypervisor", feature = "firecracker"))]
     #[error("Hyper error: {0}")]
     Hyper(#[from] hyper::Error),
     /// An HTTP error.
+    #[cfg(any(feature = "cloud-hypervisor", feature = "firecracker"))]
     #[error("HTTP error: {0}")]
     Http(#[from] hyper::http::Error),
     /// A QMP error.

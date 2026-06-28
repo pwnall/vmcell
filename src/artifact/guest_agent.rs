@@ -18,7 +18,10 @@ impl Stage for GuestAgentStage {
     }
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+        // Bump when this stage's build logic changes so a stale agent is not served.
+        const STAGE_VERSION: u32 = 1;
         let mut hasher = blake3::Hasher::new();
+        hasher.update(&STAGE_VERSION.to_le_bytes());
         hasher.update(
             inputs
                 .pins

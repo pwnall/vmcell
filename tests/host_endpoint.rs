@@ -1,47 +1,26 @@
 use imp_testing::TestVm;
 use imp_testing::agent::protocol::ExecRequest;
 use imp_testing::config::{RootfsSource, VmConfig};
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::PathBuf;
 use std::process::Command;
 
 mod common;
 
-#[tokio::test]
-#[ignore]
-async fn test_host_endpoint_ch() {
-    let vmm = CloudHypervisor::new(common::ch_bin());
+// TESTS-FEATURES-5. Uses the mandated `vmm_matrix_test!` / `require_cap!` harness and
+// `common::get_vmlinux()`/`get_rootfs()` (env-overridable, asserted-present) instead of the
+// per-backend hand-rolled tests and hardcoded `/tmp/imp-artifacts` paths.
+vmm_matrix_test!(host_endpoint, |vmm| {
+    require_cap!(
+        imp_testing::vmm::Vmm::capabilities(&vmm),
+        unprivileged_vhost_user_net,
+        vmm
+    );
     test_host_endpoint_impl(&vmm).await;
-}
-
-#[cfg(feature = "firecracker")]
-#[tokio::test]
-#[ignore]
-async fn test_host_endpoint_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
-        println!("Skipping: vhost-user-net not supported");
-        return;
-    }
-    test_host_endpoint_impl(&vmm).await;
-}
-
-#[cfg(feature = "qemu")]
-#[tokio::test]
-#[ignore]
-async fn test_host_endpoint_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
-        println!("Skipping: vhost-user-net not supported");
-        return;
-    }
-    test_host_endpoint_impl(&vmm).await;
-}
+});
 
 async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let _ = env_logger::builder().is_test(true).try_init();
-    let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
-    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
+    let vmlinux = common::get_vmlinux();
+    let rootfs = common::get_rootfs();
 
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .build()
@@ -67,7 +46,10 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     .await
     .expect("Failed to start VM");
 
-    let host_ip = format!("10.200.{}.1", vm.vmid());
+    // The guest gateway IP uses the centralized (vmid % 254) + 1 octet math, not
+    // the raw vmid — using the raw vmid is an off-by-one that reaches no host.
+    let (host_ip, _guest_ip, _cidr) = imp_testing::net::ip_math(vm.vmid()).expect("ip_math");
+    let host_ip = host_ip.to_string();
 
     let mut child = Command::new("python3")
         .args([

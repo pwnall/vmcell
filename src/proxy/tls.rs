@@ -4,12 +4,14 @@ use crate::error::{Error, Result};
 use hudsucker::certificate_authority::{CertificateAuthority, RcgenAuthority};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::crypto::aws_lc_rs;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Manages the MITM proxy's Certificate Authority (CA)
 pub struct CaManager {
     ca_cert_pem: String,
+    dir: PathBuf,
 }
 
 /// A cloneable wrapper for `RcgenAuthority` to be shared across proxy instances.
@@ -25,7 +27,30 @@ impl CertificateAuthority for SharedAuthority {
     }
 }
 
-static CA_CACHE: OnceLock<(String, Arc<RcgenAuthority>)> = OnceLock::new();
+/// Process-global cache of materialized CAs, keyed by the artifacts directory
+/// they were generated/loaded in.
+///
+/// Keying on the directory is load-bearing for correctness: a second `new()`
+/// invoked with a different `IMP_ARTIFACTS_DIR` must mint (or load) the CA for
+/// *that* directory rather than reuse one from an unrelated directory, so the
+/// CA baked into a rootfs matches the authority the proxy presents. Within a
+/// single directory the cache also lets concurrent proxy instances agree on one
+/// authority. The map only grows by one small entry per distinct directory and
+/// holds no borrowed state, so the process-global lifetime is sound.
+/// Materialized CA cache: artifacts dir -> (CA PEM, parsed authority).
+type CaCacheMap = HashMap<PathBuf, (String, Arc<RcgenAuthority>)>;
+
+static CA_CACHE: OnceLock<Mutex<CaCacheMap>> = OnceLock::new(); // allow-global-state: CA cache keyed by artifacts dir (see doc above); no borrowed state, sound
+
+fn ca_cache() -> &'static Mutex<CaCacheMap> {
+    CA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn artifacts_dir() -> PathBuf {
+    std::env::var("IMP_ARTIFACTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("/tmp/imp-artifacts-{}", std::process::id())))
+}
 
 impl CaManager {
     /// Initializes the CA Manager, loading or generating the root CA
@@ -33,17 +58,25 @@ impl CaManager {
     /// # Errors
     /// Returns an error if filesystem operations or key generation fail.
     pub fn new() -> Result<Self> {
-        if let Some((cert_pem, _)) = CA_CACHE.get() {
-            return Ok(Self {
-                ca_cert_pem: cert_pem.clone(),
-            });
+        Self::new_in(artifacts_dir())
+    }
+
+    /// Initializes the CA Manager for an explicit artifacts directory.
+    ///
+    /// # Errors
+    /// Returns an error if filesystem operations or key generation fail.
+    fn new_in(dir: PathBuf) -> Result<Self> {
+        // Fast path: a CA was already materialized for this directory.
+        {
+            let cache = ca_cache().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cert_pem, _)) = cache.get(&dir) {
+                return Ok(Self {
+                    ca_cert_pem: cert_pem.clone(),
+                    dir,
+                });
+            }
         }
 
-        let dir = std::env::var("IMP_ARTIFACTS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(format!("/tmp/imp-artifacts-{}", std::process::id()))
-            });
         std::fs::create_dir_all(&dir)?;
 
         let cert_path = dir.join("ca.pem");
@@ -98,10 +131,18 @@ impl CaManager {
 
         let auth = RcgenAuthority::new(key_pair, cert, 1_000, aws_lc_rs::default_provider());
 
-        // Initialize the cache if multiple threads race, just use the generated one
-        let _ = CA_CACHE.set((ca_cert_pem.clone(), Arc::new(auth)));
+        // Publish under this directory's key. If another thread raced us, keep
+        // the entry it inserted so every instance for this directory agrees on
+        // one authority.
+        let ca_cert_pem = {
+            let mut cache = ca_cache().lock().unwrap_or_else(|e| e.into_inner());
+            let entry = cache
+                .entry(dir.clone())
+                .or_insert_with(|| (ca_cert_pem.clone(), Arc::new(auth)));
+            entry.0.clone()
+        };
 
-        Ok(Self { ca_cert_pem })
+        Ok(Self { ca_cert_pem, dir })
     }
 
     /// Returns the CA certificate in PEM format for baking into the rootfs
@@ -114,9 +155,46 @@ impl CaManager {
     /// # Errors
     /// Returns an error if CA not initialized.
     pub fn authority(&self) -> Result<SharedAuthority> {
-        if let Some((_, auth)) = CA_CACHE.get() {
+        let cache = ca_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, auth)) = cache.get(&self.dir) {
             return Ok(SharedAuthority(Arc::clone(auth)));
         }
         Err(Error::Proxy("CA not initialized".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Buggy impl guarded (PROXY-6): a process-global cache that is not keyed on
+    // the artifacts dir makes a second `new()` with a *different* dir reuse the
+    // first CA — the two certs would be equal and `assert_ne!` would go red.
+    #[test]
+    fn ca_cache_is_keyed_on_artifacts_dir() {
+        let dir1 = tempfile::tempdir().expect("tempdir1");
+        let dir2 = tempfile::tempdir().expect("tempdir2");
+
+        let ca1 = CaManager::new_in(dir1.path().to_path_buf()).expect("ca1");
+        let ca2 = CaManager::new_in(dir2.path().to_path_buf()).expect("ca2");
+
+        // Distinct directories must yield distinct CAs (no cross-dir reuse).
+        assert_ne!(
+            ca1.ca_cert_pem(),
+            ca2.ca_cert_pem(),
+            "a different artifacts dir must not reuse the first CA"
+        );
+
+        // The same directory must reuse its cached CA.
+        let ca1_again = CaManager::new_in(dir1.path().to_path_buf()).expect("ca1 again");
+        assert_eq!(
+            ca1.ca_cert_pem(),
+            ca1_again.ca_cert_pem(),
+            "the same artifacts dir must reuse its cached CA"
+        );
+
+        // The authority is resolvable per directory.
+        assert!(ca1.authority().is_ok());
+        assert!(ca2.authority().is_ok());
     }
 }

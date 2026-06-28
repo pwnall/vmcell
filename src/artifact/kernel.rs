@@ -56,7 +56,10 @@ impl Stage for KernelStage {
     }
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+        // Bump when this stage's build logic changes so stale kernels are not served.
+        const STAGE_VERSION: u32 = 1;
         let mut hasher = blake3::Hasher::new();
+        hasher.update(&STAGE_VERSION.to_le_bytes());
         hasher.update(
             inputs
                 .pins
@@ -212,8 +215,18 @@ impl Stage for KernelStage {
 
         tokio::fs::copy(workdir.join("vmlinux"), out).await?;
 
-        Ok(StageOutputs::default())
+        Ok(kernel_outputs(out))
     }
+}
+
+/// Builds the [`StageOutputs`] for a kernel build, registering the `kernel` artifact so
+/// downstream stages (snapshot, mmdebstrap builder) always see it on a cold build — not only
+/// on a warm-cache hit. Omitting this on the cold path lets the snapshot stage fall through
+/// to a `/tmp/vmlinux` fallback.
+fn kernel_outputs(out: &Path) -> StageOutputs {
+    let mut outputs = StageOutputs::default();
+    outputs.artifacts.insert("kernel".into(), out.to_path_buf());
+    outputs
 }
 
 #[cfg(test)]
@@ -251,5 +264,19 @@ mod tests {
         assert_ne!(stage.cache_key(&inputs1), stage.cache_key(&inputs2));
         assert_ne!(stage.cache_key(&inputs1), stage.cache_key(&inputs3));
         assert_eq!(stage.cache_key(&inputs1), stage.cache_key(&inputs1));
+    }
+
+    // Guards ARTIFACT-PIPELINE-6: the cold build path must register the `kernel` artifact in
+    // its outputs (like the warm-cache path does), or downstream stages lose it and fall
+    // through to `/tmp/vmlinux`. A buggy `Ok(StageOutputs::default())` goes red here.
+    #[test]
+    fn test_kernel_outputs_registers_kernel_artifact() {
+        let out = Path::new("/some/target/vmlinux");
+        let outputs = kernel_outputs(out);
+        assert_eq!(
+            outputs.artifacts.get("kernel").map(|p| p.as_path()),
+            Some(out),
+            "cold-build outputs must register the kernel artifact"
+        );
     }
 }
