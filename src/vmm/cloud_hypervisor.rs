@@ -80,6 +80,7 @@ struct ChCpus {
 struct ChMemory {
     size: u64,
     shared: bool,
+    mergeable: bool,
 }
 
 #[derive(Serialize)]
@@ -145,6 +146,7 @@ impl CloudHypervisor {
         &self,
         res: &PerVmResources,
         snapshot_dir: Option<&Path>,
+        restore_mode: crate::config::RestoreMode,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<(
         std::path::PathBuf,
@@ -186,8 +188,17 @@ impl CloudHypervisor {
             }
             tokio::fs::write(&config_path, serde_json::to_string(&config)?).await?;
 
-            cmd.arg("--restore")
-                .arg(format!("source_url=file://{}", dir.display()));
+            // §13.3 eager-vs-lazy restore: CH v52's `--restore` accepts a
+            // `prefault=on|off` modifier on the `source_url`. `on` eagerly faults
+            // all guest memory in at restore time; `off` selects lazy/userfaultfd
+            // demand-paging. `Default` omits the modifier and uses CH's own default.
+            let mut restore_arg = format!("source_url=file://{}", dir.display());
+            match restore_mode {
+                crate::config::RestoreMode::Eager => restore_arg.push_str(",prefault=on"),
+                crate::config::RestoreMode::Lazy => restore_arg.push_str(",prefault=off"),
+                crate::config::RestoreMode::Default => {}
+            }
+            cmd.arg("--restore").arg(restore_arg);
         }
 
         let mut process = cmd
@@ -228,8 +239,9 @@ impl Vmm for CloudHypervisor {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
-        let (tmp, api_socket, vsock_path, serial_path, process, pgid) =
-            self.spawn_ch(res, None, cgroups).await?;
+        let (tmp, api_socket, vsock_path, serial_path, process, pgid) = self
+            .spawn_ch(res, None, crate::config::RestoreMode::Default, cgroups)
+            .await?;
 
         let mut fs_daemons = Vec::new();
         let mut ch_fs = Vec::new();
@@ -266,7 +278,12 @@ impl Vmm for CloudHypervisor {
             },
             memory: ChMemory {
                 size: (cfg.mem_mib as u64) << 20,
-                shared: true,
+                // KSM only deduplicates private-anonymous guest memory, so the
+                // `mergeable` (KSM) lever requires `shared=off`. Default keeps
+                // shared memory (the vhost-user paths need it); only the opt-in
+                // §13.5 KSM-density benchmark flips both.
+                shared: !cfg.ksm_mergeable,
+                mergeable: cfg.ksm_mergeable,
             },
             payload: ChPayload {
                 kernel: cfg.kernel.clone(),
@@ -380,8 +397,9 @@ impl Vmm for CloudHypervisor {
                 feature: "snapshot/restore with a vhost-user device".to_string(),
             });
         }
-        let (tmp, api_socket, vsock_path, serial_path, process, pgid) =
-            self.spawn_ch(res, Some(snapshot_dir), cgroups).await?;
+        let (tmp, api_socket, vsock_path, serial_path, process, pgid) = self
+            .spawn_ch(res, Some(snapshot_dir), cfg.restore_mode, cgroups)
+            .await?;
 
         // The guard above guarantees `cfg.shares` is empty here, so this never
         // starts virtiofsd on a restored VM.
@@ -411,7 +429,9 @@ impl Vmm for CloudHypervisor {
     fn capabilities(&self) -> VmmCapabilities {
         VmmCapabilities {
             snapshot_restore: true,
-            lazy_restore: true, // CH supports memory_restore_mode
+            // Eager-vs-lazy restore is plumbed via `VmConfig::restore_mode`
+            // (CH `--restore source_url=…,prefault=on|off`).
+            lazy_restore: true,
             virtio_fs_shares: true,
             unprivileged_vhost_user_net: true,
             nested_virt: true,
@@ -534,6 +554,7 @@ mod tests {
             memory: ChMemory {
                 size: 1024,
                 shared: true,
+                mergeable: false,
             },
             payload: ChPayload {
                 kernel: PathBuf::from("/vmlinux"),

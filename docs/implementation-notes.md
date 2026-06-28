@@ -517,3 +517,405 @@ On this KVM host (blessed release `imp-test-runner`, suites under
 Note: `tar2erofs::tar_to_erofs` gained a third parameter (`injected_symlinks`) — an intentional
 breaking change to an internal artifact-build utility (crate is `publish = false`); `cargo
 semver-checks` will flag it. `net::cleanup_orphan_netns` is a new, additive public function.
+
+## Benchmark results — resolving the §13 / §15 open questions (2026-06-28)
+
+This pass ran the §13 benchmark plan to settle the open performance questions the design left
+"defined but not yet run" (§13.1 line "footprint and on-disk-size … defined but not yet run"; §15).
+Numbers are tagged with the substrate below; per the design they are **tracked metrics, not gates**
+(§13.7), so a blocked measurement is recorded as a finding, never forced.
+
+### Substrate (record with every number)
+
+- **Host:** Intel Core Ultra 7 258V (Lunar Lake), 8 cores / 8 threads, VT-x; **CPU max 4.7 GHz**.
+  30 GiB RAM (~13 GiB free at test time). Root FS `ext4` on NVMe SSD; **`/tmp` is `tmpfs`
+  (RAM-backed)** — snapshots/artifacts there consume RAM, so density/suspend runs target ext4.
+- **Pinned tools:** Cloud Hypervisor **v52.0.0**, Firecracker **v1.16.0**, QEMU **10.2.1**,
+  virtiofsd **1.13.3**, mmdebstrap **1.5.7**; guest kernel **Linux 6.6.9** (custom microvm config);
+  rootfs base pinned by digest `debian@sha256:a617c1…` (resolves to **trixie / Debian 13**).
+- **Kernel mm settings:** THP = `madvise`; **KSM = ON** (`/sys/kernel/mm/ksm/run = 1`).
+- Suites run under `systemd-run --user --scope -p Delegate=yes` (clean cgroup *domain* scope) with
+  the blessed `imp-test-runner` (`cap_net_admin,cap_sys_admin,cap_dac_override`).
+
+### Noise-floor caveats (design §13.2 "control the noise floor")
+
+- **CPU frequency scaling is NOT pinned by default on this host** — and it matters. The
+  `intel_pstate` driver defaults to the `powersave` governor and was observed at **1.42 GHz while
+  the ceiling is 4.7 GHz**, with turbo enabled (`intel_pstate/no_turbo = 0`). An unpinned core
+  therefore varies its clock by **>3×** across a run, which adds latency variance that can swamp the
+  signal in the boot/restore/RTT numbers. **Any latency number recorded without frequency pinning
+  carries this scaling noise** and should be read as central-tendency only, not for tail/SLA quoting
+  (this compounds the §13.1 "thin tails at N≈10" caveat). Turbo, when enabled, additionally makes
+  results thermal- and neighbour-dependent.
+  - **Mitigation now implemented:** `src/cpufreq.rs` (`imp_testing::cpufreq`) provides a small,
+    unit-tested, injectable-seam helper used by the benchmarks: `CpuFreqPin::engage(SysfsCpuFreq)`
+    reads the current per-CPU `scaling_governor` (+ the `intel_pstate/no_turbo` or `cpufreq/boost`
+    turbo knob), pins every online CPU to `performance` and disables turbo for the benchmark's
+    duration, and **restores the exact prior settings on `Drop` — including on panic** (RAII; it
+    records and restores only what it actually changed, so an already-`performance` CPU or a
+    permission-denied write is never spuriously "restored"). Sysfs access is behind the
+    `CpuFreqSysfs` trait with a real `SysfsCpuFreq` impl and a recording fake, so the
+    pin/restore policy is unit-tested with no `/sys` writes (each test fails on the inverse bug:
+    forgetting a CPU, restoring a constant, leaving turbo off, restoring a CPU it never changed).
+  - **Capabilities:** the governor/turbo sysfs files are `root:root 0644`, so writing them needs
+    **`CAP_DAC_OVERRIDE` — which the test runner already grants**; **no test-runner change was
+    required**. Run benchmarks through `imp-test-runner` to pin. Without those rights (plain
+    `cargo bench`) the helper degrades to a logged warning and a no-op guard, never a hard failure
+    (benchmarks are tracked, not gated).
+- **KSM is on globally**, so all guest-RAM-footprint numbers below are **post-KSM** (can't disable
+  KSM without root on this shared host); the design's "pre-KSM" column is not separable here.
+- **Concurrency capped to avoid OOMing a shared dev box** — density figures report the *marginal
+  anonymous RSS per guest* and an *extrapolated* ceiling rather than ramping to a real OOM.
+
+### §13.6 Rootfs image size — OCI base vs mmdebstrap (the hypothesis is **inverted**)
+
+Measured the packed **erofs** image (the artifact that actually boots) from each base. The real
+pipeline's packer (`am-fs-erofs` via `tar2erofs.rs`) emits **only uncompressed** erofs (it never
+constructs a compressed node), so the **uncompressed column is the load-bearing shipped size**; the
+lz4/zstd columns are `mkfs.erofs`-only references.
+
+| Base | merged tar | erofs **uncompressed** (shipped) | erofs lz4 | erofs zstd |
+|---|---|---|---|---|
+| **OCI** `debian@a617…` (trixie) | 81.0 MB | **79.2 MB** | 50.2 MB | 44.7 MB |
+| **mmdebstrap `--variant=minbase`** (bookworm) | 170.4 MB | **165.0 MB** | 101.6 MB | 89.6 MB |
+| mmdebstrap minbase (trixie, apples-to-apples) | 123.5 MB | **120.2 MB** | — | — |
+
+Shipped `/tmp/imp-artifacts/rootfs.erofs` = 88.9 MB ≈ OCI-base 79.2 MB + ~9.7 MB injected
+guest-agent/tools — confirming the pipeline packs uncompressed.
+
+**Finding:** the §13.6 hypothesis ("mmdebstrap-minbase is the smaller image") is **wrong** on this
+substrate. The **OCI slim base is ~52% smaller** than minbase-bookworm (79 MB vs 165 MB), and still
+~34% smaller apples-to-apples within trixie (79 MB vs 120 MB). The cause is **not** apt/perl-base
+(both ship them) — the official Debian image carries `dpkg path-exclude` rules that strip
+`/usr/share/locale` (~32 MB), `/usr/share/doc`, and man pages, which a plain `mmdebstrap minbase`
+retains. So the builder-VM/mmdebstrap source earns its keep on **provenance** (the full apt signing
+chain, §8.2), **not** on size, unless it adds those excludes. Separately, switching the packer to a
+**compressed** erofs would roughly halve on-disk size (OCI 79→45 MB zstd) but trades host page-cache
+duplication + per-read decompress CPU in the guest — a runtime cost, not a free win, so uncompressed
+is defensible for a short-lived microVM rootfs. **Bug flagged:** the pin resolves to **trixie** but
+the mmdebstrap stage cache key says **`bookworm`** — pick one suite for both sources before trusting
+any cross-base delta.
+
+### §13.5 Build-time (offline, paid once per pin)
+
+- mmdebstrap `--variant=minbase` build: **17.7 s** bookworm / **12.9 s** trixie (host-side proxy).
+- OCI "assemble" (warm, decompress cached layer → merged tar): **0.44 s**. Cold registry pull not
+  measurable here — `skopeo`/`docker` are absent (see README §7); the project's in-crate `oci-client`
+  uses its own digest-pinned blob cache.
+- erofs pack wall-clock (`mkfs.erofs --tar`): OCI 0.14 s uncompressed / 0.46 s zstd; minbase 0.35 s /
+  0.68 s. (The in-crate `am-fs-erofs` pack is in the same low-hundreds-of-ms class.)
+
+### §13.3 Guest-agent toolchain: musl vs glibc (on-disk + linkage axes)
+
+| Variant | build | stripped bytes | linkage | shared-lib deps | rootfs-independent? |
+|---|---|---|---|---|---|
+| **glibc-dynamic (default)** | OK | **1,479,512** | dynamic PIE | libc6 + libgcc_s | No (needs libc6 in rootfs) |
+| **musl-static** | OK (no `musl-gcc` needed) | **1,571,424** | static-pie | none | Yes (self-contained) |
+
+**Finding:** static-musl is **~90 KiB (~6.2%) LARGER**, not smaller — it statically links libc/libgcc
+instead of borrowing the rootfs's shared `libc.so.6`. The all-Rust agent links musl *without*
+`musl-gcc` (no `cc`/`*-sys` deps), so the build succeeded here, but the moment a C/`*-sys` dependency
+enters the agent the musl path needs `musl-gcc`, which this host lacks and cannot install
+(sudo needs a password). This **confirms the design's hypothesis**: the real deciding axis is
+**toolchain-availability + rootfs-independence, not speed/size**. Since the project's rootfs is always
+Debian (always ships libc6), rootfs-independence buys nothing today → **keep glibc-dynamic as the
+default**; musl-static is justified only if a no-libc6 (distroless/from-scratch) rootfs becomes a
+requirement. (The fork→`Ready` startup and in-guest agent RSS axes are folded into the VM-phase
+cold-boot and footprint numbers below.)
+
+### Answered-by-construction / blocked (recorded, not forced)
+
+- **`lazy_restore` is advertised but NOT plumbed (latent capability bug).** *(NOTE: fixed later this
+  same session — see "CH eager-vs-lazy restore" below; this paragraph records the state at the time
+  of the first benchmark pass.)* `VmmCapabilities` reports `lazy_restore: true` for Cloud Hypervisor,
+  but the CH restore path had **no** `memory_restore_mode` / prefault plumbing — `--restore` ran CH's
+  built-in default mode. So the §13.3 "userfaultfd lazy restore" (eager-vs-lazy) benchmark could not
+  be run as-is, and the advertised capability was a dead flag (the kind AGENTS.md bans: "no dead
+  protocol variants advertised as live"); this also matched §14 #3. It was then plumbed via
+  `VmConfig::restore_mode` → `--restore …,prefault=on|off`, and the eager-vs-lazy numbers measured
+  (below). The warm-restore numbers in *this* section are the **default-mode** restore.
+- **Snapshot ↔ virtio-fs-data composition is rejected at config validation (the §3.3 law, enforced
+  in code).** `config::build()` rejects `snapshotting` combined with a virtio-fs *rootfs* or a data
+  `Share` (verified in `src/config.rs`). So the §13.3/§14 #2/§15 "does it compose" question is
+  answered **by construction**: the system never attaches a vhost-user device to a snapshot-eligible
+  VM, and the empirical CH-refusal is unreachable through the public API. The chosen fallback —
+  serve read-only data as an additional erofs/block image — is the design's standing decision; its
+  density cost is the extra image's page cache, not guest anonymous RAM (§13.6 demand-paged note).
+
+### VM-level benchmarks (new `bench-vm` modes; CH/FC/QEMU, KVM)
+
+`bench-vm` gained five measurement modes (`--mode latency|footprint|suspend-size|phase-budget|
+vsock-rtt`, plus `--count`/`--mem-mib`/`--snap-dir`); `latency` is byte-for-byte the old cold/warm
+path so the `tests/benchmark.rs` dry test stays green. All runs serial, under
+`systemd-run --user --scope` + the blessed runner, mem=256 MiB unless noted.
+
+**True cold boot is NOT achievable on this host** (so all "cold" numbers are WARM-CACHE, honestly
+labelled). Two independent, *verified* causes — and the earlier guess (an `O_TRUNC` bug) was wrong:
+(1) `/proc/sys/vm/drop_caches` is a **procfs sysctl whose write check special-cases `euid==0`** and
+does **not** honour `CAP_DAC_OVERRIDE`/`CAP_SYS_ADMIN` — confirmed in-child (`CapEff` had all three
+caps effective, `Uid=1000`, yet `open()`→`EACCES`); and (2) the artifacts live on **tmpfs**, whose
+pages are not reclaimable file cache and are immune to `drop_caches` even as root. The harness fix
+(open `O_WRONLY`, no truncate) is kept — it is correct and *would* yield true cold as real root with
+artifacts on a real disk — but on this box cold == warm-cache. (Contrast `cpufreq`: those are
+**sysfs/kernfs** files, which *do* honour `CAP_DAC_OVERRIDE`, so frequency pinning works through the
+runner — verified below.)
+
+**§13.1 Cold boot + warm restore** (N=20, warmup=3; cold = warm-cache):
+
+| Backend | Cold p50/p95/p99/max (ms) | Warm restore p50/p95/p99/max (ms) |
+|---|---|---|
+| **Cloud Hypervisor** | 571 / 599 / 599 / 599 | **107 / 122 / 122 / 122** |
+| **Firecracker** | 942 / 1000 / 1000 / 1000 | **FAILED — vsock host-UDS `EADDRINUSE` on restore** |
+| **QEMU** (`q35`) | 1510 / 1849 / 1849 / 1849 (n=19) | N/A (`snapshot_restore=false`) |
+
+Warm restore is **~5.3× faster than cold** on CH (107 vs 571 ms) — the per-test lever holds. These
+absolute numbers are **higher than the design's §13.1 figures** (CH 324/47 ms) because (a) cold is
+warm-cache not true-cold, and (b) the host is a *shared, loaded* dev box at unpinned frequency; the
+relative warm-vs-cold invariant (the load-bearing claim) is what reproduced, not the absolute ms.
+**New bug (→ Task 3):** Firecracker warm restore fails with `EADDRINUSE` re-binding the host-side
+vsock Unix socket on restore — an FC-backend/harness gap that blocks FC restore benchmarking.
+
+**§13.3 Guest-RAM footprint / density** (CH, N=8 concurrent). **Methodology correction:** CH backs
+guest RAM with a **memfd `MAP_SHARED`**, so it lands in the VMM process's **`RssShmem`, not
+`RssAnon`** (the original spec assumed RssAnon — wrong for CH).
+
+| Metric | Value |
+|---|---|
+| guest RAM (host `RssShmem`) total / per-guest | **455 MiB / ≈57 MiB** ← the density figure |
+| marginal `RssShmem` per added guest (steps 1..8) | **≈57 MiB, dead-linear** (56→113→…→455) |
+| VMM overhead (`RssAnon`) per guest | ≈1 MiB |
+| shared CH binary/libs (`RssFile`) per guest | ≈6 MiB (≈flat — shared across guests) |
+| KSM `pages_sharing` delta over the run | **0** (CH guest memory isn't `MADV_MERGEABLE` → global KSM inert) |
+| guest `MemTotal` / `MemAvailable` | 216 / 197 MiB |
+| guest PID 1 (the agent) RSS | **≈2.3 MiB** (the musl-vs-glibc axis-c figure: tiny) |
+
+Each guest touches **≈57 MiB of its 256 MiB** (demand-paged), so the RAM-tier ceiling is
+≈13 GiB / 57 MiB ≈ **~230 idle guests** (≈**52** if each faults in its full 256 MiB under load). KSM
+buys nothing here unless CH marks guest memory mergeable; the agent's own footprint is negligible.
+
+**§13.6 Suspend-state size** (CH + FC, snap dir on ext4):
+
+| Backend | mem | total | memory file | mem-file share |
+|---|---|---|---|---|
+| CH | 256 MiB | 268,486,881 B | `memory-ranges` 268,435,456 B | 100.0% |
+| CH | 512 MiB | 536,922,331 B | `memory-ranges` 536,870,912 B | 100.0% |
+| FC | 256 MiB | 268,449,343 B | `mem_file` 268,435,456 B | 100.0% |
+| FC | 512 MiB | 536,884,801 B | `mem_file` 536,870,912 B | 100.0% |
+
+Snapshot size **tracks guest RAM exactly** (256→256, 512→512 MiB; memory file = 100% of the artifact,
++~50 KiB CH / ~14 KiB FC of device/vmstate) and is **flat in rootfs size** (the 85 MiB erofs
+contributes nothing) — settling both §13.6 (absolute) and §13.7 (independence) at once. The memory
+files are **dense** (full `mem_mib`, no holes), so a sparse-snapshot pass (§14 `SEEK_DATA`/`SEEK_HOLE`)
+is the lever that would shrink an N-snapshot warm pool from ≈N×mem to its touched-pages footprint.
+
+**§13.4 Per-test critical-path budget** (CH; the design's "highest-value remaining instrumentation"):
+
+| Phase | COLD p50 / share | RESTORE p50 / share |
+|---|---|---|
+| create (`start` \| `restore`+`resume`) | 35.4 ms / 10.8% | 36.6 ms / **53.9%** |
+| connect (vsock + handshake [+ resync]) | **270.8 ms / 78.6%** | 7.2 ms / 11.6% |
+| exec (`/bin/true` round-trip) | 6.3 ms / 1.8% | 0.7 ms / 1.0% |
+| teardown (reap-VMM-first) | 31.2 ms / 8.7% | 24.2 ms / **33.6%** |
+| TOTAL (Σ phase means) | ≈342 ms | ≈68 ms |
+
+**COLD is ~79% guest-userspace-boot wait** (the `connect` phase), not VMM spawn (~11%) — so the
+restore tier exists precisely to delete that phase. **RESTORE is restore+resume (54%) + teardown
+(34%)**, while the mandatory reconnect + RNG/clock resync is only ~12% and exec ~1%. Teardown is a
+real **~24 ms / one-third of the warm budget** — confirming §13.4's "teardown is on the budget on
+purpose" (the reap-VMM-first no-leak ordering has a measured cost, not a free one).
+
+**§13.5 Datapath — vsock exec round-trip** (CH, 200 iters of `/bin/true`, incl. in-guest
+fork/exec/reap): **p50 374 µs, p95 505 µs, p99 679 µs, max 698 µs** — a **sub-millisecond**
+control-plane floor, so `exec` responsiveness is not a bottleneck.
+
+### CPU-frequency pinning — validated, and a turbo-headroom methodology finding
+
+The `cpufreq` helper was validated end-to-end through the runner: `engage()` printed
+`pinned 8 CPU(s) to performance + turbo off`, and after exit the governor/`no_turbo` were back to
+`powersave`/`0` — confirming both the **`CAP_DAC_OVERRIDE` sysfs write works** (no runner change
+needed) and the **RAII restore-on-drop**. Re-running the frequency-sensitive CH benchmarks pinned
+tightened *within-run* tails (cold p50 528 / p95 564 ms vs unpinned 571 / 599) but raised others
+(vsock-rtt p50 374→**697 µs**; phase-budget cold ≈342→≈570 ms). That is **not** noise: this CPU's
+**base frequency is 2.2 GHz vs a 4.7 GHz turbo ceiling (2.1×)**, and `performance`+`no_turbo` pins to
+the *sustained base* clock, whereas an unpinned single-VM burst (`powersave`+turbo) opportunistically
+boosts toward 4.7 GHz. So:
+
+- **Pinned (base, reproducible)** numbers are the honest *sustained* figures and, crucially, the ones
+  **representative of the system's intended dense/parallel operation** — when many VMs keep all cores
+  busy, turbo cannot engage, so the effective clock is the base clock. For a density-oriented test
+  harness these are arguably the headline numbers.
+- **Unpinned (turbo, single-VM)** numbers are best-case bursts and vary run-to-run with
+  thermals/neighbours/load — exactly the variance the pin removes.
+
+Decision: the helper keeps **`performance` governor + turbo-off** (this is what "fix CPU frequency",
+§13.2, means — a *constant* clock), and both harnesses engage it. Cross-run host-load variance still
+remains on this shared box (loadavg/used-RAM move between runs), which is the standing reason these
+are **tracked metrics, not SLAs** (§13.7). A leaked `cloud-hypervisor` from an earlier session
+(~57 MiB) was observed still running — the missing orphan-sweeper (rubric B1) again; left in place
+(force-killing shared-host processes is unsafe).
+
+## Version survey + dependency update (2026-06-28)
+
+A currency survey of every pinned/external component, and the updates applied.
+
+| Component | Was | Now / latest | Action |
+|---|---|---|---|
+| **Rust toolchain** | 1.92.0 | **1.96.0** (latest stable) | `rustup update` → built/tested/clippy on 1.96; MSRV kept at `1.85` (no need to raise — lowers the user floor). |
+| **Crate deps** | — | — | `cargo update` moved 14 (anyhow, bstr, chacha20, env_logger/`env_filter`→2.0, uuid, wasm-bindgen/web-sys/js-sys, hybrid-array) — all Rust-1.85-compatible patch/minor. |
+| **Guest kernel** | **6.6.9** | **6.12.94** (Trixie 6.12 LTS) | **pin bumped** in `pins.json` (`source_url`+`source_sha256` `a6cd115d…9ef8`). Distro-aligned (requirement §6) **and** carries the gcc-15/C23 `-std=gnu11` EFI-stub fix → also resolves the from-scratch build break. Rebuild + boot-validation is the Task-3 step. |
+| **Cloud Hypervisor** | v52.0.0 | v52.0.0 | already latest (incl. CVE-2026-45782 virtio-block fix); no change. |
+| **Firecracker** | v1.16.0 | v1.16.0 | already latest; no change. |
+| **virtiofsd / mmdebstrap / QEMU** | 1.13.3 / 1.5.7 / 10.2.1 | latest / latest / (distro) | no change (QEMU upstream 11.0.2 is informational — host package). |
+| **Debian base** | `debian@sha256:a617c1…` (trixie) | trixie = stable Debian 13 | tag `debian:trixie-slim` is correct; digest re-pin deferred (low value). |
+
+**1.96 migration touched one thing:** clippy 1.96's new `manual_checked_ops` lint flagged a manual
+`if n == 0 { 0 } else { sum / n }` in `bench-vm`'s `report_phase`; rewritten as
+`sum.checked_div(n).unwrap_or(0)`. `cargo fmt`, `clippy --all-targets --all-features -D warnings`,
+`cargo deny check` (advisories/bans/licenses/sources **ok**), and the **95/95** unit suite are all
+green on 1.96 + the updated lock. No `rust-toolchain.toml` was added (the repo intentionally floats
+the toolchain at MSRV `1.85`); pinning it is a separate decision left to the maintainer. **Note:**
+`cargo update` made 4 `deny.toml` advisory-ignores stale (`advisory-not-detected` *warnings*, not
+errors — e.g. RUSTSEC-2020-0036/`failure` whose crate the update dropped); they are kept (rationalized
++ harmless) to still guard against re-introduction under other feature combos, rather than removed.
+
+## Bug + feature-gap fixes for benchmarking (2026-06-28)
+
+### CH eager-vs-lazy restore — closes the §13.3 userfaultfd open question (supersedes the earlier "lazy_restore not plumbed" note)
+
+The earlier note recorded `lazy_restore: true` as **advertised but unplumbed** — that is now **fixed**.
+A `RestoreMode` (`Default`/`Eager`/`Lazy`, `#[non_exhaustive]`) is threaded through `VmConfig` and
+`spawn_ch`, mapping to Cloud Hypervisor v52's `--restore source_url=…,prefault=on|off` (`Default`
+omits the modifier → CH default). `bench-vm` gained `--restore-mode default|eager|lazy`. CH accepts
+the arg (20/20 successful restores each), so the long-dead capability is now real, and the §13.3
+**eager-vs-lazy** question is answered (CH, freq-pinned warm restore → agent response):
+
+| restore-mode | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| `eager` (`prefault=on`) | 160 ms | 182 ms | 182 ms | 182 ms |
+| `lazy` (`prefault=off`, userfaultfd) | **77 ms** | 113 ms | 113 ms | 113 ms |
+
+**Lazy resumes ~2× faster** because it defers guest-page fault-in to first touch (userfaultfd),
+whereas eager faults all guest RAM up front at resume. The guard against the §13.3 misreading holds:
+this resume-latency table **understates lazy's true cost**, which reappears as in-guest first-touch
+page faults *during execution* — so "lazy wins" only for time-to-resume, not necessarily for
+time-to-first-useful-work. A config builder unit test covers the new field (fails on the inverse).
+
+### Firecracker warm-restore `EADDRINUSE` — fixed (unblocks the FC restore benchmark)
+
+C's run found FC warm restore failing; root cause confirmed empirically: FC's `PUT /snapshot/load`
+**rebinds the host vsock UDS verbatim from the snapshot** (the path baked in at snapshot time,
+`/tmp/imp-vm-<pid>-<baseline_vmid>/vsock.sock`) with no load-time override — so a restore under a
+fresh vmid dir both collided with the stale baseline socket (`VsockUnixBackend … Address in use (os
+error 98)`) and pointed the agent at the wrong path. Fix (`src/vmm/firecracker.rs`): `snapshot()`
+persists the host vsock/serial paths in an `imp_host_paths.json` sidecar; `restore()` reads it
+(failing loud on a missing/corrupt sidecar **without leaking the VMM**), unlinks the stale socket so
+the bind succeeds, and adopts the snapshot's paths so the agent dials the exact UDS FC recreates.
+**FC warm restore: FAILED → p50 51 ms / p95 59 ms.** (Sequential restores from one snapshot work;
+concurrent clones would need a CoW of the snapshot dir — the same caveat CH carries.)
+
+**Cross-backend warm restore now lands as the design predicted** — FC (51 ms) < CH-lazy (77 ms) <
+CH-eager (160 ms): Firecracker *wins* restore, earning the density/snapshot tier even though it loses
+cold boot (FC ≈916 ms vs CH ≈540 ms).
+
+### trixie/bookworm suite mismatch — investigated, **no code bug**
+
+There is no hardcoded `bookworm` default: `RootfsBuildSource::Mmdebstrap { release: String }` takes the
+release from the caller, and `"bookworm"` appeared only in the **stale on-disk** `rootfs.cache_key`
+(an old build's key), which the content-addressed cache invalidates on the next build. The OCI pin
+(`debian` → trixie) is the live source. No edit needed; flagged so a future mmdebstrap-source caller
+passes `trixie` to match the pin.
+
+### gcc-15/C23 kernel build break — fixed at the pin (validation below)
+
+`pins.json` is bumped to **Linux 6.12.94**, which carries the `-std=gnu11` EFI-stub fix, so a
+from-scratch build no longer hits the C23 `false`/`bool`-keyword error. (Boot is PVH, so the EFI stub
+is unused regardless.) **Validated end-to-end on this gcc-15.2.0 host:** `imp-testing build` rebuilt
+the kernel from source — `vmlinux` reports `Linux version 6.12.94 … gcc 15.2.0` — *and* the new
+kernel **boots**: against the freshly-built `target/imp-artifacts` (6.12.94 + matching rootfs), CH
+cold boot + agent handshake and snapshot/restore both succeed (cold ≈634 ms warm-cache, warm restore
+≈169 ms; slightly above 6.6.9, plausibly the larger 6.12 init — tracked, not gated). So the
+from-scratch build that the 6.6.9-on-gcc-15 break blocked now works, on the distribution-aligned (§6)
+6.12 LTS line. The build wrote to `target/imp-artifacts`, leaving the benchmark `/tmp/imp-artifacts`
+intact.
+
+### Bonus bug found + fixed while validating the kernel: stale kernel-tarball cache
+
+Bumping the pin surfaced a real **caching bug** in `KernelStage` (`src/artifact/kernel.rs`): the
+downloaded tarball was cached at a **fixed `kernel-build/linux.tar.xz` path** behind an
+`if !exists` download guard, and the extracted tree behind `if !Makefile.exists()`. So a pin bump
+**reused the stale 6.6.9 tarball** and failed the SHA verify (`hash mismatch: expected <6.12.94>, got
+<6.6.9>`) instead of re-downloading — a violation of the content-addressed-cache discipline (a stale
+intermediate must invalidate, not error). Fixed to **verify-or-purge**: if the cached tarball's hash
+≠ the pin, purge the whole build dir and re-fetch (so the stale *extracted* tree dies too), then
+verify the fresh download (a still-mismatch = the URL served bad content → provenance hard stop).
+
+### Provenance check earned its keep: caught a wrong pinned SHA
+
+The version-research that proposed 6.12.94 also supplied a SHA256 (`a6cd115d…`) that was simply
+**wrong**. The pipeline's tarball verification **rejected it** — after the cache fix re-downloaded the
+real 148 MB `linux-6.12.94.tar.xz`, its hash was `e998a232…`. Cross-checked against kernel.org's
+signed `sha256sums.asc` (`e998a232…  linux-6.12.94.tar.xz`) and corrected `pins.json` to the verified
+value. This is exactly the "verify everything you ingest, refuse on mismatch" rule doing its job — a
+hallucinated/incorrect hash never reached a built artifact.
+
+### §13.5 KSM dedup lever — implemented and measured (was 0; now ~383–394 MiB dedup'd across 8 guests)
+
+The footprint pass first measured KSM dedup = **0**, because CH backs guest RAM with a **shared
+memfd** (`shared=on` → `RssShmem`), and KSM only merges **private-anonymous** pages. Implemented the
+lever as an opt-in `VmConfig::ksm_mergeable` (builder + unit test) that sets CH's `MemoryConfig`
+**`mergeable=on` and `shared=off`** together (the coupling is mandatory — KSM cannot merge shared
+pages; consequently the lever is mutually exclusive with vhost-user paths/rootless net, which need
+shared memory). `bench-vm` gained `--ksm-mergeable`, and the `footprint` mode now briefly accelerates
+the KSM scanner (`pages_to_scan`; `sleep_millis` is absent on kernel 7.x and bumped only if present —
+writes need the runner's `CAP_DAC_OVERRIDE`, same as `cpufreq`) for a bounded window, then restores
+it.
+
+**Result (CH, 8× 256 MiB identical guests, freq-pinned):** with the lever on, guest RAM moves to
+`RssAnon` (≈57–59 MiB/guest, as expected) and KSM deduplicates **≈98,100 pages ≈ 383 MiB** held in
+**≈12,600 canonical pages** — i.e. `pages_sharing` (the kernel's "memory saved" metric) ≈ **383 MiB**,
+**~84% of the touched anonymous RAM**, reproducible across runs (98,318 / 98,096; the 6.12.94 re-run
+gave 100,993 ≈ **394 MiB**). So for the common case (N identical rootfs/kernel guests) KSM collapses the bulk
+of guest RAM, the joint density product the design's §13.5 lever predicted — at the cost of
+`shared=off` (no vhost-user) and KSM scan CPU. It stays **opt-in** (default `ksm_mergeable=false`
+preserves shared memory and current behaviour); the benchmark is what measures the trade.
+
+## Session wrap-up — canonical re-run on 6.12.94, substrate reconciliation, and cross-cutting learnings
+
+After all the fixes landed, the **entire suite was re-run on the committed 6.12.94 pin** (freq-pinned,
+serial, all three backends) and `docs/benchmark-results.md` rewritten as the **canonical current-config
+results**. The detailed §13 tables *in this file above* are the **first pass on the then-pinned 6.6.9
+kernel** — the runs where the methodology was learned (turbo headroom, `RssShmem`-not-`RssAnon`,
+warm-cache cold, the phase budget). They are kept as the learning record, not restated; where a number
+matters, `benchmark-results.md` is authoritative. The re-run **reproduced every qualitative finding**
+(warm ≪ cold; FC *wins* restore — now 128 ms after the EADDRINUSE fix, vs CH 169 ms; lazy < eager
+restore, 176 vs 258 ms; suspend size = guest RAM, flat in rootfs; KSM lever ≈394 MiB dedup'd
+(`pages_sharing`=100,993) vs 0; vsock RTT sub-ms; micro codec tens-of-ns).
+
+**New finding from the re-run — the kernel bump has a real hot-path cost.** 6.12.94 boots ~10–15%
+slower than 6.6.9 and, more importantly, **warm restore is ~2× slower** (≈76 ms pinned on 6.6.9 →
+169 ms on 6.12.94), localized by the phase budget to the **post-restore `connect` phase** (vsock
+reconnect + clock/RNG resync ≈115 ms). The bump is still justified — it is the §6 distribution-aligned
+(Trixie) 6.12 LTS kernel **and** the fix for the gcc-15/C23 from-scratch build break — but if restore
+latency becomes the binding constraint for the "thousands of tests" goal, a **minimal 6.6.143 LTS
+bump** (also gcc-15-fixed) avoids the regression and is the cheaper lever. Worth a focused look at why
+6.12 resume+reconnect costs ~15× more than 6.6 did (kernel size at resume, or the resync path).
+
+**Operational learning — two artifact dirs.** `imp-testing build` (the CLI) writes to
+`target/imp-artifacts`, while the integration/bench harness reads `/tmp/imp-artifacts` unless
+`IMP_ARTIFACTS_DIR` is set. This is the pre-existing artifact-location split (the maintainer follow-up
+above): it let the 6.12.94 rebuild + benchmark proceed **without clobbering** the working 6.6.9
+artifacts (point the bench at `target/imp-artifacts`), but it is also a foot-gun — an edit-rebuild loop
+that runs `cargo test` never refreshes either dir, and the two can silently diverge. Consolidating onto
+one cache (keyed to the source-tree state, under `target/`) remains the recommended cleanup.
+
+**Forward-pointer — best-effort vs fail-loud (maintainer's new `todo.md` item).** Several paths added or
+exercised this session **degrade rather than fail** when a capability is missing: the `cpufreq` pin and
+the KSM accelerator no-op (with a `warn!`/print) without `CAP_DAC_OVERRIDE`; `create_slice` skips a
+cgroup limit when the controller isn't delegated; virtiofsd RO is not enforced under the experimental
+in-process FUSE. For **benchmarks** this is correct (tracked-not-gated — a bench must not abort because
+it can't pin frequency), and these are *visible* (warn), not silent. But the maintainer has filed a
+"Need design" item to migrate **functional** paths to typed required-capabilities + caller assertions +
+fail-loud, out of concern that silent/quiet degradation masks errors. That migration (deciding which
+ops are genuinely best-effort vs must-fail, and the capability-declaration mechanism) is the next
+design task; the benchmark/`cpufreq`/KSM degradations are the intended-best-effort end of that spectrum
+and should stay best-effort, with the warning made unmissable.

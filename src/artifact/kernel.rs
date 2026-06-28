@@ -103,21 +103,39 @@ impl Stage for KernelStage {
 
         let tarball = workdir.join("linux.tar.xz");
 
-        if !tarball.exists() {
+        use sha2::Digest;
+        let sha256_hex = |bytes: &[u8]| -> String {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        };
+
+        // (Re)fetch the tarball when it is missing OR its content does not match the
+        // pinned hash. The old code only checked existence, so a *bumped pin* left the
+        // stale tarball at this fixed `linux.tar.xz` path and the verify below failed
+        // ("hash mismatch") instead of re-downloading. A stale *extracted* source tree
+        // under the same workdir would survive too, so on a mismatch purge the whole
+        // build dir and re-fetch, letting extraction (gated on `Makefile`) re-run.
+        let needs_fetch = match tokio::fs::read(&tarball).await {
+            Ok(bytes) => sha256_hex(&bytes) != *kernel_source_sha256,
+            Err(_) => true,
+        };
+        if needs_fetch {
+            // Best-effort purge of any stale tarball + extracted tree (ignore "not found").
+            let _ = tokio::fs::remove_dir_all(&workdir).await;
+            tokio::fs::create_dir_all(&workdir).await?;
             let bytes = self.http_client.get(kernel_source_url).await?;
-            tokio::fs::write(&tarball, bytes).await?;
+            tokio::fs::write(&tarball, &bytes).await?;
         }
 
-        // Verify SHA256 of the tarball
+        // Verify SHA256 of the (now fresh) tarball; a mismatch here means the URL served
+        // content that does not match the pin — a provenance hard stop.
         let tarball_bytes = tokio::fs::read(&tarball).await?;
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&tarball_bytes);
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = sha256_hex(&tarball_bytes);
         if &hash != kernel_source_sha256 {
             return Err(Error::Artifact(format!(
-                "Kernel source tarball hash mismatch: expected {}, got {}",
-                kernel_source_sha256, hash
+                "Kernel source tarball hash mismatch: expected {}, got {} (url {})",
+                kernel_source_sha256, hash, kernel_source_url
             )));
         }
 

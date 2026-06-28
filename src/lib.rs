@@ -41,6 +41,10 @@ pub mod artifact;
 #[cfg(feature = "host-common")]
 pub mod config;
 
+/// CPU-frequency pinning for benchmark noise-floor discipline.
+#[cfg(feature = "host-common")]
+pub mod cpufreq;
+
 /// virtio-fs daemon implementation.
 #[cfg(feature = "host-common")]
 pub mod fs;

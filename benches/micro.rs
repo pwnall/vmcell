@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, black_box, criterion_group};
 use imp_testing::agent::protocol::{ExecRequest, Message};
 use imp_testing::artifact::{Stage, StageInputs, kernel::KernelStage};
 use std::net::Ipv4Addr;
@@ -94,4 +94,15 @@ criterion_group!(
     bench_math_30,
     bench_tar_to_erofs
 );
-criterion_main!(benches);
+
+// Custom entry point (instead of `criterion_main!`) so the micro-benchmarks run
+// under the same CPU-frequency pin as the macro harness (design §13.2). The guard
+// pins every online CPU to `performance` (turbo off) for the run and restores the
+// prior settings on drop. It is a logged no-op without CAP_DAC_OVERRIDE, so to
+// actually pin run `cargo bench` through `imp-test-runner` or as root.
+fn main() {
+    let _freq_pin =
+        imp_testing::cpufreq::CpuFreqPin::engage(imp_testing::cpufreq::SysfsCpuFreq::system());
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

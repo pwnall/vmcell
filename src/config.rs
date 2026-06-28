@@ -28,6 +28,14 @@ pub struct VmConfig {
     pub snapshotting: bool,
     /// Optional explicitly-configured VMID.
     pub vmid: Option<u32>,
+    /// Memory-restore strategy applied on the snapshot-restore path.
+    pub restore_mode: RestoreMode,
+    /// Mark guest memory `MADV_MERGEABLE` so host KSM can deduplicate identical
+    /// guest pages (CH `mergeable=on`). KSM only merges private-anonymous pages,
+    /// so enabling this also disables memory sharing (`shared=off`), making it
+    /// incompatible with vhost-user paths (rootless net, virtio-fs). A
+    /// density-vs-CPU trade measured in §13.5.
+    pub ksm_mergeable: bool,
 }
 
 /// Options for the root filesystem backing the VM.
@@ -51,6 +59,19 @@ pub enum RootfsSource {
         /// Path to the host directory serving as root.
         dir: PathBuf,
     },
+}
+
+/// Memory-restore strategy for snapshot restore (Cloud Hypervisor `prefault`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RestoreMode {
+    /// The VMM's default (CH: lazy/demand-paged).
+    #[default]
+    Default,
+    /// Eagerly fault all guest memory at restore (`prefault=on`).
+    Eager,
+    /// Lazily demand-page guest memory (`prefault=off`, userfaultfd).
+    Lazy,
 }
 
 /// A host directory shared with the guest VM via virtio-fs.
@@ -221,6 +242,8 @@ impl VmConfig {
             limits: ResourceLimits::default(),
             snapshotting: false,
             vmid: None,
+            restore_mode: RestoreMode::Default,
+            ksm_mergeable: false,
         }
     }
 }
@@ -239,6 +262,8 @@ pub struct VmConfigBuilder {
     limits: ResourceLimits,
     snapshotting: bool,
     vmid: Option<u32>,
+    restore_mode: RestoreMode,
+    ksm_mergeable: bool,
 }
 
 impl VmConfigBuilder {
@@ -295,6 +320,21 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn vmid(mut self, vmid: u32) -> Self {
         self.vmid = Some(vmid);
+        self
+    }
+
+    /// Sets the memory-restore strategy used on the snapshot-restore path.
+    #[must_use]
+    pub fn restore_mode(mut self, mode: RestoreMode) -> Self {
+        self.restore_mode = mode;
+        self
+    }
+
+    /// Enables KSM-mergeable (private-anonymous) guest memory (§13.5). See
+    /// [`VmConfig::ksm_mergeable`] for the sharing trade-off.
+    #[must_use]
+    pub fn ksm_mergeable(mut self, mergeable: bool) -> Self {
+        self.ksm_mergeable = mergeable;
         self
     }
 
@@ -384,6 +424,8 @@ impl VmConfigBuilder {
             limits: self.limits,
             snapshotting: self.snapshotting,
             vmid: self.vmid,
+            restore_mode: self.restore_mode,
+            ksm_mergeable: self.ksm_mergeable,
         })
     }
 }
@@ -406,6 +448,65 @@ mod tests {
         assert_eq!(cfg.vcpus, 1);
         assert_eq!(cfg.mem_mib, 128);
         assert!(!cfg.nested_virt);
+    }
+
+    // Guards the §13.3 eager-vs-lazy restore toggle: the builder must carry the
+    // selected `RestoreMode` onto the built config, and default to `Default`.
+    // Buggy impl: builder drops the field (always `Default`) — the `Eager`
+    // assertion below would then fail.
+    #[test]
+    fn test_builder_restore_mode() {
+        let default_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert_eq!(default_cfg.restore_mode, RestoreMode::Default);
+
+        let eager_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .restore_mode(RestoreMode::Eager)
+        .build()
+        .unwrap();
+        assert_eq!(eager_cfg.restore_mode, RestoreMode::Eager);
+        assert_ne!(eager_cfg.restore_mode, RestoreMode::Default);
+    }
+
+    // Guards the §13.5 KSM density lever: the builder must carry `ksm_mergeable`
+    // onto the built config and default to `false` (so normal VMs keep shared
+    // memory). Buggy impl: builder drops the field — the `true` assertion fails.
+    #[test]
+    fn test_builder_ksm_mergeable() {
+        let mk = |mergeable: bool| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .ksm_mergeable(mergeable)
+            .build()
+            .unwrap()
+        };
+        assert!(!mk(false).ksm_mergeable);
+        assert!(mk(true).ksm_mergeable);
+        // Default (builder untouched) must be false.
+        let default_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert!(!default_cfg.ksm_mergeable);
     }
 
     #[test]

@@ -124,3 +124,34 @@ Common recipes:
   the unit suite.
 - `just test-rootless` — the rootless (unprivileged) KVM integration tier.
 - `just test-priv` — the privileged KVM integration tier (run `just bless` once first; see §5).
+
+### 7. Packages supporting experiments
+
+The groups above are everything the product needs to build and run. The packages below are **only**
+for the *optional* performance experiments and contested-fact benchmarks in the design doc §13 (the
+`bench-vm` macro-harness plus a few out-of-band measurement probes). None is required to build or run
+`imp-testing` itself — install only the ones for the experiment you actually want to reproduce.
+
+```sh
+# §13.3  static-musl guest-agent experiment (musl vs glibc on-disk size / RSS / rootfs-independence)
+sudo apt install -y musl-tools                 # provides `musl-gcc`
+rustup target add x86_64-unknown-linux-musl    # the prebuilt musl libc rustc links against
+#   The all-Rust agent links musl *statically without* `musl-gcc`; `musl-gcc` only becomes
+#   necessary once the agent gains a C / `*-sys` dependency that has to be cross-compiled.
+
+# §13.6  rootfs image-size comparison: OCI slim base vs a minimal mmdebstrap build
+sudo apt install -y erofs-utils                # provides `mkfs.erofs` for the size/compressor probe.
+#   The production pipeline packs erofs in-crate via `am-fs-erofs`; `mkfs.erofs` is only the
+#   out-of-band yardstick used to compare lz4/zstd/uncompressed sizes.
+sudo apt install -y skopeo                      # pull the digest-pinned OCI base out-of-band.
+#   Production pulls via the in-crate `oci-client`; `skopeo` is only for the manual size probe.
+sudo apt install -y mmdebstrap                  # build the `--variant=minbase` comparison tree
+#   host-side. (Production runs mmdebstrap *inside* a builder micro-VM, so the product itself
+#   needs no host mmdebstrap — this is for the size measurement only.)
+
+# §13.2  benchmark noise-floor discipline: pin the CPU frequency so latency numbers don't drift
+sudo apt install -y linux-cpupower             # provides `cpupower` (applying a governor needs root)
+```
+
+Benchmarks are *tracked metrics, not pass/fail gates* (design §13.7), so a missing package degrades
+an experiment to "not measured here," never a build or test failure.

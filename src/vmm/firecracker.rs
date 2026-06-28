@@ -1,11 +1,29 @@
 use crate::config::VmConfig;
 use crate::error::{Error, Result};
 use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::process::Child;
+
+/// Sidecar file (written into the snapshot directory by [`FcInstance::snapshot`])
+/// recording the host-side vsock/serial UDS paths the snapshot baked in.
+///
+/// Firecracker's `PUT /snapshot/load` restores the vsock device *verbatim* from
+/// the snapshot — it rebinds the **original** host UDS path and offers no
+/// load-time override. A restore therefore runs under a fresh, vmid-derived tmp
+/// dir but must rebind (and have the agent dial) the path the snapshot recorded.
+/// This sidecar carries that path across the snapshot/restore boundary.
+const HOST_PATHS_SIDECAR: &str = "imp_host_paths.json";
+
+/// Host-side UDS paths baked into a Firecracker snapshot, persisted alongside it
+/// so a later restore can rebind/connect the exact socket FC recreates.
+#[derive(Serialize, Deserialize)]
+struct SnapshotHostPaths {
+    vsock: PathBuf,
+    serial: PathBuf,
+}
 
 /// The Firecracker VMM backend.
 #[derive(Debug, Clone)]
@@ -456,14 +474,30 @@ impl Vmm for Firecracker {
                 feature: "snapshot_restore".to_string(),
             });
         }
-        let (_tmp, api_socket, vsock_path, serial_path, process, pgid) =
+
+        // Recover the host vsock/serial UDS paths the snapshot baked in (see
+        // `snapshot()` and `HOST_PATHS_SIDECAR`). Read this *before* spawning so a
+        // corrupt/foreign snapshot fails loud without leaking a VMM process.
+        let sidecar_path = snapshot_dir.join(HOST_PATHS_SIDECAR);
+        let sidecar = tokio::fs::read_to_string(&sidecar_path).await?;
+        let host_paths: SnapshotHostPaths = serde_json::from_str(&sidecar)?;
+
+        let (_tmp, api_socket, _vsock_path, _serial_path, process, pgid) =
             self.spawn_fc(res, cgroups).await?;
+
+        // Firecracker rebinds the snapshot's recorded host vsock UDS at load time.
+        // Remove any leftover socket file there first (a sequential restore reuses
+        // the same path), otherwise the bind fails with EADDRINUSE. The directory is
+        // kept so FC can recreate the socket and reopen the serial sink.
+        let _ = tokio::fs::remove_file(&host_paths.vsock).await;
 
         let instance = FcInstance {
             process,
             api_socket,
-            vsock_path,
-            serial_path,
+            // Adopt the snapshot's paths so the agent dials the exact UDS FC
+            // recreates, not the fresh (unused) vmid-derived path from `spawn_fc`.
+            vsock_path: host_paths.vsock,
+            serial_path: host_paths.serial,
             cid: res.guest_cid,
             pgid,
         };
@@ -607,6 +641,26 @@ impl VmInstance for FcInstance {
                 }),
             )
             .await;
+
+        // On success, persist the host vsock/serial UDS paths FC baked into the
+        // snapshot so `restore()` can rebind/connect the exact socket it recreates
+        // (FC offers no load-time vsock override). Best-effort: a write failure is
+        // logged, not fatal — a missing sidecar then fails the restore loudly.
+        if res.is_ok() {
+            match serde_json::to_string(&SnapshotHostPaths {
+                vsock: self.vsock_path.clone(),
+                serial: self.serial_path.clone(),
+            }) {
+                Ok(json) => {
+                    if let Err(e) = tokio::fs::write(dir.join(HOST_PATHS_SIDECAR), json).await {
+                        tracing::warn!("Failed to write snapshot host-paths sidecar: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize snapshot host-paths sidecar: {}", e);
+                }
+            }
+        }
 
         if let Err(e) = self.resume().await {
             tracing::warn!("Failed to resume Firecracker after snapshot: {}", e);
