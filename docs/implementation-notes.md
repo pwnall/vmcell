@@ -995,3 +995,92 @@ filename** (`KernelStage::suffix` and `bench-vm`'s `kernel_filename`): the artif
 `vmlinux-6-6-143` (no dotted "extension" for `with_extension` to eat), while the pins key, the CLI
 `--kernel` label, and the cache-key *hash* stay the dotted `6.6.143`. Scoped to the kernel filename so
 no other stage's sidecar name (rootfs/resolved-pins) changes — i.e. no collateral cache invalidation.
+
+## Review 37 — newly recorded justified deviations (2026-06-29)
+
+These were surfaced by Review 37 (`docs/37-claude-code-review.md`) and confirmed as defensible,
+intended deviations. They are recorded here per the prime directive ("record deviations") instead of
+being carried as defects in the review report.
+
+### Per-deployment MITM CA minting (erofs not byte-identical across independent builds)
+
+`RootfsStage` bakes a freshly-minted CA (`CaManager::new()` → random `KeyPair::generate()`,
+`src/proxy/tls.rs:95–127`) into `usr/local/share/ca-certificates/imp-ca.crt`
+(`src/artifact/rootfs/mod.rs:142–148`), so two independent builds produce non-byte-identical
+`rootfs.erofs`.
+
+**Why:** a *reproducible* CA private key shared across deployments would be a security defect (anyone
+with the repo could mint trusted certs for every deployment's guests). Per-deployment minting is the
+correct behavior.
+
+**How to apply:** read the design §12.4 "byte-identical erofs" claim as scoped to a *fixed*
+`artifacts_dir`/CA within a single deployment — the deterministic-build guarantee is over the rootfs
+*content pipeline*, not the per-deployment CA material. Do not "fix" reproducibility by pinning the CA
+key. (Review 37 P13.)
+
+### `Error` uses stringly per-subsystem payloads (no `Error::Other` catch-all)
+
+`src/error.rs` carries `String` payloads on ~12 per-subsystem variants
+(`Vmm`/`Agent`/`Network`/`Proxy`/`Cgroup`/`Artifact`/`Config`/`Timeout`/`Serialize`/`Qmp`/`Subprocess`/`Exhaustion`)
+rather than typed sources on each.
+
+**Why:** the variants are genuinely **per-subsystem** (matchable) and there is deliberately **no**
+`Error::Other` catch-all; `#[from]` is used where a real upstream error type exists
+(`serde_json`/`postcard`/`hyper`/`reqwest`/`io`). The rubric's concern (B8) is the `Error::Other(String)`
+anti-pattern, which is absent. The stringly-per-subsystem shape is an accepted trade-off.
+
+**How to apply:** prefer a typed struct field only where a concrete source exists and adds matchability
+(e.g. a QMP error object, a subprocess exit status); otherwise the current shape stands. (Review 37 P25.)
+
+### `guest-tools` legitimately uses `reqwest` (pulls tokio/hyper) — outside the lean-tree rule
+
+`guest-tools = ["dep:reqwest", "dep:libc"]` (`Cargo.toml`), and `cargo tree --no-default-features
+--features guest-tools` shows `reqwest → hyper → tokio`. Design §12.2's wording lists `guest-tools`
+alongside `agent`/`test-runner` for the "∌ tokio/hyper/rtnetlink" tree assertion, which would be
+**unimplementable** for `guest-tools`.
+
+**Why:** the dependency-thin / lean-tree contract is, per `AGENTS.md`, scoped to the *privileged-window
+and PID-1* binaries (`imp-guest-agent`, `imp-test-runner`) — every dep there runs at elevated
+capability. `imp-guest-tools` is an ordinary **guest userspace** multicall helper (real `ip`/`curl`
+stand-ins) baked into the rootfs; it runs unprivileged inside the guest and legitimately needs a real
+HTTP client. It is *not* the host stack and not a privilege-sensitive binary.
+
+**How to apply:** the lean-tree CI assertion should cover `agent` + `test-runner` only (as the current
+CI in fact does). Reconcile design §12.2 wording to exclude `guest-tools` from the tokio/hyper tree
+rule, or replace `reqwest` with a thin blocking client if a leaner guest helper is later wanted.
+(Review 37 S45.)
+
+### Concurrent restore from a single snapshot is forward-work (single-clone today)
+
+Restoring two clones concurrently from the same snapshot dir is unsupported: CH rewrites
+`<snapshot>/config.json` **in place** (`src/vmm/cloud_hypervisor.rs:178–189`) and FC rebinds the single
+recorded vsock UDS path (`src/vmm/firecracker.rs:488–499`). Sequential restore (and CID reuse across
+sequential restores) is correct and tested.
+
+**Why:** the v13 dense-tier "many clones from one base" is a forward goal; the current
+single-clone-per-snapshot path is correct for the validated workflow, and the code comments already
+flag the multi-clone case as forward work.
+
+**How to apply:** for concurrent cloning, copy-on-write the snapshot dir (CH) and allocate a per-clone
+vsock/serial path before the in-place rewrite/rebind. Tracked as a known limitation, not a regression.
+(Review 37 S32.)
+
+## Review 37a — empirical run status update (2026-06-29)
+
+The privileged suite (all three backends) + rootless suite were run on the KVM host as part of
+Review 37 (preflight gate: `scripts/review-preflight-priv.sh`; see `docs/37-claude-code-review.md`
+"Empirical validation"). Two status updates belong here; the new *defects* (E1 memory cap, E2 FC
+restore, E3 `/tmp` leak) are tracked in the review report, not here.
+
+- **CH warm snapshot/restore is RESOLVED.** Earlier notes recorded "warm snapshot/restore fails —
+  guest vsock listener doesn't survive CH `--restore` device re-creation" as the one core-feature
+  gap. `snapshot_restore::cloud_hypervisor` now **passes end-to-end** (create → restore →
+  CID/MAC/vsock rotation → host-driven clock resync → CSPRNG reseed). Treat the prior CH vsock-rebind
+  gap as closed; the remaining restore gap is **Firecracker** (report finding E2: connection dropped
+  on the first post-restore exec).
+- **`metrics_limits` is currently RED on a correctly-delegated host** (report finding E1): with the
+  memory controller delegated and `memory.max` correctly written to the 256 MiB cap, a 512 MiB guest
+  still self-OOMs (`oom_kill == 0`), so the cap is not binding guest RAM — almost certainly the
+  default `shared=true` (shmem/memfd) guest-RAM backing being reclaimed rather than OOM-capped. This
+  is NOT the prior "controller not delegated" precondition failure; it is a real enforcement gap.
+  Note for future validation runs: do not assume a green `metrics_limits` — it fails here.
