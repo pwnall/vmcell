@@ -3,17 +3,13 @@
 use std::path::PathBuf;
 
 pub fn get_vmlinux() -> PathBuf {
-    let p = std::env::var("IMP_KERNEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts/vmlinux"));
+    let p = imp_testing::artifact::kernel_path();
     assert!(p.exists(), "vmlinux artifact missing at {:?}", p);
     p
 }
 
 pub fn get_rootfs() -> PathBuf {
-    let p = std::env::var("IMP_ROOTFS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/imp-artifacts/rootfs.erofs"));
+    let p = imp_testing::artifact::rootfs_path();
     assert!(p.exists(), "rootfs artifact missing at {:?}", p);
     p
 }

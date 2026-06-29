@@ -125,6 +125,9 @@ Common recipes:
 - `just test-rootless` — the rootless (unprivileged) KVM integration tier.
 - `just test-priv` — the privileged KVM integration tier (run `just bless` once first; see §5).
 
+Built VM artifacts (kernel, rootfs, proxy CA) default to `target/imp-artifacts`, overridable via
+`IMP_ARTIFACTS_DIR` (with `IMP_KERNEL` / `IMP_ROOTFS` overriding the individual kernel/rootfs paths).
+
 ### 7. Packages supporting experiments
 
 The groups above are everything the product needs to build and run. The packages below are **only**

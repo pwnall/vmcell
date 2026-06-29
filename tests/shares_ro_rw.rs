@@ -1,7 +1,6 @@
 use imp_testing::config::{Access, CachePolicy, RootfsSource, Share, VmConfig};
 use imp_testing::vmm::VmInstance;
 use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::PathBuf;
 
 mod common;
 
@@ -46,11 +45,8 @@ async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
 
     std::fs::write(in_dir.join("input.txt"), "hello world").unwrap();
 
-    let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
-    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
-    if !vmlinux.exists() || !rootfs.exists() {
-        panic!("Artifacts not found, skipping shares test");
-    }
+    let vmlinux = common::get_vmlinux();
+    let rootfs = common::get_rootfs();
 
     let _cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .with_share(Share::new(

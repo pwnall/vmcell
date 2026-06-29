@@ -50,7 +50,7 @@ async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
         Commands::Build => {
             println!("Building artifacts...");
             let pipeline = imp_testing::artifact::Pipeline {
-                target_dir: std::path::PathBuf::from("target/imp-artifacts"),
+                target_dir: imp_testing::artifact::artifacts_dir(),
                 stages: vec![
                     Box::new(imp_testing::artifact::ResolvePinsStage {
                         pins_file: std::path::PathBuf::from("pins.json"),
@@ -107,7 +107,7 @@ async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
                 }));
             }
             imp_testing::artifact::Pipeline {
-                target_dir: std::path::PathBuf::from("target/imp-artifacts"),
+                target_dir: imp_testing::artifact::artifacts_dir(),
                 stages,
             }
             .build(&imp_testing::artifact::Cache::default())

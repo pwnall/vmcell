@@ -2,8 +2,6 @@ use imp_testing::agent::protocol::ExecRequest;
 use imp_testing::config::{RootfsSource, VmConfig};
 use imp_testing::orchestrator::TestVm;
 
-use std::path::PathBuf;
-
 mod common;
 
 vmm_matrix_test!(nested_virt, |vmm| {
@@ -12,12 +10,8 @@ vmm_matrix_test!(nested_virt, |vmm| {
 });
 
 async fn test_nested_virt_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
-    let kernel = PathBuf::from(
-        std::env::var("IMP_KERNEL").unwrap_or_else(|_| "/tmp/imp-artifacts/vmlinux".into()),
-    );
-    let rootfs_image = PathBuf::from(
-        std::env::var("IMP_ROOTFS").unwrap_or_else(|_| "/tmp/imp-artifacts/rootfs.erofs".into()),
-    );
+    let kernel = common::get_vmlinux();
+    let rootfs_image = common::get_rootfs();
 
     let mut cfg = VmConfig::builder(
         kernel,

@@ -46,19 +46,17 @@ fn ca_cache() -> &'static Mutex<CaCacheMap> {
     CA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn artifacts_dir() -> PathBuf {
-    std::env::var("IMP_ARTIFACTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(format!("/tmp/imp-artifacts-{}", std::process::id())))
-}
-
 impl CaManager {
     /// Initializes the CA Manager, loading or generating the root CA
     ///
     /// # Errors
     /// Returns an error if filesystem operations or key generation fail.
     pub fn new() -> Result<Self> {
-        Self::new_in(artifacts_dir())
+        // The proxy CA now lives in the shared artifacts dir (default
+        // `target/imp-artifacts`) instead of the old per-pid `/tmp/imp-artifacts-<pid>`,
+        // so the authority the proxy presents matches the `ca.pem`/`ca.key` baked into
+        // the rootfs at build time.
+        Self::new_in(crate::artifact::artifacts_dir())
     }
 
     /// Initializes the CA Manager for an explicit artifacts directory.

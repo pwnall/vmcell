@@ -901,13 +901,20 @@ The ~76 ms vs 169 ms gap was the two figures coming from differently-loaded sess
 apples-to-apples. Lesson: **never compare absolute latencies across sessions on a shared box** — only
 interleaved, same-session deltas are trustworthy (§13.2 noise-floor discipline, the hard way).
 
-**Operational learning — two artifact dirs.** `imp-testing build` (the CLI) writes to
-`target/imp-artifacts`, while the integration/bench harness reads `/tmp/imp-artifacts` unless
-`IMP_ARTIFACTS_DIR` is set. This is the pre-existing artifact-location split (the maintainer follow-up
-above): it let the 6.12.94 rebuild + benchmark proceed **without clobbering** the working 6.6.9
-artifacts (point the bench at `target/imp-artifacts`), but it is also a foot-gun — an edit-rebuild loop
-that runs `cargo test` never refreshes either dir, and the two can silently diverge. Consolidating onto
-one cache (keyed to the source-tree state, under `target/`) remains the recommended cleanup.
+**Operational learning — two artifact dirs (NOW CONSOLIDATED).** Previously `imp-testing build` (the
+CLI) wrote to `target/imp-artifacts` while the integration/bench harness read `/tmp/imp-artifacts`
+(and the proxy CA defaulted to `/tmp/imp-artifacts-<pid>`) — three different defaults, a foot-gun where
+the dirs silently diverged. **Fixed:** a single helper `imp_testing::artifact::artifacts_dir()`
+(`$IMP_ARTIFACTS_DIR` or default **`target/imp-artifacts`**), with `kernel_path()` / `rootfs_path()`
+deriving from it (still overridable by `$IMP_KERNEL` / `$IMP_ROOTFS`), is now the single source of
+truth used by the CLI pipeline (`build`/`build-kernels`), `bench-vm`, every integration test
+(`tests/common`, `nested_virt`, `shares_ro_rw`, `lifecycle`), **and** the proxy CA (`tls.rs`). Moving
+the CA onto the shared dir also closed a latent bug: with `IMP_ARTIFACTS_DIR` unset the proxy used to
+mint a per-pid CA that did **not** match the CA baked into the rootfs; now it loads the same
+`target/imp-artifacts/ca.{pem,key}` the build wrote, so the authority the proxy presents matches the
+guest's trust store. The default lives under `target/` (per-checkout, gitignored), not a
+session-persistent `/tmp`. A pure `resolve_artifacts_dir()` unit-tests the default without env races;
+an adversarial residue audit confirmed no other resolver remains.
 
 **Forward-pointer — best-effort vs fail-loud (maintainer's new `todo.md` item).** Several paths added or
 exercised this session **degrade rather than fail** when a capability is missing: the `cpufreq` pin and

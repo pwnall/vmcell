@@ -85,12 +85,8 @@ async fn test_lifecycle_force_kill_qemu() {
 }
 
 async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
-    let vmlinux = PathBuf::from("/tmp/imp-artifacts/vmlinux");
-    let rootfs = PathBuf::from("/tmp/imp-artifacts/rootfs.erofs");
-
-    if !vmlinux.exists() || !rootfs.exists() {
-        panic!("Artifacts not found, skipping lifecycle test");
-    }
+    let vmlinux = common::get_vmlinux();
+    let rootfs = common::get_rootfs();
 
     let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .network_disabled()

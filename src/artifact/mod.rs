@@ -27,6 +27,36 @@ pub mod tar2erofs;
 
 use std::path::{Path, PathBuf};
 
+/// The VM-artifacts directory: `$IMP_ARTIFACTS_DIR` or the default `target/imp-artifacts`.
+/// The single source of truth for where built artifacts (kernel, rootfs, CA) live.
+#[must_use]
+pub fn artifacts_dir() -> PathBuf {
+    resolve_artifacts_dir(std::env::var_os("IMP_ARTIFACTS_DIR"))
+}
+
+/// Pure resolver behind [`artifacts_dir`], factored out so the default can be unit-tested
+/// without mutating (and racing on) the process environment.
+fn resolve_artifacts_dir(var: Option<std::ffi::OsString>) -> PathBuf {
+    var.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/imp-artifacts"))
+}
+
+/// The guest kernel image path: `$IMP_KERNEL`, else `<artifacts_dir>/vmlinux`.
+#[must_use]
+pub fn kernel_path() -> PathBuf {
+    std::env::var_os("IMP_KERNEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| artifacts_dir().join("vmlinux"))
+}
+
+/// The rootfs erofs path: `$IMP_ROOTFS`, else `<artifacts_dir>/rootfs.erofs`.
+#[must_use]
+pub fn rootfs_path() -> PathBuf {
+    std::env::var_os("IMP_ROOTFS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| artifacts_dir().join("rootfs.erofs"))
+}
+
 /// Inputs for an artifact building stage.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StageInputs {
@@ -437,6 +467,20 @@ impl Stage for ResolvePinsStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Guards the consolidated artifacts-dir default: a buggy resolver that drops the
+    // default (or points it at `/tmp/...`) goes red here. Exercises the PURE inner fn so
+    // there is no `std::env` mutation and therefore no cross-test env-var race.
+    #[test]
+    fn test_resolve_artifacts_dir_default_and_override() {
+        let default = resolve_artifacts_dir(None);
+        assert!(
+            default.ends_with("target/imp-artifacts"),
+            "default artifacts dir must be target/imp-artifacts, got {default:?}"
+        );
+        let overridden = resolve_artifacts_dir(Some("x/y".into()));
+        assert_eq!(overridden, PathBuf::from("x/y"));
+    }
 
     // Guards ARTIFACT-PIPELINE-5: a buggy impl that never emits
     // `debian_snapshot_timestamp` (so the mmdebstrap source can't run) goes red here.

@@ -118,16 +118,18 @@ async fn run_bench<V: Vmm>(
     println!("Starting benchmark: {}", name);
     let mut latencies = Vec::new();
 
-    let artifacts_dir =
-        std::env::var("IMP_ARTIFACTS_DIR").unwrap_or_else(|_| "/tmp/imp-artifacts".into());
-    let kernel_path = PathBuf::from(&artifacts_dir).join(kernel_filename(args.kernel.as_deref()));
-    let rootfs_path = PathBuf::from(&artifacts_dir).join("rootfs.erofs");
+    let artifacts_dir = imp_testing::artifact::artifacts_dir();
+    let kernel_path = artifacts_dir.join(kernel_filename(args.kernel.as_deref()));
+    let rootfs_path = artifacts_dir.join("rootfs.erofs");
 
     // Fail fast (and KVM-independently) when the artifacts are absent: attempting a boot would
     // instead hang on the agent-connect timeout (and the restore baseline boots regardless of
     // `--iterations`). Report zero successful runs and return before booting anything.
     if !kernel_path.exists() || !rootfs_path.exists() {
-        println!("{name}: No successful runs (missing artifacts in {artifacts_dir})");
+        println!(
+            "{name}: No successful runs (missing artifacts in {})",
+            artifacts_dir.display()
+        );
         return;
     }
 
@@ -360,7 +362,9 @@ fn kernel_filename(label: Option<&str>) -> String {
 /// Resolves the (dir, kernel, rootfs) artifact paths from `IMP_ARTIFACTS_DIR`,
 /// selecting `vmlinux-<label>` when a kernel-version label is given.
 fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
-    let dir = std::env::var("IMP_ARTIFACTS_DIR").unwrap_or_else(|_| "/tmp/imp-artifacts".into());
+    let dir = imp_testing::artifact::artifacts_dir()
+        .to_string_lossy()
+        .into_owned();
     let kernel = PathBuf::from(&dir).join(kernel_filename(kernel_label));
     let rootfs = PathBuf::from(&dir).join("rootfs.erofs");
     (dir, kernel, rootfs)
