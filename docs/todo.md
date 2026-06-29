@@ -1,5 +1,6 @@
 Designed, need implementing
 
+* README covering CLI capabilities and benchmark results
 
 Need design
 
@@ -13,7 +14,6 @@ Need design
   access, no additional caps), and its opposite as "privileged" (with
   capabilities). Explicitly spec tests for unprivileged and for privileged
   operation.
-* README covering CLI capabilities and benchmark results
 * Position as isolated test environment, useful for agentic harnesses and
   generic serverless
 * Ensure that the micro-VM execution primitive is reasonably general
