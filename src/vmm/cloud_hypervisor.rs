@@ -38,12 +38,19 @@ pub struct ChInstance {
     api_socket: PathBuf,
     vsock_path: PathBuf,
     serial_path: PathBuf,
+    // Per-VM temp dir owning the sockets + serial log; removed on `Drop` so it
+    // does not leak one directory per VM (E3).
+    tmp_dir: PathBuf,
     _fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
     restored: bool,
+    // Whether the backend advertises snapshot/restore, captured from
+    // `capabilities()` at construction so `snapshot()` can self-guard without a
+    // handle to the backend (M-RESTORE-3).
+    snapshot_restore_capable: bool,
     cid: u32,
     pgid: Option<u32>,
-    /// True if a vhost-user-net device is attached (rootless NAT). Such a VM is
-    /// not snapshot-eligible.
+    // True if a vhost-user-net device is attached (rootless NAT). Such a VM is
+    // not snapshot-eligible.
     vhost_user_net: bool,
 }
 
@@ -53,6 +60,51 @@ pub struct ChInstance {
 /// the `snapshot()`/`restore()` paths instead of attaching/keeping virtiofsd.
 fn has_vhost_user_device(virtio_fs_share: bool, rootless_net: bool, vhost_user_net: bool) -> bool {
     virtio_fs_share || rootless_net || vhost_user_net
+}
+
+/// Returns `true` when `cfg`/`res` describe a VM that carries a vhost-user device
+/// and is therefore **not** snapshot-eligible (§3.3 snapshot-eligibility law).
+/// This covers all three §3.3 cases at the `restore()` boundary: a virtio-fs
+/// *rootfs* **or** a virtio-fs data share (both served by virtiofsd), the
+/// rootless `vhost-user-net` NAT, and an external `vhost-user-net` socket.
+///
+/// The virtio-fs *rootfs* case (`RootfsSource::VirtioFs`) is the one CH
+/// `restore()` previously missed (M-RESTORE-3): it guarded data shares but not a
+/// virtio-fs rootfs, which is equally backed by a vhost-user device.
+fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
+    let virtio_fs = !cfg.shares.is_empty()
+        || matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. });
+    has_vhost_user_device(
+        virtio_fs,
+        matches!(cfg.net, crate::config::NetConfig::Rootless { .. }),
+        res.vhost_user_socket.is_some(),
+    )
+}
+
+/// Pre-flight self-checks for the `ChInstance::snapshot` path.
+///
+/// `snapshot()` runs on the instance, which has no handle to the backend, so the
+/// `snapshot_restore` capability is captured at construction and re-checked here
+/// (M-RESTORE-3) alongside the snapshot-eligibility law: a VM carrying a
+/// vhost-user device cannot be snapshotted.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] if the backend does not advertise
+/// `snapshot_restore`, or if the VM has a vhost-user device attached.
+fn snapshot_precheck(snapshot_restore_capable: bool, has_vhost_user: bool) -> Result<()> {
+    if !snapshot_restore_capable {
+        return Err(Error::Unsupported {
+            vmm: "cloud-hypervisor".to_string(),
+            feature: "snapshot_restore".to_string(),
+        });
+    }
+    if has_vhost_user {
+        return Err(Error::Unsupported {
+            vmm: "cloud-hypervisor".to_string(),
+            feature: "snapshot with a vhost-user device".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -243,9 +295,29 @@ impl Vmm for CloudHypervisor {
             .spawn_ch(res, None, crate::config::RestoreMode::Default, cgroups)
             .await?;
 
-        let mut fs_daemons = Vec::new();
-        let mut ch_fs = Vec::new();
+        let cid = res.guest_cid;
 
+        // H-QEMU-1 (CH sibling): construct the owning instance *before* the
+        // fallible virtiofsd starts. `tokio::process::Child` does not kill on
+        // drop, so once `spawn_ch` has returned a live CH VMM, only the
+        // instance's `Drop` (which reaps the process group, and any virtiofsd
+        // already pushed below) frees it. Building the owner first means a failed
+        // `VirtioFsDaemon::start` reaps the CH VMM instead of leaking it.
+        let mut instance = ChInstance {
+            process,
+            api_socket,
+            vsock_path: vsock_path.clone(),
+            serial_path: serial_path.clone(),
+            tmp_dir: tmp.clone(),
+            _fs_daemons: Vec::new(),
+            restored: false,
+            snapshot_restore_capable: self.capabilities().snapshot_restore,
+            cid,
+            pgid,
+            vhost_user_net: res.vhost_user_socket.is_some(),
+        };
+
+        let mut ch_fs = Vec::new();
         for share in &cfg.shares {
             let daemon = crate::fs::VirtioFsDaemon::start(share, &tmp).await?;
             ch_fs.push(ChFs {
@@ -254,22 +326,8 @@ impl Vmm for CloudHypervisor {
                 num_queues: 1,
                 queue_size: 1024,
             });
-            fs_daemons.push(daemon);
+            instance._fs_daemons.push(daemon);
         }
-
-        let cid = res.guest_cid;
-
-        let instance = ChInstance {
-            process,
-            api_socket,
-            vsock_path: vsock_path.clone(),
-            serial_path: serial_path.clone(),
-            _fs_daemons: fs_daemons,
-            restored: false,
-            cid,
-            pgid,
-            vhost_user_net: res.vhost_user_socket.is_some(),
-        };
 
         let mut ch_cfg = ChVmConfig {
             cpus: ChCpus {
@@ -385,13 +443,10 @@ impl Vmm for CloudHypervisor {
             });
         }
         // C1 / snapshot-eligibility law: a snapshot-eligible VM has no vhost-user
-        // device. Reject any virtio-fs share, rootless net, or external
-        // vhost-user-net *before* we would otherwise start virtiofsd below.
-        if has_vhost_user_device(
-            !cfg.shares.is_empty(),
-            matches!(cfg.net, crate::config::NetConfig::Rootless { .. }),
-            res.vhost_user_socket.is_some(),
-        ) {
+        // device. Reject a virtio-fs *rootfs* or data share, rootless net, or an
+        // external vhost-user-net *before* we would otherwise start virtiofsd
+        // below. (M-RESTORE-3: the virtio-fs rootfs case was previously missed.)
+        if config_has_vhost_user_device(cfg, res) {
             return Err(Error::Unsupported {
                 vmm: "cloud-hypervisor".to_string(),
                 feature: "snapshot/restore with a vhost-user device".to_string(),
@@ -416,8 +471,10 @@ impl Vmm for CloudHypervisor {
             api_socket,
             vsock_path,
             serial_path,
+            tmp_dir: tmp,
             _fs_daemons: fs_daemons,
             restored: true,
+            snapshot_restore_capable: self.capabilities().snapshot_restore,
             cid,
             pgid,
             vhost_user_net: res.vhost_user_socket.is_some(),
@@ -481,15 +538,14 @@ impl VmInstance for ChInstance {
     }
 
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
-        // C1 / snapshot-eligibility law: refuse to snapshot a VM that has a
-        // vhost-user device attached (virtiofsd or vhost-user-net) — it is not
-        // snapshot-eligible.
-        if has_vhost_user_device(!self._fs_daemons.is_empty(), false, self.vhost_user_net) {
-            return Err(Error::Unsupported {
-                vmm: "cloud-hypervisor".to_string(),
-                feature: "snapshot with a vhost-user device".to_string(),
-            });
-        }
+        // M-RESTORE-3: self-check the `snapshot_restore` capability (captured from
+        // the backend descriptor at construction) before doing any work, and
+        // enforce the C1 snapshot-eligibility law — refuse to snapshot a VM with a
+        // vhost-user device attached (virtiofsd or vhost-user-net).
+        snapshot_precheck(
+            self.snapshot_restore_capable,
+            has_vhost_user_device(!self._fs_daemons.is_empty(), false, self.vhost_user_net),
+        )?;
         #[derive(Serialize)]
         struct SnapshotReq {
             destination_url: String,
@@ -526,6 +582,9 @@ impl VmInstance for ChInstance {
 
 impl Drop for ChInstance {
     fn drop(&mut self) {
+        // Teardown order (AGENTS.md): VMM process group first — reaping it before
+        // touching virtiofsd or the per-VM directory means cleanup never races a
+        // live VMM.
         if let Some(pgid) = self.pgid {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(-(pgid as i32)),
@@ -535,8 +594,16 @@ impl Drop for ChInstance {
                 let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
             }
         }
+        // virtiofsd next: dropping each daemon kills it and removes its own socket
+        // (which lives inside `tmp_dir`) before we remove that directory.
+        self._fs_daemons.clear();
+        // Finally the sockets and the per-VM temp dir. Removing the directory
+        // (E3) reclaims `serial.log` + `api.sock.lock`, which previously leaked
+        // one-per-VM; the explicit socket removals are redundant with the
+        // `remove_dir_all` but kept for clarity of the teardown sequence.
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
+        crate::vmm::remove_vm_tmp_dir(&self.tmp_dir);
     }
 }
 
@@ -591,5 +658,109 @@ mod tests {
         assert!(has_vhost_user_device(false, false, true)); // external vhost-user-net
         // tap (privileged) net + erofs/block rootfs: snapshot-eligible.
         assert!(!has_vhost_user_device(false, false, false));
+    }
+
+    fn res_with(vhost_user_socket: Option<PathBuf>) -> PerVmResources {
+        PerVmResources {
+            cgroup_name: "imp-test".to_string(),
+            tap_name: Some("tap0".to_string()),
+            netns_name: Some("ns0".to_string()),
+            vhost_user_socket,
+            vmid: 1,
+            guest_cid: 3,
+        }
+    }
+
+    // Guards M-RESTORE-3 (CH restore boundary): the snapshot-eligibility law's
+    // third boundary must reject *all* vhost-user devices, including a virtio-fs
+    // *rootfs*. The previous impl only checked `!cfg.shares.is_empty()`, so a
+    // VirtioFs rootfs slipped through — that inverse makes the first assertion
+    // below go red.
+    #[test]
+    fn config_vhost_user_device_covers_virtio_fs_rootfs() {
+        use crate::config::{Egress, NetConfig, RootfsSource};
+
+        // virtio-fs *rootfs*, no data share, no vhost-user-net: still ineligible.
+        let virtio_fs_rootfs = VmConfig::builder(
+            "/k",
+            RootfsSource::VirtioFs {
+                dir: PathBuf::from("/d"),
+            },
+        )
+        .build()
+        .expect("build virtio-fs rootfs config");
+        assert!(
+            config_has_vhost_user_device(&virtio_fs_rootfs, &res_with(None)),
+            "virtio-fs rootfs must be rejected as a vhost-user device"
+        );
+
+        // rootless net is a vhost-user-net device.
+        let rootless = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .net(NetConfig::Rootless {
+            egress: Egress::default(),
+            host_services_port: None,
+        })
+        .build()
+        .expect("build rootless config");
+        assert!(config_has_vhost_user_device(&rootless, &res_with(None)));
+
+        // external vhost-user-net socket attached via resources.
+        let plain = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .build()
+        .expect("build plain config");
+        assert!(config_has_vhost_user_device(
+            &plain,
+            &res_with(Some(PathBuf::from("/run/vhost.sock")))
+        ));
+
+        // erofs rootfs + privileged (tap) net + no external socket: eligible.
+        let eligible = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .net(NetConfig::Privileged {
+            egress: Egress::default(),
+            host_services_port: None,
+        })
+        .build()
+        .expect("build eligible config");
+        assert!(!config_has_vhost_user_device(&eligible, &res_with(None)));
+    }
+
+    // Guards M-RESTORE-3 (CH snapshot boundary): `snapshot()` must self-check the
+    // captured `snapshot_restore` capability *and* the vhost-user-device law. The
+    // inverse of the capability check (snapshot() ignoring the descriptor) makes
+    // the first assertion go red; the inverse of the device check makes the
+    // second go red.
+    #[test]
+    fn snapshot_precheck_enforces_capability_and_law() {
+        // Backend that does not advertise snapshot_restore, even with a clean VM.
+        let err = snapshot_precheck(false, false).expect_err("incapable backend must error");
+        assert!(
+            matches!(&err, Error::Unsupported { feature, .. } if feature == "snapshot_restore"),
+            "expected snapshot_restore Unsupported, got {err:?}"
+        );
+
+        // Capable backend, but the VM carries a vhost-user device.
+        let err = snapshot_precheck(true, true).expect_err("vhost-user VM must error");
+        assert!(
+            matches!(&err, Error::Unsupported { feature, .. } if feature.contains("vhost-user")),
+            "expected vhost-user Unsupported, got {err:?}"
+        );
+
+        // Capable backend, snapshot-eligible VM: allowed.
+        assert!(snapshot_precheck(true, false).is_ok());
     }
 }

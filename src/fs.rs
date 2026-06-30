@@ -20,8 +20,8 @@ mod in_process;
 pub struct VirtioFsDaemon {
     /// The path to the vhost-user socket.
     pub socket_path: PathBuf,
-    #[cfg(not(feature = "experiment-fuse"))]
-    // process: Child,
+    /// Process-group id of the spawned `virtiofsd`; the whole group is
+    /// force-killed and reaped in `Drop`.
     #[cfg(not(feature = "experiment-fuse"))]
     pgid: Option<u32>,
     #[cfg(feature = "experiment-fuse")]
@@ -60,31 +60,53 @@ impl VirtioFsDaemon {
 
         #[cfg(unix)]
         {
-            // Drop privileges for virtiofsd if we are running as root.
+            // Decide whether to drop privileges for virtiofsd. The real confinement
+            // boundary for the share is `--sandbox=namespace` plus `--readonly` for
+            // RO shares (both applied above); a uid drop is defense-in-depth on top.
             //
-            // METRICS-FS-6: this targets the invoking developer's uid (`SUDO_UID`),
-            // falling back to `nobody` (65534), rather than allocating a *dedicated*
-            // low-privilege service uid per VM. That is the accepted approximation: the
-            // real isolation boundary for the share is `--sandbox=namespace` plus
-            // `--readonly` for RO shares (both applied above), and a per-developer uid
-            // already keeps the daemon off root. A dedicated, unused service uid (e.g.
-            // a reserved range allocated alongside the CID/VMID) would be strictly
-            // better; see cross_file_notes for the seam this would need.
-            if nix::unistd::getuid().as_raw() == 0 {
-                let uid = std::env::var("SUDO_UID")
+            // A dedicated, per-share low-privilege service uid (allocated from a
+            // reserved range alongside the CID/VMID) would be strictly better — a
+            // daemon could then reach only its one directory. That allocator is not
+            // yet wired up, so we drop to the invoking user (`SUDO_UID`) when we
+            // have one and otherwise keep privileges under `--sandbox=namespace`.
+            // We deliberately do NOT fall back to `nobody`, whose inability to read
+            // a root-owned share would turn this hardening into an `EACCES` failure;
+            // that deviation is logged in `implementation-notes.md`.
+            match decide_virtiofsd_uid(
+                nix::unistd::getuid().as_raw() == 0,
+                std::env::var("SUDO_UID")
                     .ok()
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(65534); // fallback to nobody
-                cmd.uid(uid);
+                    .and_then(|s| s.parse::<u32>().ok()),
+            ) {
+                VirtiofsdUid::DropTo(uid) => {
+                    cmd.uid(uid);
+                }
+                VirtiofsdUid::SandboxOnly => {
+                    // Running as root with no invoking user to drop to and no
+                    // dedicated service uid. We do NOT fall back to `nobody`
+                    // (65534): nobody cannot read a root-owned share, so the daemon
+                    // would `EACCES` — a uid hardening turning into a functional
+                    // failure. Rely on `--sandbox=namespace` and make the gap loud.
+                    tracing::warn!(
+                        "virtiofsd: running as root with no usable SUDO_UID and no \
+                         dedicated service uid; relying on --sandbox=namespace \
+                         confinement instead of an EACCES-prone nobody drop"
+                    );
+                }
+                VirtiofsdUid::InheritUnprivileged => {}
             }
-            // SAFETY: pre_exec is safe here because we only call async-signal-safe functions (setpgid).
+            // SAFETY: the `pre_exec` closure runs in the forked child before `execve`,
+            // so it must touch only async-signal-safe operations. `setpgid` is
+            // async-signal-safe, and the error branch builds the `io::Error` with
+            // `from_raw_os_error` (a non-allocating wrapper around the errno) rather
+            // than `io::Error::other`, which would heap-allocate after the fork.
             unsafe {
                 cmd.pre_exec(|| {
                     nix::unistd::setpgid(
                         nix::unistd::Pid::from_raw(0),
                         nix::unistd::Pid::from_raw(0),
                     )
-                    .map_err(std::io::Error::other)?;
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
                     Ok(())
                 });
             }
@@ -120,13 +142,23 @@ impl VirtioFsDaemon {
                 ready = true;
                 break;
             }
-            if let Some(status) = process.try_wait().unwrap_or(None) {
-                let stderr = std::fs::read_to_string(&stderr_log_path).unwrap_or_default();
-                return Err(crate::error::Error::Subprocess(format!(
-                    "virtiofsd exited prematurely with {}: {}",
-                    status,
-                    stderr.trim()
-                )));
+            match process.try_wait() {
+                Ok(Some(status)) => {
+                    let stderr = std::fs::read_to_string(&stderr_log_path).unwrap_or_default();
+                    return Err(crate::error::Error::Subprocess(format!(
+                        "virtiofsd exited prematurely with {}: {}",
+                        status,
+                        stderr.trim()
+                    )));
+                }
+                Ok(None) => {}
+                // Surface, rather than swallow, an error from polling the child:
+                // a failed `try_wait` means we no longer know the daemon's state.
+                Err(e) => {
+                    return Err(crate::error::Error::Subprocess(format!(
+                        "failed to poll virtiofsd status: {e}"
+                    )));
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -161,6 +193,12 @@ impl VirtioFsDaemon {
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);
+        // `start_in_process_virtiofsd` only returns `Ok` after the worker thread has
+        // built the daemon and signalled that it has reached its serve loop; a
+        // construction failure is reported as a typed error rather than a thread
+        // panic. Readiness therefore reflects an actually-serving daemon rather than
+        // mere socket existence — the `Listener` binds the socket up front, so
+        // polling for the socket file would report a dead daemon as ready (M-FS-2).
         let (handle, kill_notifier) = in_process::backend::start_in_process_virtiofsd(
             &socket_path,
             &share.host_path,
@@ -170,18 +208,12 @@ impl VirtioFsDaemon {
             crate::error::Error::Subprocess(format!("failed to start in-process virtiofsd: {}", e))
         })?;
 
-        // Wait for socket to be created
-        let mut ready = false;
-        for _ in 0..50 {
-            if socket_path.exists() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        if !ready {
+        // The listener binds the socket synchronously before the worker signals
+        // ready, so its absence here is a hard inconsistency rather than a
+        // not-yet-ready race.
+        if !socket_path.exists() {
             return Err(crate::error::Error::Subprocess(
-                "in-process virtiofsd failed to create socket".to_string(),
+                "in-process virtiofsd reported ready but its socket is missing".to_string(),
             ));
         }
 
@@ -215,5 +247,83 @@ impl Drop for VirtioFsDaemon {
             }
         }
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+/// Which uid the spawned `virtiofsd` should run as.
+///
+/// Extracted as a pure decision so the policy is unit-testable without spawning
+/// a process: in particular that we never silently fall back to `nobody`, whose
+/// inability to read a root-owned share would turn the uid hardening into an
+/// `EACCES` functional failure.
+#[cfg(all(unix, not(feature = "experiment-fuse")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtiofsdUid {
+    /// Not running as root: the daemon already runs as the unprivileged invoking
+    /// user, so its uid is left unchanged.
+    InheritUnprivileged,
+    /// Running as root with a known invoking user (`SUDO_UID`); drop to that uid
+    /// before `execve` so the daemon does not act as root.
+    DropTo(u32),
+    /// Running as root with no invoking user to drop to and no dedicated service
+    /// uid: keep privileges and rely on `--sandbox=namespace` rather than the
+    /// `EACCES`-prone `nobody` fallback.
+    SandboxOnly,
+}
+
+/// Decides which uid `virtiofsd` should run as given whether we are root and the
+/// parsed `SUDO_UID`.
+#[cfg(all(unix, not(feature = "experiment-fuse")))]
+fn decide_virtiofsd_uid(running_as_root: bool, sudo_uid: Option<u32>) -> VirtiofsdUid {
+    if !running_as_root {
+        return VirtiofsdUid::InheritUnprivileged;
+    }
+    match sudo_uid {
+        // uid 0 is not a real privilege drop; treat it as "no usable invoking user".
+        Some(uid) if uid != 0 => VirtiofsdUid::DropTo(uid),
+        _ => VirtiofsdUid::SandboxOnly,
+    }
+}
+
+#[cfg(all(test, unix, not(feature = "experiment-fuse")))]
+mod uid_tests {
+    use super::{VirtiofsdUid, decide_virtiofsd_uid};
+
+    #[test]
+    fn non_root_inherits_unprivileged() {
+        assert_eq!(
+            decide_virtiofsd_uid(false, Some(1000)),
+            VirtiofsdUid::InheritUnprivileged
+        );
+        assert_eq!(
+            decide_virtiofsd_uid(false, None),
+            VirtiofsdUid::InheritUnprivileged
+        );
+    }
+
+    #[test]
+    fn root_with_sudo_uid_drops_to_it() {
+        assert_eq!(
+            decide_virtiofsd_uid(true, Some(1000)),
+            VirtiofsdUid::DropTo(1000)
+        );
+    }
+
+    #[test]
+    fn root_without_sudo_uid_does_not_fall_back_to_nobody() {
+        // The buggy impl returned `DropTo(65534)` (nobody), which `EACCES`es on a
+        // root-owned share. This goes RED on that inverse.
+        let decision = decide_virtiofsd_uid(true, None);
+        assert_eq!(decision, VirtiofsdUid::SandboxOnly);
+        assert_ne!(decision, VirtiofsdUid::DropTo(65534));
+    }
+
+    #[test]
+    fn root_with_sudo_uid_zero_is_sandbox_only() {
+        // `SUDO_UID=0` is not a real drop; do not treat it as one.
+        assert_eq!(
+            decide_virtiofsd_uid(true, Some(0)),
+            VirtiofsdUid::SandboxOnly
+        );
     }
 }

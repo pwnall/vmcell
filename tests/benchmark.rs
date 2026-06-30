@@ -26,10 +26,12 @@ fn test_benchmark_ch_dry() {
         .stdout(predicates::str::contains("No successful runs"));
 }
 
+// TESTS-FEATURES-2 (Part C-e): serialization comes from the nextest `serial-host`
+// group (which already covers `binary(benchmark)`), not an ad-hoc
+// `#[serial_test::serial]` attribute.
 #[cfg(feature = "firecracker")]
 #[test]
-#[serial_test::serial]
-#[ignore]
+#[ignore = "needs KVM"]
 fn test_benchmark_fc() {
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
     cmd.arg("--backend")
@@ -45,8 +47,7 @@ fn test_benchmark_fc() {
 
 #[cfg(feature = "qemu")]
 #[test]
-#[serial_test::serial]
-#[ignore]
+#[ignore = "needs KVM"]
 fn test_benchmark_qemu() {
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
     cmd.arg("--backend")

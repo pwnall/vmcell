@@ -49,26 +49,27 @@ async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
     match command {
         Commands::Build => {
             println!("Building artifacts...");
-            let pipeline = imp_testing::artifact::Pipeline {
-                target_dir: imp_testing::artifact::artifacts_dir(),
-                stages: vec![
-                    Box::new(imp_testing::artifact::ResolvePinsStage {
+            let pipeline =
+                imp_testing::artifact::Pipeline::new(imp_testing::artifact::artifacts_dir())
+                    .add_stage(Box::new(imp_testing::artifact::ResolvePinsStage {
                         pins_file: std::path::PathBuf::from("pins.json"),
-                    }),
-                    Box::new(imp_testing::artifact::kernel::KernelStage {
+                    }))
+                    .add_stage(Box::new(imp_testing::artifact::kernel::KernelStage {
                         http_client: std::sync::Arc::new(
                             imp_testing::artifact::kernel::ReqwestClient,
                         ),
                         label: None,
-                    }),
-                    Box::new(imp_testing::artifact::guest_agent::GuestAgentStage {}),
-                    Box::new(imp_testing::artifact::guest_tools::GuestToolsStage {}),
-                    Box::new(imp_testing::artifact::rootfs::RootfsStage {
+                    }))
+                    .add_stage(Box::new(
+                        imp_testing::artifact::guest_agent::GuestAgentStage {},
+                    ))
+                    .add_stage(Box::new(
+                        imp_testing::artifact::guest_tools::GuestToolsStage {},
+                    ))
+                    .add_stage(Box::new(imp_testing::artifact::rootfs::RootfsStage {
                         source: imp_testing::artifact::rootfs::RootfsBuildSource::Oci,
                         cid_alloc: std::sync::Arc::new(imp_testing::vmm::CidAllocator::new()),
-                    }),
-                ],
-            };
+                    }));
             pipeline
                 .build(&imp_testing::artifact::Cache::default())
                 .await?;
@@ -95,23 +96,24 @@ async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
                 ));
             }
             println!("Building kernels: {}", labels.join(", "));
-            let mut stages: Vec<Box<dyn imp_testing::artifact::Stage>> =
-                vec![Box::new(imp_testing::artifact::ResolvePinsStage {
-                    pins_file: pins_file.clone(),
-                })];
+            let mut pipeline =
+                imp_testing::artifact::Pipeline::new(imp_testing::artifact::artifacts_dir())
+                    .add_stage(Box::new(imp_testing::artifact::ResolvePinsStage {
+                        pins_file: pins_file.clone(),
+                    }));
             for label in &labels {
                 println!("  - kernel {label} -> vmlinux-{label}");
-                stages.push(Box::new(imp_testing::artifact::kernel::KernelStage {
-                    http_client: std::sync::Arc::new(imp_testing::artifact::kernel::ReqwestClient),
-                    label: Some(label.clone()),
-                }));
+                pipeline =
+                    pipeline.add_stage(Box::new(imp_testing::artifact::kernel::KernelStage {
+                        http_client: std::sync::Arc::new(
+                            imp_testing::artifact::kernel::ReqwestClient,
+                        ),
+                        label: Some(label.clone()),
+                    }));
             }
-            imp_testing::artifact::Pipeline {
-                target_dir: imp_testing::artifact::artifacts_dir(),
-                stages,
-            }
-            .build(&imp_testing::artifact::Cache::default())
-            .await?;
+            pipeline
+                .build(&imp_testing::artifact::Cache::default())
+                .await?;
             println!("Kernels built: {}", labels.join(", "));
             Ok(())
         }

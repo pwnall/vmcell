@@ -35,6 +35,30 @@ pub mod backend {
     // virtio-net header size is 12 bytes
     const VIRTIO_NET_HDR_SIZE: usize = 12;
 
+    /// Maximum length of a single guest TX frame the NAT will buffer: the
+    /// virtio MTU (1500, the `max_transmission_unit` reported by the device)
+    /// plus the 12-byte virtio-net header. virtio-net here negotiates no
+    /// segmentation offload (no `VIRTIO_NET_F_GUEST_TSO`/`GSO`), so
+    /// a frame never legitimately exceeds this. The bound stops a crafted
+    /// descriptor chain from forcing a multi-gigabyte host allocation off a
+    /// guest-controlled `desc.len()`.
+    const MAX_FRAME_LEN: usize = VIRTIO_NET_HDR_SIZE + 1500;
+
+    /// Returns how many bytes of a TX descriptor may be read into a frame that
+    /// has already accumulated `accumulated` bytes, or `None` if reading the
+    /// full descriptor would push the frame past [`MAX_FRAME_LEN`].
+    ///
+    /// `desc_len` is guest-controlled (a virtio descriptor length, up to 4 GiB),
+    /// so it must be bounded before it is ever used as an allocation size.
+    fn bounded_tx_read(desc_len: usize, accumulated: usize) -> Option<usize> {
+        let remaining = MAX_FRAME_LEN.checked_sub(accumulated)?;
+        if desc_len > remaining {
+            None
+        } else {
+            Some(desc_len)
+        }
+    }
+
     /// MAC address for the host side of the rootless NAT.
     ///
     /// The third octet (`0xff`) is chosen so this address lies outside the range
@@ -166,14 +190,32 @@ pub mod backend {
                 let head_index = chain.head_index();
 
                 let mut packet = Vec::new();
+                let mut oversized = false;
                 for desc in chain.readable() {
-                    let mut buf = vec![0; desc.len() as usize];
-                    if mem_obj.read_slice(&mut buf, desc.addr()).is_ok() {
-                        packet.extend_from_slice(&buf);
+                    // Bound the guest-controlled descriptor length so a crafted
+                    // chain cannot drive a multi-gigabyte host allocation. An
+                    // over-MTU frame is dropped (it cannot be a valid virtio-net
+                    // frame here, where no offload is negotiated).
+                    match bounded_tx_read(desc.len() as usize, packet.len()) {
+                        Some(n) => {
+                            let mut buf = vec![0; n];
+                            if mem_obj.read_slice(&mut buf, desc.addr()).is_ok() {
+                                packet.extend_from_slice(&buf);
+                            }
+                        }
+                        None => {
+                            oversized = true;
+                            break;
+                        }
                     }
                 }
 
-                if let Some(payload) = packet.get(VIRTIO_NET_HDR_SIZE..) {
+                if oversized {
+                    log::trace!(
+                        "process_tx_queue: dropping over-MTU frame (cap {} bytes)",
+                        MAX_FRAME_LEN
+                    );
+                } else if let Some(payload) = packet.get(VIRTIO_NET_HDR_SIZE..) {
                     log::trace!(
                         "process_tx_queue: Read packet of length {} from vring: {:?}",
                         packet.len(),
@@ -235,10 +277,21 @@ pub mod backend {
         }
 
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-            Some((
-                self.kill_evt.0.try_clone().expect("clone consumer"),
-                self.kill_evt.1.try_clone().expect("clone notifier"),
-            ))
+            // Called by the vhost-user framework during setup (VMM-driven). A
+            // clone failure (e.g. fd exhaustion) must not panic the worker
+            // thread; log and report "no exit event", which only forgoes the
+            // prompt-wakeup optimization — `Drop` still sets the stop flag and
+            // connects the socket to unblock `accept()`, so teardown completes.
+            match (self.kill_evt.0.try_clone(), self.kill_evt.1.try_clone()) {
+                (Ok(consumer), Ok(notifier)) => Some((consumer, notifier)),
+                _ => {
+                    tracing::error!(
+                        "smoltcp exit_event: failed to clone kill event fd; \
+                         teardown will rely on the stop flag and socket wakeup"
+                    );
+                    None
+                }
+            }
         }
 
         fn handle_event(
@@ -319,13 +372,65 @@ pub mod backend {
         let _ = handle.join();
     }
 
+    /// Drops a host-side `TcpStream` from a NAT mapping whose guest socket has
+    /// closed, issuing an explicit `shutdown` so the upstream connection is torn
+    /// down promptly rather than lingering. Returns whether a stream was present.
+    ///
+    /// Invoked on every transition to `!is_open()` (both the permanent re-listen
+    /// path and the dynamic reclaim path) so a re-armed listener can never
+    /// cross-wire the next guest connection onto a stale host stream (H-NET-1),
+    /// and a closed dynamic mapping is never counted "live" forever (H-NET-2).
+    fn take_and_shutdown_stream(stream: &mut Option<tokio::net::TcpStream>) -> bool {
+        match stream.take() {
+            Some(s) => {
+                // `into_std` can fail if the stream is mid-operation; on failure
+                // the owned stream is dropped here, which still closes the fd.
+                if let Ok(std_stream) = s.into_std() {
+                    let _ = std_stream.shutdown(std::net::Shutdown::Both);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Handles a NAT mapping whose guest TCP socket has gone `!is_open()`.
+    ///
+    /// The stale host stream is dropped **first** (H-NET-1/H-NET-2). A permanent
+    /// forward-port listener is then re-armed with a cleared stream, so the next
+    /// guest connection dials a fresh host stream; a dynamic mapping is left
+    /// closed for the NET-5 reclaimer. Returns `true` if the caller should skip
+    /// the mapping (a closed dynamic mapping awaiting reclamation), `false` if it
+    /// was re-armed.
+    fn rearm_or_release_closed(
+        socket: &mut TcpSocket<'_>,
+        listen_port: u16,
+        stream: &mut Option<tokio::net::TcpStream>,
+        is_permanent: bool,
+    ) -> bool {
+        take_and_shutdown_stream(stream);
+        if is_permanent {
+            // Permanent forward-port listeners are always re-armed.
+            let _ = socket.listen(listen_port);
+            false
+        } else {
+            // NET-5: leave the closed dynamic socket closed (stream cleared) so
+            // it can be reclaimed; a fresh SYN recreates it on demand.
+            true
+        }
+    }
+
     /// Reclaims closed, idle *dynamic* NAT mappings and reports whether the pool
     /// has room for `additional` more sockets (NET-5).
     ///
     /// The first `permanent_count` mappings are the forward-port listeners and
-    /// are never reclaimed. Dynamic mappings whose socket is closed and which
-    /// have no live host stream are removed from both the mapping list and the
-    /// `SocketSet`. Growth past `MAX_DYNAMIC_SOCKETS` is refused.
+    /// are never reclaimed. A dynamic mapping whose socket is closed is
+    /// reclaimed regardless of whether a host stream is still attached: the
+    /// stale stream is taken and shut down (a closed guest socket cannot consume
+    /// any more upstream bytes), then the mapping is removed from both the
+    /// mapping list and the `SocketSet`. Counting such a mapping "live" purely
+    /// because its stream is `Some` is the H-NET-2 leak that wedges the cap.
+    /// Growth past `MAX_DYNAMIC_SOCKETS` is refused.
     fn reclaim_and_has_room(
         sockets: &mut SocketSet<'_>,
         port_mappings: &mut Vec<NatPortMapping>,
@@ -333,14 +438,18 @@ pub mod backend {
         additional: usize,
     ) -> bool {
         let mut reclaimed = Vec::new();
-        for (idx, (_, _, handle, stream)) in port_mappings.iter().enumerate() {
+        for (idx, (_, _, handle, stream)) in port_mappings.iter_mut().enumerate() {
             if idx < permanent_count {
                 continue;
             }
-            let live = stream.is_some() || sockets.get::<TcpSocket>(*handle).is_open();
-            if !live {
-                reclaimed.push(*handle);
+            if sockets.get::<TcpSocket>(*handle).is_open() {
+                // Still live (listening or an active connection): keep it.
+                continue;
             }
+            // H-NET-2: the guest closed this dynamic socket. Drop any stale host
+            // stream so the mapping is genuinely free before reclaiming it.
+            take_and_shutdown_stream(stream);
+            reclaimed.push(*handle);
         }
         port_mappings.retain(|(_, _, handle, _)| !reclaimed.contains(handle));
         for handle in &reclaimed {
@@ -662,12 +771,21 @@ pub mod backend {
                 {
                     let socket = sockets.get_mut::<TcpSocket>(*handle);
                     if !socket.is_open() {
-                        if i < permanent_count {
-                            // Permanent forward-port listeners are always re-armed.
-                            let _ = socket.listen(*listen_port);
-                        } else {
-                            // NET-5: leave a closed dynamic NAT socket closed so it
-                            // can be reclaimed; a fresh SYN recreates it on demand.
+                        // H-NET-1/H-NET-2: on any transition to a closed guest
+                        // socket, drop the stale host stream BEFORE re-arming a
+                        // permanent listener or leaving a dynamic mapping for
+                        // reclamation. A guest RST / guest-first close drives the
+                        // smoltcp socket to Closed with the host stream still
+                        // attached; without this, a re-armed permanent listener
+                        // cross-wires the next guest connection onto the old host
+                        // stream, and a closed dynamic mapping is counted "live"
+                        // forever, defeating the NET-5 cap.
+                        if rearm_or_release_closed(
+                            socket,
+                            *listen_port,
+                            tcp_stream,
+                            i < permanent_count,
+                        ) {
                             continue;
                         }
                     }
@@ -867,6 +985,101 @@ pub mod backend {
             }
             let room = reclaim_and_has_room(&mut sockets, &mut port_mappings, 0, 4);
             assert!(!room, "dynamic socket pool cap not enforced");
+        }
+
+        // Builds a real, connected `tokio::net::TcpStream` (loopback) for use as
+        // a NAT mapping's host stream. The server end is dropped; the client fd
+        // stays valid, which is all these tests inspect. Must be called inside a
+        // tokio runtime context (`rt.enter()`), which `from_std` requires.
+        fn connected_host_stream() -> tokio::net::TcpStream {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = std::net::TcpStream::connect(addr).expect("connect");
+            let (_server, _) = listener.accept().expect("accept");
+            client.set_nonblocking(true).expect("nonblocking");
+            tokio::net::TcpStream::from_std(client).expect("from_std")
+        }
+
+        // H-NET-2: a closed *dynamic* mapping whose host stream is still attached
+        // must be reclaimed (the pool shrinks). Buggy impl guarded: the pre-fix
+        // reclaim computed `live = stream.is_some() || is_open()`, so a closed
+        // dynamic mapping with `stream = Some(..)` was counted live forever and
+        // never freed — defeating the NET-5 cap. With that inverse, `len` stays
+        // 1 and this assert goes red. (The existing reclaim test only uses
+        // `stream = None`, so it never exercised the live-stream leak path.)
+        #[test]
+        fn reclaim_frees_closed_dynamic_mapping_with_live_stream() {
+            let rt = tokio::runtime::Runtime::new().expect("rt");
+            let _guard = rt.enter();
+
+            let mut sockets = SocketSet::new(vec![]);
+            let mut port_mappings: Vec<NatPortMapping> = Vec::new();
+
+            // A fresh smoltcp socket is in the Closed state => `!is_open()`.
+            let dynamic = sockets.add(new_tcp_socket());
+            port_mappings.push((100, 200, dynamic, Some(connected_host_stream())));
+
+            let room = reclaim_and_has_room(&mut sockets, &mut port_mappings, 0, 4);
+            assert_eq!(
+                port_mappings.len(),
+                0,
+                "a closed dynamic mapping with a live host stream must be reclaimed"
+            );
+            assert!(room, "pool should have room after reclamation");
+        }
+
+        // H-NET-1: on a guest-closed socket, the stale host stream is dropped
+        // BEFORE a permanent listener is re-armed (so the next guest connection
+        // dials a fresh host stream) and before a dynamic mapping is left for
+        // reclamation. Buggy impl guarded: re-arming / continuing without
+        // clearing `tcp_stream` leaves it `Some`, so `stream.is_none()` goes red.
+        #[test]
+        fn rearm_or_release_closed_clears_stale_stream() {
+            let rt = tokio::runtime::Runtime::new().expect("rt");
+            let _guard = rt.enter();
+
+            // Permanent mapping: re-armed (not skipped) with a cleared stream.
+            let mut socket = new_tcp_socket();
+            assert!(!socket.is_open());
+            let mut stream = Some(connected_host_stream());
+            let skip = rearm_or_release_closed(&mut socket, 8080, &mut stream, true);
+            assert!(!skip, "permanent mapping must be re-armed, not skipped");
+            assert!(socket.is_open(), "permanent listener must be re-armed");
+            assert!(
+                stream.is_none(),
+                "stale host stream must be cleared before re-arming (H-NET-1)"
+            );
+
+            // Dynamic mapping: skipped for reclamation, stream cleared.
+            let mut dsocket = new_tcp_socket();
+            let mut dstream = Some(connected_host_stream());
+            let skip = rearm_or_release_closed(&mut dsocket, 9090, &mut dstream, false);
+            assert!(
+                skip,
+                "closed dynamic mapping must be skipped for reclamation"
+            );
+            assert!(!dsocket.is_open(), "dynamic mapping must stay closed");
+            assert!(
+                dstream.is_none(),
+                "stale host stream must be cleared before continue (H-NET-2)"
+            );
+        }
+
+        // LOW: a guest-controlled descriptor length must be bounded before it is
+        // used as an allocation size. Buggy impl guarded: `vec![0; desc.len()]`
+        // unbounded would allocate up to ~4 GiB; here the 4 GiB case must be
+        // refused (`None`), and accumulation across descriptors is honored.
+        #[test]
+        fn bounded_tx_read_caps_guest_controlled_length() {
+            assert_eq!(bounded_tx_read(0, 0), Some(0));
+            assert_eq!(bounded_tx_read(100, 0), Some(100));
+            assert_eq!(bounded_tx_read(MAX_FRAME_LEN, 0), Some(MAX_FRAME_LEN));
+            // A 4 GiB descriptor must be refused, never allocated.
+            assert_eq!(bounded_tx_read(u32::MAX as usize, 0), None);
+            // The bound accounts for bytes already accumulated across descriptors.
+            assert_eq!(bounded_tx_read(5, MAX_FRAME_LEN - 5), Some(5));
+            assert_eq!(bounded_tx_read(6, MAX_FRAME_LEN - 5), None);
+            assert_eq!(bounded_tx_read(1, MAX_FRAME_LEN), None);
         }
     }
 }

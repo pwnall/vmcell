@@ -132,6 +132,27 @@ pub async fn create_vm_tmp_dir(vmid: u32) -> Result<PathBuf> {
     Ok(tmp)
 }
 
+/// Removes a per-VM temporary directory created by [`create_vm_tmp_dir`],
+/// including its serial log, lock files, and any leftover sockets.
+///
+/// Without this the directory (holding `serial.log`, and `api.sock.lock` for CH)
+/// leaks one-per-VM and `/tmp` grows unbounded across runs (E3). Call it on the
+/// owning instance's `Drop`/teardown path **after** the VMM process group has
+/// been reaped, so removal never races a live VMM.
+///
+/// Best-effort by design: this runs on the `Drop` path where there is no
+/// `Result` to surface and `Drop` must not panic; the directory may also already
+/// be gone. A genuine removal failure is logged for visibility rather than
+/// swallowed silently.
+pub(crate) fn remove_vm_tmp_dir(dir: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(dir) {
+        // A missing directory is the normal idempotent-teardown case, not a leak.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("failed to remove per-VM temp dir {}: {}", dir.display(), e);
+        }
+    }
+}
+
 /// Builds a Tokio command for the VMM, handling network namespaces and process groups.
 pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::process::Command {
     let mut std_cmd = std::process::Command::new(binary_path);
@@ -511,6 +532,30 @@ impl Drop for FakeVmInstance {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // Guards E3: the per-VM temp dir (serial.log + lock + stale sockets) must be
+    // removed on teardown, not just the vsock socket. The inverse — a teardown
+    // that removes only the sockets and leaves the directory — is exactly the
+    // leak this finding reports, and goes red here because the dir still exists.
+    #[test]
+    fn test_remove_vm_tmp_dir_removes_whole_dir() {
+        let parent = tempfile::tempdir().expect("create parent tempdir");
+        let vm_dir = parent.path().join("imp-vm-1-2");
+        std::fs::create_dir_all(&vm_dir).expect("create per-VM dir");
+        std::fs::write(vm_dir.join("serial.log"), b"boot log").expect("write serial.log");
+        std::fs::write(vm_dir.join("api.sock.lock"), b"").expect("write lock");
+        assert!(vm_dir.exists(), "precondition: per-VM dir exists");
+
+        remove_vm_tmp_dir(&vm_dir);
+
+        assert!(
+            !vm_dir.exists(),
+            "per-VM temp dir (with serial.log) leaked after teardown"
+        );
+
+        // Idempotent: removing an already-gone dir is a no-op, not a panic/error.
+        remove_vm_tmp_dir(&vm_dir);
+    }
 
     #[test]
     fn test_cid_allocator() {

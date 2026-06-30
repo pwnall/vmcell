@@ -8,7 +8,7 @@ This document captures the rationale behind key architectural decisions and non-
 - **Clock Resync on Restore:** When a VM is restored from a snapshot, Cloud Hypervisor restores the RTC to the exact time of the snapshot. Because the `snapshot_restore` test runs with networking disabled (precluding NTP), we manually fetch the host's `SystemTime::now()` and inject it via `date -s` over the guest agent connection.
 
 ### Firecracker
-- **Virtio MMIO & Snapshotting:** The guest kernel is configured with `CONFIG_VIRTIO_MMIO=y`, and Firecracker runs in its native MMIO mode (without the `--enable-pci` flag). Because of this, Firecracker's snapshot/restore capability is fully supported.
+- **Virtio MMIO & Snapshotting:** The guest kernel is configured with `CONFIG_VIRTIO_MMIO=y`, and Firecracker runs in its native MMIO mode (without the `--enable-pci` flag), which is what makes snapshot/restore possible at all. The backend implements and advertises `snapshot_restore: true`, but **warm restore is not currently working end-to-end**: the empirical KVM run (2026-06-29) shows `snapshot_restore::firecracker` failing with `Agent("Connection dropped during exec")` on the first post-restore exec — the guest-side agent reconnect does not survive the FC restore. `lazy_restore` is likewise advertised as `true` (firecracker.rs:538-539) but is **not** actually plumbed: `restore()` ignores the config (its `cfg` arg is `_cfg`) and hardcodes `mem_backend.backend_type = "File"` (firecracker.rs:526), whereas Cloud Hypervisor honors `restore_mode` via `prefault=on|off` (cloud_hypervisor.rs:196-199). *(Superseded 2026-06-29 — E2 honest gate-off: `capabilities()` now reports **`snapshot_restore: false` AND `lazy_restore: false`** (`src/vmm/firecracker.rs:51,55`), guarded by the unit test `capabilities_are_honest_about_snapshot_restore` (firecracker.rs:808). Neither is an advertised-but-broken flag any more (M-VMM-1 lying-flag / M-RESTORE-3 self-guard addressed); `restore()`/`snapshot()` self-check `snapshot_restore` and return `Error::Unsupported`. FC warm restore — the real UFFD/vsock-rebind fix — is now recorded as forward work behind the honest `false` capability. See "Review 37 fix pass" below.)*
 - **REST API:** Instead of relying on an external SDK (like `firecracker-rs-sdk`), we implement the REST client manually using `hyper` over Unix domain sockets.
 - **Boot Sequence:** Firecracker requires multiple sequential `PUT` API calls to endpoints like `/machine-config`, `/boot-source`, `/drives/rootfs`, `/network-interfaces/eth0`, `/vsock`, and `/logger` before calling `PUT /actions` with `InstanceStart` to boot.
 - **FPU XSAVE limitation:** Firecracker snapshot/restore tests can panic during restore (`restore_fpregs_from_fpstate`) if the guest environment (like Ubuntu 24.04's libc) aggressively utilizes highly optimized `glibc` AVX instructions exposing extended FPU states. For this reason, we apply a static CPU template (`T2`) to the Firecracker `MachineConfig` to mask the offending extended-state CPUID bits, allowing us to safely use our default `debian:trixie-slim` base image. We additionally pass `noxsave` on the guest kernel command line for Firecracker boots as belt-and-suspenders: it disables the guest's use of `XSAVE` entirely, so even if a CPU template is unavailable or incomplete the guest `glibc` cannot select an extended-state code path that the snapshot machinery would then mishandle. This is a justified deviation from the design's CPU-template-only recommendation (§15.2); the perf cost is acceptable for the dense/snapshot tier and the two mechanisms are independent.
@@ -60,7 +60,7 @@ This document captures the rationale behind key architectural decisions and non-
 ## Remaining Divergences from the Design
 - **Concurrency Testing (`loom`):** The design document recommended introducing `loom` for deep concurrency testing. This is skipped in the current phase.
 - **Rootless Networking Default:** `net-privileged` (TAP/TUN with `sudo`) is still frequently relied upon in the core integration test suite. Complete deprecation of privileged tests in favor of rootless `vhost-user-backend` is pending further network performance validation.
-- **Firecracker `restore()` passes `resume_vm: false`:** The design document specifies `POST /snapshot/load { resume_vm: true }`, but the implementation passes `resume_vm: false` and leaves the VM paused, relying on the orchestrator to call `instance.resume()` explicitly afterward. This matches the `VmInstance` trait contract (where `restore()` returns a paused instance and the caller calls `resume()`), is consistent with the Cloud Hypervisor restore pattern (which also requires an explicit `vm.resume` call after `--restore`), and works correctly because the orchestrator always calls `resume()` after `restore()`. The tradeoff is one extra API round-trip and a risk that a failed `resume()` call leaves a zombie paused FC process — mitigated by the orchestrator's `Drop` teardown.
+- **Firecracker `restore()` passes `resume_vm: false`:** The design document specifies `POST /snapshot/load { resume_vm: true }`, but the implementation passes `resume_vm: false` and leaves the VM paused, relying on the orchestrator to call `instance.resume()` explicitly afterward. This matches the `VmInstance` trait contract (where `restore()` returns a paused instance and the caller calls `resume()`), is consistent with the Cloud Hypervisor restore pattern (which also requires an explicit `vm.resume` call after `--restore`), and works correctly because the orchestrator always calls `resume()` after `restore()`. The tradeoff is one extra API round-trip and a risk that a failed `resume()` call leaves a zombie paused FC process — mitigated by the orchestrator's `Drop` teardown. (Note: as of the 2026-06-29 KVM run, FC warm restore fails end-to-end at the post-restore agent reconnect — `snapshot_restore::firecracker` → `Agent("Connection dropped during exec")` — so the "works correctly" claim is not currently validated; the `resume_vm:false`+explicit-`resume()` sequence itself is not the proven cause.) *(Superseded 2026-06-29 — FC now reports `snapshot_restore: false` (E2 honest gate-off), so this `restore()` path is gated off and unreachable through the public API until FC warm restore is actually fixed; tracked as forward work, not a live deviation.)*
 - **QEMU `snapshot_restore` capability reported as `false` in all configurations:** The design says QEMU is snapshot-ineligible only in the rootless+vsock configuration (because the external `vhost-device-vsock` daemon cannot migrate). The implementation conservatively reports `false` unconditionally, which also disables the code path in privileged `vhost-vsock` mode. This matches the current state where QEMU snapshot/restore via the privileged kernel `vhost-vsock` path has not been validated. The `restore()` implementation exists as forward work; it is guarded by `capabilities().snapshot_restore` so it is dead code in practice.
 - **CLI subcommands `run`, `exec`, `ls`, `rm`, `stats` are stubs:** The `imp-testing` binary's main logic is implemented in the library; the CLI stubs exist as placeholders pending argument-parsing design finalization for each subcommand.
 
@@ -129,6 +129,7 @@ findings contradict. Unjustified divergences and defects are in the review repor
 - The "**smoltcp host NAT MAC pinned to `02:00:00:00:00:fe`**" note claims the pin "avoids collisions with
   the guest's MAC". This is **wrong for vmid 254** (`mac_math(254)` == `02:00:00:00:00:fe`) — see review
   finding `NET-2`. The RX-iterate-only-when-queued and 16-socket-pool invariants in that note remain correct.
+  *(Superseded 2026-06-29: NET-2 is now FIXED — `HOST_NAT_MAC` was moved to `02:00:ff:00:00:fe` (`src/net/smoltcp.rs:45`), whose third octet `0xff` lies outside the range `mac_math(1..=254)` can produce, and the unit test `host_nat_mac_never_collides_with_guest_mac` (`smoltcp.rs:758`) guards it. The collision is no longer a live bug.)*
 
 
 ## Review 34 Remediation — known remaining issue & deferrals
@@ -188,6 +189,8 @@ Both follow-ups proposed in review 34 are implemented.
 
 ### Open finding surfaced during validation — stale rootfs / agent handshake
 
+> NOTE (resolved 2026-06-29): the rootfs was rebuilt with the current guest agent (guest tooling now shipped via `imp-guest-tools`); the host↔guest handshake succeeds across backends and the full privileged integration suite runs end-to-end (124 run / 120 passed / 4 failed / 8 skipped). The diagnosis below is kept for history.
+
 With the two follow-ups in place the VM **boots** and the cgroup path is clean, but the host↔guest **agent
 handshake times out** against the *current* `/tmp/imp-artifacts/rootfs.erofs`. Root cause is **stale
 artifacts**, not a code defect: the host `AgentClient::connect` and the *current* guest agent are consistent
@@ -221,19 +224,23 @@ scope, fresh artifacts via `IMP_KERNEL`/`IMP_ROOTFS`/`IMP_ARTIFACTS_DIR`): **ben
 agent + smoltcp NAT). The rootless suite is 7/8 (the 6 smoltcp unit tests + the rootless lifecycle test).
 Two gaps remain, both surfaced by the rebuild:
 
-- **Rootfs is missing `iproute2` (`ip`).** `test_egress_proxy_rootless` boots and connects the agent, then runs
+> NOTE (superseded 2026-06-29): both gaps below are now resolved/changed — see the inline RESOLVED notes on each. Rootfs guest tooling now ships via the `imp-guest-tools` helper (`src/bin/imp-guest-tools.rs`, `src/artifact/guest_tools.rs`), so `host_endpoint`/`egress_proxy`/`shares_ro_rw`/`nested_virt` PASS across backends. CH warm restore now works end-to-end (`snapshot_restore::cloud_hypervisor` PASSES); only FC warm restore is still broken (`snapshot_restore::firecracker` FAILS). Latest empirical run: privileged 124 run / 120 passed / 4 failed (`metrics_limits` x3 + `snapshot_restore::firecracker`) / 8 skipped; rootless 8/8 (not 7/8).
+
+- **Rootfs is missing `iproute2` (`ip`).** **(RESOLVED 2026-06-29 — guest tooling now ships in-rootfs via the `imp-guest-tools` helper (`src/bin/imp-guest-tools.rs`, `src/artifact/guest_tools.rs`); `host_endpoint`/`egress_proxy`/`shares_ro_rw`/`nested_virt` now PASS across backends. Original gap kept below for history.)** `test_egress_proxy_rootless` boots and connects the agent, then runs
   `ip a` in the guest and gets exit 127 (command not found). The OCI `debian` base (pins.json) is minimal and
   has no `iproute2`; the restore-path in-guest `ip` (DESIGN-DIVERGENCE-2) needs it too. Fix options: install a
   base tool set (`iproute2`, …) in the rootfs build — either add a package step to the OCI `RootfsStage` or
   finish the mmdebstrap-in-VM source (blocked on `ARTIFACT-PIPELINE-5`'s missing `debian_snapshot_timestamp`) —
   or make the diagnostics not depend on `ip`. The "Debian as close as possible to end-user systems" requirement
   argues for provisioning the tools.
-- **Warm snapshot/restore fails.** bench-vm's Warm-Restore reports "No successful runs" (the base VM boots and
+- **Warm snapshot/restore — RESOLVED for CH; FC still broken (2026-06-29).** Cloud Hypervisor warm restore now works end-to-end (`snapshot_restore::cloud_hypervisor` PASSES: create->restore->CID/MAC/vsock rotation->host-driven clock resync->CSPRNG reseed). Firecracker warm restore still FAILS (`snapshot_restore::firecracker`: `Agent("Connection dropped during exec")` on the first post-restore exec). Original finding kept for history: bench-vm's Warm-Restore reports "No successful runs" (the base VM boots and
   snapshots, but the restore or restored-agent reconnect fails) and leaked one VM on that path — the
   reap-on-failure fix covers the spawn path but the snapshot/restore flow has additional early-return points to
   audit. Needs its own investigation (CH `--restore` + `vm.resume` + agent reconnect/clock-resync).
 
 ### Privileged-suite results (fresh artifacts, blessed runner, domain scope): 82/88
+
+> NOTE (superseded 2026-06-29): dated snapshot, kept for history. Two of the three root causes below are now stale: the "Rootfs is too minimal" gap is RESOLVED (guest tooling ships via `imp-guest-tools`; `host_endpoint`/`egress_proxy`/`nested_virt` PASS), and the "metrics_limits passes where controllers are delegated" claim is WRONG — `metrics_limits` still FAILS even under a delegated scope (the cap is set but doesn't bind guest RAM; see the Review 37a note at the end). The `CAP_DAC_OVERRIDE` netns gap was fixed (three-cap runner). Latest run: privileged 124 / 120 passed / 4 failed. *(Superseded again 2026-06-29 — `metrics_limits` is now GREEN on all 3 backends (E1 fixed via the hard memory cap); latest validated run is privileged 186 / 186 passed / 0 failed / 14 skipped. See "Review 37 fix pass" at the end.)*
 
 `just test-priv` against the rebuilt rootfs in a `systemd-run --user --scope -p Delegate=yes` domain scope:
 **82 passed, 6 failed, 8 skipped.** Passing includes `boot`/`concurrency`/`lifecycle force-kill`/`shares`/
@@ -292,6 +299,7 @@ end-to-end — every prior attempt died at the netns permission error, masking e
    transparent restore, so options are re-binding on an accept error/timeout, or a host-driven signal). This is
    the one remaining **core-feature** gap (vs. the rootfs-tooling and harness gaps) and warrants focused
    investigation against CH's vsock snapshot semantics.
+   *(Superseded — RESOLVED: fixed by the CH `config.json` vsock/serial path rewrite on restore (`cloud_hypervisor.rs`) + the guest vsock listener re-bind (`imp-guest-agent.rs`, `REBIND_IDLE`); see the "Snapshot/restore: three fixes" section below. `snapshot_restore::cloud_hypervisor` passes end-to-end as of 2026-06-29. Firecracker warm restore is separately still broken — `snapshot_restore::firecracker` fails on the first post-restore exec.)*
 
 **Also surfaced:** killed/failed privileged tests **leak network namespaces** (`/var/run/netns/imp-net-*`) that
 need privileged `umount`+`rm` to clean — the missing periodic-sweeper / orphan-registry the review flagged
@@ -359,6 +367,8 @@ detailed diagnoses are in the sections above (this is the consolidated to-do).
 
 ### Bucket 1 — Rootfs tooling (fixes `egress_proxy`, `host_endpoint`, `nested_virt`)
 
+> **RESOLVED (2026-06-29).** Shipped the in-rootfs `imp-guest-tools` multicall helper (`src/bin/imp-guest-tools.rs`, baked into the erofs rootfs) providing `ip`/`curl`/`kvm-ok`; `egress_proxy`, `host_endpoint`, and `nested_virt` now pass across backends. See "Guest test-helper `imp-guest-tools`" below. The forward-work below is the original diagnosis, kept for history.
+
 The OCI `debian` base rootfs is minimal: it has no `iproute2` (`ip`), `curl`, or `cpu-checker` (`kvm-ok`), so
 these tests exit 127, and the restore-path in-guest `ip` (DESIGN-DIVERGENCE-2) has nothing to call. `oci::build_rootfs`
 only unpacks image layers — there is no `apt` step. **Recommended fix:** provision a base tool set. The
@@ -369,6 +379,8 @@ or pull/layer a tooled base image. Do **not** weaken the tests to dodge the tool
 build. (Doing this also un-skips the `iproute2`-dependent restore identity rotation.)
 
 ### Bucket 2 — Snapshot/restore vsock (fixes `snapshot_restore`) — the one core-feature gap
+
+> **RESOLVED (2026-06-29) for cloud-hypervisor.** Fixed via the CH `config.json` vsock/serial path rewrite on restore (`src/vmm/cloud_hypervisor.rs`) plus the guest vsock listener re-bind (`src/bin/imp-guest-agent.rs`, `REBIND_IDLE`); `snapshot_restore::cloud_hypervisor` passes end-to-end. See "Snapshot/restore: three fixes (now passing end-to-end)" below. Caveat: Firecracker warm restore is still broken — `snapshot_restore::firecracker` fails on the first post-restore exec. The diagnosis below is kept for history.
 
 After CH `--restore`, the guest's `VsockListener` (bound before the snapshot) never yields a new connection on
 the re-created vhost-vsock device, so the host's post-restore reconnect times out. The contributing
@@ -391,6 +403,7 @@ Two CI/harness items, not core-logic bugs:
   supervisor-leaf in the `just test-priv` wrapper). It passes where controllers are delegated (e.g. a proper CI
   runner). Note: moving the scope's own process into the supervisor leaf hit an `EINVAL` under
   `systemd-run --user --scope` here and needs the right invocation.
+  *(Superseded — INCOMPLETE diagnosis. Controller delegation was set up (`scripts/with-delegated-scope.sh`), but `metrics_limits` still FAILS on all 3 backends as of 2026-06-29: `memory.max` is written to the cap (`metrics.rs`) yet does not bind guest RAM — a 512 MiB guest under a 256 MiB cap self-OOMs while cgroup `memory.events oom_kill=0` (likely default `shared=true` shmem RAM is reclaimed, not OOM-capped). The real fix is the still-unimplemented fail-loud capability contract / enforced memory limit, not just controller delegation.)* *(Superseded 2026-06-29 — RESOLVED (E1): the fail-loud capability contract is now implemented (H-FAILLOUD-1) and the cap binds. `metrics.rs` `create_slice` writes `memory.swap.max=0` + `memory.oom.group=1` alongside `memory.max`, removing the shmem-reclaim escape hatch, so a 512 MiB guest under a 256 MiB cap is HOST-cgroup-OOM-killed (`memory.events oom_kill>0`). `metrics_limits` PASSES on all 3 backends under the delegated scope. See "Review 37 fix pass" below.)*
 - **Network-namespace leak / missing sweeper.** Killed or failed privileged tests leave
   `/var/run/netns/imp-net-*` (and occasionally tap/cgroup) residue that needs privileged `umount`+`rm`; a leaked
   netns then collides with a later run's vmid (`netns add … Operation not permitted`). This is the
@@ -433,7 +446,7 @@ This pass drove the host-facing integration suites to green. The recorded deviat
   test exercises post-restore connectivity). MAC rotation is the only identity change the
   snapshot test asserts in-guest.
 
-### Snapshot/restore: three fixes (now passing end-to-end)
+### Snapshot/restore: three fixes (CH warm restore now passing end-to-end; FC still broken — see 2026-06-29 run)
 The warm-restore path needed three independent fixes; all are in:
 
 1. **`config.json` rewrite on restore (the real host-side blocker).** CH (v52) `--restore` rebuilds
@@ -509,6 +522,19 @@ On this KVM host (blessed release `imp-test-runner`, suites under
   previously-failing tests now pass: `egress_proxy`, `host_endpoint`, `nested_virt`,
   `snapshot_restore`, `metrics_limits`, plus no regressions in `boot`/`concurrency`/`lifecycle`/
   `shares`/`exec`.
+  - **Superseded (2026-06-29 KVM run):** privileged **124 run / 120 passed / 4 failed** —
+    `metrics_limits` is now RED on all 3 backends (`memory.max` is set to the cap but does **not**
+    bind guest RAM; a 512 MiB guest under a 256 MiB cap self-OOMs with `memory.events oom_kill=0`)
+    and `snapshot_restore::firecracker` fails (`Agent("Connection dropped during exec")` on the
+    first post-restore exec; FC `restore()` ignores `_cfg`, `src/vmm/firecracker.rs:462`). CH
+    `snapshot_restore` still passes end-to-end (create→restore→CID/MAC/vsock rotation→clock
+    resync→CSPRNG reseed). Rootless remained 8/8.
+  - **Superseded again (2026-06-29, Review 37 fix pass):** `metrics_limits` is now GREEN on all
+    3 backends (E1 fixed — hard memory cap via `memory.swap.max=0`+`memory.oom.group=1`), and FC's
+    `snapshot_restore` is no longer counted as a failure because `capabilities()` honestly reports
+    `snapshot_restore: false` (E2) and the matrix `require_cap!`-skips FC/QEMU. Latest validated
+    privileged run under the delegated scope: **186 run / 186 passed / 0 failed / 14 skipped**. See
+    "Review 37 fix pass" below.
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, `cargo deny check`,
   the global-state ban, and the lean-agent invariant are all green. The feature-powerset gate
   remains the pre-existing red (module-on-`host-common` debt); the new `guest-tools` feature is
@@ -778,6 +804,64 @@ the toolchain at MSRV `1.85`); pinning it is a separate decision left to the mai
 errors — e.g. RUSTSEC-2020-0036/`failure` whose crate the update dropped); they are kept (rationalized
 + harmless) to still guard against re-introduction under other feature combos, rather than removed.
 
+## Final static-gate sweep — advisory + clippy fixes (2026-06-29)
+
+Running the final static gate surfaced a fresh batch of RustSec advisories that did not exist at the
+2026-06-28 survey, plus two latent clippy issues. Actions taken (all recorded here per the "Record
+deviations" prime directive):
+
+- **`time` 0.3.45 → 0.3.47 in the committed `Cargo.lock` (security fix).** `RUSTSEC-2026-0009` is a
+  real *vulnerability* (DoS via stack exhaustion in RFC-2822 date parsing), not a maintenance
+  advisory — `time` enters via `rcgen`/`hudsucker` → `x509-parser` → `der-parser` → `asn1-rs` →
+  `time`. Per the gate rule "do NOT whitelist a real problem," it was **fixed, not ignored**, via
+  `cargo update -p time --precise 0.3.47`. (Our usage parses ASN.1 UTCTime/GeneralizedTime, not
+  RFC-2822, so the vulnerable path is almost certainly unreachable — but a patched release exists,
+  so applying it beats rationalizing an ignore.)
+- **MSRV deliberately KEPT at 1.85; the fix is pinned in the lock instead.** `time` ≥ 0.3.47 has MSRV
+  1.88, while this crate intentionally targets 1.85 (and is written *without* let-chains accordingly).
+  The committed lock pins 0.3.47, so every real build on a 1.88+ toolchain (CI runs `@stable` = 1.96)
+  gets the fix; normal `cargo build`/`check`/`clippy`/`nextest` do **not** re-resolve, so the pin
+  holds. Two consequences are documented rather than papered over: (1) a from-scratch build now needs
+  Rust ≥ 1.88; (2) a `cargo update` on a 1.85 toolchain would *downgrade* `time` back to the
+  vulnerable 0.3.45. **Raising MSRV to 1.88 is left as the maintainer's deliberate call** — it was NOT
+  done here because it is a project-wide design change: clippy's MSRV-gating currently suppresses the
+  let-chain form of `collapsible_if`, and bumping to 1.88 turns those on (27 nested-if blocks across
+  `orchestrator`/`vmm/*`/`metrics`/`net/smoltcp`/`artifact`/… would then need collapsing into
+  let-chains). Forcing that refactor as a side effect of a transitive security pin would override the
+  recorded "MSRV kept at 1.85" decision, so it is surfaced for the maintainer instead of silently
+  applied.
+- **`deny.toml`: 12 dormant tokio-0.1-ecosystem `unmaintained` advisories ignored, each named.**
+  `RUSTSEC-2021-0124` (tokio 0.1.22, already present) plus the new `RUSTSEC-2026-0050/0051/0052/0054/
+  0056/0057/0058/0059/0060/0061/0063/0064` (tokio-uds/-threadpool/-sync/-current-thread/-codec/
+  -reactor/-io/-tcp/-timer/-fs/-executor/-udp). **All** enter only via `tun-tap 0.1.4 → tokio-core
+  0.1.18 → tokio 0.1.22`, the optional `net-privileged` tap path; the 0.1 subtree is dormant build-
+  graph weight superseded by the tokio 1.x host runtime, with no runtime use and no upgrade path for
+  the pinning dep `tun-tap`. These are maintenance-status-only, so ignoring (with per-crate rationale)
+  is correct, not a whitelist of a real defect.
+- **Removed the stale `RUSTSEC-2020-0036`/`failure` ignore.** `failure` is absent from the current
+  graph (the ignore emitted an `advisory-not-detected` warning). This reverses the 2026-06-28 "keep
+  it as a guard" note in favor of the deny.toml header's current, stricter policy: ignores must name
+  a crate that actually enters the graph; re-add individually only if the gate reports it again.
+- **Two clippy fixes in our code.** `src/artifact/mod.rs`: `unwrap_or_else(|_| f.as_path())` →
+  `unwrap_or(f.as_path())` (`unnecessary_lazy_evaluations`; the arg is a cheap reference). `src/bin/
+  bench-vm.rs`: `supported_backends()` rebuilt as a cfg-gated array `.to_vec()` instead of
+  `Vec::new()` + cfg'd `push`es (`vec_init_then_push`, kept per-backend feature gating via cfg on the
+  array elements), and `iter().any(|b| *b == backend)` → `contains(&backend)` (`manual_contains`).
+- **Vendored crates `vhost`/`vhost-user-backend`: `#[allow(dead_code)]` on the unused private
+  `check_feature` helpers.** `just ci` exports `RUSTFLAGS=-D warnings` process-wide (deliberately, to
+  deny warnings in path/vendored deps too — unlike the `-- -D warnings` clippy arg, which only covers
+  the top crate). That turned these third-party dead-code helpers into hard errors that aborted the
+  `just ci` clippy step *before* it reached cargo-deny/lean-invariants/ban-global-state/nextest. The
+  helpers are upstream API retained for parity, so they are allowed (not deleted), unblocking the
+  reachable gates.
+
+After these changes: `cargo fmt --check`, `clippy --all-targets --all-features -D warnings`,
+`RUSTFLAGS=-D warnings cargo clippy --all-targets --all-features` (the just-ci form), `cargo deny
+check` (advisories/bans/licenses/sources **ok**), `nextest --all-features` (**165 passed / 38
+ignored**), and `ban-global-state.sh` are all green. `just ci` now proceeds through cargo-deny, the
+lean-agent/lean-runner invariants, ban-global-state, and the unit suite, then hits the accepted-RED
+feature-powerset step (last, non-blocking) as designed (C-GATE-1 / S28).
+
 ## Bug + feature-gap fixes for benchmarking (2026-06-28)
 
 ### CH eager-vs-lazy restore — closes the §13.3 userfaultfd open question (supersedes the earlier "lazy_restore not plumbed" note)
@@ -815,7 +899,12 @@ concurrent clones would need a CoW of the snapshot dir — the same caveat CH ca
 
 **Cross-backend warm restore now lands as the design predicted** — FC (51 ms) < CH-lazy (77 ms) <
 CH-eager (160 ms): Firecracker *wins* restore, earning the density/snapshot tier even though it loses
-cold boot (FC ≈916 ms vs CH ≈540 ms).
+cold boot (FC ≈916 ms vs CH ≈540 ms). **(Superseded 2026-06-29:** the EADDRINUSE fix unblocked FC
+*restore-and-resume* in the benchmark path, but the full restore-then-exec path is **not** green — the
+`snapshot_restore::firecracker` integration test now FAILS at the *first post-restore exec* with
+`Agent("Connection dropped during exec")`. So these restore-latency numbers stand as benchmark data,
+but FC warm restore is **not** usable end-to-end; CH remains the only backend whose warm
+snapshot/restore passes the integration suite.)
 
 ### trixie/bookworm suite mismatch — investigated, **no code bug**
 
@@ -918,8 +1007,10 @@ an adversarial residue audit confirmed no other resolver remains.
 
 **Forward-pointer — best-effort vs fail-loud (maintainer's new `todo.md` item).** Several paths added or
 exercised this session **degrade rather than fail** when a capability is missing: the `cpufreq` pin and
-the KSM accelerator no-op (with a `warn!`/print) without `CAP_DAC_OVERRIDE`; `create_slice` skips a
-cgroup limit when the controller isn't delegated; virtiofsd RO is not enforced under the experimental
+the KSM accelerator no-op (with a `warn!`/print) without `CAP_DAC_OVERRIDE`; ~~`create_slice` skips a
+cgroup limit when the controller isn't delegated~~ *(SUPERSEDED 2026-06-29 — `create_slice` now
+**fails loud** with `Error::CapabilityUnavailable` on an un-enforceable requested limit; see "Review 37
+fix pass" below)*; virtiofsd RO is not enforced under the experimental
 in-process FUSE. For **benchmarks** this is correct (tracked-not-gated — a bench must not abort because
 it can't pin frequency), and these are *visible* (warn), not silent. But the maintainer has filed a
 "Need design" item to migrate **functional** paths to typed required-capabilities + caller assertions +
@@ -1077,10 +1168,131 @@ restore, E3 `/tmp` leak) are tracked in the review report, not here.
   gap. `snapshot_restore::cloud_hypervisor` now **passes end-to-end** (create → restore →
   CID/MAC/vsock rotation → host-driven clock resync → CSPRNG reseed). Treat the prior CH vsock-rebind
   gap as closed; the remaining restore gap is **Firecracker** (report finding E2: connection dropped
-  on the first post-restore exec).
+  on the first post-restore exec). *(Superseded 2026-06-29 — E2 is now addressed via honest gate-off:
+  FC `capabilities()` reports `snapshot_restore: false`, the matrix `require_cap!`-skips FC/QEMU
+  (visible), and the CH path runs the full restore (PASS). FC warm restore — the real UFFD/vsock-rebind
+  fix — remains forward work behind the honest `false`. See "Review 37 fix pass" below.)*
 - **`metrics_limits` is currently RED on a correctly-delegated host** (report finding E1): with the
   memory controller delegated and `memory.max` correctly written to the 256 MiB cap, a 512 MiB guest
   still self-OOMs (`oom_kill == 0`), so the cap is not binding guest RAM — almost certainly the
   default `shared=true` (shmem/memfd) guest-RAM backing being reclaimed rather than OOM-capped. This
   is NOT the prior "controller not delegated" precondition failure; it is a real enforcement gap.
   Note for future validation runs: do not assume a green `metrics_limits` — it fails here.
+  *(Superseded 2026-06-29 — RESOLVED (E1): `create_slice` now writes `memory.swap.max=0` +
+  `memory.oom.group=1` alongside `memory.max` (`src/metrics.rs`), closing the shmem-reclaim escape, so
+  the 512 MiB-under-256 MiB guest is HOST-cgroup-OOM-killed (`memory.events oom_kill>0`) and
+  `metrics_limits` PASSES on all 3 backends under the delegated scope. The fail-loud capability
+  contract (H-FAILLOUD-1) is also implemented: requesting a limit whose controller is not in the
+  parent `cgroup.subtree_control` now returns `Error::CapabilityUnavailable` instead of warn-and-`Ok`,
+  so the privileged suite MUST run under the delegated scope or VM creation correctly refuses. See
+  "Review 37 fix pass" below.)*
+
+## Review 37 fix pass — findings resolved (2026-06-29)
+
+All Review-37 findings flagged broken in the sections above are now addressed and the host suites were
+re-validated on this KVM host. This section supersedes the stale "still broken" framing in the earlier
+notes (each carries an inline `(Superseded 2026-06-29 …)` pointer here).
+
+### H-FAILLOUD-1 — §7.1 fail-loud capability contract IMPLEMENTED
+
+The contract is no longer "pending migration / Need design". Wired up in code:
+- `src/error.rs` adds `Error::CapabilityUnavailable { op, needed }` (a matchable, per-capability
+  variant carrying the missing capability + its remediation; `error.rs:97–104`).
+- `src/metrics.rs` `create_slice` / `try_apply_limit` now **confirm the controller is in the parent's
+  `cgroup.subtree_control`** before applying a requested functional limit (`memory.max`/`cpu.max`/
+  `pids.max`/`io.max`); a requested-but-unenforceable limit returns `Err(CapabilityUnavailable)`
+  instead of the former warn-and-`Ok` (`metrics.rs:129–155`, `213–238`; the `FakeCgroupFs` mirrors
+  the check at `408–421`). Unit tests `test_create_slice_fails_loud_when_memory_controller_undelegated`
+  and `…_for_undelegated_cpu` go red on the old unconditional `Ok(())`.
+- `ResourceUsage` gained a `limits_enforced: bool` flag (`metrics.rs:33`), set from whether the memory
+  controller is delegated into the slice (`metrics.rs:291–296`).
+- **Best-effort paths stay best-effort, but visible:** cpufreq pinning and the KSM accelerator still
+  no-op with a `warn!`/print when `CAP_DAC_OVERRIDE` is absent (benchmarks are tracked-not-gated). The
+  migration distinguished *functional* limits (now fail-loud) from genuinely best-effort tuning knobs.
+
+### E1 — `metrics_limits` RESOLVED (hard memory cap)
+
+The per-VM memory cap is now hard-bound: `create_slice` writes `memory.swap.max=0` and
+`memory.oom.group=1` alongside `memory.max` (`src/metrics.rs:216–227`). This removes the swap/shmem
+reclaim escape hatch the earlier note diagnosed, so a 512 MiB guest under a 256 MiB cap is OOM-killed
+by the **host** cgroup (`memory.events oom_kill > 0`), not its own in-guest OOM. `metrics_limits` now
+PASSES on all three backends **under the delegated scope**. Operational requirement: the privileged
+suite must run under a delegated cgroup scope (`scripts/with-delegated-scope.sh`) — otherwise the
+now-correct fail-loud contract refuses creation with `CapabilityUnavailable` (by design).
+
+### E2 — Firecracker snapshot/restore RESOLVED via honest gate-off
+
+FC `capabilities()` now reports `snapshot_restore: false` **and** `lazy_restore: false`
+(`src/vmm/firecracker.rs:51,55`), guarded by the unit test
+`capabilities_are_honest_about_snapshot_restore` (`firecracker.rs:808–821`). This addresses M-VMM-1
+(`lazy_restore` was a lying flag) and M-RESTORE-3 (capability self-guards): `restore()`/`snapshot()`
+self-check `snapshot_restore` and return `Error::Unsupported` (`firecracker.rs:529–533, 696–699`). The
+matrix `snapshot_restore` test `require_cap!`-skips FC/QEMU (visible skip) and the primary CH path runs
+the full restore (PASS). **FC warm restore** — the real UFFD/vsock-rebind fix that lets the post-restore
+agent exec survive — is recorded as **remaining forward work** behind the honest `false` capability,
+not an advertised-but-broken flag.
+
+### E3 — per-VM `/tmp/imp-vm-{pid}-{vmid}` directory leak RESOLVED
+
+The per-VM temp dir created by `vmm::create_vm_tmp_dir` (`src/vmm/mod.rs:129–133`) is now removed on
+teardown by `remove_vm_tmp_dir` (`remove_dir_all`, `mod.rs:147–151`). The panic-residue integration
+test asserts the directory is gone after the VM scope unwinds (`tests/lifecycle.rs:333–338`, the "E3"
+check), and a unit test `test_remove_vm_tmp_dir_removes_whole_dir` (`mod.rs:541`) guards the helper.
+
+### H-PROXY-1 — privileged filtered egress IMPLEMENTED (explicit-proxy MITM), with a documented limit
+
+`NetConfig::Privileged + Egress::Filtered` now boots and `egress_privileged_filtered` passes on
+CH+FC+QEMU. Three host-side bugs were fixed in `src/net/tap.rs`:
+- The FIB policy rule was added with no address family (`AF_UNSPEC` → `EAFNOSUPPORT`); now `AF_INET`
+  explicitly (`tap.rs:243–244`, equivalent to rtnetlink `.v4()`).
+- The `RTN_LOCAL` route used `RT_SCOPE_LINK` → `EINVAL` (the kernel requires
+  `fib_props[RTN_LOCAL].scope ≤ fc_scope`); now `RT_SCOPE_HOST` (scope 254) + `RTN_LOCAL` (type 2)
+  (`tap.rs:261–266`).
+- The `policy drop` prerouting ruleset dropped the explicit-proxy control traffic; `render_tproxy_rules`
+  now adds `iifname "<tap>" ip daddr <gateway> tcp dport <proxy_port> accept` (`tap.rs:452–463`) so a
+  guest steered with `http_proxy=<gateway>:<proxy_port>` reaches the same filtering proxy, while tproxy
+  still constrains direct 80/443 and everything else is dropped. Guarded by
+  `render_tproxy_rules_intercepts_web_and_drops_rest` (`tap.rs:624`).
+
+The proxy listener is `IP_TRANSPARENT` (`EgressProxy::start_transparent`, `src/proxy/mod.rs:108`;
+`bind_transparent_listener` sets the sockopt before `bind`) with original-destination recovery
+(`original_destination`), wired in the orchestrator (`src/orchestrator.rs:497–507`).
+**Documented remaining limitation:** fully transparent HTTP MITM of a *raw redirected* connection
+(absolute-form request reconstruction in the hudsucker layer) is NOT implemented — the transparent
+80/443 path CONSTRAINS egress (drops/fails, the security property) but does not emit a MITM body; the
+explicit-proxy path IS fully MITM'd. This is the review's allowed "steer the guest explicitly" variant.
+
+### M-FS-1 — virtiofsd per-share service uid: recorded deviation (SUDO_UID kept, no `nobody`)
+
+`src/fs.rs` did **not** wire up a dedicated per-share low-privilege service uid; that remains designed
+but unimplemented (`fs.rs:64–72`). What the code does today: run virtiofsd under `--sandbox=namespace`
+(`fs.rs:55`), `--readonly` for RO shares (`fs.rs:58`), and when running as root drop to the invoking
+user's `SUDO_UID` (`fs.rs:77`) — and **deliberately refuse to fall back to `nobody`** (whose inability
+to read a root-owned share would `EACCES` and silently break the mount). The root-with-no-usable-uid
+case keeps privileges under `--sandbox=namespace` and emits a loud warning (`fs.rs:86–93`); a unit test
+`root_without_sudo_uid_does_not_fall_back_to_nobody` (`fs.rs:313`) guards against the `nobody`
+regression. Recorded here as the accepted deviation: the dedicated service-uid allocator is forward
+work; the `--sandbox=namespace` + `SUDO_UID` + no-`nobody` posture is the current, intentional shape.
+
+### CH warm restore
+
+Already recorded as RESOLVED (see "Snapshot/restore: three fixes" and the Review-37a CH bullet) —
+`snapshot_restore::cloud_hypervisor` passes end-to-end. Unchanged this pass.
+
+### Final validated state (2026-06-29, this KVM host)
+
+- **Privileged suite** under a delegated cgroup scope
+  (`systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-priv`, all
+  three backends via `--features firecracker,qemu`): **186 run, 186 passed, 0 failed, 14 skipped**.
+- **Rootless suite:** 14 passed, 0 failed.
+- **Unit suite** (`cargo nextest --all-features`): 165 passed.
+- **Static gates green:** clippy `-D warnings`, `cargo fmt`, `cargo deny` (advisories/bans/licenses/
+  sources ok), the global-state ban.
+- **`cargo semver-checks` reports a deliberate MAJOR bump** — `Pipeline` encapsulation (M-API-1) plus
+  `ResourceUsage` field changes (the `limits_enforced` flag, H-FAILLOUD-1). Expected; resolve via a
+  version bump at publish/PR time, not by reverting the surface.
+
+The four Review-37 appendix justified deviations (per-deployment MITM CA minting / P13; stringly
+per-subsystem `Error` payloads with no `Error::Other` / P25; `guest-tools` legitimately uses `reqwest`
+/ S45; concurrent-restore-from-one-snapshot is forward work / S32) are recorded above in
+"Review 37 — newly recorded justified deviations" and remain accurate.

@@ -2,6 +2,11 @@
 name = "imp-testing"
 version = "0.1.0"
 edition = "2024"
+# MSRV kept at 1.85 (deliberate — see docs/implementation-notes.md). NOTE: the committed
+# Cargo.lock pins `time` 0.3.47 (the RUSTSEC-2026-0009 fix), whose own MSRV is 1.88, so a
+# from-scratch build needs 1.88+; a `cargo update` on a 1.85 toolchain would downgrade `time`
+# to the vulnerable 0.3.45. Raising MSRV to 1.88 is the maintainer's call (it also turns on
+# let-chains and would require collapsing ~27 nested-if blocks clippy then flags).
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Micro-VM-per-test integration & evaluation platform for the Imp agentic harness"
@@ -181,7 +186,11 @@ pipeline = [
 cli = ["host-common", "dep:clap", "dep:anyhow", "dep:serde_json"]
 
 agent = ["dep:vsock", "dep:rustix", "dep:signal-hook", "dep:libc", "dep:tracing", "dep:tracing-subscriber"]
-test-runner = ["dep:rustix", "dep:capctl", "dep:libc", "dep:tracing", "dep:tracing-subscriber"]
+# Dependency-thin privileged window: rustix + capctl only, plus libc for the
+# syscalls rustix does not expose here (setres{u,g}id, setgroups, getgroups,
+# getgrnam). No tracing/tracing-subscriber: this binary reports failures that
+# occur BEFORE the privilege drop, straight to stderr (see imp-test-runner.rs).
+test-runner = ["dep:rustix", "dep:capctl", "dep:libc"]
 # Guest test-helper binary (ip/curl/kvm-ok): a blocking HTTP client plus libc for
 # the interface ioctls behind `ip link set … address` (restore MAC rotation).
 guest-tools = ["dep:reqwest", "dep:libc"]

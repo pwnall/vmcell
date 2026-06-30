@@ -18,16 +18,19 @@ pub struct ResourceUsage {
     pub io_read_bytes: u64,
     /// Bytes written to disk/block devices.
     pub io_write_bytes: u64,
-    /// Bytes received over network.
+    /// Whether the requested cgroup limits are actually being enforced.
     ///
-    /// Not yet wired: cgroup v2 has no network byte accounting, and `read_stats`
-    /// only receives the cgroup name, not the VM's netns/interface handle, so this
-    /// stays `0` until a per-netns interface stats source is threaded through.
-    pub net_rx_bytes: u64,
-    /// Bytes transmitted over network.
+    /// `true` only when the `memory` controller is delegated into this cgroup
+    /// (`cgroup.controllers` lists it), meaning the limit writes took effect.
+    /// `false` when no controller is delegated — reads then fall back to bare
+    /// sysfs values and the caller must not assume enforcement (§7.1 rule 3).
+    /// A `ResourceUsage::default()` (no cgroup attached) is honestly `false`.
     ///
-    /// Not yet wired: see [`ResourceUsage::net_rx_bytes`] for why this stays `0`.
-    pub net_tx_bytes: u64,
+    /// Network byte counters are intentionally absent: cgroup v2 has no network
+    /// accounting and the read path holds only the cgroup name, not the VM's
+    /// netns/interface handle, so an always-zero `net_*` field would be a lie
+    /// (§7.1 / rubric B8). See `implementation-notes.md`.
+    pub limits_enforced: bool,
 }
 
 /// Interface for managing cgroups.
@@ -103,31 +106,57 @@ fn render_pids_max(pids_max: u32) -> String {
     pids_max.to_string()
 }
 
-/// Best-effort application of a single cgroup limit: enable `controller` on the
-/// parent's `subtree_control` so the matching control file exists on `name`, then
-/// write `value`. A constrained or non-delegated cgroup layout may not allow
-/// enabling the controller; we then `warn!` and skip the limit so VM creation still
-/// succeeds (limit-dependent tests gate on controller availability themselves).
+/// Returns whether `controller` appears as a whole space-separated token in a
+/// cgroup-v2 controller listing (`cgroup.controllers` or `cgroup.subtree_control`).
+/// A whole-token match — never a substring — so `memory` does not match `memoryx`.
+fn controller_listed(listing: &str, controller: &str) -> bool {
+    listing.split_whitespace().any(|c| c == controller)
+}
+
+/// Applies a single *requested functional* cgroup limit, failing loud per the §7.1
+/// capability contract: enable `controller` on the parent's `subtree_control` so the
+/// matching control file exists on `name`, **confirm** it is actually delegated, then
+/// write `value`. A requested limit that cannot be enforced — because the controller
+/// is not delegated, or the control file rejects the write — returns
+/// [`crate::error::Error::CapabilityUnavailable`] rather than logging a warning and skipping it
+/// (which would hand back a VM running unbounded). This is *not* best-effort; only the
+/// explicitly-listed §7.1 benchmark knobs (cpufreq/KSM) may degrade with a `warn!`.
+///
+/// # Errors
+/// Returns [`crate::error::Error::CapabilityUnavailable`] when the controller is not delegated to
+/// the parent's `subtree_control` or the limit write fails.
 #[cfg(feature = "metrics")]
-fn try_apply_limit(name: &str, controller: &str, file: &str, value: &str) {
+fn try_apply_limit(name: &str, controller: &str, file: &str, value: &str) -> Result<()> {
+    use crate::error::Error;
     if let Some(parent) = std::path::Path::new(name).parent() {
         let parent = parent.to_string_lossy();
         if !parent.is_empty() {
-            let _ = std::fs::write(
-                format!("/sys/fs/cgroup/{}/cgroup.subtree_control", parent),
-                format!("+{}", controller),
-            );
+            let subtree = format!("/sys/fs/cgroup/{}/cgroup.subtree_control", parent);
+            // Best-effort enable; a constrained/non-delegated layout silently ignores
+            // the `+controller` write, so we never trust it — we read it back.
+            let _ = std::fs::write(&subtree, format!("+{}", controller));
+            let delegated = std::fs::read_to_string(&subtree)
+                .map(|s| controller_listed(&s, controller))
+                .unwrap_or(false);
+            if !delegated {
+                return Err(Error::CapabilityUnavailable {
+                    op: format!("cgroup {} limit", file),
+                    needed: format!(
+                        "'{}' controller delegated to {}/cgroup.subtree_control",
+                        controller, parent
+                    ),
+                });
+            }
         }
     }
-    if let Err(e) = std::fs::write(format!("/sys/fs/cgroup/{}/{}", name, file), value) {
-        tracing::warn!(
-            "cgroup {}: could not apply {} (controller '{}' unavailable in this layout): {}",
-            name,
-            file,
-            controller,
-            e
-        );
-    }
+    let path = format!("/sys/fs/cgroup/{}/{}", name, file);
+    std::fs::write(&path, value).map_err(|e| Error::CapabilityUnavailable {
+        op: format!("cgroup {} limit", file),
+        needed: format!(
+            "writable {} for the '{}' controller ({})",
+            path, controller, e
+        ),
+    })
 }
 
 /// Sums the `rbytes`/`wbytes` counters across every device line of a cgroup-v2
@@ -186,18 +215,27 @@ impl CgroupFs for DefaultCgroupFs {
                     "memory",
                     "memory.max",
                     &mem_hard_limit_bytes(mem).to_string(),
-                );
+                )?;
+                // E1: make the cap a HARD bound, not a throttle. Guest RAM can be
+                // shmem/memfd-backed; under `memory.max` pressure cgroup v2 reclaims
+                // shmem to swap instead of OOM-killing, so the cap never fires and the
+                // guest overruns it. `memory.swap.max=0` removes the swap escape hatch
+                // (shmem stays charged, the cap hard-kills) and `memory.oom.group=1`
+                // makes the kill take the whole VM cgroup atomically. Both are part of
+                // the requested functional limit, so they fail loud too.
+                try_apply_limit(name, "memory", "memory.swap.max", "0")?;
+                try_apply_limit(name, "memory", "memory.oom.group", "1")?;
             }
             if let Some(cpu) = limits.cpu_max_pct {
                 let (quota, period) = cpu_quota_period(cpu);
-                try_apply_limit(name, "cpu", "cpu.max", &format!("{} {}", quota, period));
+                try_apply_limit(name, "cpu", "cpu.max", &format!("{} {}", quota, period))?;
             }
             if let Some(pids) = limits.pids_max {
-                try_apply_limit(name, "pids", "pids.max", &render_pids_max(pids));
+                try_apply_limit(name, "pids", "pids.max", &render_pids_max(pids))?;
             }
             if let Some(io) = &limits.io_max {
                 if let Some(io_str) = render_io_max(io) {
-                    try_apply_limit(name, "io", "io.max", io_str.trim_end());
+                    try_apply_limit(name, "io", "io.max", io_str.trim_end())?;
                 }
             }
         }
@@ -250,9 +288,15 @@ impl CgroupFs for DefaultCgroupFs {
             }
         }
 
-        // net_rx_bytes/net_tx_bytes are intentionally left at 0: cgroup v2 has no
-        // network byte accounting and this method has no handle to the VM's netns.
-        // See the field docs on `ResourceUsage`.
+        // limits_enforced (§7.1 rule 3): the memory controller is delegated into this
+        // cgroup iff it is listed in `cgroup.controllers`. When it is absent the limit
+        // writes were rejected and the values above are bare sysfs fallbacks, so the
+        // caller must not assume enforcement. Honestly `false` if the file is missing.
+        let controllers_path = format!("{}/cgroup.controllers", base_path);
+        usage.limits_enforced = std::fs::read_to_string(controllers_path)
+            .map(|s| controller_listed(&s, "memory"))
+            .unwrap_or(false);
+
         Ok(usage)
     }
 
@@ -289,6 +333,10 @@ pub struct FakeCgroupFs {
 struct FakeCgroupState {
     pub slices: std::collections::HashMap<String, crate::config::ResourceLimits>,
     pub tasks: std::collections::HashMap<String, Vec<u32>>,
+    /// Cgroup controllers modelled as delegated to the slice. A requested limit
+    /// whose controller is absent here must fail loud (§7.1), mirroring the real
+    /// `DefaultCgroupFs` `subtree_control` check.
+    pub delegated: std::collections::HashSet<String>,
 }
 
 #[cfg(test)]
@@ -300,12 +348,31 @@ impl Default for FakeCgroupFs {
 
 #[cfg(test)]
 impl FakeCgroupFs {
-    /// Creates a new fake cgroup filesystem.
+    /// Creates a new fake cgroup filesystem with every controller delegated, so a
+    /// well-configured host is the default and limit application succeeds.
     #[must_use]
     pub fn new() -> Self {
+        let delegated = ["memory", "cpu", "pids", "io"]
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect();
         Self {
-            state: std::sync::Arc::new(std::sync::Mutex::new(FakeCgroupState::default())),
+            state: std::sync::Arc::new(std::sync::Mutex::new(FakeCgroupState {
+                delegated,
+                ..FakeCgroupState::default()
+            })),
         }
+    }
+
+    /// Models a controller that is **not** delegated into the slice, so a requested
+    /// limit needing it must fail loud with
+    /// [`crate::error::Error::CapabilityUnavailable`] instead of a silent `Ok`
+    /// (§7.1). Drives the fail-loud unit test.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn undelegate(&self, controller: &str) {
+        self.state.lock().unwrap().delegated.remove(controller);
     }
 
     /// Checks if a slice exists.
@@ -340,6 +407,22 @@ impl FakeCgroupFs {
 impl CgroupFs for FakeCgroupFs {
     fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        // Model the §7.1 fail-loud contract: a requested limit whose controller is
+        // not delegated cannot be enforced, so return CapabilityUnavailable and do
+        // NOT record the slice as created (a silent `Ok` here is the exact bug).
+        for (requested, controller, file) in [
+            (limits.mem_max_mib.is_some(), "memory", "memory.max"),
+            (limits.cpu_max_pct.is_some(), "cpu", "cpu.max"),
+            (limits.pids_max.is_some(), "pids", "pids.max"),
+            (limits.io_max.is_some(), "io", "io.max"),
+        ] {
+            if requested && !state.delegated.contains(controller) {
+                return Err(crate::error::Error::CapabilityUnavailable {
+                    op: format!("cgroup {} limit", file),
+                    needed: format!("'{}' controller delegated to {}", controller, name),
+                });
+            }
+        }
         state.slices.insert(name.to_string(), limits.clone());
         Ok(())
     }
@@ -352,14 +435,14 @@ impl CgroupFs for FakeCgroupFs {
     }
 
     fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
+        // The fake models a delegated host, so enforcement is honestly reported true.
         Ok(ResourceUsage {
             mem_peak_mib: 42,
             mem_current_mib: 21,
             cpu_usec: 1000,
             io_read_bytes: 0,
             io_write_bytes: 0,
-            net_rx_bytes: 0,
-            net_tx_bytes: 0,
+            limits_enforced: true,
         })
     }
 
@@ -480,5 +563,79 @@ mod tests {
     #[test]
     fn test_render_pids_max_exact() {
         assert_eq!(render_pids_max(64), "64");
+    }
+
+    // Whole-token controller matching. A `listing.contains(controller)` impl (the
+    // likely bug) would match `memory` inside `memoryx` and go red on that case.
+    #[test]
+    fn test_controller_listed_whole_token() {
+        assert!(controller_listed("cpu io memory pids", "memory"));
+        assert!(controller_listed("memory", "memory"));
+        assert!(!controller_listed("cpuset cpu io pids", "memory"));
+        assert!(!controller_listed("memoryx hugetlb", "memory"));
+        assert!(!controller_listed("", "memory"));
+    }
+
+    // H-FAILLOUD-1 (§7.1 rule 2): a *requested* limit whose controller is not
+    // delegated must fail loud with a matchable CapabilityUnavailable and must NOT
+    // be recorded as created. Goes red on the old `Ok(())`-unconditional create_slice.
+    #[test]
+    fn test_create_slice_fails_loud_when_memory_controller_undelegated() {
+        let fs = FakeCgroupFs::new();
+        fs.undelegate("memory");
+        let limits = ResourceLimits {
+            mem_max_mib: Some(128),
+            cpu_max_pct: None,
+            pids_max: None,
+            io_max: None,
+        };
+        let err = fs
+            .create_slice("imp-vm-1", &limits)
+            .expect_err("requested memory.max on an undelegated controller must fail loud");
+        assert!(
+            matches!(err, crate::error::Error::CapabilityUnavailable { .. }),
+            "expected CapabilityUnavailable, got {err:?}"
+        );
+        // A limit that could not be enforced must leave no slice behind.
+        assert!(
+            !fs.has_slice("imp-vm-1"),
+            "no slice may be recorded when its requested limit could not be enforced"
+        );
+    }
+
+    // The inverse: with the controller delegated (the default), the same request
+    // succeeds — proving the failure above is the undelegation, not a blanket reject.
+    #[test]
+    fn test_create_slice_ok_when_controller_delegated() {
+        let fs = FakeCgroupFs::new();
+        let limits = ResourceLimits {
+            mem_max_mib: Some(128),
+            cpu_max_pct: None,
+            pids_max: None,
+            io_max: None,
+        };
+        fs.create_slice("imp-vm-1", &limits).unwrap();
+        assert!(fs.has_slice("imp-vm-1"));
+    }
+
+    // A requested limit fails loud for the specific undelegated controller (cpu),
+    // not just memory — guards against a memory-only check.
+    #[test]
+    fn test_create_slice_fails_loud_for_undelegated_cpu() {
+        let fs = FakeCgroupFs::new();
+        fs.undelegate("cpu");
+        let limits = ResourceLimits {
+            mem_max_mib: None,
+            cpu_max_pct: Some(50),
+            pids_max: None,
+            io_max: None,
+        };
+        let err = fs
+            .create_slice("imp-vm-1", &limits)
+            .expect_err("requested cpu.max on an undelegated controller must fail loud");
+        assert!(matches!(
+            err,
+            crate::error::Error::CapabilityUnavailable { .. }
+        ));
     }
 }

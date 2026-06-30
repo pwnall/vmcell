@@ -345,10 +345,25 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Builds the final `VmConfig`.
+    /// Builds the final [`VmConfig`], validating its internal consistency.
     ///
     /// # Errors
-    /// Returns an error if the kernel or rootfs paths do not exist.
+    /// Returns [`Error::Config`](crate::error::Error::Config) when the
+    /// configuration is internally inconsistent. The validations performed are:
+    /// - `vcpus == 0` (at least one vCPU is required);
+    /// - `mem_mib` below the 64 MiB floor;
+    /// - an empty kernel path;
+    /// - an explicit `vmid` outside the `1..=254` window used by the `/30`
+    ///   host-IP math;
+    /// - a share with an empty mount tag, or two shares sharing a mount tag;
+    /// - `snapshotting` combined with any vhost-user device — a virtio-fs
+    ///   rootfs, any virtio-fs data share, or rootless (vhost-user-net)
+    ///   networking — which violates the §3.3 snapshot-eligibility law;
+    /// - `ksm_mergeable` combined with any vhost-user device (it sets CH
+    ///   `shared=off`, mutually exclusive with the vhost-user paths — §13.5).
+    ///
+    /// This validates internal consistency only; it does **not** check that the
+    /// kernel, rootfs, or share paths exist on disk.
     ///
     /// # Examples
     /// ```rust
@@ -385,6 +400,41 @@ impl VmConfigBuilder {
             if !self.shares.is_empty() {
                 return Err(crate::error::Error::Config(
                     "virtio-fs data shares cannot be combined with snapshotting".into(),
+                ));
+            }
+            // Snapshot-eligibility law (§3.3), third boundary case: the rootless
+            // network path is an in-process vhost-user-net device, so it is
+            // mutually exclusive with snapshotting just like virtiofsd above.
+            if matches!(self.net, NetConfig::Rootless { .. }) {
+                return Err(crate::error::Error::Config(
+                    "rootless (vhost-user-net) networking cannot be combined with snapshotting"
+                        .into(),
+                ));
+            }
+        }
+
+        // §13.5 KSM lever: `ksm_mergeable` sets CH `mergeable=on, shared=off`,
+        // and KSM only merges private-anonymous pages — so `shared=off` is
+        // mutually exclusive with every vhost-user path. Enforce here (boundary
+        // 1) so an invalid combination never becomes a `VmConfig` and instead
+        // fails late at the backend, which sets `shared: !ksm_mergeable` while
+        // still attaching the vhost-user device.
+        if self.ksm_mergeable {
+            if let RootfsSource::VirtioFs { .. } = self.rootfs {
+                return Err(crate::error::Error::Config(
+                    "ksm_mergeable cannot be combined with a virtio-fs rootfs (vhost-user)".into(),
+                ));
+            }
+            if !self.shares.is_empty() {
+                return Err(crate::error::Error::Config(
+                    "ksm_mergeable cannot be combined with virtio-fs data shares (vhost-user)"
+                        .into(),
+                ));
+            }
+            if matches!(self.net, NetConfig::Rootless { .. }) {
+                return Err(crate::error::Error::Config(
+                    "ksm_mergeable cannot be combined with rootless (vhost-user-net) networking"
+                        .into(),
                 ));
             }
         }
@@ -680,5 +730,152 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, crate::error::Error::Config(_)));
         assert!(err.to_string().contains("duplicate share tag: dup"));
+    }
+
+    // M-RESTORE-3: the §3.3 snapshot-eligibility law's third boundary case.
+    // Buggy impl: build() rejects snapshot + virtio-fs rootfs and snapshot +
+    // data share but lets the rootless vhost-user-net path through, so this VM
+    // would reach the backend and fail late attaching a vhost-user device.
+    #[test]
+    fn test_reject_rootless_net_with_snapshot() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(NetConfig::Rootless {
+            egress: Egress::Open,
+            host_services_port: None,
+        })
+        .snapshotting(true)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string().contains(
+                "rootless (vhost-user-net) networking cannot be combined with snapshotting"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    // M-RESTORE-3 positive guard: the privileged tap path is NOT a vhost-user
+    // device, so snapshot + Privileged net must still build. An over-broad
+    // impl that rejects every net mode on the snapshot path turns this red
+    // (the over-block smell AGENTS.md warns about).
+    #[test]
+    fn test_accept_snapshot_with_privileged_net() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(NetConfig::Privileged {
+            egress: Egress::Open,
+            host_services_port: None,
+        })
+        .snapshotting(true)
+        .build()
+        .unwrap();
+        assert!(cfg.snapshotting);
+        assert!(matches!(cfg.net, NetConfig::Privileged { .. }));
+    }
+
+    // M-CONFIG-1: ksm_mergeable (CH shared=off) is mutually exclusive with a
+    // virtio-fs rootfs (virtiofsd, a vhost-user device). Buggy impl: build()
+    // accepts the combination and it fails late at the VMM.
+    #[test]
+    fn test_reject_ksm_mergeable_with_virtio_fs_rootfs() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::VirtioFs {
+                dir: PathBuf::from("/rootfs"),
+            },
+        )
+        .ksm_mergeable(true)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string()
+                .contains("ksm_mergeable cannot be combined with a virtio-fs rootfs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // M-CONFIG-1: ksm_mergeable is mutually exclusive with a virtio-fs data
+    // share (virtiofsd, a vhost-user device).
+    #[test]
+    fn test_reject_ksm_mergeable_with_data_share() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_share(Share::new(
+            "data",
+            "/tmp/data",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
+        .ksm_mergeable(true)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string()
+                .contains("ksm_mergeable cannot be combined with virtio-fs data shares"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // M-CONFIG-1: ksm_mergeable is mutually exclusive with rootless
+    // vhost-user-net networking.
+    #[test]
+    fn test_reject_ksm_mergeable_with_rootless_net() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(NetConfig::Rootless {
+            egress: Egress::Open,
+            host_services_port: None,
+        })
+        .ksm_mergeable(true)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string()
+                .contains("ksm_mergeable cannot be combined with rootless"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // M-CONFIG-1 positive guard: ksm_mergeable with NO vhost-user device (erofs
+    // rootfs over virtio-blk, privileged tap net, no shares) is the supported
+    // density combination and must still build. An impl that rejects every
+    // ksm_mergeable config turns this red (over-block smell).
+    #[test]
+    fn test_accept_ksm_mergeable_without_vhost_user() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(NetConfig::Privileged {
+            egress: Egress::Open,
+            host_services_port: None,
+        })
+        .ksm_mergeable(true)
+        .build()
+        .unwrap();
+        assert!(cfg.ksm_mergeable);
     }
 }

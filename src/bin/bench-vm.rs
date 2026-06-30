@@ -260,6 +260,16 @@ fn bench_label(base: &str, is_restore: bool, page_cache_dropped: bool) -> String
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Fail loud and early on a misinvocation, before any side effects (CPU-freq
+    // pinning, booting). An unknown/feature-disabled `--backend`, an unknown
+    // `--mode`, or an out-of-floor `--mem-mib` must exit non-zero — not print a
+    // notice and silently succeed (M-CLI-1), and not panic at a `.build()`
+    // `.expect()` site with a misleading "benchmark invariant" message (P22).
+    validate_backend(&args.backend)?;
+    validate_mode(&args.mode)?;
+    validate_vm_params(&args)?;
+
     println!("Running benchmarks with backend: {}", args.backend);
     println!(
         "kernel: {} (label={})",
@@ -302,31 +312,134 @@ async fn main() -> anyhow::Result<()> {
         "cloud-hypervisor" => {
             let vmm = imp_testing::vmm::cloud_hypervisor::CloudHypervisor::new("cloud-hypervisor");
             println!("Capabilities: {:?}", vmm.capabilities());
-            run_mode(&vmm, "cloud-hypervisor", &args, allocator.clone()).await;
+            run_mode(&vmm, "cloud-hypervisor", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "firecracker")]
         "firecracker" => {
             let vmm = imp_testing::vmm::firecracker::Firecracker::new("firecracker");
             println!("Capabilities: {:?}", vmm.capabilities());
-            run_mode(&vmm, "firecracker", &args, allocator.clone()).await;
+            run_mode(&vmm, "firecracker", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "qemu")]
         "qemu" => {
             let vmm = imp_testing::vmm::qemu::Qemu::new("qemu-system-x86_64");
             println!("Capabilities: {:?}", vmm.capabilities());
-            run_mode(&vmm, "qemu", &args, allocator.clone()).await;
+            run_mode(&vmm, "qemu", &args, allocator.clone()).await?;
         }
-        _ => {
-            println!("Unsupported backend or feature not enabled");
-        }
+        // Unreachable after `validate_backend`, but fail loud rather than
+        // silently succeed if the two ever drift.
+        _ => anyhow::bail!(
+            "unsupported or feature-disabled --backend '{}'",
+            args.backend
+        ),
     }
 
     Ok(())
 }
 
+/// The benchmark backends compiled into this binary, honoring the per-backend
+/// feature gates. The set is the single source of truth shared with the
+/// `--backend` dispatch in `main` so a feature-disabled backend reads as
+/// unsupported rather than silently succeeding.
+fn supported_backends() -> Vec<&'static str> {
+    // `cloud-hypervisor` is a `required-features` of this binary, so the array
+    // always has at least one element. cfg attributes gate the array elements
+    // so a feature-disabled backend reads as unsupported.
+    [
+        #[cfg(feature = "cloud-hypervisor")]
+        "cloud-hypervisor",
+        #[cfg(feature = "firecracker")]
+        "firecracker",
+        #[cfg(feature = "qemu")]
+        "qemu",
+    ]
+    .to_vec()
+}
+
+/// Validates `--backend` against [`supported_backends`].
+///
+/// # Errors
+/// Returns an error when the backend is unknown or its feature was not enabled
+/// at build time, so a CI/script typo or a feature-gated build exits non-zero
+/// instead of printing a notice and returning `Ok`.
+fn validate_backend(backend: &str) -> anyhow::Result<()> {
+    let supported = supported_backends();
+    if supported.contains(&backend) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "unsupported or feature-disabled --backend '{backend}' (compiled-in: {})",
+            supported.join(", ")
+        )
+    }
+}
+
+/// The benchmark modes this harness understands. Kept in one place so the
+/// `--mode` validator and its error message cannot drift from the dispatcher in
+/// [`run_mode`].
+const VALID_MODES: &[&str] = &[
+    "latency",
+    "footprint",
+    "suspend-size",
+    "phase-budget",
+    "vsock-rtt",
+];
+
+/// Validates `--mode` against [`VALID_MODES`].
+///
+/// # Errors
+/// Returns an error for an unknown mode so a typo exits non-zero instead of
+/// printing "Unknown mode" and returning `Ok`.
+fn validate_mode(mode: &str) -> anyhow::Result<()> {
+    if VALID_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "unknown --mode '{mode}' (valid: {})",
+            VALID_MODES.join(", ")
+        )
+    }
+}
+
+/// Validates the VM parameters shared by every benchmark mode by running them
+/// through [`VmConfig`]'s own builder, surfacing its typed validation error
+/// (chiefly a `--mem-mib` below the documented 64 MiB floor) instead of
+/// panicking later at the `.build().expect(...)` sites.
+///
+/// # Errors
+/// Propagates any [`VmConfig`] build error — currently a `mem_mib` below the
+/// floor — as a clear, non-panicking error.
+fn validate_vm_params(args: &Args) -> anyhow::Result<()> {
+    VmConfig::builder(
+        PathBuf::from("vmlinux"),
+        RootfsSource::Erofs {
+            image: PathBuf::from("rootfs.erofs"),
+        },
+    )
+    .vcpus(1)
+    .mem_mib(args.mem_mib)
+    .network_disabled()
+    .restore_mode(args.restore_mode)
+    .ksm_mergeable(args.ksm_mergeable)
+    .build()
+    .map_err(|e| anyhow::anyhow!("invalid benchmark VM parameters: {e}"))?;
+    Ok(())
+}
+
 /// Dispatches to the requested benchmark mode. `latency` preserves the original
 /// cold/warm behaviour exactly (the dry-test path); the rest answer §13.
-async fn run_mode<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
+///
+/// # Errors
+/// Returns an error for an unknown `--mode` so a typo exits non-zero rather than
+/// printing a notice and returning `Ok`. `--mode` is normally pre-validated by
+/// [`validate_mode`] in `main`; the trailing arm re-checks defensively so the
+/// two cannot silently drift.
+async fn run_mode<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
     match args.mode.as_str() {
         "latency" => {
             run_bench(vmm, "Cold Boot", args, allocator.clone(), false).await;
@@ -338,10 +451,12 @@ async fn run_mode<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAl
         "suspend-size" => run_suspend_size(vmm, backend, args, allocator).await,
         "phase-budget" => run_phase_budget(vmm, backend, args, allocator).await,
         "vsock-rtt" => run_vsock_rtt(vmm, backend, args, allocator).await,
-        other => println!(
-            "Unknown mode: {other} (valid: latency, footprint, suspend-size, phase-budget, vsock-rtt)"
+        other => anyhow::bail!(
+            "unknown --mode '{other}' (valid: {})",
+            VALID_MODES.join(", ")
         ),
     }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -1137,5 +1252,52 @@ mod tests {
         assert_eq!(bench_label("Cold Boot", false, true), "Cold Boot");
         // Restore is not page-cache sensitive in the same way; never flagged.
         assert_eq!(bench_label("Warm Restore", true, false), "Warm Restore");
+    }
+
+    // M-CLI-1: the `_` backend arm printed "Unsupported backend or feature not
+    // enabled" then let `main` return `Ok(())`, so a typo or a feature-disabled
+    // build exited 0. RED on the inverse (a validator that returns `Ok` for
+    // anything): the unknown-backend assert below fails.
+    #[test]
+    fn validate_backend_rejects_unknown_backend() {
+        assert!(validate_backend("totally-not-a-vmm").is_err());
+        assert!(validate_backend("").is_err());
+        // bench-vm's `required-features` always include `cloud-hypervisor`, so
+        // the default backend must be accepted whenever this binary compiles.
+        assert!(validate_backend("cloud-hypervisor").is_ok());
+        // Every compiled-in backend round-trips through the validator.
+        for b in supported_backends() {
+            assert!(validate_backend(b).is_ok(), "backend {b} should be valid");
+        }
+    }
+
+    // M-CLI-1: the `other =>` mode arm printed "Unknown mode" then returned, so
+    // `run_mode` (and `main`) still reported success. RED on the inverse: an
+    // accept-all validator fails the `is_err` asserts.
+    #[test]
+    fn validate_mode_rejects_unknown_mode() {
+        assert!(validate_mode("latencyy").is_err());
+        assert!(validate_mode("").is_err());
+        for m in VALID_MODES {
+            assert!(validate_mode(m).is_ok(), "mode {m} should be valid");
+        }
+    }
+
+    // P22: bench-vm `.expect()`ed on the config builder, panicking with a
+    // misleading "benchmark invariant" message for a `--mem-mib` below the 64
+    // MiB floor. The validator must instead surface config's typed error.
+    // RED on the inverse (no floor check, i.e. `.expect()`/accept-all): the
+    // below-floor case panics or returns `Ok`, failing `unwrap_err`/the assert.
+    #[test]
+    fn validate_vm_params_rejects_mem_below_floor() {
+        let bad = <Args as clap::Parser>::parse_from(["bench-vm", "--mem-mib", "32"]);
+        let err = validate_vm_params(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("mem_mib must be >= 64"),
+            "error should surface config's typed floor message, got: {err}"
+        );
+        // The documented floor itself is accepted.
+        let ok = <Args as clap::Parser>::parse_from(["bench-vm", "--mem-mib", "64"]);
+        assert!(validate_vm_params(&ok).is_ok());
     }
 }

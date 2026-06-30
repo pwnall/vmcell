@@ -13,39 +13,38 @@ wildcards = "deny"
 [advisories]
 yanked = "deny"
 # Every ignore below carries: affected crate · how it enters our graph / exposure · why acceptable.
-# We keep the *set* unchanged here; do not add a new ignore without the same three-part rationale.
-# NOTE: the RUSTSEC-2026-005x/006x batch are recent advisories with no fixed upstream release at
-# the pin we resolve; their precise crate is recorded from `cargo deny check advisories` output and
-# they sit on transitive, non-guest/non-network-reachable paths (build graph or the rust-vmm/vhost
-# device stack we drive only over a trusted vsock/virtio seam). Tracked for upgrade.
+# Do NOT add a new ignore without that same three-part rationale, and NEVER add a crate-less,
+# boilerplate "no fixed upstream release" placeholder — a bulk ignore that names no crate cannot be
+# reviewed, hides a real exposure, and is exactly the stale pattern Part D forbids. If `cargo deny`
+# surfaces a new advisory, ignore it only with its crate, exposure, and acceptance reason spelled out,
+# or fix the dependency. (The previous 16-entry crate-less `RUSTSEC-2026-005x/006x` block was removed
+# for this reason; re-add individually, with a real rationale, only if the gate actually reports one.)
 ignore = [
     # --- Unmaintained-crate advisories: maintenance status only, no known exploitable defect ---
     "RUSTSEC-2020-0016", # net2 0.2.39 (transitive, legacy I/O shim): unmaintained, superseded by socket2; build-graph only, no runtime use.
     "RUSTSEC-2024-0436", # paste 1.0.15 (transitive proc-macro): unmaintained; compile-time only, zero runtime attack surface.
     "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0: unmaintained, folded into rustls; only parses our own local CA PEM, never attacker-supplied bytes.
-    "RUSTSEC-2020-0036", # failure (transitive, if present): unmaintained error crate; surfaced only in error paths, no runtime exposure.
     "RUSTSEC-2023-0089", # atomic-polyfill 1.0.3 (transitive via embedded/no_std deps): unmaintained, superseded by portable-atomic; compile-target shim only.
     # --- Timing/sidechannel advisory with a usage-scoped justification ---
     "RUSTSEC-2023-0071", # rsa 0.9.10 (transitive): "Marvin" RSA-decrypt timing sidechannel, no fixed release; we do no RSA private-key ops on a remote-timing-observable path (proxy TLS is ECDSA via aws-lc-rs).
-    # --- Legacy transitive tokio 0.1.22 (data-race advisory) — NOT the host runtime (current tokio 1.x) ---
-    "RUSTSEC-2021-0124", # tokio 0.1.22 (legacy transitive only): oneshot data-race advisory; our async runtime is tokio 1.x, the 0.1 copy is dormant build-graph weight, no upgrade path for the pinning dep.
-    # --- Recent advisories, no fixed upstream release at our pin; transitive, non-reachable in our usage; tracked for upgrade ---
-    "RUSTSEC-2026-0009", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0050", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0051", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0052", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0053", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0054", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0055", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0056", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0057", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0058", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0059", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0060", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0061", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0062", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0063", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
-    "RUSTSEC-2026-0064", # No fixed upstream release at our pin; transitive dep off the guest/network path. Tracked for upgrade.
+    # --- Legacy tokio 0.1 ecosystem: ALL enter via tun-tap 0.1.4 → tokio-core 0.1.18 → tokio 0.1.22
+    #     (the optional `net-privileged` tap-network path). Superseded by the tokio 1.x host runtime;
+    #     this 0.1 subtree is dormant build-graph weight with no runtime use and no upgrade path for the
+    #     pinning dep tun-tap. RUSTSEC-2021-0124 is a data-race advisory (dormant copy, not the live 1.x
+    #     runtime); the rest are maintenance-status-only "unmaintained" advisories. ---
+    "RUSTSEC-2021-0124", # tokio 0.1.22 (legacy transitive only): oneshot data-race advisory; our async runtime is tokio 1.x, the 0.1 copy is dormant, no upgrade path for the pinning dep tun-tap.
+    "RUSTSEC-2026-0050", # tokio-uds 0.2.7: unmaintained tokio-0.1 unix-socket crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0051", # tokio-threadpool 0.1.18: unmaintained tokio-0.1 threadpool crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0052", # tokio-sync 0.1.8: unmaintained tokio-0.1 sync crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0054", # tokio-current-thread 0.1.7: unmaintained tokio-0.1 executor crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0056", # tokio-codec 0.1.2: unmaintained tokio-0.1 codec crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0057", # tokio-reactor 0.1.12: unmaintained tokio-0.1 reactor crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0058", # tokio-io 0.1.13: unmaintained tokio-0.1 io crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0059", # tokio-tcp 0.1.4: unmaintained tokio-0.1 tcp crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0060", # tokio-timer 0.2.13: unmaintained tokio-0.1 timer crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0061", # tokio-fs 0.1.7: unmaintained tokio-0.1 fs crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0063", # tokio-executor 0.1.10: unmaintained tokio-0.1 executor crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
+    "RUSTSEC-2026-0064", # tokio-udp 0.1.6: unmaintained tokio-0.1 udp crate; dormant via tun-tap → tokio-core → tokio 0.1.22, no runtime use.
 ]
 
 [sources]

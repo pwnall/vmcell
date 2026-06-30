@@ -358,6 +358,10 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
         }
     }
 
+    // Upstream helper retained for API parity; currently unused in this vendored
+    // copy. Allowed explicitly so the workspace-wide `-D warnings` (which denies
+    // path-dep warnings too) does not fail on third-party dead code.
+    #[allow(dead_code)]
     fn check_feature(&self, feat: VhostUserVirtioFeatures) -> Result<()> {
         if self.acked_virtio_features & feat.bits() != 0 {
             Ok(())

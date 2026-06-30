@@ -22,7 +22,7 @@ impl imp_testing::artifact::Stage for DummyStage {
         &self,
         _inputs: &imp_testing::artifact::StageInputs,
     ) -> imp_testing::artifact::CacheKey {
-        imp_testing::artifact::CacheKey(self.content.clone())
+        imp_testing::artifact::CacheKey::new(self.content.clone())
     }
 
     async fn run(
@@ -43,22 +43,19 @@ async fn test_pipeline_reset_to() {
 
     let cache = Cache::default();
 
-    let mut pipeline = Pipeline {
-        stages: vec![],
-        target_dir: tmp_dir.clone(),
-    };
-    pipeline.stages.push(Box::new(DummyStage {
-        name: "stage1".to_string(),
-        content: "content1".to_string(),
-    }));
-    pipeline.stages.push(Box::new(DummyStage {
-        name: "stage2".to_string(),
-        content: "content2".to_string(),
-    }));
-    pipeline.stages.push(Box::new(DummyStage {
-        name: "stage3".to_string(),
-        content: "content3".to_string(),
-    }));
+    let pipeline = Pipeline::new(tmp_dir.clone())
+        .add_stage(Box::new(DummyStage {
+            name: "stage1".to_string(),
+            content: "content1".to_string(),
+        }))
+        .add_stage(Box::new(DummyStage {
+            name: "stage2".to_string(),
+            content: "content2".to_string(),
+        }))
+        .add_stage(Box::new(DummyStage {
+            name: "stage3".to_string(),
+            content: "content3".to_string(),
+        }));
 
     // Initial run
     let _inputs = imp_testing::artifact::StageInputs::default();
@@ -102,26 +99,22 @@ async fn test_pipeline_reset_subset_rebuilds_downstream_only() {
     let rc = Arc::new(AtomicUsize::new(0));
     let sc = Arc::new(AtomicUsize::new(0));
 
-    let pipeline = Pipeline {
-        stages: vec![
-            Box::new(CountingStage {
-                name: "kernel".into(),
-                content: "kernel-content".into(),
-                run_count: kc.clone(),
-            }),
-            Box::new(CountingStage {
-                name: "rootfs".into(),
-                content: "rootfs-content".into(),
-                run_count: rc.clone(),
-            }),
-            Box::new(CountingStage {
-                name: "snapshot".into(),
-                content: "snapshot-content".into(),
-                run_count: sc.clone(),
-            }),
-        ],
-        target_dir: tmp_dir.clone(),
-    };
+    let pipeline = Pipeline::new(tmp_dir.clone())
+        .add_stage(Box::new(CountingStage {
+            name: "kernel".into(),
+            content: "kernel-content".into(),
+            run_count: kc.clone(),
+        }))
+        .add_stage(Box::new(CountingStage {
+            name: "rootfs".into(),
+            content: "rootfs-content".into(),
+            run_count: rc.clone(),
+        }))
+        .add_stage(Box::new(CountingStage {
+            name: "snapshot".into(),
+            content: "snapshot-content".into(),
+            run_count: sc.clone(),
+        }));
 
     // Cold build: every stage runs exactly once.
     pipeline.build(&cache).await.unwrap();
@@ -177,7 +170,7 @@ impl imp_testing::artifact::Stage for CountingStage {
         &self,
         _inputs: &imp_testing::artifact::StageInputs,
     ) -> imp_testing::artifact::CacheKey {
-        imp_testing::artifact::CacheKey(self.content.clone())
+        imp_testing::artifact::CacheKey::new(self.content.clone())
     }
 
     async fn run(
@@ -205,10 +198,7 @@ async fn test_pipeline_warm_cache_skips() {
         run_count: count.clone(),
     };
 
-    let pipeline = Pipeline {
-        stages: vec![Box::new(stage.clone())],
-        target_dir: tmp_dir.clone(),
-    };
+    let pipeline = Pipeline::new(tmp_dir.clone()).add_stage(Box::new(stage.clone()));
 
     // Run 1
     pipeline.build(&cache).await.unwrap();
@@ -305,10 +295,7 @@ async fn test_pipeline_tampered_digest_aborts() {
         run_count: count.clone(),
     };
 
-    let pipeline = Pipeline {
-        stages: vec![Box::new(stage.clone())],
-        target_dir: tmp_dir.clone(),
-    };
+    let pipeline = Pipeline::new(tmp_dir.clone()).add_stage(Box::new(stage.clone()));
 
     // Initial build
     pipeline.build(&cache).await.unwrap();
@@ -320,6 +307,39 @@ async fn test_pipeline_tampered_digest_aborts() {
     assert!(
         res.is_err(),
         "Tampered artifact should cause pipeline to abort"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// M-PIPE-1: reset_to must INVALIDATE the named stage, so a failed artifact removal
+// must surface as Err — not a swallowed `let _ =` that reports Ok while leaving a
+// VALID cached artifact behind (the next build would then serve the stale artifact).
+// We force the removal to fail by making the artifact path a NON-EMPTY DIRECTORY,
+// which `remove_file` cannot delete (a non-NotFound error). The buggy swallowing
+// impl returns Ok here → this assertion goes red.
+#[tokio::test]
+async fn test_reset_to_propagates_remove_error() {
+    let tmp_dir = std::env::temp_dir().join(format!("imp-test-reset-err-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let cache = Cache::default();
+
+    let pipeline = Pipeline::new(tmp_dir.clone()).add_stage(Box::new(DummyStage {
+        name: "stage1".to_string(),
+        content: "content1".to_string(),
+    }));
+
+    // Make the artifact path a non-empty directory so `remove_file` fails with a
+    // non-NotFound error (EISDIR / permission-shaped), which reset_to must propagate.
+    let art = tmp_dir.join("stage1");
+    std::fs::create_dir_all(&art).unwrap();
+    std::fs::write(art.join("inner"), b"block-removal").unwrap();
+
+    let res = pipeline.reset_to("stage1", &cache);
+    assert!(
+        res.is_err(),
+        "reset_to must propagate a failed artifact removal, not report Ok"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

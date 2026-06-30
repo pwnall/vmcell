@@ -27,22 +27,18 @@ pub async fn build_rootfs(
     let builder_rootfs_path = temp_dir.path().join("builder_rootfs.erofs");
 
     // 1. Build builder rootfs using OCI source. Source the builder base image+digest from
-    // the resolved pins (Stage 0 / pins.lock) so it cannot drift from the pinned rootfs; fall
-    // back to a dedicated builder pin, then to the literal only if neither is resolved.
-    let builder_image = inputs
-        .pins
-        .get("builder_base_image")
-        .or_else(|| inputs.pins.get("rootfs_image"))
-        .map(String::as_str)
-        .unwrap_or("docker.io/library/debian");
-    let builder_digest = inputs
-        .pins
-        .get("builder_base_digest")
-        .or_else(|| inputs.pins.get("rootfs_digest"))
-        .map(String::as_str)
-        .unwrap_or("sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1");
+    // the resolved pins (Stage 0 / pins.lock) so it cannot drift from the pinned rootfs.
+    // The image and digest are resolved as one ATOMIC pair — never an independent fallback
+    // that could mix a pinned image with a stale hardcoded digest (M-PIPE-2).
+    let (builder_image, builder_digest) = resolve_builder_base(&inputs.pins)?;
     tracing::info!("Building builder VM rootfs from {}...", builder_image);
-    super::oci::build_rootfs(builder_image, builder_digest, inputs, &builder_rootfs_path).await?;
+    super::oci::build_rootfs(
+        &builder_image,
+        &builder_digest,
+        inputs,
+        &builder_rootfs_path,
+    )
+    .await?;
 
     // 2. Start builder VM
     let ch_bin = std::env::var("IMP_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
@@ -181,4 +177,91 @@ pub async fn build_rootfs(
     let tar_stream: Box<dyn std::io::Read + Send> = Box::new(tar_file);
 
     super::pack_erofs_with_injection(vec![tar_stream], inputs, out).await
+}
+
+/// Resolves the builder base image as an atomic `(image, digest)` pair from the
+/// resolved pins, never mixing a pinned image with a hardcoded digest.
+///
+/// Precedence: the dedicated `builder_base_*` pins, else the `rootfs_*` pins. A
+/// half-specified pair (image without digest, or vice-versa) or a completely
+/// missing base is a hard error — a hardcoded fallback would mask a missing Stage-0
+/// pin and could pin a mismatched `image@digest` reference (M-PIPE-2 / B5
+/// "no fallback masking a missing upstream").
+///
+/// # Errors
+/// Returns [`Error::Artifact`] if no pin pair is present, or only one half of a
+/// pair is set.
+fn resolve_builder_base(
+    pins: &std::collections::HashMap<String, String>,
+) -> Result<(String, String)> {
+    for (img_key, dig_key) in [
+        ("builder_base_image", "builder_base_digest"),
+        ("rootfs_image", "rootfs_digest"),
+    ] {
+        match (pins.get(img_key), pins.get(dig_key)) {
+            (Some(img), Some(dig)) => return Ok((img.clone(), dig.clone())),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::Artifact(format!(
+                    "builder base pin pair half-specified: exactly one of \
+                     {img_key}/{dig_key} is set; provide both or neither"
+                )));
+            }
+            (None, None) => {}
+        }
+    }
+    Err(Error::Artifact(
+        "missing builder base image+digest pins (builder_base_* or rootfs_*); \
+         refusing hardcoded fallback (would pin a mismatched image@digest)"
+            .into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_builder_base;
+    use std::collections::HashMap;
+
+    // Guards M-PIPE-2: image and digest must resolve as ONE atomic pair, never an
+    // independent fallback. The buggy impl defaulted each half separately, so a
+    // half-specified pin (image without digest) silently paired with a hardcoded
+    // debian digest — a mismatched reference. Each branch below is red on that impl.
+    #[test]
+    fn test_resolve_builder_base_pairs_atomically() {
+        // image without digest must error (not pair with a hardcoded digest).
+        let mut half = HashMap::new();
+        half.insert(
+            "rootfs_image".to_string(),
+            "docker.io/library/debian".to_string(),
+        );
+        assert!(
+            resolve_builder_base(&half).is_err(),
+            "image without digest must error, not pair with a hardcoded digest"
+        );
+
+        // digest without image must also error.
+        let mut half2 = HashMap::new();
+        half2.insert("rootfs_digest".to_string(), "sha256:abc".to_string());
+        assert!(resolve_builder_base(&half2).is_err());
+
+        // Completely missing base errors (no hardcoded fallback masks a missing pin).
+        assert!(resolve_builder_base(&HashMap::new()).is_err());
+
+        // A complete rootfs pair resolves atomically.
+        let mut full = HashMap::new();
+        full.insert("rootfs_image".to_string(), "img".to_string());
+        full.insert("rootfs_digest".to_string(), "sha256:abc".to_string());
+        assert_eq!(
+            resolve_builder_base(&full).expect("pair"),
+            ("img".to_string(), "sha256:abc".to_string())
+        );
+
+        // Dedicated builder pins take precedence over the rootfs pins.
+        let mut both = full.clone();
+        both.insert("builder_base_image".to_string(), "bimg".to_string());
+        both.insert("builder_base_digest".to_string(), "sha256:def".to_string());
+        assert_eq!(
+            resolve_builder_base(&both).expect("pair"),
+            ("bimg".to_string(), "sha256:def".to_string())
+        );
+    }
 }

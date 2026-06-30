@@ -150,6 +150,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         );
         std::fs::write(snapshot_dir.join("pre_urandom.bin"), &ref_rng.stdout).unwrap();
 
+        let original_vmid = vm.vmid();
         let original_vsock = vm.instance().vsock_path().to_str().unwrap().to_string();
         vm.shutdown().await.expect("Failed to shutdown VM");
 
@@ -162,6 +163,11 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         )
         .unwrap();
         std::fs::write(snapshot_dir.join("original_vsock.txt"), original_vsock).unwrap();
+        std::fs::write(
+            snapshot_dir.join("original_vmid.txt"),
+            original_vmid.to_string(),
+        )
+        .unwrap();
     }
 
     // Sleep to ensure the host clock advances past the guest's suspended clock
@@ -182,6 +188,21 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             host_services_port: None,
         };
 
+        // M-TEST-RESTORE: hold the ORIGINAL vmid so the allocator is forced to hand
+        // the restored VM a DIFFERENT one. MAC (`mac_math(vmid)`) and the vsock path
+        // (`imp-vm-{pid}-{vmid}`) are pure functions of the vmid; the original VM was
+        // already torn down (freeing its vmid), so without this the allocator could
+        // re-hand the same vmid and the rotation asserts would pass on a no-op (or
+        // fail spuriously ~1/254). Reserving it guarantees new_vmid != original_vmid.
+        let original_vmid: u32 = std::fs::read_to_string(snapshot_dir.join("original_vmid.txt"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        vmid_alloc
+            .reserve(original_vmid)
+            .expect("original vmid is free after block 1 shutdown; reserving forces a new vmid");
+
         let mut vm = TestVm::restore(
             vmm,
             &snapshot_dir,
@@ -192,6 +213,12 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         )
         .await
         .expect("Failed to restore VM");
+
+        let new_vmid = vm.vmid();
+        assert_ne!(
+            new_vmid, original_vmid,
+            "the restored VM must receive a vmid distinct from the held original"
+        );
 
         // TESTS-LIFECYCLE-1: build the FakeClock BEFORE the first post-restore
         // agent() call. The orchestrator fires its one-shot clock resync on the
@@ -258,6 +285,15 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             original_vsock, new_vsock,
             "Vsock path should be rotated after restore"
         );
+        // M-TEST-RESTORE: assert the REAL socket path embeds the rotated vmid
+        // (imp-vm-{pid}-{new_vmid}), not merely that it differs — proving the path
+        // reflects the new identity rather than a coincidental string difference.
+        assert!(
+            new_vsock.contains(&format!("imp-vm-{}-{}", std::process::id(), new_vmid)),
+            "restored vsock path {} must embed the rotated vmid {}",
+            new_vsock,
+            new_vmid
+        );
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();
         let mac_out = vm
@@ -278,6 +314,18 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         );
         let post_mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
         assert!(!pre_mac.is_empty(), "MAC address should not be empty");
+        // M-TEST-RESTORE: assert the IN-GUEST MAC equals mac_math(new_vmid) — the
+        // positive identity proving the rotation set the correct new value. If the
+        // rotation did not run, the guest keeps mac_math(original_vmid), which differs
+        // from mac_math(new_vmid) (new != original, enforced above), so this goes red.
+        // `assert_ne!(pre, post)` alone can pass on a no-op when a re-handed vmid
+        // happens to yield an identical MAC.
+        let expected_mac = imp_testing::net::mac_math(new_vmid).expect("mac_math(new_vmid)");
+        assert_eq!(
+            post_mac, expected_mac,
+            "post-restore guest MAC must equal mac_math(new_vmid={})",
+            new_vmid
+        );
         assert_ne!(
             pre_mac, post_mac,
             "MAC address should be rotated after restore"
@@ -315,6 +363,22 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             fake_time_secs,
             post_time,
             pre_time
+        );
+
+        // TESTS-LIFECYCLE-2 (reseed isolation): assert the orchestrator's TYPED
+        // "reseed applied" result. The reseed (head -c 32 /dev/hwrng > /dev/urandom)
+        // is best-effort and warn-and-continue, so inferring it solely from two
+        // /dev/urandom reads differing can pass coincidentally even when the reseed
+        // silently failed. `restore_reseed_applied()` is set on the first
+        // post-restore agent() call (already made above) and records whether the
+        // reseed command actually ran and returned exit 0 — Some(false)/None on a
+        // silent failure flips this red. This is the control vs. the byte-difference
+        // treatment asserted below.
+        assert_eq!(
+            vm.restore_reseed_applied(),
+            Some(true),
+            "the post-restore CSPRNG reseed must have APPLIED (exit 0); a silent \
+             best-effort failure would leave the restored VM replaying predictable RNG state"
         );
 
         // TESTS-LIFECYCLE-2: assert the orchestrator's restore-path reseed

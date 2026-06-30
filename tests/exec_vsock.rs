@@ -85,6 +85,197 @@ async fn test_exec_vsock_mock() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// Mock-server helper: accept the UDS connection, complete the `CONNECT`/`OK`
+/// handshake, wrap the stream in a `LengthDelimitedCodec` capped at `frame_max`
+/// (the value the guest agrees on), and send the initial `Ready` frame.
+async fn accept_with_ready(
+    listener: UnixListener,
+    frame_max: usize,
+) -> Framed<tokio::net::UnixStream, LengthDelimitedCodec> {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut resp = String::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream.read(&mut byte).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        resp.push(byte[0] as char);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    assert_eq!(resp, "CONNECT 5000\n");
+    stream.write_all(b"OK 5000\n").await.unwrap();
+    let mut codec = LengthDelimitedCodec::new();
+    codec.set_max_frame_length(frame_max);
+    let mut framed = Framed::new(stream, codec);
+    let ready = postcard::to_stdvec(&Message::Ready).unwrap();
+    framed.send(ready.into()).await.unwrap();
+    framed
+}
+
+fn serial_log() -> imp_testing::vmm::RealSerialLog {
+    imp_testing::vmm::RealSerialLog {
+        path: std::path::PathBuf::from("/dev/null"),
+    }
+}
+
+// H-AGENT-1: after an exec() timeout desyncs the stream, a subsequent put_file
+// must fail loud rather than read the exec's stale, late-arriving Exit(0) frame
+// as its own ack. RED on the buggy put_file (no `desynced` guard): it would read
+// the stale Exit(0) and wrongly return Ok.
+#[tokio::test]
+async fn exec_timeout_desyncs_subsequent_put_file() {
+    let tmp = std::env::temp_dir().join(format!("imp-desync-exec-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = UnixListener::bind(&tmp).expect("bind UDS");
+    let vsock_path = tmp.clone();
+
+    let server = tokio::spawn(async move {
+        let mut framed = accept_with_ready(listener, 16 * 1024 * 1024).await;
+        // Read the Exec, then answer only AFTER the client's short timeout fires,
+        // with a stale Exit(0) that a desync-ignoring put_file would misread.
+        let _ = framed.next().await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = framed
+            .send(postcard::to_stdvec(&Message::Exit(0)).unwrap().into())
+            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    let mut client = AgentClient::connect(
+        &vsock_path,
+        5000,
+        std::time::Duration::from_secs(2),
+        &serial_log(),
+    )
+    .await
+    .expect("connect");
+
+    let exec_res = client
+        .exec(
+            ExecRequest::new(vec!["sleep".into(), "30".into()])
+                .with_timeout(std::time::Duration::from_millis(50)),
+        )
+        .await;
+    assert!(exec_res.is_err(), "exec must time out");
+
+    let put_res = client.put_file("/tmp/x", b"data", None).await;
+    assert!(
+        put_res.is_err(),
+        "put_file on a desynced stream must fail loud, not read the stale Exit(0) as its ack"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// H-AGENT-1 (symmetric): after a put_file() timeout desyncs the stream, the next
+// exec() must fail loud rather than read the put_file's stale Exit(0) ack as its
+// own result. RED on the buggy put_file (it never set `desynced`): exec would
+// proceed and return Ok(code 0) from the stale frame.
+#[tokio::test]
+async fn put_file_timeout_desyncs_subsequent_exec() {
+    let tmp = std::env::temp_dir().join(format!("imp-desync-put-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = UnixListener::bind(&tmp).expect("bind UDS");
+    let vsock_path = tmp.clone();
+
+    let server = tokio::spawn(async move {
+        let mut framed = accept_with_ready(listener, 16 * 1024 * 1024).await;
+        // Read the PutFile, then send its ack only after the client's short
+        // timeout fires; a desync-ignoring exec would misread it as its Exit.
+        let _ = framed.next().await.unwrap().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = framed
+            .send(postcard::to_stdvec(&Message::Exit(0)).unwrap().into())
+            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    let mut client = AgentClient::connect(
+        &vsock_path,
+        5000,
+        std::time::Duration::from_secs(2),
+        &serial_log(),
+    )
+    .await
+    .expect("connect");
+
+    let put_res = client
+        .put_file(
+            "/tmp/x",
+            b"data",
+            Some(std::time::Duration::from_millis(50)),
+        )
+        .await;
+    assert!(put_res.is_err(), "put_file must time out");
+
+    let exec_res = client
+        .exec(ExecRequest::new(vec!["echo".into(), "hi".into()]))
+        .await;
+    assert!(
+        exec_res.is_err(),
+        "exec on a desynced stream must fail loud, not read the stale put_file ack as its result"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// LOW (asymmetric frame caps): the host codec must accept a frame larger than
+// tokio_util's 8 MiB LengthDelimitedCodec default — up to the 16 MiB cap the
+// guest enforces. RED on the buggy host codec (`LengthDelimitedCodec::new()`,
+// 8 MiB): decoding this frame errors and exec returns Err.
+#[tokio::test]
+async fn host_codec_accepts_frame_above_default_8mib() {
+    let payload = vec![0xABu8; 8 * 1024 * 1024 + 64 * 1024];
+    let expected = payload.clone();
+
+    let tmp = std::env::temp_dir().join(format!("imp-bigframe-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = UnixListener::bind(&tmp).expect("bind UDS");
+    let vsock_path = tmp.clone();
+
+    let server = tokio::spawn(async move {
+        let mut framed = accept_with_ready(listener, imp_testing::agent::MAX_FRAME_BYTES).await;
+        let _ = framed.next().await.unwrap().unwrap(); // Exec
+        framed
+            .send(
+                postcard::to_stdvec(&Message::Stdout(payload))
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .unwrap();
+        framed
+            .send(postcard::to_stdvec(&Message::Exit(0)).unwrap().into())
+            .await
+            .unwrap();
+    });
+
+    let mut client = AgentClient::connect(
+        &vsock_path,
+        5000,
+        std::time::Duration::from_secs(2),
+        &serial_log(),
+    )
+    .await
+    .expect("connect");
+
+    let outcome = client
+        .exec(ExecRequest::new(vec!["big".into()]))
+        .await
+        .expect("exec must receive a >8 MiB frame the guest is allowed to send");
+    assert_eq!(outcome.code, 0);
+    assert_eq!(outcome.stdout.len(), expected.len());
+    assert_eq!(outcome.stdout, expected);
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+}
+
 mod common;
 
 vmm_matrix_test!(put_file, |vmm| {

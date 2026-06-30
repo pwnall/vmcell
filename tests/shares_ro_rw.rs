@@ -1,39 +1,21 @@
 use imp_testing::config::{Access, CachePolicy, RootfsSource, Share, VmConfig};
 use imp_testing::vmm::VmInstance;
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 
 mod common;
 
-#[tokio::test]
-#[ignore]
-async fn test_shares_ro_rw_ch() {
-    let vmm = CloudHypervisor::new(common::ch_bin());
+// Part C: use the mandated `vmm_matrix_test!` + `require_cap!` harness instead of
+// hand-rolled per-backend fns with a bare `return`-skip. `require_cap!` keeps the
+// primary CH path unexempted (a CH cap miss panics) and emits one consistent
+// skip-with-reason for FC/QEMU when `virtio_fs_shares` is unsupported. The macro
+// also stamps each generated test `#[ignore = "needs KVM"]`.
+vmm_matrix_test!(shares_ro_rw, |vmm| {
+    require_cap!(
+        imp_testing::vmm::Vmm::capabilities(&vmm),
+        virtio_fs_shares,
+        vmm
+    );
     test_shares_ro_rw_impl(&vmm).await;
-}
-
-#[cfg(feature = "firecracker")]
-#[tokio::test]
-#[ignore]
-async fn test_shares_ro_rw_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).virtio_fs_shares {
-        println!("SKIP: virtio-fs shares not supported");
-        return;
-    }
-    test_shares_ro_rw_impl(&vmm).await;
-}
-
-#[cfg(feature = "qemu")]
-#[tokio::test]
-#[ignore]
-async fn test_shares_ro_rw_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).virtio_fs_shares {
-        println!("SKIP: virtio-fs shares not supported");
-        return;
-    }
-    test_shares_ro_rw_impl(&vmm).await;
-}
+});
 
 async fn test_shares_ro_rw_impl<V: imp_testing::vmm::Vmm>(backend: &V) {
     let id = uuid::Uuid::new_v4();

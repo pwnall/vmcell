@@ -24,6 +24,16 @@ use std::sync::{Condvar, Mutex};
 /// statuses have been recorded, so the status map cannot grow without bound.
 pub const DEFAULT_MAX_REAPED_STATUSES: usize = 1024;
 
+/// Maximum length, in bytes, of a single framed control-plane message.
+///
+/// Both ends of the vsock protocol must agree on this bound: the host
+/// `AgentClient` configures its `LengthDelimitedCodec` with it (its 8 MiB
+/// default would otherwise reject a frame the guest is willing to send) and the
+/// guest agent's hand-rolled framing rejects anything larger. Keeping the two in
+/// one constant prevents the asymmetric-cap class where one side silently drops
+/// a frame the other accepts.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Maps a reaped child's termination into the exit code reported to the host.
 ///
 /// A signal-terminated child reports `128 + signal` (shell convention, e.g.
@@ -249,7 +259,11 @@ impl AgentClient {
                 continue;
             }
 
-            let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+            let mut codec = LengthDelimitedCodec::new();
+            // Align the host frame cap with the guest's (the codec default is
+            // only 8 MiB), so neither side silently drops a frame the other sent.
+            codec.set_max_frame_length(MAX_FRAME_BYTES);
+            let mut framed = Framed::new(stream, codec);
 
             let ready_result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await;
@@ -302,16 +316,52 @@ impl AgentClient {
         Ok(())
     }
 
-    /// Executes a command inside the guest VM and waits for the result.
+    /// Fails loud if a prior request left the framed stream desynchronized.
     ///
-    /// # Errors
-    /// Returns an error if the request cannot be sent or the outcome cannot be received.
-    pub async fn exec(&mut self, mut cmd: ExecRequest) -> Result<ExecOutcome> {
+    /// Every request method calls this first so a stale in-flight frame from an
+    /// abandoned (timed-out or errored) exchange can never be read as the next
+    /// request's response. Recovery is via [`AgentClient::reconnect`].
+    fn ensure_synced(&self) -> Result<()> {
         if self.desynced {
             return Err(Error::Agent(
                 "agent connection desynchronized by a prior timeout; reconnect required".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Resolves a `timeout`-wrapped request result, marking the stream desynced
+    /// on any send/decode error or timeout.
+    ///
+    /// A send/decode/connection error or a mid-exchange timeout leaves the framed
+    /// stream in an unknown state (a late frame may still be in flight), so the
+    /// next request must fail loud via [`AgentClient::ensure_synced`] until a
+    /// [`AgentClient::reconnect`]. Shared by every request method so none can
+    /// diverge from this protocol.
+    fn finish_request<T>(
+        desynced: &mut bool,
+        result: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
+        timeout_msg: &'static str,
+    ) -> Result<T> {
+        match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => {
+                *desynced = true;
+                Err(e)
+            }
+            Err(_) => {
+                *desynced = true;
+                Err(Error::Timeout(timeout_msg.into()))
+            }
+        }
+    }
+
+    /// Executes a command inside the guest VM and waits for the result.
+    ///
+    /// # Errors
+    /// Returns an error if the request cannot be sent or the outcome cannot be received.
+    pub async fn exec(&mut self, mut cmd: ExecRequest) -> Result<ExecOutcome> {
+        self.ensure_synced()?;
         // Propagate the effective timeout into the request so the guest always
         // installs a kill thread. A `None` timeout would let the guest child
         // outlive this abandoned wait and leak.
@@ -353,64 +403,165 @@ impl AgentClient {
         })
         .await;
 
-        match result {
-            Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(e)) => {
-                // A send/decode/connection error leaves the framed stream in an
-                // unknown state; force a reconnect before the next request.
-                self.desynced = true;
-                Err(e)
-            }
-            Err(_) => {
-                // Timed out mid-exchange: a late Stdout/Exit frame from this
-                // command may still be in flight, so the stream is desynced and
-                // must not be reused (it would return stale, wrong results).
-                self.desynced = true;
-                Err(Error::Timeout("Agent exec timed out".into()))
-            }
-        }
+        Self::finish_request(&mut self.desynced, result, "Agent exec timed out")
     }
 
     /// Uploads a file to the guest VM.
     ///
     /// # Errors
-    /// Returns an error if the file transfer fails.
+    /// Returns an error if the file transfer fails, times out, or the stream is
+    /// already desynchronized by a prior request (in which case a
+    /// [`AgentClient::reconnect`] is required before further requests). Like
+    /// [`AgentClient::exec`], a send/decode error or timeout here marks the
+    /// stream desynced so the next request fails loud rather than reading this
+    /// exchange's stale frame as its own response.
     pub async fn put_file(
         &mut self,
         dst: &str,
         bytes: &[u8],
         timeout: Option<std::time::Duration>,
     ) -> Result<()> {
-        tokio::time::timeout(
-            timeout.unwrap_or(std::time::Duration::from_secs(10)),
-            async {
-                let msg = Message::PutFile {
-                    dst: dst.to_string(),
-                    bytes: bytes.to_vec(),
-                };
-                let msg_bytes = postcard::to_stdvec(&msg)?;
-                self.stream
-                    .send(::bytes::Bytes::from(msg_bytes))
-                    .await
-                    .map_err(Error::Io)?;
+        self.ensure_synced()?;
+        let timeout = timeout.unwrap_or(std::time::Duration::from_secs(10));
+        let result = tokio::time::timeout(timeout, async {
+            let msg = Message::PutFile {
+                dst: dst.to_string(),
+                bytes: bytes.to_vec(),
+            };
+            let msg_bytes = postcard::to_stdvec(&msg)?;
+            self.stream
+                .send(::bytes::Bytes::from(msg_bytes))
+                .await
+                .map_err(Error::Io)?;
 
-                // Wait for ack
-                if let Some(res) = self.stream.next().await {
-                    let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
-                    let resp_msg: Message = postcard::from_bytes(&res_bytes)?;
-                    match resp_msg {
-                        Message::Exit(0) => Ok(()),
-                        Message::Exit(c) => {
-                            Err(Error::Agent(format!("put_file failed with code {}", c)))
-                        }
-                        _ => Err(Error::Agent("unexpected response to put_file".into())),
+            // Wait for ack
+            if let Some(res) = self.stream.next().await {
+                let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
+                let resp_msg: Message = postcard::from_bytes(&res_bytes)?;
+                match resp_msg {
+                    Message::Exit(0) => Ok(()),
+                    Message::Exit(c) => {
+                        Err(Error::Agent(format!("put_file failed with code {}", c)))
                     }
-                } else {
-                    Err(Error::Agent("connection closed during put_file".into()))
+                    _ => Err(Error::Agent("unexpected response to put_file".into())),
                 }
-            },
-        )
-        .await
-        .map_err(|_| Error::Timeout("put_file timed out".into()))?
+            } else {
+                Err(Error::Agent("connection closed during put_file".into()))
+            }
+        })
+        .await;
+
+        Self::finish_request(&mut self.desynced, result, "put_file timed out")
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    //! Default-suite (KVM-free) tests for the false-127 reaper coordination.
+    //! Each guards a specific documented inverse so the contract cannot silently
+    //! regress; see §4.3 / AGENTS.md "PID-1 reaper vs. waiter".
+    use super::{ReaperCoordinator, exit_code_from_termination};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn signal_termination_maps_to_128_plus_signal_not_127() {
+        // SIGKILL (9) → 137 by shell convention; SIGTERM (15) → 143. The
+        // false-127 bug reported a killed/completed process as the
+        // spawn-failure code 127. Inverse `128 + signal` → `127` goes red here.
+        assert_eq!(exit_code_from_termination(Some(9), None), 137);
+        assert_eq!(exit_code_from_termination(Some(15), None), 143);
+        assert_ne!(
+            exit_code_from_termination(Some(9), None),
+            127,
+            "a signal-killed child must never be reported as the spawn-failure 127"
+        );
+    }
+
+    #[test]
+    fn normal_exit_passes_through_status() {
+        assert_eq!(exit_code_from_termination(None, Some(0)), 0);
+        assert_eq!(exit_code_from_termination(None, Some(42)), 42);
+    }
+
+    #[test]
+    fn indeterminate_termination_is_one_not_127() {
+        // Neither signal nor exit status known: report 1, never 127. Inverse
+        // `unwrap_or(1)` → `unwrap_or(127)` goes red here.
+        assert_eq!(exit_code_from_termination(None, None), 1);
+        assert_ne!(exit_code_from_termination(None, None), 127);
+    }
+
+    #[test]
+    fn out_of_order_claims_return_each_pids_own_status() {
+        let coord = ReaperCoordinator::new();
+        coord.record_exit(100, 10);
+        coord.record_exit(200, 20);
+        coord.record_exit(300, 30);
+        // Claim in a different order than recorded; each call gets ITS pid's
+        // code, never another's. Inverse (return any recorded status) goes red.
+        assert_eq!(coord.wait_for(200), 20);
+        assert_eq!(coord.wait_for(100), 10);
+        assert_eq!(coord.wait_for(300), 30);
+        assert_eq!(coord.pending_statuses(), 0);
+    }
+
+    #[test]
+    fn blocked_waiter_does_not_steal_another_pids_status() {
+        let coord = Arc::new(ReaperCoordinator::new());
+        let waiter = {
+            let coord = Arc::clone(&coord);
+            std::thread::spawn(move || coord.wait_for(42))
+        };
+        // Let the waiter register and park on pid 42.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Record an UNRELATED pid. A correct waiter must not wake-and-claim it
+        // (the false-127 steal). Inverse (wait_for returns the first available
+        // status) makes the waiter finish early with 99.
+        coord.record_exit(7, 99);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "waiter for pid 42 must not steal pid 7's status"
+        );
+
+        // Record the real pid; the waiter claims exactly its own code.
+        coord.record_exit(42, 5);
+        assert_eq!(waiter.join().unwrap(), 5);
+        // pid 7's status was never consumed by the wrong waiter.
+        assert_eq!(coord.pending_statuses(), 1);
+    }
+
+    #[test]
+    fn unclaimed_statuses_are_bounded_by_prune() {
+        let coord = ReaperCoordinator::with_max_statuses(4);
+        for pid in 0..100u32 {
+            coord.record_exit(pid, pid as i32);
+        }
+        // Inverse (prune removed) leaves all 100 statuses; this asserts the bound.
+        assert!(
+            coord.pending_statuses() <= 4,
+            "unclaimed reaped statuses must be bounded; got {}",
+            coord.pending_statuses()
+        );
+    }
+
+    #[test]
+    fn blocked_waiter_survives_unrelated_reap_flood() {
+        let coord = Arc::new(ReaperCoordinator::with_max_statuses(2));
+        let waiter = {
+            let coord = Arc::clone(&coord);
+            std::thread::spawn(move || coord.wait_for(999))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Drive many prunes with unrelated reaps while the waiter is parked, then
+        // record its own status; it must still be delivered (not lost to prune).
+        for pid in 0..50u32 {
+            coord.record_exit(pid, 1);
+        }
+        coord.record_exit(999, 7);
+        assert_eq!(waiter.join().unwrap(), 7);
     }
 }

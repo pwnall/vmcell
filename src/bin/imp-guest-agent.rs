@@ -2,7 +2,7 @@
 #![deny(missing_docs)]
 #![deny(clippy::missing_errors_doc)]
 use imp_testing::agent::protocol::{self, ExecRequest, Message};
-use imp_testing::agent::{ReaperCoordinator, exit_code_from_termination};
+use imp_testing::agent::{MAX_FRAME_BYTES, ReaperCoordinator, exit_code_from_termination};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
 };
@@ -373,7 +373,9 @@ fn read_framed(stream: &mut VsockStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
+    // Shared cap with the host codec (see `MAX_FRAME_BYTES`); both ends agree so
+    // neither silently drops a frame the other was willing to send.
+    if len > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "message too large",

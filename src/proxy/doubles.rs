@@ -43,10 +43,20 @@ pub struct ProxyHandler {
 /// listed domain or is a strict subdomain of it (`sub.example.net` matches
 /// `example.net`). Sibling labels such as `evil-example.net` or
 /// `notexample.net` are *not* blocked — a bare `ends_with` over-blocks them.
+///
+/// Both sides are normalized first, since DNS is case-insensitive and a single
+/// trailing dot denotes the FQDN root: without this a guest trivially bypasses
+/// the filter with `EXAMPLE.NET` or `example.net.` (H-PROXY-2). A single
+/// trailing dot is stripped from each name; case is folded to ASCII lowercase.
 fn is_blocked(host: &str, blocked: &[String]) -> bool {
-    blocked
-        .iter()
-        .any(|domain| host == domain || host.ends_with(&format!(".{}", domain)))
+    let host_norm = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    blocked.iter().any(|domain| {
+        let domain_norm = domain
+            .strip_suffix('.')
+            .unwrap_or(domain.as_str())
+            .to_ascii_lowercase();
+        host_norm == domain_norm || host_norm.ends_with(&format!(".{}", domain_norm))
+    })
 }
 
 impl ProxyHandler {
@@ -187,14 +197,27 @@ mod tests {
     // Buggy impl guarded: a bare `host.ends_with(blocked)` over-blocks
     // `evil-example.net`/`notexample.net`, and an equality-only match misses
     // `sub.example.net`. Either inversion turns one of these asserts red.
+    //
+    // Also guards H-PROXY-2: a case-sensitive / trailing-dot-naive match lets a
+    // guest bypass the filter via `EXAMPLE.NET` or `example.net.`. The pre-fix
+    // impl returns `false` for both, turning the normalization asserts red.
     #[test]
     fn is_blocked_matches_label_boundaries() {
         let blocked = vec!["example.net".to_string()];
         assert!(is_blocked("example.net", &blocked));
         assert!(is_blocked("sub.example.net", &blocked));
         assert!(is_blocked("a.b.example.net", &blocked));
+        // H-PROXY-2: case-insensitive and trailing-dot-insensitive.
+        assert!(is_blocked("EXAMPLE.NET", &blocked));
+        assert!(is_blocked("example.net.", &blocked));
+        assert!(is_blocked("Sub.Example.Net", &blocked));
+        assert!(is_blocked("sub.example.net.", &blocked));
+        // A blocked entry carrying its own trailing dot must still match.
+        assert!(is_blocked("example.net", &["example.net.".to_string()]));
+        // Normalization must NOT relax the label-boundary guarantee.
         assert!(!is_blocked("evil-example.net", &blocked));
         assert!(!is_blocked("notexample.net", &blocked));
+        assert!(!is_blocked("NOTEXAMPLE.NET", &blocked));
         assert!(!is_blocked("example.net.evil.com", &blocked));
         assert!(!is_blocked("other.org", &blocked));
         assert!(!is_blocked("example.net", &[]));

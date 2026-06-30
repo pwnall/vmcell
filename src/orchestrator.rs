@@ -233,6 +233,12 @@ pub struct TestVm<V: Vmm> {
     agent_client: Option<AgentClient>,
     /// Whether the VM was restored from a snapshot.
     restored: bool,
+    /// Whether the one-shot post-restore CSPRNG reseed actually applied (exit 0)
+    /// on the first post-restore [`TestVm::agent`] call. `None` until that resync
+    /// runs; `Some(false)` when the best-effort reseed could not be applied (e.g.
+    /// `/dev/hwrng` missing). Lets a restore test assert the reseed was applied
+    /// rather than inferring it from two `/dev/urandom` reads differing.
+    restore_reseed_applied: Option<bool>,
     /// The CID guard.
     cid: Option<CidGuard>,
 }
@@ -275,6 +281,144 @@ struct EnvSetup {
     #[cfg(feature = "net-unprivileged")]
     smoltcp: Option<SmoltcpProcess>,
     proxy: Option<EgressProxy>,
+}
+
+/// Minimal guest-exec seam the one-shot post-restore resync needs.
+///
+/// Implemented for the real [`AgentClient`] and for a recording fake in the unit
+/// tests, so the resync's ordering and its "clear `restored` only after the
+/// mandatory step succeeds" contract (M-RESTORE-1) can be exercised without a
+/// live guest.
+trait GuestExec {
+    /// Runs `argv` in the guest and returns its outcome.
+    async fn exec_argv(&mut self, argv: Vec<String>) -> Result<crate::agent::ExecOutcome>;
+}
+
+impl GuestExec for AgentClient {
+    async fn exec_argv(&mut self, argv: Vec<String>) -> Result<crate::agent::ExecOutcome> {
+        self.exec(crate::agent::ExecRequest::new(argv)).await
+    }
+}
+
+/// Runs the one-shot post-restore guest resync when `*restored` is set, clearing
+/// the flag **only after** the mandatory clock resync succeeds.
+///
+/// M-RESTORE-1: a snapshot resumes at the frozen instant, so the guest clock,
+/// CSPRNG state, and network identity must be refreshed on **every** restore
+/// (§9.2). The mandatory clock resync is the *first* post-restore exec, which is
+/// exactly where the freshly-rebound guest vsock listener is flakiest. The flag
+/// is therefore propagated (`?`) and left **set** on a transient failure so the
+/// next `agent()` call retries the whole resync, instead of being cleared up
+/// front (the bug, which permanently skipped clock/RNG/MAC resync after one
+/// transient first-exec error). `*reseed_applied` records whether the
+/// best-effort CSPRNG reseed actually applied, so a caller can assert the reseed
+/// ran rather than inferring it from two `/dev/urandom` reads differing.
+async fn maybe_resync_after_restore<E: GuestExec>(
+    restored: &mut bool,
+    reseed_applied: &mut Option<bool>,
+    exec: &mut E,
+    clock: &dyn Clock,
+    vmid: u32,
+) -> Result<()> {
+    if !*restored {
+        return Ok(());
+    }
+
+    // Mandatory, host-driven clock resync: the guest cannot fix a frozen RTC from
+    // inside (§9.2). Propagated with `?` so a transient first-exec failure leaves
+    // `*restored` set and the next agent() call retries.
+    let host_time = clock
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    tracing::info!(
+        "Automatically resyncing guest clock to host time: {}",
+        host_time
+    );
+    let outcome = exec
+        .exec_argv(vec![
+            "date".to_string(),
+            "-s".to_string(),
+            format!("@{}", host_time),
+        ])
+        .await?;
+    if outcome.code != 0 {
+        tracing::warn!(
+            "Failed to automatically resync guest clock: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+    }
+
+    // Best-effort re-seed of the guest CSPRNG from the virtio-rng device after
+    // restore (the snapshot may have captured RNG state). The reseed itself is
+    // best-effort — a missing/unreadable `/dev/hwrng` must not fail the resync —
+    // but whether it applied is recorded so a restore test can assert it ran.
+    let reseed = match exec
+        .exec_argv(vec![
+            "sh".into(),
+            "-c".into(),
+            "head -c 32 /dev/hwrng > /dev/urandom".into(),
+        ])
+        .await
+    {
+        Ok(outcome) => {
+            if outcome.code != 0 {
+                tracing::warn!(
+                    "restore RNG reseed failed (exit {}): {}",
+                    outcome.code,
+                    String::from_utf8_lossy(&outcome.stderr)
+                );
+            }
+            outcome.code == 0
+        }
+        Err(e) => {
+            tracing::warn!("restore RNG reseed could not be executed: {}", e);
+            false
+        }
+    };
+    *reseed_applied = Some(reseed);
+
+    let mac = crate::net::mac_math(vmid)
+        .map_err(|e| crate::error::Error::Agent(format!("mac math: {}", e)))?;
+    let (gateway, _guest_ip, ip) = crate::net::ip_math(vmid)
+        .map_err(|e| crate::error::Error::Agent(format!("ip math: {}", e)))?;
+    // NOTE: re-running `ip` inside the guest on restore diverges from the
+    // zero-netlink-in-PID-1 invariant; it is a documented last-resort fallback for
+    // rotating the guest network identity after a snapshot restore until
+    // device-layer rotation lands (see implementation-notes.md). `ip addr flush`
+    // drops the IP-PNP default route, so it MUST be re-added via the /30 gateway,
+    // otherwise post-restore egress to non-local destinations breaks. The Result
+    // is surfaced (warn) rather than discarded, and is best-effort: it never keeps
+    // `restored` set.
+    match exec
+        .exec_argv(vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "ip link set eth0 address {mac} && ip addr flush dev eth0 && ip addr add {ip} dev eth0 && ip route add default via {gateway} dev eth0"
+            ),
+        ])
+        .await
+    {
+        Ok(outcome) if outcome.code != 0 => {
+            tracing::warn!(
+                "restore network bring-up failed (exit {}): {}",
+                outcome.code,
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+        }
+        Err(e) => {
+            tracing::warn!("restore network bring-up could not be executed: {}", e);
+        }
+        _ => {}
+    }
+
+    // Clear `restored` ONLY now — after the mandatory clock resync above
+    // succeeded (M-RESTORE-1). The RNG/network steps are best-effort and never
+    // keep the flag set.
+    *restored = false;
+    Ok(())
 }
 
 impl<V: Vmm> TestVm<V> {
@@ -347,7 +491,20 @@ impl<V: Vmm> TestVm<V> {
                 if let crate::config::Egress::Filtered(proxy_cfg) = egress {
                     #[cfg(feature = "proxy")]
                     {
-                        let px = EgressProxy::start(crate::proxy::ProxyConfig {
+                        // Privileged egress front-end: the nft TPROXY ruleset
+                        // (`tproxy to :<port>`, emitted below) redirects the guest's
+                        // tcp/80,443 into this listener, so it MUST be an
+                        // `IP_TRANSPARENT` socket for the kernel to deliver the
+                        // redirected connections and preserve the original
+                        // destination (H-PROXY-1). `start_transparent` fails loud if
+                        // `IP_TRANSPARENT` cannot be set (e.g. missing CAP_NET_ADMIN)
+                        // rather than silently degrading to a non-transparent bind
+                        // that TPROXY cannot deliver to. NOTE: hudsucker is an
+                        // explicit-proxy MITM (expects CONNECT/absolute-form), so a
+                        // fully transparent HTTP MITM additionally needs absolute-form
+                        // reconstruction from the recovered destination; that is
+                        // tracked as follow-up — see implementation-notes.md.
+                        let px = EgressProxy::start_transparent(crate::proxy::ProxyConfig {
                             port: 0,
                             netns: Some(format!("imp-net-{}", vmid)),
                             doubles: proxy_cfg.doubles.clone(),
@@ -519,6 +676,7 @@ impl<V: Vmm> TestVm<V> {
             cgroup_fs: Some(cgroup_fs),
             agent_client: None,
             restored: false,
+            restore_reseed_applied: None,
             cid: Some(env.cid_guard),
         })
     }
@@ -605,21 +763,27 @@ impl<V: Vmm> TestVm<V> {
             cgroup_fs: Some(cgroup_fs),
             agent_client: None,
             restored: true,
+            restore_reseed_applied: None,
             cid: Some(env.cid_guard),
         })
     }
 
-    /// Connects to the VM agent, returning a mutable reference to the client.
+    /// Gets the agent client, connecting (and waiting for the connection) on
+    /// first use.
     ///
-    /// # Errors
-    /// Returns an error if the agent connection or handshake fails.
-    /// Gets the agent client, waiting for the connection if necessary.
+    /// On the **first** call after a snapshot restore this also performs the
+    /// one-shot guest resync — clock, CSPRNG reseed, and network identity (§9.2);
+    /// see [`maybe_resync_after_restore`]. The `restored` flag is cleared only
+    /// after the mandatory clock resync succeeds, so a transient first-exec
+    /// failure retries on the next call rather than permanently skipping the
+    /// resync (M-RESTORE-1).
     ///
     /// # Panics
     /// Panics if the VM instance is missing.
     ///
     /// # Errors
-    /// Returns an error if the connection fails or times out.
+    /// Returns an error if the agent connection or handshake fails or times out,
+    /// or if the mandatory post-restore clock resync exec fails.
     pub async fn agent(
         &mut self,
         timeout: Option<std::time::Duration>,
@@ -652,8 +816,6 @@ impl<V: Vmm> TestVm<V> {
             .ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))?;
 
         if self.restored {
-            self.restored = false;
-
             // No explicit reconnect here: this `agent()` is the first call after
             // restore (agent_client started `None`), so the `connect()` above
             // already IS the post-restore connection. CH re-creates the vhost-vsock
@@ -662,93 +824,35 @@ impl<V: Vmm> TestVm<V> {
             // imp-guest-agent), and `AgentClient::connect` retries with backoff
             // until that fresh listener accepts. A second, overlapping connect would
             // be redundant.
-
-            // Automatically resync guest clock forward
-            let host_time = clock
-                .now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            tracing::info!(
-                "Automatically resyncing guest clock to host time: {}",
-                host_time
-            );
-            let outcome = agent_ref
-                .exec(crate::agent::ExecRequest::new(vec![
-                    "date".to_string(),
-                    "-s".to_string(),
-                    format!("@{}", host_time),
-                ]))
-                .await?;
-            if outcome.code != 0 {
-                tracing::warn!(
-                    "Failed to automatically resync guest clock: {}",
-                    String::from_utf8_lossy(&outcome.stderr)
-                );
-            }
-
-            // Best-effort re-seed of the guest CSPRNG from the virtio-rng
-            // device after restore (the snapshot may have captured RNG state).
-            // Surface failures rather than silently discarding the Result.
-            match agent_ref
-                .exec(crate::agent::ExecRequest::new(vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "head -c 32 /dev/hwrng > /dev/urandom".into(),
-                ]))
-                .await
-            {
-                Ok(outcome) if outcome.code != 0 => {
-                    tracing::warn!(
-                        "restore RNG reseed failed (exit {}): {}",
-                        outcome.code,
-                        String::from_utf8_lossy(&outcome.stderr)
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("restore RNG reseed could not be executed: {}", e);
-                }
-                _ => {}
-            }
-
-            let mac = crate::net::mac_math(self.vmid.as_ref().expect("vmid missing").vmid)
-                .map_err(|e| crate::error::Error::Agent(format!("mac math: {}", e)))?;
-            let (gateway, _guest_ip, ip) =
-                crate::net::ip_math(self.vmid.as_ref().expect("vmid missing").vmid)
-                    .map_err(|e| crate::error::Error::Agent(format!("ip math: {}", e)))?;
-            // NOTE: re-running `ip` inside the guest on restore diverges from the
-            // zero-netlink-in-PID-1 invariant; it is a documented last-resort
-            // fallback for rotating the guest network identity after a snapshot
-            // restore until device-layer rotation lands (see
-            // implementation-notes.md). `ip addr flush` drops the IP-PNP default
-            // route, so it MUST be re-added via the /30 gateway, otherwise
-            // post-restore egress to non-local destinations breaks. The Result
-            // is surfaced rather than discarded.
-            match agent_ref
-                .exec(crate::agent::ExecRequest::new(vec![
-                    "sh".into(),
-                    "-c".into(),
-                    format!(
-                        "ip link set eth0 address {mac} && ip addr flush dev eth0 && ip addr add {ip} dev eth0 && ip route add default via {gateway} dev eth0"
-                    ),
-                ]))
-                .await
-            {
-                Ok(outcome) if outcome.code != 0 => {
-                    tracing::warn!(
-                        "restore network bring-up failed (exit {}): {}",
-                        outcome.code,
-                        String::from_utf8_lossy(&outcome.stderr)
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("restore network bring-up could not be executed: {}", e);
-                }
-                _ => {}
-            }
+            let vmid = self.vmid.as_ref().expect("vmid missing").vmid;
+            // M-RESTORE-1: clears `self.restored` only after the mandatory clock
+            // resync succeeds, so a transient first-exec failure retries the full
+            // resync on the next call instead of being silently dropped.
+            maybe_resync_after_restore(
+                &mut self.restored,
+                &mut self.restore_reseed_applied,
+                agent_ref,
+                clock,
+                vmid,
+            )
+            .await?;
         }
 
         Ok(agent_ref)
+    }
+
+    /// Whether the one-shot post-restore CSPRNG reseed actually applied (exit 0)
+    /// on the first post-restore [`TestVm::agent`] call.
+    ///
+    /// `None` before that resync has run; `Some(true)` when the reseed
+    /// (`head -c 32 /dev/hwrng > /dev/urandom`) succeeded; `Some(false)` when the
+    /// best-effort reseed could not be applied. A restore test asserts
+    /// `Some(true)` instead of inferring the reseed from two `/dev/urandom` reads
+    /// differing (which can pass coincidentally even when the reseed silently
+    /// failed).
+    #[must_use]
+    pub fn restore_reseed_applied(&self) -> Option<bool> {
+        self.restore_reseed_applied
     }
 
     /// Retrieves resource usage metrics for the VM.
@@ -759,7 +863,15 @@ impl<V: Vmm> TestVm<V> {
         if let (Some(cg_name), Some(fs)) = (&self.cgroup_name, &self.cgroup_fs) {
             fs.read_stats(cg_name)
         } else {
-            Ok(ResourceUsage::default())
+            // No cgroup is attached, so no requested limit is being enforced —
+            // surface that honestly (`limits_enforced: false`) rather than handing
+            // back an all-zero usage that implies a measured, enforced state
+            // (§7.1 rule 3 / H-FAILLOUD-1). `ResourceUsage::default()` already has
+            // the flag `false`; spell it out so the intent cannot silently drift.
+            Ok(ResourceUsage {
+                limits_enforced: false,
+                ..ResourceUsage::default()
+            })
         }
     }
 
@@ -796,9 +908,13 @@ impl<V: Vmm> Drop for TestVm<V> {
         #[cfg(feature = "net-unprivileged")]
         drop(self.smoltcp.take());
         drop(self.proxy.take());
-        if let Some(mut ns) = self.netns.take() {
-            let _ = ns.delete();
-        }
+        // Netns teardown (after proxy, before cgroup — preserving the documented
+        // order). `NetNamespace::delete()` is idempotent and `NetNamespace::Drop`
+        // performs the single teardown and surfaces a *genuine* failure via the
+        // NET-8 warning. Dropping the taken value tears the namespace down exactly
+        // once at this point in the order; an explicit `delete()` here would only
+        // risk a redundant attempt (and, pre-guard, a spurious WARN) — M-NET-3.
+        drop(self.netns.take());
         if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
             let _ = fs.delete_slice(&cg_name);
         }
@@ -1079,5 +1195,241 @@ mod tests {
         )
         .await;
         assert!(matches!(res, Err(crate::error::Error::Config(_))));
+    }
+
+    /// A recording guest-exec fake for the post-restore resync tests. Fails the
+    /// first `fail_first_n` calls (modelling a just-rebound, still-flaky vsock),
+    /// then records and succeeds; the CSPRNG reseed command's exit code is
+    /// configurable to drive the "reseed not applied" path.
+    #[derive(Default)]
+    struct FakeExec {
+        recorded: Vec<Vec<String>>,
+        calls: usize,
+        fail_first_n: usize,
+        rng_exit_code: i32,
+    }
+
+    impl GuestExec for FakeExec {
+        async fn exec_argv(&mut self, argv: Vec<String>) -> Result<crate::agent::ExecOutcome> {
+            self.calls += 1;
+            if self.calls <= self.fail_first_n {
+                return Err(crate::error::Error::Agent(
+                    "transient post-restore drop".into(),
+                ));
+            }
+            let code = if argv.iter().any(|a| a.contains("/dev/hwrng")) {
+                self.rng_exit_code
+            } else {
+                0
+            };
+            self.recorded.push(argv);
+            Ok(crate::agent::ExecOutcome {
+                code,
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
+
+    fn fixed_clock() -> FakeClock {
+        FakeClock {
+            time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        }
+    }
+
+    // M-RESTORE-1. A transient failure of the FIRST post-restore exec (the
+    // mandatory clock resync) must NOT clear `restored`; the next call must retry
+    // the full resync. Buggy impl (clearing `restored` up front, then a hard `?`
+    // on the first exec) leaves `restored == false` after the failure, so the
+    // resync — clock, RNG reseed, MAC/network — never runs again. This goes red on
+    // that inverse: it asserts the flag stays set after the failed pass and that
+    // the full three-command resync runs on the retry.
+    #[tokio::test]
+    async fn test_resync_retries_after_transient_first_exec_failure() {
+        let clock = fixed_clock();
+        let mut restored = true;
+        let mut reseed = None;
+        let mut exec = FakeExec {
+            fail_first_n: 1,
+            ..FakeExec::default()
+        };
+
+        let first =
+            maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5).await;
+        assert!(
+            first.is_err(),
+            "transient clock-resync failure must propagate"
+        );
+        assert!(
+            restored,
+            "restored must stay set after a transient first-exec failure so the resync retries"
+        );
+        assert!(
+            reseed.is_none(),
+            "no reseed result recorded on the failed pass"
+        );
+        assert!(
+            exec.recorded.is_empty(),
+            "the failed first exec must not have recorded any resync command"
+        );
+
+        // Retry: the guest is reachable now; the full resync runs and only then is
+        // the flag cleared.
+        let second =
+            maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5).await;
+        assert!(second.is_ok(), "the retried resync must succeed");
+        assert!(
+            !restored,
+            "restored is cleared only AFTER the mandatory clock resync succeeds"
+        );
+        assert_eq!(
+            reseed,
+            Some(true),
+            "the reseed applied on the successful pass"
+        );
+        // The three resync commands ran, in order: clock, RNG reseed, network.
+        assert_eq!(exec.recorded.len(), 3, "full resync must run on retry");
+        assert_eq!(exec.recorded[0][0], "date");
+        assert!(exec.recorded[1].iter().any(|a| a.contains("/dev/hwrng")));
+        assert!(
+            exec.recorded[2]
+                .iter()
+                .any(|a| a.contains("ip link set eth0 address"))
+        );
+    }
+
+    // Test-discipline (c): the typed "reseed applied" result must report
+    // Some(false) when the best-effort reseed command exits non-zero (e.g.
+    // /dev/hwrng missing), so a restore test can assert the reseed actually
+    // applied instead of inferring it from two /dev/urandom reads differing.
+    // Buggy impl (always recording Some(true), or never recording) goes red.
+    #[tokio::test]
+    async fn test_resync_records_reseed_not_applied_on_nonzero_exit() {
+        let clock = fixed_clock();
+        let mut restored = true;
+        let mut reseed = None;
+        let mut exec = FakeExec {
+            rng_exit_code: 1,
+            ..FakeExec::default()
+        };
+        maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5)
+            .await
+            .expect("clock resync succeeds; the reseed is best-effort");
+        assert_eq!(
+            reseed,
+            Some(false),
+            "a non-zero reseed exit must be surfaced as not-applied"
+        );
+        assert!(
+            !restored,
+            "a best-effort reseed failure must NOT keep restored set (the clock resync succeeded)"
+        );
+    }
+
+    // The resync is a no-op when the VM was not restored: no exec is issued and no
+    // reseed result is recorded. Guards against running the resync on a cold boot.
+    #[tokio::test]
+    async fn test_resync_is_noop_when_not_restored() {
+        let clock = fixed_clock();
+        let mut restored = false;
+        let mut reseed = None;
+        let mut exec = FakeExec::default();
+        maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5)
+            .await
+            .unwrap();
+        assert!(exec.recorded.is_empty(), "no resync when not restored");
+        assert_eq!(reseed, None);
+    }
+
+    /// A `CgroupFs` whose `read_stats` reports a configurable `limits_enforced`,
+    /// so `usage()` can be shown to surface the real enforcement state rather than
+    /// a rosy constant.
+    #[derive(Debug, Clone)]
+    struct EnforcementCgroupFs {
+        enforced: bool,
+    }
+
+    impl crate::metrics::CgroupFs for EnforcementCgroupFs {
+        fn create_slice(&self, _name: &str, _limits: &crate::config::ResourceLimits) -> Result<()> {
+            Ok(())
+        }
+        fn delete_slice(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
+            Ok(ResourceUsage {
+                limits_enforced: self.enforced,
+                ..ResourceUsage::default()
+            })
+        }
+        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn start_with_cgroup(fs: EnforcementCgroupFs) -> TestVm<crate::vmm::FakeVmm> {
+        let vmm = crate::vmm::FakeVmm::default();
+        TestVm::start(
+            &vmm,
+            erofs_cfg(),
+            std::sync::Arc::new(crate::vmm::CidAllocator::new()),
+            VmidAllocator::new(),
+            Box::new(fs),
+        )
+        .await
+        .expect("start should succeed with fakes")
+    }
+
+    // H-FAILLOUD-1 (surfacing). When the cgroup reports limits NOT enforced (an
+    // undelegated controller — the VM is effectively running unbounded), usage()
+    // must surface limits_enforced=false. Buggy impl that returns
+    // ResourceUsage::default() unconditionally (ignoring read_stats) or hardcodes
+    // true goes red here, while the inverse (enforced) test below stays green —
+    // proving usage() reflects the real flag, not a constant.
+    #[tokio::test]
+    async fn test_usage_surfaces_unenforced_limits_honestly() {
+        let vm = start_with_cgroup(EnforcementCgroupFs { enforced: false }).await;
+        let usage = vm.usage().await.unwrap();
+        assert!(
+            !usage.limits_enforced,
+            "usage() must honestly surface that the requested limits are NOT enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_usage_surfaces_enforced_limits() {
+        let vm = start_with_cgroup(EnforcementCgroupFs { enforced: true }).await;
+        let usage = vm.usage().await.unwrap();
+        assert!(
+            usage.limits_enforced,
+            "usage() must surface enforced limits as true (control for the false case)"
+        );
+    }
+
+    // H-FAILLOUD-1 (surfacing). The no-cgroup-attached branch (orchestrator
+    // usage() else arm) must report limits_enforced=false, not imply an all-zero,
+    // measured-and-enforced usage. Buggy impl returning a usage with the flag
+    // forced true (or omitting the field's honest default) goes red.
+    #[tokio::test]
+    async fn test_usage_without_cgroup_reports_unenforced() {
+        let vm: TestVm<crate::vmm::FakeVmm> = TestVm {
+            vmid: None,
+            instance: None,
+            netns: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: None,
+            cgroup_name: None,
+            cgroup_fs: None,
+            agent_client: None,
+            restored: false,
+            restore_reseed_applied: None,
+            cid: None,
+        };
+        let usage = vm.usage().await.unwrap();
+        assert!(
+            !usage.limits_enforced,
+            "with no cgroup attached, usage() must report limits as unenforced"
+        );
     }
 }

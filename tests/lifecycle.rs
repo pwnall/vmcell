@@ -62,7 +62,7 @@ impl imp_testing::metrics::CgroupFs for RecordingCgroupFs {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs KVM"]
 async fn test_lifecycle_force_kill_ch() {
     let vmm = CloudHypervisor::new(common::ch_bin());
     test_lifecycle_force_kill_impl(&vmm).await;
@@ -70,7 +70,7 @@ async fn test_lifecycle_force_kill_ch() {
 
 #[cfg(feature = "firecracker")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs KVM"]
 async fn test_lifecycle_force_kill_fc() {
     let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
     test_lifecycle_force_kill_impl(&vmm).await;
@@ -78,7 +78,7 @@ async fn test_lifecycle_force_kill_fc() {
 
 #[cfg(feature = "qemu")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs KVM"]
 async fn test_lifecycle_force_kill_qemu() {
     let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
     test_lifecycle_force_kill_impl(&vmm).await;
@@ -242,7 +242,7 @@ async fn test_lifecycle_fake_vmm() {
 // Serialization comes from the nextest `serial-host` group (TESTS-LIFECYCLE-7),
 // not an ad-hoc `#[serial_test::serial]`.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs KVM + CAP_NET_ADMIN (privileged tap networking)"]
 async fn test_lifecycle_panic_residue_ch() {
     // Privileged tap networking needs CAP_NET_ADMIN; gate on the effective set.
     if !common::has_cap_net_admin() {
@@ -328,6 +328,18 @@ async fn test_lifecycle_panic_residue_ch() {
         !vsock_path.exists(),
         "vsock socket leaked at {}",
         vsock_path.display()
+    );
+
+    // 4b. E3: the per-VM `/tmp/imp-vm-{pid}-{vmid}` DIRECTORY itself (holding
+    //     serial.log, and api.sock.lock for CH) must also be removed on teardown —
+    //     not just the vsock socket inside it. The leak fix landed in vmm/mod.rs
+    //     (remove_vm_tmp_dir); without it `/tmp` grows one dir per VM, unbounded.
+    //     The pid/vmid naming mirrors `vmm::create_vm_tmp_dir`.
+    let per_vm_dir = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), vmid));
+    assert!(
+        !per_vm_dir.exists(),
+        "per-VM temp dir leaked at {}",
+        per_vm_dir.display()
     );
 
     // 5. CID released back to the allocator (Drop releases the real instance).

@@ -25,6 +25,54 @@ struct SnapshotHostPaths {
     serial: PathBuf,
 }
 
+/// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
+/// because it has a vhost-user device attached (virtio-fs share, rootless net, or
+/// external vhost-user-net). The snapshot-eligibility law (§3.3) requires every
+/// backend to self-guard `snapshot()`/`restore()` against such a VM rather than
+/// assume the caller already checked. Firecracker's `create()` already rejects all
+/// vhost-user devices up front, so on FC this is defense in depth — it stays correct
+/// if a future path constructs an `FcInstance` differently. Mirrors the CH helper.
+fn has_vhost_user_device(virtio_fs_share: bool, rootless_net: bool, vhost_user_net: bool) -> bool {
+    virtio_fs_share || rootless_net || vhost_user_net
+}
+
+/// The Firecracker capability descriptor, exposed as a free function so both
+/// [`Firecracker::capabilities`] and [`FcInstance::snapshot`] consult the **same**
+/// source of truth — the latter holds no handle to the `Firecracker` backend yet
+/// must self-check `snapshot_restore` (M-RESTORE-3).
+fn fc_capabilities() -> VmmCapabilities {
+    VmmCapabilities {
+        // E2 (empirical, KVM host): FC warm restore drops the first post-restore
+        // exec ("Connection dropped during exec") whereas CH passes the same test.
+        // The fix spans the guest agent's vsock re-bind and the host reconnect/retry
+        // (outside this module) and needs KVM validation, so the capability is gated
+        // OFF until it passes the matrix test on a KVM host — advertising a broken
+        // capability is the "lying flag" smell. Flip back to `true` only then.
+        snapshot_restore: false,
+        // M-VMM-1: a real UFFD page-fault backend for `RestoreMode::Lazy` is not
+        // wired (restore would hardcode `backend_type: "File"`, faulting eagerly), so
+        // the flag is honest-false rather than silently degrading Lazy to eager.
+        lazy_restore: false,
+        virtio_fs_shares: false,
+        unprivileged_vhost_user_net: false,
+        nested_virt: false,
+    }
+}
+
+/// Serializes and writes the host vsock/serial UDS paths Firecracker baked into a
+/// snapshot to the [`HOST_PATHS_SIDECAR`] file in `dir`. The sidecar is part of the
+/// snapshot artifact and `restore()` hard-requires it, so a serialize or write
+/// failure is surfaced (M-RESTORE-2) — never logged-and-swallowed, which would
+/// report an unrestorable snapshot as successful.
+async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, serial: &Path) -> Result<()> {
+    let json = serde_json::to_string(&SnapshotHostPaths {
+        vsock: vsock.to_path_buf(),
+        serial: serial.to_path_buf(),
+    })?;
+    tokio::fs::write(dir.join(HOST_PATHS_SIDECAR), json).await?;
+    Ok(())
+}
+
 /// The Firecracker VMM backend.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -71,6 +119,11 @@ pub struct FcInstance {
     serial_path: PathBuf,
     cid: u32,
     pgid: Option<u32>,
+    /// True if an external vhost-user-net device is attached. Such a VM is not
+    /// snapshot-eligible (§3.3); `snapshot()` self-guards on it. Always `false` on
+    /// FC today because `create()` rejects every vhost-user device up front, but the
+    /// field keeps the snapshot guard correct by construction. Mirrors CH.
+    vhost_user_net: bool,
 }
 
 impl FcInstance {
@@ -191,6 +244,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         serial_path: PathBuf::new(),
         cid: 0,
         pgid,
+        vhost_user_net: false,
     };
 
     #[derive(Serialize)]
@@ -314,6 +368,10 @@ impl Vmm for Firecracker {
             serial_path: serial_path.clone(),
             cid: res.guest_cid,
             pgid,
+            // Always false here: the vhost-user-socket rejection above already
+            // returned `Unsupported`. Computed from `res` to mirror CH and stay
+            // correct if that guard ever moves.
+            vhost_user_net: res.vhost_user_socket.is_some(),
         };
 
         #[derive(Serialize)]
@@ -462,7 +520,7 @@ impl Vmm for Firecracker {
     async fn restore(
         &self,
         snapshot_dir: &Path,
-        _cfg: &VmConfig,
+        cfg: &VmConfig,
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
@@ -472,6 +530,20 @@ impl Vmm for Firecracker {
             return Err(Error::Unsupported {
                 vmm: "firecracker".to_string(),
                 feature: "snapshot_restore".to_string(),
+            });
+        }
+        // M-RESTORE-3 / snapshot-eligibility law: a snapshot-eligible VM has no
+        // vhost-user device. Reject any virtio-fs share, rootless net, or external
+        // vhost-user-net handed to us via the config, mirroring CH's guard, before
+        // spawning a VMM. FC never attaches these, so this is defense in depth.
+        if has_vhost_user_device(
+            !cfg.shares.is_empty(),
+            matches!(cfg.net, crate::config::NetConfig::Rootless { .. }),
+            res.vhost_user_socket.is_some(),
+        ) {
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                feature: "snapshot/restore with a vhost-user device".to_string(),
             });
         }
 
@@ -500,6 +572,8 @@ impl Vmm for Firecracker {
             serial_path: host_paths.serial,
             cid: res.guest_cid,
             pgid,
+            // Guarded false above; computed from `res` to mirror CH.
+            vhost_user_net: res.vhost_user_socket.is_some(),
         };
 
         // Load snapshot
@@ -534,13 +608,7 @@ impl Vmm for Firecracker {
     }
 
     fn capabilities(&self) -> VmmCapabilities {
-        VmmCapabilities {
-            snapshot_restore: true,
-            lazy_restore: true, // Firecracker supports UFFD lazy restore
-            virtio_fs_shares: false,
-            unprivileged_vhost_user_net: false,
-            nested_virt: false,
-        }
+        fc_capabilities()
     }
 
     fn id(&self) -> &str {
@@ -621,6 +689,23 @@ impl VmInstance for FcInstance {
     }
 
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
+        // M-RESTORE-3: self-check the capability descriptor and the
+        // snapshot-eligibility law (no vhost-user device) before doing any work,
+        // mirroring CH's `snapshot()` guards. A backend never assumes the caller
+        // already checked.
+        if !fc_capabilities().snapshot_restore {
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                feature: "snapshot_restore".to_string(),
+            });
+        }
+        if has_vhost_user_device(false, false, self.vhost_user_net) {
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                feature: "snapshot with a vhost-user device".to_string(),
+            });
+        }
+
         #[derive(Serialize)]
         struct SnapshotCreate {
             snapshot_type: String,
@@ -630,7 +715,7 @@ impl VmInstance for FcInstance {
 
         self.pause().await?;
 
-        let res = self
+        let snap_res = self
             .api_request(
                 "PUT",
                 "/snapshot/create",
@@ -644,29 +729,22 @@ impl VmInstance for FcInstance {
 
         // On success, persist the host vsock/serial UDS paths FC baked into the
         // snapshot so `restore()` can rebind/connect the exact socket it recreates
-        // (FC offers no load-time vsock override). Best-effort: a write failure is
-        // logged, not fatal — a missing sidecar then fails the restore loudly.
-        if res.is_ok() {
-            match serde_json::to_string(&SnapshotHostPaths {
-                vsock: self.vsock_path.clone(),
-                serial: self.serial_path.clone(),
-            }) {
-                Ok(json) => {
-                    if let Err(e) = tokio::fs::write(dir.join(HOST_PATHS_SIDECAR), json).await {
-                        tracing::warn!("Failed to write snapshot host-paths sidecar: {}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to serialize snapshot host-paths sidecar: {}", e);
-                }
-            }
-        }
+        // (FC offers no load-time vsock override). The sidecar is part of the
+        // artifact and `restore()` hard-requires it, so a write failure is
+        // propagated (M-RESTORE-2) — reporting an unrestorable snapshot as `Ok`
+        // would only surface later as a confusing `restore()` error.
+        let result = match snap_res {
+            Ok(()) => write_host_paths_sidecar(dir, &self.vsock_path, &self.serial_path).await,
+            Err(e) => Err(e),
+        };
 
+        // Always attempt to resume so a snapshot of a still-live VM is not stranded
+        // paused; a resume failure is non-fatal and only logged.
         if let Err(e) = self.resume().await {
             tracing::warn!("Failed to resume Firecracker after snapshot: {}", e);
         }
 
-        res
+        result
     }
 
     fn vsock_path(&self) -> &Path {
@@ -717,5 +795,77 @@ mod tests {
         assert_eq!(a.cpu_template.get(), Some(&Some("T2".to_string())));
         // `b` has an independent, still-empty cache.
         assert_eq!(b.cpu_template.get(), None);
+    }
+
+    // Guards E2 (FC warm restore is empirically broken on a KVM host — gated off)
+    // and M-VMM-1 (no real UFFD backend is wired). The advertised capability must be
+    // HONEST. The buggy impl (advertising `snapshot_restore: true` while the first
+    // post-restore exec drops, or `lazy_restore: true` while Lazy silently degrades
+    // to eager) makes these asserts go red. With `true`, `require_cap!` would run a
+    // broken FC restore scenario instead of skipping with reason. Flip these to
+    // `true` only once FC warm restore passes the matrix test on a KVM host.
+    #[test]
+    fn capabilities_are_honest_about_snapshot_restore() {
+        let caps = Firecracker::new("/usr/bin/firecracker").capabilities();
+        assert!(
+            !caps.snapshot_restore,
+            "FC snapshot_restore must stay gated off until E2 is fixed and KVM-validated"
+        );
+        assert!(
+            !caps.lazy_restore,
+            "FC lazy_restore must be false until a real UFFD backend is wired (M-VMM-1)"
+        );
+        // The instance-facing free function and the `Vmm` trait method must agree, so
+        // `FcInstance::snapshot`'s self-check sees the same gate the orchestrator does.
+        assert_eq!(caps.snapshot_restore, fc_capabilities().snapshot_restore);
+        assert_eq!(caps.lazy_restore, fc_capabilities().lazy_restore);
+    }
+
+    // Guards M-RESTORE-3: the snapshot-eligibility predicate (§3.3) that backs both
+    // the `restore()` and `snapshot()` self-guards. The buggy impl (no guard — i.e.
+    // a predicate that always returns false) would let a vhost-user VM be
+    // snapshotted/restored.
+    #[test]
+    fn vhost_user_device_guard() {
+        assert!(has_vhost_user_device(true, false, false)); // virtio-fs data share
+        assert!(has_vhost_user_device(false, true, false)); // rootless net
+        assert!(has_vhost_user_device(false, false, true)); // external vhost-user-net
+        // privileged tap net + erofs/block rootfs: snapshot-eligible.
+        assert!(!has_vhost_user_device(false, false, false));
+    }
+
+    // Guards M-RESTORE-2: the restore sidecar is part of the snapshot artifact, so a
+    // write failure must be SURFACED, not swallowed. The buggy impl
+    // (`let _ = tokio::fs::write(...).await; Ok(())`) returns `Ok` even when the
+    // write fails, making `snapshot()` report an unrestorable snapshot as success;
+    // the failure-path assert below then goes red. The happy path also round-trips
+    // the exact paths so the sidecar is proven readable by `restore()`.
+    #[tokio::test]
+    async fn sidecar_write_round_trips_and_surfaces_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vsock = PathBuf::from("/tmp/imp-vsock.sock");
+        let serial = PathBuf::from("/tmp/imp-serial.log");
+
+        // Happy path: the sidecar is written and round-trips back the exact paths.
+        write_host_paths_sidecar(dir.path(), &vsock, &serial)
+            .await
+            .expect("sidecar write should succeed in a writable dir");
+        let raw = tokio::fs::read_to_string(dir.path().join(HOST_PATHS_SIDECAR))
+            .await
+            .expect("sidecar file should exist after a successful write");
+        let parsed: SnapshotHostPaths =
+            serde_json::from_str(&raw).expect("sidecar should be valid json");
+        assert_eq!(parsed.vsock, vsock);
+        assert_eq!(parsed.serial, serial);
+
+        // Failure path: a non-existent target directory makes the write fail; the
+        // error MUST propagate rather than be swallowed into `Ok`.
+        let missing = dir.path().join("does-not-exist").join("nested");
+        assert!(
+            write_host_paths_sidecar(&missing, &vsock, &serial)
+                .await
+                .is_err(),
+            "a failed sidecar write must surface an error, not be swallowed"
+        );
     }
 }

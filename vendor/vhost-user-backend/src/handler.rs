@@ -245,6 +245,10 @@ where
     }
 
     /// Helper to check if VirtioFeature enabled
+    // Upstream helper retained for API parity; currently unused in this vendored
+    // copy. Allowed explicitly so the workspace-wide `-D warnings` (which denies
+    // path-dep warnings too) does not fail on third-party dead code.
+    #[allow(dead_code)]
     fn check_feature(&self, feat: VhostUserVirtioFeatures) -> VhostUserResult<()> {
         if self.acked_features & feat.bits() != 0 {
             Ok(())

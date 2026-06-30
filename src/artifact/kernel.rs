@@ -79,6 +79,21 @@ impl KernelStage {
             None => "kernel_source_sha256".to_string(),
         }
     }
+
+    /// The key under which this stage registers its built kernel in the
+    /// [`StageOutputs`]/[`StageInputs`] artifact map.
+    ///
+    /// The default (unlabelled) kernel registers under `"kernel"` — the key every
+    /// downstream stage (rootfs, snapshot) reads — while each labelled kernel
+    /// registers under `"kernel-<label>"`. Without this, every labelled kernel
+    /// collapsed onto the single `"kernel"` key and a multi-kernel `Artifacts` map
+    /// lost all but one entry (M-PIPE-4).
+    fn artifact_key(&self) -> String {
+        match &self.label {
+            Some(l) => format!("kernel-{l}"),
+            None => "kernel".to_string(),
+        }
+    }
 }
 
 use async_trait::async_trait;
@@ -86,7 +101,10 @@ use async_trait::async_trait;
 #[async_trait]
 impl Stage for KernelStage {
     fn name(&self) -> &str {
-        "kernel"
+        // Each labelled kernel stage must have a DISTINCT name so `reset_to` can
+        // target exactly one of them; sharing `"kernel"` made every labelled stage
+        // indistinguishable (M-PIPE-4). The default kernel keeps the name `"kernel"`.
+        self.label.as_deref().unwrap_or("kernel")
     }
 
     fn out_path(&self, target_dir: &Path) -> std::path::PathBuf {
@@ -96,11 +114,16 @@ impl Stage for KernelStage {
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         // Bump when this stage's build logic changes so stale kernels are not served.
         const STAGE_VERSION: u32 = 1;
+        // Unambiguous field separator: without it, label||url||sha||config are a flat
+        // byte stream where e.g. (label="x", url="A") and (label="", url="xA") collide
+        // to the same key (non-injective hash).
+        const SEP: &[u8] = b"\x1f";
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
-        // The version label distinguishes coexisting kernel stages. Hashing an empty
-        // string for `None` is a no-op, so the default kernel's key is unchanged.
+        hasher.update(SEP);
+        // The version label distinguishes coexisting kernel stages.
         hasher.update(self.label.as_deref().unwrap_or_default().as_bytes());
+        hasher.update(SEP);
         hasher.update(
             inputs
                 .pins
@@ -108,6 +131,7 @@ impl Stage for KernelStage {
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
+        hasher.update(SEP);
         hasher.update(
             inputs
                 .pins
@@ -115,6 +139,7 @@ impl Stage for KernelStage {
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
+        hasher.update(SEP);
         hasher.update(
             inputs
                 .pins
@@ -211,6 +236,10 @@ impl Stage for KernelStage {
                     if stripped_path.as_os_str().is_empty() {
                         continue;
                     }
+                    // Defense-in-depth: even though the tarball is SHA-pinned, never
+                    // let an entry escape the build dir via a `..` or absolute/prefixed
+                    // component (tar-slip). Fail loud rather than write outside workdir.
+                    reject_path_traversal(&stripped_path)?;
                     let out_path = workdir_path.join(stripped_path);
 
                     if file.header().entry_type() == tar::EntryType::Directory {
@@ -279,17 +308,41 @@ impl Stage for KernelStage {
 
         tokio::fs::copy(workdir.join("vmlinux"), out).await?;
 
-        Ok(kernel_outputs(out))
+        Ok(kernel_outputs(out, &self.artifact_key()))
     }
 }
 
-/// Builds the [`StageOutputs`] for a kernel build, registering the `kernel` artifact so
-/// downstream stages (snapshot, mmdebstrap builder) always see it on a cold build — not only
-/// on a warm-cache hit. Omitting this on the cold path lets the snapshot stage fall through
-/// to a `/tmp/vmlinux` fallback.
-fn kernel_outputs(out: &Path) -> StageOutputs {
+/// Rejects a stripped tar entry path that would escape the extraction root via a
+/// `..` component or an absolute/prefixed path (tar-slip defense-in-depth).
+///
+/// # Errors
+/// Returns [`Error::Artifact`] if `stripped` contains a parent-dir, root, or
+/// prefix component.
+fn reject_path_traversal(stripped: &Path) -> Result<()> {
+    use std::path::Component;
+    if stripped.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(Error::Artifact(format!(
+            "refusing kernel tarball entry with path traversal: {}",
+            stripped.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Builds the [`StageOutputs`] for a kernel build, registering the built kernel under
+/// `key` (`"kernel"` for the default, `"kernel-<label>"` for a labelled stage) so
+/// downstream stages (snapshot, mmdebstrap builder) always see it on a cold build — not
+/// only on a warm-cache hit. Omitting this on the cold path lets the snapshot stage fall
+/// through to a `/tmp/vmlinux` fallback; collapsing every labelled kernel onto `"kernel"`
+/// loses all but one entry in a multi-kernel `Artifacts` map (M-PIPE-4).
+fn kernel_outputs(out: &Path, key: &str) -> StageOutputs {
     let mut outputs = StageOutputs::default();
-    outputs.artifacts.insert("kernel".into(), out.to_path_buf());
+    outputs.artifacts.insert(key.to_string(), out.to_path_buf());
     outputs
 }
 
@@ -337,11 +390,84 @@ mod tests {
     #[test]
     fn test_kernel_outputs_registers_kernel_artifact() {
         let out = Path::new("/some/target/vmlinux");
-        let outputs = kernel_outputs(out);
+        let outputs = kernel_outputs(out, "kernel");
         assert_eq!(
             outputs.artifacts.get("kernel").map(|p| p.as_path()),
             Some(out),
             "cold-build outputs must register the kernel artifact"
         );
+    }
+
+    // Guards M-PIPE-4: labelled kernel stages must have DISTINCT names (so `reset_to`
+    // can target one) and register under DISTINCT artifact keys (so a multi-kernel
+    // Artifacts map does not collapse to a single entry). The buggy impl returned
+    // `"kernel"` for both name() and the artifact key regardless of label → red here.
+    #[test]
+    fn test_kernel_stage_name_and_key_distinct_per_label() {
+        let mk = |label: Option<&str>| KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+            label: label.map(str::to_string),
+        };
+        let default = mk(None);
+        let k66 = mk(Some("6.6.143"));
+        let k612 = mk(Some("6.12.94"));
+
+        assert_eq!(default.name(), "kernel");
+        assert_ne!(
+            k66.name(),
+            k612.name(),
+            "labelled kernels must have distinct names"
+        );
+        assert_ne!(k66.name(), default.name());
+
+        assert_eq!(default.artifact_key(), "kernel");
+        assert_ne!(
+            k66.artifact_key(),
+            k612.artifact_key(),
+            "labelled kernels must register under distinct artifact keys"
+        );
+        assert_ne!(k66.artifact_key(), default.artifact_key());
+    }
+
+    // Guards the LOW non-injective-hash finding: without a field delimiter the
+    // concatenation label||url makes two distinct stages hash identically. Here
+    // (label="x", url="A") and (label="", url="xA") collide on the buggy impl.
+    #[test]
+    fn test_kernel_cache_key_field_delimiter_injective() {
+        let s1 = KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+            label: Some("x".into()),
+        };
+        let mut i1 = StageInputs::default();
+        i1.pins.insert("kernel_x_source_url".into(), "A".into());
+        i1.pins.insert("kernel_x_source_sha256".into(), "B".into());
+        i1.pins.insert("kernel_microvm_config".into(), "C".into());
+
+        let s2 = KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+            label: None,
+        };
+        let mut i2 = StageInputs::default();
+        i2.pins.insert("kernel_source_url".into(), "xA".into());
+        i2.pins.insert("kernel_source_sha256".into(), "B".into());
+        i2.pins.insert("kernel_microvm_config".into(), "C".into());
+
+        assert_ne!(
+            s1.cache_key(&i1),
+            s2.cache_key(&i2),
+            "concatenating label||url without a delimiter makes the cache key non-injective"
+        );
+    }
+
+    // Guards the LOW tar-slip finding: extraction must reject entries that escape the
+    // build dir via `..`, an absolute path, or a prefix. A buggy impl with no check
+    // would `join` these and write outside workdir; this helper makes them an error.
+    #[test]
+    fn test_reject_path_traversal() {
+        assert!(reject_path_traversal(Path::new("kernel/Makefile")).is_ok());
+        assert!(reject_path_traversal(Path::new("a/b/c.c")).is_ok());
+        assert!(reject_path_traversal(Path::new("../etc/passwd")).is_err());
+        assert!(reject_path_traversal(Path::new("a/../../b")).is_err());
+        assert!(reject_path_traversal(Path::new("/abs/evil")).is_err());
     }
 }

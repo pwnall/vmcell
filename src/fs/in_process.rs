@@ -192,9 +192,18 @@ pub mod backend {
                 return Err(std::io::Error::other("HandleEventNotEpollIn"));
             }
 
+            // `handle_event` is driven by the guest kicking a virtqueue, so a
+            // malformed `device_event`/`vrings` pairing is guest-reachable and must
+            // never panic. Return a typed error instead of `expect`.
             let mut vring_state = match device_event {
-                HIPRIO_QUEUE_EVENT => vrings.first().expect("vrings empty").get_mut(),
-                REQ_QUEUE_EVENT => vrings.get(1).expect("vrings too small").get_mut(),
+                HIPRIO_QUEUE_EVENT => vrings
+                    .first()
+                    .ok_or_else(|| std::io::Error::other("hiprio vring missing"))?
+                    .get_mut(),
+                REQ_QUEUE_EVENT => vrings
+                    .get(1)
+                    .ok_or_else(|| std::io::Error::other("request vring missing"))?
+                    .get_mut(),
                 _ => {
                     return Err(std::io::Error::other("HandleEventUnknownEvent"));
                 }
@@ -259,23 +268,104 @@ pub mod backend {
             Listener::new(socket_path, true).map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let socket_path_str = socket_path.to_string_lossy().into_owned();
+        // The worker reports its construction result and then signals readiness over
+        // this channel. Building the daemon inside the worker keeps the daemon off
+        // the thread boundary (it is not required to be `Send`), but a construction
+        // failure is no longer an `expect` panic: the previous code panicked here,
+        // and because `Listener::new` had already created the socket file, a
+        // socket-existence readiness check reported a *dead* daemon as ready
+        // (M-FS-2). Now the caller waits for an explicit ready/err signal, so
+        // readiness reflects an actually-constructed, serving daemon.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
         let handle = std::thread::spawn(move || {
             tracing::info!(
                 "in-process virtiofsd: thread started, listening on {:?}",
                 socket_path_str
             );
-            let mut vu_daemon = VhostUserDaemon::new(
+            let mut vu_daemon = match VhostUserDaemon::new(
                 String::from("in-process-virtiofsd"),
                 backend,
                 GuestMemoryAtomic::new(GuestMemoryMmap::new()),
-            )
-            .expect("vu daemon new");
-            let _ = vu_daemon.start(&mut listener).map_err(|e| {
-                tracing::error!("in-process virtiofsd panic: {:?}", e);
-            });
+            ) {
+                Ok(daemon) => daemon,
+                Err(e) => {
+                    // Report the failure instead of panicking, so the caller
+                    // returns a typed error rather than a false-ready daemon.
+                    let _ = ready_tx.send(Err(std::io::Error::other(format!(
+                        "failed to construct vhost-user daemon: {e:?}"
+                    ))));
+                    return;
+                }
+            };
+            // The daemon is constructed; signal readiness immediately before the
+            // (blocking) serve loop. Waiting for `start` to return would deadlock,
+            // as the frontend only connects after `VirtioFsDaemon::start` returns —
+            // this is the same readiness point as the external daemon's listening
+            // socket (bound, about to accept).
+            let _ = ready_tx.send(Ok(()));
+            if let Err(e) = vu_daemon.start(&mut listener) {
+                tracing::error!("in-process virtiofsd: serve loop failed: {e:?}");
+            }
             let _ = vu_daemon.wait();
         });
 
+        // Bound the wait so a worker that fails to construct or never reaches the
+        // serve loop surfaces as a typed error instead of hanging the caller.
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "in-process virtiofsd worker did not start: {e}"
+                )));
+            }
+        }
+
         Ok((handle, kill_notifier))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        // `super::*` brings the parent module's imports (incl. the
+        // `VhostUserBackendMut` trait needed for `handle_event` method resolution,
+        // `EventSet`, `VringMutex`) and the queue-event consts into scope.
+        use super::*;
+
+        fn new_handler() -> VhostUserFsBackendHandler {
+            let vfs = Vfs::new(VfsOptions::default());
+            VhostUserFsBackendHandler::new(Arc::new(vfs)).expect("construct backend handler")
+        }
+
+        // A guest can kick a queue whose vring is not present in `vrings`. The
+        // dispatch path must return a typed error, not panic (which the previous
+        // `vrings.first().expect(...)` / `vrings.get(1).expect(...)` did). This test
+        // goes RED on that inverse: an `expect` on the empty slice unwinds and the
+        // `#[test]` fails on the panic.
+        #[test]
+        fn handle_event_empty_vrings_errors_not_panics() {
+            let mut handler = new_handler();
+            let no_vrings: &[VringMutex] = &[];
+
+            let hiprio = handler.handle_event(HIPRIO_QUEUE_EVENT, EventSet::IN, no_vrings, 0);
+            assert!(
+                hiprio.is_err(),
+                "hiprio kick with no vrings must error, got {hiprio:?}"
+            );
+
+            let req = handler.handle_event(REQ_QUEUE_EVENT, EventSet::IN, no_vrings, 0);
+            assert!(
+                req.is_err(),
+                "request kick with no vrings must error, got {req:?}"
+            );
+        }
+
+        // An unknown device event is also guest-reachable and must be a typed error.
+        #[test]
+        fn handle_event_unknown_event_errors() {
+            let mut handler = new_handler();
+            let no_vrings: &[VringMutex] = &[];
+            let res = handler.handle_event(42, EventSet::IN, no_vrings, 0);
+            assert!(res.is_err(), "unknown device event must error, got {res:?}");
+        }
     }
 }

@@ -85,6 +85,23 @@ pub enum Error {
         /// The unsupported feature (e.g., "snapshot", "virtio-fs").
         feature: String,
     },
+    /// A *requested functional* operation cannot be enforced because the host
+    /// capability it needs is absent — for example a cgroup controller that is
+    /// not delegated to the per-VM slice, so a requested `memory.max`/`cpu.max`
+    /// limit would be silently ignored.
+    ///
+    /// Per the §7.1 fail-loud capability contract this is returned (matchable,
+    /// carrying the missing capability and its remediation) instead of logging a
+    /// warning and returning `Ok`, so a caller never receives a VM whose
+    /// requested limits were not applied.
+    #[error("capability unavailable for {op}: needs {needed}")]
+    CapabilityUnavailable {
+        /// The operation that could not be enforced (e.g. "cgroup memory.max limit").
+        op: String,
+        /// The exact missing capability and its remediation (e.g.
+        /// "'memory' controller delegated to <parent>/cgroup.subtree_control").
+        needed: String,
+    },
 }
 
 /// A specialized Result type for imp-testing.
@@ -109,6 +126,22 @@ mod tests {
             Error::Serialize("unknown error".to_string()).to_string(),
             "Serialization error: unknown error"
         );
+    }
+
+    #[test]
+    fn test_capability_unavailable_display_and_match() {
+        let err = Error::CapabilityUnavailable {
+            op: "cgroup memory.max limit".to_string(),
+            needed: "'memory' controller delegated".to_string(),
+        };
+        // Display carries both the op and the missing capability (a caller greps
+        // these for remediation); an inverted format string goes red here.
+        assert_eq!(
+            err.to_string(),
+            "capability unavailable for cgroup memory.max limit: needs 'memory' controller delegated"
+        );
+        // The variant must be matchable (not a stringly-typed `Vmm`/`Cgroup`).
+        assert!(matches!(err, Error::CapabilityUnavailable { .. }));
     }
 
     #[test]

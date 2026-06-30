@@ -100,7 +100,7 @@ pub trait Netlink: Send + Sync {
     /// Sets up TPROXY routing policy in the namespace.
     ///
     /// # Errors
-    /// Returns an error if applying the ip commands fails.
+    /// Returns an error if the `rtnetlink` rule/route operations fail.
     fn setup_tproxy_routing(&self, netns: &str) -> Result<()>;
 }
 
@@ -239,6 +239,10 @@ impl Netlink for RtNetlink {
 
                     let mut rule = handle.rule().add();
                     let msg = rule.message_mut();
+                    // An FIB rule message with no address family is rejected by the
+                    // kernel with EAFNOSUPPORT; `rule().add()` leaves it AF_UNSPEC, so
+                    // set AF_INET explicitly (equivalent to rtnetlink's `.v4()`).
+                    msg.header.family = netlink_packet_route::AddressFamily::Inet;
                     msg.header.table = 100;
                     msg.header.action = netlink_packet_route::rule::RuleAction::Other(1); // FR_ACT_TO_TBL
                     msg.attributes
@@ -249,9 +253,16 @@ impl Netlink for RtNetlink {
 
                     let mut route = handle.route().add();
                     let msg = route.message_mut();
+                    // Same as the rule above: an unset address family is rejected with
+                    // EAFNOSUPPORT. This is an IPv4 local route into table 100.
+                    msg.header.address_family = netlink_packet_route::AddressFamily::Inet;
                     msg.header.table = 100;
                     msg.header.protocol = netlink_packet_route::route::RouteProtocol::Other(2); // RTPROT_BOOT
-                    msg.header.scope = netlink_packet_route::route::RouteScope::Other(253); // RT_SCOPE_LINK
+                    // RTN_LOCAL requires scope >= RT_SCOPE_HOST: the kernel's
+                    // fib_create_info rejects fib_props[RTN_LOCAL].scope (HOST) >
+                    // fc_scope with EINVAL, so RT_SCOPE_LINK is invalid for a local
+                    // route (iproute2 also forces HOST for `ip route add local`).
+                    msg.header.scope = netlink_packet_route::route::RouteScope::Other(254); // RT_SCOPE_HOST
                     msg.header.kind = netlink_packet_route::route::RouteType::Other(2); // RTN_LOCAL
                     msg.attributes
                         .push(netlink_packet_route::route::RouteAttribute::Oif(lo_idx));
@@ -338,6 +349,11 @@ pub struct NetNamespace {
     /// Held tap fd. Now always `None`: the tap is made persistent in the netns
     /// (`TUNSETPERSIST`) and our fd is dropped so the VMM can open the interface.
     _tap: Option<tun_tap::Iface>,
+    /// Whether `delete()` has already torn down the namespace. Makes `delete()`
+    /// idempotent so an explicit teardown followed by `Drop` (or a double
+    /// `delete()`) is a silent no-op rather than a spurious teardown warning
+    /// (M-NET-3); the NET-8 warning is then reserved for genuine failures.
+    deleted: bool,
 }
 
 impl std::fmt::Debug for NetNamespace {
@@ -361,7 +377,23 @@ impl NetNamespace {
 
         netlink.add_netns(&name)?;
 
-        let tap = netlink.setup_tap(&name, &tap_name, vmid)?;
+        // H-QEMU-1 (netns sibling): the netns now exists. If setup_tap fails, `Self`
+        // is never constructed, so `Drop` cannot reclaim it — tear the namespace
+        // back down here. Removing the netns also reaps any half-created persistent
+        // tap that setup_tap left inside it, so a failed create() leaks nothing.
+        let tap = match netlink.setup_tap(&name, &tap_name, vmid) {
+            Ok(tap) => tap,
+            Err(e) => {
+                if let Err(cleanup_err) = netlink.delete_netns(&name) {
+                    tracing::warn!(
+                        "NetNamespace::create: failed to clean up netns {} after setup_tap error: {}",
+                        name,
+                        cleanup_err
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             name,
@@ -369,16 +401,28 @@ impl NetNamespace {
             vmid,
             netlink,
             _tap: tap,
+            deleted: false,
         })
     }
 
     /// Deletes the network namespace and associated interfaces.
     ///
+    /// Idempotent: once a `delete()` has succeeded, further calls (including the
+    /// one in `Drop`) are silent no-ops, so a successful explicit teardown does
+    /// not provoke a spurious `Drop` warning (M-NET-3).
+    ///
     /// # Errors
-    /// Returns an error if the `ip netns delete` command fails.
+    /// Returns an error if removing the namespace (via `netns_rs`) fails.
     pub fn delete(&mut self) -> Result<()> {
+        if self.deleted {
+            return Ok(());
+        }
         self._tap.take();
         self.netlink.delete_netns(&self.name)?;
+        // Only mark deleted after a successful teardown: a failed delete_netns
+        // leaves `deleted` false so `Drop` retries and the NET-8 warning still
+        // surfaces a genuine teardown failure.
+        self.deleted = true;
         Ok(())
     }
 
@@ -393,24 +437,31 @@ impl NetNamespace {
 
     /// Render the TPROXY ruleset for nftables.
     ///
-    /// The prerouting chain defaults to `policy drop` and only TPROXY-redirects
-    /// TCP destined for ports 80 and 443 to the egress proxy; every other packet
-    /// from the guest tap is logged and dropped.
+    /// The prerouting chain defaults to `policy drop`. It TPROXY-redirects guest
+    /// TCP destined for ports 80 and 443 into the egress proxy, and additionally
+    /// accepts guest traffic addressed to the proxy itself (`gateway:proxy_port`)
+    /// so a guest steered with `http_proxy=<gateway>:<proxy_port>` reaches the
+    /// same filtering front-end (the explicit-proxy MITM variant of H-PROXY-1).
+    /// Every other packet from the guest tap is logged and dropped, so no egress
+    /// escapes the proxy.
     ///
     /// NET-7 (recorded deviation): this deliberately drops UDP/443 (QUIC). QUIC
     /// cannot be transparently intercepted by the TCP-oriented egress proxy, so
     /// blocking it forces clients to fall back to interceptable TCP/TLS, keeping
     /// all egress observable. This is an intentional posture, not an oversight.
-    pub fn render_tproxy_rules(&self, proxy_port: u16) -> String {
+    pub fn render_tproxy_rules(&self, proxy_port: u16, gateway: &str) -> String {
         format!(
             "table ip proxy {{\n\
             \tchain prerouting {{\n\
             \t\ttype filter hook prerouting priority mangle; policy drop;\n\
-            \t\tiifname \"{}\" tcp dport {{ 80, 443 }} tproxy to :{} meta mark set 1 accept\n\
-            \t\tiifname \"{}\" log prefix \"imp-drop: \" drop\n\
+            \t\tiifname \"{tap}\" tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept\n\
+            \t\tiifname \"{tap}\" ip daddr {gw} tcp dport {port} accept\n\
+            \t\tiifname \"{tap}\" log prefix \"imp-drop: \" drop\n\
             \t}}\n\
             }}",
-            self.tap_name, proxy_port, self.tap_name
+            tap = self.tap_name,
+            port = proxy_port,
+            gw = gateway
         )
     }
 
@@ -419,7 +470,8 @@ impl NetNamespace {
     /// # Errors
     /// Returns an error if the nftables rules fail to apply.
     pub fn emit_proxy_rules(&self, proxy_port: u16, applier: &dyn NftApplier) -> Result<()> {
-        let rules = self.render_tproxy_rules(proxy_port);
+        let gateway = self.host_ip()?;
+        let rules = self.render_tproxy_rules(proxy_port, &gateway);
         applier.apply_rules(&self.name, &rules)?;
         self.netlink.setup_tproxy_routing(&self.name)?;
         Ok(())
@@ -447,12 +499,30 @@ mod tests {
 
     pub struct FakeNetlink {
         pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// Records the vmid forwarded to each `setup_tap` call, in order, so a
+        /// test can assert that `create()` passes the requested vmid into the
+        /// tap /30 host-IP math (where the real `RtNetlink` derives the address).
+        pub setup_tap_vmids: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+        /// When true, `setup_tap` records and then returns an error, to drive the
+        /// post-`add_netns` cleanup path in `create()` (H-QEMU-1).
+        pub fail_setup_tap: bool,
     }
 
     impl FakeNetlink {
         pub fn new() -> Self {
             Self {
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                setup_tap_vmids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_setup_tap: false,
+            }
+        }
+
+        /// A fake whose `setup_tap` fails (after recording its call), used to
+        /// exercise `create()`'s cleanup-on-failure path.
+        pub fn new_failing_setup_tap() -> Self {
+            Self {
+                fail_setup_tap: true,
+                ..Self::new()
             }
         }
     }
@@ -469,12 +539,16 @@ mod tests {
             &self,
             netns: &str,
             tap_name: &str,
-            _vmid: u32,
+            vmid: u32,
         ) -> Result<Option<tun_tap::Iface>> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("setup_tap({}, {})", netns, tap_name));
+            self.setup_tap_vmids.lock().unwrap().push(vmid);
+            if self.fail_setup_tap {
+                return Err(Error::Network("injected setup_tap failure".to_string()));
+            }
             Ok(None)
         }
         fn delete_netns(&self, name: &str) -> Result<()> {
@@ -538,6 +612,7 @@ mod tests {
             vmid: 42,
             netlink: Box::new(FakeNetlink::new()),
             _tap: None,
+            deleted: false,
         };
         assert_eq!(ns.host_ip().unwrap(), "10.200.43.1");
     }
@@ -553,8 +628,10 @@ mod tests {
             vmid: 9,
             netlink: Box::new(FakeNetlink::new()),
             _tap: None,
+            deleted: false,
         };
-        let rules = ns.render_tproxy_rules(5000);
+        let gw = ns.host_ip().unwrap();
+        let rules = ns.render_tproxy_rules(5000, &gw);
         assert!(
             rules.contains("type filter hook prerouting priority mangle; policy drop;"),
             "ruleset missing default-drop policy: {}",
@@ -563,6 +640,14 @@ mod tests {
         assert!(
             rules.contains("iifname \"imp-tap-9\" tcp dport { 80, 443 } tproxy to :5000"),
             "ruleset missing TPROXY redirect: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "iifname \"imp-tap-9\" ip daddr {} tcp dport 5000 accept",
+                gw
+            )),
+            "ruleset missing explicit-proxy accept for the gateway: {}",
             rules
         );
         assert!(
@@ -615,5 +700,98 @@ mod tests {
             "tap must exist before tproxy routing: {:?}",
             *nc
         );
+    }
+
+    // M-NET-3: delete() is idempotent — an explicit delete() followed by a second
+    // delete() and by Drop must reach the netlink layer exactly once, so the NET-8
+    // teardown warning is reserved for genuine failures. Buggy impl guarded:
+    // without the `deleted` guard, delete_netns fires on every call (here 3×), so
+    // the spurious-re-teardown warning would fire on every VM teardown.
+    #[test]
+    fn delete_is_idempotent_single_teardown() {
+        let netlink = FakeNetlink::new();
+        let calls = netlink.calls.clone();
+        let mut ns = NetNamespace::create(5, Box::new(netlink)).unwrap();
+
+        ns.delete().unwrap();
+        ns.delete().unwrap(); // second explicit call: must be a no-op
+        drop(ns); // Drop calls delete() again: must also be a no-op
+
+        let c = calls.lock().unwrap();
+        let deletes = c
+            .iter()
+            .filter(|s| s.as_str() == "delete_netns(imp-net-5)")
+            .count();
+        assert_eq!(
+            deletes, 1,
+            "delete must reach netlink exactly once across delete()+delete()+Drop: {:?}",
+            *c
+        );
+    }
+
+    // H-QEMU-1 (netns sibling): when setup_tap fails after add_netns, create() must
+    // tear the namespace back down rather than leak it — `Self` is never constructed
+    // on this path, so `Drop` cannot reclaim it. Buggy impl guarded: a create() that
+    // returns the setup_tap error without deleting the netns records no
+    // delete_netns, so the post-add_netns leak goes unnoticed.
+    #[test]
+    fn create_cleans_up_netns_when_setup_tap_fails() {
+        let netlink = FakeNetlink::new_failing_setup_tap();
+        let calls = netlink.calls.clone();
+
+        let res = NetNamespace::create(11, Box::new(netlink));
+        assert!(res.is_err(), "create must propagate the setup_tap failure");
+
+        let c = calls.lock().unwrap();
+        let pos_add = c.iter().position(|s| s == "add_netns(imp-net-11)");
+        let pos_del = c.iter().position(|s| s == "delete_netns(imp-net-11)");
+        assert!(pos_add.is_some(), "add_netns must have run: {:?}", *c);
+        assert!(
+            pos_del.is_some() && pos_add < pos_del,
+            "create must delete the netns after setup_tap fails: {:?}",
+            *c
+        );
+    }
+
+    // LOW (tap.rs:468–479): the recording fake must capture the vmid that create()
+    // forwards into setup_tap, where the real RtNetlink derives the tap /30 host IP
+    // via ip_math. Buggy impl guarded: a fake that discards the vmid (`_vmid`) — or
+    // a create() that forwards a constant instead of the requested vmid — makes the
+    // wrong-vmid→tap-IP defect invisible; the forwarding assertion below goes red on
+    // it. The boundary cases assert the exact /30 host octet and reject overflow.
+    #[test]
+    fn create_forwards_vmid_to_setup_tap_for_correct_host_octet() {
+        // In-range /30 boundaries map to distinct, specific host octets.
+        for (vmid, expected_host) in [(1u32, "10.200.2.1"), (254u32, "10.200.1.1")] {
+            let netlink = FakeNetlink::new();
+            let vmids = netlink.setup_tap_vmids.clone();
+            let ns = NetNamespace::create(vmid, Box::new(netlink)).unwrap();
+
+            // create() forwards exactly the requested vmid (not a constant) into
+            // setup_tap, and stores the same vmid on the namespace.
+            assert_eq!(*vmids.lock().unwrap(), vec![vmid]);
+            assert_eq!(ns.vmid, vmid);
+
+            // The forwarded vmid yields the expected /30 host octet via shared math.
+            let recorded = vmids.lock().unwrap()[0];
+            let (host, _, _) = crate::net::ip_math(recorded).unwrap();
+            assert_eq!(
+                host.to_string(),
+                expected_host,
+                "vmid {} must map to host {}",
+                vmid,
+                expected_host
+            );
+        }
+
+        // Out-of-range vmids overflow the /30 host math and must be rejected, not
+        // silently wrapped into a colliding octet.
+        for vmid in [0u32, 255u32] {
+            assert!(
+                crate::net::ip_math(vmid).is_err(),
+                "vmid {} must be rejected by the /30 host-IP math",
+                vmid
+            );
+        }
     }
 }

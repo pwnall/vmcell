@@ -107,12 +107,40 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         "memory.max should match the 256 MiB cap"
     );
 
+    // E1 hard-bound preconditions: a requested memory cap must ALSO disable the swap
+    // escape hatch and enable group-OOM, otherwise shmem-backed guest RAM is reclaimed
+    // to swap and the cap throttles instead of hard-killing (the empirical E1 bug:
+    // host oom_kill stayed 0 while the guest OOM'd itself). These read back the exact
+    // values metrics::create_slice must write; a metrics impl that omits them leaves
+    // swap.max at "max" and oom.group at "0", turning these asserts red.
+    let swap_max_raw = std::fs::read_to_string(format!("{}/memory.swap.max", cg_base))
+        .expect("memory.swap.max must exist when the memory controller is delegated");
+    assert_eq!(
+        swap_max_raw.trim(),
+        "0",
+        "memory.swap.max must be 0 so the cap hard-bounds shmem-backed guest RAM (E1)"
+    );
+    let oom_group_raw = std::fs::read_to_string(format!("{}/memory.oom.group", cg_base))
+        .expect("memory.oom.group must exist when the memory controller is delegated");
+    assert_eq!(
+        oom_group_raw.trim(),
+        "1",
+        "memory.oom.group must be 1 so the OOM kill takes the whole VM cgroup (E1)"
+    );
+
     // With a delegated controller, live usage must be visible (not the silent-zero skip).
     assert!(
         stats_before.mem_current_mib > 0,
         "memory controller delegated but memory.current is 0"
     );
     assert!(stats_before.mem_peak_mib > 0, "Peak memory should be > 0");
+    // §7.1 rule 3: the read path must honestly report enforcement. The controller is
+    // delegated here (memory.max read back above), so limits_enforced must be true; a
+    // read path that never sets the flag leaves it false and this goes red.
+    assert!(
+        stats_before.limits_enforced,
+        "memory controller delegated but ResourceUsage::limits_enforced is false"
+    );
 
     // Test CPU average computation.
     let start_time = std::time::Instant::now();
