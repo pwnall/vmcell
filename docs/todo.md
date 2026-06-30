@@ -2,14 +2,34 @@
 
 * README covering CLI capabilities and benchmark results
 
+Designed in docs/39-claude-design-v15.md (the "next design round" items below; each
+landed its honestly-easy core, with the not-easy parts deferred/rejected inline):
+
+* `vmcell-test-runner` bless resilience (§12.8) — install the blessed runner to a
+  stable path outside `target/` + idempotent content-hash stamp keyed on the RUNNER
+  (never test binaries) + the confinement-root fix (anchor on the test binary's path,
+  not `/proc/self/exe`) + a pure, unit-tested `CapState` transition. ALSO answers
+  "switch to a workspace?" → yes (§10.1), but the stable-path install is the load-
+  bearing churn fix; the workspace is the structural leanness boundary.
+* Build/distribution hygiene: cargo-workspace split + content-hash bless stamp (§10.1,
+  §12.8) [done in design]; reproducible bundle SCOPED DOWN to a digest-pinned fetch-
+  and-verify manifest for our artifacts — vendoring the VMM binaries is REJECTED (QEMU
+  GPL redistribution; size; fetch-verify already gives reproducibility).
+* VM-as-a-handle lifecycle verbs (§10.2/§10.3): create/run/pause/resume/snapshot/stats/
+  destroy unified across lib + CLI, taking a `--rootfs` (erofs) arg; pause/resume/
+  snapshot promoted to first-class MicroVm methods. DEFERRED: list/rm + standalone exec
+  (need the impd daemon's cross-process registry — collides with ordered-Drop); fork
+  (the §16.2 CoW-clone item).
+* Bring-your-own OCI image → `vmcell oci2erofs IMAGE@DIGEST` build-time utility (§8.2/
+  §11); VM verbs take the resulting erofs. Fail loud on a libc6-less base; static-musl
+  agent is an explicit `--agent-musl` opt-in, not a silent fallback.
+* Per-test kernel config-fragment matrix (§8.3): base SHA + sorted KConfig fragment set,
+  content-addressed. config-only fragments in scope; PREEMPT_RT (needs patched source)
+  and KCOV extraction (needs guest tooling, §16.2) excluded; per-test API deferred.
+
+
 ## Need design
 
-* Reconsider `vmcell-test-runner` design for testing privileged operations. We're
-  blocked on me running `just bless` too often. Are there approaches that would
-  be more resilient to code changes? Alternatively, can we design a more robust
-  suite of tests for the `vmcell-test-runner` binary so that we don't have to get
-  it rebuilt as often? Does the binary get rebuilt often because of unrelated
-  changes, suggesting we should switch to a cargo workspace?
 * Migrate all "best-effort" functionality (do something if the capabilties
   exist, move on otherwise) to failing on missing capabiltiies. Implementations
   must document the required capabilities. Callers must ensure they have the
@@ -21,17 +41,13 @@
 ## Need directional decision
 
 Candidate capabilities surfaced by the vmcell rebrand (full detail + invariant
-guardrails in docs/38-claude-design-v14.md §16). Each is triaged; the decision is
-which to pull forward. V/E = value/effort.
+guardrails in docs/39-claude-design-v15.md §16). Each is triaged; the decision is
+which to pull forward. V/E = value/effort. (v15 already pulled four §16.1 candidates
+forward — lifecycle verbs, oci2erofs, the kernel-fragment matrix, and the workspace +
+bless-stamp build hygiene — see "Designed, need implementing" above.)
 
 Adopt-now (cheap, high-value, extend an existing seam):
 
-* Build/distribution hygiene: cargo-workspace split + content-hash bless stamp +
-  reproducible bundle (also resolves the just-bless churn above) [V:high/E:med]
-* VM-as-a-handle lifecycle verbs (create/list/pause/resume/fork/destroy/stats)
-  unified across lib + CLI + daemon API [V:high/E:med]
-* Bring-your-own OCI image as an erofs rootfs source (per-sandbox) [V:high/E:med]
-* Per-test kernel config-fragment matrix (extend the kernels registry) [V:high/E:med]
 * Deterministic clock control over vsock (set/freeze/forward-jump) [V:high/E:med]
 * Custom init + append-only boot-args passthrough [V:med/E:low]
 * Egress + model cassettes: deterministic record/replay over the MITM proxy [V:high/E:med]

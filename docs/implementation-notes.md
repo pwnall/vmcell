@@ -1444,3 +1444,53 @@ a generation past the reservation epoch and accepted as that child's exit. Fully
 recording the reaped status **inside** the `wait()` critical section (under the same lock that performs
 the reservation/generation bump), a riskier restructuring of the reaper/waiter coordination that is
 **deliberately deferred** rather than rushed alongside the teardown fixes above.
+
+## v15 design decisions (design-only; pending implementation, 2026-06-30)
+
+docs/39-claude-design-v15.md adds specification only — no code changed, nothing re-validated
+on a KVM host. These are the justified deviations from the v14 plan that the implementer must
+honor (recorded here per AGENTS.md "record deviations"):
+
+- **Capability-runner bless durability — the confinement-root correction.** v14's churn-fix #1
+  ("install the blessed runner to a stable path outside `target/`") was latently broken:
+  `real_cargo_target_dir()` derived the confinement root from the runner's own `/proc/self/exe`
+  by walking to the nearest `target/` ancestor, so a runner installed at `./.vmcell-bin/` (no
+  `target/` ancestor) would fail `ensure_under_cargo_target_dir()` for *every* test. v15 re-sources
+  the confinement root from the **exec target's** (test binary's) already-canonicalized path — the
+  test binary nextest hands the runner is always under `target/`. This is a stronger defense-in-depth
+  and the precondition that makes the stable-path install functional. Implement as
+  `confine_under_target_dir_of(target)`; keep the raw-input `..` rejection before canonicalization.
+- **Never content-hash test binaries (hard design rule).** The `.blessed` content-hash stamp keys on
+  the **runner** binary only (idempotent re-`setcap`). The runner must NOT hash/pin/allowlist the
+  content of the test binaries it execs — it is a generic privilege-injector; the boundary is
+  who-may-exec-the-runner (group restriction) + path-confinement, and pinning test-binary hashes
+  would re-introduce the per-iteration churn the whole fix removes while adding no security.
+- **Pure `CapState` transition.** Extract `main()`'s inheritable→bounding-drop→ambient-raise→trim→uid
+  sequence into a pure `plan_privilege_transition(CapState, need, euid)` and unit-test each step against
+  its buggy inverse, including the setuid-form uid-before-ambient ordering. Only `set_current`/
+  `setresuid`/`exec` stay integration-only. Stable install path: project-local gitignored
+  `./.vmcell-bin/` (NOT `$CARGO_HOME/bin`, to avoid cross-checkout collisions); add it to `.gitignore`.
+- **Cargo workspace split** (lib + a new shared `vmcell-protocol` crate + `vmcell-test-runner` /
+  `vmcell-guest-agent` / `vmcell-guest-tools` member crates). `[patch.crates-io]` moves to the
+  workspace root; the lean-tree CI checks become per-member. Note: the workspace does NOT fix the
+  re-bless churn (members share `target/` + `RUSTFLAGS` fingerprint) — the stable-path install does.
+- **VM lifecycle verbs — deferrals.** Committed: create/run/pause/resume/snapshot/stats/destroy on a
+  live handle, with pause/resume/snapshot promoted from the `VmInstance` trait to first-class
+  `MicroVm` methods (a `cargo-semver-checks`-visible addition — expect it). DEFERRED with reason:
+  `list`/`rm`/standalone `exec` need VMs to outlive their creating process → the `impd` daemon, which
+  collides with the ordered-`Drop`-owns-cleanup invariant if forced into the single-process model;
+  `fork` → the §16.2 CoW-clone item (even correctness-only fork needs the per-backend single-use
+  config rewrite generalized). VM verbs take a `--rootfs` (erofs) path argument.
+- **`oci2erofs` utility** runs the FULL rootfs pipeline parameterized by the base image (the inject
+  tail hard-requires the guest-agent; there is no "minimal" path). Cache key is **input-based**
+  (image digest + injected content + stage version) — the v14 §16.1 "keyed on the output" wording was
+  imprecise; validity stays content-addressed. Fail loud (single-pass `/lib64/libc.so.6` scan) on a
+  libc6-less base; static-musl is an explicit `--agent-musl` opt-in, never a silent fallback
+  (silent toolchain-swap violates the §7.1 fail-loud contract).
+- **Kernel config-fragment matrix** is config-only. PREEMPT_RT (needs an rt-patched source → a separate
+  registry source) and KCOV *extraction* (needs the §16.2 guest helper) are excluded; fragments hash in
+  sorted order; fail loud on a non-zero `olddefconfig`; bound the CI matrix (cold KASAN ~45–90 min).
+- **Reproducible bundle scoped down.** A digest-pinned fetch-and-verify manifest for our artifacts
+  (kernel/erofs/CA/pins.json) only. Vendoring the VMM binaries is REJECTED (QEMU GPL redistribution;
+  CH/FC size/maintenance; fetch-verify already gives reproducibility). Offline-everything = a consumer
+  Dockerfile.
