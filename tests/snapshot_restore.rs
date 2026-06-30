@@ -21,7 +21,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     let id = uuid::Uuid::new_v4();
     let snapshot_dir = std::env::temp_dir().join(format!(
-        "imp-test-snapshot-restore-{}-{}",
+        "vmcell-test-snapshot-restore-{}-{}",
         std::process::id(),
         id
     ));

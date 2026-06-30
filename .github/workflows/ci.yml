@@ -70,6 +70,8 @@ jobs:
         run: |
           ./scripts/ban-global-state.sh
           ./scripts/test-ban-global-state.sh   # the scanner's own red-on-inverse self-test
+          ./scripts/ban-legacy-terms.sh        # design v14 §10.7 rename gate: no rootless/TestVm/imp_testing/imp-* in non-historical code
+          ./scripts/test-ban-legacy-terms.sh   # the rename gate's own red-on-inverse self-test
 
       - name: public-API semver (PRs only)
         if: github.event_name == 'pull_request'

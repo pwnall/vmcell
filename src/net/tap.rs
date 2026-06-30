@@ -373,7 +373,7 @@ impl NetNamespace {
     /// Returns an error if the `rtnetlink` operations fail.
     pub fn create(vmid: u32, netlink: Box<dyn Netlink>) -> Result<Self> {
         let name = format!("vmcell-net-{}", vmid);
-        let tap_name = format!("imp-tap-{}", vmid);
+        let tap_name = format!("vmcell-tap-{}", vmid);
 
         netlink.add_netns(&name)?;
 
@@ -456,7 +456,7 @@ impl NetNamespace {
             \t\ttype filter hook prerouting priority mangle; policy drop;\n\
             \t\tiifname \"{tap}\" tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept\n\
             \t\tiifname \"{tap}\" ip daddr {gw} tcp dport {port} accept\n\
-            \t\tiifname \"{tap}\" log prefix \"imp-drop: \" drop\n\
+            \t\tiifname \"{tap}\" log prefix \"vmcell-drop: \" drop\n\
             \t}}\n\
             }}",
             tap = self.tap_name,
@@ -624,7 +624,7 @@ mod tests {
     fn render_tproxy_rules_intercepts_web_and_drops_rest() {
         let ns = NetNamespace {
             name: "vmcell-net-9".into(),
-            tap_name: "imp-tap-9".into(),
+            tap_name: "vmcell-tap-9".into(),
             vmid: 9,
             netlink: Box::new(FakeNetlink::new()),
             _tap: None,
@@ -638,20 +638,20 @@ mod tests {
             rules
         );
         assert!(
-            rules.contains("iifname \"imp-tap-9\" tcp dport { 80, 443 } tproxy to :5000"),
+            rules.contains("iifname \"vmcell-tap-9\" tcp dport { 80, 443 } tproxy to :5000"),
             "ruleset missing TPROXY redirect: {}",
             rules
         );
         assert!(
             rules.contains(&format!(
-                "iifname \"imp-tap-9\" ip daddr {} tcp dport 5000 accept",
+                "iifname \"vmcell-tap-9\" ip daddr {} tcp dport 5000 accept",
                 gw
             )),
             "ruleset missing explicit-proxy accept for the gateway: {}",
             rules
         );
         assert!(
-            rules.contains("iifname \"imp-tap-9\" log prefix \"imp-drop: \" drop"),
+            rules.contains("iifname \"vmcell-tap-9\" log prefix \"vmcell-drop: \" drop"),
             "ruleset missing catch-all drop: {}",
             rules
         );

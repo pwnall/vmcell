@@ -7,7 +7,7 @@ use vmcell::agent::protocol::{ExecRequest, Message};
 
 #[tokio::test]
 async fn test_exec_vsock_mock() {
-    let tmp = std::env::temp_dir().join(format!("imp-test-vsock-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("vmcell-test-vsock-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let listener = UnixListener::bind(&tmp).expect("Failed to bind UDS");
 
@@ -127,7 +127,7 @@ fn serial_log() -> vmcell::vmm::RealSerialLog {
 // the stale Exit(0) and wrongly return Ok.
 #[tokio::test]
 async fn exec_timeout_desyncs_subsequent_put_file() {
-    let tmp = std::env::temp_dir().join(format!("imp-desync-exec-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("vmcell-desync-exec-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();
@@ -177,7 +177,7 @@ async fn exec_timeout_desyncs_subsequent_put_file() {
 // proceed and return Ok(code 0) from the stale frame.
 #[tokio::test]
 async fn put_file_timeout_desyncs_subsequent_exec() {
-    let tmp = std::env::temp_dir().join(format!("imp-desync-put-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("vmcell-desync-put-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();
@@ -233,7 +233,7 @@ async fn host_codec_accepts_frame_above_default_8mib() {
     let payload = vec![0xABu8; 8 * 1024 * 1024 + 64 * 1024];
     let expected = payload.clone();
 
-    let tmp = std::env::temp_dir().join(format!("imp-bigframe-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("vmcell-bigframe-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();

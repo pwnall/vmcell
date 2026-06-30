@@ -233,14 +233,40 @@ async fn test_lifecycle_fake_vmm() {
 }
 
 // TESTS-LIFECYCLE-3: a panic inside the VM scope must leave ZERO host residue.
-// Uses privileged networking so netns + tap teardown is exercised, and targets
-// the ACTUAL computed cgroup path (possibly nested under systemd/the capability
-// runner) rather than the un-nested guess that made the old check trivially true.
-// Serialization comes from the nextest `serial-host` group (TESTS-LIFECYCLE-7),
-// not an ad-hoc `#[serial_test::serial]`.
+// Driven across the backend matrix (CH/FC/QEMU) so the E3 per-VM temp-dir
+// reclamation (step 4b) and the netns/tap/cgroup/CID/VMID teardown are asserted
+// identically for every backend — the leak fix landed in each backend's `Drop`,
+// so each must clear its `/tmp/vmcell-vm-{pid}-{vmid}` dir on the panic path.
 #[tokio::test]
 #[ignore = "needs KVM + CAP_NET_ADMIN (privileged tap networking)"]
 async fn test_lifecycle_panic_residue_ch() {
+    let vmm = CloudHypervisor::new(common::ch_bin());
+    test_lifecycle_panic_residue_impl(&vmm).await;
+}
+
+#[cfg(feature = "firecracker")]
+#[tokio::test]
+#[ignore = "needs KVM + CAP_NET_ADMIN (privileged tap networking)"]
+async fn test_lifecycle_panic_residue_fc() {
+    let vmm = vmcell::vmm::firecracker::Firecracker::new(common::fc_bin());
+    test_lifecycle_panic_residue_impl(&vmm).await;
+}
+
+#[cfg(feature = "qemu")]
+#[tokio::test]
+#[ignore = "needs KVM + CAP_NET_ADMIN (privileged tap networking)"]
+async fn test_lifecycle_panic_residue_qemu() {
+    let vmm = vmcell::vmm::qemu::Qemu::new(common::qemu_bin());
+    test_lifecycle_panic_residue_impl(&vmm).await;
+}
+
+// Shared body for the panic-residue matrix above. Uses privileged networking so
+// netns + tap teardown is exercised, and targets the ACTUAL computed cgroup path
+// (possibly nested under systemd/the capability runner) rather than the un-nested
+// guess that made the old check trivially true. Serialization comes from the
+// nextest `serial-host` group (TESTS-LIFECYCLE-7), not an ad-hoc
+// `#[serial_test::serial]`.
+async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Privileged tap networking needs CAP_NET_ADMIN; gate on the effective set.
     if !common::has_cap_net_admin() {
         panic!(
@@ -253,7 +279,6 @@ async fn test_lifecycle_panic_residue_ch() {
     // capability runner has CAP_SYS_ADMIN + CAP_DAC_OVERRIDE).
     common::clean_vmcell_netns();
 
-    let vmm = CloudHypervisor::new(common::ch_bin());
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
 
@@ -270,7 +295,7 @@ async fn test_lifecycle_panic_residue_ch() {
 
     let (vmid, guest_cid, vsock_path) = {
         let vm = MicroVm::start(
-            &vmm,
+            vmm,
             cfg,
             cid_alloc.clone(),
             vmid_alloc.clone(),
@@ -313,7 +338,7 @@ async fn test_lifecycle_panic_residue_ch() {
     );
 
     // 3. The tap must not have been leaked onto the host.
-    let host_tap = format!("/sys/class/net/imp-tap-{}", vmid);
+    let host_tap = format!("/sys/class/net/vmcell-tap-{}", vmid);
     assert!(
         !std::path::Path::new(&host_tap).exists(),
         "tap interface leaked on host at {}",
@@ -331,7 +356,7 @@ async fn test_lifecycle_panic_residue_ch() {
     //     serial.log, and api.sock.lock for CH) must also be removed on teardown —
     //     not just the vsock socket inside it. The leak fix landed in vmm/mod.rs
     //     (remove_vm_tmp_dir); without it `/tmp` grows one dir per VM, unbounded.
-    //     The pid/vmid naming mirrors `vmm::create_vm_tmp_dir`.
+    //     The pid/vmid naming mirrors `vmm::VmTempDir::create`.
     let per_vm_dir =
         std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
     assert!(
@@ -515,8 +540,13 @@ async fn test_lifecycle_unprivileged_smoltcp() {
     .expect("Failed to start unprivileged VM");
 
     let vmid = vm.vmid();
-    // The unprivileged NAT exposes its vhost-user socket at this path.
-    let sock_path = format!("/tmp/imp-smoltcp-{}.sock", vmid);
+    // The unprivileged NAT's vhost-user socket now lives INSIDE the single owned
+    // per-VM scratch dir (`/tmp/vmcell-vm-{pid}-{vmid}/smoltcp.sock`), not a
+    // free-standing `/tmp/vmcell-smoltcp-*.sock`. The pid/vmid naming mirrors
+    // `vmm::VmTempDir::create`.
+    let per_vm_dir =
+        std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
+    let sock_path = per_vm_dir.join("smoltcp.sock");
 
     let agent = match vm
         .agent(
@@ -572,11 +602,16 @@ async fn test_lifecycle_unprivileged_smoltcp() {
         .await
         .expect("Failed to shutdown unprivileged VM");
 
-    // Unprivileged teardown drops the SmoltcpProcess, whose vhost Listener unlinks the
-    // NAT socket on drop. A leak here means teardown skipped the smoltcp process.
+    // Unprivileged teardown drops the SmoltcpProcess (whose vhost Listener unlinks
+    // the NAT socket) and then the orchestrator's `VmTempDir` guard removes the
+    // whole per-VM dir LAST. Asserting the directory is gone proves both: the
+    // smoltcp socket inside it was reclaimed AND the single owned dir was removed
+    // (consistent with the panic-residue test). A surviving dir means teardown
+    // skipped the smoltcp process or leaked the scratch dir.
     assert!(
-        !std::path::Path::new(&sock_path).exists(),
-        "unprivileged smoltcp NAT socket {} must be cleaned up after shutdown",
-        sock_path
+        !per_vm_dir.exists(),
+        "per-VM temp dir {} (holding the smoltcp NAT socket {}) must be cleaned up after shutdown",
+        per_vm_dir.display(),
+        sock_path.display()
     );
 }

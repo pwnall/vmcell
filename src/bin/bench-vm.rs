@@ -9,11 +9,7 @@ use vmcell::orchestrator::{MicroVm, VmidAllocator};
 use vmcell::vmm::{CidAllocator, VmInstance, Vmm};
 
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Macro-benchmarking harness for Imp-testing VMs"
-)]
+#[command(author, version, about = "Macro-benchmarking harness for vmcell VMs")]
 struct Args {
     #[arg(long, default_value = "cloud-hypervisor")]
     backend: String,
@@ -40,7 +36,7 @@ struct Args {
 
     /// Directory (must be on a real FS, NOT tmpfs) for `suspend-size` /
     /// `phase-budget` snapshots — a RAM-backed tmpfs would mis-measure size.
-    #[arg(long, default_value = "./target/imp-bench-snap")]
+    #[arg(long, default_value = "./target/vmcell-bench-snap")]
     snap_dir: String,
 
     /// Memory-restore strategy for the warm-restore path (CH `prefault`):
@@ -142,7 +138,7 @@ async fn run_bench<V: Vmm>(
         .expect("valid VM configuration benchmark invariant");
     let cid_allocator = std::sync::Arc::new(CidAllocator::new());
 
-    let snap_dir = std::env::temp_dir().join(format!("imp-bench-snap-{}", std::process::id()));
+    let snap_dir = std::env::temp_dir().join(format!("vmcell-bench-snap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&snap_dir);
 
     if is_restore {

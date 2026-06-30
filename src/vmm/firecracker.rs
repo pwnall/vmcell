@@ -150,15 +150,14 @@ impl Firecracker {
         std::path::PathBuf,
         std::path::PathBuf,
         std::path::PathBuf,
-        std::path::PathBuf,
         tokio::process::Child,
         Option<u32>,
     )> {
-        let tmp = crate::vmm::create_vm_tmp_dir(res.vmid).await?;
-
-        let api_socket = tmp.join("api.sock");
-        let vsock_path = tmp.join("vsock.sock");
-        let serial_path = tmp.join("serial.log");
+        // The orchestrator owns the per-VM scratch dir; derive our socket and
+        // serial-log paths inside it.
+        let api_socket = res.tmp_dir.join("api.sock");
+        let vsock_path = res.tmp_dir.join("vsock.sock");
+        let serial_path = res.tmp_dir.join("serial.log");
 
         // Firecracker expects the socket to not exist before it creates it.
         let _ = tokio::fs::remove_file(&api_socket).await;
@@ -191,7 +190,7 @@ impl Firecracker {
             return Err(e);
         }
 
-        Ok((tmp, api_socket, vsock_path, serial_path, process, pgid))
+        Ok((api_socket, vsock_path, serial_path, process, pgid))
     }
 }
 
@@ -202,7 +201,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         .unwrap_or_default()
         .as_nanos();
     let api_socket = tmp_dir.join(format!(
-        "imp-fc-probe-{}-{}.socket",
+        "vmcell-fc-probe-{}-{}.socket",
         std::process::id(),
         counter
     ));
@@ -362,7 +361,7 @@ impl Vmm for Firecracker {
 
         let template = self.detect_cpu_template(cfg).await;
 
-        let (_tmp, api_socket, vsock_path, serial_path, process, pgid) =
+        let (api_socket, vsock_path, serial_path, process, pgid) =
             self.spawn_fc(res, cgroups).await?;
 
         let instance = FcInstance {
@@ -559,7 +558,7 @@ impl Vmm for Firecracker {
         let sidecar = tokio::fs::read_to_string(&sidecar_path).await?;
         let host_paths: SnapshotHostPaths = serde_json::from_str(&sidecar)?;
 
-        let (_tmp, api_socket, _vsock_path, _serial_path, process, pgid) =
+        let (api_socket, _vsock_path, _serial_path, process, pgid) =
             self.spawn_fc(res, cgroups).await?;
 
         // Firecracker rebinds the snapshot's recorded host vsock UDS at load time.
@@ -767,6 +766,9 @@ impl VmInstance for FcInstance {
 
 impl Drop for FcInstance {
     fn drop(&mut self) {
+        // Teardown order (AGENTS.md): VMM process group first — reaping it before
+        // touching the sockets or the per-VM directory means cleanup never races a
+        // live VMM.
         if let Some(pgid) = self.pgid {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(-(pgid as i32)),
@@ -776,6 +778,9 @@ impl Drop for FcInstance {
                 let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
             }
         }
+        // Unlink our own sockets. The per-VM directory itself is owned and removed
+        // once by the orchestrator's `VmTempDir` guard (after this instance and the
+        // smoltcp process are dropped), not here. Mirrors CH.
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
     }
@@ -848,8 +853,8 @@ mod tests {
     #[tokio::test]
     async fn sidecar_write_round_trips_and_surfaces_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let vsock = PathBuf::from("/tmp/imp-vsock.sock");
-        let serial = PathBuf::from("/tmp/imp-serial.log");
+        let vsock = PathBuf::from("/tmp/vmcell-vsock.sock");
+        let serial = PathBuf::from("/tmp/vmcell-serial.log");
 
         // Happy path: the sidecar is written and round-trips back the exact paths.
         write_host_paths_sidecar(dir.path(), &vsock, &serial)

@@ -190,7 +190,8 @@ pub enum NetConfig {
         /// Optional port for host services accessible from the guest.
         host_services_port: Option<u16>,
     },
-    /// Unprivileged mode using passt or userspace networking.
+    /// Unprivileged mode using an in-process smoltcp stack plus a vhost-user-net
+    /// NAT, requiring no extra Linux capabilities (passt was deliberately rejected).
     Unprivileged {
         /// Egress proxy configuration.
         egress: Egress,

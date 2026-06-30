@@ -52,6 +52,8 @@ ci:
     cargo clippy --no-default-features --features guest-tools --bin vmcell-guest-tools
     ./scripts/ban-global-state.sh
     ./scripts/test-ban-global-state.sh
+    ./scripts/ban-legacy-terms.sh
+    ./scripts/test-ban-legacy-terms.sh
     cargo nextest run --all-features
     # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main merge-base).
     baseline="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse main 2>/dev/null || true)"

@@ -40,8 +40,9 @@ pub async fn build_rootfs(
     )
     .await?;
 
-    // 2. Start builder VM
-    let ch_bin = std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
+    // 2. Start builder VM. Shared resolver so this stage and the snapshot stage read
+    // the SAME env var (VMCELL_CH_BIN) — no per-call-site CH-binary drift.
+    let ch_bin = crate::artifact::ch_binary_path();
     let vmm = CloudHypervisor::new(ch_bin);
     // cid_alloc is passed in
     let vmid_alloc = VmidAllocator::new();

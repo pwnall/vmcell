@@ -57,6 +57,20 @@ pub fn rootfs_path() -> PathBuf {
         .unwrap_or_else(|| artifacts_dir().join("rootfs.erofs"))
 }
 
+/// The cloud-hypervisor binary path: `$VMCELL_CH_BIN`, else bare `cloud-hypervisor`
+/// (resolved on `PATH`).
+///
+/// The single source of truth for the CH binary so every stage that boots a VM
+/// (the snapshot stage and the mmdebstrap builder stage) reads the **same** env var.
+/// Previously the snapshot stage read `CLOUD_HYPERVISOR_PATH` while the builder read
+/// `VMCELL_CH_BIN`, so overriding one left the other on the default — the kind of
+/// per-call-site drift §11.1 consolidation and the `VMCELL_*` namespacing of §10.7-C
+/// exist to prevent.
+#[cfg(feature = "pipeline")]
+pub(crate) fn ch_binary_path() -> String {
+    std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
+}
+
 /// Inputs for an artifact building stage.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -352,6 +366,57 @@ fn guest_agent_closure_hash(crate_root: &Path) -> Result<String> {
     for f in &files {
         // Fold the crate-relative path (so a rename/move invalidates) with an
         // unambiguous delimiter, then the file's content hash.
+        let rel = f.strip_prefix(crate_root).unwrap_or(f.as_path());
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(guest_agent_src_hash(f)?.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Hashes the **source closure** the `vmcell-guest-tools` helper binary compiles
+/// from: its thin binary source (`src/bin/vmcell-guest-tools.rs`) **plus**
+/// `Cargo.lock` (the pinned dependency versions). Files are taken relative to
+/// `crate_root` and folded in a deterministic, sorted order with a stable hasher
+/// (blake3) — mirroring [`guest_agent_closure_hash`].
+///
+/// Folding `Cargo.lock` is the whole point: `vmcell-guest-tools` links
+/// reqwest/rustls, so a dependency bump changes the **built** helper while the
+/// `.rs` source is byte-identical. Hashing only the source (the old behavior) left
+/// the cache key unchanged on a bump, so the stage hit cache and a stale
+/// `ip`/`curl`/`kvm-ok` helper was re-baked into the rootfs (§11.2 caching rules
+/// 3-4). The closure must travel as one identity.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if the binary source is missing, or
+/// any closure file cannot be read — a hard stop, never a silent partial hash (the
+/// old `if let Ok(content)` swallow that quietly produced a content-blind key).
+#[cfg(feature = "pipeline")]
+pub(crate) fn guest_tools_closure_hash(crate_root: &Path) -> Result<String> {
+    // The bin source is mandatory; its absence is a hard stop.
+    let bin = crate_root.join("src/bin/vmcell-guest-tools.rs");
+    if !bin.is_file() {
+        return Err(crate::error::Error::Artifact(format!(
+            "guest-tools binary source missing at {}",
+            bin.display()
+        )));
+    }
+    let mut files: Vec<PathBuf> = vec![bin];
+    // Cargo.lock pins the dependency versions the helper compiles against; fold it
+    // if present (a workspace may build the lock only on demand).
+    let lock = crate_root.join("Cargo.lock");
+    if lock.is_file() {
+        files.push(lock);
+    }
+    // Deterministic order regardless of filesystem enumeration.
+    files.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    for f in &files {
+        // Fold the crate-relative path (so a rename/move invalidates) with an
+        // unambiguous delimiter, then the file's content hash. `guest_agent_src_hash`
+        // is a generic fail-hard file-content hash reused here.
         let rel = f.strip_prefix(crate_root).unwrap_or(f.as_path());
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
@@ -794,6 +859,50 @@ mod tests {
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "missing guest-agent bin wrapper must be a hard error, got {res:?}"
+        );
+    }
+
+    // Guards §11.2 caching rules 3-4 for vmcell-guest-tools: the helper links
+    // reqwest/rustls, so a dependency bump changes Cargo.lock but NOT the `.rs`
+    // source. The closure hash must fold Cargo.lock so the bump invalidates the
+    // key. The buggy source-only hash (the old `if let Ok(content)` over just the
+    // .rs) stays EQUAL across the lock change below and so re-bakes a stale helper.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn test_guest_tools_closure_hash_tracks_cargo_lock() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin_dir = root.path().join("src/bin");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        std::fs::write(bin_dir.join("vmcell-guest-tools.rs"), b"fn main() {}").expect("write bin");
+        std::fs::write(root.path().join("Cargo.lock"), b"# lock v1").expect("write lock");
+
+        let h1 = guest_tools_closure_hash(root.path()).expect("closure hash 1");
+
+        // Bump a dependency: Cargo.lock changes, the helper `.rs` source does not.
+        std::fs::write(root.path().join("Cargo.lock"), b"# lock v2 (dep bump)")
+            .expect("rewrite lock");
+        let h2 = guest_tools_closure_hash(root.path()).expect("closure hash 2");
+        assert_ne!(
+            h1, h2,
+            "a Cargo.lock change (dependency bump) must change the guest-tools closure hash"
+        );
+
+        // Sanity: identical inputs hash identically (deterministic).
+        std::fs::write(root.path().join("Cargo.lock"), b"# lock v1").expect("restore lock");
+        let h1b = guest_tools_closure_hash(root.path()).expect("closure hash 1b");
+        assert_eq!(h1, h1b, "identical closure inputs must hash identically");
+    }
+
+    // Guards the hard-stop half: a missing guest-tools bin source must be a hard
+    // error, never a silent partial/empty closure hash that hits a stale cache.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn test_guest_tools_closure_hash_fails_hard_on_missing_bin() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let res = guest_tools_closure_hash(empty.path());
+        assert!(
+            matches!(res, Err(crate::error::Error::Artifact(_))),
+            "missing guest-tools bin source must be a hard error, got {res:?}"
         );
     }
 }

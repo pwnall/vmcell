@@ -241,6 +241,11 @@ pub struct MicroVm<V: Vmm> {
     restore_reseed_applied: Option<bool>,
     /// The CID guard.
     cid: Option<CidGuard>,
+    /// The per-VM scratch-directory guard. Created early in `start()`/`restore()`
+    /// (before networking) so a partway construction failure still reclaims it,
+    /// and dropped LAST on teardown — after the instance, smoltcp, and daemons
+    /// whose sockets live inside it are gone.
+    tmp_dir: Option<crate::vmm::VmTempDir>,
 }
 
 /// A guard that deletes the cgroup slice on drop unless disarmed.
@@ -464,6 +469,7 @@ impl<V: Vmm> MicroVm<V> {
 
     async fn setup_env(
         vmid: u32,
+        tmp_dir: &std::path::Path,
         cfg: &VmConfig,
         cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
         cgroup_fs: Arc<dyn crate::metrics::CgroupFs>,
@@ -541,8 +547,11 @@ impl<V: Vmm> MicroVm<V> {
                 }
                 #[cfg(feature = "net-unprivileged")]
                 {
-                    let socket_path =
-                        std::path::PathBuf::from(format!("/tmp/imp-smoltcp-{}.sock", vmid));
+                    // Consolidated into the per-VM scratch dir so the NAT socket is
+                    // owned and reclaimed with everything else. The same path is
+                    // handed to BOTH the smoltcp helper (which binds/unlinks it) and
+                    // the VMM (via `vhost_user_socket`) so both sides agree.
+                    let socket_path = tmp_dir.join("smoltcp.sock");
                     let mut ports = vec![];
                     let proxy_port_opt = if _proxy_port > 0 {
                         Some(_proxy_port)
@@ -603,6 +612,7 @@ impl<V: Vmm> MicroVm<V> {
             vhost_user_socket,
             vmid,
             guest_cid,
+            tmp_dir: tmp_dir.to_path_buf(),
         };
 
         Ok(EnvSetup {
@@ -655,8 +665,18 @@ impl<V: Vmm> MicroVm<V> {
             vmid: vmid_value,
             allocator: vmid_alloc,
         };
-        let mut env =
-            Self::setup_env(vmid.vmid, &cfg, cid_alloc.clone(), cgroup_fs.clone()).await?;
+        // Create the single owned per-VM scratch dir EARLY — before networking —
+        // so its guard reclaims it even if setup or create/boot fails partway, and
+        // so the smoltcp NAT socket can live inside it.
+        let tmp_dir = crate::vmm::VmTempDir::create(vmid.vmid).await?;
+        let mut env = Self::setup_env(
+            vmid.vmid,
+            tmp_dir.path(),
+            &cfg,
+            cid_alloc.clone(),
+            cgroup_fs.clone(),
+        )
+        .await?;
 
         let mut instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
         info!("Booting instance...");
@@ -678,6 +698,7 @@ impl<V: Vmm> MicroVm<V> {
             restored: false,
             restore_reseed_applied: None,
             cid: Some(env.cid_guard),
+            tmp_dir: Some(tmp_dir),
         })
     }
 
@@ -741,8 +762,16 @@ impl<V: Vmm> MicroVm<V> {
             vmid: vmid_value,
             allocator: vmid_alloc,
         };
-        let mut env =
-            Self::setup_env(vmid.vmid, &cfg, cid_alloc.clone(), cgroup_fs.clone()).await?;
+        // Create the single owned per-VM scratch dir EARLY (see `start()`).
+        let tmp_dir = crate::vmm::VmTempDir::create(vmid.vmid).await?;
+        let mut env = Self::setup_env(
+            vmid.vmid,
+            tmp_dir.path(),
+            &cfg,
+            cid_alloc.clone(),
+            cgroup_fs.clone(),
+        )
+        .await?;
 
         info!("Restoring instance...");
         let mut instance = vmm
@@ -765,6 +794,7 @@ impl<V: Vmm> MicroVm<V> {
             restored: true,
             restore_reseed_applied: None,
             cid: Some(env.cid_guard),
+            tmp_dir: Some(tmp_dir),
         })
     }
 
@@ -920,6 +950,11 @@ impl<V: Vmm> Drop for MicroVm<V> {
         }
         drop(self.cid.take());
         drop(self.vmid.take());
+        // The per-VM scratch dir goes LAST: the instance (VMM process group +
+        // virtiofsd/vhost-vsock daemons) and the smoltcp process — all dropped
+        // above — own sockets that live inside it, so removing it any earlier
+        // would race a live process still holding a socket there.
+        drop(self.tmp_dir.take());
     }
 }
 
@@ -1425,6 +1460,7 @@ mod tests {
             restored: false,
             restore_reseed_applied: None,
             cid: None,
+            tmp_dir: None,
         };
         let usage = vm.usage().await.unwrap();
         assert!(

@@ -29,8 +29,25 @@ pub struct ResourceUsage {
     /// Network byte counters are intentionally absent: cgroup v2 has no network
     /// accounting and the read path holds only the cgroup name, not the VM's
     /// netns/interface handle, so an always-zero `net_*` field would be a lie
-    /// (§7.1 / rubric B8). See `implementation-notes.md`.
+    /// (§7.1 / rubric B8). See the "Net counters omitted from `ResourceUsage`"
+    /// deviation in `docs/implementation-notes.md`.
     pub limits_enforced: bool,
+    /// Whether the memory counters (`mem_current_mib`, `mem_peak_mib`) were read
+    /// and parsed successfully (§7.1 rule 3: an unread counter is the same lie as a
+    /// missing one). `false` when `memory.current`/`memory.peak` are absent or fail
+    /// to parse, so the caller can tell a real `0` from an unreadable counter. A
+    /// `ResourceUsage::default()` is honestly `false`.
+    pub mem_read_ok: bool,
+    /// Whether the CPU counter (`cpu_usec`) was read and parsed successfully.
+    /// `false` when `cpu.stat` is absent or lacks a parseable `usage_usec` line,
+    /// distinguishing a real `0` from an unreadable counter (§7.1 rule 3). A
+    /// `ResourceUsage::default()` is honestly `false`.
+    pub cpu_read_ok: bool,
+    /// Whether the I/O byte counters (`io_read_bytes`, `io_write_bytes`) were read
+    /// successfully. `false` when `io.stat` is absent, distinguishing a real `0`
+    /// from an unreadable counter (§7.1 rule 3). A `ResourceUsage::default()` is
+    /// honestly `false`.
+    pub io_read_ok: bool,
 }
 
 /// Interface for managing cgroups.
@@ -191,6 +208,69 @@ fn parse_cpu_usage_usec(contents: &str) -> Option<u64> {
     })
 }
 
+/// Reads a [`ResourceUsage`] snapshot from a cgroup-v2 directory at `base_path`,
+/// surfacing per-metric availability so the caller can tell a real `0` from an
+/// unreadable counter (§7.1 rule 3: "an unread counter is the same lie as a missing
+/// one"). Reads are best-effort: an absent or unparseable control file leaves the
+/// corresponding value at `0` and its `*_read_ok` flag `false`. Factored out of
+/// [`DefaultCgroupFs::read_stats`] so the availability contract is unit-testable
+/// against a temp cgroup-like directory without writing to `/sys`.
+fn read_stats_at(base_path: &str) -> ResourceUsage {
+    let mut usage = ResourceUsage::default();
+
+    // Memory: read directly from sysfs and unconditionally (METRICS-FS-3). The
+    // previous implementation gated this on cgroups-rs reporting a Mem subsystem,
+    // which silently returned 0 in the very constrained/delegated case it claimed
+    // to handle. Only a genuinely absent control file now falls through to 0, and
+    // `mem_read_ok` then stays `false` so the caller never mistakes it for a real 0.
+    let mut mem_current_ok = false;
+    if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
+        if let Ok(val) = s.trim().parse::<u64>() {
+            usage.mem_current_mib = val / 1024 / 1024;
+            mem_current_ok = true;
+        }
+    }
+    let mut mem_peak_ok = false;
+    if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
+        if let Ok(val) = s.trim().parse::<u64>() {
+            usage.mem_peak_mib = val / 1024 / 1024;
+            mem_peak_ok = true;
+        }
+    }
+    // Both memory counters must read for the memory metrics to be trustworthy.
+    usage.mem_read_ok = mem_current_ok && mem_peak_ok;
+
+    // I/O byte counters: sum rbytes/wbytes over every device line of io.stat
+    // (METRICS-FS-1). These fields were previously never populated. `io_read_ok`
+    // is `false` when `io.stat` is absent (an empty/counter-less file is a valid 0).
+    if let Ok(s) = std::fs::read_to_string(format!("{}/io.stat", base_path)) {
+        let (read_bytes, write_bytes) = parse_io_stat_bytes(&s);
+        usage.io_read_bytes = read_bytes;
+        usage.io_write_bytes = write_bytes;
+        usage.io_read_ok = true;
+    }
+
+    // CPU usage in microseconds: the `usage_usec` line of cpu.stat. `cpu_read_ok`
+    // is `false` when the file is absent or has no parseable `usage_usec` line.
+    if let Ok(s) = std::fs::read_to_string(format!("{}/cpu.stat", base_path)) {
+        if let Some(val) = parse_cpu_usage_usec(&s) {
+            usage.cpu_usec = val;
+            usage.cpu_read_ok = true;
+        }
+    }
+
+    // limits_enforced (§7.1 rule 3): the memory controller is delegated into this
+    // cgroup iff it is listed in `cgroup.controllers`. When it is absent the limit
+    // writes were rejected and the values above are bare sysfs fallbacks, so the
+    // caller must not assume enforcement. Honestly `false` if the file is missing.
+    let controllers_path = format!("{}/cgroup.controllers", base_path);
+    usage.limits_enforced = std::fs::read_to_string(controllers_path)
+        .map(|s| controller_listed(&s, "memory"))
+        .unwrap_or(false);
+
+    usage
+}
+
 /// The default CgroupFs implementation.
 #[derive(Debug, Default, Clone)]
 pub struct DefaultCgroupFs;
@@ -255,49 +335,7 @@ impl CgroupFs for DefaultCgroupFs {
     }
 
     fn read_stats(&self, name: &str) -> Result<ResourceUsage> {
-        let mut usage = ResourceUsage::default();
-        let base_path = format!("/sys/fs/cgroup/{}", name);
-
-        // Memory: read directly from sysfs and unconditionally (METRICS-FS-3). The
-        // previous implementation gated this on cgroups-rs reporting a Mem subsystem,
-        // which silently returned 0 in the very constrained/delegated case it claimed
-        // to handle. Only a genuinely absent control file now falls through to 0.
-        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
-            if let Ok(val) = s.trim().parse::<u64>() {
-                usage.mem_current_mib = val / 1024 / 1024;
-            }
-        }
-        if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
-            if let Ok(val) = s.trim().parse::<u64>() {
-                usage.mem_peak_mib = val / 1024 / 1024;
-            }
-        }
-
-        // I/O byte counters: sum rbytes/wbytes over every device line of io.stat
-        // (METRICS-FS-1). These fields were previously never populated.
-        if let Ok(s) = std::fs::read_to_string(format!("{}/io.stat", base_path)) {
-            let (read_bytes, write_bytes) = parse_io_stat_bytes(&s);
-            usage.io_read_bytes = read_bytes;
-            usage.io_write_bytes = write_bytes;
-        }
-
-        // CPU usage in microseconds: the `usage_usec` line of cpu.stat.
-        if let Ok(s) = std::fs::read_to_string(format!("{}/cpu.stat", base_path)) {
-            if let Some(val) = parse_cpu_usage_usec(&s) {
-                usage.cpu_usec = val;
-            }
-        }
-
-        // limits_enforced (§7.1 rule 3): the memory controller is delegated into this
-        // cgroup iff it is listed in `cgroup.controllers`. When it is absent the limit
-        // writes were rejected and the values above are bare sysfs fallbacks, so the
-        // caller must not assume enforcement. Honestly `false` if the file is missing.
-        let controllers_path = format!("{}/cgroup.controllers", base_path);
-        usage.limits_enforced = std::fs::read_to_string(controllers_path)
-            .map(|s| controller_listed(&s, "memory"))
-            .unwrap_or(false);
-
-        Ok(usage)
+        Ok(read_stats_at(&format!("/sys/fs/cgroup/{}", name)))
     }
 
     fn add_task(&self, name: &str, pid: u32) -> Result<()> {
@@ -435,7 +473,8 @@ impl CgroupFs for FakeCgroupFs {
     }
 
     fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
-        // The fake models a delegated host, so enforcement is honestly reported true.
+        // The fake models a delegated host with readable counters, so enforcement is
+        // honestly reported true and every per-metric availability flag is true.
         Ok(ResourceUsage {
             mem_peak_mib: 42,
             mem_current_mib: 21,
@@ -443,6 +482,9 @@ impl CgroupFs for FakeCgroupFs {
             io_read_bytes: 0,
             io_write_bytes: 0,
             limits_enforced: true,
+            mem_read_ok: true,
+            cpu_read_ok: true,
+            io_read_ok: true,
         })
     }
 
@@ -616,6 +658,87 @@ mod tests {
         };
         fs.create_slice("vmcell-vm-1", &limits).unwrap();
         assert!(fs.has_slice("vmcell-vm-1"));
+    }
+
+    // §7.1 rule 3: when no control files exist, every per-metric availability flag
+    // must be `false` so a caller can distinguish an unreadable counter from a real 0
+    // ("an unread counter is the same lie as a missing one"). Goes red on an impl that
+    // hardcodes the flags true or never sets them off the always-zero values.
+    #[test]
+    fn test_read_stats_availability_false_when_files_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("empty-cgroup");
+        std::fs::create_dir_all(&base).expect("create empty cgroup dir");
+        // No memory.current/peak, cpu.stat, io.stat, or cgroup.controllers exist.
+        let usage = read_stats_at(&base.to_string_lossy());
+        assert!(
+            !usage.mem_read_ok,
+            "mem_read_ok must be false when memory.current/peak are absent"
+        );
+        assert!(
+            !usage.cpu_read_ok,
+            "cpu_read_ok must be false when cpu.stat is absent"
+        );
+        assert!(
+            !usage.io_read_ok,
+            "io_read_ok must be false when io.stat is absent"
+        );
+        assert!(!usage.limits_enforced);
+        // The values themselves must be the honest 0, paired with the false flags.
+        assert_eq!(usage.mem_current_mib, 0);
+        assert_eq!(usage.cpu_usec, 0);
+        assert_eq!(usage.io_read_bytes, 0);
+    }
+
+    // The inverse: with the control files present and parseable, each flag flips to
+    // true alongside the parsed value. Proves the false above is the absent file, not
+    // a flag wired permanently off.
+    #[test]
+    fn test_read_stats_availability_true_when_files_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("full-cgroup");
+        std::fs::create_dir_all(&base).expect("create cgroup dir");
+        let write = |name: &str, contents: &str| {
+            std::fs::write(base.join(name), contents).expect("write control file");
+        };
+        // 4 MiB current, 8 MiB peak.
+        write("memory.current", &(4u64 * 1024 * 1024).to_string());
+        write("memory.peak", &(8u64 * 1024 * 1024).to_string());
+        write("cpu.stat", "usage_usec 123456\nuser_usec 1\n");
+        write("io.stat", "8:0 rbytes=100 wbytes=200\n");
+        write("cgroup.controllers", "cpu io memory pids");
+
+        let usage = read_stats_at(&base.to_string_lossy());
+        assert!(usage.mem_read_ok);
+        assert!(usage.cpu_read_ok);
+        assert!(usage.io_read_ok);
+        assert_eq!(usage.mem_current_mib, 4);
+        assert_eq!(usage.mem_peak_mib, 8);
+        assert_eq!(usage.cpu_usec, 123_456);
+        assert_eq!(usage.io_read_bytes, 100);
+        assert_eq!(usage.io_write_bytes, 200);
+        assert!(usage.limits_enforced);
+    }
+
+    // A half-readable memory controller (current present, peak missing) is not
+    // trustworthy: mem_read_ok must require BOTH counters, guarding against an impl
+    // that flips the flag on the first successful read.
+    #[test]
+    fn test_read_stats_mem_read_ok_requires_both_counters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("partial-cgroup");
+        std::fs::create_dir_all(&base).expect("create cgroup dir");
+        std::fs::write(
+            base.join("memory.current"),
+            (4u64 * 1024 * 1024).to_string(),
+        )
+        .expect("write memory.current");
+        // memory.peak intentionally absent.
+        let usage = read_stats_at(&base.to_string_lossy());
+        assert!(
+            !usage.mem_read_ok,
+            "mem_read_ok must be false when memory.peak is missing"
+        );
     }
 
     // A requested limit fails loud for the specific undelegated controller (cpu),

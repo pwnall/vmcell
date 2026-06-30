@@ -26,21 +26,38 @@ impl Stage for GuestToolsStage {
 
     fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
         // Bump when this stage's build logic changes so a stale helper is not served.
-        const STAGE_VERSION: u32 = 1;
+        // Bumped to 2 with the Cargo.lock-aware closure hash.
+        const STAGE_VERSION: u32 = 2;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
-        // Fold the helper's source so a change rebuilds it — and, transitively
-        // (via the rootfs stage's content hash of this artifact), re-bakes the
-        // rootfs. Self-contained (the helper does not depend on the lib crate).
+        // Fold the helper's FULL source closure — its `.rs` source PLUS `Cargo.lock`
+        // — so a change rebuilds it and, transitively (via the rootfs stage's content
+        // hash of this artifact), re-bakes the rootfs. Folding `Cargo.lock` is what
+        // catches a dependency bump: the helper links reqwest/rustls, so a bump
+        // changes the BUILT binary while the `.rs` is byte-identical. The old
+        // source-only hash missed that and re-served a stale ip/curl/kvm-ok helper.
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let src = std::path::Path::new(&manifest_dir).join("src/bin/vmcell-guest-tools.rs");
-        if let Ok(content) = std::fs::read(&src) {
-            hasher.update(&content);
-        }
+        let crate_root = std::path::Path::new(&manifest_dir);
+        match crate::artifact::guest_tools_closure_hash(crate_root) {
+            Ok(h) => hasher.update(h.as_bytes()),
+            // A read failure must NOT silently degrade to a stable, content-blind key
+            // that hits a stale cache (the old `if let Ok(content)` swallow). Fold the
+            // error so the key cannot collide with a good one; the resulting cache miss
+            // drives `run()`, which recomputes via the same Result helper and fails hard
+            // with the real cause.
+            Err(e) => hasher.update(format!("guest-tools-closure-error:{e}").as_bytes()),
+        };
         CacheKey(format!("guest-tools-{}", hasher.finalize().to_hex()))
     }
 
     async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        // Fail hard if the helper's source closure (`.rs` source + `Cargo.lock`) is
+        // unreadable — never silently build and serve a stale helper. Mirrors the
+        // guest-agent stage's run()-side hard stop; the returned hash is needed only
+        // for its error effect here.
+        crate::artifact::guest_tools_closure_hash(std::path::Path::new(&manifest_dir))?;
+
         // Built dynamically (no crt-static): the helper links reqwest/rustls
         // (aws-lc-rs C code) which does not link cleanly fully-static, and the
         // Debian rootfs ships glibc, so a dynamic binary runs there. The helper
@@ -63,7 +80,6 @@ impl Stage for GuestToolsStage {
             ));
         }
 
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .unwrap_or_else(|_| format!("{}/target", manifest_dir));
         let tools_path = std::path::PathBuf::from(target_dir)

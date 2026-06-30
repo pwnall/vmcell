@@ -51,7 +51,9 @@ review rubric; recorded, justified deviations live in `implementation-notes.md`.
 `.unwrap()`/`panic!`/`println!`/`dbg!` in production · missing doc/`# Errors`/`# Panics`/
 `# Safety` · `DefaultHasher` in a cache key · a dep used unconditionally under a feature gate ·
 non-permissive licenses and un-rationalized advisory ignores · a `#[non_exhaustive]` omission
-that breaks the API · new module-global `static … Atomic…` · format drift · a hang (it becomes
+that breaks the API · new module-global `static … Atomic…` · a re-introduced legacy term
+(`ban-legacy-terms.sh` keeps `rootless`/`TestVm`/`imp_testing`/`imp-*` and the old `IMP_*` env vars
+out of non-historical code — design v14 §10.7) · format drift · a hang (it becomes
 a timeout). Everything below is what no gate sees.
 
 ## System contracts & invariants (read before touching the relevant subsystem)

@@ -124,9 +124,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::remove_dir_all("oldroot")?;
     }
 
+    // /sys is NOT part of the fatal core-mount set — that set is EXACTLY
+    // {overlay, /proc, /dev} (§4.3). The vsock control plane, the
+    // overlay/pivot_root sequence, and restore-path MAC rotation (ioctls) do not
+    // require sysfs, so a failed sysfs mount is logged and tolerated like the
+    // share-mount / loopback paths below. Returning Err from PID 1's main would
+    // kernel-panic the guest ("Attempted to kill init").
     if let Err(e) = mount("sysfs", "/sys", "sysfs", MountFlags::empty(), "") {
-        tracing::info!("vmcell-guest-agent: sysfs failed: {}", e);
-        return Err(e.into());
+        tracing::warn!(
+            "vmcell-guest-agent: sysfs mount failed: {}; continuing without /sys",
+            e
+        );
     }
     if let Err(e) = mount("proc", "/proc", "proc", MountFlags::empty(), "") {
         tracing::info!("vmcell-guest-agent: proc failed: {}", e);
@@ -550,6 +558,14 @@ fn handle_exec(
             });
 
             let pid = child.id();
+            // Reserve this pid in the shared reaper *immediately* after spawn, so
+            // a re-parented grandchild that previously held this (now reused) pid
+            // cannot have its lingering, unclaimed exit status mis-delivered to
+            // this child as a false result. `reserve` clears any pre-existing
+            // status for the pid and captures the generation epoch; the waiter's
+            // `wait_for(pid)` below then only accepts a status reaped at or after
+            // this point (§4.3 PID-1 reaper-vs-waiter contract).
+            reaper.reserve(pid);
             let has_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let has_exited_clone = std::sync::Arc::clone(&has_exited);
             let tx_timeout = tx.clone();

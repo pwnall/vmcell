@@ -38,9 +38,6 @@ pub struct ChInstance {
     api_socket: PathBuf,
     vsock_path: PathBuf,
     serial_path: PathBuf,
-    // Per-VM temp dir owning the sockets + serial log; removed on `Drop` so it
-    // does not leak one directory per VM (E3).
-    tmp_dir: PathBuf,
     _fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
     restored: bool,
     // Whether the backend advertises snapshot/restore, captured from
@@ -208,15 +205,14 @@ impl CloudHypervisor {
         std::path::PathBuf,
         std::path::PathBuf,
         std::path::PathBuf,
-        std::path::PathBuf,
         tokio::process::Child,
         Option<u32>,
     )> {
-        let tmp = crate::vmm::create_vm_tmp_dir(res.vmid).await?;
-
-        let api_socket = tmp.join("api.sock");
-        let vsock_path = tmp.join("vsock.sock");
-        let serial_path = tmp.join("serial.log");
+        // The orchestrator owns the per-VM scratch dir; derive our socket and
+        // serial-log paths inside it.
+        let api_socket = res.tmp_dir.join("api.sock");
+        let vsock_path = res.tmp_dir.join("vsock.sock");
+        let serial_path = res.tmp_dir.join("serial.log");
 
         let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
 
@@ -282,7 +278,7 @@ impl CloudHypervisor {
             return Err(e);
         }
 
-        Ok((tmp, api_socket, vsock_path, serial_path, process, pgid))
+        Ok((api_socket, vsock_path, serial_path, process, pgid))
     }
 }
 
@@ -295,7 +291,7 @@ impl Vmm for CloudHypervisor {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
-        let (tmp, api_socket, vsock_path, serial_path, process, pgid) = self
+        let (api_socket, vsock_path, serial_path, process, pgid) = self
             .spawn_ch(res, None, crate::config::RestoreMode::Default, cgroups)
             .await?;
 
@@ -312,7 +308,6 @@ impl Vmm for CloudHypervisor {
             api_socket,
             vsock_path: vsock_path.clone(),
             serial_path: serial_path.clone(),
-            tmp_dir: tmp.clone(),
             _fs_daemons: Vec::new(),
             restored: false,
             snapshot_restore_capable: self.capabilities().snapshot_restore,
@@ -323,7 +318,7 @@ impl Vmm for CloudHypervisor {
 
         let mut ch_fs = Vec::new();
         for share in &cfg.shares {
-            let daemon = crate::fs::VirtioFsDaemon::start(share, &tmp).await?;
+            let daemon = crate::fs::VirtioFsDaemon::start(share, &res.tmp_dir).await?;
             ch_fs.push(ChFs {
                 tag: share.tag.clone(),
                 socket: daemon.socket_path.clone(),
@@ -457,7 +452,7 @@ impl Vmm for CloudHypervisor {
                 feature: "snapshot/restore with a vhost-user device".to_string(),
             });
         }
-        let (tmp, api_socket, vsock_path, serial_path, process, pgid) = self
+        let (api_socket, vsock_path, serial_path, process, pgid) = self
             .spawn_ch(res, Some(snapshot_dir), cfg.restore_mode, cgroups)
             .await?;
 
@@ -465,7 +460,7 @@ impl Vmm for CloudHypervisor {
         // starts virtiofsd on a restored VM.
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
-            let daemon = crate::fs::VirtioFsDaemon::start(share, &tmp).await?;
+            let daemon = crate::fs::VirtioFsDaemon::start(share, &res.tmp_dir).await?;
             fs_daemons.push(daemon);
         }
 
@@ -476,7 +471,6 @@ impl Vmm for CloudHypervisor {
             api_socket,
             vsock_path,
             serial_path,
-            tmp_dir: tmp,
             _fs_daemons: fs_daemons,
             restored: true,
             snapshot_restore_capable: self.capabilities().snapshot_restore,
@@ -600,15 +594,13 @@ impl Drop for ChInstance {
             }
         }
         // virtiofsd next: dropping each daemon kills it and removes its own socket
-        // (which lives inside `tmp_dir`) before we remove that directory.
+        // before the orchestrator removes the shared per-VM directory.
         self._fs_daemons.clear();
-        // Finally the sockets and the per-VM temp dir. Removing the directory
-        // (E3) reclaims `serial.log` + `api.sock.lock`, which previously leaked
-        // one-per-VM; the explicit socket removals are redundant with the
-        // `remove_dir_all` but kept for clarity of the teardown sequence.
+        // Unlink our own sockets. The per-VM directory itself is owned and removed
+        // once by the orchestrator's `VmTempDir` guard (after this instance and the
+        // smoltcp process are dropped), not here.
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
-        crate::vmm::remove_vm_tmp_dir(&self.tmp_dir);
     }
 }
 
@@ -667,12 +659,13 @@ mod tests {
 
     fn res_with(vhost_user_socket: Option<PathBuf>) -> PerVmResources {
         PerVmResources {
-            cgroup_name: "imp-test".to_string(),
+            cgroup_name: "vmcell-test".to_string(),
             tap_name: Some("tap0".to_string()),
             netns_name: Some("ns0".to_string()),
             vhost_user_socket,
             vmid: 1,
             guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-1"),
         }
     }
 

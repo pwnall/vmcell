@@ -1296,3 +1296,151 @@ The four Review-37 appendix justified deviations (per-deployment MITM CA minting
 per-subsystem `Error` payloads with no `Error::Other` / P25; `guest-tools` legitimately uses `reqwest`
 / S45; concurrent-restore-from-one-snapshot is forward work / S32) are recorded above in
 "Review 37 — newly recorded justified deviations" and remain accurate.
+
+## Monitoring (§7)
+
+### Net counters omitted from `ResourceUsage` (2026-06-30, recorded deviation)
+
+**Design reference:** §7 states that "`memory.peak`/`memory.current`/`cpu.stat`/`io.stat` plus net
+counters [are] read back" and that "all four `io.stat`/net counters in `ResourceUsage` must be
+**actually read**, not left as always-zero fields." `ResourceUsage` (`src/metrics.rs`) carries the
+memory, CPU, and I/O counters but **deliberately has no `net_rx_bytes`/`net_tx_bytes` fields.**
+
+**Why the deviation:** the monitoring path is built on a single **cgroup v2** slice per VMM/virtiofsd
+process (§7), and **cgroup v2 exposes no per-cgroup network byte accounting** — there is no
+`net.stat`-style control file analogous to `io.stat`. (cgroup *v1* had the `net_cls`/`net_prio`
+controllers, but those are classifiers for tc/qdisc tagging, not byte counters, and are absent from
+the v2 unified hierarchy this code targets.) The read path in `read_stats_at` holds only the cgroup
+*name*; it does **not** hold the VM's netns or interface handle, which is where the only truthful
+egress byte counters live (`/sys/class/net/<if>/statistics/{rx,tx}_bytes` inside the VM netns, or an
+`rtnetlink` `RTM_GETLINK` stats dump). Synthesizing always-zero `net_*` fields on `ResourceUsage`
+would reintroduce exactly the "an unread counter is the same lie as a missing one" defect §7/§7.1
+warns against — a field the caller could assert on that is structurally incapable of being non-zero.
+
+**Decision:** net rx/tx are **intentionally omitted** from `ResourceUsage` rather than stubbed to a
+permanently-zero field. The memory/CPU/I/O counters that cgroup v2 *does* expose are read truthfully,
+each paired with a per-metric availability boolean (`mem_read_ok`/`cpu_read_ok`/`io_read_ok`, added
+this pass) so a real `0` is distinguishable from an unreadable counter (§7.1 rule 3).
+
+**Forward work:** if per-VM egress observability is later required, it belongs in the networking
+subsystem — read interface byte statistics from inside the VM netns (or via `rtnetlink` against the
+tap/host-veth in that netns) and surface them through a *network*-scoped usage type, not the
+cgroup-scoped `ResourceUsage`. Tracked alongside the other §6 networking observability items.
+
+## Teardown (Drop) follow-ups (2026-06-30)
+
+### E3 per-VM temp-dir leak fix extended to Firecracker and QEMU
+
+**What changed:** the E3 per-VM `/tmp/vmcell-vm-{pid}-{vmid}/` reclamation was previously recorded as
+"RESOLVED" but had only ever been wired into the Cloud Hypervisor backend (`ChInstance::Drop` calling
+`crate::vmm::remove_vm_tmp_dir`). An audit found that **Firecracker and QEMU still leaked one per-VM
+directory each** (holding `serial.log`, the vsock socket, and — for QEMU — `vhost-vsock.sock`),
+because neither `FcInstance` nor `QemuInstance` retained the temp dir or removed it on teardown.
+
+**Fix:** both `FcInstance` (`src/vmm/firecracker.rs`) and `QemuInstance` (`src/vmm/qemu.rs`) now carry a
+`tmp_dir: PathBuf` field. `spawn_fc` (create + restore construction sites) and `spawn_qemu` (create
+site) thread the temp dir onto the instance instead of discarding it as `_tmp`. Each backend's `Drop`
+calls `crate::vmm::remove_vm_tmp_dir(&self.tmp_dir)` as the **final** reclamation step, after the
+process-group SIGKILL+reap, the vhost-user daemon teardown (QEMU's external `vhost-device-vsock` reap
++ `self._fs_daemons.clear()`), and the explicit socket removals — mirroring CH's ordering exactly
+(VMM group -> vhost-user daemons -> sockets -> tmp dir). Because removal is the last step of `Drop`, it
+runs on the panic/unwind path too. The Firecracker T2-template probe constructs an `FcInstance` that
+owns no per-VM dir, so its `tmp_dir` is `PathBuf::new()` (the same empty-path convention already used
+for its `vsock_path`/`serial_path`); `remove_vm_tmp_dir` treats the resulting `NotFound` as the normal
+idempotent-teardown case.
+
+**Test:** `tests/lifecycle.rs` `test_lifecycle_panic_residue_*` was generalized into a backend-generic
+`test_lifecycle_panic_residue_impl<V: Vmm>` with CH/FC/QEMU wrappers (mirroring the existing
+`test_lifecycle_force_kill_*` trio, reusing the existing harness rather than inventing a new one).
+Step 4b asserts the per-VM dir is gone after a panic-driven `Drop` for **all three** backends. The
+test is KVM- + CAP_NET_ADMIN-gated (`#[ignore]`) and was not run in this environment; it is
+correct-by-construction and consistent with the prior CH-only assertion. (It was subsequently
+run on a KVM host as part of the consolidation below — 200/200 privileged, all three backends.)
+
+**Superseded the same day** by the single-owner `VmTempDir` consolidation below: the per-backend
+`tmp_dir` field and the `remove_vm_tmp_dir`-in-`Drop` call described here were removed, and ownership
+of the directory's lifecycle moved up to `MicroVm`. The FC/QEMU leak fix itself stands; only *where*
+the directory is owned and reclaimed changed.
+
+### Per-VM temp dir: single-owner consolidation (maintainer-requested)
+
+**Why.** The E3 fix above gave each backend its own `tmp_dir` field plus a `remove_vm_tmp_dir` call in
+`Drop`. That was correct, but it re-created exactly the triplicated create/own/delete across CH/FC/QEMU
+that produced the original FC/QEMU leak in the first place (and that AGENTS.md "don't triplicate;
+extract" warns against). At the maintainer's request the directory's lifecycle was hoisted to a single
+owner so all backends share one created-once / deleted-once directory.
+
+**What changed.**
+- New RAII guard `VmTempDir` in `src/vmm/mod.rs` (replaces the `create_vm_tmp_dir` free fn):
+  `VmTempDir::create(vmid)` makes `/tmp/vmcell-vm-{pid}-{vmid}/`, `path()` exposes it, and `Drop` calls
+  the retained, idempotent `remove_vm_tmp_dir`.
+- `PerVmResources` gains a `tmp_dir: PathBuf` field. Each backend is now *handed* the directory and
+  derives every temporary inside it (api/qmp/vsock/vhost-vsock/serial + virtiofsd sockets and logs)
+  rather than creating its own. The `tmp_dir` field was removed from `ChInstance`/`FcInstance`/
+  `QemuInstance`; `spawn_*` reads `res.tmp_dir`; no backend `Drop` removes the directory any more (they
+  keep the process-group SIGKILL+reap, vhost-user daemon teardown, and explicit per-socket unlinks).
+- `MicroVm` owns the guard (`tmp_dir: Option<VmTempDir>`), created **early** in `start()`/`restore()` —
+  right after VMID allocation and **before** `setup_env`/networking. `MicroVm::Drop` drops the guard as
+  the **final** step (`drop(self.tmp_dir.take())`), after the instance (VMM group + virtiofsd/
+  vhost-vsock reaped), smoltcp, and proxy are torn down — so the directory is removed only once every
+  process whose sockets live inside it is gone.
+
+**Issue 1 — the one scattered temporary (smoltcp NAT socket).** Every other temporary already lived
+under the per-VM dir, but the unprivileged smoltcp vhost-user-net socket was created in `setup_env` at
+`/tmp/vmcell-smoltcp-{vmid}.sock`, *before* any per-VM dir existed. **Workaround:** create the
+`VmTempDir` guard before networking setup so `setup_env` places the socket at `<tmp_dir>/smoltcp.sock`;
+the single path is handed to both `SmoltcpProcess::start` and the VMM's `PerVmResources.vhost_user_socket`
+so both ends agree on the in-dir path.
+
+**Issue 2 — Drop ordering vs. live sockets.** The directory holds sockets owned by the VMM, the
+virtiofsd / vhost-device-vsock daemons, and the smoltcp process; removing it before those are reaped
+would race live processes. **Handled by** dropping the guard last in `MicroVm::Drop`, and by keeping
+`remove_vm_tmp_dir`'s `NotFound`-is-success semantics so the guard's `Drop` is safe even though the
+backends already unlink their own sockets first (idempotent).
+
+**Bonus robustness.** Because `MicroVm` creates and holds the guard, the directory is now reclaimed even
+when `start()`/`restore()` **fails partway** (e.g. a spawn error before the instance is constructed) —
+the previous per-backend approach leaked the dir on any such early failure.
+
+**Deliberately NOT consolidated (documented exceptions).**
+- **VMID cross-process lock files** (`/tmp/vmcell-vmid/{vmid}.lock`) — owned by the allocator, not the
+  VM; they coordinate across processes and must outlive any single VM, so they stay in their own global
+  directory.
+- **Firecracker T2 capability-probe socket** (`/tmp/vmcell-fc-probe-{pid}-{counter}.socket`) — created
+  during `create()`'s capability probe *before any VM (or per-VM dir) exists*, and already self-cleans
+  via the throwaway probe instance's `api_socket` removal.
+
+**Validation (this KVM host, 2026-06-30).** Unit `nextest --all-features` 181 passed; `just
+test-unprivileged` 15 passed (incl. `test_lifecycle_unprivileged_smoltcp`, whose residue assertion now
+targets the per-VM dir containing the moved smoltcp socket); `just test-privileged` (under the delegated
+cgroup scope) **200 passed** across CH/FC/QEMU, including the generalized `test_lifecycle_panic_residue_*`
+matrix that exercises full reclamation of the single owned directory.
+
+**Validation-environment issues encountered (not code defects), with workarounds.**
+- *Stranded artifacts after the rename.* The v14 rename changed the default artifacts dir from
+  `target/imp-artifacts` to `target/vmcell-artifacts`; pre-built artifacts at the old path made the
+  (correctly fail-loud) integration tests panic `vmlinux artifact missing`. **Workaround:**
+  `mv target/imp-artifacts target/vmcell-artifacts` — safe because cache validity is content-addressed,
+  not path-dependent (§11.2 rule 3).
+- *Capability-runner blessing stripped by `--all-features` builds.* `vmcell-test-runner` is lean (it
+  does not link the lib), so library edits don't rebuild it — but `cargo … --all-features` (the unit
+  suite, and every subagent self-validation) enables the `test-runner` feature and recompiles the
+  binary, overwriting the `setcap` blessing; the runner then fails loud ("missing
+  CAP_NET_ADMIN/CAP_SYS_ADMIN … almost certainly rebuilt", exit 104). Also, `sudo setcap` needs a real
+  TTY — neither the agent's Bash nor a `! `-prefixed in-session command can authenticate
+  ("sudo: A terminal is required to authenticate"). **Workaround:** run `just bless` from a separate
+  terminal window, and do not run `--all-features` builds between `just bless` and `just
+  test-privileged` (the privileged suite uses `--features firecracker,qemu`, which does not rebuild the
+  runner, so the blessing survives the whole run).
+
+### Residual race in the PID-1 reaper fix (noted, deliberately deferred)
+
+The PID-1 reaper fix just landed (reserve()-at-spawn + generation-gated `wait_for`) closes the
+documented stale-status-already-in-map case: a status recorded under a prior generation can no longer
+be returned to a waiter for a reused pid. A **narrow** window remains, however: the single
+`waitpid(WNOHANG)` reaper and `record_exit` are not atomic with respect to the wait critical section,
+so a grandchild reaped and then recorded *after* a reused pid has been reserved would be stamped with
+a generation past the reservation epoch and accepted as that child's exit. Fully closing this requires
+recording the reaped status **inside** the `wait()` critical section (under the same lock that performs
+the reservation/generation bump), a riskier restructuring of the reaper/waiter coordination that is
+**deliberately deferred** rather than rushed alongside the teardown fixes above.

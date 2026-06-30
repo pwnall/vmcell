@@ -34,7 +34,7 @@ impl vmcell::artifact::Stage for DummyStage {
 
 #[tokio::test]
 async fn test_pipeline_reset_to() {
-    let tmp_dir = std::env::temp_dir().join(format!("imp-test-pipeline-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("vmcell-test-pipeline-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -86,7 +86,7 @@ async fn test_pipeline_reset_to() {
 #[tokio::test]
 async fn test_pipeline_reset_subset_rebuilds_downstream_only() {
     let tmp_dir = std::env::temp_dir().join(format!(
-        "imp-test-pipeline-reset-sub-{}",
+        "vmcell-test-pipeline-reset-sub-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -181,7 +181,7 @@ impl vmcell::artifact::Stage for CountingStage {
 #[tokio::test]
 async fn test_pipeline_warm_cache_skips() {
     let tmp_dir =
-        std::env::temp_dir().join(format!("imp-test-pipeline-warm-{}", std::process::id()));
+        std::env::temp_dir().join(format!("vmcell-test-pipeline-warm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let cache = Cache::default();
 
@@ -278,7 +278,7 @@ async fn test_pipeline_determinism() {
 #[tokio::test]
 async fn test_pipeline_tampered_digest_aborts() {
     let tmp_dir =
-        std::env::temp_dir().join(format!("imp-test-pipeline-tamp-{}", std::process::id()));
+        std::env::temp_dir().join(format!("vmcell-test-pipeline-tamp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let cache = Cache::default();
 
@@ -314,7 +314,8 @@ async fn test_pipeline_tampered_digest_aborts() {
 // impl returns Ok here → this assertion goes red.
 #[tokio::test]
 async fn test_reset_to_propagates_remove_error() {
-    let tmp_dir = std::env::temp_dir().join(format!("imp-test-reset-err-{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("vmcell-test-reset-err-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let cache = Cache::default();

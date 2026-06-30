@@ -122,7 +122,7 @@ Common recipes:
 - `just test-unit` — fast unit, codec, and property tests (no KVM, no privileges).
 - `just ci` — `cargo fmt`, clippy, feature-powerset clippy, `cargo deny`, the global-state ban, and
   the unit suite.
-- `just test-unprivileged` — the unprivileged (unprivileged) KVM integration tier.
+- `just test-unprivileged` — the unprivileged (smoltcp NAT) KVM integration tier.
 - `just test-privileged` — the privileged KVM integration tier (run `just bless` once first; see §5).
 
 Built VM artifacts (kernel, rootfs, proxy CA) default to `target/vmcell-artifacts`, overridable via

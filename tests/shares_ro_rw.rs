@@ -15,7 +15,8 @@ vmm_matrix_test!(shares_ro_rw, |vmm| {
 
 async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
     let id = uuid::Uuid::new_v4();
-    let tmp = std::env::temp_dir().join(format!("imp-test-shares-{}-{}", std::process::id(), id));
+    let tmp =
+        std::env::temp_dir().join(format!("vmcell-test-shares-{}-{}", std::process::id(), id));
     let in_dir = tmp.join("in");
     let out_dir = tmp.join("out");
     std::fs::create_dir_all(&in_dir).unwrap();

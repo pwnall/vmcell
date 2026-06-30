@@ -122,17 +122,54 @@ pub async fn unix_api_request<T: Serialize>(
     Ok(())
 }
 
-/// Creates a temporary directory for a specific VM ID.
+/// RAII guard owning a single per-VM scratch directory under the system temp dir
+/// (`/tmp/vmcell-vm-{pid}-{vmid}/`).
 ///
-/// # Errors
-/// Returns an error if the directory cannot be created.
-pub async fn create_vm_tmp_dir(vmid: u32) -> Result<PathBuf> {
-    let tmp = std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
-    tokio::fs::create_dir_all(&tmp).await?;
-    Ok(tmp)
+/// The orchestrator creates exactly one of these per VM — before networking setup —
+/// and threads its [`path`](VmTempDir::path) to every VMM backend through
+/// [`PerVmResources::tmp_dir`]. Every per-VM temporary (the API/QMP socket, the
+/// vsock socket, the serial log, the smoltcp NAT socket, virtiofsd sockets) lives
+/// inside this one directory with a single owner, replacing the former
+/// triplicated per-backend create/own/delete.
+///
+/// On [`Drop`] the directory and everything in it is removed via
+/// [`remove_vm_tmp_dir`] (idempotent), so creating the guard early also reclaims
+/// the directory if VM construction fails partway. `MicroVm` drops this guard
+/// **after** the VMM process group, the vhost-user daemons, and the smoltcp
+/// process are gone, so removal never races a process still holding a socket
+/// inside it.
+#[derive(Debug)]
+pub struct VmTempDir {
+    /// The owned per-VM directory path.
+    path: PathBuf,
 }
 
-/// Removes a per-VM temporary directory created by [`create_vm_tmp_dir`],
+impl VmTempDir {
+    /// Creates the per-VM temporary directory `/tmp/vmcell-vm-{pid}-{vmid}/` and
+    /// returns a guard that removes it on drop.
+    ///
+    /// # Errors
+    /// Returns an error if the directory cannot be created.
+    pub async fn create(vmid: u32) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
+        tokio::fs::create_dir_all(&path).await?;
+        Ok(Self { path })
+    }
+
+    /// Returns the path to the owned per-VM directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for VmTempDir {
+    fn drop(&mut self) {
+        remove_vm_tmp_dir(&self.path);
+    }
+}
+
+/// Removes a per-VM temporary directory owned by a [`VmTempDir`] guard,
 /// including its serial log, lock files, and any leftover sockets.
 ///
 /// Without this the directory (holding `serial.log`, and `api.sock.lock` for CH)
@@ -304,6 +341,11 @@ pub struct PerVmResources {
     pub vmid: u32,
     /// Context ID for vsock communication.
     pub guest_cid: u32,
+    /// Per-VM scratch directory (owned by the orchestrator via [`VmTempDir`]).
+    /// Backends derive all of their socket and serial-log paths inside this
+    /// directory; it is created once before networking setup and removed once on
+    /// teardown.
+    pub tmp_dir: PathBuf,
 }
 
 /// Virtual Machine Monitor (VMM) capabilities.
@@ -389,11 +431,7 @@ pub trait VmInstance: Send {
     /// # Errors
     /// Returns an error if the snapshot operation fails.
     async fn snapshot(&mut self, dir: &Path) -> Result<()>;
-    /// Retrieves live statistics and resource usage for the VM.
-    ///
-    /// # Errors
-    /// Returns an error if stats cannot be collected.
-    /// Returns the path to the AF_UNIX socket for vsock communication.
+    /// Returns the path to this instance's vsock control socket.
     fn vsock_path(&self) -> &Path;
     /// Returns the unique vsock Context ID (CID) assigned to this VM.
     fn guest_cid(&self) -> u32;

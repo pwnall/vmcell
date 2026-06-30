@@ -234,19 +234,18 @@ impl Qemu {
         PathBuf,
         PathBuf,
         PathBuf,
-        PathBuf,
         Child,
         Option<Child>,
         Vec<crate::fs::VirtioFsDaemon>,
         Option<u32>,
         Option<u32>,
     )> {
-        let tmp = crate::vmm::create_vm_tmp_dir(res.vmid).await?;
-
-        let qmp_socket = tmp.join("qmp.sock");
-        let vsock_path = tmp.join("vsock.sock"); // host connects here
-        let vhost_vsock = tmp.join("vhost-vsock.sock"); // qemu connects here
-        let serial_path = tmp.join("serial.log");
+        // The orchestrator owns the per-VM scratch dir; derive our socket and
+        // serial-log paths inside it.
+        let qmp_socket = res.tmp_dir.join("qmp.sock");
+        let vsock_path = res.tmp_dir.join("vsock.sock"); // host connects here
+        let vhost_vsock = res.tmp_dir.join("vhost-vsock.sock"); // qemu connects here
+        let serial_path = res.tmp_dir.join("serial.log");
 
         let mut std_vsock_cmd = std::process::Command::new("vhost-device-vsock");
         std_vsock_cmd
@@ -295,7 +294,7 @@ impl Qemu {
 
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
-            let daemon = crate::fs::VirtioFsDaemon::start(share, &tmp).await?;
+            let daemon = crate::fs::VirtioFsDaemon::start(share, &res.tmp_dir).await?;
             fs_daemons.push(daemon);
         }
 
@@ -455,7 +454,6 @@ impl Qemu {
         let (vsock_daemon, vsock_pgid) = vsock_guard.into_inner();
 
         Ok((
-            tmp,
             qmp_socket,
             vsock_path,
             serial_path,
@@ -478,7 +476,6 @@ impl Vmm for Qemu {
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         let (
-            _tmp,
             qmp_socket,
             vsock_path,
             serial_path,
@@ -596,6 +593,9 @@ impl VmInstance for QemuInstance {
 
 impl Drop for QemuInstance {
     fn drop(&mut self) {
+        // Teardown order (AGENTS.md): VMM process group first — reaping it before
+        // touching the daemons, sockets or the per-VM directory means cleanup never
+        // races a live VMM.
         if let Some(pgid) = self.pgid {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(-(pgid as i32)),
@@ -605,6 +605,9 @@ impl Drop for QemuInstance {
                 let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
             }
         }
+        // vhost-user daemons next: the external vhost-device-vsock and each virtiofsd
+        // own sockets that live inside `tmp_dir`, so they must be reaped before that
+        // directory is removed.
         if let Some(d) = self._vsock_daemon.as_mut() {
             if let Some(v_pgid) = self.vsock_pgid {
                 let _ = nix::sys::signal::kill(
@@ -616,6 +619,12 @@ impl Drop for QemuInstance {
                 }
             }
         }
+        // Dropping each virtiofsd kills it and removes its own socket before the
+        // orchestrator removes the shared per-VM directory.
+        self._fs_daemons.clear();
+        // Unlink our own sockets. The per-VM directory itself is owned and removed
+        // once by the orchestrator's `VmTempDir` guard (after this instance and the
+        // smoltcp process are dropped), not here. Mirrors CH.
         let _ = std::fs::remove_file(&self.qmp_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
     }

@@ -66,8 +66,9 @@ impl Stage for SnapshotStage {
         .build()
         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
-        let ch_binary =
-            std::env::var("CLOUD_HYPERVISOR_PATH").unwrap_or_else(|_| "cloud-hypervisor".into());
+        // Shared resolver so this stage and the mmdebstrap builder stage read the
+        // SAME env var (VMCELL_CH_BIN) — no per-call-site CH-binary drift.
+        let ch_binary = crate::artifact::ch_binary_path();
         let vmm = CloudHypervisor::new(ch_binary);
 
         let cid_alloc = self.cid_alloc.clone();

@@ -1,6 +1,6 @@
 # Benchmark Results
 
-Performance results for the `imp-testing` framework: hot-path overheads (micro-benchmarks) and
+Performance results for the `vmcell` framework: hot-path overheads (micro-benchmarks) and
 KVM lifecycle/density/size metrics (macro-benchmarks). Per design §13.7 these are **tracked metrics,
 not pass/fail gates** — absolute numbers are hardware-bound and only meaningful with their substrate.
 
@@ -10,7 +10,7 @@ not pass/fail gates** — absolute numbers are hardware-bound and only meaningfu
   4.7 GHz**. 30 GiB RAM (~13 GiB free). Root FS ext4 on NVMe; **`/tmp` is tmpfs**.
 - **Pinned tools:** Cloud Hypervisor v52.0.0, Firecracker v1.16.0, QEMU 10.2.1, virtiofsd 1.13.3,
   mmdebstrap 1.5.7; **guest kernel Linux 6.12.94** (the committed pin, distro-aligned with Trixie);
-  rootfs base `debian@…` (trixie). Built from scratch via `imp-testing build` under gcc 15.2.0.
+  rootfs base `debian@…` (trixie). Built from scratch via `vmcell build` under gcc 15.2.0.
 - **mm:** THP `madvise`, **KSM on**. Macro runs go through the capability runner under
   `systemd-run --user --scope`, and are **CPU-frequency-pinned** (`performance` + turbo off →
   numbers sit at the **sustained 2.2 GHz base**, representative of dense/all-core operation).
@@ -57,7 +57,7 @@ N=20, warmup=3, mem=256 MiB. Cold = warm-cache (see caveats). All ms.
 ## Macro — Kernel-version sweep (6.6.143 vs 6.12.94)
 
 Direct, **interleaved** comparison (same harness/session, freq-pinned, N=20) built with the
-multi-kernel pipeline (`imp-testing build-kernels`; `bench-vm --kernel <label>`). One shared rootfs.
+multi-kernel pipeline (`vmcell build-kernels`; `bench-vm --kernel <label>`). One shared rootfs.
 
 | Metric | 6.6.143 | 6.12.94 | Δ |
 | --- | --- | --- | --- |
