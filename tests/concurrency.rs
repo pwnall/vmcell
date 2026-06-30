@@ -1,6 +1,6 @@
-use imp_testing::TestVm;
-use imp_testing::config::{RootfsSource, VmConfig};
-use imp_testing::vmm::VmInstance;
+use vmcell::MicroVm;
+use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::vmm::VmInstance;
 
 mod common;
 
@@ -8,7 +8,7 @@ vmm_matrix_test!(concurrency, |vmm| {
     test_concurrency_impl(&vmm).await;
 });
 
-async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_concurrency_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
 
@@ -17,17 +17,17 @@ async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .build()
         .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
 
     let mut vms = Vec::new();
     for _ in 0..2 {
-        let vm = TestVm::start(
+        let vm = MicroVm::start(
             vmm,
             cfg.clone(),
             cid_alloc.clone(),
             vmid_alloc.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs),
+            Box::new(vmcell::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to start VM");
@@ -48,7 +48,7 @@ async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         let agent = match vm
             .agent(
                 Some(std::time::Duration::from_secs(180)),
-                &imp_testing::orchestrator::RealClock,
+                &vmcell::orchestrator::RealClock,
             )
             .await
         {
@@ -61,9 +61,7 @@ async fn test_concurrency_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             }
         };
         let outcome = match agent
-            .exec(imp_testing::agent::ExecRequest::new(vec![
-                "true".to_string(),
-            ]))
+            .exec(vmcell::agent::ExecRequest::new(vec!["true".to_string()]))
             .await
         {
             Ok(o) => o,

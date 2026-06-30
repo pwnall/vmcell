@@ -1,4 +1,4 @@
-//! Error types and result alias for the imp-testing framework.
+//! Error types and result alias for the vmcell framework.
 
 #![forbid(unsafe_code)]
 
@@ -104,7 +104,7 @@ pub enum Error {
     },
 }
 
-/// A specialized Result type for imp-testing.
+/// A specialized Result type for vmcell.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

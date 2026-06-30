@@ -33,7 +33,7 @@ pub struct VmConfig {
     /// Mark guest memory `MADV_MERGEABLE` so host KSM can deduplicate identical
     /// guest pages (CH `mergeable=on`). KSM only merges private-anonymous pages,
     /// so enabling this also disables memory sharing (`shared=off`), making it
-    /// incompatible with vhost-user paths (rootless net, virtio-fs). A
+    /// incompatible with vhost-user paths (unprivileged net, virtio-fs). A
     /// density-vs-CPU trade measured in §13.5.
     pub ksm_mergeable: bool,
 }
@@ -86,10 +86,17 @@ pub struct Share {
     pub access: Access,
     /// Caching policy for the shared directory.
     pub cache: CachePolicy,
+    /// In-guest mount point for this share. Defaults to `/<tag>`; override with
+    /// [`Share::with_guest_path`] to decouple the mount path from the virtio-fs
+    /// tag. Must be absolute and free of `:`/whitespace (it is encoded on the
+    /// kernel command line, §5.2); [`VmConfigBuilder::build`] rejects violations.
+    pub guest_path: PathBuf,
 }
 
 impl Share {
-    /// Creates a new `Share` configuration.
+    /// Creates a new `Share` configuration mounted at `/<tag>` in the guest.
+    ///
+    /// Use [`Share::with_guest_path`] to mount it somewhere other than `/<tag>`.
     #[must_use]
     pub fn new(
         tag: impl Into<String>,
@@ -97,12 +104,56 @@ impl Share {
         access: Access,
         cache: CachePolicy,
     ) -> Self {
+        let tag = tag.into();
+        let guest_path = PathBuf::from(format!("/{tag}"));
         Self {
-            tag: tag.into(),
+            tag,
             host_path: host_path.into(),
             access,
             cache,
+            guest_path,
         }
+    }
+
+    /// Overrides the in-guest mount point for this share (default `/<tag>`).
+    ///
+    /// Lets a caller mount a share at an arbitrary absolute path — e.g. tag
+    /// `data` mounted at `/srv/data` — decoupling the mount point from the
+    /// virtio-fs tag for more generic workloads. The path must be absolute and
+    /// contain neither `:` nor whitespace (it is encoded on the kernel command
+    /// line, §5.2); [`VmConfigBuilder::build`] enforces this.
+    #[must_use]
+    pub fn with_guest_path(mut self, guest_path: impl Into<PathBuf>) -> Self {
+        self.guest_path = guest_path.into();
+        self
+    }
+}
+
+/// Appends the guest boot-time mount plan for `shares` to a kernel `cmdline`.
+///
+/// The guest agent (PID 1) has no host-side view of [`VmConfig`], so the shares
+/// it must mount — their tag, mount point, and access mode — travel on the kernel
+/// command line as one `vmcell_share=<tag>:<guest_path>:<ro|rw>` token per share
+/// (§5.2: tags and mount points are caller-defined, not built into the runner).
+/// The agent reads `/proc/cmdline`, mounts each `tag` at its `guest_path` over
+/// virtiofs (default `/<tag>`), and uses a read-only mount for `ro` shares. Tags
+/// and guest paths are validated by [`VmConfigBuilder::build`] to be encodable
+/// (no `:` or whitespace), so this token is unambiguous. No shares ⇒ nothing
+/// appended.
+pub(crate) fn push_share_args(cmdline: &mut String, shares: &[Share]) {
+    for share in shares {
+        let access = match share.access {
+            Access::ReadOnly => "ro",
+            Access::ReadWrite => "rw",
+        };
+        // `build()` validated guest_path as absolute, valid UTF-8, and free of
+        // ':'/whitespace, so the lossy conversion is exact here.
+        cmdline.push_str(&format!(
+            " vmcell_share={}:{}:{}",
+            share.tag,
+            share.guest_path.to_string_lossy(),
+            access
+        ));
     }
 }
 
@@ -139,8 +190,8 @@ pub enum NetConfig {
         /// Optional port for host services accessible from the guest.
         host_services_port: Option<u16>,
     },
-    /// Rootless mode using passt or userspace networking.
-    Rootless {
+    /// Unprivileged mode using passt or userspace networking.
+    Unprivileged {
         /// Egress proxy configuration.
         egress: Egress,
         /// Optional port for host services accessible from the guest.
@@ -357,7 +408,7 @@ impl VmConfigBuilder {
     ///   host-IP math;
     /// - a share with an empty mount tag, or two shares sharing a mount tag;
     /// - `snapshotting` combined with any vhost-user device — a virtio-fs
-    ///   rootfs, any virtio-fs data share, or rootless (vhost-user-net)
+    ///   rootfs, any virtio-fs data share, or unprivileged (vhost-user-net)
     ///   networking — which violates the §3.3 snapshot-eligibility law;
     /// - `ksm_mergeable` combined with any vhost-user device (it sets CH
     ///   `shared=off`, mutually exclusive with the vhost-user paths — §13.5).
@@ -367,7 +418,7 @@ impl VmConfigBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// use imp_testing::config::{VmConfig, RootfsSource};
+    /// use vmcell::config::{VmConfig, RootfsSource};
     /// let cfg = VmConfig::builder("/path/to/kernel", RootfsSource::Erofs { image: "/path/to/rootfs".into() })
     ///     .vcpus(4)
     ///     .mem_mib(2048)
@@ -402,12 +453,12 @@ impl VmConfigBuilder {
                     "virtio-fs data shares cannot be combined with snapshotting".into(),
                 ));
             }
-            // Snapshot-eligibility law (§3.3), third boundary case: the rootless
+            // Snapshot-eligibility law (§3.3), third boundary case: the unprivileged
             // network path is an in-process vhost-user-net device, so it is
             // mutually exclusive with snapshotting just like virtiofsd above.
-            if matches!(self.net, NetConfig::Rootless { .. }) {
+            if matches!(self.net, NetConfig::Unprivileged { .. }) {
                 return Err(crate::error::Error::Config(
-                    "rootless (vhost-user-net) networking cannot be combined with snapshotting"
+                    "unprivileged (vhost-user-net) networking cannot be combined with snapshotting"
                         .into(),
                 ));
             }
@@ -431,9 +482,9 @@ impl VmConfigBuilder {
                         .into(),
                 ));
             }
-            if matches!(self.net, NetConfig::Rootless { .. }) {
+            if matches!(self.net, NetConfig::Unprivileged { .. }) {
                 return Err(crate::error::Error::Config(
-                    "ksm_mergeable cannot be combined with rootless (vhost-user-net) networking"
+                    "ksm_mergeable cannot be combined with unprivileged (vhost-user-net) networking"
                         .into(),
                 ));
             }
@@ -449,16 +500,51 @@ impl VmConfigBuilder {
         }
 
         let mut tags = std::collections::HashSet::new();
+        let mut guest_paths = std::collections::HashSet::new();
         for share in &self.shares {
             if share.tag.is_empty() {
                 return Err(crate::error::Error::Config(
                     "share tag cannot be empty".into(),
                 ));
             }
+            // The mount plan reaches the guest agent as
+            // `vmcell_share=<tag>:<guest_path>:<ro|rw>` kernel-cmdline tokens (§5.2),
+            // parsed by splitting on whitespace and then on ':'. A `:` or whitespace
+            // in the tag or the guest path would corrupt that encoding and silently
+            // mis-mount (or drop) the share, so reject it at the boundary rather than
+            // discover it as a missing mount in-guest.
+            if share.tag.contains(':') || share.tag.chars().any(char::is_whitespace) {
+                return Err(crate::error::Error::Config(format!(
+                    "share tag {:?} may not contain ':' or whitespace (it is encoded on the kernel cmdline)",
+                    share.tag
+                )));
+            }
             if !tags.insert(share.tag.clone()) {
                 return Err(crate::error::Error::Config(format!(
                     "duplicate share tag: {}",
                     share.tag
+                )));
+            }
+            let guest_path = share.guest_path.to_str().ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "share guest_path for tag {:?} must be valid UTF-8 (it is encoded on the kernel cmdline)",
+                    share.tag
+                ))
+            })?;
+            if !share.guest_path.is_absolute() {
+                return Err(crate::error::Error::Config(format!(
+                    "share guest_path {guest_path:?} (tag {:?}) must be an absolute path",
+                    share.tag
+                )));
+            }
+            if guest_path.contains(':') || guest_path.chars().any(char::is_whitespace) {
+                return Err(crate::error::Error::Config(format!(
+                    "share guest_path {guest_path:?} may not contain ':' or whitespace (it is encoded on the kernel cmdline)"
+                )));
+            }
+            if !guest_paths.insert(guest_path.to_string()) {
+                return Err(crate::error::Error::Config(format!(
+                    "duplicate share guest_path: {guest_path}"
                 )));
             }
         }
@@ -732,19 +818,167 @@ mod tests {
         assert!(err.to_string().contains("duplicate share tag: dup"));
     }
 
-    // M-RESTORE-3: the §3.3 snapshot-eligibility law's third boundary case.
-    // Buggy impl: build() rejects snapshot + virtio-fs rootfs and snapshot +
-    // data share but lets the rootless vhost-user-net path through, so this VM
-    // would reach the backend and fail late attaching a vhost-user device.
+    // A tag is encoded on the kernel cmdline as `vmcell_share=<tag>:<ro|rw>`
+    // (§5.2); `:` or whitespace in a tag would corrupt that token and silently
+    // mis-mount or drop the share, so `build()` must reject it at the boundary.
+    // Buggy impl this guards: accepting any non-empty tag, then discovering the
+    // breakage as a missing mount in-guest.
     #[test]
-    fn test_reject_rootless_net_with_snapshot() {
+    fn test_reject_share_tag_with_colon_or_whitespace() {
+        for bad in ["a:b", "has space", "tab\tinside"] {
+            let err = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_share(Share::new(
+                bad,
+                "/tmp/a",
+                Access::ReadOnly,
+                CachePolicy::Auto,
+            ))
+            .build()
+            .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)),
+                "tag {bad:?} should be rejected"
+            );
+            assert!(
+                err.to_string().contains("':' or whitespace"),
+                "tag {bad:?} error should explain the cmdline-encoding constraint: {err}"
+            );
+        }
+    }
+
+    // Conversely, an ordinary caller-defined tag (with '-' and '.') builds fine —
+    // tags are caller-defined (§5.2), not restricted to the old `imp-*` set.
+    #[test]
+    fn test_accept_custom_share_tag() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_share(Share::new(
+            "my-data.in",
+            "/tmp/a",
+            Access::ReadWrite,
+            CachePolicy::Never,
+        ))
+        .build()
+        .expect("a custom tag with '-'/'.' must be accepted");
+        assert_eq!(cfg.shares[0].tag, "my-data.in");
+    }
+
+    // The host→guest mount plan encodes each share as a cmdline token with its
+    // access mode. Buggy impls this guards: dropping the access mode, emitting
+    // nothing for rw shares, or appending tokens when there are no shares.
+    #[test]
+    fn test_push_share_args_encodes_access() {
+        let shares = vec![
+            Share::new("in", "/tmp/a", Access::ReadOnly, CachePolicy::Never),
+            Share::new("out", "/tmp/b", Access::ReadWrite, CachePolicy::Never),
+        ];
+        let mut cmdline = String::from("console=ttyS0");
+        push_share_args(&mut cmdline, &shares);
+        assert_eq!(
+            cmdline,
+            "console=ttyS0 vmcell_share=in:/in:ro vmcell_share=out:/out:rw"
+        );
+
+        let mut empty = String::from("console=ttyS0");
+        push_share_args(&mut empty, &[]);
+        assert_eq!(empty, "console=ttyS0", "no shares ⇒ nothing appended");
+    }
+
+    // `guest_path` defaults to `/<tag>` and `with_guest_path` overrides it,
+    // decoupling the mount point from the tag — the token carries the chosen path.
+    // Buggy impl this guards: ignoring guest_path and always mounting at `/<tag>`.
+    #[test]
+    fn test_with_guest_path_overrides_mount_point() {
+        let default = Share::new("data", "/tmp/a", Access::ReadOnly, CachePolicy::Never);
+        assert_eq!(default.guest_path, PathBuf::from("/data"));
+
+        let custom = Share::new("data", "/tmp/a", Access::ReadOnly, CachePolicy::Never)
+            .with_guest_path("/srv/data");
+        assert_eq!(custom.guest_path, PathBuf::from("/srv/data"));
+
+        let mut cmdline = String::new();
+        push_share_args(&mut cmdline, std::slice::from_ref(&custom));
+        assert_eq!(cmdline, " vmcell_share=data:/srv/data:ro");
+    }
+
+    // A guest_path must be absolute (it is a mount point) and encodable on the
+    // cmdline. Buggy impl: accepting a relative or `:`-bearing mount point, which
+    // mis-mounts or corrupts the boot line.
+    #[test]
+    fn test_reject_bad_guest_path() {
+        let cases: [(&str, &str); 2] = [
+            ("relative/dir", "absolute path"),
+            ("/has:colon", "':' or whitespace"),
+        ];
+        for (bad, needle) in cases {
+            let err = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_share(
+                Share::new("data", "/tmp/a", Access::ReadOnly, CachePolicy::Never)
+                    .with_guest_path(bad),
+            )
+            .build()
+            .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)) && err.to_string().contains(needle),
+                "guest_path {bad:?} should be rejected mentioning {needle:?}: {err}"
+            );
+        }
+    }
+
+    // Two distinct tags mounting the same guest path collide; build() rejects it.
+    #[test]
+    fn test_reject_duplicate_guest_path() {
         let err = VmConfig::builder(
             PathBuf::from("/vmlinux"),
             RootfsSource::Erofs {
                 image: PathBuf::from("/rootfs.erofs"),
             },
         )
-        .net(NetConfig::Rootless {
+        .with_share(
+            Share::new("a", "/tmp/a", Access::ReadOnly, CachePolicy::Never)
+                .with_guest_path("/mnt/shared"),
+        )
+        .with_share(
+            Share::new("b", "/tmp/b", Access::ReadOnly, CachePolicy::Never)
+                .with_guest_path("/mnt/shared"),
+        )
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string()
+                .contains("duplicate share guest_path: /mnt/shared"),
+            "{err}"
+        );
+    }
+
+    // M-RESTORE-3: the §3.3 snapshot-eligibility law's third boundary case.
+    // Buggy impl: build() rejects snapshot + virtio-fs rootfs and snapshot +
+    // data share but lets the unprivileged vhost-user-net path through, so this VM
+    // would reach the backend and fail late attaching a vhost-user device.
+    #[test]
+    fn test_reject_unprivileged_net_with_snapshot() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(NetConfig::Unprivileged {
             egress: Egress::Open,
             host_services_port: None,
         })
@@ -754,7 +988,7 @@ mod tests {
         assert!(matches!(err, crate::error::Error::Config(_)));
         assert!(
             err.to_string().contains(
-                "rootless (vhost-user-net) networking cannot be combined with snapshotting"
+                "unprivileged (vhost-user-net) networking cannot be combined with snapshotting"
             ),
             "unexpected error: {err}"
         );
@@ -832,17 +1066,17 @@ mod tests {
         );
     }
 
-    // M-CONFIG-1: ksm_mergeable is mutually exclusive with rootless
+    // M-CONFIG-1: ksm_mergeable is mutually exclusive with unprivileged
     // vhost-user-net networking.
     #[test]
-    fn test_reject_ksm_mergeable_with_rootless_net() {
+    fn test_reject_ksm_mergeable_with_unprivileged_net() {
         let err = VmConfig::builder(
             PathBuf::from("/vmlinux"),
             RootfsSource::Erofs {
                 image: PathBuf::from("/rootfs.erofs"),
             },
         )
-        .net(NetConfig::Rootless {
+        .net(NetConfig::Unprivileged {
             egress: Egress::Open,
             host_services_port: None,
         })
@@ -852,7 +1086,7 @@ mod tests {
         assert!(matches!(err, crate::error::Error::Config(_)));
         assert!(
             err.to_string()
-                .contains("ksm_mergeable cannot be combined with rootless"),
+                .contains("ksm_mergeable cannot be combined with unprivileged"),
             "unexpected error: {err}"
         );
     }

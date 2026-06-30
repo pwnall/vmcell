@@ -2,7 +2,7 @@
 # Preflight gate for a *privileged-aware* code review (Review 37+).
 #
 # A privileged-aware review runs the host-facing integration suites
-# (`just test-priv` / `just test-rootless`) so findings on the VMM lifecycle,
+# (`just test-privileged` / `just test-unprivileged`) so findings on the VMM lifecycle,
 # snapshot/restore, cgroup limits, netns/tap, and the egress proxy are
 # *empirically validated* rather than static-only. Those suites need: a usable
 # /dev/kvm, the capability runner blessed with +ep (NOT +p — a +p blessing
@@ -18,21 +18,21 @@
 # complete.
 #
 # Usage: scripts/review-preflight-priv.sh
-# Honors: IMP_ARTIFACTS_DIR, IMP_KERNEL, IMP_ROOTFS (same resolution as the lib).
+# Honors: VMCELL_ARTIFACTS_DIR, VMCELL_KERNEL, VMCELL_ROOTFS (same resolution as the lib).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 
-RUNNER_DEBUG="target/debug/imp-test-runner"
-RUNNER_RELEASE="target/release/imp-test-runner"
-ART_DIR="${IMP_ARTIFACTS_DIR:-target/imp-artifacts}"
-KERNEL="${IMP_KERNEL:-$ART_DIR/vmlinux}"
-ROOTFS="${IMP_ROOTFS:-$ART_DIR/rootfs.erofs}"
+RUNNER_DEBUG="target/debug/vmcell-test-runner"
+RUNNER_RELEASE="target/release/vmcell-test-runner"
+ART_DIR="${VMCELL_ARTIFACTS_DIR:-target/vmcell-artifacts}"
+KERNEL="${VMCELL_KERNEL:-$ART_DIR/vmlinux}"
+ROOTFS="${VMCELL_ROOTFS:-$ART_DIR/rootfs.erofs}"
 NEEDED_CAPS=(cap_net_admin cap_sys_admin cap_dac_override)
 
 problems=()
 note() { printf '  %s\n' "$1"; }
 
-echo "== imp-testing privileged-review preflight =="
+echo "== vmcell privileged-review preflight =="
 
 # 1) KVM ---------------------------------------------------------------------
 if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
@@ -64,7 +64,7 @@ check_runner() {
     problems+=("Capability runner $path lacks cap_net_admin,cap_sys_admin,cap_dac_override with the effective bit (+ep). Caps strip on every rebuild. Run \`just bless\`. (A +p-only blessing is NOT enough — the runner checks the EFFECTIVE set.)")
   fi
 }
-check_runner "$RUNNER_DEBUG"     # the one `just test-priv` uses
+check_runner "$RUNNER_DEBUG"     # the one `just test-privileged` uses
 
 # 3) Artifacts built ---------------------------------------------------------
 art_ok=1
@@ -74,14 +74,14 @@ if [ "$art_ok" = 1 ]; then
   note "artifacts  : OK (kernel=$KERNEL, rootfs=$ROOTFS)"
 else
   note "artifacts  : MISSING (kernel=$KERNEL exists=$([ -s "$KERNEL" ] && echo y || echo n); rootfs=$ROOTFS exists=$([ -s "$ROOTFS" ] && echo y || echo n))"
-  problems+=("VM artifacts missing. Build them: \`cargo run --bin imp-testing -- build\` (writes to $ART_DIR), or point IMP_KERNEL/IMP_ROOTFS at existing images.")
+  problems+=("VM artifacts missing. Build them: \`cargo run --bin vmcell -- build\` (writes to $ART_DIR), or point VMCELL_KERNEL/VMCELL_ROOTFS at existing images.")
 fi
 
 # 4) Delegatable cgroup-v2 domain scope -------------------------------------
 if command -v systemd-run >/dev/null 2>&1; then
   root_ctl="$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true)"
   if echo "$root_ctl" | grep -qw memory && echo "$root_ctl" | grep -qw cpu; then
-    note "cgroup     : OK (systemd-run present; root delegates [$root_ctl]) — run suites under: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-priv"
+    note "cgroup     : OK (systemd-run present; root delegates [$root_ctl]) — run suites under: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-privileged"
   else
     note "cgroup     : WARN (root subtree_control=[$root_ctl]) — memory/cpu may not delegate; metrics_limits limit assertions could be unrunnable"
     problems+=("Root cgroup does not delegate memory+cpu; the metrics_limits limit/OOM assertions need a delegated domain scope. Run the suites under \`systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh ...\`.")

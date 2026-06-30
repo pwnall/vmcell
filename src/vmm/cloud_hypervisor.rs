@@ -49,24 +49,28 @@ pub struct ChInstance {
     snapshot_restore_capable: bool,
     cid: u32,
     pgid: Option<u32>,
-    // True if a vhost-user-net device is attached (rootless NAT). Such a VM is
+    // True if a vhost-user-net device is attached (unprivileged NAT). Such a VM is
     // not snapshot-eligible.
     vhost_user_net: bool,
 }
 
 /// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
-/// because it has a vhost-user device attached (virtio-fs share, rootless net, or
+/// because it has a vhost-user device attached (virtio-fs share, unprivileged net, or
 /// vhost-user-net). The snapshot-eligibility law requires rejecting such a VM on
 /// the `snapshot()`/`restore()` paths instead of attaching/keeping virtiofsd.
-fn has_vhost_user_device(virtio_fs_share: bool, rootless_net: bool, vhost_user_net: bool) -> bool {
-    virtio_fs_share || rootless_net || vhost_user_net
+fn has_vhost_user_device(
+    virtio_fs_share: bool,
+    unprivileged_net: bool,
+    vhost_user_net: bool,
+) -> bool {
+    virtio_fs_share || unprivileged_net || vhost_user_net
 }
 
 /// Returns `true` when `cfg`/`res` describe a VM that carries a vhost-user device
 /// and is therefore **not** snapshot-eligible (§3.3 snapshot-eligibility law).
 /// This covers all three §3.3 cases at the `restore()` boundary: a virtio-fs
 /// *rootfs* **or** a virtio-fs data share (both served by virtiofsd), the
-/// rootless `vhost-user-net` NAT, and an external `vhost-user-net` socket.
+/// unprivileged `vhost-user-net` NAT, and an external `vhost-user-net` socket.
 ///
 /// The virtio-fs *rootfs* case (`RootfsSource::VirtioFs`) is the one CH
 /// `restore()` previously missed (M-RESTORE-3): it guarded data shares but not a
@@ -76,7 +80,7 @@ fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
         || matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. });
     has_vhost_user_device(
         virtio_fs,
-        matches!(cfg.net, crate::config::NetConfig::Rootless { .. }),
+        matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }),
         res.vhost_user_socket.is_some(),
     )
 }
@@ -347,7 +351,7 @@ impl Vmm for CloudHypervisor {
                 kernel: cfg.kernel.clone(),
                 cmdline: {
                     let mut s = format!(
-                        "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/imp-guest-agent imp_vmid={}",
+                        "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
                         match &cfg.rootfs {
                             crate::config::RootfsSource::Erofs { .. } => "erofs",
                             _ => "ext4",
@@ -368,6 +372,7 @@ impl Vmm for CloudHypervisor {
                     if cfg.nested_virt {
                         s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
                     }
+                    crate::config::push_share_args(&mut s, &cfg.shares);
                     s
                 },
             },
@@ -443,7 +448,7 @@ impl Vmm for CloudHypervisor {
             });
         }
         // C1 / snapshot-eligibility law: a snapshot-eligible VM has no vhost-user
-        // device. Reject a virtio-fs *rootfs* or data share, rootless net, or an
+        // device. Reject a virtio-fs *rootfs* or data share, unprivileged net, or an
         // external vhost-user-net *before* we would otherwise start virtiofsd
         // below. (M-RESTORE-3: the virtio-fs rootfs case was previously missed.)
         if config_has_vhost_user_device(cfg, res) {
@@ -647,14 +652,14 @@ mod tests {
         );
     }
 
-    // Guards C1/VMM-1: any vhost-user device (virtio-fs share, rootless net, or
+    // Guards C1/VMM-1: any vhost-user device (virtio-fs share, unprivileged net, or
     // vhost-user-net) makes a VM ineligible for snapshot/restore. The buggy impl
     // (no guard) would attach virtiofsd to a restored VM and snapshot a vhost-user
     // VM; this predicate backs both the `restore()` and `snapshot()` self-guards.
     #[test]
     fn vhost_user_device_guard() {
         assert!(has_vhost_user_device(true, false, false)); // virtio-fs data share
-        assert!(has_vhost_user_device(false, true, false)); // rootless net
+        assert!(has_vhost_user_device(false, true, false)); // unprivileged net
         assert!(has_vhost_user_device(false, false, true)); // external vhost-user-net
         // tap (privileged) net + erofs/block rootfs: snapshot-eligible.
         assert!(!has_vhost_user_device(false, false, false));
@@ -694,20 +699,20 @@ mod tests {
             "virtio-fs rootfs must be rejected as a vhost-user device"
         );
 
-        // rootless net is a vhost-user-net device.
-        let rootless = VmConfig::builder(
+        // unprivileged net is a vhost-user-net device.
+        let unprivileged = VmConfig::builder(
             "/k",
             RootfsSource::Erofs {
                 image: PathBuf::from("/i"),
             },
         )
-        .net(NetConfig::Rootless {
+        .net(NetConfig::Unprivileged {
             egress: Egress::default(),
             host_services_port: None,
         })
         .build()
-        .expect("build rootless config");
-        assert!(config_has_vhost_user_device(&rootless, &res_with(None)));
+        .expect("build unprivileged config");
+        assert!(config_has_vhost_user_device(&unprivileged, &res_with(None)));
 
         // external vhost-user-net socket attached via resources.
         let plain = VmConfig::builder(

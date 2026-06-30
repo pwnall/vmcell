@@ -7,7 +7,7 @@ use crate::agent::protocol::ExecRequest;
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::config::{RootfsSource, VmConfig};
 use crate::error::Result;
-use crate::orchestrator::TestVm;
+use crate::orchestrator::MicroVm;
 use crate::vmm::VmInstance;
 use crate::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::Path;
@@ -72,7 +72,7 @@ impl Stage for SnapshotStage {
 
         let cid_alloc = self.cid_alloc.clone();
         let vmid_alloc = self.vmid_alloc.clone();
-        let mut vm = TestVm::start(
+        let mut vm = MicroVm::start(
             &vmm,
             cfg,
             cid_alloc.clone(),

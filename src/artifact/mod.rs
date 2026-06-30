@@ -10,7 +10,7 @@ use crate::error::Result;
 /// Guest agent building stage.
 pub mod guest_agent;
 #[cfg(feature = "pipeline")]
-/// Guest test-helper (`imp-guest-tools`) building stage.
+/// Guest test-helper (`vmcell-guest-tools`) building stage.
 pub mod guest_tools;
 #[cfg(feature = "pipeline")]
 /// Kernel building stage.
@@ -27,32 +27,32 @@ pub mod tar2erofs;
 
 use std::path::{Path, PathBuf};
 
-/// The VM-artifacts directory: `$IMP_ARTIFACTS_DIR` or the default `target/imp-artifacts`.
+/// The VM-artifacts directory: `$VMCELL_ARTIFACTS_DIR` or the default `target/vmcell-artifacts`.
 /// The single source of truth for where built artifacts (kernel, rootfs, CA) live.
 #[must_use]
 pub fn artifacts_dir() -> PathBuf {
-    resolve_artifacts_dir(std::env::var_os("IMP_ARTIFACTS_DIR"))
+    resolve_artifacts_dir(std::env::var_os("VMCELL_ARTIFACTS_DIR"))
 }
 
 /// Pure resolver behind [`artifacts_dir`], factored out so the default can be unit-tested
 /// without mutating (and racing on) the process environment.
 fn resolve_artifacts_dir(var: Option<std::ffi::OsString>) -> PathBuf {
     var.map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/imp-artifacts"))
+        .unwrap_or_else(|| PathBuf::from("target/vmcell-artifacts"))
 }
 
-/// The guest kernel image path: `$IMP_KERNEL`, else `<artifacts_dir>/vmlinux`.
+/// The guest kernel image path: `$VMCELL_KERNEL`, else `<artifacts_dir>/vmlinux`.
 #[must_use]
 pub fn kernel_path() -> PathBuf {
-    std::env::var_os("IMP_KERNEL")
+    std::env::var_os("VMCELL_KERNEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| artifacts_dir().join("vmlinux"))
 }
 
-/// The rootfs erofs path: `$IMP_ROOTFS`, else `<artifacts_dir>/rootfs.erofs`.
+/// The rootfs erofs path: `$VMCELL_ROOTFS`, else `<artifacts_dir>/rootfs.erofs`.
 #[must_use]
 pub fn rootfs_path() -> PathBuf {
-    std::env::var_os("IMP_ROOTFS")
+    std::env::var_os("VMCELL_ROOTFS")
         .map(PathBuf::from)
         .unwrap_or_else(|| artifacts_dir().join("rootfs.erofs"))
 }
@@ -310,8 +310,8 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Hashes the **full source closure** the `imp-guest-agent` binary compiles from:
-/// the thin binary wrapper (`src/bin/imp-guest-agent.rs`) **plus** every `*.rs`
+/// Hashes the **full source closure** the `vmcell-guest-agent` binary compiles from:
+/// the thin binary wrapper (`src/bin/vmcell-guest-agent.rs`) **plus** every `*.rs`
 /// under `src/agent/` (the real logic it links — `ReaperCoordinator`,
 /// `exit_code_from_termination`, the wire `protocol`) **plus** `Cargo.lock` (the
 /// pinned dependency versions). All paths are taken relative to `crate_root` and
@@ -329,7 +329,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 /// stop, never a silent partial or `"unknown"` hash.
 fn guest_agent_closure_hash(crate_root: &Path) -> Result<String> {
     // The bin wrapper is mandatory; its absence is the same hard stop as before.
-    let bin = crate_root.join("src/bin/imp-guest-agent.rs");
+    let bin = crate_root.join("src/bin/vmcell-guest-agent.rs");
     if !bin.is_file() {
         return Err(crate::error::Error::Artifact(format!(
             "guest-agent binary source missing at {}",
@@ -623,8 +623,8 @@ mod tests {
     fn test_resolve_artifacts_dir_default_and_override() {
         let default = resolve_artifacts_dir(None);
         assert!(
-            default.ends_with("target/imp-artifacts"),
-            "default artifacts dir must be target/imp-artifacts, got {default:?}"
+            default.ends_with("target/vmcell-artifacts"),
+            "default artifacts dir must be target/vmcell-artifacts, got {default:?}"
         );
         let overridden = resolve_artifacts_dir(Some("x/y".into()));
         assert_eq!(overridden, PathBuf::from("x/y"));
@@ -695,7 +695,7 @@ mod tests {
     // into an `"unknown"` pin (instead of failing hard) would return Ok here.
     #[test]
     fn test_guest_agent_src_hash_fails_hard_on_missing() {
-        let missing = Path::new("/nonexistent/imp/does-not-exist/imp-guest-agent.rs");
+        let missing = Path::new("/nonexistent/imp/does-not-exist/vmcell-guest-agent.rs");
         let res = guest_agent_src_hash(missing);
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
@@ -749,7 +749,7 @@ mod tests {
         let agent_dir = root.path().join("src/agent");
         std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
         std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
-        std::fs::write(bin_dir.join("imp-guest-agent.rs"), b"fn main() {}").expect("write bin");
+        std::fs::write(bin_dir.join("vmcell-guest-agent.rs"), b"fn main() {}").expect("write bin");
         std::fs::write(agent_dir.join("mod.rs"), b"pub fn reaper() {}").expect("write mod");
         std::fs::write(agent_dir.join("protocol.rs"), b"pub struct Msg;").expect("write proto");
         std::fs::write(root.path().join("Cargo.lock"), b"# lock v1").expect("write lock");

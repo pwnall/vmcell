@@ -167,14 +167,14 @@ impl QemuInstance {
 /// typed [`Error::Vmm`] instead of silently degrading to the root-only internal
 /// kernel vsock.
 ///
-/// The external daemon is QEMU's rootless control plane (§3.2). A missing or broken
+/// The external daemon is QEMU's unprivileged control plane (§3.2). A missing or broken
 /// `vhost-device-vsock` binary is a loud misconfiguration that must surface here — the
 /// old silent `.ok()` fallback only re-emerged later as an opaque agent-handshake
 /// timeout, violating the "checked before a timeout masks it" rule (M-VMM-2).
 fn require_vsock_daemon(spawn_result: std::io::Result<Child>) -> Result<Child> {
     spawn_result.map_err(|e| {
         Error::Vmm(format!(
-            "failed to spawn the external vhost-device-vsock daemon (QEMU rootless vsock control plane): {}",
+            "failed to spawn the external vhost-device-vsock daemon (QEMU unprivileged vsock control plane): {}",
             e
         ))
     })
@@ -259,7 +259,7 @@ impl Qemu {
         use std::os::unix::process::CommandExt;
         std_vsock_cmd.process_group(0);
 
-        // The external vhost-device-vsock daemon IS QEMU's rootless control plane
+        // The external vhost-device-vsock daemon IS QEMU's unprivileged control plane
         // (§3.2). A spawn failure (e.g. a missing/broken binary) fails loud and typed
         // here — it does NOT silently degrade to the root-only internal kernel vsock,
         // which would only re-emerge later as an opaque agent-handshake timeout
@@ -325,7 +325,7 @@ impl Qemu {
             .arg("-serial")
             .arg(format!("file:{}", serial_path.display()));
 
-        // QEMU's rootless control plane is always the external vhost-device-vsock
+        // QEMU's unprivileged control plane is always the external vhost-device-vsock
         // daemon (required and confirmed healthy above), so attach it unconditionally.
         // The old silent fallback to the root-only internal vhost-vsock-pci is gone
         // (M-VMM-2): it had no config selector and only served to mask a daemon
@@ -392,7 +392,7 @@ impl Qemu {
         }
 
         let mut cmdline = format!(
-            "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/imp-guest-agent imp_vmid={}",
+            "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
             match &cfg.rootfs {
                 crate::config::RootfsSource::Erofs { .. } => "erofs",
                 _ => "ext4",
@@ -413,6 +413,7 @@ impl Qemu {
         if cfg.nested_virt {
             cmdline.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
         }
+        crate::config::push_share_args(&mut cmdline, &cfg.shares);
         cmd.arg("-kernel")
             .arg(&cfg.kernel)
             .arg("-append")

@@ -13,7 +13,7 @@ use std::process::{Command, exit};
 /// would set only the permitted set and the runner would still fail the check.
 fn blessing_remediation(uid: u32, exe: &Path) -> String {
     format!(
-        "error: imp-test-runner is missing CAP_NET_ADMIN/CAP_SYS_ADMIN (uid={uid}, no file caps).\n\
+        "error: vmcell-test-runner is missing CAP_NET_ADMIN/CAP_SYS_ADMIN (uid={uid}, no file caps).\n\
          It was almost certainly rebuilt. Restore its privileges (one-time, until next rebuild):\n\n\
          sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {}\n\n\
          Then re-run the privileged suite. See §12.8.",
@@ -53,7 +53,7 @@ fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String> {
 ///
 /// Anchored on the runner's own canonicalized executable path — NOT an
 /// attacker-controllable env var — because the binary lives at
-/// `<target>/<profile>/imp-test-runner`, so the nearest ancestor directory named
+/// `<target>/<profile>/vmcell-test-runner`, so the nearest ancestor directory named
 /// `target` is the cargo target dir. Used as the confinement root for the test
 /// binary about to be exec'd.
 fn real_cargo_target_dir() -> Result<PathBuf, String> {
@@ -186,7 +186,7 @@ fn main() {
     // after the drop could not show them. Fatal errors go straight to stderr.
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("imp-test-runner: usage: imp-test-runner <test-binary> [args...]");
+        eprintln!("vmcell-test-runner: usage: vmcell-test-runner <test-binary> [args...]");
         exit(1);
     }
 
@@ -201,7 +201,7 @@ fn main() {
 
     let target = &args[1];
     if let Err(e) = ensure_under_cargo_target_dir(target) {
-        eprintln!("imp-test-runner: {e}");
+        eprintln!("vmcell-test-runner: {e}");
         exit(1);
     }
 
@@ -217,7 +217,7 @@ fn main() {
     if euid.as_raw() == 0 && uid.as_raw() != 0 {
         // prctl(PR_SET_KEEPCAPS, 1)
         if let Err(e) = capctl::prctl::set_keepcaps(true) {
-            eprintln!("imp-test-runner: failed to set keepcaps: {e}");
+            eprintln!("vmcell-test-runner: failed to set keepcaps: {e}");
             exit(1);
         }
 
@@ -235,15 +235,15 @@ fn main() {
         // exactly `groups.len()` gids from its pointer.
         unsafe {
             if libc::setresgid(gid.as_raw(), gid.as_raw(), gid.as_raw()) != 0 {
-                eprintln!("imp-test-runner: setresgid failed");
+                eprintln!("vmcell-test-runner: setresgid failed");
                 exit(1);
             }
             if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
-                eprintln!("imp-test-runner: setgroups failed");
+                eprintln!("vmcell-test-runner: setgroups failed");
                 exit(1);
             }
             if libc::setresuid(uid.as_raw(), uid.as_raw(), uid.as_raw()) != 0 {
-                eprintln!("imp-test-runner: setresuid failed");
+                eprintln!("vmcell-test-runner: setresuid failed");
                 exit(1);
             }
         }
@@ -252,7 +252,7 @@ fn main() {
     let mut caps = match CapState::get_current() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("imp-test-runner: failed to get current capabilities: {e}");
+            eprintln!("vmcell-test-runner: failed to get current capabilities: {e}");
             exit(1);
         }
     };
@@ -262,7 +262,7 @@ fn main() {
     }
 
     if let Err(e) = caps.set_current() {
-        eprintln!("imp-test-runner: failed to set inheritable capabilities: {e}");
+        eprintln!("vmcell-test-runner: failed to set inheritable capabilities: {e}");
         exit(1);
     }
 
@@ -296,7 +296,7 @@ fn main() {
     }
     if bounding_drop_failures > 0 {
         eprintln!(
-            "imp-test-runner: warning: could not drop {bounding_drop_failures} bounding-set \
+            "vmcell-test-runner: warning: could not drop {bounding_drop_failures} bounding-set \
              capabilities (PR_CAPBSET_DROP needs CAP_SETPCAP in the effective set); the bounding \
              set is wider than intended"
         );
@@ -305,7 +305,7 @@ fn main() {
     // Raise ambient last, after the bounding set is shrunk and uid is dropped.
     for &c in &need {
         if let Err(e) = capctl::ambient::raise(c) {
-            eprintln!("imp-test-runner: failed to raise ambient capability {c:?}: {e}");
+            eprintln!("vmcell-test-runner: failed to raise ambient capability {c:?}: {e}");
             exit(1);
         }
     }
@@ -314,7 +314,7 @@ fn main() {
     let mut final_caps = match CapState::get_current() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("imp-test-runner: failed to read capabilities before trim: {e}");
+            eprintln!("vmcell-test-runner: failed to read capabilities before trim: {e}");
             exit(1);
         }
     };
@@ -325,12 +325,12 @@ fn main() {
         final_caps.effective.add(c);
     }
     if let Err(e) = final_caps.set_current() {
-        eprintln!("imp-test-runner: failed to trim capabilities: {e}");
+        eprintln!("vmcell-test-runner: failed to trim capabilities: {e}");
         exit(1);
     }
 
     let err = Command::new(target).args(&args[2..]).exec();
-    eprintln!("imp-test-runner: failed to exec {target}: {err}");
+    eprintln!("vmcell-test-runner: failed to exec {target}: {err}");
     exit(1);
 }
 
@@ -344,7 +344,7 @@ mod tests {
     // `+ep` (effective + permitted).
     #[test]
     fn remediation_message_grants_effective_and_permitted() {
-        let msg = blessing_remediation(1000, Path::new("/x/target/debug/imp-test-runner"));
+        let msg = blessing_remediation(1000, Path::new("/x/target/debug/vmcell-test-runner"));
         assert!(
             msg.contains("cap_net_admin,cap_sys_admin,cap_dac_override+ep"),
             "remediation must grant the three caps with +ep: {msg}"

@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn test_fake_cgroup_fs() {
         let fs = FakeCgroupFs::new();
-        let name = "imp-vm-1";
+        let name = "vmcell-vm-1";
         let limits = ResourceLimits {
             mem_max_mib: Some(128),
             cpu_max_pct: Some(50),
@@ -590,7 +590,7 @@ mod tests {
             io_max: None,
         };
         let err = fs
-            .create_slice("imp-vm-1", &limits)
+            .create_slice("vmcell-vm-1", &limits)
             .expect_err("requested memory.max on an undelegated controller must fail loud");
         assert!(
             matches!(err, crate::error::Error::CapabilityUnavailable { .. }),
@@ -598,7 +598,7 @@ mod tests {
         );
         // A limit that could not be enforced must leave no slice behind.
         assert!(
-            !fs.has_slice("imp-vm-1"),
+            !fs.has_slice("vmcell-vm-1"),
             "no slice may be recorded when its requested limit could not be enforced"
         );
     }
@@ -614,8 +614,8 @@ mod tests {
             pids_max: None,
             io_max: None,
         };
-        fs.create_slice("imp-vm-1", &limits).unwrap();
-        assert!(fs.has_slice("imp-vm-1"));
+        fs.create_slice("vmcell-vm-1", &limits).unwrap();
+        assert!(fs.has_slice("vmcell-vm-1"));
     }
 
     // A requested limit fails loud for the specific undelegated controller (cpu),
@@ -631,7 +631,7 @@ mod tests {
             io_max: None,
         };
         let err = fs
-            .create_slice("imp-vm-1", &limits)
+            .create_slice("vmcell-vm-1", &limits)
             .expect_err("requested cpu.max on an undelegated controller must fail loud");
         assert!(matches!(
             err,

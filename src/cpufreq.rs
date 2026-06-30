@@ -15,7 +15,7 @@
 //!
 //! The governor and turbo files under `/sys/devices/system/cpu` are owned
 //! `root:root` (mode `0644`), so writing them needs `CAP_DAC_OVERRIDE` — which
-//! the privileged test runner (`imp-test-runner`) already grants alongside
+//! the privileged test runner (`vmcell-test-runner`) already grants alongside
 //! `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`; **no extra capability is required**. Run a
 //! benchmark through the runner to pin frequency. Without those rights (e.g. a
 //! plain `cargo bench`) the writes fail with `EACCES`; [`CpuFreqPin::engage`]

@@ -1,8 +1,6 @@
 //! Guest agent running as PID 1 inside the microvm.
 #![deny(missing_docs)]
 #![deny(clippy::missing_errors_doc)]
-use imp_testing::agent::protocol::{self, ExecRequest, Message};
-use imp_testing::agent::{MAX_FRAME_BYTES, ReaperCoordinator, exit_code_from_termination};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
 };
@@ -12,6 +10,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use vmcell::agent::protocol::{self, ExecRequest, Message};
+use vmcell::agent::{MAX_FRAME_BYTES, ReaperCoordinator, exit_code_from_termination};
 use vsock::{VsockAddr, VsockListener, VsockStream};
 
 /// Reaps every currently-exited child with `WNOHANG`, recording each status in
@@ -34,9 +34,53 @@ fn drain_zombies(reaper: &ReaperCoordinator) {
     }
 }
 
+/// A virtio-fs share the guest must mount, decoded from one `vmcell_share=` token.
+struct ShareMount {
+    /// virtio-fs mount tag.
+    tag: String,
+    /// Absolute in-guest mount point (the host's `Share::guest_path`, default `/<tag>`).
+    mount_point: String,
+    /// Whether to mount read-only (the host declared `ro`).
+    read_only: bool,
+}
+
+/// Parses `vmcell_share=<tag>:<guest_path>:<ro|rw>` tokens out of the kernel
+/// command line.
+///
+/// The host emits one token per configured share (`config::push_share_args`), and
+/// the guest mounts each `tag` at its `guest_path`. A token is skipped — never
+/// trusted — when it is malformed (fewer than three `:`-separated fields, an empty
+/// tag or mount point, or an access mode other than `ro`/`rw`), so a corrupt boot
+/// line cannot silently mount read-write a share the host declared read-only.
+fn parse_share_mounts(cmdline: &str) -> Vec<ShareMount> {
+    cmdline
+        .split_ascii_whitespace()
+        .filter_map(|tok| tok.strip_prefix("vmcell_share="))
+        .filter_map(|spec| {
+            let mut fields = spec.splitn(3, ':');
+            let tag = fields.next()?;
+            let mount_point = fields.next()?;
+            let access = fields.next()?;
+            if tag.is_empty() || mount_point.is_empty() {
+                return None;
+            }
+            let read_only = match access {
+                "ro" => true,
+                "rw" => false,
+                _ => return None,
+            };
+            Some(ShareMount {
+                tag: tag.to_string(),
+                mount_point: mount_point.to_string(),
+                read_only,
+            })
+        })
+        .collect()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    tracing::info!("imp-guest-agent: starting");
+    tracing::info!("vmcell-guest-agent: starting");
 
     // Mount setup
     std::fs::create_dir_all("/sys")?;
@@ -44,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("/mnt")?;
 
     if let Err(e) = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "") {
-        tracing::info!("imp-guest-agent: mount tmpfs failed: {}", e);
+        tracing::info!("vmcell-guest-agent: mount tmpfs failed: {}", e);
         return Err(e.into());
     }
     std::fs::create_dir_all("/mnt/upper")?;
@@ -58,18 +102,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MountFlags::empty(),
         "lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work",
     ) {
-        tracing::info!("imp-guest-agent: overlay failed: {}", e);
+        tracing::info!("vmcell-guest-agent: overlay failed: {}", e);
         return Err(e.into());
     }
 
     if let Err(e) = std::env::set_current_dir("/mnt/rootfs") {
-        tracing::error!("imp-guest-agent: failed to chdir to /mnt/rootfs: {}", e);
+        tracing::error!("vmcell-guest-agent: failed to chdir to /mnt/rootfs: {}", e);
         return Err(e.into());
     }
     std::fs::create_dir_all("oldroot")?;
 
     if let Err(e) = pivot_root(".", "oldroot") {
-        tracing::info!("imp-guest-agent: pivot_root failed: {}", e);
+        tracing::info!("vmcell-guest-agent: pivot_root failed: {}", e);
         return Err(e.into());
     } else {
         mount_change(
@@ -81,49 +125,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Err(e) = mount("sysfs", "/sys", "sysfs", MountFlags::empty(), "") {
-        tracing::info!("imp-guest-agent: sysfs failed: {}", e);
+        tracing::info!("vmcell-guest-agent: sysfs failed: {}", e);
         return Err(e.into());
     }
     if let Err(e) = mount("proc", "/proc", "proc", MountFlags::empty(), "") {
-        tracing::info!("imp-guest-agent: proc failed: {}", e);
+        tracing::info!("vmcell-guest-agent: proc failed: {}", e);
         return Err(e.into());
     }
     if let Err(e) = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "") {
-        tracing::info!("imp-guest-agent: devtmpfs failed: {}", e);
+        tracing::info!("vmcell-guest-agent: devtmpfs failed: {}", e);
         return Err(e.into());
     }
 
-    // Mount the test shares that are actually attached. A share is optional — a
-    // config may attach none (the benchmark / exec-only paths do), so a missing
-    // virtio-fs tag must be logged and skipped, never propagated: returning Err
-    // from PID 1's main kernel-panics the guest ("Attempted to kill init").
-    for tag_str in ["imp-in", "imp-out", "imp-bin"] {
-        let mount_point = format!("/{}", tag_str);
+    // Mount the virtio-fs shares the host configured, decoded from the kernel
+    // command line (`vmcell_share=<tag>:<guest_path>:<ro|rw>` tokens emitted by
+    // `config::push_share_args`). Tags are caller-defined, not built into the
+    // agent (§5.2): the agent honours whatever `VmConfig.shares` specified rather
+    // than a hardcoded `imp-*` list. A share is optional — a config may attach
+    // none (the benchmark / exec-only paths do), and virtiofsd may not be attached
+    // for a declared tag, so a failed mount is logged and skipped, never
+    // propagated: returning Err from PID 1's main kernel-panics the guest
+    // ("Attempted to kill init").
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    for ShareMount {
+        tag,
+        mount_point,
+        read_only,
+    } in parse_share_mounts(&cmdline)
+    {
         if let Err(e) = std::fs::create_dir_all(&mount_point) {
             tracing::warn!(
-                "imp-guest-agent: could not create mount point {}: {}; skipping share",
+                "vmcell-guest-agent: could not create mount point {}: {}; skipping share",
                 mount_point,
                 e
             );
             continue;
         }
 
-        let flags = if tag_str == "imp-in" || tag_str == "imp-bin" {
+        let flags = if read_only {
             MountFlags::RDONLY
         } else {
             MountFlags::empty()
         };
-        if let Err(e) = mount(tag_str, &mount_point as &str, "virtiofs", flags, "") {
+        if let Err(e) = mount(tag.as_str(), &mount_point as &str, "virtiofs", flags, "") {
             tracing::warn!(
-                "imp-guest-agent: optional virtiofs share {} not attached: {}; continuing",
-                tag_str,
+                "vmcell-guest-agent: optional virtiofs share {} not attached: {}; continuing",
+                tag,
                 e
             );
         } else {
             tracing::info!(
-                "imp-guest-agent: mounted virtiofs {} at {}",
-                tag_str,
-                mount_point
+                "vmcell-guest-agent: mounted virtiofs {} at {} ({})",
+                tag,
+                mount_point,
+                if read_only { "ro" } else { "rw" }
             );
         }
     }
@@ -159,20 +214,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ifr.ifr_flags |= 0x1 | 0x40; // IFF_UP | IFF_RUNNING
                 if libc::ioctl(fd.as_raw_fd(), siocsifflags, &ifr) < 0 {
                     tracing::warn!(
-                        "imp-guest-agent: loopback bring-up (SIOCSIFFLAGS) failed: {}; continuing without lo",
+                        "vmcell-guest-agent: loopback bring-up (SIOCSIFFLAGS) failed: {}; continuing without lo",
                         std::io::Error::last_os_error()
                     );
                 }
             } else {
                 tracing::warn!(
-                    "imp-guest-agent: loopback query (SIOCGIFFLAGS) failed: {}; continuing without lo",
+                    "vmcell-guest-agent: loopback query (SIOCGIFFLAGS) failed: {}; continuing without lo",
                     std::io::Error::last_os_error()
                 );
             }
         }
     } else {
         tracing::warn!(
-            "imp-guest-agent: could not open AF_INET socket for loopback bring-up; continuing without lo"
+            "vmcell-guest-agent: could not open AF_INET socket for loopback bring-up; continuing without lo"
         );
     }
 
@@ -194,10 +249,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if vsock_ok {
-        tracing::info!("imp-guest-agent: boot self-check: AF_VSOCK transport available");
+        tracing::info!("vmcell-guest-agent: boot self-check: AF_VSOCK transport available");
     } else {
         tracing::error!(
-            "imp-guest-agent: boot self-check: AF_VSOCK unavailable ({}); the vsock control plane will not come up",
+            "vmcell-guest-agent: boot self-check: AF_VSOCK unavailable ({}); the vsock control plane will not come up",
             std::io::Error::last_os_error()
         );
     }
@@ -205,10 +260,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let virtiofs_supported = std::fs::read_to_string("/proc/filesystems")
         .is_ok_and(|contents| contents.contains("virtiofs"));
     if virtiofs_supported {
-        tracing::info!("imp-guest-agent: boot self-check: virtiofs filesystem supported");
+        tracing::info!("vmcell-guest-agent: boot self-check: virtiofs filesystem supported");
     } else {
         tracing::warn!(
-            "imp-guest-agent: boot self-check: virtiofs not advertised in /proc/filesystems"
+            "vmcell-guest-agent: boot self-check: virtiofs not advertised in /proc/filesystems"
         );
     }
 
@@ -236,7 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for signal in signals.forever() {
                 drain_zombies(&reaper);
                 if signal == signal_hook::consts::SIGTERM {
-                    tracing::info!("imp-guest-agent: received SIGTERM, exiting");
+                    tracing::info!("vmcell-guest-agent: received SIGTERM, exiting");
                     break;
                 }
             }
@@ -246,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // reap on a timer instead of leaving zombies unreaped. PID 1 must
             // never exit on a recoverable condition.
             tracing::error!(
-                "imp-guest-agent: SIGCHLD registration failed: {}; falling back to a polling reaper",
+                "vmcell-guest-agent: SIGCHLD registration failed: {}; falling back to a polling reaper",
                 e
             );
             let term = Arc::new(AtomicBool::new(false));
@@ -255,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_zombies(&reaper);
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            tracing::info!("imp-guest-agent: received SIGTERM, exiting");
+            tracing::info!("vmcell-guest-agent: received SIGTERM, exiting");
         }
     }
 
@@ -279,14 +334,14 @@ fn bind_vsock_listener() -> Option<VsockListener> {
         Ok(listener) => {
             if let Err(e) = listener.set_nonblocking(true) {
                 tracing::warn!(
-                    "imp-guest-agent: vsock set_nonblocking failed: {}; cannot poll for re-bind",
+                    "vmcell-guest-agent: vsock set_nonblocking failed: {}; cannot poll for re-bind",
                     e
                 );
             }
             Some(listener)
         }
         Err(e) => {
-            tracing::error!("imp-guest-agent: failed to bind vsock: {}", e);
+            tracing::error!("vmcell-guest-agent: failed to bind vsock: {}", e);
             None
         }
     }
@@ -311,18 +366,18 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>) {
             std::thread::sleep(ACCEPT_POLL);
             continue;
         };
-        tracing::info!("imp-guest-agent: listening on vsock port {}", VSOCK_PORT);
+        tracing::info!("vmcell-guest-agent: listening on vsock port {}", VSOCK_PORT);
 
         let mut idle = std::time::Duration::ZERO;
         loop {
             match listener.accept() {
                 Ok((mut s, _)) => {
                     idle = std::time::Duration::ZERO;
-                    tracing::info!("imp-guest-agent: accepted connection");
+                    tracing::info!("vmcell-guest-agent: accepted connection");
                     let conn_reaper = Arc::clone(reaper);
                     std::thread::spawn(move || {
                         if let Err(e) = handle_connection(&mut s, &conn_reaper) {
-                            tracing::error!("imp-guest-agent: handle_connection error: {}", e);
+                            tracing::error!("vmcell-guest-agent: handle_connection error: {}", e);
                         }
                     });
                 }
@@ -335,7 +390,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>) {
                     }
                 }
                 Err(e) => {
-                    tracing::info!("imp-guest-agent: accept error: {}; re-binding", e);
+                    tracing::info!("vmcell-guest-agent: accept error: {}; re-binding", e);
                     break;
                 }
             }
@@ -435,7 +490,7 @@ fn handle_exec(
         cmd.env(k, v);
     }
 
-    // Surface the `/imp-tools` guest-helper dir (ip/curl/kvm-ok, baked into the
+    // Surface the `/vmcell-tools` guest-helper dir (ip/curl/kvm-ok, baked into the
     // rootfs) on the child's PATH, ahead of the request-provided or inherited
     // PATH. PID 1 may inherit a minimal/empty PATH, so fall back to the standard
     // system directories.
@@ -443,9 +498,9 @@ fn handle_exec(
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
     let child_path = if base_path.is_empty() {
-        "/imp-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+        "/vmcell-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
     } else {
-        format!("/imp-tools:{base_path}")
+        format!("/vmcell-tools:{base_path}")
     };
     cmd.env("PATH", child_path);
 
@@ -547,4 +602,48 @@ fn handle_exec(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards the boot mount-plan decode (`<tag>:<guest_path>:<ro|rw>`). Buggy impls
+    // this catches: ignoring the access mode (mounting a declared-`ro` share `rw` —
+    // a real isolation break), and ignoring the guest_path (always mounting at
+    // `/<tag>` instead of the host-chosen mount point).
+    #[test]
+    fn parse_share_mounts_decodes_tag_path_and_access() {
+        let cmdline = "console=ttyS0 vmcell_share=data-in:/data-in:ro vmcell_vmid=7 vmcell_share=out:/srv/out:rw";
+        let mounts = parse_share_mounts(cmdline);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].tag, "data-in");
+        assert_eq!(mounts[0].mount_point, "/data-in");
+        assert!(mounts[0].read_only, "ro share must mount read-only");
+        assert_eq!(mounts[1].tag, "out");
+        assert_eq!(
+            mounts[1].mount_point, "/srv/out",
+            "the custom guest_path must be honoured, not derived from the tag"
+        );
+        assert!(!mounts[1].read_only, "rw share must mount read-write");
+    }
+
+    // Too few fields, an unknown access mode, and an empty tag/mount point are each
+    // dropped, not mounted — a corrupt boot line must not synthesize a share.
+    #[test]
+    fn parse_share_mounts_skips_malformed_tokens() {
+        let cmdline = "vmcell_share=notag vmcell_share=t:/m:xx vmcell_share=:/m:ro \
+                       vmcell_share=t::ro vmcell_share=ok:/ok:ro";
+        let mounts = parse_share_mounts(cmdline);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].tag, "ok");
+        assert_eq!(mounts[0].mount_point, "/ok");
+        assert!(mounts[0].read_only);
+    }
+
+    #[test]
+    fn parse_share_mounts_empty_when_no_tokens() {
+        assert!(parse_share_mounts("console=ttyS0 root=/dev/vda ro").is_empty());
+        assert!(parse_share_mounts("").is_empty());
+    }
 }

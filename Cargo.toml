@@ -1,5 +1,5 @@
 [package]
-name = "imp-testing"
+name = "vmcell"
 version = "0.1.0"
 edition = "2024"
 # MSRV kept at 1.85 (deliberate — see docs/implementation-notes.md). NOTE: the committed
@@ -13,22 +13,22 @@ description = "Micro-VM-per-test integration & evaluation platform for the Imp a
 publish = false
 
 [lib]
-name = "imp_testing"
+name = "vmcell"
 path = "src/lib.rs"
 
 [[bin]]
-name = "imp-testing"
-path = "src/bin/imp-testing.rs"
+name = "vmcell"
+path = "src/bin/vmcell.rs"
 required-features = ["cli"]
 
 [[bin]]
-name = "imp-guest-agent"
-path = "src/bin/imp-guest-agent.rs"
+name = "vmcell-guest-agent"
+path = "src/bin/vmcell-guest-agent.rs"
 required-features = ["agent"]
 
 [[bin]]
-name = "imp-test-runner"
-path = "src/bin/imp-test-runner.rs"
+name = "vmcell-test-runner"
+path = "src/bin/vmcell-test-runner.rs"
 required-features = ["test-runner"]
 
 [[bin]]
@@ -39,8 +39,8 @@ required-features = ["cloud-hypervisor", "metrics", "cli"]
 # Guest test-helper (ip/curl/kvm-ok stand-ins), shipped to the guest via a
 # read-only virtio-fs share. Built for the guest target, not the lean agent.
 [[bin]]
-name = "imp-guest-tools"
-path = "src/bin/imp-guest-tools.rs"
+name = "vmcell-guest-tools"
+path = "src/bin/vmcell-guest-tools.rs"
 required-features = ["guest-tools"]
 
 [[bench]]
@@ -189,7 +189,7 @@ agent = ["dep:vsock", "dep:rustix", "dep:signal-hook", "dep:libc", "dep:tracing"
 # Dependency-thin privileged window: rustix + capctl only, plus libc for the
 # syscalls rustix does not expose here (setres{u,g}id, setgroups, getgroups,
 # getgrnam). No tracing/tracing-subscriber: this binary reports failures that
-# occur BEFORE the privilege drop, straight to stderr (see imp-test-runner.rs).
+# occur BEFORE the privilege drop, straight to stderr (see vmcell-test-runner.rs).
 test-runner = ["dep:rustix", "dep:capctl", "dep:libc"]
 # Guest test-helper binary (ip/curl/kvm-ok): a blocking HTTP client plus libc for
 # the interface ioctls behind `ip link set … address` (restore MAC rotation).

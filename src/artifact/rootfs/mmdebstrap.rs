@@ -2,7 +2,7 @@ use crate::agent::ExecRequest;
 use crate::artifact::{StageInputs, StageOutputs};
 use crate::config::{Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig};
 use crate::error::{Error, Result};
-use crate::orchestrator::{TestVm, VmidAllocator};
+use crate::orchestrator::{MicroVm, VmidAllocator};
 use crate::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::Path;
 
@@ -41,14 +41,14 @@ pub async fn build_rootfs(
     .await?;
 
     // 2. Start builder VM
-    let ch_bin = std::env::var("IMP_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
+    let ch_bin = std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string());
     let vmm = CloudHypervisor::new(ch_bin);
     // cid_alloc is passed in
     let vmid_alloc = VmidAllocator::new();
 
     let host_out_dir = tempfile::TempDir::new().map_err(Error::Io)?;
     let share = Share::new(
-        "imp-out",
+        "vmcell-out",
         host_out_dir.path().to_path_buf(),
         Access::ReadWrite,
         CachePolicy::Never,
@@ -61,14 +61,14 @@ pub async fn build_rootfs(
         },
     )
     .with_share(share)
-    .net(NetConfig::Rootless {
+    .net(NetConfig::Unprivileged {
         egress: Egress::Open,
         host_services_port: None,
     })
     .build()?;
 
     tracing::info!("Starting builder VM...");
-    let mut vm = TestVm::start(
+    let mut vm = MicroVm::start(
         &vmm,
         cfg,
         cid_alloc.clone(),
@@ -139,7 +139,7 @@ pub async fn build_rootfs(
                     "--variant=apt".to_string(),
                     "--include=curl,ca-certificates".to_string(),
                     release.to_string(),
-                    "/imp-out/rootfs.tar".to_string(),
+                    "/vmcell-out/rootfs.tar".to_string(),
                     mirror,
                 ],
                 env: vec![],

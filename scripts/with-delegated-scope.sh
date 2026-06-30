@@ -4,7 +4,7 @@
 # cgroups with enforceable limits (required by `metrics_limits`).
 #
 # Intended to be invoked under a delegated systemd scope, e.g.:
-#   systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-priv
+#   systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-privileged
 #
 # The cgroup-v2 "no internal processes" rule means a cgroup may either hold
 # processes or enable controllers for its children, not both. So we move this

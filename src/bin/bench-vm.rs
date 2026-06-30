@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 
 use std::time::Instant;
 
-use imp_testing::agent::protocol::ExecRequest;
-use imp_testing::config::{RestoreMode, RootfsSource, VmConfig};
-use imp_testing::orchestrator::{TestVm, VmidAllocator};
-use imp_testing::vmm::{CidAllocator, VmInstance, Vmm};
+use vmcell::agent::protocol::ExecRequest;
+use vmcell::config::{RestoreMode, RootfsSource, VmConfig};
+use vmcell::orchestrator::{MicroVm, VmidAllocator};
+use vmcell::vmm::{CidAllocator, VmInstance, Vmm};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,7 +56,7 @@ struct Args {
     ksm_mergeable: bool,
 
     /// Kernel-version label to benchmark — selects `vmlinux-<label>` from
-    /// `IMP_ARTIFACTS_DIR` (built by `imp-testing build-kernels`). Omit to use the
+    /// `VMCELL_ARTIFACTS_DIR` (built by `vmcell build-kernels`). Omit to use the
     /// default `vmlinux`. This is the kernel-version benchmark dimension.
     #[arg(long)]
     kernel: Option<String>,
@@ -118,7 +118,7 @@ async fn run_bench<V: Vmm>(
     println!("Starting benchmark: {}", name);
     let mut latencies = Vec::new();
 
-    let artifacts_dir = imp_testing::artifact::artifacts_dir();
+    let artifacts_dir = vmcell::artifact::artifacts_dir();
     let kernel_path = artifacts_dir.join(kernel_filename(args.kernel.as_deref()));
     let rootfs_path = artifacts_dir.join("rootfs.erofs");
 
@@ -147,12 +147,12 @@ async fn run_bench<V: Vmm>(
 
     if is_restore {
         println!("Creating baseline snapshot for restore benchmark...");
-        let mut base_vm = match TestVm::start(
+        let mut base_vm = match MicroVm::start(
             vmm,
             cfg.clone(),
             cid_allocator.clone(),
             allocator.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs),
+            Box::new(vmcell::metrics::DefaultCgroupFs),
         )
         .await
         {
@@ -162,10 +162,7 @@ async fn run_bench<V: Vmm>(
                 return;
             }
         };
-        if let Err(e) = base_vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
-            .await
-        {
+        if let Err(e) = base_vm.agent(None, &vmcell::orchestrator::RealClock).await {
             println!("Failed to connect to base VM agent: {}", e);
             let _ = base_vm.shutdown().await;
             return;
@@ -199,29 +196,29 @@ async fn run_bench<V: Vmm>(
 
         let start = Instant::now();
         let vm_res = if is_restore {
-            TestVm::restore(
+            MicroVm::restore(
                 vmm,
                 &snap_dir,
                 cfg.clone(),
                 cid_allocator.clone(),
                 allocator.clone(),
-                Box::new(imp_testing::metrics::DefaultCgroupFs),
+                Box::new(vmcell::metrics::DefaultCgroupFs),
             )
             .await
         } else {
-            TestVm::start(
+            MicroVm::start(
                 vmm,
                 cfg.clone(),
                 cid_allocator.clone(),
                 allocator.clone(),
-                Box::new(imp_testing::metrics::DefaultCgroupFs),
+                Box::new(vmcell::metrics::DefaultCgroupFs),
             )
             .await
         };
 
         match vm_res {
             Ok(mut vm) => {
-                if let Ok(_agent) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+                if let Ok(_agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
                     let elapsed = start.elapsed().as_millis();
                     if i >= args.warmup {
                         latencies.push(elapsed);
@@ -281,48 +278,47 @@ async fn main() -> anyhow::Result<()> {
     // CPU is set to the `performance` governor with turbo disabled, and the prior
     // settings are restored when this guard drops — including on panic. Held until
     // `main` returns. Degrades to a logged no-op without CAP_DAC_OVERRIDE, so run
-    // through `imp-test-runner` (or as root) to actually pin.
-    let _freq_pin = match imp_testing::cpufreq::CpuFreqPin::engage(
-        imp_testing::cpufreq::SysfsCpuFreq::system(),
-    ) {
-        Ok(pin) if pin.is_pinned() => {
-            println!(
-                "cpufreq: pinned {} CPU(s) to `performance` + turbo off (restored on exit)",
-                pin.pinned_cpus()
-            );
-            Some(pin)
-        }
-        Ok(pin) => {
-            println!(
-                "cpufreq: NOT pinned (need CAP_DAC_OVERRIDE via imp-test-runner) — \
+    // through `vmcell-test-runner` (or as root) to actually pin.
+    let _freq_pin =
+        match vmcell::cpufreq::CpuFreqPin::engage(vmcell::cpufreq::SysfsCpuFreq::system()) {
+            Ok(pin) if pin.is_pinned() => {
+                println!(
+                    "cpufreq: pinned {} CPU(s) to `performance` + turbo off (restored on exit)",
+                    pin.pinned_cpus()
+                );
+                Some(pin)
+            }
+            Ok(pin) => {
+                println!(
+                    "cpufreq: NOT pinned (need CAP_DAC_OVERRIDE via vmcell-test-runner) — \
                  latency numbers carry CPU-scaling noise"
-            );
-            Some(pin)
-        }
-        Err(e) => {
-            println!("cpufreq: pin unavailable: {e}");
-            None
-        }
-    };
+                );
+                Some(pin)
+            }
+            Err(e) => {
+                println!("cpufreq: pin unavailable: {e}");
+                None
+            }
+        };
 
     let allocator = VmidAllocator::new();
 
     match args.backend.as_str() {
         #[cfg(feature = "cloud-hypervisor")]
         "cloud-hypervisor" => {
-            let vmm = imp_testing::vmm::cloud_hypervisor::CloudHypervisor::new("cloud-hypervisor");
+            let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new("cloud-hypervisor");
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "cloud-hypervisor", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "firecracker")]
         "firecracker" => {
-            let vmm = imp_testing::vmm::firecracker::Firecracker::new("firecracker");
+            let vmm = vmcell::vmm::firecracker::Firecracker::new("firecracker");
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "firecracker", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "qemu")]
         "qemu" => {
-            let vmm = imp_testing::vmm::qemu::Qemu::new("qemu-system-x86_64");
+            let vmm = vmcell::vmm::qemu::Qemu::new("qemu-system-x86_64");
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "qemu", &args, allocator.clone()).await?;
         }
@@ -474,10 +470,10 @@ fn kernel_filename(label: Option<&str>) -> String {
     }
 }
 
-/// Resolves the (dir, kernel, rootfs) artifact paths from `IMP_ARTIFACTS_DIR`,
+/// Resolves the (dir, kernel, rootfs) artifact paths from `VMCELL_ARTIFACTS_DIR`,
 /// selecting `vmlinux-<label>` when a kernel-version label is given.
 fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
-    let dir = imp_testing::artifact::artifacts_dir()
+    let dir = vmcell::artifact::artifacts_dir()
         .to_string_lossy()
         .into_owned();
     let kernel = PathBuf::from(&dir).join(kernel_filename(kernel_label));
@@ -580,9 +576,9 @@ fn read_proc_status_kb(pid: u32, key: &str) -> Option<u64> {
 /// Finds the host VMM process for a VM by its unique per-VM tmp dir.
 ///
 /// CH/FC do not put the vsock socket path verbatim on the command line, but the
-/// `--api-socket` argument lives in the *same* unique `imp-vm-<pid>-<vmid>` dir,
+/// `--api-socket` argument lives in the *same* unique `vmcell-vm-<pid>-<vmid>` dir,
 /// which is `vsock_path`'s parent. Match that parent **with a trailing `/`** so
-/// vmid 5 does not match vmid 50/51 (`imp-vm-…-5` is a substring of `…-50`).
+/// vmid 5 does not match vmid 50/51 (`vmcell-vm-…-5` is a substring of `…-50`).
 fn find_host_pid(vsock: &Path) -> Option<u32> {
     let parent = vsock
         .parent()
@@ -634,14 +630,14 @@ fn walk_files(dir: &Path) -> Vec<(PathBuf, u64)> {
 }
 
 /// Picks a working zero-cost exec probe command, preferring `/bin/true`.
-async fn pick_exec_cmd<V: Vmm>(vm: &mut TestVm<V>) -> Vec<String> {
+async fn pick_exec_cmd<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<String> {
     let candidates = [
         vec!["/bin/true".to_string()],
         vec!["/usr/bin/true".to_string()],
         vec!["true".to_string()],
     ];
     for c in candidates {
-        if let Ok(agent) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
             if let Ok(o) = agent.exec(ExecRequest::new(c.clone())).await {
                 if o.code == 0 {
                     return c;
@@ -685,16 +681,16 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     // Boot guests one-by-one, holding them all alive in a Vec (so all N coexist),
     // and snapshot the *total* host RssAnon after each addition — this yields a
     // real marginal slope (step N minus step N-1) within a single invocation.
-    let mut vms: Vec<TestVm<V>> = Vec::new();
+    let mut vms: Vec<MicroVm<V>> = Vec::new();
     let mut step_anon: Vec<u64> = Vec::new();
     let mut step_shmem: Vec<u64> = Vec::new();
     for i in 0..count {
-        let mut vm = match TestVm::start(
+        let mut vm = match MicroVm::start(
             vmm,
             cfg.clone(),
             cid.clone(),
             allocator.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs),
+            Box::new(vmcell::metrics::DefaultCgroupFs),
         )
         .await
         {
@@ -704,7 +700,7 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
                 break;
             }
         };
-        if let Err(e) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+        if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
             println!("footprint: agent connect {i} failed: {e}");
             let _ = vm.shutdown().await;
             break;
@@ -777,7 +773,7 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
             tot_file += read_proc_status_kb(pid, "RssFile").unwrap_or(0);
             tot_shmem += read_proc_status_kb(pid, "RssShmem").unwrap_or(0);
         }
-        if let Ok(agent) = v.agent(None, &imp_testing::orchestrator::RealClock).await {
+        if let Ok(agent) = v.agent(None, &vmcell::orchestrator::RealClock).await {
             if let Ok(o) = agent
                 .exec(ExecRequest::new(vec!["cat".into(), "/proc/meminfo".into()]))
                 .await
@@ -895,12 +891,12 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         return;
     }
 
-    let mut vm = match TestVm::start(
+    let mut vm = match MicroVm::start(
         vmm,
         cfg,
         cid,
         allocator,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     {
@@ -911,7 +907,7 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
             return;
         }
     };
-    if let Err(e) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+    if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
         println!("suspend-size: agent connect failed: {e}");
         let _ = vm.shutdown().await;
         let _ = std::fs::remove_dir_all(&snap_dir);
@@ -975,16 +971,16 @@ async fn build_baseline_snapshot<V: Vmm>(
     allocator: VmidAllocator,
     snap_dir: &Path,
 ) -> Result<(), String> {
-    let mut base = TestVm::start(
+    let mut base = MicroVm::start(
         vmm,
         cfg.clone(),
         cid,
         allocator,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .map_err(|e| e.to_string())?;
-    base.agent(None, &imp_testing::orchestrator::RealClock)
+    base.agent(None, &vmcell::orchestrator::RealClock)
         .await
         .map_err(|e| e.to_string())?;
     base.instance_mut()
@@ -1035,23 +1031,23 @@ async fn phase_budget_path<V: Vmm>(
         let t0 = Instant::now();
         let vm_res = match &snap_dir {
             Some(d) => {
-                TestVm::restore(
+                MicroVm::restore(
                     vmm,
                     d,
                     cfg.clone(),
                     cid.clone(),
                     allocator.clone(),
-                    Box::new(imp_testing::metrics::DefaultCgroupFs),
+                    Box::new(vmcell::metrics::DefaultCgroupFs),
                 )
                 .await
             }
             None => {
-                TestVm::start(
+                MicroVm::start(
                     vmm,
                     cfg.clone(),
                     cid.clone(),
                     allocator.clone(),
-                    Box::new(imp_testing::metrics::DefaultCgroupFs),
+                    Box::new(vmcell::metrics::DefaultCgroupFs),
                 )
                 .await
             }
@@ -1067,7 +1063,7 @@ async fn phase_budget_path<V: Vmm>(
 
         let t1 = Instant::now();
         let connect_ok = vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
+            .agent(None, &vmcell::orchestrator::RealClock)
             .await
             .is_ok();
         let t_connect = t1.elapsed();
@@ -1085,7 +1081,7 @@ async fn phase_budget_path<V: Vmm>(
             .unwrap_or_else(|| vec!["cat".into(), "/proc/uptime".into()]);
 
         let t2 = Instant::now();
-        if let Ok(agent) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
             let _ = agent.exec(ExecRequest::new(argv)).await;
         }
         let t_exec = t2.elapsed();
@@ -1185,12 +1181,12 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     let cid = std::sync::Arc::new(CidAllocator::new());
     let iters = args.iters();
 
-    let mut vm = match TestVm::start(
+    let mut vm = match MicroVm::start(
         vmm,
         cfg,
         cid,
         allocator,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     {
@@ -1200,7 +1196,7 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
             return;
         }
     };
-    if let Err(e) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+    if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
         println!("vsock-rtt: agent connect failed: {e}");
         let _ = vm.shutdown().await;
         return;
@@ -1208,14 +1204,14 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     let argv = pick_exec_cmd(&mut vm).await;
 
     for _ in 0..args.warmup {
-        if let Ok(agent) = vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
             let _ = agent.exec(ExecRequest::new(argv.clone())).await;
         }
     }
 
     let mut rtts = Vec::with_capacity(iters);
     for _ in 0..iters {
-        let agent = match vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+        let agent = match vm.agent(None, &vmcell::orchestrator::RealClock).await {
             Ok(a) => a,
             Err(_) => break,
         };

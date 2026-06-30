@@ -4,10 +4,10 @@ use async_trait::async_trait;
 use std::path::Path;
 
 /// A pipeline stage that builds the guest **test-helper** binary
-/// (`imp-guest-tools`: the `ip`/`curl`/`kvm-ok` stand-ins), which is then baked
+/// (`vmcell-guest-tools`: the `ip`/`curl`/`kvm-ok` stand-ins), which is then baked
 /// into the rootfs by [`crate::artifact::rootfs`].
 ///
-/// Baking (rather than a virtio-fs share) is what lets the rootless egress test
+/// Baking (rather than a virtio-fs share) is what lets the unprivileged egress test
 /// use the tools: virtiofsd cannot enter its `--sandbox namespace` without
 /// privileges, so a share would fail unprivileged, whereas the erofs rootfs is
 /// served over virtio-blk in both modes.
@@ -33,7 +33,7 @@ impl Stage for GuestToolsStage {
         // (via the rootfs stage's content hash of this artifact), re-bakes the
         // rootfs. Self-contained (the helper does not depend on the lib crate).
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        let src = std::path::Path::new(&manifest_dir).join("src/bin/imp-guest-tools.rs");
+        let src = std::path::Path::new(&manifest_dir).join("src/bin/vmcell-guest-tools.rs");
         if let Ok(content) = std::fs::read(&src) {
             hasher.update(&content);
         }
@@ -52,20 +52,22 @@ impl Stage for GuestToolsStage {
             .arg("--target")
             .arg("x86_64-unknown-linux-gnu")
             .arg("--bin")
-            .arg("imp-guest-tools")
+            .arg("vmcell-guest-tools")
             .arg("--features")
             .arg("guest-tools")
             .status()
             .await?;
         if !build_status.success() {
-            return Err(Error::Subprocess("Failed to build imp-guest-tools".into()));
+            return Err(Error::Subprocess(
+                "Failed to build vmcell-guest-tools".into(),
+            ));
         }
 
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .unwrap_or_else(|_| format!("{}/target", manifest_dir));
         let tools_path = std::path::PathBuf::from(target_dir)
-            .join("x86_64-unknown-linux-gnu/release/imp-guest-tools");
+            .join("x86_64-unknown-linux-gnu/release/vmcell-guest-tools");
 
         tokio::fs::copy(tools_path, out).await.map_err(Error::Io)?;
 

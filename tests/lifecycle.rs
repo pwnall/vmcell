@@ -1,9 +1,9 @@
-use imp_testing::TestVm;
-use imp_testing::config::{RootfsSource, VmConfig};
-use imp_testing::vmm::VmInstance;
-use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use vmcell::MicroVm;
+use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::vmm::VmInstance;
+use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
 
 mod common;
 
@@ -31,32 +31,29 @@ impl RecordingCgroupFs {
     }
 }
 
-impl imp_testing::metrics::CgroupFs for RecordingCgroupFs {
+impl vmcell::metrics::CgroupFs for RecordingCgroupFs {
     fn create_slice(
         &self,
         name: &str,
-        _limits: &imp_testing::config::ResourceLimits,
-    ) -> imp_testing::error::Result<()> {
+        _limits: &vmcell::config::ResourceLimits,
+    ) -> vmcell::error::Result<()> {
         self.log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(format!("cgroup_create:{}", name));
         Ok(())
     }
-    fn delete_slice(&self, name: &str) -> imp_testing::error::Result<()> {
+    fn delete_slice(&self, name: &str) -> vmcell::error::Result<()> {
         self.log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(format!("cgroup_delete:{}", name));
         Ok(())
     }
-    fn read_stats(
-        &self,
-        _name: &str,
-    ) -> imp_testing::error::Result<imp_testing::metrics::ResourceUsage> {
-        Ok(imp_testing::metrics::ResourceUsage::default())
+    fn read_stats(&self, _name: &str) -> vmcell::error::Result<vmcell::metrics::ResourceUsage> {
+        Ok(vmcell::metrics::ResourceUsage::default())
     }
-    fn add_task(&self, _name: &str, _pid: u32) -> imp_testing::error::Result<()> {
+    fn add_task(&self, _name: &str, _pid: u32) -> vmcell::error::Result<()> {
         Ok(())
     }
 }
@@ -72,7 +69,7 @@ async fn test_lifecycle_force_kill_ch() {
 #[tokio::test]
 #[ignore = "needs KVM"]
 async fn test_lifecycle_force_kill_fc() {
-    let vmm = imp_testing::vmm::firecracker::Firecracker::new(common::fc_bin());
+    let vmm = vmcell::vmm::firecracker::Firecracker::new(common::fc_bin());
     test_lifecycle_force_kill_impl(&vmm).await;
 }
 
@@ -80,11 +77,11 @@ async fn test_lifecycle_force_kill_fc() {
 #[tokio::test]
 #[ignore = "needs KVM"]
 async fn test_lifecycle_force_kill_qemu() {
-    let vmm = imp_testing::vmm::qemu::Qemu::new(common::qemu_bin());
+    let vmm = vmcell::vmm::qemu::Qemu::new(common::qemu_bin());
     test_lifecycle_force_kill_impl(&vmm).await;
 }
 
-async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_lifecycle_force_kill_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
 
@@ -93,14 +90,14 @@ async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .build()
         .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
@@ -114,7 +111,7 @@ async fn test_lifecycle_force_kill_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 // non-KVM; uses a hermetic recording cgroup seam (no real /sys/fs/cgroup writes).
 #[tokio::test]
 async fn test_lifecycle_fake_vmm() {
-    use imp_testing::vmm::FakeVmm;
+    use vmcell::vmm::FakeVmm;
     let fake = FakeVmm::default();
 
     let cfg = VmConfig::builder(
@@ -127,11 +124,11 @@ async fn test_lifecycle_fake_vmm() {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
 
     // --- cycle 1: cold start ---
-    let vm = TestVm::start(
+    let vm = MicroVm::start(
         &fake,
         cfg.clone(),
         cid_alloc.clone(),
@@ -189,7 +186,7 @@ async fn test_lifecycle_fake_vmm() {
     vmid_alloc.release(vmid1);
 
     // --- cycle 2: restore, reusing the shared allocators ---
-    let mut restore_vm = TestVm::restore(
+    let mut restore_vm = MicroVm::restore(
         &fake,
         std::path::Path::new("/fake/snap"),
         cfg.clone(),
@@ -223,11 +220,11 @@ async fn test_lifecycle_fake_vmm() {
     let agent_res = restore_vm
         .agent(
             Some(std::time::Duration::from_secs(1)),
-            &imp_testing::orchestrator::RealClock,
+            &vmcell::orchestrator::RealClock,
         )
         .await;
     assert!(
-        matches!(&agent_res, Err(imp_testing::Error::Timeout(_))),
+        matches!(&agent_res, Err(vmcell::Error::Timeout(_))),
         "agent() over an unreachable fake vsock must time out (is_err={})",
         agent_res.is_err()
     );
@@ -252,9 +249,9 @@ async fn test_lifecycle_panic_residue_ch() {
         );
     }
 
-    // Reap orphaned imp-net-* namespaces from prior aborted runs (no sudo; the
+    // Reap orphaned vmcell-net-* namespaces from prior aborted runs (no sudo; the
     // capability runner has CAP_SYS_ADMIN + CAP_DAC_OVERRIDE).
-    common::clean_imp_netns();
+    common::clean_vmcell_netns();
 
     let vmm = CloudHypervisor::new(common::ch_bin());
     let vmlinux = common::get_vmlinux();
@@ -263,21 +260,21 @@ async fn test_lifecycle_panic_residue_ch() {
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .build()
         .unwrap();
-    cfg.net = imp_testing::config::NetConfig::Privileged {
-        egress: imp_testing::config::Egress::Open,
+    cfg.net = vmcell::config::NetConfig::Privileged {
+        egress: vmcell::config::Egress::Open,
         host_services_port: None,
     };
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
 
     let (vmid, guest_cid, vsock_path) = {
-        let vm = TestVm::start(
+        let vm = MicroVm::start(
             &vmm,
             cfg,
             cid_alloc.clone(),
             vmid_alloc.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs),
+            Box::new(vmcell::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to start VM");
@@ -299,7 +296,7 @@ async fn test_lifecycle_panic_residue_ch() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // 1. Cgroup slice: target the ACTUAL computed name. A leak under the real
-    //    (nested) path made the old `imp-vm-{vmid}` check pass trivially.
+    //    (nested) path made the old `vmcell-vm-{vmid}` check pass trivially.
     let cg_path = format!("/sys/fs/cgroup/{}", common::computed_cgroup_name(vmid));
     assert!(
         !std::path::Path::new(&cg_path).exists(),
@@ -308,7 +305,7 @@ async fn test_lifecycle_panic_residue_ch() {
     );
 
     // 2. Named netns removed (its tap dies with it).
-    let netns_path = format!("/var/run/netns/imp-net-{}", vmid);
+    let netns_path = format!("/var/run/netns/vmcell-net-{}", vmid);
     assert!(
         !std::path::Path::new(&netns_path).exists(),
         "netns leaked at {}",
@@ -330,12 +327,13 @@ async fn test_lifecycle_panic_residue_ch() {
         vsock_path.display()
     );
 
-    // 4b. E3: the per-VM `/tmp/imp-vm-{pid}-{vmid}` DIRECTORY itself (holding
+    // 4b. E3: the per-VM `/tmp/vmcell-vm-{pid}-{vmid}` DIRECTORY itself (holding
     //     serial.log, and api.sock.lock for CH) must also be removed on teardown —
     //     not just the vsock socket inside it. The leak fix landed in vmm/mod.rs
     //     (remove_vm_tmp_dir); without it `/tmp` grows one dir per VM, unbounded.
     //     The pid/vmid naming mirrors `vmm::create_vm_tmp_dir`.
-    let per_vm_dir = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), vmid));
+    let per_vm_dir =
+        std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
     assert!(
         !per_vm_dir.exists(),
         "per-VM temp dir leaked at {}",
@@ -392,7 +390,7 @@ fn assert_instance_before_cgroup(log: &[String]) {
 // cleanup.
 #[tokio::test]
 async fn test_lifecycle_fake_vmm_drop_order_normal() {
-    use imp_testing::vmm::FakeVmm;
+    use vmcell::vmm::FakeVmm;
     let fake = FakeVmm::default();
     let log = fake.calls.clone();
 
@@ -406,11 +404,11 @@ async fn test_lifecycle_fake_vmm_drop_order_normal() {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
 
     {
-        let _vm = TestVm::start(
+        let _vm = MicroVm::start(
             &fake,
             cfg,
             cid_alloc.clone(),
@@ -434,7 +432,7 @@ async fn test_lifecycle_fake_vmm_drop_order_normal() {
 // during a PANIC unwind.
 #[tokio::test]
 async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
-    use imp_testing::vmm::FakeVmm;
+    use vmcell::vmm::FakeVmm;
     let fake = FakeVmm::default();
     let log = fake.calls.clone();
 
@@ -448,12 +446,12 @@ async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
     let cgroup_log = log.clone();
 
     let _ = tokio::spawn(async move {
-        let _vm = TestVm::start(
+        let _vm = MicroVm::start(
             &fake,
             cfg,
             cid_alloc.clone(),
@@ -475,21 +473,21 @@ async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
     assert_instance_before_cgroup(&calls);
 }
 
-// ROOTLESS NAMING: a KVM-but-unprivileged smoke test of the rootless smoltcp NAT
-// path (NetConfig::Rootless / vhost-user-net). Its NAME carries `rootless` and
-// `smoltcp` so `just test-rootless` (filter `test(rootless) | test(smoltcp)`)
+// UNPRIVILEGED NAMING: a KVM-but-unprivileged smoke test of the unprivileged smoltcp NAT
+// path (NetConfig::Unprivileged / vhost-user-net). Its NAME carries `unprivileged` and
+// `smoltcp` so `just test-unprivileged` (filter `test(unprivileged) | test(smoltcp)`)
 // selects it. #[ignore]'d for the default suite (needs KVM); runs WITHOUT
 // privilege on a KVM host.
 #[cfg(feature = "net-unprivileged")]
 #[tokio::test]
-#[ignore = "needs KVM (rootless smoltcp NAT); selected by `just test-rootless`"]
-async fn test_lifecycle_rootless_smoltcp() {
+#[ignore = "needs KVM (unprivileged smoltcp NAT); selected by `just test-unprivileged`"]
+async fn test_lifecycle_unprivileged_smoltcp() {
     let vmm = CloudHypervisor::new(common::ch_bin());
-    let caps = imp_testing::vmm::Vmm::capabilities(&vmm);
+    let caps = vmcell::vmm::Vmm::capabilities(&vmm);
     if !caps.unprivileged_vhost_user_net {
         panic!(
-            "SKIP: backend `{}` lacks unprivileged vhost-user-net (rootless smoltcp) support",
-            imp_testing::vmm::Vmm::id(&vmm)
+            "SKIP: backend `{}` lacks unprivileged vhost-user-net (unprivileged smoltcp) support",
+            vmcell::vmm::Vmm::id(&vmm)
         );
     }
 
@@ -499,31 +497,31 @@ async fn test_lifecycle_rootless_smoltcp() {
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .build()
         .unwrap();
-    cfg.net = imp_testing::config::NetConfig::Rootless {
-        egress: imp_testing::config::Egress::Open,
+    cfg.net = vmcell::config::NetConfig::Unprivileged {
+        egress: vmcell::config::Egress::Open,
         host_services_port: None,
     };
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         &vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
-    .expect("Failed to start rootless VM");
+    .expect("Failed to start unprivileged VM");
 
     let vmid = vm.vmid();
-    // The rootless NAT exposes its vhost-user socket at this path.
+    // The unprivileged NAT exposes its vhost-user socket at this path.
     let sock_path = format!("/tmp/imp-smoltcp-{}.sock", vmid);
 
     let agent = match vm
         .agent(
             Some(std::time::Duration::from_secs(120)),
-            &imp_testing::orchestrator::RealClock,
+            &vmcell::orchestrator::RealClock,
         )
         .await
     {
@@ -531,7 +529,7 @@ async fn test_lifecycle_rootless_smoltcp() {
         Err(e) => {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
             panic!(
-                "Failed to connect to agent over rootless networking: {}\nSERIAL LOG:\n{}",
+                "Failed to connect to agent over unprivileged networking: {}\nSERIAL LOG:\n{}",
                 e, log
             );
         }
@@ -540,7 +538,7 @@ async fn test_lifecycle_rootless_smoltcp() {
     // eth0 is configured by the kernel ip= cmdline (zero-netlink PID 1); the
     // smoltcp NAT carries its traffic. Confirm the interface came up.
     let operstate = agent
-        .exec(imp_testing::ExecRequest::new(vec![
+        .exec(vmcell::ExecRequest::new(vec![
             "cat".into(),
             "/sys/class/net/eth0/operstate".into(),
         ]))
@@ -557,26 +555,28 @@ async fn test_lifecycle_rootless_smoltcp() {
         .to_string();
     assert!(
         state == "up" || state == "unknown",
-        "eth0 should be up over the rootless NAT, got operstate {:?}",
+        "eth0 should be up over the unprivileged NAT, got operstate {:?}",
         state
     );
 
     let outcome = agent
-        .exec(imp_testing::ExecRequest::new(vec!["true".into()]))
+        .exec(vmcell::ExecRequest::new(vec!["true".into()]))
         .await
         .expect("exec failed");
     assert_eq!(
         outcome.code, 0,
-        "guest exec over the rootless vsock should succeed"
+        "guest exec over the unprivileged vsock should succeed"
     );
 
-    vm.shutdown().await.expect("Failed to shutdown rootless VM");
+    vm.shutdown()
+        .await
+        .expect("Failed to shutdown unprivileged VM");
 
-    // Rootless teardown drops the SmoltcpProcess, whose vhost Listener unlinks the
+    // Unprivileged teardown drops the SmoltcpProcess, whose vhost Listener unlinks the
     // NAT socket on drop. A leak here means teardown skipped the smoltcp process.
     assert!(
         !std::path::Path::new(&sock_path).exists(),
-        "rootless smoltcp NAT socket {} must be cleaned up after shutdown",
+        "unprivileged smoltcp NAT socket {} must be cleaned up after shutdown",
         sock_path
     );
 }

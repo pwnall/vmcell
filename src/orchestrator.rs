@@ -77,14 +77,14 @@ impl VmidAllocator {
     }
 
     /// Creates a VMID allocator that additionally enforces cross-process
-    /// uniqueness via lock files under `/tmp/imp-vmid`. Crashed-owner
+    /// uniqueness via lock files under `/tmp/vmcell-vmid`. Crashed-owner
     /// reservations are reclaimed by an owner-liveness check (`/proc/<pid>`), so
     /// a crash does not erode capacity permanently.
     #[must_use]
     pub fn shared() -> Self {
         Self {
             active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            lock_dir: Some(std::path::PathBuf::from("/tmp/imp-vmid")),
+            lock_dir: Some(std::path::PathBuf::from("/tmp/vmcell-vmid")),
         }
     }
 
@@ -213,7 +213,7 @@ impl Drop for VmidGuard {
 /// Represents a fully managed test VM, including its associated resources and VMM instance.
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct TestVm<V: Vmm> {
+pub struct MicroVm<V: Vmm> {
     /// The internal unique ID assigned to this VM.
     vmid: Option<VmidGuard>,
     /// The underlying VMM instance running the VM.
@@ -234,7 +234,7 @@ pub struct TestVm<V: Vmm> {
     /// Whether the VM was restored from a snapshot.
     restored: bool,
     /// Whether the one-shot post-restore CSPRNG reseed actually applied (exit 0)
-    /// on the first post-restore [`TestVm::agent`] call. `None` until that resync
+    /// on the first post-restore [`MicroVm::agent`] call. `None` until that resync
     /// runs; `Some(false)` when the best-effort reseed could not be applied (e.g.
     /// `/dev/hwrng` missing). Lets a restore test assert the reseed was applied
     /// rather than inferring it from two `/dev/urandom` reads differing.
@@ -248,7 +248,7 @@ pub struct TestVm<V: Vmm> {
 /// Created in `setup_env` immediately after the slice is created so that any
 /// later failure during VM construction (CID allocation, `create`, `boot`,
 /// `restore`, `resume`) releases the slice — mirroring `CidGuard`/`VmidGuard`.
-/// On success it is disarmed and `TestVm::Drop` takes over deletion (preserving
+/// On success it is disarmed and `MicroVm::Drop` takes over deletion (preserving
 /// the documented teardown order).
 #[derive(Debug)]
 struct CgroupGuard {
@@ -421,7 +421,7 @@ async fn maybe_resync_after_restore<E: GuestExec>(
     Ok(())
 }
 
-impl<V: Vmm> TestVm<V> {
+impl<V: Vmm> MicroVm<V> {
     /// Gets the internal unique ID assigned to this VM.
     ///
     /// # Panics
@@ -506,7 +506,7 @@ impl<V: Vmm> TestVm<V> {
                         // tracked as follow-up — see implementation-notes.md.
                         let px = EgressProxy::start_transparent(crate::proxy::ProxyConfig {
                             port: 0,
-                            netns: Some(format!("imp-net-{}", vmid)),
+                            netns: Some(format!("vmcell-net-{}", vmid)),
                             doubles: proxy_cfg.doubles.clone(),
                             blocked_domains: proxy_cfg.blocked_domains.clone(),
                         })
@@ -518,7 +518,7 @@ impl<V: Vmm> TestVm<V> {
 
                 netns = Some(ns);
             }
-            crate::config::NetConfig::Rootless {
+            crate::config::NetConfig::Unprivileged {
                 egress,
                 host_services_port,
             } => {
@@ -567,7 +567,7 @@ impl<V: Vmm> TestVm<V> {
             crate::config::NetConfig::None => {}
         }
 
-        let mut cgroup_name = format!("imp-vm-{}", vmid);
+        let mut cgroup_name = format!("vmcell-vm-{}", vmid);
         if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
             if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
                 let mut base = path.trim_start_matches('/');
@@ -575,7 +575,7 @@ impl<V: Vmm> TestVm<V> {
                     base = base.trim_end_matches("/supervisor");
                 }
                 if !base.is_empty() {
-                    cgroup_name = format!("{}/imp-vm-{}", base, vmid);
+                    cgroup_name = format!("{}/vmcell-vm-{}", base, vmid);
                 }
             }
         }
@@ -625,16 +625,16 @@ impl<V: Vmm> TestVm<V> {
     /// ```rust
     /// # use std::sync::Arc;
     /// # use std::path::PathBuf;
-    /// # use imp_testing::orchestrator::{TestVm, VmidAllocator};
-    /// # use imp_testing::config::{VmConfig, RootfsSource};
-    /// # use imp_testing::vmm::CidAllocator;
-    /// # use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
+    /// # use vmcell::orchestrator::{MicroVm, VmidAllocator};
+    /// # use vmcell::config::{VmConfig, RootfsSource};
+    /// # use vmcell::vmm::CidAllocator;
+    /// # use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
     /// # async fn run() {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::VirtioFs { dir: PathBuf::from("/rootfs") }).build().unwrap();
     /// let cid_alloc = std::sync::Arc::new(CidAllocator::new());
     /// let vmid_alloc = VmidAllocator::new();
-    /// let vm = TestVm::start(&vmm, cfg, cid_alloc.clone(), vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
+    /// let vm = MicroVm::start(&vmm, cfg, cid_alloc.clone(), vmid_alloc, Box::new(vmcell::metrics::DefaultCgroupFs::default())).await.unwrap();
     /// # }
     /// ```
     pub async fn start(
@@ -662,7 +662,7 @@ impl<V: Vmm> TestVm<V> {
         info!("Booting instance...");
         instance.boot().await?;
         info!("Instance booted.");
-        // Success: ownership of the slice transfers to the returned TestVm,
+        // Success: ownership of the slice transfers to the returned MicroVm,
         // whose Drop deletes it in the documented teardown order.
         env.cgroup_guard.disarm();
         Ok(Self {
@@ -690,17 +690,17 @@ impl<V: Vmm> TestVm<V> {
     /// ```rust
     /// # use std::sync::Arc;
     /// # use std::path::PathBuf;
-    /// # use imp_testing::orchestrator::{TestVm, VmidAllocator};
-    /// # use imp_testing::config::{VmConfig, RootfsSource};
-    /// # use imp_testing::vmm::CidAllocator;
-    /// # use imp_testing::vmm::cloud_hypervisor::CloudHypervisor;
+    /// # use vmcell::orchestrator::{MicroVm, VmidAllocator};
+    /// # use vmcell::config::{VmConfig, RootfsSource};
+    /// # use vmcell::vmm::CidAllocator;
+    /// # use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
     /// # async fn run() {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
     /// let cid_alloc = std::sync::Arc::new(CidAllocator::new());
     /// let vmid_alloc = VmidAllocator::new();
     /// let snap_dir = PathBuf::from("/tmp/snap");
-    /// let vm = TestVm::restore(&vmm, &snap_dir, cfg, cid_alloc.clone(), vmid_alloc, Box::new(imp_testing::metrics::DefaultCgroupFs::default())).await.unwrap();
+    /// let vm = MicroVm::restore(&vmm, &snap_dir, cfg, cid_alloc.clone(), vmid_alloc, Box::new(vmcell::metrics::DefaultCgroupFs::default())).await.unwrap();
     /// # }
     /// ```
     pub async fn restore(
@@ -717,9 +717,9 @@ impl<V: Vmm> TestVm<V> {
             ));
         }
 
-        if matches!(cfg.net, crate::config::NetConfig::Rootless { .. }) {
+        if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
             return Err(crate::error::Error::Config(
-                "rootless networking cannot be used with snapshot restore".into(),
+                "unprivileged networking cannot be used with snapshot restore".into(),
             ));
         }
 
@@ -821,7 +821,7 @@ impl<V: Vmm> TestVm<V> {
             // already IS the post-restore connection. CH re-creates the vhost-vsock
             // device on `--restore`, so the guest's pre-snapshot listener goes deaf;
             // the guest agent re-binds its listener on idle (see `serve_vsock` in
-            // imp-guest-agent), and `AgentClient::connect` retries with backoff
+            // vmcell-guest-agent), and `AgentClient::connect` retries with backoff
             // until that fresh listener accepts. A second, overlapping connect would
             // be redundant.
             let vmid = self.vmid.as_ref().expect("vmid missing").vmid;
@@ -842,7 +842,7 @@ impl<V: Vmm> TestVm<V> {
     }
 
     /// Whether the one-shot post-restore CSPRNG reseed actually applied (exit 0)
-    /// on the first post-restore [`TestVm::agent`] call.
+    /// on the first post-restore [`MicroVm::agent`] call.
     ///
     /// `None` before that resync has run; `Some(true)` when the reseed
     /// (`head -c 32 /dev/hwrng > /dev/urandom`) succeeded; `Some(false)` when the
@@ -900,7 +900,7 @@ impl<V: Vmm> TestVm<V> {
     }
 }
 
-impl<V: Vmm> Drop for TestVm<V> {
+impl<V: Vmm> Drop for MicroVm<V> {
     fn drop(&mut self) {
         // Enforce teardown order: VMM instance -> virtiofsd -> netns/cgroup/overlay/sockets
         drop(self.instance.take());
@@ -951,7 +951,7 @@ mod tests {
         }
     }
 
-    // CONFIG-ERROR-ORCH-6. Buggy impl: a process-global `/tmp/imp-vmid-*.lock`
+    // CONFIG-ERROR-ORCH-6. Buggy impl: a process-global `/tmp/vmcell-vmid-*.lock`
     // namespace couples two in-process allocators, so exhausting one (or a
     // leaked lock from a crashed run) would make the other fail to allocate.
     #[test]
@@ -1094,7 +1094,7 @@ mod tests {
         let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
         let vmid_alloc = VmidAllocator::new();
         let recorder = RecordingCgroupFs::default();
-        let res = TestVm::<CreateFailVmm>::start(
+        let res = MicroVm::<CreateFailVmm>::start(
             &vmm,
             cfg,
             cid_alloc,
@@ -1124,7 +1124,7 @@ mod tests {
         cfg.vmid = Some(7);
         let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
         let vmid_alloc = VmidAllocator::new();
-        let vm = TestVm::start(
+        let vm = MicroVm::start(
             &vmm,
             cfg,
             cid_alloc,
@@ -1147,7 +1147,7 @@ mod tests {
         let vmid_alloc = VmidAllocator::new();
         // Someone already holds VMID 7 on this shared allocator.
         vmid_alloc.reserve(7).expect("pre-reservation");
-        let res = TestVm::start(
+        let res = MicroVm::start(
             &vmm,
             cfg,
             cid_alloc,
@@ -1162,7 +1162,7 @@ mod tests {
     }
 
     // C1 / CONFIG-ERROR-ORCH-1. Buggy impl: restore() only guards a virtio-fs
-    // rootfs and rootless net, letting a virtio-fs data Share (a vhost-user
+    // rootfs and unprivileged net, letting a virtio-fs data Share (a vhost-user
     // device) through onto the snapshot path.
     #[tokio::test]
     async fn test_restore_rejects_data_shares() {
@@ -1185,7 +1185,7 @@ mod tests {
         .expect("valid config");
         let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
         let vmid_alloc = VmidAllocator::new();
-        let res = TestVm::restore(
+        let res = MicroVm::restore(
             &vmm,
             std::path::Path::new("/fake/snap"),
             cfg,
@@ -1367,9 +1367,9 @@ mod tests {
         }
     }
 
-    async fn start_with_cgroup(fs: EnforcementCgroupFs) -> TestVm<crate::vmm::FakeVmm> {
+    async fn start_with_cgroup(fs: EnforcementCgroupFs) -> MicroVm<crate::vmm::FakeVmm> {
         let vmm = crate::vmm::FakeVmm::default();
-        TestVm::start(
+        MicroVm::start(
             &vmm,
             erofs_cfg(),
             std::sync::Arc::new(crate::vmm::CidAllocator::new()),
@@ -1412,7 +1412,7 @@ mod tests {
     // forced true (or omitting the field's honest default) goes red.
     #[tokio::test]
     async fn test_usage_without_cgroup_reports_unenforced() {
-        let vm: TestVm<crate::vmm::FakeVmm> = TestVm {
+        let vm: MicroVm<crate::vmm::FakeVmm> = MicroVm {
             vmid: None,
             instance: None,
             netns: None,

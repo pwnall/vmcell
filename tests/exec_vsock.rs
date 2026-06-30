@@ -1,9 +1,9 @@
 use futures::{SinkExt, StreamExt};
-use imp_testing::agent::AgentClient;
-use imp_testing::agent::protocol::{ExecRequest, Message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use vmcell::agent::AgentClient;
+use vmcell::agent::protocol::{ExecRequest, Message};
 
 #[tokio::test]
 async fn test_exec_vsock_mock() {
@@ -66,7 +66,7 @@ async fn test_exec_vsock_mock() {
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
-        &imp_testing::vmm::RealSerialLog {
+        &vmcell::vmm::RealSerialLog {
             path: std::path::PathBuf::from("/dev/null"),
         },
     )
@@ -115,8 +115,8 @@ async fn accept_with_ready(
     framed
 }
 
-fn serial_log() -> imp_testing::vmm::RealSerialLog {
-    imp_testing::vmm::RealSerialLog {
+fn serial_log() -> vmcell::vmm::RealSerialLog {
+    vmcell::vmm::RealSerialLog {
         path: std::path::PathBuf::from("/dev/null"),
     }
 }
@@ -239,7 +239,7 @@ async fn host_codec_accepts_frame_above_default_8mib() {
     let vsock_path = tmp.clone();
 
     let server = tokio::spawn(async move {
-        let mut framed = accept_with_ready(listener, imp_testing::agent::MAX_FRAME_BYTES).await;
+        let mut framed = accept_with_ready(listener, vmcell::agent::MAX_FRAME_BYTES).await;
         let _ = framed.next().await.unwrap().unwrap(); // Exec
         framed
             .send(
@@ -282,9 +282,9 @@ vmm_matrix_test!(put_file, |vmm| {
     let kernel = common::get_vmlinux();
     let rootfs_image = common::get_rootfs();
 
-    let cfg = imp_testing::config::VmConfig::builder(
+    let cfg = vmcell::config::VmConfig::builder(
         kernel,
-        imp_testing::config::RootfsSource::Erofs {
+        vmcell::config::RootfsSource::Erofs {
             image: rootfs_image,
         },
     )
@@ -292,20 +292,20 @@ vmm_matrix_test!(put_file, |vmm| {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = imp_testing::TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = vmcell::MicroVm::start(
         &vmm,
         cfg,
         cid_alloc,
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
 
     let agent = vm
-        .agent(None, &imp_testing::orchestrator::RealClock)
+        .agent(None, &vmcell::orchestrator::RealClock)
         .await
         .expect("Failed to connect to agent");
 

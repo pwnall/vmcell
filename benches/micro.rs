@@ -1,10 +1,10 @@
 use criterion::{Criterion, black_box, criterion_group};
-use imp_testing::agent::protocol::{ExecRequest, Message};
-use imp_testing::artifact::{Stage, StageInputs, kernel::KernelStage};
 use std::net::Ipv4Addr;
+use vmcell::agent::protocol::{ExecRequest, Message};
+use vmcell::artifact::{Stage, StageInputs, kernel::KernelStage};
 
 #[cfg(feature = "am-fs-erofs")]
-use imp_testing::artifact::tar2erofs::tar_to_erofs;
+use vmcell::artifact::tar2erofs::tar_to_erofs;
 
 fn bench_protocol_codec(c: &mut Criterion) {
     let msg = Message::Exec(
@@ -31,7 +31,7 @@ fn bench_protocol_codec(c: &mut Criterion) {
 
 fn bench_cache_key(c: &mut Criterion) {
     let stage = KernelStage {
-        http_client: std::sync::Arc::new(imp_testing::artifact::kernel::ReqwestClient),
+        http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
         label: None,
     };
     let mut inputs = StageInputs::default();
@@ -100,10 +100,9 @@ criterion_group!(
 // under the same CPU-frequency pin as the macro harness (design §13.2). The guard
 // pins every online CPU to `performance` (turbo off) for the run and restores the
 // prior settings on drop. It is a logged no-op without CAP_DAC_OVERRIDE, so to
-// actually pin run `cargo bench` through `imp-test-runner` or as root.
+// actually pin run `cargo bench` through `vmcell-test-runner` or as root.
 fn main() {
-    let _freq_pin =
-        imp_testing::cpufreq::CpuFreqPin::engage(imp_testing::cpufreq::SysfsCpuFreq::system());
+    let _freq_pin = vmcell::cpufreq::CpuFreqPin::engage(vmcell::cpufreq::SysfsCpuFreq::system());
     benches();
     Criterion::default().configure_from_args().final_summary();
 }

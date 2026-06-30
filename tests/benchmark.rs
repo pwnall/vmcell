@@ -14,7 +14,7 @@ mod common;
 fn test_benchmark_ch_dry() {
     let empty = tempfile::tempdir().unwrap();
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
-    cmd.env("IMP_ARTIFACTS_DIR", empty.path())
+    cmd.env("VMCELL_ARTIFACTS_DIR", empty.path())
         .arg("--backend")
         .arg("cloud-hypervisor")
         .arg("--iterations")

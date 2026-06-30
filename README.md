@@ -1,4 +1,4 @@
-# Imp Testing
+# vmcell
 
 An end-to-end integration-testing and evaluation platform for the Imp agentic harness.
 Each test runs in a fresh micro-VM for structural isolation, hermetic state, and production fidelity.
@@ -37,12 +37,12 @@ What these are for:
 
 `cloud-hypervisor` (the primary VMM) and `virtiofsd` (the virtio-fs daemon) are installed via Cargo
 so they build as optimized release binaries spawned by the orchestration layer. `vhost-device-vsock`
-backs the rootless vsock control plane on the QEMU backend.
+backs the unprivileged vsock control plane on the QEMU backend.
 
 ```sh
 cargo install --git https://github.com/cloud-hypervisor/cloud-hypervisor.git cloud-hypervisor
 cargo install virtiofsd --locked
-cargo install vhost-device-vsock --locked   # only needed for the QEMU rootless-vsock path
+cargo install vhost-device-vsock --locked   # only needed for the QEMU unprivileged-vsock path
 ```
 
 Ensure that `~/.cargo/bin` is in your `$PATH` so the test suite can discover these executables.
@@ -78,22 +78,22 @@ To run privileged networking tests (like those requiring TAP interfaces or trans
 without running the entire `cargo test` suite as `root`, we use a lightweight capability-granting
 runner.
 
-Build the `imp-test-runner` for both `debug` and `release` configurations, then grant it the
+Build the `vmcell-test-runner` for both `debug` and `release` configurations, then grant it the
 necessary capabilities:
 
 ```sh
 # Build the runner
-cargo build --bin imp-test-runner --features test-runner
-cargo build --release --bin imp-test-runner --features test-runner
+cargo build --bin vmcell-test-runner --features test-runner
+cargo build --release --bin vmcell-test-runner --features test-runner
 
 # Bless the binaries with network and system admin capabilities
-sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep target/debug/imp-test-runner
-sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep target/release/imp-test-runner
+sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep target/debug/vmcell-test-runner
+sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep target/release/vmcell-test-runner
 ```
 
 `just bless` (§6) runs exactly these steps for you.
 
-*Note: You must re-run the `setcap` commands (or `just bless`) anytime the `imp-test-runner` binary is
+*Note: You must re-run the `setcap` commands (or `just bless`) anytime the `vmcell-test-runner` binary is
 recompiled, as rebuilding strips file capabilities.*
 
 To use the runner during local development, either execute your test binaries through it directly or
@@ -102,7 +102,7 @@ configure your cargo test runner (e.g., in `.cargo/config.toml`) to use it for t
 ### 6. Developer command runner (`just`) and CI tooling
 
 The lint, test, and dependency gates are driven by [`just`](https://github.com/casey/just) recipes
-(`just ci`, `just test-unit`, `just test-rootless`, `just test-priv`, `just bless`). Install `just`
+(`just ci`, `just test-unit`, `just test-unprivileged`, `just test-privileged`, `just bless`). Install `just`
 plus the Cargo subcommands those recipes call. All of these are **binary `cargo` subcommands**, not
 library dependencies, so they are installed with `cargo install` rather than added to `Cargo.toml`:
 
@@ -122,18 +122,18 @@ Common recipes:
 - `just test-unit` — fast unit, codec, and property tests (no KVM, no privileges).
 - `just ci` — `cargo fmt`, clippy, feature-powerset clippy, `cargo deny`, the global-state ban, and
   the unit suite.
-- `just test-rootless` — the rootless (unprivileged) KVM integration tier.
-- `just test-priv` — the privileged KVM integration tier (run `just bless` once first; see §5).
+- `just test-unprivileged` — the unprivileged (unprivileged) KVM integration tier.
+- `just test-privileged` — the privileged KVM integration tier (run `just bless` once first; see §5).
 
-Built VM artifacts (kernel, rootfs, proxy CA) default to `target/imp-artifacts`, overridable via
-`IMP_ARTIFACTS_DIR` (with `IMP_KERNEL` / `IMP_ROOTFS` overriding the individual kernel/rootfs paths).
+Built VM artifacts (kernel, rootfs, proxy CA) default to `target/vmcell-artifacts`, overridable via
+`VMCELL_ARTIFACTS_DIR` (with `VMCELL_KERNEL` / `VMCELL_ROOTFS` overriding the individual kernel/rootfs paths).
 
 ### 7. Packages supporting experiments
 
 The groups above are everything the product needs to build and run. The packages below are **only**
 for the *optional* performance experiments and contested-fact benchmarks in the design doc §13 (the
 `bench-vm` macro-harness plus a few out-of-band measurement probes). None is required to build or run
-`imp-testing` itself — install only the ones for the experiment you actually want to reproduce.
+`vmcell` itself — install only the ones for the experiment you actually want to reproduce.
 
 ```sh
 # §13.3  static-musl guest-agent experiment (musl vs glibc on-disk size / RSS / rootfs-independence)

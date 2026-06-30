@@ -1,15 +1,15 @@
-use imp_testing::agent::protocol::ExecRequest;
-use imp_testing::config::{RootfsSource, VmConfig};
-use imp_testing::orchestrator::TestVm;
+use vmcell::agent::protocol::ExecRequest;
+use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::orchestrator::MicroVm;
 
 mod common;
 
 vmm_matrix_test!(nested_virt, |vmm| {
-    require_cap!(imp_testing::vmm::Vmm::capabilities(&vmm), nested_virt, vmm);
+    require_cap!(vmcell::vmm::Vmm::capabilities(&vmm), nested_virt, vmm);
     test_nested_virt_impl(&vmm).await;
 });
 
-async fn test_nested_virt_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_nested_virt_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let kernel = common::get_vmlinux();
     let rootfs_image = common::get_rootfs();
 
@@ -26,22 +26,22 @@ async fn test_nested_virt_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     // Enable nested virtualization
     cfg.nested_virt = true;
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
 
-    let agent = match vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+    let agent = match vm.agent(None, &vmcell::orchestrator::RealClock).await {
         Ok(a) => a,
         Err(e) => {
-            use imp_testing::vmm::VmInstance;
+            use vmcell::vmm::VmInstance;
             let log = tokio::fs::read_to_string(vm.instance().serial_log())
                 .await
                 .unwrap_or_default();

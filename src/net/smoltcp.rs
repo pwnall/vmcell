@@ -59,7 +59,7 @@ pub mod backend {
         }
     }
 
-    /// MAC address for the host side of the rootless NAT.
+    /// MAC address for the host side of the unprivileged NAT.
     ///
     /// The third octet (`0xff`) is chosen so this address lies outside the range
     /// `crate::net::mac_math` can ever produce for a valid vmid (1..=254), whose

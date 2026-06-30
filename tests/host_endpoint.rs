@@ -1,23 +1,23 @@
-use imp_testing::TestVm;
-use imp_testing::agent::protocol::ExecRequest;
-use imp_testing::config::{RootfsSource, VmConfig};
 use std::process::Command;
+use vmcell::MicroVm;
+use vmcell::agent::protocol::ExecRequest;
+use vmcell::config::{RootfsSource, VmConfig};
 
 mod common;
 
 // TESTS-FEATURES-5. Uses the mandated `vmm_matrix_test!` / `require_cap!` harness and
 // `common::get_vmlinux()`/`get_rootfs()` (env-overridable, asserted-present) instead of the
-// per-backend hand-rolled tests and hardcoded `/tmp/imp-artifacts` paths.
+// per-backend hand-rolled tests and hardcoded `/tmp/vmcell-artifacts` paths.
 vmm_matrix_test!(host_endpoint, |vmm| {
     require_cap!(
-        imp_testing::vmm::Vmm::capabilities(&vmm),
+        vmcell::vmm::Vmm::capabilities(&vmm),
         unprivileged_vhost_user_net,
         vmm
     );
     test_host_endpoint_impl(&vmm).await;
 });
 
-async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let _ = env_logger::builder().is_test(true).try_init();
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
@@ -29,26 +29,26 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     };
-    cfg.net = imp_testing::config::NetConfig::Rootless {
-        egress: imp_testing::config::Egress::Open,
+    cfg.net = vmcell::config::NetConfig::Unprivileged {
+        egress: vmcell::config::Egress::Open,
         host_services_port: Some(port),
     };
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
 
     // The guest gateway IP uses the centralized (vmid % 254) + 1 octet math, not
     // the raw vmid — using the raw vmid is an off-by-one that reaches no host.
-    let (host_ip, _guest_ip, _cidr) = imp_testing::net::ip_math(vm.vmid()).expect("ip_math");
+    let (host_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid()).expect("ip_math");
     let host_ip = host_ip.to_string();
 
     let mut child = Command::new("python3")
@@ -65,7 +65,7 @@ async fn test_host_endpoint_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let agent = vm
-        .agent(None, &imp_testing::orchestrator::RealClock)
+        .agent(None, &vmcell::orchestrator::RealClock)
         .await
         .expect("Failed to connect to agent");
 

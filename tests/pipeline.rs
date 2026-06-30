@@ -1,6 +1,6 @@
-use imp_testing::artifact::{Cache, Pipeline, StageOutputs};
-use imp_testing::error::Result;
 use std::path::Path;
+use vmcell::artifact::{Cache, Pipeline, StageOutputs};
+use vmcell::error::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DummyStage {
@@ -9,7 +9,7 @@ struct DummyStage {
 }
 
 #[async_trait::async_trait]
-impl imp_testing::artifact::Stage for DummyStage {
+impl vmcell::artifact::Stage for DummyStage {
     fn name(&self) -> &str {
         &self.name
     }
@@ -18,16 +18,13 @@ impl imp_testing::artifact::Stage for DummyStage {
         target_dir.join(&self.name)
     }
 
-    fn cache_key(
-        &self,
-        _inputs: &imp_testing::artifact::StageInputs,
-    ) -> imp_testing::artifact::CacheKey {
-        imp_testing::artifact::CacheKey::new(self.content.clone())
+    fn cache_key(&self, _inputs: &vmcell::artifact::StageInputs) -> vmcell::artifact::CacheKey {
+        vmcell::artifact::CacheKey::new(self.content.clone())
     }
 
     async fn run(
         &self,
-        _inputs: &imp_testing::artifact::StageInputs,
+        _inputs: &vmcell::artifact::StageInputs,
         out: &Path,
     ) -> Result<StageOutputs> {
         std::fs::write(out, &self.content).unwrap();
@@ -58,7 +55,7 @@ async fn test_pipeline_reset_to() {
         }));
 
     // Initial run
-    let _inputs = imp_testing::artifact::StageInputs::default();
+    let _inputs = vmcell::artifact::StageInputs::default();
     let _res = pipeline.build(&cache).await.unwrap();
 
     assert!(tmp_dir.join("stage1").exists());
@@ -157,7 +154,7 @@ struct CountingStage {
 }
 
 #[async_trait::async_trait]
-impl imp_testing::artifact::Stage for CountingStage {
+impl vmcell::artifact::Stage for CountingStage {
     fn name(&self) -> &str {
         &self.name
     }
@@ -166,16 +163,13 @@ impl imp_testing::artifact::Stage for CountingStage {
         target_dir.join(&self.name)
     }
 
-    fn cache_key(
-        &self,
-        _inputs: &imp_testing::artifact::StageInputs,
-    ) -> imp_testing::artifact::CacheKey {
-        imp_testing::artifact::CacheKey::new(self.content.clone())
+    fn cache_key(&self, _inputs: &vmcell::artifact::StageInputs) -> vmcell::artifact::CacheKey {
+        vmcell::artifact::CacheKey::new(self.content.clone())
     }
 
     async fn run(
         &self,
-        _inputs: &imp_testing::artifact::StageInputs,
+        _inputs: &vmcell::artifact::StageInputs,
         out: &Path,
     ) -> Result<StageOutputs> {
         self.run_count.fetch_add(1, Ordering::SeqCst);
@@ -222,9 +216,9 @@ async fn test_pipeline_warm_cache_skips() {
 // path) — see src/artifact/mod.rs::hash_artifacts_sorted and src/artifact/snapshot.rs.
 #[tokio::test]
 async fn test_pipeline_determinism() {
-    use imp_testing::artifact::Stage;
-    use imp_testing::artifact::StageInputs;
-    use imp_testing::artifact::snapshot::SnapshotStage;
+    use vmcell::artifact::Stage;
+    use vmcell::artifact::StageInputs;
+    use vmcell::artifact::snapshot::SnapshotStage;
 
     // GOLDEN snapshot cache key over the six artifacts below (content-hashed, key-sorted).
     // Any regression — a stage-version bump, unsorted HashMap iteration (ARTIFACT-PIPELINE-1),
@@ -263,8 +257,8 @@ async fn test_pipeline_determinism() {
     }
 
     let stage = SnapshotStage {
-        cid_alloc: std::sync::Arc::new(imp_testing::vmm::CidAllocator::new()),
-        vmid_alloc: imp_testing::orchestrator::VmidAllocator::new(),
+        cid_alloc: std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+        vmid_alloc: vmcell::orchestrator::VmidAllocator::new(),
     };
 
     let key_a = stage.cache_key(&inputs_a);

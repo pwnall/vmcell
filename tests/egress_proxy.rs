@@ -1,26 +1,26 @@
 use hudsucker::Body;
 use hyper::Response;
-use imp_testing::TestVm;
-use imp_testing::agent::protocol::ExecRequest;
-use imp_testing::config::{Egress, ProxyConfig, RootfsSource, VmConfig};
-use imp_testing::proxy::doubles::TestDouble;
-use imp_testing::vmm::VmInstance;
+use vmcell::MicroVm;
+use vmcell::agent::protocol::ExecRequest;
+use vmcell::config::{Egress, ProxyConfig, RootfsSource, VmConfig};
+use vmcell::proxy::doubles::TestDouble;
+use vmcell::vmm::VmInstance;
 
 mod common;
 
 vmm_matrix_test!(egress_proxy, |vmm| {
     require_cap!(
-        imp_testing::vmm::Vmm::capabilities(&vmm),
+        vmcell::vmm::Vmm::capabilities(&vmm),
         unprivileged_vhost_user_net,
         vmm
     );
     test_egress_proxy_impl(&vmm).await;
 });
 
-async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let _ = env_logger::builder().is_test(true).try_init();
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("hudsucker=debug,imp_testing=debug,hyper=debug,vhost_user_backend=trace,vhost=trace,vhost_device_vsock=trace")
+        .with_env_filter("hudsucker=debug,vmcell=debug,hyper=debug,vhost_user_backend=trace,vhost=trace,vhost_device_vsock=trace")
         .with_test_writer()
         .try_init();
 
@@ -65,18 +65,18 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     }
     let _cleanup = Cleanup(python_server);
 
-    cfg.net = imp_testing::config::NetConfig::Rootless {
+    cfg.net = vmcell::config::NetConfig::Unprivileged {
         egress: Egress::Filtered(proxy_cfg),
         host_services_port: Some(host_port),
     };
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
@@ -85,12 +85,12 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let vmid = vm.vmid();
     // Gateway IP uses the centralized (vmid % 254) + 1 octet math, not the raw
     // vmid (an off-by-one that reaches no host).
-    let (gateway_ip, _g, _c) = imp_testing::net::ip_math(vmid).expect("ip_math");
+    let (gateway_ip, _g, _c) = vmcell::net::ip_math(vmid).expect("ip_math");
     let gateway = gateway_ip.to_string();
 
     println!("Connecting agent...");
     let agent = vm
-        .agent(None, &imp_testing::orchestrator::RealClock)
+        .agent(None, &vmcell::orchestrator::RealClock)
         .await
         .unwrap();
     println!("Agent connected.");
@@ -265,23 +265,23 @@ async fn test_egress_proxy_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     vm.shutdown().await.expect("Shutdown failed");
 }
 
-// ROOTLESS NAMING. A `rootless`-named test exercising the rootless egress path
-// (`NetConfig::Rootless` + the smoltcp NAT + the egress proxy). It needs KVM and CH's
-// unprivileged vhost-user-net, but NO host privilege, so `just test-rootless` (which selects
-// `test(rootless)`) can run it unprivileged. `#[ignore]`d out of the default suite, with a
+// UNPRIVILEGED NAMING. A `unprivileged`-named test exercising the unprivileged egress path
+// (`NetConfig::Unprivileged` + the smoltcp NAT + the egress proxy). It needs KVM and CH's
+// unprivileged vhost-user-net, but NO host privilege, so `just test-unprivileged` (which selects
+// `test(unprivileged)`) can run it unprivileged. `#[ignore]`d out of the default suite, with a
 // visible capability skip-with-reason rather than a silent skip==pass.
 #[cfg(feature = "cloud-hypervisor")]
 #[tokio::test]
-#[ignore = "rootless egress: needs KVM + unprivileged vhost-user-net; selected by `just test-rootless`"]
-async fn test_egress_proxy_rootless() {
-    let vmm = imp_testing::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
-    if !imp_testing::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
+#[ignore = "unprivileged egress: needs KVM + unprivileged vhost-user-net; selected by `just test-unprivileged`"]
+async fn test_egress_proxy_unprivileged() {
+    let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
+    if !vmcell::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
         println!(
-            "SKIP: cloud-hypervisor lacks unprivileged_vhost_user_net — cannot exercise the rootless egress path"
+            "SKIP: cloud-hypervisor lacks unprivileged_vhost_user_net — cannot exercise the unprivileged egress path"
         );
         return;
     }
-    // test_egress_proxy_impl configures NetConfig::Rootless + Egress::Filtered internally.
+    // test_egress_proxy_impl configures NetConfig::Unprivileged + Egress::Filtered internally.
     test_egress_proxy_impl(&vmm).await;
 }
 
@@ -295,7 +295,7 @@ vmm_matrix_test!(egress_privileged_filtered, |vmm| {
     test_egress_privileged_filtered_impl(&vmm).await;
 });
 
-async fn test_egress_privileged_filtered_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Privileged tap networking needs CAP_NET_ADMIN; gate VISIBLY (panic-skip with
     // reason, like snapshot_restore) — never skip-as-pass.
     if !common::has_cap_net_admin() {
@@ -304,8 +304,8 @@ async fn test_egress_privileged_filtered_impl<V: imp_testing::vmm::Vmm>(vmm: &V)
              not present in the effective capability set"
         );
     }
-    // Reap orphaned imp-net-* namespaces from prior aborted runs (no sudo).
-    common::clean_imp_netns();
+    // Reap orphaned vmcell-net-* namespaces from prior aborted runs (no sudo).
+    common::clean_vmcell_netns();
 
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
@@ -329,19 +329,19 @@ async fn test_egress_privileged_filtered_impl<V: imp_testing::vmm::Vmm>(vmm: &V)
     let mut cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
         .build()
         .unwrap();
-    cfg.net = imp_testing::config::NetConfig::Privileged {
+    cfg.net = vmcell::config::NetConfig::Privileged {
         egress: Egress::Filtered(proxy_cfg),
         host_services_port: None,
     };
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         vmm,
         cfg,
         cid_alloc,
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start privileged Filtered VM");
@@ -359,13 +359,13 @@ async fn test_egress_privileged_filtered_impl<V: imp_testing::vmm::Vmm>(vmm: &V)
     );
 
     let vmid = vm.vmid();
-    let (gateway_ip, _g, _c) = imp_testing::net::ip_math(vmid).expect("ip_math");
+    let (gateway_ip, _g, _c) = vmcell::net::ip_math(vmid).expect("ip_math");
     let gateway = gateway_ip.to_string();
 
     let agent = match vm
         .agent(
             Some(std::time::Duration::from_secs(120)),
-            &imp_testing::orchestrator::RealClock,
+            &vmcell::orchestrator::RealClock,
         )
         .await
     {

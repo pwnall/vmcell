@@ -48,7 +48,7 @@ jobs:
           fi
           # Graph inspection is not enough: actually compile the agent-only target so a broken
           # agent-only build (e.g. an un-gated host dep) is caught here, not on a KVM host.
-          cargo clippy --no-default-features --features agent --bin imp-guest-agent -- -D warnings
+          cargo clippy --no-default-features --features agent --bin vmcell-guest-agent -- -D warnings
 
       - name: lean-test-runner invariant   # privileged-window binary must omit the host async stack AND compile standalone
         run: |
@@ -61,10 +61,10 @@ jobs:
             echo "::error::lean-test-runner invariant violated — host stack leaked into the test-runner build"
             exit 1
           fi
-          cargo clippy --no-default-features --features test-runner --bin imp-test-runner -- -D warnings
+          cargo clippy --no-default-features --features test-runner --bin vmcell-test-runner -- -D warnings
 
       - name: guest-tools build+clippy     # guest userspace helper; build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes)
-        run: cargo clippy --no-default-features --features guest-tools --bin imp-guest-tools -- -D warnings
+        run: cargo clippy --no-default-features --features guest-tools --bin vmcell-guest-tools -- -D warnings
 
       - name: ban module-global mutable ID/atomic state
         run: |
@@ -104,20 +104,20 @@ jobs:
         with: { tool: "cargo-nextest,just" }
 
       - name: build VM artifacts
-        run: cargo run --bin imp-testing -- build
+        run: cargo run --bin vmcell -- build
 
-      - name: rootless suite (no elevation — keeps the rootless path honest)
-        run: cargo nextest run --profile integration --run-ignored all -E 'test(rootless) | test(smoltcp)'
+      - name: unprivileged suite (no elevation — keeps the unprivileged path honest)
+        run: cargo nextest run --profile integration --run-ignored all -E 'test(unprivileged) | test(smoltcp)'
 
       # Bless grants the runner cap_net_admin,cap_sys_admin (debug + release) so the privileged
-      # suite runs under the capability wrapper instead of broad `sudo -E` — mirrors `just test-priv`.
+      # suite runs under the capability wrapper instead of broad `sudo -E` — mirrors `just test-privileged`.
       - name: bless the capability runner
         run: just bless
 
       # `--features firecracker,qemu` (additive to the default cloud-hypervisor) compiles in the
       # `#[cfg(feature="firecracker")]`/`qemu` tests so the FC/QEMU backends are actually exercised
       # here, not just CH (P30). The per-backend matrix skips-with-reason when a binary is absent.
-      - name: privileged suite (via imp-test-runner capability wrapper, not sudo -E)
+      - name: privileged suite (via vmcell-test-runner capability wrapper, not sudo -E)
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/target/debug/imp-test-runner
-        run: cargo nextest run --profile integration --features firecracker,qemu --run-ignored all -E 'not (test(rootless) | test(smoltcp))'
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/target/debug/vmcell-test-runner
+        run: cargo nextest run --profile integration --features firecracker,qemu --run-ignored all -E 'not (test(unprivileged) | test(smoltcp))'

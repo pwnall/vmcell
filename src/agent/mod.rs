@@ -190,11 +190,11 @@ impl AgentClient {
     ///
     /// # Examples
     /// ```rust
-    /// # use imp_testing::agent::AgentClient;
+    /// # use vmcell::agent::AgentClient;
     /// # use std::path::Path;
     /// # use std::time::Duration;
     /// # async fn run() {
-    /// let serial = imp_testing::vmm::RealSerialLog { path: std::path::PathBuf::from("/dev/null") };
+    /// let serial = vmcell::vmm::RealSerialLog { path: std::path::PathBuf::from("/dev/null") };
     /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), &serial).await.unwrap();
     /// # }
     /// ```

@@ -1,5 +1,5 @@
-use imp_testing::config::{RootfsSource, VmConfig};
-use imp_testing::orchestrator::TestVm;
+use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::orchestrator::MicroVm;
 
 use tokio::time::{Duration, sleep};
 
@@ -10,11 +10,11 @@ vmm_matrix_test!(metrics_limits, |vmm| {
 });
 
 /// Reconstructs the (possibly nested) cgroup-v2 slice name the orchestrator created for a VM,
-/// mirroring `orchestrator::setup_env`: `{base}/imp-vm-{vmid}` when running under a delegated
-/// sub-tree (systemd / the capability runner), otherwise a bare `imp-vm-{vmid}`. The test and
+/// mirroring `orchestrator::setup_env`: `{base}/vmcell-vm-{vmid}` when running under a delegated
+/// sub-tree (systemd / the capability runner), otherwise a bare `vmcell-vm-{vmid}`. The test and
 /// the orchestrator share a process, so `/proc/self/cgroup` resolves identically here.
 fn vm_cgroup_name(vmid: u32) -> String {
-    let mut cgroup_name = format!("imp-vm-{}", vmid);
+    let mut cgroup_name = format!("vmcell-vm-{}", vmid);
     if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
         if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
             let mut base = path.trim_start_matches('/');
@@ -22,7 +22,7 @@ fn vm_cgroup_name(vmid: u32) -> String {
                 base = base.trim_end_matches("/supervisor");
             }
             if !base.is_empty() {
-                cgroup_name = format!("{}/imp-vm-{}", base, vmid);
+                cgroup_name = format!("{}/vmcell-vm-{}", base, vmid);
             }
         }
     }
@@ -41,7 +41,7 @@ fn parse_memory_events_oom_kill(contents: &str) -> Option<u64> {
     None
 }
 
-async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let kernel = common::get_vmlinux();
     let rootfs_image = common::get_rootfs();
 
@@ -63,14 +63,14 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     // Cap the host cgroup well below guest RAM.
     cfg.limits.mem_max_mib = Some(256);
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
@@ -145,10 +145,10 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     // Test CPU average computation.
     let start_time = std::time::Instant::now();
     let cpu_test_outcome = vm
-        .agent(None, &imp_testing::orchestrator::RealClock)
+        .agent(None, &vmcell::orchestrator::RealClock)
         .await
         .unwrap()
-        .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
+        .exec(vmcell::agent::protocol::ExecRequest::new(vec![
             "sh".into(),
             "-c".into(),
             "timeout 2 md5sum /dev/zero".into(),
@@ -195,10 +195,10 @@ async fn test_metrics_and_limits_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     // observable via memory.events.oom_kill regardless of any in-guest exit code. A no-op host
     // memory limit (or a guest-RAM-bound OOM) leaves oom_kill at 0 and fails the assertion.
     let oom_exec = vm
-        .agent(None, &imp_testing::orchestrator::RealClock)
+        .agent(None, &vmcell::orchestrator::RealClock)
         .await
         .unwrap()
-        .exec(imp_testing::agent::protocol::ExecRequest::new(vec![
+        .exec(vmcell::agent::protocol::ExecRequest::new(vec![
             "tail".into(),
             "/dev/zero".into(),
         ]))

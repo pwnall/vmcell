@@ -1,14 +1,14 @@
 set shell := ["bash", "-uc"]
 
-runner := "target/debug/imp-test-runner"
-runner-release := "target/release/imp-test-runner"
+runner := "target/debug/vmcell-test-runner"
+runner-release := "target/release/vmcell-test-runner"
 
 # (Re)grant the two caps the privileged suite needs. Re-run after every rebuild of the runner.
 # Builds + blesses BOTH debug and release (matches README §5); `--features test-runner` is
 # required or the required-features bin is skipped and setcap targets a stale binary.
 bless:
-    cargo build --bin imp-test-runner --features test-runner
-    cargo build --release --bin imp-test-runner --features test-runner
+    cargo build --bin vmcell-test-runner --features test-runner
+    cargo build --release --bin vmcell-test-runner --features test-runner
     sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {{runner}}
     sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {{runner-release}}
 
@@ -17,17 +17,17 @@ test-unit:
     cargo nextest run --all-features
 
 # Privileged integration suite via the capability runner (dev box only; group-restrict the runner
-# on shared hosts). Wraps every test binary with imp-test-runner via the cargo target-runner hook.
-# The in-guest test-helper (ip/curl/kvm-ok) is baked into the rootfs by `imp-testing build`, not
+# on shared hosts). Wraps every test binary with vmcell-test-runner via the cargo target-runner hook.
+# The in-guest test-helper (ip/curl/kvm-ok) is baked into the rootfs by `vmcell build`, not
 # built here.
-test-priv:
+test-privileged:
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --profile integration --features firecracker,qemu --run-ignored all \
-        -E 'not (test(rootless) | test(smoltcp))'
+        -E 'not (test(unprivileged) | test(smoltcp))'
 
-# Rootless integration suite under no elevation (keeps the rootless path honest).
-test-rootless:
-    cargo nextest run --profile integration --run-ignored all -E 'test(rootless) | test(smoltcp)'
+# Unprivileged integration suite under no elevation (keeps the unprivileged path honest).
+test-unprivileged:
+    cargo nextest run --profile integration --run-ignored all -E 'test(unprivileged) | test(smoltcp)'
 
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide
@@ -44,12 +44,12 @@ ci:
     cargo deny check
     # lean-agent invariant: omit the host stack AND compile the agent-only target standalone.
     if cargo tree -e no-dev --no-default-features --features agent | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-agent invariant violated — host stack leaked into the agent build"; exit 1; fi
-    cargo clippy --no-default-features --features agent --bin imp-guest-agent
+    cargo clippy --no-default-features --features agent --bin vmcell-guest-agent
     # lean-test-runner invariant: same host-stack ban + standalone compile for the privileged-window binary.
     if cargo tree -e no-dev --no-default-features --features test-runner | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-test-runner invariant violated — host stack leaked into the test-runner build"; exit 1; fi
-    cargo clippy --no-default-features --features test-runner --bin imp-test-runner
+    cargo clippy --no-default-features --features test-runner --bin vmcell-test-runner
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).
-    cargo clippy --no-default-features --features guest-tools --bin imp-guest-tools
+    cargo clippy --no-default-features --features guest-tools --bin vmcell-guest-tools
     ./scripts/ban-global-state.sh
     ./scripts/test-ban-global-state.sh
     cargo nextest run --all-features

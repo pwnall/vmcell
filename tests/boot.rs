@@ -1,6 +1,6 @@
-use imp_testing::TestVm;
-use imp_testing::config::{RootfsSource, VmConfig};
-use imp_testing::vmm::VmInstance;
+use vmcell::MicroVm;
+use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::vmm::VmInstance;
 
 mod common;
 
@@ -8,7 +8,7 @@ vmm_matrix_test!(boot, |vmm| {
     test_boot_impl(&vmm).await;
 });
 
-async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
+async fn test_boot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
 
@@ -17,14 +17,14 @@ async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         .build()
         .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
-    let mut vm = TestVm::start(
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut vm = MicroVm::start(
         vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
-        Box::new(imp_testing::metrics::DefaultCgroupFs),
+        Box::new(vmcell::metrics::DefaultCgroupFs),
     )
     .await
     .expect("Failed to start VM");
@@ -53,13 +53,13 @@ async fn test_boot_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
     let agent = vm
         .agent(
             Some(std::time::Duration::from_secs(60)),
-            &imp_testing::orchestrator::RealClock,
+            &vmcell::orchestrator::RealClock,
         )
         .await
         .expect("Failed to connect to agent");
 
     let outcome = agent
-        .exec(imp_testing::agent::ExecRequest::new(vec![
+        .exec(vmcell::agent::ExecRequest::new(vec![
             "echo".to_string(),
             "hello from guest".to_string(),
         ]))

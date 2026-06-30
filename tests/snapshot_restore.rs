@@ -1,24 +1,20 @@
-use imp_testing::agent::protocol::ExecRequest;
-use imp_testing::config::{RootfsSource, VmConfig};
-use imp_testing::orchestrator::TestVm;
-use imp_testing::vmm::VmInstance;
+use vmcell::agent::protocol::ExecRequest;
+use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::orchestrator::MicroVm;
+use vmcell::vmm::VmInstance;
 
 mod common;
 
 vmm_matrix_test!(snapshot_restore, |vmm| {
-    require_cap!(
-        imp_testing::vmm::Vmm::capabilities(&vmm),
-        snapshot_restore,
-        vmm
-    );
+    require_cap!(vmcell::vmm::Vmm::capabilities(&vmm), snapshot_restore, vmm);
     test_snapshot_restore_impl(&vmm).await;
 });
 
-async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
-    // Reap any orphaned imp-net-* namespaces from a prior aborted run so this
+async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
+    // Reap any orphaned vmcell-net-* namespaces from a prior aborted run so this
     // privileged-tap test's vmid cannot collide with a leak (no sudo needed; the
     // capability runner holds CAP_SYS_ADMIN + CAP_DAC_OVERRIDE).
-    common::clean_imp_netns();
+    common::clean_vmcell_netns();
 
     let kernel = common::get_vmlinux();
     let rootfs_image = common::get_rootfs();
@@ -33,8 +29,8 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         std::fs::remove_dir_all(&snapshot_dir).unwrap();
     }
 
-    let cid_alloc = std::sync::Arc::new(imp_testing::vmm::CidAllocator::new());
-    let vmid_alloc = imp_testing::orchestrator::VmidAllocator::new();
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
 
     // 1. Create a VM and take a snapshot
     {
@@ -55,22 +51,22 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         )
         .build()
         .unwrap();
-        cfg.net = imp_testing::config::NetConfig::Privileged {
-            egress: imp_testing::config::Egress::Open,
+        cfg.net = vmcell::config::NetConfig::Privileged {
+            egress: vmcell::config::Egress::Open,
             host_services_port: None,
         };
 
-        let mut vm = TestVm::start(
+        let mut vm = MicroVm::start(
             vmm,
             cfg,
             cid_alloc.clone(),
             vmid_alloc.clone(),
-            Box::new(imp_testing::metrics::DefaultCgroupFs),
+            Box::new(vmcell::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to start VM");
 
-        let agent = match vm.agent(None, &imp_testing::orchestrator::RealClock).await {
+        let agent = match vm.agent(None, &vmcell::orchestrator::RealClock).await {
             Ok(a) => a,
             Err(e) => {
                 let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
@@ -126,7 +122,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         // must perturb them. NOTE: the test never issues its own reseed — it only
         // reads /dev/urandom here and after restore and asserts they differ.
         let ref_rng = vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
+            .agent(None, &vmcell::orchestrator::RealClock)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![
@@ -183,14 +179,14 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         )
         .build()
         .unwrap();
-        cfg.net = imp_testing::config::NetConfig::Privileged {
-            egress: imp_testing::config::Egress::Open,
+        cfg.net = vmcell::config::NetConfig::Privileged {
+            egress: vmcell::config::Egress::Open,
             host_services_port: None,
         };
 
         // M-TEST-RESTORE: hold the ORIGINAL vmid so the allocator is forced to hand
         // the restored VM a DIFFERENT one. MAC (`mac_math(vmid)`) and the vsock path
-        // (`imp-vm-{pid}-{vmid}`) are pure functions of the vmid; the original VM was
+        // (`vmcell-vm-{pid}-{vmid}`) are pure functions of the vmid; the original VM was
         // already torn down (freeing its vmid), so without this the allocator could
         // re-hand the same vmid and the rotation asserts would pass on a no-op (or
         // fail spuriously ~1/254). Reserving it guarantees new_vmid != original_vmid.
@@ -203,13 +199,13 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .reserve(original_vmid)
             .expect("original vmid is free after block 1 shutdown; reserving forces a new vmid");
 
-        let mut vm = TestVm::restore(
+        let mut vm = MicroVm::restore(
             vmm,
             &snapshot_dir,
             cfg,
             cid_alloc.clone(),
             vmid_alloc,
-            Box::new(imp_testing::metrics::DefaultCgroupFs),
+            Box::new(vmcell::metrics::DefaultCgroupFs),
         )
         .await
         .expect("Failed to restore VM");
@@ -231,7 +227,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             .parse()
             .unwrap();
         let fake_time_secs = (pre_time + 1000) as u64;
-        let fake_clock = imp_testing::orchestrator::FakeClock {
+        let fake_clock = vmcell::orchestrator::FakeClock {
             time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(fake_time_secs),
         };
 
@@ -286,10 +282,10 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
             "Vsock path should be rotated after restore"
         );
         // M-TEST-RESTORE: assert the REAL socket path embeds the rotated vmid
-        // (imp-vm-{pid}-{new_vmid}), not merely that it differs — proving the path
+        // (vmcell-vm-{pid}-{new_vmid}), not merely that it differs — proving the path
         // reflects the new identity rather than a coincidental string difference.
         assert!(
-            new_vsock.contains(&format!("imp-vm-{}-{}", std::process::id(), new_vmid)),
+            new_vsock.contains(&format!("vmcell-vm-{}-{}", std::process::id(), new_vmid)),
             "restored vsock path {} must embed the rotated vmid {}",
             new_vsock,
             new_vmid
@@ -297,7 +293,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();
         let mac_out = vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
+            .agent(None, &vmcell::orchestrator::RealClock)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![
@@ -320,7 +316,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         // from mac_math(new_vmid) (new != original, enforced above), so this goes red.
         // `assert_ne!(pre, post)` alone can pass on a no-op when a re-handed vmid
         // happens to yield an identical MAC.
-        let expected_mac = imp_testing::net::mac_math(new_vmid).expect("mac_math(new_vmid)");
+        let expected_mac = vmcell::net::mac_math(new_vmid).expect("mac_math(new_vmid)");
         assert_eq!(
             post_mac, expected_mac,
             "post-restore guest MAC must equal mac_math(new_vmid={})",
@@ -336,7 +332,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         // from real wall-clock time. `restored` is already false, so this read does
         // not re-trigger a resync.
         let time_out = vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
+            .agent(None, &vmcell::orchestrator::RealClock)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
@@ -388,7 +384,7 @@ async fn test_snapshot_restore_impl<V: imp_testing::vmm::Vmm>(vmm: &V) {
         // failing this assert_ne.
         let pre_urandom = std::fs::read(snapshot_dir.join("pre_urandom.bin")).unwrap();
         let post_rng = vm
-            .agent(None, &imp_testing::orchestrator::RealClock)
+            .agent(None, &vmcell::orchestrator::RealClock)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![

@@ -31,7 +31,7 @@ impl CertificateAuthority for SharedAuthority {
 /// they were generated/loaded in.
 ///
 /// Keying on the directory is load-bearing for correctness: a second `new()`
-/// invoked with a different `IMP_ARTIFACTS_DIR` must mint (or load) the CA for
+/// invoked with a different `VMCELL_ARTIFACTS_DIR` must mint (or load) the CA for
 /// *that* directory rather than reuse one from an unrelated directory, so the
 /// CA baked into a rootfs matches the authority the proxy presents. Within a
 /// single directory the cache also lets concurrent proxy instances agree on one
@@ -53,7 +53,7 @@ impl CaManager {
     /// Returns an error if filesystem operations or key generation fail.
     pub fn new() -> Result<Self> {
         // The proxy CA now lives in the shared artifacts dir (default
-        // `target/imp-artifacts`) instead of the old per-pid `/tmp/imp-artifacts-<pid>`,
+        // `target/vmcell-artifacts`) instead of the old per-pid `/tmp/vmcell-artifacts-<pid>`,
         // so the authority the proxy presents matches the `ca.pem`/`ca.key` baked into
         // the rootfs at build time.
         Self::new_in(crate::artifact::artifacts_dir())
@@ -97,7 +97,7 @@ impl CaManager {
             let mut params = CertificateParams::default();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             let mut dn = DistinguishedName::new();
-            dn.push(DnType::OrganizationName, "Imp Testing Framework");
+            dn.push(DnType::OrganizationName, "vmcell Framework");
             dn.push(DnType::CommonName, "Imp MITM CA");
             params.distinguished_name = dn;
             let cert = params

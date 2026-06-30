@@ -1,7 +1,7 @@
-use imp_testing::agent::ExecRequest;
-use imp_testing::agent::protocol::Message;
-use imp_testing::vmm::CidAllocator;
 use proptest::prelude::*;
+use vmcell::agent::ExecRequest;
+use vmcell::agent::protocol::Message;
+use vmcell::vmm::CidAllocator;
 
 proptest! {
     #[test]
@@ -63,7 +63,7 @@ proptest! {
 
     #[test]
     fn test_proxy_config_equality(domains in prop::collection::vec(".*", 0..5)) {
-        use imp_testing::config::ProxyConfig;
+        use vmcell::config::ProxyConfig;
         let mut p1 = ProxyConfig::default();
         p1.blocked_domains = domains.clone();
 
@@ -89,9 +89,9 @@ proptest! {
     #[test]
     fn test_subnet_math(vmid in 0..=255u32) {
         if vmid == 0 || vmid == 255 {
-            assert!(imp_testing::net::ip_math(vmid).is_err());
+            assert!(vmcell::net::ip_math(vmid).is_err());
         } else {
-            let (host, guest, cidr) = imp_testing::net::ip_math(vmid).unwrap();
+            let (host, guest, cidr) = vmcell::net::ip_math(vmid).unwrap();
             let octet = ((vmid % 254) + 1) as u8;
             assert_eq!(host.octets(), [10, 200, octet, 1]);
             assert_eq!(guest.octets(), [10, 200, octet, 2]);

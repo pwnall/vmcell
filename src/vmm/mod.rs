@@ -127,7 +127,7 @@ pub async fn unix_api_request<T: Serialize>(
 /// # Errors
 /// Returns an error if the directory cannot be created.
 pub async fn create_vm_tmp_dir(vmid: u32) -> Result<PathBuf> {
-    let tmp = std::env::temp_dir().join(format!("imp-vm-{}-{}", std::process::id(), vmid));
+    let tmp = std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
     tokio::fs::create_dir_all(&tmp).await?;
     Ok(tmp)
 }
@@ -298,7 +298,7 @@ pub struct PerVmResources {
     pub tap_name: Option<String>,
     /// Optional network namespace name for privileged networking.
     pub netns_name: Option<String>,
-    /// Optional vhost-user socket path for rootless networking.
+    /// Optional vhost-user socket path for unprivileged networking.
     pub vhost_user_socket: Option<PathBuf>,
     /// Unique internal VM ID.
     pub vmid: u32,
@@ -316,7 +316,7 @@ pub struct VmmCapabilities {
     pub lazy_restore: bool,
     /// True if the VMM supports virtio-fs shared directories.
     pub virtio_fs_shares: bool,
-    /// True if the VMM supports vhost-user-net for rootless networking.
+    /// True if the VMM supports vhost-user-net for unprivileged networking.
     pub unprivileged_vhost_user_net: bool,
     /// True if the VMM supports nested virtualization (exposing KVM to guest).
     pub nested_virt: bool,
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn test_remove_vm_tmp_dir_removes_whole_dir() {
         let parent = tempfile::tempdir().expect("create parent tempdir");
-        let vm_dir = parent.path().join("imp-vm-1-2");
+        let vm_dir = parent.path().join("vmcell-vm-1-2");
         std::fs::create_dir_all(&vm_dir).expect("create per-VM dir");
         std::fs::write(vm_dir.join("serial.log"), b"boot log").expect("write serial.log");
         std::fs::write(vm_dir.join("api.sock.lock"), b"").expect("write lock");

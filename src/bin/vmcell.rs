@@ -19,7 +19,7 @@ enum Commands {
     Stats,
 }
 
-fn main() -> imp_testing::Result<()> {
+fn main() -> vmcell::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -27,7 +27,7 @@ fn main() -> imp_testing::Result<()> {
         .block_on(async_main())
 }
 
-async fn async_main() -> imp_testing::Result<()> {
+async fn async_main() -> vmcell::Result<()> {
     let cli = Cli::parse();
     dispatch(&cli.command).await
 }
@@ -38,41 +38,32 @@ async fn async_main() -> imp_testing::Result<()> {
 /// non-zero exit — rather than printing fake success. Printing "Running VM..."
 /// and returning `Ok(())` while doing nothing is the "skip == pass" failure in
 /// CLI form: it impersonates a completed operation.
-fn not_implemented(subcommand: &str) -> imp_testing::Error {
-    imp_testing::Error::Unsupported {
-        vmm: "imp-testing".to_string(),
+fn not_implemented(subcommand: &str) -> vmcell::Error {
+    vmcell::Error::Unsupported {
+        vmm: "vmcell".to_string(),
         feature: format!("subcommand `{subcommand}` is not yet implemented"),
     }
 }
 
-async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
+async fn dispatch(command: &Commands) -> vmcell::Result<()> {
     match command {
         Commands::Build => {
             println!("Building artifacts...");
-            let pipeline =
-                imp_testing::artifact::Pipeline::new(imp_testing::artifact::artifacts_dir())
-                    .add_stage(Box::new(imp_testing::artifact::ResolvePinsStage {
-                        pins_file: std::path::PathBuf::from("pins.json"),
-                    }))
-                    .add_stage(Box::new(imp_testing::artifact::kernel::KernelStage {
-                        http_client: std::sync::Arc::new(
-                            imp_testing::artifact::kernel::ReqwestClient,
-                        ),
-                        label: None,
-                    }))
-                    .add_stage(Box::new(
-                        imp_testing::artifact::guest_agent::GuestAgentStage {},
-                    ))
-                    .add_stage(Box::new(
-                        imp_testing::artifact::guest_tools::GuestToolsStage {},
-                    ))
-                    .add_stage(Box::new(imp_testing::artifact::rootfs::RootfsStage {
-                        source: imp_testing::artifact::rootfs::RootfsBuildSource::Oci,
-                        cid_alloc: std::sync::Arc::new(imp_testing::vmm::CidAllocator::new()),
-                    }));
-            pipeline
-                .build(&imp_testing::artifact::Cache::default())
-                .await?;
+            let pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
+                .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
+                    pins_file: std::path::PathBuf::from("pins.json"),
+                }))
+                .add_stage(Box::new(vmcell::artifact::kernel::KernelStage {
+                    http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
+                    label: None,
+                }))
+                .add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}))
+                .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
+                .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
+                    source: vmcell::artifact::rootfs::RootfsBuildSource::Oci,
+                    cid_alloc: std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+                }));
+            pipeline.build(&vmcell::artifact::Cache::default()).await?;
             println!("Artifacts built successfully.");
             Ok(())
         }
@@ -82,38 +73,32 @@ async fn dispatch(command: &Commands) -> imp_testing::Result<()> {
             // cross-kernel benchmark sweep. Reuses the labelled `KernelStage`; each has
             // its own cache sidecar and build dir.
             let pins_file = std::path::PathBuf::from("pins.json");
-            let content = std::fs::read_to_string(&pins_file).map_err(imp_testing::Error::Io)?;
+            let content = std::fs::read_to_string(&pins_file).map_err(vmcell::Error::Io)?;
             let json: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| imp_testing::Error::Artifact(format!("pins.json parse: {e}")))?;
+                .map_err(|e| vmcell::Error::Artifact(format!("pins.json parse: {e}")))?;
             let labels: Vec<String> = json
                 .get("kernels")
                 .and_then(|k| k.as_object())
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
             if labels.is_empty() {
-                return Err(imp_testing::Error::Artifact(
+                return Err(vmcell::Error::Artifact(
                     "no `kernels` registry in pins.json".to_string(),
                 ));
             }
             println!("Building kernels: {}", labels.join(", "));
-            let mut pipeline =
-                imp_testing::artifact::Pipeline::new(imp_testing::artifact::artifacts_dir())
-                    .add_stage(Box::new(imp_testing::artifact::ResolvePinsStage {
-                        pins_file: pins_file.clone(),
-                    }));
+            let mut pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
+                .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
+                    pins_file: pins_file.clone(),
+                }));
             for label in &labels {
                 println!("  - kernel {label} -> vmlinux-{label}");
-                pipeline =
-                    pipeline.add_stage(Box::new(imp_testing::artifact::kernel::KernelStage {
-                        http_client: std::sync::Arc::new(
-                            imp_testing::artifact::kernel::ReqwestClient,
-                        ),
-                        label: Some(label.clone()),
-                    }));
+                pipeline = pipeline.add_stage(Box::new(vmcell::artifact::kernel::KernelStage {
+                    http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
+                    label: Some(label.clone()),
+                }));
             }
-            pipeline
-                .build(&imp_testing::artifact::Cache::default())
-                .await?;
+            pipeline.build(&vmcell::artifact::Cache::default()).await?;
             println!("Kernels built: {}", labels.join(", "));
             Ok(())
         }
@@ -148,7 +133,7 @@ mod tests {
                 .block_on(dispatch(&command))
                 .expect_err("an unimplemented subcommand must return an error");
             assert!(
-                matches!(err, imp_testing::Error::Unsupported { .. }),
+                matches!(err, vmcell::Error::Unsupported { .. }),
                 "expected Error::Unsupported, got {err:?}"
             );
         }

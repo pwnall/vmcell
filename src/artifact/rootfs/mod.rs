@@ -149,27 +149,27 @@ pub async fn pack_erofs_with_injection(
 
     // The guest test-helper (ip/curl/kvm-ok) is baked into the rootfs rather than
     // mounted as a virtio-fs share: virtiofsd cannot enter its sandbox
-    // unprivileged, so a share fails in the rootless suite, whereas the erofs
+    // unprivileged, so a share fails in the unprivileged suite, whereas the erofs
     // rootfs is served over virtio-blk in both modes. Optional — builds that do
     // not run the GuestToolsStage simply omit it.
     let tools_path = inputs.artifacts.get("guest_tools").cloned();
 
     tokio::task::spawn_blocking(move || -> Result<StageOutputs> {
-        let mut injected_files = vec![("usr/sbin/imp-guest-agent", agent_path.as_path())];
+        let mut injected_files = vec![("usr/sbin/vmcell-guest-agent", agent_path.as_path())];
         #[cfg(feature = "proxy")]
         injected_files.push((
-            "usr/local/share/ca-certificates/imp-ca.crt",
+            "usr/local/share/ca-certificates/vmcell-ca.crt",
             ca_path.as_path(),
         ));
 
         let mut injected_symlinks: Vec<(&str, &str)> = Vec::new();
         if let Some(tp) = tools_path.as_deref() {
-            injected_files.push(("imp-tools/imp-guest-tools", tp));
+            injected_files.push(("vmcell-tools/vmcell-guest-tools", tp));
             // busybox-style multicall links resolved on the exec PATH (the guest
-            // agent prepends /imp-tools).
-            injected_symlinks.push(("imp-tools/ip", "imp-guest-tools"));
-            injected_symlinks.push(("imp-tools/curl", "imp-guest-tools"));
-            injected_symlinks.push(("imp-tools/kvm-ok", "imp-guest-tools"));
+            // agent prepends /vmcell-tools).
+            injected_symlinks.push(("vmcell-tools/ip", "vmcell-guest-tools"));
+            injected_symlinks.push(("vmcell-tools/curl", "vmcell-guest-tools"));
+            injected_symlinks.push(("vmcell-tools/kvm-ok", "vmcell-guest-tools"));
         }
 
         let archives: Vec<tar::Archive<Box<dyn Read + Send>>> =

@@ -15,7 +15,7 @@ use tokio::process::Child;
 /// load-time override. A restore therefore runs under a fresh, vmid-derived tmp
 /// dir but must rebind (and have the agent dial) the path the snapshot recorded.
 /// This sidecar carries that path across the snapshot/restore boundary.
-const HOST_PATHS_SIDECAR: &str = "imp_host_paths.json";
+const HOST_PATHS_SIDECAR: &str = "vmcell_host_paths.json";
 
 /// Host-side UDS paths baked into a Firecracker snapshot, persisted alongside it
 /// so a later restore can rebind/connect the exact socket FC recreates.
@@ -26,14 +26,18 @@ struct SnapshotHostPaths {
 }
 
 /// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
-/// because it has a vhost-user device attached (virtio-fs share, rootless net, or
+/// because it has a vhost-user device attached (virtio-fs share, unprivileged net, or
 /// external vhost-user-net). The snapshot-eligibility law (§3.3) requires every
 /// backend to self-guard `snapshot()`/`restore()` against such a VM rather than
 /// assume the caller already checked. Firecracker's `create()` already rejects all
 /// vhost-user devices up front, so on FC this is defense in depth — it stays correct
 /// if a future path constructs an `FcInstance` differently. Mirrors the CH helper.
-fn has_vhost_user_device(virtio_fs_share: bool, rootless_net: bool, vhost_user_net: bool) -> bool {
-    virtio_fs_share || rootless_net || vhost_user_net
+fn has_vhost_user_device(
+    virtio_fs_share: bool,
+    unprivileged_net: bool,
+    vhost_user_net: bool,
+) -> bool {
+    virtio_fs_share || unprivileged_net || vhost_user_net
 }
 
 /// The Firecracker capability descriptor, exposed as a free function so both
@@ -334,11 +338,11 @@ impl Vmm for Firecracker {
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         let caps = self.capabilities();
-        if let crate::config::NetConfig::Rootless { .. } = cfg.net {
+        if let crate::config::NetConfig::Unprivileged { .. } = cfg.net {
             if !caps.unprivileged_vhost_user_net {
                 return Err(Error::Unsupported {
                     vmm: "firecracker".to_string(),
-                    feature: "rootless_net".to_string(),
+                    feature: "unprivileged_net".to_string(),
                 });
             }
         }
@@ -403,7 +407,7 @@ impl Vmm for Firecracker {
 
         let cmdline = {
             let mut s = format!(
-                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 noxsave init=/usr/sbin/imp-guest-agent imp_vmid={}",
+                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 noxsave init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
                 match &cfg.rootfs {
                     crate::config::RootfsSource::Erofs { .. } => "erofs",
                     _ => "ext4",
@@ -424,6 +428,7 @@ impl Vmm for Firecracker {
             if cfg.nested_virt {
                 s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
             }
+            crate::config::push_share_args(&mut s, &cfg.shares);
             s
         };
 
@@ -533,12 +538,12 @@ impl Vmm for Firecracker {
             });
         }
         // M-RESTORE-3 / snapshot-eligibility law: a snapshot-eligible VM has no
-        // vhost-user device. Reject any virtio-fs share, rootless net, or external
+        // vhost-user device. Reject any virtio-fs share, unprivileged net, or external
         // vhost-user-net handed to us via the config, mirroring CH's guard, before
         // spawning a VMM. FC never attaches these, so this is defense in depth.
         if has_vhost_user_device(
             !cfg.shares.is_empty(),
-            matches!(cfg.net, crate::config::NetConfig::Rootless { .. }),
+            matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }),
             res.vhost_user_socket.is_some(),
         ) {
             return Err(Error::Unsupported {
@@ -828,7 +833,7 @@ mod tests {
     #[test]
     fn vhost_user_device_guard() {
         assert!(has_vhost_user_device(true, false, false)); // virtio-fs data share
-        assert!(has_vhost_user_device(false, true, false)); // rootless net
+        assert!(has_vhost_user_device(false, true, false)); // unprivileged net
         assert!(has_vhost_user_device(false, false, true)); // external vhost-user-net
         // privileged tap net + erofs/block rootfs: snapshot-eligible.
         assert!(!has_vhost_user_device(false, false, false));

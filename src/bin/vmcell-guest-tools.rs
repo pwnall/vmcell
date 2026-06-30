@@ -2,9 +2,9 @@
 //! `ip`, `curl`, and `kvm-ok` tools the integration tests invoke inside the
 //! guest.
 //!
-//! It is baked into the rootfs erofs at `/imp-tools/imp-guest-tools` (with
+//! It is baked into the rootfs erofs at `/vmcell-tools/vmcell-guest-tools` (with
 //! `ip`/`curl`/`kvm-ok` symlinks), which the guest agent places on the exec
-//! `PATH`. Baking — rather than a virtio-fs share — is what lets the *rootless*
+//! `PATH`. Baking — rather than a virtio-fs share — is what lets the *unprivileged*
 //! egress test use the tools: virtiofsd cannot enter its sandbox unprivileged, so
 //! a share fails there, whereas the erofs rootfs is served over virtio-blk in both
 //! modes. This keeps the base image otherwise minimal (no
@@ -14,7 +14,7 @@
 //!
 //! Dispatch is busy-box style: when invoked through an `ip`/`curl`/`kvm-ok`
 //! symlink the command is taken from `argv[0]`; otherwise the first argument
-//! selects it (`imp-guest-tools <cmd> …`).
+//! selects it (`vmcell-guest-tools <cmd> …`).
 
 use std::io::Write;
 use std::time::Duration;
@@ -24,14 +24,14 @@ fn main() {
     let prog = args.first().map(|p| basename(p)).unwrap_or_default();
 
     // `argv[0]` selects the command when invoked via a symlink; otherwise fall
-    // back to `imp-guest-tools <cmd> …`.
+    // back to `vmcell-guest-tools <cmd> …`.
     let (cmd, rest): (String, &[String]) = if is_known(&prog) {
         (prog, &args[1..])
     } else {
         match args.get(1) {
             Some(c) => (c.clone(), &args[2..]),
             None => {
-                eprintln!("usage: imp-guest-tools <ip|curl|kvm-ok> [args…]");
+                eprintln!("usage: vmcell-guest-tools <ip|curl|kvm-ok> [args…]");
                 std::process::exit(2);
             }
         }
@@ -42,7 +42,7 @@ fn main() {
         "curl" => run_curl(rest),
         "kvm-ok" => run_kvm_ok(),
         other => {
-            eprintln!("imp-guest-tools: unknown command {other}");
+            eprintln!("vmcell-guest-tools: unknown command {other}");
             2
         }
     };

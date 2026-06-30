@@ -1,4 +1,4 @@
-# AGENTS.md — Imp Testing
+# AGENTS.md — vmcell
 
 Operating instructions for any agent (or human) changing this crate. The CI gates
 (`just ci`, the lint header, `deny.toml`, `nextest.toml`) catch a fixed set of defect
@@ -35,7 +35,7 @@ review rubric; recorded, justified deviations live in `implementation-notes.md`.
    clean. If it flags something, fix the cause; don't suppress.
 3. **If you touched anything host-facing** (VMM lifecycle, netns/tap/nft, cgroups, virtiofsd,
    snapshot, the agent, the pipeline), the unit suite does **not** cover it. On a KVM-capable
-   Linux host run `just test-rootless` and `just test-priv` (the latter needs `just bless`
+   Linux host run `just test-unprivileged` and `just test-privileged` (the latter needs `just bless`
    once after the runner rebuilds). If you cannot run them in this environment, **say so
    explicitly in your change summary** and make the tests correct by construction — never
    report a host-dependent change as validated on unit tests alone. That misreport is the
@@ -60,20 +60,20 @@ These are not inferable from the code; violating them passes compilation and oft
 naive test.
 
 - **Snapshot-eligibility law.** A snapshot-eligible VM has **no vhost-user device attached** —
-  not virtio-fs (virtiofsd), not the rootless `vhost-user-net` NAT, not an external
+  not virtio-fs (virtiofsd), not the unprivileged `vhost-user-net` NAT, not an external
   `vhost-device-vsock`. Consequence: the snapshot tier runs the **privileged (tap) network
-  path and a non-vhost-user vsock**. `restore()`/`snapshot()` must reject `NetConfig::Rootless`
+  path and a non-vhost-user vsock**. `restore()`/`snapshot()` must reject `NetConfig::Unprivileged`
   and a virtio-fs *rootfs*, and must not attach virtiofsd. Enforce in code, not just docs.
 - **Capability descriptor is the contract.** Backends diverge (Firecracker has no virtio-fs, no
   vhost-user-net, no nesting). An unsupported op returns `Error::Unsupported { vmm, feature }`,
   **never a panic, never a stringly-typed `Error::Vmm`**. `restore()`/`snapshot()`/`create()`
   self-check `capabilities()` and degrade or error — they do not assume CH semantics.
-- **Teardown order.** `TestVm::Drop` tears down **VMM process group → virtiofsd → netns /
+- **Teardown order.** `MicroVm::Drop` tears down **VMM process group → virtiofsd → netns /
   cgroup / overlay / sockets**, force-killing the process *group* with a wait
   (`kill -9 -<pgid>` then reap) — not `start_kill()` (leader-only, non-blocking), which orphans
   `ip netns exec` wrappers and leaves zombies. Removing a netns while the VMM still holds
   interfaces in it hangs or leaks; reap first. Release **both CID and VMID** in `Drop`.
-- **Zero-netlink in PID 1.** `imp-guest-agent` does **no** `ip link/addr/route`; the kernel
+- **Zero-netlink in PID 1.** `vmcell-guest-agent` does **no** `ip link/addr/route`; the kernel
   `ip=` cmdline (with `CONFIG_IP_PNP=y`, virtio-net present) configures `eth0`. The restore
   path must not re-run `ip` inside the guest either. A `Netlink` fake must be assertable to
   zero calls.
@@ -90,7 +90,7 @@ naive test.
   artifact with an intact `.cache_key` must be rejected.
 - **Pipeline staging.** Stage 0 **resolves pins** into a committed `pins.lock` inside the
   pipeline. Stages pass real data via `StageInputs`/`StageOutputs` (not empty structs, not
-  `IMP_KERNEL`/`IMP_ROOTFS` env vars). The snapshot stage boots the **erofs** rootfs, not
+  `VMCELL_KERNEL`/`VMCELL_ROOTFS` env vars). The snapshot stage boots the **erofs** rootfs, not
   `Block`. Anything a stage's output depends on (incl. the guest-agent binary) is a cached
   input, not a `run()` side effect. No `/tmp/vmlinux`-style fallback paths that hide a missing
   upstream artifact — missing input is an error. `reset_to(stage)` errors on an unknown name.
@@ -126,7 +126,7 @@ naive test.
   on growable public types; `#[must_use]` on constructors/builders; no `pub` leaking internals
   (`Pipeline.stages`, backend instance fields); no dead protocol variants advertised as live
   (`Hello`, no-op `Ping`).
-- **Security in the privileged window** (`imp-test-runner`): check the **effective** set, not
+- **Security in the privileged window** (`vmcell-test-runner`): check the **effective** set, not
   permitted; **drop the bounding set before raising ambient**; trim `P`/`E` after; for the
   setuid form, change uid *before* raising ambient. CA hygiene: generate once and cache the
   parsed authority (re-self-signing per `authority()` call breaks the guest trust chain), write
@@ -150,7 +150,7 @@ confirm it goes red. Reject these smells:
   sidecar and asserts a rebuild.
 - **mock where round-trip is required** — `put_file` asserting bytes reached a UDS mock instead
   of reading the file back in the guest.
-- **string stand-ins** — path-injectivity comparing `format!("imp-vm-{vmid}")` strings instead of
+- **string stand-ins** — path-injectivity comparing `format!("vmcell-vm-{vmid}")` strings instead of
   real socket paths, never varying `pid`; `/30` math doing `ends_with(".2/30")` instead of
   asserting octets and rejecting overflow at vmid ∈ {0,1,254,255}.
 
@@ -173,14 +173,14 @@ Permissive only (MIT / Apache-2.0 / BSD / ISC / Zlib) for anything **linked**; c
 only for an external **binary** (QEMU) when it unlocks a fallback. `cargo deny` is the source of
 truth — confirm a new crate's license via the gate, not its label (the `rustables`-mislabeled-as-MIT
 precedent). GPL source is **documentation-only**: read it to understand behavior, never copy it
-into this MIT/Apache codebase. Keep the privileged-window binaries (`imp-guest-agent`,
-`imp-test-runner`) dependency-thin — every dep there executes with elevated capability — and keep
+into this MIT/Apache codebase. Keep the privileged-window binaries (`vmcell-guest-agent`,
+`vmcell-test-runner`) dependency-thin — every dep there executes with elevated capability — and keep
 the agent off the host async stack (the lean-agent CI assertion enforces this).
 
 ## Definition of done
 
 - [ ] `just ci` is clean (cause fixed, not suppressed).
-- [ ] Host-facing change: `just test-rootless` + `just test-priv` run on a KVM host, **or** the
+- [ ] Host-facing change: `just test-unprivileged` + `just test-privileged` run on a KVM host, **or** the
       summary states they were not run and why, with the tests correct by construction.
 - [ ] The new/changed behavior has a test that fails on its inverse (incl. the panic path for any
       resource you acquire, and a negative test for any validation you add).

@@ -1,4 +1,4 @@
-//! `imp-testing` is a framework for fast, snapshot-based microvm testing.
+//! `vmcell` is a framework for fast, snapshot-based microvm testing.
 //!
 //! This crate provides tools to configure, launch, and interact with microVMs.
 //! It includes abstractions for networking, virtual machine monitors (like Cloud Hypervisor),
@@ -82,7 +82,7 @@ pub use metrics::ResourceUsage;
 #[cfg(feature = "host-common")]
 pub use net::tap::NetNamespace;
 #[cfg(feature = "host-common")]
-pub use orchestrator::TestVm;
+pub use orchestrator::MicroVm;
 #[cfg(feature = "host-common")]
 pub use proxy::EgressProxy;
 #[cfg(feature = "firecracker")]

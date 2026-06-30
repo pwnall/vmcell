@@ -40,20 +40,22 @@ impl Stage for GuestAgentStage {
             .arg("--target")
             .arg("x86_64-unknown-linux-gnu")
             .arg("--bin")
-            .arg("imp-guest-agent")
+            .arg("vmcell-guest-agent")
             .arg("--features")
             .arg("agent")
             .status()
             .await?;
         if !build_status.success() {
-            return Err(Error::Subprocess("Failed to build imp-guest-agent".into()));
+            return Err(Error::Subprocess(
+                "Failed to build vmcell-guest-agent".into(),
+            ));
         }
 
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .unwrap_or_else(|_| format!("{}/target", manifest_dir));
         let agent_path = std::path::PathBuf::from(target_dir)
-            .join("x86_64-unknown-linux-gnu/release/imp-guest-agent");
+            .join("x86_64-unknown-linux-gnu/release/vmcell-guest-agent");
 
         tokio::fs::copy(agent_path, out).await.map_err(Error::Io)?;
 

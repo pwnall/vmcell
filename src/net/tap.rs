@@ -49,7 +49,7 @@ where
 /// privileged test runs.
 ///
 /// Enumerates `/var/run/netns` and removes every namespace whose name starts
-/// with `prefix` (e.g. `imp-net-`). Intended to run at the start of a
+/// with `prefix` (e.g. `vmcell-net-`). Intended to run at the start of a
 /// privileged/netns test so a namespace leaked by a prior aborted run cannot
 /// collide with this run's vmid (`netns add … Operation not permitted`). It runs
 /// under the capability runner's `CAP_SYS_ADMIN`+`CAP_DAC_OVERRIDE`, so it needs
@@ -372,7 +372,7 @@ impl NetNamespace {
     /// # Errors
     /// Returns an error if the `rtnetlink` operations fail.
     pub fn create(vmid: u32, netlink: Box<dyn Netlink>) -> Result<Self> {
-        let name = format!("imp-net-{}", vmid);
+        let name = format!("vmcell-net-{}", vmid);
         let tap_name = format!("imp-tap-{}", vmid);
 
         netlink.add_netns(&name)?;
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn render_tproxy_rules_intercepts_web_and_drops_rest() {
         let ns = NetNamespace {
-            name: "imp-net-9".into(),
+            name: "vmcell-net-9".into(),
             tap_name: "imp-tap-9".into(),
             vmid: 9,
             netlink: Box::new(FakeNetlink::new()),
@@ -674,7 +674,7 @@ mod tests {
 
         // The nft applier is invoked exactly once, for this VM's netns.
         let ac = applier_calls.lock().unwrap();
-        assert_eq!(*ac, vec!["apply_rules(imp-net-7)".to_string()]);
+        assert_eq!(*ac, vec!["apply_rules(vmcell-net-7)".to_string()]);
 
         // setup_tproxy_routing is invoked, after the netns and tap exist.
         let nc = netlink_calls.lock().unwrap();
@@ -688,7 +688,7 @@ mod tests {
             .expect("setup_tap recorded");
         let pos_tproxy = nc
             .iter()
-            .position(|c| c == "setup_tproxy_routing(imp-net-7)")
+            .position(|c| c == "setup_tproxy_routing(vmcell-net-7)")
             .expect("setup_tproxy_routing recorded");
         assert!(
             pos_add < pos_tap,
@@ -720,7 +720,7 @@ mod tests {
         let c = calls.lock().unwrap();
         let deletes = c
             .iter()
-            .filter(|s| s.as_str() == "delete_netns(imp-net-5)")
+            .filter(|s| s.as_str() == "delete_netns(vmcell-net-5)")
             .count();
         assert_eq!(
             deletes, 1,
@@ -743,8 +743,8 @@ mod tests {
         assert!(res.is_err(), "create must propagate the setup_tap failure");
 
         let c = calls.lock().unwrap();
-        let pos_add = c.iter().position(|s| s == "add_netns(imp-net-11)");
-        let pos_del = c.iter().position(|s| s == "delete_netns(imp-net-11)");
+        let pos_add = c.iter().position(|s| s == "add_netns(vmcell-net-11)");
+        let pos_del = c.iter().position(|s| s == "delete_netns(vmcell-net-11)");
         assert!(pos_add.is_some(), "add_netns must have run: {:?}", *c);
         assert!(
             pos_del.is_some() && pos_add < pos_del,

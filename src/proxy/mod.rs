@@ -76,7 +76,7 @@ impl EgressProxy {
     ///
     /// # Examples
     /// ```rust
-    /// # use imp_testing::proxy::{EgressProxy, ProxyConfig};
+    /// # use vmcell::proxy::{EgressProxy, ProxyConfig};
     /// # async fn run() {
     /// let proxy = EgressProxy::start(ProxyConfig::default()).await.unwrap();
     /// println!("Proxy listening on port {}", proxy.port);
@@ -158,7 +158,7 @@ impl EgressProxy {
             };
 
             rt.block_on(async move {
-                // Rootless mode (no netns, not transparent) only ever receives
+                // Unprivileged mode (no netns, not transparent) only ever receives
                 // connections the smoltcp NAT dials at 127.0.0.1, so bind
                 // loopback instead of exposing the proxy on all interfaces. The
                 // privileged explicit-proxy and transparent front-ends must
@@ -330,7 +330,7 @@ impl EgressProxy {
 
 /// Chooses the listener bind IP for the egress proxy.
 ///
-/// Rootless mode (no netns, not transparent) only ever receives connections the
+/// Unprivileged mode (no netns, not transparent) only ever receives connections the
 /// smoltcp NAT dials at `127.0.0.1:<port>`, so it binds loopback rather than
 /// exposing the proxy on all interfaces. The privileged explicit-proxy
 /// front-end and the transparent (`IP_TRANSPARENT`) front-end both accept
@@ -520,11 +520,11 @@ mod tests {
         value
     }
 
-    // LOW: rootless binds loopback (the NAT only dials 127.0.0.1); the
+    // LOW: unprivileged binds loopback (the NAT only dials 127.0.0.1); the
     // privileged explicit-proxy and transparent front-ends bind wildcard. Buggy
     // impl guarded: the old unconditional `[0,0,0,0]` makes the first assert red.
     #[test]
-    fn proxy_bind_ip_is_loopback_only_for_rootless() {
+    fn proxy_bind_ip_is_loopback_only_for_unprivileged() {
         assert_eq!(proxy_bind_ip(false, false), [127, 0, 0, 1]);
         assert_eq!(proxy_bind_ip(false, true), [0, 0, 0, 0]);
         assert_eq!(proxy_bind_ip(true, false), [0, 0, 0, 0]);
