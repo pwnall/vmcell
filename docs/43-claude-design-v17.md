@@ -757,12 +757,18 @@ CONFIG_VHOST_VSOCK=y               # HOST-side; only needed so an *inner* (L2) V
 The kernel command line:
 
 ```text
-console=ttyS0 root=/dev/vda rootfstype=erofs ro
+console=ttyS0 loglevel=6 random.trust_cpu=on random.trust_bootloader=on root=/dev/vda rootfstype=erofs ro
 ip=10.200.<n>.2::10.200.<n>.1:255.255.255.252::eth0:off   # n = (vmid % 254) + 1  (§10.2)
-init=/usr/sbin/vmcell-guest-agent
+panic=1 init=/usr/sbin/vmcell-guest-agent
 ```
 
-The `ip=` parameter (enabled by `CONFIG_IP_PNP=y`) sets the guest address at boot — consumed by the
+`loglevel=6` keeps the serial console attached for panic capture (§12.10 — `contains_panic` matches
+KERN_EMERG lines) and for boot diagnostics (`NOTICE`/`WARN`/`ERR`, incl. the "Linux version" banner the
+`boot.rs` integration test asserts on) while dropping the voluminous `KERN_INFO` (6) device-probe
+output that otherwise dominates cold boot (each line is a synchronous write to the byte-at-a-time 8250
+UART); it was the single largest cold-boot lever (§15). `random.trust_cpu=on` avoids a possible CRNG-
+init stall on first `getrandom()`. The `ip=` parameter (enabled by `CONFIG_IP_PNP=y`) sets the guest
+address at boot — consumed by the
 kernel's IP-PNP late-initcall, not an initramfs — so PID 1 needs no netlink in either mode (§12.3). Three
 precisions: `CONFIG_VHOST_VSOCK` is host-side (the base guest control plane needs only `VSOCKETS` +
 `VIRTIO_VSOCKETS`; `VHOST_VSOCK` earns its place only for nested virt); the erofs decompressor `CONFIG`
@@ -1492,17 +1498,29 @@ tails/SLAs**.
 host-IP parse ≈29 ns; in-memory empty-tar→erofs ≈1.23 µs. The control-plane codec and per-VM address/cache
 math are tens-to-hundreds of nanoseconds — far below anything gating a multi-second VM lifecycle.
 
-**Macro — cold boot to agent-`Ready`** (N=20, warm-cache, 256 MiB): CH ≈635/669/669 ms; Firecracker
-≈1022/1038/1038 ms; QEMU ≈1405/1732/1732 ms.
+**Macro — cold boot to agent-`Ready`** (N=20, warm-cache, 256 MiB, **post the 2026-07-01 latency
+optimization pass** — see below): CH **≈330/346 ms**; Firecracker ≈776/787 ms; QEMU ≈1400 ms
+(pre-pass; code path unchanged). Pre-pass these were CH ≈635, FC ≈1022.
 
-**Macro — warm restore to agent response** (N=20): CH **≈169/179/179 ms** (default ≈ lazy; eager ≈258);
-Firecracker ≈128/138/138 ms *(measured restore-to-handshake; the `snapshot_restore` capability is
-currently gated off, §3.2)*; QEMU N/A (snapshot-ineligible in unprivileged+vsock).
+**Macro — warm restore to agent response** (N=20): CH **≈84/94 ms** (default ≈ lazy; eager ≈258, pre-
+pass); Firecracker N/A (`snapshot_restore` gated off, §3.2); QEMU N/A (snapshot-ineligible in
+unprivileged+vsock).
+
+**Latency optimization pass (2026-07-01).** A targeted pass recovered the latency the correct-but-
+slower code had accreted vs earlier buggy-fast versions — **CH cold 642→330 ms (−49%), CH restore
+166→84 ms (−49%)** — with **no invariant relaxed** (verified: `just ci` green, unit 242/0, privileged
+suite 232/0). The levers, largest first: the guest kernel cmdline dropped the verbose `KERN_INFO`
+serial flood (`loglevel=6`, keeping a debuggable/panic-capturable log); the guest vsock accept poll
+`ACCEPT_POLL` 100→20 ms (the dominant restore-reconnect cost — the host blocks for `Ready` between its
+CONNECT/OK handshake and the guest's next `accept()`); the graceful `shutdown()` teardown now polls
+`VmInstance::has_exited` up to a 250 ms (was 500) grace instead of always sleeping it; and tighter host
+connect/api-socket poll cadences. Full method + per-lever deltas: `docs/benchmark-results.md`,
+`docs/perf-experiments-log.md`; the deviations: `docs/implementation-notes.md`.
 
 Reading these together:
 
 - **Restore validates the snapshot tier and inverts the cold-boot ordering for the metric that matters.**
-  Restore is ≈3.7× faster than cold boot on CH (635→169 ms). Firecracker *would* win restore (≈128 ms)
+  Restore is ≈3.9× faster than cold boot on CH (330→84 ms post-pass). Firecracker *would* win restore
   while losing cold boot — exactly the density/snapshot-tier role it is assigned — once its warm-restore
   reconnect is fixed. **CH is the only backend a test can restore on today.**
 - **CH lazy restore (`prefault=off`, userfaultfd) is ≈1.5× faster than eager** — freq-pinned, lazy ≈176 ms
@@ -1523,11 +1541,13 @@ on size, the builder-VM source on provenance. **Guest agent:** static-`musl` is 
 glibc-dynamic (it static-links libc rather than borrowing the rootfs `libc.so.6`), so the real deciding
 axis is toolchain-availability + rootfs-independence, not size.
 
-**Per-test critical-path budget (CH):** cold is ~89% the `connect` phase (guest-boot + agent wait), ~6%
-create/spawn, ~4% teardown, ~1% exec — which is *why* the restore tier exists, to delete that phase.
-Restore is dominated by the same `connect` phase (reconnect + RNG/clock resync ~58% ≈115 ms), then
-restore+resume ~27%, teardown ~14% (a real ≈27 ms — "teardown is on the budget on purpose," the reap-VMM-
-first no-leak ordering), exec ~1%. The vsock exec round-trip floor is sub-millisecond (p50 ≈0.7 ms incl.
+**Per-test critical-path budget (CH, post-pass, graceful `shutdown()` teardown):** cold `connect`
+(guest-boot + agent wait) ≈284 ms, create/spawn ≈42 ms, exec ≈4 ms; restore `connect` collapses to
+≈36 ms (reconnect + RNG/clock/MAC resync), restore+resume ≈58 ms, exec ≈1 ms. **Teardown note:** the
+budget measures the *graceful* `MicroVm::shutdown()` (`request_shutdown` → poll `has_exited` up to a
+250 ms grace → force-kill) at ≈283 ms — a ceiling, not a leak; the fast per-test path is `Drop`
+(force-kill the VMM process group + reap, **≈27 ms**, §12.10), which a RAII consumer pays instead. The
+vsock exec round-trip floor is sub-millisecond (p50 ≈0.7 ms incl.
 in-guest fork/exec/reap).
 
 **Which numbers become guards.** Absolute ms/density/sizes stay observational (hardware- or pin-bound).

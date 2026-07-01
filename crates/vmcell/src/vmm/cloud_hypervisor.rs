@@ -270,7 +270,7 @@ impl CloudHypervisor {
             &res.cgroup_name,
             &api_socket,
             1000,
-            20,
+            5,
         )
         .await?;
 
@@ -348,7 +348,7 @@ impl Vmm for CloudHypervisor {
                 kernel: cfg.kernel.clone(),
                 cmdline: {
                     let mut s = format!(
-                        "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
+                        "console=ttyS0 loglevel=6 random.trust_cpu=on random.trust_bootloader=on root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
                         match &cfg.rootfs {
                             crate::config::RootfsSource::Erofs { .. } => "erofs",
                             _ => "ext4",
@@ -528,6 +528,14 @@ impl VmInstance for ChInstance {
         }
         let _ = self.process.wait().await;
         Ok(())
+    }
+
+    async fn has_exited(&mut self) -> bool {
+        // Non-blocking reap of the VMM leader; `Ok(Some(_))` means it exited (the
+        // guest powered off after `request_shutdown`). Reaping the leader early is
+        // safe — the later `kill()`/`Drop` SIGKILL of the now-dead group is a
+        // harmless no-op and `process.wait()` returns the cached status.
+        matches!(self.process.try_wait(), Ok(Some(_)))
     }
 
     async fn pause(&mut self) -> Result<()> {

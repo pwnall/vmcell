@@ -578,6 +578,13 @@ impl VmInstance for QemuInstance {
         Ok(())
     }
 
+    async fn has_exited(&mut self) -> bool {
+        // Non-blocking reap of the QEMU leader; `Ok(Some(_))` means it exited after
+        // `request_shutdown` (`system_powerdown`). Safe to reap early — the later
+        // SIGKILL of the dead group is a no-op and `process.wait()` returns cached.
+        matches!(self.process.try_wait(), Ok(Some(_)))
+    }
+
     async fn snapshot(&mut self, _dir: &Path) -> Result<()> {
         Err(Error::Unsupported {
             vmm: "qemu".to_string(),

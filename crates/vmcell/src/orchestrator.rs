@@ -10,11 +10,18 @@ use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-/// Bounded grace window `shutdown()` waits after `request_shutdown()` before the
-/// SIGKILL fallback, so the guest gets time to flush and power off cleanly
-/// (ORCH-7). The `Drop` path does not wait — it force-kills immediately — so
-/// this only applies to the explicit graceful `shutdown()`.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Upper bound on the grace window `shutdown()` waits after `request_shutdown()`
+/// before the SIGKILL fallback, so the guest gets time to flush and power off
+/// cleanly (ORCH-7). `shutdown()` polls [`VmInstance::has_exited`](crate::vmm::VmInstance::has_exited)
+/// and returns as soon as the guest actually powers off, so this is only the
+/// *ceiling* for a guest that never exits on its own — not an unconditional
+/// sleep. Lowered from 500 ms: the guest agent's SIGTERM handler is `sync()` +
+/// `reboot(RB_POWER_OFF)` over a tmpfs overlay + read-only erofs root (no heavy
+/// dirty-page writeback), so 250 ms is ample flush headroom, and the force-kill
+/// remains the guaranteed fallback. The `Drop` path does not wait at all — it
+/// force-kills immediately — so this only applies to the explicit graceful
+/// `shutdown()`.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A trait for providing time.
 pub trait Clock: Send + Sync {
@@ -1055,13 +1062,20 @@ impl<V: Vmm> MicroVm<V> {
         if let Some(mut inst) = self.instance.take() {
             let _ = inst.request_shutdown().await;
 
-            // ORCH-7: give the guest a bounded grace window to flush and power
-            // off after the shutdown request, before the SIGKILL fallback — an
-            // immediate `kill()` grants ~0 flush time. (A poll that returns early
-            // once the guest actually exits would need a `try_wait` on the
-            // `VmInstance` trait, which is out of this change's file scope; the
-            // fixed window is the correct-by-construction minimal fix.)
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            // ORCH-7: give the guest a bounded grace window to flush and power off
+            // after the shutdown request, before the SIGKILL fallback — an immediate
+            // `kill()` grants ~0 flush time. But rather than *always* sleeping the
+            // whole window (the placeholder ORCH-7 shipped), poll the now-realized
+            // `VmInstance::has_exited` and return as soon as the guest has actually
+            // powered off, capping at `SHUTDOWN_GRACE`. The force-kill below is still
+            // the guaranteed fallback for a guest that never exits on its own.
+            let grace_deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+            while tokio::time::Instant::now() < grace_deadline {
+                if inst.has_exited().await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
 
             // Force-kill + reap the process group so no zombie/EBUSY blocks the
             // netns teardown below.

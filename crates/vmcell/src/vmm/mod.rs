@@ -506,6 +506,16 @@ pub trait VmInstance: Send {
     /// # Errors
     /// Returns an error if the VMM process cannot be killed.
     async fn kill(&mut self) -> Result<()>;
+    /// Reports, without blocking, whether the underlying VMM process has already
+    /// exited. The graceful [`MicroVm::shutdown`](crate::orchestrator::MicroVm::shutdown)
+    /// polls this after `request_shutdown` so it can return as soon as the guest
+    /// has actually powered off, instead of always sleeping the full grace window
+    /// (the `try_wait` early-return ORCH-7 deferred). Defaults to `false`
+    /// (conservative — "not known to have exited," so `shutdown` waits its bounded
+    /// grace) for backends/fakes without a reapable process handle.
+    async fn has_exited(&mut self) -> bool {
+        false
+    }
     /// Pauses the VM, preparing it for a snapshot.
     ///
     /// # Errors
@@ -618,6 +628,13 @@ impl VmInstance for FakeVmInstance {
             lock.push("kill".to_string());
         }
         Ok(())
+    }
+    async fn has_exited(&mut self) -> bool {
+        // The fake has no real VMM process to reap, so it is trivially "exited":
+        // `shutdown()`'s grace poll returns immediately instead of waiting the full
+        // ceiling, keeping the teardown-order unit test fast (it asserts order, not
+        // timing).
+        true
     }
     async fn pause(&mut self) -> Result<()> {
         if let Ok(mut lock) = self.calls.lock() {

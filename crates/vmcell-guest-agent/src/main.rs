@@ -371,10 +371,19 @@ fn power_off_never_returns() -> ! {
 
 /// vsock control-plane port the host's `AgentClient` connects to.
 const VSOCK_PORT: u32 = 5000;
-/// Poll cadence for the non-blocking accept loop.
-const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-/// Re-bind the listener after this much idle time with no new connection.
-const REBIND_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Poll cadence for the non-blocking accept loop. Kept small: this bounds the
+/// delay between the host's completed CONNECT/OK handshake and the guest's next
+/// `accept()` (which sends `Ready`), so it sits directly on the cold-boot and
+/// restore-reconnect critical path. A failed `accept()` is a cheap non-blocking
+/// syscall, so a tight cadence costs only a few extra idle wakeups per second.
+const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+/// Re-bind the listener after this much idle time with no new connection. Bounds
+/// the post-restore "deaf listener" window (§9.2): on CH `--restore` the
+/// pre-snapshot listener stops yielding accepts, and the guest only re-attaches
+/// to the re-created vhost-vsock device by re-binding. Re-binding is harmless
+/// during normal operation (accepted connections keep their own fds), so a
+/// shorter idle only tightens the worst-case reconnect without new risk.
+const REBIND_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Binds the `CID_ANY:VSOCK_PORT` listener in non-blocking mode.
 ///

@@ -64,7 +64,11 @@ impl AgentClient {
         serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<Self> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut backoff = std::time::Duration::from_millis(50);
+        // Poll floor while the VMM host-side socket is still absent. Kept small
+        // because a failed local AF_UNIX connect is cheap, so a tighter cadence
+        // narrows the gap between "guest became ready" and "host noticed" without
+        // busy-spinning (the deadline + panic checks still run every iteration).
+        let mut backoff = std::time::Duration::from_millis(20);
 
         loop {
             if tokio::time::Instant::now() > deadline {
@@ -77,11 +81,20 @@ impl AgentClient {
             }
 
             let mut stream = match UnixStream::connect(vsock_path).await {
-                Ok(s) => s,
+                Ok(s) => {
+                    // The VMM's host-side vsock socket is up, so we are now in the
+                    // "guest still booting / not yet listening" regime, where the
+                    // right cadence is a tight fixed poll — not the exponential
+                    // backoff that only makes sense while the socket was absent.
+                    // Reset to the floor so a few socket-absent iterations can't
+                    // inflate the guest-ready detection gap (EXP-HOST-BACKOFF-RESET).
+                    backoff = std::time::Duration::from_millis(20);
+                    s
+                }
                 Err(e) => {
                     tracing::trace!("Agent connect UnixStream::connect failed: {}", e);
                     tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_millis(500));
+                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_millis(100));
                     continue;
                 }
             };
@@ -98,7 +111,7 @@ impl AgentClient {
                 let mut byte = [0; 1];
                 use tokio::io::AsyncReadExt;
                 if let Ok(Ok(1)) = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
+                    std::time::Duration::from_millis(150),
                     stream.read(&mut byte),
                 )
                 .await

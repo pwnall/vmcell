@@ -487,7 +487,7 @@ impl Vmm for Firecracker {
 
         let cmdline = {
             let mut s = format!(
-                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
+                "console=ttyS0 loglevel=6 random.trust_cpu=on random.trust_bootloader=on root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
                 match &cfg.rootfs {
                     crate::config::RootfsSource::Erofs { .. } => "erofs",
                     _ => "ext4",
@@ -760,6 +760,13 @@ impl VmInstance for FcInstance {
         }
         let _ = self.process.wait().await;
         Ok(())
+    }
+
+    async fn has_exited(&mut self) -> bool {
+        // Non-blocking reap of the VMM leader; `Ok(Some(_))` means it exited after
+        // `request_shutdown`. Safe to reap early — the later SIGKILL of the dead
+        // group is a no-op and `process.wait()` returns the cached status.
+        matches!(self.process.try_wait(), Ok(Some(_)))
     }
 
     async fn pause(&mut self) -> Result<()> {
