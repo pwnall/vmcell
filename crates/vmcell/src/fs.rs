@@ -193,6 +193,18 @@ impl VirtioFsDaemon {
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);
+        // CFG-3: the in-process (fuse-backend-rs passthrough) backend cannot enforce a
+        // read-only share, so it must fail loud rather than silently mount it rw.
+        // Surface that as a typed, matchable `Error::Unsupported` (the capability
+        // contract) up front — instead of the stringly `Error::Subprocess` the
+        // daemon's `io::Error` was formerly wrapped into below. The in-process worker
+        // keeps the same refusal as a lower-layer backstop.
+        if read_only {
+            return Err(crate::error::Error::Unsupported {
+                vmm: "in-process-virtiofsd".to_string(),
+                feature: "read-only virtio-fs share (in-process backend)".to_string(),
+            });
+        }
         // `start_in_process_virtiofsd` only returns `Ok` after the worker thread has
         // built the daemon and signalled that it has reached its serve loop; a
         // construction failure is reported as a typed error rather than a thread
@@ -325,5 +337,39 @@ mod uid_tests {
             decide_virtiofsd_uid(true, Some(0)),
             VirtiofsdUid::SandboxOnly
         );
+    }
+}
+
+#[cfg(all(test, feature = "experiment-fuse"))]
+mod ro_share_tests {
+    use super::VirtioFsDaemon;
+    use crate::config::{Access, CachePolicy, Share};
+
+    // CFG-3: the in-process (fuse-backend-rs passthrough) backend cannot enforce a
+    // read-only share, so `start` must fail loud with a typed, matchable
+    // `Error::Unsupported` — NOT the stringly `Error::Subprocess` the daemon's
+    // `io::Error` was formerly wrapped into. This goes red if the refusal regresses to
+    // `Subprocess` (or, worse, silently mounts the share read-write).
+    #[tokio::test]
+    async fn ro_share_is_unsupported_not_subprocess() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vmcell-fs-ro-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create host share dir");
+        let share = Share::new("ro", &tmp, Access::ReadOnly, CachePolicy::Never);
+
+        let err = VirtioFsDaemon::start(&share, &tmp)
+            .await
+            .expect_err("a read-only share must be refused by the in-process backend");
+        assert!(
+            matches!(
+                &err,
+                crate::error::Error::Unsupported { feature, .. } if feature.contains("read-only")
+            ),
+            "expected a typed Unsupported for a read-only share, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

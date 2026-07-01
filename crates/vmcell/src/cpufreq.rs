@@ -260,12 +260,35 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
     /// be read or written (e.g. lacking `CAP_DAC_OVERRIDE`), or that does not
     /// offer `performance`, is skipped with a `warn!` rather than aborting the
     /// benchmark. A CPU already on `performance` is left as-is and not recorded.
+    /// Even a failure to *enumerate* the online CPUs degrades to a `warn!` and an
+    /// empty no-op guard rather than aborting (CFG-4): §7.1 lists cpufreq as the
+    /// best-effort exception that degrades **visibly**, never fatal. A benchmark is
+    /// a tracked metric, not a pass/fail gate, so it must never fail to *run*
+    /// because the noise floor could not be pinned.
     ///
     /// # Errors
-    /// Returns [`CpuFreqError`] only for a fatal failure to enumerate the online
-    /// CPUs; per-CPU and turbo failures are logged and skipped.
+    /// Currently infallible: enumeration, per-CPU, and turbo failures are all logged
+    /// and degraded to a no-op guard. The `Result` is retained for signature
+    /// stability and forward-compatibility with any future genuinely-fatal sub-case.
     pub fn engage(sysfs: S) -> Result<Self, CpuFreqError> {
-        let online = sysfs.online_cpus()?;
+        // §7.1 best-effort exception (CFG-4): a failure to enumerate the online CPUs
+        // is NOT fatal — warn and degrade to an empty no-op guard (nothing pinned,
+        // nothing to restore) instead of propagating the error and aborting the
+        // benchmark, which was the single remaining intentional fatal path.
+        let online = match sysfs.online_cpus() {
+            Ok(cpus) => cpus,
+            Err(e) => {
+                warn!(
+                    "cpufreq: cannot enumerate online CPUs ({e}); frequency NOT pinned — \
+                     benchmark numbers will carry scaling noise (best-effort, §7.1)"
+                );
+                return Ok(Self {
+                    sysfs,
+                    restore_governors: Vec::new(),
+                    restore_turbo: None,
+                });
+            }
+        };
         let mut restore_governors = Vec::new();
         let mut skipped = 0usize;
 
@@ -395,6 +418,9 @@ mod tests {
         turbo: Option<bool>,
         /// CPUs whose governor write fails (simulating EACCES without caps).
         deny_write: Vec<u32>,
+        /// When set, `online_cpus()` returns an error (simulating an unreadable
+        /// `cpu/online`), so a test can drive the enumeration-failure path.
+        fail_online: bool,
         log: Vec<Op>,
     }
 
@@ -418,9 +444,14 @@ mod tests {
                     governors,
                     turbo: Some(true),
                     deny_write: Vec::new(),
+                    fail_online: false,
                     log: Vec::new(),
                 })),
             }
+        }
+
+        fn fail_online(&self) {
+            self.inner.lock().unwrap().fail_online = true;
         }
 
         fn set_governor(&self, cpu: u32, value: &str) {
@@ -466,7 +497,14 @@ mod tests {
 
     impl CpuFreqSysfs for RecordingCpuFreq {
         fn online_cpus(&self) -> Result<Vec<u32>, CpuFreqError> {
-            Ok(self.inner.lock().unwrap().online.clone())
+            let inner = self.inner.lock().unwrap();
+            if inner.fail_online {
+                return Err(CpuFreqError::ParseOnline {
+                    raw: "<injected>".to_string(),
+                    reason: "simulated cpu/online read failure".to_string(),
+                });
+            }
+            Ok(inner.online.clone())
         }
         fn available_governors(&self, _cpu: u32) -> Result<Vec<String>, CpuFreqError> {
             Ok(self.inner.lock().unwrap().available.clone())
@@ -607,5 +645,33 @@ mod tests {
         let pin = CpuFreqPin::engage(fake.clone()).unwrap();
         assert!(!pin.is_pinned(), "nothing pinnable ⇒ no-op guard");
         assert_eq!(fake.governor(0), "ondemand", "left untouched");
+    }
+
+    // CFG-4 (§7.1): a failure to *enumerate* the online CPUs must degrade to a
+    // logged no-op guard, NOT propagate an error — cpufreq is the best-effort
+    // benchmark knob that degrades visibly, never aborts. Goes red on the old
+    // `let online = sysfs.online_cpus()?;` (which returned `Err` here, so `.expect`
+    // below would panic and fail the test).
+    #[test]
+    fn online_enumeration_failure_degrades_to_noop_not_err() {
+        let fake = RecordingCpuFreq::new(&[0, 1], "powersave");
+        fake.fail_online();
+        let pin = CpuFreqPin::engage(fake.clone())
+            .expect("enumeration failure must degrade to a no-op guard, not Err");
+        assert!(!pin.is_pinned(), "a no-op guard must report nothing pinned");
+        assert_eq!(pin.pinned_cpus(), 0);
+        // No CPU was touched: governors stay at their original value and no write was
+        // logged, so the guard's Drop is inert too.
+        assert_eq!(fake.governor(0), "powersave", "cpu0 untouched");
+        assert_eq!(fake.governor(1), "powersave", "cpu1 untouched");
+        assert!(
+            fake.log().is_empty(),
+            "no sysfs write may occur when enumeration fails"
+        );
+        drop(pin);
+        assert!(
+            fake.log().is_empty(),
+            "dropping a no-op guard must not write anything"
+        );
     }
 }

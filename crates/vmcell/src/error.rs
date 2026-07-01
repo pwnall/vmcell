@@ -42,23 +42,21 @@ pub enum Error {
     #[error("Serialization error: {0}")]
     Serialize(String),
     /// A JSON serialization error.
-    #[cfg(any(
-        feature = "cloud-hypervisor",
-        feature = "firecracker",
-        feature = "qemu",
-        feature = "cli"
-    ))]
+    // `serde_json` is a shared host-service dep (VMM config/bundle), pulled by
+    // `host-common`, so the variant tracks that feature rather than each backend.
+    #[cfg(feature = "host-common")]
     #[error("JSON error: {0}")]
     SerdeJson(#[from] serde_json::Error),
     /// A Postcard serialization error.
     #[error("Postcard error: {0}")]
     Postcard(#[from] postcard::Error),
     /// A Hyper error.
-    #[cfg(any(feature = "cloud-hypervisor", feature = "firecracker"))]
+    // `hyper` backs the shared HTTP-over-Unix VMM client, pulled by `host-common`.
+    #[cfg(feature = "host-common")]
     #[error("Hyper error: {0}")]
     Hyper(#[from] hyper::Error),
     /// An HTTP error.
-    #[cfg(any(feature = "cloud-hypervisor", feature = "firecracker"))]
+    #[cfg(feature = "host-common")]
     #[error("HTTP error: {0}")]
     Http(#[from] hyper::http::Error),
     /// A QMP error.

@@ -31,10 +31,10 @@ jobs:
       - name: clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features
 
-      # NOTE on ordering (C-GATE-1): the reachable supply-chain / lean-target / API gates run
-      # FIRST and block the job. The known-RED `cargo hack --feature-powerset` step (accepted
-      # host-common module-gating debt) is moved to the END with `continue-on-error: true`, so it
-      # stays visible (a red annotation) but no longer short-circuits the gates below it.
+      # NOTE on ordering: the reachable supply-chain / lean-target / API gates run FIRST. The
+      # `cargo hack --feature-powerset` step runs LAST and is now BLOCKING — the §10.5 host-stack
+      # collapse closed the former C-GATE-1 module-gating debt, so every ≤2-feature config compiles
+      # clean and a regression back to RED must fail the job (it is placed last only for runtime).
 
       - name: cargo-deny
         run: cargo deny check
@@ -67,20 +67,35 @@ jobs:
       - name: guest-tools build+clippy     # guest userspace helper; build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes)
         run: cargo clippy -p vmcell-guest-tools --all-targets -- -D warnings
 
+      - name: reduced-host-feature builds (blocking)   # fast per-backend smoke before the full powerset
+        run: |
+          # After the §10.5 host-stack collapse, each shipping backend in isolation pulls the full,
+          # coherent host stack (host-common → net/proxy/metrics/pipeline + the shared hyper/serde_json
+          # deps), so a single-backend build compiles — including `qemu`, which previously did not.
+          # `metrics` is part of that stack, so CFG-1's "host without metrics" config is no longer
+          # constructible (its code fix remains as defense-in-depth). The powerset below is the
+          # comprehensive guard; this loop is fast per-backend feedback.
+          for feat in cloud-hypervisor firecracker qemu; do
+            echo "::group::clippy --no-default-features --features $feat"
+            cargo clippy -p vmcell --no-default-features --features "$feat" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+
       - name: ban module-global mutable ID/atomic state
         run: |
           ./scripts/ban-global-state.sh
           ./scripts/test-ban-global-state.sh   # the scanner's own red-on-inverse self-test
           ./scripts/ban-legacy-terms.sh        # design v14 §10.7 rename gate: no rootless/TestVm/imp_testing/imp-* in non-historical code
           ./scripts/test-ban-legacy-terms.sh   # the rename gate's own red-on-inverse self-test
+          ./scripts/ban-agent-ip-shellout.sh       # AGENT-4/TEST-5: guest agent must never shell out to `ip` (zero-netlink §4.3)
+          ./scripts/test-ban-agent-ip-shellout.sh  # the ip-shellout gate's own red-on-inverse self-test
 
       - name: public-API semver (PRs only)
         if: github.event_name == 'pull_request'
         run: cargo semver-checks --baseline-rev "${{ github.event.pull_request.base.sha }}" -p vmcell
 
-      # ---- Accepted-RED debt: LAST and non-blocking (C-GATE-1). Keep it visible, not gating. ----
-      - name: clippy feature-powerset (accepted-RED debt; non-blocking)
-        continue-on-error: true            # known-RED host-common module-gating; tracked, must not short-circuit the gates above
+      # ---- Feature-powerset: LAST and BLOCKING (former C-GATE-1 debt, closed by the §10.5 collapse). ----
+      - name: clippy feature-powerset (blocking; must be GREEN after the §10.5 collapse)
         run: cargo hack --feature-powerset --depth 2 clippy -p vmcell --all-targets
 
   # ---- Fast tests: unit, codec, property. No KVM. DEFAULT (non-ignored) set only. ----

@@ -229,7 +229,6 @@ impl Qemu {
         cfg: &VmConfig,
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
-        snapshot_dir: Option<&Path>,
     ) -> Result<(
         PathBuf,
         PathBuf,
@@ -353,6 +352,8 @@ impl Qemu {
                     .arg("-device")
                     .arg("virtio-blk-pci,drive=rfs");
             }
+            // Unreachable: `create()` rejects a virtio-fs rootfs up front via
+            // `reject_virtio_fs_rootfs` (VMM-1). Kept for match exhaustiveness.
             crate::config::RootfsSource::VirtioFs { .. } => {}
         }
 
@@ -418,9 +419,10 @@ impl Qemu {
             .arg("-append")
             .arg(&cmdline);
 
-        if snapshot_dir.is_some() {
-            cmd.arg("-incoming").arg("defer");
-        }
+        // VMM-5: no `-incoming defer` here. QEMU snapshot/restore is `snapshot_restore:
+        // false` in every config (§3.2), so `restore()` returns `Unsupported` before
+        // ever spawning — the migration-incoming branch was dead code (create() only
+        // cold-boots). Removed rather than gated behind the off capability.
 
         let cmd_str = format!("{:?}", cmd);
         tracing::info!("QEMU CMD: {}", cmd_str);
@@ -431,22 +433,21 @@ impl Qemu {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        // Capture the process-group id immediately: from here on any error must reap
-        // the spawned VMM group, or it leaks (the owning instance — whose Drop reaps
-        // — is not constructed until the caller).
-        let pgid = process.id();
-
-        if let Some(pid) = process.id() {
-            if let Err(e) = cgroups.add_task(&res.cgroup_name, pid) {
-                crate::vmm::reap_process_group(&mut process, pgid);
-                return Err(e);
-            }
-        }
-
-        if let Err(e) = crate::vmm::wait_for_socket(&qmp_socket, &mut process, 1000, 20).await {
-            crate::vmm::reap_process_group(&mut process, pgid);
-            return Err(Error::Vmm(format!("QMP socket failed to appear: {}", e)));
-        }
+        // Shared spawn+register+await-ready sequence (VMM-2): capture the pgid, add the
+        // VMM to its cgroup, and block on the QMP socket — reaping the process group on
+        // any failure. Routing through the shared helper drops QEMU's former
+        // `Error::Vmm("QMP socket failed to appear")` wrapping so the readiness error is
+        // now propagated raw, identically to CH/FC. On an error here the still-armed
+        // `vsock_guard` (and `fs_daemons`) reap the vhost-user daemons via `?`/`Drop`.
+        let pgid = crate::vmm::register_and_await_ready(
+            &mut process,
+            cgroups,
+            &res.cgroup_name,
+            &qmp_socket,
+            1000,
+            20,
+        )
+        .await?;
 
         // All post-spawn fallible steps succeeded; disarm the guard and hand the
         // daemon to the caller, which constructs the long-lived QemuInstance whose
@@ -475,6 +476,12 @@ impl Vmm for Qemu {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // VMM-1: no QEMU build boots a virtio-fs *rootfs* (it would need virtiofsd as
+        // the root device + `rootfstype=virtiofs`). Reject it up front with a typed
+        // `Unsupported` instead of silently emitting `root=/dev/vda rootfstype=ext4`
+        // for a VM with no `/dev/vda`, which kernel-panics the guest on a missing root.
+        crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
+
         let (
             qmp_socket,
             vsock_path,
@@ -484,7 +491,7 @@ impl Vmm for Qemu {
             fs_daemons,
             pgid,
             vsock_pgid,
-        ) = self.spawn_qemu(cfg, res, cgroups, None).await?;
+        ) = self.spawn_qemu(cfg, res, cgroups).await?;
         Ok(QemuInstance {
             process,
             qmp_socket,
@@ -633,6 +640,76 @@ impl Drop for QemuInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Guards VMM-1 for the QEMU `create()` path: a virtio-fs *rootfs* config is
+    // buildable and reaches create(), which must self-guard with a typed `Unsupported`
+    // rather than silently building an unbootable VM (the old empty `VirtioFs => {}`
+    // arm). Inverse: an erofs rootfs must NOT trip the guard.
+    #[test]
+    fn create_rejects_virtio_fs_rootfs() {
+        use crate::config::RootfsSource;
+
+        let err = crate::vmm::reject_virtio_fs_rootfs(
+            Qemu::new("/usr/bin/qemu-system-x86_64").id(),
+            &RootfsSource::VirtioFs {
+                dir: PathBuf::from("/d"),
+            },
+        )
+        .expect_err("QEMU create() must reject a virtio-fs rootfs");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "qemu" && feature == "virtio_fs_rootfs"),
+            "expected virtio_fs_rootfs Unsupported, got {err:?}"
+        );
+
+        crate::vmm::reject_virtio_fs_rootfs(
+            Qemu::new("/usr/bin/qemu-system-x86_64").id(),
+            &RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .expect("an erofs rootfs must not trip the QEMU guard");
+    }
+
+    // Guards VMM-5: QEMU `restore()` returns `Unsupported` *before spawning* — which is
+    // exactly why the removed `-incoming defer` migration branch in `spawn_qemu` was
+    // dead code. This runs without KVM because restore() errors out immediately. The
+    // buggy inverse (a restore() that tried to spawn a `-incoming` VM) would need KVM
+    // and would not return this typed error first.
+    #[tokio::test]
+    async fn restore_is_unsupported_before_spawning() {
+        use crate::config::{RootfsSource, VmConfig};
+
+        let qemu = Qemu::new("/usr/bin/qemu-system-x86_64");
+        let cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .build()
+        .expect("build config");
+        let res = PerVmResources {
+            cgroup_name: "vmcell-test".to_string(),
+            tap_name: Some("tap0".to_string()),
+            netns_name: None,
+            vhost_user_socket: None,
+            vmid: 1,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-1"),
+        };
+        let cgroups = crate::metrics::FakeCgroupFs::new();
+
+        let err = qemu
+            .restore(Path::new("/nonexistent-snapshot"), &cfg, &res, &cgroups)
+            .await
+            .expect_err("QEMU restore must be Unsupported");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "qemu" && feature == "snapshot_restore"),
+            "expected snapshot_restore Unsupported, got {err:?}"
+        );
+    }
 
     // Guards VMM-3: a QMP reply carrying an `error` object must surface as
     // Err(Error::Qmp). The buggy impl (discarding the reply / returning Ok) would

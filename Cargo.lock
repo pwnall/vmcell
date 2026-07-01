@@ -5800,10 +5800,12 @@ dependencies = [
 name = "vmcell-guest-agent"
 version = "0.2.0"
 dependencies = [
+ "bytes 1.12.0",
  "libc",
  "postcard",
  "rustix 0.38.44",
  "signal-hook",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "vmcell-protocol",

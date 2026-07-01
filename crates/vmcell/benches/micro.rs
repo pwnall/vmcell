@@ -1,5 +1,4 @@
 use criterion::{Criterion, black_box, criterion_group};
-use std::net::Ipv4Addr;
 use vmcell::agent::protocol::{ExecRequest, Message};
 use vmcell::artifact::{Stage, StageInputs, kernel::KernelStage};
 
@@ -57,11 +56,17 @@ fn bench_cache_key(c: &mut Criterion) {
 }
 
 fn bench_math_30(c: &mut Criterion) {
+    // CLI-2: bench the REAL production `/30` helper (`net::ip_math`), which applies
+    // `(vmid % 254) + 1` and formats the guest `/30` CIDR. The old hand-rolled
+    // `format!("10.200.{vmid}.1").parse()` was a strawman: it used a different octet
+    // and skipped the modular math, so a regression in the tracked helper could never
+    // move this "math_30_ipv4_parse" number. `black_box` both the vmid input and the
+    // `(host, guest, cidr)` output so the optimizer can't fold the call away.
     c.bench_function("math_30_ipv4_parse", |b| {
         b.iter(|| {
             let vmid = black_box(42u32);
-            let ip: Ipv4Addr = format!("10.200.{}.1", vmid).parse().unwrap();
-            black_box(ip);
+            let addrs = vmcell::net::ip_math(vmid).expect("vmid 42 is in the valid /30 range");
+            black_box(addrs);
         })
     });
 }

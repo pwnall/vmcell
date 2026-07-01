@@ -67,6 +67,27 @@ struct ReaperInner {
     generation: u64,
 }
 
+impl ReaperInner {
+    /// Bumps the generation, records `code` for `pid`, and prunes unclaimed
+    /// statuses beyond `max_statuses`. The caller must hold the coordinator
+    /// lock; callers wake waiters after releasing it.
+    fn record(&mut self, pid: u32, code: i32, max_statuses: usize) {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.statuses.insert(pid, (code, generation));
+
+        if self.statuses.len() > max_statuses {
+            let max = max_statuses as u64;
+            let ReaperInner {
+                statuses, waiting, ..
+            } = self;
+            statuses.retain(|reaped_pid, (_, recorded)| {
+                waiting.contains(reaped_pid) || generation.wrapping_sub(*recorded) < max
+            });
+        }
+    }
+}
+
 impl ReaperCoordinator {
     /// Creates a coordinator with the default status bound.
     #[must_use]
@@ -112,23 +133,50 @@ impl ReaperCoordinator {
     /// been recorded, so a flood of re-parented grandchildren cannot grow the
     /// map without bound. A status a waiter is currently blocked on is never
     /// pruned.
+    ///
+    /// This records a status the caller reaped *outside* the coordinator lock.
+    /// The PID-1 reaper must instead use [`ReaperCoordinator::drain_reaped`],
+    /// which performs the reap and the record under one lock so a reused pid
+    /// cannot be reserved between them (the residual PID-reuse race, §4.3).
     pub fn record_exit(&self, pid: u32, code: i32) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.generation = inner.generation.wrapping_add(1);
-        let generation = inner.generation;
-        inner.statuses.insert(pid, (code, generation));
-
-        if inner.statuses.len() > self.max_statuses {
-            let max = self.max_statuses as u64;
-            let ReaperInner {
-                statuses, waiting, ..
-            } = &mut *inner;
-            statuses.retain(|reaped_pid, (_, recorded)| {
-                waiting.contains(reaped_pid) || generation.wrapping_sub(*recorded) < max
-            });
-        }
+        inner.record(pid, code, self.max_statuses);
         drop(inner);
         self.available.notify_all();
+    }
+
+    /// Reaps and records exit statuses **atomically** with respect to
+    /// [`ReaperCoordinator::reserve`].
+    ///
+    /// `reap` is invoked repeatedly *while the coordinator lock is held* and
+    /// must perform a single non-blocking `waitpid(WNOHANG)`-style reap,
+    /// returning `Some((pid, code))` for each reaped child or `None` once none
+    /// remain. Because the reap and its record happen under the *same* lock, an
+    /// exec thread cannot `reserve` a pid in the window *between* a `waitpid`
+    /// that freed it and the record of its status: a fork can only reuse a pid
+    /// after the `waitpid` that reaped its zombie, and that `waitpid` runs
+    /// inside this critical section together with the record, so the stale
+    /// grandchild status is always recorded *before* the reservation that then
+    /// clears it. Recording the reaped status outside the lock (via a bare
+    /// [`ReaperCoordinator::record_exit`]) reopens that race: the stale status
+    /// lands *after* the reservation epoch and is mis-delivered as the reused
+    /// child's exit.
+    ///
+    /// `reap` must not call back into this coordinator (it would deadlock).
+    pub fn drain_reaped<F>(&self, mut reap: F)
+    where
+        F: FnMut() -> Option<(u32, i32)>,
+    {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut recorded_any = false;
+        while let Some((pid, code)) = reap() {
+            inner.record(pid, code, self.max_statuses);
+            recorded_any = true;
+        }
+        drop(inner);
+        if recorded_any {
+            self.available.notify_all();
+        }
     }
 
     /// Blocks until the exit status for `pid` is recorded, then claims and
@@ -330,6 +378,72 @@ mod reaper_tests {
         assert_ne!(
             got, STALE_CODE,
             "a reused pid must never deliver the prior occupant's status"
+        );
+        assert_eq!(coord.pending_statuses(), 0);
+    }
+
+    #[test]
+    fn reap_and_record_are_atomic_wrt_reservation_under_pid_reuse() {
+        // AGENT-1: residual PID-reuse race. A zombie holds a pid until reaped, so
+        // a fork can only reuse pid X *after* the `waitpid` that reaped its
+        // grandchild. In the buggy NON-atomic reaper the grandchild's status is
+        // recorded *after* that `waitpid` releases the lock; in that window a fork
+        // reuses X, the exec path `reserve()`s it, and the child's own exit is
+        // recorded — then the late stale record lands *past* the reservation epoch
+        // and is mis-delivered. `drain_reaped` closes this by recording the reaped
+        // status inside the SAME critical section the reap runs in.
+        //
+        // Here the reap closure runs under the coordinator lock; it releases the
+        // "reusing" thread and gives it time to try to `reserve` while it (the
+        // reap) still holds the lock, then yields the stale status. Under the
+        // atomic impl the reserve blocks on the held lock until STALE is recorded,
+        // so the reservation clears STALE and the reused child claims its own
+        // REAL exit. Under the non-atomic inverse (record outside the lock) the
+        // reserve+REAL land first and STALE overwrites them past the epoch, so the
+        // waiter wrongly returns STALE and the assertion below reddens.
+        const PID: u32 = 9001;
+        const STALE_CODE: i32 = 111; // grandchild exit; must never reach the waiter
+        const REAL_CODE: i32 = 3; // the reused exec child's own exit
+
+        let coord = Arc::new(ReaperCoordinator::new());
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel::<()>();
+
+        // Models the exec path that reuses freed pid X: once the reaper signals it
+        // has reaped (freed) X, reserve X and record the reused child's own exit.
+        let reusing = {
+            let coord = Arc::clone(&coord);
+            std::thread::spawn(move || {
+                reaped_rx.recv().unwrap();
+                coord.reserve(PID);
+                coord.record_exit(PID, REAL_CODE);
+            })
+        };
+
+        let mut yielded = false;
+        coord.drain_reaped(|| {
+            if yielded {
+                return None;
+            }
+            yielded = true;
+            // Release the reusing thread, then hold the lock long enough for it to
+            // reach (and, under the atomic impl, block on) `reserve` before STALE
+            // is recorded.
+            reaped_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            Some((PID, STALE_CODE))
+        });
+
+        reusing.join().unwrap();
+
+        let got = coord.wait_for(PID);
+        assert_eq!(
+            got, REAL_CODE,
+            "a pid reused after reaping must deliver its own exit, not the stale \
+             grandchild status recorded in the same drain"
+        );
+        assert_ne!(
+            got, STALE_CODE,
+            "the non-atomic reap+record race must not resurface"
         );
         assert_eq!(coord.pending_statuses(), 0);
     }

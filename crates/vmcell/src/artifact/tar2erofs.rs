@@ -8,17 +8,24 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Converts a tar archive to an EROFS filesystem image.
+/// Builds the flat `path -> Node` map from the injected files/symlinks and the given tar
+/// archives, applying OCI whiteout semantics (`.wh.<name>` deletions and `.wh..wh..opq`
+/// opaque-dir markers) as layers are merged in order.
+///
+/// Extracted from [`tar_to_erofs`] so the decode paths no gate sees — a device node's
+/// `rdev` (which must be `makedev`-encoded, not a naive `(major<<8)|minor`) and the
+/// whiteout deletions — are unit-testable (ART-4) by inspecting the resulting nodes
+/// directly, rather than only through the opaque packed EROFS bytes.
 ///
 /// # Errors
-/// Returns an error if reading the archive or generating the EROFS image fails.
+/// Returns [`crate::error::Error::Artifact`] if an injected file or an archive entry
+/// cannot be read.
 #[cfg(feature = "am-fs-erofs")]
-pub fn tar_to_erofs<'a, R: Read + 'a>(
+fn build_node_map<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
     injected_files: Vec<(&str, &Path)>,
     injected_symlinks: Vec<(&str, &str)>,
-    require_libc6: bool,
-) -> crate::error::Result<Vec<u8>> {
+) -> crate::error::Result<HashMap<PathBuf, Node>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
     // Inject extra files
@@ -177,6 +184,22 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
             entries.insert(normalized_path, node);
         }
     }
+
+    Ok(entries)
+}
+
+/// Converts a tar archive to an EROFS filesystem image.
+///
+/// # Errors
+/// Returns an error if reading the archive or generating the EROFS image fails.
+#[cfg(feature = "am-fs-erofs")]
+pub fn tar_to_erofs<'a, R: Read + 'a>(
+    archives: impl IntoIterator<Item = tar::Archive<R>>,
+    injected_files: Vec<(&str, &Path)>,
+    injected_symlinks: Vec<(&str, &str)>,
+    require_libc6: bool,
+) -> crate::error::Result<Vec<u8>> {
+    let mut entries = build_node_map(archives, injected_files, injected_symlinks)?;
 
     // Fail loud on a base image without glibc when the injected agent is the default
     // (dynamic-glibc) build: it would die at PID 1 (§7.1 / oci2erofs §8.2). One pass over
@@ -362,5 +385,133 @@ mod tests {
             pack_one("usr/bin/coreutils", false).is_ok(),
             "a libc6-less base must pack when require_libc6=false (static-musl agent)"
         );
+    }
+
+    // ART-4: a Char/Block device node's `rdev` must be encoded with `libc::makedev`, not a
+    // naive `(major<<8)|minor`. With `minor >= 256` the two formulas DIVERGE, so swapping
+    // `makedev` for the shift reddens the `assert_eq!` against the makedev value.
+    #[test]
+    fn test_device_node_rdev_uses_makedev() {
+        use fs_erofs::inode::{S_IFBLK, S_IFCHR, S_IFMT};
+        use fs_erofs::mkfs::Node;
+
+        // minor 300 (> 255) is what makes makedev(4,300) != (4<<8)|300.
+        let (major, minor) = (4u32, 300u32);
+        let expected = libc::makedev(major as libc::c_uint, minor as libc::c_uint) as u32;
+        let naive = (major << 8) | minor;
+        assert_ne!(
+            expected, naive,
+            "test needs minor>=256 so makedev diverges from the naive shift"
+        );
+
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            for (et, path) in [
+                (tar::EntryType::Char, "dev/mychar"),
+                (tar::EntryType::Block, "dev/myblock"),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(et);
+                h.set_size(0);
+                h.set_mode(0o600);
+                h.set_device_major(major).unwrap();
+                h.set_device_minor(minor).unwrap();
+                h.set_path(path).unwrap();
+                h.set_cksum();
+                b.append(&h, std::io::empty()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let map = build_node_map(vec![archive], vec![], vec![]).expect("node map");
+
+        match map.get(Path::new("dev/mychar")) {
+            Some(Node::Device { rdev, mode, .. }) => {
+                assert_eq!(
+                    *rdev, expected,
+                    "char device rdev must be makedev-encoded (ART-4)"
+                );
+                assert_eq!(mode & S_IFMT, S_IFCHR, "char device must carry S_IFCHR");
+            }
+            other => panic!("expected a char device node, got {other:?}"),
+        }
+        match map.get(Path::new("dev/myblock")) {
+            Some(Node::Device { rdev, mode, .. }) => {
+                assert_eq!(
+                    *rdev, expected,
+                    "block device rdev must be makedev-encoded (ART-4)"
+                );
+                assert_eq!(mode & S_IFMT, S_IFBLK, "block device must carry S_IFBLK");
+            }
+            other => panic!("expected a block device node, got {other:?}"),
+        }
+    }
+
+    // ART-4: OCI whiteouts. A `.wh.<name>` entry in a later layer deletes the shadowed path
+    // from earlier layers; `.wh..wh..opq` clears a directory's children but keeps the dir.
+    // A build that ignored whiteouts would keep `etc/gone` / `opaquedir/child` → red here.
+    #[test]
+    fn test_whiteout_deletes_shadowed_paths() {
+        // Lower layer: two files, plus an opaque dir with a child.
+        let mut lower = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut lower);
+            for (path, body) in [
+                ("etc/keep", &b"k"[..]),
+                ("etc/gone", &b"g"[..]),
+                ("opaquedir/child", &b"c"[..]),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, path, body).unwrap();
+            }
+            let mut hd = tar::Header::new_gnu();
+            hd.set_entry_type(tar::EntryType::Directory);
+            hd.set_size(0);
+            hd.set_mode(0o755);
+            hd.set_path("opaquedir").unwrap();
+            hd.set_cksum();
+            b.append(&hd, std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        // Upper layer: whiteout `etc/gone` and opaque-clear `opaquedir`.
+        let mut upper = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut upper);
+            for path in ["etc/.wh.gone", "opaquedir/.wh..wh..opq"] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(0);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, path, std::io::empty()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let a1 = tar::Archive::new(std::io::Cursor::new(lower));
+        let a2 = tar::Archive::new(std::io::Cursor::new(upper));
+        let map = build_node_map(vec![a1, a2], vec![], vec![]).expect("node map");
+
+        assert!(
+            map.contains_key(Path::new("etc/keep")),
+            "an unshadowed file must survive"
+        );
+        assert!(
+            !map.contains_key(Path::new("etc/gone")),
+            ".wh.gone must delete the shadowed etc/gone"
+        );
+        assert!(
+            !map.contains_key(Path::new("opaquedir/child")),
+            ".wh..wh..opq must clear the opaque dir's children"
+        );
+        assert!(
+            map.contains_key(Path::new("opaquedir")),
+            ".wh..wh..opq must keep the opaque dir itself"
+        );
+        // The whiteout markers themselves must never be materialized as files.
+        assert!(!map.contains_key(Path::new("etc/.wh.gone")));
+        assert!(!map.contains_key(Path::new("opaquedir/.wh..wh..opq")));
     }
 }

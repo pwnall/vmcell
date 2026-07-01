@@ -285,6 +285,81 @@ pub(crate) fn reap_process_group(process: &mut tokio::process::Child, pgid: Opti
     }
 }
 
+/// Registers a freshly-spawned VMM process with its cgroup and blocks until its
+/// control socket appears, reaping the process **group** on any failure.
+///
+/// This is the one shared "capture pgid → `add_task` (reap-on-err) → `wait_for_socket`
+/// (reap-on-err)" sequence for all three backends (VMM-2). It was copy-pasted into
+/// `spawn_ch`/`spawn_fc`/`spawn_qemu` and had already diverged (QEMU wrapped the
+/// readiness error in `Error::Vmm` while CH/FC propagated the raw error); routing
+/// every backend through this helper makes the error handling **identical** — the
+/// place per-backend divergence bugs hide (AGENTS.md "don't triplicate; extract").
+///
+/// `tokio::process::Child` does not kill on drop, so a cgroup `add_task` failure or a
+/// readiness timeout here MUST reap the spawned VMM group or it leaks — the owning
+/// instance (whose `Drop` reaps) is not constructed until the caller returns. Returns
+/// the captured pgid on success.
+///
+/// # Errors
+/// Returns — after reaping the process group — the raw underlying error: the cgroup
+/// `add_task` failure, or the readiness [`Error::Timeout`]/process-exited-early
+/// `Error` from [`wait_for_socket`]. The error is returned verbatim and identically
+/// across backends, so no backend can silently diverge on how it wraps it.
+pub(crate) async fn register_and_await_ready(
+    process: &mut tokio::process::Child,
+    cgroups: &dyn crate::metrics::CgroupFs,
+    cgroup_name: &str,
+    socket_path: &Path,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<Option<u32>> {
+    // Capture the process-group id immediately: from here on any error must reap the
+    // spawned VMM group, or it leaks.
+    let pgid = process.id();
+
+    if let Some(pid) = process.id() {
+        if let Err(e) = cgroups.add_task(cgroup_name, pid) {
+            reap_process_group(process, pgid);
+            return Err(e);
+        }
+    }
+
+    if let Err(e) = wait_for_socket(socket_path, process, timeout_ms, interval_ms).await {
+        reap_process_group(process, pgid);
+        return Err(e);
+    }
+
+    Ok(pgid)
+}
+
+/// Self-guard that rejects a virtio-fs **rootfs** for a backend that cannot boot one.
+///
+/// No backend supports a virtio-fs *rootfs* today: booting one would need virtiofsd
+/// wired as the root device plus a `rootfstype=virtiofs` kernel cmdline. A plain
+/// `VirtioFs`-rootfs config is nonetheless *buildable* — `config::build()` only
+/// rejects it when **also** snapshotting — so it reaches `create()`. Without this
+/// guard, CH/QEMU hit an empty match arm (no disk attached, no virtiofsd) while the
+/// cmdline falls through to `root=/dev/vda rootfstype=ext4` for a VM that has no
+/// `/dev/vda`, and the guest kernel-panics on a missing root — silently (VMM-1). Every
+/// backend's `create()` therefore self-guards with this instead of assuming the caller
+/// checked; it returns a typed [`Error::Unsupported`], mirroring Firecracker.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] `{ vmm, feature: "virtio_fs_rootfs" }` when `rootfs`
+/// is [`crate::config::RootfsSource::VirtioFs`]; `Ok(())` for every other rootfs.
+pub(crate) fn reject_virtio_fs_rootfs(
+    vmm: &str,
+    rootfs: &crate::config::RootfsSource,
+) -> Result<()> {
+    if matches!(rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
+        return Err(crate::error::Error::Unsupported {
+            vmm: vmm.to_string(),
+            feature: "virtio_fs_rootfs".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
 #[derive(Debug)]
@@ -608,6 +683,94 @@ mod tests {
 
         // Idempotent: removing an already-gone dir is a no-op, not a panic/error.
         remove_vm_tmp_dir(&vm_dir);
+    }
+
+    // Guards VMM-1: the shared virtio-fs-rootfs self-guard every backend's `create()`
+    // calls. The buggy inverse (no guard — the empty `VirtioFs => {}` match arm CH/QEMU
+    // used to hit) silently builds an unbootable VM; here it makes the first assertion
+    // go red. An erofs/block rootfs must NOT trip the guard (the inverse over-rejection).
+    #[test]
+    fn reject_virtio_fs_rootfs_rejects_only_virtio_fs() {
+        use crate::config::RootfsSource;
+
+        let err = reject_virtio_fs_rootfs(
+            "cloud-hypervisor",
+            &RootfsSource::VirtioFs {
+                dir: PathBuf::from("/d"),
+            },
+        )
+        .expect_err("a virtio-fs rootfs must be rejected");
+        assert!(
+            matches!(&err, crate::error::Error::Unsupported { vmm, feature }
+                if vmm == "cloud-hypervisor" && feature == "virtio_fs_rootfs"),
+            "expected virtio_fs_rootfs Unsupported, got {err:?}"
+        );
+
+        // erofs and block roots are bootable — the guard must let them through.
+        reject_virtio_fs_rootfs(
+            "qemu",
+            &RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .expect("erofs rootfs must be accepted");
+        reject_virtio_fs_rootfs(
+            "firecracker",
+            &RootfsSource::Block {
+                image: PathBuf::from("/i"),
+                overlay: None,
+            },
+        )
+        .expect("block rootfs must be accepted");
+    }
+
+    /// Spawns a long-lived stand-in process in its own process group, returning the
+    /// live tokio `Child`. Drives the reap tests without a real VMM binary.
+    fn spawn_group_standin() -> tokio::process::Child {
+        let mut std_cmd = std::process::Command::new("sleep");
+        std_cmd.arg("60");
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+        tokio::process::Command::from(std_cmd)
+            .spawn()
+            .expect("spawn sleep stand-in")
+    }
+
+    // Guards VMM-2: the shared spawn+register+await-ready helper MUST reap the process
+    // group when the control socket never appears (readiness failure). The buggy
+    // inverse — a backend that diverged and dropped the bare `Child` (no kill-on-drop)
+    // on the readiness path — would leave the process running; this asserts the helper
+    // both surfaces a `Timeout` and kills the group.
+    #[tokio::test]
+    async fn register_and_await_ready_reaps_group_on_readiness_failure() {
+        let mut process = spawn_group_standin();
+        let pid = process.id().expect("stand-in pid") as i32;
+        let cgroups = crate::metrics::FakeCgroupFs::new(); // add_task succeeds
+        // A socket that never appears + a short timeout forces the readiness failure.
+        let never = std::env::temp_dir().join("vmcell-nonexistent-readiness.sock");
+        let _ = std::fs::remove_file(&never);
+
+        let result =
+            register_and_await_ready(&mut process, &cgroups, "vmcell-test", &never, 100, 20).await;
+        assert!(
+            matches!(result, Err(crate::error::Error::Timeout(_))),
+            "readiness failure must surface a Timeout, got {result:?}"
+        );
+
+        // The process group must have been reaped. Poll to stay robust against the
+        // host reaper winning the waitpid race.
+        let mut gone = false;
+        for _ in 0..50 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "register_and_await_ready must reap the process group on a readiness failure"
+        );
     }
 
     #[test]

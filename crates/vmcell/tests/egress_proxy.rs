@@ -275,12 +275,16 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 #[ignore = "unprivileged egress: needs KVM + unprivileged vhost-user-net; selected by `just test-unprivileged`"]
 async fn test_egress_proxy_unprivileged() {
     let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
-    if !vmcell::vmm::Vmm::capabilities(&vmm).unprivileged_vhost_user_net {
-        println!(
-            "SKIP: cloud-hypervisor lacks unprivileged_vhost_user_net — cannot exercise the unprivileged egress path"
-        );
-        return;
-    }
+    // TEST-2: the CH primary path must NOT be exempted from the capability
+    // check. `require_cap!` HARD-FAILS (panics) for cloud-hypervisor rather than
+    // the previous `println!("SKIP…"); return;`, so a CH capability-descriptor
+    // regression (the flag flipping to false) makes the very test
+    // `just test-unprivileged` selects fail loudly instead of passing green.
+    require_cap!(
+        vmcell::vmm::Vmm::capabilities(&vmm),
+        unprivileged_vhost_user_net,
+        vmm
+    );
     // test_egress_proxy_impl configures NetConfig::Unprivileged + Egress::Filtered internally.
     test_egress_proxy_impl(&vmm).await;
 }
@@ -419,21 +423,55 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     );
 
     // TREATMENT — the genuinely transparent scenario (Requirement #4): the guest
-    // curls the SAME host WITHOUT any http_proxy, so its packets traverse the nft
-    // TPROXY ruleset rather than an explicit proxy. Default egress must NOT escape
-    // the filter: the prerouting chain is `policy drop` + tproxy tcp/80,443 into the
-    // IP_TRANSPARENT proxy, so the connection is constrained — curl must fail AND it
-    // must NOT receive the MITM double (which only the explicit path serves).
-    // Comparing against the explicit CONTROL above (same destination, MITM body)
-    // isolates the cause as the FILTER, not an unroutable address.
+    // curls WITHOUT any http_proxy, so its packets traverse the nft TPROXY
+    // ruleset rather than an explicit proxy.
+    //
+    // LOAD-BEARING SECURITY ASSERTION (TEST-1). The prior version gated the
+    // security property on `assert_ne!(transparent.code, 0)` against the
+    // black-hole `1.2.3.4:443`. That is FILTER-INDEPENDENT: curl fails for
+    // network-unreachability whether or not any egress ruleset exists, so an
+    // implementation emitting NO ruleset (fully-open default egress) passed the
+    // old assertion unchanged. Instead, assert the HOST-OBSERVABLE *applied* nft
+    // ruleset in the VM's netns — the transparent path is "filtered" iff the
+    // kernel actually carries the default-drop TPROXY ruleset. This reddens on
+    // the exact inverse the finding names: an impl that emits no ruleset makes
+    // `nft list table ip proxy` fail (returns None -> panic below); an
+    // accept-all policy drops the `policy drop` substring -> assert red.
+    let netns = format!("vmcell-net-{}", vmid);
+    let ruleset = common::nft_list_table_in_netns(&netns, "ip proxy").unwrap_or_else(|| {
+        panic!(
+            "privileged transparent egress must apply an nft ruleset in netns {netns}; \
+             `nft list table ip proxy` returned no table — fully-open egress is a security \
+             regression, not a pass"
+        )
+    });
+    assert!(
+        ruleset.contains("policy drop"),
+        "egress prerouting chain must default-drop (no fully-open egress); applied ruleset:\n{ruleset}"
+    );
+    assert!(
+        ruleset.contains("tproxy to :"),
+        "egress ruleset must TPROXY-redirect web traffic into the transparent proxy; \
+         applied ruleset:\n{ruleset}"
+    );
+    assert!(
+        ruleset.contains("vmcell-drop"),
+        "egress ruleset must carry the catch-all drop for non-web traffic; applied ruleset:\n{ruleset}"
+    );
+
+    // Behavioral corroboration (SECONDARY, not the security gate): a transparent
+    // curl (no http_proxy) must NOT be served the explicit-proxy MITM double —
+    // that double is only returned on the explicit CONNECT/absolute-form path
+    // proven by the CONTROL above. This is deliberately not load-bearing (it is
+    // filter-independent, per the note above); the applied-ruleset check is.
     //
     // NOTE (host validation needed): hudsucker does not yet reconstruct
     // absolute-form requests from a transparently-redirected connection, so the
-    // transparent path CONSTRAINS egress (the security property) but does not yet
-    // emit a 403 body for raw transparent traffic. See implementation-notes.md
-    // (H-PROXY-1): privileged transparent intake is wired at the socket layer
-    // (IP_TRANSPARENT + original-destination recovery) pending absolute-form
-    // reconstruction in the MITM layer.
+    // transparent path CONSTRAINS egress (the ruleset asserted above) but does
+    // not yet emit a 403 body for raw transparent traffic. See
+    // implementation-notes.md (H-PROXY-1): privileged transparent intake is
+    // wired at the socket layer (IP_TRANSPARENT + original-destination recovery)
+    // pending absolute-form reconstruction in the MITM layer.
     let transparent = agent
         .exec(ExecRequest::new(vec![
             "curl".into(),
@@ -448,10 +486,6 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         ]))
         .await
         .expect("Failed to execute transparent curl");
-    assert_ne!(
-        transparent.code, 0,
-        "transparent default egress must be filtered (curl should fail without http_proxy)"
-    );
     assert!(
         !transparent.stdout.starts_with(b"MITM SUCCESS!"),
         "the transparent path must NOT serve the explicit-proxy MITM double; got: {}",

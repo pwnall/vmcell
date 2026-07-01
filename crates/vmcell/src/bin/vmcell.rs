@@ -281,6 +281,9 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             let agent = vm.agent(None, &vmcell::orchestrator::RealClock).await?;
             let outcome = agent.exec(vmcell::ExecRequest::new(argv)).await?;
             use std::io::Write as _;
+            // Best-effort relay of the guest command's captured output. A broken pipe
+            // (the consumer closed stdout/stderr) must not abort the run or mask the
+            // guest's real exit code, which we propagate below via `process::exit`.
             let _ = std::io::stdout().write_all(&outcome.stdout);
             let _ = std::io::stderr().write_all(&outcome.stderr);
             vm.shutdown().await?;

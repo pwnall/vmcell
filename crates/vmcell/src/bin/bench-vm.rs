@@ -34,8 +34,10 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     mem_mib: u32,
 
-    /// Directory (must be on a real FS, NOT tmpfs) for `suspend-size` /
-    /// `phase-budget` snapshots — a RAM-backed tmpfs would mis-measure size.
+    /// Directory (must be on a real FS, NOT tmpfs) for the `latency` warm-restore,
+    /// `suspend-size`, and `phase-budget` snapshots — a RAM-backed tmpfs would
+    /// mis-measure suspend size and make warm-restore latency systematically
+    /// optimistic (RAM-backed reads; design §13.1 snap-dir caveat).
     #[arg(long, default_value = "./target/vmcell-bench-snap")]
     snap_dir: String,
 
@@ -138,7 +140,17 @@ async fn run_bench<V: Vmm>(
         .expect("valid VM configuration benchmark invariant");
     let cid_allocator = std::sync::Arc::new(CidAllocator::new());
 
-    let snap_dir = std::env::temp_dir().join(format!("vmcell-bench-snap-{}", std::process::id()));
+    // CLI-5: honor `--snap-dir` for the warm-restore snapshot instead of `temp_dir()`
+    // (commonly tmpfs / RAM-backed), which makes warm-restore latency systematically
+    // optimistic (§13.1 snap-dir caveat). `--snap-dir` defaults to a real-FS path
+    // (`./target/vmcell-bench-snap`), matching the suspend-size / phase-budget modes.
+    let snap_dir = PathBuf::from(&args.snap_dir).join(format!(
+        "latency-{}-{}",
+        args.backend,
+        std::process::id()
+    ));
+    // Best-effort pre-clean of a stale snapshot dir left by a prior aborted run; a
+    // missing dir (the common case) is not an error worth surfacing.
     let _ = std::fs::remove_dir_all(&snap_dir);
 
     if is_restore {
@@ -160,16 +172,35 @@ async fn run_bench<V: Vmm>(
         };
         if let Err(e) = base_vm.agent(None, &vmcell::orchestrator::RealClock).await {
             println!("Failed to connect to base VM agent: {}", e);
+            // Best-effort graceful teardown of the base VM; `MicroVm::Drop` is the
+            // real, guaranteed teardown, so a shutdown error is not actionable here.
             let _ = base_vm.shutdown().await;
             return;
         }
-        std::fs::create_dir_all(&snap_dir).expect("required configuration failed");
+        // CLI-3: a real I/O failure creating the snapshot dir must degrade gracefully
+        // (report zero runs and return), mirroring `run_suspend_size`, not panic the
+        // whole harness via `.expect()`.
+        if let Err(e) = std::fs::create_dir_all(&snap_dir) {
+            println!(
+                "{name}: cannot create snapshot dir {}: {e}",
+                snap_dir.display()
+            );
+            // Best-effort teardown of the booted base VM before bailing; `Drop` still
+            // guarantees the real teardown.
+            let _ = base_vm.shutdown().await;
+            return;
+        }
         if let Err(e) = base_vm.instance_mut().snapshot(&snap_dir).await {
             println!("Failed to take snapshot of base VM: {}", e);
+            // Best-effort cleanup on the snapshot-failure path: shut the base VM down
+            // (Drop is the real teardown) and drop the partial snapshot dir. Neither
+            // error is actionable and must not mask the reported failure above.
             let _ = base_vm.shutdown().await;
             let _ = std::fs::remove_dir_all(&snap_dir);
             return;
         }
+        // Best-effort graceful shutdown of the base VM now that the snapshot is taken;
+        // `MicroVm::Drop` guarantees the real teardown regardless.
         let _ = base_vm.shutdown().await;
     }
 
@@ -220,6 +251,8 @@ async fn run_bench<V: Vmm>(
                         latencies.push(elapsed);
                     }
                 }
+                // Best-effort per-iteration teardown; `Drop` is the guaranteed path,
+                // and a shutdown error must not corrupt the latency sample above.
                 let _ = vm.shutdown().await;
             }
             Err(e) => {
@@ -230,6 +263,8 @@ async fn run_bench<V: Vmm>(
     }
 
     if is_restore {
+        // Best-effort cleanup of the baseline snapshot dir after the run; a removal
+        // failure is not worth aborting the (already-collected) report for.
         let _ = std::fs::remove_dir_all(&snap_dir);
     }
 
@@ -437,6 +472,12 @@ async fn run_mode<V: Vmm>(
             run_bench(vmm, "Cold Boot", args, allocator.clone(), false).await;
             if vmm.capabilities().snapshot_restore {
                 run_bench(vmm, "Warm Restore", args, allocator.clone(), true).await;
+            } else {
+                // CLI-4 / §13.2 visible-skip: a no-snapshot backend (e.g. FC/QEMU in
+                // the unprivileged+vsock tier, §3.3) can't run Warm Restore. Print the
+                // reason rather than silently dropping the benchmark, matching the
+                // suspend-size / phase-budget modes.
+                println!("Warm Restore: backend {backend} has no snapshot support; skipping");
             }
         }
         "footprint" => run_footprint(vmm, backend, args, allocator).await,
@@ -698,6 +739,8 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         };
         if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
             println!("footprint: agent connect {i} failed: {e}");
+            // Best-effort teardown of the just-booted guest before bailing; `Drop`
+            // guarantees the real teardown, so a shutdown error is not actionable.
             let _ = vm.shutdown().await;
             break;
         }
@@ -853,6 +896,8 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     );
     println!("guest pid1 (agent) RSS mean = {} KiB", mean_u64(&pid1_rss));
 
+    // Best-effort teardown of every resident guest; `Drop` is the guaranteed path,
+    // so a shutdown error on any one VM must not abort cleanup of the rest.
     for v in vms {
         let _ = v.shutdown().await;
     }
@@ -878,6 +923,7 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         args.mem_mib,
         std::process::id()
     ));
+    // Best-effort pre-clean of a stale snapshot dir from a prior aborted run.
     let _ = std::fs::remove_dir_all(&snap_dir);
     if let Err(e) = std::fs::create_dir_all(&snap_dir) {
         println!(
@@ -899,22 +945,28 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         Ok(v) => v,
         Err(e) => {
             println!("suspend-size: boot failed: {e}");
+            // Best-effort removal of the (empty) snapshot dir before bailing.
             let _ = std::fs::remove_dir_all(&snap_dir);
             return;
         }
     };
     if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
         println!("suspend-size: agent connect failed: {e}");
+        // Best-effort teardown + snapshot-dir cleanup; `Drop` guarantees the real
+        // teardown and neither error is actionable, so we don't surface them.
         let _ = vm.shutdown().await;
         let _ = std::fs::remove_dir_all(&snap_dir);
         return;
     }
     if let Err(e) = vm.instance_mut().snapshot(&snap_dir).await {
         println!("suspend-size: snapshot failed: {e}");
+        // Best-effort teardown + partial-snapshot cleanup on the failure path.
         let _ = vm.shutdown().await;
         let _ = std::fs::remove_dir_all(&snap_dir);
         return;
     }
+    // Best-effort graceful shutdown before we measure the on-disk snapshot; `Drop`
+    // guarantees teardown regardless of this result.
     let _ = vm.shutdown().await;
 
     let files = walk_files(&snap_dir);
@@ -954,6 +1006,7 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         println!("  {s:>12}  {}", fname(p));
     }
 
+    // Best-effort cleanup of the measured snapshot dir now that it's been reported.
     let _ = std::fs::remove_dir_all(&snap_dir);
 }
 
@@ -983,6 +1036,9 @@ async fn build_baseline_snapshot<V: Vmm>(
         .snapshot(snap_dir)
         .await
         .map_err(|e| e.to_string())?;
+    // Best-effort graceful shutdown of the baseline VM once its snapshot is written;
+    // `Drop` guarantees teardown, so a shutdown error must not fail the (successful)
+    // snapshot build we return `Ok` for.
     let _ = base.shutdown().await;
     Ok(())
 }
@@ -1022,6 +1078,10 @@ async fn phase_budget_path<V: Vmm>(
 
     for i in 0..(iters + args.warmup) {
         if snap_dir.is_none() {
+            // Best-effort cold-cache drop for the cold-boot budget. Unlike `run_bench`
+            // (which labels the warm case), the phase-budget cold path is opt-in and
+            // relative, so a failed drop just yields warm-cache create timing — not a
+            // wrong result — and needs no CAP_SYS_ADMIN gate here.
             let _ = drop_page_cache();
         }
         let t0 = Instant::now();
@@ -1065,6 +1125,7 @@ async fn phase_budget_path<V: Vmm>(
         let t_connect = t1.elapsed();
         if !connect_ok {
             println!("phase-budget {label}: iter {i} connect failed");
+            // Best-effort teardown before bailing; `Drop` guarantees teardown.
             let _ = vm.shutdown().await;
             break;
         }
@@ -1078,11 +1139,15 @@ async fn phase_budget_path<V: Vmm>(
 
         let t2 = Instant::now();
         if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
+            // The exec *result* is intentionally unused: this phase measures the
+            // exec-round-trip latency (t2..t_exec), not the command's exit/output.
             let _ = agent.exec(ExecRequest::new(argv)).await;
         }
         let t_exec = t2.elapsed();
 
         let t3 = Instant::now();
+        // Teardown is deliberately on the budget (§13.4): we time it, and `Drop`
+        // still guarantees the real teardown if `shutdown` errors.
         let _ = vm.shutdown().await;
         let t_teardown = t3.elapsed();
 
@@ -1138,6 +1203,7 @@ async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
     if vmm.capabilities().snapshot_restore {
         let snap_dir =
             PathBuf::from(&args.snap_dir).join(format!("phase-{backend}-{}", std::process::id()));
+        // Best-effort pre-clean of a stale snapshot dir from a prior aborted run.
         let _ = std::fs::remove_dir_all(&snap_dir);
         if let Err(e) = std::fs::create_dir_all(&snap_dir) {
             println!("phase-budget: cannot create snap dir: {e}");
@@ -1158,6 +1224,7 @@ async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
             }
             Err(e) => println!("phase-budget: baseline snapshot failed: {e}"),
         }
+        // Best-effort cleanup of the baseline snapshot dir after the restore budget.
         let _ = std::fs::remove_dir_all(&snap_dir);
     } else {
         println!("phase-budget: backend {backend} has no restore; cold path only");
@@ -1194,6 +1261,7 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     };
     if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
         println!("vsock-rtt: agent connect failed: {e}");
+        // Best-effort teardown before bailing; `Drop` guarantees teardown.
         let _ = vm.shutdown().await;
         return;
     }
@@ -1201,6 +1269,8 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
 
     for _ in 0..args.warmup {
         if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
+            // Warmup iteration: the exec result is discarded on purpose (it primes
+            // caches / the vsock path and is not part of the measured sample).
             let _ = agent.exec(ExecRequest::new(argv.clone())).await;
         }
     }
@@ -1218,6 +1288,8 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
             rtts.push(dt);
         }
     }
+    // Best-effort teardown after the run; `Drop` guarantees the real teardown, so a
+    // shutdown error must not corrupt the collected RTT report below.
     let _ = vm.shutdown().await;
 
     println!(

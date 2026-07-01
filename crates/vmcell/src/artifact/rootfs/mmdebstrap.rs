@@ -127,6 +127,16 @@ pub async fn build_rootfs(
             .pins
             .get("debian_snapshot_timestamp")
             .ok_or_else(|| Error::Artifact("Missing debian_snapshot_timestamp pin".into()))?;
+        // ART-7 / §11.2 provenance note (this whole path is DEFERRED — it only runs inside
+        // a fully-booted builder micro-VM, which is not yet wired end-to-end): the apt
+        // signing chain here relies on the **builder VM's own apt defaults** — the
+        // debian-archive-keyring shipped in the OCI builder base — to gpg-verify the
+        // `snapshot.debian.org` Release files, rather than an explicit `--keyring` /
+        // `Signed-By=` on this source line. `[check-valid-until=no]` disables only the
+        // Valid-Until freshness window (required for old snapshot timestamps), NOT signature
+        // verification, and `http://` is safe here because the content is gpg-signed. When
+        // this path is un-deferred it must pass an explicit **pinned** keyring so provenance
+        // does not depend on whatever keyring the base image happens to carry.
         let mirror = format!(
             "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/{}/ {} main",
             timestamp, release

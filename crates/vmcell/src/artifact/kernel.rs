@@ -312,7 +312,7 @@ impl Stage for KernelStage {
             .await?;
         if !status.success() {
             return Err(Error::Subprocess(
-                "Failed to write kernel config fragment".into(),
+                "Failed to generate base kernel config (make defconfig kvm_guest.config)".into(),
             ));
         }
 

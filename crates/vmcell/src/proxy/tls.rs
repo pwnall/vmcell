@@ -64,15 +64,26 @@ impl CaManager {
     /// # Errors
     /// Returns an error if filesystem operations or key generation fail.
     fn new_in(dir: PathBuf) -> Result<Self> {
+        // NET-4: hold the cache lock across the *entire* generate-or-load, not
+        // just the final publish. Two concurrent `new_in(dir)` for the same
+        // directory would otherwise each generate a distinct CA and `rename` it
+        // to disk (last-writer-wins) while the cache keeps the first inserter's
+        // authority — leaving the on-disk `ca.pem`/`ca.key` diverged from the
+        // in-memory authority the proxy presents. Serializing the whole critical
+        // section makes exactly one thread materialize the CA per directory, so
+        // disk and memory agree by construction. The lock is process-global, but
+        // CA materialization is rare (build-time / proxy start) and the section
+        // only does a few small filesystem ops, so serializing them is cheap. A
+        // `?` early-return drops this guard normally (no poison); a panic would
+        // poison it, which the `into_inner` recovery below tolerates.
+        let mut cache = ca_cache().lock().unwrap_or_else(|e| e.into_inner());
+
         // Fast path: a CA was already materialized for this directory.
-        {
-            let cache = ca_cache().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((cert_pem, _)) = cache.get(&dir) {
-                return Ok(Self {
-                    ca_cert_pem: cert_pem.clone(),
-                    dir,
-                });
-            }
+        if let Some((cert_pem, _)) = cache.get(&dir) {
+            return Ok(Self {
+                ca_cert_pem: cert_pem.clone(),
+                dir,
+            });
         }
 
         std::fs::create_dir_all(&dir)?;
@@ -129,16 +140,15 @@ impl CaManager {
 
         let auth = RcgenAuthority::new(key_pair, cert, 1_000, aws_lc_rs::default_provider());
 
-        // Publish under this directory's key. If another thread raced us, keep
-        // the entry it inserted so every instance for this directory agrees on
-        // one authority.
-        let ca_cert_pem = {
-            let mut cache = ca_cache().lock().unwrap_or_else(|e| e.into_inner());
-            let entry = cache
-                .entry(dir.clone())
-                .or_insert_with(|| (ca_cert_pem.clone(), Arc::new(auth)));
-            entry.0.clone()
-        };
+        // Publish under this directory's key. We have held `cache` across the
+        // whole generate-or-load, and the fast-path check above found no entry,
+        // so this is the sole materializer for `dir`: the on-disk artifacts just
+        // written and this in-memory authority are guaranteed to match. The
+        // `or_insert_with` is defensive (it cannot already be present here).
+        let entry = cache
+            .entry(dir.clone())
+            .or_insert_with(|| (ca_cert_pem.clone(), Arc::new(auth)));
+        let ca_cert_pem = entry.0.clone();
 
         Ok(Self { ca_cert_pem, dir })
     }
@@ -194,5 +204,53 @@ mod tests {
         // The authority is resolvable per directory.
         assert!(ca1.authority().is_ok());
         assert!(ca2.authority().is_ok());
+    }
+
+    // NET-4: concurrent first-time materialization for the SAME directory must
+    // leave the on-disk `ca.pem` in agreement with the in-memory authority every
+    // racing instance reports. Buggy impl guarded: the pre-fix code released the
+    // cache lock across generate+rename, so one thread could win the cache
+    // (in-memory) while another won the disk `rename` (on-disk), diverging the
+    // two. Serializing the whole generate-or-load makes exactly one thread
+    // materialize per directory, so disk and memory agree. Repeated over several
+    // rounds (a fresh dir each round) so an un-serialized impl reddens with high
+    // probability, while the serialized impl passes deterministically.
+    #[test]
+    fn concurrent_new_in_keeps_disk_and_memory_ca_in_sync() {
+        for _round in 0..8 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dir_path = dir.path().to_path_buf();
+
+            let handles: Vec<_> = (0..3)
+                .map(|_| {
+                    let d = dir_path.clone();
+                    std::thread::spawn(move || {
+                        CaManager::new_in(d)
+                            .expect("new_in")
+                            .ca_cert_pem()
+                            .to_string()
+                    })
+                })
+                .collect();
+            let in_memory: Vec<String> = handles
+                .into_iter()
+                .map(|h| h.join().expect("join"))
+                .collect();
+
+            // All racing instances must agree on one in-memory CA.
+            for pem in &in_memory {
+                assert_eq!(
+                    pem, &in_memory[0],
+                    "concurrent new_in disagreed on the in-memory CA"
+                );
+            }
+            // The on-disk CA must match that single in-memory authority.
+            let on_disk =
+                std::fs::read_to_string(dir_path.join("ca.pem")).expect("read on-disk ca.pem");
+            assert_eq!(
+                on_disk, in_memory[0],
+                "on-disk ca.pem diverged from the in-memory authority (NET-4 TOCTOU)"
+            );
+        }
     }
 }

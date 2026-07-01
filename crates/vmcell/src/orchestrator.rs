@@ -10,6 +10,12 @@ use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+/// Bounded grace window `shutdown()` waits after `request_shutdown()` before the
+/// SIGKILL fallback, so the guest gets time to flush and power off cleanly
+/// (ORCH-7). The `Drop` path does not wait — it force-kills immediately — so
+/// this only applies to the explicit graceful `shutdown()`.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A trait for providing time.
 pub trait Clock: Send + Sync {
     /// Returns the current time.
@@ -58,21 +64,58 @@ impl Drop for CidGuard {
 /// [`VmidAllocator::shared`] for cross-process uniqueness on a real host, where
 /// several runner processes may share host-global resources keyed by VMID
 /// (netns, tap, cgroup, socket paths, CID, MAC, IP).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct VmidAllocator {
     active: Arc<Mutex<std::collections::BTreeSet<u32>>>,
     /// When set, cross-process reservations are recorded as lock files in this
     /// directory. `None` (the default) means in-process-only (hermetic).
     lock_dir: Option<std::path::PathBuf>,
+    /// Injected clock used **only** to seed the search start (a hermetic,
+    /// non-critical randomization that spreads the first-tried vmid across
+    /// processes). Injected rather than reading `SystemTime::now()` directly so
+    /// this seam is consistent with the rest of the file (ORCH-8) and the seed
+    /// is deterministic under a `FakeClock` in tests.
+    ///
+    /// The `+ RefUnwindSafe` bound keeps `VmidAllocator` (and any public type that
+    /// embeds it, e.g. `artifact::SnapshotStage`) `UnwindSafe`/`RefUnwindSafe`: a
+    /// bare `dyn Clock` trait object is not unwind-safe, so storing one silently
+    /// drops those auto-traits from the public surface. Both `Clock` impls
+    /// (`RealClock`, `FakeClock`) satisfy it, so the bound is free here.
+    clock: Arc<dyn Clock + std::panic::RefUnwindSafe>,
+}
+
+impl std::fmt::Debug for VmidAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The injected `Clock` is not `Debug`; omit it (it is a non-critical seed
+        // source, never part of the allocator's identity).
+        f.debug_struct("VmidAllocator")
+            .field("active", &self.active)
+            .field("lock_dir", &self.lock_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for VmidAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VmidAllocator {
     /// Creates a new, hermetic VMID allocator (in-process reservations only).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(RealClock))
+    }
+
+    /// Creates a hermetic allocator seeded from an injected [`Clock`] (ORCH-8).
+    /// Used by the unit tests to make the search-start seed deterministic; the
+    /// public constructors seed from [`RealClock`].
+    fn with_clock(clock: Arc<dyn Clock + std::panic::RefUnwindSafe>) -> Self {
         Self {
             active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             lock_dir: None,
+            clock,
         }
     }
 
@@ -85,6 +128,7 @@ impl VmidAllocator {
         Self {
             active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             lock_dir: Some(std::path::PathBuf::from("/tmp/vmcell-vmid")),
+            clock: Arc::new(RealClock),
         }
     }
 
@@ -141,7 +185,12 @@ impl VmidAllocator {
     /// Returns an error if all 254 VMIDs are currently in use.
     pub fn allocate(&self) -> Result<u32> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        let seed = std::time::SystemTime::now()
+        // ORCH-8: seed from the injected clock (consistent with the rest of the
+        // file), not `SystemTime::now()` directly. Non-critical: `allocate()`
+        // scans all 254 vmids and returns the first free one regardless of seed.
+        let seed = self
+            .clock
+            .now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
@@ -349,10 +398,18 @@ async fn maybe_resync_after_restore<E: GuestExec>(
         ])
         .await?;
     if outcome.code != 0 {
-        tracing::warn!(
-            "Failed to automatically resync guest clock: {}",
+        // ORCH-3: the clock resync is mandatory (§9.2) — a non-zero exit is a
+        // *surfaced, typed* failure, not a warning. We return here **before**
+        // clearing `*restored`, so the flag stays set and the next `agent()`
+        // call retries the whole resync. The previous code merely `warn!`d and
+        // then cleared `restored` unconditionally, permanently masking a
+        // persistently-failing clock set and leaving time-sensitive tests to see
+        // a frozen wall clock (silent-Ok-on-failure, the exact §7.1 defect).
+        return Err(crate::error::Error::Agent(format!(
+            "mandatory post-restore clock resync failed (exit {}): {}",
+            outcome.code,
             String::from_utf8_lossy(&outcome.stderr)
-        );
+        )));
     }
 
     // Best-effort re-seed of the guest CSPRNG from the virtio-rng device after
@@ -386,35 +443,37 @@ async fn maybe_resync_after_restore<E: GuestExec>(
 
     let mac = crate::net::mac_math(vmid)
         .map_err(|e| crate::error::Error::Agent(format!("mac math: {}", e)))?;
-    let (gateway, _guest_ip, ip) = crate::net::ip_math(vmid)
-        .map_err(|e| crate::error::Error::Agent(format!("ip math: {}", e)))?;
-    // NOTE: re-running `ip` inside the guest on restore diverges from the
-    // zero-netlink-in-PID-1 invariant; it is a documented last-resort fallback for
-    // rotating the guest network identity after a snapshot restore until
-    // device-layer rotation lands (see implementation-notes.md). `ip addr flush`
-    // drops the IP-PNP default route, so it MUST be re-added via the /30 gateway,
-    // otherwise post-restore egress to non-local destinations breaks. The Result
-    // is surfaced (warn) rather than discarded, and is best-effort: it never keeps
+    // ORCH-1 / §9.2: MAC rotation is the ONLY in-guest identity change the
+    // restore path performs, via a single `ip link set eth0 address <mac>` — a
+    // device-layer write (the guest-tools helper's `SIOCSIFHWADDR` ioctl, §5.3),
+    // consistent with the zero-netlink-in-PID-1 contract (§4.3). The IP address
+    // is deliberately NOT rotated: the old `ip addr flush && ip addr add && ip
+    // route add` chain was wrong — `ip addr flush` drops the IP-PNP default route
+    // (breaking post-restore egress to non-local hosts) and re-introduces exactly
+    // the in-guest netlink the design forbids. The guest keeps the address the
+    // kernel `ip=` cmdline set. Sent as a direct argv (no `sh -c` &&-chain is
+    // needed now that it is a single command). Best-effort: never keeps
     // `restored` set.
     match exec
         .exec_argv(vec![
-            "sh".into(),
-            "-c".into(),
-            format!(
-                "ip link set eth0 address {mac} && ip addr flush dev eth0 && ip addr add {ip} dev eth0 && ip route add default via {gateway} dev eth0"
-            ),
+            "ip".into(),
+            "link".into(),
+            "set".into(),
+            "eth0".into(),
+            "address".into(),
+            mac,
         ])
         .await
     {
         Ok(outcome) if outcome.code != 0 => {
             tracing::warn!(
-                "restore network bring-up failed (exit {}): {}",
+                "restore MAC rotation failed (exit {}): {}",
                 outcome.code,
                 String::from_utf8_lossy(&outcome.stderr)
             );
         }
         Err(e) => {
-            tracing::warn!("restore network bring-up could not be executed: {}", e);
+            tracing::warn!("restore MAC rotation could not be executed: {}", e);
         }
         _ => {}
     }
@@ -732,25 +791,33 @@ impl<V: Vmm> MicroVm<V> {
         vmid_alloc: VmidAllocator,
         cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
     ) -> Result<Self> {
+        // §3.3 boundary 2 (ORCH-4): the restore-path re-check of the
+        // snapshot-eligibility law returns `Error::Unsupported { vmm, feature }`
+        // (a capability rejection a caller can match on), NOT the generic
+        // `Error::Config` — a config a snapshot-eligible VMM cannot honor is an
+        // unsupported capability, not a malformed config.
         if matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
-            return Err(crate::error::Error::Config(
-                "virtio-fs rootfs cannot be used with snapshot restore".into(),
-            ));
+            return Err(crate::error::Error::Unsupported {
+                vmm: vmm.id().to_string(),
+                feature: "snapshot restore with a virtio-fs rootfs (vhost-user device)".into(),
+            });
         }
 
         if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
-            return Err(crate::error::Error::Config(
-                "unprivileged networking cannot be used with snapshot restore".into(),
-            ));
+            return Err(crate::error::Error::Unsupported {
+                vmm: vmm.id().to_string(),
+                feature: "snapshot restore with unprivileged (vhost-user-net) networking".into(),
+            });
         }
 
         // Snapshot-eligibility law: a virtio-fs data share is served by
         // virtiofsd (a vhost-user device), which a snapshot-eligible VM must
         // not attach. Reject it here (enforced in code, not just docs).
         if !cfg.shares.is_empty() {
-            return Err(crate::error::Error::Config(
-                "virtio-fs data shares cannot be used with snapshot restore".into(),
-            ));
+            return Err(crate::error::Error::Unsupported {
+                vmm: vmm.id().to_string(),
+                feature: "snapshot restore with a virtio-fs data share (vhost-user device)".into(),
+            });
         }
 
         let cgroup_fs: Arc<dyn crate::metrics::CgroupFs> = Arc::from(cgroup_fs);
@@ -943,45 +1010,30 @@ impl<V: Vmm> MicroVm<V> {
         self.instance_mut().snapshot(dir).await
     }
 
-    /// Shuts down the VM and cleans up associated resources.
+    /// Releases every per-VM resource that must be torn down **after** the VMM
+    /// instance, in the one canonical order:
+    /// smoltcp NAT → egress proxy → netns → cgroup → CID → VMID → scratch dir.
     ///
-    /// # Errors
-    /// Returns an error if shutting down the VM or proxy fails.
-    pub async fn shutdown(mut self) -> Result<()> {
-        if let Some(mut inst) = self.instance.take() {
-            let _ = inst.request_shutdown().await;
-
-            // Actually wait for it to stop to prevent zombie and ebusy
-            let _ = inst.kill().await;
-        }
-
-        if let Some(mut ns) = self.netns.take() {
-            let _ = ns.delete();
-        }
-        if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
-            let _ = fs.delete_slice(&cg_name);
-        }
-        #[cfg(feature = "net-unprivileged")]
-        let _ = self.smoltcp.take();
-        let _ = self.proxy.take();
-        Ok(())
-    }
-}
-
-impl<V: Vmm> Drop for MicroVm<V> {
-    fn drop(&mut self) {
-        // Enforce teardown order: VMM instance -> virtiofsd -> netns/cgroup/overlay/sockets
-        drop(self.instance.take());
-
+    /// Both [`shutdown`](Self::shutdown) (after the graceful async
+    /// `request_shutdown` + `kill`) and [`Drop`] route through this single
+    /// helper so the two teardown paths **cannot diverge** (ORCH-2): the old
+    /// `shutdown()` deleted the netns *before* dropping the egress proxy, which
+    /// on the privileged path runs *inside* that netns — removing a netns while
+    /// a process still holds interfaces/sockets in it hangs or leaks (the
+    /// AGENTS.md teardown-order invariant). Every field is `take()`n, so a
+    /// second call (e.g. `Drop` running after `shutdown()` already ran) is a
+    /// no-op.
+    fn teardown_post_instance(&mut self) {
+        // The egress proxy (privileged transparent/explicit front-end) and the
+        // smoltcp NAT (unprivileged path) hold sockets/threads INSIDE the netns,
+        // so they MUST be released before the netns is deleted.
         #[cfg(feature = "net-unprivileged")]
         drop(self.smoltcp.take());
         drop(self.proxy.take());
-        // Netns teardown (after proxy, before cgroup — preserving the documented
-        // order). `NetNamespace::delete()` is idempotent and `NetNamespace::Drop`
-        // performs the single teardown and surfaces a *genuine* failure via the
-        // NET-8 warning. Dropping the taken value tears the namespace down exactly
-        // once at this point in the order; an explicit `delete()` here would only
-        // risk a redundant attempt (and, pre-guard, a spurious WARN) — M-NET-3.
+        // Netns after proxy/smoltcp, before cgroup (the documented order).
+        // `NetNamespace::delete()` is idempotent and `NetNamespace::Drop`
+        // performs the single teardown, surfacing a *genuine* failure via the
+        // NET-8 warning; dropping the taken value tears it down exactly once.
         drop(self.netns.take());
         if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
             let _ = fs.delete_slice(&cg_name);
@@ -994,6 +1046,246 @@ impl<V: Vmm> Drop for MicroVm<V> {
         // would race a live process still holding a socket there.
         drop(self.tmp_dir.take());
     }
+
+    /// Shuts down the VM and cleans up associated resources.
+    ///
+    /// # Errors
+    /// Returns an error if shutting down the VM or proxy fails.
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(mut inst) = self.instance.take() {
+            let _ = inst.request_shutdown().await;
+
+            // ORCH-7: give the guest a bounded grace window to flush and power
+            // off after the shutdown request, before the SIGKILL fallback — an
+            // immediate `kill()` grants ~0 flush time. (A poll that returns early
+            // once the guest actually exits would need a `try_wait` on the
+            // `VmInstance` trait, which is out of this change's file scope; the
+            // fixed window is the correct-by-construction minimal fix.)
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+
+            // Force-kill + reap the process group so no zombie/EBUSY blocks the
+            // netns teardown below.
+            let _ = inst.kill().await;
+            // Instance fully torn down here (end of scope) BEFORE the shared
+            // post-instance teardown deletes the netns it held interfaces in.
+        }
+
+        // ORCH-2: everything after the instance goes through the ONE shared
+        // ordered helper, so `shutdown()` and `Drop` cannot diverge — in
+        // particular the proxy/smoltcp NAT are released before the netns.
+        self.teardown_post_instance();
+        Ok(())
+    }
+}
+
+impl<V: Vmm> Drop for MicroVm<V> {
+    fn drop(&mut self) {
+        // Teardown order: VMM instance (process group + virtiofsd/vhost-vsock
+        // daemons) FIRST, then the shared post-instance teardown
+        // (proxy/smoltcp → netns → cgroup → cid → vmid → scratch dir). Routing
+        // through the same helper as `shutdown()` keeps the two paths identical
+        // (ORCH-2).
+        drop(self.instance.take());
+        self.teardown_post_instance();
+    }
+}
+
+/// Parses the trailing vmid from a per-VM resource identifier — the last
+/// `-`-separated numeric token. Works for every vmcell resource name:
+/// `vmcell-net-<vmid>`, a `vmcell-vm-<vmid>` cgroup slice (even nested under a
+/// `<base>/…` prefix), and a `vmcell-vm-<pid>-<vmid>` scratch dir. Returns
+/// `None` when the tail is not a `u32`, so a foreign entry is never swept.
+fn trailing_vmid(name: &str) -> Option<u32> {
+    name.rsplit('-').next()?.parse().ok()
+}
+
+/// Read-only enumeration seam for the orphan sweeper ([`sweep_orphans`]).
+///
+/// A hard crash (SIGKILL/OOM) bypasses [`MicroVm`]'s `Drop`, leaking
+/// host-global resources keyed by vmid — network namespaces, per-VM cgroup
+/// slices, and per-VM scratch directories — that a later vmid then collides
+/// with (ORCH-6, a standing B1 gap: teardown was previously RAII-only). The
+/// sweeper lists candidates through this trait so it can be exercised with a
+/// recording fake (no privileged host state); removal then goes through the
+/// injected [`Netlink`](crate::net::tap::Netlink)/[`CgroupFs`](crate::metrics::CgroupFs)
+/// seams so only non-live ids are reclaimed, in the canonical teardown order.
+pub trait OrphanScanner: Send + Sync {
+    /// Names of every network namespace matching the `vmcell-net-*` prefix.
+    fn scan_netns(&self) -> Vec<String>;
+    /// Names (paths relative to the cgroup-v2 root, as [`CgroupFs`](crate::metrics::CgroupFs)
+    /// expects) of every per-VM cgroup slice matching `vmcell-vm-*`.
+    fn scan_cgroup_slices(&self) -> Vec<String>;
+    /// Per-VM scratch directories whose basename matches `vmcell-vm-*`.
+    fn scan_scratch_dirs(&self) -> Vec<std::path::PathBuf>;
+}
+
+/// The production [`OrphanScanner`]: enumerates `/var/run/netns`, the cgroup-v2
+/// mount at `/sys/fs/cgroup`, and the per-VM scratch base
+/// ([`std::env::temp_dir`]).
+///
+/// Host-facing (privileged) — this real path reads privileged host state and is
+/// **correct-by-construction, not KVM/privilege-validated here**; the unit tests
+/// drive [`sweep_orphans`] through a recording fake instead. Deeply-nested
+/// delegated cgroup slices are found by a bounded recursive walk.
+#[derive(Debug, Default, Clone)]
+pub struct HostOrphanScanner;
+
+impl HostOrphanScanner {
+    /// Bounded recursive walk of the cgroup-v2 tree under `root`, collecting the
+    /// paths (relative to `/sys/fs/cgroup`) of directories named `vmcell-vm-*`.
+    fn walk_cgroup_slices(root: &std::path::Path, rel: &str, depth: u8, out: &mut Vec<String>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", rel, name)
+            };
+            if name.starts_with("vmcell-vm-") {
+                out.push(child_rel);
+                // A per-VM slice has no vmcell children; no need to descend.
+                continue;
+            }
+            Self::walk_cgroup_slices(&entry.path(), &child_rel, depth - 1, out);
+        }
+    }
+}
+
+impl OrphanScanner for HostOrphanScanner {
+    fn scan_netns(&self) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir("/var/run/netns") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("vmcell-net-"))
+            .collect()
+    }
+
+    fn scan_cgroup_slices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        Self::walk_cgroup_slices(std::path::Path::new("/sys/fs/cgroup"), "", 4, &mut out);
+        out
+    }
+
+    fn scan_scratch_dirs(&self) -> Vec<std::path::PathBuf> {
+        let base = std::env::temp_dir();
+        let Ok(dir) = std::fs::read_dir(&base) else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("vmcell-vm-"))
+            })
+            .collect()
+    }
+}
+
+/// What a [`sweep_orphans`] pass reclaimed, returned for logging and tests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SweepReport {
+    /// Network namespaces removed (in sweep order).
+    pub netns: Vec<String>,
+    /// Cgroup slices removed (in sweep order).
+    pub cgroup_slices: Vec<String>,
+    /// Per-VM scratch directories removed (in sweep order).
+    pub scratch_dirs: Vec<std::path::PathBuf>,
+}
+
+/// Reclaims orphaned per-VM host resources left by a crashed run (ORCH-6).
+///
+/// Enumerates candidates through the injected [`OrphanScanner`] and removes each
+/// one whose trailing vmid is **not** in `live_vmids` — so a resource still owned
+/// by a running VM is never swept — through the injected
+/// [`Netlink`](crate::net::tap::Netlink) (netns) and
+/// [`CgroupFs`](crate::metrics::CgroupFs) (cgroup slice) seams, plus a direct
+/// scratch-dir `remove_dir_all`. Removal follows the canonical teardown order —
+/// **netns → cgroup → scratch dir** (an orphan has no live instance or proxy, so
+/// that is the relevant tail of the AGENTS.md order). Returns a [`SweepReport`]
+/// of what was reclaimed. Intended to run once at process/suite start (a leaked
+/// netns collides with a later vmid: `netns add … Operation not permitted`).
+///
+/// The real host paths (netns delete, cgroup rmdir) are privileged and are
+/// **not** KVM/privilege-validated here; the unit tests exercise the ordering,
+/// live-skip, and per-seam delegation through recording fakes.
+pub fn sweep_orphans(
+    scanner: &dyn OrphanScanner,
+    netlink: &dyn crate::net::tap::Netlink,
+    cgroup_fs: &dyn crate::metrics::CgroupFs,
+    live_vmids: &std::collections::BTreeSet<u32>,
+) -> SweepReport {
+    let mut report = SweepReport::default();
+
+    for name in scanner.scan_netns() {
+        let Some(vmid) = trailing_vmid(&name) else {
+            continue;
+        };
+        if live_vmids.contains(&vmid) {
+            continue; // still owned by a live VM — never sweep it
+        }
+        match netlink.delete_netns(&name) {
+            Ok(()) => report.netns.push(name),
+            Err(e) => tracing::warn!("sweep_orphans: failed to delete netns {}: {}", name, e),
+        }
+    }
+
+    for name in scanner.scan_cgroup_slices() {
+        let Some(vmid) = trailing_vmid(&name) else {
+            continue;
+        };
+        if live_vmids.contains(&vmid) {
+            continue;
+        }
+        match cgroup_fs.delete_slice(&name) {
+            Ok(()) => report.cgroup_slices.push(name),
+            Err(e) => {
+                tracing::warn!(
+                    "sweep_orphans: failed to delete cgroup slice {}: {}",
+                    name,
+                    e
+                );
+            }
+        }
+    }
+
+    for dir in scanner.scan_scratch_dirs() {
+        let Some(vmid) = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(trailing_vmid)
+        else {
+            continue;
+        };
+        if live_vmids.contains(&vmid) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => report.scratch_dirs.push(dir),
+            // Already gone (a racing Drop reclaimed it) is success, not a leak.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.scratch_dirs.push(dir),
+            Err(e) => tracing::warn!(
+                "sweep_orphans: failed to remove scratch dir {}: {}",
+                dir.display(),
+                e
+            ),
+        }
+    }
+
+    report
 }
 
 #[cfg(test)]
@@ -1070,6 +1362,27 @@ mod tests {
             alloc.reserve(255),
             Err(crate::error::Error::Config(_))
         ));
+    }
+
+    // ORCH-8. The search-start seed comes from the INJECTED clock, not
+    // `SystemTime::now()` directly. On an empty allocator `allocate()` returns
+    // exactly the seeded start `(subsec_nanos % 254) + 1`, so a fixed `FakeClock`
+    // makes the first allocation deterministic. Buggy impl (seeding from
+    // `SystemTime::now()`) ignores the injected clock and returns a wall-clock
+    // value instead — reddening these exact-value assertions.
+    #[test]
+    fn test_vmid_allocate_seed_uses_injected_clock() {
+        let at = |ns: u32| -> Arc<dyn Clock + std::panic::RefUnwindSafe> {
+            Arc::new(FakeClock {
+                time: std::time::UNIX_EPOCH + std::time::Duration::new(0, ns),
+            })
+        };
+        let a = VmidAllocator::with_clock(at(1000));
+        assert_eq!(a.allocate().unwrap(), (1000 % 254) + 1);
+        // A different fixed time yields a different starting vmid → the seed is
+        // genuinely clock-derived, not a constant.
+        let b = VmidAllocator::with_clock(at(2000));
+        assert_eq!(b.allocate().unwrap(), (2000 % 254) + 1);
     }
 
     // ---- Full teardown-order assertion (design §12.4 / §12.3) ----
@@ -1415,7 +1728,9 @@ mod tests {
             Box::new(crate::metrics::FakeCgroupFs::new()),
         )
         .await;
-        assert!(matches!(res, Err(crate::error::Error::Config(_))));
+        // ORCH-4 / §3.3 boundary 2: a vhost-user device on the restore path is an
+        // `Unsupported` capability rejection, not a generic `Config` error.
+        assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
     }
 
     /// A recording guest-exec fake for the post-restore resync tests. Fails the
@@ -1428,6 +1743,9 @@ mod tests {
         calls: usize,
         fail_first_n: usize,
         rng_exit_code: i32,
+        /// Exit code returned for the mandatory `date -s` clock resync (ORCH-3);
+        /// default 0. Non-zero drives the fail-loud clock-resync path.
+        clock_exit_code: i32,
     }
 
     impl GuestExec for FakeExec {
@@ -1440,6 +1758,8 @@ mod tests {
             }
             let code = if argv.iter().any(|a| a.contains("/dev/hwrng")) {
                 self.rng_exit_code
+            } else if argv.first().map(String::as_str) == Some("date") {
+                self.clock_exit_code
             } else {
                 0
             };
@@ -1504,14 +1824,29 @@ mod tests {
             Some(true),
             "the reseed applied on the successful pass"
         );
-        // The three resync commands ran, in order: clock, RNG reseed, network.
+        // The three resync commands ran, in order: clock, RNG reseed, MAC.
         assert_eq!(exec.recorded.len(), 3, "full resync must run on retry");
         assert_eq!(exec.recorded[0][0], "date");
         assert!(exec.recorded[1].iter().any(|a| a.contains("/dev/hwrng")));
+        // ORCH-1 / §9.2: MAC rotation is a single direct `ip link set eth0
+        // address <mac>` argv — NOT an `sh -c` chain with `ip addr flush/add` +
+        // `ip route add` (which drops the IP-PNP route and re-adds in-guest
+        // netlink). Reddens if the old flush/add/route chain is restored.
+        assert_eq!(
+            &exec.recorded[2][..5],
+            &["ip", "link", "set", "eth0", "address"]
+        );
+        assert_eq!(
+            exec.recorded[2].len(),
+            6,
+            "argv is `ip link set eth0 address <mac>`"
+        );
         assert!(
-            exec.recorded[2]
+            !exec.recorded[2]
                 .iter()
-                .any(|a| a.contains("ip link set eth0 address"))
+                .any(|a| a == "flush" || a == "add" || a == "route" || a.contains("sh")),
+            "the wrong addr-flush/add + route-add chain must be gone: {:?}",
+            exec.recorded[2]
         );
     }
 
@@ -1556,6 +1891,46 @@ mod tests {
             .unwrap();
         assert!(exec.recorded.is_empty(), "no resync when not restored");
         assert_eq!(reseed, None);
+    }
+
+    // ORCH-3. A NON-ZERO exit of the mandatory clock resync (`date -s`) must be
+    // surfaced as a typed failure — NOT swallowed with a `warn!` while `restored`
+    // is cleared as if it succeeded. Buggy impl (warn + fall through +
+    // `*restored = false`) returns `Ok(())`, clears `restored`, and never retries,
+    // so a time-sensitive restored test silently sees a frozen wall clock. This
+    // reddens on that inverse: it asserts the Err is returned, `restored` stays
+    // set (so the next agent() call retries), and the best-effort RNG/MAC steps
+    // did NOT run past the failed mandatory step.
+    #[tokio::test]
+    async fn test_resync_clock_nonzero_exit_is_surfaced() {
+        let clock = fixed_clock();
+        let mut restored = true;
+        let mut reseed = None;
+        let mut exec = FakeExec {
+            clock_exit_code: 1,
+            ..FakeExec::default()
+        };
+        let res =
+            maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5).await;
+        assert!(
+            matches!(res, Err(crate::error::Error::Agent(_))),
+            "a non-zero clock-resync exit must be a surfaced, typed failure, not Ok"
+        );
+        assert!(
+            restored,
+            "restored must STAY set after a failed mandatory clock resync so it retries"
+        );
+        assert_eq!(
+            reseed, None,
+            "the best-effort RNG reseed must not run once the mandatory clock resync failed"
+        );
+        // Only the failed `date` command was attempted; no RNG/MAC follow-on.
+        assert_eq!(
+            exec.recorded.len(),
+            1,
+            "resync stops at the failed mandatory step"
+        );
+        assert_eq!(exec.recorded[0][0], "date");
     }
 
     /// A `CgroupFs` whose `read_stats` reports a configurable `limits_enforced`,
@@ -1675,6 +2050,302 @@ mod tests {
         assert!(
             calls.contains(&"resume".to_string()),
             "MicroVm::resume must delegate to the instance: {calls:?}"
+        );
+    }
+
+    // ORCH-5 (B1/B6). Dropping a `MicroVm` that holds a REAL `Some(cid)` /
+    // `Some(vmid)` guard must return BOTH ids to their allocators. The existing
+    // drop-order builder sets `cid: None, vmid: None`, so its guard-Drop release
+    // paths are no-ops; `test_allocate_vmid` exercises `release()` directly, not
+    // guard-Drop. This builds the guards, captures the ids, drops the VM, and
+    // asserts the SAME ids are handed back out. The no-op-release inverse (a
+    // `Drop`/guard that does not call `release()`) reddens: the CID re-allocation
+    // would skip `cid` and the VMID re-reservation would fail `Exhaustion`.
+    #[test]
+    fn test_drop_returns_cid_and_vmid_to_allocators() {
+        let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
+        let vmid_alloc = VmidAllocator::new();
+        let cid = cid_alloc.allocate().expect("cid"); // lowest free = 3
+        let vmid = vmid_alloc.reserve(9).expect("vmid");
+
+        let vm: MicroVm<crate::vmm::FakeVmm> = MicroVm {
+            vmid: Some(VmidGuard {
+                vmid,
+                allocator: vmid_alloc.clone(),
+            }),
+            instance: None,
+            netns: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: None,
+            cgroup_name: None,
+            cgroup_fs: None,
+            agent_client: None,
+            restored: false,
+            restore_reseed_applied: None,
+            cid: Some(CidGuard {
+                cid,
+                allocator: cid_alloc.clone(),
+            }),
+            tmp_dir: None,
+        };
+        drop(vm);
+
+        assert_eq!(
+            cid_alloc.allocate().expect("cid re-alloc"),
+            cid,
+            "the CID must be returned to the allocator on guard-Drop"
+        );
+        assert!(
+            vmid_alloc.reserve(vmid).is_ok(),
+            "the VMID must be returned to the allocator on guard-Drop"
+        );
+    }
+
+    // ---- ORCH-6: orphan sweeper (recording fakes) ----
+
+    struct FakeOrphanScanner {
+        netns: Vec<String>,
+        cgroups: Vec<String>,
+        scratch: Vec<std::path::PathBuf>,
+    }
+    impl OrphanScanner for FakeOrphanScanner {
+        fn scan_netns(&self) -> Vec<String> {
+            self.netns.clone()
+        }
+        fn scan_cgroup_slices(&self) -> Vec<String> {
+            self.cgroups.clone()
+        }
+        fn scan_scratch_dirs(&self) -> Vec<std::path::PathBuf> {
+            self.scratch.clone()
+        }
+    }
+
+    #[cfg(feature = "net-privileged")]
+    struct RecordingSweepNetlink {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[cfg(feature = "net-privileged")]
+    impl crate::net::tap::Netlink for RecordingSweepNetlink {
+        fn add_netns(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn setup_tap(
+            &self,
+            _netns: &str,
+            _tap: &str,
+            _vmid: u32,
+        ) -> Result<Option<tun_tap::Iface>> {
+            Ok(None)
+        }
+        fn delete_netns(&self, name: &str) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("netns:{name}"));
+            Ok(())
+        }
+        fn setup_tproxy_routing(&self, _netns: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingSweepCgroupFs {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl std::fmt::Debug for RecordingSweepCgroupFs {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("RecordingSweepCgroupFs")
+        }
+    }
+    impl crate::metrics::CgroupFs for RecordingSweepCgroupFs {
+        fn create_slice(&self, _name: &str, _limits: &crate::config::ResourceLimits) -> Result<()> {
+            Ok(())
+        }
+        fn delete_slice(&self, name: &str) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("cgroup:{name}"));
+            Ok(())
+        }
+        fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
+            Ok(ResourceUsage::default())
+        }
+        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // ORCH-6. `sweep_orphans` must reclaim ONLY resources whose trailing vmid is
+    // not live, in the canonical teardown order (netns -> cgroup -> scratch dir),
+    // through the injected Netlink/CgroupFs seams. Seeds the scanner with an
+    // orphan (vmid 3) and a live (vmid 7) entry of each kind. Reddens on: sweeping
+    // a live id (no-skip), skipping an orphan, or reordering netns-vs-cgroup.
+    #[cfg(feature = "net-privileged")]
+    #[test]
+    fn test_sweep_orphans_reclaims_only_dead_ids_in_order() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let nl = RecordingSweepNetlink { log: log.clone() };
+        let cg = RecordingSweepCgroupFs { log: log.clone() };
+        let live: std::collections::BTreeSet<u32> = [7].into_iter().collect();
+
+        // Real scratch dirs so removal is observable on disk (unique per process).
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let orphan_dir = base.join(format!("vmcell-vm-{pid}-3"));
+        let live_dir = base.join(format!("vmcell-vm-{pid}-7"));
+        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
+        std::fs::create_dir_all(&live_dir).expect("live dir");
+
+        let scanner = FakeOrphanScanner {
+            netns: vec!["vmcell-net-3".into(), "vmcell-net-7".into()],
+            cgroups: vec!["base/vmcell-vm-3".into(), "base/vmcell-vm-7".into()],
+            scratch: vec![orphan_dir.clone(), live_dir.clone()],
+        };
+
+        let report = sweep_orphans(&scanner, &nl, &cg, &live);
+
+        // Only the dead (vmid 3) resources were swept; the live (vmid 7) kept.
+        assert_eq!(report.netns, vec!["vmcell-net-3".to_string()]);
+        assert_eq!(report.cgroup_slices, vec!["base/vmcell-vm-3".to_string()]);
+        assert_eq!(report.scratch_dirs, vec![orphan_dir.clone()]);
+        assert!(
+            !orphan_dir.exists(),
+            "the orphan scratch dir must be removed"
+        );
+        assert!(live_dir.exists(), "the live scratch dir must be kept");
+
+        // Every netns delete precedes every cgroup delete, and only orphans were
+        // deleted through the injected seams.
+        let calls = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            calls,
+            vec![
+                "netns:vmcell-net-3".to_string(),
+                "cgroup:base/vmcell-vm-3".to_string(),
+            ],
+            "sweep must delete only the orphan, netns before cgroup: {calls:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&live_dir);
+    }
+
+    // ---- ORCH-2: shutdown() tears down the proxy BEFORE the netns ----
+    //
+    // The old `shutdown()` deleted the netns before dropping the egress proxy that
+    // runs inside it. Route both `shutdown()` and `Drop` through one shared
+    // ordered helper so they cannot diverge. This drives the REAL `shutdown()`
+    // path with a real loopback `EgressProxy`, a recording netns, and a recording
+    // cgroup. The recording netns, at delete time, probes whether the proxy's port
+    // is already free: `EgressProxy::Drop` synchronously joins its thread (freeing
+    // the port), so in the correct order the port is free ("proxy_gone") by the
+    // time the netns is deleted. The inverse (netns removed while the proxy still
+    // listens) makes the probe find the port bound ("proxy_present") -> red.
+    #[cfg(all(feature = "net-privileged", feature = "proxy"))]
+    struct ShutdownOrderNetlink {
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        proxy_port: u16,
+    }
+    #[cfg(all(feature = "net-privileged", feature = "proxy"))]
+    impl crate::net::tap::Netlink for ShutdownOrderNetlink {
+        fn add_netns(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn setup_tap(
+            &self,
+            _netns: &str,
+            _tap: &str,
+            _vmid: u32,
+        ) -> Result<Option<tun_tap::Iface>> {
+            Ok(None)
+        }
+        fn delete_netns(&self, name: &str) -> Result<()> {
+            let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+            log.push(format!("netns_delete:{name}"));
+            // If the proxy's port is bindable now, the proxy was torn down BEFORE
+            // this netns delete (correct order); if still bound, the netns is being
+            // removed while the proxy runs inside it (the ORCH-2 bug).
+            let probe = std::net::TcpListener::bind(("127.0.0.1", self.proxy_port));
+            log.push(if probe.is_ok() {
+                "proxy_gone".to_string()
+            } else {
+                "proxy_present".to_string()
+            });
+            Ok(())
+        }
+        fn setup_tproxy_routing(&self, _netns: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "net-privileged", feature = "proxy"))]
+    #[tokio::test]
+    async fn test_shutdown_tears_down_proxy_before_netns() {
+        let proxy = EgressProxy::start(ProxyConfig::default())
+            .await
+            .expect("real loopback proxy must start");
+        let port = proxy.port;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let netns = NetNamespace::create(
+            11,
+            Box::new(ShutdownOrderNetlink {
+                log: log.clone(),
+                proxy_port: port,
+            }),
+        )
+        .expect("fake netns create");
+
+        let instance = crate::vmm::FakeVmInstance {
+            vsock_path: std::path::PathBuf::from("/tmp/vmcell-shutdown-vsock.sock"),
+            serial: std::path::PathBuf::from("/tmp/vmcell-shutdown-serial.log"),
+            calls: log.clone(),
+        };
+
+        let vm = MicroVm::<crate::vmm::FakeVmm> {
+            vmid: None,
+            instance: Some(instance),
+            netns: Some(netns),
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: Some(proxy),
+            cgroup_name: Some("vmcell-vm-11".to_string()),
+            cgroup_fs: Some(std::sync::Arc::new(TimelineCgroupFs { log: log.clone() })),
+            agent_client: None,
+            restored: false,
+            restore_reseed_applied: None,
+            cid: None,
+            tmp_dir: None,
+        };
+
+        vm.shutdown().await.expect("shutdown ok");
+
+        let calls = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            calls.iter().any(|c| c == "proxy_gone"),
+            "the proxy must be torn down BEFORE the netns is deleted: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "proxy_present"),
+            "the netns must NOT be deleted while the proxy still runs inside it: {calls:?}"
+        );
+        let idx = |needle: &str| calls.iter().position(|c| c == needle);
+        let drop_i = idx("drop").expect("instance drop recorded");
+        let netns_i = idx("netns_delete:vmcell-net-11").expect("netns delete recorded");
+        let cg_i = idx("cgroup_delete").expect("cgroup delete recorded");
+        assert!(
+            drop_i < netns_i && netns_i < cg_i,
+            "shutdown() teardown must be instance -> netns -> cgroup: {calls:?}"
+        );
+        // ORCH-7: request_shutdown precedes the SIGKILL fallback (the grace sits
+        // between them).
+        let rs_i = idx("request_shutdown").expect("request_shutdown recorded");
+        let kill_i = idx("kill").expect("kill recorded");
+        assert!(
+            rs_i < kill_i,
+            "request_shutdown must precede the SIGKILL fallback: {calls:?}"
         );
     }
 }

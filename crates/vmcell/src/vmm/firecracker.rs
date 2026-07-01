@@ -107,9 +107,24 @@ impl Firecracker {
             return val.clone();
         }
 
-        let template = probe_t2_template(self, cfg).await;
-        let _ = self.cpu_template.set(template.clone());
-        template
+        let probe = probe_t2_template(self, cfg).await;
+        // VMM-4: only a DEFINITE outcome (T2 supported or firmly unsupported) is
+        // cached. A transient probe failure is warned about and left uncached so the
+        // next `create()` re-probes — a one-off host hiccup must not permanently
+        // disable the T2 template (and thus the extended-FPU restore guard) for every
+        // VM sharing this backend.
+        if probe == T2Probe::Failed {
+            tracing::warn!(
+                "Firecracker T2 CPU-template probe failed (transient host error, not a \
+                 firm 'unsupported'); not caching a result — will re-probe on the next \
+                 VM. Booting without a CPU template this time; the `noxsave` cmdline \
+                 fallback still guards extended-FPU restore."
+            );
+        }
+        if let Some(to_cache) = cache_decision(probe) {
+            let _ = self.cpu_template.set(to_cache);
+        }
+        self.cpu_template.get().cloned().flatten()
     }
 }
 
@@ -128,6 +143,11 @@ pub struct FcInstance {
     /// FC today because `create()` rejects every vhost-user device up front, but the
     /// field keeps the snapshot guard correct by construction. Mirrors CH.
     vhost_user_net: bool,
+    /// True if this instance came from a snapshot `restore()`. A restored FC VM is
+    /// returned **paused** by `POST /snapshot/load {resume_vm:false}` and resumed via
+    /// `resume()`, never `boot()` — so `boot()` self-guards on this flag and refuses
+    /// to `InstanceStart` a restored VM (VMM-6). Mirrors CH's `restored` field.
+    restored: bool,
 }
 
 impl FcInstance {
@@ -173,28 +193,76 @@ impl Firecracker {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        // Capture the process-group id immediately: from here on any error must reap
-        // the spawned VMM group, or it leaks (the owning FcInstance — whose Drop
-        // reaps — is not constructed until the caller).
-        let pgid = process.id();
-
-        if let Some(pid) = process.id() {
-            if let Err(e) = cgroups.add_task(&res.cgroup_name, pid) {
-                crate::vmm::reap_process_group(&mut process, pgid);
-                return Err(e);
-            }
-        }
-
-        if let Err(e) = crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await {
-            crate::vmm::reap_process_group(&mut process, pgid);
-            return Err(e);
-        }
+        // Shared spawn+register+await-ready sequence (VMM-2): capture the pgid, add
+        // the VMM to its cgroup, and block on the API socket — reaping the process
+        // group on any failure. Identical error handling across CH/FC/QEMU.
+        let pgid = crate::vmm::register_and_await_ready(
+            &mut process,
+            cgroups,
+            &res.cgroup_name,
+            &api_socket,
+            1000,
+            20,
+        )
+        .await?;
 
         Ok((api_socket, vsock_path, serial_path, process, pgid))
     }
 }
 
-async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> {
+/// Outcome of the one-shot T2 CPU-template probe (VMM-4).
+///
+/// The old probe returned `Option<String>`, collapsing two very different cases into
+/// `None`: a host that firmly reports T2 **unsupported**, and a probe that simply
+/// **failed** (spawn/socket/API error — transient). Caching a transient failure as
+/// "unsupported" permanently disables the T2 template — and thus the extended-FPU
+/// restore guard — for every VM sharing the backend. Distinguishing the three lets
+/// `detect_cpu_template` cache a definite answer but *re-probe* after a transient
+/// failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum T2Probe {
+    /// The host confirmed T2 support (the probe VM booted with the template).
+    Supported,
+    /// The host firmly rejected the T2 template (boot returned a template error).
+    Unsupported,
+    /// The probe could not complete (spawn/socket/API failure). Transient — must not
+    /// be cached as a definitive answer.
+    Failed,
+}
+
+/// Classifies the probe VM's `InstanceStart` result into a [`T2Probe`].
+///
+/// A `400` whose body mentions the template is the one **firm** "T2 unsupported"
+/// signal; every other error (a `500`, a timeout, a transport error) is a transient
+/// probe **failure**, not evidence that the host lacks T2 (VMM-4). Pure so the
+/// distinction is unit-testable without spawning Firecracker.
+fn classify_t2_boot(boot_res: &Result<()>) -> T2Probe {
+    match boot_res {
+        Ok(()) => T2Probe::Supported,
+        Err(Error::VmmApi { status: 400, body })
+            if body.contains("template") || body.contains("Template") =>
+        {
+            T2Probe::Unsupported
+        }
+        Err(_) => T2Probe::Failed,
+    }
+}
+
+/// Maps a probe outcome to what (if anything) `detect_cpu_template` caches.
+///
+/// `None` means "do not cache — re-probe next time"; `Some(v)` is the value stored in
+/// the shared `OnceLock`. A [`T2Probe::Failed`] must map to `None` (VMM-4): caching a
+/// transient failure as "no template" is the exact permanent-disable bug. Pure so the
+/// caching policy is unit-testable.
+fn cache_decision(probe: T2Probe) -> Option<Option<String>> {
+    match probe {
+        T2Probe::Supported => Some(Some("T2".to_string())),
+        T2Probe::Unsupported => Some(None),
+        T2Probe::Failed => None,
+    }
+}
+
+async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     let tmp_dir = std::env::temp_dir();
     let counter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -218,28 +286,27 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         .spawn()
     {
         Ok(p) => p,
-        Err(_) => return None,
+        Err(_) => return T2Probe::Failed,
     };
 
-    let mut socket_ready = false;
-    for _ in 0..50 {
-        if tokio::fs::try_exists(&api_socket).await.unwrap_or(false) {
-            socket_ready = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
-    if !socket_ready {
-        let _ = process.kill().await;
-        return None;
-    }
-
     // The probe child is its own process-group leader (`process_group(0)`), so its
-    // pid is the group id. Capture it so `FcInstance::drop` force-kills and reaps
-    // the whole group on every exit path below — never own a live firecracker with
-    // `pgid: None`, which would orphan the process and leak it.
+    // pid is the group id. Capture it immediately so every failure path below reaps
+    // the whole group — never own a live firecracker with `pgid: None`, which would
+    // orphan the process and leak it.
     let pgid = process.id();
+
+    // VMM-3: use the shared `wait_for_socket` (which also `try_wait`s the child and
+    // fails fast on an early exit) instead of a hand-rolled `try_exists`-only loop,
+    // and reap the process *group* via `reap_process_group` on failure instead of the
+    // leader-only, non-blocking `process.kill()` (which orphans the group).
+    if crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20)
+        .await
+        .is_err()
+    {
+        crate::vmm::reap_process_group(&mut process, pgid);
+        return T2Probe::Failed;
+    }
+
     let instance = FcInstance {
         process,
         api_socket: api_socket.clone(),
@@ -248,6 +315,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         cid: 0,
         pgid,
         vhost_user_net: false,
+        restored: false,
     };
 
     #[derive(Serialize)]
@@ -272,7 +340,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         .await;
 
     if mc_res.is_err() {
-        return None;
+        return T2Probe::Failed;
     }
 
     #[derive(Serialize)]
@@ -293,7 +361,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         .await;
 
     if bs_res.is_err() {
-        return None;
+        return T2Probe::Failed;
     }
 
     #[derive(Serialize)]
@@ -311,20 +379,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> Option<String> 
         )
         .await;
 
-    let success = match boot_res {
-        Ok(_) => true,
-        Err(Error::VmmApi {
-            status: 400,
-            ref body,
-        }) if body.contains("template") || body.contains("Template") => false,
-        Err(_) => false,
-    };
-
-    if success {
-        Some("T2".to_string())
-    } else {
-        None
-    }
+    classify_t2_boot(&boot_res)
 }
 
 impl Vmm for Firecracker {
@@ -336,6 +391,12 @@ impl Vmm for Firecracker {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // VMM-1: reject a virtio-fs *rootfs* up front via the shared self-guard
+        // (mirrored across CH/QEMU/FC) rather than spawning a VMM and rejecting later
+        // at the drive-configuration step. The `RootfsSource::VirtioFs` arm further
+        // below stays as defense in depth.
+        crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
+
         let caps = self.capabilities();
         if let crate::config::NetConfig::Unprivileged { .. } = cfg.net {
             if !caps.unprivileged_vhost_user_net {
@@ -375,6 +436,8 @@ impl Vmm for Firecracker {
             // returned `Unsupported`. Computed from `res` to mirror CH and stay
             // correct if that guard ever moves.
             vhost_user_net: res.vhost_user_socket.is_some(),
+            // Cold boot: `boot()` issues `InstanceStart` (not a resume).
+            restored: false,
         };
 
         #[derive(Serialize)]
@@ -558,7 +621,7 @@ impl Vmm for Firecracker {
         let sidecar = tokio::fs::read_to_string(&sidecar_path).await?;
         let host_paths: SnapshotHostPaths = serde_json::from_str(&sidecar)?;
 
-        let (api_socket, _vsock_path, _serial_path, process, pgid) =
+        let (api_socket, _vsock_path, serial_path, process, pgid) =
             self.spawn_fc(res, cgroups).await?;
 
         // Firecracker rebinds the snapshot's recorded host vsock UDS at load time.
@@ -570,14 +633,21 @@ impl Vmm for Firecracker {
         let instance = FcInstance {
             process,
             api_socket,
-            // Adopt the snapshot's paths so the agent dials the exact UDS FC
-            // recreates, not the fresh (unused) vmid-derived path from `spawn_fc`.
+            // Adopt the snapshot's vsock path so the agent dials the exact UDS FC
+            // recreates verbatim on load (no load-time override). Serial is the
+            // opposite: FC writes it to the FRESH `spawn_fc` stdout redirect
+            // (`res.tmp_dir/serial.log`), NOT the snapshot's baked serial path — so
+            // `serial_log()`/panic detection must point at the fresh path, or it reads
+            // an empty/stale file FC never writes (VMM-6).
             vsock_path: host_paths.vsock,
-            serial_path: host_paths.serial,
+            serial_path,
             cid: res.guest_cid,
             pgid,
             // Guarded false above; computed from `res` to mirror CH.
             vhost_user_net: res.vhost_user_socket.is_some(),
+            // Restored VMs are returned paused and resumed via `resume()`; `boot()`
+            // self-guards on this and refuses to `InstanceStart` (VMM-6).
+            restored: true,
         };
 
         // Load snapshot
@@ -622,6 +692,17 @@ impl Vmm for Firecracker {
 
 impl VmInstance for FcInstance {
     async fn boot(&mut self) -> Result<()> {
+        // VMM-6: a restored FC VM is returned paused by
+        // `POST /snapshot/load {resume_vm:false}` and resumed via `resume()` — never
+        // booted. Issuing `InstanceStart` on it is a misuse that would (re)start a
+        // snapshot-loaded VM, so self-guard and fail loud (a silent `Ok(())` no-op
+        // would violate the fail-loud contract) instead of `InstanceStart`-ing it.
+        if self.restored {
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                feature: "boot after restore (a restored VM is resumed, not booted)".to_string(),
+            });
+        }
         #[derive(Serialize)]
         struct Action {
             action_type: String,
@@ -789,6 +870,150 @@ impl Drop for FcInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Guards VMM-1 for the FC `create()` path: a virtio-fs *rootfs* config reaches
+    // create(), which self-guards up front with a typed `Unsupported` (FC also keeps a
+    // defense-in-depth arm at the drive step). Inverse: an erofs rootfs must NOT trip
+    // the guard.
+    #[test]
+    fn create_rejects_virtio_fs_rootfs() {
+        use crate::config::RootfsSource;
+
+        let err = crate::vmm::reject_virtio_fs_rootfs(
+            Firecracker::new("/usr/bin/firecracker").id(),
+            &RootfsSource::VirtioFs {
+                dir: PathBuf::from("/d"),
+            },
+        )
+        .expect_err("FC create() must reject a virtio-fs rootfs");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature == "virtio_fs_rootfs"),
+            "expected virtio_fs_rootfs Unsupported, got {err:?}"
+        );
+
+        crate::vmm::reject_virtio_fs_rootfs(
+            Firecracker::new("/usr/bin/firecracker").id(),
+            &RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .expect("an erofs rootfs must not trip the FC guard");
+    }
+
+    // Guards VMM-4: the probe must distinguish a firm "T2 unsupported" (a 400 template
+    // error) from a transient probe failure (a 500, a non-template 400, a timeout, a
+    // transport error). The buggy inverse — the old code collapsed every `Err(_)` to
+    // "not supported" — makes the 500/timeout/non-template assertions go red.
+    #[test]
+    fn classify_t2_boot_distinguishes_unsupported_from_failed() {
+        assert_eq!(classify_t2_boot(&Ok(())), T2Probe::Supported);
+        assert_eq!(
+            classify_t2_boot(&Err(Error::VmmApi {
+                status: 400,
+                body: "cpu template T2 not supported".to_string(),
+            })),
+            T2Probe::Unsupported
+        );
+        // A 500 is a host error, NOT a firm "unsupported".
+        assert_eq!(
+            classify_t2_boot(&Err(Error::VmmApi {
+                status: 500,
+                body: "internal error".to_string(),
+            })),
+            T2Probe::Failed
+        );
+        // A 400 that isn't about the template is also just a failure, not "unsupported".
+        assert_eq!(
+            classify_t2_boot(&Err(Error::VmmApi {
+                status: 400,
+                body: "some other validation error".to_string(),
+            })),
+            T2Probe::Failed
+        );
+        // A non-API error (timeout / transport) is a transient failure.
+        assert_eq!(
+            classify_t2_boot(&Err(Error::Timeout("probe".to_string()))),
+            T2Probe::Failed
+        );
+    }
+
+    // Guards VMM-4: a TRANSIENT probe failure must NOT be cached (so the next VM
+    // re-probes); only a definite Supported/Unsupported is cached. The buggy inverse
+    // (`Failed => Some(None)`) permanently disables the T2 template — and the
+    // extended-FPU restore guard — for every VM after a single host hiccup; here the
+    // `Failed` assertion goes red.
+    #[test]
+    fn cache_decision_never_caches_transient_failure() {
+        assert_eq!(cache_decision(T2Probe::Failed), None);
+        assert_eq!(
+            cache_decision(T2Probe::Supported),
+            Some(Some("T2".to_string()))
+        );
+        assert_eq!(cache_decision(T2Probe::Unsupported), Some(None));
+    }
+
+    /// Spawns a long-lived stand-in process in its own process group so an
+    /// `FcInstance` can own a real `Child` (whose `Drop`/`kill` reaps the group) in a
+    /// test that never boots a real VM.
+    fn spawn_group_standin() -> Child {
+        let mut std_cmd = std::process::Command::new("sleep");
+        std_cmd.arg("60");
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+        tokio::process::Command::from(std_cmd)
+            .spawn()
+            .expect("spawn sleep stand-in")
+    }
+
+    fn instance_with(restored: bool) -> FcInstance {
+        let child = spawn_group_standin();
+        FcInstance {
+            pgid: child.id(),
+            process: child,
+            // A deliberately-absent api socket: a restored VM must refuse boot BEFORE
+            // any api_request, so this path is never dialed on that branch.
+            api_socket: std::env::temp_dir().join("vmcell-fc-boot-test-nonexistent.sock"),
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            cid: 3,
+            vhost_user_net: false,
+            restored,
+        }
+    }
+
+    // Guards VMM-6: a restored FC instance must REFUSE `boot()` — a restored VM is
+    // returned paused and resumed via `resume()`, never `InstanceStart`ed. The guard is
+    // checked before any api_request, so it returns without touching the absent api
+    // socket. The buggy inverse (no `restored` flag / no guard) would `InstanceStart` a
+    // restored VM; here the restored assertion goes red. The cold instance must NOT
+    // report boot-after-restore (it proceeds to InstanceStart and fails on the missing
+    // socket with a transport error), which proves the `restored` flag is load-bearing.
+    #[tokio::test]
+    async fn restored_instance_refuses_boot() {
+        let mut restored = instance_with(true);
+        let err = restored
+            .boot()
+            .await
+            .expect_err("a restored VM must refuse boot()");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature.contains("boot after restore")),
+            "expected boot-after-restore Unsupported, got {err:?}"
+        );
+        let _ = restored.kill().await;
+
+        let mut cold = instance_with(false);
+        let err = cold
+            .boot()
+            .await
+            .expect_err("a cold VM with no api socket hits a transport error");
+        assert!(
+            !matches!(&err, Error::Unsupported { feature, .. } if feature.contains("boot after restore")),
+            "a cold instance must not report boot-after-restore, got {err:?}"
+        );
+        let _ = cold.kill().await;
+    }
 
     // Guards VMM-4: the CPU-template cache must live on the instance, not in a
     // process-global. The buggy impl (a `static OnceLock`) would let one

@@ -29,9 +29,15 @@ bless:
         return 0
       fi
       cp -f "$built" "$stable"
+      # PRIV-1: restrict the capability-carrying runner to its OWNER (0700) BEFORE setcap.
+      # The blessed runner holds cap_sys_admin (≈ root); its file mode is the REAL security
+      # boundary, not just a note — an other-executable +ep runner is a local priv-esc on a
+      # shared host, and the path-confinement is only defense-in-depth. On a shared dev box
+      # where a team shares one runner, use `chmod 0750` + a dedicated group instead of 0700.
+      chmod 0700 "$stable"
       sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep "$stable"
       echo "$h" > "$stamp"
-      echo "bless: $stable (re)blessed"
+      echo "bless: $stable (re)blessed (mode 0700, owner-only; caps +ep)"
     }
     bless_one target/debug/vmcell-test-runner {{runner}}
     bless_one target/release/vmcell-test-runner {{runner-release}}
@@ -40,8 +46,9 @@ bless:
 test-unit:
     cargo nextest run --all-features
 
-# Privileged integration suite via the capability runner (dev box only; group-restrict the runner
-# on shared hosts). Wraps every test binary with vmcell-test-runner via the cargo target-runner hook.
+# Privileged integration suite via the capability runner. `just bless` installs it 0700 (owner-only)
+# — that mode is the security boundary (PRIV-1); on a shared host use a dedicated group + 0750.
+# Wraps every test binary with vmcell-test-runner via the cargo target-runner hook.
 # The in-guest test-helper (ip/curl/kvm-ok) is baked into the rootfs by `vmcell build`, not
 # built here. `--features` is scoped to the `vmcell` member that owns the integration tests.
 test-privileged:
@@ -56,8 +63,9 @@ test-unprivileged:
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide
 # (matching CI's workflow-level env, which — unlike a clippy `-- -D warnings` arg — also denies
-# warnings surfaced through path/patched deps), and the known-RED feature-powerset step runs LAST
-# and non-blocking so it can no longer short-circuit the reachable gates (C-GATE-1 / S28).
+# warnings surfaced through path/patched deps). The feature-powerset step runs LAST and is now
+# BLOCKING: the §10.5 host-stack collapse closed the former C-GATE-1 debt, so every ≤2-feature
+# config compiles clean and a regression back to RED must fail the gate.
 ci:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -76,16 +84,29 @@ ci:
     cargo clippy -p vmcell-test-runner --all-targets
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).
     cargo clippy -p vmcell-guest-tools --all-targets
+    # Reduced-host-feature smoke (fast per-backend feedback before the full powerset below). After the
+    # §10.5 host-stack collapse, each shipping backend in isolation pulls the full, coherent host stack
+    # (host-common → net/proxy/metrics/pipeline), so a single-backend build compiles — including `qemu`,
+    # which previously did not (the shared hyper HTTP-over-Unix client + serde_json are now host-common
+    # deps). `metrics` is part of that stack, so CFG-1's "host without metrics" config is no longer
+    # constructible — the CFG-1 class is closed by construction (its code fix remains as defense-in-depth).
+    for feat in cloud-hypervisor firecracker qemu; do \
+      echo "== reduced-host-feature clippy: --no-default-features --features $feat =="; \
+      cargo clippy -p vmcell --no-default-features --features "$feat" --all-targets; \
+    done
     ./scripts/ban-global-state.sh
     ./scripts/test-ban-global-state.sh
     ./scripts/ban-legacy-terms.sh
     ./scripts/test-ban-legacy-terms.sh
+    # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the guest agent + its red-on-inverse self-test.
+    ./scripts/ban-agent-ip-shellout.sh
+    ./scripts/test-ban-agent-ip-shellout.sh
     cargo nextest run --all-features
     # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main merge-base).
     baseline="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse main 2>/dev/null || true)"
     if [ -n "$baseline" ]; then cargo semver-checks --baseline-rev "$baseline" -p vmcell; else echo "semver-checks: no main baseline available locally, skipping (CI enforces it on PRs)"; fi
-    # Accepted-RED debt LAST and non-blocking (C-GATE-1): host-common module-gating powerset.
-    set +e
-    echo "== feature-powerset (accepted-RED debt; non-blocking — see C-GATE-1) =="
+    # Feature-powerset LAST and BLOCKING (former C-GATE-1 debt, closed by the §10.5 host-stack collapse):
+    # every ≤2-feature config must compile+clippy clean under -D warnings. This is the comprehensive
+    # guard that the collapse holds; a newly mis-gated module regresses it back to RED and fails here.
+    echo "== feature-powerset (BLOCKING; must be GREEN after the §10.5 collapse) =="
     cargo hack --feature-powerset --depth 2 clippy -p vmcell --all-targets
-    echo "note: feature-powerset is known-RED accepted debt; its status does NOT gate 'just ci'."

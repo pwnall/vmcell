@@ -32,6 +32,37 @@ pub mod backend {
     const QUEUE_SIZE: usize = 1024;
     const NUM_QUEUES: usize = 2; // rx and tx
 
+    /// Bit position of `VIRTIO_NET_F_CTRL_VQ` in the virtio-net feature set.
+    ///
+    /// The backend deliberately does **not** advertise this bit (NET-2): it
+    /// declares only [`NUM_QUEUES`] `== 2` (rx/tx) and `handle_event` services no
+    /// control queue, so advertising an unbacked control vq is dead-feature drift
+    /// a guest driver could act on. Named here so the guard test can assert the
+    /// advertised set keeps it clear (test-only; production never references the
+    /// omitted bit).
+    #[cfg(test)]
+    const VIRTIO_NET_F_CTRL_VQ_BIT: u32 = 17;
+
+    /// Bit position of `VIRTIO_NET_F_MAC` (device supplies a fixed MAC).
+    const VIRTIO_NET_F_MAC_BIT: u32 = 5;
+
+    /// The virtio feature set advertised by the unprivileged vhost-user-net
+    /// backend.
+    ///
+    /// Extracted from `VhostUserBackendMut::features` so the exact advertised bit
+    /// set is unit-testable without constructing a live backend (NET-2). It
+    /// advertises virtio 1.0, indirect descriptors, the event-index optimization,
+    /// the vhost-user protocol features, and a fixed MAC — and deliberately
+    /// **omits** `VIRTIO_NET_F_CTRL_VQ`, for which there is no control queue or
+    /// handler here.
+    fn advertised_features() -> u64 {
+        1 << VIRTIO_F_VERSION_1
+            | 1 << VIRTIO_RING_F_INDIRECT_DESC
+            | 1 << VIRTIO_RING_F_EVENT_IDX
+            | vhost::vhost_user::message::VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+            | (1 << VIRTIO_NET_F_MAC_BIT)
+    }
+
     // virtio-net header size is 12 bytes
     const VIRTIO_NET_HDR_SIZE: usize = 12;
 
@@ -75,6 +106,12 @@ pub mod backend {
     /// socket). Capping the pool and reclaiming closed mappings bounds host
     /// memory (NET-5).
     const MAX_DYNAMIC_SOCKETS: usize = 256;
+
+    /// Number of listening sockets pre-armed per newly-seen destination port when
+    /// admitting a guest SYN (a small burst absorbs quick reconnects without a
+    /// per-connection round trip). Growth is refused once the pool would exceed
+    /// [`MAX_DYNAMIC_SOCKETS`]; `MAX_DYNAMIC_SOCKETS` is a multiple of this.
+    const SYN_BURST: usize = 4;
 
     /// Per-worker deadline for `SmoltcpProcess::Drop` to join a thread before
     /// detaching it, so a wedged worker cannot hang teardown forever (NET-3).
@@ -252,12 +289,7 @@ pub mod backend {
         }
 
         fn features(&self) -> u64 {
-            1 << VIRTIO_F_VERSION_1
-                | 1 << VIRTIO_RING_F_INDIRECT_DESC
-                | 1 << VIRTIO_RING_F_EVENT_IDX
-                | vhost::vhost_user::message::VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
-                | (1 << 5) // VIRTIO_NET_F_MAC
-                | (1 << 17) // VIRTIO_NET_F_CTRL_VQ
+            advertised_features()
         }
 
         fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -460,6 +492,44 @@ pub mod backend {
         dynamic_count + additional <= MAX_DYNAMIC_SOCKETS
     }
 
+    /// Admits a guest SYN to `dst_port` into the dynamic NAT socket pool.
+    ///
+    /// Extracted from the `run_network` TX scan so the per-SYN admission decision
+    /// is unit-testable without a live vhost device (NET-3). For a SYN whose
+    /// destination port has no already-open mapping, it first reclaims closed
+    /// dynamic mappings and then — **only if the pool has room for the whole
+    /// `burst`** — creates `burst` listening sockets mapped to `pxy_port`. When
+    /// the pool is full the SYN is dropped without any growth; that refusal is
+    /// the guard that keeps `port_mappings` bounded at
+    /// `permanent_count + MAX_DYNAMIC_SOCKETS` under a SYN spray to many distinct
+    /// destination ports.
+    fn admit_syn(
+        sockets: &mut SocketSet<'_>,
+        port_mappings: &mut Vec<NatPortMapping>,
+        permanent_count: usize,
+        dst_port: u16,
+        pxy_port: u16,
+        burst: usize,
+    ) {
+        let has_open = port_mappings
+            .iter()
+            .any(|(p, _, h, _)| *p == dst_port && sockets.get::<TcpSocket>(*h).is_open());
+        // Short-circuit: `reclaim_and_has_room` (with its reclamation side effect)
+        // only runs when there is no already-open mapping for this port, matching
+        // the original inline guard.
+        if has_open || !reclaim_and_has_room(sockets, port_mappings, permanent_count, burst) {
+            return;
+        }
+        for _ in 0..burst {
+            let rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+            let tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+            let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
+            let _ = socket.listen(dst_port);
+            let handle = sockets.add(socket);
+            port_mappings.push((dst_port, pxy_port, handle, None::<tokio::net::TcpStream>));
+        }
+    }
+
     impl Drop for SmoltcpProcess {
         fn drop(&mut self) {
             tracing::info!("SmoltcpProcess dropping!");
@@ -595,15 +665,39 @@ pub mod backend {
                 Instant::now(),
             );
             iface.set_any_ip(true);
+            // NET-5: the address/route storage is fixed-capacity and we add a
+            // single entry to a fresh interface, so these cannot legitimately
+            // fail. Rather than `expect` (which would silently kill the net
+            // thread on any future regression), fail loud and exit the thread
+            // cleanly so teardown still runs.
+            let mut push_ok = true;
             iface.update_ip_addrs(|ip_addrs| {
-                ip_addrs
+                if ip_addrs
                     .push(IpCidr::new(IpAddress::Ipv4(host_gw), 30))
-                    .expect("push ip");
+                    .is_err()
+                {
+                    push_ok = false;
+                }
             });
-            iface
-                .routes_mut()
-                .add_default_ipv4_route(Ipv4Address::new(10, 200, guest_ip_std.octets()[2], 2))
-                .expect("add route");
+            if !push_ok {
+                tracing::error!(
+                    "smoltcp run_network: host IP push rejected (address storage full); \
+                     exiting net thread"
+                );
+                return;
+            }
+            if let Err(e) = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
+                10,
+                200,
+                guest_ip_std.octets()[2],
+                2,
+            )) {
+                tracing::error!(
+                    "smoltcp run_network: failed to add default route: {:?}; exiting net thread",
+                    e
+                );
+                return;
+            }
             log::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
 
             let mut sockets = SocketSet::new(vec![]);
@@ -709,49 +803,20 @@ pub mod backend {
                                             {
                                                 let dst_port = tcp.dst_port();
                                                 if tcp.syn() && !tcp.ack() {
-                                                    let has_open =
-                                                        port_mappings.iter().any(|(p, _, h, _)| {
-                                                            *p == dst_port
-                                                                && sockets
-                                                                    .get::<TcpSocket>(*h)
-                                                                    .is_open()
-                                                        });
-                                                    // NET-5: reclaim closed dynamic
-                                                    // mappings and refuse growth past
-                                                    // the cap so a guest cannot exhaust
-                                                    // host memory with SYN sprays.
-                                                    if !has_open
-                                                        && reclaim_and_has_room(
-                                                            &mut sockets,
-                                                            &mut port_mappings,
-                                                            permanent_count,
-                                                            4,
-                                                        )
-                                                    {
-                                                        for _ in 0..4 {
-                                                            let rx_buffer =
-                                                                TcpSocketBuffer::new(vec![
-                                                                    0;
-                                                                    65536
-                                                                ]);
-                                                            let tx_buffer =
-                                                                TcpSocketBuffer::new(vec![
-                                                                    0;
-                                                                    65536
-                                                                ]);
-                                                            let mut socket = TcpSocket::new(
-                                                                rx_buffer, tx_buffer,
-                                                            );
-                                                            let _ = socket.listen(dst_port);
-                                                            let handle = sockets.add(socket);
-                                                            port_mappings.push((
-                                                                dst_port,
-                                                                pxy_port,
-                                                                handle,
-                                                                None::<tokio::net::TcpStream>,
-                                                            ));
-                                                        }
-                                                    }
+                                                    // NET-3/NET-5: the per-SYN admission
+                                                    // decision (reclaim closed dynamic
+                                                    // mappings, then refuse growth past
+                                                    // the cap so a SYN spray cannot
+                                                    // exhaust host memory) lives in the
+                                                    // unit-tested `admit_syn` helper.
+                                                    admit_syn(
+                                                        &mut sockets,
+                                                        &mut port_mappings,
+                                                        permanent_count,
+                                                        dst_port,
+                                                        pxy_port,
+                                                        SYN_BURST,
+                                                    );
                                                 }
                                             }
                                         }
@@ -903,6 +968,77 @@ pub mod backend {
             for vmid in 1u32..=254 {
                 assert!(crate::net::ip_math(vmid).is_ok());
             }
+        }
+
+        // NET-2: the backend must NOT advertise VIRTIO_NET_F_CTRL_VQ — it
+        // declares only NUM_QUEUES == 2 (rx/tx) and services no control queue.
+        // Buggy impl guarded: re-adding `(1 << 17)` sets the CTRL_VQ bit and
+        // reddens the first assert. The positive asserts guard the test's
+        // meaning, so the CTRL_VQ check is not vacuously true against an
+        // all-zero feature word.
+        #[test]
+        fn advertised_features_omit_ctrl_vq() {
+            let feats = advertised_features();
+            assert_eq!(
+                feats & (1u64 << VIRTIO_NET_F_CTRL_VQ_BIT),
+                0,
+                "must not advertise VIRTIO_NET_F_CTRL_VQ without a control queue/handler"
+            );
+            // The features actually backed by the device stay advertised.
+            assert_ne!(
+                feats & (1u64 << VIRTIO_F_VERSION_1),
+                0,
+                "VIRTIO_F_VERSION_1 must remain advertised"
+            );
+            assert_ne!(
+                feats & (1u64 << VIRTIO_NET_F_MAC_BIT),
+                0,
+                "VIRTIO_NET_F_MAC must remain advertised"
+            );
+        }
+
+        // NET-3: drive the real per-SYN admission path (`admit_syn`, the exact
+        // helper `run_network` calls) with more distinct destination ports than
+        // the pool can ever hold, and assert the dynamic pool stays capped at
+        // MAX_DYNAMIC_SOCKETS. Buggy impl guarded: an admission path that skipped
+        // the `reclaim_and_has_room` room check (admitting every SYN) would push
+        // distinct_ports * SYN_BURST sockets, blowing past the cap and reddening
+        // both asserts.
+        #[test]
+        fn admit_syn_caps_dynamic_pool_under_distinct_port_spray() {
+            let mut sockets = SocketSet::new(vec![]);
+            let mut port_mappings: Vec<NatPortMapping> = Vec::new();
+            let permanent_count = 0;
+            let pxy_port = 6000u16;
+
+            let distinct_ports = MAX_DYNAMIC_SOCKETS + 64;
+            for i in 0..distinct_ports {
+                // Distinct ports (10_000..) so each SYN is a newly-seen port with
+                // no already-open mapping, forcing the admission/room decision.
+                let dst_port = 10_000u16 + (i as u16);
+                admit_syn(
+                    &mut sockets,
+                    &mut port_mappings,
+                    permanent_count,
+                    dst_port,
+                    pxy_port,
+                    SYN_BURST,
+                );
+            }
+
+            let dynamic = port_mappings.len() - permanent_count;
+            assert!(
+                dynamic <= MAX_DYNAMIC_SOCKETS,
+                "dynamic NAT pool exceeded the cap under a SYN spray: {} > {}",
+                dynamic,
+                MAX_DYNAMIC_SOCKETS
+            );
+            // Admission is in whole bursts up to the cap, and MAX_DYNAMIC_SOCKETS
+            // is a multiple of SYN_BURST, so the pool fills to exactly the cap.
+            assert_eq!(
+                dynamic, MAX_DYNAMIC_SOCKETS,
+                "the pool should fill to exactly the cap under a large spray"
+            );
         }
 
         // NET-3: a bounded join must not block teardown on a wedged worker.

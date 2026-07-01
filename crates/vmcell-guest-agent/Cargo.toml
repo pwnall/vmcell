@@ -28,3 +28,10 @@ signal-hook = "0.3"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# AGENT-3: round-trip the guest's hand-rolled framing against the REAL host codec
+# in a KVM-free unit test. Dev-only, so the CI lean-agent assertion (`cargo tree
+# -e no-dev`) still sees no tokio/hyper on the agent's production graph.
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"

@@ -20,6 +20,12 @@ printf 'static COUNTER:\n    AtomicU64 = AtomicU64::new(0);\n' > "$work/src/mult
 printf 'use std::sync::atomic::AtomicU64 as Counter;\nstatic C: Counter = AtomicU64::new(0);\n' > "$work/src/alias_ctor.rs"
 # Bare aliased import of a near-exclusively-global type.
 printf 'use std::sync::atomic::AtomicBool as Flag;\n' > "$work/src/alias_use.rs"
+# Bare, UN-exempted interior-mutable singletons: these prove the OnceLock/Mutex/RwLock/Lazy
+# half of the keyword list can actually fail the self-test (PRIV-4). Before this fixture every
+# MUST-flag case used Atomic*, so deleting `OnceLock|OnceCell|Mutex|RwLock|Lazy|once_cell` from
+# the scanner left all expectations intact — a gate that could not fail for that half.
+printf 'static REGISTRY: std::sync::Mutex<u32> = std::sync::Mutex::new(0);\n' > "$work/src/bare_mutex.rs"
+printf 'static CELL: OnceLock<u32> = OnceLock::new();\n' > "$work/src/bare_oncelock.rs"
 
 # --- MUST NOT be flagged -----------------------------------------------------------------
 # Multi-line interior-mutable static, but justified with the per-line exemption marker.
@@ -46,6 +52,8 @@ if [[ $rc -ne 1 ]]; then echo "FAIL: scanner exit code = $rc, expected 1 (violat
 expect_flag multiline_atomic.rs
 expect_flag alias_ctor.rs
 expect_flag alias_use.rs
+expect_flag bare_mutex.rs
+expect_flag bare_oncelock.rs
 expect_clean exempted.rs
 expect_clean clean_const.rs
 expect_clean comment_prose.rs

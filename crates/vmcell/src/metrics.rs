@@ -77,7 +77,6 @@ pub trait CgroupFs: Send + Sync + std::fmt::Debug {
 /// Computes the cgroup-v2 `cpu.max` `(quota, period)` pair for a CPU cap expressed
 /// as a percentage of one core. The period is fixed at 100000us and the quota is the
 /// matching slice of that period (e.g. 50% -> `(50000, 100000)`, 200% -> `(200000, 100000)`).
-#[cfg(feature = "metrics")]
 fn cpu_quota_period(cpu_max_pct: u32) -> (i64, u64) {
     let period = 100_000_u64;
     let quota = u64::from(cpu_max_pct) * period / 100;
@@ -86,7 +85,6 @@ fn cpu_quota_period(cpu_max_pct: u32) -> (i64, u64) {
 
 /// Converts a memory cap in MiB to the byte value written to `memory.max`
 /// (`memory_hard_limit`). MiB is `<< 20`, not the SI `1_000_000`.
-#[cfg(feature = "metrics")]
 fn mem_hard_limit_bytes(mem_max_mib: u32) -> i64 {
     i64::from(mem_max_mib) << 20
 }
@@ -95,7 +93,6 @@ fn mem_hard_limit_bytes(mem_max_mib: u32) -> i64 {
 /// when no rate rule is set (so the caller skips the write). Format:
 /// `<device> rbps=.. wbps=.. riops=.. wiops=..\n`, emitting only the present fields
 /// in that fixed order.
-#[cfg(feature = "metrics")]
 fn render_io_max(io: &crate::config::IoMax) -> Option<String> {
     let mut rules = Vec::new();
     if let Some(rbps) = io.rbps {
@@ -118,7 +115,6 @@ fn render_io_max(io: &crate::config::IoMax) -> Option<String> {
 }
 
 /// Renders the exact `pids.max` control-file contents (a bare decimal count).
-#[cfg(feature = "metrics")]
 fn render_pids_max(pids_max: u32) -> String {
     pids_max.to_string()
 }
@@ -130,43 +126,65 @@ fn controller_listed(listing: &str, controller: &str) -> bool {
     listing.split_whitespace().any(|c| c == controller)
 }
 
-/// Applies a single *requested functional* cgroup limit, failing loud per the §7.1
-/// capability contract: enable `controller` on the parent's `subtree_control` so the
-/// matching control file exists on `name`, **confirm** it is actually delegated, then
-/// write `value`. A requested limit that cannot be enforced — because the controller
-/// is not delegated, or the control file rejects the write — returns
-/// [`crate::error::Error::CapabilityUnavailable`] rather than logging a warning and skipping it
-/// (which would hand back a VM running unbounded). This is *not* best-effort; only the
-/// explicitly-listed §7.1 benchmark knobs (cpufreq/KSM) may degrade with a `warn!`.
+/// Applies a single *requested functional* cgroup limit under `cgroup_root`, failing
+/// loud per the §7.1 capability contract: confirm `controller` is delegated on the
+/// parent's `subtree_control` (enabling it there first if absent), then write `value`.
+/// A requested limit that cannot be enforced — because the controller is not
+/// delegated, or the control file rejects the write — returns
+/// [`crate::error::Error::CapabilityUnavailable`] rather than logging a warning and
+/// skipping it (which would hand back a VM running unbounded). This is *not*
+/// best-effort; only the explicitly-listed §7.1 benchmark knobs (cpufreq/KSM) may
+/// degrade with a `warn!`.
+///
+/// `cgroup_root` is injected (default `/sys/fs/cgroup`) so the write path is
+/// unit-testable against a temp directory. The delegation read-back runs for
+/// parent-less slice names too (CFG-2): a top-level `vmcell-vm-{vmid}` slice's
+/// controllers are delegated by the cgroup *root*'s `subtree_control`, so an empty
+/// parent maps to `{cgroup_root}/cgroup.subtree_control` rather than skipping the check
+/// and relying solely on the final write-failure backstop.
 ///
 /// # Errors
-/// Returns [`crate::error::Error::CapabilityUnavailable`] when the controller is not delegated to
-/// the parent's `subtree_control` or the limit write fails.
-#[cfg(feature = "metrics")]
-fn try_apply_limit(name: &str, controller: &str, file: &str, value: &str) -> Result<()> {
+/// Returns [`crate::error::Error::CapabilityUnavailable`] when the controller is not
+/// delegated to the parent's `subtree_control` or the limit write fails.
+fn try_apply_limit_at(
+    cgroup_root: &str,
+    name: &str,
+    controller: &str,
+    file: &str,
+    value: &str,
+) -> Result<()> {
     use crate::error::Error;
     if let Some(parent) = std::path::Path::new(name).parent() {
         let parent = parent.to_string_lossy();
-        if !parent.is_empty() {
-            let subtree = format!("/sys/fs/cgroup/{}/cgroup.subtree_control", parent);
-            // Best-effort enable; a constrained/non-delegated layout silently ignores
-            // the `+controller` write, so we never trust it — we read it back.
+        // CFG-2: an empty parent (a parent-less `vmcell-vm-{vmid}` fallback name) is
+        // delegated by the cgroup root's own `subtree_control`; check it rather than
+        // skip the read-back and lean solely on the write-failure backstop below.
+        let subtree = if parent.is_empty() {
+            format!("{}/cgroup.subtree_control", cgroup_root)
+        } else {
+            format!("{}/{}/cgroup.subtree_control", cgroup_root, parent)
+        };
+        // Enable the controller on the parent's subtree_control only if it is not
+        // already delegated. A constrained/non-delegated layout silently ignores the
+        // `+controller` write, so we never trust the write — we read the effective set
+        // back and require a whole-token match.
+        let already_delegated = std::fs::read_to_string(&subtree)
+            .map(|s| controller_listed(&s, controller))
+            .unwrap_or(false);
+        if !already_delegated {
             let _ = std::fs::write(&subtree, format!("+{}", controller));
-            let delegated = std::fs::read_to_string(&subtree)
-                .map(|s| controller_listed(&s, controller))
-                .unwrap_or(false);
-            if !delegated {
-                return Err(Error::CapabilityUnavailable {
-                    op: format!("cgroup {} limit", file),
-                    needed: format!(
-                        "'{}' controller delegated to {}/cgroup.subtree_control",
-                        controller, parent
-                    ),
-                });
-            }
+        }
+        let delegated = std::fs::read_to_string(&subtree)
+            .map(|s| controller_listed(&s, controller))
+            .unwrap_or(false);
+        if !delegated {
+            return Err(Error::CapabilityUnavailable {
+                op: format!("cgroup {} limit", file),
+                needed: format!("'{}' controller delegated to {}", controller, subtree),
+            });
         }
     }
-    let path = format!("/sys/fs/cgroup/{}/{}", name, file);
+    let path = format!("{}/{}/{}", cgroup_root, name, file);
     std::fs::write(&path, value).map_err(|e| Error::CapabilityUnavailable {
         op: format!("cgroup {} limit", file),
         needed: format!(
@@ -271,57 +289,87 @@ fn read_stats_at(base_path: &str) -> ResourceUsage {
     usage
 }
 
+/// Creates the per-VM cgroup directory under `cgroup_root` and applies every
+/// requested functional limit. The limit-application block is deliberately **not**
+/// gated on the `metrics` feature (CFG-1): it writes cgroup sysfs directly via
+/// `std::fs` and pulls in no `metrics`-only dependency, so gating it silently dropped
+/// every requested limit — returning `Ok(())` on an unbounded VM — in a
+/// `--no-default-features --features cloud-hypervisor` build whose `create_slice`
+/// caller (`orchestrator::setup_env`) is *not* gated on `metrics`. `cgroup_root` is
+/// injected (default `/sys/fs/cgroup`) so the real write path is unit-testable against
+/// a temp directory without touching the host cgroup tree.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Cgroup`] if the directory cannot be created, or
+/// [`crate::error::Error::CapabilityUnavailable`] if a requested limit's controller is
+/// not delegated or its control-file write fails.
+fn create_slice_at(
+    cgroup_root: &str,
+    name: &str,
+    limits: &crate::config::ResourceLimits,
+) -> Result<()> {
+    // Create the per-VM cgroup directly with `mkdir`. The previous implementation used
+    // `cgroups-rs` `CgroupBuilder`, whose V2 path manipulates the parent's
+    // `subtree_control` and leaves the new cgroup in a state that rejects
+    // `cgroup.procs` writes (EOPNOTSUPP) under common systemd cgroup layouts; a plain
+    // directory + direct limit writes is robust across layouts. (The cgroup must still
+    // live in a non-threaded `domain` subtree — a threaded scope rejects `cgroup.procs`
+    // regardless; see implementation-notes.)
+    std::fs::create_dir_all(format!("{}/{}", cgroup_root, name))
+        .map_err(|e| crate::error::Error::Cgroup(format!("create cgroup {}: {}", name, e)))?;
+
+    if let Some(mem) = limits.mem_max_mib {
+        try_apply_limit_at(
+            cgroup_root,
+            name,
+            "memory",
+            "memory.max",
+            &mem_hard_limit_bytes(mem).to_string(),
+        )?;
+        // E1: make the cap a HARD bound, not a throttle. Guest RAM can be
+        // shmem/memfd-backed; under `memory.max` pressure cgroup v2 reclaims shmem to
+        // swap instead of OOM-killing, so the cap never fires and the guest overruns
+        // it. `memory.swap.max=0` removes the swap escape hatch (shmem stays charged,
+        // the cap hard-kills) and `memory.oom.group=1` makes the kill take the whole VM
+        // cgroup atomically. Both are part of the requested functional limit, so they
+        // fail loud too.
+        try_apply_limit_at(cgroup_root, name, "memory", "memory.swap.max", "0")?;
+        try_apply_limit_at(cgroup_root, name, "memory", "memory.oom.group", "1")?;
+    }
+    if let Some(cpu) = limits.cpu_max_pct {
+        let (quota, period) = cpu_quota_period(cpu);
+        try_apply_limit_at(
+            cgroup_root,
+            name,
+            "cpu",
+            "cpu.max",
+            &format!("{} {}", quota, period),
+        )?;
+    }
+    if let Some(pids) = limits.pids_max {
+        try_apply_limit_at(
+            cgroup_root,
+            name,
+            "pids",
+            "pids.max",
+            &render_pids_max(pids),
+        )?;
+    }
+    if let Some(io) = &limits.io_max {
+        if let Some(io_str) = render_io_max(io) {
+            try_apply_limit_at(cgroup_root, name, "io", "io.max", io_str.trim_end())?;
+        }
+    }
+    Ok(())
+}
+
 /// The default CgroupFs implementation.
 #[derive(Debug, Default, Clone)]
 pub struct DefaultCgroupFs;
 
 impl CgroupFs for DefaultCgroupFs {
     fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()> {
-        // Create the per-VM cgroup directly with `mkdir`. The previous
-        // implementation used `cgroups-rs` `CgroupBuilder`, whose V2 path
-        // manipulates the parent's `subtree_control` and leaves the new cgroup in a
-        // state that rejects `cgroup.procs` writes (EOPNOTSUPP) under common systemd
-        // cgroup layouts; a plain directory + direct limit writes is robust across
-        // layouts. (The cgroup must still live in a non-threaded `domain` subtree —
-        // a threaded scope rejects `cgroup.procs` regardless; see implementation-notes.)
-        std::fs::create_dir_all(format!("/sys/fs/cgroup/{}", name))
-            .map_err(|e| crate::error::Error::Cgroup(format!("create cgroup {}: {}", name, e)))?;
-
-        #[cfg(feature = "metrics")]
-        {
-            if let Some(mem) = limits.mem_max_mib {
-                try_apply_limit(
-                    name,
-                    "memory",
-                    "memory.max",
-                    &mem_hard_limit_bytes(mem).to_string(),
-                )?;
-                // E1: make the cap a HARD bound, not a throttle. Guest RAM can be
-                // shmem/memfd-backed; under `memory.max` pressure cgroup v2 reclaims
-                // shmem to swap instead of OOM-killing, so the cap never fires and the
-                // guest overruns it. `memory.swap.max=0` removes the swap escape hatch
-                // (shmem stays charged, the cap hard-kills) and `memory.oom.group=1`
-                // makes the kill take the whole VM cgroup atomically. Both are part of
-                // the requested functional limit, so they fail loud too.
-                try_apply_limit(name, "memory", "memory.swap.max", "0")?;
-                try_apply_limit(name, "memory", "memory.oom.group", "1")?;
-            }
-            if let Some(cpu) = limits.cpu_max_pct {
-                let (quota, period) = cpu_quota_period(cpu);
-                try_apply_limit(name, "cpu", "cpu.max", &format!("{} {}", quota, period))?;
-            }
-            if let Some(pids) = limits.pids_max {
-                try_apply_limit(name, "pids", "pids.max", &render_pids_max(pids))?;
-            }
-            if let Some(io) = &limits.io_max {
-                if let Some(io_str) = render_io_max(io) {
-                    try_apply_limit(name, "io", "io.max", io_str.trim_end())?;
-                }
-            }
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = limits;
-        Ok(())
+        create_slice_at("/sys/fs/cgroup", name, limits)
     }
 
     fn delete_slice(&self, name: &str) -> Result<()> {
@@ -556,7 +604,6 @@ mod tests {
 
     // METRICS-FS-2: exact control-file rendering. Each assertion goes red on an
     // inverted formula or a mis-rendered rule string.
-    #[cfg(feature = "metrics")]
     #[test]
     fn test_cpu_quota_period_exact() {
         // Inverting the ratio (period * 100 / pct) would give (200_000, 100_000) for 50%.
@@ -565,7 +612,6 @@ mod tests {
         assert_eq!(cpu_quota_period(200), (200_000, 100_000));
     }
 
-    #[cfg(feature = "metrics")]
     #[test]
     fn test_mem_hard_limit_bytes_exact() {
         // Using SI MB (1_000_000) or the wrong shift would fail these.
@@ -573,7 +619,6 @@ mod tests {
         assert_eq!(mem_hard_limit_bytes(1), 1_048_576);
     }
 
-    #[cfg(feature = "metrics")]
     #[test]
     fn test_render_io_max_exact() {
         let io = crate::config::IoMax {
@@ -601,7 +646,6 @@ mod tests {
         assert_eq!(render_io_max(&empty), None);
     }
 
-    #[cfg(feature = "metrics")]
     #[test]
     fn test_render_pids_max_exact() {
         assert_eq!(render_pids_max(64), "64");
@@ -760,5 +804,92 @@ mod tests {
             err,
             crate::error::Error::CapabilityUnavailable { .. }
         ));
+    }
+
+    // CFG-1: the limit-application block must run REGARDLESS of the `metrics` feature
+    // and actually write the cgroup control files. This exercises the REAL
+    // `DefaultCgroupFs` write path (`create_slice_at`) against a tempdir root — not the
+    // `FakeCgroupFs`, which over-promised relative to the old non-`metrics` impl and so
+    // never caught the silent-drop bug — so it reddens if the block is re-gated behind
+    // `metrics` (the control files would be absent) or a render formula is inverted.
+    #[test]
+    fn test_create_slice_at_writes_real_limit_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        // Model a delegated host: the cgroup root's subtree_control lists every
+        // controller so the fail-loud delegation check passes and the limits apply.
+        std::fs::write(
+            dir.path().join("cgroup.subtree_control"),
+            "cpu io memory pids",
+        )
+        .expect("seed delegated subtree_control");
+
+        let limits = ResourceLimits {
+            mem_max_mib: Some(256),
+            cpu_max_pct: Some(50),
+            pids_max: Some(64),
+            io_max: Some(crate::config::IoMax {
+                device: "8:0".to_string(),
+                rbps: Some(1000),
+                wbps: Some(2000),
+                riops: None,
+                wiops: None,
+            }),
+        };
+
+        create_slice_at(&root, "vmcell-vm-1", &limits)
+            .expect("create_slice_at must apply the requested limits on a delegated host");
+
+        let read = |f: &str| {
+            std::fs::read_to_string(dir.path().join("vmcell-vm-1").join(f))
+                .unwrap_or_else(|e| panic!("{f} must be written by the ungated limit block: {e}"))
+        };
+        // The exact bytes the kernel would see; each reddens on a re-gated/removed
+        // block (file absent) or an inverted render formula.
+        assert_eq!(read("memory.max"), (256u64 << 20).to_string());
+        assert_eq!(read("memory.swap.max"), "0");
+        assert_eq!(read("memory.oom.group"), "1");
+        assert_eq!(read("cpu.max"), "50000 100000");
+        assert_eq!(read("pids.max"), "64");
+        assert_eq!(read("io.max"), "8:0 rbps=1000 wbps=2000");
+    }
+
+    // CFG-2: a parent-less slice name must still have its controller delegation
+    // verified — against the cgroup ROOT's `subtree_control`. The old impl skipped the
+    // read-back for parent-less names, so in a tempdir (where the final control-file
+    // write always succeeds) it returned `Ok` even with the controller undelegated.
+    // This goes red on that inverse: with the root `subtree_control` NOT listing
+    // `memory`, applying a memory limit to the top-level `vmcell-vm-1` must fail loud
+    // and leave no control file behind.
+    #[test]
+    fn test_try_apply_limit_at_verifies_root_delegation_for_parentless_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        std::fs::create_dir_all(dir.path().join("vmcell-vm-1")).expect("mkdir slice");
+        // Root delegates cpu/pids but NOT memory.
+        std::fs::write(dir.path().join("cgroup.subtree_control"), "cpu pids")
+            .expect("seed root subtree_control without memory");
+
+        let err = try_apply_limit_at(&root, "vmcell-vm-1", "memory", "memory.max", "1")
+            .expect_err("undelegated memory on a parent-less name must fail loud (CFG-2)");
+        assert!(
+            matches!(err, crate::error::Error::CapabilityUnavailable { .. }),
+            "expected CapabilityUnavailable, got {err:?}"
+        );
+        assert!(
+            !dir.path().join("vmcell-vm-1/memory.max").exists(),
+            "no control file may be written when the controller is not delegated"
+        );
+
+        // Inverse: once the root delegates memory, the same call succeeds and writes —
+        // proving the failure above is the missing delegation, not a blanket reject.
+        std::fs::write(dir.path().join("cgroup.subtree_control"), "cpu memory pids")
+            .expect("re-seed root subtree_control with memory");
+        try_apply_limit_at(&root, "vmcell-vm-1", "memory", "memory.max", "42")
+            .expect("delegated memory must apply");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("vmcell-vm-1/memory.max")).unwrap(),
+            "42"
+        );
     }
 }

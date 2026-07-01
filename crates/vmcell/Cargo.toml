@@ -34,6 +34,84 @@ name = "micro"
 harness = false
 required-features = ["pipeline"]
 
+# The cache-key example uses blake3 + serde_json (the pipeline/host stack).
+[[example]]
+name = "blake3_cache_key"
+path = "examples/blake3_cache_key.rs"
+required-features = ["pipeline"]
+
+# Integration tests exercise the host stack via the `vmm_matrix_test!` harness,
+# which emits per-backend test fns `#[cfg]`-gated on the backend features. They are
+# gated on `cloud-hypervisor` (the primary backend, always present via `default`
+# and in every `just test-*` invocation): this keeps the feature-powerset from
+# compiling them under configs where the host modules are absent, AND avoids the
+# dead-code that a backend-less-but-host-common config would leave (the matrix would
+# emit no backend fn, so the shared `test_*_impl` helpers would be unused).
+[[test]]
+name = "benchmark"
+path = "tests/benchmark.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "boot"
+path = "tests/boot.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "concurrency"
+path = "tests/concurrency.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "egress_proxy"
+path = "tests/egress_proxy.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "exec_vsock"
+path = "tests/exec_vsock.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "host_endpoint"
+path = "tests/host_endpoint.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "metrics_limits"
+path = "tests/metrics_limits.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "nested_virt"
+path = "tests/nested_virt.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "pipeline"
+path = "tests/pipeline.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "proptests"
+path = "tests/proptests.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "shares_ro_rw"
+path = "tests/shares_ro_rw.rs"
+required-features = ["cloud-hypervisor"]
+
+[[test]]
+name = "snapshot_restore"
+path = "tests/snapshot_restore.rs"
+required-features = ["cloud-hypervisor"]
+
 [dependencies]
 # unconditional shared core
 serde = { version = "1", features = ["derive"] }
@@ -45,7 +123,7 @@ thiserror = "2"
 vmcell-protocol = { path = "../vmcell-protocol", version = "0.2.0" }
 
 # host common
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time", "signal"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
 futures = { version = "0.3", optional = true }
 bytes = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
@@ -141,11 +219,24 @@ env_logger = "0.11"
 experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
 default = ["cloud-hypervisor", "net-privileged", "net-unprivileged", "proxy", "metrics", "pipeline", "cli"]
 
+# Collapsed host stack (design §10.5 follow-up "one feature per binary"): enabling
+# any host binary/backend feature (cloud-hypervisor/firecracker/qemu/cli) pulls the
+# full host module set, so there are no incoherent partial host configs. The host
+# modules in lib.rs are gated on `host-common`, and their bodies need the per-module
+# deps below — so `host-common` MUST turn them all on together. (The per-module
+# features still list `host-common` in turn; cargo permits the resulting feature
+# cycle and unifies it, so any host feature yields the whole coherent stack.)
 host-common = [
     "dep:tokio", "dep:futures", "dep:bytes",
     "dep:tracing", "dep:tracing-subscriber",
     "dep:tokio-vsock", "dep:nix", "dep:uuid", "dep:which",
     "dep:tokio-util", "dep:async-trait", "dep:libc",
+    "net-privileged", "net-unprivileged", "proxy", "metrics", "pipeline",
+    # Shared host-service deps: the HTTP-over-Unix VMM client (`vmm/mod.rs`,
+    # `proxy/doubles.rs`) and JSON (VMM config/bundle) are host-common code, so
+    # their deps belong here, not only on the CH/FC backend features. This is what
+    # lets a qemu- or cli-only host build compile the shared client.
+    "dep:serde_json", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyperlocal",
 ]
 
 cloud-hypervisor = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyperlocal", "dep:serde_json"]

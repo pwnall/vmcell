@@ -11,9 +11,18 @@ use std::process::{Command, exit};
 /// The precondition (`ensure_blessed_or_explain`) checks the **effective** set,
 /// so the printed `setcap` must grant `+ep` (effective + permitted). A bare `+p`
 /// would set only the permitted set and the runner would still fail the check.
-fn blessing_remediation(uid: u32, exe: &Path) -> String {
+///
+/// The message reports the **actual** `missing` set the precondition computed
+/// (each `Cap` renders as `CAP_…`), so a missing `CAP_DAC_OVERRIDE` — omitted by
+/// the pre-fix hardcoded prose — is named rather than silently dropped (PRIV-6).
+fn blessing_remediation(uid: u32, exe: &Path, missing: &[Cap]) -> String {
+    let missing_list = missing
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "error: vmcell-test-runner is missing CAP_NET_ADMIN/CAP_SYS_ADMIN (uid={uid}, no file caps).\n\
+        "error: vmcell-test-runner is missing {missing_list} in its effective set (uid={uid}, no file caps).\n\
          It was almost certainly rebuilt. Restore its privileges (one-time, until next rebuild):\n\n\
          sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {}\n\n\
          Then re-run the privileged suite. See §12.8.",
@@ -45,6 +54,7 @@ fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String> {
         Err(blessing_remediation(
             rustix::process::getuid().as_raw(),
             &exe,
+            &missing,
         ))
     }
 }
@@ -78,22 +88,58 @@ fn confine_under(candidate: &Path, target_root: &Path) -> Result<(), String> {
     }
 }
 
-/// Confirms the exec target resolves to a binary inside ITS OWN cargo `target`
-/// directory.
+/// Derives the **trusted** confinement root from the runner's OWN (canonicalized)
+/// executable path — never from the untrusted exec argument.
 ///
-/// v15 (§12.8 churn-fix #1): the confinement root is derived from the **exec
-/// target** (the test binary, which nextest always hands us from under `target/`)
-/// rather than from the runner's own `/proc/self/exe`. The runner now lives at a
-/// stable path *outside* `target/` (so cargo's churn never re-strips its caps), and
-/// anchoring on its own path would find no `target/` ancestor and refuse every
-/// test. Anchoring on the target is also a *stronger* defense-in-depth.
+/// The blessed runner is installed to a stable path *outside* `target/`, namely
+/// `<workspace>/.vmcell-bin/<profile>/vmcell-test-runner` (justfile / §12.8
+/// churn-fix #1). The trusted workspace root is therefore the parent of the
+/// `.vmcell-bin` ancestor, and every legitimate exec target (the test binary
+/// nextest hands us, always under `<workspace>/target/…`) must descend from
+/// `<workspace>/target`. Anchoring on the runner's own location is the security
+/// boundary; anchoring on the *argument* (the pre-fix v15 behavior) was inert —
+/// a caller-supplied `target_root` is by construction an ancestor of the argument,
+/// so the containment check always passed (`/home/attacker/target/debug/evil`
+/// slipped through). A dev fallback also accepts a runner still run in place from
+/// under `target/` itself (unblessed, so it would fail the effective-set check
+/// first — but we fail closed regardless of that ordering).
+fn trusted_target_root(exe: &Path) -> Result<std::path::PathBuf, String> {
+    // Preferred: the blessed runner under <workspace>/.vmcell-bin/<profile>/… →
+    // the trusted target dir is <workspace>/target.
+    for anc in exe.ancestors() {
+        if anc.file_name() == Some(OsStr::new(".vmcell-bin")) {
+            let workspace = anc.parent().ok_or_else(|| {
+                format!(
+                    "runner path {} has a .vmcell-bin ancestor with no workspace root above it",
+                    exe.display()
+                )
+            })?;
+            return Ok(workspace.join("target"));
+        }
+    }
+    // Dev fallback: a runner still executed in place from <workspace>/target/… →
+    // its own nearest `target/` ancestor IS the trusted cargo target dir.
+    for anc in exe.ancestors() {
+        if anc.file_name() == Some(OsStr::new("target")) {
+            return Ok(anc.to_path_buf());
+        }
+    }
+    Err(format!(
+        "cannot derive a trusted target root from the runner path {}: expected a \
+         `.vmcell-bin/` (blessed, stable-path) or `target/` (in-place dev) ancestor",
+        exe.display()
+    ))
+}
+
+/// Confirms the exec target resolves to a binary inside the **trusted** cargo
+/// `target` directory derived from the runner's own location ([`trusted_target_root`]).
 ///
-/// Defense-in-depth for the privileged window: `..` is rejected on the raw input
-/// first (canonicalization strips `..`, so a later check could not distinguish an
-/// escape attempt), then the path is canonicalized (resolving symlinks; a
-/// non-existent path fails closed), its nearest `target/` ancestor is located, and
-/// the resolved path is confirmed to descend from it.
-fn confine_under_target_dir_of(target: &str) -> Result<(), String> {
+/// `..` is rejected on the raw input first (canonicalization strips `..`, so a later
+/// check could not distinguish an escape attempt), then the path is canonicalized
+/// (resolving symlinks; a non-existent path fails closed), and the resolved path is
+/// confirmed to descend from the trusted root — NOT from any `target/`-named ancestor
+/// of the argument itself, which is what made the pre-fix v15 check a no-op.
+fn confine_target_under(target: &str, trusted_root: &Path) -> Result<(), String> {
     let raw = Path::new(target);
     if raw.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(format!(
@@ -103,16 +149,7 @@ fn confine_under_target_dir_of(target: &str) -> Result<(), String> {
     let resolved = raw
         .canonicalize()
         .map_err(|e| format!("cannot resolve target {target}: {e}"))?;
-    let target_root = resolved
-        .ancestors()
-        .find(|a| a.file_name() == Some(OsStr::new("target")))
-        .ok_or_else(|| {
-            format!(
-                "could not locate a cargo `target` directory above the test binary at {}",
-                resolved.display()
-            )
-        })?;
-    confine_under(&resolved, target_root)
+    confine_under(&resolved, trusted_root)
 }
 
 /// Looks up the numeric gid for a group name, or `None` if it does not exist.
@@ -339,8 +376,27 @@ fn main() {
         exit(1);
     }
 
+    // Confine the (untrusted) exec argument under a TRUSTED root derived from the
+    // runner's OWN location — never from the argument itself (PRIV-1). The blessed
+    // runner lives at <workspace>/.vmcell-bin/<profile>/vmcell-test-runner, so the
+    // trusted cargo target dir is <workspace>/target; any exec target outside it
+    // (e.g. /home/attacker/target/debug/evil) is rejected before the cap injection.
+    let exe = match std::env::current_exe().and_then(|p| p.canonicalize()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vmcell-test-runner: cannot resolve own executable path: {e}");
+            exit(1);
+        }
+    };
+    let trusted_root = match trusted_target_root(&exe) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("vmcell-test-runner: {e}");
+            exit(1);
+        }
+    };
     let target = &args[1];
-    if let Err(e) = confine_under_target_dir_of(target) {
+    if let Err(e) = confine_target_under(target, &trusted_root) {
         eprintln!("vmcell-test-runner: {e}");
         exit(1);
     }
@@ -385,7 +441,12 @@ mod tests {
     // `+ep` (effective + permitted).
     #[test]
     fn remediation_message_grants_effective_and_permitted() {
-        let msg = blessing_remediation(1000, Path::new("/x/target/debug/vmcell-test-runner"));
+        let missing = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
+        let msg = blessing_remediation(
+            1000,
+            Path::new("/x/target/debug/vmcell-test-runner"),
+            &missing,
+        );
         assert!(
             msg.contains("cap_net_admin,cap_sys_admin,cap_dac_override+ep"),
             "remediation must grant the three caps with +ep: {msg}"
@@ -395,6 +456,29 @@ mod tests {
         assert!(
             !msg.contains("+p\n"),
             "must not print a bare +p flag: {msg}"
+        );
+    }
+
+    // Guards PRIV-6: the remediation must print the ACTUAL computed `missing` vec,
+    // not a hardcoded "CAP_NET_ADMIN/CAP_SYS_ADMIN" string that omits
+    // CAP_DAC_OVERRIDE and discards the vec. The buggy inverse (ignoring `missing`)
+    // would fail to name DAC_OVERRIDE when only it is missing.
+    #[test]
+    fn remediation_lists_actual_missing_caps_including_dac_override() {
+        // Only DAC_OVERRIDE missing → it MUST be named.
+        let msg = blessing_remediation(
+            1000,
+            Path::new("/x/target/debug/vmcell-test-runner"),
+            &[Cap::DAC_OVERRIDE],
+        );
+        assert!(
+            msg.contains("CAP_DAC_OVERRIDE"),
+            "must name the actually-missing CAP_DAC_OVERRIDE: {msg}"
+        );
+        // A hardcoded net/sys string would wrongly name caps that are NOT missing.
+        assert!(
+            !msg.contains("CAP_NET_ADMIN") && !msg.contains("CAP_SYS_ADMIN"),
+            "must not name caps that are present (only DAC_OVERRIDE missing): {msg}"
         );
     }
 
@@ -421,41 +505,78 @@ mod tests {
 
     // `..` is rejected before any filesystem resolution, so even a non-existent
     // escape path fails closed (the old impl had no `..` rejection at all). The
-    // confinement root is now derived from the exec target's own path (v15), but the
-    // raw-input `..` rejection still happens first, before canonicalization.
+    // raw-input `..` rejection happens first, before canonicalization, regardless
+    // of the trusted root.
     #[test]
-    fn confine_under_target_dir_of_rejects_dotdot() {
-        assert!(confine_under_target_dir_of("/tmp/x/target/../../usr/bin/sh").is_err());
-        assert!(confine_under_target_dir_of("relative/../escape").is_err());
+    fn confine_target_under_rejects_dotdot() {
+        let trusted = Path::new("/tmp/x/target");
+        assert!(confine_target_under("/tmp/x/target/../../usr/bin/sh", trusted).is_err());
+        assert!(confine_target_under("relative/../escape", trusted).is_err());
     }
 
-    // The exec target must live under ITS OWN `target/` ancestor (v15 §12.8): a real
-    // test binary under `<cargo target>/<profile>/deps/...` is accepted; a resolved
-    // path with no `target/` ancestor is refused. Uses a tempdir so canonicalize()
-    // succeeds on a real path. The buggy inverse — anchoring on the runner's own
-    // `/proc/self/exe` (which has no `target/` ancestor once installed to a stable
-    // path) — would refuse the first case.
+    // Derives the trusted root from the runner's OWN location (PRIV-1): the blessed
+    // runner under `<workspace>/.vmcell-bin/<profile>/…` yields `<workspace>/target`;
+    // a runner run in place from `<workspace>/target/…` yields that `target/`; a path
+    // with neither anchor is an error (fail closed).
     #[test]
-    fn confine_under_target_dir_of_accepts_real_target_descendant() {
-        let tmp = std::env::temp_dir();
-        let base = tmp.join("vmcell-conf-test/target/debug/deps");
-        std::fs::create_dir_all(&base).expect("mkdir");
-        let bin = base.join("itest-bin");
-        std::fs::write(&bin, b"#!/bin/true").expect("write bin");
-        assert!(
-            confine_under_target_dir_of(bin.to_str().expect("utf8")).is_ok(),
-            "a test binary under a real `target/` tree must be accepted"
+    fn trusted_target_root_derives_from_runner_location() {
+        // Blessed stable-path install → trusted root is the sibling workspace target/.
+        assert_eq!(
+            trusted_target_root(Path::new(
+                "/home/dev/proj/.vmcell-bin/debug/vmcell-test-runner"
+            ))
+            .expect("blessed path"),
+            Path::new("/home/dev/proj/target")
         );
-        // A real path with no `target/` ancestor is refused.
-        let no_target = tmp.join("vmcell-conf-test-notarget/bin");
-        std::fs::create_dir_all(no_target.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&no_target, b"x").expect("write");
-        assert!(
-            confine_under_target_dir_of(no_target.to_str().expect("utf8")).is_err(),
-            "a binary with no `target/` ancestor must be refused"
+        // In-place dev runner still under target/ → its own target/ is trusted.
+        assert_eq!(
+            trusted_target_root(Path::new("/home/dev/proj/target/debug/vmcell-test-runner"))
+                .expect("in-place path"),
+            Path::new("/home/dev/proj/target")
         );
-        let _ = std::fs::remove_dir_all(tmp.join("vmcell-conf-test"));
-        let _ = std::fs::remove_dir_all(tmp.join("vmcell-conf-test-notarget"));
+        // Neither `.vmcell-bin` nor `target` above the runner → fail closed.
+        assert!(trusted_target_root(Path::new("/usr/local/bin/vmcell-test-runner")).is_err());
+    }
+
+    // PRIV-1 inverse — the load-bearing security test. Confinement must anchor on the
+    // TRUSTED root derived from the runner's own location, NOT on any `target/`-named
+    // ancestor of the untrusted argument. The pre-fix no-op ACCEPTED an attacker
+    // binary under an unrelated `/…/attacker/target/…`; this test reddens on that
+    // inverse. Uses tempdirs so canonicalize() resolves real paths.
+    #[test]
+    fn confine_target_under_rejects_attacker_target_accepts_trusted_descendant() {
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp_dir");
+        // The trusted workspace, derived from the (blessed) runner's own location.
+        let ws = tmp.join("vmcell-priv1-ws");
+        let runner = ws.join(".vmcell-bin/debug/vmcell-test-runner");
+        std::fs::create_dir_all(runner.parent().expect("runner dir")).expect("mkdir runner");
+        std::fs::write(&runner, b"#!/bin/true").expect("write runner");
+        let trusted_root = trusted_target_root(&runner).expect("derive trusted root");
+        assert_eq!(trusted_root, ws.join("target"));
+
+        // A real test binary UNDER the trusted target/ is accepted.
+        let good = ws.join("target/debug/deps/itest-bin");
+        std::fs::create_dir_all(good.parent().expect("good dir")).expect("mkdir good");
+        std::fs::write(&good, b"#!/bin/true").expect("write good");
+        assert!(
+            confine_target_under(good.to_str().expect("utf8"), &trusted_root).is_ok(),
+            "a test binary under the trusted target/ must be accepted"
+        );
+
+        // An attacker binary under an UNRELATED `target/`-named dir is REJECTED —
+        // the no-op inverse accepted exactly this.
+        let attacker = tmp.join("vmcell-priv1-attacker/target/debug/evil");
+        std::fs::create_dir_all(attacker.parent().expect("attacker dir")).expect("mkdir attacker");
+        std::fs::write(&attacker, b"#!/bin/true").expect("write attacker");
+        assert!(
+            confine_target_under(attacker.to_str().expect("utf8"), &trusted_root).is_err(),
+            "an attacker-controlled `target/`-named ancestor must be REJECTED (PRIV-1)"
+        );
+
+        let _ = std::fs::remove_dir_all(ws);
+        let _ = std::fs::remove_dir_all(tmp.join("vmcell-priv1-attacker"));
     }
 
     // ---- pure privilege-transition plan: each guards a documented buggy inverse ----

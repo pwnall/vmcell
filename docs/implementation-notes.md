@@ -47,7 +47,13 @@ This document captures the rationale behind key architectural decisions and non-
 - **OCI Whiteouts:** `tar2erofs.rs` takes an iterator of `tar::Archive` streams and correctly parses OCI whiteout files (`.wh.filename` and `.wh..wh..opq`) directly in-memory, mutating the node tree before final EROFS generation.
 - **Builder VM:** The `MmdebstrapVm` source dynamically invokes `oci::build_rootfs` to build its own transient `builder_rootfs.erofs` before booting. The `ExecRequest` protocol includes a `timeout` field to safely support long-running `apt-get install` commands over the vsock connection, defaulting to 10 seconds for standard commands.
 - **External virtiofsd:** When falling back to the external `virtiofsd` binary, the `--readonly` flag is required.
-- **In-process virtiofsd Read-Only Mode:** When using the experimental in-process `fuse-backend-rs`, read-only mode is not strictly enforced natively yet. This is a justifiable difference accepted due to upstream library constraints and is hidden behind the `experiment-fuse` feature flag.
+- **In-process virtiofsd Read-Only Mode:** When using the experimental in-process `fuse-backend-rs`
+  (`experiment-fuse`), read-only enforcement is not available natively. **Updated by Review 40 (CFG-3):**
+  rather than silently mounting such a share read-write, `VirtioFsDaemon::start` now *refuses* a
+  read-only in-process share up front with a typed `Error::Unsupported { vmm: "in-process-virtiofsd",
+  feature: "read-only virtio-fs share (in-process backend)" }` (fail-loud), with the `fs/in_process.rs`
+  guard as a lower-layer backstop. The earlier "not strictly enforced" phrasing is superseded: RO is
+  not silently ignored, it is a hard typed rejection behind the `experiment-fuse` flag.
 
 ## Privileged Test Runner (`imp-test-runner`)
 - `imp-test-runner` executes privileged integration tests without invoking `cargo test` under `sudo`. It verifies it has `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` file capabilities, drops its bounding set to the bare minimum, elevates these to the Ambient set, and switches its `euid`, `egid`, and groups to the developer's identity before `execve`ing the test binary.
@@ -110,10 +116,13 @@ findings contradict. Unjustified divergences and defects are in the review repor
 - **`deny.toml` allow-list adds `Unicode-3.0` and `CDLA-Permissive-2.0`** beyond the design skeleton.
   Both are permissive licenses required by transitive deps (e.g. `unicode-ident`); adding them is the
   sanctioned way to satisfy the allow-only gate (`cargo deny` is the source of truth), not a policy break.
-- **TPROXY ruleset drops UDP/QUIC (`udp dport 443`) instead of intercepting it** (`src/net/tap.rs:315-326`),
-  a deliberate divergence from §6.3's "intercept" language: blocking QUIC forces HTTP/2-over-TCP so all
-  egress stays observable through the transparent proxy, which serves the design's egress-observability
-  goal. (Surfaced as review finding `NET-7`; recorded here as the accepted posture.)
+- **TPROXY ruleset drops UDP/QUIC instead of intercepting it** (`src/net/tap.rs`, renderer
+  `render_tproxy_rules`; UDP/443 is dropped by the chain's default `policy drop`, not by an explicit
+  `udp dport 443` rule), a deliberate divergence from §6.3's "intercept" language: blocking QUIC forces
+  HTTP/2-over-TCP so all egress stays observable through the transparent proxy, which serves the design's
+  egress-observability goal. (Surfaced as review finding `NET-7`; recorded here as the accepted posture.
+  Review 40 NET-6 corrected the stale `net/tap.rs:315-326` line reference to the current
+  `render_tproxy_rules`.)
 - **`exec_vsock::test_exec_vsock_mock` runs in the default (non-ignored) suite.** It is a UDS
   protocol/codec mock exercising the `AgentClient` handshake + `Framed<LengthDelimitedCodec>` exchange —
   not the `put_file` round-trip (which is covered separately by the `vmm_matrix_test!` that writes via
@@ -305,6 +314,10 @@ end-to-end — every prior attempt died at the netns permission error, masking e
 need privileged `umount`+`rm` to clean — the missing periodic-sweeper / orphan-registry the review flagged
 (rubric B1). A leaked netns occasionally collides with a later run's vmid (`netns add … Operation not
 permitted`). A sweeper (or a `just`-level pre-clean run via the capability runner) should reap these.
+*(Review 40 ORCH-6 — RESOLVED in code: `Orchestrator::sweep_orphans()` + the injectable `OrphanScanner`
+seam now enumerate orphaned netns / per-VM cgroup slices / scratch dirs and reap only non-live vmids via
+the injected `Netlink`/`CgroupFs` seams, in canonical order (netns → cgroup → scratch). Unit-tested with
+recording fakes; the real host-removal path still needs a privileged KVM-host run to validate end-to-end.)*
 
 ### Larger follow-ups to evaluate next (raised by the maintainer)
 
@@ -1435,6 +1448,15 @@ matrix that exercises full reclamation of the single owned directory.
 
 ### Residual race in the PID-1 reaper fix (noted, deliberately deferred)
 
+*(Review 40 AGENT-1 — RESOLVED: closed by `ReaperCoordinator::drain_reaped`, which now runs the
+`waitpid(WNOHANG)` reap **and** the status record inside the **same** lock acquisition that performs the
+reservation/generation bump. Because a zombie holds its pid until reaped, a fork can only reuse a pid
+after the `waitpid` that frees it — and that `waitpid` now executes inside the critical section — so a
+`reserve()` can never interleave between reap and record. Guarded by
+`reap_and_record_are_atomic_wrt_reservation_under_pid_reuse` (verified RED on the non-atomic inverse:
+returns the stale grandchild status instead of the reused child's real status). The deferred
+restructuring described below is exactly what landed.)*
+
 The PID-1 reaper fix just landed (reserve()-at-spawn + generation-gated `wait_for`) closes the
 documented stale-status-already-in-map case: a status recorded under a prior generation can no longer
 be returned to a waiter for a reused pid. A **narrow** window remains, however: the single
@@ -1708,3 +1730,126 @@ and are not re-listed.)
   does (the warning). Recorded corrections/follow-ups: impl-notes:52's "bare minimum" claim is
   inaccurate for the file-cap path; the per-run warning should be de-noised (log once / only when
   a *reducible* cap remains) so it cannot mask a genuine one.
+
+## Review 40 — remediation pass (2026-06-30 / 2026-07-01)
+
+Review 40 (`docs/40-claude-code-review.md`) was a full per-subsystem static re-audit against design
+v15 + the v2 rubric (4 High, 15 Medium, 34 Low). Its findings were addressed across eight
+file-disjoint subsystem clusters; each behavioral fix carries a test that goes **red on its inverse**
+(several were adversarially confirmed red by writing the buggy version). The per-finding fixes live in
+the code + the review report; recorded below are the **justified deviations, integration decisions, and
+newly-discovered forward-work** per AGENTS.md "record deviations". Stale wording flagged by the review
+(CFG-3 in-process RO, NET-6 `render_tproxy_rules` line ref, the AGENT-1 reaper race, the ORCH-6 leak
+note) was corrected in-place above.
+
+**High-severity fixes:** VMM-1 (CH & QEMU now fail loud with `Error::Unsupported { feature:
+"virtio_fs_rootfs" }` via a shared `reject_virtio_fs_rootfs` self-guard, mirroring FC); CFG-1 (cgroup
+limit application ungated from the `metrics` feature — the block writes sysfs via `std::fs` with no
+metrics-only dep; guarded by a real-`DefaultCgroupFs` write test against an injectable root); TEST-1
+(the transparent-egress filter test now asserts the host-observable applied nft ruleset — `policy drop`
++ `tproxy to :` + `vmcell-drop` — so an impl emitting *no* ruleset reddens, instead of the old
+filter-independent black-hole address); PRIV-1 (test-runner path-confinement re-anchored on the runner's
+own `current_exe()`-derived workspace `target/`, not the untrusted exec argument).
+
+**Integration decisions & justified deviations:**
+
+- **`VmidAllocator.clock` is `Arc<dyn Clock + std::panic::RefUnwindSafe>`.** ORCH-8 injected a `Clock`
+  seam for the vmid search-seed; a bare `dyn Clock` trait object is not unwind-safe, which would have
+  silently dropped `UnwindSafe`/`RefUnwindSafe` from the public `VmidAllocator` **and** from
+  `artifact::SnapshotStage` (which has a public `vmid_alloc` field) — a breaking auto-trait removal
+  flagged by `cargo semver-checks`. Bounding the stored trait object with `RefUnwindSafe` (both `Clock`
+  impls satisfy it) restores the auto-traits, so the Review-40 surface change is **purely additive** and
+  `semver-checks` reports "no update required" at 0.2.0 (no version bump).
+- **Public API additions (non-breaking, additive):** `orchestrator::{OrphanScanner, HostOrphanScanner,
+  SweepReport, Orchestrator::sweep_orphans}` (ORCH-6); `VmidAllocator` swapped derived `Debug`/`Default`
+  for manual impls (public impls preserved); the OCI pull seam (`OciPuller`/`RealOciPuller`/
+  `build_rootfs_with`) is `pub(crate)`, not public; `FcInstance` gained a **private** `restored` flag on
+  its `#[non_exhaustive]` struct.
+- **VMM-2:** QEMU's readiness-failure error is no longer wrapped in `Error::Vmm("QMP socket failed to
+  appear…")`; it now propagates the raw error identically to CH/FC (intentional alignment of the shared
+  `register_and_await_ready` helper, not a design divergence).
+- **VMM-6:** `FcInstance::boot()` now returns `Error::Unsupported` on a restored instance (fail-loud
+  refusal, consistent with "restore returns paused, orchestrator resumes"); restore uses the fresh
+  `serial.log` path for panic detection. Unreachable today (FC `snapshot_restore` is honest-`false`);
+  correct-by-construction for when FC warm-restore is un-gated.
+- **ORCH-3:** a non-zero post-restore clock-resync (`date -s`) exit now returns a typed `Error::Agent`
+  **before** `restored` is cleared (fail-loud, §9.2), instead of a `warn!`-and-clear swallow.
+- **ORCH-4:** restore-path law rejections now return `Error::Unsupported` (was `Error::Config`), per
+  §3.3 boundary 2.
+- **ORCH-7 (deviation / forward-work):** `request_shutdown()` → SIGKILL now has a bounded `SHUTDOWN_GRACE`
+  (500 ms) window instead of an unconditional immediate kill. It is a **fixed** window, not a
+  poll-until-exit: a true early-return needs a `VmInstance::try_wait` exit-status probe (a new trait
+  method in `vmm/mod.rs`, out of the ORCH file scope) — **deferred** as a `VmInstance::try_wait`
+  follow-up.
+- **CFG-1 gate + GATE forward-work:** a **blocking** reduced-host-feature clippy (CH and FC, `metrics`
+  OFF) was added to `just ci` and `ci.yml` so CFG-1's class (a `#[cfg]`-gating break in a reduced host
+  build) is now caught by a blocking gate rather than only the non-blocking feature-powerset. The **QEMU**
+  row is **deferred**: `qemu`-alone with `metrics` off does not compile because `proxy/doubles.rs` and
+  `vmm/mod.rs` use `hyper`/`hyper_util`/`http_body_util` directly, which only `cloud-hypervisor`/
+  `firecracker` pull via `dep:hyper`. This is a CFG-1-class `#[cfg]`-gating gap (fail-loud: a compile
+  error, not a silent no-op); the fix is to gate the shared hyper HTTP-over-Unix client to
+  `any(cloud-hypervisor, firecracker)` in `crates/vmcell/src` and then un-defer the QEMU gate row.
+- **PRIV-1 (security) — `bless` mode as the enforced boundary:** `just bless` now `chmod 0700` on the
+  blessed capability runner (owner-only) as the **enforced** privilege boundary, superseding the design /
+  impl-notes "group-restrict as a note" wording; `0750` + a dedicated group is documented as the
+  shared-host alternative.
+- **AGENT-3 dev-deps:** the guest-agent crate gained `tokio-util` + `bytes` as **`[dev-dependencies]`**
+  (exempt from the `cargo tree -e no-dev` lean-agent ban, re-verified empty) for the framing round-trip
+  test against the real host `LengthDelimitedCodec`.
+
+**Validation status.** The full non-KVM gate is green: `just test-unit` / `cargo nextest run
+--all-features` → **241 passed, 40 skipped**; `just ci` clean (fmt, clippy `-D warnings` all-features +
+the new CH/FC reduced-host configs, `cargo deny`, all ban-gates incl. the new agent-`ip`-shellout gate,
+the global-state self-test's new bare-`Mutex`/`OnceLock` fixtures, lean-agent/lean-test-runner trees,
+`cargo semver-checks` → "no update required"). **Host-facing paths were NOT validated on a KVM host in
+this pass** — VMM create/spawn/restore, netns/cgroup teardown + the ORCH-6 sweeper's real removal path,
+virtiofsd/cpufreq sysfs writes, the runner's capability drop + confined exec, the guest PID-1
+`reboot(RB_POWER_OFF)`, and the TEST-1/TEST-2 privileged egress assertions are unit-tested via recording
+fakes / injectable roots and are correct-by-construction. Per AGENTS.md these MUST be validated with
+`just test-unprivileged` + `just test-privileged` on a KVM/root host before the host-facing changes are
+called done.
+
+### Feature-matrix collapse (design §10.5 follow-up — implemented, 2026-07-01)
+
+Prompted by build errors surfaced when running `just ci` after squashing the Review-40 commits: `just ci`
+itself was green (exit 0), but its **non-blocking feature-powerset** step (the accepted-RED **C-GATE-1**
+debt) spewed 52–63 errors per reduced host config. Root cause: `lib.rs` gates the host modules
+(`net`, `proxy`, `artifact`, `metrics`, `orchestrator`, `vmm`, …) on `#[cfg(feature = "host-common")]`,
+but their bodies need per-module deps (`net-privileged`, `proxy`, `pipeline`, …). So any config that
+enabled `host-common` **without** the full module set (e.g. `--features cloud-hypervisor` alone) compiled
+those modules against absent crates. This is the "collapse the cargo feature matrix to one feature per
+binary" follow-up the design flagged; the maintainer chose to **collapse** it now.
+
+Implemented (Cargo.toml + a widened cfg in `error.rs`, no host logic changed):
+
+- **`host-common` now pulls the full host module set** (`net-privileged`, `net-unprivileged`, `proxy`,
+  `metrics`, `pipeline`) plus the shared host-service deps the HTTP-over-Unix VMM client and JSON config
+  use (`hyper`, `hyper-util`, `http-body-util`, `hyperlocal`, `serde_json`). Enabling **any** host
+  feature (a backend or `cli`) therefore yields the whole coherent host stack — there are no incoherent
+  partial host configs. The per-module features still list `host-common` in turn; the resulting
+  **feature cycle is intentional and accepted by cargo** (it unifies the cycle, so any host feature
+  co-enables the rest).
+- **`tokio` gained its `"fs"` feature** directly (it had relied on transitive feature unification that a
+  reduced config removed), and the `SerdeJson`/`Hyper`/`Http` `Error` variants widened from per-backend
+  cfgs (`any(cloud-hypervisor, firecracker[, qemu, cli])`) to `feature = "host-common"`, matching where
+  those deps now live. Under `default` features the resolved API is unchanged (`cargo semver-checks`:
+  no update required).
+- **`required-features` added** to the 13 integration `[[test]]` targets (`cloud-hypervisor` — the
+  primary backend, always present in `default` and every `just test-*`; the `vmm_matrix_test!` harness
+  gates backend fns, so a backend is needed to avoid dead-code) and the `blake3_cache_key` `[[example]]`
+  (`pipeline`), so reduced configs stop compiling targets whose modules are absent.
+
+Consequences:
+
+- **Every ≤2-feature config now compiles+clippies clean under `-D warnings`** (205/205 powerset combos).
+  The **feature-powerset is promoted from non-blocking accepted-RED debt to a BLOCKING gate** in both
+  `just ci` and `.github/workflows/ci.yml`; the fast per-backend reduced-host smoke now includes **qemu**
+  (which previously did not compile in isolation — the shared hyper client + serde_json are now
+  host-common deps, closing the gap C7 deferred in Review 40).
+- **CFG-1's scenario is closed by construction:** `metrics` is now part of the host stack, so a "host
+  build without `metrics`" (the config where limits could silently drop) is no longer constructible.
+  CFG-1's code fix (ungated limit application) remains as defense-in-depth.
+- **Accepted trade-off (the design §10.5 direction):** a library consumer can no longer build a *minimal*
+  backend-only lib — enabling any host backend now pulls the whole host stack (net + proxy + metrics +
+  pipeline, incl. heavier deps like `reqwest`/`oci-client`/`pgp`). The shipped `default` build is
+  unchanged (it already enabled everything), so no shipped binary gains or loses a dependency.

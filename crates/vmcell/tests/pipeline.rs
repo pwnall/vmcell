@@ -306,35 +306,167 @@ async fn test_pipeline_tampered_digest_aborts() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-// M-PIPE-1: reset_to must INVALIDATE the named stage, so a failed artifact removal
-// must surface as Err — not a swallowed `let _ =` that reports Ok while leaving a
-// VALID cached artifact behind (the next build would then serve the stale artifact).
-// We force the removal to fail by making the artifact path a NON-EMPTY DIRECTORY,
-// which `remove_file` cannot delete (a non-NotFound error). The buggy swallowing
-// impl returns Ok here → this assertion goes red.
+// ART-2: `reset_to` must PURGE a directory output (the snapshot stage's shape), not error
+// on `EISDIR`. The old `remove_file`-only path returned Err on a directory — so the
+// previously-misnamed `test_reset_to_propagates_remove_error` locked in the WRONG behavior
+// by asserting Err on a dir. Here the artifact IS a non-empty directory with an intact
+// `.cache_key`; reset_to must succeed and remove both. The old EISDIR-propagating impl
+// returns Err → the `.expect(...)` below goes red on it.
 #[tokio::test]
-async fn test_reset_to_propagates_remove_error() {
+async fn test_reset_to_purges_directory_output() {
     let tmp_dir =
-        std::env::temp_dir().join(format!("vmcell-test-reset-err-{}", std::process::id()));
+        std::env::temp_dir().join(format!("vmcell-test-reset-dir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let cache = Cache::default();
 
     let pipeline = Pipeline::new(tmp_dir.clone()).add_stage(Box::new(DummyStage {
-        name: "stage1".to_string(),
+        name: "snapshot".to_string(),
         content: "content1".to_string(),
     }));
 
-    // Make the artifact path a non-empty directory so `remove_file` fails with a
-    // non-NotFound error (EISDIR / permission-shaped), which reset_to must propagate.
-    let art = tmp_dir.join("stage1");
-    std::fs::create_dir_all(&art).unwrap();
-    std::fs::write(art.join("inner"), b"block-removal").unwrap();
+    // The artifact is a NON-EMPTY directory (a snapshot dir) with an intact `.cache_key`.
+    let art = tmp_dir.join("snapshot");
+    std::fs::create_dir_all(art.join("mem")).unwrap();
+    std::fs::write(art.join("state.json"), b"state").unwrap();
+    std::fs::write(art.join("mem/pages.bin"), b"pages").unwrap();
+    std::fs::write(tmp_dir.join("snapshot.cache_key"), b"{}").unwrap();
 
-    let res = pipeline.reset_to("stage1", &cache);
+    pipeline
+        .reset_to("snapshot", &cache)
+        .expect("reset_to must purge a directory output, not EISDIR-error");
+    assert!(
+        !art.exists(),
+        "reset_to must remove the snapshot directory output"
+    );
+    assert!(
+        !tmp_dir.join("snapshot.cache_key").exists(),
+        "reset_to must remove the .cache_key sidecar too"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[derive(Clone)]
+struct DirStage {
+    name: String,
+    key: String,
+    /// `(relative path within the output dir, bytes)`.
+    files: Vec<(String, Vec<u8>)>,
+    run_count: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl vmcell::artifact::Stage for DirStage {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn out_path(&self, target_dir: &Path) -> std::path::PathBuf {
+        target_dir.join(&self.name)
+    }
+
+    fn cache_key(&self, _inputs: &vmcell::artifact::StageInputs) -> vmcell::artifact::CacheKey {
+        vmcell::artifact::CacheKey::new(self.key.clone())
+    }
+
+    async fn run(
+        &self,
+        _inputs: &vmcell::artifact::StageInputs,
+        out: &Path,
+    ) -> Result<StageOutputs> {
+        self.run_count.fetch_add(1, Ordering::SeqCst);
+        std::fs::create_dir_all(out).unwrap();
+        for (rel, bytes) in &self.files {
+            let p = out.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, bytes).unwrap();
+        }
+        Ok(StageOutputs::default())
+    }
+}
+
+// ART-1: a DIRECTORY stage output (the snapshot stage's shape) must be cached and
+// content-verified. `hash_file` `File::open`ed the dir and `EISDIR`-ed into the `warn!`
+// arm, so no `.cache_key` sidecar was ever written and the stage re-ran on every build.
+// Here the sidecar must exist after the first build, and the warm build must SKIP the stage
+// (run count stays 1). The old code reddens both assertions.
+#[tokio::test]
+async fn test_pipeline_dir_output_cached_and_stable() {
+    let tmp_dir =
+        std::env::temp_dir().join(format!("vmcell-test-pipeline-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let cache = Cache::default();
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let pipeline = Pipeline::new(tmp_dir.clone()).add_stage(Box::new(DirStage {
+        name: "snapshot".into(),
+        key: "snap-key".into(),
+        files: vec![
+            ("state.json".into(), b"state".to_vec()),
+            ("mem/pages.bin".into(), b"pages".to_vec()),
+        ],
+        run_count: count.clone(),
+    }));
+
+    pipeline.build(&cache).await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(
+        tmp_dir.join("snapshot").is_dir(),
+        "directory output must exist"
+    );
+    assert!(
+        tmp_dir.join("snapshot.cache_key").exists(),
+        "a directory output must write a .cache_key sidecar (ART-1)"
+    );
+
+    // Warm rebuild: the directory content hash is stable and verified, so the stage is
+    // skipped instead of re-running.
+    pipeline.build(&cache).await.unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "directory output must be cached across runs (stable content hash)"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ART-1: a byte-corrupted file INSIDE a cached directory output, with the `.cache_key`
+// sidecar left intact, must be rejected on the hit path (the tamper contract) — exactly
+// like a tampered single-file artifact. The old code never wrote a sidecar for a dir, so it
+// silently rebuilt (returning Ok) → this `is_err` goes red on it.
+#[tokio::test]
+async fn test_pipeline_dir_output_tamper_rejected() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "vmcell-test-pipeline-dir-tamp-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let cache = Cache::default();
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let pipeline = Pipeline::new(tmp_dir.clone()).add_stage(Box::new(DirStage {
+        name: "snapshot".into(),
+        key: "snap-key".into(),
+        files: vec![
+            ("state.json".into(), b"state".to_vec()),
+            ("mem/pages.bin".into(), b"pages".to_vec()),
+        ],
+        run_count: count.clone(),
+    }));
+
+    pipeline.build(&cache).await.unwrap();
+
+    // Corrupt one file inside the directory; keep the sidecar intact.
+    std::fs::write(tmp_dir.join("snapshot/mem/pages.bin"), b"tampered").unwrap();
+
+    let res = pipeline.build(&cache).await;
     assert!(
         res.is_err(),
-        "reset_to must propagate a failed artifact removal, not report Ok"
+        "a corrupted file inside a cached directory output must abort on the hit path"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

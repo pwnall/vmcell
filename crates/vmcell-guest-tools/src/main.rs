@@ -393,12 +393,12 @@ fn run_curl(args: &[String]) -> i32 {
     // relying on reqwest's auto-detection (which proved unreliable here). The
     // egress tests steer traffic at the transparent proxy via http_proxy /
     // https_proxy.
-    if let Some(p) = proxy_from_env(&["all_proxy", "ALL_PROXY"]) {
-        match reqwest::Proxy::all(&p) {
-            Ok(proxy) => builder = builder.proxy(proxy),
-            Err(e) => eprintln!("curl: bad all_proxy {p}: {e}"),
-        }
-    }
+    //
+    // Order matters: reqwest applies proxies first-match, and `Proxy::all` matches
+    // *every* scheme, so the scheme-specific `http`/`https` proxies MUST be added
+    // BEFORE the `all_proxy` catch-all — otherwise `all_proxy` shadows a
+    // scheme-specific `https_proxy` for HTTPS URLs, the opposite of curl's
+    // precedence (scheme-specific wins over the catch-all) (PRIV-7).
     if let Some(p) = proxy_from_env(&["http_proxy", "HTTP_PROXY"]) {
         match reqwest::Proxy::http(&p) {
             Ok(proxy) => builder = builder.proxy(proxy),
@@ -409,6 +409,12 @@ fn run_curl(args: &[String]) -> i32 {
         match reqwest::Proxy::https(&p) {
             Ok(proxy) => builder = builder.proxy(proxy),
             Err(e) => eprintln!("curl: bad https_proxy {p}: {e}"),
+        }
+    }
+    if let Some(p) = proxy_from_env(&["all_proxy", "ALL_PROXY"]) {
+        match reqwest::Proxy::all(&p) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            Err(e) => eprintln!("curl: bad all_proxy {p}: {e}"),
         }
     }
 

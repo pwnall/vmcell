@@ -50,7 +50,7 @@ check_runner() {
   local path="$1" caps
   if [ ! -x "$path" ]; then
     note "runner     : $path NOT BUILT"
-    problems+=("Capability runner $path is not built. Run \`just bless\` (it builds AND setcaps both debug and release runners with --features test-runner).")
+    problems+=("Capability runner $path is not built. Run \`just bless\` (it builds AND setcaps both debug and release runners via -p vmcell-test-runner).")
     return
   fi
   caps="$(getcap "$path" 2>/dev/null)"

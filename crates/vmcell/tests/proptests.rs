@@ -21,21 +21,44 @@ proptest! {
             }
         }
 
-        // Release half of them
-        for i in active.iter().take(active.len() / 2) {
-            alloc.release(*i);
+        // Because nothing was released during the allocation loop, the lowest-free
+        // allocator hands out a contiguous ascending run, so `active` is sorted;
+        // the first half are the LOWEST live CIDs.
+        let half = active.len() / 2;
+        let freed: Vec<u32> = active.iter().take(half).copied().collect();
+        let held: Vec<u32> = active[half..].to_vec();
+
+        // Release the first (lowest) half.
+        for cid in &freed {
+            alloc.release(*cid);
         }
 
-        // Re-allocate
-        if let Ok(cid) = alloc.allocate() {
-            assert!(cid >= 3);
-            assert!(!active[active.len()/2..].contains(&cid));
-            active.push(cid);
+        // TEST-3: reallocation must REUSE a previously freed value (not mint a
+        // brand-new one while freed slots exist) and must never collide with a
+        // still-live CID. A no-op `release()` leaves the set unchanged, so the
+        // reallocated CID would be a fresh value NOT in `freed` -> the reuse
+        // assert goes red.
+        if !freed.is_empty() {
+            let cid = alloc.allocate().expect("a freed CID must be reallocatable");
+            prop_assert!(cid >= 3);
+            prop_assert!(
+                freed.contains(&cid),
+                "reallocated CID {} was not one of the freed values {:?}",
+                cid,
+                freed
+            );
+            prop_assert!(
+                !held.contains(&cid),
+                "reallocated CID {} collided with a still-live CID",
+                cid
+            );
+            alloc.release(cid);
         }
 
-        // Release the remaining allocated CIDs to prevent leaking into the global allocator
-        for i in active[active.len()/2..].iter() {
-            alloc.release(*i);
+        // Release the remaining allocated CIDs (fresh local allocator, but keep
+        // the set tidy).
+        for cid in &held {
+            alloc.release(*cid);
         }
     }
 
@@ -98,4 +121,61 @@ proptest! {
             assert_eq!(cidr, format!("10.200.{}.2/30", octet));
         }
     }
+}
+
+// TEST-3: deterministic reuse + "wrap without colliding with live" for the CID
+// allocator. Fills the whole guest range [3, 254], frees two BOUNDARY values
+// (the lowest and highest), and asserts reallocation reuses exactly those freed
+// values without ever handing back a still-live CID. Buggy impl guarded: a
+// no-op `release()` leaves the range full, so the first post-release
+// `allocate()` returns `Err` and the `.expect()` panics; an allocator that
+// wrapped into a live CID fails the set-equality / non-collision asserts.
+#[test]
+fn cid_allocator_reuses_freed_and_wraps_without_colliding_with_live() {
+    use std::collections::BTreeSet;
+
+    let alloc = CidAllocator::new();
+
+    // Fill the entire guest range [3, 254].
+    let mut live: BTreeSet<u32> = BTreeSet::new();
+    while let Ok(cid) = alloc.allocate() {
+        assert!((3..=254).contains(&cid), "cid {cid} out of the guest range");
+        assert!(
+            live.insert(cid),
+            "allocator handed out a duplicate CID {cid}"
+        );
+    }
+    assert_eq!(live.len(), 252, "expected 252 guest CIDs (3..=254)");
+    assert!(
+        alloc.allocate().is_err(),
+        "a full allocator must report exhaustion, not a reserved/duplicate CID"
+    );
+
+    // Free two BOUNDARY values (lowest and highest); keep the rest live.
+    alloc.release(3);
+    alloc.release(254);
+    live.remove(&3);
+    live.remove(&254);
+
+    // Reallocation must reuse the freed values, never a still-live one.
+    let a = alloc.allocate().expect("a freed CID must be reusable");
+    let b = alloc
+        .allocate()
+        .expect("the second freed CID must be reusable");
+    assert!(
+        !live.contains(&a) && !live.contains(&b),
+        "reused CID collided with a still-live one: {a}, {b}"
+    );
+    let reused: BTreeSet<u32> = [a, b].into_iter().collect();
+    assert_eq!(
+        reused,
+        BTreeSet::from([3, 254]),
+        "reallocation must reuse exactly the freed boundary CIDs, got {a} and {b}"
+    );
+
+    // Exhausted again once the freed slots are taken back.
+    assert!(
+        alloc.allocate().is_err(),
+        "allocator must be full again after the freed slots are reused"
+    );
 }

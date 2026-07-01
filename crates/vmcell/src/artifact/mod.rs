@@ -173,17 +173,81 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Removes `path` if it exists, returning `Ok(())` when it is already absent and
-/// propagating every other I/O error (e.g. permission denied, path-is-a-directory).
+/// Content hash of a stage output, whether it is a single **file** or a **directory**.
 ///
-/// Used by [`Pipeline::reset_to`] so a failed invalidation is loud, never a
-/// silent `Ok` that leaves a stale cached artifact behind.
+/// A file hashes to exactly [`hash_file`] (so existing file sidecars stay valid). A
+/// directory (e.g. the `SnapshotStage` output — ART-1) hashes over a deterministic,
+/// sorted recursive walk — relative name + type + (files) mode + content, (symlinks)
+/// target — so the whole tree is content-addressed and a byte-corrupted file inside it is
+/// rejected on the cache-hit path exactly like a tampered single-file artifact. Using
+/// `hash_file` on a directory `File::open`s it and reads → `EISDIR`, which silently
+/// defeated caching *and* tamper-verification for every directory output.
 ///
 /// # Errors
-/// Returns [`crate::error::Error::Io`] if the file exists but cannot be removed.
+/// Returns [`crate::error::Error::Io`] if `path` (or any entry under it) cannot be read.
+pub(crate) fn hash_output(path: &Path) -> Result<String> {
+    let meta = std::fs::symlink_metadata(path).map_err(crate::error::Error::Io)?;
+    if meta.is_dir() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"vmcell-dir-v1\0");
+        hash_dir_into(&mut hasher, path)?;
+        Ok(hasher.finalize().to_hex().to_string())
+    } else {
+        hash_file(path)
+    }
+}
+
+/// Folds a directory's contents into `hasher` over a deterministic sorted walk, so the
+/// hash is stable regardless of the filesystem's `read_dir` ordering.
+fn hash_dir_into(hasher: &mut blake3::Hasher, dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+        .map_err(crate::error::Error::Io)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(crate::error::Error::Io)?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry.file_name();
+        let file_type = entry.file_type().map_err(crate::error::Error::Io)?;
+        let path = entry.path();
+        hasher.update(name.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if file_type.is_dir() {
+            hasher.update(b"d");
+            hash_dir_into(hasher, &path)?;
+        } else if file_type.is_symlink() {
+            hasher.update(b"l");
+            let target = std::fs::read_link(&path).map_err(crate::error::Error::Io)?;
+            hasher.update(target.to_string_lossy().as_bytes());
+        } else {
+            hasher.update(b"f");
+            let meta = entry.metadata().map_err(crate::error::Error::Io)?;
+            hasher.update(&meta.permissions().mode().to_le_bytes());
+            hasher.update(hash_file(&path)?.as_bytes());
+        }
+        hasher.update(b"\x1e");
+    }
+    Ok(())
+}
+
+/// Removes `path` if it exists, returning `Ok(())` when it is already absent and
+/// propagating every other I/O error (e.g. permission denied).
+///
+/// Handles both a **file** (`remove_file`) and a **directory** (`remove_dir_all`) — the
+/// snapshot stage's output is a directory (ART-1/ART-2), so a `remove_file`-only path
+/// returned `EISDIR` and made `reset_to(<stage at/before snapshot>)` fail once the
+/// snapshot dir existed, defeating invalidation. A symlink is removed as a link, never
+/// followed into its target's tree.
+///
+/// Used by [`Pipeline::reset_to`] so a failed invalidation is loud, never a silent `Ok`
+/// that leaves a stale cached artifact behind.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Io`] if the path exists but cannot be removed.
 fn remove_if_present(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path).map_err(crate::error::Error::Io),
+        Ok(_) => std::fs::remove_file(path).map_err(crate::error::Error::Io),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(crate::error::Error::Io(e)),
     }
@@ -191,8 +255,8 @@ fn remove_if_present(path: &Path) -> Result<()> {
 
 /// Folds the upstream `artifacts` into `hasher` in a deterministic, key-sorted order,
 /// hashing each artifact's on-disk **content** (the identity that travels) rather than its
-/// absolute path under `target_dir`. Falls back to the path identity only if the artifact
-/// is not yet materialized on disk.
+/// absolute path under `target_dir`. An artifact not yet materialized on disk folds a
+/// stable `<unmaterialized>` marker (never its absolute path).
 ///
 /// Iterating the raw `HashMap` would feed blake3 in a process-random order (spurious cache
 /// misses) and would key on `target_dir`-relative path strings (a rebuilt upstream at the
@@ -211,8 +275,13 @@ pub(crate) fn hash_artifacts_sorted(
                 hasher.update(content_hash.as_bytes());
             }
             Err(_) => {
-                hasher.update(b"p:");
-                hasher.update(v.to_string_lossy().as_bytes());
+                // The artifact is not materialized on disk yet. Fold a STABLE marker —
+                // never the absolute `PathBuf` under `target/`, a non-traveling identity
+                // (B4/ART-8): keying on the absolute path makes the cache key vary by where
+                // `target/` lives and lets a rebuilt upstream at the same path go unnoticed.
+                // The resulting cache miss re-runs the stage, whose `run()` then fails loud
+                // on the genuinely-missing input.
+                hasher.update(b"u:<unmaterialized>");
             }
         }
     }
@@ -533,7 +602,10 @@ impl Pipeline {
                 if let Ok(metadata_str) = std::fs::read_to_string(&key_path) {
                     if let Ok(metadata) = serde_json::from_str::<CacheMetadata>(&metadata_str) {
                         if metadata.key == key.0 {
-                            if let Ok(actual_hash) = hash_file(&out_path) {
+                            // `hash_output` (not `hash_file`) so a DIRECTORY output (the
+                            // snapshot stage — ART-1) is content-hashed over a sorted walk
+                            // and tamper-verified, instead of `EISDIR`-ing out of the check.
+                            if let Ok(actual_hash) = hash_output(&out_path) {
                                 if actual_hash == metadata.hash {
                                     cached = true;
                                     cached_pins = metadata.pins;
@@ -577,9 +649,12 @@ impl Pipeline {
                 tracing::info!("Running stage {}", stage.name());
                 let outputs = stage.run(&inputs, &out_path).await?;
 
-                // Hash payload and write metadata
+                // Hash payload and write metadata. `hash_output` handles a directory
+                // output (the snapshot stage — ART-1): `hash_file` `File::open`ed the dir
+                // and `EISDIR`-ed into the `warn!` arm, so no `.cache_key` sidecar was ever
+                // written and the most expensive stage was never cached or tamper-verified.
                 if out_path.exists() {
-                    match hash_file(&out_path) {
+                    match hash_output(&out_path) {
                         Ok(hash) => {
                             let metadata = CacheMetadata {
                                 key: key.0.clone(),
@@ -654,7 +729,13 @@ impl Pipeline {
     }
 }
 
-/// A pipeline stage that resolves abstract versions into exact cryptographic hashes.
+/// Pipeline Stage 0: publishes the committed `pins.json` lock into the pipeline.
+///
+/// Despite the "resolve" name, this stage does **not** perform live version→digest
+/// resolution (that is the deferred `ARTIFACT-PIPELINE-5`); it reads the *already
+/// committed* `pins.json` (the lock), copies it to `resolved_pins.json`, flattens its
+/// entries into the propagated `pins` map, and folds in the guest-agent source-closure
+/// hash so downstream stages consume pins purely from memory (ART-6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvePinsStage {
     /// Path to the pins.json file.
@@ -673,19 +754,31 @@ impl Stage for ResolvePinsStage {
         // Unambiguous field separator so distinct (pins, agent-hash) splits cannot
         // concatenate to the same byte stream (non-injective-hash defense).
         const SEP: &[u8] = b"\x1f";
-        let content = std::fs::read_to_string(&self.pins_file).unwrap_or_default();
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
         hasher.update(SEP);
-        hasher.update(content.as_bytes());
+        // Fold the pins content — or, on a read failure, a DISTINCT error marker rather
+        // than `unwrap_or_default()`'s empty string (ART-11). Collapsing every read error
+        // (missing file, permission denied, …) to `""` made all of them share one key, and
+        // aliased with a genuinely-empty pins file. Folding the error keeps the key
+        // distinct; the resulting cache miss drives `run()`, which fails hard with the real
+        // cause. Mirrors `GuestToolsStage::cache_key`.
+        match std::fs::read_to_string(&self.pins_file) {
+            Ok(content) => hasher.update(content.as_bytes()),
+            Err(e) => hasher.update(format!("resolve-pins-read-error:{e}").as_bytes()),
+        };
         hasher.update(SEP);
         // Fold the FULL guest-agent source closure (bin wrapper + src/agent/** +
         // Cargo.lock), not just the thin wrapper, so a change to `src/agent/mod.rs`
         // invalidates the resolved pins. Otherwise a cache hit here skips re-hashing
         // the agent and a stale `guest_agent_src_hash` propagates downstream — the
-        // stale-agent-baked-into-rootfs bug (H-CACHE-1).
-        let agent_hash = guest_agent_closure_hash(&workspace_root()).unwrap_or_default();
-        hasher.update(agent_hash.as_bytes());
+        // stale-agent-baked-into-rootfs bug (H-CACHE-1). A closure-hash failure folds a
+        // distinct error marker (not `unwrap_or_default()`'s `""`) for the same ART-11
+        // reason.
+        match guest_agent_closure_hash(&workspace_root()) {
+            Ok(h) => hasher.update(h.as_bytes()),
+            Err(e) => hasher.update(format!("resolve-pins-agent-closure-error:{e}").as_bytes()),
+        };
         CacheKey(format!("resolve-pins-{}", hasher.finalize().to_hex()))
     }
 
@@ -979,5 +1072,76 @@ mod tests {
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "missing guest-tools bin source must be a hard error, got {res:?}"
         );
+    }
+
+    // ART-8: an unmaterialized upstream artifact must fold a STABLE marker, never its
+    // absolute `PathBuf` — otherwise the key varies by where `target/` lives and a rebuilt
+    // upstream at the same path is invisible. Two DIFFERENT absent absolute paths under the
+    // same artifact key must produce the SAME fold. The buggy `p:` + `to_string_lossy`
+    // path-fold makes these diverge → red here.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn test_hash_artifacts_unmaterialized_is_path_independent() {
+        let mut m1 = std::collections::HashMap::new();
+        m1.insert("k".to_string(), PathBuf::from("/nonexistent/aaa/x"));
+        let mut m2 = std::collections::HashMap::new();
+        m2.insert("k".to_string(), PathBuf::from("/nonexistent/bbb/deeper/y"));
+        let mut h1 = blake3::Hasher::new();
+        hash_artifacts_sorted(&mut h1, &m1);
+        let mut h2 = blake3::Hasher::new();
+        hash_artifacts_sorted(&mut h2, &m2);
+        assert_eq!(
+            h1.finalize(),
+            h2.finalize(),
+            "an absent artifact must fold a stable marker, not its absolute path (ART-8)"
+        );
+    }
+
+    // ART-1: a directory output hashes deterministically over its content, and a
+    // byte-corrupted file INSIDE it changes the hash — so the cache-hit tamper check can
+    // reject it. `hash_file` would `File::open` the dir and `EISDIR` here instead.
+    #[test]
+    fn test_hash_output_directory_deterministic_and_tamper_sensitive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap = dir.path().join("snapshot");
+        std::fs::create_dir_all(snap.join("mem")).expect("mkdir");
+        std::fs::write(snap.join("state.json"), b"state-v1").expect("write");
+        std::fs::write(snap.join("mem/pages.bin"), b"pages-v1").expect("write");
+
+        let h1 = hash_output(&snap).expect("hash dir");
+        let h1b = hash_output(&snap).expect("hash dir again");
+        assert_eq!(h1, h1b, "directory content hash must be deterministic");
+
+        // Corrupt one file inside the directory: the hash must change.
+        std::fs::write(snap.join("mem/pages.bin"), b"pages-TAMPERED").expect("write");
+        let h2 = hash_output(&snap).expect("hash dir after tamper");
+        assert_ne!(
+            h1, h2,
+            "a corrupted file inside the directory must change the content hash"
+        );
+    }
+
+    // ART-2: `remove_if_present` purges a NON-EMPTY directory (via `remove_dir_all`),
+    // removes a file, and treats an already-absent path as success — never `EISDIR` on a
+    // directory (which defeated `reset_to` for the snapshot stage).
+    #[test]
+    fn test_remove_if_present_file_dir_and_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // A regular file is removed.
+        let f = tmp.path().join("file");
+        std::fs::write(&f, b"x").expect("write");
+        remove_if_present(&f).expect("remove file");
+        assert!(!f.exists());
+
+        // A non-empty directory (the snapshot-dir case) is purged, not EISDIR-errored.
+        let d = tmp.path().join("dir");
+        std::fs::create_dir_all(d.join("sub")).expect("mkdir");
+        std::fs::write(d.join("sub/inner"), b"y").expect("write");
+        remove_if_present(&d).expect("remove dir must succeed, not EISDIR");
+        assert!(!d.exists());
+
+        // An already-absent path is idempotent success.
+        remove_if_present(&tmp.path().join("never")).expect("absent is Ok");
     }
 }

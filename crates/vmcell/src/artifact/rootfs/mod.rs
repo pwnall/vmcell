@@ -116,9 +116,25 @@ impl Stage for RootfsStage {
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
-        // Hash upstream artifact CONTENT in a deterministic (key-sorted) order rather than
-        // their `target_dir`-relative path strings.
-        crate::artifact::hash_artifacts_sorted(&mut hasher, &inputs.artifacts);
+        // Hash only the upstream artifacts this stage actually CONSUMES (ART-9), in a
+        // deterministic key-sorted order over their on-disk content. Folding *every*
+        // upstream artifact meant a `kernel` rebuild invalidated the OCI rootfs, which does
+        // not depend on the kernel (only the mmdebstrap source boots a builder VM off it).
+        // Over-invalidating is safe-but-wasteful; scope the fold to consumed inputs:
+        //   - OCI: the injected `guest_agent` + `guest_tools` binaries (base image is a
+        //     pin/override, not an artifact).
+        //   - mmdebstrap: the same injected binaries PLUS `kernel` (boots the builder VM).
+        let consumed: &[&str] = match &self.source {
+            RootfsBuildSource::Oci => &["guest_agent", "guest_tools"],
+            RootfsBuildSource::Mmdebstrap { .. } => &["kernel", "guest_agent", "guest_tools"],
+        };
+        let filtered: std::collections::HashMap<String, std::path::PathBuf> = inputs
+            .artifacts
+            .iter()
+            .filter(|(k, _)| consumed.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        crate::artifact::hash_artifacts_sorted(&mut hasher, &filtered);
         CacheKey(format!("rootfs-{}", hasher.finalize().to_hex()))
     }
 
@@ -265,25 +281,62 @@ mod tests {
         p
     }
 
-    // Guards ARTIFACT-PIPELINE-1: a buggy impl that hashes the `artifacts` HashMap in its
-    // process-random iteration order yields different keys for identical content.
+    // Guards ARTIFACT-PIPELINE-1 for the CONSUMED-artifact fold: the two artifacts this OCI
+    // stage consumes (`guest_agent`, `guest_tools`) must fold order-independently over their
+    // content. Inserted in opposite orders, the content-addressed key must be identical.
     #[test]
     fn test_rootfs_cache_key_order_independent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut entries: Vec<(String, PathBuf)> = Vec::new();
-        for i in 0..8 {
-            let p = write_tmp(dir.path(), &format!("f{}", i), format!("c{}", i).as_bytes());
-            entries.push((format!("art{}", i), p));
-        }
+        let agent = write_tmp(dir.path(), "guest_agent", b"agent-bytes");
+        let tools = write_tmp(dir.path(), "guest_tools", b"tools-bytes");
         let mut a = StageInputs::default();
-        for (k, v) in entries.iter() {
-            a.artifacts.insert(k.clone(), v.clone());
-        }
+        a.artifacts.insert("guest_agent".to_string(), agent.clone());
+        a.artifacts.insert("guest_tools".to_string(), tools.clone());
         let mut b = StageInputs::default();
-        for (k, v) in entries.iter().rev() {
-            b.artifacts.insert(k.clone(), v.clone());
-        }
+        b.artifacts.insert("guest_tools".to_string(), tools);
+        b.artifacts.insert("guest_agent".to_string(), agent);
         assert_eq!(stage().cache_key(&a), stage().cache_key(&b));
+    }
+
+    // ART-9: the OCI rootfs does NOT consume the kernel, so a kernel rebuild must NOT
+    // invalidate the OCI rootfs key. The mmdebstrap source boots a builder VM off the
+    // kernel, so for it a kernel change MUST change the key. Folding *all* upstream
+    // artifacts (the bug) reddens the first assertion.
+    #[test]
+    fn test_rootfs_oci_key_ignores_kernel_mmdebstrap_folds_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kernel = write_tmp(dir.path(), "vmlinux", b"kernel-v1");
+        let mut inputs = StageInputs::default();
+        inputs
+            .artifacts
+            .insert("kernel".to_string(), kernel.clone());
+
+        // OCI stage: kernel is not consumed → rebuilding it leaves the key unchanged.
+        let oci = stage();
+        let oci_k1 = oci.cache_key(&inputs);
+        std::fs::write(&kernel, b"kernel-v2-rebuilt").expect("write");
+        let oci_k2 = oci.cache_key(&inputs);
+        assert_eq!(
+            oci_k1, oci_k2,
+            "a kernel rebuild must NOT invalidate the OCI rootfs key (kernel not consumed)"
+        );
+
+        // mmdebstrap stage: kernel boots the builder VM → it IS consumed.
+        let mmd = RootfsStage {
+            source: RootfsBuildSource::Mmdebstrap {
+                release: "trixie".into(),
+            },
+            cid_alloc: Arc::new(crate::vmm::CidAllocator::new()),
+            image_override: None,
+            agent_musl: None,
+        };
+        let mmd_k1 = mmd.cache_key(&inputs);
+        std::fs::write(&kernel, b"kernel-v3-rebuilt").expect("write");
+        let mmd_k2 = mmd.cache_key(&inputs);
+        assert_ne!(
+            mmd_k1, mmd_k2,
+            "a kernel rebuild MUST invalidate the mmdebstrap rootfs key (kernel consumed)"
+        );
     }
 
     // Guards ARTIFACT-PIPELINE-2: hashing the path STRING (not content) leaves the key

@@ -24,6 +24,32 @@ impl std::fmt::Debug for TestDouble {
     }
 }
 
+/// Upper bound on entries retained in a proxy's request log (NET-1).
+///
+/// The log (`crate::proxy::RequestLog`) is written one entry per guest request
+/// on the production egress hot path, so an unbounded `Vec` grows host memory
+/// O(N) in the number of requests a guest issues. Capping it turns the log into
+/// a bounded drop-oldest ring: host memory stays O(1) regardless of guest
+/// traffic, while the most recent `MAX_REQUEST_LOG_ENTRIES` events (including
+/// `403 BLOCKED` denials) remain observable via `EgressProxy::requests()`.
+pub(crate) const MAX_REQUEST_LOG_ENTRIES: usize = 1024;
+
+/// Appends `entry` to the bounded request log, dropping the oldest entries once
+/// the log is already at [`MAX_REQUEST_LOG_ENTRIES`] (drop-oldest ring, NET-1).
+///
+/// `remove`-from-front would be `O(len)`; `drain` of the overflow prefix keeps
+/// the operation `O(overflow)` and, because `len` never exceeds the cap, the
+/// steady-state cost is a single-element drain per push.
+pub(crate) fn push_bounded(log: &mut crate::proxy::RequestLog, entry: String) {
+    if log.len() >= MAX_REQUEST_LOG_ENTRIES {
+        // Keep the most recent MAX_REQUEST_LOG_ENTRIES - 1 entries, then push
+        // `entry`, so the log holds exactly the cap afterwards.
+        let overflow = log.len() + 1 - MAX_REQUEST_LOG_ENTRIES;
+        log.drain(0..overflow);
+    }
+    log.push(entry);
+}
+
 /// The hudsucker HTTP handler that routes proxy requests.
 #[derive(Clone)]
 pub struct ProxyHandler {
@@ -78,7 +104,7 @@ impl ProxyHandler {
                 // instead of panicking on the request hot path.
                 {
                     let mut reqs = self.requests.lock().unwrap_or_else(|e| e.into_inner());
-                    reqs.push(format!("403 BLOCKED {}", host));
+                    push_bounded(&mut reqs, format!("403 BLOCKED {}", host));
                 }
                 let response = Response::builder()
                     .status(403)
@@ -95,7 +121,7 @@ impl ProxyHandler {
         {
             // Recover from a poisoned lock instead of panicking on the hot path.
             let mut reqs = self.requests.lock().unwrap_or_else(|e| e.into_inner());
-            reqs.push(req_uri.clone());
+            push_bounded(&mut reqs, req_uri.clone());
         }
 
         // Snapshot the record path and drop the lock before any file I/O, so the
@@ -261,6 +287,65 @@ mod tests {
                 panic!("CONNECT must fall through, not match a double")
             }
         }
+    }
+
+    // NET-1: the request log is a bounded drop-oldest ring. Flooding the real
+    // handler with far more requests than the cap must leave the log pinned at
+    // MAX_REQUEST_LOG_ENTRIES and drop the *oldest* entries. Buggy impl guarded:
+    // the pre-fix unbounded `Vec::push` grows to `flood` entries, so the length
+    // assert goes red (flood > cap), and the drop-oldest assert (the first
+    // request is gone, the last is retained) fails too.
+    #[test]
+    fn request_log_is_bounded_and_drops_oldest() {
+        let handler = handler_with(vec![], vec![]);
+        let flood = MAX_REQUEST_LOG_ENTRIES + 250;
+        for i in 0..flood {
+            let req = Request::builder()
+                .method(hyper::Method::GET)
+                .uri(format!("http://example.com/req/{i}"))
+                .body(hudsucker::Body::empty())
+                .expect("request builds");
+            // Forwarded (not blocked, not CONNECT, no double) => logged once.
+            match handler.route_request(req) {
+                RequestOrResponse::Request(_) => {}
+                RequestOrResponse::Response(_) => panic!("unexpected synthesized response"),
+            }
+        }
+
+        let log = handler.requests.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            log.len(),
+            MAX_REQUEST_LOG_ENTRIES,
+            "request log must stay capped at MAX_REQUEST_LOG_ENTRIES, got {}",
+            log.len()
+        );
+        // Drop-oldest: the earliest floods are evicted, the final one is kept.
+        let first_uri = "GET http://example.com/req/0".to_string();
+        let last_uri = format!("GET http://example.com/req/{}", flood - 1);
+        assert!(
+            !log.contains(&first_uri),
+            "the oldest entry must have been dropped"
+        );
+        assert!(
+            log.contains(&last_uri),
+            "the most recent entry must be retained"
+        );
+    }
+
+    // NET-1: the bounded push helper keeps exactly the cap and evicts front-first.
+    #[test]
+    fn push_bounded_keeps_cap_and_evicts_front() {
+        let mut log: crate::proxy::RequestLog = Vec::new();
+        for i in 0..(MAX_REQUEST_LOG_ENTRIES + 3) {
+            push_bounded(&mut log, format!("{i}"));
+        }
+        assert_eq!(log.len(), MAX_REQUEST_LOG_ENTRIES);
+        // The three oldest ("0","1","2") were dropped; "3" is now the front.
+        assert_eq!(log.first().map(String::as_str), Some("3"));
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some((MAX_REQUEST_LOG_ENTRIES + 2).to_string().as_str())
+        );
     }
 
     // Guards the meaningfulness of the CONNECT test: a non-CONNECT request that

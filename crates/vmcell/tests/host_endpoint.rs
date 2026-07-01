@@ -127,9 +127,12 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         String::from_utf8_lossy(&outcome.stderr)
     );
     let stdout = String::from_utf8_lossy(&outcome.stdout);
+    // TEST-4: assert the specific, stable directory-listing title (as
+    // egress_proxy.rs does) rather than a loose "Directory listing" || "html"
+    // that an error page or a stray "<html>" body would satisfy.
     assert!(
-        stdout.contains("Directory listing") || stdout.contains("html"),
-        "Output did not contain expected HTTP response: {}",
+        stdout.contains("Directory listing for"),
+        "Output did not contain the host service's directory listing: {}",
         stdout
     );
 

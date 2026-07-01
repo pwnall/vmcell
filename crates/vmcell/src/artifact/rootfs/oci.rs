@@ -1,9 +1,113 @@
 use crate::artifact::StageOutputs;
 use crate::error::Result;
+use async_trait::async_trait;
+use oci_client::manifest::OciImageManifest;
 use oci_client::{Client, Reference};
 use std::path::Path;
 
-/// Builds a root filesystem by pulling from an OCI registry.
+/// A single OCI layer's decode-relevant identity: its media type (selects the gzip/zstd
+/// decoder and gates decodability) and its `sha256:` content digest (names the cache file
+/// and is re-verified on every use).
+#[derive(Debug, Clone)]
+pub(crate) struct OciLayerDesc {
+    /// The layer's media type.
+    pub media_type: String,
+    /// The layer's `sha256:...` content digest.
+    pub digest: String,
+}
+
+/// Injectable OCI pull seam (ART-3).
+///
+/// The network pull sits behind a trait so the whole pull→cache→re-verify→decode chain in
+/// [`build_rootfs_with`] can be driven by a recording/replaying fake that serves canned
+/// manifest layers + blobs — no registry, no network — so the cache-hit re-verify,
+/// tag-rejection, and gzip/zstd decode-selection each fail on their inverse in the default
+/// suite (contrast the old inline `Client::default()`, which left the chain untested).
+#[async_trait]
+pub(crate) trait OciPuller: Send + Sync {
+    /// Resolve `reference` to its ordered layer descriptors, verifying manifest provenance.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::Error::Artifact`] if the manifest cannot be fetched or its
+    /// bytes do not match the pinned digest.
+    async fn resolve_layers(&self, reference: &Reference) -> Result<Vec<OciLayerDesc>>;
+
+    /// Pull the blob named by `digest` into `out`.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::Error::Artifact`] if the blob cannot be fetched.
+    async fn pull_blob(&self, reference: &Reference, digest: &str, out: &mut Vec<u8>)
+    -> Result<()>;
+}
+
+/// The real, network-backed puller over `oci_client::Client`.
+struct RealOciPuller {
+    client: Client,
+    auth: oci_client::secrets::RegistryAuth,
+}
+
+impl RealOciPuller {
+    fn new() -> Self {
+        Self {
+            client: Client::default(),
+            auth: oci_client::secrets::RegistryAuth::Anonymous,
+        }
+    }
+}
+
+#[async_trait]
+impl OciPuller for RealOciPuller {
+    async fn resolve_layers(&self, reference: &Reference) -> Result<Vec<OciLayerDesc>> {
+        // Re-hash the RAW manifest bytes against the pinned digest IN-CODE (ART-5 / A8
+        // "verify everything you ingest"). `pull_manifest_raw` already validates the body
+        // against the reference digest internally (oci-client 0.17 `validate_digest`), so
+        // this is defense-in-depth: we hash exactly the bytes we received and compare to the
+        // `sha256:` pin ourselves rather than trusting the transport/library alone.
+        let accepted = [
+            oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+            oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+        ];
+        let (raw, _digest) = self
+            .client
+            .pull_manifest_raw(reference, &self.auth, &accepted)
+            .await
+            .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+        if let Some(pinned) = reference.digest() {
+            verify_blob_digest(&raw, pinned)?;
+        }
+        // Resolve the (possibly multi-arch index) manifest to its platform image manifest
+        // and read its ordered layers; the client performs platform selection for an index.
+        let (manifest, _d): (OciImageManifest, String) = self
+            .client
+            .pull_image_manifest(reference, &self.auth)
+            .await
+            .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+        Ok(manifest
+            .layers
+            .into_iter()
+            .map(|l| OciLayerDesc {
+                media_type: l.media_type,
+                digest: l.digest,
+            })
+            .collect())
+    }
+
+    async fn pull_blob(
+        &self,
+        reference: &Reference,
+        digest: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.client
+            .pull_blob(reference, digest, out)
+            .await
+            .map_err(|e| crate::error::Error::Artifact(e.to_string()))
+    }
+}
+
+/// Builds a root filesystem by pulling from an OCI registry (the real network puller).
 ///
 /// # Errors
 /// Returns an error if the registry pull or unpacking fails.
@@ -14,46 +118,60 @@ pub async fn build_rootfs(
     out: &Path,
     agent_musl: Option<&Path>,
 ) -> Result<StageOutputs> {
-    let client = Client::default();
-    let auth = oci_client::secrets::RegistryAuth::Anonymous;
+    build_rootfs_with(
+        &RealOciPuller::new(),
+        image,
+        digest,
+        inputs,
+        out,
+        agent_musl,
+    )
+    .await
+}
+
+/// The pull→cache→re-verify→decode→pack core, parameterized over an injectable
+/// [`OciPuller`] so the whole chain is testable without a registry (ART-3).
+async fn build_rootfs_with(
+    puller: &dyn OciPuller,
+    image: &str,
+    digest: &str,
+    inputs: &crate::artifact::StageInputs,
+    out: &Path,
+    agent_musl: Option<&Path>,
+) -> Result<StageOutputs> {
+    // Digest-pinned pulls only: a tag (or any non-`sha256:` reference) is the §11.2
+    // provenance hard stop and is rejected BEFORE any network I/O — never a tag fallback.
     if !digest.starts_with("sha256:") {
         return Err(crate::error::Error::Artifact(format!(
-            "OCI pull requires a digest starting with 'sha256:', got {}",
-            digest
+            "OCI pull requires a digest starting with 'sha256:', got {digest}"
         )));
     }
-    let reference_str = format!("{}@{}", image, digest);
+    let reference_str = format!("{image}@{digest}");
     let reference = Reference::try_from(reference_str.as_str())
         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
-    let (manifest, _) = client
-        .pull_image_manifest(&reference, &auth)
-        .await
-        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+    let layers = puller.resolve_layers(&reference).await?;
 
     let cache_dir = out.parent().unwrap_or(Path::new(".")).join("oci-cache");
-
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
 
     let mut streams: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
 
-    for layer in manifest.layers {
+    for layer in layers {
         // A layer whose media type we cannot decode must NOT be silently skipped:
         // dropping a real layer yields an incomplete rootfs that boots as if complete
         // (silent corruption). Fail loud instead (B2 / A8).
         check_layer_media_type(&layer.media_type)?;
 
-        let digest_str = layer.digest.clone();
-        let cache_path = cache_dir.join(digest_str.replace(':', "-"));
+        let cache_path = cache_dir.join(layer.digest.replace(':', "-"));
 
         if !cache_path.exists() {
             let mut blob_data = Vec::new();
-            client
-                .pull_blob(&reference, &layer, &mut blob_data)
-                .await
-                .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+            puller
+                .pull_blob(&reference, &layer.digest, &mut blob_data)
+                .await?;
 
             // Verify before caching so corrupt network data is never persisted.
             verify_blob_digest(&blob_data, &layer.digest)?;
@@ -191,5 +309,228 @@ mod tests {
         assert!(!is_zstd_layer(
             "application/vnd.oci.image.layer.v1.tar+gzip"
         ));
+    }
+
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A recording/replaying OCI pull seam (ART-3): serves canned layer descriptors + blobs
+    /// from memory, counting resolve/blob calls, so the pull→cache→re-verify→decode chain
+    /// runs with no registry and no network.
+    struct FakeOciPuller {
+        layers: Vec<OciLayerDesc>,
+        blobs: HashMap<String, Vec<u8>>,
+        resolve_calls: AtomicUsize,
+        blob_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OciPuller for FakeOciPuller {
+        async fn resolve_layers(&self, _reference: &Reference) -> Result<Vec<OciLayerDesc>> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.layers.clone())
+        }
+
+        async fn pull_blob(
+            &self,
+            _reference: &Reference,
+            digest: &str,
+            out: &mut Vec<u8>,
+        ) -> Result<()> {
+            self.blob_calls.fetch_add(1, Ordering::SeqCst);
+            let blob = self.blobs.get(digest).ok_or_else(|| {
+                crate::error::Error::Artifact(format!("fake: no blob for {digest}"))
+            })?;
+            out.extend_from_slice(blob);
+            Ok(())
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(bytes);
+        format!("sha256:{:x}", h.finalize())
+    }
+
+    fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            for (path, body) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, path, *body).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        buf
+    }
+
+    /// A gzip-compressed tar layer; returns `(bytes, digest, media_type)`.
+    fn gzip_layer(files: &[(&str, &[u8])]) -> (Vec<u8>, String, String) {
+        let tar = build_tar(files);
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&tar).unwrap();
+        let gz = enc.finish().unwrap();
+        let digest = sha256_hex(&gz);
+        (
+            gz,
+            digest,
+            "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+        )
+    }
+
+    /// A zstd-compressed tar layer; returns `(bytes, digest, media_type)`.
+    fn zstd_layer(files: &[(&str, &[u8])]) -> (Vec<u8>, String, String) {
+        let tar = build_tar(files);
+        let z = zstd::stream::encode_all(std::io::Cursor::new(tar), 0).unwrap();
+        let digest = sha256_hex(&z);
+        (
+            z,
+            digest,
+            "application/vnd.oci.image.layer.v1.tar+zstd".to_string(),
+        )
+    }
+
+    // ART-3: a tag (non-`sha256:`) reference is the §11.2 provenance hard stop and must be
+    // rejected BEFORE any pull. A tag-fallback pull that reached the puller reddens the
+    // `resolve_calls == 0` assertion.
+    #[tokio::test]
+    async fn test_oci_tag_digest_rejected() {
+        let fake = FakeOciPuller {
+            layers: vec![],
+            blobs: HashMap::new(),
+            resolve_calls: AtomicUsize::new(0),
+            blob_calls: AtomicUsize::new(0),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("rootfs.erofs");
+        let inputs = crate::artifact::StageInputs::default();
+        let res = build_rootfs_with(&fake, "example.com/img", "latest", &inputs, &out, None).await;
+        assert!(
+            matches!(res, Err(crate::error::Error::Artifact(_))),
+            "a tag-fallback (non-digest) pull must be rejected, got {res:?}"
+        );
+        assert_eq!(
+            fake.resolve_calls.load(Ordering::SeqCst),
+            0,
+            "a rejected tag pull must not resolve any manifest"
+        );
+    }
+
+    // ART-3: drive the full pull→cache→re-verify→decode→pack chain through the fake, then a
+    // cache HIT, then a tamper — all in ONE test so the CA-materialization tail
+    // (`CaManager::new()` on the shared artifacts dir) is never entered concurrently by two
+    // test processes racing on it (the pre-existing NET-4 TOCTOU in `tls.rs`, out of scope
+    // here). This is the only unit test that reaches that tail.
+    //
+    // Asserts: (1) cold build pulls every layer and packs a non-empty erofs — the zstd layer
+    // proves decode-SELECTION, since a gzip decoder on zstd bytes would fail the tar read;
+    // (2) a warm build re-verifies but does NOT re-pull cached blobs (blob_calls stays ==
+    // layer count); (3) a byte-corrupted cached blob with an intact digest-derived filename
+    // is rejected on the hit path. Each inverse (skip re-verify on hit, re-pull on hit, wrong
+    // decoder) reddens a distinct assertion.
+    #[cfg(feature = "am-fs-erofs")]
+    #[tokio::test]
+    async fn test_oci_pull_cache_hit_reverify_and_tamper() {
+        let (gz, gz_dig, gz_mt) = gzip_layer(&[
+            ("lib/x86_64-linux-gnu/libc.so.6", b"ELF-libc"),
+            ("etc/os-release", b"base"),
+        ]);
+        let (zs, zs_dig, zs_mt) = zstd_layer(&[("marker.txt", b"from-zstd")]);
+        let mut blobs = HashMap::new();
+        blobs.insert(gz_dig.clone(), gz);
+        blobs.insert(zs_dig.clone(), zs);
+        let fake = FakeOciPuller {
+            layers: vec![
+                OciLayerDesc {
+                    media_type: gz_mt,
+                    digest: gz_dig.clone(),
+                },
+                OciLayerDesc {
+                    media_type: zs_mt,
+                    digest: zs_dig,
+                },
+            ],
+            blobs,
+            resolve_calls: AtomicUsize::new(0),
+            blob_calls: AtomicUsize::new(0),
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("rootfs.erofs");
+        let agent = dir.path().join("guest_agent");
+        std::fs::write(&agent, b"#!agent").unwrap();
+        let mut inputs = crate::artifact::StageInputs::default();
+        inputs.artifacts.insert("guest_agent".to_string(), agent);
+        let digest = sha256_hex(b"manifest-bytes");
+
+        // (1) Cold build: every layer pulled, erofs produced (gzip + zstd both decode).
+        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None)
+            .await
+            .expect("cold build");
+        assert_eq!(
+            fake.blob_calls.load(Ordering::SeqCst),
+            2,
+            "cold build must pull every layer"
+        );
+        assert!(
+            out.metadata().unwrap().len() > 0,
+            "the packed erofs must be non-empty"
+        );
+
+        // (2) Warm build: cached blobs are re-verified but NOT re-pulled.
+        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None)
+            .await
+            .expect("warm build");
+        assert_eq!(
+            fake.blob_calls.load(Ordering::SeqCst),
+            2,
+            "a cache hit must not re-pull the blobs"
+        );
+        assert_eq!(
+            fake.resolve_calls.load(Ordering::SeqCst),
+            2,
+            "resolve runs on each build"
+        );
+
+        // (3) Tamper a cached blob (intact digest-derived filename) → rejected on the hit
+        // path by the every-use re-verify.
+        let cache_file = out
+            .parent()
+            .unwrap()
+            .join("oci-cache")
+            .join(gz_dig.replace(':', "-"));
+        std::fs::write(&cache_file, b"tampered-cache-bytes").unwrap();
+        let res = build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None).await;
+        assert!(
+            matches!(res, Err(crate::error::Error::Artifact(_))),
+            "a tampered cached blob must be rejected on the hit path, got {res:?}"
+        );
+    }
+
+    // ART-4: a zstd-compressed layer must decode (via the `is_zstd_layer` selection) to its
+    // non-empty tar content. A gzip decoder on zstd bytes would fail the tar read → red.
+    #[test]
+    fn test_zstd_layer_decodes_to_nonempty() {
+        let (z, _dig, mt) = zstd_layer(&[("marker.txt", b"hello-zstd")]);
+        assert!(is_zstd_layer(&mt));
+        let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(z)).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let mut found = false;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "marker.txt" {
+                let mut s = String::new();
+                entry.read_to_string(&mut s).unwrap();
+                assert_eq!(s, "hello-zstd");
+                found = true;
+            }
+        }
+        assert!(found, "zstd layer must decode to its non-empty tar content");
     }
 }

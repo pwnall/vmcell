@@ -88,6 +88,31 @@ pub fn clean_vmcell_netns() {
     }
 }
 
+/// Reads the applied nftables ruleset for `table` inside network namespace
+/// `netns` from the host, returning the `nft list table` stdout on success.
+///
+/// This is the host-observable side of the H-PROXY-1 / TEST-1 security check:
+/// the privileged transparent-egress path is only "filtered" if the kernel in
+/// the VM's netns actually carries the TPROXY ruleset. Reading the *applied*
+/// ruleset (not the rendered string) reddens on an implementation that emits no
+/// ruleset at all (fully-open default egress) — the `nft list table` fails, so
+/// this returns `None`. Runs under the capability runner (`ip netns exec` needs
+/// CAP_SYS_ADMIN, `nft` needs CAP_NET_ADMIN — both held on the privileged
+/// suite); `nft` is present on any host where the privileged path can apply
+/// rules in the first place.
+pub fn nft_list_table_in_netns(netns: &str, table: &str) -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["netns", "exec", netns, "nft", "list", "table"])
+        .args(table.split_whitespace())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
 use vmcell::*;
 
 pub async fn start_vm<V: Vmm>(vmm: &V, cfg: VmConfig) -> MicroVm<V> {

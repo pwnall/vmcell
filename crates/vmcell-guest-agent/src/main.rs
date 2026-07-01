@@ -23,15 +23,23 @@ use vsock::{VsockAddr, VsockListener, VsockStream};
 /// re-parented grandchildren that no waiter claims are pruned by the
 /// coordinator, keeping the map bounded.
 fn drain_zombies(reaper: &ReaperCoordinator) {
-    // Stops on `Ok(None)` (no more reapable children) or `Err` (e.g. ECHILD).
-    while let Ok(Some((pid, status))) = wait(WaitOptions::NOHANG) {
-        let pid = pid.as_raw_nonzero().get() as u32;
-        let code = exit_code_from_termination(
-            status.terminating_signal().map(|s| s as i32),
-            status.exit_status().map(|c| c as i32),
-        );
-        reaper.record_exit(pid, code);
-    }
+    // The `waitpid(WNOHANG)` reap and the status record run under one lock (via
+    // `drain_reaped`) so a fork that reuses a just-freed pid cannot `reserve` it
+    // *between* the reap and the record — closing the residual PID-reuse race
+    // where a stale grandchild status is stamped past the reservation epoch and
+    // mis-delivered as the reused child's exit (AGENT-1, §4.3).
+    reaper.drain_reaped(|| match wait(WaitOptions::NOHANG) {
+        Ok(Some((pid, status))) => {
+            let pid = pid.as_raw_nonzero().get() as u32;
+            let code = exit_code_from_termination(
+                status.terminating_signal().map(|s| s as i32),
+                status.exit_status().map(|c| c as i32),
+            );
+            Some((pid, code))
+        }
+        // `Ok(None)` = no more reapable children; `Err` (e.g. ECHILD) = stop.
+        _ => None,
+    });
 }
 
 /// A virtio-fs share the guest must mount, decoded from one `vmcell_share=` token.
@@ -82,8 +90,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     tracing::info!("vmcell-guest-agent: starting");
 
-    // Mount setup
-    std::fs::create_dir_all("/sys")?;
+    // Mount setup. `/sys` is NOT in the fatal core-mount set ({overlay, /proc,
+    // /dev}, §4.3): its *mount* failure is tolerated below (:127-138), so its
+    // mount-point creation must be tolerated too — a fatal `?` here would
+    // kernel-panic PID 1 ("Attempted to kill init") on a policy the agent
+    // otherwise treats as best-effort (AGENT-6).
+    if let Err(e) = std::fs::create_dir_all("/sys") {
+        tracing::warn!(
+            "vmcell-guest-agent: could not create /sys mount point: {}; continuing (sysfs is not a fatal core mount)",
+            e
+        );
+    }
     std::fs::create_dir_all("/proc")?;
     std::fs::create_dir_all("/mnt")?;
 
@@ -299,7 +316,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for signal in signals.forever() {
                 drain_zombies(&reaper);
                 if signal == signal_hook::consts::SIGTERM {
-                    tracing::info!("vmcell-guest-agent: received SIGTERM, exiting");
                     break;
                 }
             }
@@ -318,11 +334,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_zombies(&reaper);
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            tracing::info!("vmcell-guest-agent: received SIGTERM, exiting");
         }
     }
 
-    Ok(())
+    // Either reaper loop only exits on SIGTERM. PID 1 must NOT return here: a
+    // returning init kernel-panics the guest ("Attempted to kill init"), which
+    // the host then flags via `contains_panic()`. On SIGTERM (normal teardown
+    // signals the guest before force-killing the VMM group) perform an orderly
+    // power-off instead of falling out of `main` (AGENT-2, §4.3).
+    power_off_never_returns()
+}
+
+/// Powers the guest off in response to SIGTERM and never returns.
+///
+/// PID 1 returning from `main` panics the kernel, so this diverges: it flushes
+/// filesystem buffers and issues `reboot(RB_POWER_OFF)`, which only returns on
+/// failure (e.g. a missing `CAP_SYS_BOOT`); in that case it parks forever so
+/// PID 1 still never exits.
+fn power_off_never_returns() -> ! {
+    tracing::info!("vmcell-guest-agent: received SIGTERM; powering off");
+    // SAFETY: `sync(2)` and `reboot(2)` are called with constant arguments and
+    // no pointers; `reboot` returns only on error, after which we park forever
+    // below so PID 1 never returns to the kernel.
+    unsafe {
+        libc::sync();
+        libc::reboot(libc::RB_POWER_OFF);
+    }
+    tracing::error!(
+        "vmcell-guest-agent: power-off failed ({}); parking so PID 1 never exits",
+        std::io::Error::last_os_error()
+    );
+    loop {
+        std::thread::park();
+    }
 }
 
 /// vsock control-plane port the host's `AgentClient` connects to.
@@ -417,22 +461,37 @@ fn handle_connection(
         let req_bytes = read_framed(stream)?;
         let msg: Message = postcard::from_bytes(&req_bytes)?;
 
-        if let Message::Exec(req) = msg {
-            handle_exec(req, stream, reaper)?;
-        } else if let Message::PutFile { dst, bytes } = msg {
-            handle_put_file(&dst, &bytes, stream)?;
+        match msg {
+            Message::Exec(req) => handle_exec(req, stream, reaper)?,
+            Message::PutFile { dst, bytes } => handle_put_file(&dst, &bytes, stream)?,
+            // Ready/Stdout/Stderr/Exit are guest→host frames; receiving one (or
+            // any future variant) means the peer desynced. Log it loudly and
+            // close the connection so the host reconnects on a fresh stream,
+            // rather than silently swallowing it and looping on a skewed stream
+            // (AGENT-5).
+            other => {
+                tracing::warn!(
+                    "vmcell-guest-agent: unexpected control-plane message {:?}; closing connection to resync",
+                    other
+                );
+                return Ok(());
+            }
         }
     }
 }
 
-fn send_framed(stream: &mut VsockStream, data: &[u8]) -> std::io::Result<()> {
+// Generic over `Write`/`Read` (not just `VsockStream`) so the hand-rolled
+// framing — the load-bearing interop with the host's `tokio_util`
+// `LengthDelimitedCodec` — can be round-tripped against the real codec in a
+// KVM-free unit test (AGENT-3); `VsockStream` satisfies both bounds.
+fn send_framed<W: Write>(stream: &mut W, data: &[u8]) -> std::io::Result<()> {
     let len = data.len() as u32;
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(data)?;
     Ok(())
 }
 
-fn read_framed(stream: &mut VsockStream) -> std::io::Result<Vec<u8>> {
+fn read_framed<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -661,5 +720,85 @@ mod tests {
     fn parse_share_mounts_empty_when_no_tokens() {
         assert!(parse_share_mounts("console=ttyS0 root=/dev/vda ro").is_empty());
         assert!(parse_share_mounts("").is_empty());
+    }
+
+    // AGENT-3: the guest's hand-rolled framing is the load-bearing interop with
+    // the host's `tokio_util::codec::LengthDelimitedCodec`, but the default suite
+    // otherwise only ever runs the codec on both ends. These KVM-free tests pin
+    // the two directions against the REAL codec plus the shared `MAX_FRAME_BYTES`
+    // cap, so a wrong endianness, an off-by-the-prefix, or a cap mismatch reddens
+    // here instead of only on a KVM host.
+    use bytes::{Bytes, BytesMut};
+    use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
+
+    #[test]
+    fn send_framed_is_decoded_by_real_length_delimited_codec() {
+        // Frame with the guest and decode with the host's codec. RED on a
+        // little-endian prefix, an off-by-one prefix, or a length that excludes
+        // the header: the codec mis-reads the length and returns None/wrong bytes.
+        let payload = b"hello framing interop \x00\x01\xfe\xff world".to_vec();
+        let mut wire = Vec::new();
+        send_framed(&mut wire, &payload).expect("send_framed");
+
+        // Exact wire contract: 4-byte big-endian length prefix, then the payload.
+        assert_eq!(&wire[..4], &(payload.len() as u32).to_be_bytes());
+        assert_eq!(&wire[4..], &payload[..]);
+
+        let mut codec = LengthDelimitedCodec::new();
+        let mut src = BytesMut::from(&wire[..]);
+        let frame = codec
+            .decode(&mut src)
+            .expect("codec decode")
+            .expect("a complete frame");
+        assert_eq!(&frame[..], &payload[..]);
+        assert!(src.is_empty(), "codec must consume exactly one guest frame");
+    }
+
+    #[test]
+    fn read_framed_decodes_a_real_length_delimited_codec_frame() {
+        // Encode with the host's codec and decode with the guest. RED on the same
+        // inverses in the read direction (LE prefix / off-by-one / wrong cap).
+        let payload = b"round trip the other way \xde\xad\xbe\xef".to_vec();
+        let mut codec = LengthDelimitedCodec::new();
+        let mut encoded = BytesMut::new();
+        codec
+            .encode(Bytes::from(payload.clone()), &mut encoded)
+            .expect("codec encode");
+
+        let mut cursor = std::io::Cursor::new(encoded.to_vec());
+        let decoded = read_framed(&mut cursor).expect("read_framed");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn read_framed_rejects_frame_over_max_frame_bytes() {
+        // A header declaring more than the shared cap is rejected as InvalidData
+        // *before* the body is read. RED if the cap check is dropped or loosened
+        // (it would then try to allocate/read an over-cap body instead).
+        let over = MAX_FRAME_BYTES as u32 + 1;
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&over.to_be_bytes());
+        // Body deliberately absent: the cap must trip on the header alone.
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = read_framed(&mut cursor).expect_err("over-cap frame must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_framed_accepts_frame_at_exactly_max_frame_bytes() {
+        // The boundary itself is allowed (`>` cap, not `>=`). With the header at
+        // exactly MAX and no body, read_framed passes the cap check and then fails
+        // on the missing body (UnexpectedEof) — NOT InvalidData. RED if the cap is
+        // tightened off-by-one (it would reject the boundary as InvalidData) or
+        // wired to a smaller constant.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(MAX_FRAME_BYTES as u32).to_be_bytes());
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = read_framed(&mut cursor).expect_err("short body must error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a frame at exactly the cap must pass the cap check, not be rejected as too large"
+        );
     }
 }

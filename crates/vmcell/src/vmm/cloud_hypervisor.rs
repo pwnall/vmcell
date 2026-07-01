@@ -261,22 +261,18 @@ impl CloudHypervisor {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        // Capture the process-group id immediately: from here on any error must reap
-        // the spawned VMM group, or it leaks (the owning ChInstance — whose Drop
-        // reaps — is not constructed until the caller).
-        let pgid = process.id();
-
-        if let Some(pid) = process.id() {
-            if let Err(e) = cgroups.add_task(&res.cgroup_name, pid) {
-                crate::vmm::reap_process_group(&mut process, pgid);
-                return Err(e);
-            }
-        }
-
-        if let Err(e) = crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20).await {
-            crate::vmm::reap_process_group(&mut process, pgid);
-            return Err(e);
-        }
+        // Shared spawn+register+await-ready sequence (VMM-2): capture the pgid, add
+        // the VMM to its cgroup, and block on the API socket — reaping the process
+        // group on any failure. Identical error handling across CH/FC/QEMU.
+        let pgid = crate::vmm::register_and_await_ready(
+            &mut process,
+            cgroups,
+            &res.cgroup_name,
+            &api_socket,
+            1000,
+            20,
+        )
+        .await?;
 
         Ok((api_socket, vsock_path, serial_path, process, pgid))
     }
@@ -291,6 +287,12 @@ impl Vmm for CloudHypervisor {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // VMM-1: no CH build boots a virtio-fs *rootfs* (it would need virtiofsd as the
+        // root device + `rootfstype=virtiofs`). Reject it up front with a typed
+        // `Unsupported` instead of silently emitting `root=/dev/vda rootfstype=ext4`
+        // for a VM with no `/dev/vda`, which kernel-panics the guest on a missing root.
+        crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
+
         let (api_socket, vsock_path, serial_path, process, pgid) = self
             .spawn_ch(res, None, crate::config::RestoreMode::Default, cgroups)
             .await?;
@@ -417,6 +419,8 @@ impl Vmm for CloudHypervisor {
                     direct: false,
                 });
             }
+            // Unreachable: `create()` rejects a virtio-fs rootfs up front via
+            // `reject_virtio_fs_rootfs` (VMM-1). Kept for match exhaustiveness.
             crate::config::RootfsSource::VirtioFs { .. } => {}
         }
 
@@ -642,6 +646,38 @@ mod tests {
         assert!(
             json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}")
         );
+    }
+
+    // Guards VMM-1 for the CH `create()` path: a virtio-fs *rootfs* config is
+    // buildable (config::build() only rejects it when also snapshotting) and reaches
+    // create(), which must self-guard with a typed `Unsupported` rather than silently
+    // building an unbootable VM. The buggy inverse (the old empty `VirtioFs => {}` arm,
+    // no early guard) makes the first assertion go red; an erofs rootfs must NOT trip
+    // the guard (the over-rejection inverse).
+    #[test]
+    fn create_rejects_virtio_fs_rootfs() {
+        use crate::config::RootfsSource;
+
+        let err = crate::vmm::reject_virtio_fs_rootfs(
+            CloudHypervisor::new("/usr/bin/cloud-hypervisor").id(),
+            &RootfsSource::VirtioFs {
+                dir: PathBuf::from("/d"),
+            },
+        )
+        .expect_err("CH create() must reject a virtio-fs rootfs");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "cloud-hypervisor" && feature == "virtio_fs_rootfs"),
+            "expected virtio_fs_rootfs Unsupported, got {err:?}"
+        );
+
+        crate::vmm::reject_virtio_fs_rootfs(
+            CloudHypervisor::new("/usr/bin/cloud-hypervisor").id(),
+            &RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .expect("an erofs rootfs must not trip the CH guard");
     }
 
     // Guards C1/VMM-1: any vhost-user device (virtio-fs share, unprivileged net, or
