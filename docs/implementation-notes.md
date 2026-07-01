@@ -1659,3 +1659,52 @@ tests; each was confirmed to fail on its documented buggy inverse before accepta
 is unchanged by this pass (test-only + one accessor return-type), so the KVM privileged/
 unprivileged suites did not need re-running — no lifecycle, teardown, netns, or datapath code
 was modified.
+
+## Review 39 — newly recorded justified deviations (2026-06-30)
+
+Review 39 (`docs/39-claude-code-review.md`) was a full per-subsystem static re-audit against
+design v15 + the v2 rubric. Its unjustified findings live in that report; the divergences below
+were judged **justified and deliberate** and are recorded here per AGENTS.md "record deviations"
+rather than in the review. (Divergences already recorded above — e.g. the structural
+zero-netlink guard, `host_services_port`, the pins.json-as-lock Stage 0, the QEMU/FC snapshot
+gate-offs, `Error` stringly payloads, the M-FS-1 virtiofsd uid — were confirmed still-accurate
+and are not re-listed.)
+
+- **CLI VM verbs build snapshot-eligibility by construction, not via `snapshotting: true`
+  (§3.3 / config.rs `build()`).** The `vmcell create`/`snapshot` verbs (`bin/vmcell.rs`,
+  `ephemeral_vm`) construct configs with `NetConfig::None` + `RootfsSource::Erofs` + no data
+  shares and never set `snapshotting: true`. So the build-time snapshot-eligibility check in
+  `config::build()` (which keys off `snapshotting`) is not the enforcing boundary for the CLI
+  path — the config is snapshot-eligible *by construction* (no vhost-user device is attachable),
+  and the runtime `MicroVm::snapshot` self-guard is the boundary that actually holds. Justified:
+  for a single-use ephemeral CLI VM there is no reachable config the verb could build that
+  violates the law, and the self-guard is the design-mandated inner check (rubric A5 "contracts
+  self-guard"). No behavior change is warranted; recorded so a future reader does not mistake the
+  missing `snapshotting: true` for a skipped eligibility check.
+
+- **`vmcell-test-runner` depends on `libc` in addition to `rustix` + `capctl` (§12.8; corrects
+  the impl-notes:320 "rustix + capctl only" wording).** The runner links a third crate, `libc`,
+  and uses it directly for the NSS `kvm`-group lookup (`getgrnam`) and the setuid-form
+  `setresuid`/`setresgid`/`setgroups`/`getgroups`. Justified: `getgrnam` (NSS) is not exposed by
+  `rustix`, and the group lookup is required to preserve the `kvm` gid across the privilege drop
+  (§6.4 "KVM is the `kvm` group, not a capability"). `libc` is a thin, non-async, permissively
+  licensed dep that does not violate the lean-window intent (the CI lean assertion bans
+  `tokio`/`hyper`/`rtnetlink`, all still absent). The runner's own `Cargo.toml` comment already
+  says "rustix + capctl + libc only"; the design line 793 / §12.8 snippet and impl-notes:320
+  "rustix + capctl only" are the imprecise spots to reconcile on their next revision.
+
+- **`CAP_SETPCAP` is deliberately excluded from the runner's standing capability set, so the
+  bounding-set drop is best-effort (a no-op in the file-cap form) (§12.8 / B9; corrects the
+  impl-notes:52 "drops its bounding set to the bare minimum" overstatement).** The blessed file
+  caps are exactly `{CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_DAC_OVERRIDE}`. `PR_CAPBSET_DROP` needs
+  `CAP_SETPCAP` in the effective set, which the file-cap path never holds, so
+  `apply_privilege_transition` cannot shrink the bounding set on that path and surfaces the
+  "bounding set is wider than intended" warning on every privileged run; only the setuid-root
+  fallback (root holds `SETPCAP` in permitted) actually shrinks it. Justified: adding `SETPCAP`
+  to the *standing* set to enable the bounding-drop would grant the runner a strictly more
+  powerful cap (the ability to add caps to itself) at rest — a worse security posture than an
+  un-shrunk bounding set behind an already-`+ep` runner. Keeping the standing set minimal is the
+  right tradeoff, and B9 explicitly permits "surface … or document best-effort," which the code
+  does (the warning). Recorded corrections/follow-ups: impl-notes:52's "bare minimum" claim is
+  inaccurate for the file-cap path; the per-run warning should be de-noised (log once / only when
+  a *reducible* cap remains) so it cannot mask a genuine one.
