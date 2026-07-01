@@ -1,0 +1,182 @@
+[package]
+name = "vmcell"
+version = "0.2.0"
+edition = "2024"
+# MSRV kept at 1.85 (deliberate — see docs/implementation-notes.md). NOTE: the committed
+# Cargo.lock pins `time` 0.3.47 (the RUSTSEC-2026-0009 fix), whose own MSRV is 1.88, so a
+# from-scratch build needs 1.88+; a `cargo update` on a 1.85 toolchain would downgrade `time`
+# to the vulnerable 0.3.45. Raising MSRV to 1.88 is the maintainer's call (it also turns on
+# let-chains and would require collapsing ~27 nested-if blocks clippy then flags).
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Micro-VM-per-test integration & evaluation platform for the Imp agentic harness"
+publish = false
+
+[lib]
+name = "vmcell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vmcell"
+# The CLI drives the full product surface: the artifact pipeline (build/build-kernels/oci2erofs)
+# and the VM lifecycle verbs (run/create/snapshot/stats), which need a backend + metrics. The
+# default feature set satisfies these; a cli-only build intentionally does not build this bin.
+path = "src/bin/vmcell.rs"
+required-features = ["cli", "cloud-hypervisor", "metrics", "pipeline"]
+
+[[bin]]
+name = "bench-vm"
+path = "src/bin/bench-vm.rs"
+required-features = ["cloud-hypervisor", "metrics", "cli"]
+
+[[bench]]
+name = "micro"
+harness = false
+required-features = ["pipeline"]
+
+[dependencies]
+# unconditional shared core
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+# the framed postcard wire enum, shared with the guest agent (v15 §10.1). The explicit
+# `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
+# path dep reads as a `*` requirement.
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.2.0" }
+
+# host common
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time", "signal"] }
+futures = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
+tokio-vsock = { version = "0.7", optional = true }
+nix = { version = "0.29", optional = true, features = ["mount", "sched", "process", "signal", "user", "fs"] }
+uuid = { version = "1", optional = true, features = ["v4"] }
+which = { version = "6", optional = true }
+tokio-util = { version = "0.7", optional = true, features = ["codec"] }
+libc = { version = "0.2", optional = true }
+
+# CH client
+hyper = { version = "1", optional = true, features = ["client", "http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["client", "client-legacy", "tokio"] }
+http-body-util = { version = "0.1", optional = true }
+hyperlocal = { version = "0.9", optional = true }
+serde_json = { version = "1", optional = true }
+
+# QEMU
+qapi = { version = "0.14", optional = true, features = ["qmp", "qga", "async-tokio"] }
+
+# Net
+rtnetlink = { version = "0.14", optional = true }
+netns-rs = { version = "0.1", optional = true }
+tun-tap = { version = "0.1", optional = true }
+ipnet = { version = "2", optional = true }
+
+
+# Proxy
+rustls = { version = "0.23", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rcgen = { version = "0.13", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+hudsucker = { version = "0.23", optional = true }
+
+# Metrics
+cgroups-rs = { version = "0.3", optional = true }
+procfs = { version = "0.16", optional = true }
+
+# Pipeline
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "stream", "blocking"] }
+pgp = { version = "0.14", optional = true }
+sha2 = { version = "0.10", optional = true }
+blake3 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
+lzma-rs = { version = "0.3", optional = true }
+zstd = { version = "0.13", optional = true }
+reflink-copy = { version = "0.1", optional = true }
+walkdir = { version = "2", optional = true }
+toml = { version = "0.8", optional = true }
+tempfile = { version = "3", optional = true }
+
+# CLI
+clap = { version = "4", optional = true, features = ["derive"] }
+anyhow = { version = "1", optional = true }
+
+# OCI
+oci-client = { version = "0.17", optional = true }
+
+# In-process virtio-fs experiment + unprivileged smoltcp NAT vhost-user backend
+fuse-backend-rs = { version = "0.14.0", optional = true }
+vhost = { version = "0.16.0", optional = true }
+vhost-user-backend = { version = "0.22.0", optional = true }
+virtio-queue = { version = "0.17.0", optional = true }
+vmm-sys-util = { version = "0.15.0", optional = true }
+vm-memory = { version = "=0.17.1", optional = true }
+virtio-bindings = { version = "0.2.7", optional = true }
+smoltcp = { version = "0.11.0", optional = true, features = ["std", "log", "medium-ethernet", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "phy-tuntap_interface"] }
+log = "0.4"
+jip-nftables = { version = "0.1.0", optional = true }
+am-fs-erofs = { version = "0.1.1", optional = true }
+async-trait = { version = "0.1.89", optional = true }
+# Used only by the privileged tap path (`net/tap.rs`, alongside rtnetlink 0.14) and the proxy CA
+# authority type (`proxy/tls.rs`); both are optional so they stay out of feature-trimmed builds.
+netlink-packet-route = { version = "0.19.0", optional = true }
+http = { version = "1", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+log = "0.4"
+axum = "0.7"
+assert_cmd = "2"
+predicates = "3"
+serial_test = "3"
+tempfile = "3"
+tracing-test = "0.2"
+proptest = "1"
+env_logger = "0.11"
+
+[features]
+experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
+default = ["cloud-hypervisor", "net-privileged", "net-unprivileged", "proxy", "metrics", "pipeline", "cli"]
+
+host-common = [
+    "dep:tokio", "dep:futures", "dep:bytes",
+    "dep:tracing", "dep:tracing-subscriber",
+    "dep:tokio-vsock", "dep:nix", "dep:uuid", "dep:which",
+    "dep:tokio-util", "dep:async-trait", "dep:libc",
+]
+
+cloud-hypervisor = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyperlocal", "dep:serde_json"]
+firecracker = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyperlocal", "dep:serde_json"]
+qemu = ["host-common", "dep:qapi", "dep:serde_json"]
+
+net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:tun-tap", "dep:ipnet", "dep:netlink-packet-route"]
+experiment-nftables = ["net-privileged", "dep:jip-nftables"]
+net-unprivileged = ["host-common", "dep:smoltcp", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
+
+proxy = ["host-common", "dep:rustls", "dep:tokio-rustls", "dep:rcgen", "dep:rustls-pemfile", "dep:hudsucker", "dep:http"]
+proxy-hudsucker = ["proxy"]
+
+metrics = ["host-common", "dep:cgroups-rs", "dep:procfs"]
+
+pipeline = [
+    "host-common",
+    "dep:reqwest", "dep:pgp", "dep:sha2", "dep:blake3",
+    "dep:tar", "dep:flate2", "dep:lzma-rs", "dep:zstd",
+    "dep:reflink-copy", "dep:walkdir", "dep:toml", "dep:tempfile",
+    "am-fs-erofs", "dep:oci-client",
+]
+
+cli = ["host-common", "dep:clap", "dep:anyhow", "dep:serde_json"]
+
+fuse-backend-rs = ["dep:fuse-backend-rs"]
+vhost = ["dep:vhost"]
+vhost-user-backend = ["dep:vhost-user-backend"]
+virtio-queue = ["dep:virtio-queue"]
+vmm-sys-util = ["dep:vmm-sys-util"]
+vm-memory = ["dep:vm-memory"]
+virtio-bindings = ["dep:virtio-bindings"]
+jip-nftables = ["dep:jip-nftables"]
+am-fs-erofs = ["dep:am-fs-erofs"]

@@ -21,12 +21,13 @@
 #   static CA_CACHE: OnceLock<...> = OnceLock::new(); // allow-global-state: <reason>
 # so every surviving global is justified in place and shows up in review.
 #
-# Usage: ban-global-state.sh [DIR ...]   (defaults to the shipped source trees: src benches)
+# Usage: ban-global-state.sh [DIR ...]   (defaults to the workspace member trees under crates/)
 set -euo pipefail
 
 dirs=("$@")
 if [[ ${#dirs[@]} -eq 0 ]]; then
-  dirs=(src benches)
+  # v15 workspace: all member source (lib + bins + tests + benches) lives under crates/.
+  dirs=(crates)
 fi
 
 # Interior-mutable / atomic type stems that, at module scope, indicate shared mutable state.

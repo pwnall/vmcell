@@ -2,7 +2,29 @@
 
 An end-to-end integration-testing and evaluation platform for the Imp agentic harness.
 Each test runs in a fresh micro-VM for structural isolation, hermetic state, and production fidelity.
-Driven entirely from a single Rust library.
+Driven entirely from a single Rust library, organized as a cargo **workspace**: the `vmcell` library
+(plus its CLI) and four lean member crates — `vmcell-protocol` (the shared wire enum),
+`vmcell-guest-agent` (guest PID 1), `vmcell-test-runner` (the privileged-test capability runner), and
+`vmcell-guest-tools` (the in-rootfs `ip`/`curl`/`kvm-ok` helper).
+
+## CLI (`vmcell`)
+
+The library API is the product surface; the `vmcell` binary is a thin `clap` wrapper for trying it
+out. Build it with `cargo build` (the default feature set) and run subcommands with
+`cargo run -p vmcell --bin vmcell -- <subcommand>`:
+
+| Subcommand | What it does |
+|---|---|
+| `build` | Build all VM artifacts (kernel, erofs rootfs, proxy CA) from `pins.json`. |
+| `build-kernels` | Build every kernel in the `pins.kernels` registry to `vmlinux-<label>`. |
+| `oci2erofs IMAGE@sha256:DIGEST -o out.erofs` | Convert any **digest-pinned** OCI base image into an erofs rootfs (verify blobs → whiteouts → inject agent/CA/tools → pack). Tags are rejected; a libc6-less base fails loud unless `--agent-musl <path>` supplies a static-musl agent. |
+| `run --kernel K --rootfs R [-- CMD…]` | Boot a fresh micro-VM, run `CMD` (default `/bin/true`) over vsock, tear down, and exit with the guest's exit code. |
+| `create --kernel K --rootfs R` | Boot a micro-VM and confirm the agent is ready, then tear down (a boot smoke test). |
+| `snapshot --kernel K --rootfs R --out DIR` | Boot a micro-VM and write a warm snapshot into `DIR` (snapshot-eligible config only). |
+| `stats --kernel K --rootfs R` | Boot a micro-VM, sample resource usage, print it as JSON, tear down. |
+| `bundle [-o manifest.json]` | Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel/rootfs/CA/pins.json). |
+| `verify-bundle [-m manifest.json]` | Re-hash every artifact in a manifest and fail loud on any mismatch. |
+| `exec` / `ls` / `rm` / `destroy` | Deferred to the future `impd` daemon (need a cross-process VM registry); these fail loud with a typed error. |
 
 ## Development
 
@@ -78,26 +100,33 @@ To run privileged networking tests (like those requiring TAP interfaces or trans
 without running the entire `cargo test` suite as `root`, we use a lightweight capability-granting
 runner.
 
-Build the `vmcell-test-runner` for both `debug` and `release` configurations, then grant it the
-necessary capabilities:
+Bless it once with `just bless`:
 
 ```sh
-# Build the runner
-cargo build --bin vmcell-test-runner --features test-runner
-cargo build --release --bin vmcell-test-runner --features test-runner
-
-# Bless the binaries with network and system admin capabilities
-sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep target/debug/vmcell-test-runner
-sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep target/release/vmcell-test-runner
+just bless
 ```
 
-`just bless` (§6) runs exactly these steps for you.
+This builds the runner (its own workspace member crate — no `--features` needed), installs a copy
+to a **stable path outside `target/`** (the gitignored `./.vmcell-bin/{debug,release}/vmcell-test-runner`),
+and grants *that copy* the three capabilities:
 
-*Note: You must re-run the `setcap` commands (or `just bless`) anytime the `vmcell-test-runner` binary is
-recompiled, as rebuilding strips file capabilities.*
+```sh
+sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep .vmcell-bin/debug/vmcell-test-runner
+sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep .vmcell-bin/release/vmcell-test-runner
+```
 
-To use the runner during local development, either execute your test binaries through it directly or
-configure your cargo test runner (e.g., in `.cargo/config.toml`) to use it for the privileged suite.
+**Why the stable path (v15 §12.8):** writing a binary file strips its capabilities, and cargo
+rewrites `target/<profile>/vmcell-test-runner` for reasons unrelated to the runner's own source (a
+`RUSTFLAGS=-D warnings` re-fingerprint, a feature-set toggle, a profile change). Because cargo only
+ever touches `target/`, the blessed copy under `./.vmcell-bin/` keeps its caps across all that churn,
+so you almost never need to re-bless. `just bless` is also **idempotent**: it records the runner's
+`sha256` in a sibling `.blessed` stamp and skips the `sudo setcap` (no password prompt) until the
+runner binary genuinely changes. The stamp keys on the **runner** only — never on the test binaries
+it wraps, whose identity is deliberately out of scope (the security boundary is *who may execute the
+runner* plus path-confinement, not test-binary content).
+
+The privileged suite points the cargo/nextest target-runner at this stable path; `just
+test-privileged` (§6) wires it up for you.
 
 ### 6. Developer command runner (`just`) and CI tooling
 

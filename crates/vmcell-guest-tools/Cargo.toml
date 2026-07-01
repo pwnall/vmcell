@@ -1,0 +1,18 @@
+[package]
+name = "vmcell-guest-tools"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "vmcell guest-side multicall helper: real ip/curl/kvm-ok, baked into the rootfs erofs (§5.3)"
+publish = false
+
+# A *guest* binary cross-compiled into the rootfs. Needs reqwest for genuine HTTP, so it is
+# leaner than the host but not as lean as the agent; it is NOT the host stack (its own member).
+[[bin]]
+name = "vmcell-guest-tools"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+libc = "0.2"

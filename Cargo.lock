@@ -5723,7 +5723,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "am-fs-erofs",
  "anyhow",
@@ -5732,7 +5732,6 @@ dependencies = [
  "axum",
  "blake3",
  "bytes 1.12.0",
- "capctl",
  "cgroups-rs",
  "clap",
  "criterion",
@@ -5765,14 +5764,12 @@ dependencies = [
  "reflink-copy",
  "reqwest 0.12.28",
  "rtnetlink",
- "rustix 0.38.44",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
- "signal-hook",
  "smoltcp",
  "tar",
  "tempfile",
@@ -5792,11 +5789,51 @@ dependencies = [
  "virtio-bindings",
  "virtio-queue",
  "vm-memory",
+ "vmcell-protocol",
  "vmm-sys-util",
- "vsock",
  "walkdir",
  "which",
  "zstd",
+]
+
+[[package]]
+name = "vmcell-guest-agent"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "postcard",
+ "rustix 0.38.44",
+ "signal-hook",
+ "tracing",
+ "tracing-subscriber",
+ "vmcell-protocol",
+ "vsock",
+]
+
+[[package]]
+name = "vmcell-guest-tools"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "reqwest 0.12.28",
+]
+
+[[package]]
+name = "vmcell-protocol"
+version = "0.2.0"
+dependencies = [
+ "postcard",
+ "proptest",
+ "serde",
+]
+
+[[package]]
+name = "vmcell-test-runner"
+version = "0.2.0"
+dependencies = [
+ "capctl",
+ "libc",
+ "rustix 0.38.44",
 ]
 
 [[package]]

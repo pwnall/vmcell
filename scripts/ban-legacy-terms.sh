@@ -29,12 +29,13 @@
 #   let old = "imp-testing"; // allow-legacy-term: <reason>
 # so every surviving legacy token is justified in place and shows up in review.
 #
-# Usage: ban-legacy-terms.sh [DIR ...]   (defaults to the shipped trees: src tests benches)
+# Usage: ban-legacy-terms.sh [DIR ...]   (defaults to the workspace member trees under crates/)
 set -euo pipefail
 
 dirs=("$@")
 if [[ ${#dirs[@]} -eq 0 ]]; then
-  dirs=(src tests benches)
+  # v15 workspace: all member source (lib + bins + tests + benches) lives under crates/.
+  dirs=(crates)
 fi
 
 violations=""

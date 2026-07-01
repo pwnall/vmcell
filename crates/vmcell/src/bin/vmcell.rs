@@ -1,0 +1,488 @@
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Build,
+    /// Build every kernel in the pins `kernels` registry to `vmlinux-<label>`.
+    BuildKernels,
+    /// Convert any digest-pinned OCI image into an erofs rootfs (build-time; v15 §8.2).
+    /// The base MUST be pinned by digest (`IMAGE@sha256:...`), never a tag.
+    Oci2Erofs {
+        /// The digest-pinned base image, e.g. `debian:trixie-slim@sha256:<hex>`.
+        image: String,
+        /// Output path for the packed erofs rootfs image.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Inject this prebuilt static-musl guest agent instead of the default glibc agent
+        /// (required for a libc6-less base). Without it, a libc6-less base fails loud.
+        #[arg(long)]
+        agent_musl: Option<PathBuf>,
+    },
+    /// Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel,
+    /// rootfs, proxy CA, pins.json) for reproducibility (v15 §11).
+    Bundle {
+        /// Output path for the manifest JSON (default `<artifacts_dir>/manifest.json`).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Re-hash every artifact in a manifest and fail loud on any digest mismatch (v15 §11).
+    VerifyBundle {
+        /// Manifest JSON to verify (default `<artifacts_dir>/manifest.json`).
+        #[arg(short, long)]
+        manifest: Option<PathBuf>,
+    },
+    /// Create a fresh micro-VM, run a command in it over vsock, then tear it down,
+    /// exiting with the guest command's exit code (v15 §10.2).
+    Run {
+        /// Path to the `vmlinux` direct-boot kernel image.
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Path to the erofs root filesystem image.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// vCPU count (default 2).
+        #[arg(long, default_value_t = 2)]
+        vcpus: u8,
+        /// Guest RAM in MiB (default 512).
+        #[arg(long, default_value_t = 512)]
+        mem_mib: u32,
+        /// Command (and args) to run in the guest. Defaults to `/bin/true`.
+        #[arg(trailing_var_arg = true)]
+        cmd: Vec<String>,
+    },
+    /// Create + boot a fresh micro-VM and confirm its agent is ready, then tear it
+    /// down (a boot smoke test; v15 §10.2).
+    Create {
+        /// Path to the `vmlinux` direct-boot kernel image.
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Path to the erofs root filesystem image.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// vCPU count (default 2).
+        #[arg(long, default_value_t = 2)]
+        vcpus: u8,
+        /// Guest RAM in MiB (default 512).
+        #[arg(long, default_value_t = 512)]
+        mem_mib: u32,
+    },
+    /// Boot a micro-VM and write a warm snapshot into a directory, then tear it
+    /// down (snapshot-eligible config only; v15 §10.2).
+    Snapshot {
+        /// Path to the `vmlinux` direct-boot kernel image.
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Path to the erofs root filesystem image.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// Output directory for the snapshot artifacts.
+        #[arg(long)]
+        out: PathBuf,
+        /// vCPU count (default 2).
+        #[arg(long, default_value_t = 2)]
+        vcpus: u8,
+        /// Guest RAM in MiB (default 512).
+        #[arg(long, default_value_t = 512)]
+        mem_mib: u32,
+    },
+    /// Boot a micro-VM, sample its resource usage, print it as JSON, then tear it
+    /// down (v15 §10.2).
+    Stats {
+        /// Path to the `vmlinux` direct-boot kernel image.
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Path to the erofs root filesystem image.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// vCPU count (default 2).
+        #[arg(long, default_value_t = 2)]
+        vcpus: u8,
+        /// Guest RAM in MiB (default 512).
+        #[arg(long, default_value_t = 512)]
+        mem_mib: u32,
+    },
+    /// Deferred to the `impd` daemon (§16.2): a standalone exec needs a cross-process
+    /// VM registry, which collides with the ordered-Drop-owns-cleanup invariant.
+    Exec,
+    /// Deferred to the `impd` daemon (§16.2): listing VMs needs a cross-process registry.
+    Ls,
+    /// Deferred to the `impd` daemon (§16.2): removing a VM by id needs a cross-process registry.
+    Rm,
+    /// Deferred to the `impd` daemon (§16.2): destroying a VM by id needs a cross-process
+    /// registry. Within one process the owning handle's drop/`shutdown` already destroys it.
+    Destroy,
+}
+
+fn main() -> vmcell::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("valid async runtime config")
+        .block_on(async_main())
+}
+
+async fn async_main() -> vmcell::Result<()> {
+    let cli = Cli::parse();
+    dispatch(&cli.command).await
+}
+
+/// Builds the typed error returned by a subcommand that is deferred to the `impd`
+/// daemon (§16.2) because it needs a cross-process VM registry.
+///
+/// These subcommands must fail loud — a typed, matchable error that drives a
+/// non-zero exit — rather than printing fake success. Printing "Removing VM..." and
+/// returning `Ok(())` while doing nothing is the "skip == pass" failure in CLI form:
+/// it impersonates a completed operation.
+fn deferred_to_daemon(subcommand: &str) -> vmcell::Error {
+    vmcell::Error::Unsupported {
+        vmm: "vmcell".to_string(),
+        feature: format!(
+            "subcommand `{subcommand}` needs a cross-process VM registry; deferred to the impd daemon (§16.2)"
+        ),
+    }
+}
+
+async fn dispatch(command: &Commands) -> vmcell::Result<()> {
+    match command {
+        Commands::Build => {
+            println!("Building artifacts...");
+            let pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
+                .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
+                    pins_file: std::path::PathBuf::from("pins.json"),
+                }))
+                .add_stage(Box::new(vmcell::artifact::kernel::KernelStage {
+                    http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
+                    label: None,
+                    fragments: None,
+                }))
+                .add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}))
+                .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
+                .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
+                    source: vmcell::artifact::rootfs::RootfsBuildSource::Oci,
+                    cid_alloc: std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+                    image_override: None,
+                    agent_musl: None,
+                }));
+            pipeline.build(&vmcell::artifact::Cache::default()).await?;
+            println!("Artifacts built successfully.");
+            Ok(())
+        }
+        Commands::Oci2Erofs {
+            image,
+            output,
+            agent_musl,
+        } => oci2erofs(image, output, agent_musl.as_deref()).await,
+        Commands::Bundle { out } => {
+            let dir = vmcell::artifact::artifacts_dir();
+            let candidates: [(&str, PathBuf); 4] = [
+                ("kernel", dir.join("vmlinux")),
+                ("rootfs", dir.join("rootfs.erofs")),
+                ("ca", dir.join("ca.pem")),
+                ("pins", PathBuf::from("pins.json")),
+            ];
+            let present: Vec<(&str, &std::path::Path)> = candidates
+                .iter()
+                .filter(|(_, p)| p.exists())
+                .map(|(n, p)| (*n, p.as_path()))
+                .collect();
+            if present.is_empty() {
+                return Err(vmcell::Error::Artifact(
+                    "no artifacts found to bundle; run `vmcell build` first".to_string(),
+                ));
+            }
+            // Surface what was left out — a silently-omitted artifact would make the manifest
+            // read as "covered everything" when it didn't.
+            let skipped: Vec<&str> = candidates
+                .iter()
+                .filter(|(_, p)| !p.exists())
+                .map(|(n, _)| *n)
+                .collect();
+            if !skipped.is_empty() {
+                println!(
+                    "vmcell: bundle skipping absent artifacts: {}",
+                    skipped.join(", ")
+                );
+            }
+            let manifest = vmcell::artifact::bundle::ArtifactManifest::build(&present)?;
+            let out_path = out.clone().unwrap_or_else(|| dir.join("manifest.json"));
+            manifest.write_to(&out_path)?;
+            println!(
+                "vmcell: wrote artifact manifest ({} entries) to {}",
+                present.len(),
+                out_path.display()
+            );
+            Ok(())
+        }
+        Commands::VerifyBundle { manifest } => {
+            let mp = manifest
+                .clone()
+                .unwrap_or_else(|| vmcell::artifact::artifacts_dir().join("manifest.json"));
+            vmcell::artifact::bundle::ArtifactManifest::verify_file(&mp)?;
+            println!("vmcell: artifact manifest {} verified OK", mp.display());
+            Ok(())
+        }
+        Commands::BuildKernels => {
+            // Build each kernel in the `kernels` registry to its own `vmlinux-<label>`
+            // (the kernel-version dimension), so multiple versions coexist for the
+            // cross-kernel benchmark sweep. Reuses the labelled `KernelStage`; each has
+            // its own cache sidecar and build dir.
+            let pins_file = std::path::PathBuf::from("pins.json");
+            let content = std::fs::read_to_string(&pins_file).map_err(vmcell::Error::Io)?;
+            let json: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| vmcell::Error::Artifact(format!("pins.json parse: {e}")))?;
+            let labels: Vec<String> = json
+                .get("kernels")
+                .and_then(|k| k.as_object())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            if labels.is_empty() {
+                return Err(vmcell::Error::Artifact(
+                    "no `kernels` registry in pins.json".to_string(),
+                ));
+            }
+            println!("Building kernels: {}", labels.join(", "));
+            let mut pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
+                .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
+                    pins_file: pins_file.clone(),
+                }));
+            for label in &labels {
+                println!("  - kernel {label} -> vmlinux-{label}");
+                pipeline = pipeline.add_stage(Box::new(vmcell::artifact::kernel::KernelStage {
+                    http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
+                    label: Some(label.clone()),
+                    fragments: None,
+                }));
+            }
+            pipeline.build(&vmcell::artifact::Cache::default()).await?;
+            println!("Kernels built: {}", labels.join(", "));
+            Ok(())
+        }
+        Commands::Run {
+            kernel,
+            rootfs,
+            vcpus,
+            mem_mib,
+            cmd,
+        } => {
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            let argv = if cmd.is_empty() {
+                vec!["/bin/true".to_string()]
+            } else {
+                cmd.clone()
+            };
+            let agent = vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+            let outcome = agent.exec(vmcell::ExecRequest::new(argv)).await?;
+            use std::io::Write as _;
+            let _ = std::io::stdout().write_all(&outcome.stdout);
+            let _ = std::io::stderr().write_all(&outcome.stderr);
+            vm.shutdown().await?;
+            // The CLI propagates the guest command's exit code (§10.2). Teardown has
+            // already run (shutdown consumed `vm`), so process::exit leaks nothing.
+            std::process::exit(outcome.code);
+        }
+        Commands::Create {
+            kernel,
+            rootfs,
+            vcpus,
+            mem_mib,
+        } => {
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            let vmid = vm.vmid();
+            // Confirm the guest agent handshakes — i.e. the VM actually booted —
+            // before teardown. A failure here is a real error, not a fake success.
+            vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+            println!("vmcell: VM booted and agent ready (vmid {vmid})");
+            vm.shutdown().await?;
+            Ok(())
+        }
+        Commands::Snapshot {
+            kernel,
+            rootfs,
+            out,
+            vcpus,
+            mem_mib,
+        } => {
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            // Bring the agent up so the snapshot captures an agent-ready VM.
+            vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+            std::fs::create_dir_all(out).map_err(vmcell::Error::Io)?;
+            vm.snapshot(out).await?;
+            println!("vmcell: snapshot written to {}", out.display());
+            vm.shutdown().await?;
+            Ok(())
+        }
+        Commands::Stats {
+            kernel,
+            rootfs,
+            vcpus,
+            mem_mib,
+        } => {
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+            let usage = vm.usage().await?;
+            println!("{}", format_usage_json(&usage));
+            vm.shutdown().await?;
+            Ok(())
+        }
+        Commands::Exec => Err(deferred_to_daemon("exec")),
+        Commands::Ls => Err(deferred_to_daemon("ls")),
+        Commands::Rm => Err(deferred_to_daemon("rm")),
+        Commands::Destroy => Err(deferred_to_daemon("destroy")),
+    }
+}
+
+/// Resolves the `cloud-hypervisor` binary path: `$VMCELL_CH_BIN`, else `cloud-hypervisor`
+/// on `PATH`.
+fn ch_bin() -> String {
+    std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
+}
+
+/// Creates and boots an ephemeral micro-VM from an erofs rootfs, owned by the
+/// returned handle (its `Drop`/`shutdown` performs the ordered teardown).
+///
+/// The VM does not outlive the calling process — a persistent, cross-invocation VM
+/// needs the `impd` daemon's registry (§16.2), which collides with the
+/// ordered-Drop-owns-cleanup invariant. So each VM-lifecycle CLI verb owns its VM's
+/// full lifecycle: create → operate → teardown.
+async fn ephemeral_vm(
+    kernel: &std::path::Path,
+    rootfs: &std::path::Path,
+    vcpus: u8,
+    mem_mib: u32,
+) -> vmcell::Result<vmcell::MicroVm<vmcell::CloudHypervisor>> {
+    let cfg = vmcell::config::VmConfig::builder(
+        kernel.to_path_buf(),
+        vmcell::config::RootfsSource::Erofs {
+            image: rootfs.to_path_buf(),
+        },
+    )
+    .vcpus(vcpus)
+    .mem_mib(mem_mib)
+    .build()?;
+    let vmm = vmcell::CloudHypervisor::new(ch_bin());
+    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    vmcell::MicroVm::start(
+        &vmm,
+        cfg,
+        cid_alloc,
+        vmid_alloc,
+        Box::new(vmcell::metrics::DefaultCgroupFs),
+    )
+    .await
+}
+
+/// Renders [`vmcell::ResourceUsage`] as a single-line JSON object. Hand-formatted
+/// (the type does not derive `Serialize`); the net counters are intentionally absent
+/// (cgroup v2 has no network accounting — see the impl-notes deviation).
+fn format_usage_json(u: &vmcell::ResourceUsage) -> String {
+    format!(
+        "{{\"mem_peak_mib\":{},\"mem_current_mib\":{},\"cpu_usec\":{},\
+         \"io_read_bytes\":{},\"io_write_bytes\":{},\"limits_enforced\":{},\
+         \"mem_read_ok\":{},\"cpu_read_ok\":{},\"io_read_ok\":{}}}",
+        u.mem_peak_mib,
+        u.mem_current_mib,
+        u.cpu_usec,
+        u.io_read_bytes,
+        u.io_write_bytes,
+        u.limits_enforced,
+        u.mem_read_ok,
+        u.cpu_read_ok,
+        u.io_read_ok,
+    )
+}
+
+/// Runs the full rootfs pipeline against an arbitrary digest-pinned OCI base image and
+/// writes the resulting erofs to `output` (v15 §8.2).
+///
+/// The image MUST be digest-pinned (`IMAGE@sha256:DIGEST`): a tag is a §11.2 provenance hard
+/// stop and is rejected up front. A base lacking libc6 fails loud during packing unless
+/// `agent_musl` supplies a static-musl agent (which needs no glibc). The pipeline is the SAME
+/// inject+pack tail as `vmcell build` — verify-every-blob → whiteouts → inject agent/CA/tools
+/// → erofs — only the base image (and the agent) are parameterized, so the runtime stays
+/// erofs-only.
+async fn oci2erofs(
+    image_ref: &str,
+    output: &std::path::Path,
+    agent_musl: Option<&std::path::Path>,
+) -> vmcell::Result<()> {
+    // Reject a tag: require `IMAGE@sha256:DIGEST`. The digest is whatever follows the last `@`.
+    let (image, digest) = image_ref.rsplit_once('@').ok_or_else(|| {
+        vmcell::Error::Artifact(format!(
+            "oci2erofs requires a digest-pinned image `IMAGE@sha256:DIGEST`, got `{image_ref}` \
+             (a tag is a provenance hard stop, §11.2)"
+        ))
+    })?;
+    if !digest.starts_with("sha256:") {
+        return Err(vmcell::Error::Artifact(format!(
+            "oci2erofs requires a `sha256:` digest, got `{digest}` in `{image_ref}`"
+        )));
+    }
+
+    let artifacts_dir = vmcell::artifact::artifacts_dir();
+    let mut pipeline = vmcell::artifact::Pipeline::new(artifacts_dir.clone()).add_stage(Box::new(
+        vmcell::artifact::ResolvePinsStage {
+            pins_file: std::path::PathBuf::from("pins.json"),
+        },
+    ));
+    // The default glibc agent is built by the pipeline; `--agent-musl` supplies its own
+    // prebuilt binary, so the build stage is skipped and the rootfs stage injects it instead.
+    if agent_musl.is_none() {
+        pipeline = pipeline.add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}));
+    }
+    pipeline = pipeline
+        .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
+        .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
+            source: vmcell::artifact::rootfs::RootfsBuildSource::Oci,
+            cid_alloc: std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+            image_override: Some((image.to_string(), digest.to_string())),
+            agent_musl: agent_musl.map(std::path::Path::to_path_buf),
+        }));
+
+    pipeline.build(&vmcell::artifact::Cache::default()).await?;
+
+    // The rootfs stage writes `<artifacts_dir>/rootfs.erofs`; copy it to the requested output.
+    let built = artifacts_dir.join("rootfs.erofs");
+    std::fs::copy(&built, output).map_err(vmcell::Error::Io)?;
+    println!("vmcell: wrote erofs rootfs to {}", output.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Buggy impl this guards: the daemon-deferred verbs (exec/ls/rm/destroy) printing
+    // fake success and returning Ok(()), impersonating a completed operation. Each
+    // must instead surface a typed, matchable error so the process exits non-zero.
+    // (run/create/snapshot/stats are now implemented and own a real VM lifecycle, so
+    // they are NOT in this set — they boot a VM and so are exercised by the KVM suite.)
+    #[test]
+    fn daemon_deferred_subcommands_fail_loud() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        for command in [
+            Commands::Exec,
+            Commands::Ls,
+            Commands::Rm,
+            Commands::Destroy,
+        ] {
+            let err = rt
+                .block_on(dispatch(&command))
+                .expect_err("a daemon-deferred subcommand must return an error");
+            assert!(
+                matches!(err, vmcell::Error::Unsupported { .. }),
+                "expected Error::Unsupported, got {err:?}"
+            );
+        }
+    }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "vmcell-guest-agent"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "vmcell guest PID-1 agent: vsock control plane + zombie reaper (lean, no host async stack)"
+publish = false
+
+# A library (the PID-1 reaper coordination — pure, unit-tested) plus the thin binary that
+# drives it. Both stay off the host async stack; the CI lean-agent assertion enforces this
+# structurally on the member crate (v15 §12.8 #4).
+[lib]
+name = "vmcell_guest_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vmcell-guest-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Explicit `version` alongside `path` keeps the cargo-deny `wildcards = "deny"` gate happy.
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.2.0" }
+postcard = { version = "1", features = ["use-std"] }
+vsock = "0.5"
+rustix = { version = "0.38", features = ["fs", "mount", "process", "net"] }
+signal-hook = "0.3"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

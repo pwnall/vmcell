@@ -1,0 +1,19 @@
+[package]
+name = "vmcell-protocol"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Framed postcard wire protocol shared by the vmcell host and the guest agent"
+publish = false
+
+[lib]
+name = "vmcell_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+postcard = { version = "1", features = ["use-std"] }
+proptest = "1"

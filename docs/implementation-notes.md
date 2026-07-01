@@ -1494,3 +1494,168 @@ honor (recorded here per AGENTS.md "record deviations"):
   (kernel/erofs/CA/pins.json) only. Vendoring the VMM binaries is REJECTED (QEMU GPL redistribution;
   CH/FC size/maintenance; fetch-verify already gives reproducibility). Offline-everything = a consumer
   Dockerfile.
+
+## v15 implementation pass (2026-06-30)
+
+All six v15 design items above are now IMPLEMENTED. Validated on this host with the full static
+suite: `cargo clippy --workspace --all-targets --all-features` under `RUSTFLAGS=-D warnings` (clean),
+`cargo fmt --all --check` (clean), `cargo nextest run --all-features` (**195 passed, 40 KVM-skipped**,
+up from 181 — 14 new tests), `cargo deny check` (ok), the `ban-*` scanners + their self-tests, and
+the per-member lean-tree assertions — i.e. `just ci` is green. **The privileged KVM suite was also
+run and is green: `just test-privileged` under the delegated cgroup scope → 195 passed / 0 failed /
+15 skipped** (boot/exec_vsock/put_file/metrics_limits/snapshot_restore/nested_virt/shares_ro_rw/
+concurrency/lifecycle-force-kill/panic-residue across CH/FC/QEMU). The bless durability fix was
+proven incidentally: a library rebuild between `just bless` and the suite did **not** strip the
+runner's caps (it lives at `./.vmcell-bin/`, outside `target/`).
+
+- **Workspace-split follow-up: artifacts-dir CWD anchor.** Running the privileged suite caught a
+  real defect the unit suite could not (the integration tests are `#[ignore]`'d there): cargo/nextest
+  run a *workspace member's* test binaries with the CWD set to that member's dir (`crates/vmcell/`),
+  not the workspace root, so the lib's CWD-relative `artifacts_dir()` default (`target/vmcell-artifacts`)
+  resolved to the non-existent `crates/vmcell/target/...` and every VM-booting test failed loud with
+  "vmlinux artifact missing". Fixed by anchoring the `artifacts_dir()` default on `workspace_root()`
+  (the same workspace-relative anchor the closure-hash uses), and hardening `workspace_root()` to fall
+  back to the **absolute** process CWD (`std::env::current_dir`) so it can ascend from `crates/vmcell/`
+  when `CARGO_MANIFEST_DIR` is unset at runtime. `scripts/review-preflight-priv.sh` was also repointed
+  from `target/<profile>/vmcell-test-runner` to the stable `./.vmcell-bin/<profile>/vmcell-test-runner`
+  install (the §12.8 bless path).
+
+- **Workspace split (§10.1/§10.5/§12.2).** Pure `[workspace]` root + `crates/{vmcell,
+  vmcell-protocol, vmcell-test-runner, vmcell-guest-agent, vmcell-guest-tools}`. `vmcell-protocol`
+  holds the wire enum **plus `MAX_FRAME_BYTES`** (the framing bound both ends share); the guest-agent
+  member's `lib.rs` holds `ReaperCoordinator`/`exit_code_from_termination`/`DEFAULT_MAX_REAPED_STATUSES`
+  (no host user). `[patch.crates-io]` moved to the root; the CI lean checks are now per-member
+  (`-p <crate>`). **Deviations:** (1) the v13 feature-collapse-to-one-`host`-feature was **not** done —
+  it is orthogonal to the v15 *split*, the code already diverged to fine-grained `host-common` +
+  per-subsystem features, and collapsing would churn ~90 `#[cfg(feature=…)]` sites with backend-gating
+  risk for no v15-mandated benefit; the lean boundary is now structural (separate crates) regardless of
+  the library's internal feature names. (2) `vmcell` version bumped `0.1.0 → 0.2.0` to carry the
+  semver-visible surface change (removed the guest-only items from the public `vmcell::agent`; added
+  the `MicroVm` lifecycle methods and `ExecOutcome::new`). (3) Intra-workspace path deps carry an
+  explicit `version` so cargo-deny's `wildcards = "deny"` does not read a bare `path` dep as `*`.
+  (4) The artifact guest-source **closure hash** + the `GuestAgentStage`/`GuestToolsStage` builds were
+  re-anchored from `CARGO_MANIFEST_DIR` to a `workspace_root()` helper (ascends to the dir holding
+  `crates/vmcell-protocol/Cargo.toml`) and now build with `-p <member>` into the shared workspace
+  `target/`; the closure now folds `crates/vmcell-guest-agent/src/**` + `crates/vmcell-protocol/src/**`
+  + `Cargo.lock`.
+- **Bless durability + pure `CapState` (§12.8).** `confine_under_target_dir_of(target)` derives the
+  confinement root from the **test binary's** path (not the runner's `/proc/self/exe`), keeping the
+  raw-input `..` rejection before canonicalization. `main()`'s privilege sequence is split into a pure
+  `plan_privilege_transition(...) -> PrivilegePlan` and a thin `apply_privilege_transition(plan)`; five
+  buggy-inverse unit tests cover the plan (inheritable/ambient adds, bounding-drop excludes-need,
+  final trim == need, setuid-form uid-drop present/absent, kvm-gid preserved iff held). `just bless`
+  installs the runner to the gitignored `./.vmcell-bin/{debug,release}/` and `setcap`s that copy, gated
+  by a content-hash `.blessed` stamp **keyed on the runner only**; CI + the README point at the stable
+  path. The bless idempotency logic was dry-run-verified (first→setcap, unchanged→skip, changed→setcap).
+- **Lifecycle verbs (§10.2/§10.3).** `pause`/`resume`/`snapshot` promoted to first-class `MicroVm`
+  methods (forward to `instance_mut()`), with a FakeVmInstance-recording delegation test. CLI gains
+  `run`/`create`/`snapshot`/`stats` (each owns a full create→op→teardown lifecycle; `run` propagates the
+  guest exit code) + `oci2erofs`/`bundle`/`verify-bundle`. `exec`/`ls`/`rm`/`destroy` are **fail-loud
+  deferred-to-`impd`** stubs (a standalone version needs the cross-process registry that collides with
+  ordered-Drop). The `vmcell` bin's `required-features` grew `cloud-hypervisor,metrics,pipeline` (it
+  drives the backend + pipeline). **Deviation:** `destroy` is deferred (not a live-handle CLI verb) for
+  the same registry reason as `ls`/`rm`; within one process the owning handle's `shutdown`/Drop destroys.
+- **oci2erofs (§8.2/§11).** `tar_to_erofs` gained a `require_libc6` flag and a single-pass merged-path
+  scan for `libc.so.6` (hard error when the default glibc agent is injected into a libc6-less base);
+  `pack_erofs_with_injection`/`oci::build_rootfs`/`RootfsStage` thread an `agent_musl: Option<&Path>`
+  override (injects the user-supplied static-musl binary and sets `require_libc6=false`). `RootfsStage`
+  gained an `image_override` so the CLI pulls an explicit digest-pinned base; the cache key is
+  **input-based** (image+digest+agent-musl folded, `STAGE_VERSION` 1→2). The CLI rejects a tag
+  (requires `IMAGE@sha256:…`). **Note:** the current `GuestAgentStage` still builds a *static*-glibc
+  agent (crt-static), so the libc6 guard is, for that agent, a contract check rather than a hard runtime
+  requirement; it matches the design's dynamic-glibc-default intent and is harmless for the Debian base
+  (which has libc6). Switching the default agent to dynamic-glibc is a separate, un-done change.
+- **Kernel config-fragment matrix (§8.3).** `KernelStage.fragments: Option<Vec<String>>`; cache key
+  folds the **sorted** fragment set (name + KConfig content from `kernel_fragments_<NAME>` pins),
+  `STAGE_VERSION` 1→2. `run()` appends fragments in sorted order before `olddefconfig` and **fails loud**
+  on a missing fragment pin and on a non-zero `olddefconfig` (now `Error::Artifact` with base+fragment
+  context). `parse_pins_json` flattens a `kernel_fragments` registry; `pins.json` ships KASAN/KCOV/
+  LOCKDEP/SLUB_DEBUG. Four tests: order-invariant key, set-distinguishing key, content-tracking key,
+  pins flattening. Config-only; PREEMPT_RT/KCOV-extraction excluded per design.
+- **Reproducible bundle manifest (§11).** New `artifact::bundle` module: `ArtifactManifest` over
+  `{artifact, path, blake3}` for kernel/erofs/CA/pins.json, reusing the existing `hash_file` (one
+  hashing path). `verify()` re-hashes and fails hard on mismatch; CLI `bundle`/`verify-bundle`. A
+  tamper test (intact verifies, mutated-bytes rejected) plus a JSON round-trip test. VMM-binary
+  vendoring stays rejected.
+
+## Design-alignment audit pass (2026-06-30, post-v15)
+
+An independent per-subsystem audit of the code against the authoritative v15 design
+(`docs/39-claude-design-v15.md`), with every candidate drift adversarially re-verified
+against the design text and this notes file. Result: no behavioral/contract drift; six
+confirmed divergences, all either test-discipline gaps or minor public-API/doc-sync
+mismatches. Three were fixed in code (each with a test proven to go **red on its inverse**);
+three are recorded deviations below. `just ci` re-run green after the changes (see the
+validation line at the end of this section).
+
+### Fixed in code
+
+- **Full teardown-order assertion (§12.4/§12.3).** The design mandates asserting the *full*
+  `MicroVm::Drop` order (VMM instance → netns → cgroup) via recording fakes, on both normal
+  drop and panic; the integration `assert_instance_before_cgroup` in `tests/lifecycle.rs`
+  could only observe `instance → cgroup` (its FakeVmm runs `network_disabled`, and an
+  integration test cannot inject a recording netns — `setup_env` builds a real `NetNamespace`
+  via the concrete `RtNetlink`). Added two in-crate unit tests
+  `orchestrator::tests::test_drop_order_full_chain_{normal,on_panic}` that construct `MicroVm`
+  directly with a recording netns (a `TimelineNetlink` implementing `net::tap::Netlink`) and a
+  recording cgroup fs, all writing one shared timeline, asserting `instance → netns → cgroup`.
+  This pins the load-bearing `instance → netns` edge (a netns torn down before the VMM stops
+  holding interfaces in it hangs/leaks — AGENTS.md teardown order). Verified red on a
+  cgroup-before-instance reorder of `MicroVm::Drop`. **Scope note (why not the *whole*
+  literal chain):** virtiofsd and the tmpfs overlay are owned *inside* the VMM instance's own
+  `Drop` (`MicroVm::Drop` drops `self.instance` first, which reaps the VMM process group *and*
+  its virtiofsd/vhost-vsock daemons), so they are not separately observable at the `MicroVm`
+  seam layer — the observable orchestrator-level events with injectable seams are exactly
+  instance/netns/cgroup, and all three are now ordered. No production change; the
+  `tests/lifecycle.rs` scope comment was updated to point at the new unit tests.
+- **Per-VM path injectivity prop test (§12.3/§12.7).** The design requires a `[prop]` guard
+  that the per-VM `api.sock`/`vsock.sock`/`serial.log` paths are injective in `(pid, vmid)`;
+  the only path-injectivity proptest (`net/tap.rs`) covered netns identity, not those paths,
+  and `VmTempDir::create` inlined the `format!` so `(pid, vmid)` was not prop-exercisable.
+  Extracted the pure `vmm::per_vm_scratch_dir(base, pid, vmid)` (used by `VmTempDir::create`)
+  and added (a) a proptest for the general injectivity property and (b) **deterministic**
+  regression cases for the two documented inverses — a PID-only path `(5,1)` vs `(5,2)` and a
+  delimiter-drop `vmcell-vm-{pid}{vmid}` `(1,23)` vs `(12,3)`. The deterministic cases are
+  load-bearing because a random proptest over the full `(pid, vmid)` space almost never hits a
+  concatenation-collision pair (a coincidental-pass trap); verified red on the delimiter-drop
+  inverse. The runtime path was already injective (the `-` delimiter), so this is a
+  test-coverage fix, not a behavior change.
+- **`EgressProxy::ca_cert_pem` signature (§10.2).** Design declares `-> &[u8]`; code returned
+  `&str`. Changed to `-> &[u8]` (returns `self.ca_cert_pem.as_bytes()`, PEM is UTF-8). No
+  callers of the public method existed (the rootfs-baking path uses the internal
+  `CaManager::ca_cert_pem`, left as `&str` — it is not part of the §10.2 surface).
+
+### Recorded deviations (justified, not fixed in code)
+
+- **Zero-netlink guard is structural, not a `Netlink`-fake unit test (§12.4 line 1138 / §12.7
+  line 1171).** The design's defect→guard index maps "agent does its own networking" to a unit
+  test where an injected `Netlink` fake records zero calls, and the v15 decision record
+  (design line 1466) claims that test "passes for real" — **that claim is inaccurate**: the
+  guest agent (`crates/vmcell-guest-agent`) has *no* netlink seam to inject, because the manual
+  in-guest `ip link/addr/route` bring-up was deleted by design (DESIGN-DIVERGENCE-2; `eth0` is
+  configured by the kernel `ip=` cmdline, MAC rotation is the `SIOCSIFHWADDR` *ioctl* in
+  guest-tools). A fake-`Netlink`-records-zero unit test here would be **theatrical** — the
+  only regression it could guard against is *adding* netlink code, which would not route through
+  a ceremonial fake and so could never turn it red (an inverse it cannot fail on = exactly the
+  smell AGENTS.md bans). The zero-netlink-in-PID-1 invariant is instead enforced *by
+  construction* and by a **stronger** guard: `crates/vmcell-guest-agent` has no `rtnetlink`/
+  netlink dependency, asserted in CI by the lean-agent `cargo tree -p vmcell-guest-agent | grep
+  rtnetlink` gate (`justfile`), plus the source contains no netlink call site. Deviation: the
+  guard is the dependency/structural assertion, not a fake-based unit test; the design's line
+  1138/1171/1466 wording should be read accordingly.
+- **`NetConfig` variants carry `host_services_port: Option<u16>`, not the §10.2 `host_services:
+  bool` (§10.2 lines 534/537).** The code's field is functionally required and correct: the
+  smoltcp NAT must know *which* host port to register as a permanent forward-port (see the
+  earlier "Proxy port not forwarded by the smoltcp NAT" fix), and design body §6.2 explicitly
+  calls for dynamically-assigned host-service ports — so §10.2's `bool` is the imprecise spot,
+  internally inconsistent with §6.2. `None` = disabled, `Some(port)` = enabled at that port.
+  Reverting to `bool` would drop the port and reintroduce the fixed bug, so the code stays;
+  recorded here per AGENTS.md rather than changed. (The design's §10.2 struct is the doc to
+  reconcile on its next revision.)
+
+Validation: `cargo test -p vmcell --all-features --lib` green including the three new/changed
+tests; each was confirmed to fail on its documented buggy inverse before acceptance. Full
+`just ci` re-run green (fmt/clippy `-D warnings`/deny/ban gates/nextest). Host-facing behavior
+is unchanged by this pass (test-only + one accessor return-type), so the KVM privileged/
+unprivileged suites did not need re-running — no lifecycle, teardown, netns, or datapath code
+was modified.

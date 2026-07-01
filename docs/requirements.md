@@ -158,10 +158,10 @@ both Rust library crates and all binaries.
 
 ### Source code requirements
 
-1. One Rust package that uses the 2024 edition.
-2. All functionality in one library crate, which will be used by integration
-   tests and evals.
-3. Binary crate wrapping the library crate to allow quickly trying out the
+1. One Cargo workspace that uses the 2024 Rust edition.
+2. All functionality in library crates, which make up the system interface to
+   it users (integration tests, agenti harness evals, etc).
+3. Binary crates wrapping the library crate to allow quickly trying out the
    functionality. The binary crate implements CLI argument parsing and output.
 4. Fine-grained integration tests. Ideally, one test per requirement or VM
    operation. Example: check that the tool can be used to stop a previously

@@ -22,8 +22,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 
-RUNNER_DEBUG="target/debug/vmcell-test-runner"
-RUNNER_RELEASE="target/release/vmcell-test-runner"
+# v15 §12.8: the blessed runner is installed to the stable ./.vmcell-bin/ path (outside target/,
+# so cargo's churn never strips its caps), which is also what `just test-privileged` points the
+# nextest target-runner at.
+RUNNER_DEBUG=".vmcell-bin/debug/vmcell-test-runner"
+RUNNER_RELEASE=".vmcell-bin/release/vmcell-test-runner"
 ART_DIR="${VMCELL_ARTIFACTS_DIR:-target/vmcell-artifacts}"
 KERNEL="${VMCELL_KERNEL:-$ART_DIR/vmlinux}"
 ROOTFS="${VMCELL_ROOTFS:-$ART_DIR/rootfs.erofs}"

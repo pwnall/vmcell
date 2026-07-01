@@ -29,7 +29,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy (all features)
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --workspace --all-targets --all-features
 
       # NOTE on ordering (C-GATE-1): the reachable supply-chain / lean-target / API gates run
       # FIRST and block the job. The known-RED `cargo hack --feature-powerset` step (accepted
@@ -39,32 +39,33 @@ jobs:
       - name: cargo-deny
         run: cargo deny check
 
-      - name: lean-agent invariant         # guest PID-1 binary must omit the host stack AND compile standalone
+      - name: lean-agent invariant         # guest PID-1 member must omit the host stack AND compile standalone
         run: |
-          if cargo tree -e no-dev --no-default-features --features agent \
+          # v15: the lean boundary is now a per-MEMBER structural property (§12.8 #4), so the
+          # check targets the crate directly (`-p vmcell-guest-agent`) instead of a feature slice
+          # of the old single package — no host module can leak in by construction.
+          if cargo tree -e no-dev -p vmcell-guest-agent \
                | grep -E '── (tokio|hyper|rtnetlink) v'; then
             echo "::error::lean-agent invariant violated — host stack leaked into the agent build"
             exit 1
           fi
-          # Graph inspection is not enough: actually compile the agent-only target so a broken
-          # agent-only build (e.g. an un-gated host dep) is caught here, not on a KVM host.
-          cargo clippy --no-default-features --features agent --bin vmcell-guest-agent -- -D warnings
+          # Graph inspection is not enough: actually compile the agent member so a broken
+          # agent build (e.g. an un-gated host dep) is caught here, not on a KVM host.
+          cargo clippy -p vmcell-guest-agent --all-targets -- -D warnings
 
-      - name: lean-test-runner invariant   # privileged-window binary must omit the host async stack AND compile standalone
+      - name: lean-test-runner invariant   # privileged-window member must omit the host async stack AND compile standalone
         run: |
           # Mirrors lean-agent: the test-runner runs with elevated caps, so the same async host
-          # stack (tokio/hyper/rtnetlink) must not leak in. tracing(-subscriber) is intentionally
-          # NOT in this list — it is a declared `test-runner` feature dep (Cargo.toml), exactly as
-          # for the `agent` target whose assertion also permits it.
-          if cargo tree -e no-dev --no-default-features --features test-runner \
+          # stack (tokio/hyper/rtnetlink) must not leak in.
+          if cargo tree -e no-dev -p vmcell-test-runner \
                | grep -E '── (tokio|hyper|rtnetlink) v'; then
             echo "::error::lean-test-runner invariant violated — host stack leaked into the test-runner build"
             exit 1
           fi
-          cargo clippy --no-default-features --features test-runner --bin vmcell-test-runner -- -D warnings
+          cargo clippy -p vmcell-test-runner --all-targets -- -D warnings
 
       - name: guest-tools build+clippy     # guest userspace helper; build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes)
-        run: cargo clippy --no-default-features --features guest-tools --bin vmcell-guest-tools -- -D warnings
+        run: cargo clippy -p vmcell-guest-tools --all-targets -- -D warnings
 
       - name: ban module-global mutable ID/atomic state
         run: |
@@ -75,12 +76,12 @@ jobs:
 
       - name: public-API semver (PRs only)
         if: github.event_name == 'pull_request'
-        run: cargo semver-checks --baseline-rev "${{ github.event.pull_request.base.sha }}"
+        run: cargo semver-checks --baseline-rev "${{ github.event.pull_request.base.sha }}" -p vmcell
 
       # ---- Accepted-RED debt: LAST and non-blocking (C-GATE-1). Keep it visible, not gating. ----
       - name: clippy feature-powerset (accepted-RED debt; non-blocking)
         continue-on-error: true            # known-RED host-common module-gating; tracked, must not short-circuit the gates above
-        run: cargo hack --feature-powerset --depth 2 clippy --all-targets
+        run: cargo hack --feature-powerset --depth 2 clippy -p vmcell --all-targets
 
   # ---- Fast tests: unit, codec, property. No KVM. DEFAULT (non-ignored) set only. ----
   test-unit:
@@ -106,10 +107,10 @@ jobs:
         with: { tool: "cargo-nextest,just" }
 
       - name: build VM artifacts
-        run: cargo run --bin vmcell -- build
+        run: cargo run -p vmcell --bin vmcell -- build
 
       - name: unprivileged suite (no elevation — keeps the unprivileged path honest)
-        run: cargo nextest run --profile integration --run-ignored all -E 'test(unprivileged) | test(smoltcp)'
+        run: cargo nextest run --profile integration -p vmcell --run-ignored all -E 'test(unprivileged) | test(smoltcp)'
 
       # Bless grants the runner cap_net_admin,cap_sys_admin (debug + release) so the privileged
       # suite runs under the capability wrapper instead of broad `sudo -E` — mirrors `just test-privileged`.
@@ -121,5 +122,6 @@ jobs:
       # here, not just CH (P30). The per-backend matrix skips-with-reason when a binary is absent.
       - name: privileged suite (via vmcell-test-runner capability wrapper, not sudo -E)
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/target/debug/vmcell-test-runner
-        run: cargo nextest run --profile integration --features firecracker,qemu --run-ignored all -E 'not (test(unprivileged) | test(smoltcp))'
+          # v15 §12.8: the blessed runner lives at the stable ./.vmcell-bin/ path `just bless` installs.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.vmcell-bin/debug/vmcell-test-runner
+        run: cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all -E 'not (test(unprivileged) | test(smoltcp))'

@@ -1,32 +1,17 @@
 ## Designed, need implementing
 
-* README covering CLI capabilities and benchmark results
+* README covering CLI capabilities and benchmark results — the README §5 (bless) and the
+  new CLI verbs are documented, but a full CLI-capability + benchmark-results summary section
+  is still pending.
 
-Designed in docs/39-claude-design-v15.md (the "next design round" items below; each
-landed its honestly-easy core, with the not-easy parts deferred/rejected inline):
+### v15 design items — IMPLEMENTED (2026-06-30)
 
-* `vmcell-test-runner` bless resilience (§12.8) — install the blessed runner to a
-  stable path outside `target/` + idempotent content-hash stamp keyed on the RUNNER
-  (never test binaries) + the confinement-root fix (anchor on the test binary's path,
-  not `/proc/self/exe`) + a pure, unit-tested `CapState` transition. ALSO answers
-  "switch to a workspace?" → yes (§10.1), but the stable-path install is the load-
-  bearing churn fix; the workspace is the structural leanness boundary.
-* Build/distribution hygiene: cargo-workspace split + content-hash bless stamp (§10.1,
-  §12.8) [done in design]; reproducible bundle SCOPED DOWN to a digest-pinned fetch-
-  and-verify manifest for our artifacts — vendoring the VMM binaries is REJECTED (QEMU
-  GPL redistribution; size; fetch-verify already gives reproducibility).
-* VM-as-a-handle lifecycle verbs (§10.2/§10.3): create/run/pause/resume/snapshot/stats/
-  destroy unified across lib + CLI, taking a `--rootfs` (erofs) arg; pause/resume/
-  snapshot promoted to first-class MicroVm methods. DEFERRED: list/rm + standalone exec
-  (need the impd daemon's cross-process registry — collides with ordered-Drop); fork
-  (the §16.2 CoW-clone item).
-* Bring-your-own OCI image → `vmcell oci2erofs IMAGE@DIGEST` build-time utility (§8.2/
-  §11); VM verbs take the resulting erofs. Fail loud on a libc6-less base; static-musl
-  agent is an explicit `--agent-musl` opt-in, not a silent fallback.
-* Per-test kernel config-fragment matrix (§8.3): base SHA + sorted KConfig fragment set,
-  content-addressed. config-only fragments in scope; PREEMPT_RT (needs patched source)
-  and KCOV extraction (needs guest tooling, §16.2) excluded; per-test API deferred.
-
+All five v15 "next design round" items below are implemented and validated against the full
+static suite (clippy `-D warnings` clean, fmt clean, `nextest --all-features` 195 passed /
+40 KVM-skipped, deny ok, ban gates, per-member lean checks). See
+docs/implementation-notes.md "v15 implementation pass" for the per-item deviations. KVM host
+suites were not re-run this pass (correct-by-construction; run `just bless` + `just
+test-privileged` once after a runner rebuild to confirm).
 
 ## Need design
 
@@ -41,10 +26,8 @@ landed its honestly-easy core, with the not-easy parts deferred/rejected inline)
 ## Need directional decision
 
 Candidate capabilities surfaced by the vmcell rebrand (full detail + invariant
-guardrails in docs/39-claude-design-v15.md §16). Each is triaged; the decision is
-which to pull forward. V/E = value/effort. (v15 already pulled four §16.1 candidates
-forward — lifecycle verbs, oci2erofs, the kernel-fragment matrix, and the workspace +
-bless-stamp build hygiene — see "Designed, need implementing" above.)
+guardrails in docs/38-claude-design-v14.md §16). Each is triaged; the decision
+is which to pull forward. V/E = value/effort.
 
 Adopt-now (cheap, high-value, extend an existing seam):
 
