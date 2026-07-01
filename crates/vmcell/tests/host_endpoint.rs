@@ -51,7 +51,7 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let (host_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid()).expect("ip_math");
     let host_ip = host_ip.to_string();
 
-    let mut child = Command::new("python3")
+    let child = Command::new("python3")
         .args([
             "-m",
             "http.server",
@@ -61,6 +61,19 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         ])
         .spawn()
         .expect("Failed to start http.server");
+
+    // Own the http.server child so its `Drop` reaps it even if an assertion below
+    // panics (e.g. the agent-connect `.expect(...)` on the line following) — a bare
+    // late `child.kill()` leaks the host process on the panic path (AGENTS.md
+    // "ownership owns cleanup — on panic"; audit E2, docs/41). Mirrors egress_proxy.rs.
+    struct Cleanup(std::process::Child);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _cleanup = Cleanup(child);
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -117,8 +130,7 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .await
         .expect("Exec failed");
 
-    let _ = child.kill();
-    let _ = child.wait();
+    // `_cleanup`'s `Drop` reaps the http.server (on both the success and panic paths).
 
     assert_eq!(
         outcome.code,

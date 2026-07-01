@@ -262,6 +262,20 @@ fn cache_decision(probe: T2Probe) -> Option<Option<String>> {
     }
 }
 
+/// The extended-FPU restore-guard cmdline fragment for Firecracker (empty or `"noxsave "`).
+///
+/// A T2 CPU template masks the extended-state CPUID bits so the guest `glibc` never
+/// dispatches to the AVX/AVX-512 routines whose XSAVE area can mismatch on restore
+/// (design §138). `noxsave` is the **fallback** for hosts where the template does not
+/// fit; applying it *with* a template needlessly disables the guest AVX2 the template
+/// leaves usable, so it is emitted **only when no template was applied**. Returned with a
+/// trailing space so it composes cleanly into the boot-args when non-empty and vanishes
+/// when empty. Pure so the gating is unit-testable (audit E6,
+/// `docs/41-experimental-conclusions-audit.md`).
+fn noxsave_fallback(has_cpu_template: bool) -> &'static str {
+    if has_cpu_template { "" } else { "noxsave " }
+}
+
 async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     let tmp_dir = std::env::temp_dir();
     let counter = std::time::SystemTime::now()
@@ -421,6 +435,10 @@ impl Vmm for Firecracker {
         }
 
         let template = self.detect_cpu_template(cfg).await;
+        // `noxsave` is the extended-FPU restore-guard *fallback*, applied only when no
+        // CPU template was chosen (see `noxsave_fallback`); capture the decision now,
+        // before `template` is moved into the machine-config request below.
+        let fpu_guard = noxsave_fallback(template.is_some());
 
         let (api_socket, vsock_path, serial_path, process, pgid) =
             self.spawn_fc(res, cgroups).await?;
@@ -469,7 +487,7 @@ impl Vmm for Firecracker {
 
         let cmdline = {
             let mut s = format!(
-                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 noxsave init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
+                "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
                 match &cfg.rootfs {
                     crate::config::RootfsSource::Erofs { .. } => "erofs",
                     _ => "ext4",
@@ -478,6 +496,7 @@ impl Vmm for Firecracker {
                     crate::config::RootfsSource::Erofs { .. } => "",
                     _ => "rootflags=noload",
                 },
+                fpu_guard,
                 res.vmid
             );
             if !matches!(cfg.net, crate::config::NetConfig::None) {
@@ -951,6 +970,17 @@ mod tests {
             Some(Some("T2".to_string()))
         );
         assert_eq!(cache_decision(T2Probe::Unsupported), Some(None));
+    }
+
+    /// `noxsave` is the extended-FPU guard *fallback* — emitted only when no CPU
+    /// template was applied. With a template it must be absent (it would needlessly
+    /// disable the guest AVX2 the template leaves usable). The inverse — the former
+    /// unconditional `noxsave` (audit E6, over-applied even with T2) — makes the
+    /// `true` case go red.
+    #[test]
+    fn noxsave_only_applied_without_cpu_template() {
+        assert_eq!(noxsave_fallback(false), "noxsave ");
+        assert_eq!(noxsave_fallback(true), "");
     }
 
     /// Spawns a long-lived stand-in process in its own process group so an

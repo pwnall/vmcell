@@ -1853,3 +1853,217 @@ Consequences:
   backend-only lib — enabling any host backend now pulls the whole host stack (net + proxy + metrics +
   pipeline, incl. heavier deps like `reqwest`/`oci-client`/`pgp`). The shipped `default` build is
   unchanged (it already enabled everything), so no shipped binary gains or loses a dependency.
+
+## Experimental-conclusions audit (docs/41, 2026-07-01)
+
+Re-running the implementation experiments whose conclusions were recorded while the code was buggy
+(design Appendix A.3/B, this notes file). Full write-up and method in `docs/41-experimental-conclusions-audit.md`.
+Bugs/corrections uncovered are logged here.
+
+### E1 — microvm-rejection reason is misattributed (recorded reason is WRONG)
+
+The recorded justification for rejecting the QEMU `microvm` machine type — impl-notes L20 and design §140:
+*"microvm's `virtio-net-device` (MMIO) falls back to legacy 10-byte virtio-net header, breaking networking"* —
+is **factually unsupported**. Re-tested on QEMU 10.2.1 with the real `vmlinux` (6.6.143 and 6.12.94) +
+`rootfs.erofs`:
+
+- Header size is a **feature-negotiation** property (`VIRTIO_F_VERSION_1`, bit 32), **not** a
+  transport (MMIO-vs-PCI) property. On the working `q35` baseline, `virtio-net-pci` negotiates
+  VERSION_1 + MRG_RXBUF (bit 15) → the modern **12-byte** header, and a real TCP round-trip succeeds.
+- microvm **never reaches virtio-net probe**, so the claimed 10-byte-header mechanism is unobservable
+  and cannot be the operative reason. `microvm,pcie=on` with the *exact same* `virtio-net-pci` device
+  q35 uses fails too — at the same point — refuting "microvm fails because of the virtio-net device."
+- **Real reason microvm is unusable here:** QEMU 10.2.1's microvm cannot boot these PVH kernels to
+  userspace. It panics in `start_kernel → kmem_cache_init_late` with a spurious `divide error` — the
+  faulting RIP is that function's `endbr64` (offset 0, cannot raise `#DE`), right after `sti`: a
+  **pending interrupt mis-vectored as vector 0** when IRQs are enabled, i.e. a microvm
+  interrupt-controller/early-environment problem, not virtio. Reproduced across ~24 permutations
+  (KVM *and* pure-TCG — rules out host-CPU/KVM/nesting — both kernels, all `-cpu`, all timer/clock
+  and IRQ-controller options). q35 boots the identical kernel/rootfs/cmdline every time.
+
+**Outcome:** the *decision* (keep `q35`, `qemu.rs:303`) stands; the *recorded reason* must be corrected
+to the early-boot-`#DE` finding. `-M microvm,pcie=on` is **not** a viable drop-in (tested; fails).
+Open avenue (untested, low value since q35 already works fully): a microvm-specific guest **kernel
+config** might clear the early-IRQ `#DE` — a kernel-rebuild question, not a device/machine swap.
+Incidental: microvm doesn't enumerate ISA COM1 via ACPI/PNP, so it needs an explicit
+`console=uart8250,io,0x3f8`/`earlyprintk` (else silent console — don't mistake it for a boot hang).
+
+### E2 — vendored `vhost`/`vhost-user-backend` fork is CONFIRMED needed (was "lowest-confidence")
+
+Re-tested the `[patch.crates-io]` fork (two commented `check_feature(PROTOCOL_FEATURES)?` guards:
+`vendor/vhost-user-backend/src/handler.rs:534`, `vendor/vhost/src/vhost_user/backend_req_handler.rs:554`).
+A/B (guards restored = pristine upstream 0.22.0/0.16.0 vs commented) on the QEMU + `NetConfig::Unprivileged`
+smoltcp-NAT path:
+
+- **Unpatched → QEMU fails:** `VhostUserError::InactiveFeature(PROTOCOL_FEATURES)` → `VhostUserDaemon`
+  drops the socket → QEMU `Failed to read msg header. Read 0 instead of 12` → guest never boots →
+  agent-connect timeout. Patched → QEMU passes. **CH passes unpatched** (needs no fork — sanity anchor).
+- **Message trace confirms the recorded root cause:** QEMU 10.2.1 emits `SET_VRING_ENABLE(0,1)` **before**
+  `SET_FEATURES=0x170000000`; CH emits `SET_FEATURES` first. At the enable point QEMU `acked_features=0x0`.
+  Our backend advertises `PROTOCOL_FEATURES` (smoltcp.rs:58-64) and QEMU's later `SET_FEATURES` carries the
+  bit — so the `0` is QEMU's ordering, **not** a fumbled ack. Classification **(a) genuine QEMU quirk**, not
+  a masked backend bug.
+- **Upstream unchanged:** 0.22.0/0.16.0 are newest released; both CHANGELOG "Unreleased" empty; guard still
+  enforced upstream. Patch is already minimal (both lines independently break QEMU).
+
+**Outcome:** design §10.4 L747 / impl-notes L19 wording upgraded from "lowest-confidence must-patch" to
+**confirmed by trace**. Keep the fork (or drop it *only if* QEMU-unprivileged is deprioritized — CH is
+unaffected). Consider a downstream `.patch`/narrow git-fork over fully-vendored crates for lower maintenance.
+
+**Correction to a suspected gap:** QEMU + smoltcp-unprivileged **is** CI-guarded — `just test-privileged`
+(`--features firecracker,qemu`) selects `host_endpoint::qemu` and `egress_proxy::qemu` (both
+`NetConfig::Unprivileged`), verified via `cargo nextest list`. Removing the patch reddens both. Residual
+gaps: `just test-unprivileged` doesn't compile `--features qemu`; VM tests are absent from KVM-less `just ci`.
+
+### BUG — `tests/host_endpoint.rs` leaks its `python3 -m http.server` child on early panic
+
+`host_endpoint.rs` spawns `python3 -m http.server` (~line 54) but reaps it only at lines 120-121, *after*
+the agent/curl steps, so an earlier panic (e.g. the agent-connect `Timeout` at line 70) leaks the host
+process (observed twice during the E2 unpatched runs). `egress_proxy.rs` already guards its python with a
+`Cleanup(Child)` Drop guard (lines 59-66) that survives panics; `host_endpoint.rs` should adopt the same
+pattern (AGENTS.md "ownership owns cleanup — on panic"). Not fixed in this audit pass — logged for follow-up.
+
+### E3 — QEMU CAN snapshot in the privileged config (in-kernel vhost-vsock migration validated)
+
+The design's "QEMU privileged kernel-`vhost-vsock` snapshot — Likely, unvalidated" (§140/L167, A.3 #5) is now
+**validated in its load-bearing halves**; the *unprivileged* ineligibility (external `vhost-device-vsock` =
+stateless vhost-user) is correct and untouched.
+
+- **No migration blocker (QEMU 10.2 source, `hw/virtio/vhost-vsock.c` + `vhost-vsock-common.c`):** the in-kernel
+  `vhost-vsock-pci` registers `vmstate_virtio_vhost_vsock` (`pre_save`/`post_load`) and sets **no**
+  `migrate_add_blocker` — `migrate` is permitted. `guest-cid` is a device property (not migrated) → must match on
+  the destination `-device` line. `post_load` resets vsock connections on restore, which is exactly the listener-goes-
+  deaf behavior the agent's re-bind loop (`vmcell-guest-agent/src/main.rs:402-440`) already handles — no guest change.
+  (The vhost-*user*-vsock external daemon *can* block migration — that path stays ineligible.)
+- **Mechanism verified empirically (committed pin):** q35/KVM + `vmlinux` 6.12.94 + `rootfs.erofs` over read-only
+  `virtio-blk`. QMP `stop`+`migrate exec:cat>state.bin` → `query-migrate status:"completed"` (60 MB); fresh QEMU +
+  `-incoming` + `cont` resumes **live** (dest serial continues from migrated uptime, not a reboot). Read-only erofs
+  needs no `x-ignore-shared`.
+- **Gap (not a QEMU limit):** the live agent-reconnect step is blocked in this sandbox — `/dev/vhost-vsock` is not
+  openable (the `kvm` group is empty; `/dev/kvm` works only via a per-user ACL that doesn't extend to
+  `/dev/vhost-vsock`; no passwordless sudo; runner not setuid). Run it on a real `kvm`-member host or via the
+  `CAP_DAC_OVERRIDE` capability runner.
+
+**Actionable:** wiring `qemu.rs` `snapshot()`/`restore()` (currently `Unsupported`) for the privileged config
+(`vhost-vsock-pci,guest-cid=N` + QMP `migrate`/`-incoming`, returning paused, enforcing the §3.3 law) would give
+QEMU a real snapshot tier — a capability gain, not just a doc fix. Also corrects the environment assumption that
+this host's user can open `/dev/vhost-vsock` — it cannot.
+
+### E5 — the passt-rejection reason is misattributed (AppArmor af_unix, NOT passt's seccomp)
+
+Re-tested the Exp-5 claim (`passt` rejected because *"its strict seccomp sandbox blocks `accept4`, making it
+incompatible with CH's vhost-user socket connection phase"*). On this host (passt `0.0~git20260120` newest, CH
+`v52.0.0`, Ubuntu 26.04 / kernel 7.0.0) the symptom reproduces (passt-as-listener + CH-as-client:
+`accept4 = -1 EACCES` → `epoll_ctl(…,-1) = -1 EBADF` → CH hangs at net init) but the **mechanism is wrong**:
+
+- passt's seccomp default action is `SECCOMP_RET_KILL_PROCESS` and does not filter accept4 — a seccomp block would
+  **SIGSYS-kill** passt. passt **survived** and got **`EACCES`** (an LSM errno), so its own seccomp *allows* accept4.
+- Real cause = **host AppArmor**: SELinux off, only AppArmor confines passt; Ubuntu 26.04 has AppArmor **af_unix
+  fine-grained mediation ON**, but `abstractions/passt` still uses the coarse `network unix stream,` rule, which
+  doesn't grant `unix (accept)` → `accept()` denied. **Not CH-specific** — a plain `socat` client reproduces the
+  identical `EACCES` (breaks passt-as-listener for QEMU too).
+- **Avoidable:** CH `--net …,vhost_mode=server` + passt client via `-F <fd>` boots the guest with **zero accept4
+  calls** and a completed vhost-user handshake; or fix the AppArmor profile.
+
+**Outcome:** keep smoltcp (in-process, no external dep, no LSM/seccomp entanglement — better regardless). But
+correct the recorded reason: passt is *not* CH-incompatible via seccomp; the accept4 denial is the host's stale
+AppArmor passt profile vs af_unix mediation, and is avoidable. (Caveat: attribution to AppArmor is by elimination —
+passt survives accept4 ⇒ not seccomp; direction-flip works ⇒ wiring — a per-accept `type=1400` line wasn't captured.)
+
+### E6 — FC `noxsave` is over-applied; largely unnecessary on FC v1.16.0 (AVX-512 case untestable here)
+
+Re-tested the FC extended-FPU restore guard (T2 template + `noxsave`; design §138 / A.3 #3). Findings:
+
+- **`noxsave` is applied unconditionally** (`firecracker.rs:472`) — even when the T2 template is active. Design intent is
+  fallback-only (noxsave for hosts where T2/C3 don't fit; T2 alone leaves AVX2 usable). This over-application throws away
+  AVX2. **Note:** L14 above records a *deliberate* belt-and-suspenders always-on deviation, so the code matches L14, not
+  the design — but the empirical results below undercut the "template incomplete" justification for reachable state.
+- **The `restore_fpregs_from_fpstate` panic does NOT reproduce on FC v1.16.0 here.** A guest that provably dirties
+  **AVX2/YMM** state (XCR0=0x207), snapshotted and restored into a fresh FC with **no template and no `noxsave`**,
+  **resumed cleanly** (YMM accumulator kept evolving post-restore; no xsave/fpregs fault). So `noxsave` is **not needed for
+  YMM/AVX2** on FC v1.16.0.
+- **T2 is rejected on this CPU.** `InstanceStart` → HTTP 400 *"current CPU model is not permitted to apply the CPU
+  template"* on Intel Lunar Lake; FC v1.16 **deprecates** the static `cpu_template` field. So the design's T2 leg is
+  **inoperative** on modern Intel client hybrids — such a host is exactly the "T2 doesn't fit → noxsave is the only guard"
+  case, yet raw restore is clean.
+- **Confound (honest):** no AVX-512 on this host (Lunar Lake fuses ZMM off) — the AVX-512-specific ZMM trigger is
+  unreachable, so this is decisive for YMM only, silent on ZMM. Can't fully separate "FC v1.16 fixed it" from "CPU
+  doesn't expose the state" for AVX-512.
+
+**Actionable:** gate `noxsave` behind `template.is_none()` (recovers AVX2 where T2 fits); *consider* dropping it entirely
+but validate on an AVX-512 host + older FC first. Revisit the L14 belt-and-suspenders deviation. Design-accuracy fix, not
+an active-bug fix (FC `snapshot_restore` is still `false`, so the path isn't live in vmcell).
+
+### Code fixes applied (audit follow-up, 2026-07-01)
+
+Two of the audit's concrete findings are fixed in code (the doc-text corrections to design v15 remain for a doc pass):
+
+1. **FC `noxsave` gated behind the CPU template (E6 over-application).** Extracted a pure
+   `noxsave_fallback(has_cpu_template) -> &'static str` (`crates/vmcell/src/vmm/firecracker.rs`, next to
+   `cache_decision`) returning `"noxsave "` when no template was applied and `""` when one was; `create()` captures
+   `fpu_guard = noxsave_fallback(template.is_some())` before `template` is moved into the machine-config request and
+   interpolates it into the boot-args (the hardcoded literal `noxsave` is gone). Unit test
+   `noxsave_only_applied_without_cpu_template` asserts both branches — the former unconditional `noxsave` reddens the
+   `true` case. **This supersedes the deliberate L14 "belt-and-suspenders always-on `noxsave`" deviation** and realigns
+   the code with design §138 (noxsave = fallback for hosts where the template doesn't fit; T2 leaves AVX2 usable). Rationale
+   for reverting the L14 deviation: E6 showed (a) the `restore_fpregs_from_fpstate` panic does not reproduce for reachable
+   AVX2/YMM state on FC v1.16.0 even unguarded, and (b) applying `noxsave` *with* a template needlessly disabled the guest
+   AVX2 the template preserves. Behavior on hosts where T2 doesn't fit (e.g. this Lunar Lake box, where FC rejects T2) is
+   unchanged — `template` is `None`, so `noxsave` is still applied as the intended fallback. The residual AVX-512 case is
+   untestable here (no ZMM); dropping `noxsave` *entirely* was deliberately NOT done — it needs an AVX-512 host + older FC.
+2. **`tests/host_endpoint.rs` http.server leak on panic (E2).** Wrapped the `python3 -m http.server` child in a
+   `Cleanup(std::process::Child)` `Drop` guard immediately after spawn (mirroring `egress_proxy.rs`) and removed the bare
+   late `child.kill()/wait()`, so the child is reaped on the panic path (e.g. the agent-connect `.expect`) as well as the
+   success path — AGENTS.md "ownership owns cleanup — on panic."
+
+Validation: `cargo fmt --check` clean; `cargo clippy -p vmcell --all-targets --features firecracker,qemu` under
+`RUSTFLAGS=-D warnings` clean; the new FC unit test passes; `host_endpoint.rs` compiles under the matrix features. (The
+FC boot-args change is exercised live only on a KVM host via the privileged suite; the pure helper carries the unit-level
+regression guard.)
+
+**Host-facing DoD (validated on this KVM host):** `just test-privileged` under the delegated scope =
+**232 passed / 0 failed / 17 skipped** (incl. `host_endpoint::{cloud_hypervisor,firecracker,qemu}` — the Drop-guard
+fix — and the FC-booting `metrics_limits/snapshot_restore/nested_virt::firecracker` — the gated `noxsave` cmdline);
+`just test-unprivileged` = 17 passed / 0 failed; `just test-unit` (`--all-features`) = 242 passed. On this Lunar Lake
+host FC rejects the T2 template, so `template=None` → `noxsave` is still applied (boot-args unchanged here); the gating
+change takes effect on T2-capable hosts and is guarded by the `noxsave_only_applied_without_cpu_template` unit test.
+
+### Bucket D executed (audit follow-up, via the privileged runner where needed)
+
+- **E4 (erofs byte-determinism): confirmed.** Same fixed tar → `tar2erofs::tar_to_erofs` twice → byte-identical
+  (28,672 B, same sha256). Fixed mtimes + `BTreeMap`-ordered emission.
+- **E9 (musl vs glibc agent size): confirmed.** Stripped: glibc-dynamic 1,444,344 B vs static-musl 1,542,816 B →
+  **musl +6.8% larger** (matches §13.3 ~6.2%). Default cargo build is not crt-static. Nuance: the *shipped* agent
+  (`GuestAgentStage`, L1586) is static-glibc/crt-static — a third path not in the §13.3 two-pole table.
+- **E12 (fuse RO enforcement): confirmed.** External virtiofsd enforces RO (`shares_ro_rw::cloud_hypervisor` passes);
+  in-process `experiment-fuse` fails loud (`fs::ro_share_tests::ro_share_is_unsupported_not_subprocess` passes →
+  `Error::Unsupported`, CFG-3).
+- **E7 (FC no-snapshot-under-PCI): OVERTURNED (live, FC v1.16.0).** `--enable-pci` + Full snapshot **create and restore
+  both succeed** (204, resumes `Running`; PCI restore reconstructs the PCI segment then `VcpuEvent::Resume`; no
+  `MicroVMStoppedWithError`). PCI state file is larger (22,315 vs 13,947 B) — it carries PCI device state, i.e. PCI was
+  really active. The block was real in FC ~1.10–1.12 (experimental PCI) but v1.16.0 ships stable PCI+snapshot.
+  **Design A.3 #1's "restore aborts under PCI" justification is version-stale and should be dropped** (MMIO may remain a
+  fine default for maturity/shared-vmlinux reasons, not for the stated one). Note: my earlier *reasoning-only*
+  confirmation of E7 was wrong — executing it was necessary. Caveat: virtio-blk-on-PCI only; virtio-net-on-PCI untested.
+- **E9 (OCI-slim vs mmdebstrap rootfs size): confirmed.** Measured live, trixie vs trixie, `mkfs.erofs -T0`
+  uncompressed: OCI 79.1 MB vs mmdebstrap-minbase 120.0 MB → **OCI −34.06%** (matches ~34%). Mechanism verified: OCI's
+  `dpkg path-exclude` strips locale (32.06 MB) + doc/man/info (~41 MB total), fully accounting for the delta. Nuances:
+  (a) **the pipeline's `RootfsBuildSource::Mmdebstrap` builds `--variant=apt --include=curl,ca-certificates` (129.1 MB),
+  not `--variant=minbase` (120 MB)** — so the pipeline's real OCI advantage is **38.7%**, and the "minbase ≈120 MB"
+  label describes a variant the code doesn't build; recommend the notes state the variant+number the code produces.
+  (b) both paths ship *uncompressed* erofs and `am-fs-erofs` is ~5% larger than `mkfs.erofs` — an lz4/zstd size
+  opportunity. (c) Cosmetic: the gitignored `target/vmcell-artifacts/*.cache_key` sidecars carry a stale absolute
+  `…/target/imp-artifacts/…` path in their `"artifacts"` *metadata* (pre-rename dir name); the content-addressed
+  `"key"`/`"hash"` do **not** embed it (cache hits post-rename), and `target/` is gitignored so it doesn't trip
+  `ban-legacy-terms.sh` — stale-metadata leak, not a correctness/gate bug.
+- **E11 (`kvm_guest.config` insufficiency): confirmed (config + runtime).** Out-of-tree `make defconfig kvm_guest.config`
+  on pristine 6.12.94 omits `CONFIG_VSOCKETS`, `CONFIG_VIRTIO_VSOCKETS(_COMMON)`, `CONFIG_VIRTIO_FS`, `CONFIG_EROFS_FS`
+  (all `=y` via the fragment). The built kvm_guest-only kernel boots under QEMU q35+KVM and panics at root-mount with the
+  real erofs rootfs (`VFS: … error -19` / `Unable to mount root fs`; no erofs in the bdev-fs list). Prose refinements:
+  (a) design §8.3's "first gap = `EAFNOSUPPORT` at vsock" is **order-dependent** — for the *alone* config the first
+  failure is the erofs root-mount panic (boot never reaches userspace/vsock); the vsock `EAFNOSUPPORT` needs an
+  intermediate config (erofs on, vsock off). (b) §8.3's `CONFIG_VSOCKETS_COMMON` isn't a real 6.12.94 symbol — the
+  correct name is `CONFIG_VIRTIO_VSOCKETS_COMMON`.
+
+**Bucket D summary:** E4 ✅ · E9(musl) ✅ · E9(OCI-vs-mmdebstrap) ✅ · E11 ✅ · E12 ✅ · **E7 ❌ OVERTURNED** (FC v1.16.0
+PCI+snapshot works — the one reasoning-only confirmation that executing disproved).
