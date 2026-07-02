@@ -118,8 +118,9 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // auto-resumes the VM, so its `/dev/urandom` state is exactly what the
         // snapshot froze. A restore that does NOT reseed will resume from this
         // identical frozen state and replay these same bytes; the orchestrator's
-        // restore-path reseed (`head -c 32 /dev/hwrng > /dev/urandom`) is what
-        // must perturb them. NOTE: the test never issues its own reseed — it only
+        // native post-restore reseed (a 32-byte /dev/hwrng → /dev/urandom copy in
+        // the agent's `handle_resync`, design 44 §5) is what must perturb them.
+        // NOTE: the test never issues its own reseed — it only
         // reads /dev/urandom here and after restore and asserts they differ.
         let ref_rng = vm
             .agent(None, &vmcell::orchestrator::RealClock)

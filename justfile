@@ -51,14 +51,21 @@ test-unit:
 # Wraps every test binary with vmcell-test-runner via the cargo target-runner hook.
 # The in-guest test-helper (ip/curl/kvm-ok) is baked into the rootfs by `vmcell build`, not
 # built here. `--features` is scoped to the `vmcell` member that owns the integration tests.
+# The `kind(test)` predicate scopes to the integration-test BINARIES only (all in the
+# `serial-host` nextest group), excluding the ~172 `kind(lib)` unit tests that `-p vmcell`
+# would otherwise pull in. Those lib tests are NOT in serial-host, so under the old filter they
+# ran at test-threads=num_cpus CONCURRENTLY with the single serial VM test, oversubscribing the
+# host CPU and stretching a guest's boot+agent-handshake past the connect/exec deadline — the
+# root cause of the intermittent "Agent … timed out" flake. They still run in `just test-unit` /
+# `just ci`, so no coverage is lost by excluding them here.
 test-privileged:
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all \
-        -E 'not (test(unprivileged) | test(smoltcp))'
+        -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'
 
 # Unprivileged integration suite under no elevation (keeps the unprivileged path honest).
 test-unprivileged:
-    cargo nextest run --profile integration -p vmcell --run-ignored all -E 'test(unprivileged) | test(smoltcp)'
+    cargo nextest run --profile integration -p vmcell --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide

@@ -314,14 +314,20 @@ enum — the **only** code shared between the host and the guest agent:
 
 ```rust
 #[non_exhaustive]
-pub enum Message { Ready, Exec(ExecRequest), Stdout(Vec<u8>), Stderr(Vec<u8>), Exit(i32), PutFile { .. } }
+pub enum Message {
+    Ready, Exec(ExecRequest), Stdout(Vec<u8>), Stderr(Vec<u8>), Exit(i32), PutFile { .. },
+    Resync { unix_secs: u64, unix_nanos: u32, mac: Option<[u8; 6]> },   // host→guest, §9.2
+    ResyncAck { clock_error: Option<String>, reseed_applied: bool, mac_applied: bool }, // guest→host
+}
 ```
 
 There is **no `Hello`, no `Ping`** — a dead variant and a no-op variant are both the "dead protocol
 advertised as live" smell the review rubric bans; `#[non_exhaustive]` makes re-adding either non-breaking
-if a real use appears. The guest sends `Ready` as the **first frame** after `accept`, and the host blocks
-for it — this is the handshake the restore path re-runs (§4.2). Frames are bounded (`MAX_FRAME_BYTES` =
-16 MiB); the default per-exec timeout is 10 s (`DEFAULT_EXEC_TIMEOUT`).
+if a real use appears. Every variant is live: the guest sends `Ready` as the **first frame** after
+`accept`, and the host blocks for it — this is the handshake the restore path re-runs (§4.2); the
+`Resync`/`ResyncAck` pair carries the one-shot post-restore state refresh natively (§9.2), replacing what
+were three subprocess `exec`s. Frames are bounded (`MAX_FRAME_BYTES` = 16 MiB); the default per-exec
+timeout is 10 s (`DEFAULT_EXEC_TIMEOUT`).
 
 ### 4.2 The host: `AgentClient`
 
@@ -766,9 +772,18 @@ panic=1 init=/usr/sbin/vmcell-guest-agent
 KERN_EMERG lines) and for boot diagnostics (`NOTICE`/`WARN`/`ERR`, incl. the "Linux version" banner the
 `boot.rs` integration test asserts on) while dropping the voluminous `KERN_INFO` (6) device-probe
 output that otherwise dominates cold boot (each line is a synchronous write to the byte-at-a-time 8250
-UART); it was the single largest cold-boot lever (§15). `random.trust_cpu=on` avoids a possible CRNG-
-init stall on first `getrandom()`. The `ip=` parameter (enabled by `CONFIG_IP_PNP=y`) sets the guest
-address at boot — consumed by the
+UART); it was the single largest cold-boot lever (§15). `loglevel` is set from the per-VM
+`VmConfig::kernel_verbosity` knob (default `Balanced`=6; `Verbose`/`Debug` for diagnostics). The leading
+`console=` token is likewise a per-VM knob, `VmConfig::console_mode` (default `Uart`→`console=ttyS0`;
+opt-in `VirtioConsole`→`console=hvc0`, batched over a virtqueue so verbose logging avoids the UART
+VM-exit tax — but only after virtio-pci probe, so it forfeits early-boot + pre-virtio panic capture; not
+supported on Firecracker, which rejects it. The cmdline token and the backend's console device are both
+derived from `console_mode` so they cannot desync). The host
+also appends per-VM tuning tokens the guest agent parses (clamped, untrusted): `vmcell_share=…` (§5.2)
+and `vmcell_accept_poll_ms=`/`vmcell_rebind_idle_ms=` (the guest accept/re-bind cadence, from the
+`Timeouts` profile — so a profile tunes the guest with no rootfs rebuild). `random.trust_cpu=on` avoids
+a possible CRNG-init stall on first `getrandom()`. The `ip=` parameter (enabled by `CONFIG_IP_PNP=y`)
+sets the guest address at boot — consumed by the
 kernel's IP-PNP late-initcall, not an initramfs — so PID 1 needs no netlink in either mode (§12.3). Three
 precisions: `CONFIG_VHOST_VSOCK` is host-side (the base guest control plane needs only `VSOCKETS` +
 `VIRTIO_VSOCKETS`; `VHOST_VSOCK` earns its place only for nested virt); the erofs decompressor `CONFIG`
@@ -828,8 +843,10 @@ from one snapshot needs a copy-on-write of the snapshot dir first (§16).
 
 A restored snapshot resumes at the exact instruction it was taken, so restored clones share whatever state
 was frozen in. Four things must be refreshed on **every** restore, fired once on the first post-restore
-`agent()` call after the vsock reconnect succeeds. This is the concentrated "a restored VM is not a fresh
-VM" lesson (§12.4):
+`agent()` call after the vsock reconnect succeeds — as a **single native `Resync` round-trip** (§4.1),
+applied in-agent by syscalls/ioctls with **no subprocess spawn** (this replaced three `exec`s — `date`,
+`sh`+`head`, and the multi-MB `ip` binary — removing them from the restore hot path, §15). This is the
+concentrated "a restored VM is not a fresh VM" lesson (§12.4):
 
 - **Identity (CID) — uniqueness among *live* clones, not a forced numeric change.** The vsock CID must be
   unique across *concurrently running* restored clones. It is **not** required to differ from a torn-down
@@ -838,19 +855,23 @@ VM" lesson (§12.4):
   `assert_ne!(original_cid, restored_cid)` (which is over-specified and fails precisely *because* reuse is
   correct).
 - **Identity (MAC) — rotated at the device layer, not via netlink; the IP is left alone.** MAC rotation is
-  the one in-guest identity change the restore path performs, via a single `ip link set eth0 address <mac>`
-  (the `SIOCSIFHWADDR` ioctl in guest-tools) — a device-layer write, consistent with zero-netlink-in-PID-1
-  (§12.3). The IP is deliberately *not* rotated: `ip addr flush` would drop the IP-PNP default route and
-  re-introduce in-guest netlink, so the guest keeps the address the kernel `ip=` set.
-- **Entropy** — reseed via virtio-rng. An unreseeded `getrandom()` can stall first use by seconds, and
-  because every clone resumes at the same frozen instant, RNG reuse is otherwise silent and correlated.
-  This is best-effort (from `/dev/hwrng`); only a clock-resync failure propagates.
+  the one in-guest identity change the restore path performs, via a `SIOCSIFHWADDR` ioctl applied
+  **natively in the agent** (the `netif` module reuses the guest-tools logic without spawning the `ip`
+  binary) — a device-layer write, consistent with zero-netlink-in-PID-1 (§12.3). The IP is deliberately
+  *not* rotated: `ip addr flush` would drop the IP-PNP default route and re-introduce in-guest netlink, so
+  the guest keeps the address the kernel `ip=` set. Best-effort (the ack reports whether it applied).
+- **Entropy** — reseed the CSPRNG by copying 32 bytes `/dev/hwrng`→`/dev/urandom` **natively in-agent**
+  (no `sh`+`head`). An unreseeded `getrandom()` can stall first use by seconds, and because every clone
+  resumes at the same frozen instant, RNG reuse is otherwise silent and correlated. Best-effort; the ack's
+  `reseed_applied` records whether it took.
 - **Clock** — a snapshot resumed much later resumes with a stale wall clock. The guest cannot fix this from
   inside (`hwclock --hctosys` reads the *restored* RTC — the old snapshot time — and sets the clock
   *backwards*; a restored snapshot may have no network for NTP). The resync is therefore **host-driven and
-  mandatory**: immediately after reconnect the host reads `SystemTime::now()` and pushes it to the agent
-  (`date -s`). For ephemeral tests a stale clock is cosmetic; for anything asserting on timestamps it is
-  not — so a resync failure surfaces.
+  mandatory**: the host reads `SystemTime::now()` and pushes it in the `Resync` message; the agent applies
+  it via `clock_settime` (no `date` spawn). A guest-side clock-set failure comes back as
+  `ResyncAck.clock_error` and propagates as a typed `Err` **before** the `restored` flag is cleared, so the
+  next `agent()` retries (M-RESTORE-1). For ephemeral tests a stale clock is cosmetic; for anything
+  asserting on timestamps it is not — so a resync failure surfaces.
 
 **The post-restore vsock reconnect itself is mandatory and was the hardest restore bug to close.** It is
 not a no-op, and on CH it is not merely "reuse the surviving listener": CH `--restore` rebuilds devices
@@ -1499,23 +1520,31 @@ host-IP parse ≈29 ns; in-memory empty-tar→erofs ≈1.23 µs. The control-pla
 math are tens-to-hundreds of nanoseconds — far below anything gating a multi-second VM lifecycle.
 
 **Macro — cold boot to agent-`Ready`** (N=20, warm-cache, 256 MiB, **post the 2026-07-01 latency
-optimization pass** — see below): CH **≈330/346 ms**; Firecracker ≈776/787 ms; QEMU ≈1400 ms
-(pre-pass; code path unchanged). Pre-pass these were CH ≈635, FC ≈1022.
+work** — see below): CH **≈327/348 ms** (≈309 under the `low_latency` profile); Firecracker ≈776/787 ms;
+QEMU **≈996 ms** (was ≈1400 before it gained `loglevel` via the shared cmdline builder). Pre-work these
+were CH ≈635, FC ≈1022.
 
-**Macro — warm restore to agent response** (N=20): CH **≈84/94 ms** (default ≈ lazy; eager ≈258, pre-
-pass); Firecracker N/A (`snapshot_restore` gated off, §3.2); QEMU N/A (snapshot-ineligible in
+**Macro — warm restore to agent response** (N=20): CH **≈60/74 ms** (default ≈ lazy; native in-agent
+resync, §9.2); Firecracker N/A (`snapshot_restore` gated off, §3.2); QEMU N/A (snapshot-ineligible in
 unprivileged+vsock).
 
 **Latency optimization pass (2026-07-01).** A targeted pass recovered the latency the correct-but-
-slower code had accreted vs earlier buggy-fast versions — **CH cold 642→330 ms (−49%), CH restore
-166→84 ms (−49%)** — with **no invariant relaxed** (verified: `just ci` green, unit 242/0, privileged
-suite 232/0). The levers, largest first: the guest kernel cmdline dropped the verbose `KERN_INFO`
-serial flood (`loglevel=6`, keeping a debuggable/panic-capturable log); the guest vsock accept poll
-`ACCEPT_POLL` 100→20 ms (the dominant restore-reconnect cost — the host blocks for `Ready` between its
-CONNECT/OK handshake and the guest's next `accept()`); the graceful `shutdown()` teardown now polls
-`VmInstance::has_exited` up to a 250 ms (was 500) grace instead of always sleeping it; and tighter host
-connect/api-socket poll cadences. Full method + per-lever deltas: `docs/benchmark-results.md`,
-`docs/perf-experiments-log.md`; the deviations: `docs/implementation-notes.md`.
+slower code had accreted vs earlier buggy-fast versions — **CH cold 642→330 ms, CH restore 166→84 ms** —
+with **no invariant relaxed** (`just ci` green, unit green, privileged suite green). The levers, largest
+first: the guest kernel cmdline dropped the verbose `KERN_INFO` serial flood (`loglevel=6`, keeping a
+debuggable/panic-capturable log); the guest vsock accept poll `ACCEPT_POLL` 100→20 ms (the dominant
+restore-reconnect cost — the host blocks for `Ready` between its CONNECT/OK handshake and the guest's
+next `accept()`); the graceful `shutdown()` teardown now polls `VmInstance::has_exited` up to a 250 ms
+(was 500) grace instead of always sleeping it; and tighter host connect/api-socket poll cadences.
+
+**Follow-up — tunable knobs + native resync (design 44).** `KernelVerbosity` + a unified `Timeouts`
+struct (`low_latency`/`throughput` presets) make the above per-VM tunable; a **shared cmdline builder**
+fixed a divergence where QEMU omitted `loglevel=` (QEMU cold **≈1400→996 ms**); and the post-restore
+resync is now a **single native in-agent `Resync` round-trip** (clock/RNG/MAC via syscalls+ioctl, no
+subprocess) — **CH restore 84→60 ms** (the restore `connect` phase 36→16 ms). The measured VM-exit cost
+of serial logging is **+231 ms** cold (`verbose` vs `balanced`), answering "does logging cause VM exits":
+yes — `ttyS0` is a PIO UART, one exit per byte. Full method + per-lever deltas: `docs/benchmark-results.md`,
+`docs/perf-experiments-log.md`; deviations: `docs/implementation-notes.md`.
 
 Reading these together:
 
@@ -1543,7 +1572,8 @@ axis is toolchain-availability + rootfs-independence, not size.
 
 **Per-test critical-path budget (CH, post-pass, graceful `shutdown()` teardown):** cold `connect`
 (guest-boot + agent wait) ≈284 ms, create/spawn ≈42 ms, exec ≈4 ms; restore `connect` collapses to
-≈36 ms (reconnect + RNG/clock/MAC resync), restore+resume ≈58 ms, exec ≈1 ms. **Teardown note:** the
+≈16 ms (reconnect + the single native `Resync` round-trip; was ≈36 ms with the 3 subprocess execs),
+restore+resume ≈53 ms, exec ≈1 ms. **Teardown note:** the
 budget measures the *graceful* `MicroVm::shutdown()` (`request_shutdown` → poll `has_exited` up to a
 250 ms grace → force-kill) at ≈283 ms — a ceiling, not a leak; the fast per-test path is `Drop`
 (force-kill the VMM process group + reap, **≈27 ms**, §12.10), which a RAII consumer pays instead. The

@@ -1594,6 +1594,7 @@ mod tests {
                 virtio_fs_shares: true,
                 unprivileged_vhost_user_net: true,
                 nested_virt: true,
+                virtio_console: true,
             }
         }
 

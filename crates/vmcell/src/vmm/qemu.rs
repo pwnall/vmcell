@@ -319,9 +319,32 @@ impl Qemu {
                 cfg.mem_mib
             ))
             .arg("-qmp")
-            .arg(format!("unix:{},server,nowait", qmp_socket.display()))
-            .arg("-serial")
-            .arg(format!("file:{}", serial_path.display()));
+            .arg(format!("unix:{},server,nowait", qmp_socket.display()));
+
+        // Console wiring, driven by the SAME `cfg.console_mode` as the cmdline
+        // `console=` token (`build_kernel_cmdline`) so the two move in lockstep — a
+        // desync sinks the guest console nowhere and `serial.log` goes silent.
+        // `reject_unsupported_console` already gated an unsupported mode in create().
+        match cfg.console_mode {
+            // Uart: the 8250 `ttyS0` bytes go straight to serial.log.
+            crate::config::ConsoleMode::Uart => {
+                cmd.arg("-serial")
+                    .arg(format!("file:{}", serial_path.display()));
+            }
+            // VirtioConsole: no `-serial`; `hvc0` is a virtconsole on a virtio-serial
+            // bus (q35 already provides PCI) whose chardev writes serial.log.
+            crate::config::ConsoleMode::VirtioConsole => {
+                cmd.arg("-device")
+                    .arg("virtio-serial-pci,id=virtio-serial0")
+                    .arg("-chardev")
+                    .arg(format!(
+                        "file,id=charconsole0,path={}",
+                        serial_path.display()
+                    ))
+                    .arg("-device")
+                    .arg("virtconsole,chardev=charconsole0,id=console0");
+            }
+        }
 
         // QEMU's unprivileged control plane is always the external vhost-device-vsock
         // daemon (required and confirmed healthy above), so attach it unconditionally.
@@ -459,6 +482,10 @@ impl Vmm for Qemu {
         // `Unsupported` instead of silently emitting `root=/dev/vda rootfstype=ext4`
         // for a VM with no `/dev/vda`, which kernel-panics the guest on a missing root.
         crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
+        // The cmdline `console=` token and the serial/virtconsole device wiring in
+        // `spawn_qemu` are both driven by `cfg.console_mode`; gate an unsupported
+        // mode up front so they can never desync into a silent `serial.log`.
+        crate::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
 
         let (
             qmp_socket,
@@ -486,10 +513,11 @@ impl Vmm for Qemu {
     async fn restore(
         &self,
         _snapshot_dir: &Path,
-        _cfg: &VmConfig,
+        cfg: &VmConfig,
         _res: &PerVmResources,
         _cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        crate::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
         Err(Error::Unsupported {
             vmm: "qemu".to_string(),
             feature: "snapshot_restore".to_string(),
@@ -503,6 +531,7 @@ impl Vmm for Qemu {
             virtio_fs_shares: true,
             unprivileged_vhost_user_net: true,
             nested_virt: true,
+            virtio_console: true,
         }
     }
 

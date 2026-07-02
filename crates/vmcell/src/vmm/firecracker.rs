@@ -60,6 +60,10 @@ fn fc_capabilities() -> VmmCapabilities {
         virtio_fs_shares: false,
         unprivileged_vhost_user_net: false,
         nested_virt: false,
+        // Firecracker has no virtio-console device; a VirtioConsole config is
+        // rejected up front by `reject_unsupported_console` so it can never emit
+        // `console=hvc0` with no `hvc0` device.
+        virtio_console: false,
     }
 }
 
@@ -411,6 +415,14 @@ impl Vmm for Firecracker {
         // at the drive-configuration step. The `RootfsSource::VirtioFs` arm further
         // below stays as defense in depth.
         crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
+        // FC has no virtio-console device, so a VirtioConsole config must be rejected
+        // BEFORE build_kernel_cmdline — otherwise the boot args would carry
+        // `console=hvc0` with no `hvc0` device and `serial.log` would stay empty.
+        crate::vmm::reject_unsupported_console(
+            "firecracker",
+            &self.capabilities(),
+            cfg.console_mode,
+        )?;
 
         let caps = self.capabilities();
         if let crate::config::NetConfig::Unprivileged { .. } = cfg.net {
@@ -585,6 +597,14 @@ impl Vmm for Firecracker {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // FC has no virtio-console device; reject a VirtioConsole config before any
+        // spawn/build_kernel_cmdline so it can never emit `console=hvc0` with no
+        // `hvc0` device.
+        crate::vmm::reject_unsupported_console(
+            "firecracker",
+            &self.capabilities(),
+            cfg.console_mode,
+        )?;
         // VMM-5: self-check the capability descriptor rather than assuming the
         // backend supports restore.
         if !self.capabilities().snapshot_restore {

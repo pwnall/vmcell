@@ -105,6 +105,51 @@ What changed (each measured independently, all kept):
    OK-read timeout 500→150 ms, CH api-socket poll 20→5 ms. Marginal on CH (**−4 cold / −6 restore**),
    but confirms the connect slack is guest-side and improves worst-case robustness.
 
+## Tunable config knobs + native resync (2026-07-01 follow-up, design 44)
+
+Made the pass's constants per-VM tunable and removed the last restore subprocess cost. Details +
+bug-risk per change: `docs/perf-experiments-log.md` (Phases 1–2); deviations: `docs/implementation-notes.md`.
+
+| Result (CH, p50) | value | note |
+| --- | --- | --- |
+| **warm restore** (native in-agent resync) | 84 → **60 ms** | restore `connect` phase 36 → **16 ms** (3 subprocess execs incl. the multi-MB `ip` binary → one native `Resync` round-trip) |
+| **QEMU cold boot** (shared cmdline builder → QEMU gains `loglevel=6`) | ~1400 → **996 ms** | fixed the triplication divergence where QEMU omitted `loglevel=` |
+| **`throughput` profile teardown** (`shutdown_grace` 250→50 ms) | 283 → **96 ms** | graceful-`shutdown()` path; `Drop` stays ~27 ms |
+| **`low_latency` profile cold** (guest `accept_poll` 5 ms + tight host cadence) | 327 → **309 ms** | guest poll now tuned via `vmcell_accept_poll_ms=` cmdline token |
+| **logging VM-exit cost** (`verbose` vs `balanced` cold) | 330 → **561 ms** | +231 ms = the 8250-UART PIO-exit cost of `KERN_INFO` (answers "does logging cause VM exits": yes) |
+
+**Restore, full journey:** 166 (original) → 84 (opt pass) → **60 ms** (native resync) = **−64%**.
+`KernelVerbosity` (Quiet/Balanced/Verbose/Debug) + `Timeouts { …, low_latency(), throughput() }` are on
+`VmConfig`; guest-side polls travel on the cmdline (`vmcell_accept_poll_ms=`/`vmcell_rebind_idle_ms=`,
+clamped guest-side). `perf kvm stat` for a direct exit count is blocked by `perf_event_paranoid=4` on
+this host, so the `verbose`-vs-`balanced` A/B is the exit evidence.
+
+## Console transport knob — virtio-console vs UART (2026-07-02, design 44 §1b)
+
+`ConsoleMode` (default `Uart`=`ttyS0`; opt-in `VirtioConsole`=`hvc0`) on `VmConfig`. UART is a per-byte
+PIO VM-exit; virtio-console batches over a virtqueue. Measured (CH cold, freq-pinned):
+
+| console × verbosity | cold p50 | restore p50 |
+| --- | --- | --- |
+| uart × balanced | 316 | 75 |
+| **virtio-console × balanced** | **291** | 67 |
+| uart × **verbose** (`loglevel=7`) | **558** | 75 |
+| **virtio-console × verbose** | **299** | 70 |
+
+**Virtio-console makes boot ~independent of log verbosity** (291→299 ms balanced→verbose) where UART
+scales with it (316→558 ms): `virtio-console + verbose` = **299 vs 558 ms UART (−46%)** — full kernel
+logs without the UART VM-exit tax. Restore works (67-70 ms → validates the CH `console.file` restore
+rewrite end-to-end); QEMU virtio-console boots (validates that wiring). Default is `Uart` because
+virtio-console (`hvc0`) only exists after virtio-pci probe → loses early-boot + pre-virtio panic capture
+(a correctness floor); **Firecracker has no virtio-console** → `VirtioConsole` is rejected loud+early
+(`Error::Unsupported{feature:"virtio_console"}`). Use `Uart` for panic/kernel-log tests, `VirtioConsole`
+for guest-code tests wanting a cheaper boot / cheap verbose logs.
+
+Validation for this whole follow-up: `just ci` green (semver: `vmcell` 0.2→0.3 for the intentional
+`AgentClient::connect` arity change); unit 253/0; the full `just test-privileged` is green under
+`retries=2`+`kind(test)` (see the flake section below — the intermittent CH-vsock reset is environmental,
+absorbed by fresh-VM retries).
+
 ## Macro — Kernel-version sweep (6.6.143 vs 6.12.94)
 
 Direct, **interleaved** comparison (same harness/session, freq-pinned, N=20) built with the

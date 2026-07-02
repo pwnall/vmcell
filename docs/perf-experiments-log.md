@@ -71,8 +71,62 @@ delta is that exit cost. `KernelVerbosity` lets debugging/specific tests pay it 
 (`perf kvm stat` blocked by `perf_event_paranoid=4` here; the A/B is the evidence.)
 
 **Pre-existing flakiness (not this change):** `snapshot_restore::cloud_hypervisor` /
-`egress_proxy::qemu` agent-timeout under full-suite concurrency load (differ run-to-run; restore ran
-clean in isolation). Worth a separate test-robustness look; orthogonal to these features.
+`egress_proxy::qemu` agent-timeout under full-suite concurrency load (differ run-to-run; the test
+passes **3/3 in isolation**). Worth a separate test-robustness look; orthogonal to these features.
+
+### Phase 2 — native in-agent resync + guest cmdline-tunable timeouts (rootfs rebuild) — KEEPER
+
+`Resync`/`ResyncAck` protocol pair replaces the 3 post-restore subprocess execs with one native
+round-trip: clock via `rustix::time::clock_settime`, RNG via a pure-`std::io` 32-byte
+`/dev/hwrng`→`/dev/urandom` copy, MAC via a `SIOCSIFHWADDR` ioctl in a new lean-agent `netif` module
+(reusing the guest-tools logic — removes the multi-MB `ip` binary from the restore hot path). M-RESTORE-1
+fail-loud contract preserved (`clock_error` → `Err` before clearing `restored`). Guest `ACCEPT_POLL`/
+`REBIND_IDLE` now parsed from `vmcell_accept_poll_ms=`/`vmcell_rebind_idle_ms=` cmdline tokens (clamped
+to floors), so the `Timeouts` presets tune the guest without a rootfs rebuild.
+
+| Metric | pre-Phase-2 | Phase 2 | Δ |
+| --- | --- | --- | --- |
+| CH warm restore (default) | 84 | **60 ms** | −24 (−29%) |
+| CH phase RESTORE `connect` | 36 | **16 ms** | −20 (native resync removed the 3 spawns) |
+| CH cold (default) | 330 | 327 | ~0 (resync is restore-only) |
+| CH cold (**low-latency** profile) | 327 | **309 ms** | −18 (guest `accept_poll=5ms` honored) |
+
+Validation: unit 249/0 (incl. protocol round-trip, framing, `parse_ms` clamp, ifreq layout, clock
+mapping, the 4 M-RESTORE-1 fail-loud tests); lean-agent gate clean (no reqwest/tokio/hyper in the
+agent); `snapshot_restore::ch` passes in isolation and asserts the **native** MAC rotation to
+`mac_math(new_vmid)` + clock resync (via `FakeClock`) + reseed. `boot::{ch,fc,qemu}` pass.
+
+**Restore, full journey:** 166 (original) → 84 (perf pass) → **60 ms** (native resync) = **−64%**.
+
+## Flake investigation (2026-07-02): the full-suite "Agent … timed out"
+
+**Symptom.** Running the full privileged suite, ~1–3 VM tests intermittently fail with
+`Timeout("Agent connection/exec timed out")`; the wedged guest logs `handle_connection error: failed
+to fill whole buffer` (an EOF mid-frame — the CH hybrid-vsock control connection reset). Hits any VM
+test (snapshot_restore, egress_proxy, host_endpoint, concurrency, put_file, benchmark); passes 3/3 in
+isolation.
+
+**Root cause: pre-existing / environmental — NOT a code regression.** Bisected by checking out the
+pre-optimization baseline (`50811f9`, `ACCEPT_POLL=100ms`/`REBIND_IDLE=1s`), rebuilding its rootfs, and
+running the suite 6×: it **also flakes** (2 clean, then intermittent failures) — so the perf pass did
+not introduce it. It is an intermittent CH-vsock reset under repeated back-to-back boots; the rate
+rises with host load (slower runs flake more). No leaks (netns=0, no orphaned VMMs/scopes; the 25 loop
+devices are snapd, unrelated), ample memory. The historical "195/0" baseline was a single (lucky) run.
+
+**Ruled out (each tested, reverted):**
+- *Lib-test oversubscription* — the suite pulled the ~172 `kind(lib)` unit tests (not in `serial-host`)
+  to run at num_cpus alongside the serial VM test. Scoping to `kind(test)` (justfile) removed them, but
+  the flake persisted → not the (sole) cause. Kept anyway (correct: lib tests belong in `test-unit`;
+  less load; faster suite 236→59 tests).
+- *Guest listener re-bind resetting the active connection* — gated re-bind on "no active connection";
+  the flake persisted, and the gate risks the design's "stale connection may never EOF" case → reverted.
+
+**Fix: `nextest retries` + `kind(test)` scoping.** `retries = {backoff=exponential, count=3, delay=5s,
+max-delay=20s}` on the `integration` profile: a transient reset is sidestepped by a fresh-VM retry
+(with growing delays to outlast a load burst), while a genuine break still fails all 4 attempts, so
+coverage is preserved. This is the standard, honest mitigation for a confirmed-intermittent
+environmental integration flake (a real host run occasionally, not 40× back-to-back like this bisect
+session, sees a lower base rate). Deeper CH-vsock reliability work is possible future work.
 
 ## Experiments
 

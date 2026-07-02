@@ -1,6 +1,9 @@
 [package]
 name = "vmcell"
-version = "0.2.0"
+# 0.2 → 0.3: intentional breaking change — `AgentClient::connect`/`reconnect` gained a
+# `&Timeouts` param (per-VM tunable connect cadence, design 44 §3). A 0.x minor bump is
+# the SemVer slot for a breaking change on a pre-1.0 crate (cargo-semver-checks gate).
+version = "0.3.0"
 edition = "2024"
 # MSRV kept at 1.85 (deliberate — see docs/implementation-notes.md). NOTE: the committed
 # Cargo.lock pins `time` 0.3.47 (the RUSTSEC-2026-0009 fix), whose own MSRV is 1.88, so a

@@ -120,6 +120,7 @@ struct ChVmConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     net: Vec<ChNet>,
     serial: ChSerial,
+    console: ChConsole,
     vsock: ChVsock,
 }
 
@@ -174,7 +175,54 @@ struct ChNet {
 #[derive(Serialize)]
 struct ChSerial {
     mode: String,
-    file: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<PathBuf>,
+}
+
+/// CH `console` device config (mirrors [`ChSerial`]). CH attaches a default `Tty`
+/// console; the [`ConsoleMode`](crate::config::ConsoleMode) wiring turns it `Off`
+/// for the UART path and drives it as a `File`-backed virtio-console for the
+/// `VirtioConsole` path so exactly one console sinks to `serial.log`.
+#[derive(Serialize)]
+struct ChConsole {
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<PathBuf>,
+}
+
+/// Maps a [`ConsoleMode`](crate::config::ConsoleMode) to the CH `serial`/`console`
+/// device pair, kept in lockstep with the cmdline `console=` token
+/// (`build_kernel_cmdline`): `Uart` sinks the 8250 `ttyS0` to `serial.log`
+/// (serial=`File`, console=`Off` — CH's default `Tty` console is turned off so no
+/// stray second console appears); `VirtioConsole` sinks `hvc0` via CH's
+/// virtio-console to the same file (serial=`Off`, console=`File`). Emitting the
+/// wrong pair (or desyncing it from the cmdline token) silences `serial.log`.
+fn console_devices(
+    mode: crate::config::ConsoleMode,
+    serial_path: PathBuf,
+) -> (ChSerial, ChConsole) {
+    match mode {
+        crate::config::ConsoleMode::Uart => (
+            ChSerial {
+                mode: "File".into(),
+                file: Some(serial_path),
+            },
+            ChConsole {
+                mode: "Off".into(),
+                file: None,
+            },
+        ),
+        crate::config::ConsoleMode::VirtioConsole => (
+            ChSerial {
+                mode: "Off".into(),
+                file: None,
+            },
+            ChConsole {
+                mode: "File".into(),
+                file: Some(serial_path),
+            },
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -235,9 +283,23 @@ impl CloudHypervisor {
                 vsock["socket"] =
                     serde_json::Value::String(vsock_path.to_string_lossy().into_owned());
             }
+            // The serial sink lives under `serial.file` for a Uart VM and under
+            // `console.file` for a VirtioConsole VM (the other device serializes as
+            // `{"mode":"Off"}` with no `file`). Rewrite whichever one the snapshot
+            // recorded to this restore's fresh serial_path — the cmdline `console=`
+            // token and this device wiring stay in lockstep — otherwise the restored
+            // VM re-opens the original instance's deleted temp path and logs nowhere.
             if let Some(serial) = config.get_mut("serial") {
-                serial["file"] =
-                    serde_json::Value::String(serial_path.to_string_lossy().into_owned());
+                if serial.get("file").is_some() {
+                    serial["file"] =
+                        serde_json::Value::String(serial_path.to_string_lossy().into_owned());
+                }
+            }
+            if let Some(console) = config.get_mut("console") {
+                if console.get("file").is_some() {
+                    console["file"] =
+                        serde_json::Value::String(serial_path.to_string_lossy().into_owned());
+                }
             }
             tokio::fs::write(&config_path, serde_json::to_string(&config)?).await?;
 
@@ -293,6 +355,14 @@ impl Vmm for CloudHypervisor {
         // `Unsupported` instead of silently emitting `root=/dev/vda rootfstype=ext4`
         // for a VM with no `/dev/vda`, which kernel-panics the guest on a missing root.
         crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
+        // The cmdline `console=` token and the serial/console device pair below are
+        // both derived from `cfg.console_mode`; gate an unsupported mode up front so
+        // they can never desync into a silent `serial.log`.
+        crate::vmm::reject_unsupported_console(
+            "cloud-hypervisor",
+            &self.capabilities(),
+            cfg.console_mode,
+        )?;
 
         let (api_socket, vsock_path, serial_path, process, pgid) = self
             .spawn_ch(cfg, res, None, crate::config::RestoreMode::Default, cgroups)
@@ -331,6 +401,10 @@ impl Vmm for CloudHypervisor {
             instance._fs_daemons.push(daemon);
         }
 
+        // Serial/console device pair, kept in lockstep with the cmdline `console=`
+        // token derived from the same `cfg.console_mode`.
+        let (serial, console) = console_devices(cfg.console_mode, serial_path);
+
         let mut ch_cfg = ChVmConfig {
             cpus: ChCpus {
                 boot_vcpus: cfg.vcpus,
@@ -352,10 +426,8 @@ impl Vmm for CloudHypervisor {
             disks: vec![],
             fs: ch_fs,
             net: vec![],
-            serial: ChSerial {
-                mode: "File".into(),
-                file: serial_path,
-            },
+            serial,
+            console,
             vsock: ChVsock {
                 cid,
                 socket: vsock_path,
@@ -422,6 +494,13 @@ impl Vmm for CloudHypervisor {
                 feature: "snapshot_restore".to_string(),
             });
         }
+        // Gate an unsupported console mode before spawn/config-rewrite: the restore
+        // path re-derives the same serial/console wiring the snapshot baked in.
+        crate::vmm::reject_unsupported_console(
+            "cloud-hypervisor",
+            &self.capabilities(),
+            cfg.console_mode,
+        )?;
         // C1 / snapshot-eligibility law: a snapshot-eligible VM has no vhost-user
         // device. Reject a virtio-fs *rootfs* or data share, unprivileged net, or an
         // external vhost-user-net *before* we would otherwise start virtiofsd
@@ -471,6 +550,7 @@ impl Vmm for CloudHypervisor {
             virtio_fs_shares: true,
             unprivileged_vhost_user_net: true,
             nested_virt: true,
+            virtio_console: true,
         }
     }
 
@@ -617,7 +697,11 @@ mod tests {
             net: vec![],
             serial: ChSerial {
                 mode: "File".into(),
-                file: PathBuf::from("/serial.log"),
+                file: Some(PathBuf::from("/serial.log")),
+            },
+            console: ChConsole {
+                mode: "Off".into(),
+                file: None,
             },
             vsock: ChVsock {
                 cid: 3,
@@ -629,6 +713,43 @@ mod tests {
         assert!(!json.contains("\"disks\"")); // skip_serializing_if empty
         assert!(
             json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}")
+        );
+    }
+
+    // The serial/console device pair must move in lockstep with the cmdline
+    // `console=` token, both derived from `cfg.console_mode`. Uart => serial File +
+    // console Off; VirtioConsole => serial Off + console File. RED if the two are
+    // swapped or desynced (either the guest console sinks nowhere and `serial.log`
+    // goes silent, or two consoles fight over the file).
+    #[test]
+    fn console_devices_map_serial_and_console_in_lockstep() {
+        use crate::config::ConsoleMode;
+        let path = PathBuf::from("/tmp/serial.log");
+
+        // Uart: 8250 ttyS0 sinks to serial.log; CH's default Tty console is OFF.
+        let (serial, console) = console_devices(ConsoleMode::Uart, path.clone());
+        let sj = serde_json::to_string(&serial).unwrap();
+        let cj = serde_json::to_string(&console).unwrap();
+        assert!(
+            sj.contains("\"mode\":\"File\"") && sj.contains("/tmp/serial.log"),
+            "uart serial must be a File sink to serial.log: {sj}"
+        );
+        assert_eq!(
+            cj, "{\"mode\":\"Off\"}",
+            "uart console must be Off with no file (no stray second console): {cj}"
+        );
+
+        // VirtioConsole: serial OFF, hvc0 console sinks to serial.log.
+        let (serial, console) = console_devices(ConsoleMode::VirtioConsole, path.clone());
+        let sj = serde_json::to_string(&serial).unwrap();
+        let cj = serde_json::to_string(&console).unwrap();
+        assert_eq!(
+            sj, "{\"mode\":\"Off\"}",
+            "virtio-console serial must be Off with no file: {sj}"
+        );
+        assert!(
+            cj.contains("\"mode\":\"File\"") && cj.contains("/tmp/serial.log"),
+            "virtio-console console must be a File sink to serial.log: {cj}"
         );
     }
 

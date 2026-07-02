@@ -173,6 +173,10 @@ mod tests {
         );
 
         // The MAC bytes live at offset 2..8 (after the u16 family), verbatim.
-        assert_eq!(&ifr.ifru[2..8], &mac, "MAC must be at the hwaddr data offset");
+        assert_eq!(
+            &ifr.ifru[2..8],
+            &mac,
+            "MAC must be at the hwaddr data offset"
+        );
     }
 }

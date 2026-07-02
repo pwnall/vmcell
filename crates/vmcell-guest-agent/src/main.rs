@@ -917,7 +917,13 @@ mod tests {
         );
         // The FIRST parseable token wins (matches the strip_prefix+parse contract).
         assert_eq!(
-            parse_ms("vmcell_accept_poll_ms=x vmcell_accept_poll_ms=9", key, 20, 1, 10_000),
+            parse_ms(
+                "vmcell_accept_poll_ms=x vmcell_accept_poll_ms=9",
+                key,
+                20,
+                1,
+                10_000
+            ),
             Duration::from_millis(9)
         );
     }

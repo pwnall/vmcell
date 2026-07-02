@@ -45,6 +45,13 @@ pub struct VmConfig {
     /// balanced profile; [`Timeouts::low_latency`] / [`Timeouts::throughput`]
     /// are ready-made presets (§10).
     pub timeouts: Timeouts,
+    /// Guest console device driving `serial.log`. Default [`ConsoleMode::Uart`]
+    /// (8250 `ttyS0`) is alive from the first instruction, so it captures early
+    /// boot and a pre-virtio panic; [`ConsoleMode::VirtioConsole`] (`hvc0`) batches
+    /// output via a virtqueue (no per-byte VM-exit) but only exists after the
+    /// virtio-pci probe. The cmdline `console=` token and the per-backend device
+    /// wiring are both derived from this field so they can never desync.
+    pub console_mode: ConsoleMode,
 }
 
 /// Per-VM hot-path timing knobs, gathered so a workload can pick a profile in one
@@ -188,8 +195,9 @@ pub(crate) fn build_kernel_cmdline(
         _ => "rootflags=noload",
     };
     let mut s = format!(
-        "console=ttyS0 loglevel={} random.trust_cpu=on random.trust_bootloader=on \
+        "console={} loglevel={} random.trust_cpu=on random.trust_bootloader=on \
          root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
+        cfg.console_mode.console(),
         cfg.kernel_verbosity.loglevel(),
         rootfstype,
         rootflags,
@@ -269,6 +277,38 @@ impl KernelVerbosity {
             KernelVerbosity::Balanced => 6,
             KernelVerbosity::Verbose => 7,
             KernelVerbosity::Debug => 8,
+        }
+    }
+}
+
+/// Guest console device, mapped to the `console=` boot parameter and the matching
+/// per-backend console device wiring.
+///
+/// The cmdline `console=` token and the device wiring must move in lockstep, or the
+/// guest writes its console to a device that sinks nowhere and `serial.log` goes
+/// silent. Both are derived from this one knob so they cannot desync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConsoleMode {
+    /// Legacy 8250 `ttyS0`: alive from the first instruction (early-boot + panic
+    /// capture, §12.10) but per-byte PIO VM-exits. The safe default.
+    #[default]
+    Uart,
+    /// virtio-console `hvc0`: batched via virtqueue (~no exit tax) — but only
+    /// exists after virtio-pci probe, so early boot + a pre-virtio panic are LOST
+    /// (use `Uart` for panic-sensitive / kernel-log tests). Not supported on
+    /// Firecracker. For guest-code tests that don't inspect the kernel log.
+    VirtioConsole,
+}
+
+impl ConsoleMode {
+    /// The `console=` kernel-cmdline token for this mode (`ttyS0` for the 8250
+    /// UART, `hvc0` for virtio-console).
+    #[must_use]
+    pub fn console(self) -> &'static str {
+        match self {
+            ConsoleMode::Uart => "ttyS0",
+            ConsoleMode::VirtioConsole => "hvc0",
         }
     }
 }
@@ -510,6 +550,7 @@ impl VmConfig {
             ksm_mergeable: false,
             kernel_verbosity: KernelVerbosity::Balanced,
             timeouts: Timeouts::default(),
+            console_mode: ConsoleMode::Uart,
         }
     }
 }
@@ -532,6 +573,7 @@ pub struct VmConfigBuilder {
     ksm_mergeable: bool,
     kernel_verbosity: KernelVerbosity,
     timeouts: Timeouts,
+    console_mode: ConsoleMode,
 }
 
 impl VmConfigBuilder {
@@ -621,6 +663,16 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn timeouts(mut self, timeouts: Timeouts) -> Self {
         self.timeouts = timeouts.clamped();
+        self
+    }
+
+    /// Sets the guest [`ConsoleMode`] (default [`ConsoleMode::Uart`]). Choose
+    /// [`ConsoleMode::VirtioConsole`] for guest-code tests that don't inspect the
+    /// kernel log (it loses early boot / a pre-virtio panic and is unsupported on
+    /// Firecracker).
+    #[must_use]
+    pub fn console_mode(mut self, m: ConsoleMode) -> Self {
+        self.console_mode = m;
         self
     }
 
@@ -799,6 +851,7 @@ impl VmConfigBuilder {
             ksm_mergeable: self.ksm_mergeable,
             kernel_verbosity: self.kernel_verbosity,
             timeouts: self.timeouts,
+            console_mode: self.console_mode,
         })
     }
 }
@@ -1427,9 +1480,26 @@ mod tests {
         let plain = build_kernel_cmdline(&cfg, 1, "").unwrap();
         let fpu = build_kernel_cmdline(&cfg, 1, "noxsave ").unwrap();
         for c in [&plain, &fpu] {
+            // The default (Uart) console token is `ttyS0`, emitted as the FIRST
+            // cmdline token. A hardcoded `console=hvc0` (or a dropped token) reddens.
+            assert!(
+                c.contains("console=ttyS0"),
+                "default console token missing: {c}"
+            );
+            assert!(
+                c.starts_with("console=ttyS0"),
+                "console must be the first token: {c}"
+            );
+            assert!(!c.contains("console=hvc0"), "Uart must not emit hvc0: {c}");
             assert!(c.contains("loglevel=6"), "missing loglevel: {c}");
-            assert!(c.contains("vmcell_accept_poll_ms=20"), "missing accept poll: {c}");
-            assert!(c.contains("vmcell_rebind_idle_ms=250"), "missing rebind idle: {c}");
+            assert!(
+                c.contains("vmcell_accept_poll_ms=20"),
+                "missing accept poll: {c}"
+            );
+            assert!(
+                c.contains("vmcell_rebind_idle_ms=250"),
+                "missing rebind idle: {c}"
+            );
             assert!(
                 c.contains("init=/usr/sbin/vmcell-guest-agent"),
                 "missing init: {c}"
@@ -1437,8 +1507,14 @@ mod tests {
         }
         // The FPU guard is inserted immediately before `init=`; the empty
         // backend_extra leaves `panic=1 init=` adjacent.
-        assert!(fpu.contains("panic=1 noxsave init="), "fpu guard misplaced: {fpu}");
-        assert!(plain.contains("panic=1 init="), "unexpected extra token: {plain}");
+        assert!(
+            fpu.contains("panic=1 noxsave init="),
+            "fpu guard misplaced: {fpu}"
+        );
+        assert!(
+            plain.contains("panic=1 init="),
+            "unexpected extra token: {plain}"
+        );
 
         let verbose = VmConfig::builder(
             PathBuf::from("/vmlinux"),
@@ -1451,6 +1527,68 @@ mod tests {
         .build()
         .unwrap();
         let vc = build_kernel_cmdline(&verbose, 1, "").unwrap();
-        assert!(vc.contains("loglevel=7"), "verbose loglevel not honored: {vc}");
+        assert!(
+            vc.contains("loglevel=7"),
+            "verbose loglevel not honored: {vc}"
+        );
+
+        // A VirtioConsole VM must emit `console=hvc0` as the first token and NOT
+        // `console=ttyS0`. A hardcoded `console=ttyS0` (the pre-knob wiring) reddens.
+        let virtio = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .console_mode(ConsoleMode::VirtioConsole)
+        .network_disabled()
+        .build()
+        .unwrap();
+        let hvc = build_kernel_cmdline(&virtio, 1, "").unwrap();
+        assert!(
+            hvc.starts_with("console=hvc0"),
+            "VirtioConsole must emit console=hvc0 first: {hvc}"
+        );
+        assert!(
+            !hvc.contains("console=ttyS0"),
+            "VirtioConsole must not emit ttyS0: {hvc}"
+        );
+    }
+
+    // §12.10 console knob: each mode maps to its `console=` token. Buggy impl this
+    // guards: a swapped arm (Uart→hvc0 or VirtioConsole→ttyS0) reddens an equality.
+    #[test]
+    fn console_mode_mapping() {
+        assert_eq!(ConsoleMode::Uart.console(), "ttyS0");
+        assert_eq!(ConsoleMode::VirtioConsole.console(), "hvc0");
+    }
+
+    // The builder must carry the selected `ConsoleMode` onto the built config and
+    // default to `Uart` (the safe early-boot + panic-capture console). Buggy impl:
+    // the builder drops the field (always `Uart`) — the `VirtioConsole` assertion
+    // then fails.
+    #[test]
+    fn console_mode_builder_carry_through() {
+        let default_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert_eq!(default_cfg.console_mode, ConsoleMode::Uart);
+
+        let virtio_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .console_mode(ConsoleMode::VirtioConsole)
+        .build()
+        .unwrap();
+        assert_eq!(virtio_cfg.console_mode, ConsoleMode::VirtioConsole);
+        assert_ne!(virtio_cfg.console_mode, ConsoleMode::Uart);
     }
 }

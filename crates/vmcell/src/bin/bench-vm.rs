@@ -70,6 +70,12 @@ struct Args {
     /// VM-exit cost dimension.
     #[arg(long, default_value = "balanced")]
     kernel_verbosity: String,
+
+    /// Guest console mode: `uart` (default, 8250 `ttyS0` — early-boot + panic
+    /// capture, per-byte VM-exits) or `virtio-console` (`hvc0` — batched, ~no exit
+    /// tax, but loses early boot / pre-virtio panics; not supported on Firecracker).
+    #[arg(long, default_value = "uart")]
+    console: String,
 }
 
 /// Maps the `--profile` flag to a [`Timeouts`] preset (unknown → `default`).
@@ -89,6 +95,15 @@ fn verbosity_for(s: &str) -> vmcell::config::KernelVerbosity {
         "verbose" => K::Verbose,
         "debug" => K::Debug,
         _ => K::Balanced,
+    }
+}
+
+/// Maps the `--console` flag to a [`ConsoleMode`] (unknown → `Uart`).
+fn console_for(s: &str) -> vmcell::config::ConsoleMode {
+    use vmcell::config::ConsoleMode as C;
+    match s {
+        "virtio-console" => C::VirtioConsole,
+        _ => C::Uart,
     }
 }
 
@@ -170,6 +185,7 @@ async fn run_bench<V: Vmm>(
         .restore_mode(args.restore_mode)
         .timeouts(timeouts_for(&args.profile))
         .kernel_verbosity(verbosity_for(&args.kernel_verbosity))
+        .console_mode(console_for(&args.console))
         .build()
         .expect("valid VM configuration benchmark invariant");
     let cid_allocator = std::sync::Arc::new(CidAllocator::new());
@@ -553,24 +569,20 @@ fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
 }
 
 /// Builds the standard network-disabled erofs VM config used by every mode,
-/// applying the run's `--profile` timeouts and `--kernel-verbosity`.
-fn build_cfg(
-    kernel: PathBuf,
-    rootfs: PathBuf,
-    mem_mib: u32,
-    restore_mode: RestoreMode,
-    ksm_mergeable: bool,
-    timeouts: vmcell::config::Timeouts,
-    verbosity: vmcell::config::KernelVerbosity,
-) -> VmConfig {
+/// applying the run's `--mem-mib`, `--restore-mode`, `--profile` timeouts,
+/// `--kernel-verbosity`, and `--console` from `args`. `ksm_mergeable` stays an
+/// explicit argument because only `footprint` opts into it (§13.5); every other
+/// mode passes `false`.
+fn build_cfg(args: &Args, kernel: PathBuf, rootfs: PathBuf, ksm_mergeable: bool) -> VmConfig {
     VmConfig::builder(kernel, RootfsSource::Erofs { image: rootfs })
         .vcpus(1)
-        .mem_mib(mem_mib)
+        .mem_mib(args.mem_mib)
         .network_disabled()
-        .restore_mode(restore_mode)
+        .restore_mode(args.restore_mode)
         .ksm_mergeable(ksm_mergeable)
-        .timeouts(timeouts)
-        .kernel_verbosity(verbosity)
+        .timeouts(timeouts_for(&args.profile))
+        .kernel_verbosity(verbosity_for(&args.kernel_verbosity))
+        .console_mode(console_for(&args.console))
         .build()
         .expect("valid VM configuration benchmark invariant")
 }
@@ -742,15 +754,7 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         return;
     }
     let count = args.count.max(1);
-    let cfg = build_cfg(
-        kernel,
-        rootfs,
-        args.mem_mib,
-        args.restore_mode,
-        args.ksm_mergeable,
-        timeouts_for(&args.profile),
-        verbosity_for(&args.kernel_verbosity),
-    );
+    let cfg = build_cfg(args, kernel, rootfs, args.ksm_mergeable);
     let cid = std::sync::Arc::new(CidAllocator::new());
 
     let ksm_shared_before = read_ksm("pages_shared");
@@ -957,15 +961,7 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         println!("suspend-size: backend {backend} has no snapshot support; skipping");
         return;
     }
-    let cfg = build_cfg(
-        kernel,
-        rootfs,
-        args.mem_mib,
-        args.restore_mode,
-        false,
-        timeouts_for(&args.profile),
-        verbosity_for(&args.kernel_verbosity),
-    );
+    let cfg = build_cfg(args, kernel, rootfs, false);
     let cid = std::sync::Arc::new(CidAllocator::new());
     let snap_dir = PathBuf::from(&args.snap_dir).join(format!(
         "suspend-{backend}-{}-{}",
@@ -1233,15 +1229,7 @@ async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         println!("phase-budget: No successful runs (missing artifacts in {dir})");
         return;
     }
-    let cfg = build_cfg(
-        kernel,
-        rootfs,
-        args.mem_mib,
-        args.restore_mode,
-        false,
-        timeouts_for(&args.profile),
-        verbosity_for(&args.kernel_verbosity),
-    );
+    let cfg = build_cfg(args, kernel, rootfs, false);
     let cid = std::sync::Arc::new(CidAllocator::new());
 
     // Cold-boot path (opt-in budget).
@@ -1297,15 +1285,7 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         println!("vsock-rtt: No successful runs (missing artifacts in {dir})");
         return;
     }
-    let cfg = build_cfg(
-        kernel,
-        rootfs,
-        args.mem_mib,
-        args.restore_mode,
-        false,
-        timeouts_for(&args.profile),
-        verbosity_for(&args.kernel_verbosity),
-    );
+    let cfg = build_cfg(args, kernel, rootfs, false);
     let cid = std::sync::Arc::new(CidAllocator::new());
     let iters = args.iters();
 

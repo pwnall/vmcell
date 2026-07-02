@@ -131,11 +131,8 @@ impl AgentClient {
             loop {
                 let mut byte = [0; 1];
                 use tokio::io::AsyncReadExt;
-                if let Ok(Ok(1)) = tokio::time::timeout(
-                    timeouts.connect_ok_read,
-                    stream.read(&mut byte),
-                )
-                .await
+                if let Ok(Ok(1)) =
+                    tokio::time::timeout(timeouts.connect_ok_read, stream.read(&mut byte)).await
                 {
                     resp.push(byte[0] as char);
                     if byte[0] == b'\n' {

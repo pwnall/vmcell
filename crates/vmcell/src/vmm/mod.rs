@@ -360,6 +360,37 @@ pub(crate) fn reject_virtio_fs_rootfs(
     Ok(())
 }
 
+/// Self-guard that rejects [`ConsoleMode::VirtioConsole`](crate::config::ConsoleMode::VirtioConsole)
+/// on a backend whose capability descriptor does not advertise `virtio_console`
+/// (Firecracker).
+///
+/// The kernel-cmdline `console=` token (`build_kernel_cmdline`) and the per-backend
+/// console device wiring must move in lockstep: a backend that emitted `console=hvc0`
+/// with no virtio-console device would send the guest's console output nowhere and
+/// leave `serial.log` silent. Every backend's `create()`/`restore()` self-guards with
+/// this instead of assuming the caller checked, returning a typed
+/// [`Error::Unsupported`](crate::error::Error::Unsupported) that mirrors the other
+/// capability rejects. A [`ConsoleMode::Uart`](crate::config::ConsoleMode::Uart)
+/// config is always accepted.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`](crate::error::Error::Unsupported)
+/// `{ vmm, feature: "virtio_console" }` when `mode` is `VirtioConsole` and
+/// `caps.virtio_console` is `false`; `Ok(())` otherwise.
+pub(crate) fn reject_unsupported_console(
+    vmm: &str,
+    caps: &VmmCapabilities,
+    mode: crate::config::ConsoleMode,
+) -> Result<()> {
+    if matches!(mode, crate::config::ConsoleMode::VirtioConsole) && !caps.virtio_console {
+        return Err(crate::error::Error::Unsupported {
+            vmm: vmm.into(),
+            feature: "virtio_console".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
 #[derive(Debug)]
@@ -452,6 +483,11 @@ pub struct VmmCapabilities {
     pub unprivileged_vhost_user_net: bool,
     /// True if the VMM supports nested virtualization (exposing KVM to guest).
     pub nested_virt: bool,
+    /// True if the VMM can attach a virtio-console (`hvc0`) device (Cloud
+    /// Hypervisor and QEMU). Firecracker has no virtio-console, so a
+    /// [`ConsoleMode::VirtioConsole`](crate::config::ConsoleMode::VirtioConsole)
+    /// config is rejected there (`console=hvc0` with no device silences the log).
+    pub virtio_console: bool,
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
@@ -602,6 +638,7 @@ impl Vmm for FakeVmm {
             virtio_fs_shares: true,
             unprivileged_vhost_user_net: true,
             nested_virt: true,
+            virtio_console: true,
         }
     }
 
@@ -788,6 +825,50 @@ mod tests {
             gone,
             "register_and_await_ready must reap the process group on a readiness failure"
         );
+    }
+
+    // Guards the shared console self-guard: VirtioConsole on a backend that does not
+    // advertise `virtio_console` (Firecracker) must return a typed
+    // `Unsupported { feature: "virtio_console" }`; a capable backend (CH/QEMU) must
+    // accept it; and Uart is always accepted regardless of the capability. The buggy
+    // inverse (no guard, or gating the wrong mode) lets a VirtioConsole config reach a
+    // backend with no hvc0 device — `console=hvc0` then sinks nowhere and serial.log
+    // goes silent — and reddens one of the assertions below.
+    #[test]
+    fn reject_unsupported_console_gates_only_virtio_on_incapable_backends() {
+        use crate::config::ConsoleMode;
+
+        let caps = |virtio_console: bool| VmmCapabilities {
+            snapshot_restore: true,
+            lazy_restore: false,
+            virtio_fs_shares: true,
+            unprivileged_vhost_user_net: true,
+            nested_virt: true,
+            virtio_console,
+        };
+
+        // FC-like (virtio_console:false) + VirtioConsole => Unsupported.
+        let err =
+            reject_unsupported_console("firecracker", &caps(false), ConsoleMode::VirtioConsole)
+                .expect_err("an incapable backend must reject VirtioConsole");
+        assert!(
+            matches!(&err, crate::error::Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature == "virtio_console"),
+            "expected virtio_console Unsupported, got {err:?}"
+        );
+
+        // CH/QEMU-like (virtio_console:true) + VirtioConsole => Ok.
+        reject_unsupported_console("cloud-hypervisor", &caps(true), ConsoleMode::VirtioConsole)
+            .expect("a capable backend must accept VirtioConsole");
+        reject_unsupported_console("qemu", &caps(true), ConsoleMode::VirtioConsole)
+            .expect("a capable backend must accept VirtioConsole");
+
+        // Uart is always accepted, on capable and incapable backends alike (the
+        // over-rejection inverse — gating Uart too — reddens here).
+        reject_unsupported_console("firecracker", &caps(false), ConsoleMode::Uart)
+            .expect("Uart must always be accepted");
+        reject_unsupported_console("cloud-hypervisor", &caps(true), ConsoleMode::Uart)
+            .expect("Uart must always be accepted");
     }
 
     #[test]

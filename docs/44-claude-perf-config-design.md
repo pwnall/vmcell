@@ -1,5 +1,16 @@
 # 44 — Tunable performance config + native in-agent resync (design)
 
+> **Status: IMPLEMENTED (2026-07-01 / -07-02).** Shipped + validated (`just ci` green, unit 253/0,
+> `just test-privileged` green under `retries`). Results: QEMU cold ≈1400→996 ms, `throughput` teardown
+> 283→96 ms, `low_latency` cold 327→309 ms, native-resync restore 84→60 ms, logging VM-exit cost +231 ms;
+> **console knob (§1b): virtio-console+verbose 558→299 ms (−46%)** — verbose logs without the UART tax.
+> **Flake (2026-07-02):** the full-suite "Agent … timed out" was bisected to a **pre-existing/
+> environmental** intermittent CH-vsock reset (flakes on the baseline too); fixed with `nextest retries`
+> + `kind(test)` scoping, not a product code change (details: `perf-experiments-log.md`).
+> Measured deltas → `benchmark-results.md` + `perf-experiments-log.md`; settled behavior folded into
+> design v17 §4.1/§8.3/§9.2/§15; deviations → `implementation-notes.md`. `vmcell` bumped 0.2.0→0.3.0 for
+> the intentional `AgentClient::connect`/`reconnect` signature change.
+
 Design for two maintainer-requested follow-ups to the 2026-07-01 latency pass (§15 /
 `benchmark-results.md`):
 
@@ -52,10 +63,45 @@ pub enum KernelVerbosity {
 Only debugging / a test that asserts on a specific kernel line opts into `Verbose`/`Debug`; everyone
 else keeps `Balanced` and does not pay the exit tax. `boot.rs` (asserts the `"Linux version"` NOTICE
 banner) stays green under `Balanced` (already true) and any higher level. Panic capture is unaffected
-at every level (`contains_panic` matches KERN_EMERG). **virtio-console (`hvc0`)** would batch bytes
-(≈1 notify-exit per burst) and nearly erase the tax, but it only exists after virtio-pci enumeration —
-too late for early boot / a pre-virtio panic — so `ttyS0` stays the early+panic console; a hybrid
-`console=ttyS0 console=hvc0` is noted as future work, not in scope here.
+at every level (`contains_panic` matches KERN_EMERG). `loglevel` reduces the *volume* of logging; the
+next knob (§1b) reduces the *per-line cost* at the source.
+
+## 1b. Console transport is a knob — virtio-console vs UART (IMPLEMENTED 2026-07-02)
+
+The `loglevel` knob dials how much prints; `ConsoleMode` dials **how** it prints — the transport that
+turns each logged byte into (or not into) a VM exit:
+
+```rust
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConsoleMode {
+    #[default]
+    Uart,           // console=ttyS0 — legacy 8250, alive from instruction 0 → early-boot + panic
+                    //   capture, but a per-byte PIO VM-exit (the §1 tax)
+    VirtioConsole,  // console=hvc0 — batched over a virtqueue (~1 notify-exit per burst → tax gone),
+                    //   but only exists AFTER virtio-pci probe → early boot + a pre-virtio panic are lost
+}
+```
+
+**Default `Uart`, `VirtioConsole` opt-in** — because panic capture is a correctness floor:
+`contains_panic` (§12.10) greps the serial log, the connect loop aborts on it, and on virtio-console an
+early/pre-virtio panic never reaches `hvc0` (and `panic=1` reboots before `hvc0`'s flush is serviced),
+so a broken guest would surface as an opaque handshake timeout instead of a caught panic. `boot.rs`'s
+`"Linux version"` (a pre-virtio KERN_NOTICE) is likewise lost/flaky on `hvc0`. So the safe transport is
+the default and the lossy-but-fast one is opt-in (mirrors `KernelVerbosity::Balanced`). Guidance:
+**debugging + tests that inspect the kernel log / rely on panic capture use `Uart`; the majority
+(guest-code tests that don't read the kernel log) opt into `VirtioConsole`** for a cheaper boot and
+cheap *verbose* logs.
+
+**Per-backend (capability descriptor `virtio_console`):** CH v52 — yes (`console:{mode:File,file}`;
+the restore config-rewrite moves `console.file` in lockstep with `serial.file`/`vsock.socket`). QEMU —
+yes (`virtio-serial-pci` + `virtconsole` chardev-to-file). **Firecracker — no** (8250-only over
+virtio-MMIO): `VirtioConsole` is rejected loud+early with `Error::Unsupported{feature:"virtio_console"}`
+**before** the cmdline is built, so it can never emit `console=hvc0` with no `hvc0` device. The cmdline
+`console=` token and the per-backend device wiring are both derived from the one `cfg.console_mode`, so
+they cannot desync (the sharp footgun: a `console=hvc0` cmdline over an 8250-only device → silent log).
+The payoff: `VirtioConsole` lets a test run **verbose** kernel logging at ~the `Balanced`-UART cost —
+full logs without the ~231 ms UART VM-exit tax (§15).
 
 ## 2. One shared cmdline builder (fixes a real divergence)
 
