@@ -10,19 +10,6 @@ use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-/// Upper bound on the grace window `shutdown()` waits after `request_shutdown()`
-/// before the SIGKILL fallback, so the guest gets time to flush and power off
-/// cleanly (ORCH-7). `shutdown()` polls [`VmInstance::has_exited`](crate::vmm::VmInstance::has_exited)
-/// and returns as soon as the guest actually powers off, so this is only the
-/// *ceiling* for a guest that never exits on its own — not an unconditional
-/// sleep. Lowered from 500 ms: the guest agent's SIGTERM handler is `sync()` +
-/// `reboot(RB_POWER_OFF)` over a tmpfs overlay + read-only erofs root (no heavy
-/// dirty-page writeback), so 250 ms is ample flush headroom, and the force-kill
-/// remains the guaranteed fallback. The `Drop` path does not wait at all — it
-/// force-kills immediately — so this only applies to the explicit graceful
-/// `shutdown()`.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// A trait for providing time.
 pub trait Clock: Send + Sync {
     /// Returns the current time.
@@ -302,6 +289,10 @@ pub struct MicroVm<V: Vmm> {
     /// and dropped LAST on teardown — after the instance, smoltcp, and daemons
     /// whose sockets live inside it are gone.
     tmp_dir: Option<crate::vmm::VmTempDir>,
+    /// Per-VM hot-path timing knobs captured from the [`VmConfig`] at
+    /// construction, so `agent()`'s connect cadence and `shutdown()`'s grace
+    /// window honor the caller-selected profile rather than hard-coded constants.
+    timeouts: crate::config::Timeouts,
 }
 
 /// A guard that deletes the cgroup slice on drop unless disarmed.
@@ -344,21 +335,52 @@ struct EnvSetup {
     proxy: Option<EgressProxy>,
 }
 
-/// Minimal guest-exec seam the one-shot post-restore resync needs.
+/// Minimal guest-resync seam the one-shot post-restore resync needs.
 ///
-/// Implemented for the real [`AgentClient`] and for a recording fake in the unit
-/// tests, so the resync's ordering and its "clear `restored` only after the
-/// mandatory step succeeds" contract (M-RESTORE-1) can be exercised without a
-/// live guest.
-trait GuestExec {
-    /// Runs `argv` in the guest and returns its outcome.
-    async fn exec_argv(&mut self, argv: Vec<String>) -> Result<crate::agent::ExecOutcome>;
+/// Implemented for the real [`AgentClient`] (a single native `resync` round-trip)
+/// and for a recording fake in the unit tests, so the resync's mandatory-clock
+/// fail-loud + retry contract (M-RESTORE-1) can be exercised without a live guest.
+trait GuestResync {
+    /// Runs the native post-restore resync in the guest and returns its outcome.
+    async fn resync(
+        &mut self,
+        unix_secs: u64,
+        unix_nanos: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<crate::agent::ResyncOutcome>;
 }
 
-impl GuestExec for AgentClient {
-    async fn exec_argv(&mut self, argv: Vec<String>) -> Result<crate::agent::ExecOutcome> {
-        self.exec(crate::agent::ExecRequest::new(argv)).await
+impl GuestResync for AgentClient {
+    async fn resync(
+        &mut self,
+        unix_secs: u64,
+        unix_nanos: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<crate::agent::ResyncOutcome> {
+        // Resolves to the inherent `AgentClient::resync` (inherent methods win
+        // over the same-named trait method), so this delegates rather than
+        // recursing.
+        self.resync(unix_secs, unix_nanos, mac).await
     }
+}
+
+/// Parses a canonical `xx:xx:xx:xx:xx:xx` MAC string into its six bytes.
+///
+/// The restore resync carries the MAC as raw bytes on the wire, but
+/// [`crate::net::mac_math`] centralizes the vmid→MAC mapping as a string; this
+/// converts without duplicating that mapping. Returns `None` on a malformed
+/// string (wrong group count or a non-hex octet).
+fn parse_mac_bytes(s: &str) -> Option<[u8; 6]> {
+    let mut parts = s.split(':');
+    let mut out = [0u8; 6];
+    for slot in &mut out {
+        *slot = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    // Reject a 7th (or longer) group so a malformed string can't masquerade.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
 }
 
 /// Runs the one-shot post-restore guest resync when `*restored` is set, clearing
@@ -366,15 +388,17 @@ impl GuestExec for AgentClient {
 ///
 /// M-RESTORE-1: a snapshot resumes at the frozen instant, so the guest clock,
 /// CSPRNG state, and network identity must be refreshed on **every** restore
-/// (§9.2). The mandatory clock resync is the *first* post-restore exec, which is
-/// exactly where the freshly-rebound guest vsock listener is flakiest. The flag
-/// is therefore propagated (`?`) and left **set** on a transient failure so the
-/// next `agent()` call retries the whole resync, instead of being cleared up
-/// front (the bug, which permanently skipped clock/RNG/MAC resync after one
-/// transient first-exec error). `*reseed_applied` records whether the
+/// (§9.2). This now drives a single **native** in-agent resync round-trip
+/// (design 44 §5) instead of three subprocess execs. The round-trip is propagated
+/// (`?`) so a transient transport failure leaves `*restored` **set** and the next
+/// `agent()` call retries the whole resync, instead of being cleared up front (the
+/// bug, which permanently skipped clock/RNG/MAC resync after one transient error).
+/// The clock resync is mandatory and fail-loud: a `Some(clock_error)` in the ack
+/// returns a typed `Err` **before** the flag is cleared (identical semantics to
+/// the old non-zero-`date`-exit path). `*reseed_applied` records whether the
 /// best-effort CSPRNG reseed actually applied, so a caller can assert the reseed
 /// ran rather than inferring it from two `/dev/urandom` reads differing.
-async fn maybe_resync_after_restore<E: GuestExec>(
+async fn maybe_resync_after_restore<E: GuestResync>(
     restored: &mut bool,
     reseed_applied: &mut Option<bool>,
     exec: &mut E,
@@ -385,109 +409,62 @@ async fn maybe_resync_after_restore<E: GuestExec>(
         return Ok(());
     }
 
-    // Mandatory, host-driven clock resync: the guest cannot fix a frozen RTC from
-    // inside (§9.2). Propagated with `?` so a transient first-exec failure leaves
-    // `*restored` set and the next agent() call retries.
-    let host_time = clock
+    // Host instant for the mandatory clock resync (§9.2): the guest cannot fix a
+    // frozen RTC from inside. Carried as whole secs + sub-second nanos on the wire.
+    let since_epoch = clock
         .now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .unwrap_or_default();
+    let unix_secs = since_epoch.as_secs();
+    let unix_nanos = since_epoch.subsec_nanos();
+
+    // ORCH-1 / §9.2: MAC rotation is the ONLY in-guest identity change the restore
+    // path performs — applied natively via `SIOCSIFHWADDR` (no in-guest netlink),
+    // keeping the zero-netlink-in-PID-1 contract (§4.3). The IP address is
+    // deliberately NOT rotated (the guest keeps the kernel `ip=` cmdline address).
+    // `mac_math` centralizes the vmid→MAC mapping as a string; convert it to the
+    // six bytes the wire protocol carries without duplicating that mapping.
+    let mac_str = crate::net::mac_math(vmid)
+        .map_err(|e| crate::error::Error::Agent(format!("mac math: {}", e)))?;
+    let mac = parse_mac_bytes(&mac_str).ok_or_else(|| {
+        crate::error::Error::Agent(format!("mac math produced an unparseable MAC: {}", mac_str))
+    })?;
+
     tracing::info!(
-        "Automatically resyncing guest clock to host time: {}",
-        host_time
+        "Automatically resyncing guest after restore to host time {}.{:09}",
+        unix_secs,
+        unix_nanos
     );
-    let outcome = exec
-        .exec_argv(vec![
-            "date".to_string(),
-            "-s".to_string(),
-            format!("@{}", host_time),
-        ])
-        .await?;
-    if outcome.code != 0 {
-        // ORCH-3: the clock resync is mandatory (§9.2) — a non-zero exit is a
-        // *surfaced, typed* failure, not a warning. We return here **before**
-        // clearing `*restored`, so the flag stays set and the next `agent()`
-        // call retries the whole resync. The previous code merely `warn!`d and
-        // then cleared `restored` unconditionally, permanently masking a
-        // persistently-failing clock set and leaving time-sensitive tests to see
-        // a frozen wall clock (silent-Ok-on-failure, the exact §7.1 defect).
+
+    // One native round-trip. Propagated with `?` so a transient transport failure
+    // leaves `*restored` set and the next agent() call retries the whole resync.
+    let outcome = exec.resync(unix_secs, unix_nanos, Some(mac)).await?;
+
+    if let Some(err) = outcome.clock_error {
+        // ORCH-3 / M-RESTORE-1: the clock resync is mandatory (§9.2) — a guest-side
+        // clock-set failure is a *surfaced, typed* failure, not a warning. We
+        // return here **before** clearing `*restored`, so the flag stays set and
+        // the next `agent()` call retries the whole resync (identical to the old
+        // non-zero-exit path). Clearing it here (silent-Ok-on-failure) would leave
+        // time-sensitive restored tests seeing a frozen wall clock (§7.1 defect).
         return Err(crate::error::Error::Agent(format!(
-            "mandatory post-restore clock resync failed (exit {}): {}",
-            outcome.code,
-            String::from_utf8_lossy(&outcome.stderr)
+            "mandatory post-restore clock resync failed: {}",
+            err
         )));
     }
 
-    // Best-effort re-seed of the guest CSPRNG from the virtio-rng device after
-    // restore (the snapshot may have captured RNG state). The reseed itself is
-    // best-effort — a missing/unreadable `/dev/hwrng` must not fail the resync —
-    // but whether it applied is recorded so a restore test can assert it ran.
-    let reseed = match exec
-        .exec_argv(vec![
-            "sh".into(),
-            "-c".into(),
-            "head -c 32 /dev/hwrng > /dev/urandom".into(),
-        ])
-        .await
-    {
-        Ok(outcome) => {
-            if outcome.code != 0 {
-                tracing::warn!(
-                    "restore RNG reseed failed (exit {}): {}",
-                    outcome.code,
-                    String::from_utf8_lossy(&outcome.stderr)
-                );
-            }
-            outcome.code == 0
-        }
-        Err(e) => {
-            tracing::warn!("restore RNG reseed could not be executed: {}", e);
-            false
-        }
-    };
-    *reseed_applied = Some(reseed);
+    // Best-effort CSPRNG reseed: whether it applied is recorded so a restore test
+    // can assert it ran; a not-applied reseed never keeps `restored` set.
+    *reseed_applied = Some(outcome.reseed_applied);
 
-    let mac = crate::net::mac_math(vmid)
-        .map_err(|e| crate::error::Error::Agent(format!("mac math: {}", e)))?;
-    // ORCH-1 / §9.2: MAC rotation is the ONLY in-guest identity change the
-    // restore path performs, via a single `ip link set eth0 address <mac>` — a
-    // device-layer write (the guest-tools helper's `SIOCSIFHWADDR` ioctl, §5.3),
-    // consistent with the zero-netlink-in-PID-1 contract (§4.3). The IP address
-    // is deliberately NOT rotated: the old `ip addr flush && ip addr add && ip
-    // route add` chain was wrong — `ip addr flush` drops the IP-PNP default route
-    // (breaking post-restore egress to non-local hosts) and re-introduces exactly
-    // the in-guest netlink the design forbids. The guest keeps the address the
-    // kernel `ip=` cmdline set. Sent as a direct argv (no `sh -c` &&-chain is
-    // needed now that it is a single command). Best-effort: never keeps
-    // `restored` set.
-    match exec
-        .exec_argv(vec![
-            "ip".into(),
-            "link".into(),
-            "set".into(),
-            "eth0".into(),
-            "address".into(),
-            mac,
-        ])
-        .await
-    {
-        Ok(outcome) if outcome.code != 0 => {
-            tracing::warn!(
-                "restore MAC rotation failed (exit {}): {}",
-                outcome.code,
-                String::from_utf8_lossy(&outcome.stderr)
-            );
-        }
-        Err(e) => {
-            tracing::warn!("restore MAC rotation could not be executed: {}", e);
-        }
-        _ => {}
+    // MAC rotation is best-effort; a not-applied rotation is logged, not fatal.
+    if !outcome.mac_applied {
+        tracing::warn!("restore MAC rotation did not apply in the guest");
     }
 
     // Clear `restored` ONLY now — after the mandatory clock resync above
-    // succeeded (M-RESTORE-1). The RNG/network steps are best-effort and never
-    // keep the flag set.
+    // succeeded (M-RESTORE-1). The RNG/MAC steps are best-effort and never keep
+    // the flag set.
     *restored = false;
     Ok(())
 }
@@ -765,6 +742,7 @@ impl<V: Vmm> MicroVm<V> {
             restore_reseed_applied: None,
             cid: Some(env.cid_guard),
             tmp_dir: Some(tmp_dir),
+            timeouts: cfg.timeouts,
         })
     }
 
@@ -869,6 +847,7 @@ impl<V: Vmm> MicroVm<V> {
             restore_reseed_applied: None,
             cid: Some(env.cid_guard),
             tmp_dir: Some(tmp_dir),
+            timeouts: cfg.timeouts,
         })
     }
 
@@ -901,6 +880,7 @@ impl<V: Vmm> MicroVm<V> {
                     .vsock_path(),
                 5000,
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
+                &self.timeouts,
                 &crate::vmm::RealSerialLog {
                     path: self
                         .instance
@@ -1067,9 +1047,10 @@ impl<V: Vmm> MicroVm<V> {
             // `kill()` grants ~0 flush time. But rather than *always* sleeping the
             // whole window (the placeholder ORCH-7 shipped), poll the now-realized
             // `VmInstance::has_exited` and return as soon as the guest has actually
-            // powered off, capping at `SHUTDOWN_GRACE`. The force-kill below is still
-            // the guaranteed fallback for a guest that never exits on its own.
-            let grace_deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+            // powered off, capping at `self.timeouts.shutdown_grace`. The force-kill
+            // below is still the guaranteed fallback for a guest that never exits on
+            // its own.
+            let grace_deadline = tokio::time::Instant::now() + self.timeouts.shutdown_grace;
             while tokio::time::Instant::now() < grace_deadline {
                 if inst.has_exited().await {
                     break;
@@ -1500,6 +1481,7 @@ mod tests {
             restore_reseed_applied: None,
             cid: None,
             tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
         }
     }
 
@@ -1747,38 +1729,37 @@ mod tests {
         assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
     }
 
-    /// A recording guest-exec fake for the post-restore resync tests. Fails the
+    /// A recording guest-resync fake for the post-restore resync tests. Fails the
     /// first `fail_first_n` calls (modelling a just-rebound, still-flaky vsock),
-    /// then records and succeeds; the CSPRNG reseed command's exit code is
-    /// configurable to drive the "reseed not applied" path.
+    /// then records the single `resync` call and returns a configurable
+    /// [`crate::agent::ResyncOutcome`] (drives the clock-fail-loud path via
+    /// `clock_error`, and the reseed-applied observability via the bool).
     #[derive(Default)]
-    struct FakeExec {
-        recorded: Vec<Vec<String>>,
+    struct FakeGuestResync {
+        /// The `(unix_secs, unix_nanos, mac)` of each resync call that was not
+        /// forced to fail.
+        recorded: Vec<(u64, u32, Option<[u8; 6]>)>,
         calls: usize,
         fail_first_n: usize,
-        rng_exit_code: i32,
-        /// Exit code returned for the mandatory `date -s` clock resync (ORCH-3);
-        /// default 0. Non-zero drives the fail-loud clock-resync path.
-        clock_exit_code: i32,
+        /// The outcome returned once a call is allowed to succeed.
+        outcome: crate::agent::ResyncOutcome,
     }
 
-    impl GuestExec for FakeExec {
-        async fn exec_argv(&mut self, argv: Vec<String>) -> Result<crate::agent::ExecOutcome> {
+    impl GuestResync for FakeGuestResync {
+        async fn resync(
+            &mut self,
+            unix_secs: u64,
+            unix_nanos: u32,
+            mac: Option<[u8; 6]>,
+        ) -> Result<crate::agent::ResyncOutcome> {
             self.calls += 1;
             if self.calls <= self.fail_first_n {
                 return Err(crate::error::Error::Agent(
                     "transient post-restore drop".into(),
                 ));
             }
-            let code = if argv.iter().any(|a| a.contains("/dev/hwrng")) {
-                self.rng_exit_code
-            } else if argv.first().map(String::as_str) == Some("date") {
-                self.clock_exit_code
-            } else {
-                0
-            };
-            self.recorded.push(argv);
-            Ok(crate::agent::ExecOutcome::new(code, vec![], vec![]))
+            self.recorded.push((unix_secs, unix_nanos, mac));
+            Ok(self.outcome.clone())
         }
     }
 
@@ -1788,32 +1769,34 @@ mod tests {
         }
     }
 
-    // M-RESTORE-1. A transient failure of the FIRST post-restore exec (the
-    // mandatory clock resync) must NOT clear `restored`; the next call must retry
-    // the full resync. Buggy impl (clearing `restored` up front, then a hard `?`
-    // on the first exec) leaves `restored == false` after the failure, so the
-    // resync — clock, RNG reseed, MAC/network — never runs again. This goes red on
+    // M-RESTORE-1. A transient failure of the post-restore resync round-trip (the
+    // mandatory clock resync rides inside it) must NOT clear `restored`; the next
+    // call must retry the full resync. Buggy impl (clearing `restored` up front,
+    // then a hard `?` on the resync) leaves `restored == false` after the failure,
+    // so the resync — clock, RNG reseed, MAC — never runs again. This goes red on
     // that inverse: it asserts the flag stays set after the failed pass and that
-    // the full three-command resync runs on the retry.
+    // the resync runs (once, natively) on the retry.
     #[tokio::test]
     async fn test_resync_retries_after_transient_first_exec_failure() {
         let clock = fixed_clock();
         let mut restored = true;
         let mut reseed = None;
-        let mut exec = FakeExec {
+        let mut exec = FakeGuestResync {
             fail_first_n: 1,
-            ..FakeExec::default()
+            outcome: crate::agent::ResyncOutcome {
+                clock_error: None,
+                reseed_applied: true,
+                mac_applied: true,
+            },
+            ..FakeGuestResync::default()
         };
 
         let first =
             maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5).await;
-        assert!(
-            first.is_err(),
-            "transient clock-resync failure must propagate"
-        );
+        assert!(first.is_err(), "transient resync failure must propagate");
         assert!(
             restored,
-            "restored must stay set after a transient first-exec failure so the resync retries"
+            "restored must stay set after a transient failure so the resync retries"
         );
         assert!(
             reseed.is_none(),
@@ -1821,11 +1804,11 @@ mod tests {
         );
         assert!(
             exec.recorded.is_empty(),
-            "the failed first exec must not have recorded any resync command"
+            "the failed resync must not have recorded a call"
         );
 
-        // Retry: the guest is reachable now; the full resync runs and only then is
-        // the flag cleared.
+        // Retry: the guest is reachable now; the resync runs and only then is the
+        // flag cleared.
         let second =
             maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5).await;
         assert!(second.is_ok(), "the retried resync must succeed");
@@ -1838,45 +1821,43 @@ mod tests {
             Some(true),
             "the reseed applied on the successful pass"
         );
-        // The three resync commands ran, in order: clock, RNG reseed, MAC.
-        assert_eq!(exec.recorded.len(), 3, "full resync must run on retry");
-        assert_eq!(exec.recorded[0][0], "date");
-        assert!(exec.recorded[1].iter().any(|a| a.contains("/dev/hwrng")));
-        // ORCH-1 / §9.2: MAC rotation is a single direct `ip link set eth0
-        // address <mac>` argv — NOT an `sh -c` chain with `ip addr flush/add` +
-        // `ip route add` (which drops the IP-PNP route and re-adds in-guest
-        // netlink). Reddens if the old flush/add/route chain is restored.
+        // Exactly ONE native resync round-trip ran on the retry, replacing the 3
+        // subprocess execs. Reddens if the resync silently no-ops or spawns execs.
         assert_eq!(
-            &exec.recorded[2][..5],
-            &["ip", "link", "set", "eth0", "address"]
+            exec.recorded.len(),
+            1,
+            "the native resync is a single round-trip"
         );
+        let (secs, nanos, mac) = exec.recorded[0];
+        // It carried the host wall-clock instant (from the injected clock)...
+        assert_eq!(secs, 1_700_000_000, "resync must carry the host unix_secs");
+        assert_eq!(nanos, 0, "resync must carry the host sub-second nanos");
+        // ...and the per-vmid MAC as BYTES (vmid 5 -> 02:00:00:00:00:05), not a
+        // stringly `ip link set` argv. Reddens on a wrong vmid→MAC mapping.
         assert_eq!(
-            exec.recorded[2].len(),
-            6,
-            "argv is `ip link set eth0 address <mac>`"
-        );
-        assert!(
-            !exec.recorded[2]
-                .iter()
-                .any(|a| a == "flush" || a == "add" || a == "route" || a.contains("sh")),
-            "the wrong addr-flush/add + route-add chain must be gone: {:?}",
-            exec.recorded[2]
+            mac,
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x05]),
+            "resync must carry the vmid->MAC mapping as bytes"
         );
     }
 
     // Test-discipline (c): the typed "reseed applied" result must report
-    // Some(false) when the best-effort reseed command exits non-zero (e.g.
-    // /dev/hwrng missing), so a restore test can assert the reseed actually
-    // applied instead of inferring it from two /dev/urandom reads differing.
-    // Buggy impl (always recording Some(true), or never recording) goes red.
+    // Some(false) when the guest reports the best-effort reseed did not apply (e.g.
+    // /dev/hwrng missing), so a restore test can assert the reseed actually applied
+    // instead of inferring it from two /dev/urandom reads differing. Buggy impl
+    // (always recording Some(true), or never recording) goes red.
     #[tokio::test]
     async fn test_resync_records_reseed_not_applied_on_nonzero_exit() {
         let clock = fixed_clock();
         let mut restored = true;
         let mut reseed = None;
-        let mut exec = FakeExec {
-            rng_exit_code: 1,
-            ..FakeExec::default()
+        let mut exec = FakeGuestResync {
+            outcome: crate::agent::ResyncOutcome {
+                clock_error: None,
+                reseed_applied: false,
+                mac_applied: true,
+            },
+            ..FakeGuestResync::default()
         };
         maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5)
             .await
@@ -1884,7 +1865,7 @@ mod tests {
         assert_eq!(
             reseed,
             Some(false),
-            "a non-zero reseed exit must be surfaced as not-applied"
+            "a not-applied reseed must be surfaced as Some(false)"
         );
         assert!(
             !restored,
@@ -1892,14 +1873,15 @@ mod tests {
         );
     }
 
-    // The resync is a no-op when the VM was not restored: no exec is issued and no
-    // reseed result is recorded. Guards against running the resync on a cold boot.
+    // The resync is a no-op when the VM was not restored: no round-trip is issued
+    // and no reseed result is recorded. Guards against running the resync on a cold
+    // boot.
     #[tokio::test]
     async fn test_resync_is_noop_when_not_restored() {
         let clock = fixed_clock();
         let mut restored = false;
         let mut reseed = None;
-        let mut exec = FakeExec::default();
+        let mut exec = FakeGuestResync::default();
         maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5)
             .await
             .unwrap();
@@ -1907,28 +1889,32 @@ mod tests {
         assert_eq!(reseed, None);
     }
 
-    // ORCH-3. A NON-ZERO exit of the mandatory clock resync (`date -s`) must be
-    // surfaced as a typed failure — NOT swallowed with a `warn!` while `restored`
-    // is cleared as if it succeeded. Buggy impl (warn + fall through +
-    // `*restored = false`) returns `Ok(())`, clears `restored`, and never retries,
-    // so a time-sensitive restored test silently sees a frozen wall clock. This
-    // reddens on that inverse: it asserts the Err is returned, `restored` stays
-    // set (so the next agent() call retries), and the best-effort RNG/MAC steps
-    // did NOT run past the failed mandatory step.
+    // ORCH-3 / M-RESTORE-1. A guest-reported failure of the mandatory clock resync
+    // (`ResyncAck.clock_error = Some(..)`) must be surfaced as a typed failure —
+    // NOT swallowed while `restored` is cleared as if it succeeded. Buggy impl
+    // (ignore clock_error + `*restored = false`) returns `Ok(())`, clears
+    // `restored`, and never retries, so a time-sensitive restored test silently
+    // sees a frozen wall clock. This reddens on that inverse: it asserts the Err is
+    // returned, `restored` stays set (so the next agent() call retries), and the
+    // best-effort reseed result was NOT recorded past the failed mandatory step.
     #[tokio::test]
     async fn test_resync_clock_nonzero_exit_is_surfaced() {
         let clock = fixed_clock();
         let mut restored = true;
         let mut reseed = None;
-        let mut exec = FakeExec {
-            clock_exit_code: 1,
-            ..FakeExec::default()
+        let mut exec = FakeGuestResync {
+            outcome: crate::agent::ResyncOutcome {
+                clock_error: Some("clock_settime: EPERM".into()),
+                reseed_applied: false,
+                mac_applied: false,
+            },
+            ..FakeGuestResync::default()
         };
         let res =
             maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5).await;
         assert!(
             matches!(res, Err(crate::error::Error::Agent(_))),
-            "a non-zero clock-resync exit must be a surfaced, typed failure, not Ok"
+            "a guest clock-resync error must be a surfaced, typed failure, not Ok"
         );
         assert!(
             restored,
@@ -1936,15 +1922,15 @@ mod tests {
         );
         assert_eq!(
             reseed, None,
-            "the best-effort RNG reseed must not run once the mandatory clock resync failed"
+            "the reseed result must not be recorded once the mandatory clock resync failed"
         );
-        // Only the failed `date` command was attempted; no RNG/MAC follow-on.
+        // The single native resync was attempted, but the fail-loud clock error
+        // stops it before the reseed outcome is recorded.
         assert_eq!(
             exec.recorded.len(),
             1,
-            "resync stops at the failed mandatory step"
+            "the resync round-trip was attempted once"
         );
-        assert_eq!(exec.recorded[0][0], "date");
     }
 
     /// A `CgroupFs` whose `read_stats` reports a configurable `limits_enforced`,
@@ -2032,6 +2018,7 @@ mod tests {
             restore_reseed_applied: None,
             cid: None,
             tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
         };
         let usage = vm.usage().await.unwrap();
         assert!(
@@ -2102,6 +2089,7 @@ mod tests {
                 allocator: cid_alloc.clone(),
             }),
             tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
         };
         drop(vm);
 
@@ -2332,6 +2320,7 @@ mod tests {
             restore_reseed_applied: None,
             cid: None,
             tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
         };
 
         vm.shutdown().await.expect("shutdown ok");

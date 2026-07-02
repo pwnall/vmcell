@@ -164,6 +164,7 @@ impl FcInstance {
 impl Firecracker {
     async fn spawn_fc(
         &self,
+        cfg: &VmConfig,
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<(
@@ -202,7 +203,7 @@ impl Firecracker {
             &res.cgroup_name,
             &api_socket,
             1000,
-            20,
+            cfg.timeouts.api_socket_poll.as_millis() as u64,
         )
         .await?;
 
@@ -441,7 +442,7 @@ impl Vmm for Firecracker {
         let fpu_guard = noxsave_fallback(template.is_some());
 
         let (api_socket, vsock_path, serial_path, process, pgid) =
-            self.spawn_fc(res, cgroups).await?;
+            self.spawn_fc(cfg, res, cgroups).await?;
 
         let instance = FcInstance {
             process,
@@ -485,33 +486,7 @@ impl Vmm for Firecracker {
             boot_args: String,
         }
 
-        let cmdline = {
-            let mut s = format!(
-                "console=ttyS0 loglevel=6 random.trust_cpu=on random.trust_bootloader=on root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
-                match &cfg.rootfs {
-                    crate::config::RootfsSource::Erofs { .. } => "erofs",
-                    _ => "ext4",
-                },
-                match &cfg.rootfs {
-                    crate::config::RootfsSource::Erofs { .. } => "",
-                    _ => "rootflags=noload",
-                },
-                fpu_guard,
-                res.vmid
-            );
-            if !matches!(cfg.net, crate::config::NetConfig::None) {
-                let (host_ip, guest_ip, _) = crate::net::ip_math(res.vmid)?;
-                s.push_str(&format!(
-                    " ip={}::{}:255.255.255.252::eth0:off",
-                    guest_ip, host_ip
-                ));
-            }
-            if cfg.nested_virt {
-                s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
-            }
-            crate::config::push_share_args(&mut s, &cfg.shares);
-            s
-        };
+        let cmdline = crate::config::build_kernel_cmdline(cfg, res.vmid, fpu_guard)?;
 
         instance
             .api_request(
@@ -641,7 +616,7 @@ impl Vmm for Firecracker {
         let host_paths: SnapshotHostPaths = serde_json::from_str(&sidecar)?;
 
         let (api_socket, _vsock_path, serial_path, process, pgid) =
-            self.spawn_fc(res, cgroups).await?;
+            self.spawn_fc(cfg, res, cgroups).await?;
 
         // Firecracker rebinds the snapshot's recorded host vsock UDS at load time.
         // Remove any leftover socket file there first (a sequential restore reuses

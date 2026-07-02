@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use vmcell_guest_agent::{ReaperCoordinator, exit_code_from_termination};
+use vmcell_guest_agent::{ReaperCoordinator, exit_code_from_termination, netif};
 use vmcell_protocol::{self as protocol, ExecRequest, MAX_FRAME_BYTES, Message};
 use vsock::{VsockAddr, VsockListener, VsockStream};
 
@@ -84,6 +84,30 @@ fn parse_share_mounts(cmdline: &str) -> Vec<ShareMount> {
             })
         })
         .collect()
+}
+
+/// Parses a whole-millisecond timeout token out of the (UNTRUSTED) kernel command
+/// line, clamped into the inclusive `[floor_ms, ceil_ms]` window.
+///
+/// Scans the whitespace-split tokens for the first that `strip_prefix(key)` and
+/// then parses as a `u64`, and clamps the result into `[floor_ms, ceil_ms]` — so a
+/// hostile or fat-fingered boot line cannot drive a guest timeout to a busy-spin
+/// (`0`) or an unbounded stall. An absent, non-numeric, or overflowing token falls
+/// back to `default_ms` (assumed already in range). `/proc/cmdline` is
+/// host-controlled but treated as untrusted here, exactly like
+/// [`parse_share_mounts`].
+fn parse_ms(
+    cmdline: &str,
+    key: &str,
+    default_ms: u64,
+    floor_ms: u64,
+    ceil_ms: u64,
+) -> std::time::Duration {
+    let ms = cmdline
+        .split_ascii_whitespace()
+        .find_map(|tok| tok.strip_prefix(key)?.parse::<u64>().ok())
+        .map_or(default_ms, |v| v.clamp(floor_ms, ceil_ms));
+    std::time::Duration::from_millis(ms)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -299,9 +323,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // are pruned so the status map stays bounded.
     let reaper = Arc::new(ReaperCoordinator::new());
 
+    // Per-VM guest timeout tuning from the (untrusted) kernel cmdline (§8.3): the
+    // host emits `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` from
+    // `cfg.timeouts` so the accept/re-bind cadence is tunable without a rootfs
+    // rebuild. Absent/garbage tokens fall back to the compiled defaults
+    // (`ACCEPT_POLL` / `REBIND_IDLE`); each is clamped to a correctness floor so a
+    // `0` cannot busy-spin PID 1.
+    let accept_poll = parse_ms(
+        &cmdline,
+        "vmcell_accept_poll_ms=",
+        ACCEPT_POLL.as_millis() as u64,
+        1,
+        10_000,
+    );
+    let rebind_idle = parse_ms(
+        &cmdline,
+        "vmcell_rebind_idle_ms=",
+        REBIND_IDLE.as_millis() as u64,
+        20,
+        60_000,
+    );
+
     // Spawn vsock listener thread (recoverable across snapshot/restore).
     let listener_reaper = Arc::clone(&reaper);
-    std::thread::spawn(move || serve_vsock(&listener_reaper));
+    std::thread::spawn(move || serve_vsock(&listener_reaper, accept_poll, rebind_idle));
 
     // Main thread is the PID 1 zombie reaper. It is woken by SIGCHLD rather
     // than polling, so an exec's exit is observed immediately instead of up to
@@ -371,18 +416,22 @@ fn power_off_never_returns() -> ! {
 
 /// vsock control-plane port the host's `AgentClient` connects to.
 const VSOCK_PORT: u32 = 5000;
-/// Poll cadence for the non-blocking accept loop. Kept small: this bounds the
-/// delay between the host's completed CONNECT/OK handshake and the guest's next
-/// `accept()` (which sends `Ready`), so it sits directly on the cold-boot and
-/// restore-reconnect critical path. A failed `accept()` is a cheap non-blocking
-/// syscall, so a tight cadence costs only a few extra idle wakeups per second.
+/// Compiled **default** poll cadence for the non-blocking accept loop, used when
+/// the host does not emit `vmcell_accept_poll_ms=` on the cmdline (§8.3). Kept
+/// small: this bounds the delay between the host's completed CONNECT/OK handshake
+/// and the guest's next `accept()` (which sends `Ready`), so it sits directly on
+/// the cold-boot and restore-reconnect critical path. A failed `accept()` is a
+/// cheap non-blocking syscall, so a tight cadence costs only a few extra idle
+/// wakeups per second.
 const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
-/// Re-bind the listener after this much idle time with no new connection. Bounds
-/// the post-restore "deaf listener" window (§9.2): on CH `--restore` the
-/// pre-snapshot listener stops yielding accepts, and the guest only re-attaches
-/// to the re-created vhost-vsock device by re-binding. Re-binding is harmless
-/// during normal operation (accepted connections keep their own fds), so a
-/// shorter idle only tightens the worst-case reconnect without new risk.
+/// Compiled **default** re-bind idle window, used when the host does not emit
+/// `vmcell_rebind_idle_ms=` on the cmdline (§8.3): re-bind the listener after this
+/// much idle time with no new connection. Bounds the post-restore "deaf listener"
+/// window (§9.2): on CH `--restore` the pre-snapshot listener stops yielding
+/// accepts, and the guest only re-attaches to the re-created vhost-vsock device by
+/// re-binding. Re-binding is harmless during normal operation (accepted
+/// connections keep their own fds), so a shorter idle only tightens the worst-case
+/// reconnect without new risk.
 const REBIND_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Binds the `CID_ANY:VSOCK_PORT` listener in non-blocking mode.
@@ -421,10 +470,14 @@ fn bind_vsock_listener() -> Option<VsockListener> {
 /// fds, and the fresh listener re-binds the same `CID_ANY:VSOCK_PORT` on the live
 /// device. Each accepted connection is served on its own thread so a parked stale
 /// connection never blocks new accepts.
-fn serve_vsock(reaper: &Arc<ReaperCoordinator>) {
+fn serve_vsock(
+    reaper: &Arc<ReaperCoordinator>,
+    accept_poll: std::time::Duration,
+    rebind_idle: std::time::Duration,
+) {
     loop {
         let Some(listener) = bind_vsock_listener() else {
-            std::thread::sleep(ACCEPT_POLL);
+            std::thread::sleep(accept_poll);
             continue;
         };
         tracing::info!("vmcell-guest-agent: listening on vsock port {}", VSOCK_PORT);
@@ -443,9 +496,9 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>) {
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(ACCEPT_POLL);
-                    idle += ACCEPT_POLL;
-                    if idle >= REBIND_IDLE {
+                    std::thread::sleep(accept_poll);
+                    idle += accept_poll;
+                    if idle >= rebind_idle {
                         // Drop this listener and re-bind on the current device.
                         break;
                     }
@@ -473,6 +526,11 @@ fn handle_connection(
         match msg {
             Message::Exec(req) => handle_exec(req, stream, reaper)?,
             Message::PutFile { dst, bytes } => handle_put_file(&dst, &bytes, stream)?,
+            Message::Resync {
+                unix_secs,
+                unix_nanos,
+                mac,
+            } => handle_resync(unix_secs, unix_nanos, mac, stream)?,
             // Ready/Stdout/Stderr/Exit are guest→host frames; receiving one (or
             // any future variant) means the peer desynced. Log it loudly and
             // close the connection so the host reconnects on a fresh stream,
@@ -533,6 +591,86 @@ fn handle_put_file(
     let code = if result.is_ok() { 0 } else { 1 };
     let exit_msg = postcard::to_stdvec(&Message::Exit(code))?;
     send_framed(stream, &exit_msg)?;
+    Ok(())
+}
+
+/// Maps a host `(unix_secs, unix_nanos)` instant to the `rustix` [`Timespec`] the
+/// mandatory post-restore clock set consumes.
+///
+/// Split out as a pure function so the field mapping (`unix_secs`→`tv_sec`,
+/// `unix_nanos`→`tv_nsec`) is unit-tested: a swapped or truncated assignment
+/// reddens `resync_timespec_maps_fields` without a live guest / a privileged
+/// `clock_settime`.
+///
+/// [`Timespec`]: rustix::time::Timespec
+fn resync_timespec(unix_secs: u64, unix_nanos: u32) -> rustix::time::Timespec {
+    rustix::time::Timespec {
+        tv_sec: unix_secs as i64,
+        tv_nsec: unix_nanos as i64,
+    }
+}
+
+/// Copies 32 bytes of `/dev/hwrng` into `/dev/urandom` (best-effort CSPRNG
+/// reseed), byte-identical to the `head -c 32 /dev/hwrng > /dev/urandom` redirect
+/// the exec-based restore path used: writing to `/dev/urandom` mixes the bytes
+/// into the pool without crediting entropy.
+///
+/// # Errors
+/// Returns the underlying [`std::io::Error`] if `/dev/hwrng` is missing/unreadable
+/// or `/dev/urandom` cannot be written. The caller treats any error as
+/// "reseed not applied" and never fails the resync on it.
+fn reseed_urandom_from_hwrng() -> std::io::Result<()> {
+    let mut hwrng = std::fs::File::open("/dev/hwrng")?;
+    let mut buf = [0u8; 32];
+    hwrng.read_exact(&mut buf)?;
+    let mut urandom = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/urandom")?;
+    urandom.write_all(&buf)?;
+    Ok(())
+}
+
+/// Handles a [`Message::Resync`] post-restore resync natively — replacing the
+/// three subprocess execs (`date` / `head -c 32 /dev/hwrng` / `ip link set`) —
+/// and always replies with a [`Message::ResyncAck`] carrying each step's outcome
+/// (design 44 §5).
+///
+/// The clock set is **mandatory** (§9.2): a failure is reported via `clock_error`
+/// but NEVER propagated with `?` or a panic — the ack must always be sent so the
+/// host gets a definitive answer and decides (it treats a `Some(clock_error)` as a
+/// hard, retryable failure). The CSPRNG reseed and MAC rotation are best-effort
+/// and reported via the two bool flags; neither failing aborts the ack.
+fn handle_resync(
+    unix_secs: u64,
+    unix_nanos: u32,
+    mac: Option<[u8; 6]>,
+    stream: &mut VsockStream,
+) -> std::io::Result<()> {
+    // 1. Clock (MANDATORY): set CLOCK_REALTIME to the host instant. Never `?` — a
+    //    failure is reported in the ack, not propagated.
+    let clock_error = match rustix::time::clock_settime(
+        rustix::time::ClockId::Realtime,
+        resync_timespec(unix_secs, unix_nanos),
+    ) {
+        Ok(()) => None,
+        Err(e) => Some(e.to_string()),
+    };
+
+    // 2. RNG reseed (best-effort): a missing/unreadable hwrng yields false, never
+    //    an error.
+    let reseed_applied = reseed_urandom_from_hwrng().is_ok();
+
+    // 3. MAC rotation (best-effort): install the new eth0 hwaddr in-process via
+    //    SIOCSIFHWADDR (no in-guest netlink). Absent MAC → not applied.
+    let mac_applied = matches!(mac, Some(m) if netif::set_mac_bytes("eth0", m).is_ok());
+
+    let ack = Message::ResyncAck {
+        clock_error,
+        reseed_applied,
+        mac_applied,
+    };
+    let bytes = postcard::to_stdvec(&ack).map_err(std::io::Error::other)?;
+    send_framed(stream, &bytes)?;
     Ok(())
 }
 
@@ -729,6 +867,76 @@ mod tests {
     fn parse_share_mounts_empty_when_no_tokens() {
         assert!(parse_share_mounts("console=ttyS0 root=/dev/vda ro").is_empty());
         assert!(parse_share_mounts("").is_empty());
+    }
+
+    // §8.3: the guest-tuning cmdline tokens are UNTRUSTED and must be clamped into
+    // `[floor, ceil]`, falling back to the compiled default when absent/garbage.
+    // The clamp is load-bearing: an un-clamped parse would let
+    // `vmcell_accept_poll_ms=0` busy-spin PID 1's accept loop (0ms sleep).
+    #[test]
+    fn parse_ms_clamps_and_defaults() {
+        use std::time::Duration;
+        let key = "vmcell_accept_poll_ms=";
+        // Absent → the compiled default.
+        assert_eq!(
+            parse_ms("console=ttyS0 ro", key, 20, 1, 10_000),
+            Duration::from_millis(20)
+        );
+        // An in-range value is honored verbatim.
+        assert_eq!(
+            parse_ms("vmcell_accept_poll_ms=7 ro", key, 20, 1, 10_000),
+            Duration::from_millis(7)
+        );
+        // 0 is clamped UP to the floor (1) — the busy-spin guard. RED on an
+        // un-clamped parse that would return 0.
+        assert_eq!(
+            parse_ms("vmcell_accept_poll_ms=0", key, 20, 1, 10_000),
+            Duration::from_millis(1),
+            "0 must clamp to the floor so it cannot busy-spin PID 1"
+        );
+        // Above the ceiling is clamped DOWN.
+        assert_eq!(
+            parse_ms("vmcell_accept_poll_ms=999999", key, 20, 1, 10_000),
+            Duration::from_millis(10_000)
+        );
+        // Non-numeric garbage → the default (not a partial/zero parse).
+        assert_eq!(
+            parse_ms("vmcell_accept_poll_ms=abc", key, 20, 1, 10_000),
+            Duration::from_millis(20)
+        );
+        // Overflowing `u64` → the default (parse fails, not saturates).
+        assert_eq!(
+            parse_ms(
+                "vmcell_accept_poll_ms=99999999999999999999999999",
+                key,
+                20,
+                1,
+                10_000
+            ),
+            Duration::from_millis(20)
+        );
+        // The FIRST parseable token wins (matches the strip_prefix+parse contract).
+        assert_eq!(
+            parse_ms("vmcell_accept_poll_ms=x vmcell_accept_poll_ms=9", key, 20, 1, 10_000),
+            Duration::from_millis(9)
+        );
+    }
+
+    // The (secs, nanos) → Timespec mapping the mandatory post-restore clock set
+    // consumes. RED on a units swap (secs↔nanos) or a truncating nanos cast.
+    #[test]
+    fn resync_timespec_maps_fields() {
+        let ts = resync_timespec(1_700_000_000, 123_456_789);
+        assert_eq!(ts.tv_sec, 1_700_000_000, "unix_secs must map to tv_sec");
+        assert_eq!(ts.tv_nsec, 123_456_789, "unix_nanos must map to tv_nsec");
+        assert_ne!(
+            ts.tv_sec, 123_456_789,
+            "a secs↔nanos swap must not put the nanos in tv_sec"
+        );
+        // The full u32 nanos range maps without overflow/truncation.
+        let ts_max = resync_timespec(0, u32::MAX);
+        assert_eq!(ts_max.tv_sec, 0);
+        assert_eq!(ts_max.tv_nsec, u32::MAX as i64);
     }
 
     // AGENT-3: the guest's hand-rolled framing is the load-bearing interop with

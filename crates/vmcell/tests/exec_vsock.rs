@@ -66,6 +66,7 @@ async fn test_exec_vsock_mock() {
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
+        &vmcell::config::Timeouts::default(),
         &vmcell::vmm::RealSerialLog {
             path: std::path::PathBuf::from("/dev/null"),
         },
@@ -148,6 +149,7 @@ async fn exec_timeout_desyncs_subsequent_put_file() {
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
+        &vmcell::config::Timeouts::default(),
         &serial_log(),
     )
     .await
@@ -198,6 +200,7 @@ async fn put_file_timeout_desyncs_subsequent_exec() {
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
+        &vmcell::config::Timeouts::default(),
         &serial_log(),
     )
     .await
@@ -259,6 +262,7 @@ async fn host_codec_accepts_frame_above_default_8mib() {
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
+        &vmcell::config::Timeouts::default(),
         &serial_log(),
     )
     .await

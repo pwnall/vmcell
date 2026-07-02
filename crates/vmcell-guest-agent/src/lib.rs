@@ -6,6 +6,10 @@
 //! shares only the [`vmcell_protocol`] wire enum).
 #![deny(missing_docs)]
 
+/// Minimal interface-configuration helpers (native MAC rotation) for the
+/// post-restore resync — libc-only, so the lean-agent graph stays host-stack-free.
+pub mod netif;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex};
 

@@ -391,29 +391,7 @@ impl Qemu {
                 ));
         }
 
-        let mut cmdline = format!(
-            "console=ttyS0 root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
-            match &cfg.rootfs {
-                crate::config::RootfsSource::Erofs { .. } => "erofs",
-                _ => "ext4",
-            },
-            match &cfg.rootfs {
-                crate::config::RootfsSource::Erofs { .. } => "",
-                _ => "rootflags=noload",
-            },
-            res.vmid
-        );
-        if !matches!(cfg.net, crate::config::NetConfig::None) {
-            let (host_ip, guest_ip, _) = crate::net::ip_math(res.vmid)?;
-            cmdline.push_str(&format!(
-                " ip={}::{}:255.255.255.252::eth0:off",
-                guest_ip, host_ip
-            ));
-        }
-        if cfg.nested_virt {
-            cmdline.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
-        }
-        crate::config::push_share_args(&mut cmdline, &cfg.shares);
+        let cmdline = crate::config::build_kernel_cmdline(cfg, res.vmid, "")?;
         cmd.arg("-kernel")
             .arg(&cfg.kernel)
             .arg("-append")
@@ -445,7 +423,7 @@ impl Qemu {
             &res.cgroup_name,
             &qmp_socket,
             1000,
-            20,
+            cfg.timeouts.api_socket_poll.as_millis() as u64,
         )
         .await?;
 

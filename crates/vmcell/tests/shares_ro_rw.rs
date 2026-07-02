@@ -62,6 +62,7 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
         vm.instance().vsock_path(),
         5000,
         std::time::Duration::from_secs(10),
+        &vmcell::config::Timeouts::default(),
         &vmcell::vmm::RealSerialLog {
             path: vm.instance().serial_log().to_path_buf(),
         },

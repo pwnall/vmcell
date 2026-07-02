@@ -58,6 +58,38 @@ struct Args {
     /// default `vmlinux`. This is the kernel-version benchmark dimension.
     #[arg(long)]
     kernel: Option<String>,
+
+    /// Timeouts profile: `default` (balanced), `low-latency` (min time-to-output),
+    /// or `throughput` (min whole-lifecycle incl. teardown). Selects the
+    /// `Timeouts` preset applied to every VM in the run.
+    #[arg(long, default_value = "default")]
+    profile: String,
+
+    /// Guest kernel console verbosity: `balanced` (default, `loglevel=6`),
+    /// `quiet` (3), `verbose` (7), or `debug` (8). Drives the serial-logging
+    /// VM-exit cost dimension.
+    #[arg(long, default_value = "balanced")]
+    kernel_verbosity: String,
+}
+
+/// Maps the `--profile` flag to a [`Timeouts`] preset (unknown → `default`).
+fn timeouts_for(profile: &str) -> vmcell::config::Timeouts {
+    match profile {
+        "low-latency" => vmcell::config::Timeouts::low_latency(),
+        "throughput" => vmcell::config::Timeouts::throughput(),
+        _ => vmcell::config::Timeouts::default(),
+    }
+}
+
+/// Maps the `--kernel-verbosity` flag to a [`KernelVerbosity`] (unknown → `Balanced`).
+fn verbosity_for(s: &str) -> vmcell::config::KernelVerbosity {
+    use vmcell::config::KernelVerbosity as K;
+    match s {
+        "quiet" => K::Quiet,
+        "verbose" => K::Verbose,
+        "debug" => K::Debug,
+        _ => K::Balanced,
+    }
 }
 
 /// Parses the `--restore-mode` flag into a [`RestoreMode`], rejecting any value
@@ -136,6 +168,8 @@ async fn run_bench<V: Vmm>(
         .mem_mib(args.mem_mib)
         .network_disabled()
         .restore_mode(args.restore_mode)
+        .timeouts(timeouts_for(&args.profile))
+        .kernel_verbosity(verbosity_for(&args.kernel_verbosity))
         .build()
         .expect("valid VM configuration benchmark invariant");
     let cid_allocator = std::sync::Arc::new(CidAllocator::new());
@@ -518,13 +552,16 @@ fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
     (dir, kernel, rootfs)
 }
 
-/// Builds the standard network-disabled erofs VM config used by every mode.
+/// Builds the standard network-disabled erofs VM config used by every mode,
+/// applying the run's `--profile` timeouts and `--kernel-verbosity`.
 fn build_cfg(
     kernel: PathBuf,
     rootfs: PathBuf,
     mem_mib: u32,
     restore_mode: RestoreMode,
     ksm_mergeable: bool,
+    timeouts: vmcell::config::Timeouts,
+    verbosity: vmcell::config::KernelVerbosity,
 ) -> VmConfig {
     VmConfig::builder(kernel, RootfsSource::Erofs { image: rootfs })
         .vcpus(1)
@@ -532,6 +569,8 @@ fn build_cfg(
         .network_disabled()
         .restore_mode(restore_mode)
         .ksm_mergeable(ksm_mergeable)
+        .timeouts(timeouts)
+        .kernel_verbosity(verbosity)
         .build()
         .expect("valid VM configuration benchmark invariant")
 }
@@ -709,6 +748,8 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         args.mem_mib,
         args.restore_mode,
         args.ksm_mergeable,
+        timeouts_for(&args.profile),
+        verbosity_for(&args.kernel_verbosity),
     );
     let cid = std::sync::Arc::new(CidAllocator::new());
 
@@ -916,7 +957,15 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         println!("suspend-size: backend {backend} has no snapshot support; skipping");
         return;
     }
-    let cfg = build_cfg(kernel, rootfs, args.mem_mib, args.restore_mode, false);
+    let cfg = build_cfg(
+        kernel,
+        rootfs,
+        args.mem_mib,
+        args.restore_mode,
+        false,
+        timeouts_for(&args.profile),
+        verbosity_for(&args.kernel_verbosity),
+    );
     let cid = std::sync::Arc::new(CidAllocator::new());
     let snap_dir = PathBuf::from(&args.snap_dir).join(format!(
         "suspend-{backend}-{}-{}",
@@ -1184,7 +1233,15 @@ async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         println!("phase-budget: No successful runs (missing artifacts in {dir})");
         return;
     }
-    let cfg = build_cfg(kernel, rootfs, args.mem_mib, args.restore_mode, false);
+    let cfg = build_cfg(
+        kernel,
+        rootfs,
+        args.mem_mib,
+        args.restore_mode,
+        false,
+        timeouts_for(&args.profile),
+        verbosity_for(&args.kernel_verbosity),
+    );
     let cid = std::sync::Arc::new(CidAllocator::new());
 
     // Cold-boot path (opt-in budget).
@@ -1240,7 +1297,15 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         println!("vsock-rtt: No successful runs (missing artifacts in {dir})");
         return;
     }
-    let cfg = build_cfg(kernel, rootfs, args.mem_mib, args.restore_mode, false);
+    let cfg = build_cfg(
+        kernel,
+        rootfs,
+        args.mem_mib,
+        args.restore_mode,
+        false,
+        timeouts_for(&args.profile),
+        verbosity_for(&args.kernel_verbosity),
+    );
     let cid = std::sync::Arc::new(CidAllocator::new());
     let iters = args.iters();
 

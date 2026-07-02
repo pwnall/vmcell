@@ -27,6 +27,26 @@ use tokio::net::UnixStream;
 #[cfg(feature = "host-common")]
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+/// The per-step outcome of a native post-restore [`AgentClient::resync`]
+/// (design 44 §5).
+///
+/// Mirrors the guest's `ResyncAck`: `clock_error` is `Some(msg)` iff the
+/// mandatory guest clock set failed (the orchestrator treats that as a hard,
+/// retryable failure — M-RESTORE-1), and the best-effort `reseed_applied` /
+/// `mac_applied` flags report whether the CSPRNG reseed and MAC rotation took
+/// effect in the guest.
+#[cfg(feature = "host-common")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ResyncOutcome {
+    /// `Some(err)` iff the mandatory guest `CLOCK_REALTIME` set failed.
+    pub clock_error: Option<String>,
+    /// Whether the best-effort guest CSPRNG reseed applied.
+    pub reseed_applied: bool,
+    /// Whether the best-effort guest `eth0` MAC rotation applied.
+    pub mac_applied: bool,
+}
+
 #[cfg(feature = "host-common")]
 /// A client for communicating with the guest agent over vsock.
 #[derive(Debug)]
@@ -54,13 +74,14 @@ impl AgentClient {
     /// # use std::time::Duration;
     /// # async fn run() {
     /// let serial = vmcell::vmm::RealSerialLog { path: std::path::PathBuf::from("/dev/null") };
-    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), &serial).await.unwrap();
+    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), &vmcell::config::Timeouts::default(), &serial).await.unwrap();
     /// # }
     /// ```
     pub async fn connect(
         vsock_path: &Path,
         port: u32,
         timeout: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
         serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<Self> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -68,7 +89,7 @@ impl AgentClient {
         // because a failed local AF_UNIX connect is cheap, so a tighter cadence
         // narrows the gap between "guest became ready" and "host noticed" without
         // busy-spinning (the deadline + panic checks still run every iteration).
-        let mut backoff = std::time::Duration::from_millis(20);
+        let mut backoff = timeouts.connect_backoff_floor;
 
         loop {
             if tokio::time::Instant::now() > deadline {
@@ -88,13 +109,13 @@ impl AgentClient {
                     // backoff that only makes sense while the socket was absent.
                     // Reset to the floor so a few socket-absent iterations can't
                     // inflate the guest-ready detection gap (EXP-HOST-BACKOFF-RESET).
-                    backoff = std::time::Duration::from_millis(20);
+                    backoff = timeouts.connect_backoff_floor;
                     s
                 }
                 Err(e) => {
                     tracing::trace!("Agent connect UnixStream::connect failed: {}", e);
                     tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_millis(100));
+                    backoff = std::cmp::min(backoff * 2, timeouts.connect_backoff_cap);
                     continue;
                 }
             };
@@ -111,7 +132,7 @@ impl AgentClient {
                 let mut byte = [0; 1];
                 use tokio::io::AsyncReadExt;
                 if let Ok(Ok(1)) = tokio::time::timeout(
-                    std::time::Duration::from_millis(150),
+                    timeouts.connect_ok_read,
                     stream.read(&mut byte),
                 )
                 .await
@@ -180,8 +201,9 @@ impl AgentClient {
         port: u32,
         serial_log: &dyn crate::vmm::SerialLog,
         timeout: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
     ) -> Result<()> {
-        let new_client = Self::connect(vsock_path, port, timeout, serial_log).await?;
+        let new_client = Self::connect(vsock_path, port, timeout, timeouts, serial_log).await?;
         self.stream = new_client.stream;
         // A fresh stream is back in sync, so clear any prior desync state.
         self.desynced = false;
@@ -324,5 +346,63 @@ impl AgentClient {
         .await;
 
         Self::finish_request(&mut self.desynced, result, "put_file timed out")
+    }
+
+    /// Performs the one-shot native post-restore resync (design 44 §5): sets the
+    /// guest clock to the host instant, best-effort reseeds the guest CSPRNG, and
+    /// best-effort rotates the guest `eth0` MAC — one request, one ack — replacing
+    /// the three post-restore subprocess execs (`date` / `head` / `ip`).
+    ///
+    /// # Errors
+    /// Returns an error if the request cannot be sent, the ack cannot be received
+    /// or decoded, the exchange times out, or the stream is already
+    /// desynchronized by a prior request (a [`AgentClient::reconnect`] is then
+    /// required). Like the other request methods, any send/decode error or timeout
+    /// marks the stream desynced so the next request fails loud. Note a
+    /// `Some(clock_error)` in the returned [`ResyncOutcome`] is **not** an `Err`
+    /// here — the transport succeeded; the caller decides how to treat the
+    /// mandatory-clock failure.
+    pub async fn resync(
+        &mut self,
+        unix_secs: u64,
+        unix_nanos: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<ResyncOutcome> {
+        self.ensure_synced()?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let msg = Message::Resync {
+                unix_secs,
+                unix_nanos,
+                mac,
+            };
+            let msg_bytes = postcard::to_stdvec(&msg)?;
+            self.stream
+                .send(::bytes::Bytes::from(msg_bytes))
+                .await
+                .map_err(Error::Io)?;
+
+            // Await exactly one ack frame.
+            if let Some(res) = self.stream.next().await {
+                let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
+                let resp_msg: Message = postcard::from_bytes(&res_bytes)?;
+                match resp_msg {
+                    Message::ResyncAck {
+                        clock_error,
+                        reseed_applied,
+                        mac_applied,
+                    } => Ok(ResyncOutcome {
+                        clock_error,
+                        reseed_applied,
+                        mac_applied,
+                    }),
+                    _ => Err(Error::Agent("unexpected response to resync".into())),
+                }
+            } else {
+                Err(Error::Agent("connection closed during resync".into()))
+            }
+        })
+        .await;
+
+        Self::finish_request(&mut self.desynced, result, "resync timed out")
     }
 }

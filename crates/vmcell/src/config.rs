@@ -36,6 +36,179 @@ pub struct VmConfig {
     /// incompatible with vhost-user paths (unprivileged net, virtio-fs). A
     /// density-vs-CPU trade measured in §13.5.
     pub ksm_mergeable: bool,
+    /// Guest kernel console log verbosity (`loglevel=`). Default
+    /// [`KernelVerbosity::Balanced`] is the §15 perf-optimal; raise it only for
+    /// debugging / a test that asserts on a specific kernel log line.
+    pub kernel_verbosity: KernelVerbosity,
+    /// Per-VM hot-path timing knobs (connect cadence, teardown grace, guest
+    /// accept/re-bind polls). Default [`Timeouts::default`] is the shipped
+    /// balanced profile; [`Timeouts::low_latency`] / [`Timeouts::throughput`]
+    /// are ready-made presets (§10).
+    pub timeouts: Timeouts,
+}
+
+/// Per-VM hot-path timing knobs, gathered so a workload can pick a profile in one
+/// place. Only the timings that (a) sit on the per-test hot path and (b) a
+/// workload legitimately trades are here; internal readiness/QMP/join timeouts
+/// stay as constants (they are correctness-floor mechanics, not workload knobs).
+///
+/// Two presets are provided: [`Timeouts::low_latency`] minimizes time-to-output
+/// (tightens every connect/accept cadence, leaves teardown graceful) and
+/// [`Timeouts::throughput`] minimizes whole-lifecycle wall-clock (cuts the
+/// graceful-shutdown grace). All constructors clamp to correctness floors so a
+/// preset can never produce a busy-spin or a sub-viable window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Timeouts {
+    /// Host: initial/reset backoff between failed vsock connects while the VMM
+    /// socket is still absent (mirrors the guest `accept_poll`; jointly the
+    /// reconnect cadence). Floor 1 ms.
+    pub connect_backoff_floor: std::time::Duration,
+    /// Host: upper clamp for the doubling connect backoff. Floor = the floor.
+    pub connect_backoff_cap: std::time::Duration,
+    /// Host: per-byte read timeout for the vsock-mux `OK` handshake line. Floor 5 ms.
+    pub connect_ok_read: std::time::Duration,
+    /// Host: VMM control-socket readiness poll interval after spawn. Floor 1 ms.
+    pub api_socket_poll: std::time::Duration,
+    /// Host: ceiling for the graceful `shutdown()` grace window (polls
+    /// `has_exited`, so this bounds only a guest that never exits on its own).
+    /// The `Drop` force-kill path does not use this.
+    pub shutdown_grace: std::time::Duration,
+    /// Guest (emitted on the cmdline): non-blocking accept poll cadence. Floor 1 ms.
+    pub guest_accept_poll: std::time::Duration,
+    /// Guest (emitted on the cmdline): post-restore listener re-bind idle window.
+    /// Floor 20 ms.
+    pub guest_rebind_idle: std::time::Duration,
+}
+
+impl Default for Timeouts {
+    /// The shipped balanced profile (the §15 post-optimization-pass values).
+    fn default() -> Self {
+        Self {
+            connect_backoff_floor: std::time::Duration::from_millis(20),
+            connect_backoff_cap: std::time::Duration::from_millis(100),
+            connect_ok_read: std::time::Duration::from_millis(150),
+            api_socket_poll: std::time::Duration::from_millis(5),
+            shutdown_grace: std::time::Duration::from_millis(250),
+            guest_accept_poll: std::time::Duration::from_millis(20),
+            guest_rebind_idle: std::time::Duration::from_millis(250),
+        }
+    }
+}
+
+impl Timeouts {
+    /// Clamps every field into its correctness floor so a hand-built or preset
+    /// `Timeouts` can never busy-spin PID 1 or collapse a window below viability.
+    #[must_use]
+    fn clamped(mut self) -> Self {
+        use std::time::Duration;
+        let max = |a: Duration, b: Duration| if a > b { a } else { b };
+        self.connect_backoff_floor = max(self.connect_backoff_floor, Duration::from_millis(1));
+        self.connect_backoff_cap = max(self.connect_backoff_cap, self.connect_backoff_floor);
+        self.connect_ok_read = max(self.connect_ok_read, Duration::from_millis(5));
+        self.api_socket_poll = max(self.api_socket_poll, Duration::from_millis(1));
+        self.guest_accept_poll = max(self.guest_accept_poll, Duration::from_millis(1));
+        self.guest_rebind_idle = max(self.guest_rebind_idle, Duration::from_millis(20));
+        self
+    }
+
+    /// Preset that minimizes **time-to-output** (start → first exec output):
+    /// tightens every connect/accept cadence (host + guest) so the gap between
+    /// "guest ready" and "host noticed" shrinks. Teardown is **not** optimized —
+    /// `shutdown_grace` stays graceful (this profile excludes teardown by design).
+    #[must_use]
+    pub fn low_latency() -> Self {
+        use std::time::Duration;
+        Self {
+            connect_backoff_floor: Duration::from_millis(5),
+            connect_backoff_cap: Duration::from_millis(40),
+            connect_ok_read: Duration::from_millis(100),
+            api_socket_poll: Duration::from_millis(2),
+            shutdown_grace: Duration::from_millis(250),
+            guest_accept_poll: Duration::from_millis(5),
+            guest_rebind_idle: Duration::from_millis(150),
+        }
+        .clamped()
+    }
+
+    /// Preset that minimizes **whole per-test wall-clock** (incl. teardown): cuts
+    /// the graceful-`shutdown()` grace (the largest tunable in the aggregate) and
+    /// keeps connect cadences moderate (tight polls cost idle-CPU wakeups, which
+    /// hurt a dense farm). A caller that tears down via `Drop`/RAII already gets
+    /// the ~27 ms fast path; this helps graceful-`shutdown()` users.
+    #[must_use]
+    pub fn throughput() -> Self {
+        use std::time::Duration;
+        Self {
+            connect_backoff_floor: Duration::from_millis(10),
+            connect_backoff_cap: Duration::from_millis(75),
+            connect_ok_read: Duration::from_millis(150),
+            api_socket_poll: Duration::from_millis(3),
+            shutdown_grace: Duration::from_millis(50),
+            guest_accept_poll: Duration::from_millis(10),
+            guest_rebind_idle: Duration::from_millis(200),
+        }
+        .clamped()
+    }
+}
+
+/// Appends the guest-side timing tokens to a kernel `cmdline` (§8.3). The guest
+/// agent parses `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` (whole ms,
+/// clamped guest-side) to tune its accept/re-bind cadence per VM without a rootfs
+/// rebuild; absent tokens fall back to the agent's compiled defaults.
+pub(crate) fn push_guest_timeout_args(cmdline: &mut String, timeouts: &Timeouts) {
+    cmdline.push_str(&format!(
+        " vmcell_accept_poll_ms={} vmcell_rebind_idle_ms={}",
+        timeouts.guest_accept_poll.as_millis(),
+        timeouts.guest_rebind_idle.as_millis(),
+    ));
+}
+
+/// Builds the guest kernel command line — the **single** source of truth shared by
+/// all three backends (`console`, `loglevel`, RNG-trust, root/rootfs, `panic`,
+/// `init`, `vmcell_vmid`, optional `ip=`/nested/shares, and the guest timing
+/// tokens). Centralizing it fixes the prior triplication where QEMU's inline
+/// cmdline silently omitted `loglevel=` (paying the full 8250 UART tax, §8.3).
+/// `backend_extra` carries the one genuine per-backend fragment (Firecracker's
+/// `noxsave ` FPU guard), inserted before `init=` exactly where it was.
+///
+/// # Errors
+/// Propagates the `/30` host-IP math error when networking is enabled.
+pub(crate) fn build_kernel_cmdline(
+    cfg: &VmConfig,
+    vmid: u32,
+    backend_extra: &str,
+) -> Result<String, crate::error::Error> {
+    let rootfstype = match &cfg.rootfs {
+        RootfsSource::Erofs { .. } => "erofs",
+        _ => "ext4",
+    };
+    let rootflags = match &cfg.rootfs {
+        RootfsSource::Erofs { .. } => "",
+        _ => "rootflags=noload",
+    };
+    let mut s = format!(
+        "console=ttyS0 loglevel={} random.trust_cpu=on random.trust_bootloader=on \
+         root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
+        cfg.kernel_verbosity.loglevel(),
+        rootfstype,
+        rootflags,
+        backend_extra,
+        vmid,
+    );
+    if !matches!(cfg.net, NetConfig::None) {
+        let (host_ip, guest_ip, _) = crate::net::ip_math(vmid)?;
+        s.push_str(&format!(
+            " ip={}::{}:255.255.255.252::eth0:off",
+            guest_ip, host_ip
+        ));
+    }
+    if cfg.nested_virt {
+        s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
+    }
+    push_share_args(&mut s, &cfg.shares);
+    push_guest_timeout_args(&mut s, &cfg.timeouts);
+    Ok(s)
 }
 
 /// Options for the root filesystem backing the VM.
@@ -59,6 +232,45 @@ pub enum RootfsSource {
         /// Path to the host directory serving as root.
         dir: PathBuf,
     },
+}
+
+/// Guest kernel console log verbosity, mapped to the `loglevel=` boot parameter.
+///
+/// Kernel `printk` to the legacy 8250 `ttyS0` UART is a **per-byte PIO trap → VM
+/// exit** (§8.3), so verbose boot logging is a real cold-boot cost — the single
+/// largest lever in the §15 latency pass. This knob lets debugging and specific
+/// tests opt into a verbose log without making every VM pay the exit tax. Panic
+/// capture ([`contains_panic`](crate::vmm::SerialLog::contains_panic), KERN_EMERG)
+/// works at every level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KernelVerbosity {
+    /// `loglevel=3` — err/crit only. Fastest boot, but a healthy log is nearly
+    /// empty, so not suitable for a test that greps a boot line (e.g. `boot.rs`).
+    Quiet,
+    /// `loglevel=6` — the shipped default: drops the `KERN_INFO` device-probe
+    /// flood while keeping the `NOTICE` banner + `WARN`/`ERR` + panic lines.
+    #[default]
+    Balanced,
+    /// `loglevel=7` — adds the `KERN_INFO` flood back (pays the full UART tax);
+    /// for diagnosing a device-probe issue.
+    Verbose,
+    /// `loglevel=8` — everything, for a wedged-boot post-mortem.
+    Debug,
+}
+
+impl KernelVerbosity {
+    /// The `loglevel=` numeric value for this verbosity (kernel console loglevel:
+    /// a message prints iff its level `<` this value).
+    #[must_use]
+    pub fn loglevel(self) -> u8 {
+        match self {
+            KernelVerbosity::Quiet => 3,
+            KernelVerbosity::Balanced => 6,
+            KernelVerbosity::Verbose => 7,
+            KernelVerbosity::Debug => 8,
+        }
+    }
 }
 
 /// Memory-restore strategy for snapshot restore (Cloud Hypervisor `prefault`).
@@ -296,6 +508,8 @@ impl VmConfig {
             vmid: None,
             restore_mode: RestoreMode::Default,
             ksm_mergeable: false,
+            kernel_verbosity: KernelVerbosity::Balanced,
+            timeouts: Timeouts::default(),
         }
     }
 }
@@ -316,6 +530,8 @@ pub struct VmConfigBuilder {
     vmid: Option<u32>,
     restore_mode: RestoreMode,
     ksm_mergeable: bool,
+    kernel_verbosity: KernelVerbosity,
+    timeouts: Timeouts,
 }
 
 impl VmConfigBuilder {
@@ -387,6 +603,24 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn ksm_mergeable(mut self, mergeable: bool) -> Self {
         self.ksm_mergeable = mergeable;
+        self
+    }
+
+    /// Sets the guest kernel console verbosity ([`KernelVerbosity`], default
+    /// [`KernelVerbosity::Balanced`]). Raise it for debugging or a test that
+    /// asserts on a specific kernel log line.
+    #[must_use]
+    pub fn kernel_verbosity(mut self, verbosity: KernelVerbosity) -> Self {
+        self.kernel_verbosity = verbosity;
+        self
+    }
+
+    /// Sets the per-VM hot-path [`Timeouts`] (default [`Timeouts::default`]). Use
+    /// [`Timeouts::low_latency`] or [`Timeouts::throughput`] for the ready-made
+    /// profiles.
+    #[must_use]
+    pub fn timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts.clamped();
         self
     }
 
@@ -563,6 +797,8 @@ impl VmConfigBuilder {
             vmid: self.vmid,
             restore_mode: self.restore_mode,
             ksm_mergeable: self.ksm_mergeable,
+            kernel_verbosity: self.kernel_verbosity,
+            timeouts: self.timeouts,
         })
     }
 }
@@ -1112,5 +1348,109 @@ mod tests {
         .build()
         .unwrap();
         assert!(cfg.ksm_mergeable);
+    }
+
+    // §8.3 UART tax lever: each verbosity maps to its `loglevel=` number. Buggy
+    // impl this guards: an off-by-one or a swapped arm (e.g. Balanced→7, or
+    // Verbose→6) — any wrong mapping turns one of these equalities red.
+    #[test]
+    fn kernel_verbosity_loglevel_mapping() {
+        assert_eq!(KernelVerbosity::Quiet.loglevel(), 3);
+        assert_eq!(KernelVerbosity::Balanced.loglevel(), 6);
+        assert_eq!(KernelVerbosity::Verbose.loglevel(), 7);
+        assert_eq!(KernelVerbosity::Debug.loglevel(), 8);
+    }
+
+    // §10 timing presets: `low_latency` tightens the connect/accept cadence but
+    // leaves teardown graceful, and `throughput` cuts the graceful-shutdown grace.
+    // Buggy impls this guards: a preset that forgets to lower a knob (equal to
+    // default), or `low_latency` that also cuts `shutdown_grace` (the excluded
+    // knob) — either flips one comparison.
+    #[test]
+    fn timeouts_presets_ordering() {
+        let d = Timeouts::default();
+        let ll = Timeouts::low_latency();
+        let tp = Timeouts::throughput();
+        assert!(ll.guest_accept_poll < d.guest_accept_poll);
+        assert!(ll.connect_backoff_floor < d.connect_backoff_floor);
+        assert!(tp.shutdown_grace < d.shutdown_grace);
+        // low_latency deliberately excludes teardown: its grace stays == default.
+        assert_eq!(ll.shutdown_grace, d.shutdown_grace);
+    }
+
+    // The builder's `.timeouts()` clamps every knob to its correctness floor so a
+    // hand-built (or preset) `Timeouts` can never busy-spin PID 1. Buggy impl:
+    // `.timeouts()` stores the value verbatim without `.clamped()`, so a 0 ms
+    // poll survives — the assertions below then fail.
+    #[test]
+    fn timeouts_clamp_floors() {
+        use std::time::Duration;
+        let raw = Timeouts {
+            connect_backoff_floor: Duration::from_millis(0),
+            connect_backoff_cap: Duration::from_millis(100),
+            connect_ok_read: Duration::from_millis(150),
+            api_socket_poll: Duration::from_millis(5),
+            shutdown_grace: Duration::from_millis(250),
+            guest_accept_poll: Duration::from_millis(0),
+            guest_rebind_idle: Duration::from_millis(250),
+        };
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .timeouts(raw)
+        .build()
+        .unwrap();
+        assert!(cfg.timeouts.guest_accept_poll >= Duration::from_millis(1));
+        assert!(cfg.timeouts.connect_backoff_floor >= Duration::from_millis(1));
+    }
+
+    // The shared cmdline builder is the single source of truth for `loglevel=` and
+    // the guest timing tokens across all three backends — closing the prior
+    // triplication where QEMU silently omitted `loglevel=`. Buggy impls this
+    // guards: a builder that drops `loglevel=`, forgets the guest timing tokens,
+    // ignores `backend_extra`, or mis-places the FPU guard relative to `init=`.
+    #[test]
+    fn build_kernel_cmdline_all_backends_have_loglevel() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .network_disabled()
+        .build()
+        .unwrap();
+
+        let plain = build_kernel_cmdline(&cfg, 1, "").unwrap();
+        let fpu = build_kernel_cmdline(&cfg, 1, "noxsave ").unwrap();
+        for c in [&plain, &fpu] {
+            assert!(c.contains("loglevel=6"), "missing loglevel: {c}");
+            assert!(c.contains("vmcell_accept_poll_ms=20"), "missing accept poll: {c}");
+            assert!(c.contains("vmcell_rebind_idle_ms=250"), "missing rebind idle: {c}");
+            assert!(
+                c.contains("init=/usr/sbin/vmcell-guest-agent"),
+                "missing init: {c}"
+            );
+        }
+        // The FPU guard is inserted immediately before `init=`; the empty
+        // backend_extra leaves `panic=1 init=` adjacent.
+        assert!(fpu.contains("panic=1 noxsave init="), "fpu guard misplaced: {fpu}");
+        assert!(plain.contains("panic=1 init="), "unexpected extra token: {plain}");
+
+        let verbose = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .kernel_verbosity(KernelVerbosity::Verbose)
+        .network_disabled()
+        .build()
+        .unwrap();
+        let vc = build_kernel_cmdline(&verbose, 1, "").unwrap();
+        assert!(vc.contains("loglevel=7"), "verbose loglevel not honored: {vc}");
     }
 }

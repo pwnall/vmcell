@@ -49,6 +49,31 @@ debuggable serial log (+panic capture) at a ~43 ms cost. Validation: **`just ci`
 bug_risk noted below. The "buggy-fast → correct-slow" gap was mostly recoverable: the verbose serial
 console (EXP-1) and a coarse guest accept poll (EXP-4) were the two biggest levers.
 
+## Follow-up: tunable config knobs + native resync (design `docs/44-...`)
+
+### Phase 1 — KernelVerbosity + Timeouts presets + shared cmdline builder (host-only) — KEEPER
+
+`KernelVerbosity` (Quiet/Balanced/Verbose/Debug → `loglevel=3/6/7/8`) and a `Timeouts` struct with
+`default()`/`low_latency()`/`throughput()` presets (all clamped to floors) on `VmConfig`; a single
+`build_kernel_cmdline` shared by all 3 backends. Wired into connect/shutdown/api-poll; bench-vm gained
+`--profile` / `--kernel-verbosity`. Unit 246/0; boot::{ch,fc,qemu} pass.
+
+| Result | value |
+| --- | --- |
+| **QEMU cold boot** (shared builder gives QEMU its missing `loglevel=6`) | ~1400 → **996 ms** |
+| **`throughput` profile teardown** (`shutdown_grace` 250→50 ms) | 283 → **96 ms** |
+| **Logging VM-exit cost** (CH cold, `verbose` vs `balanced`) | 561 vs 330 → **+231 ms** |
+| CH cold (regression check, default profile) | 333 ms (unchanged) |
+
+**VM-exit finding (maintainer's question):** yes — kernel serial logging causes VM exits. `ttyS0` is a
+legacy **PIO** 8250 UART, so each logged byte traps to the VMM; the +231 ms `verbose`-vs-`balanced`
+delta is that exit cost. `KernelVerbosity` lets debugging/specific tests pay it without taxing every VM.
+(`perf kvm stat` blocked by `perf_event_paranoid=4` here; the A/B is the evidence.)
+
+**Pre-existing flakiness (not this change):** `snapshot_restore::cloud_hypervisor` /
+`egress_proxy::qemu` agent-timeout under full-suite concurrency load (differ run-to-run; restore ran
+clean in isolation). Worth a separate test-robustness look; orthogonal to these features.
+
 ## Experiments
 
 ### EXP-1 — Quieter guest kernel boot console (host cmdline; no rootfs rebuild) — KEEPER (as `loglevel=6`)

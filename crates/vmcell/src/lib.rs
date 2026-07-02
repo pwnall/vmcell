@@ -75,7 +75,7 @@ pub mod vmm;
 pub use agent::AgentClient;
 pub use agent::{ExecOutcome, ExecRequest};
 #[cfg(feature = "host-common")]
-pub use config::{NetConfig, ResourceLimits, Share, VmConfig};
+pub use config::{KernelVerbosity, NetConfig, ResourceLimits, Share, Timeouts, VmConfig};
 pub use error::{Error, Result};
 #[cfg(feature = "host-common")]
 pub use metrics::ResourceUsage;

@@ -49,6 +49,39 @@ pub enum Message {
         /// File contents.
         bytes: Vec<u8>,
     },
+    /// Host→guest one-shot post-restore resync request (design 44 §5).
+    ///
+    /// A snapshot resumes at the frozen instant, so the host drives one native
+    /// in-agent resync — replacing the three post-restore subprocess execs
+    /// (`date` / `head -c 32 /dev/hwrng` / `ip link set`). It carries the host
+    /// wall-clock instant the guest must set `CLOCK_REALTIME` to and an optional
+    /// new `eth0` MAC to install; one request elicits exactly one
+    /// [`Message::ResyncAck`].
+    Resync {
+        /// Whole seconds since the Unix epoch for the guest `CLOCK_REALTIME` set.
+        unix_secs: u64,
+        /// Sub-second nanoseconds component of the target realtime clock.
+        unix_nanos: u32,
+        /// Optional new `eth0` hardware address to install via `SIOCSIFHWADDR`;
+        /// `None` skips the MAC rotation.
+        mac: Option<[u8; 6]>,
+    },
+    /// Guest→host acknowledgement of a [`Message::Resync`], reporting each step's
+    /// outcome (design 44 §5).
+    ///
+    /// The clock set is mandatory: `clock_error` is `Some(msg)` iff it failed
+    /// (the host treats that as a hard, retryable failure and does not clear its
+    /// restored flag). The CSPRNG reseed and MAC rotation are best-effort, with
+    /// `reseed_applied` / `mac_applied` reporting whether each took effect.
+    ResyncAck {
+        /// `Some(err)` iff the mandatory `CLOCK_REALTIME` set failed; `None` on
+        /// success.
+        clock_error: Option<String>,
+        /// Whether the best-effort `/dev/hwrng`→`/dev/urandom` reseed applied.
+        reseed_applied: bool,
+        /// Whether the best-effort `eth0` MAC rotation applied.
+        mac_applied: bool,
+    },
 }
 
 /// A request to execute a command inside the guest VM.
@@ -170,6 +203,28 @@ mod tests {
                 dst: "/tmp/test".to_string(),
                 bytes: vec![7, 8, 9],
             },
+            // Resync/ResyncAck round-trip: a dropped/reordered field or a
+            // secs↔nanos swap reddens the `assert_eq!(msg, decoded)` below.
+            Message::Resync {
+                unix_secs: 1_700_000_000,
+                unix_nanos: 123_456_789,
+                mac: Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x05]),
+            },
+            Message::Resync {
+                unix_secs: 0,
+                unix_nanos: 0,
+                mac: None,
+            },
+            Message::ResyncAck {
+                clock_error: Some("clock_settime: EPERM".to_string()),
+                reseed_applied: true,
+                mac_applied: false,
+            },
+            Message::ResyncAck {
+                clock_error: None,
+                reseed_applied: false,
+                mac_applied: true,
+            },
         ];
 
         for msg in msgs {
@@ -219,6 +274,20 @@ mod tests {
                         timeout,
                     })
                 }),
+            (any::<u64>(), any::<u32>(), any::<Option<[u8; 6]>>()).prop_map(
+                |(unix_secs, unix_nanos, mac)| Message::Resync {
+                    unix_secs,
+                    unix_nanos,
+                    mac,
+                }
+            ),
+            (any::<Option<String>>(), any::<bool>(), any::<bool>()).prop_map(
+                |(clock_error, reseed_applied, mac_applied)| Message::ResyncAck {
+                    clock_error,
+                    reseed_applied,
+                    mac_applied,
+                }
+            ),
         ]
     }
 

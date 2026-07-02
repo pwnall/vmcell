@@ -197,6 +197,7 @@ impl ChInstance {
 impl CloudHypervisor {
     async fn spawn_ch(
         &self,
+        cfg: &VmConfig,
         res: &PerVmResources,
         snapshot_dir: Option<&Path>,
         restore_mode: crate::config::RestoreMode,
@@ -270,7 +271,7 @@ impl CloudHypervisor {
             &res.cgroup_name,
             &api_socket,
             1000,
-            5,
+            cfg.timeouts.api_socket_poll.as_millis() as u64,
         )
         .await?;
 
@@ -294,7 +295,7 @@ impl Vmm for CloudHypervisor {
         crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
 
         let (api_socket, vsock_path, serial_path, process, pgid) = self
-            .spawn_ch(res, None, crate::config::RestoreMode::Default, cgroups)
+            .spawn_ch(cfg, res, None, crate::config::RestoreMode::Default, cgroups)
             .await?;
 
         let cid = res.guest_cid;
@@ -346,32 +347,7 @@ impl Vmm for CloudHypervisor {
             },
             payload: ChPayload {
                 kernel: cfg.kernel.clone(),
-                cmdline: {
-                    let mut s = format!(
-                        "console=ttyS0 loglevel=6 random.trust_cpu=on random.trust_bootloader=on root=/dev/vda rootfstype={} ro {} panic=1 init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
-                        match &cfg.rootfs {
-                            crate::config::RootfsSource::Erofs { .. } => "erofs",
-                            _ => "ext4",
-                        },
-                        match &cfg.rootfs {
-                            crate::config::RootfsSource::Erofs { .. } => "",
-                            _ => "rootflags=noload",
-                        },
-                        res.vmid
-                    );
-                    if !matches!(cfg.net, crate::config::NetConfig::None) {
-                        let (host_ip, guest_ip, _) = crate::net::ip_math(res.vmid)?;
-                        s.push_str(&format!(
-                            " ip={}::{}:255.255.255.252::eth0:off",
-                            guest_ip, host_ip
-                        ));
-                    }
-                    if cfg.nested_virt {
-                        s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
-                    }
-                    crate::config::push_share_args(&mut s, &cfg.shares);
-                    s
-                },
+                cmdline: crate::config::build_kernel_cmdline(cfg, res.vmid, "")?,
             },
             disks: vec![],
             fs: ch_fs,
@@ -457,7 +433,7 @@ impl Vmm for CloudHypervisor {
             });
         }
         let (api_socket, vsock_path, serial_path, process, pgid) = self
-            .spawn_ch(res, Some(snapshot_dir), cfg.restore_mode, cgroups)
+            .spawn_ch(cfg, res, Some(snapshot_dir), cfg.restore_mode, cgroups)
             .await?;
 
         // The guard above guarantees `cfg.shares` is empty here, so this never
