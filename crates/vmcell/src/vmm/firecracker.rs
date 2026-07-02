@@ -46,13 +46,16 @@ fn has_vhost_user_device(
 /// must self-check `snapshot_restore` (M-RESTORE-3).
 fn fc_capabilities() -> VmmCapabilities {
     VmmCapabilities {
-        // E2 (empirical, KVM host): FC warm restore drops the first post-restore
-        // exec ("Connection dropped during exec") whereas CH passes the same test.
-        // The fix spans the guest agent's vsock re-bind and the host reconnect/retry
-        // (outside this module) and needs KVM validation, so the capability is gated
-        // OFF until it passes the matrix test on a KVM host — advertising a broken
-        // capability is the "lying flag" smell. Flip back to `true` only then.
-        snapshot_restore: false,
+        // E2 (empirical, KVM host, pre-v17): FC warm restore used to drop the first
+        // post-restore exec ("Connection dropped during exec"). That symptom predated
+        // the guest agent's generic re-bind-after-restore loop (REBIND_IDLE 250 ms,
+        // cmdline-tunable, now event-driven poll(2)) and the native in-agent resync —
+        // re-validated ON (EXP-E, docs/45-claude-perf-investigation.md): the full
+        // snapshot_restore::firecracker matrix assertion set (post-restore exec,
+        // native MAC rotation, reseed, fail-loud clock resync, ordered teardown)
+        // passes repeatedly in isolation on a KVM host. Flip back to `false` only
+        // with a reproducing failure recorded in docs/45.
+        snapshot_restore: true,
         // M-VMM-1: a real UFFD page-fault backend for `RestoreMode::Lazy` is not
         // wired (restore would hardcode `backend_type: "File"`, faulting eagerly), so
         // the flag is honest-false rather than silently degrading Lazy to eager.
@@ -64,6 +67,13 @@ fn fc_capabilities() -> VmmCapabilities {
         // rejected up front by `reject_unsupported_console` so it can never emit
         // `console=hvc0` with no `hvc0` device.
         virtio_console: false,
+        // FC's `PUT /snapshot/load` re-binds the snapshot's recorded host vsock
+        // UDS path VERBATIM — no load-time override exists in v1.16 — so a
+        // restored VM never gets fresh host-side socket paths (see
+        // `HOST_PATHS_SIDECAR` and `reject_live_baked_vsock`). All restores of a
+        // lineage share the one baked path: restore-while-alive is rejected and
+        // concurrent restores from one lineage are unsupported.
+        restore_rotates_host_paths: false,
     }
 }
 
@@ -78,6 +88,53 @@ async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, serial: &Path) -> Re
         serial: serial.to_path_buf(),
     })?;
     tokio::fs::write(dir.join(HOST_PATHS_SIDECAR), json).await?;
+    Ok(())
+}
+
+/// Pre-restore guard + cleanup for the snapshot's baked host vsock UDS path
+/// (`restore_rotates_host_paths: false` — FC re-binds this exact path verbatim).
+///
+/// A leftover socket *file* at the baked path is normal (the base VM's teardown
+/// unlinks best-effort, and a sequential restore reuses the path), and must be
+/// removed or FC's bind fails `EADDRINUSE`. But a socket that still **accepts a
+/// connection** means a live VMM — the snapshotted VM or a prior restore of the
+/// same lineage — still owns it; unlinking it would silently sever that VM's
+/// agent transport. So: if the path exists, probe it with a short-timeout
+/// connect and fail loud with a typed `Error::Vmm` naming the path when a
+/// listener answers. Only a dead path (ECONNREFUSED / ENOENT / timeout) proceeds
+/// to `remove_file` + `create_dir_all(parent)` — the parent re-creation matters
+/// because the baked path lives in the long-gone base VM's scratch dir, and a
+/// missing parent fails `PUT /snapshot/load` with ENOENT.
+///
+/// TOCTOU, honestly: the probe and the unlink are not atomic — a restore racing
+/// this window can still lose. This is a *misuse guard* catching the realistic
+/// sequential mistake (restoring while the lineage is alive), not a security
+/// boundary; the single-lineage constraint (design §16) is the real contract.
+async fn reject_live_baked_vsock(path: &Path) -> Result<()> {
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        // Only `Ok(Ok(_))` — a listener actually accepted the probe — rejects.
+        // ECONNREFUSED / ENOENT / not-a-socket (`Ok(Err(_))`) and a probe timeout
+        // (`Err(_)`) all mean no live listener owns the path: a stale leftover.
+        if let Ok(Ok(_stream)) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tokio::net::UnixStream::connect(path),
+        )
+        .await
+        {
+            return Err(Error::Vmm(format!(
+                "snapshot's baked host vsock path {} is still in use (a live \
+                 listener accepted a probe connection): the snapshotted VM or a \
+                 prior restore of this snapshot lineage still owns it; Firecracker \
+                 re-binds this exact path verbatim, so restore must wait for that \
+                 VM's teardown",
+                path.display()
+            )));
+        }
+    }
+    let _ = tokio::fs::remove_file(path).await;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     Ok(())
 }
 
@@ -318,9 +375,14 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     // fails fast on an early exit) instead of a hand-rolled `try_exists`-only loop,
     // and reap the process *group* via `reap_process_group` on failure instead of the
     // leader-only, non-blocking `process.kill()` (which orphans the group).
-    if crate::vmm::wait_for_socket(&api_socket, &mut process, 1000, 20)
-        .await
-        .is_err()
+    if crate::vmm::wait_for_socket(
+        &api_socket,
+        &mut process,
+        1000,
+        cfg.timeouts.api_socket_poll.as_millis() as u64,
+    )
+    .await
+    .is_err()
     {
         crate::vmm::reap_process_group(&mut process, pgid);
         return T2Probe::Failed;
@@ -570,6 +632,20 @@ impl Vmm for Firecracker {
                 .await?;
         }
 
+        // Configure the entropy device (virtio-rng -> guest /dev/hwrng). The
+        // guest agent's post-restore CSPRNG reseed reads 32 bytes of /dev/hwrng
+        // into /dev/urandom (design §9.2); CH always carries an rng device, but
+        // FC only attaches one when explicitly configured — without it the
+        // restored guest replays the snapshot-frozen entropy pool and the resync
+        // ack reports `reseed_applied: false`. The device is snapshot-supported
+        // in FC v1.16, so it travels through snapshot/load like the other
+        // virtio-mmio devices.
+        #[derive(Serialize)]
+        struct Entropy {}
+        instance
+            .api_request("PUT", "/entropy", Some(&Entropy {}))
+            .await?;
+
         // Configure Vsock
         #[derive(Serialize)]
         struct Vsock {
@@ -635,14 +711,18 @@ impl Vmm for Firecracker {
         let sidecar = tokio::fs::read_to_string(&sidecar_path).await?;
         let host_paths: SnapshotHostPaths = serde_json::from_str(&sidecar)?;
 
+        // Firecracker rebinds the snapshot's recorded host vsock UDS at load time,
+        // VERBATIM (`restore_rotates_host_paths: false`). Guard-then-clean the
+        // baked path — reject a still-live listener, remove a stale leftover
+        // (else the bind fails EADDRINUSE), resurrect the missing parent dir
+        // (else `PUT /snapshot/load` fails ENOENT) — see `reject_live_baked_vsock`.
+        // Runs BEFORE spawning, like the sidecar read above, so a rejected restore
+        // fails loud without leaking a VMM process. The restored instance adopts
+        // the path and its `Drop` removes the resurrected dir.
+        reject_live_baked_vsock(&host_paths.vsock).await?;
+
         let (api_socket, _vsock_path, serial_path, process, pgid) =
             self.spawn_fc(cfg, res, cgroups).await?;
-
-        // Firecracker rebinds the snapshot's recorded host vsock UDS at load time.
-        // Remove any leftover socket file there first (a sequential restore reuses
-        // the same path), otherwise the bind fails with EADDRINUSE. The directory is
-        // kept so FC can recreate the socket and reopen the serial sink.
-        let _ = tokio::fs::remove_file(&host_paths.vsock).await;
 
         let instance = FcInstance {
             process,
@@ -885,6 +965,16 @@ impl Drop for FcInstance {
         // smoltcp process are dropped), not here. Mirrors CH.
         let _ = std::fs::remove_file(&self.api_socket);
         let _ = std::fs::remove_file(&self.vsock_path);
+        // A RESTORED instance adopts the snapshot's baked vsock path, whose parent
+        // dir `restore()` resurrected (it belongs to the long-gone base VM, so no
+        // `VmTempDir` guard owns it). Remove it here — `remove_dir` is
+        // non-recursive, so it only succeeds once empty, and it is a no-op for a
+        // cold-booted instance whose vsock lives in the guard-owned scratch dir
+        // (still holding api.sock/serial.log at this point, and removed by the
+        // guard anyway).
+        if let Some(parent) = self.vsock_path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }
 
@@ -1064,28 +1154,51 @@ mod tests {
         assert_eq!(b.cpu_template.get(), None);
     }
 
-    // Guards E2 (FC warm restore is empirically broken on a KVM host — gated off)
-    // and M-VMM-1 (no real UFFD backend is wired). The advertised capability must be
-    // HONEST. The buggy impl (advertising `snapshot_restore: true` while the first
-    // post-restore exec drops, or `lazy_restore: true` while Lazy silently degrades
-    // to eager) makes these asserts go red. With `true`, `require_cap!` would run a
-    // broken FC restore scenario instead of skipping with reason. Flip these to
-    // `true` only once FC warm restore passes the matrix test on a KVM host.
+    // Guards the capability HONESTY in both directions: `snapshot_restore` is
+    // advertised `true` only because the full FC restore matrix assertion set was
+    // re-validated on a KVM host (EXP-E, docs/45 — the historical E2 drop predated
+    // the generic re-bind + native resync); `lazy_restore` stays honest-false until
+    // a real UFFD backend is wired (M-VMM-1 — Lazy would silently degrade to eager).
+    // A regression that turns FC restore back into the E2 symptom must flip the
+    // capability AND this test together, with the failure recorded in docs/45.
     #[test]
     fn capabilities_are_honest_about_snapshot_restore() {
         let caps = Firecracker::new("/usr/bin/firecracker").capabilities();
         assert!(
-            !caps.snapshot_restore,
-            "FC snapshot_restore must stay gated off until E2 is fixed and KVM-validated"
+            caps.snapshot_restore,
+            "FC snapshot_restore is KVM-validated ON (EXP-E); a deliberate re-gate must update docs/45"
         );
         assert!(
             !caps.lazy_restore,
             "FC lazy_restore must be false until a real UFFD backend is wired (M-VMM-1)"
         );
+        // FC re-binds the snapshot's baked host vsock UDS path VERBATIM (no
+        // load-time override in v1.16); advertising rotation would let callers
+        // assume fresh per-restore paths FC cannot provide (and would flip the
+        // snapshot_restore integration test onto the CH-only rotation asserts).
+        assert!(
+            !caps.restore_rotates_host_paths,
+            "FC restore_rotates_host_paths must be false: /snapshot/load re-binds the \
+             baked path verbatim"
+        );
+        // CH, by contrast, rewrites the restore config so the vsock lands in the NEW
+        // VM's scratch dir (§9.2) — the rotation semantics the integration test's
+        // `assert_ne` branch encodes.
+        assert!(
+            crate::vmm::cloud_hypervisor::CloudHypervisor::new("/usr/bin/cloud-hypervisor")
+                .capabilities()
+                .restore_rotates_host_paths,
+            "CH restore_rotates_host_paths must be true: the restore config rewrite \
+             moves host socket paths into the restored VM's own scratch dir"
+        );
         // The instance-facing free function and the `Vmm` trait method must agree, so
         // `FcInstance::snapshot`'s self-check sees the same gate the orchestrator does.
         assert_eq!(caps.snapshot_restore, fc_capabilities().snapshot_restore);
         assert_eq!(caps.lazy_restore, fc_capabilities().lazy_restore);
+        assert_eq!(
+            caps.restore_rotates_host_paths,
+            fc_capabilities().restore_rotates_host_paths
+        );
     }
 
     // Guards M-RESTORE-3: the snapshot-eligibility predicate (§3.3) that backs both
@@ -1133,6 +1246,58 @@ mod tests {
                 .await
                 .is_err(),
             "a failed sidecar write must surface an error, not be swallowed"
+        );
+    }
+
+    // Guards the pre-restore liveness guard (`restore_rotates_host_paths: false`):
+    // a baked vsock path with a LIVE listener (the snapshotted VM or a prior
+    // restore of the lineage still running) must be rejected with a typed
+    // still-in-use `Error::Vmm` naming the path — and the live socket must
+    // SURVIVE. The buggy inverse — a guard that skips the connect probe and
+    // unlinks unconditionally (the pre-guard `remove_file` + `create_dir_all`) —
+    // returns `Ok` and severs the live VM's agent transport, reddening both
+    // live-listener assertions (verified red). The stale-file and missing-file
+    // arms pin the cleanup contract the happy restore path depends on.
+    #[tokio::test]
+    async fn reject_live_baked_vsock_rejects_live_listener_and_clears_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Live listener: typed rejection, socket left untouched.
+        let live = dir.path().join("live.sock");
+        let _listener = tokio::net::UnixListener::bind(&live).expect("bind live listener");
+        let err = reject_live_baked_vsock(&live)
+            .await
+            .expect_err("a live listener on the baked path must be rejected");
+        assert!(
+            matches!(&err, Error::Vmm(msg)
+                if msg.contains("still in use") && msg.contains("live.sock")),
+            "expected a typed still-in-use Error::Vmm naming the path, got {err:?}"
+        );
+        assert!(
+            live.exists(),
+            "the guard must NOT unlink a live VM's socket on the reject path"
+        );
+
+        // Stale leftover (a dead socket file, no listener): cleared, parent kept —
+        // the sequential-restore case where the bind would otherwise EADDRINUSE.
+        let stale = dir.path().join("gone-vm").join("stale.sock");
+        std::fs::create_dir_all(stale.parent().expect("parent")).expect("mk parent");
+        drop(tokio::net::UnixListener::bind(&stale).expect("bind then drop = stale file"));
+        assert!(stale.exists(), "precondition: the stale socket file exists");
+        reject_live_baked_vsock(&stale)
+            .await
+            .expect("a stale socket file must be cleared, not rejected");
+        assert!(!stale.exists(), "the stale socket file must be removed");
+
+        // Missing file AND missing parent (the torn-down base VM's scratch dir):
+        // Ok, with the parent resurrected so FC's verbatim re-bind can succeed.
+        let missing = dir.path().join("gone-parent").join("missing.sock");
+        reject_live_baked_vsock(&missing)
+            .await
+            .expect("a missing baked path must be accepted");
+        assert!(
+            missing.parent().expect("parent").is_dir(),
+            "the baked path's parent dir must be (re)created for FC's verbatim re-bind"
         );
     }
 }

@@ -108,3 +108,95 @@ relaxed; every added knob clamps to a correctness floor; the M-RESTORE-1 fail-lo
   retry sidesteps the transient reset; a real break still fails all attempts) + `-E 'kind(test)'` on the
   suites (keeps the ~172 lib unit tests off the VM suite — they run in `test-unit`). Detail:
   `docs/perf-experiments-log.md` "Flake investigation".
+- **`shutdown()` grace poll step is adaptive, not the fixed 20 ms (2026-07-02, EXP-D/OPP-5 of
+  `docs/45-claude-perf-investigation.md`).** Deliberate deviation from design 44's "the poll step stays
+  20 ms" note: the `has_exited` cadence now derives from the configured grace (<= 50 ms → 5 ms,
+  <= 150 ms → 10 ms, else 20 ms; the 5 ms floor is at most ~10 wakeups in a 50 ms window — not a
+  busy-spin). *Why:* the `throughput` preset's 50 ms grace on a 20 ms grid exits at ~60 ms even when
+  ceiling-bound, and an in-window guest exit pays up to 20 ms detection quantization. The same pass
+  fixes deadline placement: the grace deadline is computed **before** `request_shutdown` (the RPC's
+  round trip no longer silently extends the window) and clamped post-ack to >= one poll step — the RPC
+  has no timeout (`vmm::unix_api_request`), so a stalled RPC would otherwise skip the poll loop and
+  grant ~0 post-ack flush, the anti-pattern ORCH-7 exists to prevent. Pinned by new orchestrator unit
+  tests (stalled-RPC still gets a post-ack poll; 50 ms grace returns in [50, 60) ms on a 5 ms step;
+  ORCH-2/7 teardown-order test untouched).
+- **Guest accept loop is event-driven, not a sleep loop (2026-07-02, EXP-C/OPP-2 of `docs/45-...`).**
+  `serve_vsock` no longer does `accept` → `WouldBlock` → `sleep(accept_poll)` (a mean ~half-interval of
+  added latency on every connect, cold and restore); it blocks in `poll(2)` on the listener fd for
+  `POLLIN` with the **remaining re-bind idle window** as the timeout (rustix `event` feature on the
+  existing dep — no new crate, lean-agent gate green), so a host connection wakes the agent
+  sub-millisecond. The §9.2/§12.4 re-bind-after-restore semantics are **unchanged**: the idle window is
+  a bounded, `Instant`-based deadline (`last accept or (re)bind + rebind_idle`); only a *real* accept
+  restarts it — an `EINTR`'d poll (PID 1 takes SIGCHLD; poll is never auto-restarted) and a spurious
+  `POLLIN`→`WouldBlock` wakeup re-poll with the recomputed remainder and do **not** reset the deadline,
+  so a deaf post-restore listener still runs out the clock and re-binds. `POLLERR`/`POLLHUP`/`POLLNVAL`
+  and non-`EINTR` poll errors are logged and treated as the deaf-listener case (re-bind, never exit).
+  **Semantic change:** `Timeouts::guest_accept_poll` / `vmcell_accept_poll_ms` now paces only the
+  bind-failure retry; its `parse_ms` 1 ms floor stays load-bearing there, and the poll timeout carries
+  its own 1 ms floor (a sub-ms remainder must not truncate to a busy-spinning 0). Pinned by unit tests
+  on the extracted pure policy (`next_deadline`/`remaining_idle`/`poll_timeout_ms`): each verified RED
+  on its inverse (deadline reset on spurious wakeup / `Some(ZERO)` at the deadline / a dropped 1 ms
+  floor).
+- **The two residual hardcoded 20 ms readiness polls now use `timeouts.api_socket_poll` (2026-07-02,
+  EXP-A/OPP-1 of `docs/45-...`).** The QEMU vhost-device-vsock daemon wait (`qemu.rs`) and the FC T2
+  CPU-template probe wait (`firecracker.rs`) were the last `wait_for_socket` call sites on a literal
+  20 ms while every sibling used the profile-tuned `api_socket_poll` (5 ms default / 2 ms low-latency)
+  — the cadence divergence design 44 §7 parked as "a cleanup, noted for later". Pure cadence change
+  within the existing 1 ms floor; fail-fast-on-early-exit unchanged. `wait_for_socket` also clamps its
+  interval to >= 1 ms (the interval arrives via the pub `VmConfig.timeouts` field — a 0 would have
+  divided by zero; pinned by a red-on-inverse unit test). Measured: QEMU cold create 140→124 ms p50.
+- **Guest cmdline gained `cryptomgr.notests raid=noautodetect` (2026-07-02, EXP-B/OPP-3 of
+  `docs/45-...`).** Chosen by a printk-timestamp probe (one debug-verbosity boot), which *disqualified*
+  the fashionable microVM trims — `i8042.nokbd/noaux` (no PS/2 probe runs in this guest),
+  `pci=lastbus=0` (ACPI/ECAM already stops at bus 0), `tsc=reliable` (kvm-clock already skips
+  calibration) — and instead surfaced the built-in crypto self-tests (~10 ms) and the md RAID
+  autodetect scan (~2 ms) as the only real cmdline-trimmable boot work. Self-tests are a boot-time QA
+  pass, not a runtime dependency; no RAID device can exist. Measured: CH cold −6 ms / FC −4 ms p50 —
+  at the noise floor, kept for the consistent cross-backend direction at zero risk. Cmdline-builder
+  unit test pins both tokens.
+- **Firecracker warm restore wired end-to-end: `snapshot_restore` flipped `true` (2026-07-02;
+  deliberate deviation from design v17 §3.2/§3.3/§16, which record FC as gated off).** The historical
+  E2 symptom — the first post-restore `exec` dropping — is cured by the guest agent's *generic*
+  re-bind-after-restore loop plus two host-side fixes: (1) `MicroVm::snapshot()` invalidates the cached
+  `AgentClient` after a successful backend snapshot (FC severs established vsock connections across its
+  pause/snapshot/resume; CH keeps them alive — invalidating uniformly costs at most one cheap
+  reconnect), and (2) FC `restore()` re-creates the baked vsock path's parent dir before
+  `PUT /snapshot/load` (FC re-binds the snapshot's recorded host UDS path **verbatim** — no load-time
+  override exists in v1.16 — and the ancestor VM's scratch dir is gone by then; `FcInstance::Drop`
+  removes the resurrected dir). The verbatim re-bind is now a declared contract: new capability field
+  `VmmCapabilities.restore_rotates_host_paths` (CH `true` via its restore config-rewrite, FC/QEMU
+  `false`), consumed by the `snapshot_restore` integration test to assert each backend's REAL
+  semantics — path rotation + rotated-vmid embedding on CH, path *equality* on FC — instead of
+  encoding CH semantics for everyone. Consequence of `false`: a lineage's restores share one host
+  vsock path, so FC `restore()` gained a fail-loud liveness guard (`reject_live_baked_vsock`: a
+  100 ms `UnixStream::connect` probe; a live listener → typed `Error::Vmm` "still in use" instead of
+  silently unlinking a live VM's socket; stale file → removed; missing parent → re-created; TOCTOU
+  documented as a misuse guard, not a security boundary), and concurrent restores from one lineage
+  stay unsupported (subsumed by the §16 single-snapshot-CoW gap). FC `create()` also now attaches the
+  **entropy device** (virtio-rng → guest `/dev/hwrng`): CH always carries an rng device, but without
+  the explicit `PUT /entropy` the FC guest has no hwrng, the post-restore reseed reports
+  `reseed_applied: false`, and the restored VM replays frozen CSPRNG state. Validated on this KVM
+  host: `snapshot_restore::firecracker` 10/10 in a diagnostic loop + 1+3/3 official runs, and
+  `snapshot_restore::cloud_hypervisor` green (no CH regression from the shared test edits). Unit
+  coverage: liveness-guard trio (live listener → typed Err, verified red on a probe-skipping guard;
+  stale → cleared; missing → parent resurrected) and capability-honesty pins (FC
+  `restore_rotates_host_paths=false`, CH `true`).
+- **PID-1 reaper: reservation epoch is captured PRE-spawn (AGENT-2, 2026-07-02).** Root cause of the
+  long-standing sporadic 10 s `Agent exec timed out` (~30% of `snapshot_restore::firecracker` runs
+  once the rotation asserts stopped masking it; also the likely mechanism behind the historical
+  CH-suite "environmental" flake that `nextest retries` papered over): an instant child (`head -c 32
+  /dev/urandom` ≈ 1 ms) exits and is drained by the PID-1 reaper *between* `spawn` and
+  `reaper.reserve(pid)` — on a 1-vcpu guest the child often runs to completion before the exec thread
+  is rescheduled — and the old `reserve` unconditionally wiped any pre-existing status for the pid,
+  including the child's OWN, stranding the waiter on the condvar forever (guest kernel stacks captured
+  during a wedge confirmed: child reaped and gone, waiter futex-parked). Fix: `ReaperCoordinator::
+  pre_spawn_epoch()` is captured before `Command::spawn`; `reserve(pid, epoch)` now discards only a
+  status recorded **at or before** that epoch (a genuine previous occupant of the reused pid — its
+  zombie was necessarily reaped-and-recorded, atomically under the drain lock, before the kernel could
+  reuse the pid) and keeps a post-epoch status as the child's own for immediate delivery. Residual
+  window recorded honestly in the doc-comment: a grandchild status recorded between epoch capture and
+  the fork whose pid is instantly recycled to the new child would still be misattributed — that needs
+  a full pid-space wrap inside a microseconds window. Pinned by
+  `reserve_after_fast_child_already_drained_delivers_status` (verified red on the pre-fix wipe); the
+  existing reuse/atomicity tests updated to the epoch API keep the stale-status guarantees green.
+  Agent change ⇒ rootfs rebuilt (the closure hash folds agent sources).

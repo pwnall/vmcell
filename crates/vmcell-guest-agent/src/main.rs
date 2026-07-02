@@ -10,6 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 use vmcell_guest_agent::{ReaperCoordinator, exit_code_from_termination, netif};
 use vmcell_protocol::{self as protocol, ExecRequest, MAX_FRAME_BYTES, Message};
 use vsock::{VsockAddr, VsockListener, VsockStream};
@@ -325,8 +326,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Per-VM guest timeout tuning from the (untrusted) kernel cmdline (§8.3): the
     // host emits `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` from
-    // `cfg.timeouts` so the accept/re-bind cadence is tunable without a rootfs
-    // rebuild. Absent/garbage tokens fall back to the compiled defaults
+    // `cfg.timeouts` so the bind-retry / re-bind cadence is tunable without a
+    // rootfs rebuild. Absent/garbage tokens fall back to the compiled defaults
     // (`ACCEPT_POLL` / `REBIND_IDLE`); each is clamped to a correctness floor so a
     // `0` cannot busy-spin PID 1.
     let accept_poll = parse_ms(
@@ -416,13 +417,15 @@ fn power_off_never_returns() -> ! {
 
 /// vsock control-plane port the host's `AgentClient` connects to.
 const VSOCK_PORT: u32 = 5000;
-/// Compiled **default** poll cadence for the non-blocking accept loop, used when
-/// the host does not emit `vmcell_accept_poll_ms=` on the cmdline (§8.3). Kept
-/// small: this bounds the delay between the host's completed CONNECT/OK handshake
-/// and the guest's next `accept()` (which sends `Ready`), so it sits directly on
-/// the cold-boot and restore-reconnect critical path. A failed `accept()` is a
-/// cheap non-blocking syscall, so a tight cadence costs only a few extra idle
-/// wakeups per second.
+/// Compiled **default** retry cadence for a *failed vsock `bind`*, used when the
+/// host does not emit `vmcell_accept_poll_ms=` on the cmdline (§8.3).
+///
+/// **Semantic change (OPP-2):** the accept path itself is now event-driven — a
+/// blocking `poll(2)` on the listener fd wakes sub-millisecond on connection
+/// arrival — so this cadence no longer bounds connect latency. It governs only
+/// how often [`serve_vsock`] retries after `bind_vsock_listener` fails. The
+/// `parse_ms` floor clamp (1 ms) stays load-bearing on that path: a hostile
+/// `vmcell_accept_poll_ms=0` must not turn the bind-retry loop into a busy-spin.
 const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// Compiled **default** re-bind idle window, used when the host does not emit
 /// `vmcell_rebind_idle_ms=` on the cmdline (§8.3): re-bind the listener after this
@@ -457,54 +460,179 @@ fn bind_vsock_listener() -> Option<VsockListener> {
     }
 }
 
+/// One iteration's outcome in the accept loop, as seen by the re-bind deadline
+/// policy ([`next_deadline`]).
+#[derive(Clone, Copy, Debug)]
+enum AcceptOutcome {
+    /// `accept()` returned a live connection.
+    Accepted,
+    /// `poll(2)` reported `POLLIN` but `accept()` said `WouldBlock` — a spurious
+    /// wakeup.
+    SpuriousReadable,
+    /// `poll(2)` returned `EINTR` (PID 1 takes `SIGCHLD`; `poll` is never
+    /// auto-restarted by `SA_RESTART`).
+    Interrupted,
+}
+
+/// The re-bind deadline policy for one accept-loop iteration: only a **real**
+/// accept restarts the idle window; a spurious wakeup or `EINTR` leaves the
+/// deadline untouched.
+///
+/// The untouched-deadline half is the load-bearing part (§9.2/§12.4): a
+/// post-restore *deaf* listener never delivers a real accept, but `poll` can
+/// still wake (signals, stray revents). If those wakes extended the deadline,
+/// the idle window would never elapse and the listener would never re-bind.
+fn next_deadline(
+    deadline: Instant,
+    now: Instant,
+    rebind_idle: Duration,
+    outcome: AcceptOutcome,
+) -> Instant {
+    match outcome {
+        AcceptOutcome::Accepted => now + rebind_idle,
+        AcceptOutcome::SpuriousReadable | AcceptOutcome::Interrupted => deadline,
+    }
+}
+
+/// Remaining time in the re-bind idle window, or `None` once the deadline has
+/// been reached — the caller must then re-bind, not poll again.
+///
+/// Saturating: a `now` past the deadline yields `None`, never an underflow
+/// panic. Exactly-at-deadline is `None`, not `Some(ZERO)` — a zero remainder
+/// fed to [`poll_timeout_ms`] would be floored back up to 1 ms and the deaf
+/// listener would keep polling forever instead of re-binding.
+fn remaining_idle(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (remaining > Duration::ZERO).then_some(remaining)
+}
+
+/// Clamps a remaining idle window into the whole-millisecond timeout `poll(2)`
+/// takes: floored at 1 ms and otherwise truncated so it never overshoots the
+/// remaining window by a full tick.
+///
+/// The 1 ms floor is a correctness floor, like the `parse_ms` clamp: a
+/// sub-millisecond remainder truncated to `0` means "return immediately", which
+/// busy-spins PID 1 until the deadline check catches up. Overshooting a sub-ms
+/// remainder by <1 ms is harmless — the deadline itself is enforced on
+/// [`Instant`]s by [`remaining_idle`], not by the poll timeout.
+fn poll_timeout_ms(remaining: Duration) -> i32 {
+    remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+}
+
 /// Serves the vsock control plane, re-binding the listener across snapshot
 /// restores.
 ///
 /// After a CH/Firecracker `--restore` the vhost-vsock device is re-created and
 /// the listener bound before the snapshot goes deaf — it never yields the host's
 /// post-restore reconnect (and the stale connection may never EOF), so a
-/// bound-once listener wedges the warm-restore path forever. We therefore run a
-/// non-blocking accept loop and re-`bind` whenever the listener has been idle for
-/// `REBIND_IDLE`, which re-attaches it to the *current* device. Re-binding is
-/// harmless during normal operation: already-accepted connections keep their own
-/// fds, and the fresh listener re-binds the same `CID_ANY:VSOCK_PORT` on the live
-/// device. Each accepted connection is served on its own thread so a parked stale
-/// connection never blocks new accepts.
-fn serve_vsock(
-    reaper: &Arc<ReaperCoordinator>,
-    accept_poll: std::time::Duration,
-    rebind_idle: std::time::Duration,
-) {
+/// bound-once listener wedges the warm-restore path forever. We therefore
+/// re-`bind` whenever the listener has been idle for `rebind_idle`, which
+/// re-attaches it to the *current* device. Re-binding is harmless during normal
+/// operation: already-accepted connections keep their own fds, and the fresh
+/// listener re-binds the same `CID_ANY:VSOCK_PORT` on the live device. Each
+/// accepted connection is served on its own thread so a parked stale connection
+/// never blocks new accepts.
+///
+/// The wait is event-driven (OPP-2): instead of `accept` → `WouldBlock` →
+/// `sleep(accept_poll)` (a mean ~half-interval of added latency on *every*
+/// connect), the loop blocks in `poll(2)` on the listener fd for `POLLIN` with
+/// the **remaining re-bind window** as the timeout, so a host connection wakes
+/// the agent sub-millisecond while the idle window still elapses exactly as
+/// before. The deadline is `Instant`-based ([`remaining_idle`]) and only a real
+/// accept restarts it ([`next_deadline`]); `EINTR` and spurious wakeups re-poll
+/// with the recomputed remainder. `accept_poll` now paces only the bind-failure
+/// retry (see [`ACCEPT_POLL`]). Any poll-level listener failure
+/// (`POLLERR`/`POLLHUP`/`POLLNVAL`, or an errno other than `EINTR`) is logged
+/// and treated like the deaf-listener case — re-bind, never exit: PID 1 must
+/// never give up the control plane.
+fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_idle: Duration) {
+    use rustix::event::{PollFd, PollFlags};
+
     loop {
         let Some(listener) = bind_vsock_listener() else {
+            // Bind-failure retry cadence: the one remaining consumer of
+            // `accept_poll`, still floor-clamped by `parse_ms` so a cmdline `0`
+            // cannot busy-spin PID 1.
             std::thread::sleep(accept_poll);
             continue;
         };
         tracing::info!("vmcell-guest-agent: listening on vsock port {}", VSOCK_PORT);
 
-        let mut idle = std::time::Duration::ZERO;
-        loop {
-            match listener.accept() {
-                Ok((mut s, _)) => {
-                    idle = std::time::Duration::ZERO;
-                    tracing::info!("vmcell-guest-agent: accepted connection");
-                    let conn_reaper = Arc::clone(reaper);
-                    std::thread::spawn(move || {
-                        if let Err(e) = handle_connection(&mut s, &conn_reaper) {
-                            tracing::error!("vmcell-guest-agent: handle_connection error: {}", e);
-                        }
-                    });
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(accept_poll);
-                    idle += accept_poll;
-                    if idle >= rebind_idle {
-                        // Drop this listener and re-bind on the current device.
+        // Idle window starts at the (re)bind; only a successful accept restarts
+        // it. Once it elapses with no accepted connection — or an arm below
+        // `break`s on a listener-level failure — fall out, drop this listener,
+        // and re-bind on the current device (§9.2).
+        let mut deadline = Instant::now() + rebind_idle;
+        while let Some(remaining) = remaining_idle(deadline, Instant::now()) {
+            let mut fds = [PollFd::new(&listener, PollFlags::IN)];
+            match rustix::event::poll(&mut fds, poll_timeout_ms(remaining)) {
+                // Timed out: loop back — the recomputed remainder hits zero (or
+                // re-polls a sub-ms tail once) and triggers the re-bind.
+                Ok(0) => {}
+                Ok(_) => {
+                    let revents = fds[0].revents();
+                    if revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
+                        tracing::warn!(
+                            "vmcell-guest-agent: vsock listener poll revents {:?}; re-binding",
+                            revents
+                        );
                         break;
                     }
+                    // POLLIN: the (still non-blocking) listener should have a
+                    // connection ready.
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            deadline = next_deadline(
+                                deadline,
+                                Instant::now(),
+                                rebind_idle,
+                                AcceptOutcome::Accepted,
+                            );
+                            tracing::info!("vmcell-guest-agent: accepted connection");
+                            let conn_reaper = Arc::clone(reaper);
+                            std::thread::spawn(move || {
+                                if let Err(e) = handle_connection(&mut s, &conn_reaper) {
+                                    tracing::error!(
+                                        "vmcell-guest-agent: handle_connection error: {}",
+                                        e
+                                    );
+                                }
+                            });
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // Spurious wakeup: re-poll with the recomputed
+                            // remainder. MUST NOT restart the idle window — a
+                            // deaf listener has to run out the clock and re-bind.
+                            deadline = next_deadline(
+                                deadline,
+                                Instant::now(),
+                                rebind_idle,
+                                AcceptOutcome::SpuriousReadable,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::info!("vmcell-guest-agent: accept error: {}; re-binding", e);
+                            break;
+                        }
+                    }
+                }
+                Err(rustix::io::Errno::INTR) => {
+                    // PID 1 takes SIGCHLD and poll(2) is never auto-restarted:
+                    // re-poll with the recomputed remainder, deadline untouched.
+                    deadline = next_deadline(
+                        deadline,
+                        Instant::now(),
+                        rebind_idle,
+                        AcceptOutcome::Interrupted,
+                    );
                 }
                 Err(e) => {
-                    tracing::info!("vmcell-guest-agent: accept error: {}; re-binding", e);
+                    // Fail loud, then recover: any other poll failure is treated
+                    // like the deaf-listener case — re-bind rather than exit.
+                    tracing::warn!(
+                        "vmcell-guest-agent: vsock listener poll failed: {}; re-binding",
+                        e
+                    );
                     break;
                 }
             }
@@ -721,6 +849,15 @@ fn handle_exec(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // AGENT-2: capture the reservation epoch BEFORE the spawn. An instant child
+    // can exit and be drained by the PID-1 reaper before this thread reaches
+    // `reserve` (on one vcpu the child often runs to completion first); the
+    // pre-spawn epoch lets `reserve` recognize that already-recorded status as
+    // the child's own (recorded after the epoch) instead of wiping it as a stale
+    // previous occupant's — which stranded the waiter forever and surfaced on
+    // the host as a sporadic "Agent exec timed out" for a command that had
+    // already succeeded.
+    let pre_spawn_epoch = reaper.pre_spawn_epoch();
     match cmd.spawn() {
         Ok(mut child) => {
             let mut stdout = child
@@ -764,14 +901,16 @@ fn handle_exec(
             });
 
             let pid = child.id();
-            // Reserve this pid in the shared reaper *immediately* after spawn, so
+            // Reserve this pid in the shared reaper with the PRE-SPAWN epoch, so
             // a re-parented grandchild that previously held this (now reused) pid
             // cannot have its lingering, unclaimed exit status mis-delivered to
-            // this child as a false result. `reserve` clears any pre-existing
-            // status for the pid and captures the generation epoch; the waiter's
-            // `wait_for(pid)` below then only accepts a status reaped at or after
-            // this point (§4.3 PID-1 reaper-vs-waiter contract).
-            reaper.reserve(pid);
+            // this child as a false result: `reserve` clears a status recorded at
+            // or before the epoch, and the waiter's `wait_for(pid)` below only
+            // accepts one recorded strictly after it (§4.3 PID-1 reaper-vs-waiter
+            // contract). A status recorded after the epoch — this child's own,
+            // when it exited and was drained before this line ran — survives the
+            // reservation and is delivered immediately (AGENT-2).
+            reaper.reserve(pid, pre_spawn_epoch);
             let has_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let has_exited_clone = std::sync::Arc::clone(&has_exited);
             let tx_timeout = tx.clone();
@@ -872,7 +1011,9 @@ mod tests {
     // §8.3: the guest-tuning cmdline tokens are UNTRUSTED and must be clamped into
     // `[floor, ceil]`, falling back to the compiled default when absent/garbage.
     // The clamp is load-bearing: an un-clamped parse would let
-    // `vmcell_accept_poll_ms=0` busy-spin PID 1's accept loop (0ms sleep).
+    // `vmcell_accept_poll_ms=0` busy-spin PID 1's bind-retry loop (0ms sleep; since
+    // OPP-2 this token paces only the bind-failure retry — the accept wait itself
+    // is event-driven).
     #[test]
     fn parse_ms_clamps_and_defaults() {
         use std::time::Duration;
@@ -926,6 +1067,85 @@ mod tests {
             ),
             Duration::from_millis(9)
         );
+    }
+
+    // OPP-2: the pure deadline policy behind the event-driven accept loop. Only a
+    // REAL accept restarts the re-bind idle window; a spurious POLLIN→WouldBlock
+    // wakeup or an EINTR'd poll leaves the deadline exactly where it was. RED on
+    // an impl that resets the deadline on either (`SpuriousReadable => now +
+    // rebind_idle`): a post-restore deaf listener never yields a real accept but
+    // its poll can still wake, so a resetting policy re-arms the window forever
+    // and the §9.2 re-bind never fires.
+    #[test]
+    fn spurious_wakeup_and_eintr_do_not_reset_the_deadline() {
+        let start = Instant::now();
+        let idle = Duration::from_millis(250);
+        let deadline = start + idle;
+        // 200 ms into the window, so a buggy reset would move the deadline.
+        let now = start + Duration::from_millis(200);
+        assert_eq!(
+            next_deadline(deadline, now, idle, AcceptOutcome::SpuriousReadable),
+            deadline,
+            "a spurious POLLIN→WouldBlock wakeup must not extend the re-bind deadline"
+        );
+        assert_eq!(
+            next_deadline(deadline, now, idle, AcceptOutcome::Interrupted),
+            deadline,
+            "an EINTR'd poll (PID 1 takes SIGCHLD) must not extend the re-bind deadline"
+        );
+        // Only a successful accept restarts the idle window — anchored at `now`,
+        // not at the old deadline.
+        assert_eq!(
+            next_deadline(deadline, now, idle, AcceptOutcome::Accepted),
+            now + idle,
+            "a real accept must restart the idle window from now"
+        );
+    }
+
+    // The remaining-window math the poll timeout is derived from. RED on an impl
+    // returning `Some(ZERO)` at the deadline (fed through the 1 ms poll-timeout
+    // floor, the deaf listener would re-poll forever instead of re-binding) or one
+    // that underflows/panics once `now` passes the deadline.
+    #[test]
+    fn remaining_idle_counts_down_and_expires_exactly_at_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(250);
+        // Mid-window: the exact Instant-based remainder, no cadence quantization.
+        assert_eq!(
+            remaining_idle(deadline, now),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            remaining_idle(deadline, now + Duration::from_millis(100)),
+            Some(Duration::from_millis(150))
+        );
+        // Exactly at the deadline the window is expired — None (re-bind), not
+        // Some(ZERO) (another poll).
+        assert_eq!(remaining_idle(deadline, deadline), None);
+        // Past the deadline: saturating, still None.
+        assert_eq!(
+            remaining_idle(deadline, deadline + Duration::from_millis(40)),
+            None
+        );
+    }
+
+    // The poll(2) timeout clamp. RED if the 1 ms floor is dropped: a sub-ms
+    // remainder truncates to 0 = "return immediately" and PID 1 busy-spins until
+    // the deadline check catches up.
+    #[test]
+    fn poll_timeout_ms_floors_at_one_ms_and_never_exceeds_remaining() {
+        assert_eq!(
+            poll_timeout_ms(Duration::from_micros(300)),
+            1,
+            "a sub-millisecond remainder must floor to 1 ms, not truncate to 0"
+        );
+        assert_eq!(poll_timeout_ms(Duration::from_millis(1)), 1);
+        // Whole-ms truncation: never over the remaining window by a full tick.
+        assert_eq!(poll_timeout_ms(Duration::from_micros(2500)), 2);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(250)), 250);
+        // Absurdly large windows saturate at i32::MAX instead of wrapping negative
+        // (a negative poll timeout means "block forever" — the re-bind would die).
+        assert_eq!(poll_timeout_ms(Duration::from_secs(u64::MAX)), i32::MAX);
     }
 
     // The (secs, nanos) → Timespec mapping the mandatory post-restore clock set

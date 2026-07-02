@@ -990,11 +990,28 @@ impl<V: Vmm> MicroVm<V> {
     /// rejected at `VmConfig::build()` (the §3.3 law), and a backend that does not
     /// advertise `snapshot_restore` returns [`crate::error::Error::Unsupported`].
     ///
+    /// On success, any cached agent connection is invalidated: the next
+    /// [`MicroVm::agent`] call transparently reconnects, so the resumed VM
+    /// stays usable on every backend at the cost of at most one cheap
+    /// reconnect.
+    ///
     /// # Errors
     /// Returns an error if the backend fails to snapshot, or
     /// [`crate::error::Error::Unsupported`] on a backend without snapshot support.
     pub async fn snapshot(&mut self, dir: &std::path::Path) -> Result<()> {
-        self.instance_mut().snapshot(dir).await
+        self.instance_mut().snapshot(dir).await?;
+        // Firecracker severs established vsock connections across its internal
+        // pause/snapshot/resume cycle (Cloud Hypervisor keeps them alive), so a
+        // cached `AgentClient` on the resumed VM would fail its very next
+        // request with "Connection dropped". Invalidate uniformly: it costs at
+        // most one cheap reconnect on the next `agent()` call — the guest
+        // listener accepts it, since the accept loop is independent of the
+        // severed per-connection fd — and makes the post-snapshot VM usable on
+        // every backend instead of only CH. On an `Err` above we leave the
+        // client alone (the `?` returns early): the snapshot didn't happen, so
+        // the connection state is whatever it already was.
+        self.agent_client = None;
+        Ok(())
     }
 
     /// Releases every per-VM resource that must be torn down **after** the VMM
@@ -1040,22 +1057,33 @@ impl<V: Vmm> MicroVm<V> {
     /// Returns an error if shutting down the VM or proxy fails.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(mut inst) = self.instance.take() {
-            let _ = inst.request_shutdown().await;
-
             // ORCH-7: give the guest a bounded grace window to flush and power off
             // after the shutdown request, before the SIGKILL fallback — an immediate
-            // `kill()` grants ~0 flush time. But rather than *always* sleeping the
-            // whole window (the placeholder ORCH-7 shipped), poll the now-realized
-            // `VmInstance::has_exited` and return as soon as the guest has actually
-            // powered off, capping at `self.timeouts.shutdown_grace`. The force-kill
-            // below is still the guaranteed fallback for a guest that never exits on
-            // its own.
-            let grace_deadline = tokio::time::Instant::now() + self.timeouts.shutdown_grace;
+            // `kill()` grants ~0 flush time. The window opens at RPC-*send*, with a
+            // one-poll-step post-ack floor (the clamp below): the deadline is
+            // computed BEFORE `request_shutdown`, so the RPC's own round trip
+            // spends the grace instead of silently extending it. Rather than
+            // *always* sleeping the whole window (the placeholder ORCH-7 shipped),
+            // poll the now-realized `VmInstance::has_exited` and return as soon as
+            // the guest has actually powered off, capping at
+            // `self.timeouts.shutdown_grace`. The force-kill below is still the
+            // guaranteed fallback for a guest that never exits on its own.
+            let poll_step = shutdown_poll_step(self.timeouts.shutdown_grace);
+            let mut grace_deadline = tokio::time::Instant::now() + self.timeouts.shutdown_grace;
+            let _ = inst.request_shutdown().await;
+            // Post-ack floor: the shutdown RPC has no timeout
+            // (`vmm::unix_api_request`), so an RPC stalled for >= the grace would
+            // arrive here with the deadline already past and skip the poll loop
+            // entirely — ~0 post-ack flush time, the exact anti-pattern the ORCH-7
+            // grace exists to prevent. Clamping the deadline to now + one poll
+            // step guarantees >= 1 `has_exited` check after the guest acknowledged
+            // the shutdown.
+            grace_deadline = grace_deadline.max(tokio::time::Instant::now() + poll_step);
             while tokio::time::Instant::now() < grace_deadline {
                 if inst.has_exited().await {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                tokio::time::sleep(poll_step).await;
             }
 
             // Force-kill + reap the process group so no zombie/EBUSY blocks the
@@ -1082,6 +1110,24 @@ impl<V: Vmm> Drop for MicroVm<V> {
         // (ORCH-2).
         drop(self.instance.take());
         self.teardown_post_instance();
+    }
+}
+
+/// Derives `shutdown()`'s `has_exited` poll cadence from the configured grace
+/// ceiling: <= 50 ms -> 5 ms, <= 150 ms -> 10 ms, else 20 ms. A short
+/// `throughput`-profile grace (50 ms) on the old fixed 20 ms grid quantized up
+/// to ~60 ms even when ceiling-bound, and an in-window exit paid up to 20 ms of
+/// detection latency; the 5 ms floor is at most ~10 wakeups in a 50 ms window —
+/// finer detection, not a busy-spin. (Deliberate deviation from design 44's
+/// "the poll step stays 20 ms" note — recorded in `implementation-notes.md`.)
+fn shutdown_poll_step(grace: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    if grace <= Duration::from_millis(50) {
+        Duration::from_millis(5)
+    } else if grace <= Duration::from_millis(150) {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(20)
     }
 }
 
@@ -1595,6 +1641,7 @@ mod tests {
                 unprivileged_vhost_user_net: true,
                 nested_virt: true,
                 virtio_console: true,
+                restore_rotates_host_paths: true,
             }
         }
 
@@ -2055,6 +2102,156 @@ mod tests {
         );
     }
 
+    // Builds a `MicroVm` around `instance` with a live cached `AgentClient`
+    // seeded over one end of a socketpair, so a test can observe whether a
+    // lifecycle verb invalidates the cache. Returns the peer end too: dropping
+    // it would only half-close the stream, but keeping it alive makes the
+    // "connection state untouched" reading of the Err-path test literal.
+    fn vm_with_seeded_agent_client<V: Vmm>(
+        instance: V::Instance,
+    ) -> (MicroVm<V>, tokio::net::UnixStream) {
+        let (local, peer) = tokio::net::UnixStream::pair().expect("socketpair");
+        let vm = MicroVm::<V> {
+            vmid: None,
+            instance: Some(instance),
+            netns: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: None,
+            cgroup_name: None,
+            cgroup_fs: None,
+            agent_client: Some(AgentClient::from_stream_for_tests(local)),
+            restored: false,
+            restore_reseed_applied: None,
+            cid: None,
+            tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
+        };
+        (vm, peer)
+    }
+
+    // FC severs established vsock connections across its internal
+    // pause/snapshot/resume cycle (CH keeps them alive), so a cached
+    // `AgentClient` is dead on the resumed VM. `MicroVm::snapshot()`
+    // self-guards by dropping the cache after a successful backend snapshot;
+    // the next `agent()` call reconnects. RED on the inverse — a `snapshot()`
+    // that forgets the invalidation leaves `agent_client` populated here.
+    #[tokio::test]
+    async fn test_snapshot_success_invalidates_cached_agent_client() {
+        let instance = crate::vmm::FakeVmInstance {
+            vsock_path: std::path::PathBuf::from("/tmp/vmcell-snap-inval-vsock.sock"),
+            serial: std::path::PathBuf::from("/tmp/vmcell-snap-inval-serial.log"),
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (mut vm, _peer) = vm_with_seeded_agent_client::<crate::vmm::FakeVmm>(instance);
+        vm.snapshot(std::path::Path::new("/tmp/vmcell-snap-inval"))
+            .await
+            .expect("the fake snapshot succeeds");
+        assert!(
+            vm.agent_client.is_none(),
+            "a successful snapshot() must invalidate the cached agent client \
+             (FC severs established vsock connections across pause/snapshot/resume)"
+        );
+    }
+
+    // A VMM/instance pair whose `snapshot()` always fails, to pin the Err path
+    // of `MicroVm::snapshot()`: the snapshot did not happen, so the cached
+    // agent connection must be left exactly as it was. `create`/`restore` are
+    // unreachable — the test constructs the `MicroVm` directly, like the
+    // teardown-order and grace tests.
+    struct SnapFailVmm;
+
+    impl Vmm for SnapFailVmm {
+        type Instance = SnapFailInstance;
+
+        async fn create(
+            &self,
+            _cfg: &VmConfig,
+            _res: &PerVmResources,
+            _cgroups: &dyn crate::metrics::CgroupFs,
+        ) -> Result<Self::Instance> {
+            unreachable!("snapshot Err-path test constructs MicroVm directly")
+        }
+
+        async fn restore(
+            &self,
+            _snapshot_dir: &std::path::Path,
+            _cfg: &VmConfig,
+            _res: &PerVmResources,
+            _cgroups: &dyn crate::metrics::CgroupFs,
+        ) -> Result<Self::Instance> {
+            unreachable!("snapshot Err-path test constructs MicroVm directly")
+        }
+
+        fn capabilities(&self) -> crate::vmm::VmmCapabilities {
+            unreachable!("MicroVm::snapshot() delegates without querying capabilities")
+        }
+
+        fn id(&self) -> &str {
+            "snapfail"
+        }
+    }
+
+    struct SnapFailInstance {
+        vsock: std::path::PathBuf,
+        serial: std::path::PathBuf,
+    }
+
+    impl VmInstance for SnapFailInstance {
+        async fn boot(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn request_shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn kill(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn has_exited(&mut self) -> bool {
+            true
+        }
+        async fn pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn snapshot(&mut self, _dir: &std::path::Path) -> Result<()> {
+            Err(crate::error::Error::Vmm("snapshot failed".into()))
+        }
+        fn vsock_path(&self) -> &std::path::Path {
+            &self.vsock
+        }
+        fn guest_cid(&self) -> u32 {
+            3
+        }
+        fn serial_log(&self) -> &std::path::Path {
+            &self.serial
+        }
+    }
+
+    // The Err path of `MicroVm::snapshot()` leaves the cached client alone:
+    // no snapshot happened, so the connection state is whatever it already
+    // was. RED on an unconditional invalidation (dropping the cache before or
+    // regardless of the backend result).
+    #[tokio::test]
+    async fn test_snapshot_failure_keeps_cached_agent_client() {
+        let instance = SnapFailInstance {
+            vsock: std::path::PathBuf::from("/tmp/vmcell-snap-fail-vsock.sock"),
+            serial: std::path::PathBuf::from("/tmp/vmcell-snap-fail-serial.log"),
+        };
+        let (mut vm, _peer) = vm_with_seeded_agent_client::<SnapFailVmm>(instance);
+        let result = vm
+            .snapshot(std::path::Path::new("/tmp/vmcell-snap-fail"))
+            .await;
+        assert!(result.is_err(), "the failing fake must surface its error");
+        assert!(
+            vm.agent_client.is_some(),
+            "a failed snapshot() must leave the cached agent client in place \
+             (the snapshot didn't happen, so the connection is untouched)"
+        );
+    }
+
     // ORCH-5 (B1/B6). Dropping a `MicroVm` that holds a REAL `Some(cid)` /
     // `Some(vmid)` guard must return BOTH ids to their allocators. The existing
     // drop-order builder sets `cid: None, vmid: None`, so its guard-Drop release
@@ -2350,6 +2547,225 @@ mod tests {
         assert!(
             rs_i < kill_i,
             "request_shutdown must precede the SIGKILL fallback: {calls:?}"
+        );
+    }
+
+    // ---- EXP-D (ORCH-7 refinement): grace-deadline placement + adaptive poll step ----
+    //
+    // A driven fake whose `request_shutdown` RPC blocks for a configurable time
+    // and whose `has_exited` answer is scripted (always `false` here — a guest
+    // that never exits on its own), recording every call into a shared timeline.
+    // `create`/`restore` are unreachable: these tests construct the `MicroVm`
+    // directly, like the teardown-order tests above.
+    struct GraceVmm;
+
+    impl Vmm for GraceVmm {
+        type Instance = GraceInstance;
+
+        async fn create(
+            &self,
+            _cfg: &VmConfig,
+            _res: &PerVmResources,
+            _cgroups: &dyn crate::metrics::CgroupFs,
+        ) -> Result<Self::Instance> {
+            unreachable!("grace tests construct MicroVm directly")
+        }
+
+        async fn restore(
+            &self,
+            _snapshot_dir: &std::path::Path,
+            _cfg: &VmConfig,
+            _res: &PerVmResources,
+            _cgroups: &dyn crate::metrics::CgroupFs,
+        ) -> Result<Self::Instance> {
+            unreachable!("grace tests construct MicroVm directly")
+        }
+
+        fn capabilities(&self) -> crate::vmm::VmmCapabilities {
+            unreachable!("shutdown() never queries capabilities")
+        }
+
+        fn id(&self) -> &str {
+            "grace-fake"
+        }
+    }
+
+    struct GraceInstance {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        // How long the fake shutdown RPC blocks before acknowledging.
+        rpc_delay: std::time::Duration,
+        vsock: std::path::PathBuf,
+        serial: std::path::PathBuf,
+    }
+
+    impl VmInstance for GraceInstance {
+        async fn boot(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn request_shutdown(&mut self) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("request_shutdown".to_string());
+            tokio::time::sleep(self.rpc_delay).await;
+            Ok(())
+        }
+        async fn kill(&mut self) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("kill".to_string());
+            Ok(())
+        }
+        async fn has_exited(&mut self) -> bool {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("has_exited".to_string());
+            false
+        }
+        async fn pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn snapshot(&mut self, _dir: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn vsock_path(&self) -> &std::path::Path {
+            &self.vsock
+        }
+        fn guest_cid(&self) -> u32 {
+            3
+        }
+        fn serial_log(&self) -> &std::path::Path {
+            &self.serial
+        }
+    }
+
+    fn grace_vm(
+        rpc_delay: std::time::Duration,
+        grace: std::time::Duration,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> MicroVm<GraceVmm> {
+        MicroVm::<GraceVmm> {
+            vmid: None,
+            instance: Some(GraceInstance {
+                calls,
+                rpc_delay,
+                vsock: std::path::PathBuf::from("/tmp/vmcell-grace-vsock.sock"),
+                serial: std::path::PathBuf::from("/tmp/vmcell-grace-serial.log"),
+            }),
+            netns: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: None,
+            cgroup_name: None,
+            cgroup_fs: None,
+            agent_client: None,
+            restored: false,
+            restore_reseed_applied: None,
+            cid: None,
+            tmp_dir: None,
+            timeouts: crate::config::Timeouts {
+                shutdown_grace: grace,
+                ..crate::config::Timeouts::default()
+            },
+        }
+    }
+
+    // EXP-D (c): the adaptive step's exact thresholds — <= 50 ms -> 5 ms,
+    // <= 150 ms -> 10 ms, else 20 ms — with both sides of each boundary pinned
+    // so an off-by-one (`<` vs `<=`) goes red.
+    #[test]
+    fn test_shutdown_poll_step_thresholds() {
+        use std::time::Duration;
+        let step = |ms| shutdown_poll_step(Duration::from_millis(ms));
+        assert_eq!(step(1), Duration::from_millis(5));
+        assert_eq!(step(50), Duration::from_millis(5));
+        assert_eq!(step(51), Duration::from_millis(10));
+        assert_eq!(step(150), Duration::from_millis(10));
+        assert_eq!(step(151), Duration::from_millis(20));
+        assert_eq!(step(250), Duration::from_millis(20));
+    }
+
+    // EXP-D (a)+(b): the grace window opens at RPC-send with a one-poll-step
+    // post-ack floor. `request_shutdown` has no timeout, so this fake stalls the
+    // RPC for ~grace-length (60 ms >= the 50 ms grace): the pre-RPC deadline has
+    // already passed by the time the ack arrives. The clamp must still grant
+    // >= 1 `has_exited` poll after the ack — RED on a naive pre-RPC deadline
+    // without the post-RPC clamp (the loop is skipped: zero polls, ~0 post-ack
+    // flush). The elapsed bound additionally pins the deadline *placement*:
+    // computing it after the RPC (the old code) would hold this never-exiting
+    // guest for rpc_delay + grace ~= 110 ms, while the fixed placement returns
+    // after ~rpc_delay + one 5 ms poll step (~65 ms).
+    #[tokio::test]
+    async fn test_shutdown_stalled_rpc_still_gets_post_ack_poll() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let vm = grace_vm(
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(50),
+            calls.clone(),
+        );
+        let started = std::time::Instant::now();
+        vm.shutdown().await.expect("shutdown ok");
+        let elapsed = started.elapsed();
+
+        let log = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let idx = |needle: &str| log.iter().position(|c| c == needle);
+        let rs_i = idx("request_shutdown").expect("request_shutdown recorded");
+        let kill_i = idx("kill").expect("kill recorded");
+        let post_ack_polls = log
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| c.as_str() == "has_exited" && *i > rs_i && *i < kill_i)
+            .count();
+        assert!(
+            post_ack_polls >= 1,
+            "a stalled shutdown RPC must still yield >= 1 post-ack has_exited poll \
+             before the force-kill: {log:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(95),
+            "the grace window must open at RPC-send, not restart at RPC-return \
+             (60 ms RPC + 50 ms grace would be ~110 ms): {elapsed:?}"
+        );
+    }
+
+    // EXP-D (c): a 50 ms grace derives a 5 ms poll step, so a never-exiting
+    // guest holds shutdown() for the grace ceiling plus at most one step
+    // (~[50, 55) ms). RED on the old fixed 20 ms step: its 0/20/40 grid's final
+    // sleep cannot land before 60 ms (tokio sleeps never wake early), outside
+    // the < 60 ms bound. The poll count is the jitter-robust second signal: a
+    // 5 ms step fits >= 4 polls into the window even under heavy scheduler
+    // noise, while the 20 ms grid gets at most 3.
+    #[tokio::test]
+    async fn test_shutdown_grace_50ms_polls_finely_and_returns_on_time() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let vm = grace_vm(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(50),
+            calls.clone(),
+        );
+        let started = std::time::Instant::now();
+        vm.shutdown().await.expect("shutdown ok");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "a never-exiting guest must be granted the full grace ceiling: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(60),
+            "a 50 ms grace must not be quantized onto a coarser poll grid: {elapsed:?}"
+        );
+        let log = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let polls = log.iter().filter(|c| c.as_str() == "has_exited").count();
+        assert!(
+            polls >= 4,
+            "a 50 ms grace must poll on a 5 ms step (>= 4 polls), not the coarse \
+             20 ms grid (exactly 3): {polls} polls, {log:?}"
         );
     }
 }

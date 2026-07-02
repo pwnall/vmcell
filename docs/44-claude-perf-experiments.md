@@ -128,6 +128,14 @@ coverage is preserved. This is the standard, honest mitigation for a confirmed-i
 environmental integration flake (a real host run occasionally, not 40× back-to-back like this bisect
 session, sees a lower base rate). Deeper CH-vsock reliability work is possible future work.
 
+**2026-07-02 UPDATE — root cause found (AGENT-2).** The dominant cause was **not** environmental: it
+was a PID-1 reaper race in the guest agent — `ReaperCoordinator::reserve()` running after the SIGCHLD
+drain had already recorded a fast child's exit discarded that child's *own* status as "stale", parking
+its waiter forever (host sees a 10 s exec timeout). Found while stabilizing the FC restore probe,
+reproduced on pre-optimization code, fixed with an epoch-based `reserve(pid, epoch)` (red-checked).
+Details: `docs/45-claude-perf-investigation.md` EXP-E #5; `docs/implementation-notes.md`. The retries
+stay as defense-in-depth, but back-to-back suite runs should now flake far less.
+
 ## Experiments
 
 ### EXP-1 — Quieter guest kernel boot console (host cmdline; no rootfs rebuild) — KEEPER (as `loglevel=6`)

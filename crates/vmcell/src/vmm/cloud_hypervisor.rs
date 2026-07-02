@@ -551,6 +551,10 @@ impl Vmm for CloudHypervisor {
             unprivileged_vhost_user_net: true,
             nested_virt: true,
             virtio_console: true,
+            // CH's restore config rewrite moves the vsock/serial paths into the
+            // restored VM's OWN fresh scratch dir before launch (§9.2), so every
+            // restore gets rotated host-side socket paths.
+            restore_rotates_host_paths: true,
         }
     }
 

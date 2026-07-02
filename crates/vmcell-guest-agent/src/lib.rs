@@ -110,25 +110,66 @@ impl ReaperCoordinator {
         }
     }
 
-    /// Reserves `pid` for an exec waiter that just spawned a child with it.
+    /// Returns the current record generation, to be captured by the exec path
+    /// **before** spawning a child and passed to [`ReaperCoordinator::reserve`]
+    /// as the reservation epoch.
+    ///
+    /// The epoch must pre-date the fork so `reserve` can classify a status it
+    /// finds already recorded for the child's pid: a status recorded **at or
+    /// before** the epoch belongs to a previous occupant of the (reused) pid —
+    /// that occupant's zombie was necessarily reaped (and, via the atomic
+    /// [`ReaperCoordinator::drain_reaped`], recorded) before the kernel could
+    /// hand the pid to the new child — while a status recorded **after** the
+    /// epoch is the new child's own exit, drained by PID 1 before the exec
+    /// thread reached `reserve` (the fast-exit race, AGENT-2).
+    #[must_use]
+    pub fn pre_spawn_epoch(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
+    /// Reserves `pid` for an exec waiter that just spawned a child with it,
+    /// using the [`ReaperCoordinator::pre_spawn_epoch`] captured **before** the
+    /// spawn.
     ///
     /// PID 1 reaps re-parented grandchildren no waiter will ever claim, so a
     /// status for `pid` can linger in the map until a generation prune ages it
     /// out. If the kernel later reuses `pid` for a fresh exec child, that stale
     /// status would otherwise be mis-delivered to the new waiter (a false exit
-    /// code for a process that never produced it). Calling `reserve` from the
-    /// exec path immediately after spawn closes that window: it drops any
-    /// pre-existing status for `pid` and records the current generation as the
-    /// reservation epoch, so a subsequent [`ReaperCoordinator::wait_for`] only
-    /// accepts a status reaped strictly *after* this point. The matching
-    /// reservation is consumed when `wait_for` returns the child's own status.
-    pub fn reserve(&self, pid: u32) {
+    /// code for a process that never produced it). `reserve` drops such a
+    /// pre-epoch status and records the epoch, so a subsequent
+    /// [`ReaperCoordinator::wait_for`] only accepts a status reaped strictly
+    /// after it. The matching reservation is consumed when `wait_for` returns
+    /// the child's own status.
+    ///
+    /// The epoch **must** be captured before the spawn, not here (AGENT-2): an
+    /// instant child can exit and be drained by the PID-1 reaper in the window
+    /// between `spawn` and `reserve` (on one vcpu the child often runs to
+    /// completion before the exec thread is rescheduled). Its own status is then
+    /// already in the map — recorded *after* the pre-spawn epoch — and must
+    /// survive the reservation; the pre-fix unconditional wipe stranded the
+    /// waiter forever and surfaced on the host as a sporadic 10 s
+    /// "Agent exec timed out" on an instant command. Residual window, honestly:
+    /// a grandchild status recorded *between* the epoch capture and the fork
+    /// whose pid the kernel immediately hands to the new child would still be
+    /// misattributed — that needs the whole pid space to recycle within the
+    /// microseconds-wide spawn window, which is unreachable in practice.
+    pub fn reserve(&self, pid: u32, pre_spawn_epoch: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // Drop a status left by a previous occupant of this (now reused) pid; it
-        // is not this child's and must not be claimed.
-        inner.statuses.remove(&pid);
-        let epoch = inner.generation;
-        inner.reservations.insert(pid, epoch);
+        // Drop only a status recorded at or before the pre-spawn epoch (a
+        // previous occupant's); one recorded after it is this child's own exit
+        // and must be left for the waiter. Serial-number comparison mirrors
+        // `wait_for` so the two stay consistent under generation wrap.
+        if let Some(&(_, recorded)) = inner.statuses.get(&pid) {
+            let age = recorded.wrapping_sub(pre_spawn_epoch);
+            let recorded_after_epoch = age != 0 && age < u64::MAX / 2;
+            if !recorded_after_epoch {
+                inner.statuses.remove(&pid);
+            }
+        }
+        inner.reservations.insert(pid, pre_spawn_epoch);
     }
 
     /// Records a reaped child's `code` for `pid` and wakes any waiter.
@@ -356,8 +397,12 @@ mod reaper_tests {
         coord.record_exit(PID, STALE_CODE);
         assert_eq!(coord.pending_statuses(), 1);
 
-        // Exec spawns a child that reuses pid X and reserves it after spawn.
-        coord.reserve(PID);
+        // Exec spawns a child that reuses pid X and reserves it after spawn. The
+        // epoch is captured just before that spawn — i.e. after the previous
+        // occupant's status was recorded (the pid can only be reused once its
+        // zombie was reaped, and the atomic drain records under the same lock).
+        let epoch = coord.pre_spawn_epoch();
+        coord.reserve(PID, epoch);
 
         let waiter = {
             let coord = Arc::clone(&coord);
@@ -418,7 +463,11 @@ mod reaper_tests {
             let coord = Arc::clone(&coord);
             std::thread::spawn(move || {
                 reaped_rx.recv().unwrap();
-                coord.reserve(PID);
+                // The pre-spawn epoch capture takes the coordinator lock, so
+                // under the atomic drain it blocks until STALE is recorded —
+                // the epoch then post-dates STALE and the reservation clears it.
+                let epoch = coord.pre_spawn_epoch();
+                coord.reserve(PID, epoch);
                 coord.record_exit(PID, REAL_CODE);
             })
         };
@@ -453,11 +502,45 @@ mod reaper_tests {
     }
 
     #[test]
+    fn reserve_after_fast_child_already_drained_delivers_status() {
+        // AGENT-2: an instant child (`head -c 32 /dev/urandom` takes ~1 ms) can
+        // exit and be drained by the PID-1 reaper in the window between `spawn`
+        // and `reserve` — on a 1-vcpu guest the child often runs to completion
+        // before the exec thread is rescheduled. The pre-fix `reserve` wiped any
+        // pre-existing status for the pid — including the child's OWN — so
+        // `wait_for` blocked forever and the host saw a sporadic 10 s
+        // "Agent exec timed out" on a command that had already succeeded (the
+        // dominant snapshot_restore::firecracker flake). With the pre-SPAWN
+        // epoch, the child's status (recorded strictly after the epoch) survives
+        // the reservation and is delivered immediately. The buggy inverse
+        // (unconditional wipe / epoch captured at reserve time) reddens the
+        // recv_timeout below instead of hanging the suite.
+        const PID: u32 = 777;
+        let coord = Arc::new(ReaperCoordinator::new());
+        let epoch = coord.pre_spawn_epoch(); // captured before the "spawn"
+        // The child exits instantly; the PID-1 drain records it BEFORE the exec
+        // thread reaches `reserve`.
+        coord.record_exit(PID, 0);
+        coord.reserve(PID, epoch);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter_coord = Arc::clone(&coord);
+        std::thread::spawn(move || {
+            let _ = tx.send(waiter_coord.wait_for(PID));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter must deliver the fast child's own status, not hang (AGENT-2)");
+        assert_eq!(got, 0, "the fast child's own exit code must be delivered");
+        assert_eq!(coord.pending_statuses(), 0);
+    }
+
+    #[test]
     fn reservation_only_constrains_its_own_pid() {
         // A reservation for one pid must not change delivery for an unreserved
         // pid (the legacy single-occupant path stays intact).
         let coord = ReaperCoordinator::new();
-        coord.reserve(1);
+        let epoch = coord.pre_spawn_epoch();
+        coord.reserve(1, epoch);
         coord.record_exit(2, 55); // unreserved pid: first status delivered as before
         assert_eq!(coord.wait_for(2), 55);
         // The reserved pid still works once its own post-reservation status lands.

@@ -23,7 +23,9 @@ path = "src/main.rs"
 vmcell-protocol = { path = "../vmcell-protocol", version = "0.2.0" }
 postcard = { version = "1", features = ["use-std"] }
 vsock = "0.5"
-rustix = { version = "0.38", features = ["fs", "mount", "process", "net", "time"] }
+# `event` powers the event-driven vsock accept loop (poll(2) on the listener fd,
+# OPP-2); a feature on the existing dep, so the lean-agent graph gains no crate.
+rustix = { version = "0.38", features = ["fs", "mount", "process", "net", "time", "event"] }
 signal-hook = "0.3"
 libc = "0.2"
 tracing = "0.1"

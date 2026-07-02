@@ -275,7 +275,13 @@ impl Qemu {
         // Wait for the vhost-vsock socket to appear; on failure reap the daemon's
         // group before the RAII guard takes ownership, so a half-started daemon never
         // leaks.
-        if let Err(e) = crate::vmm::wait_for_socket(&vhost_vsock, &mut vsock_daemon, 1000, 20).await
+        if let Err(e) = crate::vmm::wait_for_socket(
+            &vhost_vsock,
+            &mut vsock_daemon,
+            1000,
+            cfg.timeouts.api_socket_poll.as_millis() as u64,
+        )
+        .await
         {
             crate::vmm::reap_process_group(&mut vsock_daemon, vsock_pgid);
             return Err(Error::Vmm(format!(
@@ -532,6 +538,10 @@ impl Vmm for Qemu {
             unprivileged_vhost_user_net: true,
             nested_virt: true,
             virtio_console: true,
+            // Honest-false: QEMU restore() is unwired (returns Unsupported), so
+            // no path rotation exists to advertise. Revisit with the privileged
+            // in-kernel-vhost-vsock wiring (§16).
+            restore_rotates_host_paths: false,
         }
     }
 

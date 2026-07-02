@@ -109,8 +109,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         let original_cid = vm.instance().guest_cid();
 
         std::fs::create_dir_all(&snapshot_dir).unwrap();
-        vm.instance_mut()
-            .snapshot(&snapshot_dir)
+        vm.snapshot(&snapshot_dir)
             .await
             .expect("Failed to create snapshot");
 
@@ -278,19 +277,39 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         let original_vsock =
             std::fs::read_to_string(snapshot_dir.join("original_vsock.txt")).unwrap();
         let new_vsock = vm.instance().vsock_path().to_str().unwrap();
-        assert_ne!(
-            original_vsock, new_vsock,
-            "Vsock path should be rotated after restore"
-        );
-        // M-TEST-RESTORE: assert the REAL socket path embeds the rotated vmid
-        // (vmcell-vm-{pid}-{new_vmid}), not merely that it differs — proving the path
-        // reflects the new identity rather than a coincidental string difference.
-        assert!(
-            new_vsock.contains(&format!("vmcell-vm-{}-{}", std::process::id(), new_vmid)),
-            "restored vsock path {} must embed the rotated vmid {}",
-            new_vsock,
-            new_vmid
-        );
+        // The host-side vsock path contract is per-backend, declared by
+        // `restore_rotates_host_paths` (the capability descriptor is the contract):
+        // CH's restore config-rewrite moves the socket into the NEW VM's scratch
+        // dir; FC's `PUT /snapshot/load` re-binds the snapshot's baked path
+        // VERBATIM (no load-time override exists in v1.16). Each branch asserts
+        // its backend's REAL semantics — the opposite outcome reddens either one.
+        if vmcell::vmm::Vmm::capabilities(vmm).restore_rotates_host_paths {
+            assert_ne!(
+                original_vsock, new_vsock,
+                "Vsock path should be rotated after restore"
+            );
+            // M-TEST-RESTORE: assert the REAL socket path embeds the rotated vmid
+            // (vmcell-vm-{pid}-{new_vmid}), not merely that it differs — proving the
+            // path reflects the new identity rather than a coincidental string
+            // difference.
+            assert!(
+                new_vsock.contains(&format!("vmcell-vm-{}-{}", std::process::id(), new_vmid)),
+                "restored vsock path {} must embed the rotated vmid {}",
+                new_vsock,
+                new_vmid
+            );
+        } else {
+            // Verbatim re-bind: every restore of this snapshot lineage shares the
+            // ONE baked host path. The agent reconnect above already proved the
+            // rebound path functional; a rotated path here would mean the backend
+            // diverged from its declared capability.
+            assert_eq!(
+                new_vsock,
+                original_vsock.as_str(),
+                "a restore_rotates_host_paths=false backend must re-bind the \
+                 snapshot's baked vsock path verbatim"
+            );
+        }
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();
         let mac_out = vm

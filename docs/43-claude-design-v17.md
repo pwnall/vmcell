@@ -286,17 +286,18 @@ check (confirmed by a live message trace — §10.4). Cold boot ≈1405 ms.
 
 | Capability | CH | Firecracker | QEMU |
 |---|---|---|---|
-| `snapshot_restore` | **✓** | ✗ *(gated off pending reconnect fix)* | ✗ *(privileged in-kernel-vhost-vsock validated, unwired)* |
+| `snapshot_restore` | **✓** | **✓** *(single-lineage host paths — `restore_rotates_host_paths: false`, §16)* | ✗ *(privileged in-kernel-vhost-vsock validated, unwired)* |
 | `lazy_restore` (demand-paged) | ✓ (`memory_restore_mode`) | ✗ | ✗ |
 | `virtio_fs_shares` | ✓ | ✗ (block-only) | ✓ |
 | `unprivileged_vhost_user_net` | ✓ | ✗ | ✓ |
 | `nested_virt` | ✓ | ✗ | ✓ |
 | cold boot (p50, §15) | ≈635 ms | ≈1022 ms | ≈1405 ms |
-| warm restore (p50, §15) | ≈169 ms | ≈128 ms *(measured; capability off)* | — |
+| warm restore (p50, §15) | ≈169 ms | ≈128 ms | — |
 
 The cold-boot/restore inversion pins each backend's *intended* role: CH is the feature-complete default
-and cold-boot leader (and the working snapshot tier today); Firecracker cold-boots slower than CH but
-restores fastest, earning the density/snapshot tier once its warm-restore reconnect is fixed; QEMU is the
+and cold-boot leader (and the fully-featured snapshot tier); Firecracker cold-boots slower than CH but
+restores fastest, earning the density/snapshot tier now that its warm restore is validated end-to-end
+(with the single-lineage host-path constraint, §16); QEMU is the
 slowest cold-booter, the fallback for the awkward cases, and the most-proven nester. The orchestrator reads roles off
 `capabilities()`; the test/bench matrix **skips — never fails** — a scenario a backend can't run.
 
@@ -1597,14 +1598,20 @@ What is *not* yet done, so a new developer knows where the edges are. (The v14 r
 cargo workspace, the durable re-bless fix, the lifecycle verbs, `oci2erofs`, and the feature-matrix
 collapse have all **landed** — they are described in the body as current, not listed here.)
 
-- **Firecracker warm restore.** Its `snapshot_restore`/`lazy_restore` capabilities are honest `false`: the
-  MMIO snapshot creates fine but the first post-restore `exec` drops (the guest vsock listener doesn't
-  re-attach after FC re-creates the device). The FC restore *mechanism* is already sketched — a fresh
-  process + `POST /snapshot/load {resume_vm:false}` (restore returns paused, caller resumes), `PATCH /vm`
-  for pause/resume, and a `vmcell_host_paths.json` sidecar that `restore()` reads to unlink the stale host
-  vsock UDS baked in at snapshot time (else `EADDRINUSE`) — so the remaining work is the **guest-side**
-  rebind (the FC analog of the CH fix in §9.2) plus the UFFD lazy-restore backend. Fixing it unlocks the
-  fastest-restore tier. **CH is the only wired, end-to-end-validated snapshot backend today.**
+- **Firecracker warm restore.** `snapshot_restore` is now **`true`** (2026-07-02,
+  `implementation-notes.md`): the historical first-post-restore-`exec` drop was cured by the guest
+  agent's *generic* re-bind-after-restore work (the §9.2/§12.4 idle-window re-bind — no FC-specific
+  guest fix was needed) plus two host-side fixes (`MicroVm::snapshot()` invalidates its cached agent
+  client — FC severs established vsock connections across pause/snapshot/resume — and `restore()`
+  re-creates the baked vsock path's parent dir before `POST /snapshot/load`). The mechanism is the
+  sketched one: a fresh process + `POST /snapshot/load {resume_vm:false}` (restore returns paused,
+  caller resumes), `PATCH /vm` for pause/resume, and the `vmcell_host_paths.json` sidecar. Two gaps
+  remain: **UFFD lazy restore** is unwired (`lazy_restore: false`, M-VMM-1 — `RestoreMode::Lazy` would
+  silently fault eagerly), and FC re-binds the snapshot's baked host vsock UDS **verbatim** (no
+  load-time override in v1.16), declared as `restore_rotates_host_paths: false` — a lineage's restores
+  share one host path, so `restore()` fail-loud-guards against restoring while the snapshotted VM (or
+  a prior restore) is still alive, and concurrent restores from one lineage are unsupported (subsumed
+  by the single-snapshot-CoW gap below).
 - **QEMU snapshot: privileged tier validated but unwired.** `snapshot_restore: false`. The QEMU *migration
   mechanism* for the privileged in-kernel-`vhost-vsock` config is validated at the QEMU level (no
   QEMU-10.2 migration blocker; migrate→restore verified live), but it is not wired as a vmcell backend;

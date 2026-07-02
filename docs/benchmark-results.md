@@ -4,13 +4,76 @@ Performance results for the `vmcell` framework: hot-path overheads (micro-benchm
 KVM lifecycle/density/size metrics (macro-benchmarks). Per design §13.7 these are **tracked metrics,
 not pass/fail gates** — absolute numbers are hardware-bound and only meaningful with their substrate.
 
-> **Latency optimization pass — 2026-07-01.** The cold-boot and warm-restore numbers below are
-> **post** a targeted latency-recovery pass that cut **CH cold 642→330 ms (−49%)** and **CH warm
-> restore 166→84 ms (−49%)** without relaxing any correctness invariant. See the dedicated section
-> "Latency optimization pass" below, `docs/perf-experiments-log.md` (per-experiment deltas), and
-> `docs/implementation-notes.md` (the deviations). The detailed sub-analyses further down (kernel
-> sweep, eager/lazy, footprint, suspend-size) were measured **pre-pass**: their *relative*
-> conclusions still hold, but their absolute cold/restore ms are superseded by the table below.
+> **Canonical numbers: the 2026-07-02 post-investigation matrix** (directly below) — the
+> 2026-07-01 profile-matrix baseline plus the `docs/45` experiment pass (EXP-A…E, incl. the
+> Firecracker warm-restore unlock). The historical pass sections further down record how the
+> system got here (CH cold 642→330 ms, CH restore 166→84→60 ms); the detailed sub-analyses
+> (kernel sweep, eager/lazy, footprint, suspend-size) were measured **pre-pass**: their
+> *relative* conclusions still hold, but their absolute cold/restore ms are superseded by the
+> tables below.
+
+## Post-investigation matrix (2026-07-02 — after the docs/45 experiment pass) — CANONICAL
+
+The docs/45 investigation (EXP-A…E) landed on top of the 2026-07-01 baseline below. Same
+substrate/method. What changed: readiness-poll unification (EXP-A), `cryptomgr.notests
+raid=noautodetect` cmdline trims (EXP-B), event-driven guest accept via poll(2) (EXP-C),
+teardown grace deadline-before-RPC + adaptive poll step (EXP-D), and **Firecracker warm restore
+unlocked** (EXP-E: capability now honestly `true`; plus the AGENT-2 guest reaper-race fix that
+was the real cause of the historical "Agent … timed out" flake — QEMU now drops zero bench
+iterations).
+
+**Time-to-ready (latency mode), p50 / p95 ms — Δ vs the 07-01 baseline below:**
+
+| Backend | `default` cold | `default` restore | `low_latency` restore |
+| --- | --- | --- | --- |
+| **Cloud Hypervisor** | 316 / 331 (≈) | **58 / 67** (−8) | 54 / 66 (≈) |
+| **Firecracker** | 764 / 792 (−14) | **24 / 33** (NEW — was N/A; fastest restore tier) | **23 / 28** |
+| **QEMU** (`q35`) | **965 / 995** (−38, and 20/20 iterations vs 16–17/20) | N/A (`snapshot_restore=false`) | N/A |
+
+**End-to-end lifecycle (phase-budget TOTAL), p50 ms, `throughput` profile — Δ vs baseline:**
+
+| Backend × path | baseline | post-experiments |
+| --- | --- | --- |
+| CH cold | 405 | **361** (teardown 95→56) |
+| CH restore | 161 | **120** |
+| **FC restore** | N/A | **64** (create 13 + connect 13 + exec 10 + teardown 31) |
+| FC cold | 860 | **848** |
+| QEMU cold | 1112 | ~1080 (n=14) |
+
+Per-experiment attribution, mechanisms, bug-risk analysis, and the FC-restore unlock narrative:
+`docs/45-claude-perf-investigation.md`; deviations: `docs/implementation-notes.md`.
+
+## Profile-matrix re-run (2026-07-01, HEAD `37c5067`) — the docs/45 baseline
+
+Same substrate as below; N=20 (latency) / N=12 (phase-budget), warmup=3, mem=256 MiB,
+freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matrix.
+
+**Time-to-ready (latency mode: start|restore → agent `Ready`), p50 / p95 ms:**
+
+| Backend | `default` cold | `low_latency` cold | `default` restore | `low_latency` restore |
+| --- | --- | --- | --- | --- |
+| **Cloud Hypervisor** | 318 / 332 | **290 / 308** | 66 / 74 | **54 / 66** |
+| **Firecracker** | 778 / 806 | 760 / 775 | N/A (`snapshot_restore` off, §3.2) | N/A |
+| **QEMU** (`q35`) | 1003 / 1138 | 993 / 1097 | N/A | N/A |
+
+**End-to-end lifecycle (phase-budget TOTAL: create+connect+exec+graceful teardown), p50 ms:**
+
+| Backend × path | `default` | `throughput` |
+| --- | --- | --- |
+| CH cold | 604 | **405** |
+| CH restore | 359 | **161** |
+| FC cold | 1063 | **860** |
+| QEMU cold | 1311 | 1112 † |
+
+- The `low_latency` preset buys **−28 ms CH cold / −12 ms CH restore** (tighter guest accept poll
+  5 ms + host cadences); FC/QEMU move only ~2% because their cold path is guest-boot-bound.
+- The `throughput` preset (50 ms shutdown grace) cuts **~200 ms** off every graceful lifecycle;
+  CH restore e2e lands at **161 ms**. (RAII `Drop` consumers pay ~27 ms teardown regardless.)
+- † QEMU intermittently loses iterations to the known environmental agent-timeout flake
+  (`docs/perf-experiments-log.md` "Flake investigation"): latency-mode counts were 17/20 and
+  16/20, and the throughput phase-budget needed retries to complete a full n=12 pass (a
+  failure breaks the phase loop). CH/FC dropped zero iterations across the whole matrix.
+- vsock exec RTT floor re-confirmed: **p50 711 µs / p95 852 µs / p99 1013 µs** (CH, 200×).
 
 ## Substrate (this measurement pass — 2026-06-28 base; 2026-07-01 optimization pass)
 
@@ -28,27 +91,28 @@ not pass/fail gates** — absolute numbers are hardware-bound and only meaningfu
 
 ## Micro-Benchmarks (`criterion`, in-process; not freq-pinned)
 
-| Benchmark | Description | p50 |
+| Benchmark | Description | p50 (2026-07-01 re-run) |
 | --- | --- | --- |
-| `protocol_encode` | `postcard` encode of `Message::Exec` | 55.9 ns |
-| `protocol_decode` | `postcard` decode | 82.9 ns |
-| `cache_key_generation` | hashing struct variants + configs for the artifact cache key | 218 ns |
-| `math_30_ipv4_parse` | `/30` host-IP parse (`10.200.<vmid>.1`) | 29.3 ns |
-| `in_memory_tar2erofs_empty` | erofs node-tree pack of an empty tar, in-memory | 1.23 µs |
+| `protocol_encode` | `postcard` encode of `Message::Exec` | 54.8 ns |
+| `protocol_decode` | `postcard` decode | 86.2 ns |
+| `cache_key_generation` | hashing struct variants + configs for the artifact cache key | 260 ns |
+| `math_30_ipv4_parse` | `/30` host-IP parse (`10.200.<vmid>.1`) | 23.2 ns |
+| `in_memory_tar2erofs_empty` | erofs node-tree pack of an empty tar, in-memory | 1.26 µs |
 
 The control-plane codec and per-VM address/cache math are tens-to-hundreds of ns — far below the
 multi-second VM lifecycle.
 
-## Macro — Cold boot & Warm restore (start → guest agent `Ready`)
+## Macro — Cold boot & Warm restore (start → guest agent `Ready`) — historical (opt-pass era)
 
-N=20, warmup=3, mem=256 MiB. Cold = warm-cache (see caveats). All ms. **Post the 2026-07-01
-optimization pass:**
+N=20, warmup=3, mem=256 MiB. Cold = warm-cache (see caveats). All ms. **As measured right after
+the 2026-07-01 optimization pass** (pre native-resync / pre shared-cmdline-builder; canonical
+current numbers are in the profile-matrix section above):
 
 | Backend | Cold p50 / p95 | Warm restore p50 / p95 |
 | --- | --- | --- |
-| **Cloud Hypervisor** | **330 / 346** | **84 / 94** |
+| **Cloud Hypervisor** | **330 / 346** | **84 / 94** (now 66 with native resync) |
 | **Firecracker** | **776 / 787** | N/A (`snapshot_restore` gated off, §3.2) |
-| **QEMU** (`q35`) | ~1400 (pre-pass; code path unchanged) | N/A (`snapshot_restore=false`) |
+| **QEMU** (`q35`) | ~1400 (pre shared-cmdline; now ~1003) | N/A (`snapshot_restore=false`) |
 
 - Warm restore is **~3.9× faster than cold** on CH — the per-test lever holds, now at **84 ms**. The
   optimization pass cut CH cold **642→330 ms** and CH restore **166→84 ms** with no invariant relaxed;
@@ -215,15 +279,18 @@ scan CPU. **Off by default.**
 Snapshot size **tracks guest RAM exactly** and is **flat in rootfs size**. Memory files are dense →
 sparse-snapshot (`SEEK_HOLE`) is the lever for warm-pool density.
 
-## Macro — Per-test critical-path budget (CH, n=12) — post-optimization
+## Macro — Per-test critical-path budget (CH, n=12) — 2026-07-01 re-run
+
+Default profile (graceful `shutdown()` teardown); throughput-profile totals in the
+profile-matrix section above.
 
 | Phase | COLD p50 / share | RESTORE p50 / share |
 | --- | --- | --- |
-| create (`start` \| `restore`+`resume`) | 42 ms / 7% | 58 ms / 15% |
-| connect (vsock + handshake [+resync]) | **284 ms / 46%** | **36 ms / 9%** |
-| exec (`/bin/true`) | 4 ms / 1% | 1 ms / 0% |
-| teardown (graceful `shutdown()`) | 283 ms / 47% | 287 ms / 75% |
-| **TOTAL** | **≈606 ms** | **≈378 ms** |
+| create (`start` \| `restore`+`resume`) | 44 ms / 7% | 54 ms / 14% |
+| connect (vsock + handshake [+resync]) | **279 ms / 45%** | **22 ms / 6%** |
+| exec (`/bin/true`) | 4 ms / 1% | 5 ms / 1% |
+| teardown (graceful `shutdown()`) | 285 ms / 47% | 279 ms / 78% |
+| **TOTAL** | **≈604 ms** | **≈359 ms** |
 
 Cold is now guest-boot-bound but ~50% smaller (`connect` 591→284 ms after the `loglevel=6` cmdline +
 accept-poll levers); restore `connect` collapsed to **~36 ms** (was 115 ms) after the guest accept

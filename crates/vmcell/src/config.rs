@@ -194,8 +194,15 @@ pub(crate) fn build_kernel_cmdline(
         RootfsSource::Erofs { .. } => "",
         _ => "rootflags=noload",
     };
+    // `cryptomgr.notests` / `raid=noautodetect` skip boot work that is dead in this
+    // guest: the built-in crypto self-tests (~10 ms measured via printk timestamps —
+    // docs/45-claude-perf-investigation.md EXP-B) and the md RAID autodetect scan
+    // (~2 ms; no RAID device can exist). Neither affects virtio/vsock/virtio-fs/erofs,
+    // `ip=` autoconfig, panic capture, or the in-kernel crypto itself (self-tests are
+    // a boot-time QA pass, not a runtime dependency).
     let mut s = format!(
         "console={} loglevel={} random.trust_cpu=on random.trust_bootloader=on \
+         cryptomgr.notests raid=noautodetect \
          root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
         cfg.console_mode.console(),
         cfg.kernel_verbosity.loglevel(),
@@ -1492,6 +1499,17 @@ mod tests {
             );
             assert!(!c.contains("console=hvc0"), "Uart must not emit hvc0: {c}");
             assert!(c.contains("loglevel=6"), "missing loglevel: {c}");
+            // Boot-probe trims (EXP-B, docs/45): the crypto self-test skip and the md
+            // RAID autodetect skip are universal (all backends). A builder that drops
+            // them silently re-pays the ~12 ms of dead boot work.
+            assert!(
+                c.contains("cryptomgr.notests"),
+                "missing crypto self-test skip: {c}"
+            );
+            assert!(
+                c.contains("raid=noautodetect"),
+                "missing RAID autodetect skip: {c}"
+            );
             assert!(
                 c.contains("vmcell_accept_poll_ms=20"),
                 "missing accept poll: {c}"

@@ -249,6 +249,10 @@ pub async fn wait_for_socket(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<()> {
+    // The interval is caller-supplied via the pub `VmConfig.timeouts` field, so it
+    // must not be trusted to be non-zero: clamp to >= 1 ms before the division
+    // below divides by zero (and before the sleep degenerates into a busy-spin).
+    let interval_ms = interval_ms.max(1);
     let iterations = timeout_ms / interval_ms;
     for _ in 0..iterations {
         if tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
@@ -488,6 +492,18 @@ pub struct VmmCapabilities {
     /// [`ConsoleMode::VirtioConsole`](crate::config::ConsoleMode::VirtioConsole)
     /// config is rejected there (`console=hvc0` with no device silences the log).
     pub virtio_console: bool,
+    /// True if `restore()` gives the restored VM **fresh host-side socket paths**
+    /// inside its own scratch dir. Cloud Hypervisor does: its restore config
+    /// rewrite moves the vsock/serial paths into the new VM's tmp dir before
+    /// launch (§9.2). Firecracker does not: `PUT /snapshot/load` re-binds the
+    /// snapshot's recorded host vsock UDS path **verbatim** — no load-time
+    /// override exists in FC v1.16. Consequences when `false`: every restore of
+    /// a snapshot lineage shares the ONE baked host vsock path, so (a) restoring
+    /// while the snapshotted VM (or a prior restore of it) is still alive is
+    /// rejected by the backend's pre-restore liveness guard, and (b) concurrent
+    /// restores from one snapshot lineage are unsupported (the design §16
+    /// single-snapshot-CoW gap covers both backends anyway).
+    pub restore_rotates_host_paths: bool,
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
@@ -639,6 +655,11 @@ impl Vmm for FakeVmm {
             unprivileged_vhost_user_net: true,
             nested_virt: true,
             virtio_console: true,
+            // Mirrors CH (the primary backend the fake stands in for). No fake-
+            // backed test asserts on restore paths today; a test exercising the
+            // FC-style verbatim-rebind semantics should build its own fake with
+            // this set `false`.
+            restore_rotates_host_paths: true,
         }
     }
 
@@ -827,6 +848,34 @@ mod tests {
         );
     }
 
+    // Guards the interval clamp in `wait_for_socket`: the interval is caller-supplied
+    // via the pub `VmConfig.timeouts` field, so an unclamped implementation (the buggy
+    // inverse) computes `timeout_ms / 0` and panics before any readiness check runs.
+    // With the clamp, a 0-interval call degrades to a 1 ms poll and still finds the
+    // already-present socket path.
+    #[tokio::test]
+    async fn wait_for_socket_zero_interval_does_not_divide_by_zero() {
+        // `kill_on_drop` (not `spawn_group_standin`) so the single-process stand-in
+        // is reclaimed even when the call panics — the buggy-inverse path this test
+        // guards never reaches the explicit reap below.
+        let mut process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep stand-in");
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("present.sock");
+        std::fs::write(&sock, b"").expect("create stand-in socket path");
+
+        let result = wait_for_socket(&sock, &mut process, 100, 0).await;
+
+        // Best-effort prompt reap on the success path (kill_on_drop covers panic);
+        // the discarded results cannot affect the verdict, which is `result` below.
+        let _ = process.start_kill();
+        let _ = process.wait().await;
+        result.expect("a present socket with a 0 interval must succeed, not panic");
+    }
+
     // Guards the shared console self-guard: VirtioConsole on a backend that does not
     // advertise `virtio_console` (Firecracker) must return a typed
     // `Unsupported { feature: "virtio_console" }`; a capable backend (CH/QEMU) must
@@ -845,6 +894,7 @@ mod tests {
             unprivileged_vhost_user_net: true,
             nested_virt: true,
             virtio_console,
+            restore_rotates_host_paths: true,
         };
 
         // FC-like (virtio_console:false) + VirtioConsole => Unsupported.

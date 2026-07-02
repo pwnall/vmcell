@@ -240,7 +240,7 @@ async fn run_bench<V: Vmm>(
             let _ = base_vm.shutdown().await;
             return;
         }
-        if let Err(e) = base_vm.instance_mut().snapshot(&snap_dir).await {
+        if let Err(e) = base_vm.snapshot(&snap_dir).await {
             println!("Failed to take snapshot of base VM: {}", e);
             // Best-effort cleanup on the snapshot-failure path: shut the base VM down
             // (Drop is the real teardown) and drop the partial snapshot dir. Neither
@@ -1003,7 +1003,7 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         let _ = std::fs::remove_dir_all(&snap_dir);
         return;
     }
-    if let Err(e) = vm.instance_mut().snapshot(&snap_dir).await {
+    if let Err(e) = vm.snapshot(&snap_dir).await {
         println!("suspend-size: snapshot failed: {e}");
         // Best-effort teardown + partial-snapshot cleanup on the failure path.
         let _ = vm.shutdown().await;
@@ -1077,10 +1077,7 @@ async fn build_baseline_snapshot<V: Vmm>(
     base.agent(None, &vmcell::orchestrator::RealClock)
         .await
         .map_err(|e| e.to_string())?;
-    base.instance_mut()
-        .snapshot(snap_dir)
-        .await
-        .map_err(|e| e.to_string())?;
+    base.snapshot(snap_dir).await.map_err(|e| e.to_string())?;
     // Best-effort graceful shutdown of the baseline VM once its snapshot is written;
     // `Drop` guarantees teardown, so a shutdown error must not fail the (successful)
     // snapshot build we return `Ok` for.

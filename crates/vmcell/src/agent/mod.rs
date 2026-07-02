@@ -188,6 +188,24 @@ impl AgentClient {
         }
     }
 
+    /// Builds a client directly over an already-connected stream, bypassing the
+    /// CONNECT handshake, for unit tests that only need a `Some(AgentClient)`
+    /// to observe cache-invalidation behavior (e.g. `MicroVm::snapshot()`
+    /// dropping its cached client). Uses the same codec configuration as
+    /// [`AgentClient::connect`] and starts in-sync (`desynced: false`).
+    /// `#[cfg(test)]` + `pub(crate)` so no test-only constructor ships in the
+    /// public surface.
+    #[cfg(test)]
+    pub(crate) fn from_stream_for_tests(stream: UnixStream) -> Self {
+        let mut codec = LengthDelimitedCodec::new();
+        // Mirror `connect`: align the host frame cap with the guest's.
+        codec.set_max_frame_length(MAX_FRAME_BYTES);
+        Self {
+            stream: Framed::new(stream, codec),
+            desynced: false,
+        }
+    }
+
     /// Reconnects to the guest agent.
     ///
     /// # Errors
