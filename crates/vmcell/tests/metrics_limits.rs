@@ -9,25 +9,11 @@ vmm_matrix_test!(metrics_limits, |vmm| {
     test_metrics_and_limits_impl(&vmm).await;
 });
 
-/// Reconstructs the (possibly nested) cgroup-v2 slice name the orchestrator created for a VM,
-/// mirroring `orchestrator::setup_env`: `{base}/vmcell-vm-{vmid}` when running under a delegated
-/// sub-tree (systemd / the capability runner), otherwise a bare `vmcell-vm-{vmid}`. The test and
-/// the orchestrator share a process, so `/proc/self/cgroup` resolves identically here.
-fn vm_cgroup_name(vmid: u32) -> String {
-    let mut cgroup_name = format!("vmcell-vm-{}", vmid);
-    if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
-        if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
-            let mut base = path.trim_start_matches('/');
-            if base.ends_with("/supervisor") {
-                base = base.trim_end_matches("/supervisor");
-            }
-            if !base.is_empty() {
-                cgroup_name = format!("{}/vmcell-vm-{}", base, vmid);
-            }
-        }
-    }
-    cgroup_name
-}
+// L-TEST-4 / H-HOST-3: the per-VM cgroup slice name is derived by
+// `common::computed_cgroup_name`, which delegates the `/proc/self/cgroup` parse to
+// the single canonical `vmcell::metrics::cgroup_base_from_proc` the orchestrator
+// itself uses. The former line-for-line `vm_cgroup_name` duplicate here is deleted
+// so a future naming change lives in exactly one place and cannot drift silently.
 
 /// Parses the `oom_kill` counter out of a cgroup-v2 `memory.events` file
 /// (`key value` lines). Returns `None` when the line is absent.
@@ -80,7 +66,7 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     let stats_before = vm.usage().await.expect("Failed to get VM stats");
 
-    let cgroup_name = vm_cgroup_name(vm.vmid());
+    let cgroup_name = common::computed_cgroup_name(vm.vmid());
     let cg_base = format!("/sys/fs/cgroup/{}", cgroup_name);
 
     // HARD precondition (TESTS-FEATURES-3): the memory controller MUST be delegated to the
@@ -157,6 +143,11 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .expect("Failed to run cpu load");
 
     // We used timeout 2, and md5sum /dev/zero saturates one CPU; the timeout kills it.
+    // N-TEST-3: this is a BOUNDED two-value accept, not the loose `137 || 1 || -1`
+    // smell. `timeout(1)` exits 124 when it has to send SIGKILL after its own grace
+    // window; it exits 128+15=143 when the child dies from the initial SIGTERM it
+    // sends first (which of the two occurs is a scheduling race). No other code is
+    // accepted, so a command that instead exited 0 (never killed) still reddens.
     assert!(
         cpu_test_outcome.code == 124 || cpu_test_outcome.code == 143,
         "CPU load should be killed by timeout (expected 124 or 143), got code {}",

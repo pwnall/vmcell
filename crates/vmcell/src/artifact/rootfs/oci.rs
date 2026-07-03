@@ -1,7 +1,7 @@
 use crate::artifact::StageOutputs;
 use crate::error::Result;
 use async_trait::async_trait;
-use oci_client::manifest::OciImageManifest;
+use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::{Client, Reference};
 use std::path::Path;
 
@@ -77,21 +77,39 @@ impl OciPuller for RealOciPuller {
         if let Some(pinned) = reference.digest() {
             verify_blob_digest(&raw, pinned)?;
         }
-        // Resolve the (possibly multi-arch index) manifest to its platform image manifest
-        // and read its ordered layers; the client performs platform selection for an index.
-        let (manifest, _d): (OciImageManifest, String) = self
-            .client
-            .pull_image_manifest(reference, &self.auth)
-            .await
-            .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
-        Ok(manifest
-            .layers
-            .into_iter()
-            .map(|l| OciLayerDesc {
-                media_type: l.media_type,
-                digest: l.digest,
-            })
-            .collect())
+        // Read the ordered layers straight out of the VERIFIED raw bytes (M-ART-3): the
+        // layer list we consume must descend from exactly the bytes we hashed against the
+        // pin, never a second, independently-fetched manifest whose verification we delegate
+        // to the library (a registry answering the two fetches differently would defeat the
+        // pin). The old code re-fetched via `pull_image_manifest` and discarded `raw`.
+        match parse_oci_manifest(&raw)? {
+            OciManifest::Image(m) => Ok(map_layers(m)),
+            OciManifest::ImageIndex(idx) => {
+                // Multi-arch index: select the platform sub-manifest, then fetch + VERIFY it
+                // against the digest carried in the (already-verified) index, so the layer
+                // list still descends from the pin. Host-platform selection matches the
+                // prior default-client behavior (unchanged for a single-platform pin).
+                let sub_digest = oci_client::client::current_platform_resolver(&idx.manifests)
+                    .ok_or_else(|| {
+                        crate::error::Error::Artifact(
+                            "OCI image index has no entry matching the host platform".into(),
+                        )
+                    })?;
+                let sub_ref = reference.clone_with_digest(sub_digest.clone());
+                let (sub_raw, _d) = self
+                    .client
+                    .pull_manifest_raw(&sub_ref, &self.auth, &accepted)
+                    .await
+                    .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+                verify_blob_digest(&sub_raw, &sub_digest)?;
+                match parse_oci_manifest(&sub_raw)? {
+                    OciManifest::Image(m) => Ok(map_layers(m)),
+                    OciManifest::ImageIndex(_) => Err(crate::error::Error::Artifact(
+                        "OCI image index pointed at a nested index (unsupported)".into(),
+                    )),
+                }
+            }
+        }
     }
 
     async fn pull_blob(
@@ -254,6 +272,31 @@ fn read_and_verify_cached_blob(cache_path: &Path, expected_digest: &str) -> Resu
     let blob_data =
         std::fs::read(cache_path).map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
     verify_blob_digest(&blob_data, expected_digest)
+}
+
+/// Parses the ALREADY-VERIFIED raw manifest bytes into an [`OciManifest`] (M-ART-3), so the
+/// layers we consume come from exactly the bytes we hashed against the pin. The untagged
+/// enum distinguishes a single-platform image manifest (has `config` + `layers`) from a
+/// multi-arch index (has `manifests`); the caller descends an index by its verified digests.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if the bytes are not a valid OCI manifest.
+fn parse_oci_manifest(raw: &[u8]) -> Result<OciManifest> {
+    serde_json::from_slice(raw).map_err(|e| {
+        crate::error::Error::Artifact(format!("failed to parse verified OCI manifest bytes: {e}"))
+    })
+}
+
+/// Maps an [`OciImageManifest`]'s ordered layers to the decode-relevant [`OciLayerDesc`]s.
+fn map_layers(manifest: OciImageManifest) -> Vec<OciLayerDesc> {
+    manifest
+        .layers
+        .into_iter()
+        .map(|l| OciLayerDesc {
+            media_type: l.media_type,
+            digest: l.digest,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -532,5 +575,57 @@ mod tests {
             }
         }
         assert!(found, "zstd layer must decode to its non-empty tar content");
+    }
+
+    // M-ART-3: the ordered layer list must come from parsing the VERIFIED raw manifest
+    // bytes, not a second, independently-fetched manifest. This exercises the parse-from-
+    // verified-bytes mechanism that replaced the discarded-then-refetched second fetch: an
+    // image manifest's layers are read straight out of its bytes, in order.
+    #[test]
+    fn test_parse_manifest_layers_from_verified_bytes() {
+        let manifest_json = r#"{
+            "schemaVersion": 2,
+            "config": {"mediaType":"application/vnd.oci.image.config.v1+json",
+                       "digest":"sha256:cfg","size":1},
+            "layers": [
+                {"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip",
+                 "digest":"sha256:layer1","size":2},
+                {"mediaType":"application/vnd.oci.image.layer.v1.tar+zstd",
+                 "digest":"sha256:layer2","size":3}
+            ]
+        }"#;
+        let layers = match parse_oci_manifest(manifest_json.as_bytes()).expect("parse") {
+            OciManifest::Image(m) => map_layers(m),
+            OciManifest::ImageIndex(_) => panic!("expected a single-platform image manifest"),
+        };
+        assert_eq!(layers.len(), 2, "both layers must be read from the bytes");
+        assert_eq!(layers[0].digest, "sha256:layer1");
+        assert_eq!(
+            layers[1].media_type, "application/vnd.oci.image.layer.v1.tar+zstd",
+            "layer order and media type must be preserved from the verified bytes"
+        );
+    }
+
+    // M-ART-3: a multi-arch index must parse as `ImageIndex` (not accidentally as an empty
+    // image manifest) so `resolve_layers` descends it by fetching + VERIFYING the platform
+    // sub-manifest by its index-carried digest, rather than trusting a delegated second fetch.
+    #[test]
+    fn test_parse_manifest_distinguishes_index() {
+        let index_json = r#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"mediaType":"application/vnd.oci.image.manifest.v1+json",
+                 "digest":"sha256:amd64","size":1,
+                 "platform":{"architecture":"amd64","os":"linux"}}
+            ]
+        }"#;
+        assert!(
+            matches!(
+                parse_oci_manifest(index_json.as_bytes()).expect("parse"),
+                OciManifest::ImageIndex(_)
+            ),
+            "a multi-arch manifest list must parse as ImageIndex, not an image manifest"
+        );
     }
 }

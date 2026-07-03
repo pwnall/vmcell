@@ -109,7 +109,32 @@ criterion_group!(
 // prior settings on drop. It is a logged no-op without CAP_DAC_OVERRIDE, so to
 // actually pin run `cargo bench` through `vmcell-test-runner` or as root.
 fn main() {
-    let _freq_pin = vmcell::cpufreq::CpuFreqPin::engage(vmcell::cpufreq::SysfsCpuFreq::system());
+    // Report the freq-pin status to stderr (criterion owns stdout) so a run is not
+    // silently un-pinned (L-BIN-6): without CAP_DAC_OVERRIDE the pin is a logged
+    // no-op, and with no subscriber installed that warning is invisible — leaving
+    // "not freq-pinned" a convention rather than observed evidence. Mirrors the
+    // macro harness (`bench-vm`), which prints `is_pinned()`/`pinned_cpus()`.
+    let _freq_pin =
+        match vmcell::cpufreq::CpuFreqPin::engage(vmcell::cpufreq::SysfsCpuFreq::system()) {
+            Ok(pin) if pin.is_pinned() => {
+                eprintln!(
+                    "cpufreq: pinned {} CPU(s) to `performance` + turbo off (restored on exit)",
+                    pin.pinned_cpus()
+                );
+                Some(pin)
+            }
+            Ok(pin) => {
+                eprintln!(
+                    "cpufreq: NOT pinned (need CAP_DAC_OVERRIDE via vmcell-test-runner) — \
+                 micro-bench numbers carry CPU-scaling noise"
+                );
+                Some(pin)
+            }
+            Err(e) => {
+                eprintln!("cpufreq: pin unavailable: {e}");
+                None
+            }
+        };
     benches();
     Criterion::default().configure_from_args().final_summary();
 }

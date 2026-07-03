@@ -63,8 +63,10 @@ pub enum Error {
     #[error("QMP error: {0}")]
     Qmp(String),
     /// A Reqwest HTTP error.
+    // Distinct prefix from `Error::Http` (the hyper VMM client) so a bare log line
+    // is unambiguous about which HTTP backend failed (N-ORCH-2).
     #[cfg(feature = "pipeline")]
-    #[error("HTTP error: {0}")]
+    #[error("HTTP client error: {0}")]
     Reqwest(#[from] reqwest::Error),
     /// A subprocess execution error.
     #[error("Subprocess error: {0}")]
@@ -97,7 +99,9 @@ pub enum Error {
         /// The operation that could not be enforced (e.g. "cgroup memory.max limit").
         op: String,
         /// The exact missing capability and its remediation (e.g.
-        /// "'memory' controller delegated to <parent>/cgroup.subtree_control").
+        /// `'memory' controller delegated to <parent>/cgroup.subtree_control`).
+        // Backticks (a code span) so rustdoc does not treat `<parent>` as an HTML
+        // tag — an unclosed tag hard-fails `cargo doc` (M-HOST-1).
         needed: String,
     },
 }

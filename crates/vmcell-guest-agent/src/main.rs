@@ -130,7 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("/mnt")?;
 
     if let Err(e) = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "") {
-        tracing::info!("vmcell-guest-agent: mount tmpfs failed: {}", e);
+        // Fatal core mount (§4.3): failure returns Err and kernel-panics PID 1, so
+        // log it at error — louder than the tolerated best-effort failures (sysfs,
+        // shares, loopback) that log at warn (N-GUEST-1: the levels were inverted).
+        tracing::error!("vmcell-guest-agent: mount tmpfs failed: {}", e);
         return Err(e.into());
     }
     std::fs::create_dir_all("/mnt/upper")?;
@@ -144,7 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MountFlags::empty(),
         "lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work",
     ) {
-        tracing::info!("vmcell-guest-agent: overlay failed: {}", e);
+        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        tracing::error!("vmcell-guest-agent: overlay failed: {}", e);
         return Err(e.into());
     }
 
@@ -155,16 +159,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("oldroot")?;
 
     if let Err(e) = pivot_root(".", "oldroot") {
-        tracing::info!("vmcell-guest-agent: pivot_root failed: {}", e);
+        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        tracing::error!("vmcell-guest-agent: pivot_root failed: {}", e);
         return Err(e.into());
-    } else {
-        mount_change(
-            "/",
-            MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
-        )?;
-        unmount("oldroot", UnmountFlags::DETACH)?;
-        std::fs::remove_dir_all("oldroot")?;
     }
+    // The `else` is unnecessary after the early `return Err` above (N-GUEST-1):
+    // the success path continues here.
+    mount_change(
+        "/",
+        MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+    )?;
+    unmount("oldroot", UnmountFlags::DETACH)?;
+    std::fs::remove_dir_all("oldroot")?;
 
     // /sys is NOT part of the fatal core-mount set — that set is EXACTLY
     // {overlay, /proc, /dev} (§4.3). The vsock control plane, the
@@ -179,11 +185,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if let Err(e) = mount("proc", "/proc", "proc", MountFlags::empty(), "") {
-        tracing::info!("vmcell-guest-agent: proc failed: {}", e);
+        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        tracing::error!("vmcell-guest-agent: proc failed: {}", e);
         return Err(e.into());
     }
     if let Err(e) = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "") {
-        tracing::info!("vmcell-guest-agent: devtmpfs failed: {}", e);
+        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        tracing::error!("vmcell-guest-agent: devtmpfs failed: {}", e);
         return Err(e.into());
     }
 
@@ -233,51 +241,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Bring up loopback interface without shelling out to `ip`
-    #[repr(C)]
-    struct ifreq {
-        ifr_name: [std::os::raw::c_char; 16],
-        ifr_flags: std::os::raw::c_short,
-    }
-    let socket = rustix::net::socket(
-        rustix::net::AddressFamily::INET,
-        rustix::net::SocketType::DGRAM,
-        None,
-    );
-    if let Ok(fd) = socket {
-        use std::os::fd::AsRawFd;
-        let mut ifr = ifreq {
-            ifr_name: [0; 16],
-            ifr_flags: 0,
-        };
-        ifr.ifr_name[0] = b'l' as std::os::raw::c_char;
-        ifr.ifr_name[1] = b'o' as std::os::raw::c_char;
-        // SAFETY: `ifr` is a correctly-sized, zero-initialized `ifreq`; both
-        // ioctls operate solely on that struct through a valid `AF_INET`
-        // socket fd. Loopback bring-up is best-effort and not required for the
-        // vsock control plane, so a failure is logged and tolerated — returning
-        // `Err` from PID 1's `main` would kernel-panic the guest.
-        unsafe {
-            let siocgifflags = 0x8913; // SIOCGIFFLAGS
-            let siocsifflags = 0x8914; // SIOCSIFFLAGS
-            if libc::ioctl(fd.as_raw_fd(), siocgifflags, &mut ifr) >= 0 {
-                ifr.ifr_flags |= 0x1 | 0x40; // IFF_UP | IFF_RUNNING
-                if libc::ioctl(fd.as_raw_fd(), siocsifflags, &ifr) < 0 {
-                    tracing::warn!(
-                        "vmcell-guest-agent: loopback bring-up (SIOCSIFFLAGS) failed: {}; continuing without lo",
-                        std::io::Error::last_os_error()
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    "vmcell-guest-agent: loopback query (SIOCGIFFLAGS) failed: {}; continuing without lo",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-    } else {
+    // Bring up loopback without shelling out to `ip`, via the audited 40-byte
+    // `IfReq` helper (C-GUEST-1/M-GUEST-5). The prior inline path here declared an
+    // 18-byte `ifreq` and passed it to `SIOCG/SIOCSIFFLAGS`, which `copy_to_user`
+    // the kernel's 40-byte `struct ifreq` — a 22-byte OOB write on PID 1's stack.
+    // Best-effort: loopback is not required for the vsock control plane, so a
+    // failure is logged and tolerated (returning `Err` from PID 1 would panic).
+    if let Err(e) = netif::set_loopback_up() {
         tracing::warn!(
-            "vmcell-guest-agent: could not open AF_INET socket for loopback bring-up; continuing without lo"
+            "vmcell-guest-agent: loopback bring-up failed: {}; continuing without lo",
+            e
         );
     }
 
@@ -345,6 +318,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         60_000,
     );
 
+    // Install the SIGCHLD/SIGTERM handler BEFORE spawning the vsock listener
+    // thread (L-GUEST-11). The listener spawns exec children on accepted
+    // connections; a child that exits in the window before the handler is
+    // installed would deliver its SIGCHLD to the default disposition and be
+    // recorded only on the *next* SIGCHLD — delaying (or, absent any later
+    // signal, stranding) that exit. Registering first closes the window; the
+    // pre-spawn drain below still catches anything that exited before this point.
+    let signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGCHLD,
+        signal_hook::consts::SIGTERM,
+    ]);
+
     // Spawn vsock listener thread (recoverable across snapshot/restore).
     let listener_reaper = Arc::clone(&reaper);
     std::thread::spawn(move || serve_vsock(&listener_reaper, accept_poll, rebind_idle));
@@ -354,10 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ~100 ms late. SIGCHLD coalesces, so each wake drains *all* reapable
     // children.
     drain_zombies(&reaper); // catch anything that exited before registration
-    match signal_hook::iterator::Signals::new([
-        signal_hook::consts::SIGCHLD,
-        signal_hook::consts::SIGTERM,
-    ]) {
+    match signals {
         Ok(mut signals) => {
             for signal in signals.forever() {
                 drain_zombies(&reaper);
@@ -592,10 +574,27 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                             let conn_reaper = Arc::clone(reaper);
                             std::thread::spawn(move || {
                                 if let Err(e) = handle_connection(&mut s, &conn_reaper) {
-                                    tracing::error!(
-                                        "vmcell-guest-agent: handle_connection error: {}",
-                                        e
-                                    );
+                                    // A clean host disconnect surfaces as
+                                    // `read_framed`'s `UnexpectedEof` (the length
+                                    // prefix's `read_exact` hits EOF between
+                                    // requests): that is the normal end of a
+                                    // connection, not a fault, so log it at info.
+                                    // Reserve error level for genuine
+                                    // protocol/transport failures (L-GUEST-10).
+                                    let clean_eof =
+                                        e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                                            io.kind() == std::io::ErrorKind::UnexpectedEof
+                                        });
+                                    if clean_eof {
+                                        tracing::info!(
+                                            "vmcell-guest-agent: host closed the connection"
+                                        );
+                                    } else {
+                                        tracing::error!(
+                                            "vmcell-guest-agent: handle_connection error: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             });
                         }
@@ -612,6 +611,13 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                         }
                         Err(e) => {
                             tracing::info!("vmcell-guest-agent: accept error: {}; re-binding", e);
+                            // L-GUEST-4: back off before the outer loop re-binds.
+                            // A persistent accept error (e.g. EMFILE) would
+                            // otherwise spin: break → immediate re-bind → poll →
+                            // accept error → … with no pause. The bind-failure
+                            // path already sleeps `accept_poll`; mirror it here so
+                            // every recover-by-rebind path is rate-limited.
+                            std::thread::sleep(accept_poll);
                             break;
                         }
                     }
@@ -633,6 +639,9 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                         "vmcell-guest-agent: vsock listener poll failed: {}; re-binding",
                         e
                     );
+                    // L-GUEST-4: back off before re-binding so a persistent poll
+                    // failure cannot spin the bind→poll→error loop.
+                    std::thread::sleep(accept_poll);
                     break;
                 }
             }
@@ -658,7 +667,8 @@ fn handle_connection(
                 unix_secs,
                 unix_nanos,
                 mac,
-            } => handle_resync(unix_secs, unix_nanos, mac, stream)?,
+                ipv4,
+            } => handle_resync(unix_secs, unix_nanos, mac, ipv4, stream)?,
             // Ready/Stdout/Stderr/Exit are guest→host frames; receiving one (or
             // any future variant) means the peer desynced. Log it loudly and
             // close the connection so the host reconnects on a fresh stream,
@@ -680,6 +690,17 @@ fn handle_connection(
 // `LengthDelimitedCodec` — can be round-tripped against the real codec in a
 // KVM-free unit test (AGENT-3); `VsockStream` satisfies both bounds.
 fn send_framed<W: Write>(stream: &mut W, data: &[u8]) -> std::io::Result<()> {
+    // Enforce the shared cap on the ENCODE side too (L-GUEST-2), mirroring the
+    // host codec and the guest decode path. Without this, a `data.len()` above
+    // `u32::MAX` would silently truncate through `as u32` and the host would
+    // decode a wrong length; even below that, sending an over-cap frame the host
+    // rejects only wastes a round-trip. Fail loud at the source instead.
+    if data.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
     let len = data.len() as u32;
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(data)?;
@@ -772,6 +793,7 @@ fn handle_resync(
     unix_secs: u64,
     unix_nanos: u32,
     mac: Option<[u8; 6]>,
+    ipv4: Option<protocol::Ipv4Reconfig>,
     stream: &mut VsockStream,
 ) -> std::io::Result<()> {
     // 1. Clock (MANDATORY): set CLOCK_REALTIME to the host instant. Never `?` — a
@@ -785,17 +807,62 @@ fn handle_resync(
     };
 
     // 2. RNG reseed (best-effort): a missing/unreadable hwrng yields false, never
-    //    an error.
-    let reseed_applied = reseed_urandom_from_hwrng().is_ok();
+    //    an error. Log the underlying cause (L-GUEST-6) rather than collapsing it
+    //    to a bare bool — debugging `reseed_applied=false` otherwise means guessing
+    //    between a missing `/dev/hwrng`, a short read, and an unwritable pool.
+    let reseed_applied = match reseed_urandom_from_hwrng() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                "vmcell-guest-agent: resync hwrng reseed failed: {}; continuing (best-effort)",
+                e
+            );
+            false
+        }
+    };
 
     // 3. MAC rotation (best-effort): install the new eth0 hwaddr in-process via
-    //    SIOCSIFHWADDR (no in-guest netlink). Absent MAC → not applied.
-    let mac_applied = matches!(mac, Some(m) if netif::set_mac_bytes("eth0", m).is_ok());
+    //    SIOCSIFHWADDR (no in-guest netlink). Absent MAC → not applied. Log the
+    //    io::Error cause on failure (L-GUEST-6) instead of discarding it via
+    //    `.is_ok()`.
+    let mac_applied = match mac {
+        None => false,
+        Some(m) => match netif::set_mac_bytes("eth0", m) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "vmcell-guest-agent: resync MAC rotation failed: {}; continuing (best-effort)",
+                    e
+                );
+                false
+            }
+        },
+    };
+
+    // 4. IPv4 rotation (best-effort, H-VMM-1): the restore/zygote path rotates the
+    //    vmid, so the guest resumes with the frozen `ip=` address of the original
+    //    vmid — re-point `eth0` + the default route to the rotated `/30`, in-process
+    //    via SIOCSIFADDR/route ioctls (no in-guest netlink), exactly as the MAC
+    //    rotation above. Absent config → not applied. Log the cause on failure.
+    let ip_applied = match ipv4 {
+        None => false,
+        Some(cfg) => match netif::set_ipv4("eth0", cfg.addr, cfg.prefix_len, cfg.gateway) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "vmcell-guest-agent: resync IP rotation failed: {}; continuing (best-effort)",
+                    e
+                );
+                false
+            }
+        },
+    };
 
     let ack = Message::ResyncAck {
         clock_error,
         reseed_applied,
         mac_applied,
+        ip_applied,
     };
     let bytes = postcard::to_stdvec(&ack).map_err(std::io::Error::other)?;
     send_framed(stream, &bytes)?;
@@ -848,6 +915,11 @@ fn handle_exec(
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Point the child's stdin at /dev/null (M-GUEST-1). PID 1's own fd 0 is the
+    // serial console (`/dev/console`), from which no input ever arrives, so a
+    // command that reads stdin (`cat`, `wc`, a `sh` heredoc) would block on the
+    // console and run out its timeout instead of seeing EOF immediately.
+    cmd.stdin(Stdio::null());
 
     // AGENT-2: capture the reservation epoch BEFORE the spawn. An instant child
     // can exit and be drained by the PID-1 reaper before this thread reaches
@@ -1211,6 +1283,36 @@ mod tests {
         let mut cursor = std::io::Cursor::new(encoded.to_vec());
         let decoded = read_framed(&mut cursor).expect("read_framed");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn send_framed_rejects_frame_over_max_frame_bytes() {
+        // L-GUEST-2: the encode side enforces the shared cap too, so an over-cap
+        // frame is rejected at the source rather than sent with a truncated (or,
+        // above u32::MAX, wrapped) length prefix the host then mis-decodes. RED if
+        // the encode-side check is dropped: `send_framed` would return Ok and write
+        // the frame, leaving the sink non-empty.
+        let data = vec![0u8; MAX_FRAME_BYTES + 1];
+        let mut sink = Vec::new();
+        let err = send_framed(&mut sink, &data).expect_err("over-cap frame must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            sink.is_empty(),
+            "an over-cap frame must be rejected before any byte is written"
+        );
+    }
+
+    #[test]
+    fn send_framed_accepts_frame_at_exactly_max_frame_bytes() {
+        // The boundary is allowed (`>` cap, not `>=`), symmetric with the decode
+        // path. A frame at exactly the cap is framed with the 4-byte length prefix
+        // + payload. RED if the encode cap is tightened off-by-one (it would then
+        // reject the boundary as InvalidData).
+        let data = vec![0xA5u8; MAX_FRAME_BYTES];
+        let mut sink = Vec::new();
+        send_framed(&mut sink, &data).expect("a frame at exactly the cap must be accepted");
+        assert_eq!(sink.len(), 4 + MAX_FRAME_BYTES);
+        assert_eq!(&sink[..4], &(MAX_FRAME_BYTES as u32).to_be_bytes());
     }
 
     #[test]

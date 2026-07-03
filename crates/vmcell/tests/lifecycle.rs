@@ -293,7 +293,7 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
     let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
 
-    let (vmid, guest_cid, vsock_path) = {
+    let (vmid, guest_cid, vsock_path, netns_path, cg_path, per_vm_dir) = {
         let vm = MicroVm::start(
             vmm,
             cfg,
@@ -308,44 +308,73 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         let guest_cid = vm.instance().guest_cid();
         let vsock_path = vm.instance().vsock_path().to_path_buf();
 
+        // M-TEST-2: capture every resource path and PRECHECK it exists while the VM
+        // is still alive, so the negative residue asserts below cannot pass
+        // vacuously. If `setup_env`'s naming ever drifts from these templates, a
+        // precheck fails LOUDLY here, instead of the residue check silently asserting
+        // the absence of a path that was never created. Inverse: remove a resource's
+        // creation in the backend and its precheck reddens, proving the residue
+        // assertion targets the REAL path.
+        let netns_path = format!("/var/run/netns/vmcell-net-{}", vmid);
+        // NOTE: the tap (`vmcell-tap-{vmid}`) lives INSIDE the per-VM netns, so it
+        // never appears at `/sys/class/net/` in the root netns — a root-sysfs check
+        // would be vacuous both while-live and after-drop. Its cleanup is covered by
+        // the netns residue check below ("its tap dies with it").
+        let cg_path = format!("/sys/fs/cgroup/{}", common::computed_cgroup_name(vmid));
+        let per_vm_dir =
+            std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
+        assert!(
+            std::path::Path::new(&netns_path).exists(),
+            "netns {} must exist while the VM is live (precheck before residue test)",
+            netns_path
+        );
+        assert!(
+            std::path::Path::new(&cg_path).exists(),
+            "cgroup slice {} must exist while the VM is live (precheck before residue test)",
+            cg_path
+        );
+        assert!(
+            per_vm_dir.exists(),
+            "per-VM temp dir {} must exist while the VM is live (precheck before residue test)",
+            per_vm_dir.display()
+        );
+        assert!(
+            vsock_path.exists(),
+            "vsock socket {} must exist while the VM is live (precheck before residue test)",
+            vsock_path.display()
+        );
+
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _vm = vm;
             panic!("simulate panic inside scope");
         }));
 
         // Scope ends, but vm was already dropped during the panic unwind.
-        (vmid, guest_cid, vsock_path)
+        (vmid, guest_cid, vsock_path, netns_path, cg_path, per_vm_dir)
     };
 
     // Give drop side effects a moment (process-group reap, netns delete).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // 1. Cgroup slice: target the ACTUAL computed name. A leak under the real
-    //    (nested) path made the old `vmcell-vm-{vmid}` check pass trivially.
-    let cg_path = format!("/sys/fs/cgroup/{}", common::computed_cgroup_name(vmid));
+    // 1. Cgroup slice: target the ACTUAL computed name (captured + prechecked while
+    //    the VM was alive). A leak under the real (nested) path made the old
+    //    `vmcell-vm-{vmid}` check pass trivially.
     assert!(
         !std::path::Path::new(&cg_path).exists(),
         "cgroup slice leaked at {}",
         cg_path
     );
 
-    // 2. Named netns removed (its tap dies with it).
-    let netns_path = format!("/var/run/netns/vmcell-net-{}", vmid);
+    // 2. Named netns removed (its netns-local tap dies with it — the tap cannot
+    //    outlive the netns it was created in, so a separate root-sysfs tap check
+    //    would be vacuous).
     assert!(
         !std::path::Path::new(&netns_path).exists(),
         "netns leaked at {}",
         netns_path
     );
 
-    // 3. The tap must not have been leaked onto the host.
-    let host_tap = format!("/sys/class/net/vmcell-tap-{}", vmid);
-    assert!(
-        !std::path::Path::new(&host_tap).exists(),
-        "tap interface leaked on host at {}",
-        host_tap
-    );
-
-    // 4. The per-VM vsock socket (in the VM temp dir) is removed by the instance Drop.
+    // 3. The per-VM vsock socket (in the VM temp dir) is removed by the instance Drop.
     assert!(
         !vsock_path.exists(),
         "vsock socket leaked at {}",
@@ -356,9 +385,7 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     //     serial.log, and api.sock.lock for CH) must also be removed on teardown —
     //     not just the vsock socket inside it. The leak fix landed in vmm/mod.rs
     //     (remove_vm_tmp_dir); without it `/tmp` grows one dir per VM, unbounded.
-    //     The pid/vmid naming mirrors `vmm::VmTempDir::create`.
-    let per_vm_dir =
-        std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
+    //     The pid/vmid naming mirrors `vmm::VmTempDir::create` (captured above).
     assert!(
         !per_vm_dir.exists(),
         "per-VM temp dir leaked at {}",
@@ -500,24 +527,33 @@ async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
     assert_instance_before_cgroup(&calls);
 }
 
-// UNPRIVILEGED NAMING: a KVM-but-unprivileged smoke test of the unprivileged smoltcp NAT
-// path (NetConfig::Unprivileged / vhost-user-net). Its NAME carries `unprivileged` and
-// `smoltcp` so `just test-unprivileged` (filter `test(unprivileged) | test(smoltcp)`)
-// selects it. #[ignore]'d for the default suite (needs KVM); runs WITHOUT
-// privilege on a KVM host.
+// UNPRIVILEGED NAMING: a KVM-but-unprivileged smoke test of the unprivileged smoltcp
+// NAT path (NetConfig::Unprivileged / vhost-user-net), parameterized over the backend
+// matrix (M-TEST-8) instead of hardcoding CloudHypervisor. Both CH and QEMU advertise
+// `unprivileged_vhost_user_net`, so both legs run WITHOUT ambient caps under
+// `just test-unprivileged` — previously this was CH-only, so QEMU's unprivileged NAT
+// was never exercised without privilege (its only coverage ran inside the PRIVILEGED
+// suite, masking any regression specific to the unprivileged path). The generated test
+// NAMES carry `unprivileged` + `smoltcp` so the `test(unprivileged) | test(smoltcp)`
+// filter selects them; each is `#[ignore]`d (needs KVM) out of the default suite.
+// `require_cap!` keeps the CH primary path unexempted (a CH cap miss panics) and emits
+// one VISIBLE skip-with-reason for a backend lacking the capability.
+//
+// NOTE: exercising the QEMU leg also needs `--features qemu` on `just test-unprivileged`
+// (M-TEST-8 part b — a justfile change outside this file); without it only the CH leg
+// compiles, matching the prior behavior.
 #[cfg(feature = "net-unprivileged")]
-#[tokio::test]
-#[ignore = "needs KVM (unprivileged smoltcp NAT); selected by `just test-unprivileged`"]
-async fn test_lifecycle_unprivileged_smoltcp() {
-    let vmm = CloudHypervisor::new(common::ch_bin());
-    let caps = vmcell::vmm::Vmm::capabilities(&vmm);
-    if !caps.unprivileged_vhost_user_net {
-        panic!(
-            "SKIP: backend `{}` lacks unprivileged vhost-user-net (unprivileged smoltcp) support",
-            vmcell::vmm::Vmm::id(&vmm)
-        );
-    }
+vmm_matrix_test!(lifecycle_unprivileged_smoltcp, |vmm| {
+    require_cap!(
+        vmcell::vmm::Vmm::capabilities(&vmm),
+        unprivileged_vhost_user_net,
+        vmm
+    );
+    test_lifecycle_unprivileged_smoltcp_impl(&vmm).await;
+});
 
+#[cfg(feature = "net-unprivileged")]
+async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let vmlinux = common::get_vmlinux();
     let rootfs = common::get_rootfs();
 
@@ -532,7 +568,7 @@ async fn test_lifecycle_unprivileged_smoltcp() {
     let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
     let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
     let mut vm = MicroVm::start(
-        &vmm,
+        vmm,
         cfg,
         cid_alloc.clone(),
         vmid_alloc,
@@ -568,26 +604,37 @@ async fn test_lifecycle_unprivileged_smoltcp() {
     };
 
     // eth0 is configured by the kernel ip= cmdline (zero-netlink PID 1); the
-    // smoltcp NAT carries its traffic. Confirm the interface came up.
-    let operstate = agent
-        .exec(vmcell::ExecRequest::new(vec![
-            "cat".into(),
-            "/sys/class/net/eth0/operstate".into(),
-        ]))
-        .await
-        .expect("exec failed");
-    assert_eq!(
-        operstate.code,
-        0,
-        "reading eth0 operstate failed: {:?}",
-        String::from_utf8_lossy(&operstate.stderr)
-    );
-    let state = String::from_utf8_lossy(&operstate.stdout)
-        .trim()
-        .to_string();
+    // smoltcp NAT carries its traffic. Confirm the interface comes up. POLL a few
+    // times: on some backends (QEMU) the operstate briefly reads "down" right after
+    // the agent becomes reachable, before the virtio-net link settles to
+    // "up"/"unknown" — a single read races that transition (flaky). The assertion
+    // after the loop still reddens if eth0 never comes up.
+    let mut state = String::new();
+    for _ in 0..15 {
+        let operstate = agent
+            .exec(vmcell::ExecRequest::new(vec![
+                "cat".into(),
+                "/sys/class/net/eth0/operstate".into(),
+            ]))
+            .await
+            .expect("exec failed");
+        assert_eq!(
+            operstate.code,
+            0,
+            "reading eth0 operstate failed: {:?}",
+            String::from_utf8_lossy(&operstate.stderr)
+        );
+        state = String::from_utf8_lossy(&operstate.stdout)
+            .trim()
+            .to_string();
+        if state == "up" || state == "unknown" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     assert!(
         state == "up" || state == "unknown",
-        "eth0 should be up over the unprivileged NAT, got operstate {:?}",
+        "eth0 should be up over the unprivileged NAT within the poll window, got operstate {:?}",
         state
     );
 

@@ -15,12 +15,10 @@ use std::os::fd::RawFd;
 /// # Errors
 /// Returns the OS error if the ioctl fails.
 pub(crate) fn set_tun_persist(fd: RawFd) -> io::Result<()> {
-    // TUNSETPERSIST = _IOW('T', 203, int).
-    const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
     // SAFETY: `fd` is a valid, open tun/tap fd owned by the caller for the duration
-    // of this call; `TUNSETPERSIST` takes an `int` by value (1 = persist) and the
-    // kernel retains no pointer past the syscall.
-    let rc = unsafe { libc::ioctl(fd, TUNSETPERSIST, 1 as libc::c_int) };
+    // of this call; `libc::TUNSETPERSIST` (`_IOW('T', 203, int)`) takes an `int` by
+    // value (1 = persist) and the kernel retains no pointer past the syscall.
+    let rc = unsafe { libc::ioctl(fd, libc::TUNSETPERSIST, 1 as libc::c_int) };
     if rc == 0 {
         Ok(())
     } else {

@@ -43,6 +43,10 @@ pub struct QemuInstance {
     cid: u32,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
+    // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
+    // leader is reaped the kernel can recycle its pgid, so `kill`/`Drop` must NOT
+    // re-`SIGKILL` the process group or they could hit an unrelated group (M-VMM-1).
+    reaped: bool,
 }
 
 /// The kind of a single QMP protocol line.
@@ -223,22 +227,43 @@ impl Drop for VsockDaemonGuard {
     }
 }
 
+/// The paths, process handles, and pgids produced by [`Qemu::spawn_qemu`]. A named
+/// struct (not an 8-tuple) so the two adjacent `Option<u32>` pgids cannot be silently
+/// swapped and cross-wire the SIGKILL targets in `kill`/`Drop` (L-VMM-6).
+struct SpawnedQemu {
+    qmp_socket: PathBuf,
+    vsock_path: PathBuf,
+    serial_path: PathBuf,
+    process: Child,
+    vsock_daemon: Option<Child>,
+    fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
+    pgid: Option<u32>,
+    vsock_pgid: Option<u32>,
+}
+
+/// Appends the config-independent QEMU machine flags that must be present on every
+/// launch. `-S` freezes the guest vCPUs at spawn so the guest does not start running
+/// until `boot()` issues `cont` — without it `create()` would already be running the
+/// guest and `boot()` would be a no-op `cont` on an already-running VM (H-VMM-2). Split
+/// out so a unit test can assert `-S` is emitted without spawning QEMU.
+fn push_fixed_qemu_flags(cmd: &mut tokio::process::Command) {
+    cmd.arg("-nodefaults")
+        .arg("-no-user-config")
+        .arg("-nographic")
+        .arg("-cpu")
+        .arg("host")
+        .arg("-enable-kvm")
+        // Freeze vCPUs at launch; boot() -> `cont` is the real start point (H-VMM-2).
+        .arg("-S");
+}
+
 impl Qemu {
     async fn spawn_qemu(
         &self,
         cfg: &VmConfig,
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
-    ) -> Result<(
-        PathBuf,
-        PathBuf,
-        PathBuf,
-        Child,
-        Option<Child>,
-        Vec<crate::fs::VirtioFsDaemon>,
-        Option<u32>,
-        Option<u32>,
-    )> {
+    ) -> Result<SpawnedQemu> {
         // The orchestrator owns the per-VM scratch dir; derive our socket and
         // serial-log paths inside it.
         let qmp_socket = res.tmp_dir.join("qmp.sock");
@@ -310,16 +335,12 @@ impl Qemu {
             .arg("-m")
             .arg(cfg.mem_mib.to_string())
             .arg("-smp")
-            .arg(cfg.vcpus.to_string())
-            .arg("-nodefaults")
-            .arg("-no-user-config")
-            .arg("-nographic")
-            .arg("-cpu")
-            .arg("host")
-            .arg("-enable-kvm")
-            .arg("-trace")
-            .arg("vhost_user_*")
-            .arg("-object")
+            .arg(cfg.vcpus.to_string());
+        // Fixed, config-independent flags — including `-S` to freeze the guest vCPUs at
+        // launch so `boot()`'s `cont` is the real start point (H-VMM-2). The former
+        // `-trace vhost_user_*` debug residue is dropped (L-VMM-4).
+        push_fixed_qemu_flags(&mut cmd);
+        cmd.arg("-object")
             .arg(format!(
                 "memory-backend-file,id=mem,size={}M,mem-path=/dev/shm,share=on",
                 cfg.mem_mib
@@ -432,7 +453,10 @@ impl Qemu {
         // cold-boots). Removed rather than gated behind the off capability.
 
         let cmd_str = format!("{:?}", cmd);
-        tracing::info!("QEMU CMD: {}", cmd_str);
+        // Debug level (not info): the full command line is diagnostic noise on every
+        // create, and with stderr inherited it should not clutter harness output
+        // (L-VMM-4).
+        tracing::debug!("QEMU CMD: {}", cmd_str);
 
         let mut process = cmd
             .stdin(Stdio::null())
@@ -461,7 +485,7 @@ impl Qemu {
         // Drop now owns the daemon's teardown.
         let (vsock_daemon, vsock_pgid) = vsock_guard.into_inner();
 
-        Ok((
+        Ok(SpawnedQemu {
             qmp_socket,
             vsock_path,
             serial_path,
@@ -470,7 +494,7 @@ impl Qemu {
             fs_daemons,
             pgid,
             vsock_pgid,
-        ))
+        })
     }
 }
 
@@ -493,7 +517,7 @@ impl Vmm for Qemu {
         // mode up front so they can never desync into a silent `serial.log`.
         crate::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
 
-        let (
+        let SpawnedQemu {
             qmp_socket,
             vsock_path,
             serial_path,
@@ -502,7 +526,7 @@ impl Vmm for Qemu {
             fs_daemons,
             pgid,
             vsock_pgid,
-        ) = self.spawn_qemu(cfg, res, cgroups).await?;
+        } = self.spawn_qemu(cfg, res, cgroups).await?;
         Ok(QemuInstance {
             process,
             qmp_socket,
@@ -513,6 +537,7 @@ impl Vmm for Qemu {
             cid: res.guest_cid,
             pgid,
             vsock_pgid,
+            reaped: false,
         })
     }
 
@@ -576,12 +601,18 @@ impl VmInstance for QemuInstance {
         .await;
 
         if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            // Skip the group SIGKILL if the leader was already reaped (its pgid may be
+            // recycled) — M-VMM-1.
+            if !self.reaped {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
         }
         let _ = self.process.wait().await;
+        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
+        self.reaped = true;
 
         if let Some(mut d) = self._vsock_daemon.take() {
             if let Some(v_pgid) = self.vsock_pgid {
@@ -597,9 +628,16 @@ impl VmInstance for QemuInstance {
 
     async fn has_exited(&mut self) -> bool {
         // Non-blocking reap of the QEMU leader; `Ok(Some(_))` means it exited after
-        // `request_shutdown` (`system_powerdown`). Safe to reap early — the later
-        // SIGKILL of the dead group is a no-op and `process.wait()` returns cached.
-        matches!(self.process.try_wait(), Ok(Some(_)))
+        // `request_shutdown` (`system_powerdown`). Record the reap so `kill()`/`Drop`
+        // do NOT re-`SIGKILL` the process group: once the leader is reaped the kernel
+        // may recycle its pgid and signalling `-pgid` could hit an unrelated group
+        // (M-VMM-1).
+        if matches!(self.process.try_wait(), Ok(Some(_))) {
+            self.reaped = true;
+            true
+        } else {
+            false
+        }
     }
 
     async fn snapshot(&mut self, _dir: &Path) -> Result<()> {
@@ -628,12 +666,16 @@ impl Drop for QemuInstance {
         // touching the daemons, sockets or the per-VM directory means cleanup never
         // races a live VMM.
         if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            if let Some(pid) = self.process.id() {
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+            // Skip the group SIGKILL + reap if the leader was already reaped (via
+            // `has_exited`/`kill`): its pgid may have been recycled (M-VMM-1).
+            if !self.reaped {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                if let Some(pid) = self.process.id() {
+                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+                }
             }
         }
         // vhost-user daemons next: the external vhost-device-vsock and each virtiofsd
@@ -664,6 +706,24 @@ impl Drop for QemuInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Guards H-VMM-2: every QEMU launch must carry `-S` so the guest stays frozen until
+    // boot() issues `cont`. Without it create() spawns an already-running guest and
+    // boot() is a no-op cont that trivially succeeds on either impl — nothing else can
+    // catch it. Inverse: drop `-S` from push_fixed_qemu_flags and this reddens.
+    #[test]
+    fn qemu_freezes_vcpus_with_dash_s_flag() {
+        let mut cmd = tokio::process::Command::new("qemu-system-x86_64");
+        push_fixed_qemu_flags(&mut cmd);
+        let has_s = cmd
+            .as_std()
+            .get_args()
+            .any(|a| a == std::ffi::OsStr::new("-S"));
+        assert!(
+            has_s,
+            "QEMU must launch with -S to freeze vCPUs until boot()"
+        );
+    }
 
     // Guards VMM-1 for the QEMU `create()` path: a virtio-fs *rootfs* config is
     // buildable and reaches create(), which must self-guard with a typed `Unsupported`

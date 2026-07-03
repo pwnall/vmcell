@@ -125,7 +125,7 @@ jobs:
         run: cargo run -p vmcell --bin vmcell -- build
 
       - name: unprivileged suite (no elevation — keeps the unprivileged path honest)
-        run: cargo nextest run --profile integration -p vmcell --run-ignored all -E 'test(unprivileged) | test(smoltcp)'
+        run: cargo nextest run --profile integration -p vmcell --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
       # Bless grants the runner cap_net_admin,cap_sys_admin (debug + release) so the privileged
       # suite runs under the capability wrapper instead of broad `sudo -E` — mirrors `just test-privileged`.
@@ -139,4 +139,4 @@ jobs:
         env:
           # v15 §12.8: the blessed runner lives at the stable ./.vmcell-bin/ path `just bless` installs.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.vmcell-bin/debug/vmcell-test-runner
-        run: cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all -E 'not (test(unprivileged) | test(smoltcp))'
+        run: cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'

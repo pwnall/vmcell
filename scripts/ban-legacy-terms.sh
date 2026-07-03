@@ -20,22 +20,28 @@
 # `implementation` / `import`. Every banned `imp` pattern requires a trailing `-`/`_` (or the
 # uppercase `IMP_` env form), so none of those legitimate spellings can match.
 #
-# Line comments are stripped before pattern-matching, so prose in a comment that mentions a banned
-# word (e.g. a note about the old name) is not a false positive — but the exemption marker (below)
-# is honoured first, before stripping.
+# Line comments are stripped before pattern-matching (`//` for Rust/C sources, `#` for non-.rs files
+# like the justfile / shell / toml), so prose in a comment that mentions a banned word (e.g. a note
+# about the old name) is not a false positive — but the exemption marker (below) is honoured first,
+# before stripping.
 #
 # There are NO blanket whole-file exemptions. A genuinely-justified legacy mention must carry a
 # per-line exemption marker on the same line:
 #   let old = "imp-testing"; // allow-legacy-term: <reason>
 # so every surviving legacy token is justified in place and shows up in review.
 #
-# Usage: ban-legacy-terms.sh [DIR ...]   (defaults to the workspace member trees under crates/)
+# Usage: ban-legacy-terms.sh [DIR ...]   (defaults to the crates/ member trees + the justfile)
 set -euo pipefail
 
 dirs=("$@")
 if [[ ${#dirs[@]} -eq 0 ]]; then
-  # v15 workspace: all member source (lib + bins + tests + benches) lives under crates/.
-  dirs=(crates)
+  # v15 workspace: member source (lib + bins + tests + benches) lives under crates/; the build
+  # orchestration lives in the justfile. Both are non-historical code the rename must hold in
+  # (L-BIN-3). scripts/ and docs/ are deliberately NOT in the default scope: the ban/legacy gate
+  # scripts and their self-tests legitimately embed the retired tokens (as detection patterns and
+  # red-on-inverse fixtures), and docs/ carries the historical record of the rename itself — scanning
+  # either would flag those legitimate mentions. Pass an explicit path to scan them ad hoc.
+  dirs=(crates justfile)
 fi
 
 violations=""
@@ -60,7 +66,11 @@ for f in "${files[@]}"; do
       # Honour the per-line exemption marker first (it lives in the comment), before stripping.
       if (line ~ /allow-legacy-term:/) next
       code = line
-      sub(/\/\/.*/, "", code)   # drop the line comment for pattern analysis
+      sub(/\/\/.*/, "", code)   # drop the // line comment for pattern analysis (Rust/C sources)
+      # Non-Rust members (justfile, shell, toml) comment with `#`; strip those too so a banned token
+      # quoted in prose is not a false positive. Only for non-.rs files — Rust uses `#` for attributes
+      # (`#[cfg…]`) and raw strings (`r#"…"#`), where `#`-stripping would corrupt the line (L-BIN-3).
+      if (FN !~ /\.rs$/) sub(/#.*/, "", code)
       if (code ~ /TestVm/ \
        || code ~ /[Rr]ootless/ \
        || code ~ /imp[_-]testing/ \

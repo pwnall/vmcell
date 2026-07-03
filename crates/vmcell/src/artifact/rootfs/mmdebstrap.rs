@@ -166,9 +166,12 @@ pub async fn build_rootfs(
     }
     .await;
 
-    // Shutdown builder VM
+    // Shutdown builder VM. Surface a shutdown failure as a warning (never swallow it —
+    // L-ART-1) without aborting the primary flow; `build_res` is checked just below.
     tracing::info!("Shutting down builder VM...");
-    let _ = vm.shutdown().await;
+    if let Err(e) = vm.shutdown().await {
+        tracing::warn!("Failed to shutdown builder VM: {}", e);
+    }
 
     build_res?;
 
@@ -200,7 +203,7 @@ pub async fn build_rootfs(
 /// # Errors
 /// Returns [`Error::Artifact`] if no pin pair is present, or only one half of a
 /// pair is set.
-fn resolve_builder_base(
+pub(super) fn resolve_builder_base(
     pins: &std::collections::HashMap<String, String>,
 ) -> Result<(String, String)> {
     for (img_key, dig_key) in [

@@ -54,23 +54,61 @@ pub fn has_cap_net_admin() -> bool {
 
 /// Recomputes the cgroup-v2 slice name the orchestrator assigns to a VM, so a
 /// residue check can target the *actual* (possibly systemd-/runner-nested) path
-/// `/sys/fs/cgroup/<name>` rather than the un-nested `vmcell-vm-<vmid>` guess. This
-/// mirrors `orchestrator::MicroVm::setup_env` exactly; if the two diverge the
-/// residue assertion silently passes, so they must stay in lockstep.
+/// `/sys/fs/cgroup/<name>` rather than the un-nested `vmcell-vm-<vmid>` guess. The
+/// base-path derivation is delegated to `vmcell::metrics::cgroup_base_from_proc`
+/// — the SAME canonical parser `orchestrator::MicroVm::setup_env` uses (H-HOST-3)
+/// — so this cannot drift from the orchestrator and make the residue assertion
+/// silently pass against a path that was never created.
 pub fn computed_cgroup_name(vmid: u32) -> String {
-    let mut name = format!("vmcell-vm-{}", vmid);
     if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
-        if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
-            let mut base = path.trim_start_matches('/');
-            if base.ends_with("/supervisor") {
-                base = base.trim_end_matches("/supervisor");
-            }
-            if !base.is_empty() {
-                name = format!("{}/vmcell-vm-{}", base, vmid);
-            }
+        if let Some(base) = vmcell::metrics::cgroup_base_from_proc(&cgroup_str) {
+            return format!("{}/vmcell-vm-{}", base, vmid);
         }
     }
-    name
+    format!("vmcell-vm-{}", vmid)
+}
+
+/// Records a capability-driven test skip to a durable, run-scoped manifest so the
+/// skip becomes an auditable artifact rather than a nextest-captured (therefore
+/// invisible) stdout line on a passing test — the "skip == pass" hazard H-TEST-3
+/// names. The manifest path comes from `VMCELL_SKIP_MANIFEST` when set (a final CI
+/// step can point it at a known file and diff the collected skips against the
+/// expected set); otherwise it falls back to a per-process file under the temp
+/// dir. The load-bearing red-on-inverse guard for a capability going dark is the
+/// per-flag capability-honesty pin in each test file; this manifest is the audit
+/// trail on top of that.
+///
+/// Best-effort by design: a manifest-write failure must never turn a legitimate
+/// capability skip into a hard test failure, so the I/O errors are surfaced via
+/// `eprintln!` and then intentionally not propagated.
+pub fn record_capability_skip(vmm: &str, capability: &str) {
+    use std::io::Write as _;
+    let path = std::env::var_os("VMCELL_SKIP_MANIFEST")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("vmcell-skips-{}.txt", std::process::id()))
+        });
+    let line = format!("SKIP {vmm} {capability}\n");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        // Intentional discard of the write result: recording is best-effort, so a
+        // failed append is logged but must not mask the capability skip as failure.
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                eprintln!(
+                    "record_capability_skip: append to {} failed: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "record_capability_skip: open {} failed: {e}",
+            path.display()
+        ),
+    }
 }
 
 /// Reaps orphaned `vmcell-net-*` network namespaces before a privileged/netns test.
@@ -136,6 +174,17 @@ macro_rules! require_cap {
             if vmcell::vmm::Vmm::id(&$vmm) == "cloud-hypervisor" {
                 panic!("SKIP == PASS ERROR: Primary backend (cloud-hypervisor) MUST support capability `{}`", stringify!($field));
             } else {
+                // H-TEST-3: a bare `println!` + `return` is scored by nextest as a
+                // silent PASS (a passing test's stdout is captured and discarded),
+                // so a capability regression that darkens an FC/QEMU leg would leave
+                // no trace. Record the skip to a run-scoped manifest so it is a
+                // durable, auditable artifact. The actual red-on-inverse guard for a
+                // flag flipping is the per-flag capability-honesty pin in each test
+                // file (runs in the default, non-KVM suite).
+                $crate::common::record_capability_skip(
+                    vmcell::vmm::Vmm::id(&$vmm),
+                    stringify!($field),
+                );
                 println!("SKIP: backend `{}` lacks capability `{}`", vmcell::vmm::Vmm::id(&$vmm), stringify!($field));
                 return;
             }

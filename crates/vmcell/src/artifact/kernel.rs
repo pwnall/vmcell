@@ -283,11 +283,31 @@ impl Stage for KernelStage {
                     // let an entry escape the build dir via a `..` or absolute/prefixed
                     // component (tar-slip). Fail loud rather than write outside workdir.
                     reject_path_traversal(&stripped_path)?;
-                    let out_path = workdir_path.join(stripped_path);
+                    let out_path = workdir_path.join(&stripped_path);
 
                     if file.header().entry_type() == tar::EntryType::Directory {
                         std::fs::create_dir_all(&out_path)?;
                     } else {
+                        // Symlink-through defense-in-depth (L-ART-3): a tar symlink whose
+                        // target escapes the build dir (an absolute path, or one climbing
+                        // above the extraction root) would let a LATER entry write THROUGH it
+                        // outside workdir. `unpack` (unlike `unpack_in`) does not guard this,
+                        // so reject an escaping symlink at creation — then no such link exists
+                        // for a subsequent entry to write through.
+                        if file.header().entry_type() == tar::EntryType::Symlink {
+                            if let Some(target) = file.link_name().map_err(|e| {
+                                Error::Artifact(format!("bad kernel tarball symlink: {}", e))
+                            })? {
+                                if symlink_escapes(&stripped_path, &target) {
+                                    return Err(Error::Artifact(format!(
+                                        "refusing kernel tarball symlink {} -> {} escaping \
+                                         the build dir",
+                                        stripped_path.display(),
+                                        target.display()
+                                    )));
+                                }
+                            }
+                        }
                         if let Some(parent) = out_path.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
@@ -300,7 +320,7 @@ impl Stage for KernelStage {
                 Ok(())
             })
             .await
-            .expect("spawn_blocking failed")?;
+            .map_err(|e| Error::Artifact(format!("spawn_blocking extract failed: {}", e)))??;
         }
 
         let status = Command::new("make")
@@ -400,6 +420,37 @@ fn reject_path_traversal(stripped: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Returns whether a symlink at `link_path` (relative to the extraction root) pointing at
+/// `target` would resolve OUTSIDE the extraction root — i.e. an absolute target, or a
+/// relative target whose `..` components climb above the root (L-ART-3). A legitimate
+/// relative symlink that stays within the tree (including one using `..` that does not
+/// escape, common in kernel source) returns `false`.
+fn symlink_escapes(link_path: &Path, target: &Path) -> bool {
+    use std::path::Component;
+    if target.is_absolute() {
+        return true;
+    }
+    // Depth of the symlink's PARENT directory below the root; each target component walks it.
+    let mut depth: i64 = link_path
+        .parent()
+        .map(|p| p.components().count() as i64)
+        .unwrap_or(0);
+    for comp in target.components() {
+        match comp {
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+    }
+    false
 }
 
 /// Builds the [`StageOutputs`] for a kernel build, registering the built kernel under
@@ -610,5 +661,166 @@ mod tests {
         assert!(reject_path_traversal(Path::new("../etc/passwd")).is_err());
         assert!(reject_path_traversal(Path::new("a/../../b")).is_err());
         assert!(reject_path_traversal(Path::new("/abs/evil")).is_err());
+    }
+
+    // L-ART-3: `symlink_escapes` flags exactly the symlinks that resolve OUTSIDE the
+    // extraction root (absolute target, or `..` climbing above root) and allows legit
+    // relative links (including in-tree `..`, common in kernel source). A no-op defense
+    // (always `false`) reddens the escaping cases.
+    #[test]
+    fn test_symlink_escapes() {
+        assert!(
+            symlink_escapes(Path::new("dir"), Path::new("/etc")),
+            "an absolute symlink target escapes"
+        );
+        assert!(
+            symlink_escapes(Path::new("a/b"), Path::new("../../../etc")),
+            "a relative target climbing above the root escapes"
+        );
+        assert!(
+            !symlink_escapes(Path::new("a/b"), Path::new("../c")),
+            "an in-tree relative target is allowed"
+        );
+        assert!(
+            !symlink_escapes(
+                Path::new("arch/x/include/asm"),
+                Path::new("../../../include/asm-generic")
+            ),
+            "a deep in-tree kernel-style symlink is allowed"
+        );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A recording HTTP client (M-ART-9): serves canned bytes and counts `get()` calls, so
+    /// the kernel provenance path (hash-mismatch hard stop, verify-or-purge) runs with no
+    /// network.
+    struct FakeHttpClient {
+        body: Vec<u8>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for FakeHttpClient {
+        async fn get(&self, _url: &str) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.body.clone())
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
+    }
+
+    fn kernel_inputs(sha: String) -> StageInputs {
+        let mut i = StageInputs::default();
+        i.pins
+            .insert("kernel_source_url".into(), "http://example/k".into());
+        i.pins.insert("kernel_source_sha256".into(), sha);
+        i.pins
+            .insert("kernel_microvm_config".into(), "CONFIG_X=y\n".into());
+        i
+    }
+
+    // M-ART-9 (1): served bytes that do not match the pinned SHA are a provenance HARD STOP.
+    // Dropping the hash check (accepting any bytes) would let run() proceed to a decode error
+    // with a different message -> the "mismatch" assertion goes red.
+    #[tokio::test]
+    async fn test_kernel_hash_mismatch_hard_stops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: b"wrong-bytes".to_vec(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = KernelStage {
+            http_client: fake.clone(),
+            label: None,
+            fragments: None,
+        };
+        // Pin the hash of DIFFERENT bytes, so the served content mismatches.
+        let res = stage
+            .run(&kernel_inputs(sha256_hex(b"right-bytes")), &out)
+            .await;
+        match res {
+            Err(Error::Artifact(m)) => {
+                assert!(
+                    m.contains("mismatch"),
+                    "expected a hash-mismatch stop, got: {m}"
+                )
+            }
+            other => panic!("expected an Artifact hash-mismatch error, got {other:?}"),
+        }
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            1,
+            "one fetch attempt precedes the mismatch stop"
+        );
+    }
+
+    // M-ART-9 (2): a stale tarball on disk with a BUMPED pin must be re-fetched AND the stale
+    // extracted tree purged. The old existence-only check saw the tarball present, skipped
+    // the fetch (calls == 0) and kept the stale marker -> both assertions go red.
+    #[tokio::test]
+    async fn test_kernel_bumped_pin_refetches_and_purges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let workdir = dir.path().join("kernel-build");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join("linux.tar.xz"), b"old-tarball").unwrap();
+        std::fs::write(workdir.join("stale_marker"), b"stale").unwrap();
+        let fresh = b"fresh-bytes";
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: fresh.to_vec(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = KernelStage {
+            http_client: fake.clone(),
+            label: None,
+            fragments: None,
+        };
+        // Bumped pin (hash of the fresh bytes != the stale tarball's hash). run() re-fetches
+        // and purges the workdir, then fails at the xz-decompress of the non-xz fresh bytes —
+        // AFTER the provenance behavior asserted below.
+        let _ = stage.run(&kernel_inputs(sha256_hex(fresh)), &out).await;
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            1,
+            "a bumped pin (content mismatch) must re-fetch"
+        );
+        assert!(
+            !workdir.join("stale_marker").exists(),
+            "a bumped pin must purge the stale extracted tree"
+        );
+    }
+
+    // M-ART-9 (3): a cached tarball whose CONTENT matches the pin must NOT be re-fetched. An
+    // always-fetch regression would call get() -> the `== 0` assertion goes red.
+    #[tokio::test]
+    async fn test_kernel_matching_cache_skips_fetch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let workdir = dir.path().join("kernel-build");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let cached = b"cached-tarball-bytes";
+        std::fs::write(workdir.join("linux.tar.xz"), cached).unwrap();
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: b"unused".to_vec(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = KernelStage {
+            http_client: fake.clone(),
+            label: None,
+            fragments: None,
+        };
+        let _ = stage.run(&kernel_inputs(sha256_hex(cached)), &out).await;
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            0,
+            "a content-matching cached tarball must not be re-fetched"
+        );
     }
 }

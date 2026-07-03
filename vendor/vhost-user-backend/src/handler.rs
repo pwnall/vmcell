@@ -529,9 +529,18 @@ where
     }
 
     fn set_vring_enable(&mut self, index: u32, enable: bool) -> VhostUserResult<()> {
-        // This request should be handled only when VHOST_USER_F_PROTOCOL_FEATURES
-        // has been negotiated. BUT QEMU sends it before SET_FEATURES!
-        // self.check_feature(VhostUserVirtioFeatures::PROTOCOL_FEATURES)?;
+        // Carried vmcell patch (root Cargo.toml `[patch.crates-io]`; design v17
+        // §10.4). Upstream requires VHOST_USER_F_PROTOCOL_FEATURES to be negotiated
+        // before SET_VRING_ENABLE — but QEMU (unprivileged vhost-user-vsock tier)
+        // sends SET_VRING_ENABLE *before* SET_FEATURES completes. Accept that early
+        // delivery ONLY while features are not yet acked; once SET_FEATURES has run
+        // we re-enforce the upstream invariant, so a conformant frontend that
+        // negotiated *without* PROTOCOL_FEATURES is still rejected (M-VEND-2 — the
+        // prior unconditional comment-out also relaxed this late case). Drop the
+        // whole patch if the QEMU-unprivileged tier is removed.
+        if self.features_acked {
+            self.check_feature(VhostUserVirtioFeatures::PROTOCOL_FEATURES)?;
+        }
 
         let vring = self
             .vrings
@@ -869,5 +878,45 @@ mod tests {
 
         let events = backend.lock().unwrap().events();
         assert_eq!(events, 1, "Backend SHOULD have been kicked after enabling");
+    }
+
+    // M-VEND-2: the carried patch must accept SET_VRING_ENABLE that arrives BEFORE
+    // SET_FEATURES (QEMU's out-of-spec early delivery) yet still ENFORCE the
+    // PROTOCOL_FEATURES gate once features have been acked. This reddens on the
+    // prior unconditional comment-out (case 2 would then wrongly succeed) AND on a
+    // naive always-check fix (case 1 would then wrongly reject QEMU's early
+    // message).
+    #[test]
+    fn set_vring_enable_quirk_gating() {
+        let mk = || {
+            let mem = GuestMemoryAtomic::new(
+                GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
+            );
+            let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+            VhostUserHandler::new(backend, mem).unwrap()
+        };
+
+        // Case 1 (quirk): before SET_FEATURES the feature gate is skipped, so the
+        // early SET_VRING_ENABLE is NOT rejected with InactiveFeature.
+        let mut early = mk();
+        assert!(
+            !matches!(
+                early.set_vring_enable(0, true),
+                Err(VhostUserError::InactiveFeature(_))
+            ),
+            "early SET_VRING_ENABLE (before SET_FEATURES) must not be feature-gated"
+        );
+
+        // Case 2 (enforcement): after SET_FEATURES WITHOUT PROTOCOL_FEATURES, the
+        // gate is re-enforced and SET_VRING_ENABLE is rejected.
+        let mut late = mk();
+        late.set_features(0).unwrap();
+        assert!(
+            matches!(
+                late.set_vring_enable(0, true),
+                Err(VhostUserError::InactiveFeature(_))
+            ),
+            "after SET_FEATURES without PROTOCOL_FEATURES, SET_VRING_ENABLE must be rejected"
+        );
     }
 }

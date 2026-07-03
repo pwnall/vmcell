@@ -24,8 +24,18 @@ bless:
       # stable copy still exists, the stable copy is already blessed (cargo never touches it) — skip
       # both the copy (which would strip caps) and the sudo setcap.
       local h; h="$(sha256sum "$built" | cut -d' ' -f1)"
-      if [[ -f "$stamp" && -f "$stable" && "$(cat "$stamp")" == "$h" ]]; then
-        echo "bless: $stable already blessed (runner sha256 unchanged); skipping setcap"
+      # M-BIN-2: the stamp+existence check alone is a FALSE skip if the stable copy silently lost
+      # its caps or mode out-of-band (rsync / backup-restore / fs-move strips file xattrs). Also
+      # verify the stable copy STILL carries all three caps with the effective bit (+ep / =ep) AND
+      # its 0700 owner-only mode; if any check fails, fall through and RE-bless rather than reporting
+      # a no-op "already blessed" that leaves the runner effectively un-capped (review-preflight-priv
+      # then reads that as skip==pass).
+      local caps_now; caps_now="$(getcap "$stable" 2>/dev/null || true)"
+      if [[ -f "$stamp" && -f "$stable" && "$(cat "$stamp")" == "$h" ]] \
+         && [[ "$caps_now" == *cap_net_admin* && "$caps_now" == *cap_sys_admin* \
+               && "$caps_now" == *cap_dac_override* && "$caps_now" == *ep* ]] \
+         && [[ "$(stat -c %a "$stable" 2>/dev/null)" == "700" ]]; then
+        echo "bless: $stable already blessed (runner sha256 unchanged, caps +ep, mode 0700); skipping setcap"
         return 0
       fi
       cp -f "$built" "$stable"
@@ -65,7 +75,10 @@ test-privileged:
 
 # Unprivileged integration suite under no elevation (keeps the unprivileged path honest).
 test-unprivileged:
-    cargo nextest run --profile integration -p vmcell --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
+    # `--features qemu` (additive over the default set) builds QEMU's unprivileged
+    # NAT leg too, so the M-TEST-8 `vmm_matrix_test!` exercises the smoltcp NAT on
+    # both CH and QEMU rather than the CH leg alone.
+    cargo nextest run --profile integration -p vmcell --features qemu --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide
@@ -81,6 +94,13 @@ ci:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --all-features
     cargo deny check
+    # M-VEND-3: assert the carried vhost patch is actually applied. A caret version
+    # bump would silently drop the `[patch.crates-io]` (only a "Patch was not used"
+    # warning), regressing the QEMU-unprivileged SET_VRING_ENABLE quirk with a green
+    # build. `cargo tree` prints a path dep with its path in parens, so require both
+    # to resolve from vendor/.
+    if ! cargo tree -e normal --all-features 2>/dev/null | grep -qE 'vhost v0\.16\.0 \(.*vendor/vhost\)'; then echo "M-VEND-3: vhost 0.16.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
+    if ! cargo tree -e normal --all-features 2>/dev/null | grep -qE 'vhost-user-backend v0\.22\.0 \(.*vendor/vhost-user-backend\)'; then echo "M-VEND-3: vhost-user-backend 0.22.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
     # lean-agent invariant: the guest PID-1 member must omit the host stack AND compile standalone.
     # v15: the lean boundary is now a per-MEMBER structural property (§12.8 #4), so the check
     # targets the crate directly (`-p`) rather than a feature slice of the old single package.

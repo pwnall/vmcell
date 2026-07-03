@@ -1,6 +1,6 @@
-use capctl::{Cap, CapState};
+use capctl::{Cap, CapSet, CapState};
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path};
 use std::process::{Command, exit};
@@ -26,8 +26,31 @@ fn blessing_remediation(uid: u32, exe: &Path, missing: &[Cap]) -> String {
          It was almost certainly rebuilt. Restore its privileges (one-time, until next rebuild):\n\n\
          sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {}\n\n\
          Then re-run the privileged suite. See §12.8.",
-        exe.display()
+        shell_single_quote(exe)
     )
+}
+
+/// Shell-single-quotes a path so a copy-pasted `setcap` command survives a
+/// workspace path containing spaces or shell metacharacters (N-HOST-3). An
+/// unquoted path with a space would be split by the shell into separate
+/// arguments; single quotes disable all expansion, and an embedded single quote is
+/// escaped with the standard `'\''` idiom.
+fn shell_single_quote(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
+}
+
+/// Computes which of `need` are absent from the `effective` capability set.
+///
+/// Kept PURE (no `CapState::get_current`) so the check is unit-testable against its
+/// buggy inverse (M-HOST-3): the privileged window needs the caps in the EFFECTIVE
+/// set (file-cap `+ep` form), and a cap that is only *permitted* would fail at first
+/// use, so the precondition must test `effective`, never `permitted`. A test that
+/// puts a cap in permitted-only reddens if this ever consulted the permitted set.
+fn compute_missing(effective: &CapSet, need: &[Cap]) -> Vec<Cap> {
+    need.iter()
+        .copied()
+        .filter(|&c| !effective.has(c))
+        .collect()
 }
 
 fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String> {
@@ -40,12 +63,7 @@ fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String> {
     }
 
     // The privileged window needs these caps in the EFFECTIVE set (file-caps +ep form).
-    let mut missing = Vec::new();
-    for &c in need {
-        if !caps.effective.has(c) {
-            missing.push(c);
-        }
-    }
+    let missing = compute_missing(&caps.effective, need);
 
     if missing.is_empty() {
         Ok(())
@@ -139,7 +157,12 @@ fn trusted_target_root(exe: &Path) -> Result<std::path::PathBuf, String> {
 /// (resolving symlinks; a non-existent path fails closed), and the resolved path is
 /// confirmed to descend from the trusted root — NOT from any `target/`-named ancestor
 /// of the argument itself, which is what made the pre-fix v15 check a no-op.
-fn confine_target_under(target: &str, trusted_root: &Path) -> Result<(), String> {
+///
+/// Returns the **canonicalized** path on success so the caller execs exactly the
+/// file that was verified (M-HOST-2) — never the raw argument, whose bare filename
+/// would trigger a `PATH` lookup and whose symlink could be re-pointed between the
+/// check and the exec.
+fn confine_target_under(target: &str, trusted_root: &Path) -> Result<std::path::PathBuf, String> {
     let raw = Path::new(target);
     if raw.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(format!(
@@ -149,7 +172,8 @@ fn confine_target_under(target: &str, trusted_root: &Path) -> Result<(), String>
     let resolved = raw
         .canonicalize()
         .map_err(|e| format!("cannot resolve target {target}: {e}"))?;
-    confine_under(&resolved, trusted_root)
+    confine_under(&resolved, trusted_root)?;
+    Ok(resolved)
 }
 
 /// Looks up the numeric gid for a group name, or `None` if it does not exist.
@@ -361,7 +385,11 @@ fn main() {
     // must stay dependency-thin (no host async/log stack), and it has to report
     // failures that occur BEFORE the privilege drop — a subscriber initialized
     // after the drop could not show them. Fatal errors go straight to stderr.
-    let args: Vec<String> = env::args().collect();
+    // L-HOST-4: `env::args()` panics on non-UTF-8 argv (a legal condition on Linux)
+    // in this privileged binary. Use `args_os()` and refuse a non-UTF-8 target path
+    // with a typed error instead of an unhelpful panic. Passthrough args (`args[2..]`)
+    // are kept as `OsString` and never require UTF-8.
+    let args: Vec<OsString> = env::args_os().collect();
     if args.len() < 2 {
         eprintln!("vmcell-test-runner: usage: vmcell-test-runner <test-binary> [args...]");
         exit(1);
@@ -395,11 +423,23 @@ fn main() {
             exit(1);
         }
     };
-    let target = &args[1];
-    if let Err(e) = confine_target_under(target, &trusted_root) {
-        eprintln!("vmcell-test-runner: {e}");
-        exit(1);
-    }
+    let target = match args[1].to_str() {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "vmcell-test-runner: refusing non-UTF-8 target path: {:?}",
+                args[1]
+            );
+            exit(1);
+        }
+    };
+    let resolved_target = match confine_target_under(target, &trusted_root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("vmcell-test-runner: {e}");
+            exit(1);
+        }
+    };
 
     // Compute the privilege transition as PURE data (unit-tested against its buggy
     // inverses), then apply it. For the setuid-root form the uid drop is part of the
@@ -426,8 +466,15 @@ fn main() {
         exit(1);
     }
 
-    let err = Command::new(target).args(&args[2..]).exec();
-    eprintln!("vmcell-test-runner: failed to exec {target}: {err}");
+    // M-HOST-2: exec the CANONICALIZED, verified path returned by
+    // `confine_target_under` — not the raw argument. Execing the raw `target` would
+    // re-open a possibly-different file: a bare filename triggers a `PATH` lookup,
+    // and a symlink could be re-pointed between the check and the exec (TOCTOU).
+    let err = Command::new(&resolved_target).args(&args[2..]).exec();
+    eprintln!(
+        "vmcell-test-runner: failed to exec {}: {err}",
+        resolved_target.display()
+    );
     exit(1);
 }
 
@@ -703,5 +750,58 @@ mod tests {
 
         // no kvm group on the host → just the primary gid.
         assert_eq!(merge_preserved_groups(1000, None, &[4]), vec![1000]);
+    }
+
+    // M-HOST-3: `compute_missing` returns exactly the needed caps ABSENT from the
+    // given set. `ensure_blessed_or_explain` passes the EFFECTIVE set, so a cap
+    // present only in permitted (absent from effective) MUST be reported missing —
+    // the privileged window fails at first use on a permitted-only cap. This pure
+    // seam is what the pre-fix code lacked: swapping effective→permitted at the call
+    // site now has a test that reddens (a permitted-only cap would wrongly pass).
+    #[test]
+    fn compute_missing_reports_caps_absent_from_the_given_set() {
+        let mut effective = CapSet::empty();
+        effective.add(Cap::NET_ADMIN); // present in effective
+        // SYS_ADMIN is NOT in `effective` (imagine it sits in permitted-only).
+        let missing = compute_missing(&effective, &[Cap::NET_ADMIN, Cap::SYS_ADMIN]);
+        assert_eq!(
+            missing,
+            vec![Cap::SYS_ADMIN],
+            "only the absent cap is missing"
+        );
+
+        // An empty effective set → every needed cap is missing (the permitted-only
+        // case that must NOT be reported as satisfied).
+        let empty = CapSet::empty();
+        assert_eq!(
+            compute_missing(&empty, &[Cap::NET_ADMIN]),
+            vec![Cap::NET_ADMIN],
+            "a cap absent from effective (e.g. permitted-only) must be reported missing"
+        );
+
+        // All present → nothing missing (inverse of the above).
+        let mut all = CapSet::empty();
+        all.add(Cap::NET_ADMIN);
+        all.add(Cap::SYS_ADMIN);
+        assert!(
+            compute_missing(&all, &[Cap::NET_ADMIN, Cap::SYS_ADMIN]).is_empty(),
+            "no caps missing when all needed are effective"
+        );
+    }
+
+    // N-HOST-3: the printed `setcap` command must shell-quote the exe path so a
+    // workspace path with spaces stays a single copy-pasteable argument (an unquoted
+    // path would be split by the shell). Goes RED if the single-quoting is dropped.
+    #[test]
+    fn remediation_shell_quotes_exe_path_with_spaces() {
+        let msg = blessing_remediation(
+            1000,
+            Path::new("/home/a b/proj/target/debug/vmcell-test-runner"),
+            &[Cap::NET_ADMIN],
+        );
+        assert!(
+            msg.contains("+ep '/home/a b/proj/target/debug/vmcell-test-runner'"),
+            "exe path with spaces must be single-quoted for copy-paste: {msg}"
+        );
     }
 }

@@ -317,7 +317,7 @@ enum — the **only** code shared between the host and the guest agent:
 #[non_exhaustive]
 pub enum Message {
     Ready, Exec(ExecRequest), Stdout(Vec<u8>), Stderr(Vec<u8>), Exit(i32), PutFile { .. },
-    Resync { unix_secs: u64, unix_nanos: u32, mac: Option<[u8; 6]> },   // host→guest, §9.2
+    Resync { unix_secs: u64, unix_nanos: u32, mac: Option<[u8; 6]>, ipv4: Option<Ipv4Reconfig> }, // host→guest, §9.2 (H-VMM-1)
     ResyncAck { clock_error: Option<String>, reseed_applied: bool, mac_applied: bool }, // guest→host
 }
 ```
@@ -855,12 +855,19 @@ concentrated "a restored VM is not a fresh VM" lesson (§12.4):
   correct check on a *sequential* restore is "the restored guest has a valid, live CID," **not**
   `assert_ne!(original_cid, restored_cid)` (which is over-specified and fails precisely *because* reuse is
   correct).
-- **Identity (MAC) — rotated at the device layer, not via netlink; the IP is left alone.** MAC rotation is
-  the one in-guest identity change the restore path performs, via a `SIOCSIFHWADDR` ioctl applied
-  **natively in the agent** (the `netif` module reuses the guest-tools logic without spawning the `ip`
-  binary) — a device-layer write, consistent with zero-netlink-in-PID-1 (§12.3). The IP is deliberately
-  *not* rotated: `ip addr flush` would drop the IP-PNP default route and re-introduce in-guest netlink, so
-  the guest keeps the address the kernel `ip=` set. Best-effort (the ack reports whether it applied).
+- **Identity (MAC *and* IP) — rotated at the device layer, not via netlink (H-VMM-1, "rotate
+  everything").** A snapshot is a *zygote*: one suspended VM is resumed into many **concurrent** children,
+  each of which must have a **distinct** network identity (its own netns/tap/`/30`/MAC/IP) so they never
+  collide on the host. The restore path therefore rotates the vmid, and the guest must move its whole
+  network identity to match: the MAC via `SIOCSIFHWADDR`, and — superseding the earlier "leave the IP
+  alone" note — the **IP + default route** via `SIOCSIFADDR`/`SIOCSIFNETMASK`/`SIOCADDRT`, all applied
+  **natively in the agent** (`netif`) as device-layer writes, consistent with zero-netlink-in-PID-1
+  (§12.3). The host side rewrites the baked `net[].tap` to the rotated tap in the CH restore config, so the
+  guest's rotated `/30` and its host-side tap/nft wiring belong to the same vmid. The guest resumes with the
+  frozen `ip=` of the *original* vmid; leaving it (the prior behavior) left every restored clone on a dead
+  `/30` with silently dead egress. Both are best-effort; the ack reports `mac_applied` / `ip_applied`.
+  *(Note: restoring many clones in parallel from one snapshot dir still needs a copy-on-write of that dir
+  first — the in-place `config.json` rewrite is single-use; tracked as §16 forward work.)*
 - **Entropy** — reseed the CSPRNG by copying 32 bytes `/dev/hwrng`→`/dev/urandom` **natively in-agent**
   (no `sh`+`head`). An unreseeded `getrandom()` can stall first use by seconds, and because every clone
   resumes at the same frozen instant, RNG reuse is otherwise silent and correlated. Best-effort; the ack's
@@ -998,9 +1005,11 @@ synthesize invalid addresses), centralized in one unit-tested `/30` helper, whic
 ≈254 concurrent VMs on one `/16`** (§16). VMID range is `1..=254`; CID space is `3..=254`.
 
 Two lifecycle nuances worth knowing at the interface: `request_shutdown()` sends the graceful signal, then
-SIGKILLs after a fixed **500 ms `SHUTDOWN_GRACE`** window (a true poll-until-exit needs a
-`VmInstance::try_wait` method, deferred); and `agent()` borrows all of `MicroVm` mutably for the returned
-ref's lifetime, so read the cheap immutable `vmid()`/`proxy` into locals *before* calling `agent()`.
+**polls `VmInstance::has_exited()` on an adaptive step and returns as soon as the guest powers off**,
+capping at the configured `Timeouts::shutdown_grace` (default 250 ms) before the SIGKILL fallback (the
+EXP-D poll-until-exit rework — `has_exited` is the `try_wait` early-return); and `agent()` borrows all of
+`MicroVm` mutably for the returned ref's lifetime, so read the cheap immutable `vmid()`/`proxy` into locals
+*before* calling `agent()`.
 
 The `AgentClient`, `ResourceUsage`, `ResourceLimits`, `VmmCapabilities`, `Vmm`/`VmInstance`, `NetConfig`,
 and `Share` shapes are shown in §3–§7 where they are used. All per-VM temporaries (API/vsock sockets,
@@ -1459,7 +1468,7 @@ debugging time).
 covered against each buggy inverse: the `+ep` (not `+p`) remediation message; the path-confinement
 (described in §14 below); `merge_preserved_groups` (kvm-gid preserved iff held, never invented); and — the
 deepest fix — a **pure `plan_privilege_transition(CapState, need, euid)`** so the capability-state sequence
-(inheritable-add → bounding-drop → ambient-raise → trim → uid) and the security-critical **setuid-form
+(uid → inheritable-add → bounding-drop → ambient-raise → trim) and the security-critical **setuid-form
 uid-before-ambient ordering** are verified *before* a bless, not only by running the suite. Only the thin
 `setresuid`/`setgroups`/`set_current`/`ambient::raise`/`exec` syscalls stay integration-only.
 
@@ -1637,8 +1646,6 @@ collapse have all **landed** — they are described in the body as current, not 
   can still collide with a later vmid between runs.
 - **The virtiofsd per-share service-uid allocator** is unimplemented (it uses `SUDO_UID`, refuses `nobody`,
   §5.2).
-- **`request_shutdown` polls a fixed 500 ms grace** before SIGKILL; a true poll-until-exit needs a
-  `VmInstance::try_wait` method (§10.2).
 - **The ≈254-concurrent-VM ceiling per `/16`.** Beyond that, widen the address scheme to a second octet
   (§10.2).
 - **Cross-version snapshot fragility.** Pin one exact CH+virtiofsd build for any snapshot pool; CH does not

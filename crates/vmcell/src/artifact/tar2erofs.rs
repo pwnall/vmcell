@@ -28,45 +28,10 @@ fn build_node_map<'a, R: Read + 'a>(
 ) -> crate::error::Result<HashMap<PathBuf, Node>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
-    // Inject extra files
-    for (dest_path, src_path) in injected_files {
-        let content = std::fs::read(src_path).map_err(|e| {
-            crate::error::Error::Artifact(format!(
-                "Failed to read injected file {:?}: {}",
-                src_path, e
-            ))
-        })?;
-        let meta = NodeMeta {
-            uid: 0,
-            gid: 0,
-            mtime: 0,
-            mtime_nsec: 0,
-        };
-        let mode = 0o755 | fs_erofs::inode::S_IFREG;
-        let node = Node::File {
-            mode,
-            data: content,
-            meta,
-            xattrs: vec![],
-        };
-        entries.insert(normalize_path(Path::new(dest_path)), node);
-    }
-
-    // Inject symlinks (e.g. the guest test-helper's ip/curl/kvm-ok multicall links).
-    for (dest_path, target) in injected_symlinks {
-        let node = Node::Symlink {
-            mode: 0o777 | fs_erofs::inode::S_IFLNK,
-            target: target.to_string(),
-            meta: NodeMeta {
-                uid: 0,
-                gid: 0,
-                mtime: 0,
-                mtime_nsec: 0,
-            },
-            xattrs: vec![],
-        };
-        entries.insert(normalize_path(Path::new(dest_path)), node);
-    }
+    // NOTE: the injected files/symlinks (guest-agent, CA, guest-tools) are inserted AFTER
+    // the layer merge below — see the tail of this function (H-ART-3 / design v17 §8.2:
+    // "inject ... then stream the tree"). Injecting before the merge let an upper layer's
+    // content or a `.wh.` whiteout silently clobber the baked agent or CA.
 
     for mut archive in archives {
         for file in archive
@@ -161,6 +126,53 @@ fn build_node_map<'a, R: Read + 'a>(
                     meta,
                     xattrs: vec![],
                 },
+                // A hardlink must NOT be silently dropped (H-ART-2): the default Debian base
+                // carries e.g. `usr/bin/perl5.NN` -> `usr/bin/perl`, which would otherwise
+                // vanish from the packed rootfs. MATERIALIZE it — copy the target file's
+                // content to the link path (erofs has no hardlink-dedup requirement here).
+                // A tar hardlink references an EARLIER entry, so the target is already in the
+                // merged tree. Fail loud (never `_ => continue`) only if the target is absent
+                // or is not a regular file. (`tar::EntryType` is non-exhaustive, so the
+                // trailing `_` still catches genuinely-unknown future types.)
+                tar::EntryType::Link => {
+                    let target = file
+                        .link_name()
+                        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?
+                        .ok_or_else(|| {
+                            crate::error::Error::Artifact(format!(
+                                "hardlink {} has no target",
+                                path.display()
+                            ))
+                        })?;
+                    let target_normalized = normalize_path(&target);
+                    match entries.get(&target_normalized) {
+                        Some(Node::File {
+                            mode,
+                            data,
+                            meta,
+                            xattrs,
+                        }) => Node::File {
+                            mode: *mode,
+                            data: data.clone(),
+                            meta: *meta,
+                            xattrs: xattrs.clone(),
+                        },
+                        Some(_) => {
+                            return Err(crate::error::Error::Artifact(format!(
+                                "hardlink {} -> {} target is not a regular file",
+                                path.display(),
+                                target.display()
+                            )));
+                        }
+                        None => {
+                            return Err(crate::error::Error::Artifact(format!(
+                                "hardlink {} -> {} target not found in the merged tree",
+                                path.display(),
+                                target.display()
+                            )));
+                        }
+                    }
+                }
                 _ => continue,
             };
 
@@ -185,6 +197,47 @@ fn build_node_map<'a, R: Read + 'a>(
         }
     }
 
+    // Inject the agent/CA/guest-tools AFTER every layer is merged (H-ART-3 / design v17
+    // §8.2: "inject ... then stream the tree"). Injecting last makes the injected files
+    // authoritative: an upper layer's content or a `.wh.` whiteout can no longer clobber the
+    // baked guest-agent or the CA under `usr/local/share/ca-certificates/`.
+    for (dest_path, src_path) in injected_files {
+        let content = std::fs::read(src_path).map_err(|e| {
+            crate::error::Error::Artifact(format!(
+                "Failed to read injected file {:?}: {}",
+                src_path, e
+            ))
+        })?;
+        let meta = NodeMeta {
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        let mode = 0o755 | fs_erofs::inode::S_IFREG;
+        let node = Node::File {
+            mode,
+            data: content,
+            meta,
+            xattrs: vec![],
+        };
+        entries.insert(normalize_path(Path::new(dest_path)), node);
+    }
+    for (dest_path, target) in injected_symlinks {
+        let node = Node::Symlink {
+            mode: 0o777 | fs_erofs::inode::S_IFLNK,
+            target: target.to_string(),
+            meta: NodeMeta {
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            xattrs: vec![],
+        };
+        entries.insert(normalize_path(Path::new(dest_path)), node);
+    }
+
     Ok(entries)
 }
 
@@ -201,21 +254,23 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
 ) -> crate::error::Result<Vec<u8>> {
     let mut entries = build_node_map(archives, injected_files, injected_symlinks)?;
 
-    // Fail loud on a base image without glibc when the injected agent is the default
-    // (dynamic-glibc) build: it would die at PID 1 (§7.1 / oci2erofs §8.2). One pass over
-    // the merged path set for `libc.so.6` under any `lib*` dir (lib64, lib/<triple>,
-    // usr/lib...). The static-musl agent path (`--agent-musl`) needs no libc6 and sets
-    // `require_libc6 = false`. This is a hard stop, never a silent pack of a base that
-    // cannot run the agent.
+    // Fail loud on a base image without glibc (§7.1 / oci2erofs §8.2). One pass over the
+    // merged path set for `libc.so.6` under any `lib*` dir (lib64, lib/<triple>, usr/lib...).
+    // The default guest-agent is built `-C target-feature=+crt-static` (guest_agent stage),
+    // so it does not itself need libc6 — but the guest-tools helper and every user `exec`
+    // workload in the Debian rootfs do (L-ART-8). The static-musl agent path
+    // (`--agent-musl`) also drops the guard (`require_libc6 = false`). This is a hard stop,
+    // never a silent pack of a base that cannot run guest-tools / user workloads.
     if require_libc6
         && !entries
             .keys()
             .any(|p| p.file_name().is_some_and(|n| n == "libc.so.6"))
     {
         return Err(crate::error::Error::Artifact(
-            "base image is missing libc6 (no `libc.so.6` found): the default glibc guest-agent \
-             would fail at PID 1. Use a base that includes libc6, or supply a static-musl agent \
-             with `--agent-musl`."
+            "base image is missing libc6 (no `libc.so.6` found): the default guest-agent is \
+             statically linked and does not need it, but the guest-tools helper and user exec \
+             workloads do. Use a base that includes libc6, or supply a static-musl agent with \
+             `--agent-musl`."
                 .to_string(),
         ));
     }
@@ -280,18 +335,27 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
         let parent_path = path
             .parent()
             .ok_or_else(|| crate::error::Error::Artifact("No parent".into()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| crate::error::Error::Artifact("No filename".into()))?
+            .to_string_lossy()
+            .into_owned();
         if let Some(Node::Dir {
             entries: dir_entries,
             ..
         }) = entries.get_mut(parent_path)
         {
-            dir_entries.insert(
-                path.file_name()
-                    .ok_or_else(|| crate::error::Error::Artifact("No filename".into()))?
-                    .to_string_lossy()
-                    .into_owned(),
-                node,
-            );
+            dir_entries.insert(name, node);
+        } else {
+            // A child whose parent path is occupied by a NON-directory node (e.g. a layer
+            // left `a/b` a regular file while another entry provides `a/b/c`) must fail loud,
+            // never be silently dropped (L-ART-6) — a malformed layer stack is an error like
+            // the media-type check, not a quietly-incomplete tree.
+            return Err(crate::error::Error::Artifact(format!(
+                "cannot add child {} under non-directory node {}",
+                name,
+                parent_path.display()
+            )));
         }
     }
 
@@ -513,5 +577,155 @@ mod tests {
         // The whiteout markers themselves must never be materialized as files.
         assert!(!map.contains_key(Path::new("etc/.wh.gone")));
         assert!(!map.contains_key(Path::new("opaquedir/.wh..wh..opq")));
+    }
+
+    // Builds a single-file (regular) tar entry into `buf`.
+    fn append_file(b: &mut tar::Builder<&mut Vec<u8>>, path: &str, body: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, path, body).unwrap();
+    }
+
+    // H-ART-2: a tar HARDLINK entry (type byte '1') must be MATERIALIZED — the link path gets
+    // the target file's content — never silently dropped (`_ => continue`). The default Debian
+    // base carries `usr/bin/perl5.NN` -> `usr/bin/perl`; the old wildcard made it vanish, and a
+    // fail-loud variant would break the default build (that base HAS this hardlink). RED on
+    // both the drop (link path missing) and the fail-loud (build errors) versions.
+    #[test]
+    fn test_hardlink_entry_is_materialized() {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            append_file(&mut b, "usr/bin/perl", b"real-perl");
+            // A hardlink pointing at the regular file above. The caller must set the entry
+            // type to `Link` (append_link does not) so the entry reads back as a hardlink.
+            let mut hl = tar::Header::new_gnu();
+            hl.set_entry_type(tar::EntryType::Link);
+            hl.set_size(0);
+            hl.set_mode(0o644);
+            b.append_link(&mut hl, "usr/bin/perl5.40.1", "usr/bin/perl")
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let entries = build_node_map(vec![archive], vec![], vec![]).expect("build");
+        let link = entries
+            .get(&normalize_path(Path::new("usr/bin/perl5.40.1")))
+            .expect("the hardlink must be materialized, not dropped");
+        match link {
+            Node::File { data, .. } => {
+                assert_eq!(
+                    data, b"real-perl",
+                    "hardlink content must equal the target's"
+                );
+            }
+            other => panic!("a materialized hardlink must be a regular file, got {other:?}"),
+        }
+
+        // A hardlink whose target is genuinely absent still fails loud (never a silent drop).
+        let mut orphan = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut orphan);
+            let mut hl = tar::Header::new_gnu();
+            hl.set_entry_type(tar::EntryType::Link);
+            hl.set_size(0);
+            hl.set_mode(0o644);
+            b.append_link(&mut hl, "usr/bin/dangling", "usr/bin/nonexistent")
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let archive = tar::Archive::new(std::io::Cursor::new(orphan));
+        assert!(
+            matches!(
+                build_node_map(vec![archive], vec![], vec![]),
+                Err(crate::error::Error::Artifact(_))
+            ),
+            "a hardlink to a missing target must still fail loud"
+        );
+    }
+
+    // H-ART-3: injected files (agent/CA/tools) are merged as the TAIL, after all layers.
+    // (1) A `.wh.` whiteout in an upper layer that deletes the CA dir must NOT remove the
+    // injected CA. (2) A layer that carries the injected path with different content must be
+    // overwritten by the injected file. The buggy inject-before-merge order reddens both.
+    #[test]
+    fn test_injection_survives_whiteout_and_layer_overwrite() {
+        // A real file on disk for the injected CA.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = dir.path().join("ca.crt");
+        std::fs::write(&ca, b"-----INJECTED-CA-----").unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::write(&agent, b"INJECTED-AGENT").unwrap();
+
+        // Lower layer: a base file, plus a guest-agent with DIFFERENT (stale) content.
+        let mut lower = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut lower);
+            append_file(&mut b, "etc/os-release", b"base");
+            append_file(&mut b, "usr/sbin/vmcell-guest-agent", b"STALE-LAYER-AGENT");
+            append_file(
+                &mut b,
+                "usr/local/share/ca-certificates/other.crt",
+                b"other",
+            );
+            b.finish().unwrap();
+        }
+        // Upper layer: whiteout the whole CA dir.
+        let mut upper = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut upper);
+            append_file(&mut b, "usr/local/share/.wh.ca-certificates", &[]);
+            b.finish().unwrap();
+        }
+        let a1 = tar::Archive::new(std::io::Cursor::new(lower));
+        let a2 = tar::Archive::new(std::io::Cursor::new(upper));
+        let injected_files = vec![
+            (
+                "usr/local/share/ca-certificates/vmcell-ca.crt",
+                ca.as_path(),
+            ),
+            ("usr/sbin/vmcell-guest-agent", agent.as_path()),
+        ];
+        let map = build_node_map(vec![a1, a2], injected_files, vec![]).expect("node map");
+
+        // (1) The injected CA survives the whiteout that deleted the CA dir.
+        match map.get(Path::new("usr/local/share/ca-certificates/vmcell-ca.crt")) {
+            Some(Node::File { data, .. }) => {
+                assert_eq!(data, b"-----INJECTED-CA-----");
+            }
+            other => panic!("injected CA must survive an upper-layer whiteout, got {other:?}"),
+        }
+        // (2) The injected agent wins over the stale layer content.
+        match map.get(Path::new("usr/sbin/vmcell-guest-agent")) {
+            Some(Node::File { data, .. }) => {
+                assert_eq!(
+                    data, b"INJECTED-AGENT",
+                    "the injected agent (tail) must overwrite the layer's stale agent"
+                );
+            }
+            other => panic!("expected the injected agent file, got {other:?}"),
+        }
+    }
+
+    // L-ART-6: a child whose parent path is occupied by a NON-directory node must fail loud,
+    // never be silently dropped. Here `a/b` is a regular file and `a/b/c` is a child under
+    // it. The buggy version (no `else` arm) packs Ok with `a/b/c` missing.
+    #[test]
+    fn test_tar_to_erofs_rejects_child_under_nondir() {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            append_file(&mut b, "a/b", b"file");
+            append_file(&mut b, "a/b/c", b"child");
+            b.finish().unwrap();
+        }
+        let archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let res = tar_to_erofs(vec![archive], vec![], vec![], false);
+        assert!(
+            matches!(res, Err(crate::error::Error::Artifact(_))),
+            "a child under a non-directory parent must fail loud (L-ART-6), got {res:?}"
+        );
     }
 }

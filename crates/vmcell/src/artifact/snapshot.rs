@@ -8,9 +8,8 @@ use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::config::{RootfsSource, VmConfig};
 use crate::error::Result;
 use crate::orchestrator::MicroVm;
-use crate::vmm::VmInstance;
 use crate::vmm::cloud_hypervisor::CloudHypervisor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A pipeline stage that creates a base VM snapshot for fast booting.
 pub struct SnapshotStage {
@@ -37,6 +36,20 @@ impl Stage for SnapshotStage {
         const STAGE_VERSION: u32 = 1;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
+        // Fold the pinned Cloud Hypervisor build identity (M-ART-7 / §16): a snapshot is only
+        // valid for the exact CH build that produced it — CH does not guarantee cross-version
+        // snapshot compatibility — so a CH upgrade must invalidate stale snapshots at build
+        // time, not at first `restore()`. The pin travels via Stage 0 (`cloud_hypervisor` in
+        // pins.json / resolved_pins). virtiofsd is not folded: a snapshot-eligible VM has no
+        // vhost-user device (§3.3), so the snapshot itself never runs virtiofsd.
+        hasher.update(b"ch\0");
+        hasher.update(
+            inputs
+                .pins
+                .get("cloud_hypervisor")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
         // Hash the upstream kernel/rootfs CONTENT (deterministic, key-sorted) rather than
         // their `target_dir`-relative path strings: new kernel/rootfs bytes at the same path
         // must invalidate the snapshot, otherwise a stale snapshot is served.
@@ -56,15 +69,7 @@ impl Stage for SnapshotStage {
                 crate::error::Error::Artifact("missing rootfs upstream input".into())
             })?;
 
-        let cfg = VmConfig::builder(
-            kernel,
-            RootfsSource::Erofs {
-                image: rootfs_image,
-            },
-        )
-        .network_disabled()
-        .build()
-        .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+        let cfg = snapshot_vm_config(kernel, rootfs_image)?;
 
         // Shared resolver so this stage and the mmdebstrap builder stage read the
         // SAME env var (VMCELL_CH_BIN) — no per-call-site CH-binary drift.
@@ -91,12 +96,45 @@ impl Stage for SnapshotStage {
         tokio::fs::create_dir_all(out)
             .await
             .map_err(crate::error::Error::Io)?;
-        vm.instance_mut().snapshot(out).await?;
+        // Go through the first-class `MicroVm::snapshot` verb (M-ART-2), not
+        // `instance_mut().snapshot()`: the former invalidates the cached `AgentClient` after
+        // a successful snapshot (so the resumed VM stays usable on every backend) and is the
+        // self-guarding entry point aligned with the §3.3 snapshot-eligibility law.
+        vm.snapshot(out).await?;
 
         vm.shutdown().await?;
 
-        Ok(StageOutputs::default())
+        Ok(snapshot_outputs(out))
     }
+}
+
+/// Builds the snapshot stage's [`VmConfig`], declaring `snapshotting(true)` (M-ART-2) so the
+/// §3.3 snapshot-eligibility guards in `config::build()` engage (a virtio-fs rootfs/share or
+/// unprivileged vhost-user-net is rejected). `network_disabled` keeps the boot vhost-user-free.
+fn snapshot_vm_config(kernel: PathBuf, rootfs_image: PathBuf) -> Result<VmConfig> {
+    VmConfig::builder(
+        kernel,
+        RootfsSource::Erofs {
+            image: rootfs_image,
+        },
+    )
+    .network_disabled()
+    .snapshotting(true)
+    .build()
+    .map_err(|e| crate::error::Error::Artifact(e.to_string()))
+}
+
+/// Builds the [`StageOutputs`] for a snapshot build, registering the snapshot directory under
+/// `"snapshot"` (M-ART-1) so downstream stages and the warm-cache restore see it on a COLD
+/// build, not only on a warm-cache hit. Mirrors `kernel_outputs`. Returning
+/// `StageOutputs::default()` registered nothing on the cold path while the warm-cache fallback
+/// did, so the two paths disagreed.
+fn snapshot_outputs(out: &Path) -> StageOutputs {
+    let mut outputs = StageOutputs::default();
+    outputs
+        .artifacts
+        .insert("snapshot".to_string(), out.to_path_buf());
+    outputs
 }
 
 #[cfg(test)]
@@ -155,6 +193,53 @@ mod tests {
         std::fs::write(&kernel, b"kernel-v2-rebuilt").expect("write");
         let k2 = stage().cache_key(&inputs);
         assert_ne!(k1, k2, "new kernel bytes must change the snapshot key");
+    }
+
+    // M-ART-1: the cold build path must register the `snapshot` artifact in its outputs
+    // (like the warm-cache path does), or downstream stages lose it. A buggy
+    // `Ok(StageOutputs::default())` registers nothing -> red here.
+    #[test]
+    fn test_snapshot_outputs_registers_snapshot_artifact() {
+        let out = Path::new("/some/target/snapshot");
+        let outputs = snapshot_outputs(out);
+        assert_eq!(
+            outputs.artifacts.get("snapshot").map(|p| p.as_path()),
+            Some(out),
+            "cold-build outputs must register the snapshot artifact (M-ART-1)"
+        );
+    }
+
+    // M-ART-2: the snapshot stage must declare `snapshotting(true)` so the §3.3 snapshot-
+    // eligibility guards in `config::build()` engage. The buggy config (no snapshotting flag)
+    // leaves `cfg.snapshotting == false` -> red here. (config::build() separately rejects
+    // Unprivileged + snapshotting; that negative test lives in config.rs.)
+    #[test]
+    fn test_snapshot_vm_config_declares_snapshotting() {
+        let cfg = snapshot_vm_config(
+            PathBuf::from("/k/vmlinux"),
+            PathBuf::from("/r/rootfs.erofs"),
+        )
+        .expect("snapshot config must build");
+        assert!(
+            cfg.snapshotting,
+            "the snapshot stage must declare snapshotting(true) (M-ART-2)"
+        );
+    }
+
+    // M-ART-7: a Cloud Hypervisor version bump must invalidate the snapshot cache key (§16:
+    // CH does not guarantee cross-version snapshot compatibility). The buggy version (no CH
+    // fold) leaves the two keys equal -> red here.
+    #[test]
+    fn test_snapshot_cache_key_tracks_ch_identity() {
+        let mut a = StageInputs::default();
+        a.pins.insert("cloud_hypervisor".into(), "v40.0".into());
+        let mut b = StageInputs::default();
+        b.pins.insert("cloud_hypervisor".into(), "v41.0".into());
+        assert_ne!(
+            stage().cache_key(&a),
+            stage().cache_key(&b),
+            "a CH version bump must invalidate the snapshot cache key (M-ART-7)"
+        );
     }
 
     // Guards ARTIFACT-PIPELINE-3: a missing upstream input must be a hard error (the kernel

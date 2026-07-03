@@ -20,18 +20,28 @@ async fn test_concurrency_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
     let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
 
+    // M-TEST-3: drive N>=3 `MicroVm::start` futures CONCURRENTLY (`join_all`) on the
+    // SHARED allocators, so simultaneous creation actually races the CID / VMID /
+    // netns / nft allocators. The old serial `for` loop `.await`ed each start before
+    // the next, so no two creations ever overlapped and an allocator TOCTOU race was
+    // untestable. N=3 (not 2) also catches an off-by-one that only repeats every 3rd
+    // allocation. A degenerate or unsynchronized allocator that hands out a duplicate
+    // CID / VMID / socket path under contention fails the distinctness asserts below.
+    let start_futures: Vec<_> = (0..3)
+        .map(|_| {
+            MicroVm::start(
+                vmm,
+                cfg.clone(),
+                cid_alloc.clone(),
+                vmid_alloc.clone(),
+                Box::new(vmcell::metrics::DefaultCgroupFs),
+            )
+        })
+        .collect();
+
     let mut vms = Vec::new();
-    for _ in 0..2 {
-        let vm = MicroVm::start(
-            vmm,
-            cfg.clone(),
-            cid_alloc.clone(),
-            vmid_alloc.clone(),
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-        .await
-        .expect("Failed to start VM");
-        vms.push(vm);
+    for res in futures::future::join_all(start_futures).await {
+        vms.push(res.expect("Failed to start VM"));
     }
 
     // Assert all booted successfully and have distinct VMIDs, guest CIDs, and vsock paths

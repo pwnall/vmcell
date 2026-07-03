@@ -200,3 +200,53 @@ relaxed; every added knob clamps to a correctness floor; the M-RESTORE-1 fail-lo
   `reserve_after_fast_child_already_drained_delivers_status` (verified red on the pre-fix wipe); the
   existing reuse/atomicity tests updated to the epoch API keep the stale-status guarantees green.
   Agent change ⇒ rootfs rebuilt (the closure hash folds agent sources).
+
+## Code review 46 pass (2026-07-03): deviations & recorded gaps
+
+Addressing `docs/46-claude-code-review.md`. Deliberate divergences and known gaps that are
+enforced/documented in code rather than fully closed:
+
+- **H-VMM-1 resolved by "rotate everything" (supersedes the old §9.2 "don't rotate the guest IP").**
+  A snapshot is a *zygote* — one suspended VM resumed into many concurrent children, each needing a
+  distinct network identity — so the restore path rotates the vmid and the guest now rotates its whole
+  network identity to match: MAC (`SIOCSIFHWADDR`, as before) **and** IP + default route
+  (`SIOCSIFADDR`/`SIOCSIFNETMASK`/`SIOCADDRT`), all native in-agent (zero-netlink). The `Resync` protocol
+  gained an `ipv4: Option<Ipv4Reconfig>`; the CH restore rewrite re-points the baked `net[].tap` to the
+  rotated tap. Prior behavior left every restored clone on the original vmid's dead `/30` with silently
+  dead egress. Folded into design §9.2. Parallel restore from one snapshot dir still needs a CoW of that
+  dir (in-place `config.json` rewrite is single-use) — §16 forward work.
+
+- **`Egress::Open` provides no arbitrary outbound egress (H-NET-4, §16 gap).** `Open` selects
+  "no interception proxy"; connectivity is then only what the mode's datapath natively provides —
+  the unprivileged NAT reaches the registered `host_services_port`/proxy forwards, the privileged
+  path reaches only what its TPROXY ruleset admits. Dialing the frame's real destination / host
+  masquerade is **not implemented**. The variant doc now says so; `Open` stays the default because
+  the mmdebstrap builder and the lifecycle/host-endpoint tests rely on it (none need arbitrary
+  egress). Closing it (real re-origination or a typed `Unsupported`) is forward work.
+- **Privileged `host_services_port` is rejected, not implemented (H-ORCH-3/H-NET-2).**
+  `config::build()` returns `Error::Config` for `Privileged { host_services_port: Some(_) }` — the
+  privileged TPROXY ruleset policy-drops everything but the web/proxy ports, so honoring it would
+  need a new accept rule + host binding. Fail-loud rejection replaces the prior silent no-op.
+- **Proxy CA is per-artifacts-dir, not per-run (M-NET-6).** Deliberate divergence from the
+  AGENTS.md per-run CA-hygiene rule: the CA is baked into the *cached* rootfs, so a per-run CA
+  would invalidate the guest trust chain on every run. Documented at the `proxy::tls` site.
+- **mmdebstrap apt verification uses the base builder image's keyring (M-ART-5).** Design §11.2
+  describes a separately-pinned apt keyring; the code relies on the pinned base image's keyring
+  (equivalent trust root, pinned by the base-image digest). `snapshot.debian.org` timestamp pin is
+  unchanged.
+- **`mkfs.erofs` fallback is unimplemented (M-ART-11, §8.2/§16 gap).** The erofs writer is the
+  `tar2erofs`/`oci2erofs` in-process path only; the design's `mkfs.erofs` shell fallback is not
+  wired. Missing-input is a hard error, not a fallback.
+- **`ResourceUsage.limits_enforced` means "memory controller delegated" (M-HOST-5).** The read
+  path holds only the cgroup name, so it reports the one controller whose silent absence lets the
+  memory cap not fire; it is **not** a per-controller (cpu/pids/io) enforcement guarantee. The name
+  is kept for API stability; the field doc states the precise meaning.
+- **Snapshot cache key folds the pinned Cloud Hypervisor identity (M-ART-7).** A CH build bump now
+  invalidates stale snapshots at build time (CH gives no cross-version snapshot compatibility);
+  virtiofsd is deliberately not folded (a snapshot-eligible VM runs none). The `pipeline.rs` golden
+  moved accordingly.
+- **Carried vhost patch (M-VEND-2/3, N-VEND-1).** `vendor/vhost{,-user-backend}` are the
+  crates.io-packaged 0.16.0/0.22.0 sources vendored in-tree (stronger than the design's "git fork
+  rev": content is in git). The `SET_VRING_ENABLE` PROTOCOL_FEATURES relaxation is now gated on
+  `features_acked` (accept QEMU's early delivery; re-enforce the spec after `SET_FEATURES`). Exact
+  `=` version pins + a `just ci` `cargo tree` assertion prevent a silent patch-drop on a bump.

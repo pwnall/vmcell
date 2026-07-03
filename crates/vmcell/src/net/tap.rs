@@ -6,6 +6,22 @@
 use crate::error::{Error, Result};
 use futures::stream::TryStreamExt;
 
+/// Extracts a human-readable message from a thread panic payload (N-NET-4).
+///
+/// `std::thread::JoinHandle::join` returns the panic value as a
+/// `Box<dyn Any + Send>`; the common `panic!("literal")` / `panic!("{}", …)`
+/// payloads are a `&str` or `String`. Downcasting to those recovers the real
+/// cause instead of collapsing every panic to one fixed string.
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 fn run_in_tokio<F, Fut, T>(f: F) -> std::result::Result<T, String>
 where
     F: FnOnce() -> Fut + Send,
@@ -27,7 +43,12 @@ where
             rt.block_on(f())
         })
         .join()
-        .map_err(|_| "netlink worker thread panicked".to_string())?
+        .map_err(|panic| {
+            format!(
+                "netlink worker thread panicked: {}",
+                panic_payload_str(panic.as_ref())
+            )
+        })?
     })
 }
 
@@ -244,7 +265,7 @@ impl Netlink for RtNetlink {
                     // set AF_INET explicitly (equivalent to rtnetlink's `.v4()`).
                     msg.header.family = netlink_packet_route::AddressFamily::Inet;
                     msg.header.table = 100;
-                    msg.header.action = netlink_packet_route::rule::RuleAction::Other(1); // FR_ACT_TO_TBL
+                    msg.header.action = netlink_packet_route::rule::RuleAction::ToTable;
                     msg.attributes
                         .push(netlink_packet_route::rule::RuleAttribute::FwMark(1));
                     rule.execute()
@@ -257,13 +278,15 @@ impl Netlink for RtNetlink {
                     // EAFNOSUPPORT. This is an IPv4 local route into table 100.
                     msg.header.address_family = netlink_packet_route::AddressFamily::Inet;
                     msg.header.table = 100;
-                    msg.header.protocol = netlink_packet_route::route::RouteProtocol::Other(2); // RTPROT_BOOT
+                    // RTPROT_KERNEL (value 2). The previous `Other(2)` carried a
+                    // comment mislabeling 2 as RTPROT_BOOT — boot is 3; 2 is kernel.
+                    msg.header.protocol = netlink_packet_route::route::RouteProtocol::Kernel;
                     // RTN_LOCAL requires scope >= RT_SCOPE_HOST: the kernel's
                     // fib_create_info rejects fib_props[RTN_LOCAL].scope (HOST) >
                     // fc_scope with EINVAL, so RT_SCOPE_LINK is invalid for a local
                     // route (iproute2 also forces HOST for `ip route add local`).
-                    msg.header.scope = netlink_packet_route::route::RouteScope::Other(254); // RT_SCOPE_HOST
-                    msg.header.kind = netlink_packet_route::route::RouteType::Other(2); // RTN_LOCAL
+                    msg.header.scope = netlink_packet_route::route::RouteScope::Host;
+                    msg.header.kind = netlink_packet_route::route::RouteType::Local;
                     msg.attributes
                         .push(netlink_packet_route::route::RouteAttribute::Oif(lo_idx));
                     route
@@ -617,9 +640,11 @@ mod tests {
         assert_eq!(ns.host_ip().unwrap(), "10.200.43.1");
     }
 
-    // NET-6: assert the rendered TPROXY ruleset. Buggy impl guarded: dropping the
-    // default-drop policy or pointing TPROXY at the wrong port would silently let
-    // guest traffic bypass the egress proxy.
+    // M-NET-3 / NET-6: pin the rendered TPROXY ruleset with a GOLDEN-EQUALITY
+    // assertion, not substring `contains` checks. A contains-based test cannot
+    // fail when a *fifth*, more permissive rule (e.g. an `iifname … accept` or a
+    // `udp dport 443 accept` QUIC hole) is inserted above the catch-all drop —
+    // the golden equality does. vmid 9 maps to gateway 10.200.10.1 via ip_math.
     #[test]
     fn render_tproxy_rules_intercepts_web_and_drops_rest() {
         let ns = NetNamespace {
@@ -631,29 +656,45 @@ mod tests {
             deleted: false,
         };
         let gw = ns.host_ip().unwrap();
+        assert_eq!(gw, "10.200.10.1", "vmid 9 must map to gateway 10.200.10.1");
         let rules = ns.render_tproxy_rules(5000, &gw);
+
+        let expected = "table ip proxy {\n\
+            \tchain prerouting {\n\
+            \t\ttype filter hook prerouting priority mangle; policy drop;\n\
+            \t\tiifname \"vmcell-tap-9\" tcp dport { 80, 443 } tproxy to :5000 meta mark set 1 accept\n\
+            \t\tiifname \"vmcell-tap-9\" ip daddr 10.200.10.1 tcp dport 5000 accept\n\
+            \t\tiifname \"vmcell-tap-9\" log prefix \"vmcell-drop: \" drop\n\
+            \t}\n\
+            }";
+        assert_eq!(
+            rules, expected,
+            "TPROXY ruleset drifted from its golden text; any inserted/reordered rule must be reviewed"
+        );
+
+        // NET-7 (recorded deviation): UDP/443 (QUIC) is deliberately NOT accepted;
+        // pin its absence explicitly so a re-introduced QUIC hole reddens loudly.
         assert!(
-            rules.contains("type filter hook prerouting priority mangle; policy drop;"),
-            "ruleset missing default-drop policy: {}",
+            !rules.contains("udp dport 443"),
+            "QUIC (UDP/443) must remain un-accepted so all egress stays interceptable: {}",
             rules
         );
+    }
+
+    // N-NET-4: a netlink-worker panic must surface its real payload, not a fixed
+    // string. Buggy impl guarded: the pre-fix `map_err(|_| "…panicked".into())`
+    // discards the payload, so neither substring below would be recoverable.
+    #[test]
+    fn panic_payload_str_extracts_message() {
+        let p = std::panic::catch_unwind(|| panic!("netlink-boom")).unwrap_err();
         assert!(
-            rules.contains("iifname \"vmcell-tap-9\" tcp dport { 80, 443 } tproxy to :5000"),
-            "ruleset missing TPROXY redirect: {}",
-            rules
+            panic_payload_str(p.as_ref()).contains("netlink-boom"),
+            "must recover a &str panic payload"
         );
+        let p = std::panic::catch_unwind(|| panic!("{}", format!("dyn-{}", 7))).unwrap_err();
         assert!(
-            rules.contains(&format!(
-                "iifname \"vmcell-tap-9\" ip daddr {} tcp dport 5000 accept",
-                gw
-            )),
-            "ruleset missing explicit-proxy accept for the gateway: {}",
-            rules
-        );
-        assert!(
-            rules.contains("iifname \"vmcell-tap-9\" log prefix \"vmcell-drop: \" drop"),
-            "ruleset missing catch-all drop: {}",
-            rules
+            panic_payload_str(p.as_ref()).contains("dyn-7"),
+            "must recover a String panic payload"
         );
     }
 

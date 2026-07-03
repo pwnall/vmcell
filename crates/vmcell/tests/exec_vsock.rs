@@ -93,7 +93,19 @@ async fn accept_with_ready(
     listener: UnixListener,
     frame_max: usize,
 ) -> Framed<tokio::net::UnixStream, LengthDelimitedCodec> {
-    let (mut stream, _) = listener.accept().await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    handshake_ready(stream, frame_max).await
+}
+
+/// Completes the `CONNECT`/`OK` handshake on an ALREADY-ACCEPTED stream and sends
+/// the initial `Ready` frame, returning the framed stream. Unlike
+/// [`accept_with_ready`] this does not consume a `UnixListener`, so a server task
+/// can accept multiple connections on one listener — needed by the reconnect test,
+/// whose recovery opens a second connection to the same path.
+async fn handshake_ready(
+    mut stream: tokio::net::UnixStream,
+    frame_max: usize,
+) -> Framed<tokio::net::UnixStream, LengthDelimitedCodec> {
     let mut resp = String::new();
     loop {
         let mut byte = [0u8; 1];
@@ -275,6 +287,189 @@ async fn host_codec_accepts_frame_above_default_8mib() {
     assert_eq!(outcome.code, 0);
     assert_eq!(outcome.stdout.len(), expected.len());
     assert_eq!(outcome.stdout, expected);
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// M-GUEST-4: the connect loop must FAST-FAIL when the serial log shows a kernel
+// panic (mod.rs:100-101), not spin to the deadline. RED on a buggy connect that
+// drops the panic check: with a nonexistent socket it would retry until the full
+// timeout elapses and then return `Timeout`, so BOTH the error variant and the
+// elapsed-time bound below flip.
+#[tokio::test]
+async fn connect_panic_in_serial_log_fails_fast() {
+    // A socket path that does NOT exist: connect must return via the panic check
+    // (which precedes `UnixStream::connect`), so it never depends on this path.
+    let vsock_path =
+        std::env::temp_dir().join(format!("vmcell-nopath-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&vsock_path);
+
+    let serial = vmcell::vmm::FakeSerialLog { panicked: true };
+
+    // Generous timeout: a fast-fail returns in well under a second; a connect that
+    // ignored the panic would loop the whole 10s before timing out.
+    let timeout = std::time::Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let res = AgentClient::connect(
+        &vsock_path,
+        5000,
+        timeout,
+        &vmcell::config::Timeouts::default(),
+        &serial,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(&res, Err(vmcell::Error::Agent(_))),
+        "connect must fail with Error::Agent on a panicked serial log, got {res:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "connect must FAST-FAIL on a serial-log panic (returned in {elapsed:?}); a connect \
+         that ignored the panic check would spin to the {timeout:?} deadline"
+    );
+}
+
+// M-GUEST-4: a mid-exchange STREAM ERROR (not a timeout) must also mark the stream
+// desynced — the `Ok(Err)` arm of `finish_request` (mod.rs:257-259), distinct from
+// the `Elapsed` arm the two timeout tests above exercise. The server reads the Exec
+// then closes the connection before any Exit, so the client's exec ends in an error,
+// not an `Elapsed`. RED on a buggy `finish_request` that sets `desynced` only on the
+// timeout arm: the follow-up request would NOT fail loud with "reconnect required".
+#[tokio::test]
+async fn stream_error_desyncs_subsequent_request() {
+    let tmp = std::env::temp_dir().join(format!("vmcell-streamerr-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = UnixListener::bind(&tmp).expect("bind UDS");
+    let vsock_path = tmp.clone();
+
+    let server = tokio::spawn(async move {
+        let mut framed = accept_with_ready(listener, vmcell::agent::MAX_FRAME_BYTES).await;
+        let _ = framed.next().await; // read the Exec frame
+        drop(framed); // close mid-exchange (no Exit) -> client exec errors, not a timeout
+    });
+
+    let mut client = AgentClient::connect(
+        &vsock_path,
+        5000,
+        std::time::Duration::from_secs(2),
+        &vmcell::config::Timeouts::default(),
+        &serial_log(),
+    )
+    .await
+    .expect("connect");
+
+    // No per-request timeout override: the error arrives from the closed stream, so
+    // this exercises the error path, NOT an `Elapsed` timeout.
+    let exec_res = client
+        .exec(ExecRequest::new(vec!["echo".into(), "hi".into()]))
+        .await;
+    assert!(
+        exec_res.is_err(),
+        "exec must error when the server closes the stream mid-exchange"
+    );
+
+    let next = client
+        .exec(ExecRequest::new(vec!["echo".into(), "again".into()]))
+        .await;
+    assert!(
+        matches!(&next, Err(vmcell::Error::Agent(m)) if m.contains("reconnect required")),
+        "a mid-exchange stream error must desync the stream so the next request fails loud; \
+         got {next:?}"
+    );
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// M-GUEST-4: reconnect() must CLEAR the desynced flag (mod.rs:224) so requests work
+// again after recovery. RED on a buggy reconnect that swaps the stream but leaves
+// `desynced = true`: the post-reconnect exec would fail `ensure_synced()` with
+// "reconnect required" instead of succeeding.
+#[tokio::test]
+async fn reconnect_clears_desynced() {
+    let tmp = std::env::temp_dir().join(format!("vmcell-reconnect-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = UnixListener::bind(&tmp).expect("bind UDS");
+    let vsock_path = tmp.clone();
+
+    let server = tokio::spawn(async move {
+        // Connection 1: handshake, read the Exec, then close (EOF) so the client's
+        // exec ends without an Exit frame -> Err -> desynced = true.
+        let (s1, _) = listener.accept().await.unwrap();
+        let mut f1 = handshake_ready(s1, vmcell::agent::MAX_FRAME_BYTES).await;
+        let _ = f1.next().await; // Exec
+        drop(f1);
+
+        // Connection 2 (the reconnect): handshake on the SAME listener, then answer
+        // the exec with Stdout + Exit(0). The single retained listener is why this
+        // test uses `handshake_ready` rather than the listener-consuming
+        // `accept_with_ready`.
+        let (s2, _) = listener.accept().await.unwrap();
+        let mut f2 = handshake_ready(s2, vmcell::agent::MAX_FRAME_BYTES).await;
+        let _ = f2.next().await.unwrap().unwrap(); // Exec
+        f2.send(
+            postcard::to_stdvec(&Message::Stdout(b"ok\n".to_vec()))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+        f2.send(postcard::to_stdvec(&Message::Exit(0)).unwrap().into())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    });
+
+    let mut client = AgentClient::connect(
+        &vsock_path,
+        5000,
+        std::time::Duration::from_secs(2),
+        &vmcell::config::Timeouts::default(),
+        &serial_log(),
+    )
+    .await
+    .expect("connect");
+
+    // Cause a desync: the server closes conn 1 mid-exchange.
+    let first = client
+        .exec(ExecRequest::new(vec!["echo".into(), "x".into()]))
+        .await;
+    assert!(
+        first.is_err(),
+        "exec must error when the server closes the stream mid-exchange (desyncs)"
+    );
+    // Confirm the stream is genuinely desynced before recovery.
+    let blocked = client
+        .exec(ExecRequest::new(vec!["echo".into(), "y".into()]))
+        .await;
+    assert!(
+        matches!(&blocked, Err(vmcell::Error::Agent(m)) if m.contains("reconnect required")),
+        "a request on the desynced stream must fail loud before reconnect; got {blocked:?}"
+    );
+
+    // reconnect() must clear the desync so the next exec succeeds.
+    client
+        .reconnect(
+            &vsock_path,
+            5000,
+            std::time::Duration::from_secs(2),
+            &vmcell::config::Timeouts::default(),
+            &serial_log(),
+        )
+        .await
+        .expect("reconnect");
+
+    let after = client
+        .exec(ExecRequest::new(vec!["echo".into(), "z".into()]))
+        .await
+        .expect("exec after reconnect must succeed (reconnect must clear `desynced`)");
+    assert_eq!(
+        after.code, 0,
+        "post-reconnect exec must return the server's Exit(0), proving the stream is back in sync"
+    );
 
     server.await.unwrap();
     let _ = std::fs::remove_file(&tmp);

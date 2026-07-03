@@ -89,7 +89,7 @@ impl ProxyHandler {
     /// Routes a single request, returning either a synthesized response (an
     /// egress block or a test double) or the request to forward upstream.
     fn route_request(&self, req: Request<hudsucker::Body>) -> RequestOrResponse {
-        tracing::info!("Proxy intercepted request to: {}", req.uri());
+        tracing::debug!("Proxy intercepted request to: {}", req.uri());
 
         let host_str = req
             .uri()
@@ -190,7 +190,7 @@ impl HttpHandler for ProxyHandler {
         _ctx: &HttpContext,
         res: Response<hudsucker::Body>,
     ) -> Response<hudsucker::Body> {
-        tracing::info!("Proxy forwarding response, status: {}", res.status());
+        tracing::debug!("Proxy forwarding response, status: {}", res.status());
         res
     }
 }

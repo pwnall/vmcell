@@ -60,6 +60,10 @@ impl Drop for CidGuard {
 /// (netns, tap, cgroup, socket paths, CID, MAC, IP).
 #[derive(Clone)]
 pub struct VmidAllocator {
+    /// Set of allocated VMIDs. Mutex-poison recovery via `into_inner()` is sound
+    /// throughout: every critical section is a single `BTreeSet` insert/remove/
+    /// contains with no intermediate invariant, so the set is always valid after
+    /// any panic point (N-ORCH-3).
     active: Arc<Mutex<std::collections::BTreeSet<u32>>>,
     /// When set, cross-process reservations are recorded as lock files in this
     /// directory. `None` (the default) means in-process-only (hermetic).
@@ -119,50 +123,82 @@ impl VmidAllocator {
     /// a crash does not erode capacity permanently.
     #[must_use]
     pub fn shared() -> Self {
+        Self::shared_at("/tmp/vmcell-vmid")
+    }
+
+    /// Like [`VmidAllocator::shared`] but with an injectable lock directory, so the
+    /// cross-process claim/reclaim path is unit-testable (H-ORCH-4). `shared()`
+    /// delegates here with the production `/tmp/vmcell-vmid` path.
+    #[must_use]
+    pub fn shared_at(dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            lock_dir: Some(std::path::PathBuf::from("/tmp/vmcell-vmid")),
+            lock_dir: Some(dir.into()),
             clock: Arc::new(RealClock),
         }
     }
 
     /// Attempts to claim `vmid` in the cross-process lock directory.
     ///
-    /// Returns `true` when there is no cross-process locking configured
-    /// (hermetic mode) or the claim succeeded; `false` when another live
-    /// process already holds it.
+    /// Returns `true` when there is no cross-process locking configured (hermetic
+    /// mode) or the claim succeeded; `false` when another **live** process already
+    /// holds it.
+    ///
+    /// The claim is atomic and self-healing (H-ORCH-4): the lock file is created
+    /// *already carrying* the owner pid (never the old create-then-write two-step
+    /// that could crash between the two and leave an empty, unreclaimable lock),
+    /// and reclaim of a dead/empty owner is serialized by an atomic `rename`, so
+    /// two racing processes cannot both pass the liveness check and dual-claim.
     fn try_claim_fs(&self, vmid: u32) -> bool {
         let Some(dir) = &self.lock_dir else {
             return true;
         };
         let _ = std::fs::create_dir_all(dir);
-        let lock_path = dir.join(format!("{}.lock", vmid));
-        if std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .is_ok()
-        {
-            let _ = std::fs::write(&lock_path, std::process::id().to_string());
-            return true;
-        }
-        // Owner-liveness reclaim: if the recorded owner is gone, take it over.
-        if let Ok(contents) = std::fs::read_to_string(&lock_path) {
-            if let Ok(pid) = contents.trim().parse::<u32>() {
-                if !std::path::Path::new(&format!("/proc/{}", pid)).exists()
-                    && std::fs::remove_file(&lock_path).is_ok()
-                    && std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&lock_path)
-                        .is_ok()
-                {
-                    let _ = std::fs::write(&lock_path, std::process::id().to_string());
-                    return true;
-                }
+        let lock_path = dir.join(format!("{vmid}.lock"));
+        // Bounded retries absorb a concurrent reclaimer transitioning the lock.
+        for _ in 0..8 {
+            if Self::atomic_claim(dir, &lock_path, vmid) {
+                return true;
             }
+            // The lock exists. Reclaim it iff its owner is dead, or it is empty /
+            // unparseable (a process that crashed mid-claim under the old path).
+            let contents = match std::fs::read_to_string(&lock_path) {
+                Ok(c) => c,
+                // Vanished between the failed link and the read — retry.
+                Err(_) => continue,
+            };
+            let owner_alive = contents
+                .trim()
+                .parse::<u32>()
+                .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+                .unwrap_or(false);
+            if owner_alive {
+                return false;
+            }
+            // Dead/empty: atomically steal the right to reclaim by renaming the
+            // stale lock to a unique temp. Exactly one racer wins the rename; the
+            // losers get `ENOENT` and retry the claim from the top.
+            let steal = dir.join(format!("{vmid}.stale.{}", std::process::id()));
+            if std::fs::rename(&lock_path, &steal).is_ok() {
+                let _ = std::fs::remove_file(&steal);
+            }
+            // Whether we freed it or lost the race, loop and re-attempt the claim.
         }
         false
+    }
+
+    /// Creates `lock_path` as a fresh hard link to a temp file already containing
+    /// our pid. `hard_link` fails if `lock_path` exists, giving mutual exclusion,
+    /// and the winning lock is never observably empty. The temp is always removed.
+    fn atomic_claim(dir: &std::path::Path, lock_path: &std::path::Path, vmid: u32) -> bool {
+        let tmp = dir.join(format!("{vmid}.lock.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, std::process::id().to_string()).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        let linked = std::fs::hard_link(&tmp, lock_path).is_ok();
+        let _ = std::fs::remove_file(&tmp);
+        linked
     }
 
     /// Releases the cross-process lock for `vmid`, if any.
@@ -276,9 +312,10 @@ pub struct MicroVm<V: Vmm> {
     agent_client: Option<AgentClient>,
     /// Whether the VM was restored from a snapshot.
     restored: bool,
-    /// Whether the one-shot post-restore CSPRNG reseed actually applied (exit 0)
-    /// on the first post-restore [`MicroVm::agent`] call. `None` until that resync
-    /// runs; `Some(false)` when the best-effort reseed could not be applied (e.g.
+    /// Whether the one-shot post-restore CSPRNG reseed actually applied (the
+    /// `ResyncAck.reseed_applied` field, set by the native in-agent resync) on the
+    /// first post-restore [`MicroVm::agent`] call. `None` until that resync runs;
+    /// `Some(false)` when the best-effort reseed could not be applied (e.g.
     /// `/dev/hwrng` missing). Lets a restore test assert the reseed was applied
     /// rather than inferring it from two `/dev/urandom` reads differing.
     restore_reseed_applied: Option<bool>,
@@ -325,14 +362,23 @@ impl Drop for CgroupGuard {
     }
 }
 
+/// Transient holder for the resources `setup_env` allocates before the VMM
+/// instance exists. On the happy path each field is moved into `MicroVm` (and the
+/// guards disarmed) before the instance is built; on any mid-construction failure
+/// (`create`/`boot`/`restore`/`resume`) the un-moved fields drop **in declaration
+/// order**, which is therefore **load-bearing** (H-ORCH-1): it mirrors
+/// `teardown_post_instance` exactly — proxy and the smoltcp NAT (which hold
+/// sockets/threads *inside* the netns) drop **before** the netns, then cgroup,
+/// then cid. Deleting the netns while the proxy still runs inside it hangs/leaks,
+/// so this order must not be reshuffled.
 struct EnvSetup {
-    res: PerVmResources,
-    cid_guard: CidGuard,
-    cgroup_guard: CgroupGuard,
-    netns: Option<NetNamespace>,
+    proxy: Option<EgressProxy>,
     #[cfg(feature = "net-unprivileged")]
     smoltcp: Option<SmoltcpProcess>,
-    proxy: Option<EgressProxy>,
+    netns: Option<NetNamespace>,
+    cgroup_guard: CgroupGuard,
+    cid_guard: CidGuard,
+    res: PerVmResources,
 }
 
 /// Minimal guest-resync seam the one-shot post-restore resync needs.
@@ -347,6 +393,7 @@ trait GuestResync {
         unix_secs: u64,
         unix_nanos: u32,
         mac: Option<[u8; 6]>,
+        ipv4: Option<crate::agent::protocol::Ipv4Reconfig>,
     ) -> Result<crate::agent::ResyncOutcome>;
 }
 
@@ -356,11 +403,12 @@ impl GuestResync for AgentClient {
         unix_secs: u64,
         unix_nanos: u32,
         mac: Option<[u8; 6]>,
+        ipv4: Option<crate::agent::protocol::Ipv4Reconfig>,
     ) -> Result<crate::agent::ResyncOutcome> {
         // Resolves to the inherent `AgentClient::resync` (inherent methods win
         // over the same-named trait method), so this delegates rather than
         // recursing.
-        self.resync(unix_secs, unix_nanos, mac).await
+        self.resync(unix_secs, unix_nanos, mac, ipv4).await
     }
 }
 
@@ -411,17 +459,23 @@ async fn maybe_resync_after_restore<E: GuestResync>(
 
     // Host instant for the mandatory clock resync (§9.2): the guest cannot fix a
     // frozen RTC from inside. Carried as whole secs + sub-second nanos on the wire.
+    // L-ORCH-4: a pre-1970 host clock must fail loud — the mandatory resync is the
+    // one step the design insists never silently degrades, so `unwrap_or_default()`
+    // (which would push epoch-0 into the guest) is a typed error here instead.
     let since_epoch = clock
         .now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+        .map_err(|_| {
+            crate::error::Error::Agent(
+                "host clock is before the Unix epoch; refusing to resync guest to 1970".into(),
+            )
+        })?;
     let unix_secs = since_epoch.as_secs();
     let unix_nanos = since_epoch.subsec_nanos();
 
     // ORCH-1 / §9.2: MAC rotation is the ONLY in-guest identity change the restore
     // path performs — applied natively via `SIOCSIFHWADDR` (no in-guest netlink),
-    // keeping the zero-netlink-in-PID-1 contract (§4.3). The IP address is
-    // deliberately NOT rotated (the guest keeps the kernel `ip=` cmdline address).
+    // keeping the zero-netlink-in-PID-1 contract (§4.3).
     // `mac_math` centralizes the vmid→MAC mapping as a string; convert it to the
     // six bytes the wire protocol carries without duplicating that mapping.
     let mac_str = crate::net::mac_math(vmid)
@@ -429,6 +483,23 @@ async fn maybe_resync_after_restore<E: GuestResync>(
     let mac = parse_mac_bytes(&mac_str).ok_or_else(|| {
         crate::error::Error::Agent(format!("mac math produced an unparseable MAC: {}", mac_str))
     })?;
+
+    // H-VMM-1: the IP address IS rotated on restore (superseding the old §9.2
+    // "do not rotate the guest IP" note). A snapshot is a *zygote* — resumed into
+    // many concurrent children, each needing a distinct network identity — so the
+    // vmid rotates and the guest's frozen `ip=` no longer matches its rotated
+    // host-side tap/`/30`. Derive the new `/30` from the same centralized
+    // `ip_math` the host wiring uses: the guest takes `guest_ip`, its default route
+    // goes via `host_ip` (the gateway). Applied natively in-guest (SIOCSIFADDR +
+    // route ioctls, no netlink), exactly like the MAC above.
+    let (host_ip, guest_ip, _cidr) = crate::net::ip_math(vmid)
+        .map_err(|e| crate::error::Error::Agent(format!("ip math: {}", e)))?;
+    let ipv4 = crate::agent::protocol::Ipv4Reconfig {
+        addr: guest_ip.octets(),
+        // The `/30` point-to-point prefix `ip_math` produces.
+        prefix_len: 30,
+        gateway: host_ip.octets(),
+    };
 
     tracing::info!(
         "Automatically resyncing guest after restore to host time {}.{:09}",
@@ -438,7 +509,9 @@ async fn maybe_resync_after_restore<E: GuestResync>(
 
     // One native round-trip. Propagated with `?` so a transient transport failure
     // leaves `*restored` set and the next agent() call retries the whole resync.
-    let outcome = exec.resync(unix_secs, unix_nanos, Some(mac)).await?;
+    let outcome = exec
+        .resync(unix_secs, unix_nanos, Some(mac), Some(ipv4))
+        .await?;
 
     if let Some(err) = outcome.clock_error {
         // ORCH-3 / M-RESTORE-1: the clock resync is mandatory (§9.2) — a guest-side
@@ -460,6 +533,12 @@ async fn maybe_resync_after_restore<E: GuestResync>(
     // MAC rotation is best-effort; a not-applied rotation is logged, not fatal.
     if !outcome.mac_applied {
         tracing::warn!("restore MAC rotation did not apply in the guest");
+    }
+
+    // IP rotation is best-effort here (a non-networked restored VM has no eth0);
+    // for a tap-networked VM a not-applied rotation means dead egress, so log it.
+    if !outcome.ip_applied {
+        tracing::warn!("restore IP rotation did not apply in the guest");
     }
 
     // Clear `restored` ONLY now — after the mandatory clock resync above
@@ -487,6 +566,16 @@ impl<V: Vmm> MicroVm<V> {
     }
 
     /// Gets a mutable reference to the underlying VMM instance.
+    ///
+    /// # Invariant (M-ORCH-5)
+    /// Do **not** drive the VM's lifecycle through this accessor. In particular
+    /// **do not call [`crate::vmm::VmInstance::snapshot`] directly** — use
+    /// [`MicroVm::snapshot`], which additionally invalidates the cached
+    /// [`AgentClient`] (backends such as Firecracker sever established vsock
+    /// connections across snapshot; the EXP-E fix). Calling `snapshot()` here
+    /// bypasses that guard and leaves a stale, silently-broken cached client.
+    /// This accessor exists for read-mostly probes (`serial_log`, `vsock_path`,
+    /// `guest_cid`) and the explicit `kill()` teardown.
     ///
     /// # Panics
     /// Panics if the instance is missing.
@@ -531,7 +620,15 @@ impl<V: Vmm> MicroVm<V> {
                 egress,
                 host_services_port,
             } => {
+                // `egress` is consumed below only under `feature = "proxy"`; the
+                // discard silences the unused binding when the proxy is compiled
+                // out (it is a config selector, not a resource).
                 let _ = egress;
+                // H-ORCH-3/H-NET-2: `host_services_port` is not implemented on the
+                // privileged path. `config::build()` rejects `Some(_)` here, so it
+                // is always `None` — this is a validated-away no-op, not a silent
+                // drop of a requested feature.
+                debug_assert!(host_services_port.is_none());
                 let _ = host_services_port;
                 let ns = NetNamespace::create(vmid, Box::new(crate::net::tap::RtNetlink))?;
                 tap_name = Some(ns.tap_name.clone());
@@ -619,16 +716,15 @@ impl<V: Vmm> MicroVm<V> {
             crate::config::NetConfig::None => {}
         }
 
+        // §12.7 sibling placement: create the per-VM slice as a sibling of the
+        // supervisor's own leaf, using the shared, unit-tested line-based parser
+        // in `metrics` (M-ORCH-4/H-HOST-3) — not an inline `split("0::")` over the
+        // whole file, which folds trailing lines into the path on a hybrid v1/v2
+        // hierarchy.
         let mut cgroup_name = format!("vmcell-vm-{}", vmid);
         if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
-            if let Some(path) = cgroup_str.trim().split("0::").nth(1) {
-                let mut base = path.trim_start_matches('/');
-                if base.ends_with("/supervisor") {
-                    base = base.trim_end_matches("/supervisor");
-                }
-                if !base.is_empty() {
-                    cgroup_name = format!("{}/vmcell-vm-{}", base, vmid);
-                }
+            if let Some(base) = crate::metrics::cgroup_base_from_proc(&cgroup_str) {
+                cgroup_name = format!("{}/vmcell-vm-{}", base, vmid);
             }
         }
 
@@ -684,7 +780,9 @@ impl<V: Vmm> MicroVm<V> {
     /// # use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
     /// # async fn run() {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
-    /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::VirtioFs { dir: PathBuf::from("/rootfs") }).build().unwrap();
+    /// // Erofs is the supported, snapshot-compatible rootfs; a virtio-fs *rootfs*
+    /// // is rejected by every backend, so the example uses erofs (L-ORCH-1).
+    /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
     /// let cid_alloc = std::sync::Arc::new(CidAllocator::new());
     /// let vmid_alloc = VmidAllocator::new();
     /// let vm = MicroVm::start(&vmm, cfg, cid_alloc.clone(), vmid_alloc, Box::new(vmcell::metrics::DefaultCgroupFs::default())).await.unwrap();
@@ -742,7 +840,11 @@ impl<V: Vmm> MicroVm<V> {
             restore_reseed_applied: None,
             cid: Some(env.cid_guard),
             tmp_dir: Some(tmp_dir),
-            timeouts: cfg.timeouts,
+            // M-ORCH-3: re-clamp at the orchestrator boundary. The builder/presets
+            // clamp, but `Timeouts`' fields are `pub`, so a caller can mutate
+            // `cfg.timeouts` after `build()` down to a busy-spin; clamping here
+            // guarantees the connect/accept/grace cadences honor their floors.
+            timeouts: cfg.timeouts.clamped(),
         })
     }
 
@@ -847,7 +949,11 @@ impl<V: Vmm> MicroVm<V> {
             restore_reseed_applied: None,
             cid: Some(env.cid_guard),
             tmp_dir: Some(tmp_dir),
-            timeouts: cfg.timeouts,
+            // M-ORCH-3: re-clamp at the orchestrator boundary. The builder/presets
+            // clamp, but `Timeouts`' fields are `pub`, so a caller can mutate
+            // `cfg.timeouts` after `build()` down to a busy-spin; clamping here
+            // guarantees the connect/accept/grace cadences honor their floors.
+            timeouts: cfg.timeouts.clamped(),
         })
     }
 
@@ -866,7 +972,7 @@ impl<V: Vmm> MicroVm<V> {
     ///
     /// # Errors
     /// Returns an error if the agent connection or handshake fails or times out,
-    /// or if the mandatory post-restore clock resync exec fails.
+    /// or if the mandatory post-restore clock resync round-trip fails.
     pub async fn agent(
         &mut self,
         timeout: Option<std::time::Duration>,
@@ -894,11 +1000,6 @@ impl<V: Vmm> MicroVm<V> {
             self.agent_client = Some(client);
         }
 
-        let agent_ref = self
-            .agent_client
-            .as_mut()
-            .ok_or_else(|| crate::error::Error::Agent("Failed to connect to agent".into()))?;
-
         if self.restored {
             // No explicit reconnect here: this `agent()` is the first call after
             // restore (agent_client started `None`), so the `connect()` above
@@ -909,28 +1010,47 @@ impl<V: Vmm> MicroVm<V> {
             // until that fresh listener accepts. A second, overlapping connect would
             // be redundant.
             let vmid = self.vmid.as_ref().expect("vmid missing").vmid;
+            // The client is guaranteed present: it was cached above if `None`
+            // (N-ORCH-1 — the prior `ok_or_else` error arm was unreachable).
+            let client = self
+                .agent_client
+                .as_mut()
+                .expect("agent_client was populated above");
             // M-RESTORE-1: clears `self.restored` only after the mandatory clock
-            // resync succeeds, so a transient first-exec failure retries the full
-            // resync on the next call instead of being silently dropped.
-            maybe_resync_after_restore(
+            // resync succeeds, so a transient failure retries the full resync on the
+            // next call instead of being silently dropped.
+            if let Err(e) = maybe_resync_after_restore(
                 &mut self.restored,
                 &mut self.restore_reseed_applied,
-                agent_ref,
+                client,
                 clock,
                 vmid,
             )
-            .await?;
+            .await
+            {
+                // H-ORCH-2: a transient resync transport failure marks the cached
+                // client desynced, and nothing ever auto-reconnects it — so leaving
+                // it cached wedges *every* future `agent()` on `ensure_synced`.
+                // Evict it here so the next call re-connects and retries the whole
+                // resync, honoring the M-RESTORE-1 retry contract.
+                self.agent_client = None;
+                return Err(e);
+            }
         }
 
-        Ok(agent_ref)
+        Ok(self
+            .agent_client
+            .as_mut()
+            .expect("agent_client was populated above"))
     }
 
-    /// Whether the one-shot post-restore CSPRNG reseed actually applied (exit 0)
-    /// on the first post-restore [`MicroVm::agent`] call.
+    /// Whether the one-shot post-restore CSPRNG reseed actually applied (the
+    /// `ResyncAck.reseed_applied` ack field) on the first post-restore
+    /// [`MicroVm::agent`] call.
     ///
-    /// `None` before that resync has run; `Some(true)` when the reseed
-    /// (`head -c 32 /dev/hwrng > /dev/urandom`) succeeded; `Some(false)` when the
-    /// best-effort reseed could not be applied. A restore test asserts
+    /// `None` before that resync has run; `Some(true)` when the reseed (the native
+    /// in-agent `/dev/hwrng`→`/dev/urandom` 32-byte copy) succeeded; `Some(false)`
+    /// when the best-effort reseed could not be applied. A restore test asserts
     /// `Some(true)` instead of inferring the reseed from two `/dev/urandom` reads
     /// differing (which can pass coincidentally even when the reseed silently
     /// failed).
@@ -1054,7 +1174,13 @@ impl<V: Vmm> MicroVm<V> {
     /// Shuts down the VM and cleans up associated resources.
     ///
     /// # Errors
-    /// Returns an error if shutting down the VM or proxy fails.
+    /// Currently always returns `Ok(())`. The graceful `request_shutdown` and the
+    /// `kill` fallback are best-effort and their failures are **logged**, not
+    /// propagated (M-ORCH-2): teardown is guaranteed by
+    /// [`teardown_post_instance`](Self::teardown_post_instance) and `Drop`
+    /// regardless of either RPC's outcome, so surfacing an error would offer the
+    /// caller no additional recovery. The `Result` return is retained so a future
+    /// fallible-teardown step can be added without a signature break.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(mut inst) = self.instance.take() {
             // ORCH-7: give the guest a bounded grace window to flush and power off
@@ -1070,7 +1196,12 @@ impl<V: Vmm> MicroVm<V> {
             // guaranteed fallback for a guest that never exits on its own.
             let poll_step = shutdown_poll_step(self.timeouts.shutdown_grace);
             let mut grace_deadline = tokio::time::Instant::now() + self.timeouts.shutdown_grace;
-            let _ = inst.request_shutdown().await;
+            // Best-effort: an already-powered-off guest fails this benignly, so a
+            // failure is logged at debug (not surfaced) — the force-kill below is
+            // the guarantee (M-ORCH-2).
+            if let Err(e) = inst.request_shutdown().await {
+                tracing::debug!("graceful shutdown request failed (will force-kill): {}", e);
+            }
             // Post-ack floor: the shutdown RPC has no timeout
             // (`vmm::unix_api_request`), so an RPC stalled for >= the grace would
             // arrive here with the deadline already past and skip the poll loop
@@ -1087,8 +1218,12 @@ impl<V: Vmm> MicroVm<V> {
             }
 
             // Force-kill + reap the process group so no zombie/EBUSY blocks the
-            // netns teardown below.
-            let _ = inst.kill().await;
+            // netns teardown below. This is the guaranteed fallback, so a failure
+            // is a genuine concern — log at warn (M-ORCH-2). `Drop` still runs the
+            // ordered teardown regardless.
+            if let Err(e) = inst.kill().await {
+                tracing::warn!("force-kill during shutdown failed: {}", e);
+            }
             // Instance fully torn down here (end of scope) BEFORE the shared
             // post-instance teardown deletes the netns it held interfaces in.
         }
@@ -1376,6 +1511,56 @@ mod tests {
             );
         }
         assert_eq!(from_b.len(), 254);
+    }
+
+    // H-ORCH-4: the cross-process lock dir is now injectable (`shared_at`), so the
+    // claim/reclaim path is testable at all. A live cross-process owner blocks the
+    // claim; releasing frees it. (On unmodified code there is no seam to inject a
+    // hermetic dir, so this test cannot even be written against `shared()`.)
+    #[test]
+    fn shared_at_conflict_between_live_owners() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = VmidAllocator::shared_at(dir.path());
+        let b = VmidAllocator::shared_at(dir.path());
+        assert_eq!(a.reserve(9).expect("a claims 9"), 9);
+        // `b` has a distinct in-process set; only the fs lock rejects it, and only
+        // because our pid is alive.
+        assert!(
+            matches!(b.reserve(9), Err(crate::error::Error::Exhaustion(_))),
+            "a live cross-process owner must block the claim"
+        );
+        a.release(9);
+        assert_eq!(b.reserve(9).expect("b claims after release"), 9);
+        b.release(9);
+    }
+
+    // H-ORCH-4: an EMPTY lock (a process that crashed between the old non-atomic
+    // create and its separate pid-write) must be reclaimable — RED on the old
+    // code, which required a parseable pid to reclaim and so leaked that vmid
+    // forever. A dead owner's lock is likewise reclaimable, and a successful claim
+    // leaves a parseable pid (the atomic create-with-content).
+    #[test]
+    fn shared_at_reclaims_empty_and_dead_locks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+
+        std::fs::write(path.join("5.lock"), b"").expect("seed empty lock");
+        let a = VmidAllocator::shared_at(path);
+        assert!(
+            a.try_claim_fs(5),
+            "an empty (crashed-mid-claim) lock must reclaim"
+        );
+        let content = std::fs::read_to_string(path.join("5.lock")).unwrap();
+        assert_eq!(
+            content.trim().parse::<u32>().unwrap(),
+            std::process::id(),
+            "a claimed lock must carry the owner pid atomically"
+        );
+
+        // `/proc/4294967295` can never exist, so this owner is definitively dead.
+        std::fs::write(path.join("6.lock"), u32::MAX.to_string()).unwrap();
+        let b = VmidAllocator::shared_at(path);
+        assert!(b.try_claim_fs(6), "a dead owner's lock must be reclaimable");
     }
 
     // CONFIG-ERROR-ORCH-5 / DESIGN-DIVERGENCE-4. Buggy impl: reserve() does not
@@ -1739,6 +1924,32 @@ mod tests {
         );
     }
 
+    // M-ORCH-3: the builder/presets clamp, but `Timeouts`' fields are `pub`, so a
+    // post-`build()` mutation can drive a correctness floor to zero (a busy-spin on
+    // PID 1's connect/accept loop). start() must re-clamp at the boundary. RED on
+    // the inverse (no re-clamp at start): the zeroed floors survive onto the VM.
+    #[tokio::test]
+    async fn timeouts_reclamped_at_start_guards_pub_field_mutation() {
+        use std::time::Duration;
+        let vmm = crate::vmm::FakeVmm::default();
+        let mut cfg = erofs_cfg();
+        cfg.timeouts.connect_backoff_floor = Duration::ZERO;
+        cfg.timeouts.guest_accept_poll = Duration::ZERO;
+        cfg.timeouts.api_socket_poll = Duration::ZERO;
+        let vm = MicroVm::start(
+            &vmm,
+            cfg,
+            std::sync::Arc::new(crate::vmm::CidAllocator::new()),
+            VmidAllocator::new(),
+            Box::new(crate::metrics::FakeCgroupFs::new()),
+        )
+        .await
+        .expect("start with fakes");
+        assert!(vm.timeouts.connect_backoff_floor >= Duration::from_millis(1));
+        assert!(vm.timeouts.guest_accept_poll >= Duration::from_millis(1));
+        assert!(vm.timeouts.api_socket_poll >= Duration::from_millis(1));
+    }
+
     // C1 / CONFIG-ERROR-ORCH-1. Buggy impl: restore() only guards a virtio-fs
     // rootfs and unprivileged net, letting a virtio-fs data Share (a vhost-user
     // device) through onto the snapshot path.
@@ -1787,6 +1998,8 @@ mod tests {
         /// The `(unix_secs, unix_nanos, mac)` of each resync call that was not
         /// forced to fail.
         recorded: Vec<(u64, u32, Option<[u8; 6]>)>,
+        /// The `ipv4` argument of each recorded call (H-VMM-1).
+        recorded_ipv4: Vec<Option<crate::agent::protocol::Ipv4Reconfig>>,
         calls: usize,
         fail_first_n: usize,
         /// The outcome returned once a call is allowed to succeed.
@@ -1799,6 +2012,7 @@ mod tests {
             unix_secs: u64,
             unix_nanos: u32,
             mac: Option<[u8; 6]>,
+            ipv4: Option<crate::agent::protocol::Ipv4Reconfig>,
         ) -> Result<crate::agent::ResyncOutcome> {
             self.calls += 1;
             if self.calls <= self.fail_first_n {
@@ -1807,6 +2021,7 @@ mod tests {
                 ));
             }
             self.recorded.push((unix_secs, unix_nanos, mac));
+            self.recorded_ipv4.push(ipv4);
             Ok(self.outcome.clone())
         }
     }
@@ -1835,6 +2050,7 @@ mod tests {
                 clock_error: None,
                 reseed_applied: true,
                 mac_applied: true,
+                ip_applied: true,
             },
             ..FakeGuestResync::default()
         };
@@ -1887,6 +2103,19 @@ mod tests {
             Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x05]),
             "resync must carry the vmid->MAC mapping as bytes"
         );
+        // H-VMM-1: ...and the rotated `/30` IPv4 identity, derived from the SAME
+        // `ip_math` the host wiring uses (vmid 5 -> octet 6 -> guest 10.200.6.2,
+        // gateway 10.200.6.1, /30). Reddens if the IP is not rotated (the old
+        // "guest keeps its frozen ip=" behavior sent `None` here).
+        assert_eq!(
+            exec.recorded_ipv4[0],
+            Some(crate::agent::protocol::Ipv4Reconfig {
+                addr: [10, 200, 6, 2],
+                prefix_len: 30,
+                gateway: [10, 200, 6, 1],
+            }),
+            "resync must carry the rotated /30 guest IP + gateway"
+        );
     }
 
     // Test-discipline (c): the typed "reseed applied" result must report
@@ -1904,6 +2133,7 @@ mod tests {
                 clock_error: None,
                 reseed_applied: false,
                 mac_applied: true,
+                ip_applied: true,
             },
             ..FakeGuestResync::default()
         };
@@ -1955,6 +2185,7 @@ mod tests {
                 clock_error: Some("clock_settime: EPERM".into()),
                 reseed_applied: false,
                 mac_applied: false,
+                ip_applied: false,
             },
             ..FakeGuestResync::default()
         };
@@ -2700,7 +2931,12 @@ mod tests {
     // computing it after the RPC (the old code) would hold this never-exiting
     // guest for rpc_delay + grace ~= 110 ms, while the fixed placement returns
     // after ~rpc_delay + one 5 ms poll step (~65 ms).
-    #[tokio::test]
+    // L-ORCH-5: `start_paused` makes tokio time deterministic — every delay in the
+    // fake and the shutdown loop is a `tokio::time::sleep`, so virtual time
+    // advances exactly by the scheduled durations with no wall-clock jitter. The
+    // elapsed measurement uses `tokio::time::Instant` (virtual), so the bounds
+    // pin the deadline arithmetic exactly instead of racing the host scheduler.
+    #[tokio::test(start_paused = true)]
     async fn test_shutdown_stalled_rpc_still_gets_post_ack_poll() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let vm = grace_vm(
@@ -2708,7 +2944,7 @@ mod tests {
             std::time::Duration::from_millis(50),
             calls.clone(),
         );
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         vm.shutdown().await.expect("shutdown ok");
         let elapsed = started.elapsed();
 
@@ -2740,7 +2976,8 @@ mod tests {
     // the < 60 ms bound. The poll count is the jitter-robust second signal: a
     // 5 ms step fits >= 4 polls into the window even under heavy scheduler
     // noise, while the 20 ms grid gets at most 3.
-    #[tokio::test]
+    // L-ORCH-5: deterministic tokio time (see the sibling test above).
+    #[tokio::test(start_paused = true)]
     async fn test_shutdown_grace_50ms_polls_finely_and_returns_on_time() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let vm = grace_vm(
@@ -2748,7 +2985,7 @@ mod tests {
             std::time::Duration::from_millis(50),
             calls.clone(),
         );
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         vm.shutdown().await.expect("shutdown ok");
         let elapsed = started.elapsed();
 

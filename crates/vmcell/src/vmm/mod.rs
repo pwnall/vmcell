@@ -8,14 +8,14 @@ use crate::error::Result;
 /// Cloud Hypervisor VMM backend implementation.
 pub mod cloud_hypervisor;
 
-pub use cloud_hypervisor::CloudHypervisor;
+pub use cloud_hypervisor::{ChInstance, CloudHypervisor};
 
 #[cfg(feature = "firecracker")]
 /// Firecracker VMM backend implementation.
 pub mod firecracker;
 
 #[cfg(feature = "firecracker")]
-pub use firecracker::Firecracker;
+pub use firecracker::{FcInstance, Firecracker};
 
 #[cfg(feature = "qemu")]
 /// QEMU VMM backend implementation.
@@ -66,60 +66,79 @@ impl SerialLog for FakeSerialLog {
 
 /// Helper to send an HTTP request over a Unix domain socket.
 ///
+/// Bounds the whole connect → handshake → send → collect sequence with a fixed
+/// ceiling so a wedged VMM control socket can never hang a `create`/`boot`/`pause`/
+/// `snapshot` RPC forever — the failure surfaces as a typed
+/// [`Error::Timeout`](crate::error::Error::Timeout) before an outer readiness timeout
+/// could mask it (M-VMM-2). The QMP path already caps at 2 s; this uses a wider margin.
+///
 /// # Errors
-/// Returns an error if the request cannot be sent or the server returns an error status.
+/// Returns an error if the request cannot be sent, the server returns a non-2xx
+/// status (as [`Error::VmmApi`](crate::error::Error::VmmApi) carrying the status and
+/// body), or the request does not complete within the timeout ceiling
+/// ([`Error::Timeout`](crate::error::Error::Timeout)).
 pub async fn unix_api_request<T: Serialize>(
     api_socket: &Path,
     method: &str,
     path: &str,
     body: Option<&T>,
 ) -> Result<()> {
-    let stream = tokio::net::UnixStream::connect(api_socket).await?;
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::time::timeout(REQUEST_TIMEOUT, async move {
+        let stream = tokio::net::UnixStream::connect(api_socket).await?;
 
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            tracing::warn!("HTTP connection failed: {:?}", err);
-        }
-    });
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
 
-    let body_bytes = if let Some(b) = body {
-        serde_json::to_vec(b)
-            .map_err(|e| crate::error::Error::Serialize(format!("serialize: {}", e)))?
-    } else {
-        Vec::new()
-    };
-
-    let req = hyper::Request::builder()
-        .method(method)
-        .uri(path)
-        .header("Host", "localhost")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .body(http_body_util::Full::new(hyper::body::Bytes::from(
-            body_bytes,
-        )))?;
-
-    let res = sender.send_request(req).await?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        use http_body_util::BodyExt;
-        let bytes = res
-            .into_body()
-            .collect()
-            .await
-            .map(|c| c.to_bytes())
-            .unwrap_or_default();
-        return Err(crate::error::Error::VmmApi {
-            status: status.as_u16(),
-            body: String::from_utf8_lossy(&bytes).into_owned(),
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                tracing::warn!("HTTP connection failed: {:?}", err);
+            }
         });
-    }
 
-    Ok(())
+        let body_bytes = if let Some(b) = body {
+            serde_json::to_vec(b)
+                .map_err(|e| crate::error::Error::Serialize(format!("serialize: {}", e)))?
+        } else {
+            Vec::new()
+        };
+
+        let req = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                body_bytes,
+            )))?;
+
+        let res = sender.send_request(req).await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            use http_body_util::BodyExt;
+            let bytes = res
+                .into_body()
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            return Err(crate::error::Error::VmmApi {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        crate::error::Error::Timeout(format!(
+            "VMM API request {method} {path} did not complete within {REQUEST_TIMEOUT:?}"
+        ))
+    })?
 }
 
 /// RAII guard owning a single per-VM scratch directory under the system temp dir
@@ -212,7 +231,10 @@ pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::pro
     std_cmd.process_group(0);
     if let Some(netns) = netns_name {
         let netns_path = format!("/var/run/netns/{}\0", netns);
-        // SAFETY: kill is safe to call and only sends a signal to a process.
+        // SAFETY: the closure passed to `pre_exec` runs post-fork/pre-exec and calls
+        // only async-signal-safe syscalls (`open`, `setns`, `close`) on the
+        // pre-allocated, NUL-terminated `netns_path` string — no allocation, no
+        // non-reentrant libc call — so it is sound to run in the forked child.
         unsafe {
             std_cmd.pre_exec(move || {
                 let fd = libc::open(
@@ -237,35 +259,50 @@ pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::pro
 
 /// Waits until the given socket path appears, or times out.
 ///
-/// Returns true if the socket is found. Returns false if the timeout is reached
-/// or if the provided process exits early.
+/// Polls for the socket's existence on an absolute deadline. If the spawned process
+/// exits before the socket appears, fails fast with the real exit status instead of
+/// falling through to a later, less-informative timeout.
 ///
 /// # Errors
-/// Returns an error if the process exits before the socket appears,
-/// or if the timeout is reached.
+/// - Returns [`Error::Vmm`](crate::error::Error::Vmm) if the process exits before the
+///   socket appears.
+/// - Returns [`Error::Timeout`](crate::error::Error::Timeout) if the socket does not
+///   appear within `timeout_ms`.
 pub async fn wait_for_socket(
     socket_path: &Path,
     process: &mut tokio::process::Child,
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<()> {
-    // The interval is caller-supplied via the pub `VmConfig.timeouts` field, so it
-    // must not be trusted to be non-zero: clamp to >= 1 ms before the division
-    // below divides by zero (and before the sleep degenerates into a busy-spin).
-    let interval_ms = interval_ms.max(1);
-    let iterations = timeout_ms / interval_ms;
-    for _ in 0..iterations {
+    // The interval is caller-supplied via the pub `VmConfig.timeouts` field, so clamp
+    // it to >= 1 ms (a 0 interval would busy-spin). Drive off an absolute deadline so
+    // (a) the socket is checked at least once even when `interval_ms > timeout_ms`
+    // (the old `timeout_ms / interval_ms == 0` computed zero iterations and returned
+    // Timeout without a single check), and (b) a socket appearing in the final
+    // sub-interval is not missed (L-VMM-1).
+    let interval = std::time::Duration::from_millis(interval_ms.max(1));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    loop {
         if tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
             return Ok(());
         }
+        // Fail fast on an early VMM exit so the real cause surfaces instead of a
+        // later, less-informative Timeout (M-VMM-8).
         if let Some(status) = process.try_wait().unwrap_or(None) {
             return Err(crate::error::Error::Vmm(format!(
-                "process exited early: {}",
-                status
+                "process exited early: {status}"
             )));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let sleep_dur = interval.min(deadline - now);
+        tokio::time::sleep(sleep_dur).await;
     }
+
     Err(crate::error::Error::Timeout(
         "socket failed to appear in time".into(),
     ))
@@ -395,6 +432,39 @@ pub(crate) fn reject_unsupported_console(
     Ok(())
 }
 
+/// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
+/// because it has a vhost-user device attached (a virtio-fs share/rootfs served by
+/// virtiofsd, the unprivileged `vhost-user-net` NAT, or an external `vhost-user-net`
+/// socket). The snapshot-eligibility law (§3.3) requires every backend to self-guard
+/// `snapshot()`/`restore()` against such a VM rather than assume the caller checked.
+///
+/// This is the ONE shared predicate for all backends (M-VMM-5): the former per-backend
+/// copies had already diverged — the Firecracker copy never grew the virtio-fs *rootfs*
+/// term the CH copy carried, so a virtio-fs-rootfs restore slipped its guard (H-VMM-3).
+/// Centralizing it makes that class of divergence impossible.
+pub(crate) fn has_vhost_user_device(
+    virtio_fs_share: bool,
+    unprivileged_net: bool,
+    vhost_user_net: bool,
+) -> bool {
+    virtio_fs_share || unprivileged_net || vhost_user_net
+}
+
+/// Returns `true` when `cfg`/`res` describe a VM that carries any vhost-user device and
+/// is therefore **not** snapshot-eligible (§3.3). Covers all three boundary cases at
+/// `restore()`/`snapshot()`: a virtio-fs data share **or** a virtio-fs *rootfs* (both
+/// backed by virtiofsd — the rootfs case the per-backend copies used to miss, H-VMM-3),
+/// the unprivileged `vhost-user-net` NAT, and an external `vhost-user-net` socket.
+pub(crate) fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
+    let virtio_fs = !cfg.shares.is_empty()
+        || matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. });
+    has_vhost_user_device(
+        virtio_fs,
+        matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }),
+        res.vhost_user_socket.is_some(),
+    )
+}
+
 /// Allocates unique Context IDs (CIDs) for vsock connections.
 /// CIDs >= 3 are available for guests.
 #[derive(Debug)]
@@ -507,14 +577,28 @@ pub struct VmmCapabilities {
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
+///
+/// A backend abstracts the differences between QEMU, Cloud Hypervisor, and
+/// Firecracker. Every implementation **self-checks** unsupported operations against
+/// its [`capabilities`](Vmm::capabilities) and returns
+/// [`Error::Unsupported`](crate::error::Error::Unsupported) with a typed feature name
+/// rather than assuming the caller validated first (design §3.1).
 pub trait Vmm: Send + Sync {
     /// The associated instance type representing a running VM.
     type Instance: VmInstance;
 
-    /// Creates a new VM instance with the given configuration and resources.
+    /// Creates a new VM from configuration.
+    ///
+    /// Spawns the VMM process, registers it with its cgroup, and waits for the control
+    /// socket to appear. The returned instance is **ready to
+    /// [`boot`](VmInstance::boot)** — the guest is configured but not yet running.
     ///
     /// # Errors
-    /// Returns an error if the VMM process fails to start or configuration is invalid.
+    /// Returns an error if the VMM process fails to spawn or become ready, or if the
+    /// configuration is invalid for this backend — e.g.
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) for a virtio-fs rootfs,
+    /// an unsupported console mode, or unprivileged networking on a backend that lacks
+    /// vhost-user-net.
     async fn create(
         &self,
         cfg: &VmConfig,
@@ -522,10 +606,23 @@ pub trait Vmm: Send + Sync {
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance>;
 
-    /// Restores a VM instance from a snapshot directory with the given resources.
+    /// Restores a VM from a snapshot directory.
+    ///
+    /// The returned instance is **paused**: the caller continues with
+    /// [`resume`](VmInstance::resume), **never** [`boot`](VmInstance::boot) — the guest
+    /// is already running inside the snapshot and is resumed from its paused point, not
+    /// cold-booted (design §3.1). Device topology is reconstructed from the snapshot;
+    /// `cfg` is consulted only for timeouts, console-mode validation, and capability
+    /// self-checks.
     ///
     /// # Errors
-    /// Returns an error if the VMM process fails to start from the snapshot.
+    /// - [`Error::Unsupported`](crate::error::Error::Unsupported) when this backend does
+    ///   not advertise `capabilities().snapshot_restore`.
+    /// - [`Error::Unsupported`](crate::error::Error::Unsupported) when `cfg`/`res` carry
+    ///   any vhost-user device (a virtio-fs share or rootfs, unprivileged networking, or
+    ///   an external vhost-user-net socket) — the snapshot-eligibility law (§3.3)
+    ///   rejects such a VM before restore.
+    /// - Snapshot I/O, parse, or VMM-start errors.
     async fn restore(
         &self,
         snapshot_dir: &Path,
@@ -535,6 +632,10 @@ pub trait Vmm: Send + Sync {
     ) -> Result<Self::Instance>;
 
     /// Returns the capabilities of this VMM backend.
+    ///
+    /// Callers **must** consult this before invoking optional operations (snapshot,
+    /// restore, nested virt, virtio-fs, …); a `false` capability means the operation
+    /// returns [`Error::Unsupported`](crate::error::Error::Unsupported).
     fn capabilities(&self) -> VmmCapabilities;
 
     /// Returns the string identifier of this VMM backend.
@@ -545,8 +646,16 @@ pub trait Vmm: Send + Sync {
 pub trait VmInstance: Send {
     /// Boots the VM from a created state.
     ///
+    /// Valid only on instances returned by [`Vmm::create`], never on a restored
+    /// instance — a restored VM is already running inside its snapshot and must be
+    /// [`resume`](VmInstance::resume)d, not booted. Backends whose restored instance
+    /// cannot boot self-guard and return
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported).
+    ///
     /// # Errors
-    /// Returns an error if the boot process fails.
+    /// Returns an error if the boot process fails, or
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) if called on a restored
+    /// instance.
     async fn boot(&mut self) -> Result<()>;
     /// Requests a graceful shutdown of the VM.
     ///
@@ -573,7 +682,10 @@ pub trait VmInstance: Send {
     /// # Errors
     /// Returns an error if pausing fails.
     async fn pause(&mut self) -> Result<()>;
-    /// Resumes the VM after it was paused or snapshotted.
+    /// Resumes the VM after it was paused or snapshot-restored.
+    ///
+    /// This is the continuation point for a restored instance (see
+    /// [`Vmm::restore`]), which is returned paused rather than booted.
     ///
     /// # Errors
     /// Returns an error if resuming fails.
@@ -874,6 +986,194 @@ mod tests {
         let _ = process.start_kill();
         let _ = process.wait().await;
         result.expect("a present socket with a 0 interval must succeed, not panic");
+    }
+
+    // Guards M-VMM-8: the readiness wait must surface an early VMM exit as the real
+    // cause, not fall through to a Timeout a full window later. Inverse: delete the
+    // `try_wait` guard and this returns a Timeout (after the whole deadline) instead of
+    // a fast `Vmm("process exited early")`, reddening both assertions.
+    #[tokio::test]
+    async fn wait_for_socket_fails_fast_on_early_process_exit() {
+        let mut process = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("spawn sh");
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let never = dir.path().join("vmcell-never-appears.sock");
+
+        let start = std::time::Instant::now();
+        // A generous 5 s ceiling: the fail-fast path must return in well under it.
+        let result = wait_for_socket(&never, &mut process, 5000, 50).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(&result, Err(crate::error::Error::Vmm(msg)) if msg.contains("exited early")),
+            "an early process exit must return a Vmm error naming it, got {result:?}"
+        );
+        assert!(
+            elapsed.as_millis() < 2000,
+            "early exit must fail fast (well under the 5 s ceiling), took {elapsed:?}"
+        );
+    }
+
+    // Guards L-VMM-1: with interval > timeout the old `timeout_ms / interval_ms == 0`
+    // loop ran zero checks and returned Timeout without ever looking; the deadline loop
+    // must still check at least once and find an already-present socket. Inverse:
+    // restore the iteration-count loop and this returns Timeout immediately.
+    #[tokio::test]
+    async fn wait_for_socket_interval_greater_than_timeout_still_checks_once() {
+        let mut process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep stand-in");
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("present.sock");
+        std::fs::write(&sock, b"").expect("create stand-in socket path");
+
+        let result = wait_for_socket(&sock, &mut process, 100, 2000).await;
+        let _ = process.start_kill();
+        let _ = process.wait().await;
+        result.expect("interval > timeout must still check the present socket once");
+    }
+
+    // Guards M-VMM-2: a control socket that accepts a connection but never speaks must
+    // not hang a control RPC forever — it surfaces a typed Timeout. Paused time
+    // auto-advances to the request ceiling once every task is parked on the silent
+    // socket. Inverse: remove the `tokio::time::timeout` wrap and this never returns.
+    #[tokio::test(start_paused = true)]
+    async fn unix_api_request_times_out_on_wedged_socket() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("wedged.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind wedged listener");
+        tokio::spawn(async move {
+            if let Ok((_stream, _)) = listener.accept().await {
+                // Hold the accepted connection open but never respond.
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let result = unix_api_request(&sock, "GET", "/health", None::<&()>).await;
+        assert!(
+            matches!(result, Err(crate::error::Error::Timeout(_))),
+            "a wedged control socket must surface a Timeout, got {result:?}"
+        );
+    }
+
+    // Guards M-VMM-9: a non-2xx reply must map to Error::VmmApi carrying the status AND
+    // the response body (firecracker's T2 probe pattern-matches status 400 + body
+    // "template"). Inverse: drop the body-collection loop and `body` is empty,
+    // reddening `contains("template")`; drop the status mapping and it is not VmmApi.
+    #[tokio::test]
+    async fn unix_api_request_maps_non_2xx_status_and_body() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind api listener");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Drain the request so the client's write completes.
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\ntemplate error";
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+                // Hold the connection briefly so the client reads the full body.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        let result = unix_api_request(&sock, "POST", "/test", None::<&serde_json::Value>).await;
+        let _ = server.await;
+        assert!(
+            matches!(&result, Err(crate::error::Error::VmmApi { status: 400, body })
+                if body.contains("template")),
+            "a non-2xx reply must map to VmmApi with status + body, got {result:?}"
+        );
+    }
+
+    fn res_with(vhost_user_socket: Option<PathBuf>) -> PerVmResources {
+        PerVmResources {
+            cgroup_name: "vmcell-test".to_string(),
+            tap_name: Some("tap0".to_string()),
+            netns_name: Some("ns0".to_string()),
+            vhost_user_socket,
+            vmid: 1,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-1"),
+        }
+    }
+
+    // Guards M-VMM-5 / H-VMM-3: the ONE shared snapshot-eligibility predicate. The
+    // pure truth table plus the four config boundaries — including a virtio-fs
+    // *rootfs* (the term the FC copy used to miss). Inverse: drop the
+    // `RootfsSource::VirtioFs` term from `config_has_vhost_user_device` and the
+    // virtio-fs-rootfs assertion reddens.
+    #[test]
+    fn config_has_vhost_user_device_covers_all_boundaries() {
+        use crate::config::{Egress, NetConfig, RootfsSource};
+
+        assert!(has_vhost_user_device(true, false, false));
+        assert!(has_vhost_user_device(false, true, false));
+        assert!(has_vhost_user_device(false, false, true));
+        assert!(!has_vhost_user_device(false, false, false));
+
+        let virtio_fs_rootfs = VmConfig::builder(
+            "/k",
+            RootfsSource::VirtioFs {
+                dir: PathBuf::from("/d"),
+            },
+        )
+        .build()
+        .expect("build virtio-fs rootfs config");
+        assert!(
+            config_has_vhost_user_device(&virtio_fs_rootfs, &res_with(None)),
+            "a virtio-fs rootfs must be treated as a vhost-user device"
+        );
+
+        let unprivileged = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .net(NetConfig::Unprivileged {
+            egress: Egress::default(),
+            host_services_port: None,
+        })
+        .build()
+        .expect("build unprivileged config");
+        assert!(config_has_vhost_user_device(&unprivileged, &res_with(None)));
+
+        let plain = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .build()
+        .expect("build plain config");
+        assert!(config_has_vhost_user_device(
+            &plain,
+            &res_with(Some(PathBuf::from("/run/vhost.sock")))
+        ));
+
+        let eligible = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .net(NetConfig::Privileged {
+            egress: Egress::default(),
+            host_services_port: None,
+        })
+        .build()
+        .expect("build eligible config");
+        assert!(!config_has_vhost_user_device(&eligible, &res_with(None)));
     }
 
     // Guards the shared console self-guard: VirtioConsole on a backend that does not

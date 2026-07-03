@@ -59,11 +59,21 @@ impl Stage for RootfsStage {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
         // The injected-agent identity is an INPUT: the static-musl override path changes the
-        // built rootfs vs. the default glibc agent, so fold its path (oci2erofs §8.2).
+        // built rootfs vs. the default glibc agent (oci2erofs §8.2). Fold its CONTENT hash,
+        // not its absolute path string (H-ART-1): when `agent_musl` is injected the
+        // GuestAgentStage is skipped, so the agent has no other content identity in the key —
+        // rebuilding the musl agent at the SAME path must still invalidate the rootfs. On a
+        // read failure fold a distinct error marker (the miss re-runs `run()`, which fails
+        // loud on the genuinely-missing input) — mirrors the ART-11 error-marker convention.
         match &self.agent_musl {
             Some(p) => {
                 hasher.update(b"agent-musl\0");
-                hasher.update(p.to_string_lossy().as_bytes());
+                match crate::artifact::hash_file(p) {
+                    Ok(h) => hasher.update(h.as_bytes()),
+                    Err(_) => {
+                        hasher.update(format!("missing-agent-musl:{}", p.display()).as_bytes())
+                    }
+                };
             }
             None => {
                 hasher.update(b"agent-default\0");
@@ -104,7 +114,37 @@ impl Stage for RootfsStage {
                         .map(|s| s.as_bytes())
                         .unwrap_or_default(),
                 );
+                // Fold the resolved builder-base image+digest (M-ART-4): the mmdebstrap
+                // source boots a builder VM from this base, so re-pointing `builder_base_*`
+                // (or `rootfs_*`) at new bytes must invalidate the rootfs — mirrors the OCI
+                // arm's image/digest fold. A resolution failure folds empty strings; the
+                // stage's `run()` re-resolves and fails loud on a genuinely-missing pin.
+                let (builder_image, builder_digest) =
+                    mmdebstrap::resolve_builder_base(&inputs.pins).unwrap_or_default();
+                hasher.update(builder_image.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(builder_digest.as_bytes());
             }
+        }
+        // Fold the baked proxy CA cert content (M-ART-10). `run()` writes the deployment CA
+        // into the rootfs (`usr/local/share/ca-certificates/vmcell-ca.crt`) as a side effect;
+        // it is not an upstream artifact, so without this a CA rotation (new `ca.pem`/`ca.key`
+        // under the artifacts dir) would cache-hit and re-serve a rootfs trusting the OLD CA —
+        // the proxy then presents a cert the guest does not trust and HTTPS intercept breaks
+        // silently. A CA-read failure folds a distinct marker; the resulting miss re-runs
+        // `run()`, which surfaces the real cause. (An injectable CA seam — L-ART-12 — would
+        // let this be unit-tested without touching the global artifacts dir; deferred.)
+        #[cfg(feature = "proxy")]
+        {
+            match crate::proxy::tls::CaManager::new().map(|m| m.ca_cert_pem().to_string()) {
+                Ok(pem) => {
+                    hasher.update(b"ca\0");
+                    hasher.update(pem.as_bytes());
+                }
+                Err(e) => {
+                    hasher.update(format!("ca-read-error:{e}").as_bytes());
+                }
+            };
         }
         // The guest agent is injected into the rootfs, so its source identity (which
         // travels via the resolved pins) must be part of the key: rebuilding the agent at
@@ -369,6 +409,77 @@ mod tests {
         b.pins
             .insert("guest_agent_src_hash".to_string(), "hash-bbb".to_string());
         assert_ne!(stage().cache_key(&a), stage().cache_key(&b));
+    }
+
+    fn mmd_stage() -> RootfsStage {
+        RootfsStage {
+            source: RootfsBuildSource::Mmdebstrap {
+                release: "trixie".into(),
+            },
+            cid_alloc: Arc::new(crate::vmm::CidAllocator::new()),
+            image_override: None,
+            agent_musl: None,
+        }
+    }
+
+    // H-ART-1: the injected static-musl agent must be folded by CONTENT, not by its path
+    // string. When `agent_musl` is set the GuestAgentStage is skipped, so the agent has no
+    // other content identity in the key — rebuilding it at the SAME path must invalidate the
+    // rootfs. The buggy path-string fold leaves k1 == k2 (same path) -> red here.
+    #[test]
+    fn test_rootfs_agent_musl_key_tracks_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = write_tmp(dir.path(), "agent-musl", b"musl-v1");
+        let s = RootfsStage {
+            source: RootfsBuildSource::Oci,
+            cid_alloc: Arc::new(crate::vmm::CidAllocator::new()),
+            image_override: None,
+            agent_musl: Some(agent.clone()),
+        };
+        let inputs = StageInputs::default();
+        let k1 = s.cache_key(&inputs);
+        // Rebuild the musl agent in place at the SAME path.
+        std::fs::write(&agent, b"musl-v2-rebuilt-at-same-path").expect("write");
+        let k2 = s.cache_key(&inputs);
+        assert_ne!(
+            k1, k2,
+            "a rebuilt agent-musl at the same path must invalidate the rootfs key (H-ART-1)"
+        );
+    }
+
+    // M-ART-4: the mmdebstrap rootfs boots a builder VM from the resolved builder-base, so
+    // re-pointing the builder-base image/digest at new bytes must invalidate the key. The
+    // buggy version (no builder-base fold) leaves the key unchanged -> red on both asserts.
+    #[test]
+    fn test_mmdebstrap_cache_key_tracks_builder_base() {
+        let s = mmd_stage();
+        let mut a = StageInputs::default();
+        a.pins.insert("rootfs_image".into(), "img".into());
+        a.pins.insert("rootfs_digest".into(), "sha256:aaa".into());
+        let ka = s.cache_key(&a);
+
+        // Re-pointing the builder-base digest at new bytes must invalidate the key.
+        let mut b = StageInputs::default();
+        b.pins.insert("rootfs_image".into(), "img".into());
+        b.pins.insert("rootfs_digest".into(), "sha256:bbb".into());
+        assert_ne!(
+            ka,
+            s.cache_key(&b),
+            "re-pointing the builder-base digest must invalidate the mmdebstrap rootfs key"
+        );
+
+        // The dedicated builder_base_* pins (precedence over rootfs_*) must also change it.
+        let mut c = StageInputs::default();
+        c.pins.insert("rootfs_image".into(), "img".into());
+        c.pins.insert("rootfs_digest".into(), "sha256:aaa".into());
+        c.pins.insert("builder_base_image".into(), "bimg".into());
+        c.pins
+            .insert("builder_base_digest".into(), "sha256:ccc".into());
+        assert_ne!(
+            ka,
+            s.cache_key(&c),
+            "the dedicated builder-base pins must fold into the mmdebstrap rootfs key"
+        );
     }
 
     // Guards ARTIFACT-PIPELINE-3: a missing guest_agent input must be a hard error, never a

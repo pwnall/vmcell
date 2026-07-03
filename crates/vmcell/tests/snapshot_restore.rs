@@ -256,6 +256,41 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             panic!("Exec failed. Outcome: {:?}", result);
         }
 
+        // H-VMM-1 ("rotate everything"): the restore/zygote path rotated the vmid,
+        // so the guest must have rotated its eth0 IP + default route to the NEW
+        // vmid's /30 (via the native resync's SIOCSIFADDR + route ioctls) — the old
+        // behavior left the guest on the ORIGINAL vmid's dead /30 with silently dead
+        // egress. Read the guest's route table and assert the default route goes via
+        // the rotated gateway (host_ip of the new vmid). `/proc/net/route` prints the
+        // gateway as a little-endian hex u32. Reddens if the IP/route was not rotated
+        // (the guest keeps the original gateway) — i.e. exactly the H-VMM-1 defect.
+        let (host_ip, _guest_ip, _cidr) =
+            vmcell::net::ip_math(new_vmid).expect("ip_math for the rotated vmid");
+        let expected_gw_hex = format!("{:08X}", u32::from_le_bytes(host_ip.octets()));
+        let route = vm
+            .agent(None, &fake_clock)
+            .await
+            .expect("agent after restore")
+            .exec(ExecRequest::new(vec![
+                "cat".to_string(),
+                "/proc/net/route".to_string(),
+            ]))
+            .await
+            .expect("read /proc/net/route");
+        let route_table = String::from_utf8_lossy(&route.stdout);
+        let default_via_rotated_gw = route_table.lines().any(|line| {
+            let mut f = line.split_whitespace();
+            let _iface = f.next();
+            let dest = f.next();
+            let gw = f.next();
+            dest == Some("00000000") && gw.is_some_and(|g| g.eq_ignore_ascii_case(&expected_gw_hex))
+        });
+        assert!(
+            default_via_rotated_gw,
+            "post-restore guest default route must go via the rotated gateway {host_ip} \
+             (hex {expected_gw_hex}); guest /proc/net/route:\n{route_table}"
+        );
+
         let original_cid: u32 = std::fs::read_to_string(snapshot_dir.join("original_cid.txt"))
             .unwrap()
             .parse()
@@ -381,15 +416,15 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             pre_time
         );
 
-        // TESTS-LIFECYCLE-2 (reseed isolation): assert the orchestrator's TYPED
-        // "reseed applied" result. The reseed (head -c 32 /dev/hwrng > /dev/urandom)
-        // is best-effort and warn-and-continue, so inferring it solely from two
-        // /dev/urandom reads differing can pass coincidentally even when the reseed
-        // silently failed. `restore_reseed_applied()` is set on the first
-        // post-restore agent() call (already made above) and records whether the
-        // reseed command actually ran and returned exit 0 — Some(false)/None on a
-        // silent failure flips this red. This is the control vs. the byte-difference
-        // treatment asserted below.
+        // TESTS-LIFECYCLE-2 (reseed isolation): the typed `restore_reseed_applied()`
+        // is the failing-capable control — it directly asserts the orchestrator's
+        // post-restore reseed command ran and returned exit 0. It is set on the first
+        // post-restore agent() call (already made above). The byte-diff below is
+        // corroboration only: it fails on gross replay, NOT on a skipped reseed,
+        // because the reference and post-restore /dev/urandom reads occur at different
+        // CRNG stream offsets and differ even without any reseed (M-TEST-1). This
+        // typed assert is the load-bearing red-on-inverse guard: a silent
+        // best-effort failure yields Some(false)/None and flips it red.
         assert_eq!(
             vm.restore_reseed_applied(),
             Some(true),
@@ -397,11 +432,11 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
              best-effort failure would leave the restored VM replaying predictable RNG state"
         );
 
-        // TESTS-LIFECYCLE-2: assert the orchestrator's restore-path reseed
-        // perturbed the frozen CSPRNG state captured in block 1. The test issues NO
-        // reseed of its own. If the orchestrator reseed is deleted, the restored VM
-        // replays the snapshot-frozen state and produces BYTE-IDENTICAL output,
-        // failing this assert_ne.
+        // Corroboration (NOT load-bearing): verify the frozen RNG state was
+        // perturbed. The two reads occur at different CRNG stream offsets, so they
+        // differ by construction even without a reseed — this catches only gross
+        // replay, not a skipped reseed. The true guard is `restore_reseed_applied()`
+        // above; the test issues NO reseed of its own.
         let pre_urandom = std::fs::read(snapshot_dir.join("pre_urandom.bin")).unwrap();
         let post_rng = vm
             .agent(None, &vmcell::orchestrator::RealClock)

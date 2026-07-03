@@ -1,3 +1,10 @@
+# L-TEST-3: pin the minimum nextest version so the "a filter that selects zero tests is a CI FAILURE,
+# not a pass" contract (design §14) can't silently regress. nextest's default `--no-tests=fail` landed
+# in 0.9.85; on an older pinned runner (or if a future default flips) a rename that zeroes the
+# `unprivileged`/`smoltcp` selection would otherwise green-pass an empty suite. This key is top-level
+# (before any [profile.*]) so TOML does not fold it into a profile table.
+nextest-version = "0.9.85"
+
 [profile.default]
 # Unit/codec/property tests are fast; flag anything that stalls.
 slow-timeout = { period = "30s", terminate-after = 2 }
@@ -23,10 +30,10 @@ fail-fast = false
 serial-host = { max-threads = 1 }
 
 [[profile.integration.overrides]]
-# List the suites that create a VM or touch netns/cgroups/nft.
-filter = '''
-    binary(boot) | binary(lifecycle) | binary(concurrency) | binary(snapshot_restore)
-  | binary(egress_proxy) | binary(host_endpoint) | binary(metrics_limits)
-  | binary(nested_virt) | binary(shares_ro_rw) | binary(pipeline) | binary(proptests) | binary(benchmark) | binary(exec_vsock)
-'''
+# M-TEST-5: POSITIVELY select every vmcell integration-test binary (current AND future) so a newly
+# added VM-booting test auto-joins serial-host instead of silently running unserialized and racing on
+# netns / cgroups / nft (the old hand-maintained allowlist had no completeness guard). N-TEST-2:
+# `proptests` is pure in-memory property testing (no host state), so it is excluded to keep its
+# parallelism — a new VM test still auto-joins because it will not be named `proptests`.
+filter = 'package(vmcell) & kind(test) & !binary(proptests)'
 test-group = 'serial-host'

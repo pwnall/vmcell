@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 pub struct ManifestEntry {
     /// Logical artifact name (e.g. `"kernel"`, `"rootfs"`, `"ca"`, `"pins"`).
     pub artifact: String,
-    /// The path the artifact was hashed from.
+    /// The artifact's path. As serialized by [`ArtifactManifest::write_to`] this is stored
+    /// RELATIVE to the manifest's own directory (L-ART-9), so the manifest travels: it
+    /// verifies on any host after the manifest and its artifacts are moved together. A
+    /// legacy absolute path is honored as-is by [`ArtifactManifest::verify_in`].
     pub path: PathBuf,
     /// blake3 hex digest of the artifact's bytes.
     pub blake3: String,
@@ -55,33 +58,56 @@ impl ArtifactManifest {
         Ok(Self { entries })
     }
 
-    /// Writes the manifest as pretty JSON to `out`.
+    /// Writes the manifest as pretty JSON to `out`, storing each entry's path RELATIVE to
+    /// `out`'s directory (L-ART-9) so the manifest travels. A path that is not under the
+    /// manifest directory is written unchanged (it cannot be made portable).
     ///
     /// # Errors
     /// Returns [`Error::Artifact`] on a serialization failure or [`Error::Io`] on a write
     /// failure.
     pub fn write_to(&self, out: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
+        let base = out.parent().unwrap_or_else(|| Path::new("."));
+        let portable = ArtifactManifest {
+            entries: self
+                .entries
+                .iter()
+                .map(|e| ManifestEntry {
+                    artifact: e.artifact.clone(),
+                    path: e
+                        .path
+                        .strip_prefix(base)
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|_| e.path.clone()),
+                    blake3: e.blake3.clone(),
+                })
+                .collect(),
+        };
+        let json = serde_json::to_string_pretty(&portable)
             .map_err(|e| Error::Artifact(format!("manifest serialization failed: {e}")))?;
         std::fs::write(out, json).map_err(Error::Io)
     }
 
-    /// Re-hashes every entry and FAILS HARD on the first digest mismatch — a tampered
-    /// artifact (or one swapped under an otherwise-intact manifest) is rejected, never
-    /// trusted on the strength of the manifest's recorded digest alone (§11.2 / verify what
-    /// you ingest).
+    /// Re-hashes every entry (resolving relative paths against `base`) and FAILS HARD on the
+    /// first digest mismatch — a tampered artifact (or one swapped under an otherwise-intact
+    /// manifest) is rejected, never trusted on the strength of the manifest's recorded digest
+    /// alone (§11.2 / verify what you ingest). An absolute entry path is used as-is (legacy).
     ///
     /// # Errors
     /// Returns [`Error::Artifact`] on any digest mismatch, or [`Error::Io`] if an entry's
     /// file cannot be read.
-    pub fn verify(&self) -> Result<()> {
+    pub fn verify_in(&self, base: &Path) -> Result<()> {
         for entry in &self.entries {
-            let actual = hash_file(&entry.path)?;
+            let resolved = if entry.path.is_absolute() {
+                entry.path.clone()
+            } else {
+                base.join(&entry.path)
+            };
+            let actual = hash_file(&resolved)?;
             if actual != entry.blake3 {
                 return Err(Error::Artifact(format!(
                     "artifact `{}` digest mismatch at {}: manifest {}, actual {}",
                     entry.artifact,
-                    entry.path.display(),
+                    resolved.display(),
                     entry.blake3,
                     actual
                 )));
@@ -90,7 +116,18 @@ impl ArtifactManifest {
         Ok(())
     }
 
-    /// Loads a manifest from a JSON file and verifies it (`read` + [`ArtifactManifest::verify`]).
+    /// Re-hashes every entry, resolving a relative path against the current directory. Prefer
+    /// [`ArtifactManifest::verify_file`], which resolves against the manifest's own directory.
+    ///
+    /// # Errors
+    /// Returns [`Error::Artifact`] on any digest mismatch, or [`Error::Io`] if an entry's
+    /// file cannot be read.
+    pub fn verify(&self) -> Result<()> {
+        self.verify_in(Path::new("."))
+    }
+
+    /// Loads a manifest from a JSON file and verifies it, resolving each relative entry path
+    /// against the MANIFEST's own directory (L-ART-9) so a moved bundle still verifies.
     ///
     /// # Errors
     /// Returns [`Error::Io`] / [`Error::Artifact`] on a read or parse failure, or on a digest
@@ -99,7 +136,8 @@ impl ArtifactManifest {
         let json = std::fs::read_to_string(manifest_path).map_err(Error::Io)?;
         let manifest: Self = serde_json::from_str(&json)
             .map_err(|e| Error::Artifact(format!("malformed manifest JSON: {e}")))?;
-        manifest.verify()
+        let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        manifest.verify_in(base)
     }
 }
 
@@ -145,5 +183,33 @@ mod tests {
         let mp = dir.path().join("manifest.json");
         manifest.write_to(&mp).expect("write manifest");
         ArtifactManifest::verify_file(&mp).expect("a written, untouched manifest must verify");
+    }
+
+    // L-ART-9: a manifest must travel. Build it referencing an artifact under dir A, then move
+    // the manifest + artifact to dir B (a different host) and verify. With machine-local
+    // absolute paths stored (the bug), verify_file resolves the vanished A path and fails ->
+    // red; storing paths relative to the manifest dir resolves B and passes.
+    #[test]
+    fn test_manifest_travels_across_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("A");
+        let b = dir.path().join("B");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        std::fs::write(a.join("artifact"), b"bytes").unwrap();
+        let manifest =
+            ArtifactManifest::build(&[("art", a.join("artifact").as_path())]).expect("build");
+        let ma = a.join("manifest.json");
+        manifest.write_to(&ma).expect("write");
+
+        // Move the manifest AND the artifact to B, then drop A entirely (host A is gone).
+        std::fs::write(b.join("artifact"), b"bytes").unwrap();
+        let mb = b.join("manifest.json");
+        std::fs::rename(&ma, &mb).unwrap();
+        std::fs::remove_dir_all(&a).unwrap();
+
+        ArtifactManifest::verify_file(&mb)
+            .expect("a moved manifest + artifact must still verify (paths travel)");
     }
 }

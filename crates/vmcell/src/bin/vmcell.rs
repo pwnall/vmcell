@@ -55,7 +55,11 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
         /// Command (and args) to run in the guest. Defaults to `/bin/true`.
-        #[arg(trailing_var_arg = true)]
+        ///
+        /// `allow_hyphen_values` lets the guest argv carry its own flags without a
+        /// `--` separator, e.g. `vmcell run --kernel k --rootfs r /bin/sh -c 'echo hi'`
+        /// — otherwise clap intercepts the leading-hyphen `-c` as an unknown option.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
     /// Create + boot a fresh micro-VM and confirm its agent is ready, then tear it
@@ -121,12 +125,21 @@ enum Commands {
     Destroy,
 }
 
-fn main() -> vmcell::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+fn main() {
+    // Surface the error's `Display` (the thiserror `#[error("…")]` message) on a
+    // non-zero exit, not its `Debug` struct-dump. Returning `vmcell::Result<()>`
+    // from `main` prints errors via `Termination`/`{:?}`, so an
+    // `Error::Unsupported { vmm, feature }` would read as a raw struct instead of
+    // the human-readable "Unsupported feature in …: …" line (L-BIN-4).
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("valid async runtime config")
-        .block_on(async_main())
+        .block_on(async_main());
+    if let Err(e) = result {
+        eprintln!("vmcell: {e}");
+        std::process::exit(1);
+    }
 }
 
 async fn async_main() -> vmcell::Result<()> {
@@ -156,7 +169,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             println!("Building artifacts...");
             let pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
                 .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
-                    pins_file: std::path::PathBuf::from("pins.json"),
+                    pins_file: pins_path(),
                 }))
                 .add_stage(Box::new(vmcell::artifact::kernel::KernelStage {
                     http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
@@ -182,16 +195,28 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
         } => oci2erofs(image, output, agent_musl.as_deref()).await,
         Commands::Bundle { out } => {
             let dir = vmcell::artifact::artifacts_dir();
-            let candidates: [(&str, PathBuf); 4] = [
-                ("kernel", dir.join("vmlinux")),
-                ("rootfs", dir.join("rootfs.erofs")),
-                ("ca", dir.join("ca.pem")),
-                ("pins", PathBuf::from("pins.json")),
+            let mut candidates: Vec<(String, PathBuf)> = vec![
+                ("kernel".to_string(), dir.join("vmlinux")),
+                ("rootfs".to_string(), dir.join("rootfs.erofs")),
+                ("ca".to_string(), dir.join("ca.pem")),
+                ("pins".to_string(), pins_path()),
             ];
+            // Cover every labelled kernel built by `build-kernels` (`vmlinux-<label>`),
+            // not just the default `vmlinux` — otherwise the manifest silently omits
+            // the cross-kernel sweep's artifacts (N-BIN-4).
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let fname = e.file_name();
+                    let name = fname.to_string_lossy();
+                    if let Some(label) = kernel_label_from_filename(&name) {
+                        candidates.push((format!("kernel-{label}"), e.path()));
+                    }
+                }
+            }
             let present: Vec<(&str, &std::path::Path)> = candidates
                 .iter()
                 .filter(|(_, p)| p.exists())
-                .map(|(n, p)| (*n, p.as_path()))
+                .map(|(n, p)| (n.as_str(), p.as_path()))
                 .collect();
             if present.is_empty() {
                 return Err(vmcell::Error::Artifact(
@@ -203,7 +228,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             let skipped: Vec<&str> = candidates
                 .iter()
                 .filter(|(_, p)| !p.exists())
-                .map(|(n, _)| *n)
+                .map(|(n, _)| n.as_str())
                 .collect();
             if !skipped.is_empty() {
                 println!(
@@ -234,7 +259,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             // (the kernel-version dimension), so multiple versions coexist for the
             // cross-kernel benchmark sweep. Reuses the labelled `KernelStage`; each has
             // its own cache sidecar and build dir.
-            let pins_file = std::path::PathBuf::from("pins.json");
+            let pins_file = pins_path();
             let content = std::fs::read_to_string(&pins_file).map_err(vmcell::Error::Io)?;
             let json: serde_json::Value = serde_json::from_str(&content)
                 .map_err(|e| vmcell::Error::Artifact(format!("pins.json parse: {e}")))?;
@@ -348,6 +373,61 @@ fn ch_bin() -> String {
     std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
 }
 
+/// Resolves the committed `pins.json` at the workspace root, independent of the
+/// process CWD (L-BIN-10). Artifacts anchor on the workspace root (design §11), so a
+/// bare `PathBuf::from("pins.json")` would read pins from a *different* location than
+/// the artifacts when the tool is run from `crates/vmcell/`. Mirrors the library's
+/// `workspace_root` ascent (the `vmcell-protocol` marker); falls back to a
+/// CWD-relative `pins.json` for an installed binary run outside the tree.
+///
+/// The library's `workspace_root` is `pub(crate)`, so it cannot be reused here — see
+/// the integrator note to expose it publicly and collapse this duplicate.
+fn pins_path() -> PathBuf {
+    let start = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    for dir in start.ancestors() {
+        if dir.join("crates/vmcell-protocol/Cargo.toml").is_file() {
+            return dir.join("pins.json");
+        }
+    }
+    PathBuf::from("pins.json")
+}
+
+/// Extracts the version label of a labelled kernel artifact filename
+/// (`vmlinux-<label>` → `Some("<label>")`), used by `bundle` to cover every
+/// `vmlinux-*` built by `build-kernels`, not just the default `vmlinux` (N-BIN-4).
+/// The bare `vmlinux` (no `-`) and an empty label return `None`.
+fn kernel_label_from_filename(name: &str) -> Option<&str> {
+    match name.strip_prefix("vmlinux-") {
+        Some(label) if !label.is_empty() => Some(label),
+        _ => None,
+    }
+}
+
+/// Validates an OCI digest string (`sha256:<64 lowercase/upper hex>`), rejecting an
+/// empty, short/long, or non-hex digest that the bare `starts_with("sha256:")` check
+/// would accept (N-BIN-3).
+///
+/// # Errors
+/// Returns [`vmcell::Error::Artifact`] when the algorithm prefix is not `sha256:` or
+/// the hex body is not exactly 64 hex digits.
+fn validate_oci_digest(digest: &str) -> vmcell::Result<()> {
+    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+        vmcell::Error::Artifact(format!(
+            "oci2erofs requires a `sha256:` digest, got `{digest}`"
+        ))
+    })?;
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(vmcell::Error::Artifact(format!(
+            "oci2erofs requires a valid sha256 hex digest (64 hex chars), got {} char(s) in `{digest}`",
+            hex.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Creates and boots an ephemeral micro-VM from an erofs rootfs, owned by the
 /// returned handle (its `Drop`/`shutdown` performs the ordered teardown).
 ///
@@ -424,16 +504,24 @@ async fn oci2erofs(
              (a tag is a provenance hard stop, §11.2)"
         ))
     })?;
-    if !digest.starts_with("sha256:") {
-        return Err(vmcell::Error::Artifact(format!(
-            "oci2erofs requires a `sha256:` digest, got `{digest}` in `{image_ref}`"
-        )));
-    }
+    // Full digest validation (N-BIN-3): the bare `starts_with("sha256:")` check accepts
+    // `sha256:` followed by anything (empty, wrong length, non-hex).
+    validate_oci_digest(digest)?;
 
-    let artifacts_dir = vmcell::artifact::artifacts_dir();
-    let mut pipeline = vmcell::artifact::Pipeline::new(artifacts_dir.clone()).add_stage(Box::new(
+    // Build into a per-invocation staging dir, NOT the canonical `artifacts_dir` root
+    // (M-BIN-6): the rootfs stage writes `<target_dir>/rootfs.erofs`, so building at
+    // `artifacts_dir` would clobber the canonical `rootfs.erofs` that every test/bench
+    // boots. The staging dir is a *distinct sibling* under `artifacts_dir` (same real
+    // disk — not the system temp dir, which is often a size-limited tmpfs), so a large
+    // rootfs has room. Copy only the final image out to `--output`. Trade-off: the
+    // staging dir has no cache history, so the agent/tools/rootfs stages rebuild.
+    let stage_dir =
+        vmcell::artifact::artifacts_dir().join(format!("oci2erofs-stage-{}", std::process::id()));
+    // Best-effort pre-clean of a stale staging dir from a prior aborted run.
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    let mut pipeline = vmcell::artifact::Pipeline::new(stage_dir.clone()).add_stage(Box::new(
         vmcell::artifact::ResolvePinsStage {
-            pins_file: std::path::PathBuf::from("pins.json"),
+            pins_file: pins_path(),
         },
     ));
     // The default glibc agent is built by the pipeline; `--agent-musl` supplies its own
@@ -452,9 +540,14 @@ async fn oci2erofs(
 
     pipeline.build(&vmcell::artifact::Cache::default()).await?;
 
-    // The rootfs stage writes `<artifacts_dir>/rootfs.erofs`; copy it to the requested output.
-    let built = artifacts_dir.join("rootfs.erofs");
-    std::fs::copy(&built, output).map_err(vmcell::Error::Io)?;
+    // The rootfs stage writes `<stage_dir>/rootfs.erofs`; copy it to the requested
+    // output, leaving the canonical `artifacts_dir/rootfs.erofs` untouched (M-BIN-6).
+    let built = stage_dir.join("rootfs.erofs");
+    let copy_res = std::fs::copy(&built, output).map_err(vmcell::Error::Io);
+    // Best-effort cleanup of the staging dir regardless of the copy result; it is a
+    // per-pid scratch dir under the system temp dir, so a leftover is not actionable.
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    copy_res?;
     println!("vmcell: wrote erofs rootfs to {}", output.display());
     Ok(())
 }
@@ -486,6 +579,60 @@ mod tests {
                 matches!(err, vmcell::Error::Unsupported { .. }),
                 "expected Error::Unsupported, got {err:?}"
             );
+            // L-BIN-4: `main` now surfaces the error's `Display` (human-readable),
+            // not its `Debug` struct-dump. Guard that the `Display` message is the
+            // "…: …" sentence, not `Unsupported { vmm: …, feature: … }`. RED on the
+            // inverse (a `main`/`Error` that emits the Debug form): the struct syntax
+            // would appear and the human phrase would not.
+            let shown = err.to_string();
+            assert!(
+                shown.contains("cross-process VM registry"),
+                "Display should be the human-readable message, got: {shown}"
+            );
+            assert!(
+                !shown.contains("Unsupported {"),
+                "Display must not be the Debug struct-dump, got: {shown}"
+            );
         }
+    }
+
+    // N-BIN-3: the old `digest.starts_with(\"sha256:\")` check accepted an empty,
+    // short, or non-hex digest. RED on the inverse (prefix-only check): each bad
+    // digest below would pass instead of erroring.
+    #[test]
+    fn validate_oci_digest_rejects_malformed() {
+        assert!(
+            validate_oci_digest("sha256:").is_err(),
+            "empty hex must error"
+        );
+        assert!(
+            validate_oci_digest("sha256:xyz").is_err(),
+            "too-short must error"
+        );
+        assert!(
+            validate_oci_digest(&format!("sha256:{}", "z".repeat(64))).is_err(),
+            "non-hex must error"
+        );
+        assert!(
+            validate_oci_digest("md5:abc").is_err(),
+            "wrong algo must error"
+        );
+        // A well-formed 64-hex digest is accepted.
+        assert!(validate_oci_digest(&format!("sha256:{}", "a".repeat(64))).is_ok());
+    }
+
+    // N-BIN-4: `bundle` must recognize `vmlinux-<label>` kernels but not the bare
+    // `vmlinux` (already covered) or an empty label. RED on the inverse (matching
+    // bare `vmlinux` or accepting an empty label).
+    #[test]
+    fn kernel_label_from_filename_matches_labelled_only() {
+        assert_eq!(
+            kernel_label_from_filename("vmlinux-6.12.94"),
+            Some("6.12.94")
+        );
+        assert_eq!(kernel_label_from_filename("vmlinux-6.6"), Some("6.6"));
+        assert_eq!(kernel_label_from_filename("vmlinux"), None);
+        assert_eq!(kernel_label_from_filename("vmlinux-"), None);
+        assert_eq!(kernel_label_from_filename("rootfs.erofs"), None);
     }
 }

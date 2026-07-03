@@ -61,50 +61,86 @@ struct Args {
 
     /// Timeouts profile: `default` (balanced), `low-latency` (min time-to-output),
     /// or `throughput` (min whole-lifecycle incl. teardown). Selects the
-    /// `Timeouts` preset applied to every VM in the run.
-    #[arg(long, default_value = "default")]
+    /// `Timeouts` preset applied to every VM in the run. An unknown value is
+    /// rejected at parse time (no silent default — H-BIN-1).
+    #[arg(long, default_value = "default", value_parser = parse_profile)]
     profile: String,
 
     /// Guest kernel console verbosity: `balanced` (default, `loglevel=6`),
     /// `quiet` (3), `verbose` (7), or `debug` (8). Drives the serial-logging
-    /// VM-exit cost dimension.
-    #[arg(long, default_value = "balanced")]
-    kernel_verbosity: String,
+    /// VM-exit cost dimension. An unknown value is rejected at parse time.
+    #[arg(long, default_value = "balanced", value_parser = parse_verbosity)]
+    kernel_verbosity: vmcell::config::KernelVerbosity,
 
     /// Guest console mode: `uart` (default, 8250 `ttyS0` — early-boot + panic
     /// capture, per-byte VM-exits) or `virtio-console` (`hvc0` — batched, ~no exit
     /// tax, but loses early boot / pre-virtio panics; not supported on Firecracker).
-    #[arg(long, default_value = "uart")]
-    console: String,
+    /// An unknown value is rejected at parse time.
+    #[arg(long, default_value = "uart", value_parser = parse_console)]
+    console: vmcell::config::ConsoleMode,
 }
 
-/// Maps the `--profile` flag to a [`Timeouts`] preset (unknown → `default`).
+/// Validates the `--profile` flag, rejecting any value other than `default`,
+/// `low-latency`, or `throughput` (H-BIN-1). Returns the validated name unchanged so
+/// the run header can echo it; [`timeouts_for`] maps it to the preset.
+fn parse_profile(s: &str) -> Result<String, String> {
+    match s {
+        "default" | "low-latency" | "throughput" => Ok(s.to_string()),
+        other => Err(format!(
+            "invalid profile '{other}' (expected: default, low-latency, throughput)"
+        )),
+    }
+}
+
+/// Maps the (already-validated by [`parse_profile`]) `--profile` name to a
+/// [`Timeouts`](vmcell::config::Timeouts) preset.
 fn timeouts_for(profile: &str) -> vmcell::config::Timeouts {
     match profile {
         "low-latency" => vmcell::config::Timeouts::low_latency(),
         "throughput" => vmcell::config::Timeouts::throughput(),
+        // Only `"default"` reaches here for a validated flag; the catch-all keeps
+        // the mapping total (the CLI value_parser is the actual gate).
         _ => vmcell::config::Timeouts::default(),
     }
 }
 
-/// Maps the `--kernel-verbosity` flag to a [`KernelVerbosity`] (unknown → `Balanced`).
-fn verbosity_for(s: &str) -> vmcell::config::KernelVerbosity {
+/// Parses the `--kernel-verbosity` flag into a
+/// [`KernelVerbosity`](vmcell::config::KernelVerbosity), rejecting unknown values
+/// (H-BIN-1) instead of silently defaulting to `Balanced`.
+fn parse_verbosity(s: &str) -> Result<vmcell::config::KernelVerbosity, String> {
     use vmcell::config::KernelVerbosity as K;
     match s {
-        "quiet" => K::Quiet,
-        "verbose" => K::Verbose,
-        "debug" => K::Debug,
-        _ => K::Balanced,
+        "quiet" => Ok(K::Quiet),
+        "balanced" => Ok(K::Balanced),
+        "verbose" => Ok(K::Verbose),
+        "debug" => Ok(K::Debug),
+        other => Err(format!(
+            "invalid kernel-verbosity '{other}' (expected: quiet, balanced, verbose, debug)"
+        )),
     }
 }
 
-/// Maps the `--console` flag to a [`ConsoleMode`] (unknown → `Uart`).
-fn console_for(s: &str) -> vmcell::config::ConsoleMode {
+/// Parses the `--console` flag into a [`ConsoleMode`](vmcell::config::ConsoleMode),
+/// rejecting unknown values (H-BIN-1) instead of silently defaulting to `Uart`.
+fn parse_console(s: &str) -> Result<vmcell::config::ConsoleMode, String> {
     use vmcell::config::ConsoleMode as C;
     match s {
-        "virtio-console" => C::VirtioConsole,
-        _ => C::Uart,
+        "uart" => Ok(C::Uart),
+        "virtio-console" => Ok(C::VirtioConsole),
+        other => Err(format!(
+            "invalid console '{other}' (expected: uart, virtio-console)"
+        )),
     }
+}
+
+/// The run-header line echoing the resolved `--profile`/`--kernel-verbosity`/
+/// `--console` knobs (H-BIN-1), so a run's actual configuration is visible rather
+/// than silently defaulted.
+fn resolved_knobs_line(args: &Args) -> String {
+    format!(
+        "profile: {}  kernel-verbosity: {:?}  console: {:?}",
+        args.profile, args.kernel_verbosity, args.console
+    )
 }
 
 /// Parses the `--restore-mode` flag into a [`RestoreMode`], rejecting any value
@@ -128,29 +164,29 @@ impl Args {
     }
 }
 
-fn report(name: &str, latencies: &mut [u128]) {
-    if latencies.is_empty() {
-        println!("{}: No successful runs", name);
-        return;
+/// Formats the trailing `dropped=/warmup_failed=` accounting for a report line so a
+/// silently-shrunk sample count is visible (H-BIN-2). Empty when nothing was dropped.
+fn accounting_suffix(dropped: usize, warmup_failed: usize) -> String {
+    if dropped == 0 && warmup_failed == 0 {
+        String::new()
+    } else {
+        format!(" dropped={dropped} warmup_failed={warmup_failed}")
     }
-    latencies.sort_unstable();
-    let count = latencies.len() as f64;
-    let p50 = latencies[(count * 0.5).floor() as usize];
-    let p95 = latencies[(count * 0.95).floor() as usize];
-    let p99 = latencies[(count * 0.99).floor() as usize];
-    let max = latencies
-        .last()
-        .expect("latencies should not be empty at this point");
+}
 
-    println!(
-        "{}: count={} p50={}ms p95={}ms p99={}ms max={}ms",
-        name,
-        latencies.len(),
-        p50,
-        p95,
-        p99,
-        max
-    );
+/// Reports p50/p95/p99/max for a sample set, collapsed onto the single [`pcts`]
+/// helper (L-BIN-7) instead of a duplicate hand-rolled `floor` index that lacked the
+/// nearest-rank clamp (H-BIN-1-revisited). `dropped`/`warmup_failed` surface any
+/// iterations discarded during collection.
+fn report(name: &str, latencies: &mut [u128], dropped: usize, warmup_failed: usize) {
+    let acct = accounting_suffix(dropped, warmup_failed);
+    match pcts(latencies) {
+        Some((p50, p95, p99, max)) => println!(
+            "{name}: count={}{acct} p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms",
+            latencies.len()
+        ),
+        None => println!("{name}: No successful runs{acct}"),
+    }
 }
 
 async fn run_bench<V: Vmm>(
@@ -159,46 +195,42 @@ async fn run_bench<V: Vmm>(
     args: &Args,
     allocator: VmidAllocator,
     is_restore: bool,
-) {
+) -> anyhow::Result<()> {
     println!("Starting benchmark: {}", name);
     let mut latencies = Vec::new();
 
-    let artifacts_dir = vmcell::artifact::artifacts_dir();
-    let kernel_path = artifacts_dir.join(kernel_filename(args.kernel.as_deref()));
-    let rootfs_path = artifacts_dir.join("rootfs.erofs");
+    // L-BIN-7: resolve artifact paths and build the VM config through the SAME
+    // helpers every other mode uses, instead of a hand-rolled duplicate that could
+    // drift (it lacked `ksm_mergeable`, and re-derived the config knobs).
+    let (dir, kernel_path, rootfs_path) = artifact_paths(args.kernel.as_deref());
 
-    // Fail fast (and KVM-independently) when the artifacts are absent: attempting a boot would
-    // instead hang on the agent-connect timeout (and the restore baseline boots regardless of
-    // `--iterations`). Report zero successful runs and return before booting anything.
+    // Fail LOUD (M-BIN-1) rather than exit-0 when the artifacts are absent: the
+    // harness measured nothing, so automation must not read it as success. Still
+    // KVM-independent — we check before booting, which would otherwise hang on the
+    // agent-connect timeout.
     if !kernel_path.exists() || !rootfs_path.exists() {
-        println!(
-            "{name}: No successful runs (missing artifacts in {})",
-            artifacts_dir.display()
-        );
-        return;
+        println!("{name}: No successful runs (missing artifacts in {dir})");
+        anyhow::bail!("{name}: missing artifacts in {dir}");
     }
 
-    let cfg = VmConfig::builder(kernel_path, RootfsSource::Erofs { image: rootfs_path })
-        .vcpus(1)
-        .mem_mib(args.mem_mib)
-        .network_disabled()
-        .restore_mode(args.restore_mode)
-        .timeouts(timeouts_for(&args.profile))
-        .kernel_verbosity(verbosity_for(&args.kernel_verbosity))
-        .console_mode(console_for(&args.console))
-        .build()
-        .expect("valid VM configuration benchmark invariant");
+    let cfg = build_cfg(args, kernel_path, rootfs_path, false);
     let cid_allocator = std::sync::Arc::new(CidAllocator::new());
 
-    // CLI-5: honor `--snap-dir` for the warm-restore snapshot instead of `temp_dir()`
-    // (commonly tmpfs / RAM-backed), which makes warm-restore latency systematically
-    // optimistic (§13.1 snap-dir caveat). `--snap-dir` defaults to a real-FS path
-    // (`./target/vmcell-bench-snap`), matching the suspend-size / phase-budget modes.
-    let snap_dir = PathBuf::from(&args.snap_dir).join(format!(
+    // CLI-5 / N-BIN-5: honor `--snap-dir` for the warm-restore snapshot, resolved on
+    // the workspace root (not the process CWD) so it lands on the same real FS as the
+    // artifacts, instead of `temp_dir()` (commonly tmpfs / RAM-backed), which makes
+    // warm-restore latency systematically optimistic (§13.1 snap-dir caveat).
+    let snap_dir = resolve_snap_dir(&args.snap_dir).join(format!(
         "latency-{}-{}",
         args.backend,
         std::process::id()
     ));
+    if is_restore && is_tmpfs(&snap_dir) {
+        println!(
+            "warning: snap-dir {} is on tmpfs; warm-restore latency will be optimistic (§13.1)",
+            snap_dir.display()
+        );
+    }
     // Best-effort pre-clean of a stale snapshot dir left by a prior aborted run; a
     // missing dir (the common case) is not an error worth surfacing.
     let _ = std::fs::remove_dir_all(&snap_dir);
@@ -215,39 +247,30 @@ async fn run_bench<V: Vmm>(
         .await
         {
             Ok(vm) => vm,
-            Err(e) => {
-                println!("Failed to start base VM for snapshotting: {}", e);
-                return;
-            }
+            // M-BIN-1: a baseline-snapshot failure is an attempted-and-failed run, not
+            // a skip — fail loud so it can't masquerade as success.
+            Err(e) => anyhow::bail!("{name}: failed to start base VM for snapshotting: {e}"),
         };
         if let Err(e) = base_vm.agent(None, &vmcell::orchestrator::RealClock).await {
-            println!("Failed to connect to base VM agent: {}", e);
             // Best-effort graceful teardown of the base VM; `MicroVm::Drop` is the
             // real, guaranteed teardown, so a shutdown error is not actionable here.
             let _ = base_vm.shutdown().await;
-            return;
+            anyhow::bail!("{name}: failed to connect to base VM agent: {e}");
         }
-        // CLI-3: a real I/O failure creating the snapshot dir must degrade gracefully
-        // (report zero runs and return), mirroring `run_suspend_size`, not panic the
-        // whole harness via `.expect()`.
         if let Err(e) = std::fs::create_dir_all(&snap_dir) {
-            println!(
+            // Best-effort teardown of the booted base VM before bailing.
+            let _ = base_vm.shutdown().await;
+            anyhow::bail!(
                 "{name}: cannot create snapshot dir {}: {e}",
                 snap_dir.display()
             );
-            // Best-effort teardown of the booted base VM before bailing; `Drop` still
-            // guarantees the real teardown.
-            let _ = base_vm.shutdown().await;
-            return;
         }
         if let Err(e) = base_vm.snapshot(&snap_dir).await {
-            println!("Failed to take snapshot of base VM: {}", e);
             // Best-effort cleanup on the snapshot-failure path: shut the base VM down
-            // (Drop is the real teardown) and drop the partial snapshot dir. Neither
-            // error is actionable and must not mask the reported failure above.
+            // (Drop is the real teardown) and drop the partial snapshot dir.
             let _ = base_vm.shutdown().await;
             let _ = std::fs::remove_dir_all(&snap_dir);
-            return;
+            anyhow::bail!("{name}: failed to take snapshot of base VM: {e}");
         }
         // Best-effort graceful shutdown of the base VM now that the snapshot is taken;
         // `MicroVm::Drop` guarantees the real teardown regardless.
@@ -255,20 +278,21 @@ async fn run_bench<V: Vmm>(
     }
 
     // Tracks whether every cold-boot iteration managed to drop the page cache.
-    // If any write fails (we lack CAP_SYS_ADMIN / root), the cold numbers are
-    // actually warm-cache and we say so on the label instead of mislabeling them.
+    // M-BIN-8: under the file-cap runner (euid != 0) the `drop_caches` write is
+    // silently ineffective (the procfs sysctl permission is euid-based), so
+    // `drop_page_cache` verifies via a `Cached`-drop check rather than trusting the
+    // write. If any iteration could not actually drop the cache, the cold numbers are
+    // warm-cache and the label says so instead of mislabeling them.
     let mut page_cache_dropped = true;
+    // H-BIN-2: post-warmup agent-connect failures shrink the sample set — count and
+    // print them (with the iteration + error) instead of letting the count silently
+    // drop. Warmup failures are tracked separately since they never count as samples.
+    let mut dropped = 0usize;
+    let mut warmup_failed = 0usize;
 
     for i in 0..(args.iters() + args.warmup) {
-        if !is_restore {
-            // A "cold boot" is only cold if the page cache is cold. Drop it
-            // directly via /proc/sys/vm/drop_caches — no interactive sudo, so it
-            // works under the privileged test-runner / root without a tty prompt.
-            // O_TRUNC on a procfs sysctl is rejected, so open write-only (no
-            // create/truncate) and write_all; only flag warm if that fails.
-            if !drop_page_cache() {
-                page_cache_dropped = false;
-            }
+        if !is_restore && !drop_page_cache() {
+            page_cache_dropped = false;
         }
 
         let start = Instant::now();
@@ -295,10 +319,22 @@ async fn run_bench<V: Vmm>(
 
         match vm_res {
             Ok(mut vm) => {
-                if let Ok(_agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
-                    let elapsed = start.elapsed().as_millis();
-                    if i >= args.warmup {
-                        latencies.push(elapsed);
+                match vm.agent(None, &vmcell::orchestrator::RealClock).await {
+                    Ok(_agent) => {
+                        let elapsed = start.elapsed().as_millis();
+                        if i >= args.warmup {
+                            latencies.push(elapsed);
+                        }
+                    }
+                    Err(e) => {
+                        // H-BIN-2: a silent `if let Ok(_agent)` hid agent-connect
+                        // failures; surface each and account for the discarded sample.
+                        println!("{name}: iteration {i} agent-connect failed: {e}");
+                        if i >= args.warmup {
+                            dropped += 1;
+                        } else {
+                            warmup_failed += 1;
+                        }
                     }
                 }
                 // Best-effort per-iteration teardown; `Drop` is the guaranteed path,
@@ -306,7 +342,7 @@ async fn run_bench<V: Vmm>(
                 let _ = vm.shutdown().await;
             }
             Err(e) => {
-                println!("Run failed (expected if artifacts/KVM are missing): {}", e);
+                println!("{name}: iteration {i} create/restore failed: {e}");
                 break;
             }
         }
@@ -321,7 +357,16 @@ async fn run_bench<V: Vmm>(
     report(
         &bench_label(name, is_restore, page_cache_dropped),
         &mut latencies,
+        dropped,
+        warmup_failed,
     );
+
+    // M-BIN-1: attempted the run but collected zero post-warmup samples → fail loud so
+    // automation sees a non-zero exit instead of a silent "No successful runs".
+    if latencies.is_empty() {
+        anyhow::bail!("{name}: no successful post-warmup samples");
+    }
+    Ok(())
 }
 
 /// Returns the report label, annotating a cold-boot benchmark whose page cache
@@ -354,6 +399,9 @@ async fn main() -> anyhow::Result<()> {
         kernel_filename(args.kernel.as_deref()),
         args.kernel.as_deref().unwrap_or("default")
     );
+    // H-BIN-1: echo the resolved profile/verbosity/console so a run's actual knobs
+    // are visible (and provably not silently defaulted from a rejected typo).
+    println!("{}", resolved_knobs_line(&args));
 
     // Pin CPU frequency for the whole run (design §13.2 noise floor): every online
     // CPU is set to the `performance` governor with turbo disabled, and the prior
@@ -485,8 +533,14 @@ fn validate_mode(mode: &str) -> anyhow::Result<()> {
 ///
 /// # Errors
 /// Propagates any [`VmConfig`] build error — currently a `mem_mib` below the
-/// floor — as a clear, non-panicking error.
+/// floor — as a clear, non-panicking error, and rejects `--count 0` (N-BIN-2),
+/// which the `footprint` mode would otherwise silently clamp to 1.
 fn validate_vm_params(args: &Args) -> anyhow::Result<()> {
+    // N-BIN-2: reject `--count 0` loudly rather than silently clamping to 1 — a run
+    // that measures zero guests is a misinvocation, not a request for one guest.
+    if args.count == 0 {
+        anyhow::bail!("--count must be >= 1 (0 guests measures nothing)");
+    }
     VmConfig::builder(
         PathBuf::from("vmlinux"),
         RootfsSource::Erofs {
@@ -519,16 +573,17 @@ async fn run_mode<V: Vmm>(
 ) -> anyhow::Result<()> {
     match args.mode.as_str() {
         "latency" => {
-            run_bench(vmm, "Cold Boot", args, allocator.clone(), false).await;
+            run_bench(vmm, "Cold Boot", args, allocator.clone(), false).await?;
             if vmm.capabilities().snapshot_restore {
-                run_bench(vmm, "Warm Restore", args, allocator.clone(), true).await;
+                run_bench(vmm, "Warm Restore", args, allocator.clone(), true).await?;
             } else {
                 // CLI-4 / §13.2 visible-skip: a no-snapshot backend (e.g. FC/QEMU in
                 // the unprivileged+vsock tier, §3.3) can't run Warm Restore. Print the
-                // reason rather than silently dropping the benchmark, matching the
-                // suspend-size / phase-budget modes.
+                // reason rather than silently dropping the benchmark; a genuine
+                // capability skip is success (Ok), not a failure (M-BIN-1).
                 println!("Warm Restore: backend {backend} has no snapshot support; skipping");
             }
+            Ok(())
         }
         "footprint" => run_footprint(vmm, backend, args, allocator).await,
         "suspend-size" => run_suspend_size(vmm, backend, args, allocator).await,
@@ -539,7 +594,6 @@ async fn run_mode<V: Vmm>(
             VALID_MODES.join(", ")
         ),
     }
-    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -554,6 +608,76 @@ fn kernel_filename(label: Option<&str>) -> String {
     match label {
         Some(l) => format!("vmlinux-{}", l.replace('.', "-")),
         None => "vmlinux".to_string(),
+    }
+}
+
+/// The workspace root, so `--snap-dir` anchors independent of the process CWD
+/// (N-BIN-5). Mirrors the library's `workspace_root` ascent (the `vmcell-protocol`
+/// marker); the library's is `pub(crate)` so it cannot be reused here — see the
+/// integrator note to expose it publicly and collapse this duplicate.
+fn workspace_root() -> PathBuf {
+    let start = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    for dir in start.ancestors() {
+        if dir.join("crates/vmcell-protocol/Cargo.toml").is_file() {
+            return dir.to_path_buf();
+        }
+    }
+    start
+}
+
+/// Resolves `--snap-dir` to an absolute, CWD-independent path anchored on the
+/// workspace root (N-BIN-5): artifacts anchor there too (§11), so an out-of-root
+/// invocation must not measure a *different* filesystem for the warm-restore snapshot
+/// than for the artifacts. An absolute `--snap-dir` is honored verbatim.
+fn resolve_snap_dir(raw: &str) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        p
+    } else {
+        workspace_root().join(p)
+    }
+}
+
+/// The filesystem type backing `path`, per the longest mount-point prefix in a
+/// `/proc/self/mountinfo` dump. Factored out (pure) so the tmpfs check is testable
+/// without a real mount table (N-BIN-5).
+fn path_fstype(mountinfo: &str, path: &Path) -> Option<String> {
+    let mut best_len = 0usize;
+    let mut best: Option<String> = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Optional fields precede a `-` separator; mount point is field 4, fstype is
+        // the first field after the separator.
+        let Some(sep) = fields.iter().position(|f| *f == "-") else {
+            continue;
+        };
+        let (Some(mp), Some(fstype)) = (fields.get(4), fields.get(sep + 1)) else {
+            continue;
+        };
+        let mp = PathBuf::from(mp);
+        if path.starts_with(&mp) {
+            let len = mp.as_os_str().len();
+            // `>=` so a longer (more specific) mount wins ties against the root `/`.
+            if len >= best_len {
+                best_len = len;
+                best = Some((*fstype).to_string());
+            }
+        }
+    }
+    best
+}
+
+/// Best-effort check whether `path` lives on a tmpfs mount (RAM-backed), which makes
+/// warm-restore latency systematically optimistic (§13.1). Consults
+/// `/proc/self/mountinfo`; a non-Linux/unreadable table degrades to `false`.
+fn is_tmpfs(path: &Path) -> bool {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(mi) => path_fstype(&mi, &canon).as_deref() == Some("tmpfs"),
+        Err(_) => false,
     }
 }
 
@@ -581,35 +705,69 @@ fn build_cfg(args: &Args, kernel: PathBuf, rootfs: PathBuf, ksm_mergeable: bool)
         .restore_mode(args.restore_mode)
         .ksm_mergeable(ksm_mergeable)
         .timeouts(timeouts_for(&args.profile))
-        .kernel_verbosity(verbosity_for(&args.kernel_verbosity))
-        .console_mode(console_for(&args.console))
+        .kernel_verbosity(args.kernel_verbosity)
+        .console_mode(args.console)
         .build()
         .expect("valid VM configuration benchmark invariant")
 }
 
-/// Drops the host page cache. Returns true only if the open AND write both
-/// succeed. Opens write-only (no `O_CREAT`/`O_TRUNC`): `O_TRUNC` on a procfs
-/// sysctl is rejected even with `CAP_DAC_OVERRIDE`, which silently broke the
-/// original `std::fs::write` cold path (it always reported a warm cache).
+/// Reads a `/proc/meminfo` field in kB (`None` if unreadable/absent).
+fn read_meminfo_kb(key: &str) -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_kv_kb(&s, key)
+}
+
+/// Decides whether a `drop_caches` attempt actually took effect (M-BIN-8). A write
+/// that "succeeds" but leaves `Cached` untouched is a warm cache — the permission was
+/// silently ignored under the file-cap runner (euid != 0) — so only a real decrease in
+/// `Cached` (or no cache to begin with) counts as cold.
+fn cache_drop_effective(
+    wrote: bool,
+    cached_before: Option<u64>,
+    cached_after: Option<u64>,
+) -> bool {
+    if !wrote {
+        return false;
+    }
+    match (cached_before, cached_after) {
+        // There was page cache to drop: require it to have actually shrunk.
+        (Some(before), Some(after)) if before > 0 => after < before,
+        // No prior cache (already cold) or meminfo unreadable → trust the write.
+        _ => true,
+    }
+}
+
+/// Drops the host page cache and verifies it took effect. Opens write-only (no
+/// `O_CREAT`/`O_TRUNC`): `O_TRUNC` on a procfs sysctl is rejected even with
+/// `CAP_DAC_OVERRIDE`, which silently broke the original `std::fs::write` cold path.
+/// Returns true only if the write succeeds AND `Cached` actually dropped — a
+/// successful-but-ineffective write (euid != 0 under the file-cap runner) is still a
+/// warm cache and is flagged as such (M-BIN-8), rather than trusting write success.
 fn drop_page_cache() -> bool {
     use std::io::Write;
-    match std::fs::OpenOptions::new()
+    let before = read_meminfo_kb("Cached");
+    let wrote = match std::fs::OpenOptions::new()
         .write(true)
         .open("/proc/sys/vm/drop_caches")
     {
         Ok(mut f) => f.write_all(b"3\n").is_ok(),
         Err(_) => false,
-    }
+    };
+    cache_drop_effective(wrote, before, read_meminfo_kb("Cached"))
 }
 
-/// p50/p95/p99/max of a sample set (indices clamped to the last element).
+/// p50/p95/p99/max of a sample set via the **nearest-rank** method: index
+/// `ceil(q*n) - 1`, clamped to `[0, n-1]` (H-BIN-1-revisited). The old `floor(q*n)`
+/// was one rank too high whenever `q*n` is integral — at N=20, `floor(20*0.95)=19`
+/// returned the sample MAXIMUM as p95, so p95 and max were always identical.
 fn pcts(latencies: &mut [u128]) -> Option<(u128, u128, u128, u128)> {
     if latencies.is_empty() {
         return None;
     }
     latencies.sort_unstable();
-    let last = latencies.len() - 1;
-    let idx = |q: f64| ((latencies.len() as f64 * q).floor() as usize).min(last);
+    let n = latencies.len();
+    let last = n - 1;
+    let idx = |q: f64| ((n as f64 * q).ceil() as usize).saturating_sub(1).min(last);
     Some((
         latencies[idx(0.5)],
         latencies[idx(0.95)],
@@ -667,7 +825,14 @@ fn read_proc_status_kb(pid: u32, key: &str) -> Option<u64> {
 /// `--api-socket` argument lives in the *same* unique `vmcell-vm-<pid>-<vmid>` dir,
 /// which is `vsock_path`'s parent. Match that parent **with a trailing `/`** so
 /// vmid 5 does not match vmid 50/51 (`vmcell-vm-…-5` is a substring of `…-50`).
-fn find_host_pid(vsock: &Path) -> Option<u32> {
+///
+/// M-BIN-7: several processes can share that per-VM dir on the command line — on
+/// QEMU the `vhost-device-vsock` daemon is spawned (with a *lower* pid) before the
+/// VMM and carries the same socket dir, so a plain first-match measures the wrong
+/// process. Prefer the process whose cmdline also names the VMM binary (`vmm_hint`,
+/// e.g. `cloud-hypervisor` / `qemu` / `firecracker`); only fall back to a dir-only
+/// match (e.g. the vsock daemon) when no candidate names the VMM.
+fn find_host_pid(vsock: &Path, vmm_hint: &str) -> Option<u32> {
     let parent = vsock
         .parent()
         .unwrap_or(vsock)
@@ -676,6 +841,7 @@ fn find_host_pid(vsock: &Path) -> Option<u32> {
     let needle = format!("{parent}/");
     let full = vsock.to_string_lossy().to_string();
     let me = std::process::id();
+    let mut fallback = None;
     for e in std::fs::read_dir("/proc").ok()?.flatten() {
         let pid: u32 = match e.file_name().to_string_lossy().parse() {
             Ok(p) => p,
@@ -689,11 +855,38 @@ fn find_host_pid(vsock: &Path) -> Option<u32> {
             // string, and the trailing `/` keeps the match on a boundary.
             let s = String::from_utf8_lossy(&bytes);
             if s.contains(&full) || s.contains(&needle) {
-                return Some(pid);
+                if s.contains(vmm_hint) {
+                    // The actual VMM process — the one whose guest RAM we want.
+                    return Some(pid);
+                }
+                // A dir-sharing helper (e.g. the vsock daemon); use only if nothing
+                // better turns up.
+                fallback.get_or_insert(pid);
             }
         }
     }
-    None
+    fallback
+}
+
+/// The `(anon, shmem)` report annotations for a backend's guest-RAM memory model
+/// (M-BIN-7): CH backs guest RAM with a shared memfd (accounted as `RssShmem`), while
+/// Firecracker uses private anonymous guest RAM (accounted as `RssAnon`), so the
+/// hard-coded CH-only labels would invert the reading on FC.
+fn footprint_mem_notes(backend: &str) -> (&'static str, &'static str) {
+    match backend {
+        "cloud-hypervisor" => (
+            "VMM overhead; guest RAM is shmem on CH",
+            "CH guest-RAM memfd; the real density figure",
+        ),
+        "firecracker" => (
+            "VMM overhead + private-anon guest RAM on Firecracker (the real density figure)",
+            "shared shmem (minimal on FC; guest RAM is the anon line above)",
+        ),
+        _ => (
+            "RssAnon: VMM overhead / anon guest RAM (backend-dependent)",
+            "RssShmem: shared guest RAM, if the backend uses a memfd (backend-dependent)",
+        ),
+    }
 }
 
 /// Recursively lists `(path, size)` for every regular file under `dir`.
@@ -747,13 +940,20 @@ fn mean_u64(v: &[u64]) -> u64 {
 // ----------------------------------------------------------------------------
 // §13.3 — footprint: per-guest RAM, shared erofs page cache, KSM dedup.
 // ----------------------------------------------------------------------------
-async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
+async fn run_footprint<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
     let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("footprint: No successful runs (missing artifacts in {dir})");
-        return;
+        anyhow::bail!("footprint: missing artifacts in {dir}");
     }
-    let count = args.count.max(1);
+    // N-BIN-2: `--count 0` is rejected loudly in `validate_vm_params`, so `count` is
+    // >= 1 here (no silent `.max(1)` clamp).
+    let count = args.count;
     let cfg = build_cfg(args, kernel, rootfs, args.ksm_mergeable);
     let cid = std::sync::Arc::new(CidAllocator::new());
 
@@ -796,7 +996,7 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         let mut anon = 0u64;
         let mut shmem = 0u64;
         for v in &vms {
-            if let Some(pid) = find_host_pid(v.instance().vsock_path()) {
+            if let Some(pid) = find_host_pid(v.instance().vsock_path(), backend) {
                 anon += read_proc_status_kb(pid, "RssAnon").unwrap_or(0);
                 shmem += read_proc_status_kb(pid, "RssShmem").unwrap_or(0);
             }
@@ -808,7 +1008,7 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     let n = vms.len();
     if n == 0 {
         println!("footprint: No successful runs");
-        return;
+        anyhow::bail!("footprint: no guests booted");
     }
 
     // Give KSM a window to scan & dedup the now-resident guest pages. With the
@@ -850,9 +1050,14 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     let mut guest_total = 0u64;
     let mut guest_avail = Vec::new();
     let mut pid1_rss = Vec::new();
+    // M-BIN-7: count how many per-VM host pids actually resolved, so an unresolved
+    // process (collapsed to 0 by `unwrap_or(0)`) is visible instead of silently
+    // deflating the reported totals.
+    let mut resolved = 0usize;
     for v in vms.iter_mut() {
         let vsock = v.instance().vsock_path().to_path_buf();
-        if let Some(pid) = find_host_pid(&vsock) {
+        if let Some(pid) = find_host_pid(&vsock, backend) {
+            resolved += 1;
             tot_anon += read_proc_status_kb(pid, "RssAnon").unwrap_or(0);
             tot_file += read_proc_status_kb(pid, "RssFile").unwrap_or(0);
             tot_shmem += read_proc_status_kb(pid, "RssShmem").unwrap_or(0);
@@ -901,12 +1106,20 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     let marginals_shmem = marginal_of(&step_shmem);
     let marg_mean_shmem = mean_u64(&marginals_shmem);
 
+    let (anon_note, shmem_note) = footprint_mem_notes(backend);
     println!(
         "=== FOOTPRINT (backend={backend} N={n} mem_mib={}) ===",
         args.mem_mib
     );
+    // M-BIN-7: surface incomplete host-pid attribution instead of silently reporting
+    // deflated totals as if every VM resolved.
+    if resolved < n {
+        println!(
+            "footprint: warning — resolved {resolved}/{n} host pids; per-VM memory attribution is incomplete"
+        );
+    }
     println!(
-        "host RssAnon total = {} MiB  (per-guest mean = {} MiB)  [VMM overhead; guest RAM is shmem on CH]",
+        "host RssAnon total = {} MiB  (per-guest mean = {} MiB)  [{anon_note}]",
         tot_anon / 1024,
         (tot_anon / 1024) / n as u64
     );
@@ -916,7 +1129,7 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         (tot_file / 1024) / n as u64
     );
     println!(
-        "host RssShmem total = {} MiB  (per-guest mean = {} MiB)  [CH guest-RAM memfd; the real density figure]",
+        "host RssShmem total = {} MiB  (per-guest mean = {} MiB)  [{shmem_note}]",
         tot_shmem / 1024,
         (tot_shmem / 1024) / n as u64
     );
@@ -934,6 +1147,14 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
         sharing_delta * 4 / 1024
     );
     println!("KSM pages_shared:  before={ksm_shared_before} after={ksm_shared_after}");
+    if args.ksm_mergeable {
+        // N-BIN-2: restoring `run`/`pages_to_scan` re-disables the scanner but does
+        // NOT un-merge pages already deduped during this run, so the host KSM state is
+        // not byte-for-byte what it was before. Say so rather than imply a full reset.
+        println!(
+            "KSM note: the scanner knobs were restored, but pages merged during this run stay merged (host KSM state is not fully reset)"
+        );
+    }
     println!(
         "guest MemTotal = {} MiB  MemAvailable mean = {} MiB",
         guest_total / 1024,
@@ -946,24 +1167,31 @@ async fn run_footprint<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     for v in vms {
         let _ = v.shutdown().await;
     }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
 // §13.6 — suspend-size: snapshot bytes + memory-file share, vs guest RAM.
 // ----------------------------------------------------------------------------
-async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
+async fn run_suspend_size<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
     let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("suspend-size: No successful runs (missing artifacts in {dir})");
-        return;
+        anyhow::bail!("suspend-size: missing artifacts in {dir}");
     }
     if !vmm.capabilities().snapshot_restore {
+        // Genuine capability skip → success (M-BIN-1), not a failure.
         println!("suspend-size: backend {backend} has no snapshot support; skipping");
-        return;
+        return Ok(());
     }
     let cfg = build_cfg(args, kernel, rootfs, false);
     let cid = std::sync::Arc::new(CidAllocator::new());
-    let snap_dir = PathBuf::from(&args.snap_dir).join(format!(
+    let snap_dir = resolve_snap_dir(&args.snap_dir).join(format!(
         "suspend-{backend}-{}-{}",
         args.mem_mib,
         std::process::id()
@@ -971,11 +1199,10 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
     // Best-effort pre-clean of a stale snapshot dir from a prior aborted run.
     let _ = std::fs::remove_dir_all(&snap_dir);
     if let Err(e) = std::fs::create_dir_all(&snap_dir) {
-        println!(
+        anyhow::bail!(
             "suspend-size: cannot create snap dir {}: {e}",
             snap_dir.display()
         );
-        return;
     }
 
     let mut vm = match MicroVm::start(
@@ -989,26 +1216,23 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
     {
         Ok(v) => v,
         Err(e) => {
-            println!("suspend-size: boot failed: {e}");
             // Best-effort removal of the (empty) snapshot dir before bailing.
             let _ = std::fs::remove_dir_all(&snap_dir);
-            return;
+            anyhow::bail!("suspend-size: boot failed: {e}");
         }
     };
     if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
-        println!("suspend-size: agent connect failed: {e}");
         // Best-effort teardown + snapshot-dir cleanup; `Drop` guarantees the real
-        // teardown and neither error is actionable, so we don't surface them.
+        // teardown and neither cleanup error is actionable.
         let _ = vm.shutdown().await;
         let _ = std::fs::remove_dir_all(&snap_dir);
-        return;
+        anyhow::bail!("suspend-size: agent connect failed: {e}");
     }
     if let Err(e) = vm.snapshot(&snap_dir).await {
-        println!("suspend-size: snapshot failed: {e}");
         // Best-effort teardown + partial-snapshot cleanup on the failure path.
         let _ = vm.shutdown().await;
         let _ = std::fs::remove_dir_all(&snap_dir);
-        return;
+        anyhow::bail!("suspend-size: snapshot failed: {e}");
     }
     // Best-effort graceful shutdown before we measure the on-disk snapshot; `Drop`
     // guarantees teardown regardless of this result.
@@ -1053,6 +1277,7 @@ async fn run_suspend_size<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
 
     // Best-effort cleanup of the measured snapshot dir now that it's been reported.
     let _ = std::fs::remove_dir_all(&snap_dir);
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
@@ -1105,7 +1330,7 @@ async fn phase_budget_path<V: Vmm>(
     cid: std::sync::Arc<CidAllocator>,
     allocator: VmidAllocator,
     snap_dir: Option<PathBuf>,
-) {
+) -> anyhow::Result<()> {
     let label = if snap_dir.is_some() {
         "RESTORE"
     } else {
@@ -1203,7 +1428,7 @@ async fn phase_budget_path<V: Vmm>(
 
     if p_create.is_empty() {
         println!("phase-budget {label} ({backend}): No successful runs");
-        return;
+        anyhow::bail!("phase-budget {label} ({backend}): no successful post-warmup samples");
     }
 
     let sum = |v: &[u128]| -> u128 { v.iter().sum() };
@@ -1218,18 +1443,25 @@ async fn phase_budget_path<V: Vmm>(
     report_phase("exec    ", &mut p_exec, total_mean);
     report_phase("teardown", &mut p_teardown, total_mean);
     println!("  TOTAL (sum of phase means) ~= {total_mean} µs");
+    Ok(())
 }
 
-async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
+async fn run_phase_budget<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
     let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("phase-budget: No successful runs (missing artifacts in {dir})");
-        return;
+        anyhow::bail!("phase-budget: missing artifacts in {dir}");
     }
     let cfg = build_cfg(args, kernel, rootfs, false);
     let cid = std::sync::Arc::new(CidAllocator::new());
 
-    // Cold-boot path (opt-in budget).
+    // Cold-boot path (opt-in budget). A zero-sample cold path is an attempted-and-
+    // failed run → propagate (M-BIN-1).
     phase_budget_path(
         vmm,
         backend,
@@ -1239,19 +1471,20 @@ async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
         allocator.clone(),
         None,
     )
-    .await;
+    .await?;
 
     // Restore path (the hot path) — build the baseline snapshot once.
     if vmm.capabilities().snapshot_restore {
-        let snap_dir =
-            PathBuf::from(&args.snap_dir).join(format!("phase-{backend}-{}", std::process::id()));
+        let snap_dir = resolve_snap_dir(&args.snap_dir)
+            .join(format!("phase-{backend}-{}", std::process::id()));
         // Best-effort pre-clean of a stale snapshot dir from a prior aborted run.
         let _ = std::fs::remove_dir_all(&snap_dir);
         if let Err(e) = std::fs::create_dir_all(&snap_dir) {
-            println!("phase-budget: cannot create snap dir: {e}");
-            return;
+            anyhow::bail!("phase-budget: cannot create snap dir: {e}");
         }
-        match build_baseline_snapshot(vmm, &cfg, cid.clone(), allocator.clone(), &snap_dir).await {
+        let baseline =
+            build_baseline_snapshot(vmm, &cfg, cid.clone(), allocator.clone(), &snap_dir).await;
+        let restore_res = match baseline {
             Ok(()) => {
                 phase_budget_path(
                     vmm,
@@ -1262,25 +1495,36 @@ async fn run_phase_budget<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator
                     allocator.clone(),
                     Some(snap_dir.clone()),
                 )
-                .await;
+                .await
             }
-            Err(e) => println!("phase-budget: baseline snapshot failed: {e}"),
-        }
-        // Best-effort cleanup of the baseline snapshot dir after the restore budget.
+            Err(e) => Err(anyhow::anyhow!(
+                "phase-budget: baseline snapshot failed: {e}"
+            )),
+        };
+        // Best-effort cleanup of the baseline snapshot dir after the restore budget,
+        // regardless of whether the restore path succeeded.
         let _ = std::fs::remove_dir_all(&snap_dir);
+        restore_res?;
     } else {
+        // Genuine capability skip → success; the cold path already ran.
         println!("phase-budget: backend {backend} has no restore; cold path only");
     }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
 // §13.5 — vsock-rtt: control-plane exec round-trip latency floor.
 // ----------------------------------------------------------------------------
-async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: VmidAllocator) {
+async fn run_vsock_rtt<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
     let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
     if !kernel.exists() || !rootfs.exists() {
         println!("vsock-rtt: No successful runs (missing artifacts in {dir})");
-        return;
+        anyhow::bail!("vsock-rtt: missing artifacts in {dir}");
     }
     let cfg = build_cfg(args, kernel, rootfs, false);
     let cid = std::sync::Arc::new(CidAllocator::new());
@@ -1296,16 +1540,12 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     .await
     {
         Ok(v) => v,
-        Err(e) => {
-            println!("vsock-rtt: boot failed: {e}");
-            return;
-        }
+        Err(e) => anyhow::bail!("vsock-rtt: boot failed: {e}"),
     };
     if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
-        println!("vsock-rtt: agent connect failed: {e}");
         // Best-effort teardown before bailing; `Drop` guarantees teardown.
         let _ = vm.shutdown().await;
-        return;
+        anyhow::bail!("vsock-rtt: agent connect failed: {e}");
     }
     let argv = pick_exec_cmd(&mut vm).await;
 
@@ -1318,30 +1558,49 @@ async fn run_vsock_rtt<V: Vmm>(vmm: &V, backend: &str, args: &Args, allocator: V
     }
 
     let mut rtts = Vec::with_capacity(iters);
-    for _ in 0..iters {
+    // H-BIN-2: count exec failures that shrink the sample set instead of the silent
+    // `if r.is_ok()` drop, and surface the error rather than a bare `break`.
+    let mut dropped = 0usize;
+    for i in 0..iters {
         let agent = match vm.agent(None, &vmcell::orchestrator::RealClock).await {
             Ok(a) => a,
-            Err(_) => break,
+            Err(e) => {
+                println!("vsock-rtt: iteration {i} agent-connect failed: {e}");
+                break;
+            }
         };
         let t = Instant::now();
         let r = agent.exec(ExecRequest::new(argv.clone())).await;
         let dt = t.elapsed().as_micros();
-        if r.is_ok() {
-            rtts.push(dt);
+        match r {
+            Ok(_) => rtts.push(dt),
+            Err(e) => {
+                println!("vsock-rtt: iteration {i} exec failed: {e}");
+                dropped += 1;
+            }
         }
     }
     // Best-effort teardown after the run; `Drop` guarantees the real teardown, so a
     // shutdown error must not corrupt the collected RTT report below.
     let _ = vm.shutdown().await;
 
+    let acct = accounting_suffix(dropped, 0);
     println!(
-        "=== VSOCK-RTT (backend={backend} n={} cmd={argv:?}) ===",
+        "=== VSOCK-RTT (backend={backend} n={}{acct} cmd={argv:?}) ===",
         rtts.len()
     );
-    if let Some((p50, p95, p99, max)) = pcts(&mut rtts) {
-        println!("  per-round-trip exec latency: p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs");
-    } else {
-        println!("  No successful runs");
+    match pcts(&mut rtts) {
+        Some((p50, p95, p99, max)) => {
+            println!(
+                "  per-round-trip exec latency: p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs"
+            );
+            Ok(())
+        }
+        None => {
+            println!("  No successful runs");
+            // M-BIN-1: attempted but zero samples → fail loud.
+            anyhow::bail!("vsock-rtt: no successful exec round-trips");
+        }
     }
 }
 
@@ -1405,5 +1664,133 @@ mod tests {
         // The documented floor itself is accepted.
         let ok = <Args as clap::Parser>::parse_from(["bench-vm", "--mem-mib", "64"]);
         assert!(validate_vm_params(&ok).is_ok());
+    }
+
+    // N-BIN-2: `--count 0` was silently clamped to 1 by `args.count.max(1)`. RED on
+    // the inverse (silent clamp / no check): the count-0 case returns `Ok`.
+    #[test]
+    fn validate_vm_params_rejects_zero_count() {
+        let bad = <Args as clap::Parser>::parse_from(["bench-vm", "--count", "0"]);
+        assert!(validate_vm_params(&bad).is_err());
+        let ok = <Args as clap::Parser>::parse_from(["bench-vm", "--count", "1"]);
+        assert!(validate_vm_params(&ok).is_ok());
+    }
+
+    // H-BIN-1-revisited: `report`/`pcts` used `floor(q*n)`, one rank too high when
+    // `q*n` is integral — at N=20 it returned index 19 (the MAX) for p95. Nearest-rank
+    // `ceil(q*n)-1` gives p50=10, p95=19, p99=20. RED on the old `floor` impl (which
+    // yields p50=11, p95=20).
+    #[test]
+    fn percentile_nearest_rank_correctness() {
+        let mut v: Vec<u128> = (1..=20).collect();
+        let (p50, p95, p99, max) = pcts(&mut v).expect("non-empty sample set");
+        assert_eq!(p50, 10, "p50 nearest-rank");
+        assert_eq!(p95, 19, "p95 nearest-rank (NOT the max)");
+        assert_eq!(p99, 20, "p99 nearest-rank");
+        assert_eq!(max, 20, "max is the last element");
+        // Degenerate sizes stay in-bounds.
+        assert_eq!(pcts(&mut [7u128]), Some((7, 7, 7, 7)));
+        assert_eq!(pcts(&mut []), None);
+    }
+
+    // H-BIN-2: dropped/warmup-failed iterations silently shrank the reported count.
+    // RED on the inverse (a suffix that is always empty): the `dropped=5` assert fails.
+    #[test]
+    fn accounting_suffix_surfaces_drops() {
+        assert_eq!(accounting_suffix(0, 0), "");
+        let s = accounting_suffix(5, 2);
+        assert!(s.contains("dropped=5"), "got {s}");
+        assert!(s.contains("warmup_failed=2"), "got {s}");
+    }
+
+    // M-BIN-8: the cold label trusted the `drop_caches` write's success alone, so a
+    // silently-ineffective write (euid != 0) mislabeled a warm cache as cold. RED on
+    // the inverse (`fn(...) -> wrote`): the (wrote, unchanged-Cached) case returns true.
+    #[test]
+    fn cache_drop_effective_flags_ineffective_write() {
+        // Write failed → not effective (warm).
+        assert!(!cache_drop_effective(false, Some(100), Some(10)));
+        // Write "succeeded" but Cached did not drop → ineffective (warm).
+        assert!(!cache_drop_effective(true, Some(100), Some(100)));
+        // Write succeeded and Cached dropped → effective (cold).
+        assert!(cache_drop_effective(true, Some(100), Some(10)));
+        // No prior cache (already cold) → trivially effective.
+        assert!(cache_drop_effective(true, Some(0), Some(0)));
+    }
+
+    // M-BIN-7: the footprint host-RAM annotations were hard-coded CH memfd/shmem
+    // terms, which invert on Firecracker (private anon guest RAM). RED on the inverse
+    // (always the CH strings): the FC anon assertion and the CH != FC assertion fail.
+    #[test]
+    fn footprint_notes_are_backend_specific() {
+        let (_a_ch, s_ch) = footprint_mem_notes("cloud-hypervisor");
+        assert!(s_ch.contains("memfd"), "CH shmem note should mention memfd");
+        let (a_fc, s_fc) = footprint_mem_notes("firecracker");
+        assert!(
+            a_fc.to_lowercase().contains("anon"),
+            "FC anon note should mention anon, got: {a_fc}"
+        );
+        assert_ne!(s_ch, s_fc, "CH and FC shmem notes must differ");
+    }
+
+    // H-BIN-1: `--profile`/`--kernel-verbosity`/`--console` silently defaulted on an
+    // unknown value (the `_ => default` arms). RED on the inverse (accept-all
+    // parser): the typo `is_err` asserts fail. Note the underscore spelling
+    // `low_latency` (vs the hyphenated flag) is a real, rejected typo.
+    #[test]
+    fn cli_enum_parsers_reject_typos() {
+        assert!(parse_profile("low_latency").is_err()); // underscore typo
+        assert!(parse_profile("throughputt").is_err());
+        assert!(parse_profile("low-latency").is_ok());
+        assert!(parse_profile("default").is_ok());
+        assert!(parse_profile("throughput").is_ok());
+
+        assert!(parse_console("virtio_console_typo").is_err());
+        assert!(parse_console("virtio-console").is_ok());
+        assert!(parse_console("uart").is_ok());
+
+        assert!(parse_verbosity("balancedd").is_err());
+        assert!(parse_verbosity("quiet").is_ok());
+        assert!(parse_verbosity("debug").is_ok());
+    }
+
+    // H-BIN-1: the run header now echoes the resolved knobs. RED on the inverse (no
+    // echo / hard-coded defaults): the resolved values would be absent from the line.
+    #[test]
+    fn header_echoes_resolved_knobs() {
+        let a = <Args as clap::Parser>::parse_from([
+            "bench-vm",
+            "--profile",
+            "low-latency",
+            "--console",
+            "virtio-console",
+        ]);
+        let line = resolved_knobs_line(&a);
+        assert!(line.contains("profile: low-latency"), "{line}");
+        assert!(line.contains("VirtioConsole"), "{line}");
+    }
+
+    // N-BIN-5: the tmpfs check must match the LONGEST mount-point prefix, not the
+    // first (`/` matches every absolute path). RED on the inverse (first-match): the
+    // nested `/home/x/target/snap` path resolves to the root `ext4` instead of tmpfs.
+    #[test]
+    fn path_fstype_uses_longest_mount_prefix() {
+        let mi = "\
+1 0 8:1 / / rw shared:1 - ext4 /dev/sda1 rw
+2 0 0:22 / /dev/shm rw shared:2 - tmpfs tmpfs rw
+3 0 0:23 / /home/x/target rw shared:3 - tmpfs tmpfs rw
+";
+        assert_eq!(
+            path_fstype(mi, Path::new("/dev/shm/snap")).as_deref(),
+            Some("tmpfs")
+        );
+        assert_eq!(
+            path_fstype(mi, Path::new("/var/data")).as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(
+            path_fstype(mi, Path::new("/home/x/target/vmcell-bench-snap")).as_deref(),
+            Some("tmpfs")
+        );
     }
 }

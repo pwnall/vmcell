@@ -49,37 +49,10 @@ pub struct ChInstance {
     // True if a vhost-user-net device is attached (unprivileged NAT). Such a VM is
     // not snapshot-eligible.
     vhost_user_net: bool,
-}
-
-/// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
-/// because it has a vhost-user device attached (virtio-fs share, unprivileged net, or
-/// vhost-user-net). The snapshot-eligibility law requires rejecting such a VM on
-/// the `snapshot()`/`restore()` paths instead of attaching/keeping virtiofsd.
-fn has_vhost_user_device(
-    virtio_fs_share: bool,
-    unprivileged_net: bool,
-    vhost_user_net: bool,
-) -> bool {
-    virtio_fs_share || unprivileged_net || vhost_user_net
-}
-
-/// Returns `true` when `cfg`/`res` describe a VM that carries a vhost-user device
-/// and is therefore **not** snapshot-eligible (§3.3 snapshot-eligibility law).
-/// This covers all three §3.3 cases at the `restore()` boundary: a virtio-fs
-/// *rootfs* **or** a virtio-fs data share (both served by virtiofsd), the
-/// unprivileged `vhost-user-net` NAT, and an external `vhost-user-net` socket.
-///
-/// The virtio-fs *rootfs* case (`RootfsSource::VirtioFs`) is the one CH
-/// `restore()` previously missed (M-RESTORE-3): it guarded data shares but not a
-/// virtio-fs rootfs, which is equally backed by a vhost-user device.
-fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
-    let virtio_fs = !cfg.shares.is_empty()
-        || matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. });
-    has_vhost_user_device(
-        virtio_fs,
-        matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }),
-        res.vhost_user_socket.is_some(),
-    )
+    // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
+    // leader is reaped the kernel can recycle its pgid, so `kill`/`Drop` must NOT
+    // re-`SIGKILL` the process group or they could hit an unrelated group (M-VMM-1).
+    reaped: bool,
 }
 
 /// Pre-flight self-checks for the `ChInstance::snapshot` path.
@@ -242,6 +215,87 @@ impl ChInstance {
     }
 }
 
+/// The paths and handles produced by [`CloudHypervisor::spawn_ch`].
+struct SpawnedCh {
+    api_socket: PathBuf,
+    vsock_path: PathBuf,
+    serial_path: PathBuf,
+    process: Child,
+    pgid: Option<u32>,
+    /// The guest CID baked into a restored snapshot's `config.json` (`vsock.cid`), or
+    /// `None` on a cold create. A restored guest keeps this CID verbatim (CH rebuilds
+    /// the vsock device from the snapshot), so `guest_cid()` must report it rather than
+    /// the orchestrator's fresh allocation (M-VMM-3).
+    baked_cid: Option<u32>,
+}
+
+/// Reads the guest CID a CH snapshot baked into its `config.json` (`vsock.cid`).
+///
+/// Returns `None` when the field is absent or malformed so the caller falls back to
+/// the fresh allocation. A restored guest keeps this CID verbatim (CH rebuilds the
+/// vsock device from the snapshot), so `guest_cid()` must report it (M-VMM-3).
+fn baked_cid_from_config(config: &serde_json::Value) -> Option<u32> {
+    config
+        .get("vsock")
+        .and_then(|v| v.get("cid"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|c| u32::try_from(c).ok())
+}
+
+/// Rewrites a CH restore `config.json` in place so its host-side paths point at the
+/// fresh restore VM's scratch dir instead of the (deleted) original instance's.
+///
+/// The snapshot recorded the original VM's vsock socket and serial/console file paths;
+/// CH (v52) exposes no restore-time override, so they must be rewritten before launch
+/// or the host dials a vsock CH never binds (agent handshake times out) and the serial
+/// log stays empty. Handles both console wirings: a `Uart` VM records the sink under
+/// `serial.file` (console is `{"mode":"Off"}`), a `VirtioConsole` VM under
+/// `console.file` (serial is `{"mode":"Off"}`). Extracted pure so its edge cases are
+/// unit-testable without KVM (M-VMM-10).
+///
+/// # Errors
+/// Currently infallible; returns [`Result`] so a future stricter rewrite can fail loud.
+fn rewrite_restore_config(
+    config: &mut serde_json::Value,
+    vsock_path: &Path,
+    serial_path: &Path,
+    tap_name: Option<&str>,
+) -> Result<()> {
+    if let Some(vsock) = config.get_mut("vsock") {
+        vsock["socket"] = serde_json::Value::String(vsock_path.to_string_lossy().into_owned());
+    }
+    // H-VMM-1: rewrite every net device's baked tap name to THIS restore's tap.
+    // The snapshot recorded the ORIGINAL vmid's tap (`vmcell-tap-<old>`), which does
+    // not exist in this restore's freshly-built netns — CH would open a dangling
+    // device and guest egress would be dead. The guest's IP + default route are
+    // rotated to match by the native resync (see `maybe_resync_after_restore`), so
+    // the whole L2/L3 identity moves to the rotated vmid together.
+    if let Some(tap) = tap_name {
+        if let Some(nets) = config.get_mut("net").and_then(|n| n.as_array_mut()) {
+            for net in nets.iter_mut() {
+                if net.get("tap").is_some() {
+                    net["tap"] = serde_json::Value::String(tap.to_string());
+                }
+            }
+        }
+    }
+    // The serial sink lives under `serial.file` for a Uart VM and under `console.file`
+    // for a VirtioConsole VM (the other device serializes as `{"mode":"Off"}` with no
+    // `file`). Rewrite whichever one the snapshot recorded so the restored VM logs to
+    // the fresh serial_path instead of the original instance's deleted temp path.
+    if let Some(serial) = config.get_mut("serial") {
+        if serial.get("file").is_some() {
+            serial["file"] = serde_json::Value::String(serial_path.to_string_lossy().into_owned());
+        }
+    }
+    if let Some(console) = config.get_mut("console") {
+        if console.get("file").is_some() {
+            console["file"] = serde_json::Value::String(serial_path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
 impl CloudHypervisor {
     async fn spawn_ch(
         &self,
@@ -250,13 +304,7 @@ impl CloudHypervisor {
         snapshot_dir: Option<&Path>,
         restore_mode: crate::config::RestoreMode,
         cgroups: &dyn crate::metrics::CgroupFs,
-    ) -> Result<(
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        tokio::process::Child,
-        Option<u32>,
-    )> {
+    ) -> Result<SpawnedCh> {
         // The orchestrator owns the per-VM scratch dir; derive our socket and
         // serial-log paths inside it.
         let api_socket = res.tmp_dir.join("api.sock");
@@ -264,6 +312,10 @@ impl CloudHypervisor {
         let serial_path = res.tmp_dir.join("serial.log");
 
         let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
+
+        // The guest CID a restored snapshot baked in (populated from config.json in the
+        // restore branch below); `None` on a cold create (M-VMM-3).
+        let mut baked_cid: Option<u32> = None;
 
         if let Some(dir) = snapshot_dir {
             // CH `--restore` reconstructs every device from the snapshot's
@@ -279,28 +331,19 @@ impl CloudHypervisor {
             let config_path = dir.join("config.json");
             let content = tokio::fs::read_to_string(&config_path).await?;
             let mut config: serde_json::Value = serde_json::from_str(&content)?;
-            if let Some(vsock) = config.get_mut("vsock") {
-                vsock["socket"] =
-                    serde_json::Value::String(vsock_path.to_string_lossy().into_owned());
-            }
-            // The serial sink lives under `serial.file` for a Uart VM and under
-            // `console.file` for a VirtioConsole VM (the other device serializes as
-            // `{"mode":"Off"}` with no `file`). Rewrite whichever one the snapshot
-            // recorded to this restore's fresh serial_path — the cmdline `console=`
-            // token and this device wiring stay in lockstep — otherwise the restored
-            // VM re-opens the original instance's deleted temp path and logs nowhere.
-            if let Some(serial) = config.get_mut("serial") {
-                if serial.get("file").is_some() {
-                    serial["file"] =
-                        serde_json::Value::String(serial_path.to_string_lossy().into_owned());
-                }
-            }
-            if let Some(console) = config.get_mut("console") {
-                if console.get("file").is_some() {
-                    console["file"] =
-                        serde_json::Value::String(serial_path.to_string_lossy().into_owned());
-                }
-            }
+            // Surface the CID the snapshot baked in: the restored guest keeps it
+            // verbatim, so `guest_cid()` must report it, not the fresh allocation
+            // (M-VMM-3).
+            baked_cid = baked_cid_from_config(&config);
+            // Point the vsock/serial/console host paths at this restore's fresh scratch
+            // dir before launch (M-VMM-10), and rewrite the baked tap name to this
+            // restore's tap (H-VMM-1).
+            rewrite_restore_config(
+                &mut config,
+                &vsock_path,
+                &serial_path,
+                res.tap_name.as_deref(),
+            )?;
             tokio::fs::write(&config_path, serde_json::to_string(&config)?).await?;
 
             // §13.3 eager-vs-lazy restore: CH v52's `--restore` accepts a
@@ -337,7 +380,14 @@ impl CloudHypervisor {
         )
         .await?;
 
-        Ok((api_socket, vsock_path, serial_path, process, pgid))
+        Ok(SpawnedCh {
+            api_socket,
+            vsock_path,
+            serial_path,
+            process,
+            pgid,
+            baked_cid,
+        })
     }
 }
 
@@ -364,7 +414,14 @@ impl Vmm for CloudHypervisor {
             cfg.console_mode,
         )?;
 
-        let (api_socket, vsock_path, serial_path, process, pgid) = self
+        let SpawnedCh {
+            api_socket,
+            vsock_path,
+            serial_path,
+            process,
+            pgid,
+            baked_cid: _,
+        } = self
             .spawn_ch(cfg, res, None, crate::config::RestoreMode::Default, cgroups)
             .await?;
 
@@ -387,6 +444,7 @@ impl Vmm for CloudHypervisor {
             cid,
             pgid,
             vhost_user_net: res.vhost_user_socket.is_some(),
+            reaped: false,
         };
 
         let mut ch_fs = Vec::new();
@@ -505,13 +563,20 @@ impl Vmm for CloudHypervisor {
         // device. Reject a virtio-fs *rootfs* or data share, unprivileged net, or an
         // external vhost-user-net *before* we would otherwise start virtiofsd
         // below. (M-RESTORE-3: the virtio-fs rootfs case was previously missed.)
-        if config_has_vhost_user_device(cfg, res) {
+        if crate::vmm::config_has_vhost_user_device(cfg, res) {
             return Err(Error::Unsupported {
                 vmm: "cloud-hypervisor".to_string(),
                 feature: "snapshot/restore with a vhost-user device".to_string(),
             });
         }
-        let (api_socket, vsock_path, serial_path, process, pgid) = self
+        let SpawnedCh {
+            api_socket,
+            vsock_path,
+            serial_path,
+            process,
+            pgid,
+            baked_cid,
+        } = self
             .spawn_ch(cfg, res, Some(snapshot_dir), cfg.restore_mode, cgroups)
             .await?;
 
@@ -523,7 +588,10 @@ impl Vmm for CloudHypervisor {
             fs_daemons.push(daemon);
         }
 
-        let cid = res.guest_cid;
+        // A restored guest keeps the CID baked into its snapshot; report that, not the
+        // orchestrator's fresh allocation (M-VMM-3). Fall back to the fresh CID only if
+        // the snapshot's config.json lacked a readable `vsock.cid`.
+        let cid = baked_cid.unwrap_or(res.guest_cid);
 
         let instance = ChInstance {
             process,
@@ -536,6 +604,7 @@ impl Vmm for CloudHypervisor {
             cid,
             pgid,
             vhost_user_net: res.vhost_user_socket.is_some(),
+            reaped: false,
         };
 
         Ok(instance)
@@ -565,13 +634,17 @@ impl Vmm for CloudHypervisor {
 
 impl VmInstance for ChInstance {
     async fn boot(&mut self) -> Result<()> {
+        // §3.1 / M-VMM-4: a restored VM is returned paused and resumed via `resume()`,
+        // NEVER booted. Silently remapping boot()->vm.resume papered over the misuse;
+        // fail loud and typed instead, mirroring Firecracker.
         if self.restored {
-            self.api_request("PUT", "/api/v1/vm.resume", None::<&()>)
-                .await
-        } else {
-            self.api_request("PUT", "/api/v1/vm.boot", None::<&()>)
-                .await
+            return Err(Error::Unsupported {
+                vmm: "cloud-hypervisor".to_string(),
+                feature: "boot after restore (a restored VM is resumed, not booted)".to_string(),
+            });
         }
+        self.api_request("PUT", "/api/v1/vm.boot", None::<&()>)
+            .await
     }
 
     async fn request_shutdown(&mut self) -> Result<()> {
@@ -581,21 +654,33 @@ impl VmInstance for ChInstance {
 
     async fn kill(&mut self) -> Result<()> {
         if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            // Skip the group SIGKILL if the leader was already reaped (its pgid may be
+            // recycled) — M-VMM-1.
+            if !self.reaped {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
         }
         let _ = self.process.wait().await;
+        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
+        self.reaped = true;
         Ok(())
     }
 
     async fn has_exited(&mut self) -> bool {
         // Non-blocking reap of the VMM leader; `Ok(Some(_))` means it exited (the
-        // guest powered off after `request_shutdown`). Reaping the leader early is
-        // safe — the later `kill()`/`Drop` SIGKILL of the now-dead group is a
-        // harmless no-op and `process.wait()` returns the cached status.
-        matches!(self.process.try_wait(), Ok(Some(_)))
+        // guest powered off after `request_shutdown`). Record the reap so `kill()`/
+        // `Drop` do NOT re-`SIGKILL` the process group: once the leader is reaped the
+        // kernel may recycle its pgid and signalling `-pgid` could hit an unrelated
+        // group (M-VMM-1).
+        if matches!(self.process.try_wait(), Ok(Some(_))) {
+            self.reaped = true;
+            true
+        } else {
+            false
+        }
     }
 
     async fn pause(&mut self) -> Result<()> {
@@ -615,7 +700,11 @@ impl VmInstance for ChInstance {
         // vhost-user device attached (virtiofsd or vhost-user-net).
         snapshot_precheck(
             self.snapshot_restore_capable,
-            has_vhost_user_device(!self._fs_daemons.is_empty(), false, self.vhost_user_net),
+            crate::vmm::has_vhost_user_device(
+                !self._fs_daemons.is_empty(),
+                false,
+                self.vhost_user_net,
+            ),
         )?;
         #[derive(Serialize)]
         struct SnapshotReq {
@@ -657,12 +746,16 @@ impl Drop for ChInstance {
         // touching virtiofsd or the per-VM directory means cleanup never races a
         // live VMM.
         if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            if let Some(pid) = self.process.id() {
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+            // Skip the group SIGKILL + reap if the leader was already reaped (via
+            // `has_exited`/`kill`): its pgid may have been recycled (M-VMM-1).
+            if !self.reaped {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                if let Some(pid) = self.process.id() {
+                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+                }
             }
         }
         // virtiofsd next: dropping each daemon kills it and removes its own socket
@@ -789,97 +882,213 @@ mod tests {
         .expect("an erofs rootfs must not trip the CH guard");
     }
 
-    // Guards C1/VMM-1: any vhost-user device (virtio-fs share, unprivileged net, or
-    // vhost-user-net) makes a VM ineligible for snapshot/restore. The buggy impl
-    // (no guard) would attach virtiofsd to a restored VM and snapshot a vhost-user
-    // VM; this predicate backs both the `restore()` and `snapshot()` self-guards.
-    #[test]
-    fn vhost_user_device_guard() {
-        assert!(has_vhost_user_device(true, false, false)); // virtio-fs data share
-        assert!(has_vhost_user_device(false, true, false)); // unprivileged net
-        assert!(has_vhost_user_device(false, false, true)); // external vhost-user-net
-        // tap (privileged) net + erofs/block rootfs: snapshot-eligible.
-        assert!(!has_vhost_user_device(false, false, false));
-    }
-
-    fn res_with(vhost_user_socket: Option<PathBuf>) -> PerVmResources {
-        PerVmResources {
-            cgroup_name: "vmcell-test".to_string(),
-            tap_name: Some("tap0".to_string()),
-            netns_name: Some("ns0".to_string()),
-            vhost_user_socket,
-            vmid: 1,
-            guest_cid: 3,
-            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-1"),
-        }
-    }
-
-    // Guards M-RESTORE-3 (CH restore boundary): the snapshot-eligibility law's
-    // third boundary must reject *all* vhost-user devices, including a virtio-fs
-    // *rootfs*. The previous impl only checked `!cfg.shares.is_empty()`, so a
-    // VirtioFs rootfs slipped through — that inverse makes the first assertion
-    // below go red.
-    #[test]
-    fn config_vhost_user_device_covers_virtio_fs_rootfs() {
-        use crate::config::{Egress, NetConfig, RootfsSource};
-
-        // virtio-fs *rootfs*, no data share, no vhost-user-net: still ineligible.
-        let virtio_fs_rootfs = VmConfig::builder(
-            "/k",
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/d"),
-            },
-        )
-        .build()
-        .expect("build virtio-fs rootfs config");
+    // Guards M-VMM-4: a restored CH VM is resumed via `resume()`, never booted; boot()
+    // must fail loud and typed instead of silently remapping to `vm.resume`. The guard
+    // runs before any api_request, so the absent api socket is never dialed. Inverse
+    // (the old boot()->vm.resume remap) dials the missing socket and returns a
+    // transport error, not this typed Unsupported — reddening the assertion.
+    #[tokio::test]
+    async fn restored_ch_instance_refuses_boot() {
+        let mut std_cmd = std::process::Command::new("sleep");
+        std_cmd.arg("60");
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+        let child = tokio::process::Command::from(std_cmd)
+            .spawn()
+            .expect("spawn stand-in");
+        let mut inst = ChInstance {
+            pgid: child.id(),
+            process: child,
+            api_socket: std::env::temp_dir().join("vmcell-ch-boot-test-nonexistent.sock"),
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            _fs_daemons: Vec::new(),
+            restored: true,
+            snapshot_restore_capable: true,
+            cid: 3,
+            vhost_user_net: false,
+            reaped: false,
+        };
+        let err = inst
+            .boot()
+            .await
+            .expect_err("a restored CH VM must refuse boot()");
         assert!(
-            config_has_vhost_user_device(&virtio_fs_rootfs, &res_with(None)),
-            "virtio-fs rootfs must be rejected as a vhost-user device"
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "cloud-hypervisor" && feature.contains("boot after restore")),
+            "expected boot-after-restore Unsupported, got {err:?}"
         );
+        let _ = inst.kill().await;
+    }
 
-        // unprivileged net is a vhost-user-net device.
-        let unprivileged = VmConfig::builder(
-            "/k",
-            RootfsSource::Erofs {
-                image: PathBuf::from("/i"),
-            },
-        )
-        .net(NetConfig::Unprivileged {
-            egress: Egress::default(),
-            host_services_port: None,
-        })
-        .build()
-        .expect("build unprivileged config");
-        assert!(config_has_vhost_user_device(&unprivileged, &res_with(None)));
+    // Guards M-VMM-1 (CH): once the leader is reaped its pgid can be recycled — kill()
+    // must NOT SIGKILL `-pgid`. A live decoy process stands in for that recycled group.
+    // Inverse: drop the `!self.reaped` guard in kill() and the decoy is SIGKILLed
+    // (try_wait then reports it exited), reddening the assert.
+    #[tokio::test]
+    async fn kill_does_not_signal_pgid_when_reaped() {
+        let mut decoy = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("60");
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+            tokio::process::Command::from(c)
+                .spawn()
+                .expect("spawn decoy")
+        };
+        let decoy_pid = decoy.id().expect("decoy pid") as i32;
 
-        // external vhost-user-net socket attached via resources.
-        let plain = VmConfig::builder(
-            "/k",
-            RootfsSource::Erofs {
-                image: PathBuf::from("/i"),
-            },
-        )
-        .build()
-        .expect("build plain config");
-        assert!(config_has_vhost_user_device(
-            &plain,
-            &res_with(Some(PathBuf::from("/run/vhost.sock")))
-        ));
+        // A fast-exiting child as the instance's own leader so kill()'s process.wait()
+        // returns promptly instead of blocking on a live process.
+        let leader = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true` leader");
+        let mut inst = ChInstance {
+            process: leader,
+            api_socket: PathBuf::new(),
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            _fs_daemons: Vec::new(),
+            restored: false,
+            snapshot_restore_capable: true,
+            cid: 3,
+            pgid: Some(decoy_pid as u32),
+            vhost_user_net: false,
+            reaped: true,
+        };
+        inst.kill().await.expect("kill");
 
-        // erofs rootfs + privileged (tap) net + no external socket: eligible.
-        let eligible = VmConfig::builder(
-            "/k",
-            RootfsSource::Erofs {
-                image: PathBuf::from("/i"),
-            },
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let decoy_status = decoy.try_wait().expect("try_wait decoy");
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-decoy_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = decoy.wait().await;
+
+        assert!(
+            decoy_status.is_none(),
+            "kill() on a reaped CH instance must not SIGKILL a (recycled) pgid"
+        );
+    }
+
+    // Guards M-VMM-3: a restored CH guest keeps the CID baked into its snapshot's
+    // config.json; `guest_cid()` must report that, read from `vsock.cid`. Inverse:
+    // ignore `vsock.cid` and return the fresh allocation — the Some(42) assertion reddens.
+    #[test]
+    fn baked_cid_from_config_reads_vsock_cid() {
+        assert_eq!(
+            baked_cid_from_config(&serde_json::json!({"vsock": {"cid": 42, "socket": "/x"}})),
+            Some(42)
+        );
+        // Absent / malformed -> None so the caller falls back to the fresh allocation.
+        assert_eq!(baked_cid_from_config(&serde_json::json!({})), None);
+        assert_eq!(
+            baked_cid_from_config(&serde_json::json!({"vsock": {}})),
+            None
+        );
+        assert_eq!(
+            baked_cid_from_config(&serde_json::json!({"vsock": {"cid": "not-a-number"}})),
+            None
+        );
+    }
+
+    // Guards M-VMM-10: the restore config rewrite must move vsock/serial host paths
+    // into the fresh restore's scratch dir. A Uart VM records the sink under
+    // `serial.file` (console Off). Inverse: drop the serial arm and serial.file keeps
+    // the old, deleted path (the restored VM logs nowhere).
+    #[test]
+    fn rewrite_restore_config_rewrites_uart_paths() {
+        let mut config = serde_json::json!({
+            "vsock": { "cid": 3, "socket": "/old/vsock.sock" },
+            "serial": { "mode": "File", "file": "/old/serial.log" },
+            "console": { "mode": "Off" }
+        });
+        rewrite_restore_config(
+            &mut config,
+            &PathBuf::from("/new/vsock.sock"),
+            &PathBuf::from("/new/serial.log"),
+            None,
         )
-        .net(NetConfig::Privileged {
-            egress: Egress::default(),
-            host_services_port: None,
-        })
-        .build()
-        .expect("build eligible config");
-        assert!(!config_has_vhost_user_device(&eligible, &res_with(None)));
+        .expect("rewrite");
+        assert_eq!(config["vsock"]["socket"], "/new/vsock.sock");
+        assert_eq!(config["serial"]["file"], "/new/serial.log");
+        assert_eq!(config["console"], serde_json::json!({"mode": "Off"}));
+    }
+
+    // M-VMM-10: a VirtioConsole VM records the sink under `console.file` (serial Off).
+    // Inverse: drop the console arm and the VirtioConsole sink keeps the old path,
+    // silencing serial.log on restore.
+    #[test]
+    fn rewrite_restore_config_rewrites_virtio_console_paths() {
+        let mut config = serde_json::json!({
+            "vsock": { "cid": 3, "socket": "/old/vsock.sock" },
+            "serial": { "mode": "Off" },
+            "console": { "mode": "File", "file": "/old/serial.log" }
+        });
+        rewrite_restore_config(
+            &mut config,
+            &PathBuf::from("/new/vsock.sock"),
+            &PathBuf::from("/new/serial.log"),
+            None,
+        )
+        .expect("rewrite");
+        assert_eq!(config["console"]["file"], "/new/serial.log");
+        assert_eq!(config["serial"], serde_json::json!({"mode": "Off"}));
+        assert_eq!(config["vsock"]["socket"], "/new/vsock.sock");
+    }
+
+    // H-VMM-1: the restore config rewrite must re-point every net device's baked
+    // tap (`vmcell-tap-<old>`) to THIS restore's tap. Inverse: drop the net-tap arm
+    // and the restored guest opens the original vmid's tap — which does not exist in
+    // the fresh netns — leaving egress dead. A `None` tap (no privileged net) leaves
+    // the config untouched.
+    #[test]
+    fn rewrite_restore_config_rewrites_tap_name() {
+        let mut config = serde_json::json!({
+            "vsock": { "socket": "/old/vsock.sock" },
+            "net": [ { "tap": "vmcell-tap-7", "mac": "02:00:00:00:00:07" } ],
+        });
+        rewrite_restore_config(
+            &mut config,
+            &PathBuf::from("/new/vsock.sock"),
+            &PathBuf::from("/new/serial.log"),
+            Some("vmcell-tap-42"),
+        )
+        .expect("rewrite");
+        assert_eq!(config["net"][0]["tap"], "vmcell-tap-42");
+        // The MAC is left for the in-guest resync to rotate; only the tap moves here.
+        assert_eq!(config["net"][0]["mac"], "02:00:00:00:00:07");
+
+        // With no tap (None), the net array is untouched.
+        let mut config2 = serde_json::json!({
+            "vsock": { "socket": "/old/vsock.sock" },
+            "net": [ { "tap": "vmcell-tap-7" } ],
+        });
+        rewrite_restore_config(
+            &mut config2,
+            &PathBuf::from("/new/vsock.sock"),
+            &PathBuf::from("/new/serial.log"),
+            None,
+        )
+        .expect("rewrite");
+        assert_eq!(config2["net"][0]["tap"], "vmcell-tap-7");
+    }
+
+    // M-VMM-10: the rewrite must not panic on a null `file` field.
+    #[test]
+    fn rewrite_restore_config_handles_null_file() {
+        let mut config = serde_json::json!({
+            "vsock": { "socket": "/old/vsock.sock" },
+            "serial": { "file": null },
+        });
+        rewrite_restore_config(
+            &mut config,
+            &PathBuf::from("/new/vsock.sock"),
+            &PathBuf::from("/new/serial.log"),
+            None,
+        )
+        .expect("rewrite must not fail on a null file field");
     }
 
     // Guards M-RESTORE-3 (CH snapshot boundary): `snapshot()` must self-check the

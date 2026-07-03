@@ -2,6 +2,11 @@
 all-features = true
 
 [licenses]
+# THIS list is the authoritative permissive allow-list (AGENTS.md defers to `cargo deny` as the
+# source of truth). It is a superset of the AGENTS.md prose ("MIT / Apache-2.0 / BSD / ISC / Zlib"):
+# the extras — `Apache-2.0 WITH LLVM-exception`, `0BSD`, `Unicode-3.0`, `CDLA-Permissive-2.0` — are
+# all OSI-permissive, non-copyleft, and safe for a linked dependency (N-BIN-1). Add a new license
+# here only after confirming it is permissive; copyleft stays out (external QEMU binary excepted).
 allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
          "BSD-3-Clause", "BSD-2-Clause", "ISC", "Zlib", "0BSD", "Unicode-3.0", "CDLA-Permissive-2.0"]
 private = { ignore = true }

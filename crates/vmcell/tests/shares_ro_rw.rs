@@ -13,6 +13,39 @@ vmm_matrix_test!(shares_ro_rw, |vmm| {
     test_shares_ro_rw_impl(&vmm).await;
 });
 
+// H-TEST-3: capability-honesty pin for `virtio_fs_shares`. `require_cap!` skips a
+// backend that lacks this flag, and under nextest a skip is an INVISIBLE pass — so
+// a descriptor regression (e.g. QEMU's `virtio_fs_shares` flipping to false) would
+// silently turn `shares_ro_rw::qemu` into a green no-op with no test catching it.
+// This non-KVM pin fixes the documented value for EVERY backend, so such a flip
+// reddens HERE in the default suite. Mirrors the FC snapshot pins in
+// src/vmm/firecracker.rs. Inverse: flip any asserted value and this goes red.
+#[test]
+fn capability_honesty_virtio_fs_shares() {
+    #[cfg(feature = "cloud-hypervisor")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(
+            common::ch_bin()
+        ))
+        .virtio_fs_shares,
+        "CH (primary) must support virtio_fs_shares; a false silently skips shares_ro_rw::cloud_hypervisor"
+    );
+    #[cfg(feature = "firecracker")]
+    assert!(
+        !vmcell::vmm::Vmm::capabilities(&vmcell::vmm::firecracker::Firecracker::new(
+            common::fc_bin()
+        ))
+        .virtio_fs_shares,
+        "FC has no virtio-fs, so it must NOT advertise virtio_fs_shares; a true here hides a real gap"
+    );
+    #[cfg(feature = "qemu")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::qemu::Qemu::new(common::qemu_bin()))
+            .virtio_fs_shares,
+        "QEMU must support virtio_fs_shares; a false here silently skips shares_ro_rw::qemu"
+    );
+}
+
 async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
     let id = uuid::Uuid::new_v4();
     let tmp =
@@ -97,7 +130,18 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
         ]))
         .await
         .expect("Exec failed");
-    assert_ne!(res.code, 0);
+    assert_ne!(res.code, 0, "write to RO share should fail");
+    // L-TEST-1: assert the SPECIFIC EROFS signal, not merely any nonzero exit. The
+    // successful `cat` above proves the share is mounted, so a share mistakenly
+    // mounted rw would let the write succeed (code 0) and redden the assert_ne. But
+    // a bare nonzero also accepts EACCES / a transient shell error; the named
+    // contract is "virtiofsd enforces read_only", so pin the exact "Read-only file
+    // system" (EROFS) message. Inverse: mount the RO share rw and this goes red.
+    assert!(
+        String::from_utf8_lossy(&res.stderr).contains("Read-only file system"),
+        "write to RO share must fail with EROFS (Read-only file system), got: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
 
     // Verify write to RW share succeeds
     let res = client

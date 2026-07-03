@@ -6,9 +6,11 @@ mod common;
 // TESTS-FEATURES-2. The full benchmark needs KVM and is too slow for CI, so the CH path used
 // to assert nothing (commented-out p50 check) — pure theater. Instead, drive bench-vm down a
 // deterministic, KVM-independent DRY path: point it at an empty artifacts dir so no VM can be
-// started (missing kernel/rootfs, and no KVM needed). The harness must degrade gracefully to
-// the "No successful runs" report while still exiting 0. This runs in the default suite (no
-// `#[ignore]`) and goes red if the dry path panics, exits non-zero, or stops reporting.
+// started (missing kernel/rootfs, and no KVM needed). The harness must degrade *gracefully*:
+// print the "No successful runs" report with a clear "missing artifacts" cause, and — per
+// M-BIN-1 — exit NON-ZERO so a perf baseline / CI can't silently green-pass an empty result
+// (zero post-warmup samples). Runs in the default suite (no `#[ignore]`); goes red if the dry
+// path panics, stops reporting, or regresses to exiting 0 on a total failure.
 #[cfg(feature = "cloud-hypervisor")]
 #[test]
 fn test_benchmark_ch_dry() {
@@ -22,8 +24,9 @@ fn test_benchmark_ch_dry() {
         .arg("--warmup")
         .arg("0");
     cmd.assert()
-        .success()
-        .stdout(predicates::str::contains("No successful runs"));
+        .failure()
+        .stdout(predicates::str::contains("No successful runs"))
+        .stderr(predicates::str::contains("missing artifacts"));
 }
 
 // TESTS-FEATURES-2 (Part C-e): serialization comes from the nextest `serial-host`

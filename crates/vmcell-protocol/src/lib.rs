@@ -28,7 +28,35 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// abandoned wait and leak.
 pub const DEFAULT_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// IPv4 reconfiguration the guest applies to `eth0` during a post-restore resync
+/// (H-VMM-1 — "rotate everything").
+///
+/// A snapshot is a *zygote*: one suspended VM is resumed into many concurrent
+/// children, each of which must have a **distinct** network identity (its own
+/// netns/tap/`/30`/MAC/IP) so they don't collide on the host. The restore path
+/// therefore rotates the vmid — but the guest resumes with the *frozen* `ip=`
+/// address of the original vmid, which no longer matches its rotated host-side
+/// tap/`/30` wiring. This message re-points the guest's `eth0` address and default
+/// route to the rotated identity, exactly as the `mac` field re-points the
+/// hardware address. Octets are carried verbatim (endianness-free on the wire).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4Reconfig {
+    /// The guest's new `eth0` address (e.g. `10.200.<m>.2`).
+    pub addr: [u8; 4],
+    /// The subnet prefix length (`30` for the point-to-point `/30`).
+    pub prefix_len: u8,
+    /// The new default-route gateway — the host side of the `/30`
+    /// (e.g. `10.200.<m>.1`).
+    pub gateway: [u8; 4],
+}
+
 /// A message exchanged between the host and the guest agent.
+///
+/// **Append-only.** `postcard` encodes each variant by its zero-based
+/// declaration index, so the variant order is part of the wire protocol: new
+/// variants must be *appended* and existing ones never reordered or removed, or
+/// the host and guest would disagree on the discriminant. `#[non_exhaustive]`
+/// keeps out-of-crate matches from silently breaking when a variant is appended.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
@@ -65,6 +93,13 @@ pub enum Message {
         /// Optional new `eth0` hardware address to install via `SIOCSIFHWADDR`;
         /// `None` skips the MAC rotation.
         mac: Option<[u8; 6]>,
+        /// Optional new `eth0` IPv4 address + default route to install (H-VMM-1);
+        /// `None` skips the IP rotation. The restore/zygote path rotates the vmid
+        /// so the guest's frozen `ip=` address no longer matches its rotated
+        /// host-side tap/`/30` wiring — this re-points it, exactly as `mac`
+        /// re-points the hardware address. Appended after `mac` (per-variant
+        /// field order is part of the postcard wire encoding).
+        ipv4: Option<Ipv4Reconfig>,
     },
     /// Guest→host acknowledgement of a [`Message::Resync`], reporting each step's
     /// outcome (design 44 §5).
@@ -81,6 +116,9 @@ pub enum Message {
         reseed_applied: bool,
         /// Whether the best-effort `eth0` MAC rotation applied.
         mac_applied: bool,
+        /// Whether the best-effort `eth0` IPv4 address + default-route rotation
+        /// applied (H-VMM-1). Appended after `mac_applied`.
+        ip_applied: bool,
     },
 }
 
@@ -111,18 +149,21 @@ impl ExecRequest {
     }
 
     /// Sets the environment variables.
+    #[must_use]
     pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
         self
     }
 
     /// Sets the working directory.
+    #[must_use]
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
 
     /// Sets the timeout for the request.
+    #[must_use]
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -158,6 +199,11 @@ impl ExecOutcome {
 }
 
 impl Default for ExecOutcome {
+    /// Creates an outcome with code `-1` — a sentinel for "no exit code was
+    /// observed yet", deliberately outside the `0..=255` range any real process
+    /// exit status occupies, so a defaulted outcome that is never overwritten
+    /// (e.g. a stream that ended before an `Exit` frame) is distinguishable from
+    /// a genuine exit.
     fn default() -> Self {
         Self {
             code: -1,
@@ -209,21 +255,29 @@ mod tests {
                 unix_secs: 1_700_000_000,
                 unix_nanos: 123_456_789,
                 mac: Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x05]),
+                ipv4: Some(Ipv4Reconfig {
+                    addr: [10, 200, 5, 2],
+                    prefix_len: 30,
+                    gateway: [10, 200, 5, 1],
+                }),
             },
             Message::Resync {
                 unix_secs: 0,
                 unix_nanos: 0,
                 mac: None,
+                ipv4: None,
             },
             Message::ResyncAck {
                 clock_error: Some("clock_settime: EPERM".to_string()),
                 reseed_applied: true,
                 mac_applied: false,
+                ip_applied: false,
             },
             Message::ResyncAck {
                 clock_error: None,
                 reseed_applied: false,
                 mac_applied: true,
+                ip_applied: true,
             },
         ];
 
@@ -274,20 +328,38 @@ mod tests {
                         timeout,
                     })
                 }),
-            (any::<u64>(), any::<u32>(), any::<Option<[u8; 6]>>()).prop_map(
-                |(unix_secs, unix_nanos, mac)| Message::Resync {
+            (
+                any::<u64>(),
+                any::<u32>(),
+                any::<Option<[u8; 6]>>(),
+                prop::option::of((any::<[u8; 4]>(), any::<u8>(), any::<[u8; 4]>()).prop_map(
+                    |(addr, prefix_len, gateway)| Ipv4Reconfig {
+                        addr,
+                        prefix_len,
+                        gateway,
+                    },
+                ),),
+            )
+                .prop_map(|(unix_secs, unix_nanos, mac, ipv4)| Message::Resync {
                     unix_secs,
                     unix_nanos,
                     mac,
-                }
-            ),
-            (any::<Option<String>>(), any::<bool>(), any::<bool>()).prop_map(
-                |(clock_error, reseed_applied, mac_applied)| Message::ResyncAck {
-                    clock_error,
-                    reseed_applied,
-                    mac_applied,
-                }
-            ),
+                    ipv4,
+                }),
+            (
+                any::<Option<String>>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(|(clock_error, reseed_applied, mac_applied, ip_applied)| {
+                    Message::ResyncAck {
+                        clock_error,
+                        reseed_applied,
+                        mac_applied,
+                        ip_applied,
+                    }
+                }),
         ]
     }
 

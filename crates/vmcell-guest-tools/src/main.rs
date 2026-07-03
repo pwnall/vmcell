@@ -301,6 +301,19 @@ fn set_link_up(fd: libc::c_int, dev: &str, up: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Builds the `ifreq` submitted to `SIOCSIFHWADDR` for `dev`+`mac`: the interface
+/// name, `ARPHRD_ETHER` in the sockaddr family, then the six MAC bytes. Split out
+/// so the byte layout is unit-testable without a live interface (M-GUEST-3),
+/// mirroring the guest-agent `netif::hwaddr_ifreq` helper.
+fn hwaddr_ifreq(dev: &str, mac: [u8; 6]) -> Result<IfReq, String> {
+    let mut ifr = IfReq::new(dev)?;
+    // ifr_hwaddr: sa_family (host-order u16) then sa_data; first 6 data bytes are
+    // the MAC.
+    ifr.ifru[0..2].copy_from_slice(&ARPHRD_ETHER.to_ne_bytes());
+    ifr.ifru[2..8].copy_from_slice(&mac);
+    Ok(ifr)
+}
+
 fn set_mac(dev: &str, mac_str: &str) -> Result<(), String> {
     let mac = parse_mac(mac_str).ok_or_else(|| format!("invalid MAC: {mac_str}"))?;
     let fd = open_inet_socket()?;
@@ -309,17 +322,17 @@ fn set_mac(dev: &str, mac_str: &str) -> Result<(), String> {
         // bring it down (best effort) then back up around the set.
         let _ = set_link_up(fd, dev, false);
 
-        let mut ifr = IfReq::new(dev)?;
-        // ifr_hwaddr: sa_family (u16) then sa_data; first 6 bytes are the MAC.
-        ifr.ifru[0..2].copy_from_slice(&ARPHRD_ETHER.to_ne_bytes());
-        ifr.ifru[2..8].copy_from_slice(&mac);
+        let mut ifr = hwaddr_ifreq(dev, mac)?;
         // SAFETY: `ifr` is a correctly sized `struct ifreq`; SIOCSIFHWADDR reads
         // the name and the `ifr_hwaddr` sockaddr from the union bytes.
         if unsafe { libc::ioctl(fd, SIOCSIFHWADDR, &mut ifr) } < 0 {
-            return Err(format!(
-                "SIOCSIFHWADDR: {}",
-                std::io::Error::last_os_error()
-            ));
+            let err = format!("SIOCSIFHWADDR: {}", std::io::Error::last_os_error());
+            // M-GUEST-2: the link was brought down above; re-raise it even on this
+            // failure path so a failed (best-effort) MAC change never strands the
+            // restored guest's eth0 administratively DOWN with no one to re-raise
+            // it. The re-up is itself best-effort — the original error is returned.
+            let _ = set_link_up(fd, dev, true);
+            return Err(err);
         }
 
         set_link_up(fd, dev, true)?;
@@ -493,10 +506,29 @@ fn url_host_port(url: &str, default_port: u16) -> Option<(String, u16)> {
     }
 }
 
-/// Performs a raw HTTP `CONNECT` to `proxy` for `host:port` and, if the proxy
-/// refuses the tunnel (non-2xx, e.g. a blocked domain's 403), prints the proxy's
+/// Extracts the numeric status from an HTTP `CONNECT` response's status line
+/// (`HTTP/1.1 <code> <reason>`). Returns `None` if the line is missing or the
+/// code is not a parseable number.
+fn parse_status_code(head: &str) -> Option<u16> {
+    head.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Whether a proxy `CONNECT` response head indicates the tunnel was established —
+/// true only for a 2xx status. A non-2xx (e.g. a blocked domain's 403) is a real
+/// failure — real curl exits non-zero — so this returns false and the caller must
+/// not collapse it to exit 0 (H-GUEST-1).
+fn connect_succeeded(head: &str) -> bool {
+    parse_status_code(head).is_some_and(|code| (200..300).contains(&code))
+}
+
+/// Performs a raw HTTP `CONNECT` to `proxy` for `host:port`, prints the proxy's
 /// response — status line + headers to stderr (verbose), body to stdout — the way
-/// curl does. Returns `true` if it read a response from the proxy.
+/// curl does, and returns whether the tunnel was **established** (a 2xx status).
+///
+/// A non-2xx refusal (e.g. a blocked domain's 403) is still printed so the egress
+/// test can observe it, but returns `false` so the caller surfaces the failure as
+/// a non-zero exit instead of collapsing every https-via-proxy failure to exit 0
+/// (H-GUEST-1: the banned any-error-to-success probe).
 fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verbose: bool) -> bool {
     use std::io::{Read, Write};
     let Some((phost, pport)) = url_host_port(proxy, 8080) else {
@@ -547,7 +579,10 @@ fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verb
     }
     let _ = std::io::stdout().write_all(body);
     let _ = std::io::stdout().flush();
-    true
+    // Success is a 2xx tunnel establishment ONLY. Returning `true` for any
+    // response (the pre-fix behaviour) let a blocked domain's 403, a TLS failure,
+    // or a mid-body RST collapse to exit 0 (H-GUEST-1).
+    connect_succeeded(&head_str)
 }
 
 fn proxy_from_env(keys: &[&str]) -> Option<String> {
@@ -568,4 +603,170 @@ fn parse_resolve(spec: &str) -> Option<(String, u16, std::net::IpAddr)> {
     let port: u16 = parts.next()?.parse().ok()?;
     let ip: std::net::IpAddr = parts.next()?.parse().ok()?;
     Some((host, port, ip))
+}
+
+#[cfg(test)]
+mod tests {
+    //! M-GUEST-3: guest-tools had ZERO unit tests, leaving the pure parsers and
+    //! the duplicated `ifreq` layout unguarded. Each test below reddens on a
+    //! specific inverse (see comments).
+    use super::*;
+
+    #[test]
+    fn parse_mac_accepts_six_hex_octets() {
+        assert_eq!(
+            parse_mac("aa:bb:cc:dd:ee:ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        // Leading/trailing whitespace is trimmed before splitting.
+        assert_eq!(
+            parse_mac("  02:00:00:00:00:05\n"),
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x05])
+        );
+    }
+
+    #[test]
+    fn parse_mac_rejects_malformed() {
+        // Too few octets (5) — must NOT accept a short MAC.
+        assert_eq!(parse_mac("ff:01:02:03:04"), None);
+        // Too many octets (7) — the `n >= 6` guard must reject it.
+        assert_eq!(parse_mac("00:01:02:03:04:05:06"), None);
+        // A single token is not a MAC (RED on a bounds-free parser that accepts it).
+        assert_eq!(parse_mac("ff"), None);
+        // Non-hex octet.
+        assert_eq!(parse_mac("zz:00:00:00:00:00"), None);
+        assert_eq!(parse_mac(""), None);
+    }
+
+    #[test]
+    fn url_host_port_parses_scheme_host_port_path() {
+        assert_eq!(
+            url_host_port("http://host:123/path", 443),
+            Some(("host".to_string(), 123))
+        );
+        // No explicit port → the default.
+        assert_eq!(
+            url_host_port("https://example.com/x", 443),
+            Some(("example.com".to_string(), 443))
+        );
+        // No scheme, explicit port.
+        assert_eq!(
+            url_host_port("proxy.local:8080", 8080),
+            Some(("proxy.local".to_string(), 8080))
+        );
+        // A non-numeric port falls back to the default rather than failing.
+        assert_eq!(
+            url_host_port("http://host:notaport/p", 443),
+            Some(("host".to_string(), 443))
+        );
+    }
+
+    #[test]
+    fn parse_resolve_parses_host_port_addr() {
+        let (host, port, ip) = parse_resolve("blocked.com:443:1.2.3.4").expect("valid resolve");
+        assert_eq!(host, "blocked.com");
+        assert_eq!(port, 443);
+        assert_eq!(ip, "1.2.3.4".parse::<std::net::IpAddr>().unwrap());
+        // Malformed: missing the address field, or a bad port/addr.
+        assert!(parse_resolve("blocked.com:443").is_none());
+        assert!(parse_resolve("blocked.com:notaport:1.2.3.4").is_none());
+        assert!(parse_resolve("blocked.com:443:not.an.ip").is_none());
+    }
+
+    #[test]
+    fn is_write_verb_matches_only_write_verbs() {
+        for v in ["add", "del", "delete", "change", "replace", "flush"] {
+            let owned = v.to_string();
+            assert!(is_write_verb(Some(&owned)), "{v} must be a write verb");
+        }
+        for v in ["up", "down", "show", "list"] {
+            let owned = v.to_string();
+            assert!(!is_write_verb(Some(&owned)), "{v} must NOT be a write verb");
+        }
+        assert!(!is_write_verb(None), "a read form (no verb) is not a write");
+    }
+
+    // M-GUEST-3 / L-GUEST-8 class: pin the guest-tools `IfReq` to the kernel's
+    // `struct ifreq` size. C-GUEST-1 showed an unpinned ifreq is an OOB-copy
+    // vector, and guest-tools duplicated the layout with no guard. Shrinking
+    // `ifru` (e.g. to [u8; 20]) would pass the offset asserts below but reddens
+    // here.
+    #[test]
+    fn ifreq_matches_kernel_struct_size() {
+        assert_eq!(
+            std::mem::size_of::<IfReq>(),
+            std::mem::size_of::<libc::ifreq>(),
+            "IfReq must match the kernel `struct ifreq` size (40 bytes on x86-64)"
+        );
+    }
+
+    // Pins the `ifr_hwaddr` byte layout SIOCSIFHWADDR consumes (parallel to
+    // netif.rs). RED on a wrong hwaddr offset (MAC at 0) or a byte-swapped family.
+    #[test]
+    fn hwaddr_ifreq_layout() {
+        let mac = [0x02, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        let ifr = hwaddr_ifreq("eth0", mac).expect("ifreq");
+        assert_eq!(
+            &ifr.name[..4],
+            &[
+                b'e' as libc::c_char,
+                b't' as libc::c_char,
+                b'h' as libc::c_char,
+                b'0' as libc::c_char
+            ],
+            "ifr_name must be the device"
+        );
+        assert_eq!(ifr.name[4], 0, "ifr_name must be NUL-terminated");
+        assert_eq!(
+            &ifr.ifru[0..2],
+            &[0x01, 0x00],
+            "sa_family must be ARPHRD_ETHER, little-endian"
+        );
+        assert_eq!(
+            u16::from_ne_bytes([ifr.ifru[0], ifr.ifru[1]]),
+            ARPHRD_ETHER,
+            "sa_family must decode to ARPHRD_ETHER"
+        );
+        assert_eq!(
+            &ifr.ifru[2..8],
+            &mac,
+            "MAC must be at the hwaddr data offset"
+        );
+    }
+
+    // A device name too long for IFNAMSIZ is rejected (not silently truncated),
+    // matching netif.rs's IfReq::new.
+    #[test]
+    fn ifreq_new_rejects_overlong_device() {
+        let long = "x".repeat(libc::IFNAMSIZ);
+        assert!(IfReq::new(&long).is_err());
+        assert!(IfReq::new("eth0").is_ok());
+    }
+
+    // H-GUEST-1: probe_connect treats ONLY a 2xx CONNECT as success. RED on the
+    // pre-fix "any response ⇒ true": a blocked domain's 403 would be classified as
+    // success and collapse to exit 0.
+    #[test]
+    fn connect_succeeded_only_on_2xx() {
+        assert!(connect_succeeded("HTTP/1.1 200 Connection established\r\n"));
+        assert!(connect_succeeded("HTTP/1.1 204 No Content"));
+        assert!(!connect_succeeded(
+            "HTTP/1.1 403 Forbidden\r\nProxy-Agent: x\r\n"
+        ));
+        assert!(!connect_succeeded("HTTP/1.1 502 Bad Gateway"));
+        assert!(!connect_succeeded("garbage-with-no-code"));
+        assert!(!connect_succeeded(""));
+    }
+
+    #[test]
+    fn parse_status_code_extracts_the_numeric_code() {
+        assert_eq!(parse_status_code("HTTP/1.1 200 OK"), Some(200));
+        assert_eq!(parse_status_code("HTTP/1.1 403 Forbidden"), Some(403));
+        assert_eq!(
+            parse_status_code("HTTP/1.0 500 Internal Server Error"),
+            Some(500)
+        );
+        assert_eq!(parse_status_code("no-code-here"), None);
+        assert_eq!(parse_status_code(""), None);
+    }
 }

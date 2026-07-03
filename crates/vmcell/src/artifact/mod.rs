@@ -200,6 +200,7 @@ pub(crate) fn hash_output(path: &Path) -> Result<String> {
 /// Folds a directory's contents into `hasher` over a deterministic sorted walk, so the
 /// hash is stable regardless of the filesystem's `read_dir` ordering.
 fn hash_dir_into(hasher: &mut blake3::Hasher, dir: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
         .map_err(crate::error::Error::Io)?
@@ -210,15 +211,22 @@ fn hash_dir_into(hasher: &mut blake3::Hasher, dir: &Path) -> Result<()> {
         let name = entry.file_name();
         let file_type = entry.file_type().map_err(crate::error::Error::Io)?;
         let path = entry.path();
-        hasher.update(name.to_string_lossy().as_bytes());
+        // `OsStr::as_bytes` preserves non-UTF-8 names (L-ART-5): `to_string_lossy` collapses
+        // distinct non-UTF-8 names to U+FFFD, so two different filenames could hash the same.
+        hasher.update(name.as_bytes());
         hasher.update(b"\0");
         if file_type.is_dir() {
             hasher.update(b"d");
+            // Fold the directory's own mode (L-ART-5) so a chmod on a directory inside the
+            // tree changes the hash (previously only file modes were folded).
+            let meta = entry.metadata().map_err(crate::error::Error::Io)?;
+            hasher.update(&meta.permissions().mode().to_le_bytes());
             hash_dir_into(hasher, &path)?;
         } else if file_type.is_symlink() {
             hasher.update(b"l");
             let target = std::fs::read_link(&path).map_err(crate::error::Error::Io)?;
-            hasher.update(target.to_string_lossy().as_bytes());
+            // Preserve a non-UTF-8 symlink target too (L-ART-5).
+            hasher.update(target.as_os_str().as_bytes());
         } else {
             hasher.update(b"f");
             let meta = entry.metadata().map_err(crate::error::Error::Io)?;
@@ -269,7 +277,12 @@ pub(crate) fn hash_artifacts_sorted(
     let sorted: std::collections::BTreeMap<&String, &PathBuf> = artifacts.iter().collect();
     for (k, v) in sorted {
         hasher.update(k.as_bytes());
-        match hash_file(v) {
+        // `hash_output` (not `hash_file`) so a DIRECTORY artifact (e.g. the snapshot-stage
+        // output) is content-hashed over its recursive walk (M-ART-6). `hash_file` on a
+        // directory `File::open`s it and reads -> `EISDIR`, indistinguishable from the
+        // genuine-miss `NotFound` arm below — so a content change to a file INSIDE a
+        // directory artifact would not invalidate a downstream key.
+        match hash_output(v) {
             Ok(content_hash) => {
                 hasher.update(b"c:");
                 hasher.update(content_hash.as_bytes());
@@ -343,6 +356,14 @@ fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, St
         }
         if let Some(dig) = r.get("digest").and_then(|v| v.as_str()) {
             pins_map.insert("rootfs_digest".to_string(), dig.to_string());
+        }
+    }
+    // Emit the CH/virtiofsd build identity for the snapshot pool (§16 / M-ART-7): a snapshot
+    // is only valid for the exact CH build that produced it, so the snapshot stage folds the
+    // `cloud_hypervisor` pin into its cache key. Emitted only when present in pins.json.
+    for key in ["cloud_hypervisor", "virtiofsd"] {
+        if let Some(v) = json.get(key).and_then(|v| v.as_str()) {
+            pins_map.insert(key.to_string(), v.to_string());
         }
     }
     // Emit the Debian snapshot.debian.org timestamp pin if present (top-level or under
@@ -451,7 +472,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 /// Returns [`crate::error::Error::Artifact`] if the binary entry point is missing,
 /// either source tree cannot be read, or any closure file cannot be read — a hard
 /// stop, never a silent partial or `"unknown"` hash.
-fn guest_agent_closure_hash(ws_root: &Path) -> Result<String> {
+pub(crate) fn guest_agent_closure_hash(ws_root: &Path) -> Result<String> {
     // The agent binary entry point is mandatory; its absence is the same hard stop.
     let main_rs = ws_root.join("crates/vmcell-guest-agent/src/main.rs");
     if !main_rs.is_file() {
@@ -599,34 +620,38 @@ impl Pipeline {
             let mut cached_artifacts = std::collections::HashMap::new();
 
             if out_path.exists() && key_path.exists() {
-                if let Ok(metadata_str) = std::fs::read_to_string(&key_path) {
-                    if let Ok(metadata) = serde_json::from_str::<CacheMetadata>(&metadata_str) {
-                        if metadata.key == key.0 {
-                            // `hash_output` (not `hash_file`) so a DIRECTORY output (the
-                            // snapshot stage — ART-1) is content-hashed over a sorted walk
-                            // and tamper-verified, instead of `EISDIR`-ing out of the check.
-                            if let Ok(actual_hash) = hash_output(&out_path) {
-                                if actual_hash == metadata.hash {
-                                    cached = true;
-                                    cached_pins = metadata.pins;
-                                    cached_artifacts = metadata.artifacts;
-                                } else {
-                                    return Err(crate::error::Error::Artifact(format!(
-                                        "Tampered artifact for stage {}: payload hash mismatch",
-                                        stage.name()
-                                    )));
-                                }
-                            }
-                        }
-                    } else {
-                        // Fallback for old cache key format: just a string
-                        if metadata_str == key.0 {
-                            // Can't verify hash or recover pins. Miss cache to force rebuild and get proper format.
-                            tracing::warn!(
-                                "Cache invalid for stage {}: old cache format",
+                // The sidecar EXISTS (checked above), so a read failure is a real I/O error
+                // (permission denied / EISDIR), never a genuine miss. Fail loud (L-ART-4)
+                // rather than silently treat a locked/tampered cache as a rebuild.
+                let metadata_str =
+                    std::fs::read_to_string(&key_path).map_err(crate::error::Error::Io)?;
+                if let Ok(metadata) = serde_json::from_str::<CacheMetadata>(&metadata_str) {
+                    if metadata.key == key.0 {
+                        // `hash_output` (not `hash_file`) so a DIRECTORY output (the snapshot
+                        // stage — ART-1) is content-hashed over a sorted walk and
+                        // tamper-verified. The output EXISTS (checked), so a hash failure is a
+                        // real I/O error, not a miss — surface it, don't silently rebuild
+                        // (L-ART-4).
+                        let actual_hash = hash_output(&out_path)?;
+                        if actual_hash == metadata.hash {
+                            cached = true;
+                            cached_pins = metadata.pins;
+                            cached_artifacts = metadata.artifacts;
+                        } else {
+                            return Err(crate::error::Error::Artifact(format!(
+                                "Tampered artifact for stage {}: payload hash mismatch",
                                 stage.name()
-                            );
+                            )));
                         }
+                    }
+                } else {
+                    // Fallback for old cache key format: just a string
+                    if metadata_str == key.0 {
+                        // Can't verify hash or recover pins. Miss cache to force rebuild and get proper format.
+                        tracing::warn!(
+                            "Cache invalid for stage {}: old cache format",
+                            stage.name()
+                        );
                     }
                 }
             }
@@ -1143,5 +1168,225 @@ mod tests {
 
         // An already-absent path is idempotent success.
         remove_if_present(&tmp.path().join("never")).expect("absent is Ok");
+    }
+
+    // M-ART-7: `parse_pins_json` must emit the CH/virtiofsd build identity so the snapshot
+    // stage can fold it. A buggy impl that ignores these keys returns None -> red.
+    #[test]
+    fn test_parse_pins_emits_ch_virtiofsd_identity() {
+        let json = r#"{ "cloud_hypervisor": "v40.0", "virtiofsd": "v1.11.0" }"#;
+        let map = parse_pins_json(json).expect("valid pins JSON");
+        assert_eq!(
+            map.get("cloud_hypervisor").map(String::as_str),
+            Some("v40.0")
+        );
+        assert_eq!(map.get("virtiofsd").map(String::as_str), Some("v1.11.0"));
+    }
+
+    // M-ART-6: a DIRECTORY artifact must be content-hashed by `hash_artifacts_sorted`, so a
+    // content change to a file inside it changes the fold. The buggy `hash_file`-on-a-dir
+    // EISDIRs and folds the `unmaterialized` marker regardless -> the two folds stay equal.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn test_hash_artifacts_sorted_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snap).expect("mkdir");
+        std::fs::write(snap.join("state.bin"), b"state-v1").expect("write");
+        let mut m = std::collections::HashMap::new();
+        m.insert("snapshot".to_string(), snap.clone());
+
+        let mut h1 = blake3::Hasher::new();
+        hash_artifacts_sorted(&mut h1, &m);
+        let d1 = h1.finalize();
+
+        std::fs::write(snap.join("state.bin"), b"state-v2-tampered").expect("write");
+        let mut h2 = blake3::Hasher::new();
+        hash_artifacts_sorted(&mut h2, &m);
+        let d2 = h2.finalize();
+
+        assert_ne!(
+            d1, d2,
+            "a directory artifact's content change must change the fold (M-ART-6)"
+        );
+    }
+
+    // L-ART-5: `hash_dir_into` must preserve non-UTF-8 names/targets (not `to_string_lossy`)
+    // and fold directory modes. (1) two distinct non-UTF-8 filenames that collapse to the
+    // same U+FFFD must hash differently; (2) a chmod on a directory inside the tree must
+    // change the hash. Both go red on the lossy / no-dir-mode buggy version.
+    #[test]
+    fn test_hash_dir_preserves_non_utf8_names_and_dir_modes() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let name_a = std::ffi::OsStr::from_bytes(b"\xff");
+        let name_b = std::ffi::OsStr::from_bytes(b"\xfe");
+        let pa = root.join(name_a);
+        std::fs::write(&pa, b"x").unwrap();
+        let h_a = hash_output(&root).expect("hash");
+        std::fs::rename(&pa, root.join(name_b)).unwrap();
+        let h_b = hash_output(&root).expect("hash");
+        assert_ne!(
+            h_a, h_b,
+            "distinct non-UTF-8 names must not collapse to the same hash (L-ART-5)"
+        );
+
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let h1 = hash_output(&root).expect("hash");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let h2 = hash_output(&root).expect("hash");
+        assert_ne!(
+            h1, h2,
+            "a directory-mode change inside the tree must change the hash (L-ART-5)"
+        );
+    }
+
+    /// A trivial stage whose output is a fixed file, for the cache-bookkeeping tests.
+    struct TrivialStage;
+    #[async_trait::async_trait]
+    impl Stage for TrivialStage {
+        fn name(&self) -> &str {
+            "trivial"
+        }
+        fn cache_key(&self, _: &StageInputs) -> CacheKey {
+            CacheKey("trivial-k".into())
+        }
+        fn out_path(&self, t: &Path) -> PathBuf {
+            t.join("trivial_out")
+        }
+        async fn run(&self, _: &StageInputs, out: &Path) -> Result<StageOutputs> {
+            tokio::fs::write(out, b"out")
+                .await
+                .map_err(crate::error::Error::Io)?;
+            Ok(StageOutputs::default())
+        }
+    }
+
+    // L-ART-4: an existing-but-unreadable cache sidecar must fail the build LOUD, never fall
+    // through to a silent rebuild. A directory at the sidecar path makes `read_to_string`
+    // EISDIR regardless of uid; the buggy `if let Ok(metadata_str)` swallows it (build Ok),
+    // so this `is_err()` assertion goes red on the old behavior.
+    #[tokio::test]
+    async fn test_build_fails_loud_on_unreadable_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().to_path_buf();
+        let out = target.join("trivial_out");
+        std::fs::write(&out, b"out").unwrap();
+        std::fs::create_dir_all(out.with_extension("cache_key")).unwrap();
+        let pipeline = Pipeline::new(target).add_stage(Box::new(TrivialStage));
+        let res = pipeline.build(&Cache::default()).await;
+        assert!(
+            res.is_err(),
+            "an existing-but-unreadable cache sidecar must fail the build loud (L-ART-4)"
+        );
+    }
+
+    /// Stage A of the warm-hit restoration test: constant key, emits a pin + an artifact.
+    #[cfg(feature = "pipeline")]
+    struct WarmStageA;
+    #[cfg(feature = "pipeline")]
+    #[async_trait::async_trait]
+    impl Stage for WarmStageA {
+        fn name(&self) -> &str {
+            "A"
+        }
+        fn cache_key(&self, _: &StageInputs) -> CacheKey {
+            CacheKey("A-const".into())
+        }
+        fn out_path(&self, t: &Path) -> PathBuf {
+            t.join("A_out")
+        }
+        async fn run(&self, _: &StageInputs, out: &Path) -> Result<StageOutputs> {
+            tokio::fs::write(out, b"a-content")
+                .await
+                .map_err(crate::error::Error::Io)?;
+            let mut o = StageOutputs::default();
+            o.pins.insert("my_pin".into(), "value".into());
+            o.artifacts.insert("my_artifact".into(), out.to_path_buf());
+            Ok(o)
+        }
+    }
+
+    /// Stage B: its key folds both the restored pin AND the restored artifact content, and
+    /// its run() requires both — so deleting either restoration loop re-runs it.
+    #[cfg(feature = "pipeline")]
+    struct WarmStageB {
+        runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[cfg(feature = "pipeline")]
+    #[async_trait::async_trait]
+    impl Stage for WarmStageB {
+        fn name(&self) -> &str {
+            "B"
+        }
+        fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+            let mut h = blake3::Hasher::new();
+            h.update(b"B");
+            match inputs.pins.get("my_pin") {
+                Some(v) => h.update(v.as_bytes()),
+                None => h.update(b"<no-pin>"),
+            };
+            let filtered: std::collections::HashMap<String, PathBuf> = inputs
+                .artifacts
+                .iter()
+                .filter(|(k, _)| k.as_str() == "my_artifact")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            hash_artifacts_sorted(&mut h, &filtered);
+            CacheKey(format!("B-{}", h.finalize().to_hex()))
+        }
+        fn out_path(&self, t: &Path) -> PathBuf {
+            t.join("B_out")
+        }
+        async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inputs
+                .pins
+                .get("my_pin")
+                .ok_or_else(|| crate::error::Error::Artifact("Missing pin my_pin".into()))?;
+            inputs.artifacts.get("my_artifact").ok_or_else(|| {
+                crate::error::Error::Artifact("Missing artifact my_artifact".into())
+            })?;
+            tokio::fs::write(out, b"b-content")
+                .await
+                .map_err(crate::error::Error::Io)?;
+            Ok(StageOutputs::default())
+        }
+    }
+
+    // M-ART-12: on a warm cache hit of stage A, its cached pins AND artifacts must be
+    // restored into `inputs` so a downstream stage B still keys/consumes them. Deleting the
+    // `cached_pins` loop (B fails "Missing pin"/re-runs) or the `cached_artifacts` loop (B
+    // re-keys and re-runs) makes B run a second time -> the `== 1` assertion goes red.
+    #[cfg(feature = "pipeline")]
+    #[tokio::test]
+    async fn test_warm_hit_restores_pins_and_artifacts_downstream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mk = || {
+            Pipeline::new(dir.path().to_path_buf())
+                .add_stage(Box::new(WarmStageA))
+                .add_stage(Box::new(WarmStageB { runs: runs.clone() }))
+        };
+        // Cold build: A and B both run.
+        mk().build(&Cache::default()).await.expect("cold build");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "B runs once on the cold build"
+        );
+        // Warm build: A cache-hits and MUST restore my_pin + my_artifact so B stays cached.
+        mk().build(&Cache::default()).await.expect("warm build");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "B must stay cached on the warm build; a dropped restoration loop re-runs it (M-ART-12)"
+        );
     }
 }

@@ -18,7 +18,13 @@ pub struct ResourceUsage {
     pub io_read_bytes: u64,
     /// Bytes written to disk/block devices.
     pub io_write_bytes: u64,
-    /// Whether the requested cgroup limits are actually being enforced.
+    /// Whether the `memory` controller is delegated into this cgroup — the honest
+    /// proxy for "the hard memory cap took effect", **not** a guarantee that every
+    /// requested limit (cpu/pids/io) is enforced (M-HOST-5). The name is retained
+    /// for API stability, but a read that holds only the cgroup *name* cannot know
+    /// which controllers were requested, so it reports the one whose silent absence
+    /// lets the memory cap not fire; a caller needing per-controller enforcement
+    /// must consult the individual control files.
     ///
     /// `true` only when the `memory` controller is delegated into this cgroup
     /// (`cgroup.controllers` lists it), meaning the limit writes took effect.
@@ -74,6 +80,32 @@ pub trait CgroupFs: Send + Sync + std::fmt::Debug {
     fn add_task(&self, name: &str, pid: u32) -> Result<()>;
 }
 
+/// Parses `/proc/self/cgroup` contents into the base (unified, v2) cgroup path the
+/// per-VM slice is created *under*, stripping the supervisor's own `/supervisor`
+/// leaf so the VM slice becomes a **sibling** of the supervisor, not a child
+/// (§12.7 "no internal processes"). Returns `None` when there is no `0::` unified
+/// entry or the resulting base is empty.
+///
+/// This is the single home for the derivation (AGENTS.md: "cgroup logic lives in
+/// `metrics.rs`"), consumed by the orchestrator and mirrored in the tests
+/// (M-ORCH-4/H-HOST-3). It parses **line-by-line** so a hybrid v1/v2 hierarchy —
+/// where the `0::` line is not the whole file — cannot fold trailing lines into
+/// the path, and it strips `/supervisor` **exactly once** (`strip_suffix`, not the
+/// repeat-stripping `trim_end_matches`).
+#[must_use]
+pub fn cgroup_base_from_proc(contents: &str) -> Option<String> {
+    let path = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim_start_matches('/');
+    let base = path.strip_suffix("/supervisor").unwrap_or(path);
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_string())
+    }
+}
+
 /// Computes the cgroup-v2 `cpu.max` `(quota, period)` pair for a CPU cap expressed
 /// as a percentage of one core. The period is fixed at 100000us and the quota is the
 /// matching slice of that period (e.g. 50% -> `(50000, 100000)`, 200% -> `(200000, 100000)`).
@@ -126,6 +158,38 @@ fn controller_listed(listing: &str, controller: &str) -> bool {
     listing.split_whitespace().any(|c| c == controller)
 }
 
+/// Classifies a failed limit-write into a typed error, distinguishing a rejected
+/// limit *value* from a missing host capability. `EINVAL` means the kernel refused
+/// the value itself (e.g. a `cpu.max` quota below the kernel's µs floor, or a
+/// malformed `io.max` device) — a caller bug that must surface as
+/// [`crate::error::Error::Cgroup`] so its remediation is "fix the limit", not
+/// "enable delegation". Every other errno (`EACCES`/`EPERM`/`EROFS`, or anything
+/// unexpected) is treated as the §7.1 capability/permission failure and stays
+/// [`crate::error::Error::CapabilityUnavailable`]. Kept pure so the errno split is
+/// unit-testable without provoking a real `EINVAL` from the filesystem (M-HOST-4).
+fn classify_limit_write_err(
+    file: &str,
+    path: &str,
+    controller: &str,
+    value: &str,
+    e: &std::io::Error,
+) -> crate::error::Error {
+    use crate::error::Error;
+    if e.raw_os_error() == Some(libc::EINVAL) {
+        Error::Cgroup(format!(
+            "invalid limit value {value:?} for {path} ('{controller}' controller): {e}"
+        ))
+    } else {
+        Error::CapabilityUnavailable {
+            op: format!("cgroup {} limit", file),
+            needed: format!(
+                "writable {} for the '{}' controller ({})",
+                path, controller, e
+            ),
+        }
+    }
+}
+
 /// Applies a single *requested functional* cgroup limit under `cgroup_root`, failing
 /// loud per the §7.1 capability contract: confirm `controller` is delegated on the
 /// parent's `subtree_control` (enabling it there first if absent), then write `value`.
@@ -145,7 +209,10 @@ fn controller_listed(listing: &str, controller: &str) -> bool {
 ///
 /// # Errors
 /// Returns [`crate::error::Error::CapabilityUnavailable`] when the controller is not
-/// delegated to the parent's `subtree_control` or the limit write fails.
+/// delegated to the parent's `subtree_control`, or when the limit write fails for a
+/// capability/permission reason (`EACCES`/`EPERM`/`EROFS`). A write the kernel
+/// rejects for a bad limit *value* (`EINVAL`) returns
+/// [`crate::error::Error::Cgroup`] instead (M-HOST-4).
 fn try_apply_limit_at(
     cgroup_root: &str,
     name: &str,
@@ -185,13 +252,8 @@ fn try_apply_limit_at(
         }
     }
     let path = format!("{}/{}/{}", cgroup_root, name, file);
-    std::fs::write(&path, value).map_err(|e| Error::CapabilityUnavailable {
-        op: format!("cgroup {} limit", file),
-        needed: format!(
-            "writable {} for the '{}' controller ({})",
-            path, controller, e
-        ),
-    })
+    std::fs::write(&path, value)
+        .map_err(|e| classify_limit_write_err(file, &path, controller, value, &e))
 }
 
 /// Sums the `rbytes`/`wbytes` counters across every device line of a cgroup-v2
@@ -373,11 +435,20 @@ impl CgroupFs for DefaultCgroupFs {
     }
 
     fn delete_slice(&self, name: &str) -> Result<()> {
-        if !name.is_empty() {
-            // Best-effort rmdir of the (now-empty) per-VM cgroup. The owning VMM
-            // process group is reaped before this runs, so the cgroup has no
-            // remaining members.
-            let _ = std::fs::remove_dir(format!("/sys/fs/cgroup/{}", name));
+        // Contracts self-guard (L-HOST-1): an empty name is a caller bug, not an
+        // in-band "no-op" sentinel — fail loud instead of a silent `Ok`.
+        if name.is_empty() {
+            return Err(crate::error::Error::Cgroup(
+                "cgroup name cannot be empty".to_string(),
+            ));
+        }
+        // Best-effort rmdir of the (now-empty) per-VM cgroup. The owning VMM
+        // process group is reaped before this runs, so the cgroup has no
+        // remaining members. A failure (e.g. members still present) is a leak, so
+        // surface it as a `warn!` rather than swallowing it invisibly (L-HOST-2);
+        // deletion itself stays best-effort.
+        if let Err(e) = std::fs::remove_dir(format!("/sys/fs/cgroup/{}", name)) {
+            tracing::warn!("failed to remove cgroup {}: {}", name, e);
         }
         Ok(())
     }
@@ -387,17 +458,22 @@ impl CgroupFs for DefaultCgroupFs {
     }
 
     fn add_task(&self, name: &str, pid: u32) -> Result<()> {
-        if !name.is_empty() {
-            let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
-            // Write PID directly to bypass `Cgroup::add_task` limitations for nested unprivileged cgroups
-            std::fs::write(&procs_path, pid.to_string()).map_err(|e| {
-                crate::error::Error::Cgroup(format!(
-                    "Failed to add process {} to cgroup {}: {}",
-                    pid, name, e
-                ))
-            })?;
-            tracing::info!("Added process {} to cgroup {}", pid, name);
+        // Contracts self-guard (L-HOST-1): reject an empty name instead of silently
+        // succeeding on a caller bug (there is no valid empty-named cgroup).
+        if name.is_empty() {
+            return Err(crate::error::Error::Cgroup(
+                "cgroup name cannot be empty".to_string(),
+            ));
         }
+        let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
+        // Write PID directly to bypass `Cgroup::add_task` limitations for nested unprivileged cgroups
+        std::fs::write(&procs_path, pid.to_string()).map_err(|e| {
+            crate::error::Error::Cgroup(format!(
+                "Failed to add process {} to cgroup {}: {}",
+                pid, name, e
+            ))
+        })?;
+        tracing::info!("Added process {} to cgroup {}", pid, name);
         Ok(())
     }
 }
@@ -547,6 +623,42 @@ impl CgroupFs for FakeCgroupFs {
 mod tests {
     use super::*;
     use crate::config::ResourceLimits;
+
+    // M-ORCH-4/H-HOST-3: a hybrid v1/v2 `/proc/self/cgroup` where the `0::` line
+    // is not last must yield only that line's path — the old `split("0::").nth(1)`
+    // over the whole string folded the trailing lines into the base name.
+    #[test]
+    fn cgroup_base_parses_line_by_line_on_hybrid_hierarchy() {
+        let hybrid = "12:pids:/system.slice\n0::/parent/supervisor\n5:cpu:/other";
+        assert_eq!(cgroup_base_from_proc(hybrid).as_deref(), Some("parent"));
+    }
+
+    // M-ORCH-4: `/supervisor` is stripped EXACTLY once. The old `trim_end_matches`
+    // stripped repeated suffixes, so `a/supervisor/supervisor` collapsed to `a`.
+    #[test]
+    fn cgroup_base_strips_supervisor_leaf_once() {
+        assert_eq!(
+            cgroup_base_from_proc("0::/a/supervisor/supervisor").as_deref(),
+            Some("a/supervisor")
+        );
+        assert_eq!(
+            cgroup_base_from_proc("0::/a/supervisor").as_deref(),
+            Some("a")
+        );
+    }
+
+    // An empty base or a missing unified entry yields `None` (the orchestrator then
+    // falls back to a top-level `vmcell-vm-<vmid>` slice).
+    #[test]
+    fn cgroup_base_none_on_empty_or_missing() {
+        assert_eq!(cgroup_base_from_proc("0::/"), None);
+        assert_eq!(
+            cgroup_base_from_proc("0::/supervisor").as_deref(),
+            Some("supervisor")
+        );
+        assert_eq!(cgroup_base_from_proc("2:cpu:/only/v1/lines"), None);
+        assert_eq!(cgroup_base_from_proc(""), None);
+    }
 
     #[test]
     fn test_fake_cgroup_fs() {
@@ -890,6 +1002,78 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("vmcell-vm-1/memory.max")).unwrap(),
             "42"
+        );
+    }
+
+    // M-HOST-4 part B: a limit write rejected for a bad VALUE (EINVAL — e.g. a
+    // `cpu.max` quota below the kernel floor) is a caller bug that must map to
+    // `Error::Cgroup`, while a permission/read-only failure keeps the §7.1
+    // `CapabilityUnavailable` remediation. Goes RED on the old "every write error →
+    // CapabilityUnavailable" mapping (EINVAL would then match CapabilityUnavailable).
+    #[test]
+    fn classify_limit_write_err_splits_einval_from_permission() {
+        use crate::error::Error;
+        let einval = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(
+            matches!(
+                classify_limit_write_err("cpu.max", "/p/cpu.max", "cpu", "0 100000", &einval),
+                Error::Cgroup(_)
+            ),
+            "EINVAL (bad limit value) must be Error::Cgroup, not CapabilityUnavailable"
+        );
+        // The capability/permission errnos must remain CapabilityUnavailable so the
+        // "enable delegation" remediation still fires.
+        for errno in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                matches!(
+                    classify_limit_write_err("cpu.max", "/p/cpu.max", "cpu", "0 100000", &e),
+                    Error::CapabilityUnavailable { .. }
+                ),
+                "errno {errno} must remain CapabilityUnavailable"
+            );
+        }
+    }
+
+    // M-HOST-5: `limits_enforced` reports specifically whether the MEMORY controller
+    // is delegated (the knob whose silent absence lets the hard memory cap not fire),
+    // not "any requested controller is enforced". A cgroup delegating cpu+pids but
+    // NOT memory must therefore report `false`; adding memory flips it `true`. Goes
+    // RED on an impl that checks "any controller present", a substring, or the
+    // first-requested controller instead of the fixed `memory` token.
+    #[test]
+    fn test_read_stats_limits_enforced_tracks_memory_controller_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("cg");
+        std::fs::create_dir_all(&base).expect("mkdir");
+        // cpu and pids delegated, memory NOT.
+        std::fs::write(base.join("cgroup.controllers"), "cpu pids").expect("controllers");
+        assert!(
+            !read_stats_at(&base.to_string_lossy()).limits_enforced,
+            "memory not delegated ⇒ limits_enforced must be false even if cpu/pids are"
+        );
+        // Now delegate memory too — the flag flips, proving the check is memory-specific.
+        std::fs::write(base.join("cgroup.controllers"), "cpu memory pids").expect("controllers");
+        assert!(
+            read_stats_at(&base.to_string_lossy()).limits_enforced,
+            "memory delegated ⇒ limits_enforced true"
+        );
+    }
+
+    // L-HOST-1: an empty cgroup name is a caller bug, not a silent success. The real
+    // `DefaultCgroupFs` must self-guard in both delete_slice and add_task and return
+    // a typed error BEFORE touching `/sys`. Goes RED on the old
+    // `if !name.is_empty() { … } Ok(())` silent-Ok.
+    #[test]
+    fn default_cgroup_fs_rejects_empty_name() {
+        let fs = DefaultCgroupFs;
+        assert!(
+            matches!(fs.delete_slice(""), Err(crate::error::Error::Cgroup(_))),
+            "delete_slice with an empty name must error"
+        );
+        assert!(
+            matches!(fs.add_task("", 1234), Err(crate::error::Error::Cgroup(_))),
+            "add_task with an empty name must error"
         );
     }
 }

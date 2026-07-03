@@ -7,9 +7,10 @@
 //! (and disables turbo for determinism) for the duration of a benchmark, and —
 //! crucially — **restores the original settings on `Drop`, including on panic**.
 //!
-//! The sysfs reads/writes live behind the [`CpuFreqSysfs`] trait so the policy
-//! ([`CpuFreqPin`]) is unit-tested against the in-memory [`RecordingCpuFreq`]
-//! fake with no real `/sys` access. The real implementation is [`SysfsCpuFreq`].
+//! The sysfs reads/writes live behind the [`crate::cpufreq::CpuFreqSysfs`] trait so
+//! the policy ([`crate::cpufreq::CpuFreqPin`]) is unit-tested against an in-memory
+//! `RecordingCpuFreq` fake with no real `/sys` access. The real implementation is
+//! [`crate::cpufreq::SysfsCpuFreq`].
 //!
 //! # Capabilities
 //!
@@ -18,7 +19,7 @@
 //! the privileged test runner (`vmcell-test-runner`) already grants alongside
 //! `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`; **no extra capability is required**. Run a
 //! benchmark through the runner to pin frequency. Without those rights (e.g. a
-//! plain `cargo bench`) the writes fail with `EACCES`; [`CpuFreqPin::engage`]
+//! plain `cargo bench`) the writes fail with `EACCES`; [`crate::cpufreq::CpuFreqPin::engage`]
 //! then degrades to a logged warning and a no-op guard rather than failing the
 //! benchmark, because benchmarks are tracked metrics, not pass/fail gates.
 
@@ -51,6 +52,12 @@ pub enum CpuFreqError {
         /// Why parsing failed.
         reason: String,
     },
+    /// A turbo/boost write was requested on a host that exposes no turbo control
+    /// (neither `intel_pstate/no_turbo` nor `cpufreq/boost`). Returned instead of a
+    /// silent `Ok` so a knob write that changes nothing does not report success
+    /// ("a write that fails must not lie", L-HOST-6).
+    #[error("no turbo/boost control on this host")]
+    NoTurboControl,
 }
 
 /// Abstraction over the cpufreq sysfs surface, so the [`CpuFreqPin`] policy is
@@ -230,8 +237,11 @@ impl CpuFreqSysfs for SysfsCpuFreq {
         if boost.exists() {
             return Self::write(&boost, if enabled { "1" } else { "0" });
         }
-        // No turbo control: nothing to write, and no error — treat as a no-op.
-        Ok(())
+        // No turbo control: a write that changes nothing must not report success
+        // (L-HOST-6). Fail loud so a direct caller learns the write was not applied;
+        // `engage`/`Drop` never reach here, as they only write after `read_turbo`
+        // returned `Some(_)` (a present control file).
+        Err(CpuFreqError::NoTurboControl)
     }
 }
 
@@ -536,9 +546,12 @@ mod tests {
         }
         fn write_turbo(&self, enabled: bool) -> Result<(), CpuFreqError> {
             let mut inner = self.inner.lock().unwrap();
-            if inner.turbo.is_some() {
-                inner.turbo = Some(enabled);
+            // Model a control-less host like the real `SysfsCpuFreq`: a write with no
+            // turbo control fails loud rather than lying, and records nothing.
+            if inner.turbo.is_none() {
+                return Err(CpuFreqError::NoTurboControl);
             }
+            inner.turbo = Some(enabled);
             inner.log.push(Op::Turbo { enabled });
             Ok(())
         }
@@ -672,6 +685,71 @@ mod tests {
         assert!(
             fake.log().is_empty(),
             "dropping a no-op guard must not write anything"
+        );
+    }
+
+    // L-HOST-5: the module headline claims settings are "restored on Drop, including
+    // on panic". Drive that explicitly: engage a pin, panic inside catch_unwind, and
+    // after the unwind confirm the governor was restored. Goes RED if restoration
+    // were moved off the Drop path (e.g. into an explicit shutdown() that a panic
+    // skips).
+    #[test]
+    fn pin_restores_governor_on_panic() {
+        let fake = RecordingCpuFreq::new(&[0], "powersave");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pin = CpuFreqPin::engage(fake.clone()).unwrap();
+            assert_eq!(fake.governor(0), "performance", "pinned while alive");
+            panic!("benchmark panicked while pinned");
+        }));
+        assert!(result.is_err(), "the closure must have unwound");
+        // Drop ran during the unwind and restored the original governor.
+        assert_eq!(
+            fake.governor(0),
+            "powersave",
+            "governor must be restored even when the benchmark panics"
+        );
+    }
+
+    // L-HOST-5 (restore-failure branch): if a restore write fails during Drop, the
+    // guard must WARN, never panic — Drop must not unwind. Deny the restore write
+    // after engage, then drop; reaching the assertions without a panic exercises the
+    // `warn!` branch. Goes RED if Drop's restore used `.expect()`/`?` on the write.
+    #[test]
+    fn drop_warns_and_does_not_panic_when_restore_write_fails() {
+        let fake = RecordingCpuFreq::new(&[0], "powersave");
+        let pin = CpuFreqPin::engage(fake.clone()).unwrap();
+        assert_eq!(fake.governor(0), "performance");
+        // Make the restore write fail (simulate EACCES appearing mid-benchmark).
+        fake.deny_write(0);
+        drop(pin); // must warn, not panic
+        // The restore could not be applied, so the governor stays at performance;
+        // the load-bearing assertion is that we got here without unwinding.
+        assert_eq!(fake.governor(0), "performance");
+    }
+
+    // L-HOST-6: a turbo write on a host with no turbo/boost control must FAIL loud,
+    // not return a silent Ok — "a knob write that fails must not lie". Goes RED on
+    // the old `Ok(())` no-op branch. Covers both the fake and the real sysfs impl.
+    #[test]
+    fn write_turbo_without_control_errors() {
+        let fake = RecordingCpuFreq::new(&[0], "powersave");
+        fake.set_turbo(None); // host exposes no turbo control
+        assert!(
+            matches!(fake.write_turbo(false), Err(CpuFreqError::NoTurboControl)),
+            "a turbo write with no control must fail loud, not return Ok"
+        );
+        assert!(
+            !fake.log().iter().any(|op| matches!(op, Op::Turbo { .. })),
+            "a failed no-control turbo write must record nothing"
+        );
+
+        // The real sysfs impl over an empty root (neither intel_pstate/no_turbo nor
+        // cpufreq/boost present) must likewise fail loud.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sysfs = SysfsCpuFreq::with_root(dir.path());
+        assert!(
+            matches!(sysfs.write_turbo(false), Err(CpuFreqError::NoTurboControl)),
+            "SysfsCpuFreq with no turbo control must fail loud"
         );
     }
 }

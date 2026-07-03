@@ -17,6 +17,37 @@ vmm_matrix_test!(egress_proxy, |vmm| {
     test_egress_proxy_impl(&vmm).await;
 });
 
+// H-TEST-3: capability-honesty pin for `unprivileged_vhost_user_net`. `require_cap!`
+// gates egress_proxy on this flag; a nextest skip is an INVISIBLE pass, so if a
+// backend's `unprivileged_vhost_user_net` flipped false the egress leg would go
+// dark silently. This non-KVM pin fixes the documented value per backend so the
+// flip reddens here in the default suite. Inverse: flip any asserted value.
+#[test]
+fn capability_honesty_unprivileged_vhost_user_net() {
+    #[cfg(feature = "cloud-hypervisor")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(
+            common::ch_bin()
+        ))
+        .unprivileged_vhost_user_net,
+        "CH (primary) must support unprivileged_vhost_user_net; a false silently skips egress_proxy::cloud_hypervisor"
+    );
+    #[cfg(feature = "firecracker")]
+    assert!(
+        !vmcell::vmm::Vmm::capabilities(&vmcell::vmm::firecracker::Firecracker::new(
+            common::fc_bin()
+        ))
+        .unprivileged_vhost_user_net,
+        "FC must NOT advertise unprivileged_vhost_user_net; a true here hides a real gap"
+    );
+    #[cfg(feature = "qemu")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::qemu::Qemu::new(common::qemu_bin()))
+            .unprivileged_vhost_user_net,
+        "QEMU must support unprivileged_vhost_user_net; a false silently skips egress_proxy::qemu"
+    );
+}
+
 async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let _ = env_logger::builder().is_test(true).try_init();
     let _ = tracing_subscriber::fmt()
@@ -262,6 +293,20 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         requests
     );
 
+    // L-TEST-2: the guest-visible 403 above proves the block reached the guest, but
+    // NOT that the proxy recorded it. Assert the host-observable '403 BLOCKED
+    // blocked.com' log entry so the end-to-end wiring (hudsucker dispatch -> handler
+    // -> shared request log) is covered at the integration level, not just in the
+    // unit double. Inverse: a handler that blocks but skips the log append drops
+    // this entry and reddens here.
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.starts_with("403 BLOCKED") && r.contains("blocked.com")),
+        "Proxy should record a '403 BLOCKED' entry for the blocked domain; got: {:?}",
+        requests
+    );
+
     vm.shutdown().await.expect("Shutdown failed");
 }
 
@@ -449,9 +494,12 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         ruleset.contains("policy drop"),
         "egress prerouting chain must default-drop (no fully-open egress); applied ruleset:\n{ruleset}"
     );
+    // M-TEST-4: bind the TPROXY target to the LIVE proxy port, not any `tproxy to :`.
+    // A bare substring match accepts a ruleset wired to a dead/wrong port; asserting
+    // the exact `tproxy to :{proxy_port}` reddens on such a composition bug.
     assert!(
-        ruleset.contains("tproxy to :"),
-        "egress ruleset must TPROXY-redirect web traffic into the transparent proxy; \
+        ruleset.contains(&format!("tproxy to :{proxy_port}")),
+        "egress ruleset must TPROXY-redirect web traffic to the live proxy port {proxy_port}; \
          applied ruleset:\n{ruleset}"
     );
     assert!(

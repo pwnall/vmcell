@@ -156,6 +156,16 @@ impl ReaperCoordinator {
     /// whose pid the kernel immediately hands to the new child would still be
     /// misattributed — that needs the whole pid space to recycle within the
     /// microseconds-wide spawn window, which is unreachable in practice.
+    ///
+    /// A symmetric residual window exists on the *other* side (L-GUEST-5): if
+    /// exec A's child (pid X) exits and is drained but A's waiter has not yet
+    /// claimed its status, and exec B's [`pre_spawn_epoch`] happens to be captured
+    /// after A's status generation, then `reserve(X, B's_epoch)` classifies A's
+    /// still-unclaimed status as a pre-epoch previous occupant's and removes it.
+    /// This requires a full pid wrap inside A's claim window with concurrent
+    /// execs, making it as unreachable as the grandchild window above.
+    ///
+    /// [`pre_spawn_epoch`]: ReaperCoordinator::pre_spawn_epoch
     pub fn reserve(&self, pid: u32, pre_spawn_epoch: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // Drop only a status recorded at or before the pre-spawn epoch (a

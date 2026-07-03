@@ -32,6 +32,15 @@ pub mod backend {
     const QUEUE_SIZE: usize = 1024;
     const NUM_QUEUES: usize = 2; // rx and tx
 
+    /// Number of bytes to read from the host stream this poll tick so the
+    /// following `send_slice` enqueues **all** of them (C-NET-1). Bounded by the
+    /// smoltcp socket's free TX room (`capacity - queued`) and the scratch buffer
+    /// length: reading more than the socket can accept would leave an un-enqueued
+    /// tail that the host→guest pump would silently drop, corrupting the stream.
+    fn host_read_budget(send_capacity: usize, send_queue: usize, buf_len: usize) -> usize {
+        send_capacity.saturating_sub(send_queue).min(buf_len)
+    }
+
     /// Bit position of `VIRTIO_NET_F_CTRL_VQ` in the virtio-net feature set.
     ///
     /// The backend deliberately does **not** advertise this bit (NET-2): it
@@ -87,6 +96,40 @@ pub mod backend {
             None
         } else {
             Some(desc_len)
+        }
+    }
+
+    /// Computes the smoltcp interface addresses for `vmid` from the shared
+    /// `crate::net::ip_math` /30 host-IP math (M-NET-2/NET-4): the host gateway
+    /// (`10.200.n.1`, assigned to the NAT interface) and the guest address
+    /// (`10.200.n.2`, used as the default-route gateway). Returns an error for an
+    /// out-of-range vmid — which `run_network` surfaces loudly and then exits its
+    /// thread cleanly instead of panicking. This is the *single* place the /30
+    /// addresses are derived (no re-hardcoded `10.200.x.y` literals) and the exact
+    /// fallible prologue the NET-4 guard test drives.
+    fn nat_addrs(vmid: u32) -> crate::error::Result<(Ipv4Address, Ipv4Address)> {
+        let (host_gw_std, guest_ip_std, _) = crate::net::ip_math(vmid)?;
+        // smoltcp 0.11 provides `From<std::net::Ipv4Addr>`, so the shared std
+        // addresses convert directly rather than being rebuilt octet-by-octet.
+        Ok((
+            Ipv4Address::from(host_gw_std),
+            Ipv4Address::from(guest_ip_std),
+        ))
+    }
+
+    /// Computes the used length to report for an RX frame delivery (L-NET-2).
+    ///
+    /// `offset` is how many bytes of the `frame_len`-byte frame were written into
+    /// the guest's writable descriptors. If the whole frame fit, report it
+    /// (`Some(frame_len)`); if it was truncated (the writable descriptors could
+    /// not hold the frame) or a descriptor write failed, the partial bytes must
+    /// NOT be forwarded — return `None` so the caller drops the frame and returns
+    /// the descriptor with a zero used length instead of a corrupt, truncated one.
+    fn rx_used_len(offset: usize, frame_len: usize, write_failed: bool) -> Option<usize> {
+        if write_failed || offset < frame_len {
+            None
+        } else {
+            Some(frame_len)
         }
     }
 
@@ -189,7 +232,7 @@ pub mod backend {
         where
             F: FnOnce(&mut [u8]) -> R,
         {
-            log::trace!("TxTokenImpl::consume called with len={}", len);
+            tracing::trace!("TxTokenImpl::consume called with len={}", len);
             let mut packet = vec![0; len];
             let result = f(&mut packet);
             self.0.push_back(packet);
@@ -228,6 +271,7 @@ pub mod backend {
 
                 let mut packet = Vec::new();
                 let mut oversized = false;
+                let mut read_failed = false;
                 for desc in chain.readable() {
                     // Bound the guest-controlled descriptor length so a crafted
                     // chain cannot drive a multi-gigabyte host allocation. An
@@ -238,6 +282,14 @@ pub mod backend {
                             let mut buf = vec![0; n];
                             if mem_obj.read_slice(&mut buf, desc.addr()).is_ok() {
                                 packet.extend_from_slice(&buf);
+                            } else {
+                                // L-NET-2: a descriptor read failed mid-frame.
+                                // Continuing would splice the following descriptors
+                                // onto the hole and forward a CORRUPT frame, so
+                                // poison and drop the whole frame (mirror the
+                                // oversized path).
+                                read_failed = true;
+                                break;
                             }
                         }
                         None => {
@@ -248,19 +300,23 @@ pub mod backend {
                 }
 
                 if oversized {
-                    log::trace!(
+                    tracing::trace!(
                         "process_tx_queue: dropping over-MTU frame (cap {} bytes)",
                         MAX_FRAME_LEN
                     );
+                } else if read_failed {
+                    tracing::trace!(
+                        "process_tx_queue: dropping frame after a guest-memory read failure"
+                    );
                 } else if let Some(payload) = packet.get(VIRTIO_NET_HDR_SIZE..) {
-                    log::trace!(
+                    tracing::trace!(
                         "process_tx_queue: Read packet of length {} from vring: {:?}",
                         packet.len(),
                         payload
                     );
                     state.tx_queue.push_back(payload.to_vec());
                 } else {
-                    log::trace!("process_tx_queue: packet too short: {}", packet.len());
+                    tracing::trace!("process_tx_queue: packet too short: {}", packet.len());
                 }
 
                 if vring_state.add_used(head_index, 0).is_err() {
@@ -269,6 +325,9 @@ pub mod backend {
             }
 
             if used_any {
+                // Best-effort guest notification: a signal failure only forgoes a
+                // wakeup this tick (the guest still drains on its next kick), so it
+                // is logged nowhere and non-fatal here.
                 let _ = vring_state.signal_used_queue();
             }
 
@@ -352,6 +411,8 @@ pub mod backend {
                 let mut vring_state = vring1.get_mut();
                 if self.event_idx {
                     loop {
+                        // Masking notifications is a throughput hint; a failure only
+                        // costs an extra wakeup, so the result is deliberately ignored.
                         let _ = vring_state.disable_notification();
                         Self::process_tx_queue(&mut state, &mut vring_state)?;
                         if !vring_state.enable_notification().unwrap_or(false) {
@@ -359,6 +420,8 @@ pub mod backend {
                         }
                     }
                 } else {
+                    // As above: notification masking is advisory; a failure is
+                    // non-fatal (at worst an extra wakeup), so the result is ignored.
                     let _ = vring_state.disable_notification();
                     Self::process_tx_queue(&mut state, &mut vring_state)?;
                     vring_state.enable_notification().unwrap_or(false);
@@ -442,7 +505,11 @@ pub mod backend {
     ) -> bool {
         take_and_shutdown_stream(stream);
         if is_permanent {
-            // Permanent forward-port listeners are always re-armed.
+            // Permanent forward-port listeners are always re-armed. `listen` on a
+            // just-closed socket can only fail if the port is 0 or the socket is
+            // already open; neither holds here (forward ports are non-zero and the
+            // socket is Closed), and a spurious failure is retried next tick — so
+            // the result is deliberately ignored.
             let _ = socket.listen(listen_port);
             false
         } else {
@@ -524,6 +591,10 @@ pub mod backend {
             let rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
             let tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
             let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
+            // `dst_port` is guest-controlled; `listen` fails only for port 0, in
+            // which case the fresh socket is simply added un-listening and later
+            // reclaimed (the SYN is effectively dropped) — so the result is
+            // deliberately ignored rather than propagated.
             let _ = socket.listen(dst_port);
             let handle = sockets.add(socket);
             port_mappings.push((dst_port, pxy_port, handle, None::<tokio::net::TcpStream>));
@@ -641,22 +712,42 @@ pub mod backend {
             state: Arc<Mutex<SharedState>>,
             stop_flag: Arc<std::sync::atomic::AtomicBool>,
         ) {
-            let (host_gw_std, guest_ip_std, _) = match crate::net::ip_math(vmid) {
-                Ok(parts) => parts,
+            // M-NET-2/NET-4: derive both /30 addresses from the shared ip_math via
+            // the single `nat_addrs` helper (no re-hardcoded `10.200.x.y` literals);
+            // an out-of-range vmid fails loud and exits the thread cleanly instead
+            // of panicking. `host_gw` (10.200.n.1) is the NAT interface address;
+            // `guest_gw` (10.200.n.2) is the default-route gateway.
+            let (host_gw, guest_gw) = match nat_addrs(vmid) {
+                Ok(addrs) => addrs,
                 Err(e) => {
-                    // NET-4: never panic the net thread on an out-of-range vmid;
-                    // fail loud and exit the thread cleanly instead.
                     tracing::error!("smoltcp run_network: invalid vmid {}: {}", vmid, e);
                     return;
                 }
             };
-            let host_gw = Ipv4Address::new(10, 200, host_gw_std.octets()[2], 1);
             // NET-2: use a host MAC that `crate::net::mac_math` can never produce
             // for a valid vmid, so it can never collide with a guest MAC.
             let mac_addr = EthernetAddress(HOST_NAT_MAC);
 
             let mut config = Config::new(HardwareAddress::Ethernet(mac_addr));
-            config.random_seed = 0;
+            // L-NET-5: seed the TCP ISN / ephemeral-port RNG per instance so the
+            // sequence space is neither predictable nor identical across VMs (the
+            // old fixed `0` seed was both). Read the OS entropy pool directly and
+            // XOR in `vmid` — `std::hash::RandomState` is clippy-banned (B4: never
+            // for content addressing) and there is no `rand` dependency here.
+            {
+                use std::io::Read;
+                let mut seed = [0u8; 8];
+                let entropy = std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| f.read_exact(&mut seed).map(|()| u64::from_ne_bytes(seed)))
+                    .unwrap_or_else(|_| {
+                        // Near-impossible on Linux; fall back to wall-clock nanos so
+                        // the seed still varies across boots.
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_nanos() as u64)
+                    });
+                config.random_seed = entropy ^ u64::from(vmid);
+            }
             let mut iface = Interface::new(
                 config,
                 &mut SmoltcpDevice {
@@ -686,19 +777,14 @@ pub mod backend {
                 );
                 return;
             }
-            if let Err(e) = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
-                10,
-                200,
-                guest_ip_std.octets()[2],
-                2,
-            )) {
+            if let Err(e) = iface.routes_mut().add_default_ipv4_route(guest_gw) {
                 tracing::error!(
                     "smoltcp run_network: failed to add default route: {:?}; exiting net thread",
                     e
                 );
                 return;
             }
-            log::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
+            tracing::trace!("smoltcp iface configured with IPs: {:?}", iface.ip_addrs());
 
             let mut sockets = SocketSet::new(vec![]);
 
@@ -738,7 +824,7 @@ pub mod backend {
                             if let Ok(mut chains) = avail_chains {
                                 while let Some(packet) = state_guard.rx_queue.pop_front() {
                                     if let Some(chain) = chains.next() {
-                                        log::trace!(
+                                        tracing::trace!(
                                             "process_rx_queue: Sending packet of length {} to guest",
                                             packet.len()
                                         );
@@ -748,7 +834,7 @@ pub mod backend {
                                         full_packet.extend_from_slice(&packet);
 
                                         let mut offset = 0;
-                                        let mut written = 0;
+                                        let mut write_failed = false;
                                         for desc in chain.writable() {
                                             let to_write = std::cmp::min(
                                                 full_packet.len() - offset,
@@ -763,12 +849,38 @@ pub mod backend {
                                                         .is_ok()
                                                     {
                                                         offset += to_write;
-                                                        written += to_write;
+                                                    } else {
+                                                        // L-NET-2: a descriptor write
+                                                        // failed; the frame is now
+                                                        // partial and must be dropped.
+                                                        write_failed = true;
+                                                        break;
                                                     }
                                                 }
                                             }
                                         }
-                                        used_descs.push((head_index, written as u32));
+                                        // L-NET-2: only forward a frame that fully fit
+                                        // the writable descriptors. A truncated frame
+                                        // (writable room < frame, or a write failure)
+                                        // is DROPPED — return the descriptor with a
+                                        // zero used length rather than deliver a
+                                        // corrupt, truncated frame to the guest.
+                                        let used_len = match rx_used_len(
+                                            offset,
+                                            full_packet.len(),
+                                            write_failed,
+                                        ) {
+                                            Some(len) => len as u32,
+                                            None => {
+                                                tracing::trace!(
+                                                    "process_rx_queue: dropping frame that did not fit the writable descriptors ({} of {} bytes)",
+                                                    offset,
+                                                    full_packet.len()
+                                                );
+                                                0
+                                            }
+                                        };
+                                        used_descs.push((head_index, used_len));
                                     } else {
                                         state_guard.rx_queue.push_front(packet);
                                         break;
@@ -788,6 +900,9 @@ pub mod backend {
                                 }
                             }
                             if used_any {
+                                // Best-effort guest notification: a signal failure
+                                // only forgoes a wakeup this tick (the guest drains
+                                // on its next kick), so the result is ignored.
                                 let _ = vring_state.signal_used_queue();
                             }
                         }
@@ -861,6 +976,10 @@ pub mod backend {
                                 tokio::net::TcpStream::connect(format!("127.0.0.1:{}", target_port))
                                     .await
                             {
+                                // TCP_NODELAY is a latency optimization; if the
+                                // setsockopt fails the connection still works
+                                // (merely with Nagle enabled), so the result is
+                                // deliberately ignored.
                                 let _ = stream.set_nodelay(true);
                                 *tcp_stream = Some(stream);
                             }
@@ -869,20 +988,54 @@ pub mod backend {
                         let mut closed = false;
                         if let Some(stream) = tcp_stream {
                             if socket.can_send() {
-                                let mut buf = [0; 8192];
-                                match stream.try_read(&mut buf) {
-                                    Ok(0) => {
+                                // C-NET-1: bound the host read to the socket's
+                                // *available* TX capacity. `send_slice` enqueues
+                                // only up to the free TX buffer ("down to zero"),
+                                // and `can_send()` above is true when as little as
+                                // one byte is free — so an unbounded 8 KiB read
+                                // whose tail does not fit was silently DROPPED,
+                                // corrupting any host→guest stream large enough to
+                                // fill the guest receive window. Reading only what
+                                // will fit guarantees the whole read is enqueued.
+                                let mut buf = [0u8; 8192];
+                                let avail = host_read_budget(
+                                    socket.send_capacity(),
+                                    socket.send_queue(),
+                                    buf.len(),
+                                );
+                                // `can_send()` guarantees `avail >= 1`; guard anyway
+                                // so a zero-length read can never be mis-read as EOF.
+                                let read_res = if avail == 0 {
+                                    Ok(0)
+                                } else {
+                                    stream.try_read(buf.get_mut(..avail).unwrap_or(&mut []))
+                                };
+                                match read_res {
+                                    Ok(0) if avail > 0 => {
                                         closed = true;
                                     }
+                                    Ok(0) => {}
                                     Ok(n) => {
                                         // NET-1/C2: guest-driven; never panic. On a
                                         // send error close the socket and drop the
                                         // host stream below.
-                                        if let Err(e) =
-                                            socket.send_slice(buf.get(..n).unwrap_or(&[]))
-                                        {
-                                            tracing::error!("smoltcp send_slice failed: {:?}", e);
-                                            closed = true;
+                                        match socket.send_slice(buf.get(..n).unwrap_or(&[])) {
+                                            Ok(enqueued) => {
+                                                // The read was bounded by `avail`, so
+                                                // the whole `n` must have enqueued —
+                                                // pin the no-drop invariant loudly.
+                                                debug_assert_eq!(
+                                                    enqueued, n,
+                                                    "send_slice must enqueue the whole bounded read (no drop)"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "smoltcp send_slice failed: {:?}",
+                                                    e
+                                                );
+                                                closed = true;
+                                            }
                                         }
                                     }
                                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -934,6 +1087,25 @@ pub mod backend {
         // Shadow the glob-imported `smoltcp::time::Instant` with the std clock.
         use std::time::{Duration, Instant};
 
+        // C-NET-1: the host→guest pump must read only as many bytes as the socket
+        // can enqueue this tick. With a nearly-full 64 KiB TX buffer (one byte
+        // free), the pump must read exactly ONE byte — not the full 8 KiB scratch,
+        // whose 8191-byte tail `send_slice` would silently drop. RED on the old
+        // unbounded read (which always yielded `min(8192, ∞) == 8192`).
+        #[test]
+        fn host_read_budget_bounds_read_to_free_tx_room() {
+            // One byte free in a 64 KiB TX buffer → read exactly one byte.
+            assert_eq!(host_read_budget(65536, 65535, 8192), 1);
+            // Empty TX buffer → read a full scratch-buffer's worth.
+            assert_eq!(host_read_budget(65536, 0, 8192), 8192);
+            // Full TX buffer → read nothing (no drop, no false EOF).
+            assert_eq!(host_read_budget(65536, 65536, 8192), 0);
+            // Room larger than the scratch buffer is capped by the buffer.
+            assert_eq!(host_read_budget(65536, 40000, 8192), 8192);
+            // Never underflows if the queue somehow exceeds capacity.
+            assert_eq!(host_read_budget(1024, 2048, 8192), 0);
+        }
+
         // NET-2: the host NAT MAC must never collide with any guest MAC produced
         // by `mac_math` for a valid vmid. Buggy impl guarded: HOST_NAT_MAC =
         // 02:00:00:00:00:fe == mac_math(254), which silently wedged vmid 254.
@@ -958,15 +1130,39 @@ pub mod backend {
             }
         }
 
-        // NET-4: run_network validates vmid via `ip_math` and exits cleanly on a
-        // bad value. Buggy impl guarded: it used `ip_math(vmid).expect(...)`,
-        // panicking the net thread for vmid 0 or > 254.
+        // M-NET-4/NET-4: exercise the EXACT fallible prologue `run_network` uses
+        // (`nat_addrs`), not `ip_math` in isolation. Out-of-range vmids must be
+        // rejected — so `run_network` exits its thread cleanly instead of
+        // panicking on `.expect`. Buggy impl guarded: reintroducing an `.expect`
+        // into `nat_addrs`/`run_network` would panic here on vmid 0/255.
+        //
+        // M-NET-2: the addresses `nat_addrs` builds must equal the shared ip_math
+        // /30 output byte-for-byte (no re-hardcoded `10.200.x.y` literals that
+        // could silently diverge). Boundary + interior vmids are checked.
         #[test]
         fn run_network_vmid_is_validated_by_ip_math() {
-            assert!(crate::net::ip_math(0).is_err());
-            assert!(crate::net::ip_math(255).is_err());
-            for vmid in 1u32..=254 {
-                assert!(crate::net::ip_math(vmid).is_ok());
+            assert!(nat_addrs(0).is_err());
+            assert!(nat_addrs(255).is_err());
+
+            for vmid in [1u32, 2, 127, 253, 254] {
+                let (host_gw, guest_gw) = nat_addrs(vmid).expect("in-range vmid must resolve");
+                let (host_std, guest_std, _) = crate::net::ip_math(vmid).unwrap();
+                // Byte-for-byte equality with the shared /30 math.
+                assert_eq!(
+                    host_gw.0,
+                    host_std.octets(),
+                    "host gw drifted for vmid {}",
+                    vmid
+                );
+                assert_eq!(
+                    guest_gw.0,
+                    guest_std.octets(),
+                    "guest gw drifted for vmid {}",
+                    vmid
+                );
+                // The host gateway is the /30 `.1` and the guest is the `.2`.
+                assert_eq!(host_gw.0[3], 1, "host gw must be the .1 of the /30");
+                assert_eq!(guest_gw.0[3], 2, "guest gw must be the .2 of the /30");
             }
         }
 
@@ -1216,6 +1412,24 @@ pub mod backend {
             assert_eq!(bounded_tx_read(5, MAX_FRAME_LEN - 5), Some(5));
             assert_eq!(bounded_tx_read(6, MAX_FRAME_LEN - 5), None);
             assert_eq!(bounded_tx_read(1, MAX_FRAME_LEN), None);
+        }
+
+        // L-NET-2: an RX frame that does not fully fit the guest's writable
+        // descriptors (or hits a descriptor write failure) must be DROPPED, never
+        // forwarded truncated. Buggy impl guarded: the pre-fix code reported the
+        // partial `written` length unconditionally, delivering a corrupt frame —
+        // here the truncated/failed cases must yield `None` (drop), not a partial
+        // `Some`.
+        #[test]
+        fn rx_used_len_drops_truncated_frames() {
+            // Whole frame fit: report its full length.
+            assert_eq!(rx_used_len(1512, 1512, false), Some(1512));
+            // Truncated (writable descriptors too small): drop, never forward partial.
+            assert_eq!(rx_used_len(1000, 1512, false), None);
+            // A descriptor write failure drops even a fully-offset frame.
+            assert_eq!(rx_used_len(1512, 1512, true), None);
+            // Zero-length edge is not a truncation.
+            assert_eq!(rx_used_len(0, 0, false), Some(0));
         }
     }
 }

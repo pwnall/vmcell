@@ -3,7 +3,11 @@ name = "vmcell"
 # 0.2 → 0.3: intentional breaking change — `AgentClient::connect`/`reconnect` gained a
 # `&Timeouts` param (per-VM tunable connect cadence, design 44 §3). A 0.x minor bump is
 # the SemVer slot for a breaking change on a pre-1.0 crate (cargo-semver-checks gate).
-version = "0.3.0"
+# 0.3 → 0.4: intentional breaking change — `AgentClient::resync` (and the `GuestResync`
+# seam) gained an `ipv4: Option<Ipv4Reconfig>` param for H-VMM-1 guest-IP rotation on
+# restore, and `AgentClient::reconnect`'s params were reordered to match `connect`
+# (N-GUEST-3). `ResyncOutcome` gained `ip_applied` (additive, `#[non_exhaustive]`).
+version = "0.4.0"
 edition = "2024"
 # MSRV kept at 1.85 (deliberate — see docs/implementation-notes.md). NOTE: the committed
 # Cargo.lock pins `time` 0.3.47 (the RUSTSEC-2026-0009 fix), whose own MSRV is 1.88, so a
@@ -123,7 +127,7 @@ thiserror = "2"
 # the framed postcard wire enum, shared with the guest agent (v15 §10.1). The explicit
 # `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
 # path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.2.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.3.0" }
 
 # host common
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
@@ -189,8 +193,13 @@ oci-client = { version = "0.17", optional = true }
 
 # In-process virtio-fs experiment + unprivileged smoltcp NAT vhost-user backend
 fuse-backend-rs = { version = "0.14.0", optional = true }
-vhost = { version = "0.16.0", optional = true }
-vhost-user-backend = { version = "0.22.0", optional = true }
+# M-VEND-3: exact `=` pins. A carried `[patch.crates-io]` (root Cargo.toml) points
+# these at vendor/vhost{,-user-backend}. A caret bump (e.g. to 0.17) would silently
+# drop the patch with only a "Patch was not used" warning — regressing the
+# QEMU-unprivileged SET_VRING_ENABLE quirk with a green build. `=` forbids the bump;
+# the `ci` recipe additionally asserts both resolve from the path patch.
+vhost = { version = "=0.16.0", optional = true }
+vhost-user-backend = { version = "=0.22.0", optional = true }
 virtio-queue = { version = "0.17.0", optional = true }
 vmm-sys-util = { version = "0.15.0", optional = true }
 vm-memory = { version = "=0.17.1", optional = true }
@@ -207,7 +216,10 @@ http = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the deterministic
+# EXP-D shutdown-timing tests (L-ORCH-5). Test-only: dev-deps do not affect the
+# production build or the feature powerset.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
 log = "0.4"
 axum = "0.7"
 assert_cmd = "2"

@@ -45,6 +45,9 @@ pub struct ResyncOutcome {
     pub reseed_applied: bool,
     /// Whether the best-effort guest `eth0` MAC rotation applied.
     pub mac_applied: bool,
+    /// Whether the best-effort guest `eth0` IPv4 + default-route rotation applied
+    /// (H-VMM-1 — the restore/zygote vmid rotation).
+    pub ip_applied: bool,
 }
 
 #[cfg(feature = "host-common")]
@@ -58,6 +61,25 @@ pub struct AgentClient {
     /// return a wrong result. Further requests fail loud until
     /// [`AgentClient::reconnect`] re-establishes the stream.
     desynced: bool,
+}
+
+/// How a request closure failed, with respect to whether the framed stream is
+/// still safe to reuse.
+///
+/// [`AgentClient::finish_request`] marks the stream desynced only for a
+/// [`RequestFailure::Transport`] (or a timeout); a [`RequestFailure::Clean`]
+/// leaves it in sync, so a protocol-complete application failure never forces a
+/// spurious reconnect (L-GUEST-1).
+#[cfg(feature = "host-common")]
+enum RequestFailure {
+    /// The exchange completed structurally — one request, one fully received and
+    /// decoded response — but the application reported failure (e.g. `put_file`'s
+    /// non-zero `Exit`). The stream stays in sync.
+    Clean(Error),
+    /// A send, decode, or transport failure, or a stream that ended
+    /// mid-exchange: a late or partial frame may still be in flight, so the
+    /// stream must be marked desynced until a reconnect.
+    Transport(Error),
 }
 
 #[cfg(feature = "host-common")]
@@ -210,13 +232,17 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns an error if the connection fails or times out.
+    ///
+    /// Parameter order mirrors [`AgentClient::connect`]
+    /// (`vsock_path, port, timeout, timeouts, serial_log`) so the two cannot be
+    /// transposed at a call site (N-GUEST-3).
     pub async fn reconnect(
         &mut self,
         vsock_path: &Path,
         port: u32,
-        serial_log: &dyn crate::vmm::SerialLog,
         timeout: std::time::Duration,
         timeouts: &crate::config::Timeouts,
+        serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<()> {
         let new_client = Self::connect(vsock_path, port, timeout, timeouts, serial_log).await?;
         self.stream = new_client.stream;
@@ -240,21 +266,35 @@ impl AgentClient {
     }
 
     /// Resolves a `timeout`-wrapped request result, marking the stream desynced
-    /// on any send/decode error or timeout.
+    /// only when the failure could have left a stale frame in flight.
     ///
-    /// A send/decode/connection error or a mid-exchange timeout leaves the framed
-    /// stream in an unknown state (a late frame may still be in flight), so the
+    /// The closure reports its failure as a [`RequestFailure`]. A
+    /// [`RequestFailure::Transport`] (a send/decode/connection error, or a stream
+    /// that ended mid-exchange) or a `timeout` (`Elapsed`) leaves the framed
+    /// stream in an unknown state — a late frame may still be in flight — so the
     /// next request must fail loud via [`AgentClient::ensure_synced`] until a
-    /// [`AgentClient::reconnect`]. Shared by every request method so none can
-    /// diverge from this protocol.
+    /// [`AgentClient::reconnect`]. A [`RequestFailure::Clean`] — a
+    /// protocol-complete application failure whose full response frame was
+    /// received and decoded (e.g. `put_file`'s non-zero `Exit`) — leaves the
+    /// stream in sync and does **not** desync it, so a clean per-request failure
+    /// never forces a spurious reconnect (L-GUEST-1). Shared by every request
+    /// method so none can diverge from this protocol.
     fn finish_request<T>(
         desynced: &mut bool,
-        result: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
+        result: std::result::Result<
+            std::result::Result<T, RequestFailure>,
+            tokio::time::error::Elapsed,
+        >,
         timeout_msg: &'static str,
     ) -> Result<T> {
         match result {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(e)) => {
+            // Protocol-complete application failure: the stream is still in sync,
+            // so surface the error WITHOUT desyncing (L-GUEST-1).
+            Ok(Err(RequestFailure::Clean(e))) => Err(e),
+            // Send/decode/transport failure, or a stream that ended mid-exchange:
+            // a stale frame may still be in flight, so desync.
+            Ok(Err(RequestFailure::Transport(e))) => {
                 *desynced = true;
                 Err(e)
             }
@@ -279,18 +319,21 @@ impl AgentClient {
 
         let result = tokio::time::timeout(timeout, async {
             let msg = Message::Exec(cmd);
-            let bytes = postcard::to_stdvec(&msg)?;
+            let bytes =
+                postcard::to_stdvec(&msg).map_err(|e| RequestFailure::Transport(e.into()))?;
 
             self.stream
                 .send(::bytes::Bytes::from(bytes))
                 .await
-                .map_err(Error::Io)?;
+                .map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
 
             let mut outcome = ExecOutcome::default();
 
             while let Some(res) = self.stream.next().await {
-                let bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
-                let msg: Message = postcard::from_bytes(&bytes)?;
+                let bytes: ::bytes::BytesMut =
+                    res.map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
+                let msg: Message = postcard::from_bytes(&bytes)
+                    .map_err(|e| RequestFailure::Transport(e.into()))?;
 
                 match msg {
                     Message::Stdout(data) => {
@@ -303,12 +346,21 @@ impl AgentClient {
                         outcome.code = code;
                         return Ok(outcome);
                     }
-                    _ => {}
+                    // L-GUEST-10: an unexpected message on the exec stream (a
+                    // protocol mismatch or a stray control frame) is surfaced at
+                    // `warn`, not silently dropped — a silent `_ => {}` would hide
+                    // a desync where the guest and host disagree on the protocol.
+                    other => {
+                        tracing::warn!("unexpected message on exec stream (ignored): {:?}", other);
+                    }
                 }
             }
 
-            // If stream ends without Exit, treat it as connection drop
-            Err(Error::Agent("Connection dropped during exec".into()))
+            // Stream ended without Exit: the connection dropped mid-exchange, so
+            // the stream is desynced (Transport), not a clean application failure.
+            Err(RequestFailure::Transport(Error::Agent(
+                "Connection dropped during exec".into(),
+            )))
         })
         .await;
 
@@ -337,25 +389,37 @@ impl AgentClient {
                 dst: dst.to_string(),
                 bytes: bytes.to_vec(),
             };
-            let msg_bytes = postcard::to_stdvec(&msg)?;
+            let msg_bytes =
+                postcard::to_stdvec(&msg).map_err(|e| RequestFailure::Transport(e.into()))?;
             self.stream
                 .send(::bytes::Bytes::from(msg_bytes))
                 .await
-                .map_err(Error::Io)?;
+                .map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
 
             // Wait for ack
             if let Some(res) = self.stream.next().await {
-                let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
-                let resp_msg: Message = postcard::from_bytes(&res_bytes)?;
+                let res_bytes: ::bytes::BytesMut =
+                    res.map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
+                let resp_msg: Message = postcard::from_bytes(&res_bytes)
+                    .map_err(|e| RequestFailure::Transport(e.into()))?;
                 match resp_msg {
                     Message::Exit(0) => Ok(()),
-                    Message::Exit(c) => {
-                        Err(Error::Agent(format!("put_file failed with code {}", c)))
-                    }
-                    _ => Err(Error::Agent("unexpected response to put_file".into())),
+                    // A protocol-complete application failure: the guest ran the
+                    // put_file, it failed, and sent a full Exit(c) ack. The stream
+                    // is in sync, so report the failure WITHOUT desyncing so the
+                    // next request need not force a spurious reconnect (L-GUEST-1).
+                    Message::Exit(c) => Err(RequestFailure::Clean(Error::Agent(format!(
+                        "put_file failed with code {}",
+                        c
+                    )))),
+                    _ => Err(RequestFailure::Transport(Error::Agent(
+                        "unexpected response to put_file".into(),
+                    ))),
                 }
             } else {
-                Err(Error::Agent("connection closed during put_file".into()))
+                Err(RequestFailure::Transport(Error::Agent(
+                    "connection closed during put_file".into(),
+                )))
             }
         })
         .await;
@@ -382,6 +446,7 @@ impl AgentClient {
         unix_secs: u64,
         unix_nanos: u32,
         mac: Option<[u8; 6]>,
+        ipv4: Option<protocol::Ipv4Reconfig>,
     ) -> Result<ResyncOutcome> {
         self.ensure_synced()?;
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -389,35 +454,97 @@ impl AgentClient {
                 unix_secs,
                 unix_nanos,
                 mac,
+                ipv4,
             };
-            let msg_bytes = postcard::to_stdvec(&msg)?;
+            let msg_bytes =
+                postcard::to_stdvec(&msg).map_err(|e| RequestFailure::Transport(e.into()))?;
             self.stream
                 .send(::bytes::Bytes::from(msg_bytes))
                 .await
-                .map_err(Error::Io)?;
+                .map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
 
             // Await exactly one ack frame.
             if let Some(res) = self.stream.next().await {
-                let res_bytes: ::bytes::BytesMut = res.map_err(Error::Io)?;
-                let resp_msg: Message = postcard::from_bytes(&res_bytes)?;
+                let res_bytes: ::bytes::BytesMut =
+                    res.map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
+                let resp_msg: Message = postcard::from_bytes(&res_bytes)
+                    .map_err(|e| RequestFailure::Transport(e.into()))?;
                 match resp_msg {
                     Message::ResyncAck {
                         clock_error,
                         reseed_applied,
                         mac_applied,
+                        ip_applied,
                     } => Ok(ResyncOutcome {
                         clock_error,
                         reseed_applied,
                         mac_applied,
+                        ip_applied,
                     }),
-                    _ => Err(Error::Agent("unexpected response to resync".into())),
+                    _ => Err(RequestFailure::Transport(Error::Agent(
+                        "unexpected response to resync".into(),
+                    ))),
                 }
             } else {
-                Err(Error::Agent("connection closed during resync".into()))
+                Err(RequestFailure::Transport(Error::Agent(
+                    "connection closed during resync".into(),
+                )))
             }
         })
         .await;
 
         Self::finish_request(&mut self.desynced, result, "resync timed out")
+    }
+}
+
+#[cfg(all(test, feature = "host-common"))]
+mod tests {
+    use super::{AgentClient, Error, RequestFailure};
+
+    // L-GUEST-1: finish_request desyncs only when a stale frame could still be in
+    // flight. A `Clean` failure — a protocol-complete application error whose full
+    // ack frame was received and decoded (e.g. put_file's non-zero Exit) — leaves
+    // the stream in sync, so the next request must NOT be forced through a
+    // reconnect. RED on the pre-fix finish_request, which set `desynced` on ANY
+    // `Ok(Err(_))`: this test's `assert!(!desynced)` would then fail.
+    #[test]
+    fn finish_request_clean_failure_does_not_desync() {
+        let mut desynced = false;
+        let result: std::result::Result<
+            std::result::Result<(), RequestFailure>,
+            tokio::time::error::Elapsed,
+        > = Ok(Err(RequestFailure::Clean(Error::Agent(
+            "put_file failed with code 1".into(),
+        ))));
+        let out = AgentClient::finish_request(&mut desynced, result, "unused");
+        assert!(
+            out.is_err(),
+            "a clean application failure must still surface as an error"
+        );
+        assert!(
+            !desynced,
+            "a protocol-complete application failure must NOT desync the stream"
+        );
+    }
+
+    // The other half of the contract: a `Transport` failure (send/decode/
+    // connection loss, or a mid-exchange stream end) still desyncs, so the next
+    // request fails loud until a reconnect. RED if the fix over-corrects and stops
+    // desyncing on transport errors.
+    #[test]
+    fn finish_request_transport_failure_desyncs() {
+        let mut desynced = false;
+        let result: std::result::Result<
+            std::result::Result<(), RequestFailure>,
+            tokio::time::error::Elapsed,
+        > = Ok(Err(RequestFailure::Transport(Error::Io(
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        ))));
+        let out = AgentClient::finish_request(&mut desynced, result, "unused");
+        assert!(out.is_err());
+        assert!(
+            desynced,
+            "a transport failure must desync the stream so the next request fails loud"
+        );
     }
 }

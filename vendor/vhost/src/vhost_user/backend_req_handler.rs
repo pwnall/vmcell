@@ -551,6 +551,14 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
             }
             Ok(FrontendReq::SET_VRING_ENABLE) => {
                 let msg = self.extract_request_body::<VhostUserVringState>(&hdr, size, &buf)?;
+                // vmcell carried patch (root Cargo.toml `[patch.crates-io]`, design
+                // v17 §10.4): QEMU sends SET_VRING_ENABLE before SET_FEATURES
+                // completes, so the PROTOCOL_FEATURES check is relaxed here. This
+                // low-level dispatch layer has no `features_acked` state, so the
+                // *precise* gating (accept early, enforce after SET_FEATURES) lives
+                // in vhost-user-backend `handler.rs::set_vring_enable` (M-VEND-2).
+                // Temporary — drop with the rest of the patch if the
+                // QEMU-unprivileged tier is deprecated.
                 // self.check_feature(VhostUserVirtioFeatures::PROTOCOL_FEATURES)?;
                 let enable = match msg.num {
                     1 => true,

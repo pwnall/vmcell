@@ -1,6 +1,9 @@
 [package]
 name = "vmcell-protocol"
-version = "0.2.0"
+# 0.2 → 0.3: intentional breaking change — `Message::Resync` gained an `ipv4` field and
+# `Message::ResyncAck` gained `ip_applied` (H-VMM-1 guest-IP rotation on restore), plus a
+# new `Ipv4Reconfig` type. A 0.x minor bump is the SemVer slot for a pre-1.0 break.
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"

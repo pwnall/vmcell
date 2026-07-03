@@ -56,6 +56,49 @@ pub struct EgressProxy {
     record_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
 }
 
+/// Deadline for [`EgressProxy::drop`] to join the proxy worker before detaching
+/// it (M-NET-1). Mirrors the smoltcp NAT's `JOIN_TIMEOUT`: hudsucker's graceful
+/// shutdown waits on in-flight connections, so a stalled upstream/guest connect
+/// could otherwise block `Drop` forever.
+const PROXY_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Joins the proxy worker thread but gives up after `timeout`, detaching it
+/// rather than hanging teardown indefinitely (M-NET-1). An OS thread cannot be
+/// safely force-killed, so a wedged worker is logged and detached; the process
+/// continues and the detached thread is dropped without a zombie.
+fn join_thread_with_timeout(handle: std::thread::JoinHandle<()>, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            tracing::error!(
+                "EgressProxy: proxy worker did not exit within {:?}; detaching",
+                timeout
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Finished; reap it. A panic payload is intentionally discarded because Drop
+    // must not unwind.
+    let _ = handle.join();
+}
+
+/// Extracts a human-readable message from a thread panic payload (L-NET-7).
+///
+/// `JoinHandle::join` yields the panic value as a `Box<dyn Any + Send>`; the
+/// usual `panic!("literal")` / `panic!("{}", …)` payloads are a `&str` or
+/// `String`. Downcasting to those recovers the real cause instead of collapsing
+/// a worker panic into the opaque "channel closed" recv error.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         tracing::info!("EgressProxy dropping!");
@@ -63,7 +106,9 @@ impl Drop for EgressProxy {
             let _ = tx.send(());
         }
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // M-NET-1: bound the join so a wedged in-flight connection cannot hang
+            // teardown; on timeout the worker is logged and detached.
+            join_thread_with_timeout(thread, PROXY_JOIN_TIMEOUT);
         }
     }
 }
@@ -125,11 +170,40 @@ impl EgressProxy {
 
         // We run the proxy in its own thread to apply `setns` if needed
         let thread = std::thread::spawn(move || {
+            // H-NET-3: in privileged (netns) mode the listener must be created
+            // *inside* the per-VM netns so the TPROXY ruleset delivers redirected
+            // connections and preserves the original destination — but every
+            // upstream connection the proxy dials must originate in the host root
+            // netns. That netns contains only the tap /30 and `lo`, so a proxy
+            // trapped there can serve doubles/403 but can never re-originate real
+            // upstream traffic. Capture the host (root) netns now, *before*
+            // entering the VM netns, so the upstream leg can be moved back to it
+            // after the listener is bound (a socket's netns is fixed at socket()
+            // time, so the already-bound listener stays in the VM netns).
+            let host_netns = if cfg.netns.is_some() {
+                match std::fs::File::open("/proc/thread-self/ns/net") {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Failed to open host netns: {}", e)));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
             #[allow(clippy::collapsible_if)]
             if let Some(ref netns) = cfg.netns {
                 match std::fs::File::open(format!("/var/run/netns/{}", netns)) {
                     Ok(file) => {
-                        // SAFETY: Thread isolation for network namespace
+                        // SAFETY: `setns(2)` with a live fd opened just above from
+                        // `/var/run/netns/<name>`, valid for the duration of the
+                        // call. `CLONE_NEWNET` scopes the move to *this* worker
+                        // thread only (other threads keep their netns); the
+                        // current-thread tokio runtime built below runs solely on
+                        // this thread, so its listener socket inherits this netns.
+                        // The return value is checked against 0 — a failure aborts
+                        // startup rather than silently binding in the wrong netns.
                         let ret = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
                         if ret != 0 {
                             let _ = tx.send(Err(format!(
@@ -217,6 +291,28 @@ impl EgressProxy {
                     }
                 };
 
+                // H-NET-3: the listener is now bound inside the VM netns. Re-enter
+                // the host root netns so every upstream connection hudsucker dials
+                // below originates there and reaches the real network. The listener
+                // fd keeps its VM-netns binding (fixed at socket() time), so it
+                // still receives TPROXY-redirected guest connections; only newly
+                // created upstream sockets pick up the host netns.
+                if let Some(ref host_ns) = host_netns {
+                    // SAFETY: `host_ns` is a live fd opened from
+                    // `/proc/thread-self/ns/net` before this thread entered the VM
+                    // netns, valid for this call. `CLONE_NEWNET` scopes the move
+                    // back to this current-thread-runtime worker only; the return
+                    // is checked and a failure aborts startup.
+                    let ret = unsafe { libc::setns(host_ns.as_raw_fd(), libc::CLONE_NEWNET) };
+                    if ret != 0 {
+                        let _ = tx.send(Err(format!(
+                            "Failed to re-enter host netns for upstream re-origination: {}",
+                            std::io::Error::last_os_error()
+                        )));
+                        return;
+                    }
+                }
+
                 // Initialize the CA manager
                 let ca_manager = match tls::CaManager::new() {
                     Ok(cm) => cm,
@@ -272,15 +368,24 @@ impl EgressProxy {
 
         let port_res = match rx.await {
             Ok(res) => res,
-            Err(e) => {
-                let _ = thread.join();
-                return Err(Error::Proxy(e.to_string()));
+            Err(recv_err) => {
+                // L-NET-7: the worker dropped its readiness sender without sending
+                // — it panicked before signaling (e.g. inside CaManager or
+                // hudsucker init). Join it and surface the panic payload instead of
+                // the opaque "channel closed" recv error.
+                let msg = match thread.join() {
+                    Ok(()) => format!("proxy readiness channel closed: {}", recv_err),
+                    Err(panic) => {
+                        format!("proxy thread panicked: {}", panic_message(panic.as_ref()))
+                    }
+                };
+                return Err(Error::Proxy(msg));
             }
         };
         let (port, ca_cert_pem) = match port_res {
             Ok(res) => res,
             Err(e) => {
-                let _ = thread.join();
+                join_thread_with_timeout(thread, PROXY_JOIN_TIMEOUT);
                 return Err(Error::Proxy(e));
             }
         };
@@ -600,5 +705,48 @@ mod tests {
             // port, which differs from the server addr.
             assert_ne!(got, accepted.peer_addr().expect("peer"));
         });
+    }
+
+    // M-NET-1: the bounded Drop join must not hang on a wedged proxy worker.
+    // Buggy impl guarded: a plain `handle.join()` blocks until the worker exits,
+    // and this worker only exits after `release` is set *after* the join returns,
+    // so an unbounded join would deadlock this test.
+    #[test]
+    fn join_thread_with_timeout_does_not_block_on_wedged_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let release = Arc::new(AtomicBool::new(false));
+        let r2 = release.clone();
+        let handle = std::thread::spawn(move || {
+            while !r2.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let start = std::time::Instant::now();
+        join_thread_with_timeout(handle, std::time::Duration::from_millis(50));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "bounded join blocked on a wedged worker"
+        );
+        // Let the detached worker exit cleanly.
+        release.store(true, Ordering::Relaxed);
+    }
+
+    // L-NET-7: a worker panic before readiness must surface its real payload, not
+    // a fixed string. Buggy impl guarded: mapping the recv error to a constant
+    // "channel closed" drops the payload, so neither substring below is
+    // recoverable.
+    #[test]
+    fn panic_message_recovers_payload() {
+        let p = std::panic::catch_unwind(|| panic!("ca-boom")).unwrap_err();
+        assert!(
+            panic_message(p.as_ref()).contains("ca-boom"),
+            "must recover a &str panic payload"
+        );
+        let p = std::panic::catch_unwind(|| panic!("{}", format!("init-{}", 9))).unwrap_err();
+        assert!(
+            panic_message(p.as_ref()).contains("init-9"),
+            "must recover a String panic payload"
+        );
     }
 }

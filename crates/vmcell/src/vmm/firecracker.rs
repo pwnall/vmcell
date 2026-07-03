@@ -8,36 +8,27 @@ use std::process::Stdio;
 use tokio::process::Child;
 
 /// Sidecar file (written into the snapshot directory by [`FcInstance::snapshot`])
-/// recording the host-side vsock/serial UDS paths the snapshot baked in.
+/// recording the host-side vsock UDS path and guest CID the snapshot baked in.
 ///
 /// Firecracker's `PUT /snapshot/load` restores the vsock device *verbatim* from
 /// the snapshot — it rebinds the **original** host UDS path and offers no
 /// load-time override. A restore therefore runs under a fresh, vmid-derived tmp
-/// dir but must rebind (and have the agent dial) the path the snapshot recorded.
-/// This sidecar carries that path across the snapshot/restore boundary.
+/// dir but must rebind (and have the agent dial) the path the snapshot recorded,
+/// and report the guest's baked CID. This sidecar carries both across the
+/// snapshot/restore boundary.
 const HOST_PATHS_SIDECAR: &str = "vmcell_host_paths.json";
 
-/// Host-side UDS paths baked into a Firecracker snapshot, persisted alongside it
-/// so a later restore can rebind/connect the exact socket FC recreates.
+/// Host-side vsock UDS path and guest CID baked into a Firecracker snapshot,
+/// persisted alongside it so a later restore can rebind the exact socket FC
+/// recreates (it offers no load-time override) and report the guest's baked CID.
 #[derive(Serialize, Deserialize)]
 struct SnapshotHostPaths {
+    /// Host vsock UDS path FC baked into the snapshot; `restore()` re-binds it verbatim.
     vsock: PathBuf,
-    serial: PathBuf,
-}
-
-/// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
-/// because it has a vhost-user device attached (virtio-fs share, unprivileged net, or
-/// external vhost-user-net). The snapshot-eligibility law (§3.3) requires every
-/// backend to self-guard `snapshot()`/`restore()` against such a VM rather than
-/// assume the caller already checked. Firecracker's `create()` already rejects all
-/// vhost-user devices up front, so on FC this is defense in depth — it stays correct
-/// if a future path constructs an `FcInstance` differently. Mirrors the CH helper.
-fn has_vhost_user_device(
-    virtio_fs_share: bool,
-    unprivileged_net: bool,
-    vhost_user_net: bool,
-) -> bool {
-    virtio_fs_share || unprivileged_net || vhost_user_net
+    /// Guest CID baked into the snapshot. A restored FC VM keeps this CID (the vsock
+    /// device is loaded verbatim), so `guest_cid()` must report it, not the
+    /// orchestrator's fresh allocation (M-VMM-3).
+    cid: u32,
 }
 
 /// The Firecracker capability descriptor, exposed as a free function so both
@@ -77,15 +68,15 @@ fn fc_capabilities() -> VmmCapabilities {
     }
 }
 
-/// Serializes and writes the host vsock/serial UDS paths Firecracker baked into a
-/// snapshot to the [`HOST_PATHS_SIDECAR`] file in `dir`. The sidecar is part of the
+/// Serializes and writes the host vsock UDS path and guest CID Firecracker baked into
+/// a snapshot to the [`HOST_PATHS_SIDECAR`] file in `dir`. The sidecar is part of the
 /// snapshot artifact and `restore()` hard-requires it, so a serialize or write
 /// failure is surfaced (M-RESTORE-2) — never logged-and-swallowed, which would
 /// report an unrestorable snapshot as successful.
-async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, serial: &Path) -> Result<()> {
+async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, cid: u32) -> Result<()> {
     let json = serde_json::to_string(&SnapshotHostPaths {
         vsock: vsock.to_path_buf(),
-        serial: serial.to_path_buf(),
+        cid,
     })?;
     tokio::fs::write(dir.join(HOST_PATHS_SIDECAR), json).await?;
     Ok(())
@@ -209,6 +200,10 @@ pub struct FcInstance {
     /// `resume()`, never `boot()` — so `boot()` self-guards on this flag and refuses
     /// to `InstanceStart` a restored VM (VMM-6). Mirrors CH's `restored` field.
     restored: bool,
+    /// True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
+    /// leader is reaped the kernel can recycle its pgid, so `kill`/`Drop` must NOT
+    /// re-`SIGKILL` the process group or they could hit an unrelated group (M-VMM-1).
+    reaped: bool,
 }
 
 impl FcInstance {
@@ -397,6 +392,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
         pgid,
         vhost_user_net: false,
         restored: false,
+        reaped: false,
     };
 
     #[derive(Serialize)]
@@ -491,7 +487,9 @@ impl Vmm for Firecracker {
             if !caps.unprivileged_vhost_user_net {
                 return Err(Error::Unsupported {
                     vmm: "firecracker".to_string(),
-                    feature: "unprivileged_net".to_string(),
+                    // N-VMM-1: match the VmmCapabilities field name so callers matching
+                    // feature strings see one consistent spelling across backends.
+                    feature: "unprivileged_vhost_user_net".to_string(),
                 });
             }
         }
@@ -531,6 +529,7 @@ impl Vmm for Firecracker {
             vhost_user_net: res.vhost_user_socket.is_some(),
             // Cold boot: `boot()` issues `InstanceStart` (not a resume).
             restored: false,
+            reaped: false,
         };
 
         #[derive(Serialize)]
@@ -689,15 +688,13 @@ impl Vmm for Firecracker {
                 feature: "snapshot_restore".to_string(),
             });
         }
-        // M-RESTORE-3 / snapshot-eligibility law: a snapshot-eligible VM has no
-        // vhost-user device. Reject any virtio-fs share, unprivileged net, or external
-        // vhost-user-net handed to us via the config, mirroring CH's guard, before
-        // spawning a VMM. FC never attaches these, so this is defense in depth.
-        if has_vhost_user_device(
-            !cfg.shares.is_empty(),
-            matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }),
-            res.vhost_user_socket.is_some(),
-        ) {
+        // M-RESTORE-3 / H-VMM-3 / snapshot-eligibility law: a snapshot-eligible VM has
+        // no vhost-user device. Use the SHARED predicate (which also covers a virtio-fs
+        // *rootfs* — the case FC's former inline check missed) to reject any virtio-fs
+        // share/rootfs, unprivileged net, or external vhost-user-net handed to us via
+        // the config, before spawning a VMM. FC never attaches these, so this is
+        // defense in depth.
+        if crate::vmm::config_has_vhost_user_device(cfg, res) {
             return Err(Error::Unsupported {
                 vmm: "firecracker".to_string(),
                 feature: "snapshot/restore with a vhost-user device".to_string(),
@@ -735,13 +732,17 @@ impl Vmm for Firecracker {
             // an empty/stale file FC never writes (VMM-6).
             vsock_path: host_paths.vsock,
             serial_path,
-            cid: res.guest_cid,
+            // A restored guest keeps the CID baked into its snapshot (the vsock device
+            // is loaded verbatim); report that, not the orchestrator's fresh allocation
+            // (M-VMM-3).
+            cid: host_paths.cid,
             pgid,
             // Guarded false above; computed from `res` to mirror CH.
             vhost_user_net: res.vhost_user_socket.is_some(),
             // Restored VMs are returned paused and resumed via `resume()`; `boot()`
             // self-guards on this and refuses to `InstanceStart` (VMM-6).
             restored: true,
+            reaped: false,
         };
 
         // Load snapshot
@@ -828,20 +829,32 @@ impl VmInstance for FcInstance {
 
     async fn kill(&mut self) -> Result<()> {
         if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+            // Skip the group SIGKILL if the leader was already reaped (its pgid may be
+            // recycled) — M-VMM-1.
+            if !self.reaped {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
         }
         let _ = self.process.wait().await;
+        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
+        self.reaped = true;
         Ok(())
     }
 
     async fn has_exited(&mut self) -> bool {
         // Non-blocking reap of the VMM leader; `Ok(Some(_))` means it exited after
-        // `request_shutdown`. Safe to reap early — the later SIGKILL of the dead
-        // group is a no-op and `process.wait()` returns the cached status.
-        matches!(self.process.try_wait(), Ok(Some(_)))
+        // `request_shutdown`. Record the reap so `kill()`/`Drop` do NOT re-`SIGKILL`
+        // the process group: once the leader is reaped the kernel may recycle its pgid
+        // and signalling `-pgid` could hit an unrelated group (M-VMM-1).
+        if matches!(self.process.try_wait(), Ok(Some(_))) {
+            self.reaped = true;
+            true
+        } else {
+            false
+        }
     }
 
     async fn pause(&mut self) -> Result<()> {
@@ -885,7 +898,7 @@ impl VmInstance for FcInstance {
                 feature: "snapshot_restore".to_string(),
             });
         }
-        if has_vhost_user_device(false, false, self.vhost_user_net) {
+        if crate::vmm::has_vhost_user_device(false, false, self.vhost_user_net) {
             return Err(Error::Unsupported {
                 vmm: "firecracker".to_string(),
                 feature: "snapshot with a vhost-user device".to_string(),
@@ -920,7 +933,7 @@ impl VmInstance for FcInstance {
         // propagated (M-RESTORE-2) — reporting an unrestorable snapshot as `Ok`
         // would only surface later as a confusing `restore()` error.
         let result = match snap_res {
-            Ok(()) => write_host_paths_sidecar(dir, &self.vsock_path, &self.serial_path).await,
+            Ok(()) => write_host_paths_sidecar(dir, &self.vsock_path, self.cid).await,
             Err(e) => Err(e),
         };
 
@@ -952,12 +965,16 @@ impl Drop for FcInstance {
         // touching the sockets or the per-VM directory means cleanup never races a
         // live VMM.
         if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            if let Some(pid) = self.process.id() {
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+            // Skip the group SIGKILL + reap if the leader was already reaped (via
+            // `has_exited`/`kill`): its pgid may have been recycled (M-VMM-1).
+            if !self.reaped {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                if let Some(pid) = self.process.id() {
+                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+                }
             }
         }
         // Unlink our own sockets. The per-VM directory itself is owned and removed
@@ -1101,6 +1118,7 @@ mod tests {
             cid: 3,
             vhost_user_net: false,
             restored,
+            reaped: false,
         }
     }
 
@@ -1201,33 +1219,176 @@ mod tests {
         );
     }
 
-    // Guards M-RESTORE-3: the snapshot-eligibility predicate (§3.3) that backs both
-    // the `restore()` and `snapshot()` self-guards. The buggy impl (no guard — i.e.
-    // a predicate that always returns false) would let a vhost-user VM be
-    // snapshotted/restored.
-    #[test]
-    fn vhost_user_device_guard() {
-        assert!(has_vhost_user_device(true, false, false)); // virtio-fs data share
-        assert!(has_vhost_user_device(false, true, false)); // unprivileged net
-        assert!(has_vhost_user_device(false, false, true)); // external vhost-user-net
-        // privileged tap net + erofs/block rootfs: snapshot-eligible.
-        assert!(!has_vhost_user_device(false, false, false));
+    // Guards H-VMM-3: FC restore()'s snapshot-eligibility guard must reject a virtio-fs
+    // *rootfs* (a vhost-user device), not just data shares — via the SHARED
+    // `config_has_vhost_user_device` predicate. It returns BEFORE reading the sidecar or
+    // spawning, so no KVM/snapshot artifact is needed. Inverse (the old inline check
+    // that only looked at `cfg.shares`) falls through to the sidecar read and fails with
+    // an I/O error, not this typed vhost-user Unsupported — reddening the assert.
+    #[tokio::test]
+    async fn restore_rejects_virtio_fs_rootfs() {
+        use crate::config::RootfsSource;
+        let fc = Firecracker::new("/usr/bin/firecracker");
+        let cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::VirtioFs {
+                dir: PathBuf::from("/d"),
+            },
+        )
+        .build()
+        .expect("build virtio-fs rootfs config");
+        let res = PerVmResources {
+            cgroup_name: "vmcell-test".to_string(),
+            tap_name: Some("tap0".to_string()),
+            netns_name: None,
+            vhost_user_socket: None,
+            vmid: 1,
+            guest_cid: 3,
+            tmp_dir: std::env::temp_dir().join("vmcell-fc-restore-vfs-test"),
+        };
+        let cgroups = crate::metrics::FakeCgroupFs::new();
+        let err = fc
+            .restore(Path::new("/nonexistent-snapshot"), &cfg, &res, &cgroups)
+            .await
+            .expect_err("FC restore must reject a virtio-fs rootfs");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature.contains("vhost-user")),
+            "expected a vhost-user Unsupported, got {err:?}"
+        );
     }
 
-    // Guards M-RESTORE-2: the restore sidecar is part of the snapshot artifact, so a
-    // write failure must be SURFACED, not swallowed. The buggy impl
+    // Guards N-VMM-1: the Unsupported.feature string for unprivileged networking must
+    // match the VmmCapabilities field name (`unprivileged_vhost_user_net`), not the
+    // ad-hoc `unprivileged_net`. create() reaches this check before spawning, so no KVM
+    // is needed. Inverse (the old "unprivileged_net" literal) reddens the assert.
+    #[tokio::test]
+    async fn create_rejects_unprivileged_net_with_capability_field_name() {
+        use crate::config::{Egress, NetConfig, RootfsSource};
+        let fc = Firecracker::new("/usr/bin/firecracker");
+        let cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .net(NetConfig::Unprivileged {
+            egress: Egress::default(),
+            host_services_port: None,
+        })
+        .build()
+        .expect("build unprivileged config");
+        let res = PerVmResources {
+            cgroup_name: "vmcell-test".to_string(),
+            tap_name: None,
+            netns_name: None,
+            vhost_user_socket: None,
+            vmid: 1,
+            guest_cid: 3,
+            tmp_dir: std::env::temp_dir().join("vmcell-fc-unpriv-test"),
+        };
+        let cgroups = crate::metrics::FakeCgroupFs::new();
+        let err = fc
+            .create(&cfg, &res, &cgroups)
+            .await
+            .expect_err("FC has no unprivileged vhost-user-net");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature == "unprivileged_vhost_user_net"),
+            "expected the capability-field-name feature string, got {err:?}"
+        );
+    }
+
+    // Guards M-VMM-1: `has_exited` must RECORD the leader's reap so `kill`/`Drop` do not
+    // re-`SIGKILL` a possibly-recycled pgid. Inverse: `has_exited` returns the bool
+    // without setting `reaped` and the field stays false, reddening the assert.
+    #[tokio::test]
+    async fn has_exited_records_reaped() {
+        let mut inst = instance_with(false);
+        // Kill the stand-in leader's group so `has_exited` observes an exited process.
+        if let Some(pgid) = inst.pgid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-(pgid as i32)),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let mut exited = false;
+        for _ in 0..100 {
+            if inst.has_exited().await {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(exited, "has_exited must report the killed leader as exited");
+        assert!(
+            inst.reaped,
+            "has_exited must record `reaped` after reaping the leader (M-VMM-1)"
+        );
+    }
+
+    // Guards M-VMM-1: once the leader is reaped, its pgid can be recycled — `kill` must
+    // NOT `SIGKILL` `-pgid` or it could hit an unrelated group. A live decoy process
+    // stands in for that recycled group. Inverse: drop the `!self.reaped` guard in
+    // `kill` and the decoy is SIGKILLed, so `try_wait` reports it exited — reddening
+    // the assert.
+    #[tokio::test]
+    async fn kill_does_not_signal_pgid_when_reaped() {
+        // Decoy occupying a pgid, in its own process group.
+        let mut decoy = spawn_group_standin();
+        let decoy_pid = decoy.id().expect("decoy pid") as i32;
+
+        // The instance's own leader is already gone (reaped == true). Use a fast-exiting
+        // child so `kill`'s `process.wait()` returns promptly instead of blocking.
+        let leader = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true` leader");
+        let mut inst = FcInstance {
+            process: leader,
+            api_socket: PathBuf::new(),
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            cid: 3,
+            pgid: Some(decoy_pid as u32),
+            vhost_user_net: false,
+            restored: false,
+            reaped: true,
+        };
+        inst.kill().await.expect("kill");
+
+        // A SIGKILL to the (recycled) pgid would land within a few ms; give it time.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let decoy_status = decoy.try_wait().expect("try_wait decoy");
+        // Clean up the decoy regardless of the outcome.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-decoy_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = decoy.wait().await;
+
+        assert!(
+            decoy_status.is_none(),
+            "kill() on a reaped instance must not SIGKILL a (recycled) pgid — the decoy died"
+        );
+    }
+
+    // Guards M-RESTORE-2 + M-VMM-3: the restore sidecar is part of the snapshot
+    // artifact, so a write failure must be SURFACED, not swallowed. The buggy impl
     // (`let _ = tokio::fs::write(...).await; Ok(())`) returns `Ok` even when the
     // write fails, making `snapshot()` report an unrestorable snapshot as success;
-    // the failure-path assert below then goes red. The happy path also round-trips
-    // the exact paths so the sidecar is proven readable by `restore()`.
+    // the failure-path assert below then goes red. The happy path round-trips the
+    // vsock path AND the baked guest CID so `restore()` can rebind the socket and
+    // report the CID — inverse (drop the `cid` field / read a fresh CID) reddens the
+    // CID assertion.
     #[tokio::test]
     async fn sidecar_write_round_trips_and_surfaces_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let vsock = PathBuf::from("/tmp/vmcell-vsock.sock");
-        let serial = PathBuf::from("/tmp/vmcell-serial.log");
+        let baked_cid: u32 = 7;
 
-        // Happy path: the sidecar is written and round-trips back the exact paths.
-        write_host_paths_sidecar(dir.path(), &vsock, &serial)
+        // Happy path: the sidecar is written and round-trips back the exact vsock path
+        // and baked CID.
+        write_host_paths_sidecar(dir.path(), &vsock, baked_cid)
             .await
             .expect("sidecar write should succeed in a writable dir");
         let raw = tokio::fs::read_to_string(dir.path().join(HOST_PATHS_SIDECAR))
@@ -1236,13 +1397,16 @@ mod tests {
         let parsed: SnapshotHostPaths =
             serde_json::from_str(&raw).expect("sidecar should be valid json");
         assert_eq!(parsed.vsock, vsock);
-        assert_eq!(parsed.serial, serial);
+        assert_eq!(
+            parsed.cid, baked_cid,
+            "the sidecar must carry the guest CID a restore reports (M-VMM-3)"
+        );
 
         // Failure path: a non-existent target directory makes the write fail; the
         // error MUST propagate rather than be swallowed into `Ok`.
         let missing = dir.path().join("does-not-exist").join("nested");
         assert!(
-            write_host_paths_sidecar(&missing, &vsock, &serial)
+            write_host_paths_sidecar(&missing, &vsock, baked_cid)
                 .await
                 .is_err(),
             "a failed sidecar write must surface an error, not be swallowed"

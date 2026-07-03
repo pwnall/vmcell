@@ -1,17 +1,21 @@
 //! Dev utility: emit a valid pipeline `CacheMetadata` JSON for the prebuilt
 //! `vmlinux`, so the kernel stage is treated as a cache hit instead of being
-//! rebuilt (the from-scratch kernel build is broken under gcc-15 / C23 — see
-//! implementation-notes.md). The kernel is unchanged, so reusing it is correct.
+//! rebuilt (a from-scratch kernel build is broken under gcc-15 / C23 — design
+//! v17 §1506). The kernel is unchanged, so reusing it is correct.
 //!
-//! Replicates `KernelStage::cache_key` (blake3 over STAGE_VERSION + the three
-//! kernel pins) and `hash_file` (blake3 of the artifact) exactly.
+//! This calls the REAL `KernelStage::cache_key` (with the same `label: None,
+//! fragments: None` as `vmcell build`) instead of re-deriving the hash by hand, so
+//! the emitted key cannot drift from the pipeline (M-BIN-5: the old hand-rolled copy
+//! had `STAGE_VERSION = 1` vs the real `2`, no `\x1f` field separators, and never
+//! folded the label — every one a silent mismatch that made the cache miss).
 //!
 //! Usage: cargo run --example blake3_cache_key --features pipeline -- \
 //!            <pins.json> <vmlinux_path>
 //! Prints the CacheMetadata JSON to stdout.
 use std::io::Read;
 
-const KERNEL_STAGE_VERSION: u32 = 1;
+use vmcell::artifact::kernel::{KernelStage, ReqwestClient};
+use vmcell::artifact::{Stage, StageInputs};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -25,13 +29,24 @@ fn main() {
     let sha = k["source_sha256"].as_str().expect("source_sha256");
     let cfg = k["microvm_config"].as_str().expect("microvm_config");
 
-    // Mirror KernelStage::cache_key.
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&KERNEL_STAGE_VERSION.to_le_bytes());
-    hasher.update(url.as_bytes());
-    hasher.update(sha.as_bytes());
-    hasher.update(cfg.as_bytes());
-    let key = format!("kernel-{}", hasher.finalize().to_hex());
+    // Build the exact stage `vmcell build` uses (the default, unlabelled kernel with
+    // no config fragments) and feed it the resolved pins under the same keys
+    // `ResolvePinsStage` publishes. Calling the tracked `cache_key` guarantees the
+    // emitted key matches whatever the pipeline would compute — no re-implementation.
+    let stage = KernelStage {
+        http_client: std::sync::Arc::new(ReqwestClient),
+        label: None,
+        fragments: None,
+    };
+    let mut inputs = StageInputs::default();
+    inputs.pins.insert("kernel_source_url".into(), url.into());
+    inputs
+        .pins
+        .insert("kernel_source_sha256".into(), sha.into());
+    inputs
+        .pins
+        .insert("kernel_microvm_config".into(), cfg.into());
+    let key = stage.cache_key(&inputs).0;
 
     // Mirror hash_file(vmlinux).
     let mut file = std::fs::File::open(&vmlinux_path).expect("open vmlinux");

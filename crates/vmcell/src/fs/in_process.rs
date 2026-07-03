@@ -7,8 +7,8 @@ pub mod backend {
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{FsCacheReqHandler, Reader, VirtioFsWriter};
     use std::sync::{Arc, Mutex, RwLock};
+    use vhost::vhost_user::Listener;
     use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-    use vhost::vhost_user::{Backend, Listener};
     use vhost_user_backend::{
         VhostUserBackendMut, VhostUserDaemon, VringMutex, VringState, VringT,
     };
@@ -33,7 +33,6 @@ pub mod backend {
         kill_evt: (EventConsumer, EventNotifier),
         mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
         server: Arc<Server<Arc<Vfs>>>,
-        vu_req: Option<Backend>,
     }
 
     impl VhostUserFsBackend {
@@ -106,13 +105,22 @@ pub mod backend {
 
     struct VhostUserFsBackendHandler {
         backend: Mutex<VhostUserFsBackend>,
+        /// Pre-cloned kill eventfd pair handed to the framework's epoll worker via
+        /// the `exit_event` trait method. The clone (an fd `dup`, fallible
+        /// under `EMFILE`) happens ONCE here at construction, where the failure is a
+        /// typed `io::Result` the caller surfaces — not inside `exit_event`, whose
+        /// signature cannot report it and so used to `.expect()`, a production panic
+        /// on a load-dependent host condition (M-HOST-6). Handed out at most once
+        /// (single serve thread); a second call yields `None`, which is safe because
+        /// shutdown is also driven by the caller's `kill_notifier` clone.
+        exit_event: Mutex<Option<(EventConsumer, EventNotifier)>>,
     }
 
-    // METRICS-FS-4: recover from a poisoned `backend` mutex instead of panicking.
-    // The guarded state is plain device state (event_idx, mem, vu_req, the kill
-    // eventfd) with no enforced cross-field invariant, so continuing with the
-    // last-written value after a panic in another holder is sound and keeps a
-    // guest-driven path from turning a transient poison into a hard crash.
+    // METRICS-FS-4: recover from a poisoned mutex instead of panicking. The guarded
+    // state is plain device state (event_idx, mem, the kill eventfd) with no enforced
+    // cross-field invariant, so continuing with the last-written value after a panic
+    // in another holder is sound and keeps a guest-driven path from turning a
+    // transient poison into a hard crash.
     fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -126,11 +134,21 @@ pub mod backend {
                 )?,
                 mem: None,
                 server: Arc::new(Server::new(vfs)),
-                vu_req: None,
             };
+
+            // Pre-clone the kill eventfd pair for `exit_event` here (M-HOST-6): the
+            // `try_clone` fd-dup can fail under fd exhaustion, and this is the only
+            // place that failure is a typed `io::Error` rather than a mid-protocol
+            // panic. Both clones `dup` the same underlying eventfd, so a
+            // `kill_notifier.notify()` still wakes this consumer.
+            let exit_pair = (
+                backend.kill_evt.0.try_clone()?,
+                backend.kill_evt.1.try_clone()?,
+            );
 
             Ok(VhostUserFsBackendHandler {
                 backend: Mutex::new(backend),
+                exit_event: Mutex::new(Some(exit_pair)),
             })
         }
     }
@@ -170,15 +188,12 @@ pub mod backend {
             Ok(())
         }
 
-        fn set_backend_req_fd(&mut self, vu_req: Backend) {
-            lock_recover(&self.backend).vu_req = Some(vu_req);
-        }
-
         fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-            let backend = lock_recover(&self.backend);
-            let consumer = backend.kill_evt.0.try_clone().expect("clone consumer");
-            let notifier = backend.kill_evt.1.try_clone().expect("clone notifier");
-            Some((consumer, notifier))
+            // Hand out the pre-cloned kill eventfd pair (cloned fallibly at
+            // construction, so no fd-exhaustion `.expect()` panic here — M-HOST-6).
+            // Taken once; a later worker gets `None`, which is safe as shutdown is
+            // also driven by the caller's `kill_notifier`.
+            lock_recover(&self.exit_event).take()
         }
 
         fn handle_event(
@@ -366,6 +381,25 @@ pub mod backend {
             let no_vrings: &[VringMutex] = &[];
             let res = handler.handle_event(42, EventSet::IN, no_vrings, 0);
             assert!(res.is_err(), "unknown device event must error, got {res:?}");
+        }
+
+        // M-HOST-6: `exit_event` must NOT re-`try_clone` the kill eventfd (an fd-dup
+        // that panicked via `.expect()` under EMFILE). The pair is cloned once at
+        // construction and handed out at most once. This asserts the take-once
+        // behavior (a second call yields `None`) and, by never panicking, that the
+        // fd-exhaustion `.expect()` is gone. Goes RED if `exit_event` reverts to
+        // per-call cloning (a second call would then yield `Some`, not `None`).
+        #[test]
+        fn exit_event_hands_out_prebuilt_pair_once_no_panic() {
+            let handler = new_handler();
+            assert!(
+                handler.exit_event(0).is_some(),
+                "first exit_event must yield the pre-cloned kill eventfd pair"
+            );
+            assert!(
+                handler.exit_event(0).is_none(),
+                "exit_event must not re-clone; a second call yields None, never a panic"
+            );
         }
     }
 }

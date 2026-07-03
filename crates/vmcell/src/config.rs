@@ -62,8 +62,11 @@ pub struct VmConfig {
 /// Two presets are provided: [`Timeouts::low_latency`] minimizes time-to-output
 /// (tightens every connect/accept cadence, leaves teardown graceful) and
 /// [`Timeouts::throughput`] minimizes whole-lifecycle wall-clock (cuts the
-/// graceful-shutdown grace). All constructors clamp to correctness floors so a
-/// preset can never produce a busy-spin or a sub-viable window.
+/// graceful-shutdown grace). The builder and preset constructors clamp to
+/// correctness floors; because the fields are `pub`, a caller can mutate a
+/// `VmConfig.timeouts` after `build()`, so the orchestrator **re-clamps** at
+/// `MicroVm::start()` time (M-ORCH-3) — a preset or a hand-built `Timeouts` can
+/// therefore never produce a busy-spin or a sub-viable window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Timeouts {
@@ -106,8 +109,11 @@ impl Default for Timeouts {
 impl Timeouts {
     /// Clamps every field into its correctness floor so a hand-built or preset
     /// `Timeouts` can never busy-spin PID 1 or collapse a window below viability.
+    ///
+    /// `pub(crate)` so the orchestrator can re-clamp at `start()` time, guarding
+    /// against post-`build()` mutation of the `pub` fields (M-ORCH-3).
     #[must_use]
-    fn clamped(mut self) -> Self {
+    pub(crate) fn clamped(mut self) -> Self {
         use std::time::Duration;
         let max = |a: Duration, b: Duration| if a > b { a } else { b };
         self.connect_backoff_floor = max(self.connect_backoff_floor, Duration::from_millis(1));
@@ -186,6 +192,17 @@ pub(crate) fn build_kernel_cmdline(
     vmid: u32,
     backend_extra: &str,
 ) -> Result<String, crate::error::Error> {
+    // Self-guard (L-ORCH-2): a virtio-fs rootfs has no `/dev/vda`, so emitting the
+    // `root=/dev/vda rootfstype=ext4` line below would build an unbootable cmdline
+    // that kernel-panics the guest. Every backend rejects a virtio-fs rootfs up
+    // front today, but this shared builder must not silently depend on "the caller
+    // checked first" (AGENTS.md contract-self-guard).
+    if let RootfsSource::VirtioFs { .. } = &cfg.rootfs {
+        return Err(crate::error::Error::Config(
+            "virtio-fs rootfs cannot be booted from the kernel cmdline (no /dev/vda block device)"
+                .into(),
+        ));
+    }
     let rootfstype = match &cfg.rootfs {
         RootfsSource::Erofs { .. } => "erofs",
         _ => "ext4",
@@ -218,8 +235,16 @@ pub(crate) fn build_kernel_cmdline(
             guest_ip, host_ip
         ));
     }
+    // `nested_virt` controls the guest KVM's *nested* (L2) capability via the
+    // `kvm-{intel,amd}.nested` module param. Emit it EXPLICITLY in both directions:
+    // `-cpu host` exposes VMX unconditionally (so L1 `/dev/kvm` always exists), and
+    // modern guest kernels default `nested=Y`, so omitting the token on `false`
+    // would leave nested virt on — making the flag a silent no-op (L-TEST-6). The
+    // explicit `=0` makes it a genuine, observable lever.
     if cfg.nested_virt {
         s.push_str(" kvm-intel.nested=1 kvm-amd.nested=1");
+    } else {
+        s.push_str(" kvm-intel.nested=0 kvm-amd.nested=0");
     }
     push_share_args(&mut s, &cfg.shares);
     push_guest_timeout_args(&mut s, &cfg.timeouts);
@@ -446,7 +471,12 @@ pub enum NetConfig {
     Privileged {
         /// Egress proxy configuration.
         egress: Egress,
-        /// Optional port for host services accessible from the guest.
+        /// Must be `None`: host-service reachability is only implemented on the
+        /// [`NetConfig::Unprivileged`] NAT path. `config::build()` rejects
+        /// `Some(_)` here rather than silently ignoring it (H-ORCH-3/H-NET-2) —
+        /// the privileged TPROXY ruleset policy-drops everything but the web
+        /// TPROXY and the proxy port, so a host-service port would not reach the
+        /// guest anyway.
         host_services_port: Option<u16>,
     },
     /// Unprivileged mode using an in-process smoltcp stack plus a vhost-user-net
@@ -470,7 +500,16 @@ pub enum Egress {
     Filtered(ProxyConfig),
     /// All egress traffic is blocked.
     Blocked,
-    /// Egress traffic is allowed without interception.
+    /// No egress **interception** is configured (no proxy is started).
+    ///
+    /// This is *not* unrestricted outbound internet: it selects "no filtering
+    /// proxy", and connectivity is then whatever the networking mode's datapath
+    /// natively provides — the unprivileged NAT reaches only the registered
+    /// `host_services_port`/proxy forwards, and the privileged path reaches only
+    /// what its TPROXY ruleset admits. Arbitrary outbound egress (dialing the
+    /// frame's real destination / host masquerade) is **not implemented** for
+    /// `Open` in either mode; see implementation-notes.md (§16, H-NET-4). Use
+    /// [`Egress::Filtered`] for a mediated egress path.
     #[default]
     Open,
 }
@@ -523,7 +562,7 @@ pub struct ResourceLimits {
 }
 
 /// I/O maximum limits mapping to `io.max`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IoMax {
     /// Device node string, e.g., "8:0" or "254:0"
@@ -732,6 +771,41 @@ impl VmConfigBuilder {
             ));
         }
 
+        // M-HOST-4: reject out-of-range resource-limit values at the boundary. A
+        // bad value (e.g. `cpu_max_pct == 0` → a sub-floor `cpu.max` quota, or a
+        // malformed `io.max` device key) is rejected by the kernel with EINVAL at
+        // the cgroup write, where it would otherwise masquerade as a missing-
+        // capability error and send the caller chasing a delegation problem.
+        if self.limits.cpu_max_pct == Some(0) {
+            return Err(crate::error::Error::Config(
+                "cpu_max_pct must be > 0".into(),
+            ));
+        }
+        if self.limits.mem_max_mib == Some(0) {
+            return Err(crate::error::Error::Config(
+                "mem_max_mib must be > 0".into(),
+            ));
+        }
+        if self.limits.pids_max == Some(0) {
+            return Err(crate::error::Error::Config("pids_max must be > 0".into()));
+        }
+        if let Some(io) = &self.limits.io_max {
+            // cgroup `io.max` keys on a `maj:min` device number; anything else is
+            // written verbatim and rejected with EINVAL.
+            let valid = io.device.split_once(':').is_some_and(|(maj, min)| {
+                !maj.is_empty()
+                    && !min.is_empty()
+                    && maj.bytes().all(|b| b.is_ascii_digit())
+                    && min.bytes().all(|b| b.is_ascii_digit())
+            });
+            if !valid {
+                return Err(crate::error::Error::Config(format!(
+                    "io_max device {:?} must be in maj:min form (e.g. \"8:0\")",
+                    io.device
+                )));
+            }
+        }
+
         if self.snapshotting {
             if let RootfsSource::VirtioFs { .. } = self.rootfs {
                 return Err(crate::error::Error::Config(
@@ -793,6 +867,20 @@ impl VmConfigBuilder {
             }
         }
 
+        // H-ORCH-3/H-NET-2: `host_services_port` is only wired on the unprivileged
+        // NAT path. On the privileged path the field is dropped, so accepting
+        // `Some(_)` would be a silent no-op (the §12.2 fail-loud violation). Reject
+        // it at the boundary with a typed error instead.
+        if let NetConfig::Privileged {
+            host_services_port: Some(_),
+            ..
+        } = self.net
+        {
+            return Err(crate::error::Error::Config(
+                "host_services_port is only supported on Unprivileged networking".into(),
+            ));
+        }
+
         let mut tags = std::collections::HashSet::new();
         let mut guest_paths = std::collections::HashSet::new();
         for share in &self.shares {
@@ -839,6 +927,21 @@ impl VmConfigBuilder {
             if !guest_paths.insert(guest_path.to_string()) {
                 return Err(crate::error::Error::Config(format!(
                     "duplicate share guest_path: {guest_path}"
+                )));
+            }
+            // L-ORCH-7: existence stays unchecked (the host dir may be created
+            // later), but an empty or relative `host_path` is a config error, not
+            // a late virtiofsd-spawn subprocess failure. Reject it at the boundary.
+            if share.host_path.as_os_str().is_empty() {
+                return Err(crate::error::Error::Config(format!(
+                    "share host_path for tag {:?} cannot be empty",
+                    share.tag
+                )));
+            }
+            if share.host_path.is_relative() {
+                return Err(crate::error::Error::Config(format!(
+                    "share host_path {:?} (tag {:?}) must be an absolute path",
+                    share.host_path, share.tag
                 )));
             }
         }
@@ -994,6 +1097,169 @@ mod tests {
         .build()
         .unwrap_err();
         assert!(err.to_string().contains("vmid must be <= 254"));
+    }
+
+    // L-ORCH-6: the negative tests pin {0, 255, 32, 0-vcpu}, but an over-strict
+    // impl (`vmid <= 1`, `mem_mib <= 64`) would also pass them. Pin the accepted
+    // boundaries so shrinking the valid window one notch goes red here.
+    #[test]
+    fn accept_boundary_vmid_and_mem() {
+        let mk = |f: &dyn Fn(VmConfigBuilder) -> VmConfigBuilder| {
+            f(VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            ))
+            .build()
+        };
+        mk(&|b| b.vmid(1)).expect("vmid 1 is in range");
+        mk(&|b| b.vmid(254)).expect("vmid 254 is in range");
+        mk(&|b| b.mem_mib(64)).expect("mem_mib 64 is at the floor");
+    }
+
+    // H-ORCH-3/H-NET-2: `host_services_port` is only wired on the unprivileged NAT
+    // path; on the privileged path it was silently dropped (a §12.2 fail-loud
+    // violation). Buggy impl this guards: `build()` accepts the combination.
+    #[test]
+    fn reject_privileged_with_host_services_port() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(NetConfig::Privileged {
+            egress: Egress::Open,
+            host_services_port: Some(8080),
+        })
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(err.to_string().contains("host_services_port"));
+        // The unprivileged path with the same port must still build.
+        VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(NetConfig::Unprivileged {
+            egress: Egress::Open,
+            host_services_port: Some(8080),
+        })
+        .build()
+        .expect("unprivileged host_services_port is supported");
+    }
+
+    // L-ORCH-7: an empty or relative `host_path` is a boundary config error, not a
+    // late virtiofsd-spawn subprocess failure. Buggy impl: `build()` accepts it.
+    #[test]
+    fn reject_bad_share_host_path() {
+        for bad in ["", "rel/path"] {
+            let err = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_share(Share::new("s", bad, Access::ReadOnly, CachePolicy::Auto))
+            .build()
+            .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)),
+                "host_path {bad:?} must be rejected as a config error"
+            );
+            assert!(err.to_string().contains("host_path"));
+        }
+    }
+
+    // L-ORCH-2: the shared cmdline builder must self-guard against a virtio-fs
+    // rootfs (no `/dev/vda`) rather than emitting an unbootable
+    // `root=/dev/vda rootfstype=ext4` line. Buggy impl: the `_ => "ext4"` arm
+    // silently produces the panicking cmdline.
+    #[test]
+    fn reject_virtio_fs_rootfs_cmdline_build() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::VirtioFs {
+                dir: PathBuf::from("/rootfs"),
+            },
+        )
+        .build()
+        .unwrap();
+        let err = build_kernel_cmdline(&cfg, 1, "").unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        // An erofs rootfs still builds a bootable line.
+        let ok = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert!(
+            build_kernel_cmdline(&ok, 1, "")
+                .unwrap()
+                .contains("rootfstype=erofs")
+        );
+    }
+
+    // M-HOST-4: out-of-range resource-limit values are rejected at build() so they
+    // surface as a typed Config error, not a misattributed CapabilityUnavailable at
+    // the cgroup write. RED if the boundary validation is absent (build returns Ok).
+    #[test]
+    fn reject_bad_resource_limits() {
+        let mk = |limits: ResourceLimits| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .limits(limits)
+            .build()
+        };
+        let bad = [
+            ResourceLimits {
+                cpu_max_pct: Some(0),
+                ..Default::default()
+            },
+            ResourceLimits {
+                mem_max_mib: Some(0),
+                ..Default::default()
+            },
+            ResourceLimits {
+                pids_max: Some(0),
+                ..Default::default()
+            },
+            ResourceLimits {
+                io_max: Some(IoMax {
+                    device: "notadev".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        for limits in bad {
+            assert!(
+                matches!(mk(limits.clone()), Err(crate::error::Error::Config(_))),
+                "limits {limits:?} must be rejected"
+            );
+        }
+        // Valid limits still build (including a well-formed maj:min device).
+        mk(ResourceLimits {
+            cpu_max_pct: Some(50),
+            mem_max_mib: Some(128),
+            pids_max: Some(64),
+            io_max: Some(IoMax {
+                device: "8:0".into(),
+                rbps: Some(1000),
+                ..Default::default()
+            }),
+        })
+        .expect("valid limits must build");
     }
 
     // Guards C1 / snapshot-eligibility law. Buggy impl: build() only rejects a

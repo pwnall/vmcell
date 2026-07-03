@@ -52,10 +52,18 @@ impl CaManager {
     /// # Errors
     /// Returns an error if filesystem operations or key generation fail.
     pub fn new() -> Result<Self> {
-        // The proxy CA now lives in the shared artifacts dir (default
-        // `target/vmcell-artifacts`) instead of the old per-pid `/tmp/vmcell-artifacts-<pid>`,
-        // so the authority the proxy presents matches the `ca.pem`/`ca.key` baked into
-        // the rootfs at build time.
+        // CA LIFETIME (M-NET-6, recorded deviation from AGENTS CA-hygiene):
+        // AGENTS specifies a *per-run-scoped* CA path, but the proxy CA here is
+        // instead cached in the shared artifacts dir (default
+        // `target/vmcell-artifacts`) and persists across runs — regenerated only
+        // when `ca.pem`/`ca.key` are missing. This is deliberate and load-bearing:
+        // the CA is baked into the rootfs trust store at build time, and the
+        // cached rootfs is reused across runs, so a fresh per-run CA would present
+        // an authority the (cached) guest does not trust, breaking every HTTPS
+        // intercept. The private key is still written `0600` via a temp-then-
+        // rename atomic write (see `new_in`), so the persistence does not weaken
+        // key confidentiality. (Deviation to also be logged in
+        // implementation-notes.md — see change summary; this file cannot edit it.)
         Self::new_in(crate::artifact::artifacts_dir())
     }
 
@@ -252,5 +260,31 @@ mod tests {
                 "on-disk ca.pem diverged from the in-memory authority (NET-4 TOCTOU)"
             );
         }
+    }
+
+    // M-NET-7: the CA private key must be written `0600` and via a temp-then-
+    // rename atomic publish. Buggy impl guarded: a plain `std::fs::write` (default
+    // 0644, non-atomic) fails the mode assertion, and a crash between write and
+    // rename would leave a `ca.key.tmp` residue the second assertion forbids.
+    #[test]
+    fn ca_key_is_written_0600_and_leaves_no_tmp_residue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf();
+
+        // Fresh dir => generate path (writes ca.key with the guarded permissions).
+        let _ca = CaManager::new_in(dir_path.clone()).expect("ca");
+
+        let key_path = dir_path.join("ca.key");
+        let meta = std::fs::metadata(&key_path).expect("stat ca.key");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "ca.key must be written 0600, got {:#o}", mode);
+
+        // The atomic temp-then-rename must leave no partial `ca.key.tmp` behind.
+        assert!(
+            !dir_path.join("ca.key.tmp").exists(),
+            "ca.key.tmp residue must not remain after the atomic rename"
+        );
     }
 }

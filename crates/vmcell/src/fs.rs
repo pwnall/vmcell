@@ -20,12 +20,16 @@ mod in_process;
 pub struct VirtioFsDaemon {
     /// The path to the vhost-user socket.
     pub socket_path: PathBuf,
-    /// Process-group id of the spawned `virtiofsd`; the whole group is
-    /// force-killed and reaped in `Drop`.
+    /// The spawned `virtiofsd` child, **held** (never dropped early) so its
+    /// pid/pgid cannot be recycled before `Drop` force-kills and reaps the whole
+    /// process group. `Drop` reads the pgid from this live handle
+    /// (`process.id()`), never a stale stored id: a dropped `tokio::process::Child`
+    /// is orphan-reaped on `SIGCHLD`, which would free the pid for reuse and let
+    /// `Drop` signal an unrelated process group (H-HOST-1 pid-reuse hazard). This
+    /// matches the CH backend's "hold the Child, gate on `process.id()`" pattern.
     #[cfg(not(feature = "experiment-fuse"))]
-    pgid: Option<u32>,
+    process: Option<tokio::process::Child>,
     #[cfg(feature = "experiment-fuse")]
-    #[allow(dead_code)]
     handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(feature = "experiment-fuse")]
     kill_notifier: Option<vmm_sys_util::event::EventNotifier>,
@@ -154,7 +158,18 @@ impl VirtioFsDaemon {
                 Ok(None) => {}
                 // Surface, rather than swallow, an error from polling the child:
                 // a failed `try_wait` means we no longer know the daemon's state.
+                // L-HOST-3: a dropped tokio `Child` is NOT killed (kill_on_drop is
+                // false), so force-kill and reap the group before returning — the
+                // same cleanup as the timeout path below — to avoid leaking a
+                // possibly-live virtiofsd on this acquire-then-fail path.
                 Err(e) => {
+                    if let Some(p) = pgid {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(-(p as i32)),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(p as i32), None);
+                    }
                     return Err(crate::error::Error::Subprocess(format!(
                         "failed to poll virtiofsd status: {e}"
                     )));
@@ -170,7 +185,11 @@ impl VirtioFsDaemon {
                 );
                 let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(p as i32), None);
             }
-            let _ = process.start_kill();
+            // N-HOST-1: no redundant `process.start_kill()` here — the pgid leader
+            // (the virtiofsd process, which `setpgid`'d itself) was just SIGKILL'd
+            // and reaped above, so `start_kill` on the reaped leader is a guaranteed
+            // no-op error and is exactly the leader-only API the teardown contract
+            // warns against.
             let stderr = std::fs::read_to_string(&stderr_log_path).unwrap_or_default();
             return Err(crate::error::Error::Subprocess(format!(
                 "virtiofsd failed to create socket: {}",
@@ -180,8 +199,10 @@ impl VirtioFsDaemon {
 
         Ok(Self {
             socket_path,
+            // Hold the live `Child` (H-HOST-1) so its pid cannot be recycled before
+            // `Drop` reaps the group; `Drop` reads the pgid from it, not `pgid`.
             #[cfg(not(feature = "experiment-fuse"))]
-            pgid,
+            process: Some(process),
         })
     }
 
@@ -241,12 +262,19 @@ impl Drop for VirtioFsDaemon {
     fn drop(&mut self) {
         #[cfg(not(feature = "experiment-fuse"))]
         {
-            if let Some(pgid) = self.pgid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pgid as i32), None);
+            // H-HOST-1: read the pgid from the LIVE, still-held child handle so we
+            // never signal a recycled pid. `process.id()` is `None` only once the
+            // child has been reaped, in which case there is nothing to kill. Holding
+            // the `Child` until here pins the pid across the kill+reap; the `Child`
+            // is dropped after this block, after the group has already been reaped.
+            if let Some(process) = self.process.take() {
+                if let Some(pgid) = process.id() {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(-(pgid as i32)),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pgid as i32), None);
+                }
             }
         }
         #[cfg(feature = "experiment-fuse")]
@@ -336,6 +364,64 @@ mod uid_tests {
         assert_eq!(
             decide_virtiofsd_uid(true, Some(0)),
             VirtiofsdUid::SandboxOnly
+        );
+    }
+}
+
+#[cfg(all(test, unix, not(feature = "experiment-fuse")))]
+mod drop_reaps_tests {
+    use super::VirtioFsDaemon;
+
+    // H-HOST-1 (teardown): `Drop` must force-kill and reap the HELD child's process
+    // group, reading the pgid from the live `Child` handle rather than a stored raw
+    // id. The pid-reuse RACE itself is not unit-testable without a process fake (a
+    // controlled test never recycles the pid, so the buggy stored-pgid version would
+    // "pass" too — see the change summary), but this locks the surrounding teardown
+    // contract: a long-lived child in its own group is gone after `Drop`. It goes RED
+    // if `Drop` stops killing/reaping the held process (e.g. the field or the
+    // kill+waitpid is removed).
+    #[tokio::test]
+    async fn drop_kills_and_reaps_held_child_process_group() {
+        // A child that outlives the test unless killed, in its OWN process group
+        // (mirrors virtiofsd's `setpgid(0,0)`), so the group-kill path is exercised.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("10");
+        // SAFETY: async-signal-safe `setpgid` runs in the forked child before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child has a pid") as i32;
+
+        let daemon = VirtioFsDaemon {
+            socket_path: std::env::temp_dir().join(format!("vmcell-h1-{pid}.sock")),
+            process: Some(child),
+        };
+        // Sanity: the process is alive before `Drop` (signal 0 probes existence).
+        assert!(
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                None::<nix::sys::signal::Signal>
+            )
+            .is_ok(),
+            "child must be alive before Drop"
+        );
+
+        drop(daemon);
+
+        // `Drop`'s waitpid blocks until the reaped leader is gone, so by now
+        // signalling the pid fails with ESRCH (no such process).
+        assert_eq!(
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                None::<nix::sys::signal::Signal>
+            ),
+            Err(nix::errno::Errno::ESRCH),
+            "Drop must have killed and reaped the held child's process group"
         );
     }
 }

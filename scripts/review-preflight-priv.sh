@@ -58,8 +58,11 @@ check_runner() {
   for c in "${NEEDED_CAPS[@]}"; do
     case "$caps" in *"$c"*) ;; *) ok=0 ;; esac
   done
-  # Effective bit: getcap renders the file-effective flag as `=ep` / `+ep`.
-  case "$caps" in *ep*) ;; *) ok=0 ;; esac
+  # Effective bit: getcap renders the file-effective flag as a distinct field `=ep` / `+ep`.
+  # Match that field, NOT a bare `ep` substring — the getcap line also prints the file PATH, so a
+  # path component containing `ep` (…/deps/…, a username with `ep`) would spuriously satisfy `*ep*`
+  # even on a `+p`-only (un-raised) runner, reading as skip==pass (L-BIN-2).
+  case "$caps" in *=ep*|*+ep*) ;; *) ok=0 ;; esac
   if [ "$ok" = 1 ]; then
     note "runner     : OK ($path : ${caps#* })"
   else
@@ -68,6 +71,13 @@ check_runner() {
   fi
 }
 check_runner "$RUNNER_DEBUG"     # the one `just test-privileged` uses
+# The release runner is optional for `just test-privileged` (which wraps with the DEBUG build), but
+# `just bless` blesses both. If a release runner IS present, verify it too so a half-blessed install
+# (a release copy that lost its caps) is visible instead of silently un-checked — RUNNER_RELEASE was
+# previously defined but never used (L-BIN-2). A missing release build is fine and is not flagged.
+if [ -x "$RUNNER_RELEASE" ]; then
+  check_runner "$RUNNER_RELEASE"
+fi
 
 # 3) Artifacts built ---------------------------------------------------------
 art_ok=1

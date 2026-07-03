@@ -223,9 +223,11 @@ async fn test_pipeline_determinism() {
     // GOLDEN snapshot cache key over the six artifacts below (content-hashed, key-sorted).
     // Any regression — a stage-version bump, unsorted HashMap iteration (ARTIFACT-PIPELINE-1),
     // a switch back to path-string hashing (ARTIFACT-PIPELINE-2), or a changed prefix — moves
-    // this value and turns the assertions red.
+    // this value and turns the assertions red. Updated for M-ART-7: the key now folds the pinned
+    // Cloud Hypervisor build identity (`b"ch\0"` + the `cloud_hypervisor` pin, empty here since
+    // these `StageInputs` carry no pins) so a CH upgrade invalidates stale snapshots.
     const GOLDEN: &str =
-        "snapshot-63fe6180ba1188682df001dc5be51fd97213504612c90e0ff44b83aa4169c34a";
+        "snapshot-c0eefc0b98188b0370cade71e26726806ea4cdc99fe4270851105e92859d088c";
 
     // Identical (key, content) artifacts. inputs_a and inputs_b place the SAME content under
     // two DIFFERENT directories and insert it in OPPOSITE order: a content-addressed,
