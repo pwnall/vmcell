@@ -77,8 +77,12 @@ pub fn rootfs_path() -> PathBuf {
 /// `VMCELL_CH_BIN`, so overriding one left the other on the default — the kind of
 /// per-call-site drift §11.1 consolidation and the `VMCELL_*` namespacing of §10.7-C
 /// exist to prevent.
+///
+/// Public so out-of-crate artifact builders (`vmcell-rootfs-builder`,
+/// `vmcell-kernel-builder`) that boot a builder VM resolve the CH binary the same
+/// way — one resolver, no per-call-site drift.
 #[cfg(feature = "pipeline")]
-pub(crate) fn ch_binary_path() -> String {
+pub fn ch_binary_path() -> String {
     std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
 }
 
@@ -158,7 +162,15 @@ struct CacheMetadata {
     artifacts: std::collections::HashMap<String, PathBuf>,
 }
 
-pub(crate) fn hash_file(path: &Path) -> Result<String> {
+/// Streams `path` through blake3 and returns its lowercase-hex content hash.
+///
+/// Public so out-of-crate artifact builders fold upstream/injected content into their
+/// own cache keys with the *same* hasher `vmcell`'s stages use (blake3, never
+/// `DefaultHasher`) — content that travels, not a `target/`-relative path string.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Io`] if `path` cannot be opened or read.
+pub fn hash_file(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(crate::error::Error::Io)?;
     let mut hasher = blake3::Hasher::new();
@@ -168,7 +180,11 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(buf.get(..n).expect("valid slice"));
+        // `n <= buf.len()` always (read never returns more than the buffer), so `get(..n)` is
+        // `Some`; the `if let` avoids both a panic (no `# Panics`) and an index-slice.
+        if let Some(chunk) = buf.get(..n) {
+            hasher.update(chunk);
+        }
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -183,9 +199,12 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
 /// `hash_file` on a directory `File::open`s it and reads → `EISDIR`, which silently
 /// defeated caching *and* tamper-verification for every directory output.
 ///
+/// Public so out-of-crate artifact builders content-address a directory or file output
+/// with the same walk `vmcell`'s stages use.
+///
 /// # Errors
 /// Returns [`crate::error::Error::Io`] if `path` (or any entry under it) cannot be read.
-pub(crate) fn hash_output(path: &Path) -> Result<String> {
+pub fn hash_output(path: &Path) -> Result<String> {
     let meta = std::fs::symlink_metadata(path).map_err(crate::error::Error::Io)?;
     if meta.is_dir() {
         let mut hasher = blake3::Hasher::new();
@@ -269,8 +288,12 @@ fn remove_if_present(path: &Path) -> Result<()> {
 /// Iterating the raw `HashMap` would feed blake3 in a process-random order (spurious cache
 /// misses) and would key on `target_dir`-relative path strings (a rebuilt upstream at the
 /// same path would not invalidate the key). Sorting + content-hashing fixes both.
+///
+/// Public so out-of-crate artifact builders fold the same consumed-artifact set into
+/// their own cache keys deterministically (`vmcell-rootfs-builder` folds the seed
+/// kernel + injected agent/tools this way).
 #[cfg(feature = "pipeline")]
-pub(crate) fn hash_artifacts_sorted(
+pub fn hash_artifacts_sorted(
     hasher: &mut blake3::Hasher,
     artifacts: &std::collections::HashMap<String, PathBuf>,
 ) {
@@ -323,6 +346,30 @@ fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, St
         }
         if let Some(cfg) = k.get("microvm_config").and_then(|v| v.as_str()) {
             pins_map.insert("kernel_microvm_config".to_string(), cfg.to_string());
+        }
+    }
+    // Flatten the prebuilt-kernel bootstrap pin (§8.5): a digest-pinned `vmlinux` the
+    // in-`vmcell` `PrebuiltKernelBuilder` downloads and SHA-verifies as the bootstrap
+    // seed (the seed the in-VM `vmcell-kernel-builder` boots its builder VM on). Emitted
+    // only when present; absent → the prebuilt bootstrap fails loud and host-make is the
+    // guaranteed fallback seed.
+    if let Some(p) = json.get("kernel_prebuilt") {
+        if let Some(url) = p.get("url").and_then(|v| v.as_str()) {
+            pins_map.insert("kernel_prebuilt_url".to_string(), url.to_string());
+        }
+        if let Some(sha) = p.get("sha256").and_then(|v| v.as_str()) {
+            pins_map.insert("kernel_prebuilt_sha256".to_string(), sha.to_string());
+        }
+        // Optional archive extraction: many prebuilt `vmlinux` binaries (e.g. the validated
+        // Kata Containers kernel, §8.5) ship *inside* a compressed tar. When `archive_member`
+        // is set, the download is a `.tar.zst`/`.tar` archive verified against `archive_sha256`;
+        // the named member is extracted and re-verified against `sha256`. Both digests fold
+        // into the cache key so re-pointing either invalidates the artifact.
+        if let Some(m) = p.get("archive_member").and_then(|v| v.as_str()) {
+            pins_map.insert("kernel_prebuilt_archive_member".to_string(), m.to_string());
+        }
+        if let Some(s) = p.get("archive_sha256").and_then(|v| v.as_str()) {
+            pins_map.insert("kernel_prebuilt_archive_sha256".to_string(), s.to_string());
         }
     }
     // Flatten the multi-kernel registry: each `kernels.<label>` → keyed pins
@@ -881,6 +928,29 @@ mod tests {
         );
     }
 
+    // §8.5: the `kernel_prebuilt` bootstrap block flattens to `kernel_prebuilt_url` /
+    // `kernel_prebuilt_sha256`; a doc with no such block leaves the keys absent (so the
+    // prebuilt bootstrap fails loud rather than fetching from an empty URL).
+    #[test]
+    fn test_parse_pins_flattens_kernel_prebuilt() {
+        let json = r#"{ "kernel_prebuilt": { "url": "https://h/vmlinux", "sha256": "abc123" } }"#;
+        let map = parse_pins_json(json).expect("valid pins JSON");
+        assert_eq!(
+            map.get("kernel_prebuilt_url").map(String::as_str),
+            Some("https://h/vmlinux")
+        );
+        assert_eq!(
+            map.get("kernel_prebuilt_sha256").map(String::as_str),
+            Some("abc123")
+        );
+
+        // Absent block → absent keys.
+        let empty = parse_pins_json(r#"{ "rootfs": { "image": "i", "digest": "d" } }"#)
+            .expect("valid pins JSON");
+        assert!(!empty.contains_key("kernel_prebuilt_url"));
+        assert!(!empty.contains_key("kernel_prebuilt_sha256"));
+    }
+
     // Guards the multi-kernel dimension: each `kernels.<label>` must flatten to
     // `kernel_<label>_source_url` / `_source_sha256` so a labelled KernelStage can
     // build it. A buggy impl that ignores `kernels` returns None for these keys.
@@ -989,7 +1059,7 @@ mod tests {
     #[cfg(feature = "pipeline")]
     #[test]
     fn test_guest_agent_closure_hash_tracks_agent_module_change() {
-        use crate::artifact::rootfs::{RootfsBuildSource, RootfsStage};
+        use crate::artifact::rootfs::RootfsStage;
 
         // A fixture "workspace root" mirroring the real v15 layout: the guest-agent
         // member (binary entry point + reaper lib) PLUS the shared protocol crate it
@@ -1013,8 +1083,6 @@ mod tests {
         let h1 = guest_agent_closure_hash(root.path()).expect("closure hash 1");
 
         let rootfs = RootfsStage {
-            source: RootfsBuildSource::Oci,
-            cid_alloc: std::sync::Arc::new(crate::vmm::CidAllocator::new()),
             image_override: None,
             agent_musl: None,
         };

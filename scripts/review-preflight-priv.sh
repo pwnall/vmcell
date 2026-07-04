@@ -87,7 +87,7 @@ if [ "$art_ok" = 1 ]; then
   note "artifacts  : OK (kernel=$KERNEL, rootfs=$ROOTFS)"
 else
   note "artifacts  : MISSING (kernel=$KERNEL exists=$([ -s "$KERNEL" ] && echo y || echo n); rootfs=$ROOTFS exists=$([ -s "$ROOTFS" ] && echo y || echo n))"
-  problems+=("VM artifacts missing. Build them: \`cargo run --bin vmcell -- build\` (writes to $ART_DIR), or point VMCELL_KERNEL/VMCELL_ROOTFS at existing images.")
+  problems+=("VM artifacts missing. Build them: \`cargo run -p vmcell-cli --bin vmcell -- build\` (writes to $ART_DIR), or point VMCELL_KERNEL/VMCELL_ROOTFS at existing images.")
 fi
 
 # 4) Delegatable cgroup-v2 domain scope -------------------------------------

@@ -6,6 +6,13 @@ members = [
     "crates/vmcell-guest-agent",
     "crates/vmcell-test-runner",
     "crates/vmcell-guest-tools",
+    # v20 §5.4/§8.5: the two in-VM builders, extracted out of `vmcell`. Each depends on
+    # `vmcell` (to drive a builder micro-VM + reuse its shared build utilities); `vmcell`
+    # has no edge back to them. `vmcell-cli` is the composition root that wires all three,
+    # kept out of the `vmcell` package so the dependency graph stays acyclic.
+    "crates/vmcell-rootfs-builder",
+    "crates/vmcell-kernel-builder",
+    "crates/vmcell-cli",
 ]
 
 # Carried patch: QEMU-unprivileged vhost-user only (relaxes a PROTOCOL_FEATURES check on

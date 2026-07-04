@@ -14,6 +14,12 @@
       "source_sha256": "e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2"
     }
   },
+  "kernel_prebuilt": {
+    "url": "https://github.com/kata-containers/kata-containers/releases/download/3.32.0/kata-static-3.32.0-amd64.tar.zst",
+    "archive_sha256": "1449ecea50bd91fa73a94648db195d18950fe869ba4b1f12d05f55f1fa7c1b01",
+    "archive_member": "./opt/kata/share/kata-containers/vmlinux-6.18.35-197",
+    "sha256": "43701715ae2885f936bbe5c66a2de7c14dc51de7d19412d04833e4bbcf205bd0"
+  },
   "rootfs": {
     "image": "docker.io/library/debian",
     "digest": "sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1"

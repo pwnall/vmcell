@@ -1,0 +1,26 @@
+[package]
+name = "vmcell-rootfs-builder"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Builds a Debian rootfs with mmdebstrap inside a vmcell builder micro-VM"
+publish = false
+
+[lib]
+name = "vmcell_rootfs_builder"
+path = "src/lib.rs"
+
+[dependencies]
+# The in-VM mmdebstrap builder drives a vmcell builder micro-VM (MicroVm/VmConfig/agent),
+# builds its builder-base rootfs with vmcell's OCI packer, and emits the final erofs via
+# vmcell's shared inject+pack tail. It needs the host stack: a backend, metrics, pipeline.
+vmcell = { path = "../vmcell", version = "0.5.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+async-trait = "0.1.89"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tracing = "0.1"
+tempfile = "3"
+blake3 = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

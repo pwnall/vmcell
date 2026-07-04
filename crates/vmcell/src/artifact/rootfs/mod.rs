@@ -1,8 +1,11 @@
 //! Root filesystem artifact building.
 //!
-//! This module provides the `RootfsStage` pipeline step, which creates a
-//! minimal root filesystem for the virtual machines. It supports building
-//! via OCI registry pull or by running mmdebstrap inside a micro-VM.
+//! This module provides the `RootfsStage` pipeline step, which creates a minimal root
+//! filesystem for the virtual machines from an **OCI registry pull** — the in-`vmcell`
+//! bootstrap rootfs source (host-native, no VM). The full-apt **`mmdebstrap`-inside-a-VM**
+//! source now lives in the separate `vmcell-rootfs-builder` crate (§5.4 / §8.2), which
+//! calls [`pack_erofs_with_injection`] and [`resolve_builder_base`] here so every rootfs
+//! source shares one inject/CA/erofs tail.
 
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::error::{Error, Result};
@@ -10,29 +13,12 @@ use async_trait::async_trait;
 use std::io::Read;
 use std::path::Path;
 
-/// mmdebstrap micro-VM builder source.
-pub mod mmdebstrap;
 /// OCI registry pull source.
 pub mod oci;
 
-/// Root filesystem construction source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RootfsBuildSource {
-    /// OCI registry pull source.
-    Oci,
-    /// Full-apt source running mmdebstrap inside a micro-VM.
-    Mmdebstrap {
-        /// The Debian release suite to use (e.g., "bookworm").
-        release: String,
-    },
-}
-
-/// A pipeline stage that builds a root filesystem.
+/// A pipeline stage that builds a root filesystem from an OCI base image (the in-`vmcell`
+/// bootstrap source, §8.2). The in-VM `mmdebstrap` source is `vmcell-rootfs-builder`.
 pub struct RootfsStage {
-    /// The source method to build the root filesystem.
-    pub source: RootfsBuildSource,
-    /// The CID allocator for VMs run by this stage.
-    pub cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
     /// Explicit `(image, digest)` override for the OCI source (v15 `oci2erofs`, §8.2):
     /// `Some` ignores the pinned `rootfs_image`/`rootfs_digest` and pulls this digest-pinned
     /// base instead. `None` uses the pins (the default `vmcell build`).
@@ -55,119 +41,46 @@ impl Stage for RootfsStage {
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         // Bump when this stage's build logic changes so stale outputs are not served.
         // v15: bumped to 2 with the oci2erofs image-override + agent-musl inputs.
-        const STAGE_VERSION: u32 = 2;
+        // v20: bumped to 3 — the shared injected-content fold (agent-musl + CA +
+        // guest-agent source) moved into `fold_rootfs_injection_identity` (called first),
+        // which reorders the hashed byte stream. A one-time OCI-rootfs rebuild is harmless.
+        const STAGE_VERSION: u32 = 3;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
-        // The injected-agent identity is an INPUT: the static-musl override path changes the
-        // built rootfs vs. the default glibc agent (oci2erofs §8.2). Fold its CONTENT hash,
-        // not its absolute path string (H-ART-1): when `agent_musl` is injected the
-        // GuestAgentStage is skipped, so the agent has no other content identity in the key —
-        // rebuilding the musl agent at the SAME path must still invalidate the rootfs. On a
-        // read failure fold a distinct error marker (the miss re-runs `run()`, which fails
-        // loud on the genuinely-missing input) — mirrors the ART-11 error-marker convention.
-        match &self.agent_musl {
-            Some(p) => {
-                hasher.update(b"agent-musl\0");
-                match crate::artifact::hash_file(p) {
-                    Ok(h) => hasher.update(h.as_bytes()),
-                    Err(_) => {
-                        hasher.update(format!("missing-agent-musl:{}", p.display()).as_bytes())
-                    }
-                };
-            }
-            None => {
-                hasher.update(b"agent-default\0");
-            }
-        }
-        match &self.source {
-            RootfsBuildSource::Oci => {
-                hasher.update(b"oci");
-                // oci2erofs: the CLI-provided digest-pinned base is an INPUT (not a pin) and
-                // must be content-addressed directly; otherwise a stale erofs is reused for a
-                // different IMAGE@DIGEST. Fall back to the pins for the default `vmcell build`.
-                let (image, digest) = match &self.image_override {
-                    Some((i, d)) => (i.as_str(), d.as_str()),
-                    None => (
-                        inputs
-                            .pins
-                            .get("rootfs_image")
-                            .map(String::as_str)
-                            .unwrap_or_default(),
-                        inputs
-                            .pins
-                            .get("rootfs_digest")
-                            .map(String::as_str)
-                            .unwrap_or_default(),
-                    ),
-                };
-                hasher.update(image.as_bytes());
-                hasher.update(b"\0");
-                hasher.update(digest.as_bytes());
-            }
-            RootfsBuildSource::Mmdebstrap { release } => {
-                hasher.update(b"mmdebstrap");
-                hasher.update(release.as_bytes());
-                hasher.update(
-                    inputs
-                        .pins
-                        .get("debian_snapshot_timestamp")
-                        .map(|s| s.as_bytes())
-                        .unwrap_or_default(),
-                );
-                // Fold the resolved builder-base image+digest (M-ART-4): the mmdebstrap
-                // source boots a builder VM from this base, so re-pointing `builder_base_*`
-                // (or `rootfs_*`) at new bytes must invalidate the rootfs — mirrors the OCI
-                // arm's image/digest fold. A resolution failure folds empty strings; the
-                // stage's `run()` re-resolves and fails loud on a genuinely-missing pin.
-                let (builder_image, builder_digest) =
-                    mmdebstrap::resolve_builder_base(&inputs.pins).unwrap_or_default();
-                hasher.update(builder_image.as_bytes());
-                hasher.update(b"\0");
-                hasher.update(builder_digest.as_bytes());
-            }
-        }
-        // Fold the baked proxy CA cert content (M-ART-10). `run()` writes the deployment CA
-        // into the rootfs (`usr/local/share/ca-certificates/vmcell-ca.crt`) as a side effect;
-        // it is not an upstream artifact, so without this a CA rotation (new `ca.pem`/`ca.key`
-        // under the artifacts dir) would cache-hit and re-serve a rootfs trusting the OLD CA —
-        // the proxy then presents a cert the guest does not trust and HTTPS intercept breaks
-        // silently. A CA-read failure folds a distinct marker; the resulting miss re-runs
-        // `run()`, which surfaces the real cause. (An injectable CA seam — L-ART-12 — would
-        // let this be unit-tested without touching the global artifacts dir; deferred.)
-        #[cfg(feature = "proxy")]
-        {
-            match crate::proxy::tls::CaManager::new().map(|m| m.ca_cert_pem().to_string()) {
-                Ok(pem) => {
-                    hasher.update(b"ca\0");
-                    hasher.update(pem.as_bytes());
-                }
-                Err(e) => {
-                    hasher.update(format!("ca-read-error:{e}").as_bytes());
-                }
-            };
-        }
-        // The guest agent is injected into the rootfs, so its source identity (which
-        // travels via the resolved pins) must be part of the key: rebuilding the agent at
-        // the same path must invalidate the rootfs, otherwise a stale agent stays baked in.
-        hasher.update(
-            inputs
-                .pins
-                .get("guest_agent_src_hash")
-                .map(|s| s.as_bytes())
-                .unwrap_or_default(),
-        );
+        // Fold the identity of everything the shared inject+pack tail bakes in (the optional
+        // static-musl agent override, the deployment CA, the guest-agent source closure) —
+        // ONE implementation, shared with the out-of-crate in-VM rootfs builders (§5.4).
+        fold_rootfs_injection_identity(&mut hasher, inputs, self.agent_musl.as_deref());
+        hasher.update(b"oci");
+        // oci2erofs: the CLI-provided digest-pinned base is an INPUT (not a pin) and
+        // must be content-addressed directly; otherwise a stale erofs is reused for a
+        // different IMAGE@DIGEST. Fall back to the pins for the default `vmcell build`.
+        let (image, digest) = match &self.image_override {
+            Some((i, d)) => (i.as_str(), d.as_str()),
+            None => (
+                inputs
+                    .pins
+                    .get("rootfs_image")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                inputs
+                    .pins
+                    .get("rootfs_digest")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            ),
+        };
+        hasher.update(image.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(digest.as_bytes());
         // Hash only the upstream artifacts this stage actually CONSUMES (ART-9), in a
         // deterministic key-sorted order over their on-disk content. Folding *every*
         // upstream artifact meant a `kernel` rebuild invalidated the OCI rootfs, which does
-        // not depend on the kernel (only the mmdebstrap source boots a builder VM off it).
-        // Over-invalidating is safe-but-wasteful; scope the fold to consumed inputs:
-        //   - OCI: the injected `guest_agent` + `guest_tools` binaries (base image is a
-        //     pin/override, not an artifact).
-        //   - mmdebstrap: the same injected binaries PLUS `kernel` (boots the builder VM).
-        let consumed: &[&str] = match &self.source {
-            RootfsBuildSource::Oci => &["guest_agent", "guest_tools"],
-            RootfsBuildSource::Mmdebstrap { .. } => &["kernel", "guest_agent", "guest_tools"],
-        };
+        // not depend on the kernel (the OCI source boots no VM). Scope the fold to the
+        // injected `guest_agent` + `guest_tools` binaries (the base image is a pin/override,
+        // not an artifact). The in-VM `mmdebstrap` source, which additionally consumes the
+        // seed `kernel`, lives in `vmcell-rootfs-builder` and folds it in its own key.
+        let consumed: &[&str] = &["guest_agent", "guest_tools"];
         let filtered: std::collections::HashMap<String, std::path::PathBuf> = inputs
             .artifacts
             .iter()
@@ -179,30 +92,122 @@ impl Stage for RootfsStage {
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
-        match &self.source {
-            RootfsBuildSource::Oci => {
-                // oci2erofs (§8.2): the CLI override pulls an explicit digest-pinned base;
-                // the default `vmcell build` resolves the pinned Debian image from the pins.
-                let (image, digest) =
-                    match &self.image_override {
-                        Some((i, d)) => (i.clone(), d.clone()),
-                        None => {
-                            let image = inputs.pins.get("rootfs_image").ok_or_else(|| {
-                                Error::Artifact("Missing rootfs_image pin".into())
-                            })?;
-                            let digest = inputs.pins.get("rootfs_digest").ok_or_else(|| {
-                                Error::Artifact("Missing rootfs_digest pin".into())
-                            })?;
-                            (image.clone(), digest.clone())
-                        }
-                    };
-                oci::build_rootfs(&image, &digest, inputs, out, self.agent_musl.as_deref()).await
+        // oci2erofs (§8.2): the CLI override pulls an explicit digest-pinned base;
+        // the default `vmcell build` resolves the pinned Debian image from the pins.
+        let (image, digest) = match &self.image_override {
+            Some((i, d)) => (i.clone(), d.clone()),
+            None => {
+                let image = inputs
+                    .pins
+                    .get("rootfs_image")
+                    .ok_or_else(|| Error::Artifact("Missing rootfs_image pin".into()))?;
+                let digest = inputs
+                    .pins
+                    .get("rootfs_digest")
+                    .ok_or_else(|| Error::Artifact("Missing rootfs_digest pin".into()))?;
+                (image.clone(), digest.clone())
             }
-            RootfsBuildSource::Mmdebstrap { release } => {
-                mmdebstrap::build_rootfs(release, inputs, out, self.cid_alloc.clone()).await
-            }
+        };
+        oci::build_rootfs(&image, &digest, inputs, out, self.agent_musl.as_deref()).await
+    }
+}
+
+/// Folds the identity of everything the shared inject+pack tail ([`pack_erofs_with_injection`])
+/// bakes into a rootfs — the optional static-musl agent override (by CONTENT, H-ART-1), the
+/// deployment proxy CA cert (M-ART-10), and the guest-agent source closure — into `hasher`.
+///
+/// Every rootfs builder folds this identically: the in-`vmcell` OCI [`RootfsStage`] and the
+/// out-of-crate in-VM sources (`vmcell-rootfs-builder`). Kept here so there is exactly ONE
+/// implementation of the injected-content identity (§5.4; AGENTS.md "don't triplicate;
+/// extract") — a musl-agent/CA/agent rebuild then invalidates the cached erofs from any source.
+///
+/// Callers fold their own `STAGE_VERSION`, source discriminator, source-specific pins, and
+/// consumed-artifact set (via [`crate::artifact::hash_artifacts_sorted`]) around this call.
+#[cfg(feature = "pipeline")]
+pub fn fold_rootfs_injection_identity(
+    hasher: &mut blake3::Hasher,
+    inputs: &StageInputs,
+    agent_musl: Option<&Path>,
+) {
+    // The injected-agent identity: a static-musl override (folded by CONTENT, not path string,
+    // since the GuestAgentStage is skipped on that path) vs. the default glibc agent. A read
+    // failure folds a distinct marker; the resulting miss re-runs the build, which fails loud.
+    match agent_musl {
+        Some(p) => {
+            hasher.update(b"agent-musl\0");
+            match crate::artifact::hash_file(p) {
+                Ok(h) => hasher.update(h.as_bytes()),
+                Err(_) => hasher.update(format!("missing-agent-musl:{}", p.display()).as_bytes()),
+            };
+        }
+        None => {
+            hasher.update(b"agent-default\0");
         }
     }
+    // The baked proxy CA cert content (M-ART-10): `run()` writes the deployment CA into the
+    // rootfs as a side effect, so a CA rotation must invalidate the cached erofs or the guest
+    // trusts the old CA and HTTPS intercept breaks silently. A read failure folds a marker.
+    #[cfg(feature = "proxy")]
+    {
+        match crate::proxy::tls::CaManager::new().map(|m| m.ca_cert_pem().to_string()) {
+            Ok(pem) => {
+                hasher.update(b"ca\0");
+                hasher.update(pem.as_bytes());
+            }
+            Err(e) => {
+                hasher.update(format!("ca-read-error:{e}").as_bytes());
+            }
+        };
+    }
+    // The guest-agent source identity (travels via the resolved pins): rebuilding the agent
+    // must invalidate the rootfs, otherwise a stale agent stays baked in.
+    hasher.update(
+        inputs
+            .pins
+            .get("guest_agent_src_hash")
+            .map(String::as_bytes)
+            .unwrap_or_default(),
+    );
+}
+
+/// Resolves the builder-base image as an atomic `(image, digest)` pair from the resolved
+/// pins, never mixing a pinned image with a hardcoded digest.
+///
+/// Public so the out-of-crate in-VM rootfs/kernel builders (`vmcell-rootfs-builder`,
+/// `vmcell-kernel-builder`) resolve the builder-VM base image the *same* way the bootstrap
+/// pipeline does — one resolver, no drift.
+///
+/// Precedence: the dedicated `builder_base_*` pins, else the `rootfs_*` pins. A
+/// half-specified pair (image without digest, or vice-versa) or a completely missing base
+/// is a hard error — a hardcoded fallback would mask a missing Stage-0 pin and could pin a
+/// mismatched `image@digest` reference (M-PIPE-2 / B5 "no fallback masking a missing
+/// upstream").
+///
+/// # Errors
+/// Returns [`Error::Artifact`] if no pin pair is present, or only one half of a pair is set.
+pub fn resolve_builder_base(
+    pins: &std::collections::HashMap<String, String>,
+) -> Result<(String, String)> {
+    for (img_key, dig_key) in [
+        ("builder_base_image", "builder_base_digest"),
+        ("rootfs_image", "rootfs_digest"),
+    ] {
+        match (pins.get(img_key), pins.get(dig_key)) {
+            (Some(img), Some(dig)) => return Ok((img.clone(), dig.clone())),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::Artifact(format!(
+                    "builder base pin pair half-specified: exactly one of \
+                     {img_key}/{dig_key} is set; provide both or neither"
+                )));
+            }
+            (None, None) => {}
+        }
+    }
+    Err(Error::Artifact(
+        "missing builder base image+digest pins (builder_base_* or rootfs_*); \
+         refusing hardcoded fallback (would pin a mismatched image@digest)"
+            .into(),
+    ))
 }
 
 /// Shared logic to take a list of tar streams, inject the agent and CA, and pack it into erofs.
@@ -303,13 +308,11 @@ pub async fn pack_erofs_with_injection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     fn stage() -> RootfsStage {
         RootfsStage {
-            source: RootfsBuildSource::Oci,
-            cid_alloc: Arc::new(crate::vmm::CidAllocator::new()),
             image_override: None,
             agent_musl: None,
         }
@@ -338,12 +341,12 @@ mod tests {
         assert_eq!(stage().cache_key(&a), stage().cache_key(&b));
     }
 
-    // ART-9: the OCI rootfs does NOT consume the kernel, so a kernel rebuild must NOT
-    // invalidate the OCI rootfs key. The mmdebstrap source boots a builder VM off the
-    // kernel, so for it a kernel change MUST change the key. Folding *all* upstream
-    // artifacts (the bug) reddens the first assertion.
+    // ART-9: the OCI rootfs does NOT consume the kernel (it boots no VM), so a kernel
+    // rebuild must NOT invalidate the OCI rootfs key. Folding *all* upstream artifacts (the
+    // bug) reddens the assertion. (The in-VM `mmdebstrap` source, which consumes the seed
+    // kernel, folds it in its own key in `vmcell-rootfs-builder`.)
     #[test]
-    fn test_rootfs_oci_key_ignores_kernel_mmdebstrap_folds_it() {
+    fn test_rootfs_oci_key_ignores_kernel() {
         let dir = tempfile::tempdir().expect("tempdir");
         let kernel = write_tmp(dir.path(), "vmlinux", b"kernel-v1");
         let mut inputs = StageInputs::default();
@@ -351,7 +354,6 @@ mod tests {
             .artifacts
             .insert("kernel".to_string(), kernel.clone());
 
-        // OCI stage: kernel is not consumed → rebuilding it leaves the key unchanged.
         let oci = stage();
         let oci_k1 = oci.cache_key(&inputs);
         std::fs::write(&kernel, b"kernel-v2-rebuilt").expect("write");
@@ -359,23 +361,6 @@ mod tests {
         assert_eq!(
             oci_k1, oci_k2,
             "a kernel rebuild must NOT invalidate the OCI rootfs key (kernel not consumed)"
-        );
-
-        // mmdebstrap stage: kernel boots the builder VM → it IS consumed.
-        let mmd = RootfsStage {
-            source: RootfsBuildSource::Mmdebstrap {
-                release: "trixie".into(),
-            },
-            cid_alloc: Arc::new(crate::vmm::CidAllocator::new()),
-            image_override: None,
-            agent_musl: None,
-        };
-        let mmd_k1 = mmd.cache_key(&inputs);
-        std::fs::write(&kernel, b"kernel-v3-rebuilt").expect("write");
-        let mmd_k2 = mmd.cache_key(&inputs);
-        assert_ne!(
-            mmd_k1, mmd_k2,
-            "a kernel rebuild MUST invalidate the mmdebstrap rootfs key (kernel consumed)"
         );
     }
 
@@ -411,17 +396,6 @@ mod tests {
         assert_ne!(stage().cache_key(&a), stage().cache_key(&b));
     }
 
-    fn mmd_stage() -> RootfsStage {
-        RootfsStage {
-            source: RootfsBuildSource::Mmdebstrap {
-                release: "trixie".into(),
-            },
-            cid_alloc: Arc::new(crate::vmm::CidAllocator::new()),
-            image_override: None,
-            agent_musl: None,
-        }
-    }
-
     // H-ART-1: the injected static-musl agent must be folded by CONTENT, not by its path
     // string. When `agent_musl` is set the GuestAgentStage is skipped, so the agent has no
     // other content identity in the key — rebuilding it at the SAME path must invalidate the
@@ -431,8 +405,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = write_tmp(dir.path(), "agent-musl", b"musl-v1");
         let s = RootfsStage {
-            source: RootfsBuildSource::Oci,
-            cid_alloc: Arc::new(crate::vmm::CidAllocator::new()),
             image_override: None,
             agent_musl: Some(agent.clone()),
         };
@@ -447,38 +419,47 @@ mod tests {
         );
     }
 
-    // M-ART-4: the mmdebstrap rootfs boots a builder VM from the resolved builder-base, so
-    // re-pointing the builder-base image/digest at new bytes must invalidate the key. The
-    // buggy version (no builder-base fold) leaves the key unchanged -> red on both asserts.
+    // Guards M-PIPE-2 (moved from the mmdebstrap module with `resolve_builder_base`): image
+    // and digest must resolve as ONE atomic pair, never an independent fallback that pairs a
+    // pinned image with a hardcoded digest. Each branch is red on the buggy per-half-default
+    // impl. The in-VM builder crates rely on this shared resolver.
     #[test]
-    fn test_mmdebstrap_cache_key_tracks_builder_base() {
-        let s = mmd_stage();
-        let mut a = StageInputs::default();
-        a.pins.insert("rootfs_image".into(), "img".into());
-        a.pins.insert("rootfs_digest".into(), "sha256:aaa".into());
-        let ka = s.cache_key(&a);
-
-        // Re-pointing the builder-base digest at new bytes must invalidate the key.
-        let mut b = StageInputs::default();
-        b.pins.insert("rootfs_image".into(), "img".into());
-        b.pins.insert("rootfs_digest".into(), "sha256:bbb".into());
-        assert_ne!(
-            ka,
-            s.cache_key(&b),
-            "re-pointing the builder-base digest must invalidate the mmdebstrap rootfs key"
+    fn test_resolve_builder_base_pairs_atomically() {
+        // image without digest must error (not pair with a hardcoded digest).
+        let mut half = HashMap::new();
+        half.insert(
+            "rootfs_image".to_string(),
+            "docker.io/library/debian".to_string(),
+        );
+        assert!(
+            resolve_builder_base(&half).is_err(),
+            "image without digest must error, not pair with a hardcoded digest"
         );
 
-        // The dedicated builder_base_* pins (precedence over rootfs_*) must also change it.
-        let mut c = StageInputs::default();
-        c.pins.insert("rootfs_image".into(), "img".into());
-        c.pins.insert("rootfs_digest".into(), "sha256:aaa".into());
-        c.pins.insert("builder_base_image".into(), "bimg".into());
-        c.pins
-            .insert("builder_base_digest".into(), "sha256:ccc".into());
-        assert_ne!(
-            ka,
-            s.cache_key(&c),
-            "the dedicated builder-base pins must fold into the mmdebstrap rootfs key"
+        // digest without image must also error.
+        let mut half2 = HashMap::new();
+        half2.insert("rootfs_digest".to_string(), "sha256:abc".to_string());
+        assert!(resolve_builder_base(&half2).is_err());
+
+        // Completely missing base errors (no hardcoded fallback masks a missing pin).
+        assert!(resolve_builder_base(&HashMap::new()).is_err());
+
+        // A complete rootfs pair resolves atomically.
+        let mut full = HashMap::new();
+        full.insert("rootfs_image".to_string(), "img".to_string());
+        full.insert("rootfs_digest".to_string(), "sha256:abc".to_string());
+        assert_eq!(
+            resolve_builder_base(&full).expect("pair"),
+            ("img".to_string(), "sha256:abc".to_string())
+        );
+
+        // Dedicated builder pins take precedence over the rootfs pins.
+        let mut both = full.clone();
+        both.insert("builder_base_image".to_string(), "bimg".to_string());
+        both.insert("builder_base_digest".to_string(), "sha256:def".to_string());
+        assert_eq!(
+            resolve_builder_base(&both).expect("pair"),
+            ("bimg".to_string(), "sha256:def".to_string())
         );
     }
 

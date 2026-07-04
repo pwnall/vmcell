@@ -122,7 +122,7 @@ jobs:
         with: { tool: "cargo-nextest,just" }
 
       - name: build VM artifacts
-        run: cargo run -p vmcell --bin vmcell -- build
+        run: cargo run -p vmcell-cli --bin vmcell -- build --kernel-source host-make
 
       - name: unprivileged suite (no elevation — keeps the unprivileged path honest)
         run: cargo nextest run --profile integration -p vmcell --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'

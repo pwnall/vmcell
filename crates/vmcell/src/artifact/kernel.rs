@@ -453,6 +453,182 @@ fn symlink_escapes(link_path: &Path, target: &Path) -> bool {
     false
 }
 
+/// A pipeline stage that fetches a **prebuilt** `vmlinux` — the bootstrap kernel seed
+/// (§8.5). Where [`KernelStage`] compiles from source on the host, this stage downloads a
+/// digest-pinned prebuilt kernel and verifies it against `kernel_prebuilt_sha256`, then
+/// registers it under the `kernel` artifact key exactly like the compiled path.
+///
+/// This is the fast bootstrap seed: it needs no toolchain and no builder VM, so it is the
+/// seed that lets the in-VM `vmcell-kernel-builder` boot its own builder VM (the
+/// seed-kernel chicken-and-egg, §8.5). It is only usable when a prebuilt kernel that
+/// satisfies the §8.3 built-in config is pinned; otherwise [`KernelStage`] (host-`make`)
+/// remains the guaranteed fallback seed.
+pub struct PrebuiltKernelStage {
+    /// The HTTP client used to download the prebuilt kernel.
+    pub http_client: std::sync::Arc<dyn HttpClient>,
+}
+
+#[async_trait]
+impl Stage for PrebuiltKernelStage {
+    fn name(&self) -> &str {
+        "kernel"
+    }
+
+    fn out_path(&self, target_dir: &Path) -> std::path::PathBuf {
+        target_dir.join("vmlinux")
+    }
+
+    fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
+        // Bump when this stage's fetch/verify logic changes so stale kernels are not served.
+        const STAGE_VERSION: u32 = 1;
+        const SEP: &[u8] = b"\x1f";
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&STAGE_VERSION.to_le_bytes());
+        hasher.update(SEP);
+        hasher.update(b"prebuilt");
+        hasher.update(SEP);
+        hasher.update(
+            inputs
+                .pins
+                .get("kernel_prebuilt_url")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
+        hasher.update(SEP);
+        hasher.update(
+            inputs
+                .pins
+                .get("kernel_prebuilt_sha256")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
+        // Optional archive-extraction identity (§8.5): a prebuilt shipped inside a tar
+        // (e.g. the Kata kernel) is keyed on the archive member path + the archive's own
+        // digest, so re-pointing either invalidates the extracted kernel.
+        hasher.update(SEP);
+        hasher.update(
+            inputs
+                .pins
+                .get("kernel_prebuilt_archive_member")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
+        hasher.update(SEP);
+        hasher.update(
+            inputs
+                .pins
+                .get("kernel_prebuilt_archive_sha256")
+                .map(|s| s.as_bytes())
+                .unwrap_or_default(),
+        );
+        CacheKey(format!("kernel-prebuilt-{}", hasher.finalize().to_hex()))
+    }
+
+    async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        let url = inputs.pins.get("kernel_prebuilt_url").ok_or_else(|| {
+            Error::Artifact(
+                "Missing kernel_prebuilt_url pin (no prebuilt kernel seed is pinned; use the \
+                 host-make or in-VM kernel builder instead)"
+                    .into(),
+            )
+        })?;
+        let expected_sha = inputs
+            .pins
+            .get("kernel_prebuilt_sha256")
+            .ok_or_else(|| Error::Artifact("Missing kernel_prebuilt_sha256 pin".into()))?;
+
+        let downloaded = self.http_client.get(url).await?;
+
+        // The final `vmlinux` bytes: either the download directly, or a member extracted from a
+        // verified archive (the Kata kernel ships inside a `.tar.zst`, §8.5).
+        let vmlinux_bytes = match inputs.pins.get("kernel_prebuilt_archive_member") {
+            None => downloaded,
+            Some(member) => {
+                // Verify the ARCHIVE against its own pinned digest first (provenance hard stop),
+                // then extract + re-verify the member against `kernel_prebuilt_sha256`.
+                let archive_sha =
+                    inputs.pins.get("kernel_prebuilt_archive_sha256").ok_or_else(|| {
+                        Error::Artifact(
+                            "kernel_prebuilt_archive_member is set but kernel_prebuilt_archive_sha256 \
+                             is missing (both are required to verify the archive)"
+                                .into(),
+                        )
+                    })?;
+                let got = sha256_hex(&downloaded);
+                if &got != archive_sha {
+                    return Err(Error::Artifact(format!(
+                        "prebuilt kernel archive hash mismatch: expected {archive_sha}, got {got} (url {url})"
+                    )));
+                }
+                let member = member.clone();
+                tokio::task::spawn_blocking(move || extract_tar_member(&downloaded, &member))
+                    .await
+                    .map_err(|e| {
+                        Error::Artifact(format!("archive extraction task failed: {e}"))
+                    })??
+            }
+        };
+
+        let got = sha256_hex(&vmlinux_bytes);
+        if &got != expected_sha {
+            // Provenance hard stop: a prebuilt kernel is opaque bytes, so an intact digest
+            // is the *only* integrity check — never accept a mismatch (§11.2, §8.5).
+            return Err(Error::Artifact(format!(
+                "prebuilt kernel hash mismatch: expected {expected_sha}, got {got} (url {url})"
+            )));
+        }
+        if let Some(parent) = out.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(out, &vmlinux_bytes).await?;
+        Ok(kernel_outputs(out, "kernel"))
+    }
+}
+
+/// The lowercase-hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Extracts a single regular-file member from a (optionally zstd-compressed) tar `archive`,
+/// streaming so only the target member is held in memory. `member` is matched with any leading
+/// `./` stripped from both sides. zstd is detected by its magic bytes, so a plain `.tar` also
+/// works.
+///
+/// # Errors
+/// [`Error::Artifact`] if decompression fails or the member is absent.
+fn extract_tar_member(archive: &[u8], member: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let cursor = std::io::Cursor::new(archive);
+    // zstd magic: 0x28 0xB5 0x2F 0xFD.
+    let reader: Box<dyn Read> = if archive.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        Box::new(
+            zstd::stream::read::Decoder::new(cursor)
+                .map_err(|e| Error::Artifact(format!("zstd decode failed: {e}")))?,
+        )
+    } else {
+        Box::new(cursor)
+    };
+    let want = member.trim_start_matches("./");
+    let mut tar = tar::Archive::new(reader);
+    for entry in tar.entries()? {
+        let mut e = entry?;
+        let path = e.path()?.into_owned();
+        let got = path.to_string_lossy();
+        if got.trim_start_matches("./") == want {
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).map_err(Error::Io)?;
+            return Ok(buf);
+        }
+    }
+    Err(Error::Artifact(format!(
+        "archive member `{member}` not found in the prebuilt kernel archive"
+    )))
+}
+
 /// Builds the [`StageOutputs`] for a kernel build, registering the built kernel under
 /// `key` (`"kernel"` for the default, `"kernel-<label>"` for a labelled stage) so
 /// downstream stages (snapshot, mmdebstrap builder) always see it on a cold build — not
@@ -795,6 +971,216 @@ mod tests {
             !workdir.join("stale_marker").exists(),
             "a bumped pin must purge the stale extracted tree"
         );
+    }
+
+    // §8.5 prebuilt bootstrap seed: a downloaded prebuilt kernel whose bytes do not match
+    // the pinned SHA is a provenance HARD STOP (the digest is the only integrity check on
+    // opaque prebuilt bytes). Dropping the check would write the wrong bytes and return Ok
+    // -> the mismatch assertion goes red.
+    #[tokio::test]
+    async fn test_prebuilt_kernel_hash_mismatch_hard_stops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: b"prebuilt-bytes".to_vec(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = PrebuiltKernelStage {
+            http_client: fake.clone(),
+        };
+        let mut inputs = StageInputs::default();
+        inputs.pins.insert(
+            "kernel_prebuilt_url".into(),
+            "http://example/vmlinux".into(),
+        );
+        // Pin the SHA of DIFFERENT bytes.
+        inputs
+            .pins
+            .insert("kernel_prebuilt_sha256".into(), sha256_hex(b"other-bytes"));
+        match stage.run(&inputs, &out).await {
+            Err(Error::Artifact(m)) => {
+                assert!(m.contains("mismatch"), "expected a hash mismatch, got: {m}")
+            }
+            other => panic!("expected an Artifact hash-mismatch error, got {other:?}"),
+        }
+        assert!(
+            !out.exists(),
+            "a mismatched prebuilt kernel must not be written to the output path"
+        );
+    }
+
+    // §8.5: a matching prebuilt is written and registered under the `kernel` artifact key
+    // (so downstream consumers / a VM find it). The inverse (registering nothing, or a
+    // different key) reddens the artifact-key assertion.
+    #[tokio::test]
+    async fn test_prebuilt_kernel_matching_writes_and_registers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let body = b"good-prebuilt-vmlinux".to_vec();
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: body.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = PrebuiltKernelStage {
+            http_client: fake.clone(),
+        };
+        let mut inputs = StageInputs::default();
+        inputs.pins.insert(
+            "kernel_prebuilt_url".into(),
+            "http://example/vmlinux".into(),
+        );
+        inputs
+            .pins
+            .insert("kernel_prebuilt_sha256".into(), sha256_hex(&body));
+        let outputs = stage.run(&inputs, &out).await.expect("prebuilt build");
+        assert_eq!(std::fs::read(&out).expect("read out"), body);
+        assert_eq!(
+            outputs.artifacts.get("kernel").map(|p| p.as_path()),
+            Some(out.as_path()),
+            "prebuilt stage must register the kernel artifact"
+        );
+    }
+
+    // §8.5: a missing prebuilt pin is a fail-loud error, never a silent success (the
+    // host-make builder is the fallback seed, chosen by the caller — not by a silent skip).
+    #[tokio::test]
+    async fn test_prebuilt_kernel_missing_pin_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: b"x".to_vec(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = PrebuiltKernelStage { http_client: fake };
+        let res = stage.run(&StageInputs::default(), &out).await;
+        assert!(
+            matches!(res, Err(Error::Artifact(_))),
+            "a missing prebuilt pin must fail loud, got {res:?}"
+        );
+    }
+
+    /// Builds a single-member `.tar.zst` in memory (mirrors how the Kata kernel ships, §8.5).
+    fn make_tar_zst(member: &str, content: &[u8]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, member, content)
+                .expect("append");
+            builder.finish().expect("finish");
+        }
+        zstd::stream::encode_all(std::io::Cursor::new(tar_bytes), 0).expect("zstd")
+    }
+
+    // §8.5: a prebuilt shipped inside a `.tar.zst` (the Kata case) is verified against the
+    // ARCHIVE digest, the named member extracted, then re-verified against the member digest —
+    // and written out. The inverse (writing the whole archive as the kernel) reddens the
+    // content assertion.
+    #[tokio::test]
+    async fn test_prebuilt_kernel_archive_extracts_and_verifies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let member_path = "./opt/kata/share/kata-containers/vmlinux-test";
+        let member_content = b"REAL-VMLINUX-ELF-BYTES".to_vec();
+        let archive = make_tar_zst(member_path, &member_content);
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: archive.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = PrebuiltKernelStage { http_client: fake };
+        let mut inputs = StageInputs::default();
+        inputs
+            .pins
+            .insert("kernel_prebuilt_url".into(), "http://x/kata.tar.zst".into());
+        inputs.pins.insert(
+            "kernel_prebuilt_archive_sha256".into(),
+            sha256_hex(&archive),
+        );
+        inputs
+            .pins
+            .insert("kernel_prebuilt_archive_member".into(), member_path.into());
+        inputs
+            .pins
+            .insert("kernel_prebuilt_sha256".into(), sha256_hex(&member_content));
+        stage
+            .run(&inputs, &out)
+            .await
+            .expect("archive prebuilt build");
+        assert_eq!(
+            std::fs::read(&out).expect("read out"),
+            member_content,
+            "the extracted member (not the whole archive) must be written as vmlinux"
+        );
+    }
+
+    // §8.5: a tampered archive (bytes not matching `archive_sha256`) is a provenance hard stop
+    // before extraction — the archive digest is the integrity check on opaque compressed bytes.
+    #[tokio::test]
+    async fn test_prebuilt_kernel_archive_sha_mismatch_hard_stops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let archive = make_tar_zst("./vmlinux", b"content");
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: archive,
+            calls: AtomicUsize::new(0),
+        });
+        let stage = PrebuiltKernelStage { http_client: fake };
+        let mut inputs = StageInputs::default();
+        inputs
+            .pins
+            .insert("kernel_prebuilt_url".into(), "http://x/a.tar.zst".into());
+        // Pin the WRONG archive digest.
+        inputs.pins.insert(
+            "kernel_prebuilt_archive_sha256".into(),
+            sha256_hex(b"other"),
+        );
+        inputs
+            .pins
+            .insert("kernel_prebuilt_archive_member".into(), "./vmlinux".into());
+        inputs
+            .pins
+            .insert("kernel_prebuilt_sha256".into(), sha256_hex(b"content"));
+        match stage.run(&inputs, &out).await {
+            Err(Error::Artifact(m)) => assert!(m.contains("archive hash mismatch"), "got {m}"),
+            other => panic!("expected archive hash mismatch, got {other:?}"),
+        }
+        assert!(!out.exists());
+    }
+
+    // §8.5: a member absent from the archive is a hard error, never a silent empty/whole-archive
+    // write.
+    #[tokio::test]
+    async fn test_prebuilt_kernel_archive_missing_member_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        let archive = make_tar_zst("./present", b"x");
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: archive.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = PrebuiltKernelStage { http_client: fake };
+        let mut inputs = StageInputs::default();
+        inputs
+            .pins
+            .insert("kernel_prebuilt_url".into(), "http://x/a.tar.zst".into());
+        inputs.pins.insert(
+            "kernel_prebuilt_archive_sha256".into(),
+            sha256_hex(&archive),
+        );
+        inputs
+            .pins
+            .insert("kernel_prebuilt_archive_member".into(), "./absent".into());
+        inputs
+            .pins
+            .insert("kernel_prebuilt_sha256".into(), sha256_hex(b"x"));
+        match stage.run(&inputs, &out).await {
+            Err(Error::Artifact(m)) => assert!(m.contains("not found"), "got {m}"),
+            other => panic!("expected member-not-found error, got {other:?}"),
+        }
     }
 
     // M-ART-9 (3): a cached tarball whose CONTENT matches the pin must NOT be re-fetched. An

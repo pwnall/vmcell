@@ -8,11 +8,48 @@ struct Cli {
     command: Commands,
 }
 
+/// Which kernel builder produces the `vmlinux` for `build` (design v20 §8.5).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum KernelSource {
+    /// Download + SHA-verify a digest-pinned prebuilt `vmlinux` (the fast, no-toolchain
+    /// bootstrap seed; the pinned Kata kernel is validated to boot §8.5).
+    Prebuilt,
+    /// Compile from the pinned source with `make` on the HOST (the guaranteed fallback seed).
+    HostMake,
+    /// Compile from the pinned source INSIDE a builder micro-VM (`vmcell-kernel-builder`).
+    InVm,
+}
+
+/// Which rootfs builder produces the erofs for `build` (design v20 §5.4).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum RootfsSourceKind {
+    /// Pull + unpack a digest-pinned OCI base image on the HOST (the bootstrap source).
+    Oci,
+    /// Full-apt `mmdebstrap` INSIDE a builder micro-VM (`vmcell-rootfs-builder`).
+    Mmdebstrap,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    Build,
+    /// Build the kernel + rootfs + agent + tools artifacts into the artifacts dir.
+    Build {
+        /// Which kernel builder to use for the `vmlinux` seed (§8.5).
+        #[arg(long, value_enum, default_value_t = KernelSource::Prebuilt)]
+        kernel_source: KernelSource,
+        /// Which rootfs builder to use for the erofs (§5.4).
+        #[arg(long, value_enum, default_value_t = RootfsSourceKind::Oci)]
+        rootfs_source: RootfsSourceKind,
+        /// Debian release suite for the `mmdebstrap` rootfs source (ignored for `oci`).
+        #[arg(long, default_value = "trixie")]
+        release: String,
+    },
     /// Build every kernel in the pins `kernels` registry to `vmlinux-<label>`.
-    BuildKernels,
+    BuildKernels {
+        /// Compile each kernel inside a builder micro-VM (`vmcell-kernel-builder`) instead of
+        /// on the host — the in-VM path needs a seed kernel already present (§8.5).
+        #[arg(long)]
+        in_vm: bool,
+    },
     /// Convert any digest-pinned OCI image into an erofs rootfs (build-time; v15 §8.2).
     /// The base MUST be pinned by digest (`IMAGE@sha256:...`), never a tag.
     Oci2Erofs {
@@ -163,27 +200,71 @@ fn deferred_to_daemon(subcommand: &str) -> vmcell::Error {
     }
 }
 
+/// Builds the kernel [`Stage`](vmcell::artifact::Stage) selected by `source` — a `vmcell`
+/// bootstrap producer (prebuilt download or host-`make`) or the in-VM `vmcell-kernel-builder`.
+/// This is the composition-root wiring that keeps the dependency graph acyclic (§10.1): only
+/// `vmcell-cli` names the builder crates.
+fn kernel_stage(
+    source: KernelSource,
+    label: Option<String>,
+    fragments: Option<Vec<String>>,
+    cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
+) -> Box<dyn vmcell::artifact::Stage> {
+    let http_client = std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient);
+    match source {
+        KernelSource::Prebuilt => {
+            Box::new(vmcell::artifact::kernel::PrebuiltKernelStage { http_client })
+        }
+        KernelSource::HostMake => Box::new(vmcell::artifact::kernel::KernelStage {
+            http_client,
+            label,
+            fragments,
+        }),
+        KernelSource::InVm => Box::new(vmcell_kernel_builder::InVmKernelStage {
+            http_client,
+            label,
+            fragments,
+            cid_alloc,
+        }),
+    }
+}
+
+/// Builds the rootfs [`Stage`](vmcell::artifact::Stage) selected by `source` — the `vmcell`
+/// OCI bootstrap producer or the in-VM `vmcell-rootfs-builder` mmdebstrap source (§5.4).
+fn rootfs_stage(
+    source: RootfsSourceKind,
+    release: String,
+    cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
+) -> Box<dyn vmcell::artifact::Stage> {
+    match source {
+        RootfsSourceKind::Oci => Box::new(vmcell::artifact::rootfs::RootfsStage {
+            image_override: None,
+            agent_musl: None,
+        }),
+        RootfsSourceKind::Mmdebstrap => {
+            Box::new(vmcell_rootfs_builder::MmdebstrapRootfsStage { release, cid_alloc })
+        }
+    }
+}
+
 async fn dispatch(command: &Commands) -> vmcell::Result<()> {
     match command {
-        Commands::Build => {
+        Commands::Build {
+            kernel_source,
+            rootfs_source,
+            release,
+        } => {
             println!("Building artifacts...");
+            // One CID allocator shared by any in-VM builder stage this pipeline runs.
+            let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
             let pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
                 .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
                     pins_file: pins_path(),
                 }))
-                .add_stage(Box::new(vmcell::artifact::kernel::KernelStage {
-                    http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
-                    label: None,
-                    fragments: None,
-                }))
+                .add_stage(kernel_stage(*kernel_source, None, None, cid_alloc.clone()))
                 .add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}))
                 .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
-                .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
-                    source: vmcell::artifact::rootfs::RootfsBuildSource::Oci,
-                    cid_alloc: std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
-                    image_override: None,
-                    agent_musl: None,
-                }));
+                .add_stage(rootfs_stage(*rootfs_source, release.clone(), cid_alloc));
             pipeline.build(&vmcell::artifact::Cache::default()).await?;
             println!("Artifacts built successfully.");
             Ok(())
@@ -254,11 +335,12 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             println!("vmcell: artifact manifest {} verified OK", mp.display());
             Ok(())
         }
-        Commands::BuildKernels => {
+        Commands::BuildKernels { in_vm } => {
             // Build each kernel in the `kernels` registry to its own `vmlinux-<label>`
             // (the kernel-version dimension), so multiple versions coexist for the
-            // cross-kernel benchmark sweep. Reuses the labelled `KernelStage`; each has
-            // its own cache sidecar and build dir.
+            // cross-kernel benchmark sweep. Each labelled stage has its own cache sidecar
+            // and build dir. `--in-vm` compiles inside a builder micro-VM instead.
+            let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
             let pins_file = pins_path();
             let content = std::fs::read_to_string(&pins_file).map_err(vmcell::Error::Io)?;
             let json: serde_json::Value = serde_json::from_str(&content)
@@ -278,13 +360,19 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                 .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
                     pins_file: pins_file.clone(),
                 }));
+            let ksrc = if *in_vm {
+                KernelSource::InVm
+            } else {
+                KernelSource::HostMake
+            };
             for label in &labels {
                 println!("  - kernel {label} -> vmlinux-{label}");
-                pipeline = pipeline.add_stage(Box::new(vmcell::artifact::kernel::KernelStage {
-                    http_client: std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient),
-                    label: Some(label.clone()),
-                    fragments: None,
-                }));
+                pipeline = pipeline.add_stage(kernel_stage(
+                    ksrc,
+                    Some(label.clone()),
+                    None,
+                    cid_alloc.clone(),
+                ));
             }
             pipeline.build(&vmcell::artifact::Cache::default()).await?;
             println!("Kernels built: {}", labels.join(", "));
@@ -532,8 +620,6 @@ async fn oci2erofs(
     pipeline = pipeline
         .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
         .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
-            source: vmcell::artifact::rootfs::RootfsBuildSource::Oci,
-            cid_alloc: std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
             image_override: Some((image.to_string(), digest.to_string())),
             agent_musl: agent_musl.map(std::path::Path::to_path_buf),
         }));
