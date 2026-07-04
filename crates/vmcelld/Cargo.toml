@@ -1,0 +1,34 @@
+[package]
+name = "vmcelld"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "vmcelld: the blessed vmcell control-plane daemon binary (thin wrapper over vmcell-daemon; design v21 §D)"
+publish = false
+
+# Thin binary wrapper (AGENTS.md "functionality in the library, binary is the wrapper"): it blesses
+# (refuse-to-start without the three caps, RETAINING them — no uid drop/exec, v21 §D2), parses the
+# server config, and runs `vmcell-daemon`'s server. All logic lives in the library.
+[[bin]]
+name = "vmcelld"
+path = "src/main.rs"
+
+[dependencies]
+vmcell-daemon = { path = "../vmcell-daemon", version = "0.1.0" }
+vmcell-privilege = { path = "../vmcell-privilege", version = "0.1.0" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The integration tests (tests/integration.rs) spawn a real `vmcelld` through the blessed runner and
+# drive it over HTTP — dogfooding the client. `#[ignore]` by default (need KVM + blessed runner +
+# artifacts); run via `just test-daemon`.
+vmcell-daemon-client = { path = "../vmcell-daemon-client", version = "0.1.0" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
+url = "2"
+libc = "0.2"

@@ -1,0 +1,17 @@
+[package]
+name = "vmcell-privilege"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "vmcell shared privileged-window capability/blessing predicates (one law, one predicate for the test-runner and the daemon)"
+publish = false
+
+# Deliberately dependency-thin: rustix + capctl + libc only, never the vmcell library and no
+# async/host stack — every function here runs inside (or gates entry to) the privileged window,
+# and both the runner (transient exec) and the daemon (long-lived, retains caps) link it. The CI
+# lean assertion enforces this structurally (design v21 §D1.1) the same way it does for the runner.
+[dependencies]
+rustix = { version = "0.38", features = ["process"] }
+capctl = "0.2.4"
+libc = "0.2"

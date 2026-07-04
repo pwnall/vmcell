@@ -5823,6 +5823,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmcell-daemon"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "tokio 1.52.3",
+ "tower",
+ "tracing",
+ "vmcell",
+ "vmcell-privilege",
+]
+
+[[package]]
+name = "vmcell-daemon-client"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio 1.52.3",
+ "url",
+ "vmcell-daemon",
+]
+
+[[package]]
 name = "vmcell-guest-agent"
 version = "0.2.0"
 dependencies = [
@@ -5860,6 +5891,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmcell-privilege"
+version = "0.1.0"
+dependencies = [
+ "capctl",
+ "libc",
+ "rustix 0.38.44",
+]
+
+[[package]]
 name = "vmcell-protocol"
 version = "0.3.0"
 dependencies = [
@@ -5882,11 +5922,39 @@ dependencies = [
 
 [[package]]
 name = "vmcell-test-runner"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
- "capctl",
- "libc",
  "rustix 0.38.44",
+ "vmcell-privilege",
+]
+
+[[package]]
+name = "vmcelld"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "reqwest 0.12.28",
+ "tempfile",
+ "tokio 1.52.3",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "vmcell-daemon",
+ "vmcell-daemon-client",
+ "vmcell-privilege",
+]
+
+[[package]]
+name = "vmcelld-ctl"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio 1.52.3",
+ "url",
+ "vmcell-daemon-client",
 ]
 
 [[package]]

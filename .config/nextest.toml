@@ -37,3 +37,10 @@ serial-host = { max-threads = 1 }
 # parallelism — a new VM test still auto-joins because it will not be named `proptests`.
 filter = 'package(vmcell) & kind(test) & !binary(proptests)'
 test-group = 'serial-host'
+
+[[profile.integration.overrides]]
+# v21 §D10: each `vmcelld` integration test spawns a real daemon that boots a Cloud Hypervisor
+# micro-VM (netns / cgroup / tap host state) — serialize them alongside the `vmcell` VM tests so a
+# concurrent `--run-ignored` run does not race on host state.
+filter = 'package(vmcelld) & kind(test)'
+test-group = 'serial-host'

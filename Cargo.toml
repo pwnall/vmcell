@@ -17,6 +17,16 @@ members = [
     # artifact↔system contract (§5.4/§8.5/§12); depends on `vmcell`, reuses its integration
     # checks. `vmcell`'s tests dev-depend on it (a permitted dev-dep cycle).
     "crates/vmcell-artifact-validator",
+    # v21 §D1.1: the control-plane daemon and its client. `vmcell-privilege` is the lean shared
+    # capability/blessing crate (also linked by `vmcell-test-runner`). The daemon library owns the
+    # artifact store + VM registry + HTTP API; `vmcelld` is its blessed binary. The client library
+    # mirrors the vmcell entry points over HTTP; `vmcelld-ctl` is its CLI. `vmcell` has no edge to
+    # any of these — the daemon depends on `vmcell`, never the reverse.
+    "crates/vmcell-privilege",
+    "crates/vmcell-daemon",
+    "crates/vmcelld",
+    "crates/vmcell-daemon-client",
+    "crates/vmcelld-ctl",
 ]
 
 # The cargo-fuzz crate is NOT a workspace member: libfuzzer-sys only builds under `cargo fuzz` on

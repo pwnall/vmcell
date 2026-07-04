@@ -62,6 +62,62 @@ what remains forward work.
   where per-builder divergence bugs hide. Exposing one implementation via `pub` makes the reuse structural.
   Other half of the 0.5.0 bump. See §5.4, §10.1.
 
+## v21 — control-plane daemon (`vmcelld`) + client
+
+Design: `docs/53-claude-design-v21.md`. New crates: `vmcell-privilege`, `vmcell-daemon`, `vmcelld`,
+`vmcell-daemon-client`, `vmcelld-ctl`. Fold the settled entries into the design body and delete them here
+as they stabilize.
+
+- **(a) The daemon OWNS its VMs (holds the `MicroVm` handles); it is not stateless.** An earlier draft
+  explored a stateless daemon (detached VMs + on-disk descriptors + reattach). *Reason it was dropped:* it
+  needed a new vmcell detach/reattach primitive AND abandoned the "`Drop` releases resources" invariant.
+  The owning model reuses the single-process `MicroVm` ownership in-process, needs **no** vmcell change,
+  and keeps teardown-is-ownership intact; crash recovery is the **start-up `sweep_orphans`** (empty live
+  set) instead of reattach. See §D4.
+
+- **(b) `vmcelld` is NOT blessed on the dev hot path — it is launched through the blessed
+  `vmcell-test-runner`, which confers the caps via the ambient set.** `just bless` blesses only the runner
+  (which rarely changes); `vmcell-daemon`/`vmcelld` rebuild with no `setcap` churn. *Reason:* the same
+  file-cap-churn problem the runner already solved for the ever-changing test binaries. Standalone/prod
+  `vmcelld` uses systemd `AmbientCapabilities=` or a one-off `setcap`. See §D2.
+
+- **(c) INVERTED launch for integration vs. manual.** Integration tests wrap the **test binary** with the
+  runner (nextest target-runner) so the test itself holds the caps, and spawn `vmcelld` **directly** (it
+  inherits the ambient caps). *Reason:* a privileged test can plant privileged pre-existing state (an
+  orphan netns for the start-up-sweep test) and inspect per-VM teardown residue — things a
+  `vmcelld`-via-runner spawn from an unprivileged test cannot. Manual poking (`just daemon`) still launches
+  `vmcelld` *through* the runner (no privileged test process to inherit from). See §D10, `just test-daemon`.
+
+- **(d) `mem_read_ok`/`limits_enforced` both mean "the memory controller is delegated into the per-VM
+  slice" — memory metrics are UNREADABLE (not just unenforced) without a delegated cgroup scope.** An
+  integration test initially asserted `mem_read_ok` unconditionally and reddened without delegation
+  (`memory.current` doesn't exist in a non-delegated slice). The test now asserts both flags **track**
+  delegation (`stats_limits_enforced_matches_delegation`). Honest §7.2 behavior, not a bug.
+
+- **(e) Snapshot/restore/net knobs on the daemon API.** `CreateVmRequest` gained `net`
+  (`none`/`privileged`/`unprivileged`), `snapshotting`, and `restore_from` (a store prefix). The launcher
+  maps `NetMode`→`NetConfig`, sets `.snapshotting()`, and dispatches cold-boot vs. **`restore_cow`** (so
+  the named snapshot is preserved and re-restorable, design v20 §9.4). *Reason:* the daemon defaulted to
+  `NetConfig::None` + no snapshotting, so snapshot/restore and real guest networking were unreachable
+  through the API. See §D5.1.
+
+- **(f) Guest-tools `ip route` prints the RAW `/proc/net/route` table (hex, tab-separated), not the
+  `default via …` form.** The privileged-net test first asserted `ip route` contained `"default"` and
+  reddened. A default route is a row with Destination `00000000` (0.0.0.0) and a non-zero Gateway; the
+  test now parses that (`has_default_route`) and asserts `eth0` is `state up` with `inet 10.200.x/30`.
+
+- **Validated on the KVM host (2026-07-04), this env (KVM rw via ACL, CH at `~/.cargo/bin`, runner
+  blessed, artifacts built).** `crates/vmcelld/tests/integration.rs` (run via `just test-daemon`, under a
+  systemd-delegated scope) — **10/10 green**: healthz + artifact list; real CH micro-VM boot + `exec`
+  data-plane (`exit 0`, guest stdout, `id -un`=root, `uname -r`=6.12.94); full create/list/exec/stats/
+  destroy lifecycle; bearer auth 401/403/200; `limits_enforced` true under delegation (`mem_current_mib`
+  64) and honestly false without; start-up sweep reclaims a planted orphan netns; destroy removes the
+  per-VM scratch dir; **snapshot → restore-by-name preserves a guest tmpfs marker**; **privileged tap net**
+  gives a host netns + guest `eth0` `10.200.x/30` + default route; **`vmcelld-ctl`** drives
+  `run`/`ls`/`artifact ls`. A harness bug was fixed en route: `Daemon::Drop` must `SIGTERM` (graceful
+  `shutdown_all`) then fall back to `SIGKILL`, else a panicking test orphans its CH VMs. **Still unrun:**
+  the QEMU/Firecracker snapshot tiers (v20 §16: unwired), filtered-egress, and a concurrent-load run.
+
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.

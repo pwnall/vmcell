@@ -5,6 +5,12 @@ set shell := ["bash", "-uc"]
 runner := ".vmcell-bin/debug/vmcell-test-runner"
 runner-release := ".vmcell-bin/release/vmcell-test-runner"
 
+# v21 §D2: `vmcelld` is NOT blessed on the dev hot path. It gets its caps by being LAUNCHED THROUGH the
+# blessed runner (`just daemon`, and integration tests), which raises the three caps into the ambient
+# set and execs `vmcelld` — so the ever-changing daemon rebuilds with no `setcap` churn. Only the runner
+# (which rarely changes) carries file-caps. A standalone/production `vmcelld` is capped by the service
+# manager (systemd `AmbientCapabilities=`) or a one-off `setcap`, off this hot path.
+
 # Grant the three caps the privileged suite needs, durably (v15 §12.8). Builds the runner, copies
 # it to the stable, gitignored ./.vmcell-bin/ path, and setcaps THAT copy. Idempotent via a
 # content-hash `.blessed` stamp keyed on the RUNNER binary only (never test binaries): a re-run is
@@ -52,6 +58,16 @@ bless:
     bless_one target/debug/vmcell-test-runner {{runner}}
     bless_one target/release/vmcell-test-runner {{runner-release}}
 
+# Run `vmcelld` for manual poking (v21 §D), LAUNCHED THROUGH the blessed runner so it gets its caps
+# without being blessed itself (§D2) — so it rebuilds with no `setcap` churn. Requires `just bless`
+# first (blesses the runner). Uses --allow-unauthenticated for a loopback dev bind ONLY; pass
+# --api-key-file for anything real.
+daemon artifacts_dir="/tmp/vmcell-artifacts" bind="127.0.0.1:8787":
+    cargo build -p vmcelld
+    mkdir -p {{artifacts_dir}}
+    {{justfile_directory()}}/{{runner}} {{justfile_directory()}}/target/debug/vmcelld \
+        --artifacts-dir {{artifacts_dir}} --bind {{bind}} --allow-unauthenticated
+
 # Fast inner loop: unit + codec + property tests. No KVM, no privileges.
 test-unit:
     cargo nextest run --all-features
@@ -72,6 +88,19 @@ test-privileged:
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all \
         -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'
+
+# v21 §D10: daemon integration tests. The TEST BINARY is wrapped by the blessed runner (nextest
+# target-runner), so it holds the caps and can plant privileged pre-existing state (an orphan netns for
+# the start-up-sweep test) and inspect per-VM teardown residue; it then spawns `vmcelld` DIRECTLY,
+# which inherits the caps via the ambient set (the inverse of `just daemon`, which launches `vmcelld`
+# *through* the runner for manual poking). Each test boots a real Cloud Hypervisor micro-VM and asserts
+# the HTTP surface + data plane over `vmcell-daemon-client`. Runs under a systemd-delegated cgroup scope
+# so the `limits_enforced` assertion sees real enforcement. Requires `just bless` (runner) + artifacts.
+test-daemon:
+    cargo build -p vmcelld -p vmcelld-ctl
+    systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh \
+        env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
+        cargo nextest run --profile integration -p vmcelld --run-ignored all
 
 # Unprivileged integration suite under no elevation (keeps the unprivileged path honest).
 test-unprivileged:
@@ -109,6 +138,10 @@ ci:
     # lean-test-runner invariant: same host-stack ban + standalone compile for the privileged-window member.
     if cargo tree -e no-dev -p vmcell-test-runner | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-test-runner invariant violated — host stack leaked into the test-runner build"; exit 1; fi
     cargo clippy -p vmcell-test-runner --all-targets
+    # lean-privilege invariant (v21 §D1.1): the shared blessing/capability crate is linked by BOTH the
+    # runner and the daemon, so it must stay as lean as the runner — no host async stack.
+    if cargo tree -e no-dev -p vmcell-privilege | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-privilege invariant violated — host stack leaked into vmcell-privilege"; exit 1; fi
+    cargo clippy -p vmcell-privilege --all-targets
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).
     cargo clippy -p vmcell-guest-tools --all-targets
     # Reduced-host-feature smoke (fast per-backend feedback before the full powerset below). After the

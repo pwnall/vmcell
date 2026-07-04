@@ -7,9 +7,16 @@ Deploy at the repository root as `AGENTS.md`. Terse by design; the reasoning liv
 
 vmcell runs each integration test in an isolated micro-VM. Cloud Hypervisor is the primary backend;
 Firecracker and QEMU are secondary, behind one `Vmm` trait with a `VmmCapabilities` descriptor.
-Crates: `vmcell` (host lib + CLI), `vmcell-protocol`, `vmcell-guest-agent` (PID 1 in-guest),
-`vmcell-test-runner` (privileged capability runner), `vmcell-guest-tools`. Two operating modes:
-**unprivileged** (KVM group only, smoltcp NAT) and **privileged** (three caps, netns/tap/nft, the
+Crates: `vmcell` (host lib), `vmcell-cli` (the `vmcell` CLI), `vmcell-protocol`, `vmcell-guest-agent`
+(PID 1 in-guest), `vmcell-test-runner` (privileged capability runner), `vmcell-guest-tools`,
+`vmcell-rootfs-builder`/`vmcell-kernel-builder`/`vmcell-artifact-validator` (in-VM build + validate),
+and the v21 control plane: `vmcell-privilege` (shared blessing/capability predicates, linked by the
+runner and the daemon), `vmcell-daemon` + `vmcelld` (the daemon lib + blessed binary),
+`vmcell-daemon-client` + `vmcelld-ctl` (the client lib + CLI). Three entry surfaces: the **library**,
+the **`vmcell` CLI**, and the **`vmcelld` daemon** (HTTP/REST, bearer-auth; it **owns** the VMs it
+starts — holds the `MicroVm` handles, releases them on `Drop`, and reclaims crash-leaked
+netns/cgroup/scratch with a start-up orphan sweep; see `docs/53-claude-design-v21.md`). Two operating
+modes: **unprivileged** (KVM group only, smoltcp NAT) and **privileged** (three caps, netns/tap/nft, the
 only snapshot-eligible mode).
 
 ## Read before changing anything
