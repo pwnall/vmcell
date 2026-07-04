@@ -16,6 +16,27 @@
 //! a green all-skipped report). `Extended`/`Full` checks that need a host capability the run
 //! lacks (CAP_NET_ADMIN, cgroup delegation, a backend feature) record a
 //! [`CheckStatus::Skip`] with a reason — never a silent pass.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::dbg_macro
+    )
+)]
 
 pub mod checks;
 pub mod harness;

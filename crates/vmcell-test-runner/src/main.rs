@@ -1,9 +1,48 @@
+//! Privileged nextest target-runner: raises the three capabilities the privileged suite needs
+//! (`cap_net_admin,cap_sys_admin,cap_dac_override`), confines the exec target under the trusted
+//! cargo `target/` dir derived from its OWN location, then `execvp`s the test binary.
+//!
+//! No crate-level `forbid(unsafe_code)`: the privilege transition uses raw capability/syscall FFI,
+//! audited via `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn`. `print_stdout`/`print_stderr`
+//! are intentionally NOT denied — a target-runner's operator diagnostics go to stderr by contract.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::dbg_macro
+    )
+)]
+
 use capctl::{Cap, CapSet, CapState};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path};
-use std::process::{Command, exit};
+use std::process::Command;
+
+/// Terminate the wrapper with a non-zero status so the target runner records a failure.
+///
+/// This binary is a nextest target-runner: on any setup error it must exit non-zero. At every
+/// call site there is no owned host state to unwind — the privilege transition has either not
+/// happened yet or is being aborted — so `process::exit` (banned elsewhere for skipping Drop) is
+/// the correct terminator. Centralized here behind one `allow` so the ban stays live in the rest
+/// of the file.
+fn exit_failure() -> ! {
+    #[allow(clippy::disallowed_methods)]
+    std::process::exit(1)
+}
 
 /// Builds the operator-facing remediation message shown when the runner lacks
 /// its capabilities.
@@ -390,10 +429,17 @@ fn main() {
     // with a typed error instead of an unhelpful panic. Passthrough args (`args[2..]`)
     // are kept as `OsString` and never require UTF-8.
     let args: Vec<OsString> = env::args_os().collect();
-    if args.len() < 2 {
+    // argv[0] is the runner, argv[1] the test binary, argv[2..] its forwarded args. Split via
+    // `split_first` (non-panicking) so the exec path carries no `indexing_slicing`, which is denied
+    // crate-wide — a target-runner must fail closed, never panic-index on a malformed argv.
+    let Some((_runner, rest)) = args.split_first() else {
         eprintln!("vmcell-test-runner: usage: vmcell-test-runner <test-binary> [args...]");
-        exit(1);
-    }
+        exit_failure();
+    };
+    let Some((target_os, forwarded)) = rest.split_first() else {
+        eprintln!("vmcell-test-runner: usage: vmcell-test-runner <test-binary> [args...]");
+        exit_failure();
+    };
 
     // DAC_OVERRIDE is required by the privileged tap path: `netns_rs::NetNs::new`
     // creates the bind-mount target under `/var/run/netns`, which is `root:root`,
@@ -401,7 +447,7 @@ fn main() {
     let need = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
     if let Err(e) = ensure_blessed_or_explain(&need) {
         eprintln!("{e}");
-        exit(1);
+        exit_failure();
     }
 
     // Confine the (untrusted) exec argument under a TRUSTED root derived from the
@@ -413,31 +459,28 @@ fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vmcell-test-runner: cannot resolve own executable path: {e}");
-            exit(1);
+            exit_failure();
         }
     };
     let trusted_root = match trusted_target_root(&exe) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("vmcell-test-runner: {e}");
-            exit(1);
+            exit_failure();
         }
     };
-    let target = match args[1].to_str() {
+    let target = match target_os.to_str() {
         Some(s) => s,
         None => {
-            eprintln!(
-                "vmcell-test-runner: refusing non-UTF-8 target path: {:?}",
-                args[1]
-            );
-            exit(1);
+            eprintln!("vmcell-test-runner: refusing non-UTF-8 target path: {target_os:?}");
+            exit_failure();
         }
     };
     let resolved_target = match confine_target_under(target, &trusted_root) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vmcell-test-runner: {e}");
-            exit(1);
+            exit_failure();
         }
     };
 
@@ -463,19 +506,19 @@ fn main() {
     );
     if let Err(e) = apply_privilege_transition(&plan) {
         eprintln!("vmcell-test-runner: {e}");
-        exit(1);
+        exit_failure();
     }
 
     // M-HOST-2: exec the CANONICALIZED, verified path returned by
     // `confine_target_under` — not the raw argument. Execing the raw `target` would
     // re-open a possibly-different file: a bare filename triggers a `PATH` lookup,
     // and a symlink could be re-pointed between the check and the exec (TOCTOU).
-    let err = Command::new(&resolved_target).args(&args[2..]).exec();
+    let err = Command::new(&resolved_target).args(forwarded).exec();
     eprintln!(
         "vmcell-test-runner: failed to exec {}: {err}",
         resolved_target.display()
     );
-    exit(1);
+    exit_failure();
 }
 
 #[cfg(test)]

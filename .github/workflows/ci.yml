@@ -81,6 +81,9 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: rustdoc (deny warnings)   # broken/private intra-doc links; clippy does NOT run rustdoc lints
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+
       - name: ban module-global mutable ID/atomic state
         run: |
           ./scripts/ban-global-state.sh

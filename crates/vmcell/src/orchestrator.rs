@@ -907,17 +907,18 @@ impl<V: Vmm> MicroVm<V> {
     /// whether the copy used a block-level reflink or a full byte copy
     /// ([`CowSupport`](crate::CowSupport)).
     ///
-    /// This is the low-level primitive behind [`Zygote::spawn_clone`]; most
+    /// This is the low-level primitive behind [`Zygote::spawn_clone`](crate::Zygote::spawn_clone); most
     /// callers want [`Zygote`](crate::Zygote), which owns the immutable master and
     /// gates concurrent fan-out on the backend capability. A single CoW clone
     /// works on any snapshot backend; concurrent fan-out needs
     /// `capabilities().restore_rotates_host_paths` (§3.3) — enforced by
-    /// [`Zygote::spawn_clones`], not here.
+    /// [`Zygote::spawn_clones`](crate::Zygote::spawn_clones), not here.
     ///
     /// # Errors
     /// Returns an error if the copy-on-write copy, network setup, proxy start, or
     /// VM restore fails. The eligibility re-checks of [`MicroVm::restore`] apply
-    /// identically (a clone with a vhost-user device is [`Error::Unsupported`]).
+    /// identically (a clone with a vhost-user device is
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported)).
     pub async fn restore_cow(
         vmm: &V,
         zygote_dir: &std::path::Path,
@@ -1053,7 +1054,7 @@ impl<V: Vmm> MicroVm<V> {
     ///
     /// On the **first** call after a snapshot restore this also performs the
     /// one-shot guest resync — clock, CSPRNG reseed, and network identity (§9.2);
-    /// see [`maybe_resync_after_restore`]. The `restored` flag is cleared only
+    /// see `maybe_resync_after_restore` (private). The `restored` flag is cleared only
     /// after the mandatory clock resync succeeds, so a transient first-exec
     /// failure retries on the next call rather than permanently skipping the
     /// resync (M-RESTORE-1).
@@ -1268,7 +1269,7 @@ impl<V: Vmm> MicroVm<V> {
     /// Currently always returns `Ok(())`. The graceful `request_shutdown` and the
     /// `kill` fallback are best-effort and their failures are **logged**, not
     /// propagated (M-ORCH-2): teardown is guaranteed by
-    /// [`teardown_post_instance`](Self::teardown_post_instance) and `Drop`
+    /// `teardown_post_instance` (private) and `Drop`
     /// regardless of either RPC's outcome, so surfacing an error would offer the
     /// caller no additional recovery. The `Result` return is retained so a future
     /// fallible-teardown step can be added without a signature break.

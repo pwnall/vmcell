@@ -121,6 +121,13 @@ ci:
       echo "== reduced-host-feature clippy: --no-default-features --features $feat =="; \
       cargo clippy -p vmcell --no-default-features --features "$feat" --all-targets; \
     done
+    # rustdoc gate (docs/51): RUSTDOCFLAGS=-D warnings turns EVERY rustdoc lint into a hard error —
+    # broken/private intra-doc links, unresolved links — for the whole public surface. clippy does
+    # NOT run rustdoc lints, and `cargo doc` runs nowhere else, so without this a broken doc link is
+    # invisible until someone reads the HTML. `--all-features` documents the widest API; `--no-deps`
+    # keeps it to our crates. (Benign cargo warning: the `vmcell` lib and the `vmcell` CLI bin share a
+    # doc output path — cosmetic, not a rustdoc lint, so it does not fail the -D-warnings gate.)
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
     ./scripts/ban-global-state.sh
     ./scripts/test-ban-global-state.sh
     ./scripts/ban-legacy-terms.sh

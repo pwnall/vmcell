@@ -47,6 +47,9 @@ async fn exec(agent: &mut AgentClient, argv: &[&str]) -> Result<vmcell::ExecOutc
 
 /// The kernel reaches userspace: the serial console shows the "Linux version" banner within a
 /// bounded window (← `boot.rs`). A kernel that never boots (bad config, wrong format) reddens.
+///
+/// # Errors
+/// Returns `Err` if the kernel never reaches userspace within the boot window (bad config / wrong format) or the console cannot be read.
 pub async fn kernel_banner<V: Vmm>(vm: &MicroVm<V>) -> Result<(), String> {
     let log = vm.instance().serial_log().to_path_buf();
     for _ in 0..150 {
@@ -65,6 +68,9 @@ pub async fn kernel_banner<V: Vmm>(vm: &MicroVm<V>) -> Result<(), String> {
 
 /// An exec round-trips: `echo` returns exit 0 with the expected stdout (← `boot.rs`). Proves the
 /// vsock control plane + PID-1 agent exec path end to end.
+///
+/// # Errors
+/// Returns `Err` if the exec fails, exits non-zero, or returns unexpected stdout.
 pub async fn agent_exec_roundtrip(agent: &mut AgentClient) -> Result<(), String> {
     let out = exec(agent, &["echo", "vmcell-validate-marker"]).await?;
     if out.code != 0 {
@@ -80,6 +86,9 @@ pub async fn agent_exec_roundtrip(agent: &mut AgentClient) -> Result<(), String>
 /// `put_file` then read the bytes back **in the guest** — a real round-trip, not a mock UDS
 /// assertion (← `exec_vsock.rs`; AGENTS.md "mock where round-trip is required"). Proves the
 /// PutFile protocol writes real guest files.
+///
+/// # Errors
+/// Returns `Err` if `put_file` fails or the bytes read back in-guest differ.
 pub async fn agent_put_file_roundtrip(agent: &mut AgentClient) -> Result<(), String> {
     let dst = "/run/vmcell-validate-putfile";
     let payload = b"vmcell-validate-putfile-payload-42";
@@ -103,6 +112,9 @@ pub async fn agent_put_file_roundtrip(agent: &mut AgentClient) -> Result<(), Str
 
 /// The rootfs ships glibc `libc.so.6` (← §5.4 libc6 scan; the dynamically-linked agent already
 /// proves it, but a custom rootfs is checked explicitly across the common multiarch paths).
+///
+/// # Errors
+/// Returns `Err` if `libc.so.6` is absent from every probed multiarch path (or the probe exec fails).
 pub async fn rootfs_libc6(agent: &mut AgentClient) -> Result<(), String> {
     let out = exec(
         agent,
@@ -121,6 +133,9 @@ pub async fn rootfs_libc6(agent: &mut AgentClient) -> Result<(), String> {
 }
 
 /// The injected deployment proxy CA is baked into the trust store (← §5.4 / §11 CA injection).
+///
+/// # Errors
+/// Returns `Err` if the injected proxy CA is not present in the guest trust store.
 pub async fn rootfs_ca_cert(agent: &mut AgentClient) -> Result<(), String> {
     let out = exec(
         agent,
@@ -142,6 +157,9 @@ pub async fn rootfs_ca_cert(agent: &mut AgentClient) -> Result<(), String> {
 
 /// The in-rootfs guest-tools multicall is present and its `ip`/`curl`/`kvm-ok` names resolve on
 /// the agent's exec PATH (← §5.3).
+///
+/// # Errors
+/// Returns `Err` if the guest-tools multicall or its `ip`/`curl`/`kvm-ok` names do not resolve on the exec PATH.
 pub async fn rootfs_guest_tools(agent: &mut AgentClient) -> Result<(), String> {
     let out = exec(
         agent,
@@ -160,6 +178,9 @@ pub async fn rootfs_guest_tools(agent: &mut AgentClient) -> Result<(), String> {
 
 /// The tmpfs overlay upper is writable over the read-only erofs base: write then read a file on
 /// the root fs (← §5.1). A read-only-only root (missing overlay/tmpfs) reddens.
+///
+/// # Errors
+/// Returns `Err` if the root fs is not writable (missing tmpfs overlay) or the write/read-back mismatches.
 pub async fn rootfs_overlay_writable(agent: &mut AgentClient) -> Result<(), String> {
     let out = exec(
         agent,
@@ -193,6 +214,9 @@ pub async fn rootfs_overlay_writable(agent: &mut AgentClient) -> Result<(), Stri
 /// carrying the **exact** `(vmid%254)+1` /30 address the orchestrator's `ip_math` expects (a
 /// kernel that configured a wrong/default address, or a cmdline/`ip_math` desync, reddens), and
 /// that a non-empty routing table exists (IP-PNP installs the default route).
+///
+/// # Errors
+/// Returns `Err` if `eth0` is not `state up`, carries the wrong address vs `ip_math`, or has no route.
 pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
     let (_, guest_ip, _) = vmcell::net::ip_math(vm.vmid())
         .map_err(|e| format!("ip_math({}) failed: {e}", vm.vmid()))?;
@@ -235,6 +259,9 @@ pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
 /// A read-only virtio-fs share rejects writes with EROFS and serves reads; a read-write share's
 /// writes are visible on the host (← `shares_ro_rw.rs`, §5.2). `in_marker` was written to the RO
 /// share host-side; `host_out_dir` is the RW share's host directory.
+///
+/// # Errors
+/// Returns `Err` if the RO share accepts a write (or fails reads) or the RW share's write is not visible host-side.
 pub async fn virtiofs_shares(
     agent: &mut AgentClient,
     host_out_dir: &std::path::Path,
@@ -275,6 +302,9 @@ pub async fn virtiofs_shares(
 
 /// With nested virt enabled, the guest sees `/dev/kvm` — `kvm-ok` exits 0 (← `nested_virt.rs`,
 /// §8.3). The VM must have been booted with `nested_virt = true`.
+///
+/// # Errors
+/// Returns `Err` if `/dev/kvm` is absent in the guest (`kvm-ok` non-zero) — e.g. the VM was not booted with `nested_virt`.
 pub async fn nested_kvm_ok(agent: &mut AgentClient) -> Result<(), String> {
     let out = exec(agent, &["kvm-ok"]).await?;
     if out.code != 0 {
@@ -288,6 +318,9 @@ pub async fn nested_kvm_ok(agent: &mut AgentClient) -> Result<(), String> {
 
 /// Per-VM cgroup usage is observable and honestly reports enforcement (← `metrics_limits.rs`,
 /// §7.1). Requires the memory controller delegated (the caller gates on that).
+///
+/// # Errors
+/// Returns `Err` if per-VM cgroup usage cannot be read or misreports enforcement.
 pub async fn metrics_usage_readable<V: Vmm>(vm: &MicroVm<V>) -> Result<(), String> {
     let usage = vm
         .usage()
@@ -311,6 +344,9 @@ pub async fn metrics_usage_readable<V: Vmm>(vm: &MicroVm<V>) -> Result<(), Strin
 /// Boots N VMs **concurrently** on shared allocators and asserts each gets a distinct
 /// vmid / guest-CID / vsock path and execs successfully (← `concurrency.rs`, §12.0). Catches an
 /// allocator that hands out duplicates under contention.
+///
+/// # Errors
+/// Returns `Err` if any concurrent VM fails to boot/exec or two VMs collide on vmid / guest-CID / vsock path.
 pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<(), String> {
     use vmcell::orchestrator::VmidAllocator;
     use vmcell::vmm::CidAllocator;
@@ -372,6 +408,9 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
 /// Snapshot a running VM and restore it, confirming the **restored** VM boots back to
 /// agent-ready and execs (← `snapshot_restore.rs`, §9/§12.4). Proves the artifact survives the
 /// PVH snapshot/restore path. The VM must be a snapshot-eligible config (no vhost-user device).
+///
+/// # Errors
+/// Returns `Err` if snapshot or restore fails, or the restored VM does not return to agent-ready and exec.
 pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<(), String> {
     use vmcell::orchestrator::VmidAllocator;
     use vmcell::vmm::CidAllocator;
@@ -429,6 +468,9 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
 /// A host cgroup memory cap below guest RAM is the binding limit: a runaway allocation trips the
 /// host OOM killer, observable via `memory.events` `oom_kill` (← `metrics_limits.rs`, §7). The VM
 /// must be booted with `mem_mib=512, limits.mem_max_mib=Some(256)`.
+///
+/// # Errors
+/// Returns `Err` if the capped allocation does not trip the host OOM killer (no `oom_kill` observed) or the metric cannot be read.
 pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
     let events_path = cgroup_events_path(vm.vmid());
     // Fire a runaway allocation; the VMM may itself be OOM-killed, so ignore the exec result —

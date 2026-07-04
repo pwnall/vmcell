@@ -1,0 +1,28 @@
+# cargo-fuzz crate for the guest/network decode surfaces (rubric B10). Deliberately EXCLUDED from
+# the root workspace (see `exclude = ["fuzz"]` in the top-level Cargo.toml): libfuzzer-sys links the
+# libFuzzer/sanitizer runtime and only builds under `cargo fuzz` on nightly, so it must never be
+# pulled into a stable `cargo build --workspace` / nextest / doc / hack run.
+[package]
+name = "vmcell-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The real wire type; path points at the repo's `crates/` layout (docs/51 wrote `../vmcell-protocol`,
+# aligned here to the actual member path).
+vmcell-protocol = { path = "../crates/vmcell-protocol" }
+# postcard is the actual decode surface (`vmcell-protocol` has no `decode_frame`; the doc's name was a
+# placeholder — the honest entry point is a framed postcard `Message`).
+postcard = { version = "1", features = ["use-std"] }
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false

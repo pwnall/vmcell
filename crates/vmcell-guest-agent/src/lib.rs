@@ -4,7 +4,31 @@
 //! and its unit tests — compile without any host async stack. The thin binary in
 //! `main.rs` drives a [`ReaperCoordinator`]; the host never links this code (it
 //! shares only the [`vmcell_protocol`] wire enum).
-#![deny(missing_docs)]
+//!
+//! No crate-level `forbid(unsafe_code)`: `netif` issues raw `ioctl`/socket syscalls for the
+//! post-restore MAC/loopback bring-up, so the unsafe surface is audited via
+//! `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn` instead.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::dbg_macro
+    )
+)]
 
 /// Minimal interface-configuration helpers (native MAC rotation) for the
 /// post-restore resync — libc-only, so the lean-agent graph stays host-stack-free.

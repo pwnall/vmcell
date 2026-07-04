@@ -4,7 +4,8 @@
 //! filesystem for the virtual machines from an **OCI registry pull** — the in-`vmcell`
 //! bootstrap rootfs source (host-native, no VM). The full-apt **`mmdebstrap`-inside-a-VM**
 //! source now lives in the separate `vmcell-rootfs-builder` crate (§5.4 / §8.2), which
-//! calls [`pack_erofs_with_injection`] and [`resolve_builder_base`] here so every rootfs
+//! calls [`pack_erofs_with_injection`](crate::artifact::rootfs::pack_erofs_with_injection) and
+//! [`resolve_builder_base`](crate::artifact::rootfs::resolve_builder_base) here so every rootfs
 //! source shares one inject/CA/erofs tail.
 
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};

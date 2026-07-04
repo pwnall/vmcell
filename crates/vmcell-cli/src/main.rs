@@ -1,3 +1,29 @@
+//! `vmcell` command-line entry point: the composition root that wires the `vmcell` library and the
+//! in-VM `vmcell-rootfs-builder` / `vmcell-kernel-builder` stages into runnable subcommands
+//! (`build`, `create`, …).
+//!
+//! `print_stdout`/`print_stderr` are intentionally NOT denied here — a CLI's whole job is to write
+//! results and diagnostics to stdout/stderr.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::dbg_macro
+    )
+)]
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -175,6 +201,9 @@ fn main() {
         .block_on(async_main());
     if let Err(e) = result {
         eprintln!("vmcell: {e}");
+        // allow(disallowed_methods): top-level bin exit AFTER the runtime future returned and its
+        // Drops ran — nothing left to unwind; a non-zero shell status is the required contract.
+        #[allow(clippy::disallowed_methods)]
         std::process::exit(1);
     }
 }
@@ -402,6 +431,9 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             vm.shutdown().await?;
             // The CLI propagates the guest command's exit code (§10.2). Teardown has
             // already run (shutdown consumed `vm`), so process::exit leaks nothing.
+            // allow(disallowed_methods): ordered teardown already completed above; exiting with
+            // the guest's own code is the documented CLI contract.
+            #[allow(clippy::disallowed_methods)]
             std::process::exit(outcome.code);
         }
         Commands::Create {

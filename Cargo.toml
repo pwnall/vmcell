@@ -19,6 +19,11 @@ members = [
     "crates/vmcell-artifact-validator",
 ]
 
+# The cargo-fuzz crate is NOT a workspace member: libfuzzer-sys only builds under `cargo fuzz` on
+# nightly, so keeping it out means `cargo build --workspace` / nextest / doc / hack (all stable, all
+# --locked) never try to compile it. The nightly `fuzz.yml` job drives it via `cargo fuzz` directly.
+exclude = ["fuzz"]
+
 # Carried patch: QEMU-unprivileged vhost-user only (relaxes a PROTOCOL_FEATURES check on
 # SET_VRING_ENABLE that QEMU sends before SET_FEATURES finalizes). Lives at the workspace root
 # (v15 §10.1) so it applies to every member that links vhost / vhost-user-backend.

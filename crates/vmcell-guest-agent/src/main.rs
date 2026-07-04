@@ -1,6 +1,29 @@
 //! Guest agent running as PID 1 inside the microvm.
-#![deny(missing_docs)]
-#![deny(clippy::missing_errors_doc)]
+//!
+//! No crate-level `forbid(unsafe_code)`: PID-1 setup issues raw mount/syscall FFI. The unsafe
+//! surface is audited via `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn`. The
+//! `unwrap_used`/`panic` bans are load-bearing here — a PID-1 panic aborts the whole guest.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::dbg_macro
+    )
+)]
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
 };
@@ -874,14 +897,16 @@ fn handle_exec(
     stream: &mut VsockStream,
     reaper: &Arc<ReaperCoordinator>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if req.argv.is_empty() {
+    // `split_first` is the non-panicking form of the "argv[0] is the program, argv[1..] the
+    // args" split, and folds in the empty-argv guard (indexing_slicing is denied in PID-1 code).
+    let Some((program, args)) = req.argv.split_first() else {
         let exit_msg = postcard::to_stdvec(&Message::Exit(1))?;
         send_framed(stream, &exit_msg)?;
         return Ok(());
-    }
+    };
 
-    let mut cmd = Command::new(&req.argv[0]);
-    cmd.args(&req.argv[1..]);
+    let mut cmd = Command::new(program);
+    cmd.args(args);
     // Run the child as its own process-group leader so the timeout path can
     // signal the whole group (`kill(-pgid)`), tearing down any subprocesses it
     // spawned rather than only the leader.
@@ -950,7 +975,10 @@ fn handle_exec(
                     match stdout.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let _ = tx_out.send(Message::Stdout(buf[..n].to_vec()));
+                            // `read` guarantees n <= buf.len(); `get(..n)` is the non-panicking
+                            // spelling of that (indexing_slicing is denied in PID-1 code).
+                            let chunk = buf.get(..n).unwrap_or_default().to_vec();
+                            let _ = tx_out.send(Message::Stdout(chunk));
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -964,7 +992,8 @@ fn handle_exec(
                     match stderr.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let _ = tx_err.send(Message::Stderr(buf[..n].to_vec()));
+                            let chunk = buf.get(..n).unwrap_or_default().to_vec();
+                            let _ = tx_err.send(Message::Stderr(chunk));
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,

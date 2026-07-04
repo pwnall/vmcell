@@ -152,7 +152,7 @@ pub async fn unix_api_request<T: Serialize>(
 /// triplicated per-backend create/own/delete.
 ///
 /// On [`Drop`] the directory and everything in it is removed via
-/// [`remove_vm_tmp_dir`] (idempotent), so creating the guard early also reclaims
+/// `remove_vm_tmp_dir` (idempotent, private), so creating the guard early also reclaims
 /// the directory if VM construction fails partway. `MicroVm` drops this guard
 /// **after** the VMM process group, the vhost-user daemons, and the smoltcp
 /// process are gone, so removal never races a process still holding a socket

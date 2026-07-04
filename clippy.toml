@@ -1,3 +1,8 @@
+# Declared MSRV. The EFFECTIVE build floor is 1.88 via the committed lockfile (time 0.3.47 pins
+# RUSTSEC-2026-0009); CI builds --locked on 1.88 (see the toolchain note in the design §10.5 and
+# AGENTS.md). This declared value keeps clippy's msrv-gated lints honest without lowering that floor.
+msrv = "1.85"
+
 # Tests may unwrap/expect/print/dbg; production code may not (see the not(test) deny-list in lib.rs).
 allow-unwrap-in-tests  = true
 allow-expect-in-tests  = true
@@ -11,6 +16,12 @@ disallowed-types = [
     { path = "std::collections::hash_map::RandomState", reason = "seeded per process — never for content-addressed keys (B4)" },
 ]
 
+# NOTE on `std::env::temp_dir` (docs/51 lists it as a candidate ban): NOT banned here on purpose.
+# The rubric (docs/50 B1) classifies bare-/tmp as `[BP]` with an explicit "dev-workstation scope is a
+# recorded trade, kept visible", and the repo uses `temp_dir` deliberately for the per-VM scratch base
+# (`VmTempDir::create`, `OrphanScanner::scan_scratch_dirs`). A hard ban would contradict that recorded
+# trade and bury ~10 intentional sites under per-site allows — the trade stays visible in code instead.
 disallowed-methods = [
     { path = "std::env::set_var", reason = "unsafe in 2024 and process-global; if truly needed, call before any threads start with a // SAFETY note" },
+    { path = "std::process::exit", reason = "skips Drop-based ordered teardown; return from main instead. The PID-1 guest agent must never exit at all (§12.6) — per-site allow with rationale if a bin truly requires it" },
 ]

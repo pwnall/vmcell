@@ -15,6 +15,28 @@
 //! Dispatch is busy-box style: when invoked through an `ip`/`curl`/`kvm-ok`
 //! symlink the command is taken from `argv[0]`; otherwise the first argument
 //! selects it (`vmcell-guest-tools <cmd> …`).
+//!
+//! `print_stdout`/`print_stderr` are intentionally NOT denied here — reproducing `ip`/`curl`/`kvm-ok`
+//! output on stdout/stderr is the whole point of the tool.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::dbg_macro
+    )
+)]
 
 use std::io::Write;
 use std::time::Duration;
@@ -26,12 +48,15 @@ fn main() {
     // `argv[0]` selects the command when invoked via a symlink; otherwise fall
     // back to `vmcell-guest-tools <cmd> …`.
     let (cmd, rest): (String, &[String]) = if is_known(&prog) {
-        (prog, &args[1..])
+        (prog, args.get(1..).unwrap_or(&[]))
     } else {
         match args.get(1) {
-            Some(c) => (c.clone(), &args[2..]),
+            Some(c) => (c.clone(), args.get(2..).unwrap_or(&[])),
             None => {
                 eprintln!("usage: vmcell-guest-tools <ip|curl|kvm-ok> [args…]");
+                // allow(disallowed_methods): a busy-box multicall helper relays its status as the
+                // process exit code; nothing is owned to unwind here (usage error before any work).
+                #[allow(clippy::disallowed_methods)]
                 std::process::exit(2);
             }
         }
@@ -46,6 +71,9 @@ fn main() {
             2
         }
     };
+    // allow(disallowed_methods): the multicall helper's whole contract is to relay the selected
+    // sub-tool's exit code as its own process status; there is no owned host state to unwind.
+    #[allow(clippy::disallowed_methods)]
     std::process::exit(code);
 }
 
@@ -86,7 +114,7 @@ fn run_kvm_ok() -> i32 {
 
 fn run_ip(args: &[String]) -> i32 {
     match args.first().map(String::as_str).unwrap_or("addr") {
-        "link" | "l" => run_ip_link(&args[1..]),
+        "link" | "l" => run_ip_link(args.get(1..).unwrap_or(&[])),
         "addr" | "a" | "address" => {
             // Read form (`ip addr`) lists interfaces; write forms
             // (`add`/`flush`/`del`/…) are accepted as no-ops so the orchestrator's
@@ -135,7 +163,7 @@ fn run_ip_link(args: &[String]) -> i32 {
     let mut dev: Option<String> = None;
     let mut mac: Option<String> = None;
     let mut up: Option<bool> = None;
-    let mut it = args[1..].iter();
+    let mut it = args.get(1..).unwrap_or(&[]).iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "dev" => dev = it.next().cloned(),
@@ -273,10 +301,9 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let mut out = [0u8; 6];
     let mut n = 0;
     for part in s.trim().split(':') {
-        if n >= 6 {
-            return None;
-        }
-        out[n] = u8::from_str_radix(part, 16).ok()?;
+        // `get_mut` folds in the ">6 octets → reject" guard without indexing (denied crate-wide).
+        let slot = out.get_mut(n)?;
+        *slot = u8::from_str_radix(part, 16).ok()?;
         n += 1;
     }
     if n == 6 { Some(out) } else { None }
@@ -604,7 +631,7 @@ fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verb
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
+                buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
                 if buf.len() > 64 * 1024 {
                     break;
                 }
@@ -618,7 +645,10 @@ fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verb
     // Split status line + headers from the body on the first blank line.
     let split = buf.windows(4).position(|w| w == b"\r\n\r\n");
     let (head, body): (&[u8], &[u8]) = match split {
-        Some(i) => (&buf[..i], &buf[i + 4..]),
+        Some(i) => (
+            buf.get(..i).unwrap_or_default(),
+            buf.get(i + 4..).unwrap_or_default(),
+        ),
         None => (&buf[..], &[]),
     };
     let head_str = String::from_utf8_lossy(head);

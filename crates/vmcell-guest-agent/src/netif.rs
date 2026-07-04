@@ -109,7 +109,7 @@ fn set_link_up(fd: libc::c_int, dev: &str, up: bool) -> std::io::Result<()> {
 /// Brings the loopback interface (`lo`) administratively up via `SIOCSIFFLAGS`,
 /// without spawning `ip`.
 ///
-/// Reuses the audited 40-byte [`IfReq`] and [`set_link_up`] path
+/// Reuses the audited 40-byte `IfReq` and `set_link_up` path
 /// (C-GUEST-1/M-GUEST-5): the previous inline loopback bring-up in `main` declared
 /// its own **18-byte** `ifreq`, but `SIOCG/SIOCSIFFLAGS` `copy_{from,to}_user` the
 /// kernel's **40-byte** `struct ifreq` — a 22-byte out-of-bounds read/write onto
@@ -212,6 +212,9 @@ fn sockaddr_in_v4(addr: [u8; 4]) -> libc::sockaddr {
     // we write only the `sockaddr_in` fields through the aliasing pointer.
     let mut sa: libc::sockaddr = unsafe { std::mem::zeroed() };
     let sin = std::ptr::addr_of_mut!(sa) as *mut libc::sockaddr_in;
+    // SAFETY: `sin` points at the stack-owned `sa`, which is valid and correctly aligned for
+    // `sockaddr_in` (it shares `sockaddr`'s alignment and is no larger); we only write initialized
+    // scalar fields through it, never read uninitialized memory.
     unsafe {
         (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
         (*sin).sin_port = 0;
@@ -242,6 +245,8 @@ fn replace_default_route(fd: libc::c_int, gateway: [u8; 4]) -> std::io::Result<(
         .map(|s| parse_default_gateways(&s))
         .unwrap_or_default();
     for old_gw in existing {
+        // SAFETY: `rtentry` is a C POD struct whose all-zero bit pattern is a valid, fully
+        // initialized value; every field is overwritten below before the ioctl reads it.
         let mut del: libc::rtentry = unsafe { std::mem::zeroed() };
         del.rt_dst = sockaddr_in_v4([0, 0, 0, 0]);
         del.rt_genmask = sockaddr_in_v4([0, 0, 0, 0]);
@@ -253,6 +258,8 @@ fn replace_default_route(fd: libc::c_int, gateway: [u8; 4]) -> std::io::Result<(
             libc::ioctl(fd, SIOCDELRT, &del);
         }
     }
+    // SAFETY: `rtentry` is a C POD struct whose all-zero bit pattern is a valid, fully
+    // initialized value; every field is overwritten below before the ioctl reads it.
     let mut add: libc::rtentry = unsafe { std::mem::zeroed() };
     add.rt_dst = sockaddr_in_v4([0, 0, 0, 0]);
     add.rt_genmask = sockaddr_in_v4([0, 0, 0, 0]);

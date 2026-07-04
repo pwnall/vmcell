@@ -18,6 +18,27 @@
 //! masquerade) — a build-time developer/CI operation where `CAP_NET_ADMIN` is acceptable
 //! (v20 §16). apt still performs the full in-guest gpg chain verification against the base
 //! image's `debian-archive-keyring`.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::dbg_macro
+    )
+)]
 
 use std::path::Path;
 use std::sync::Arc;

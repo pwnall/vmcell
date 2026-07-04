@@ -1,0 +1,42 @@
+name: fuzz-nightly
+
+# Non-blocking by construction: it is scheduled (gates no PR), but a red run is visible on the
+# Actions tab and any crash uploads its reproducer. Covers the rubric B10 decode surfaces — today
+# the framed postcard `Message` decoder (fuzz/fuzz_targets/protocol_decode.rs); add a target per new
+# parser guest or network bytes reach (CH REST/chunked response, OCI/tar layer ingest).
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-fuzz" }
+
+      - name: run all fuzz targets (5 min each)
+        run: |
+          for t in $(cargo fuzz list); do
+            echo "::group::cargo fuzz run $t"
+            cargo fuzz run "$t" -- -max_total_time=300
+            echo "::endgroup::"
+          done
+
+      - name: upload crash reproducers
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/

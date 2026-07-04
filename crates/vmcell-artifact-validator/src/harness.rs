@@ -10,6 +10,9 @@ use vmcell::{MicroVm, VmConfig, Vmm};
 
 /// The built `vmlinux` artifact path (`VMCELL_KERNEL` or `target/vmcell-artifacts/vmlinux`),
 /// asserting it exists — the tests' known-good kernel.
+///
+/// # Panics
+/// Panics if the resolved `vmlinux` artifact does not exist (build it first: `vmcell build`).
 #[must_use]
 pub fn get_vmlinux() -> PathBuf {
     let p = vmcell::artifact::kernel_path();
@@ -18,6 +21,9 @@ pub fn get_vmlinux() -> PathBuf {
 }
 
 /// The built erofs rootfs artifact path (`VMCELL_ROOTFS` or the default), asserting it exists.
+///
+/// # Panics
+/// Panics if the resolved rootfs artifact does not exist (build it first: `vmcell build`).
 #[must_use]
 pub fn get_rootfs() -> PathBuf {
     let p = vmcell::artifact::rootfs_path();

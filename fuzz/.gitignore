@@ -1,0 +1,5 @@
+# cargo-fuzz working state — build output, evolving corpus, and crash reproducers are all local.
+/target
+/corpus
+/artifacts
+/coverage
