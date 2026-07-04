@@ -200,6 +200,15 @@ fn print_links() {
         if !mac.is_empty() {
             println!("    link/ether {mac}");
         }
+        // The IPv4 address the kernel configured (via IP-PNP `ip=` for eth0) — read over the
+        // SIOCGIFADDR ioctl, so `ip a` reports the actual `inet` line like real `ip`. Absent on
+        // an unconfigured interface (e.g. a down link), in which case no line is printed.
+        if let Some((addr, prefix)) = read_ipv4(name) {
+            println!(
+                "    inet {}.{}.{}.{}/{}",
+                addr[0], addr[1], addr[2], addr[3], prefix
+            );
+        }
     }
 }
 
@@ -227,6 +236,8 @@ fn read_trim(path: &str) -> Option<String> {
 
 const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
 const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+const SIOCGIFADDR: libc::c_ulong = 0x8915;
+const SIOCGIFNETMASK: libc::c_ulong = 0x891b;
 const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
 const ARPHRD_ETHER: u16 = 1;
 const IFF_UP: i16 = 0x1;
@@ -312,6 +323,49 @@ fn hwaddr_ifreq(dev: &str, mac: [u8; 6]) -> Result<IfReq, String> {
     ifr.ifru[0..2].copy_from_slice(&ARPHRD_ETHER.to_ne_bytes());
     ifr.ifru[2..8].copy_from_slice(&mac);
     Ok(ifr)
+}
+
+/// Extracts the four IPv4 address bytes from an `ifreq` union filled by `SIOCGIFADDR`/
+/// `SIOCGIFNETMASK`: the union holds a `sockaddr_in` (`sin_family` u16 @0, `sin_port` u16 @2,
+/// `sin_addr` @4). Split out so the offset is unit-testable without a live interface (M-GUEST-3,
+/// mirroring `hwaddr_ifreq`).
+fn ipv4_from_ifru(ifru: &[u8; 24]) -> [u8; 4] {
+    [ifru[4], ifru[5], ifru[6], ifru[7]]
+}
+
+/// The CIDR prefix length of a contiguous IPv4 netmask (e.g. `255.255.255.252` → `30`).
+fn netmask_to_prefix(mask: [u8; 4]) -> u8 {
+    u32::from_be_bytes(mask).count_ones() as u8
+}
+
+/// Reads an interface's IPv4 address (`SIOCGIFADDR`) and netmask prefix (`SIOCGIFNETMASK`) via
+/// ioctls on an `AF_INET` socket — the same dependency-free path the MAC ioctls use (no netlink).
+/// Returns `None` when the interface has no IPv4 address (e.g. `lo` before configuration, or a
+/// down link), which the `SIOCGIFADDR` ioctl reports as `EADDRNOTAVAIL`.
+fn read_ipv4(dev: &str) -> Option<([u8; 4], u8)> {
+    let fd = open_inet_socket().ok()?;
+    let res = (|| {
+        let mut ifr = IfReq::new(dev).ok()?;
+        // SAFETY: `ifr` is a correctly sized `struct ifreq`; SIOCGIFADDR reads the name and
+        // writes the `ifr_addr` sockaddr into the union bytes.
+        if unsafe { libc::ioctl(fd, SIOCGIFADDR, &mut ifr) } < 0 {
+            return None;
+        }
+        let addr = ipv4_from_ifru(&ifr.ifru);
+        let mut mask_ifr = IfReq::new(dev).ok()?;
+        // SAFETY: same struct shape; SIOCGIFNETMASK writes `ifr_netmask` (a sockaddr).
+        let prefix = if unsafe { libc::ioctl(fd, SIOCGIFNETMASK, &mut mask_ifr) } < 0 {
+            32
+        } else {
+            netmask_to_prefix(ipv4_from_ifru(&mask_ifr.ifru))
+        };
+        Some((addr, prefix))
+    })();
+    // SAFETY: `fd` is the socket we opened and no longer use.
+    unsafe {
+        libc::close(fd);
+    }
+    res
 }
 
 fn set_mac(dev: &str, mac_str: &str) -> Result<(), String> {
@@ -732,6 +786,27 @@ mod tests {
             &mac,
             "MAC must be at the hwaddr data offset"
         );
+    }
+
+    // Pins the `sockaddr_in` offset SIOCGIFADDR/SIOCGIFNETMASK fill: sin_family (2) + sin_port
+    // (2) then the 4 address bytes at offset 4. A wrong offset would read port/family bytes as
+    // the address and print a garbage `inet` line. Inverse: shift the slice and this reddens.
+    #[test]
+    fn ipv4_from_ifru_reads_sin_addr_at_offset_4() {
+        let mut ifru = [0u8; 24];
+        ifru[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes()); // sin_family
+        ifru[2..4].copy_from_slice(&0u16.to_ne_bytes()); // sin_port
+        ifru[4..8].copy_from_slice(&[10, 200, 23, 2]); // sin_addr
+        assert_eq!(ipv4_from_ifru(&ifru), [10, 200, 23, 2]);
+    }
+
+    // A contiguous netmask maps to its CIDR prefix (the /30 the design's per-VM subnet uses).
+    #[test]
+    fn netmask_to_prefix_counts_bits() {
+        assert_eq!(netmask_to_prefix([255, 255, 255, 252]), 30);
+        assert_eq!(netmask_to_prefix([255, 255, 255, 255]), 32);
+        assert_eq!(netmask_to_prefix([255, 255, 255, 0]), 24);
+        assert_eq!(netmask_to_prefix([0, 0, 0, 0]), 0);
     }
 
     // A device name too long for IFNAMSIZ is rejected (not silently truncated),

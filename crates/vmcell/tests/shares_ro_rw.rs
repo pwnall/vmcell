@@ -1,5 +1,4 @@
 use vmcell::config::{Access, CachePolicy, RootfsSource, Share, VmConfig};
-use vmcell::vmm::VmInstance;
 
 mod common;
 
@@ -55,107 +54,45 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
     std::fs::create_dir_all(&in_dir).unwrap();
     std::fs::create_dir_all(&out_dir).unwrap();
 
+    // Seed the read-only share with the exact content the shared `checks::virtiofs_shares`
+    // expects (v20 §5.2); the RO-read / RO-write-EROFS / RW-visible contract lives in that one
+    // extracted function the validator also runs.
     std::fs::write(in_dir.join("input.txt"), "hello world").unwrap();
 
-    let vmlinux = common::get_vmlinux();
-    let rootfs = common::get_rootfs();
-
-    let _cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
-        .with_share(Share::new(
-            "vmcell-in",
-            &in_dir,
-            Access::ReadOnly,
-            CachePolicy::Never,
-        ))
-        .with_share(Share::new(
-            "vmcell-out",
-            &out_dir,
-            Access::ReadWrite,
-            CachePolicy::Never,
-        ))
-        .network_disabled()
-        .build()
-        .unwrap();
-
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = vmcell::MicroVm::start(
-        backend,
-        _cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
-
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    let mut client = vmcell::agent::AgentClient::connect(
-        vm.instance().vsock_path(),
-        5000,
-        std::time::Duration::from_secs(10),
-        &vmcell::config::Timeouts::default(),
-        &vmcell::vmm::RealSerialLog {
-            path: vm.instance().serial_log().to_path_buf(),
+    let cfg = VmConfig::builder(
+        common::get_vmlinux(),
+        RootfsSource::Erofs {
+            image: common::get_rootfs(),
         },
     )
-    .await
-    .expect("Failed to connect to agent");
+    .with_share(Share::new(
+        "vmcell-in",
+        &in_dir,
+        Access::ReadOnly,
+        CachePolicy::Never,
+    ))
+    .with_share(Share::new(
+        "vmcell-out",
+        &out_dir,
+        Access::ReadWrite,
+        CachePolicy::Never,
+    ))
+    .network_disabled()
+    .build()
+    .unwrap();
 
-    // Verify read from RO share
-    let res = client
-        .exec(vmcell::agent::protocol::ExecRequest::new(vec![
-            "cat".into(),
-            "/vmcell-in/input.txt".into(),
-        ]))
+    let mut vm = common::start_vm(backend, cfg).await;
+    let agent = vm
+        .agent(
+            Some(std::time::Duration::from_secs(60)),
+            &vmcell::orchestrator::RealClock,
+        )
         .await
-        .expect("Exec failed");
-    if res.code != 0 {
-        let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
-        panic!(
-            "cat failed: {}\nSerial log: {}",
-            String::from_utf8_lossy(&res.stderr),
-            log
-        );
-    }
-    assert_eq!(res.stdout, b"hello world");
+        .expect("Failed to connect to agent");
 
-    // Verify write to RO share fails
-    let res = client
-        .exec(vmcell::agent::protocol::ExecRequest::new(vec![
-            "sh".into(),
-            "-c".into(),
-            "echo fail > /vmcell-in/test.txt".into(),
-        ]))
+    vmcell_artifact_validator::checks::virtiofs_shares(agent, &out_dir)
         .await
-        .expect("Exec failed");
-    assert_ne!(res.code, 0, "write to RO share should fail");
-    // L-TEST-1: assert the SPECIFIC EROFS signal, not merely any nonzero exit. The
-    // successful `cat` above proves the share is mounted, so a share mistakenly
-    // mounted rw would let the write succeed (code 0) and redden the assert_ne. But
-    // a bare nonzero also accepts EACCES / a transient shell error; the named
-    // contract is "virtiofsd enforces read_only", so pin the exact "Read-only file
-    // system" (EROFS) message. Inverse: mount the RO share rw and this goes red.
-    assert!(
-        String::from_utf8_lossy(&res.stderr).contains("Read-only file system"),
-        "write to RO share must fail with EROFS (Read-only file system), got: {}",
-        String::from_utf8_lossy(&res.stderr)
-    );
-
-    // Verify write to RW share succeeds
-    let res = client
-        .exec(vmcell::agent::protocol::ExecRequest::new(vec![
-            "sh".into(),
-            "-c".into(),
-            "echo success > /vmcell-out/output.txt".into(),
-        ]))
-        .await
-        .expect("Exec failed");
-    assert_eq!(res.code, 0);
-
-    let output = std::fs::read_to_string(out_dir.join("output.txt")).unwrap();
-    assert_eq!(output, "success\n");
+        .expect("virtio-fs RO/RW share contract");
 
     vmcell::vmm::VmInstance::kill(vm.instance_mut())
         .await

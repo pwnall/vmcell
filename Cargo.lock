@@ -5789,11 +5789,24 @@ dependencies = [
  "virtio-bindings",
  "virtio-queue",
  "vm-memory",
+ "vmcell-artifact-validator",
  "vmcell-protocol",
  "vmm-sys-util",
  "walkdir",
  "which",
  "zstd",
+]
+
+[[package]]
+name = "vmcell-artifact-validator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures 0.3.32",
+ "tempfile",
+ "tokio 1.52.3",
+ "tracing",
+ "vmcell",
 ]
 
 [[package]]

@@ -15,18 +15,6 @@ vmm_matrix_test!(metrics_limits, |vmm| {
 // itself uses. The former line-for-line `vm_cgroup_name` duplicate here is deleted
 // so a future naming change lives in exactly one place and cannot drift silently.
 
-/// Parses the `oom_kill` counter out of a cgroup-v2 `memory.events` file
-/// (`key value` lines). Returns `None` when the line is absent.
-fn parse_memory_events_oom_kill(contents: &str) -> Option<u64> {
-    for line in contents.lines() {
-        let mut it = line.split_whitespace();
-        if it.next() == Some("oom_kill") {
-            return it.next().and_then(|v| v.parse::<u64>().ok());
-        }
-    }
-    None
-}
-
 async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let kernel = common::get_vmlinux();
     let rootfs_image = common::get_rootfs();
@@ -181,48 +169,13 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         elapsed
     );
 
-    // Test OOM-kill (TESTS-FEATURES-1). memory.max is 256 MiB while guest RAM is 512 MiB, so
-    // the cgroup is the BINDING limit: a runaway allocation trips the HOST cgroup OOM killer,
-    // observable via memory.events.oom_kill regardless of any in-guest exit code. A no-op host
-    // memory limit (or a guest-RAM-bound OOM) leaves oom_kill at 0 and fails the assertion.
-    let oom_exec = vm
-        .agent(None, &vmcell::orchestrator::RealClock)
+    // Test OOM-kill (TESTS-FEATURES-1): the host cgroup cap (256 MiB) is the binding limit
+    // below the 512 MiB guest RAM, so a runaway allocation trips the HOST OOM killer
+    // (memory.events oom_kill). This is the extracted `checks::metrics_mem_limit_ooms` the
+    // validator runs (v20 §7) — one implementation of the OOM-observation.
+    vmcell_artifact_validator::checks::metrics_mem_limit_ooms(&mut vm)
         .await
-        .unwrap()
-        .exec(vmcell::agent::protocol::ExecRequest::new(vec![
-            "tail".into(),
-            "/dev/zero".into(),
-        ]))
-        .await;
-    // The VMM process itself may be the task the cgroup OOM-kills, so the exec may return
-    // SIGKILL (137) or fail outright — either is acceptable; the binding signal is the host
-    // cgroup counter polled below, not the in-guest exit code.
-    match &oom_exec {
-        Ok(o) => println!("memory bloat exec exit code: {}", o.code),
-        Err(e) => println!("memory bloat exec failed (VMM likely OOM-killed): {e}"),
-    }
-
-    // Poll memory.events for the host-observable OOM (the counter can lag the kill slightly).
-    let events_path = format!("{}/memory.events", cg_base);
-    let mut oom_kill = 0u64;
-    for _ in 0..50 {
-        if let Ok(events) = std::fs::read_to_string(&events_path) {
-            if let Some(n) = parse_memory_events_oom_kill(&events) {
-                oom_kill = n;
-                if oom_kill > 0 {
-                    break;
-                }
-            }
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        oom_kill > 0,
-        "cgroup memory.max (256 MiB) must be the BINDING limit: expected memory.events \
-         oom_kill > 0 at {}, got {}",
-        events_path,
-        oom_kill
-    );
+        .expect("host cgroup memory cap must be the binding OOM limit");
 
     // The VMM may already be dead (OOM-killed); tolerate a failed shutdown — Drop still tears
     // down the slice, netns and sockets. We only care that the OOM signal was observed.

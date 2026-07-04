@@ -1,78 +1,44 @@
-use vmcell::MicroVm;
+use std::time::Duration;
 use vmcell::config::{RootfsSource, VmConfig};
-use vmcell::vmm::VmInstance;
+use vmcell::orchestrator::RealClock;
+use vmcell_artifact_validator::checks;
 
 mod common;
 
+// The boot contract (kernel banner → agent-ready → exec round-trip) is the extracted
+// `checks::*` the artifact validator runs; this test drives them on the built artifacts so a
+// regression in either reddens here AND in the validator (single source of truth, v20 §8.5).
 vmm_matrix_test!(boot, |vmm| {
     test_boot_impl(&vmm).await;
 });
 
 async fn test_boot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
-    let vmlinux = common::get_vmlinux();
-    let rootfs = common::get_rootfs();
-
-    let cfg = VmConfig::builder(vmlinux, RootfsSource::Erofs { image: rootfs })
-        .network_disabled()
-        .build()
-        .unwrap();
-
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
+    let cfg = VmConfig::builder(
+        common::get_vmlinux(),
+        RootfsSource::Erofs {
+            image: common::get_rootfs(),
+        },
     )
-    .await
-    .expect("Failed to start VM");
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
-    println!("SERIAL LOG:\n{}", log);
+    .network_disabled()
+    .build()
+    .unwrap();
 
-    let serial_log = vm.instance().serial_log().to_path_buf();
+    let mut vm = common::start_vm(vmm, cfg).await;
 
-    let mut booted = false;
-    for _ in 0..100 {
-        if serial_log.exists() {
-            let log_content = tokio::fs::read_to_string(&serial_log)
-                .await
-                .unwrap_or_default();
-            if log_content.contains("Linux version") {
-                booted = true;
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    assert!(booted, "VM failed to boot (did not see expected log line)");
+    checks::kernel_banner(&vm)
+        .await
+        .expect("kernel must print the Linux banner");
 
     let agent = vm
-        .agent(
-            Some(std::time::Duration::from_secs(60)),
-            &vmcell::orchestrator::RealClock,
-        )
+        .agent(Some(Duration::from_secs(60)), &RealClock)
         .await
-        .expect("Failed to connect to agent");
-
-    let outcome = agent
-        .exec(vmcell::agent::ExecRequest::new(vec![
-            "echo".to_string(),
-            "hello from guest".to_string(),
-        ]))
+        .expect("agent must reach ready");
+    checks::agent_exec_roundtrip(agent)
         .await
-        .expect("exec failed");
-
-    assert_eq!(outcome.code, 0, "exec returned non-zero code");
-    let stdout = String::from_utf8_lossy(&outcome.stdout);
-    assert!(
-        stdout.contains("hello from guest"),
-        "expected stdout to contain 'hello from guest', got: {}",
-        stdout
-    );
+        .expect("exec must round-trip");
+    checks::agent_put_file_roundtrip(agent)
+        .await
+        .expect("put_file must round-trip");
 
     vm.shutdown().await.expect("Failed to shutdown VM");
 }

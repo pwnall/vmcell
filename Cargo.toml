@@ -13,6 +13,10 @@ members = [
     "crates/vmcell-rootfs-builder",
     "crates/vmcell-kernel-builder",
     "crates/vmcell-cli",
+    # Boots test micro-VMs to validate a candidate kernel+rootfs pair against the whole
+    # artifact↔system contract (§5.4/§8.5/§12); depends on `vmcell`, reuses its integration
+    # checks. `vmcell`'s tests dev-depend on it (a permitted dev-dep cycle).
+    "crates/vmcell-artifact-validator",
 ]
 
 # Carried patch: QEMU-unprivileged vhost-user only (relaxes a PROTOCOL_FEATURES check on

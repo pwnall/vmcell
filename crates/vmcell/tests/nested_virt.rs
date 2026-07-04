@@ -112,19 +112,11 @@ async fn test_nested_virt_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         }
     };
 
-    // Check if nested virtualization is available inside the VM
-    let result = agent
-        .exec(ExecRequest::new(vec!["kvm-ok".to_string()]))
+    // The positive nested-virt contract is the extracted `checks::nested_kvm_ok` the validator
+    // runs (v20 §8.5); driving it here keeps one implementation.
+    vmcell_artifact_validator::checks::nested_kvm_ok(agent)
         .await
-        .expect("Failed to run kvm-ok");
-
-    println!("kvm-ok stdout: {}", String::from_utf8_lossy(&result.stdout));
-    println!("kvm-ok stderr: {}", String::from_utf8_lossy(&result.stderr));
-
-    assert_eq!(
-        result.code, 0,
-        "kvm-ok returned non-zero code, meaning nested virt is unavailable"
-    );
+        .expect("nested /dev/kvm must be exposed with nested_virt = true");
 
     vm.shutdown().await.expect("Failed to shutdown VM");
 }

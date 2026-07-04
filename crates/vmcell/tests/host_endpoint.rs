@@ -77,47 +77,19 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+    // The IP-PNP contract (guest eth0 carries its (vmid%254)+1 /30 address, zero-netlink, via
+    // the `ip=` cmdline) is the extracted `checks::net_ip_pnp` the validator runs (v20 §8.3/§12.3).
+    vmcell_artifact_validator::checks::net_ip_pnp(&mut vm)
+        .await
+        .expect("guest IP-PNP must configure eth0");
+
+    // Give network time to settle, then exercise the NAT host-service forward (a vmcell
+    // networking feature, not an artifact property — kept inline here).
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let agent = vm
         .agent(None, &vmcell::orchestrator::RealClock)
         .await
         .expect("Failed to connect to agent");
-
-    // Give network time to come up in guest
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    let ip_a = agent
-        .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
-        .await
-        .unwrap();
-    assert_eq!(
-        ip_a.code,
-        0,
-        "ip a failed: {:?}",
-        String::from_utf8_lossy(&ip_a.stderr)
-    );
-    println!("Guest IP A:\n{}", String::from_utf8_lossy(&ip_a.stdout));
-    let ip_r = agent
-        .exec(ExecRequest::new(vec!["ip".into(), "route".into()]))
-        .await
-        .unwrap();
-    assert_eq!(
-        ip_r.code,
-        0,
-        "ip route failed: {:?}",
-        String::from_utf8_lossy(&ip_r.stderr)
-    );
-    println!("Guest IP Route:\n{}", String::from_utf8_lossy(&ip_r.stdout));
-    let ip_n = agent
-        .exec(ExecRequest::new(vec!["ip".into(), "neigh".into()]))
-        .await
-        .unwrap();
-    assert_eq!(
-        ip_n.code,
-        0,
-        "ip neigh failed: {:?}",
-        String::from_utf8_lossy(&ip_n.stderr)
-    );
-    println!("Guest IP Neigh:\n{}", String::from_utf8_lossy(&ip_n.stdout));
 
     let outcome = agent
         .exec(ExecRequest::new(vec![
