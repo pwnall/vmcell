@@ -1,7 +1,7 @@
 # AGENTS.md — vmcell
 
 Deploy at the repository root as `AGENTS.md`. Terse by design; the reasoning lives in
-`docs/48-claude-code-review-rubric.md` (rubric) and `docs/47-claude-design-v18.md` (design). (`9` represents an arbitrary digit, use the latest version you find)
+`docs/48-claude-code-review-rubric.md` (rubric) and `docs/47-claude-design-v18.md` (design).
 
 ## What this is
 
@@ -17,9 +17,9 @@ only snapshot-eligible mode).
 - `implementation-notes.md` — recorded, justified deviations. Do not "fix" entries listed there;
   record new justified deviations there instead of silently diverging. Retire an entry when it is
   empirically disproven.
-- `docs/99-claude-code-review-rubric.md` — every rule below is expanded there with its defect history.
-- `docs/benchmark-results.md` — measured perf levers. Do not re-derive refuted levers.
-- `docs/99-claude-design-v99.md` — architecture; pary particular attention to lists cross-cutting invariants with owners.
+- `docs/48-claude-code-review-rubric.md` — every rule below is expanded there with its defect history.
+- `docs/45-*.md` + `docs/benchmark-results.md` — measured perf levers. Do not re-derive refuted levers.
+- `docs/47-claude-design-v18.md` — architecture; §12 lists cross-cutting invariants with owners.
 
 ## Non-negotiable rules
 
