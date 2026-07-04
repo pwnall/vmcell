@@ -848,7 +848,16 @@ impl<V: Vmm> MicroVm<V> {
         })
     }
 
-    /// Restores a VM from a snapshot directory with the given configuration.
+    /// Restores a single VM from a snapshot directory with the given configuration.
+    ///
+    /// This is the **single-use** restore path: it hands the backend the caller's
+    /// `snapshot_dir` directly, and the CH backend rewrites that dir's
+    /// `config.json` in place (FC reads its per-dir sidecar), so restoring more
+    /// than one VM from one dir — or restoring concurrently — races and corrupts
+    /// it (§9.1). To mint *many* identical VMs from one suspend image without that
+    /// hazard, capture a [`Zygote`](crate::Zygote) and use its copy-on-write
+    /// fan-out (or [`MicroVm::restore_cow`] for a single CoW clone), which restores
+    /// each clone from its own private copy and leaves the master untouched (§9.4).
     ///
     /// # Errors
     /// Returns an error if network setup, proxy start, or VM restore fails.
@@ -878,6 +887,63 @@ impl<V: Vmm> MicroVm<V> {
         vmid_alloc: VmidAllocator,
         cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
     ) -> Result<Self> {
+        Self::restore_inner(
+            vmm,
+            snapshot_dir,
+            cfg,
+            cid_alloc,
+            vmid_alloc,
+            cgroup_fs,
+            false,
+        )
+        .await
+        .map(|(vm, _cow)| vm)
+    }
+
+    /// Restores one clone from a zygote suspend image, copy-on-write-copying the
+    /// suspend data into this clone's own scratch dir **before** restore so the
+    /// master image is never mutated and concurrent clones never race on the
+    /// backend's in-place `config.json` rewrite (§9.4). Returns the clone and
+    /// whether the copy used a block-level reflink or a full byte copy
+    /// ([`CowSupport`](crate::CowSupport)).
+    ///
+    /// This is the low-level primitive behind [`Zygote::spawn_clone`]; most
+    /// callers want [`Zygote`](crate::Zygote), which owns the immutable master and
+    /// gates concurrent fan-out on the backend capability. A single CoW clone
+    /// works on any snapshot backend; concurrent fan-out needs
+    /// `capabilities().restore_rotates_host_paths` (§3.3) — enforced by
+    /// [`Zygote::spawn_clones`], not here.
+    ///
+    /// # Errors
+    /// Returns an error if the copy-on-write copy, network setup, proxy start, or
+    /// VM restore fails. The eligibility re-checks of [`MicroVm::restore`] apply
+    /// identically (a clone with a vhost-user device is [`Error::Unsupported`]).
+    pub async fn restore_cow(
+        vmm: &V,
+        zygote_dir: &std::path::Path,
+        cfg: VmConfig,
+        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
+        vmid_alloc: VmidAllocator,
+        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
+    ) -> Result<(Self, crate::reflink::CowSupport)> {
+        Self::restore_inner(vmm, zygote_dir, cfg, cid_alloc, vmid_alloc, cgroup_fs, true).await
+    }
+
+    /// Shared body of [`MicroVm::restore`] (single-use, `cow = false`) and
+    /// [`MicroVm::restore_cow`] (`cow = true`). When `cow`, the snapshot dir is
+    /// reflink-copied into this VM's scratch dir first and the backend restores
+    /// from that private copy; otherwise the caller's dir is used directly. The
+    /// returned [`CowSupport`](crate::reflink::CowSupport) is only meaningful when
+    /// `cow` (the single-use path returns `FullCopy` as an ignored placeholder).
+    async fn restore_inner(
+        vmm: &V,
+        snapshot_dir: &std::path::Path,
+        cfg: VmConfig,
+        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
+        vmid_alloc: VmidAllocator,
+        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
+        cow: bool,
+    ) -> Result<(Self, crate::reflink::CowSupport)> {
         // §3.3 boundary 2 (ORCH-4): the restore-path re-check of the
         // snapshot-eligibility law returns `Error::Unsupported { vmm, feature }`
         // (a capability rejection a caller can match on), NOT the generic
@@ -918,6 +984,30 @@ impl<V: Vmm> MicroVm<V> {
         };
         // Create the single owned per-VM scratch dir EARLY (see `start()`).
         let tmp_dir = crate::vmm::VmTempDir::create(vmid.vmid).await?;
+
+        // Zygote fan-out (§9.4): a clone restores from its OWN copy of the
+        // suspend image, never the shared master. The CH backend rewrites the
+        // snapshot's `config.json` in place per restore (FC reads a per-dir
+        // sidecar), so restoring N clones from one dir races and corrupts it
+        // (§9.1); a per-clone copy removes the race AND keeps the zygote master
+        // immutable (§12.12). The copy lives INSIDE this VM's scratch dir, so the
+        // `tmp_dir` guard's Drop reclaims it with everything else (teardown order,
+        // §12.10). On a reflink-capable filesystem the copy is a near-instant
+        // block-level clone; otherwise it degrades to a full byte copy — reported
+        // as `CowSupport`. The single-use `restore` path (`cow == false`) hands
+        // the caller's dir to the backend directly, preserving its documented
+        // in-place rewrite behavior.
+        let (effective_dir, cow_support) = if cow {
+            let clone_dir = tmp_dir.path().join("zygote-snapshot");
+            let support = crate::reflink::clone_tree_cow(snapshot_dir, &clone_dir).await?;
+            (std::borrow::Cow::Owned(clone_dir), support)
+        } else {
+            (
+                std::borrow::Cow::Borrowed(snapshot_dir),
+                crate::reflink::CowSupport::FullCopy,
+            )
+        };
+
         let mut env = Self::setup_env(
             vmid.vmid,
             tmp_dir.path(),
@@ -929,13 +1019,13 @@ impl<V: Vmm> MicroVm<V> {
 
         info!("Restoring instance...");
         let mut instance = vmm
-            .restore(snapshot_dir, &cfg, &env.res, &*cgroup_fs)
+            .restore(&effective_dir, &cfg, &env.res, &*cgroup_fs)
             .await?;
         info!("Resuming instance...");
         instance.resume().await?;
         info!("Instance resumed.");
         env.cgroup_guard.disarm();
-        Ok(Self {
+        let vm = Self {
             vmid: Some(vmid),
             instance: Some(instance),
             netns: env.netns,
@@ -954,7 +1044,8 @@ impl<V: Vmm> MicroVm<V> {
             // `cfg.timeouts` after `build()` down to a busy-spin; clamping here
             // guarantees the connect/accept/grace cadences honor their floors.
             timeouts: cfg.timeouts.clamped(),
-        })
+        };
+        Ok((vm, cow_support))
     }
 
     /// Gets the agent client, connecting (and waiting for the connection) on

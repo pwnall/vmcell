@@ -119,6 +119,11 @@ name = "snapshot_restore"
 path = "tests/snapshot_restore.rs"
 required-features = ["cloud-hypervisor"]
 
+[[test]]
+name = "zygote"
+path = "tests/zygote.rs"
+required-features = ["cloud-hypervisor"]
+
 [dependencies]
 # unconditional shared core
 serde = { version = "1", features = ["derive"] }
@@ -252,6 +257,11 @@ host-common = [
     # their deps belong here, not only on the CH/FC backend features. This is what
     # lets a qemu- or cli-only host build compile the shared client.
     "dep:serde_json", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyperlocal",
+    # Zygote copy-on-write fan-out (§9.4): the orchestrator reflink-clones a
+    # suspend image (`reflink`) per clone and walks the snapshot dir tree
+    # (`walkdir`). These live here, not only on `pipeline`, so the CoW-clone
+    # path compiles in any host build (`pipeline` still gets them via this set).
+    "dep:reflink-copy", "dep:walkdir",
 ]
 
 cloud-hypervisor = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyperlocal", "dep:serde_json"]
@@ -271,7 +281,9 @@ pipeline = [
     "host-common",
     "dep:reqwest", "dep:pgp", "dep:sha2", "dep:blake3",
     "dep:tar", "dep:flate2", "dep:lzma-rs", "dep:zstd",
-    "dep:reflink-copy", "dep:walkdir", "dep:toml", "dep:tempfile",
+    # `reflink-copy`/`walkdir` are declared on `host-common` (zygote CoW fan-out,
+    # §9.4); `pipeline` inherits them through `host-common` above.
+    "dep:toml", "dep:tempfile",
     "am-fs-erofs", "dep:oci-client",
 ]
 

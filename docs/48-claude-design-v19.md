@@ -1,4 +1,16 @@
-# vmcell — Design Document (v18)
+# vmcell — Design Document (v19)
+
+> **v19 (this revision) — zygote suspend/resume fan-out.** Promotes the
+> single-snapshot copy-on-write clone from forward-work (v18 §16/§17) to a
+> built-and-tested feature: suspend one agent-ready VM into a **zygote**, then
+> mint many identical VMs by reflink-copy-on-write-copying the suspend image per
+> clone and restoring each private copy — paying the kernel-boot cost once, not
+> per VM. New: §9.4 (the mechanism), the `Zygote` API (§10.2), invariant §12.12
+> (the master is immutable — each clone restores from its own copy), and the
+> concurrent-fan-out gate reusing the existing `restore_rotates_host_paths`
+> capability rather than a new flag (§3.3). Validated end-to-end on CH (a live
+> concurrent 3-clone pool) and FC (concurrent fan-out correctly refused; single
+> clone works).
 
 **vmcell** is a micro-VM runner for isolated environments, driven entirely from one Rust library. On a
 Linux/x86-64 host with KVM it lets you *create a fresh micro-VM, run a command in it over a typed
@@ -315,7 +327,7 @@ a `PROTOCOL_FEATURES` check only until the guest's features are acked
 |---|---|---|---|
 | `snapshot_restore` | **✓** | **✓** *(single-lineage host paths — `restore_rotates_host_paths: false`, §16)* | ✗ *(privileged in-kernel-vhost-vsock validated, unwired)* |
 | `lazy_restore` (demand-paged) | ✓ (`--restore … prefault=on\|off`) | ✗ | ✗ |
-| `restore_rotates_host_paths` | ✓ *(restore config-rewrite)* | ✗ *(verbatim baked vsock path)* | ✗ |
+| `restore_rotates_host_paths` | ✓ *(restore config-rewrite; enables concurrent zygote fan-out, §9.4)* | ✗ *(verbatim baked vsock path — single-lineage)* | ✗ |
 | `virtio_fs_shares` | ✓ | ✗ (block-only) | ✓ |
 | `unprivileged_vhost_user_net` | ✓ | ✗ | ✓ |
 | `nested_virt` | ✓ | ✗ | ✓ |
@@ -332,6 +344,14 @@ slowest cold-booter, the fallback for the awkward cases, and the most-proven nes
 
 The one law that explains every snapshot entry above — *a VM is snapshot-eligible only if no vhost-user
 device is attached to it* — is stated and enforced in §12.1.
+
+`restore_rotates_host_paths` carries a second role beyond the restore-time path rewrite: it is the
+**concurrent zygote fan-out gate** (§9.4). Copy-on-write gives each clone its own snapshot *files*, but it
+cannot change a host path a backend bakes into the binary snapshot state; only a backend that rewrites host
+paths per restore can hand N *concurrent* clones distinct vsock/serial/tap paths. So `Zygote::spawn_clones`
+reads this flag and refuses a concurrent fan-out (`n > 1`) on a backend where it is `false` — a typed
+`Error::Unsupported`, never a silent socket collision. Reusing the existing capability (rather than a
+bespoke fan-out flag) keeps the "report, don't assume" discipline intact and cannot drift out of sync.
 
 ---
 
@@ -984,9 +1004,11 @@ data shares** (§12.1 — read-only data is served as an extra erofs/block image
 The mechanics: snapshot = `pause`→snapshot→(`resume` or stay paused for immediate kill); restore returns
 a **paused** instance the caller `resume()`s — never `boot()`/`create()`. The on-disk size of a suspend
 image **tracks guest RAM exactly** and is flat in rootfs size (a 256 MiB-RAM guest writes an ≈256 MiB
-memory file whether the rootfs is slim or fat, §15), so an N-snapshot warm pool costs ≈N×guest-RAM on
-disk. The in-place `config.json`/sidecar path rewrites (§3.2) are **single-use**, so restoring many clones
-from one snapshot needs a copy-on-write of the snapshot dir first (§16).
+memory file whether the rootfs is slim or fat, §15). The in-place `config.json`/sidecar path rewrites
+(§3.2) are **single-use** — a plain `restore()` mutates the caller's snapshot dir in place, so it is for
+*one* VM. Minting *many* identical VMs from one suspend image is the **zygote fan-out** (§9.4): reflink-
+copy-on-write-copy the suspend dir per clone and restore each private copy, so on a reflink-capable
+filesystem an N-VM warm pool costs ≈N×*dirtied* pages on disk rather than N×guest-RAM.
 
 ### 9.2 Restore correctness
 
@@ -1018,8 +1040,10 @@ concentrated "a restored VM is not a fresh VM" lesson (§12.4):
   guest's rotated `/30` and its host-side tap/nft wiring belong to the same vmid. The guest resumes with the
   frozen `ip=` of the *original* vmid; leaving it (the prior behavior) left every restored clone on a dead
   `/30` with silently dead egress. Both are best-effort; the ack reports `mac_applied` / `ip_applied`.
-  *(Note: restoring many clones in parallel from one snapshot dir still needs a copy-on-write of that dir
-  first — the in-place `config.json` rewrite is single-use; tracked as §16 forward work.)*
+  *(This per-clone identity rotation is exactly what makes a **concurrent** zygote fan-out safe: N clones
+  resumed from one suspend image each rotate to their own vmid/tap/`/30`/MAC/IP, so they never collide on
+  the host. Restoring many clones in parallel from one dir also needs a copy-on-write of that dir — the
+  in-place `config.json` rewrite is single-use; that is now implemented, §9.4.)*
 - **Entropy** — reseed the CSPRNG by copying 32 bytes `/dev/hwrng`→`/dev/urandom` **natively in-agent**
   (no `sh`+`head`). An unreseeded `getrandom()` can stall first use by seconds, and because every clone
   resumes at the same frozen instant, RNG reuse is otherwise silent and correlated. Best-effort; the ack's
@@ -1068,6 +1092,55 @@ added guest is dead-linear at ≈58 MiB, and the agent PID 1 is ≈2.4 MiB. So t
 faults its full 256 MiB under load). The next limits
 after RAM are one-virtiofsd-per-VM, tap/netns/nft scaling, and host FD/PID limits.
 
+### 9.4 Zygote fan-out: copy-on-write clones from one suspend image
+
+Booting the guest kernel to "agent-ready" is the dominant per-VM cost (§15). When a workload needs *many*
+identical VMs — a warm serverless pool, a fan-out of agent sandboxes, a batch of test cells — paying that
+boot cost per VM is waste. The **zygote** pattern pays it once and then clones the *suspended* result:
+
+1. **Suspend once.** Boot one VM to agent-ready and snapshot it while paused. That frozen suspend/resume
+   image is the **zygote master** (`Zygote::suspend`, §10.2). It is the same snapshot the warm tier already
+   produces (§9.1) — the pipeline's `SnapshotStage` output *is* a zygote master (§11.1).
+2. **Copy-on-write per clone.** To mint a clone, **reflink-copy the whole suspend dir** into the clone's
+   own scratch dir, then `restore()` + `resume()` from that private copy. On a reflink-capable host
+   filesystem (XFS, Btrfs, bcachefs) the copy is a near-instant block-level `FICLONE` that shares physical
+   storage with the master until a clone writes; on any other filesystem (ext4, tmpfs) it degrades to a
+   full byte copy — correct, just not free. The copy is reported as `CowSupport::{Reflink, FullCopy}` so a
+   caller building a large pool on a non-reflink filesystem can warn (or pick a different scratch dir).
+   The vetted `reflink-copy` crate owns the ioctl and the fallback, so no new `unsafe` enters the tree.
+3. **Fresh identity per clone.** Each clone allocates a **fresh vmid** from the shared `VmidAllocator`
+   (hence a distinct `/30`/MAC/IP, §9.2), its own netns/cgroup/vsock socket, and runs the mandatory
+   post-restore resync (clock/entropy/MAC/IP) on its first `agent()` call. So N clones resumed from one
+   frozen instant never collide on the host.
+
+**Why the per-clone copy is load-bearing, not an optimization.** The single-use restore path rewrites the
+snapshot's `config.json` (CH) — vsock/serial/tap host paths — *in place* (§3.2). Two restores from one
+shared dir race on that file and corrupt it. Restoring from a **private copy** removes the race *and*
+keeps the zygote master byte-for-byte immutable (invariant §12.12), so the master can be cloned again,
+indefinitely. This is the difference between v18's single-use snapshot and v19's reusable zygote.
+
+**The concurrent-fan-out gate is a capability, not a flag: `restore_rotates_host_paths` (§3.3).** CoW gives
+each clone its own *files*, but it cannot change a path a backend **bakes into the binary snapshot state**.
+CH rewrites every host path per restore into the clone's own scratch dir (`restore_rotates_host_paths:
+true`), so N concurrent CH clones each get a distinct vsock/serial/tap — fan-out works. Firecracker re-binds
+the vsock UDS baked into its `snapshot_file` **verbatim** (`false`, no v1.16 load-time override), so two
+concurrent FC clones would fight over one socket path — and copying the dir does not change the baked path.
+So `Zygote::spawn_clones(n)` **refuses `n > 1` on a non-rotating backend with a typed `Error::Unsupported`**
+rather than letting the clones collide; a *single* FC clone (sequential lineage) is still fine. This reuses
+the exact capability the warm tier already declares — the descriptor that says "this backend rotates host
+paths on restore" is precisely the property that makes concurrent fan-out possible, so there is no new flag
+to keep in sync (a bespoke fan-out boolean would be a second source of truth for the same fact, free to
+drift from `restore_rotates_host_paths` — exactly the "report, don't assume" trap §3.1 warns against).
+
+**Cost model.** A `FullCopy` pool costs N×guest-RAM of disk and copy bandwidth (the ext4 case); a `Reflink`
+pool costs ≈N×*dirtied* pages, near-zero at rest, because CH maps the memory file read-mostly and only the
+tiny per-clone `config.json` diverges. RAM is unchanged from §9.3 (each clone still demand-faults its own
+≈58 MiB); the zygote win is **wall-clock and disk**, not RAM. `spawn_clones` mints the pool **concurrently**
+and is **all-or-nothing**: if any clone fails, the ones already up are torn down in the documented order
+(§12.10) and the first error is returned — no half-built pool leaks. Measured on CH: a live pool of 3
+concurrent clones from one zygote, each with a distinct vmid/MAC/vsock and a working `exec`, with the master
+`config.json` byte-identical afterward (§14).
+
 ---
 
 ## 10. The Rust library (`vmcell`)
@@ -1110,6 +1183,8 @@ proxy/           # EgressProxy (hudsucker MITM), TLS CA + leaf minting, test dou
 metrics.rs       # CgroupFs trait (real + recording fake), slice mgmt, peak/avg readers (direct sysfs writes)
 cpufreq.rs       # benchmark-only CpuFreqSysfs seam: pin governor/turbo, RAII restore-on-drop
 orchestrator.rs  # MicroVm handle; VmidAllocator/CidAllocator; Clock seam; ordered Drop; sweep_orphans
+reflink.rs       # zygote CoW copy: reflink-or-copy a suspend dir per clone; CowSupport (§9.4, forbid(unsafe))
+zygote.rs        # Zygote: suspend once, mint many; the concurrent-fan-out gate (§9.4)
 artifact/        # Stage trait, Pipeline, cache, kernel/rootfs(oci,guest_tools,mmdebstrap_vm)/snapshot stages, bundle
 ```
 
@@ -1142,7 +1217,8 @@ pub struct VmConfig {
 pub struct MicroVm<V: Vmm> { /* instance, cgroup, net, virtiofsd, cid, vmid, tmp_dir, ... */ }
 impl<V: Vmm> MicroVm<V> {
     pub async fn start(vmm: &V, cfg: VmConfig, cids: Arc<CidAllocator>, vmids: VmidAllocator, cgroups: Box<dyn CgroupFs>) -> Result<Self>;
-    pub async fn restore(vmm: &V, snapshot_dir: &Path, cfg: VmConfig, cids: Arc<CidAllocator>, vmids: VmidAllocator, cgroups: Box<dyn CgroupFs>) -> Result<Self>;
+    pub async fn restore(vmm: &V, snapshot_dir: &Path, cfg: VmConfig, cids: Arc<CidAllocator>, vmids: VmidAllocator, cgroups: Box<dyn CgroupFs>) -> Result<Self>; // SINGLE-USE: rewrites snapshot_dir in place
+    pub async fn restore_cow(vmm: &V, zygote_dir: &Path, cfg: VmConfig, cids: Arc<CidAllocator>, vmids: VmidAllocator, cgroups: Box<dyn CgroupFs>) -> Result<(Self, CowSupport)>; // reflink-CoW copy first (§9.4)
     pub fn vmid(&self) -> u32;
     pub fn proxy(&self) -> Option<&EgressProxy>;          // the egress-proxy handle, if egress is filtered
     pub async fn agent(&mut self, timeout: Option<Duration>, clock: &dyn Clock) -> Result<&mut AgentClient>; // None => 10 s; clock drives the first post-restore resync
@@ -1153,6 +1229,19 @@ impl<V: Vmm> MicroVm<V> {
     pub async fn shutdown(self) -> Result<()>;            // graceful, then verify gone
 }
 impl<V: Vmm> Drop for MicroVm<V> { /* kill VMM proc-group → virtiofsd → tap/netns/cgroup/overlay/tmp_dir */ }
+
+// ---- zygote.rs — suspend once, mint many (§9.4) ----
+pub enum CowSupport { Reflink, FullCopy }   // was the per-clone copy a block-level reflink, or a full byte copy?
+pub struct Zygote { /* immutable master snapshot dir + the snapshot-eligible clone config (vmid cleared) */ }
+impl Zygote {
+    pub async fn suspend<V: Vmm>(vm: &mut MicroVm<V>, cfg: VmConfig, master_dir: impl Into<PathBuf>) -> Result<Self>; // snapshot a live VM
+    pub async fn from_snapshot_dir(master_dir: impl Into<PathBuf>, cfg: VmConfig) -> Result<Self>;                    // adopt a SnapshotStage artifact
+    pub async fn spawn_clone<V: Vmm>(&self, vmm: &V, cids: Arc<CidAllocator>, vmids: VmidAllocator, cgroups: Box<dyn CgroupFs>) -> Result<MicroVm<V>>;       // one CoW clone
+    pub async fn spawn_clones<V, F>(&self, vmm: &V, count: usize, cids: Arc<CidAllocator>, vmids: VmidAllocator, make_cgroups: F) -> Result<Vec<MicroVm<V>>> // concurrent pool, all-or-nothing
+        where V: Vmm, F: FnMut() -> Box<dyn CgroupFs>;   // Unsupported when count > 1 && !capabilities().restore_rotates_host_paths (§9.4)
+    pub fn probe_cow_support(&self) -> CowSupport;         // up-front reflink probe of the master's filesystem
+    pub fn master_dir(&self) -> &Path;
+}
 ```
 
 `MicroVm::start`/`restore` take the CID allocator (`Arc<CidAllocator>`), the VMID allocator (a
@@ -1171,6 +1260,20 @@ processes cannot dual-claim, and liveness is a `/proc/<pid>` check. It also inje
 third IPv4 octet as **`(vmid % 254) + 1`** (`10.200.<octet>.{1,2}` — a raw counter would exceed 255 and
 synthesize invalid addresses), centralized in one unit-tested `/30` helper, which **caps a single host at
 ≈254 concurrent VMs on one `/16`** (§16). VMID range is `1..=254`; CID space is `3..=254`.
+
+**`Zygote` — the suspend-once, mint-many handle (§9.4).** A `Zygote` owns an *immutable* master snapshot
+dir plus the snapshot-eligible config its clones restore with (the config's `vmid` is cleared, since every
+clone is allocated a fresh one). `suspend()` captures it from a live `MicroVm`; `from_snapshot_dir()` adopts
+a `SnapshotStage` artifact (§11.1). Both fail-fast reject an ineligible config (a vhost-user device, §12.1)
+at construction, before any copy is minted. `spawn_clone` reflink-copy-on-write-copies the master into the
+clone's own scratch dir and restores from that private copy (so the master is never mutated, §12.12);
+`spawn_clones(count)` does the same `count` times **concurrently** and **all-or-nothing** — one shared
+`VmidAllocator`/`CidAllocator` hands the clones distinct vmids/CIDs, and on any error the clones already up
+are torn down in order. `spawn_clones` returns `Error::Unsupported` when `count > 1` and the backend does
+not rotate host paths (`restore_rotates_host_paths == false`, §3.3) — a concurrent fan-out needs per-clone
+host paths, which CoW alone cannot synthesize. `restore_cow` is the same primitive without the pool
+ergonomics; the low-level CoW copy lives in `reflink.rs` (`#![forbid(unsafe_code)]` — the `FICLONE` ioctl
+and its full-copy fallback are the vetted `reflink-copy` crate's, so no `unsafe` enters the tree).
 
 **`Timeouts` — the per-VM hot-path timing profile.** Seven `Duration` fields gather every tunable hot-path
 wait (defaults in ms; `low_latency()` / `throughput()` in parentheses): `connect_backoff_floor` 20 (5/10)
@@ -1360,7 +1463,9 @@ printing success.
    Rebuilt only when the config fragment or pinned source changes.
 2. **Root filesystem** (per profile): a single read-only erofs packed in memory by `am-fs-erofs` from a
    merged tar, from one of two interchangeable sources sharing the inject+pack tail (§8.2). Kernel-independent.
-3. **Warm snapshot** (per VMM + profile): boot the erofs base to "agent-ready," snapshot.
+3. **Warm snapshot** (per VMM + profile): boot the erofs base to "agent-ready," snapshot. This suspend image
+   is directly usable as a **zygote master** (§9.4): `Zygote::from_snapshot_dir` adopts it and mints
+   copy-on-write clones from it, so the artifact that speeds a single restore also seeds a warm pool.
 4. **Proxy CA cert**: minted once **per artifacts dir** and cached (a process-global cache keyed by the
    artifacts dir returns the generate-once CA plus its parsed authority — re-self-signing per `authority()`
    call would break the guest trust chain), baked into the rootfs trust store. This is deliberately **not**
@@ -1617,6 +1722,30 @@ offer workload-agnostically goes in the library; a capability that encodes what 
 *function* should *do* with a VM ships as a thin consumer crate on top (§17). Reviewing each addition
 against this line is the standing guard.
 
+### 12.12 A zygote master is immutable; clones restore from private copy-on-write copies
+
+> **A zygote's suspend image is never mutated by cloning. Every clone restores from its own copy-on-write
+> copy of the suspend dir, made *before* the backend touches it.**
+
+The single-use restore path rewrites the snapshot's `config.json` (CH) — vsock/serial/tap host paths — *in
+place* (§3.2). That is fine for one restore of one snapshot, but it means a plain `restore()` **mutates the
+caller's dir**, and two restores from one dir race on that file and corrupt it. The zygote fan-out (§9.4)
+therefore reflink-copies the whole suspend dir into each clone's own scratch dir first and restores from
+that private copy. Two consequences are load-bearing:
+
+- **The master stays byte-for-byte identical**, so it can be cloned again, indefinitely — the property that
+  makes it a *zygote* and not a one-shot snapshot. The integration test asserts the master's `config.json`
+  is unchanged after a fan-out (§14); the reflink unit test asserts a clone is an independent copy (writing
+  the clone never touches the master).
+- **The copy is the clone's scratch, so ordered teardown reclaims it.** The CoW copy lives *inside* the
+  per-VM `tmp_dir`, so the existing teardown order (§12.10) removes it with everything else — no separate
+  cleanup path to forget, no shared inode two clones could race on.
+
+Enforced by construction: `restore_cow`/`Zygote` do the copy in the orchestrator **before** calling the
+backend, so no backend change is needed and no code path can restore a clone directly from the master.
+(A single sequential clone on a verbatim-rebind backend is still safe; the *concurrent* case is gated by
+`restore_rotates_host_paths`, §3.3 / §9.4.)
+
 ## 13. Hard-won lessons
 
 Four meta-lessons recur across the implementation history (Appendix A) and are worth stating directly:
@@ -1736,6 +1865,17 @@ theatrical (they passed on their inverse), which the review caught:
   **per-backend `restore_rotates_host_paths` branch** — host vsock/serial path rotation + rotated-vmid
   embedding on CH, path *equality* on FC — so the test consults the capability descriptor instead of encoding
   CH semantics for every backend.
+- `zygote.rs` (§9.4): suspend one VM into a zygote, then on a host-path-rotating backend mint a **concurrent
+  pool of N clones** and assert each has a **distinct vmid, distinct in-guest MAC (`== mac_math(vmid)`), and
+  distinct host vsock path**, all alive at once with a working `exec`; assert the **master `config.json` is
+  byte-identical after the fan-out** (the immutability guard, §12.12 — reddens on the single-use in-place
+  rewrite reaching the master). On a verbatim-rebind backend the same test asserts a **concurrent fan-out is
+  `Error::Unsupported`** while a **single clone works** — the capability-gated branch, mirroring
+  `snapshot_restore.rs`. The reflink primitive and the fan-out orchestration are *also* unit-tested with no
+  KVM: `reflink::tests` proves a clone is an independent copy (writing it never mutates the master) and the
+  full-copy fallback path; `zygote::tests` drives a **`FakeVmm`-recorded** fan-out that asserts every clone
+  restored from its **own** private CoW dir (never the master) with a distinct vmid, and that the
+  concurrent-gate returns `Unsupported` on a fake whose `restore_rotates_host_paths` is `false`.
 - `egress_proxy.rs`: **HTTPS** interception logged; a registered **double** answers; a **filter rule blocks
   a domain and the guest sees it, and the block is recorded**; the proxy observes the guest's **intended
   destination**; a real `CONNECT` falls through; the double **ignores `Method::CONNECT`**; the domain match
@@ -1949,7 +2089,8 @@ collapse have all **landed** — they are described in the body as current, not 
   load-time override in v1.16), declared as `restore_rotates_host_paths: false` — a lineage's restores
   share one host path, so `restore()` fail-loud-guards (the `reject_live_baked_vsock` liveness probe)
   against restoring while the snapshotted VM (or a prior restore) is still alive, and concurrent restores
-  from one lineage are unsupported (subsumed by the single-snapshot-CoW gap below). For reference, the wired
+  from one lineage are unsupported — so the zygote fan-out (§9.4) refuses a concurrent (`n > 1`) FC pool
+  with `Error::Unsupported` (gated on `restore_rotates_host_paths`); a single FC clone is fine. For reference, the wired
   mechanism is a fresh process + `PUT /snapshot/load {resume_vm:false}` (restore returns paused, caller
   resumes), `PATCH /vm` for pause/resume, the `vmcell_host_paths.json` sidecar, and a `create()`-time
   `PUT /entropy` virtio-rng attach (without which the post-restore reseed silently reports
@@ -1960,9 +2101,13 @@ collapse have all **landed** — they are described in the body as current, not 
   remaining work is the live agent-reconnect run + wiring `snapshot()`/`restore()` and flipping the
   capability for that config only. (This "validated at the QEMU level, not wired end-to-end" is a weaker
   claim than CH's wired-and-validated tier above.)
-- **Single-snapshot CoW for many clones.** The CH `config.json` and FC sidecar path rewrites are single-use
-  (in-place); restoring N clones from one snapshot needs a copy-on-write of the snapshot dir first — the
-  warm-pool density story depends on it (with sparse-snapshot — `SEEK_HOLE` — the un-taken pool-density lever, Appendix C).
+- **Single-snapshot CoW for many clones — LANDED in v19 (§9.4).** The zygote fan-out reflink-copy-on-write-
+  copies the suspend dir per clone and restores each private copy (`Zygote`, `MicroVm::restore_cow`), so the
+  in-place `config.json`/sidecar rewrites are per-clone and the master stays immutable (§12.12). Concurrent
+  fan-out is gated on `restore_rotates_host_paths` (CH ✓; FC single-lineage, below). **Residual:** (a) FC
+  still has no per-clone host-path override, so a *concurrent* FC fan-out from one lineage is `Unsupported`
+  (a single FC clone works); (b) **sparse-snapshot** (`SEEK_HOLE`) to shrink the on-disk suspend image is
+  the un-taken pool-density lever (Appendix C) — orthogonal to CoW and still open.
 - **Live pin resolution.** `ResolvePinsStage` loads a committed `pins.json` rather than live-resolving
   tag→digest / `snapshot.debian.org` timestamps. (The OCI fetch itself is now behind the injectable
   `OciPuller` seam with a recording/replaying `FakeOciPuller`, so the requirement-7 replay + tamper tests
@@ -2051,9 +2196,12 @@ injection** (`netem` via rtnetlink on the tap path); **extra virtio-blk devices 
 injection** (plain virtio-blk composes with snapshot); **append-only extra kernel cmdline + optional `init=`
 override**.
 
-**Design-now-build-later.** Single-snapshot **copy-on-write clone / `fork()`** with lineage handles (the
-headline primitive both the agentic and serverless domains share — reflink-CoW the snapshot dir before each
-restore, mint N divergent clones in tens of ms); the **`impd` daemon** + versioned control-plane API +
+**Design-now-build-later.** Single-snapshot **copy-on-write clone / `fork()`** — the headline primitive both
+the agentic and serverless domains share — **shipped in v19 as the zygote fan-out** (§9.4): `Zygote` is the
+lineage handle, reflink-CoW-copies the suspend dir per clone, and mints N divergent clones concurrently.
+What remains *future* on top of it: a **`fork()`-style divergence API** that clones a *running* VM at an
+arbitrary point (not just the agent-ready zygote), and per-clone **overlay divergence tracking**. The
+**`impd` daemon** + versioned control-plane API +
 warm-pool manager (the productization seam — VMs that outlive their creator, which the single-process
 `MicroVm` ownership model can't provide, so `list`/`rm`/standalone `exec` live here); **privileged-window
 hardening** (each VMM's own seccomp, a jailer-equivalent, and a **setup broker** — the recommended privilege

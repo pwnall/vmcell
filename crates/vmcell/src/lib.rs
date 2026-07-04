@@ -63,9 +63,17 @@ mod net_sys;
 #[cfg(feature = "host-common")]
 pub mod orchestrator;
 
+/// Copy-on-write cloning of zygote suspend images (§9.4).
+#[cfg(feature = "host-common")]
+mod reflink;
+
 /// Egress proxy implementation.
 #[cfg(feature = "host-common")]
 pub mod proxy;
+
+/// Zygote suspend/resume fan-out: mint many identical VMs from one suspend image.
+#[cfg(feature = "host-common")]
+pub mod zygote;
 
 /// VMM interface and backend implementations.
 #[cfg(feature = "host-common")]
@@ -87,9 +95,13 @@ pub use net::tap::NetNamespace;
 pub use orchestrator::MicroVm;
 #[cfg(feature = "host-common")]
 pub use proxy::EgressProxy;
+#[cfg(feature = "host-common")]
+pub use reflink::CowSupport;
 #[cfg(feature = "firecracker")]
 pub use vmm::Firecracker;
 #[cfg(feature = "qemu")]
 pub use vmm::Qemu;
 #[cfg(feature = "host-common")]
 pub use vmm::{CloudHypervisor, VmInstance, Vmm};
+#[cfg(feature = "host-common")]
+pub use zygote::Zygote;
