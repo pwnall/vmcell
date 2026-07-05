@@ -1,22 +1,14 @@
 # AGENTS.md — vmcell
 
-Deploy at the repository root as `AGENTS.md`. Terse by design; the reasoning lives in
-`docs/48-claude-code-review-rubric.md` (rubric) and `docs/47-claude-design-v18.md` (design). (`9` represents an arbitrary digit, use the latest version you find)
-
 ## What this is
 
 vmcell runs each integration test in an isolated micro-VM. Cloud Hypervisor is the primary backend;
 Firecracker and QEMU are secondary, behind one `Vmm` trait with a `VmmCapabilities` descriptor.
-Crates: `vmcell` (host lib), `vmcell-cli` (the `vmcell` CLI), `vmcell-protocol`, `vmcell-guest-agent`
-(PID 1 in-guest), `vmcell-test-runner` (privileged capability runner), `vmcell-guest-tools`,
-`vmcell-rootfs-builder`/`vmcell-kernel-builder`/`vmcell-artifact-validator` (in-VM build + validate),
-and the v21 control plane: `vmcell-privilege` (shared blessing/capability predicates, linked by the
-runner and the daemon), `vmcell-daemon` + `vmcelld` (the daemon lib + blessed binary),
-`vmcell-daemon-client` + `vmcelld-ctl` (the client lib + CLI). Three entry surfaces: the **library**,
-the **`vmcell` CLI**, and the **`vmcelld` daemon** (HTTP/REST, bearer-auth; it **owns** the VMs it
-starts — holds the `MicroVm` handles, releases them on `Drop`, and reclaims crash-leaked
-netns/cgroup/scratch with a start-up orphan sweep; see `docs/53-claude-design-v21.md`). Two operating
-modes: **unprivileged** (KVM group only, smoltcp NAT) and **privileged** (three caps, netns/tap/nft, the
+Crates (under `crates/`): `vmcell` (host lib), `vmcell-cli`, `vmcell-protocol`,
+`vmcell-guest-agent` (PID 1 in-guest), `vmcell-test-runner` (privileged capability runner),
+`vmcell-guest-tools`, plus the rootfs/kernel builders and the artifact validator. Two operating
+modes:
+**unprivileged** (KVM group only, smoltcp NAT) and **privileged** (three caps, netns/tap/nft, the
 only snapshot-eligible mode).
 
 ## Read before changing anything
@@ -24,9 +16,11 @@ only snapshot-eligible mode).
 - `implementation-notes.md` — recorded, justified deviations. Do not "fix" entries listed there;
   record new justified deviations there instead of silently diverging. Retire an entry when it is
   empirically disproven.
-- `docs/99-claude-code-review-rubric.md` — every rule below is expanded there with its defect history.
+- `docs/99-claude-fable-code-review-rubric-v99.md` — every rule below is expanded there with its
+  defect history. (`9` represents an arbitrary digit, use the newest version you find)
 - `docs/benchmark-results.md` — measured perf levers. Do not re-derive refuted levers.
-- `docs/99-claude-design-v99.md` — architecture; pary particular attention to lists cross-cutting invariants with owners.
+- `docs/99-claude-design-v99.md` — architecture; pay particular attention to the list of
+  cross-cutting invariants with owners.
 
 ## Non-negotiable rules
 
@@ -50,6 +44,11 @@ only snapshot-eligible mode).
 - Fail loud. No bare `let _ =` on a `Result` or on an accepted input. Every accepted input —
   config field, CLI flag, env var, feature gate — is honored or rejected at construction; a feature
   gate may remove a capability (`CapabilityUnavailable`), never silently change semantics.
+- Suppressions: `#[expect(<lint>, reason = "…")]` on the **single statement** that needs it —
+  never a fn, module, or crate scope (`clippy::allow_attributes*` deny plain and reason-less
+  suppressions in production code). If a lint fires only under some feature or platform, scope with
+  `cfg_attr` — or a reasoned `#[allow]` there. Route repeated legitimate sites through one helper
+  (`exit_failure()`) so one suppression covers the class.
 - Defaults get the strictest scrutiny: the default arm is the least-tested path. `Egress::Open`
   must actually forward.
 - One law, one predicate. A cross-cutting invariant lives in exactly one function or const that
@@ -66,7 +65,8 @@ only snapshot-eligible mode).
 - Helper daemons: spawn with `PR_SET_PDEATHSIG` + `CLOEXEC`; reap on every error path; a failed
   later spawn step reaps the earlier daemons.
 - PID-1 discipline in the guest agent: never `exit`; reap children via the `ReaperCoordinator`
-  epochs; signal handling per §12.6.
+  epochs; signal handling per §12.6. A PID-1 panic aborts the guest, so the agent binary keeps the
+  full deny family (`unwrap_used`, `panic`, `print_*`).
 - Deadlines are `Instant`, propagated outer-bounds-inner. Concurrent startup is cancellation-safe:
   a failed sibling future must not leak the others' resources.
 - Runtime files under `XDG_RUNTIME_DIR` (or the artifacts dir), never bare `/tmp` on shared hosts.
@@ -76,7 +76,8 @@ only snapshot-eligible mode).
 
 - Kernel ABI structs are `#[repr(C)]`, defined once, with `size_of`/offset asserts against the ABI —
   no inline byte-math reimplementations (the 18-byte `ifreq` wrote 22 bytes past a PID-1 stack).
-- Every `unsafe` block has a `SAFETY:` comment proving the actual obligation, not restating the op.
+- Every `unsafe` block holds **one** operation (`multiple_unsafe_ops_per_block` denies) with a
+  `SAFETY:` comment proving that operation's obligation, not restating it.
 - Guest- or network-derived lengths are validated against `MAX_FRAME_BYTES` before allocation or
   indexing; integer narrowing from the wire is `try_from`, never `as`.
 - The guest framing round-trips against the real host codec, both directions, including over-cap
@@ -103,8 +104,9 @@ only snapshot-eligible mode).
 ## Done means
 
 - `just ci` green locally (it is the CI definition; both set `RUSTFLAGS=-D warnings`).
-- For host-facing changes: `just preflight`, then both operating-mode suites green on a KVM host,
-  all three backends, and the skip manifest reviewed (`just skips`).
+- For host-facing changes: `scripts/review-preflight-priv.sh`, then both operating-mode suites
+  green on a KVM host (`just test-privileged` + the unprivileged suite), all three backends, and
+  the skip manifest reviewed.
 - New public API: rustdoc complete (`missing_docs` denies), `cargo semver-checks` clean.
 - The privileged runner is re-blessed after rebuilds (`just bless`; blessing is stripped on rewrite
   by design).
@@ -122,6 +124,9 @@ only snapshot-eligible mode).
 - Dependencies: permissive licenses only (cargo-deny allow-list enforces); `cargo deny` ignores
   carry a per-crate rationale; vendored patches (`vendor/vhost*`) keep exact `=` pins — a caret
   requirement silently drops the patch.
-- The effective toolchain floor is 1.88 (lockfile pins `time 0.3.47` for RUSTSEC-2026-0009); do not
-  `cargo update` on an older toolchain — it downgrades `time` to the vulnerable version. Build
-  `--locked`.
+- Toolchain: `rust-toolchain.toml` pins 1.96.1 (the latest stable) and the declared `rust-version`
+  **equals** it (one `[workspace.package]` fact). An understated MSRV lets MSRV-aware resolvers hand
+  consumers older, potentially-vulnerable dependency versions instead of the advisory-clean ones the
+  lockfile pins. Build `--locked`; never `cargo update` on a toolchain older than the pinned floor.
+- No unused dependencies (`cargo machete`; macro-only false positives get a per-crate ignore).
+  Third-party GitHub Actions stay pinned to full commit SHAs; Dependabot moves the pins.

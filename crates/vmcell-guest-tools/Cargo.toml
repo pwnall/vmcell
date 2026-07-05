@@ -2,7 +2,7 @@
 name = "vmcell-guest-tools"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "vmcell guest-side multicall helper: real ip/curl/kvm-ok, baked into the rootfs erofs (§5.3)"
 publish = false

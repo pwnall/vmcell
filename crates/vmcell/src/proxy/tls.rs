@@ -279,7 +279,7 @@ mod tests {
         let key_path = dir_path.join("ca.key");
         let meta = std::fs::metadata(&key_path).expect("stat ca.key");
         let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "ca.key must be written 0600, got {:#o}", mode);
+        assert_eq!(mode, 0o600, "ca.key must be written 0600, got {mode:#o}");
 
         // The atomic temp-then-rename must leave no partial `ca.key.tmp` behind.
         assert!(

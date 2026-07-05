@@ -235,10 +235,10 @@ impl Daemon {
         let http = reqwest::Client::new();
         let url = format!("{}/healthz", self.base);
         for _ in 0..80 {
-            if let Ok(r) = http.get(&url).send().await {
-                if r.status().is_success() {
-                    return;
-                }
+            if let Ok(r) = http.get(&url).send().await
+                && r.status().is_success()
+            {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

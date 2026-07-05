@@ -70,8 +70,8 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             Ok(a) => a,
             Err(e) => {
                 let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
-                println!("SERIAL LOG:\n{}", log);
-                panic!("Failed to connect to agent: {}", e);
+                println!("SERIAL LOG:\n{log}");
+                panic!("Failed to connect to agent: {e}");
             }
         };
 
@@ -239,7 +239,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         let agent_res = vm.agent(None, &fake_clock).await;
         if agent_res.is_err() {
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            println!("SERIAL LOG ON ERROR:\n{}", log);
+            println!("SERIAL LOG ON ERROR:\n{log}");
             panic!("Failed to connect to agent: {:?}", agent_res.err().unwrap());
         }
         let result = agent_res
@@ -252,8 +252,8 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .unwrap();
         if String::from_utf8_lossy(&result.stdout).trim() != "restored" {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap();
-            println!("SERIAL LOG:\n{}", log);
-            panic!("Exec failed. Outcome: {:?}", result);
+            println!("SERIAL LOG:\n{log}");
+            panic!("Exec failed. Outcome: {result:?}");
         }
 
         // H-VMM-1 ("rotate everything"): the restore/zygote path rotated the vmid,
@@ -329,9 +329,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             // difference.
             assert!(
                 new_vsock.contains(&format!("vmcell-vm-{}-{}", std::process::id(), new_vmid)),
-                "restored vsock path {} must embed the rotated vmid {}",
-                new_vsock,
-                new_vmid
+                "restored vsock path {new_vsock} must embed the rotated vmid {new_vmid}"
             );
         } else {
             // Verbatim re-bind: every restore of this snapshot lineage shares the
@@ -374,8 +372,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         let expected_mac = vmcell::net::mac_math(new_vmid).expect("mac_math(new_vmid)");
         assert_eq!(
             post_mac, expected_mac,
-            "post-restore guest MAC must equal mac_math(new_vmid={})",
-            new_vmid
+            "post-restore guest MAC must equal mac_math(new_vmid={new_vmid})"
         );
         assert_ne!(
             pre_mac, post_mac,
@@ -409,11 +406,8 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // fail the lower bound.
         assert!(
             post_time >= fake_time_secs as i64 && post_time < fake_time_secs as i64 + 30,
-            "clock resync must set the guest clock to the INJECTED FakeClock time (≈{}), got {}; \
-             a resync that ignored the injected Clock would land near real wall-clock time (≈{})",
-            fake_time_secs,
-            post_time,
-            pre_time
+            "clock resync must set the guest clock to the INJECTED FakeClock time (≈{fake_time_secs}), got {post_time}; \
+             a resync that ignored the injected Clock would land near real wall-clock time (≈{pre_time})"
         );
 
         // TESTS-LIFECYCLE-2 (reseed isolation): the typed `restore_reseed_applied()`

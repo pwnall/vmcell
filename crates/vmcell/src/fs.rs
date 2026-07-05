@@ -135,7 +135,7 @@ impl VirtioFsDaemon {
             .stderr(Stdio::from(stderr_file));
 
         let mut process = cmd.spawn().map_err(|e| {
-            crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {}", e))
+            crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {e}"))
         })?;
         let pgid = process.id();
 
@@ -238,7 +238,7 @@ impl VirtioFsDaemon {
             read_only,
         )
         .map_err(|e| {
-            crate::error::Error::Subprocess(format!("failed to start in-process virtiofsd: {}", e))
+            crate::error::Error::Subprocess(format!("failed to start in-process virtiofsd: {e}"))
         })?;
 
         // The listener binds the socket synchronously before the worker signals
@@ -267,14 +267,14 @@ impl Drop for VirtioFsDaemon {
             // child has been reaped, in which case there is nothing to kill. Holding
             // the `Child` until here pins the pid across the kill+reap; the `Child`
             // is dropped after this block, after the group has already been reaped.
-            if let Some(process) = self.process.take() {
-                if let Some(pgid) = process.id() {
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(-(pgid as i32)),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
-                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pgid as i32), None);
-                }
+            if let Some(process) = self.process.take()
+                && let Some(pgid) = process.id()
+            {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-(pgid as i32)),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pgid as i32), None);
             }
         }
         #[cfg(feature = "experiment-fuse")]

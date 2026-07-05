@@ -19,11 +19,13 @@
 //! `print_stdout`/`print_stderr` are intentionally NOT denied here — reproducing `ip`/`curl`/`kvm-ok`
 //! output on stdout/stderr is the whole point of the tool.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block // one obligation per SAFETY comment
 )]
 #![cfg_attr(
     not(test),
@@ -34,7 +36,9 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
-        clippy::dbg_macro
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 
@@ -54,9 +58,12 @@ fn main() {
             Some(c) => (c.clone(), args.get(2..).unwrap_or(&[])),
             None => {
                 eprintln!("usage: vmcell-guest-tools <ip|curl|kvm-ok> [args…]");
-                // allow(disallowed_methods): a busy-box multicall helper relays its status as the
+                // expect(disallowed_methods): a busy-box multicall helper relays its status as the
                 // process exit code; nothing is owned to unwind here (usage error before any work).
-                #[allow(clippy::disallowed_methods)]
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "multicall helper relays status as its exit code; nothing owned to unwind (usage error)"
+                )]
                 std::process::exit(2);
             }
         }
@@ -71,9 +78,12 @@ fn main() {
             2
         }
     };
-    // allow(disallowed_methods): the multicall helper's whole contract is to relay the selected
+    // expect(disallowed_methods): the multicall helper's whole contract is to relay the selected
     // sub-tool's exit code as its own process status; there is no owned host state to unwind.
-    #[allow(clippy::disallowed_methods)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "multicall helper relays the sub-tool's exit code as its status; no owned host state to unwind"
+    )]
     std::process::exit(code);
 }
 
@@ -183,11 +193,11 @@ fn run_ip_link(args: &[String]) -> i32 {
         eprintln!("ip link set: no device specified");
         return 1;
     };
-    if let Some(mac) = mac {
-        if let Err(e) = set_mac(&dev, &mac) {
-            eprintln!("ip link set {dev} address {mac}: {e}");
-            return 1;
-        }
+    if let Some(mac) = mac
+        && let Err(e) = set_mac(&dev, &mac)
+    {
+        eprintln!("ip link set {dev} address {mac}: {e}");
+        return 1;
     }
     if let Some(up) = up {
         let fd = match open_inet_socket() {
@@ -448,10 +458,10 @@ fn run_curl(args: &[String]) -> i32 {
                 }
             }
             "--resolve" => {
-                if let Some(spec) = it.next() {
-                    if let Some(parsed) = parse_resolve(spec) {
-                        resolve.push(parsed);
-                    }
+                if let Some(spec) = it.next()
+                    && let Some(parsed) = parse_resolve(spec)
+                {
+                    resolve.push(parsed);
                 }
             }
             // Flags we accept but don't need to act on for the tested behaviour.
@@ -549,16 +559,13 @@ fn run_curl(args: &[String]) -> i32 {
             // refusal (status to stderr, body to stdout), which the egress test
             // asserts on, so on an https-via-proxy failure we redo the CONNECT
             // manually to surface it.
-            if url.starts_with("https://") {
-                if let Some(proxy) =
+            if url.starts_with("https://")
+                && let Some(proxy) =
                     proxy_from_env(&["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"])
-                {
-                    if let Some((host, port)) = url_host_port(&url, 443) {
-                        if probe_connect(&proxy, &host, port, max_time, verbose) {
-                            return 0;
-                        }
-                    }
-                }
+                && let Some((host, port)) = url_host_port(&url, 443)
+                && probe_connect(&proxy, &host, port, max_time, verbose)
+            {
+                return 0;
             }
             // Print the full error source chain — reqwest's top-level Display is
             // just "error sending request for url (...)".
@@ -671,10 +678,10 @@ fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verb
 
 fn proxy_from_env(keys: &[&str]) -> Option<String> {
     for k in keys {
-        if let Ok(v) = std::env::var(k) {
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if let Ok(v) = std::env::var(k)
+            && !v.is_empty()
+        {
+            return Some(v);
         }
     }
     None

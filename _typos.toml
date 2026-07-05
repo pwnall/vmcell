@@ -1,0 +1,19 @@
+# `typos` config. Keep it near-empty: every exception is a permanent blind spot, so add entries only
+# when `typos` misfires on project vocabulary, not preemptively.
+[files]
+# Vendored crates and generated/binary corpora are not ours to spell-check; `docs/historical/` holds
+# frozen, superseded design docs (archival records, not maintained prose) — excluded so archival
+# quotes/terms (e.g. a truncated HN title, the `THR` UART register) don't gate CI.
+extend-exclude = ["vendor/", "target/", "fuzz/corpus/", "fuzz/artifacts/", "docs/historical/"]
+
+[default.extend-words]
+# Each entry is a demonstrated false positive on real project vocabulary or an external API name.
+anc = "anc"                  # loop var for `Path::ancestors()` (vmcell-test-runner)
+ba = "ba"                    # `ab`/`ba` swapped-input test vars (vmcell-kernel-builder cache-key test)
+mis = "mis"                  # the hyphenated prefix in "mis-delivered"/"mis-delivery" (reaper docs)
+Oif = "Oif"                  # netlink `RouteAttribute::Oif` (output interface) — external crate API
+flate = "flate"              # the `flate2` crate name tokenizes to `flate`
+passt = "passt"              # `passt` user-mode networking tool (named in design/config prose)
+Passt = "Passt"              # capitalized form of the same tool name
+Criticals = "Criticals"      # severity-category plural in the code-review rubric ("Criticals and Highs")
+unparseable = "unparseable"  # accepted variant spelling used in metrics/qemu doc comments

@@ -107,7 +107,6 @@ pub struct StageOutputs {
 }
 
 /// A cache key that uniquely identifies the inputs to a stage.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CacheKey(pub String);
@@ -734,14 +733,14 @@ impl Pipeline {
                                 pins: outputs.pins.clone(),
                                 artifacts: outputs.artifacts.clone(),
                             };
-                            if let Ok(json) = serde_json::to_string(&metadata) {
-                                if let Err(e) = std::fs::write(&key_path, json) {
-                                    tracing::warn!(
-                                        "Failed to write cache key for stage {}: {}",
-                                        stage.name(),
-                                        e
-                                    );
-                                }
+                            if let Ok(json) = serde_json::to_string(&metadata)
+                                && let Err(e) = std::fs::write(&key_path, json)
+                            {
+                                tracing::warn!(
+                                    "Failed to write cache key for stage {}: {}",
+                                    stage.name(),
+                                    e
+                                );
                             }
                         }
                         Err(e) => {
@@ -793,8 +792,7 @@ impl Pipeline {
         }
         if !found {
             return Err(crate::error::Error::Artifact(format!(
-                "Stage not found: {}",
-                stage
+                "Stage not found: {stage}"
             )));
         }
         Ok(())

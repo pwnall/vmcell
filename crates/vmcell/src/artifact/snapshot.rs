@@ -163,8 +163,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut entries: Vec<(String, PathBuf)> = Vec::new();
         for i in 0..8 {
-            let p = write_tmp(dir.path(), &format!("f{}", i), format!("c{}", i).as_bytes());
-            entries.push((format!("art{}", i), p));
+            let p = write_tmp(dir.path(), &format!("f{i}"), format!("c{i}").as_bytes());
+            entries.push((format!("art{i}"), p));
         }
         let mut a = StageInputs::default();
         for (k, v) in entries.iter() {
@@ -252,8 +252,7 @@ mod tests {
         let res = stage().run(&inputs, &out).await;
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
-            "missing kernel upstream must hard-error, got {:?}",
-            res
+            "missing kernel upstream must hard-error, got {res:?}"
         );
     }
 }

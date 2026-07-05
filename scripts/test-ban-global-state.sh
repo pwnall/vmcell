@@ -33,6 +33,7 @@ printf 'static CACHE:\n    OnceLock<u32> = OnceLock::new(); // allow-global-stat
 # Plain consts, including a string that mentions "Mutex" and a `'static` lifetime.
 printf 'static MAX_RETRIES: usize = 10;\nstatic LABEL: &str = "uses a Mutex internally";\nfn f() -> &%cstatic str { "x" }\n' "'" > "$work/src/clean_const.rs"
 # Prose comment containing a fake ctor — stripped before analysis, so not a false positive.
+# shellcheck disable=SC2016  # the backticks are literal Rust source, not shell expansion (intended)
 printf '// buggy: `static GLOBAL: Mutex<u32> = Mutex::new(0)` would leak.\nstatic OK: u32 = 5;\n' > "$work/src/comment_prose.rs"
 
 set +e

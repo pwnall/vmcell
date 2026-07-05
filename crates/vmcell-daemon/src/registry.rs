@@ -132,10 +132,10 @@ impl Registry {
     pub async fn create(&self, req: CreateVmRequest) -> DaemonResult<CreatedVm> {
         let kernel_path = self.resolve_existing(&req.kernel, "kernel")?;
         let rootfs_path = self.resolve_existing(&req.rootfs, "rootfs")?;
-        if let Some(cmd) = &req.command {
-            if cmd.is_empty() {
-                return Err(DaemonError::BadRequest("command must be non-empty".into()));
-            }
+        if let Some(cmd) = &req.command
+            && cmd.is_empty()
+        {
+            return Err(DaemonError::BadRequest("command must be non-empty".into()));
         }
         // Fail loud early on a snapshot-ineligible request (design v20 §12.1), rather than deferring to
         // the config builder's `Error`.
@@ -320,10 +320,10 @@ impl Registry {
         for slot in slots {
             let mut inner = slot.inner.lock().await;
             inner.state = VmState::Destroying;
-            if let Some(h) = inner.handle.take() {
-                if let Err(e) = h.shutdown().await {
-                    tracing::warn!(vm = %slot.id, error = %e, "VM shutdown during daemon teardown failed");
-                }
+            if let Some(h) = inner.handle.take()
+                && let Err(e) = h.shutdown().await
+            {
+                tracing::warn!(vm = %slot.id, error = %e, "VM shutdown during daemon teardown failed");
             }
         }
     }

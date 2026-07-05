@@ -21,9 +21,11 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
+      - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae  # nightly branch
+        with: { toolchain: nightly }
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
         with: { tool: "cargo-fuzz" }
 
       - name: run all fuzz targets (5 min each)
@@ -36,7 +38,7 @@ jobs:
 
       - name: upload crash reproducers
         if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/

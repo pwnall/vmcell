@@ -16,12 +16,12 @@ pub use vmcell_artifact_validator::harness::{
 /// Recomputes the cgroup-v2 slice name the orchestrator assigns to a VM, so a residue check can
 /// target the *actual* (possibly systemd-/runner-nested) path. Test-only (residue tooling).
 pub fn computed_cgroup_name(vmid: u32) -> String {
-    if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
-        if let Some(base) = vmcell::metrics::cgroup_base_from_proc(&cgroup_str) {
-            return format!("{}/vmcell-vm-{}", base, vmid);
-        }
+    if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup")
+        && let Some(base) = vmcell::metrics::cgroup_base_from_proc(&cgroup_str)
+    {
+        return format!("{base}/vmcell-vm-{vmid}");
     }
-    format!("vmcell-vm-{}", vmid)
+    format!("vmcell-vm-{vmid}")
 }
 
 /// Records a capability-driven test skip to a durable, run-scoped manifest so the skip is an
@@ -60,10 +60,7 @@ pub fn clean_vmcell_netns() {
     let netns_prefix = vmcell::naming::netns_sweep_prefix(vmcell::naming::DEFAULT_RESOURCE_PREFIX);
     let removed = vmcell::net::cleanup_orphan_netns(&netns_prefix);
     if !removed.is_empty() {
-        println!(
-            "clean_vmcell_netns: reaped orphaned namespaces: {:?}",
-            removed
-        );
+        println!("clean_vmcell_netns: reaped orphaned namespaces: {removed:?}");
     }
 }
 

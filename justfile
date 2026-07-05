@@ -168,8 +168,30 @@ ci:
     # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the guest agent + its red-on-inverse self-test.
     ./scripts/ban-agent-ip-shellout.sh
     ./scripts/test-ban-agent-ip-shellout.sh
+    # ---- Toolchain honesty + non-Rust-surface gates (rubric Part D) ----
+    # Toolchain honesty: the declared MSRV (`[workspace.package] rust-version`) equals the pinned
+    # `rust-toolchain.toml` channel (the latest stable). An UNDERSTATED rust-version lets MSRV-aware
+    # resolvers hand consumers older, potentially-vulnerable dependency versions instead of the
+    # advisory-clean ones the lockfile pins; kept in lockstep with clippy.toml's msrv by review.
+    rv=$(sed -nE 's/^rust-version *= *"([0-9.]+)".*/\1/p' Cargo.toml | head -n1)
+    ch=$(sed -nE 's/^channel *= *"([0-9.]+)".*/\1/p' rust-toolchain.toml | head -n1)
+    [ -n "$rv" ] && [ "$rv" = "$ch" ] || { echo "MSRV drift: [workspace.package] rust-version=$rv vs rust-toolchain channel=$ch" >&2; exit 1; }
+    # The ban scripts, preflight, bless path, and delegated-scope helper are load-bearing,
+    # security-adjacent bash — lint them all.
+    shellcheck scripts/*.sh
+    # Workflow files: correctness (actionlint also shellchecks `run:` blocks) + security (zizmor:
+    # script injection, over-broad permissions, unpinned actions — the suites run on a SELF-HOSTED
+    # KVM runner, where a compromised action is lateral movement onto the host).
+    actionlint
+    zizmor .github/workflows/
+    # Unused dependencies enlarge the audited, licensed, advisory-scanned surface. Macro-only false
+    # positives get a per-crate [package.metadata.cargo-machete] ignored entry.
+    cargo machete
+    # Docs are a first-class artifact in this repo.
+    typos
     cargo nextest run --all-features
-    # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main merge-base).
+    # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main
+    # merge-base). Runs on the pinned toolchain — 1.96.1 satisfies cargo-semver-checks' rustc floor.
     baseline="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse main 2>/dev/null || true)"
     if [ -n "$baseline" ]; then cargo semver-checks --baseline-rev "$baseline" -p vmcell; else echo "semver-checks: no main baseline available locally, skipping (CI enforces it on PRs)"; fi
     # Feature-powerset LAST and BLOCKING (former C-GATE-1 debt, closed by the §10.5 host-stack collapse):

@@ -169,11 +169,11 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .with_env(vec![
                 (
                     "http_proxy".to_string(),
-                    format!("http://{}:{}", gateway, proxy_port),
+                    format!("http://{gateway}:{proxy_port}"),
                 ),
                 (
                     "https_proxy".to_string(),
-                    format!("http://{}:{}", gateway, proxy_port),
+                    format!("http://{gateway}:{proxy_port}"),
                 ),
             ]),
         )
@@ -209,11 +209,11 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .with_env(vec![
                 (
                     "http_proxy".to_string(),
-                    format!("http://{}:{}", gateway, proxy_port),
+                    format!("http://{gateway}:{proxy_port}"),
                 ),
                 (
                     "https_proxy".to_string(),
-                    format!("http://{}:{}", gateway, proxy_port),
+                    format!("http://{gateway}:{proxy_port}"),
                 ),
             ]),
         )
@@ -224,9 +224,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let blocked_stdout = String::from_utf8_lossy(&blocked_outcome.stdout);
     assert!(
         blocked_stderr.contains("403") && blocked_stdout.contains("Blocked by Imp Proxy"),
-        "Did not receive 403 Forbidden for blocked domain: {}\nSTDOUT: {}",
-        blocked_stderr,
-        blocked_stdout
+        "Did not receive 403 Forbidden for blocked domain: {blocked_stderr}\nSTDOUT: {blocked_stdout}"
     );
 
     // Plain-HTTP host-service proxying (TESTS-FEATURES-6): an absolute-form GET to the local
@@ -244,7 +242,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             ])
             .with_env(vec![(
                 "http_proxy".to_string(),
-                format!("http://{}:{}", gateway, proxy_port),
+                format!("http://{gateway}:{proxy_port}"),
             )]),
         )
         .await
@@ -265,8 +263,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     assert!(
         plain_http_body.contains("Directory listing for"),
         "plain-HTTP proxied response body must be the host service's directory \
-         listing; got: {}",
-        plain_http_body
+         listing; got: {plain_http_body}"
     );
 
     // Drop agent so we can borrow vm immutably
@@ -289,8 +286,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         requests
             .iter()
             .any(|r| r.starts_with("CONNECT") && r.contains("example.com")),
-        "Proxy should observe a CONNECT tunnel for the intended HTTPS destination, got: {:?}",
-        requests
+        "Proxy should observe a CONNECT tunnel for the intended HTTPS destination, got: {requests:?}"
     );
 
     // L-TEST-2: the guest-visible 403 above proves the block reached the guest, but
@@ -303,8 +299,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         requests
             .iter()
             .any(|r| r.starts_with("403 BLOCKED") && r.contains("blocked.com")),
-        "Proxy should record a '403 BLOCKED' entry for the blocked domain; got: {:?}",
-        requests
+        "Proxy should record a '403 BLOCKED' entry for the blocked domain; got: {requests:?}"
     );
 
     vm.shutdown().await.expect("Shutdown failed");
@@ -421,7 +416,7 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         Ok(a) => a,
         Err(e) => {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
-            panic!("Failed to connect to agent: {}\nSERIAL LOG:\n{}", e, log);
+            panic!("Failed to connect to agent: {e}\nSERIAL LOG:\n{log}");
         }
     };
 
@@ -445,11 +440,11 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .with_env(vec![
                 (
                     "http_proxy".to_string(),
-                    format!("http://{}:{}", gateway, proxy_port),
+                    format!("http://{gateway}:{proxy_port}"),
                 ),
                 (
                     "https_proxy".to_string(),
-                    format!("http://{}:{}", gateway, proxy_port),
+                    format!("http://{gateway}:{proxy_port}"),
                 ),
             ]),
         )
@@ -482,7 +477,7 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // the exact inverse the finding names: an impl that emits no ruleset makes
     // `nft list table ip proxy` fail (returns None -> panic below); an
     // accept-all policy drops the `policy drop` substring -> assert red.
-    let netns = format!("vmcell-net-{}", vmid);
+    let netns = format!("vmcell-net-{vmid}");
     let ruleset = common::nft_list_table_in_netns(&netns, "ip proxy").unwrap_or_else(|| {
         panic!(
             "privileged transparent egress must apply an nft ruleset in netns {netns}; \

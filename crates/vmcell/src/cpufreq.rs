@@ -399,10 +399,10 @@ impl<S: CpuFreqSysfs> Drop for CpuFreqPin<S> {
                 warn!("cpufreq: cpu{cpu}: failed to restore governor `{governor}`: {e}");
             }
         }
-        if let Some(original) = self.restore_turbo {
-            if let Err(e) = self.sysfs.write_turbo(original) {
-                warn!("cpufreq: failed to restore turbo={original}: {e}");
-            }
+        if let Some(original) = self.restore_turbo
+            && let Err(e) = self.sysfs.write_turbo(original)
+        {
+            warn!("cpufreq: failed to restore turbo={original}: {e}");
         }
     }
 }

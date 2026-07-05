@@ -1,0 +1,20 @@
+# Freshness automation for the two update surfaces the gates created: the SHA-pinned GitHub Actions
+# and the `--locked` Cargo lockfile. With `--locked` everywhere, dependency bumps land ONLY through
+# these reviewed PRs — each one runs the full gate suite, and `cargo deny` still adjudicates
+# licenses/advisories on the result. Dependabot also moves the action SHA-pins forward, so the
+# pin policy costs nothing after the first pass (zizmor's `unpinned-uses` flags any that regress).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Group the routine noise; majors arrive as individual PRs that get real review.
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]

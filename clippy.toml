@@ -1,7 +1,8 @@
-# Declared MSRV. The EFFECTIVE build floor is 1.88 via the committed lockfile (time 0.3.47 pins
-# RUSTSEC-2026-0009); CI builds --locked on 1.88 (see the toolchain note in the design §10.5 and
-# AGENTS.md). This declared value keeps clippy's msrv-gated lints honest without lowering that floor.
-msrv = "1.85"
+# Declared MSRV = the tested floor, tracking the latest stable (1.96.1). An UNDERSTATED rust-version is
+# worse than cosmetic — it lets an MSRV-aware resolver hand consumers older, potentially-vulnerable
+# dependency versions instead of the advisory-clean ones the lockfile pins. Kept in lockstep with
+# rust-toolchain.toml + [workspace.package] rust-version by the sync assertion in `just ci` / ci.yml.
+msrv = "1.96.1"
 
 # Tests may unwrap/expect/print/dbg; production code may not (see the not(test) deny-list in lib.rs).
 allow-unwrap-in-tests  = true

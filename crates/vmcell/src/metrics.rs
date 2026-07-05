@@ -128,16 +128,16 @@ fn mem_hard_limit_bytes(mem_max_mib: u32) -> i64 {
 fn render_io_max(io: &crate::config::IoMax) -> Option<String> {
     let mut rules = Vec::new();
     if let Some(rbps) = io.rbps {
-        rules.push(format!("rbps={}", rbps));
+        rules.push(format!("rbps={rbps}"));
     }
     if let Some(wbps) = io.wbps {
-        rules.push(format!("wbps={}", wbps));
+        rules.push(format!("wbps={wbps}"));
     }
     if let Some(riops) = io.riops {
-        rules.push(format!("riops={}", riops));
+        rules.push(format!("riops={riops}"));
     }
     if let Some(wiops) = io.wiops {
-        rules.push(format!("wiops={}", wiops));
+        rules.push(format!("wiops={wiops}"));
     }
     if rules.is_empty() {
         None
@@ -181,11 +181,8 @@ fn classify_limit_write_err(
         ))
     } else {
         Error::CapabilityUnavailable {
-            op: format!("cgroup {} limit", file),
-            needed: format!(
-                "writable {} for the '{}' controller ({})",
-                path, controller, e
-            ),
+            op: format!("cgroup {file} limit"),
+            needed: format!("writable {path} for the '{controller}' controller ({e})"),
         }
     }
 }
@@ -227,9 +224,9 @@ fn try_apply_limit_at(
         // delegated by the cgroup root's own `subtree_control`; check it rather than
         // skip the read-back and lean solely on the write-failure backstop below.
         let subtree = if parent.is_empty() {
-            format!("{}/cgroup.subtree_control", cgroup_root)
+            format!("{cgroup_root}/cgroup.subtree_control")
         } else {
-            format!("{}/{}/cgroup.subtree_control", cgroup_root, parent)
+            format!("{cgroup_root}/{parent}/cgroup.subtree_control")
         };
         // Enable the controller on the parent's subtree_control only if it is not
         // already delegated. A constrained/non-delegated layout silently ignores the
@@ -239,19 +236,19 @@ fn try_apply_limit_at(
             .map(|s| controller_listed(&s, controller))
             .unwrap_or(false);
         if !already_delegated {
-            let _ = std::fs::write(&subtree, format!("+{}", controller));
+            let _ = std::fs::write(&subtree, format!("+{controller}"));
         }
         let delegated = std::fs::read_to_string(&subtree)
             .map(|s| controller_listed(&s, controller))
             .unwrap_or(false);
         if !delegated {
             return Err(Error::CapabilityUnavailable {
-                op: format!("cgroup {} limit", file),
-                needed: format!("'{}' controller delegated to {}", controller, subtree),
+                op: format!("cgroup {file} limit"),
+                needed: format!("'{controller}' controller delegated to {subtree}"),
             });
         }
     }
-    let path = format!("{}/{}/{}", cgroup_root, name, file);
+    let path = format!("{cgroup_root}/{name}/{file}");
     std::fs::write(&path, value)
         .map_err(|e| classify_limit_write_err(file, &path, controller, value, &e))
 }
@@ -304,18 +301,18 @@ fn read_stats_at(base_path: &str) -> ResourceUsage {
     // to handle. Only a genuinely absent control file now falls through to 0, and
     // `mem_read_ok` then stays `false` so the caller never mistakes it for a real 0.
     let mut mem_current_ok = false;
-    if let Ok(s) = std::fs::read_to_string(format!("{}/memory.current", base_path)) {
-        if let Ok(val) = s.trim().parse::<u64>() {
-            usage.mem_current_mib = val / 1024 / 1024;
-            mem_current_ok = true;
-        }
+    if let Ok(s) = std::fs::read_to_string(format!("{base_path}/memory.current"))
+        && let Ok(val) = s.trim().parse::<u64>()
+    {
+        usage.mem_current_mib = val / 1024 / 1024;
+        mem_current_ok = true;
     }
     let mut mem_peak_ok = false;
-    if let Ok(s) = std::fs::read_to_string(format!("{}/memory.peak", base_path)) {
-        if let Ok(val) = s.trim().parse::<u64>() {
-            usage.mem_peak_mib = val / 1024 / 1024;
-            mem_peak_ok = true;
-        }
+    if let Ok(s) = std::fs::read_to_string(format!("{base_path}/memory.peak"))
+        && let Ok(val) = s.trim().parse::<u64>()
+    {
+        usage.mem_peak_mib = val / 1024 / 1024;
+        mem_peak_ok = true;
     }
     // Both memory counters must read for the memory metrics to be trustworthy.
     usage.mem_read_ok = mem_current_ok && mem_peak_ok;
@@ -323,7 +320,7 @@ fn read_stats_at(base_path: &str) -> ResourceUsage {
     // I/O byte counters: sum rbytes/wbytes over every device line of io.stat
     // (METRICS-FS-1). These fields were previously never populated. `io_read_ok`
     // is `false` when `io.stat` is absent (an empty/counter-less file is a valid 0).
-    if let Ok(s) = std::fs::read_to_string(format!("{}/io.stat", base_path)) {
+    if let Ok(s) = std::fs::read_to_string(format!("{base_path}/io.stat")) {
         let (read_bytes, write_bytes) = parse_io_stat_bytes(&s);
         usage.io_read_bytes = read_bytes;
         usage.io_write_bytes = write_bytes;
@@ -332,18 +329,18 @@ fn read_stats_at(base_path: &str) -> ResourceUsage {
 
     // CPU usage in microseconds: the `usage_usec` line of cpu.stat. `cpu_read_ok`
     // is `false` when the file is absent or has no parseable `usage_usec` line.
-    if let Ok(s) = std::fs::read_to_string(format!("{}/cpu.stat", base_path)) {
-        if let Some(val) = parse_cpu_usage_usec(&s) {
-            usage.cpu_usec = val;
-            usage.cpu_read_ok = true;
-        }
+    if let Ok(s) = std::fs::read_to_string(format!("{base_path}/cpu.stat"))
+        && let Some(val) = parse_cpu_usage_usec(&s)
+    {
+        usage.cpu_usec = val;
+        usage.cpu_read_ok = true;
     }
 
     // limits_enforced (§7.1 rule 3): the memory controller is delegated into this
     // cgroup iff it is listed in `cgroup.controllers`. When it is absent the limit
     // writes were rejected and the values above are bare sysfs fallbacks, so the
     // caller must not assume enforcement. Honestly `false` if the file is missing.
-    let controllers_path = format!("{}/cgroup.controllers", base_path);
+    let controllers_path = format!("{base_path}/cgroup.controllers");
     usage.limits_enforced = std::fs::read_to_string(controllers_path)
         .map(|s| controller_listed(&s, "memory"))
         .unwrap_or(false);
@@ -377,8 +374,8 @@ fn create_slice_at(
     // directory + direct limit writes is robust across layouts. (The cgroup must still
     // live in a non-threaded `domain` subtree — a threaded scope rejects `cgroup.procs`
     // regardless; see implementation-notes.)
-    std::fs::create_dir_all(format!("{}/{}", cgroup_root, name))
-        .map_err(|e| crate::error::Error::Cgroup(format!("create cgroup {}: {}", name, e)))?;
+    std::fs::create_dir_all(format!("{cgroup_root}/{name}"))
+        .map_err(|e| crate::error::Error::Cgroup(format!("create cgroup {name}: {e}")))?;
 
     if let Some(mem) = limits.mem_max_mib {
         try_apply_limit_at(
@@ -405,7 +402,7 @@ fn create_slice_at(
             name,
             "cpu",
             "cpu.max",
-            &format!("{} {}", quota, period),
+            &format!("{quota} {period}"),
         )?;
     }
     if let Some(pids) = limits.pids_max {
@@ -417,10 +414,10 @@ fn create_slice_at(
             &render_pids_max(pids),
         )?;
     }
-    if let Some(io) = &limits.io_max {
-        if let Some(io_str) = render_io_max(io) {
-            try_apply_limit_at(cgroup_root, name, "io", "io.max", io_str.trim_end())?;
-        }
+    if let Some(io) = &limits.io_max
+        && let Some(io_str) = render_io_max(io)
+    {
+        try_apply_limit_at(cgroup_root, name, "io", "io.max", io_str.trim_end())?;
     }
     Ok(())
 }
@@ -447,14 +444,14 @@ impl CgroupFs for DefaultCgroupFs {
         // remaining members. A failure (e.g. members still present) is a leak, so
         // surface it as a `warn!` rather than swallowing it invisibly (L-HOST-2);
         // deletion itself stays best-effort.
-        if let Err(e) = std::fs::remove_dir(format!("/sys/fs/cgroup/{}", name)) {
+        if let Err(e) = std::fs::remove_dir(format!("/sys/fs/cgroup/{name}")) {
             tracing::warn!("failed to remove cgroup {}: {}", name, e);
         }
         Ok(())
     }
 
     fn read_stats(&self, name: &str) -> Result<ResourceUsage> {
-        Ok(read_stats_at(&format!("/sys/fs/cgroup/{}", name)))
+        Ok(read_stats_at(&format!("/sys/fs/cgroup/{name}")))
     }
 
     fn add_task(&self, name: &str, pid: u32) -> Result<()> {
@@ -465,12 +462,11 @@ impl CgroupFs for DefaultCgroupFs {
                 "cgroup name cannot be empty".to_string(),
             ));
         }
-        let procs_path = format!("/sys/fs/cgroup/{}/cgroup.procs", name);
+        let procs_path = format!("/sys/fs/cgroup/{name}/cgroup.procs");
         // Write PID directly to bypass `Cgroup::add_task` limitations for nested unprivileged cgroups
         std::fs::write(&procs_path, pid.to_string()).map_err(|e| {
             crate::error::Error::Cgroup(format!(
-                "Failed to add process {} to cgroup {}: {}",
-                pid, name, e
+                "Failed to add process {pid} to cgroup {name}: {e}"
             ))
         })?;
         tracing::info!("Added process {} to cgroup {}", pid, name);
@@ -580,8 +576,8 @@ impl CgroupFs for FakeCgroupFs {
         ] {
             if requested && !state.delegated.contains(controller) {
                 return Err(crate::error::Error::CapabilityUnavailable {
-                    op: format!("cgroup {} limit", file),
-                    needed: format!("'{}' controller delegated to {}", controller, name),
+                    op: format!("cgroup {file} limit"),
+                    needed: format!("'{controller}' controller delegated to {name}"),
                 });
             }
         }

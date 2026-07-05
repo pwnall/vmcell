@@ -55,19 +55,16 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let stats_before = vm.usage().await.expect("Failed to get VM stats");
 
     let cgroup_name = common::computed_cgroup_name(vm.vmid());
-    let cg_base = format!("/sys/fs/cgroup/{}", cgroup_name);
+    let cg_base = format!("/sys/fs/cgroup/{cgroup_name}");
 
     // HARD precondition (TESTS-FEATURES-3): the memory controller MUST be delegated to the
     // slice, otherwise the limit assertions cannot run. A missing or `max` `memory.max` is a
     // real misconfiguration of the privileged runner, never a reason to silently pass. (This
     // test is `#[ignore]`d and only runs under the KVM/privileged tier where the capability
     // runner delegates the controllers.)
-    let memory_max_path = format!("{}/memory.max", cg_base);
+    let memory_max_path = format!("{cg_base}/memory.max");
     let mem_max_raw = std::fs::read_to_string(&memory_max_path).unwrap_or_else(|e| {
-        panic!(
-            "memory controller not delegated to {} ({e}): cannot validate memory limits",
-            cg_base
-        )
+        panic!("memory controller not delegated to {cg_base} ({e}): cannot validate memory limits")
     });
     let max_bytes: u64 = mem_max_raw.trim().parse().unwrap_or_else(|_| {
         panic!(
@@ -87,14 +84,14 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // host oom_kill stayed 0 while the guest OOM'd itself). These read back the exact
     // values metrics::create_slice must write; a metrics impl that omits them leaves
     // swap.max at "max" and oom.group at "0", turning these asserts red.
-    let swap_max_raw = std::fs::read_to_string(format!("{}/memory.swap.max", cg_base))
+    let swap_max_raw = std::fs::read_to_string(format!("{cg_base}/memory.swap.max"))
         .expect("memory.swap.max must exist when the memory controller is delegated");
     assert_eq!(
         swap_max_raw.trim(),
         "0",
         "memory.swap.max must be 0 so the cap hard-bounds shmem-backed guest RAM (E1)"
     );
-    let oom_group_raw = std::fs::read_to_string(format!("{}/memory.oom.group", cg_base))
+    let oom_group_raw = std::fs::read_to_string(format!("{cg_base}/memory.oom.group"))
         .expect("memory.oom.group must exist when the memory controller is delegated");
     assert_eq!(
         oom_group_raw.trim(),
@@ -163,10 +160,7 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // The VM has 1 vcpu by default, so the ceiling is ~100%.
     assert!(
         cpu_percent > 50.0,
-        "CPU usage should be >50% (got {}%, diff {} usec over {}s)",
-        cpu_percent,
-        diff_usec,
-        elapsed
+        "CPU usage should be >50% (got {cpu_percent}%, diff {diff_usec} usec over {elapsed}s)"
     );
 
     // Test OOM-kill (TESTS-FEATURES-1): the host cgroup cap (256 MiB) is the binding limit

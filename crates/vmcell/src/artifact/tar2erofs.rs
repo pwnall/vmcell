@@ -203,10 +203,7 @@ fn build_node_map<'a, R: Read + 'a>(
     // baked guest-agent or the CA under `usr/local/share/ca-certificates/`.
     for (dest_path, src_path) in injected_files {
         let content = std::fs::read(src_path).map_err(|e| {
-            crate::error::Error::Artifact(format!(
-                "Failed to read injected file {:?}: {}",
-                src_path, e
-            ))
+            crate::error::Error::Artifact(format!("Failed to read injected file {src_path:?}: {e}"))
         })?;
         let meta = NodeMeta {
             uid: 0,

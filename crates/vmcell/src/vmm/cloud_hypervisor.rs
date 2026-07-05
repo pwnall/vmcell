@@ -270,12 +270,12 @@ fn rewrite_restore_config(
     // device and guest egress would be dead. The guest's IP + default route are
     // rotated to match by the native resync (see `maybe_resync_after_restore`), so
     // the whole L2/L3 identity moves to the rotated vmid together.
-    if let Some(tap) = tap_name {
-        if let Some(nets) = config.get_mut("net").and_then(|n| n.as_array_mut()) {
-            for net in nets.iter_mut() {
-                if net.get("tap").is_some() {
-                    net["tap"] = serde_json::Value::String(tap.to_string());
-                }
+    if let Some(tap) = tap_name
+        && let Some(nets) = config.get_mut("net").and_then(|n| n.as_array_mut())
+    {
+        for net in nets.iter_mut() {
+            if net.get("tap").is_some() {
+                net["tap"] = serde_json::Value::String(tap.to_string());
             }
         }
     }
@@ -283,15 +283,15 @@ fn rewrite_restore_config(
     // for a VirtioConsole VM (the other device serializes as `{"mode":"Off"}` with no
     // `file`). Rewrite whichever one the snapshot recorded so the restored VM logs to
     // the fresh serial_path instead of the original instance's deleted temp path.
-    if let Some(serial) = config.get_mut("serial") {
-        if serial.get("file").is_some() {
-            serial["file"] = serde_json::Value::String(serial_path.to_string_lossy().into_owned());
-        }
+    if let Some(serial) = config.get_mut("serial")
+        && serial.get("file").is_some()
+    {
+        serial["file"] = serde_json::Value::String(serial_path.to_string_lossy().into_owned());
     }
-    if let Some(console) = config.get_mut("console") {
-        if console.get("file").is_some() {
-            console["file"] = serde_json::Value::String(serial_path.to_string_lossy().into_owned());
-        }
+    if let Some(console) = config.get_mut("console")
+        && console.get("file").is_some()
+    {
+        console["file"] = serde_json::Value::String(serial_path.to_string_lossy().into_owned());
     }
     Ok(())
 }

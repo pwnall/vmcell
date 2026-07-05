@@ -2,7 +2,7 @@
 name = "vmcell-artifact-validator"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Validates custom-built vmcell artifacts (kernel, rootfs) against the artifact↔system contract by booting test micro-VMs"
 publish = false
@@ -16,7 +16,6 @@ path = "src/lib.rs"
 # capability descriptors + net math. It needs the host stack: a backend, metrics, pipeline
 # (for artifact_path helpers). `vmcell` has no dependency on this crate.
 vmcell = { path = "../vmcell", version = "0.6.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
-async-trait = "0.1.89"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"
 tracing = "0.1"

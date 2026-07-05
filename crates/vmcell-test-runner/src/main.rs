@@ -17,11 +17,13 @@
 //! capability/syscall FFI. `print_stdout`/`print_stderr` are intentionally NOT denied — a
 //! target-runner's operator diagnostics go to stderr by contract.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block // one obligation per SAFETY comment
 )]
 #![cfg_attr(
     not(test),
@@ -32,7 +34,9 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
-        clippy::dbg_macro
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 
@@ -51,9 +55,12 @@ use vmcell_privilege::{
 /// This binary is a nextest target-runner: on any setup error it must exit non-zero. At every call
 /// site there is no owned host state to unwind — the privilege transition has either not happened
 /// yet or is being aborted — so `process::exit` (banned elsewhere for skipping Drop) is the correct
-/// terminator. Centralized here behind one `allow` so the ban stays live in the rest of the file.
+/// terminator. Centralized here behind one `#[expect]` so the ban stays live in the rest of the file.
 fn exit_failure() -> ! {
-    #[allow(clippy::disallowed_methods)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "nextest target-runner setup-error terminator; no owned host state to unwind at any call site"
+    )]
     std::process::exit(1)
 }
 

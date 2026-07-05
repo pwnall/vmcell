@@ -22,7 +22,7 @@ impl HttpClient for ReqwestClient {
     async fn get(&self, url: &str) -> Result<Vec<u8>> {
         let response = reqwest::get(url)
             .await
-            .map_err(|e| Error::Artifact(format!("Failed to download: {}", e)))?;
+            .map_err(|e| Error::Artifact(format!("Failed to download: {e}")))?;
         if !response.status().is_success() {
             return Err(Error::Artifact(format!(
                 "Failed to download: status {}",
@@ -32,7 +32,7 @@ impl HttpClient for ReqwestClient {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| Error::Artifact(format!("Failed to read: {}", e)))?;
+            .map_err(|e| Error::Artifact(format!("Failed to read: {e}")))?;
         Ok(bytes.to_vec())
     }
 }
@@ -248,8 +248,7 @@ impl Stage for KernelStage {
         let hash = sha256_hex(&tarball_bytes);
         if &hash != kernel_source_sha256 {
             return Err(Error::Artifact(format!(
-                "Kernel source tarball hash mismatch: expected {}, got {} (url {})",
-                kernel_source_sha256, hash, kernel_source_url
+                "Kernel source tarball hash mismatch: expected {kernel_source_sha256}, got {hash} (url {kernel_source_url})"
             )));
         }
 
@@ -263,7 +262,7 @@ impl Stage for KernelStage {
                     let xz_file = std::fs::File::open(&tarball_path)?;
                     let mut tar_file = std::fs::File::create(&tar_uncompressed_path)?;
                     lzma_rs::xz_decompress(&mut std::io::BufReader::new(xz_file), &mut tar_file)
-                        .map_err(|e| Error::Artifact(format!("Decompression failed: {:?}", e)))?;
+                        .map_err(|e| Error::Artifact(format!("Decompression failed: {e:?}")))?;
                 }
 
                 let tar_file_read = std::fs::File::open(&tar_uncompressed_path)?;
@@ -294,19 +293,18 @@ impl Stage for KernelStage {
                         // outside workdir. `unpack` (unlike `unpack_in`) does not guard this,
                         // so reject an escaping symlink at creation — then no such link exists
                         // for a subsequent entry to write through.
-                        if file.header().entry_type() == tar::EntryType::Symlink {
-                            if let Some(target) = file.link_name().map_err(|e| {
-                                Error::Artifact(format!("bad kernel tarball symlink: {}", e))
-                            })? {
-                                if symlink_escapes(&stripped_path, &target) {
-                                    return Err(Error::Artifact(format!(
-                                        "refusing kernel tarball symlink {} -> {} escaping \
+                        if file.header().entry_type() == tar::EntryType::Symlink
+                            && let Some(target) = file.link_name().map_err(|e| {
+                                Error::Artifact(format!("bad kernel tarball symlink: {e}"))
+                            })?
+                            && symlink_escapes(&stripped_path, &target)
+                        {
+                            return Err(Error::Artifact(format!(
+                                "refusing kernel tarball symlink {} -> {} escaping \
                                          the build dir",
-                                        stripped_path.display(),
-                                        target.display()
-                                    )));
-                                }
-                            }
+                                stripped_path.display(),
+                                target.display()
+                            )));
                         }
                         if let Some(parent) = out_path.parent() {
                             std::fs::create_dir_all(parent)?;
@@ -320,7 +318,7 @@ impl Stage for KernelStage {
                 Ok(())
             })
             .await
-            .map_err(|e| Error::Artifact(format!("spawn_blocking extract failed: {}", e)))??;
+            .map_err(|e| Error::Artifact(format!("spawn_blocking extract failed: {e}")))??;
         }
 
         let status = Command::new("make")

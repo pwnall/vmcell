@@ -215,7 +215,7 @@ impl VmidAllocator {
     /// Releases the cross-process lock for `vmid`, if any.
     fn release_fs(&self, vmid: u32) {
         if let Some(dir) = &self.lock_dir {
-            let lock_path = dir.join(format!("{}.lock", vmid));
+            let lock_path = dir.join(format!("{vmid}.lock"));
             let _ = std::fs::remove_file(&lock_path);
         }
     }
@@ -257,21 +257,18 @@ impl VmidAllocator {
     pub fn reserve(&self, vmid: u32) -> Result<u32> {
         if !(1..=254).contains(&vmid) {
             return Err(crate::error::Error::Config(format!(
-                "vmid {} out of range (must be 1..=254)",
-                vmid
+                "vmid {vmid} out of range (must be 1..=254)"
             )));
         }
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if active.contains(&vmid) {
             return Err(crate::error::Error::Exhaustion(format!(
-                "VMID {} already reserved",
-                vmid
+                "VMID {vmid} already reserved"
             )));
         }
         if !self.try_claim_fs(vmid) {
             return Err(crate::error::Error::Exhaustion(format!(
-                "VMID {} already in use by another process",
-                vmid
+                "VMID {vmid} already in use by another process"
             )));
         }
         active.insert(vmid);
@@ -365,10 +362,10 @@ impl CgroupGuard {
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Err(e) = self.fs.delete_slice(&self.name) {
-                tracing::warn!("failed to delete leaked cgroup slice {}: {}", self.name, e);
-            }
+        if self.armed
+            && let Err(e) = self.fs.delete_slice(&self.name)
+        {
+            tracing::warn!("failed to delete leaked cgroup slice {}: {}", self.name, e);
         }
     }
 }
@@ -490,9 +487,9 @@ async fn maybe_resync_after_restore<E: GuestResync>(
     // `mac_math` centralizes the vmid→MAC mapping as a string; convert it to the
     // six bytes the wire protocol carries without duplicating that mapping.
     let mac_str = crate::net::mac_math(vmid)
-        .map_err(|e| crate::error::Error::Agent(format!("mac math: {}", e)))?;
+        .map_err(|e| crate::error::Error::Agent(format!("mac math: {e}")))?;
     let mac = parse_mac_bytes(&mac_str).ok_or_else(|| {
-        crate::error::Error::Agent(format!("mac math produced an unparseable MAC: {}", mac_str))
+        crate::error::Error::Agent(format!("mac math produced an unparseable MAC: {mac_str}"))
     })?;
 
     // H-VMM-1: the IP address IS rotated on restore (superseding the old §9.2
@@ -504,7 +501,7 @@ async fn maybe_resync_after_restore<E: GuestResync>(
     // goes via `host_ip` (the gateway). Applied natively in-guest (SIOCSIFADDR +
     // route ioctls, no netlink), exactly like the MAC above.
     let (host_ip, guest_ip, _cidr) = crate::net::ip_math(vmid)
-        .map_err(|e| crate::error::Error::Agent(format!("ip math: {}", e)))?;
+        .map_err(|e| crate::error::Error::Agent(format!("ip math: {e}")))?;
     let ipv4 = crate::agent::protocol::Ipv4Reconfig {
         addr: guest_ip.octets(),
         // The `/30` point-to-point prefix `ip_math` produces.
@@ -532,8 +529,7 @@ async fn maybe_resync_after_restore<E: GuestResync>(
         // non-zero-exit path). Clearing it here (silent-Ok-on-failure) would leave
         // time-sensitive restored tests seeing a frozen wall clock (§7.1 defect).
         return Err(crate::error::Error::Agent(format!(
-            "mandatory post-restore clock resync failed: {}",
-            err
+            "mandatory post-restore clock resync failed: {err}"
         )));
     }
 
@@ -623,7 +619,8 @@ impl<V: Vmm> MicroVm<V> {
         let mut proxy = None;
         let mut tap_name = None;
         let mut netns_name = None;
-        #[allow(unused_mut)]
+        // `mut`: reassigned on the `net-unprivileged` leg below, which `host-common` always enables
+        // (and this fn only compiles under `host-common`), so the binding is unconditionally mutated.
         let mut vhost_user_socket = None;
 
         match &cfg.net {
@@ -738,10 +735,10 @@ impl<V: Vmm> MicroVm<V> {
         // hierarchy.
         let leaf = crate::naming::cgroup_slice_name(&cfg.resource_prefix, vmid);
         let mut cgroup_name = leaf.clone();
-        if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
-            if let Some(base) = crate::metrics::cgroup_base_from_proc(&cgroup_str) {
-                cgroup_name = format!("{base}/{leaf}");
-            }
+        if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup")
+            && let Some(base) = crate::metrics::cgroup_base_from_proc(&cgroup_str)
+        {
+            cgroup_name = format!("{base}/{leaf}");
         }
 
         cgroup_fs.create_slice(&cgroup_name, &cfg.limits)?;
@@ -1494,7 +1491,7 @@ impl HostOrphanScanner {
             let child_rel = if rel.is_empty() {
                 name.clone()
             } else {
-                format!("{}/{}", rel, name)
+                format!("{rel}/{name}")
             };
             if name.starts_with(vm_prefix) {
                 out.push(child_rel);

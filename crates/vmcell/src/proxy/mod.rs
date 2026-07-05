@@ -184,7 +184,7 @@ impl EgressProxy {
                 match std::fs::File::open("/proc/thread-self/ns/net") {
                     Ok(f) => Some(f),
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to open host netns: {}", e)));
+                        let _ = tx.send(Err(format!("Failed to open host netns: {e}")));
                         return;
                     }
                 }
@@ -192,9 +192,8 @@ impl EgressProxy {
                 None
             };
 
-            #[allow(clippy::collapsible_if)]
             if let Some(ref netns) = cfg.netns {
-                match std::fs::File::open(format!("/var/run/netns/{}", netns)) {
+                match std::fs::File::open(format!("/var/run/netns/{netns}")) {
                     Ok(file) => {
                         // SAFETY: `setns(2)` with a live fd opened just above from
                         // `/var/run/netns/<name>`, valid for the duration of the
@@ -214,7 +213,7 @@ impl EgressProxy {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to open netns file: {}", e)));
+                        let _ = tx.send(Err(format!("Failed to open netns file: {e}")));
                         return;
                     }
                 }
@@ -226,7 +225,7 @@ impl EgressProxy {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = tx.send(Err(format!("Failed to build tokio runtime: {}", e)));
+                    let _ = tx.send(Err(format!("Failed to build tokio runtime: {e}")));
                     return;
                 }
             };
@@ -249,8 +248,7 @@ impl EgressProxy {
                         Ok(std_listener) => {
                             if let Err(e) = std_listener.set_nonblocking(true) {
                                 let _ = tx.send(Err(format!(
-                                    "Failed to set transparent listener non-blocking: {}",
-                                    e
+                                    "Failed to set transparent listener non-blocking: {e}"
                                 )));
                                 return;
                             }
@@ -258,8 +256,7 @@ impl EgressProxy {
                                 Ok(l) => l,
                                 Err(e) => {
                                     let _ = tx.send(Err(format!(
-                                        "Failed to adopt transparent listener: {}",
-                                        e
+                                        "Failed to adopt transparent listener: {e}"
                                     )));
                                     return;
                                 }
@@ -267,8 +264,7 @@ impl EgressProxy {
                         }
                         Err(e) => {
                             let _ = tx.send(Err(format!(
-                                "Failed to bind transparent listener on {}: {:?}",
-                                addr, e
+                                "Failed to bind transparent listener on {addr}: {e:?}"
                             )));
                             return;
                         }
@@ -277,7 +273,7 @@ impl EgressProxy {
                     match TcpListener::bind(addr).await {
                         Ok(l) => l,
                         Err(e) => {
-                            let _ = tx.send(Err(format!("Failed to bind to {}: {}", addr, e)));
+                            let _ = tx.send(Err(format!("Failed to bind to {addr}: {e}")));
                             return;
                         }
                     }
@@ -286,7 +282,7 @@ impl EgressProxy {
                 let port = match listener.local_addr() {
                     Ok(addr) => addr.port(),
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to get local address: {}", e)));
+                        let _ = tx.send(Err(format!("Failed to get local address: {e}")));
                         return;
                     }
                 };
@@ -317,7 +313,7 @@ impl EgressProxy {
                 let ca_manager = match tls::CaManager::new() {
                     Ok(cm) => cm,
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to initialize CA: {:?}", e)));
+                        let _ = tx.send(Err(format!("Failed to initialize CA: {e:?}")));
                         return;
                     }
                 };
@@ -325,7 +321,7 @@ impl EgressProxy {
                 let authority = match ca_manager.authority() {
                     Ok(auth) => auth,
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Failed to build CA authority: {:?}", e)));
+                        let _ = tx.send(Err(format!("Failed to build CA authority: {e:?}")));
                         return;
                     }
                 };
@@ -353,7 +349,7 @@ impl EgressProxy {
                 {
                     Ok(p) => p,
                     Err(e) => {
-                        let _ = tx.send(Err(format!("Proxy builder failed: {:?}", e)));
+                        let _ = tx.send(Err(format!("Proxy builder failed: {e:?}")));
                         return;
                     }
                 };
@@ -374,7 +370,7 @@ impl EgressProxy {
                 // hudsucker init). Join it and surface the panic payload instead of
                 // the opaque "channel closed" recv error.
                 let msg = match thread.join() {
-                    Ok(()) => format!("proxy readiness channel closed: {}", recv_err),
+                    Ok(()) => format!("proxy readiness channel closed: {recv_err}"),
                     Err(panic) => {
                         format!("proxy thread panicked: {}", panic_message(panic.as_ref()))
                     }
@@ -593,7 +589,7 @@ pub fn bind_transparent_listener(addr: SocketAddr) -> Result<std::net::TcpListen
 pub fn original_destination(stream: &tokio::net::TcpStream) -> Result<SocketAddr> {
     stream
         .local_addr()
-        .map_err(|e| Error::Proxy(format!("original destination (local_addr): {}", e)))
+        .map_err(|e| Error::Proxy(format!("original destination (local_addr): {e}")))
 }
 
 #[cfg(test)]

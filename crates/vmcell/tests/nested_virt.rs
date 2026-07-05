@@ -108,7 +108,7 @@ async fn test_nested_virt_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             let log = tokio::fs::read_to_string(vm.instance().serial_log())
                 .await
                 .unwrap_or_default();
-            panic!("Failed to connect to agent: {}\nSerial log:\n{}", e, log);
+            panic!("Failed to connect to agent: {e}\nSerial log:\n{log}");
         }
     };
 
@@ -169,7 +169,7 @@ async fn test_nested_virt_disabled_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             let log = tokio::fs::read_to_string(vm.instance().serial_log())
                 .await
                 .unwrap_or_default();
-            panic!("Failed to connect to agent: {}\nSerial log:\n{}", e, log);
+            panic!("Failed to connect to agent: {e}\nSerial log:\n{log}");
         }
     };
 

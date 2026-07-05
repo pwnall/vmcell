@@ -235,8 +235,7 @@ pub(crate) fn build_kernel_cmdline(
     if !matches!(cfg.net, NetConfig::None) {
         let (host_ip, guest_ip, _) = crate::net::ip_math(vmid)?;
         s.push_str(&format!(
-            " ip={}::{}:255.255.255.252::eth0:off",
-            guest_ip, host_ip
+            " ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"
         ));
     }
     // `nested_virt` controls the guest KVM's *nested* (L2) capability via the

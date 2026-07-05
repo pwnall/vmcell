@@ -178,8 +178,7 @@ impl QemuInstance {
 fn require_vsock_daemon(spawn_result: std::io::Result<Child>) -> Result<Child> {
     spawn_result.map_err(|e| {
         Error::Vmm(format!(
-            "failed to spawn the external vhost-device-vsock daemon (QEMU unprivileged vsock control plane): {}",
-            e
+            "failed to spawn the external vhost-device-vsock daemon (QEMU unprivileged vsock control plane): {e}"
         ))
     })
 }
@@ -320,8 +319,7 @@ impl Qemu {
         {
             crate::vmm::reap_process_group(&mut vsock_daemon, vsock_pgid);
             return Err(Error::Vmm(format!(
-                "vhost-device-vsock failed to start: {}",
-                e
+                "vhost-device-vsock failed to start: {e}"
             )));
         }
 
@@ -433,10 +431,7 @@ impl Qemu {
 
         if let Some(tap) = &res.tap_name {
             cmd.arg("-netdev")
-                .arg(format!(
-                    "tap,id=net0,ifname={},script=no,downscript=no",
-                    tap
-                ))
+                .arg(format!("tap,id=net0,ifname={tap},script=no,downscript=no"))
                 .arg("-device")
                 .arg("virtio-net-pci,netdev=net0");
         } else if let Some(socket) = &res.vhost_user_socket {
@@ -462,7 +457,7 @@ impl Qemu {
         // ever spawning — the migration-incoming branch was dead code (create() only
         // cold-boots). Removed rather than gated behind the off capability.
 
-        let cmd_str = format!("{:?}", cmd);
+        let cmd_str = format!("{cmd:?}");
         // Debug level (not info): the full command line is diagnostic noise on every
         // create, and with stderr inherited it should not clutter harness output
         // (L-VMM-4).
@@ -718,15 +713,15 @@ impl Drop for QemuInstance {
         // vhost-user daemons next: the external vhost-device-vsock and each virtiofsd
         // own sockets that live inside `tmp_dir`, so they must be reaped before that
         // directory is removed.
-        if let Some(d) = self._vsock_daemon.as_mut() {
-            if let Some(v_pgid) = self.vsock_pgid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(v_pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                if let Some(pid) = d.id() {
-                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
-                }
+        if let Some(d) = self._vsock_daemon.as_mut()
+            && let Some(v_pgid) = self.vsock_pgid
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-(v_pgid as i32)),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            if let Some(pid) = d.id() {
+                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
             }
         }
         // Dropping each virtiofsd kills it and removes its own socket before the

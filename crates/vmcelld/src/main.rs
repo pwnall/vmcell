@@ -8,6 +8,7 @@
 //!
 //! `print_stdout`/`print_stderr` are NOT denied — a daemon binary logs startup/fatal diagnostics.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![cfg_attr(
     not(test),
     deny(
@@ -15,7 +16,9 @@
         clippy::panic,
         clippy::indexing_slicing,
         clippy::todo,
-        clippy::unimplemented
+        clippy::unimplemented,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 
@@ -76,10 +79,13 @@ fn main() {
         .init();
 
     if let Err(code) = run() {
-        // allow(disallowed_methods): top-level terminator. Either the config/blessing check failed
+        // expect(disallowed_methods): top-level terminator. Either the config/blessing check failed
         // before any owned resource exists, or the server future returned after `shutdown_all`/`Drop`
         // already tore the owned VMs down; a non-zero shell status is the required contract.
-        #[allow(clippy::disallowed_methods)]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "top-level terminator; owned VMs already torn down (shutdown_all/Drop) or none exist yet"
+        )]
         std::process::exit(code);
     }
 }

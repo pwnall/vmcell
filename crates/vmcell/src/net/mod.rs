@@ -26,13 +26,13 @@ use std::net::Ipv4Addr;
 /// Returns an error if the VMID is out of range.
 pub fn ip_math(vmid: u32) -> Result<(Ipv4Addr, Ipv4Addr, String)> {
     if vmid == 0 || vmid > 254 {
-        return Err(Error::Network(format!("VMID {} out of range", vmid)));
+        return Err(Error::Network(format!("VMID {vmid} out of range")));
     }
     let octet = ((vmid % 254) + 1) as u8;
     Ok((
         Ipv4Addr::new(10, 200, octet, 1),
         Ipv4Addr::new(10, 200, octet, 2),
-        format!("10.200.{}.2/30", octet),
+        format!("10.200.{octet}.2/30"),
     ))
 }
 
@@ -42,7 +42,7 @@ pub fn ip_math(vmid: u32) -> Result<(Ipv4Addr, Ipv4Addr, String)> {
 /// Returns an error if the VMID is out of range.
 pub fn mac_math(vmid: u32) -> Result<String> {
     if vmid == 0 || vmid > 254 {
-        return Err(Error::Network(format!("VMID {} out of range", vmid)));
+        return Err(Error::Network(format!("VMID {vmid} out of range")));
     }
     Ok(format!(
         "02:00:{:02x}:{:02x}:{:02x}:{:02x}",

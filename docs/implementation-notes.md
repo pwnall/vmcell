@@ -132,6 +132,23 @@ as they stabilize.
   shared-process model but passes under **nextest**, which is process-per-test — the project's runner.)
   **Still unrun:** the QEMU/Firecracker snapshot tiers (v20 §16: unwired), filtered-egress, concurrent-load.
 
+## Automated quality gates (docs/56) — wire-crate cast lints are `not(test)`-scoped
+
+- **The B10 wire-crate cast lints (`clippy::cast_possible_truncation` / `cast_sign_loss` /
+  `cast_possible_wrap`) live in the `#![cfg_attr(not(test), deny(...))]` block, not the unconditional
+  `#![deny(...)]` block the `docs/56` preamble template shows.** *Reason:* B10 ("integer narrowing
+  **from the wire** is `try_from`, never `as`") is a production decode-surface rule, and the repo
+  already relaxes production-strictness lints in tests — `clippy.toml` carries
+  `allow-{unwrap,expect,print,dbg}-in-tests` and AGENTS.md states "Tests may unwrap/expect/print/dbg;
+  production code may not." Denying casts crate-wide (incl. tests) forced `try_from`/`.cast_signed()`
+  churn on test byte-vector construction (e.g. `b'e' as c_char`, `AF_INET as u16` in layout asserts)
+  that carries no wire-decode risk. Scoping to `not(test)` keeps the full B10 rigor on the production
+  path (the real fix landed at `vmcell-guest-agent`'s framing length-prefix and the `netif` FFI
+  narrowings, the latter centralized behind one reasoned `AF_INET_FAMILY` const) while matching the
+  established lenient-in-tests idiom. `clippy::multiple_unsafe_ops_per_block` stays **unconditional** —
+  it is a safety-discipline lint, not a production-strictness one. Retire this entry if the template
+  is updated to say `not(test)`.
+
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.

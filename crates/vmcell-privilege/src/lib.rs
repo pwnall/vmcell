@@ -12,11 +12,13 @@
 //! No crate-level `forbid(unsafe_code)`: the transition uses raw capability/syscall FFI, audited via
 //! `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn`.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block // one obligation per SAFETY comment
 )]
 #![cfg_attr(
     not(test),
@@ -27,7 +29,9 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
-        clippy::dbg_macro
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 
@@ -147,37 +151,36 @@ pub fn ensure_blessed_or_explain(need: &[Cap]) -> Result<(), String> {
 #[must_use]
 pub fn lookup_group_gid(name: &str) -> Option<libc::gid_t> {
     let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `getgrnam` receives a valid NUL-terminated C string and returns either
-    // NULL or a pointer to a `group`. We read `gr_gid` once and copy it out; the pointer
-    // is not retained. Single-threaded pre-exec context.
-    unsafe {
-        let grp = libc::getgrnam(cname.as_ptr());
-        if grp.is_null() {
-            None
-        } else {
-            Some((*grp).gr_gid)
-        }
+    // SAFETY: `getgrnam` receives a valid NUL-terminated C string (from `CString`) and returns
+    // either NULL or a pointer to a `group` owned by the C library; the pointer is not retained.
+    let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
+    if grp.is_null() {
+        None
+    } else {
+        // SAFETY: `grp` is non-null (checked above) and points to a valid `group` from `getgrnam`;
+        // we read `gr_gid` once and copy it out without retaining the pointer. Single-threaded.
+        Some(unsafe { (*grp).gr_gid })
     }
 }
 
 /// Returns the process's current supplementary group ids.
 #[must_use]
 pub fn current_supplementary_groups() -> Vec<libc::gid_t> {
-    // SAFETY: the first `getgroups` (size 0, null ptr) only queries the count; the second
-    // fills an exactly-sized buffer. Standard `getgroups(2)` usage.
-    unsafe {
-        let n = libc::getgroups(0, std::ptr::null_mut());
-        if n <= 0 {
-            return Vec::new();
-        }
-        let mut buf: Vec<libc::gid_t> = vec![0; n as usize];
-        let got = libc::getgroups(n, buf.as_mut_ptr());
-        if got < 0 {
-            return Vec::new();
-        }
-        buf.truncate(got as usize);
-        buf
+    // SAFETY: `getgroups(0, NULL)` only queries the current supplementary-group count and writes
+    // nothing — the standard `getgroups(2)` size-probe.
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n <= 0 {
+        return Vec::new();
     }
+    let mut buf: Vec<libc::gid_t> = vec![0; n as usize];
+    // SAFETY: `buf` holds exactly `n` elements (the count queried above), so `getgroups` fills at
+    // most `n` gids into a buffer it fully owns for the duration of the call.
+    let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+    if got < 0 {
+        return Vec::new();
+    }
+    buf.truncate(got as usize);
+    buf
 }
 
 /// Builds the supplementary-group list to install before dropping uid.
@@ -194,10 +197,11 @@ pub fn merge_preserved_groups(
     held: &[libc::gid_t],
 ) -> Vec<libc::gid_t> {
     let mut groups = vec![gid];
-    if let Some(kvm) = kvm_gid {
-        if kvm != gid && held.contains(&kvm) {
-            groups.push(kvm);
-        }
+    if let Some(kvm) = kvm_gid
+        && kvm != gid
+        && held.contains(&kvm)
+    {
+        groups.push(kvm);
     }
     groups
 }
@@ -288,19 +292,20 @@ pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
     //    PR_SET_KEEPCAPS preserves the permitted set across the uid change.
     if let Some(drop) = &plan.uid_drop {
         capctl::prctl::set_keepcaps(true).map_err(|e| format!("failed to set keepcaps: {e}"))?;
-        // SAFETY: single-threaded pre-exec context; we return (and the caller exits) on any
-        // failure and spawn no threads. `groups` is non-empty and `setgroups` reads exactly
-        // `groups.len()` gids from a valid pointer.
-        unsafe {
-            if libc::setresgid(drop.gid, drop.gid, drop.gid) != 0 {
-                return Err("setresgid failed".to_string());
-            }
-            if libc::setgroups(drop.groups.len(), drop.groups.as_ptr()) != 0 {
-                return Err("setgroups failed".to_string());
-            }
-            if libc::setresuid(drop.uid, drop.uid, drop.uid) != 0 {
-                return Err("setresuid failed".to_string());
-            }
+        // SAFETY: single-threaded pre-exec context; we return (and the caller exits) on any failure
+        // and spawn no threads. Drops the real/effective/saved gid to the invoking user's gid.
+        if unsafe { libc::setresgid(drop.gid, drop.gid, drop.gid) } != 0 {
+            return Err("setresgid failed".to_string());
+        }
+        // SAFETY: `groups` is non-empty and `setgroups` reads exactly `groups.len()` gids from the
+        // valid pointer `drop.groups.as_ptr()`; still single-threaded pre-exec.
+        if unsafe { libc::setgroups(drop.groups.len(), drop.groups.as_ptr()) } != 0 {
+            return Err("setgroups failed".to_string());
+        }
+        // SAFETY: performed AFTER the gid drop + setgroups (the order is load-bearing — uid must go
+        // last, while the gid/group changes still have privilege); single-threaded pre-exec context.
+        if unsafe { libc::setresuid(drop.uid, drop.uid, drop.uid) } != 0 {
+            return Err("setresuid failed".to_string());
         }
     }
 
@@ -316,11 +321,12 @@ pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
     // 3. Shrink the bounding set. PR_CAPBSET_DROP needs CAP_SETPCAP in EFFECTIVE; raise it
     //    from permitted first if we hold it (setuid-root form). Best-effort — but surface,
     //    never swallow, a failed drop.
-    if let Ok(mut st) = CapState::get_current() {
-        if st.permitted.has(Cap::SETPCAP) && !st.effective.has(Cap::SETPCAP) {
-            st.effective.add(Cap::SETPCAP);
-            let _ = st.set_current();
-        }
+    if let Ok(mut st) = CapState::get_current()
+        && st.permitted.has(Cap::SETPCAP)
+        && !st.effective.has(Cap::SETPCAP)
+    {
+        st.effective.add(Cap::SETPCAP);
+        let _ = st.set_current();
     }
     let mut bounding_drop_failures = 0usize;
     for &c in &plan.bounding_drop {

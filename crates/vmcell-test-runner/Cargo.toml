@@ -2,7 +2,7 @@
 name = "vmcell-test-runner"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "vmcell privileged-test capability runner: file-caps -> ambient caps -> exec as dev uid (§12.8)"
 publish = false

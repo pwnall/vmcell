@@ -483,15 +483,15 @@ impl Vmm for Firecracker {
         )?;
 
         let caps = self.capabilities();
-        if let crate::config::NetConfig::Unprivileged { .. } = cfg.net {
-            if !caps.unprivileged_vhost_user_net {
-                return Err(Error::Unsupported {
-                    vmm: "firecracker".to_string(),
-                    // N-VMM-1: match the VmmCapabilities field name so callers matching
-                    // feature strings see one consistent spelling across backends.
-                    feature: "unprivileged_vhost_user_net".to_string(),
-                });
-            }
+        if let crate::config::NetConfig::Unprivileged { .. } = cfg.net
+            && !caps.unprivileged_vhost_user_net
+        {
+            return Err(Error::Unsupported {
+                vmm: "firecracker".to_string(),
+                // N-VMM-1: match the VmmCapabilities field name so callers matching
+                // feature strings see one consistent spelling across backends.
+                feature: "unprivileged_vhost_user_net".to_string(),
+            });
         }
         if res.vhost_user_socket.is_some() {
             return Err(Error::Unsupported {

@@ -4,11 +4,13 @@
 //! surface is audited via `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn`. The
 //! `unwrap_used`/`panic` bans are load-bearing here — a PID-1 panic aborts the whole guest.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block // one obligation per SAFETY comment
 )]
 #![cfg_attr(
     not(test),
@@ -21,7 +23,15 @@
         clippy::indexing_slicing,
         clippy::print_stdout,
         clippy::print_stderr,
-        clippy::dbg_macro
+        clippy::dbg_macro,
+        // B10: production guest/network-derived values narrow with `try_from`, never `as` (wire
+        // crate). Test vectors may still build byte patterns with `as` — the repo's lenient-in-tests
+        // idiom (clippy.toml allow-*-in-tests, AGENTS.md; see docs/implementation-notes.md).
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 use rustix::mount::{
@@ -54,10 +64,10 @@ fn drain_zombies(reaper: &ReaperCoordinator) {
     // mis-delivered as the reused child's exit (AGENT-1, §4.3).
     reaper.drain_reaped(|| match wait(WaitOptions::NOHANG) {
         Ok(Some((pid, status))) => {
-            let pid = pid.as_raw_nonzero().get() as u32;
+            let pid = pid.as_raw_nonzero().get().cast_unsigned();
             let code = exit_code_from_termination(
-                status.terminating_signal().map(|s| s as i32),
-                status.exit_status().map(|c| c as i32),
+                status.terminating_signal().map(|s| s.cast_signed()),
+                status.exit_status().map(|c| c.cast_signed()),
             );
             Some((pid, code))
         }
@@ -282,17 +292,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // failure. Probe AF_VSOCK by actually opening a socket; the host-side
     // `/dev/vhost-vsock` device is irrelevant inside the guest, so it is not
     // consulted.
-    // SAFETY: `socket(2)`/`close(2)` are invoked with constant, valid
-    // arguments; the returned fd (when non-negative) is closed immediately and
-    // never otherwise used.
-    let vsock_ok = unsafe {
-        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
-        if fd >= 0 {
-            libc::close(fd);
-            true
-        } else {
-            false
-        }
+    // SAFETY: `socket(2)` is invoked with constant, valid arguments (AF_VSOCK/SOCK_STREAM, protocol
+    // 0); the returned fd is checked and closed below before any other use.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    let vsock_ok = if fd >= 0 {
+        // SAFETY: `fd` is a live socket fd just returned by `socket(2)` above; closed exactly once
+        // here and never used afterwards.
+        unsafe { libc::close(fd) };
+        true
+    } else {
+        false
     };
     if vsock_ok {
         tracing::info!("vmcell-guest-agent: boot self-check: AF_VSOCK transport available");
@@ -329,14 +338,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let accept_poll = parse_ms(
         &cmdline,
         "vmcell_accept_poll_ms=",
-        ACCEPT_POLL.as_millis() as u64,
+        u64::try_from(ACCEPT_POLL.as_millis()).unwrap_or(u64::MAX),
         1,
         10_000,
     );
     let rebind_idle = parse_ms(
         &cmdline,
         "vmcell_rebind_idle_ms=",
-        REBIND_IDLE.as_millis() as u64,
+        u64::try_from(REBIND_IDLE.as_millis()).unwrap_or(u64::MAX),
         20,
         60_000,
     );
@@ -404,11 +413,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// PID 1 still never exits.
 fn power_off_never_returns() -> ! {
     tracing::info!("vmcell-guest-agent: received SIGTERM; powering off");
-    // SAFETY: `sync(2)` and `reboot(2)` are called with constant arguments and
-    // no pointers; `reboot` returns only on error, after which we park forever
-    // below so PID 1 never returns to the kernel.
+    // SAFETY: `sync(2)` takes no arguments and no pointers — flush filesystem buffers before reboot.
     unsafe {
         libc::sync();
+    }
+    // SAFETY: `reboot(2)` is called with the constant `RB_POWER_OFF` and no pointers; it returns only
+    // on error, after which we park forever below so PID 1 never returns to the kernel.
+    unsafe {
         libc::reboot(libc::RB_POWER_OFF);
     }
     tracing::error!(
@@ -521,7 +532,11 @@ fn remaining_idle(deadline: Instant, now: Instant) -> Option<Duration> {
 /// remainder by <1 ms is harmless — the deadline itself is enforced on
 /// [`Instant`]s by [`remaining_idle`], not by the poll timeout.
 fn poll_timeout_ms(remaining: Duration) -> i32 {
-    remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+    // Cap at i32::MAX (an over-long remainder), floor at 1 ms; both are correctness bounds, not a
+    // truncating `as` — `try_from` saturates instead of wrapping. Equivalent to the old clamp+cast.
+    i32::try_from(remaining.as_millis())
+        .unwrap_or(i32::MAX)
+        .max(1)
 }
 
 /// Serves the vsock control plane, re-binding the listener across snapshot
@@ -724,7 +739,10 @@ fn send_framed<W: Write>(stream: &mut W, data: &[u8]) -> std::io::Result<()> {
             "frame too large",
         ));
     }
-    let len = data.len() as u32;
+    // `data.len() <= MAX_FRAME_BYTES` (checked just above) < u32::MAX, so this never truncates; the
+    // saturating fallback is dead but keeps the narrowing honest (a bogus over-cap length would be
+    // sent as u32::MAX, which the host rejects — never a silently-wrong small length).
+    let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(data)?;
     Ok(())
@@ -777,8 +795,8 @@ fn handle_put_file(
 /// [`Timespec`]: rustix::time::Timespec
 fn resync_timespec(unix_secs: u64, unix_nanos: u32) -> rustix::time::Timespec {
     rustix::time::Timespec {
-        tv_sec: unix_secs as i64,
-        tv_nsec: unix_nanos as i64,
+        tv_sec: i64::try_from(unix_secs).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(unix_nanos),
     }
 }
 
@@ -1026,7 +1044,7 @@ fn handle_exec(
                 std::thread::sleep(timeout);
                 if !has_exited_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     use rustix::process::{Pid, Signal, kill_process_group};
-                    if let Some(p) = Pid::from_raw(pid as i32) {
+                    if let Some(p) = Pid::from_raw(pid.cast_signed()) {
                         let _ = kill_process_group(p, Signal::Kill);
                     }
                     let _ = tx_timeout.send(Message::Stderr(b"Command timed out\n".to_vec()));
@@ -1054,7 +1072,7 @@ fn handle_exec(
             }
         }
         Err(e) => {
-            let err_msg = format!("Failed to spawn command: {}", e);
+            let err_msg = format!("Failed to spawn command: {e}");
             let msg = postcard::to_stdvec(&Message::Stderr(err_msg.into_bytes()))?;
             send_framed(stream, &msg)?;
 

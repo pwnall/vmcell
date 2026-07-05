@@ -118,7 +118,7 @@ proptest! {
             let octet = ((vmid % 254) + 1) as u8;
             assert_eq!(host.octets(), [10, 200, octet, 1]);
             assert_eq!(guest.octets(), [10, 200, octet, 2]);
-            assert_eq!(cidr, format!("10.200.{}.2/30", octet));
+            assert_eq!(cidr, format!("10.200.{octet}.2/30"));
         }
     }
 }

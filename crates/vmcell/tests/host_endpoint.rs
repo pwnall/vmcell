@@ -116,8 +116,7 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // that an error page or a stray "<html>" body would satisfy.
     assert!(
         stdout.contains("Directory listing for"),
-        "Output did not contain the host service's directory listing: {}",
-        stdout
+        "Output did not contain the host service's directory listing: {stdout}"
     );
 
     vm.shutdown().await.expect("Shutdown failed");

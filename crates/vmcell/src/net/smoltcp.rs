@@ -840,22 +840,18 @@ pub mod backend {
                                                 full_packet.len() - offset,
                                                 desc.len() as usize,
                                             );
-                                            if to_write > 0 {
-                                                if let Some(chunk) =
+                                            if to_write > 0
+                                                && let Some(chunk) =
                                                     full_packet.get(offset..offset + to_write)
-                                                {
-                                                    if mem_obj
-                                                        .write_slice(chunk, desc.addr())
-                                                        .is_ok()
-                                                    {
-                                                        offset += to_write;
-                                                    } else {
-                                                        // L-NET-2: a descriptor write
-                                                        // failed; the frame is now
-                                                        // partial and must be dropped.
-                                                        write_failed = true;
-                                                        break;
-                                                    }
+                                            {
+                                                if mem_obj.write_slice(chunk, desc.addr()).is_ok() {
+                                                    offset += to_write;
+                                                } else {
+                                                    // L-NET-2: a descriptor write
+                                                    // failed; the frame is now
+                                                    // partial and must be dropped.
+                                                    write_failed = true;
+                                                    break;
                                                 }
                                             }
                                         }
@@ -910,32 +906,28 @@ pub mod backend {
 
                     if let Some(pxy_port) = proxy_port {
                         for packet in &state_guard.tx_queue {
-                            if let Ok(frame) = EthernetFrame::new_checked(&packet[..]) {
-                                if frame.ethertype() == EthernetProtocol::Ipv4 {
-                                    if let Ok(ipv4) = Ipv4Packet::new_checked(frame.payload()) {
-                                        if ipv4.next_header() == IpProtocol::Tcp {
-                                            if let Ok(tcp) = TcpPacket::new_checked(ipv4.payload())
-                                            {
-                                                let dst_port = tcp.dst_port();
-                                                if tcp.syn() && !tcp.ack() {
-                                                    // NET-3/NET-5: the per-SYN admission
-                                                    // decision (reclaim closed dynamic
-                                                    // mappings, then refuse growth past
-                                                    // the cap so a SYN spray cannot
-                                                    // exhaust host memory) lives in the
-                                                    // unit-tested `admit_syn` helper.
-                                                    admit_syn(
-                                                        &mut sockets,
-                                                        &mut port_mappings,
-                                                        permanent_count,
-                                                        dst_port,
-                                                        pxy_port,
-                                                        SYN_BURST,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
+                            if let Ok(frame) = EthernetFrame::new_checked(&packet[..])
+                                && frame.ethertype() == EthernetProtocol::Ipv4
+                                && let Ok(ipv4) = Ipv4Packet::new_checked(frame.payload())
+                                && ipv4.next_header() == IpProtocol::Tcp
+                                && let Ok(tcp) = TcpPacket::new_checked(ipv4.payload())
+                            {
+                                let dst_port = tcp.dst_port();
+                                if tcp.syn() && !tcp.ack() {
+                                    // NET-3/NET-5: the per-SYN admission
+                                    // decision (reclaim closed dynamic
+                                    // mappings, then refuse growth past
+                                    // the cap so a SYN spray cannot
+                                    // exhaust host memory) lives in the
+                                    // unit-tested `admit_syn` helper.
+                                    admit_syn(
+                                        &mut sockets,
+                                        &mut port_mappings,
+                                        permanent_count,
+                                        dst_port,
+                                        pxy_port,
+                                        SYN_BURST,
+                                    );
                                 }
                             }
                         }
@@ -971,18 +963,17 @@ pub mod backend {
                     }
 
                     if socket.can_send() || socket.can_recv() {
-                        if tcp_stream.is_none() {
-                            if let Ok(stream) =
-                                tokio::net::TcpStream::connect(format!("127.0.0.1:{}", target_port))
+                        if tcp_stream.is_none()
+                            && let Ok(stream) =
+                                tokio::net::TcpStream::connect(format!("127.0.0.1:{target_port}"))
                                     .await
-                            {
-                                // TCP_NODELAY is a latency optimization; if the
-                                // setsockopt fails the connection still works
-                                // (merely with Nagle enabled), so the result is
-                                // deliberately ignored.
-                                let _ = stream.set_nodelay(true);
-                                *tcp_stream = Some(stream);
-                            }
+                        {
+                            // TCP_NODELAY is a latency optimization; if the
+                            // setsockopt fails the connection still works
+                            // (merely with Nagle enabled), so the result is
+                            // deliberately ignored.
+                            let _ = stream.set_nodelay(true);
+                            *tcp_stream = Some(stream);
                         }
 
                         let mut closed = false;
@@ -1047,21 +1038,21 @@ pub mod backend {
 
                             if socket.can_recv() {
                                 let mut buf = [0; 8192];
-                                if let Ok(n) = socket.peek_slice(&mut buf) {
-                                    if n > 0 {
-                                        match stream.try_write(buf.get(..n).unwrap_or(&[])) {
-                                            Ok(written) => {
-                                                // NET-1/C2: guest-driven; never panic.
-                                                if let Err(e) = socket.recv(|_| (written, ())) {
-                                                    tracing::error!("smoltcp recv failed: {:?}", e);
-                                                    closed = true;
-                                                }
-                                            }
-                                            Err(ref e)
-                                                if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                            Err(_) => {
+                                if let Ok(n) = socket.peek_slice(&mut buf)
+                                    && n > 0
+                                {
+                                    match stream.try_write(buf.get(..n).unwrap_or(&[])) {
+                                        Ok(written) => {
+                                            // NET-1/C2: guest-driven; never panic.
+                                            if let Err(e) = socket.recv(|_| (written, ())) {
+                                                tracing::error!("smoltcp recv failed: {:?}", e);
                                                 closed = true;
                                             }
+                                        }
+                                        Err(ref e)
+                                            if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                        Err(_) => {
+                                            closed = true;
                                         }
                                     }
                                 }
@@ -1124,8 +1115,7 @@ pub mod backend {
                 assert_ne!(
                     crate::net::mac_math(vmid).unwrap(),
                     host,
-                    "host NAT MAC collides with guest MAC for vmid {}",
-                    vmid
+                    "host NAT MAC collides with guest MAC for vmid {vmid}"
                 );
             }
         }
@@ -1151,14 +1141,12 @@ pub mod backend {
                 assert_eq!(
                     host_gw.0,
                     host_std.octets(),
-                    "host gw drifted for vmid {}",
-                    vmid
+                    "host gw drifted for vmid {vmid}"
                 );
                 assert_eq!(
                     guest_gw.0,
                     guest_std.octets(),
-                    "guest gw drifted for vmid {}",
-                    vmid
+                    "guest gw drifted for vmid {vmid}"
                 );
                 // The host gateway is the /30 `.1` and the guest is the `.2`.
                 assert_eq!(host_gw.0[3], 1, "host gw must be the .1 of the /30");
@@ -1225,9 +1213,7 @@ pub mod backend {
             let dynamic = port_mappings.len() - permanent_count;
             assert!(
                 dynamic <= MAX_DYNAMIC_SOCKETS,
-                "dynamic NAT pool exceeded the cap under a SYN spray: {} > {}",
-                dynamic,
-                MAX_DYNAMIC_SOCKETS
+                "dynamic NAT pool exceeded the cap under a SYN spray: {dynamic} > {MAX_DYNAMIC_SOCKETS}"
             );
             // Admission is in whole bursts up to the cap, and MAX_DYNAMIC_SOCKETS
             // is a multiple of SYN_BURST, so the pool fills to exactly the cap.

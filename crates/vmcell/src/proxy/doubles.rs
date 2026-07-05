@@ -81,7 +81,7 @@ fn is_blocked(host: &str, blocked: &[String]) -> bool {
             .strip_suffix('.')
             .unwrap_or(domain.as_str())
             .to_ascii_lowercase();
-        host_norm == domain_norm || host_norm.ends_with(&format!(".{}", domain_norm))
+        host_norm == domain_norm || host_norm.ends_with(&format!(".{domain_norm}"))
     })
 }
 
@@ -96,25 +96,24 @@ impl ProxyHandler {
             .host()
             .or_else(|| req.uri().authority().map(|a| a.host()));
 
-        if let Some(host) = host_str {
-            if is_blocked(host, &self.blocked_domains) {
-                tracing::info!("Proxy blocking request to {}", host);
-                // Record the denial so the most security-relevant events are
-                // observable via `requests()`. Recover from a poisoned lock
-                // instead of panicking on the request hot path.
-                {
-                    let mut reqs = self.requests.lock().unwrap_or_else(|e| e.into_inner());
-                    push_bounded(&mut reqs, format!("403 BLOCKED {}", host));
-                }
-                let response = Response::builder()
-                    .status(403)
-                    .body(hudsucker::Body::from(format!(
-                        "Blocked by Imp Proxy: {}\n",
-                        host
-                    )))
-                    .expect("Valid response builder");
-                return RequestOrResponse::Response(response);
+        if let Some(host) = host_str
+            && is_blocked(host, &self.blocked_domains)
+        {
+            tracing::info!("Proxy blocking request to {}", host);
+            // Record the denial so the most security-relevant events are
+            // observable via `requests()`. Recover from a poisoned lock
+            // instead of panicking on the request hot path.
+            {
+                let mut reqs = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+                push_bounded(&mut reqs, format!("403 BLOCKED {host}"));
             }
+            let response = Response::builder()
+                .status(403)
+                .body(hudsucker::Body::from(format!(
+                    "Blocked by Imp Proxy: {host}\n"
+                )))
+                .expect("Valid response builder");
+            return RequestOrResponse::Response(response);
         }
 
         let req_uri = format!("{} {}", req.method(), req.uri());
@@ -139,7 +138,7 @@ impl ProxyHandler {
                 .open(&path)
             {
                 Ok(mut f) => {
-                    if let Err(e) = writeln!(f, "{}", req_uri) {
+                    if let Err(e) = writeln!(f, "{req_uri}") {
                         tracing::warn!("Failed to write cassette {}: {}", path.display(), e);
                     }
                 }

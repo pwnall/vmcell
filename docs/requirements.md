@@ -170,7 +170,7 @@ both Rust library crates and all binaries.
    for a Debian development host.
 6. Rust best practice compliance vetted by tools such as `clippy` and `rustfmt`.
 7. Unit tests for all functions and methods that are testable.
-8. Minor architectural accomodations for increasing the unit tests coverage,
+8. Minor architectural accommodations for increasing the unit tests coverage,
    without going overboard.
 
 ### System dependency requirements

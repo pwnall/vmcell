@@ -5,11 +5,13 @@
 //! `print_stdout`/`print_stderr` are intentionally NOT denied here — a CLI's whole job is to write
 //! results and diagnostics to stdout/stderr.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block // one obligation per SAFETY comment
 )]
 #![cfg_attr(
     not(test),
@@ -20,7 +22,9 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
-        clippy::dbg_macro
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 
@@ -201,9 +205,12 @@ fn main() {
         .block_on(async_main());
     if let Err(e) = result {
         eprintln!("vmcell: {e}");
-        // allow(disallowed_methods): top-level bin exit AFTER the runtime future returned and its
+        // expect(disallowed_methods): top-level bin exit AFTER the runtime future returned and its
         // Drops ran — nothing left to unwind; a non-zero shell status is the required contract.
-        #[allow(clippy::disallowed_methods)]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "top-level exit after the runtime future's Drops ran; nothing left to unwind"
+        )]
         std::process::exit(1);
     }
 }
@@ -431,9 +438,12 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             vm.shutdown().await?;
             // The CLI propagates the guest command's exit code (§10.2). Teardown has
             // already run (shutdown consumed `vm`), so process::exit leaks nothing.
-            // allow(disallowed_methods): ordered teardown already completed above; exiting with
+            // expect(disallowed_methods): ordered teardown already completed above; exiting with
             // the guest's own code is the documented CLI contract.
-            #[allow(clippy::disallowed_methods)]
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "ordered teardown already ran (shutdown consumed vm); relay the guest's exit code"
+            )]
             std::process::exit(outcome.code);
         }
         Commands::Create {

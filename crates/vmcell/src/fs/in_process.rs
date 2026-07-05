@@ -2,7 +2,7 @@
 //! In-process virtio-fs daemon implementation using vhost-user.
 //!
 #[cfg(feature = "experiment-fuse")]
-pub mod backend {
+pub(crate) mod backend {
     use fuse_backend_rs::api::{Vfs, VfsOptions, server::Server};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
     use fuse_backend_rs::transport::{FsCacheReqHandler, Reader, VirtioFsWriter};
@@ -240,7 +240,7 @@ pub mod backend {
         }
     }
 
-    pub fn start_in_process_virtiofsd(
+    pub(crate) fn start_in_process_virtiofsd(
         socket_path: &std::path::Path,
         host_path: &std::path::Path,
         read_only: bool,

@@ -142,7 +142,7 @@ impl AgentClient {
                 }
             };
 
-            let connect_msg = format!("CONNECT {}\n", port);
+            let connect_msg = format!("CONNECT {port}\n");
             if let Err(e) = stream.write_all(connect_msg.as_bytes()).await {
                 tracing::trace!("Agent connect write_all failed: {}", e);
                 continue;
@@ -409,8 +409,7 @@ impl AgentClient {
                     // is in sync, so report the failure WITHOUT desyncing so the
                     // next request need not force a spurious reconnect (L-GUEST-1).
                     Message::Exit(c) => Err(RequestFailure::Clean(Error::Agent(format!(
-                        "put_file failed with code {}",
-                        c
+                        "put_file failed with code {c}"
                     )))),
                     _ => Err(RequestFailure::Transport(Error::Agent(
                         "unexpected response to put_file".into(),

@@ -58,10 +58,10 @@ pub fn has_effective_cap(bit: u32) -> bool {
         return false;
     };
     for line in status.lines() {
-        if let Some(hex) = line.strip_prefix("CapEff:") {
-            if let Ok(bits) = u64::from_str_radix(hex.trim(), 16) {
-                return bits & (1u64 << bit) != 0;
-            }
+        if let Some(hex) = line.strip_prefix("CapEff:")
+            && let Ok(bits) = u64::from_str_radix(hex.trim(), 16)
+        {
+            return bits & (1u64 << bit) != 0;
         }
     }
     false

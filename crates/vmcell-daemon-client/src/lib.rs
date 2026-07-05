@@ -7,9 +7,16 @@
 //! (design v21 §D8). DTOs are re-exported from `vmcell-daemon` (linked without its server stack), so a
 //! request the client serializes and the daemon deserializes are the SAME type.
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![cfg_attr(
     not(test),
-    deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
+    )
 )]
 
 use std::path::{Path, PathBuf};

@@ -53,10 +53,10 @@ async fn exec(agent: &mut AgentClient, argv: &[&str]) -> Result<vmcell::ExecOutc
 pub async fn kernel_banner<V: Vmm>(vm: &MicroVm<V>) -> Result<(), String> {
     let log = vm.instance().serial_log().to_path_buf();
     for _ in 0..150 {
-        if let Ok(content) = tokio::fs::read_to_string(&log).await {
-            if content.contains("Linux version") {
-                return Ok(());
-            }
+        if let Ok(content) = tokio::fs::read_to_string(&log).await
+            && content.contains("Linux version")
+        {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -483,12 +483,11 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), S
         let _ = exec(agent, &["tail", "/dev/zero"]).await;
     }
     for _ in 0..50 {
-        if let Ok(events) = std::fs::read_to_string(&events_path) {
-            if let Some(n) = parse_oom_kill(&events) {
-                if n > 0 {
-                    return Ok(());
-                }
-            }
+        if let Ok(events) = std::fs::read_to_string(&events_path)
+            && let Some(n) = parse_oom_kill(&events)
+            && n > 0
+        {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

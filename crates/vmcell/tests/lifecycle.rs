@@ -40,14 +40,14 @@ impl vmcell::metrics::CgroupFs for RecordingCgroupFs {
         self.log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(format!("cgroup_create:{}", name));
+            .push(format!("cgroup_create:{name}"));
         Ok(())
     }
     fn delete_slice(&self, name: &str) -> vmcell::error::Result<()> {
         self.log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(format!("cgroup_delete:{}", name));
+            .push(format!("cgroup_delete:{name}"));
         Ok(())
     }
     fn read_stats(&self, _name: &str) -> vmcell::error::Result<vmcell::metrics::ResourceUsage> {
@@ -180,8 +180,7 @@ async fn test_lifecycle_fake_vmm() {
     cid_alloc.release(3);
     assert!(
         vmid_alloc.reserve(vmid1).is_ok(),
-        "shutdown must release VMID {}",
-        vmid1
+        "shutdown must release VMID {vmid1}"
     );
     vmid_alloc.release(vmid1);
 
@@ -315,7 +314,7 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // the absence of a path that was never created. Inverse: remove a resource's
         // creation in the backend and its precheck reddens, proving the residue
         // assertion targets the REAL path.
-        let netns_path = format!("/var/run/netns/vmcell-net-{}", vmid);
+        let netns_path = format!("/var/run/netns/vmcell-net-{vmid}");
         // NOTE: the tap (`vmcell-tap-{vmid}`) lives INSIDE the per-VM netns, so it
         // never appears at `/sys/class/net/` in the root netns — a root-sysfs check
         // would be vacuous both while-live and after-drop. Its cleanup is covered by
@@ -325,13 +324,11 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
         assert!(
             std::path::Path::new(&netns_path).exists(),
-            "netns {} must exist while the VM is live (precheck before residue test)",
-            netns_path
+            "netns {netns_path} must exist while the VM is live (precheck before residue test)"
         );
         assert!(
             std::path::Path::new(&cg_path).exists(),
-            "cgroup slice {} must exist while the VM is live (precheck before residue test)",
-            cg_path
+            "cgroup slice {cg_path} must exist while the VM is live (precheck before residue test)"
         );
         assert!(
             per_vm_dir.exists(),
@@ -361,8 +358,7 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     //    `vmcell-vm-{vmid}` check pass trivially.
     assert!(
         !std::path::Path::new(&cg_path).exists(),
-        "cgroup slice leaked at {}",
-        cg_path
+        "cgroup slice leaked at {cg_path}"
     );
 
     // 2. Named netns removed (its netns-local tap dies with it — the tap cannot
@@ -370,8 +366,7 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     //    would be vacuous).
     assert!(
         !std::path::Path::new(&netns_path).exists(),
-        "netns leaked at {}",
-        netns_path
+        "netns leaked at {netns_path}"
     );
 
     // 3. The per-VM vsock socket (in the VM temp dir) is removed by the instance Drop.
@@ -396,16 +391,14 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     assert_eq!(
         cid_alloc.allocate().expect("cid available"),
         guest_cid,
-        "guest CID {} was not released on Drop",
-        guest_cid
+        "guest CID {guest_cid} was not released on Drop"
     );
     cid_alloc.release(guest_cid);
 
     // 6. VMID released back to the allocator on Drop.
     assert!(
         vmid_alloc.reserve(vmid).is_ok(),
-        "VMID {} was not released on Drop",
-        vmid
+        "VMID {vmid} was not released on Drop"
     );
     vmid_alloc.release(vmid);
 }
@@ -418,15 +411,14 @@ fn assert_instance_before_cgroup(log: &[String]) {
     let drop_idx = log
         .iter()
         .position(|c| c == "drop")
-        .unwrap_or_else(|| panic!("instance drop not recorded; timeline: {:?}", log));
+        .unwrap_or_else(|| panic!("instance drop not recorded; timeline: {log:?}"));
     let cg_del_idx = log
         .iter()
         .position(|c| c.starts_with("cgroup_delete"))
-        .unwrap_or_else(|| panic!("cgroup delete not recorded; timeline: {:?}", log));
+        .unwrap_or_else(|| panic!("cgroup delete not recorded; timeline: {log:?}"));
     assert!(
         drop_idx < cg_del_idx,
-        "VMM instance must be torn down before the cgroup slice; got timeline: {:?}",
-        log
+        "VMM instance must be torn down before the cgroup slice; got timeline: {log:?}"
     );
 }
 
@@ -597,8 +589,7 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
         Err(e) => {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
             panic!(
-                "Failed to connect to agent over unprivileged networking: {}\nSERIAL LOG:\n{}",
-                e, log
+                "Failed to connect to agent over unprivileged networking: {e}\nSERIAL LOG:\n{log}"
             );
         }
     };
@@ -634,8 +625,7 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
     }
     assert!(
         state == "up" || state == "unknown",
-        "eth0 should be up over the unprivileged NAT within the poll window, got operstate {:?}",
-        state
+        "eth0 should be up over the unprivileged NAT within the poll window, got operstate {state:?}"
     );
 
     let outcome = agent

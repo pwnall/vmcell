@@ -1,0 +1,9 @@
+# The single toolchain source of truth. rustup honors it locally, CI installs from it
+# (`rustup toolchain install` in ci.yml reads this file), and the `just ci` sync assertion keeps it
+# equal to the declared `[workspace.package] rust-version` — so the declared-vs-effective toolchain
+# drift the design §10.5 note documents can no longer widen silently. The floor tracks the latest
+# stable (1.96.1); building/updating on it keeps the lockfile on advisory-clean dependency versions.
+[toolchain]
+channel = "1.96.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -52,7 +52,7 @@ impl IfReq {
         }
         let mut name = [0 as c_char; libc::IFNAMSIZ];
         for (slot, &b) in name.iter_mut().zip(bytes) {
-            *slot = b as c_char;
+            *slot = b.cast_signed();
         }
         Ok(IfReq {
             name,
@@ -204,20 +204,36 @@ fn parse_default_gateways(proc_net_route: &str) -> Vec<[u8; 4]> {
         .collect()
 }
 
+/// `AF_INET` (`c_int`) narrowed to `sa_family_t` once, behind one reasoned `expect`. `AF_INET` is the
+/// constant 2, so the narrowing is lossless; centralizing it keeps the single `as` cast (which the
+/// wire-crate B10 lints otherwise forbid) in one place — `try_from` cannot fail for a fixed constant.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "AF_INET is the constant 2 — fits sa_family_t (u16) losslessly"
+)]
+const AF_INET_FAMILY: libc::sa_family_t = libc::AF_INET as libc::sa_family_t;
+
 /// Builds a `libc::sockaddr` holding an `AF_INET` `sockaddr_in` for `addr` (port 0).
 /// `sin_addr.s_addr` is network byte order — the octets are laid out verbatim, so
 /// `from_ne_bytes` (an identity on the byte pattern) is correct.
 fn sockaddr_in_v4(addr: [u8; 4]) -> libc::sockaddr {
-    // SAFETY: `sockaddr` and `sockaddr_in` share the `sa_family`-prefixed layout;
-    // we write only the `sockaddr_in` fields through the aliasing pointer.
+    // SAFETY: `sockaddr` is a C POD whose all-zero bit pattern is a valid, fully initialized value.
     let mut sa: libc::sockaddr = unsafe { std::mem::zeroed() };
     let sin = std::ptr::addr_of_mut!(sa) as *mut libc::sockaddr_in;
-    // SAFETY: `sin` points at the stack-owned `sa`, which is valid and correctly aligned for
-    // `sockaddr_in` (it shares `sockaddr`'s alignment and is no larger); we only write initialized
-    // scalar fields through it, never read uninitialized memory.
+    // `sockaddr` and `sockaddr_in` share the `sa_family`-prefixed layout, and `sin` points at the
+    // stack-owned `sa` (valid, correctly aligned, no larger than `sockaddr`); every write below goes
+    // through that pointer to an initialized scalar field, never reading uninitialized memory.
+    // SAFETY: valid, aligned `sin` (see above) — set the address family.
     unsafe {
-        (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
+        (*sin).sin_family = AF_INET_FAMILY;
+    }
+    // SAFETY: valid, aligned `sin` (see above) — zero the port.
+    unsafe {
         (*sin).sin_port = 0;
+    }
+    // SAFETY: valid, aligned `sin` (see above) — set the address (octets verbatim; `from_ne_bytes`
+    // is the identity on the network-order byte pattern).
+    unsafe {
         (*sin).sin_addr = libc::in_addr {
             s_addr: u32::from_ne_bytes(addr),
         };
@@ -230,7 +246,7 @@ fn sockaddr_in_v4(addr: [u8; 4]) -> libc::sockaddr {
 /// port sits between them). Pure over the byte buffer for unit testing.
 fn write_ifru_sockaddr(ifru: &mut [u8; 24], addr: [u8; 4]) {
     ifru.fill(0);
-    ifru[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+    ifru[0..2].copy_from_slice(&AF_INET_FAMILY.to_ne_bytes());
     // ifru[2..4] is the (zero) sin_port.
     ifru[4..8].copy_from_slice(&addr);
 }

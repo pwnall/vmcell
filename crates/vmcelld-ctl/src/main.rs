@@ -6,9 +6,16 @@
 //!
 //! `print_stdout`/`print_stderr` are NOT denied — a CLI writes results to stdout/stderr.
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![cfg_attr(
     not(test),
-    deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
+    )
 )]
 
 use clap::{Parser, Subcommand};
@@ -122,15 +129,21 @@ fn main() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("vmcelld-ctl: cannot build runtime: {e}");
-            // allow(disallowed_methods): the runtime failed to build — no owned state to unwind.
-            #[allow(clippy::disallowed_methods)]
+            // expect(disallowed_methods): the runtime failed to build — no owned state to unwind.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "runtime failed to build — no owned state to unwind"
+            )]
             std::process::exit(1);
         }
     };
     let code = rt.block_on(async_main());
-    // allow(disallowed_methods): the async body returned and its Drops ran; the CLI must exit with
+    // expect(disallowed_methods): the async body returned and its Drops ran; the CLI must exit with
     // the guest's own code (run/exec) or 0/1 — a non-zero shell status is the contract (design v20 §11).
-    #[allow(clippy::disallowed_methods)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "async body returned and its Drops ran; relay the guest's exit code as the shell status"
+    )]
     std::process::exit(code);
 }
 

@@ -2,7 +2,7 @@
 name = "vmcell-daemon"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "vmcell control-plane daemon library: artifact store, cross-process VM registry, and the HTTP REST API (v21 §D)"
 publish = false
@@ -28,7 +28,6 @@ server = [
     "dep:tempfile",
     "dep:tracing",
     "dep:vmcell",
-    "dep:vmcell-privilege",
 ]
 
 [dependencies]
@@ -47,7 +46,11 @@ sha2 = { version = "0.10", optional = true }
 tempfile = { version = "3", optional = true }
 tracing = { version = "0.1", optional = true }
 vmcell = { path = "../vmcell", version = "0.6.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"], optional = true }
-vmcell-privilege = { path = "../vmcell-privilege", version = "0.1.0", optional = true }
+
+[package.metadata.cargo-machete]
+# False positive: async-trait is a proc-macro used via #[async_trait]
+# (launcher.rs/server.rs/registry.rs) — not a path-referenced crate.
+ignored = ["async-trait"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

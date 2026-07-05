@@ -41,12 +41,12 @@ pub struct RealSerialLog {
 
 impl SerialLog for RealSerialLog {
     fn contains_panic(&self) -> bool {
-        if self.path.exists() {
-            if let Ok(log_content) = std::fs::read_to_string(&self.path) {
-                return log_content.contains("Kernel panic")
-                    || log_content.contains("panicked at")
-                    || log_content.contains("panic - not syncing");
-            }
+        if self.path.exists()
+            && let Ok(log_content) = std::fs::read_to_string(&self.path)
+        {
+            return log_content.contains("Kernel panic")
+                || log_content.contains("panicked at")
+                || log_content.contains("panic - not syncing");
         }
         false
     }
@@ -99,7 +99,7 @@ pub async fn unix_api_request<T: Serialize>(
 
         let body_bytes = if let Some(b) = body {
             serde_json::to_vec(b)
-                .map_err(|e| crate::error::Error::Serialize(format!("serialize: {}", e)))?
+                .map_err(|e| crate::error::Error::Serialize(format!("serialize: {e}")))?
         } else {
             Vec::new()
         };
@@ -230,28 +230,36 @@ pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::pro
     use std::os::unix::process::CommandExt;
     std_cmd.process_group(0);
     if let Some(netns) = netns_name {
-        let netns_path = format!("/var/run/netns/{}\0", netns);
-        // SAFETY: the closure passed to `pre_exec` runs post-fork/pre-exec and calls
-        // only async-signal-safe syscalls (`open`, `setns`, `close`) on the
-        // pre-allocated, NUL-terminated `netns_path` string — no allocation, no
-        // non-reentrant libc call — so it is sound to run in the forked child.
-        unsafe {
-            std_cmd.pre_exec(move || {
-                let fd = libc::open(
+        let netns_path = format!("/var/run/netns/{netns}\0");
+        // The closure passed to `pre_exec` runs post-fork/pre-exec and calls only async-signal-safe
+        // syscalls (`open`/`setns`/`close`) on the pre-allocated, NUL-terminated `netns_path` string —
+        // no allocation, no non-reentrant libc call — so it is sound in the forked child. Defined
+        // outside the `unsafe` block so each syscall carries its own one-op `unsafe` + SAFETY note.
+        let enter_netns = move || -> std::io::Result<()> {
+            // SAFETY: `open(2)` on the pre-allocated NUL-terminated `netns_path`; async-signal-safe.
+            let fd = unsafe {
+                libc::open(
                     netns_path.as_ptr() as *const libc::c_char,
                     libc::O_RDONLY | libc::O_CLOEXEC,
-                );
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
-                    let err = std::io::Error::last_os_error();
-                    libc::close(fd);
-                    return Err(err);
-                }
-                libc::close(fd);
-                Ok(())
-            });
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `setns(2)` on the fd opened just above; async-signal-safe.
+            if unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: close the fd opened above on the error path; async-signal-safe.
+                unsafe { libc::close(fd) };
+                return Err(err);
+            }
+            // SAFETY: close the fd opened above on the success path; async-signal-safe.
+            unsafe { libc::close(fd) };
+            Ok(())
+        };
+        // SAFETY: `pre_exec` runs `enter_netns` post-fork/pre-exec; it is async-signal-safe (above).
+        unsafe {
+            std_cmd.pre_exec(enter_netns);
         }
     }
     tokio::process::Command::from(std_cmd)
@@ -358,11 +366,11 @@ pub(crate) async fn register_and_await_ready(
     // spawned VMM group, or it leaks.
     let pgid = process.id();
 
-    if let Some(pid) = process.id() {
-        if let Err(e) = cgroups.add_task(cgroup_name, pid) {
-            reap_process_group(process, pgid);
-            return Err(e);
-        }
+    if let Some(pid) = process.id()
+        && let Err(e) = cgroups.add_task(cgroup_name, pid)
+    {
+        reap_process_group(process, pgid);
+        return Err(e);
     }
 
     if let Err(e) = wait_for_socket(socket_path, process, timeout_ms, interval_ms).await {

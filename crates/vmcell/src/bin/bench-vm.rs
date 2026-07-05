@@ -196,7 +196,7 @@ async fn run_bench<V: Vmm>(
     allocator: VmidAllocator,
     is_restore: bool,
 ) -> anyhow::Result<()> {
-    println!("Starting benchmark: {}", name);
+    println!("Starting benchmark: {name}");
     let mut latencies = Vec::new();
 
     // L-BIN-7: resolve artifact paths and build the VM config through the SAME
@@ -800,14 +800,12 @@ fn write_ksm(field: &str, value: &str) -> bool {
 fn parse_kv_kb(text: &str, key: &str) -> Option<u64> {
     for line in text.lines() {
         let mut it = line.split_whitespace();
-        if let Some(k) = it.next() {
-            if k.trim_end_matches(':') == key {
-                if let Some(v) = it.next() {
-                    if let Ok(n) = v.parse::<u64>() {
-                        return Some(n);
-                    }
-                }
-            }
+        if let Some(k) = it.next()
+            && k.trim_end_matches(':') == key
+            && let Some(v) = it.next()
+            && let Ok(n) = v.parse::<u64>()
+        {
+            return Some(n);
         }
     }
     None
@@ -918,12 +916,11 @@ async fn pick_exec_cmd<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<String> {
         vec!["true".to_string()],
     ];
     for c in candidates {
-        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
-            if let Ok(o) = agent.exec(ExecRequest::new(c.clone())).await {
-                if o.code == 0 {
-                    return c;
-                }
-            }
+        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await
+            && let Ok(o) = agent.exec(ExecRequest::new(c.clone())).await
+            && o.code == 0
+        {
+            return c;
         }
     }
     vec!["cat".to_string(), "/proc/uptime".to_string()]

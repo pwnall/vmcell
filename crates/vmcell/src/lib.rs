@@ -5,15 +5,27 @@
 //! and an agent protocol for executing commands inside the guest.
 
 #![deny(missing_docs)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block, // one obligation per SAFETY comment
     unsafe_op_in_unsafe_fn,
     rustdoc::broken_intra_doc_links
 )]
-#![allow(async_fn_in_trait)]
+// The host `Vmm`/`Stage`/… traits deliberately use `async fn` in traits; the desugaring caveats are
+// understood and accepted. Scoped to `host-common` (where those traits live) so the expectation is
+// fulfilled exactly when they compile — a bare crate-level `#[expect]` would go unfulfilled in the
+// no-host-feature powerset configs where none is present, and a bare `#[allow]` now trips B11.
+#![cfg_attr(
+    feature = "host-common",
+    expect(
+        async_fn_in_trait,
+        reason = "host traits intentionally use async-fn-in-trait; caveats accepted (host-common only)"
+    )
+)]
 #![cfg_attr(
     not(test),
     deny(
@@ -25,7 +37,9 @@
         clippy::indexing_slicing,
         clippy::print_stdout,
         clippy::print_stderr,
-        clippy::dbg_macro
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
 /// Agent protocol and client implementation.

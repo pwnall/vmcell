@@ -28,10 +28,10 @@ ignore = [
     # --- Unmaintained-crate advisories: maintenance status only, no known exploitable defect ---
     "RUSTSEC-2020-0016", # net2 0.2.39 (transitive, legacy I/O shim): unmaintained, superseded by socket2; build-graph only, no runtime use.
     "RUSTSEC-2024-0436", # paste 1.0.15 (transitive proc-macro): unmaintained; compile-time only, zero runtime attack surface.
-    "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0: unmaintained, folded into rustls; only parses our own local CA PEM, never attacker-supplied bytes.
     "RUSTSEC-2023-0089", # atomic-polyfill 1.0.3 (transitive via embedded/no_std deps): unmaintained, superseded by portable-atomic; compile-target shim only.
-    # --- Timing/sidechannel advisory with a usage-scoped justification ---
-    "RUSTSEC-2023-0071", # rsa 0.9.10 (transitive): "Marvin" RSA-decrypt timing sidechannel, no fixed release; we do no RSA private-key ops on a remote-timing-observable path (proxy TLS is ECDSA via aws-lc-rs).
+    # (Removed RUSTSEC-2025-0134 / rustls-pemfile and RUSTSEC-2023-0071 / rsa: those crates left the
+    #  graph when the unused `rustls-pemfile` and `pgp` deps were dropped — cargo-machete gate — so
+    #  their ignores are no longer exercised. Re-add individually, with a real rationale, if they return.)
     # --- Legacy tokio 0.1 ecosystem: ALL enter via tun-tap 0.1.4 → tokio-core 0.1.18 → tokio 0.1.22
     #     (the optional `net-privileged` tap-network path). Superseded by the tokio 1.x host runtime;
     #     this 0.1 subtree is dormant build-graph weight with no runtime use and no upgrade path for the

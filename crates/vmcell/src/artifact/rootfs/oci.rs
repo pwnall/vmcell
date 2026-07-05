@@ -260,8 +260,7 @@ fn verify_blob_digest(blob: &[u8], expected_digest: &str) -> Result<()> {
     let hash = format!("sha256:{:x}", hasher.finalize());
     if hash != expected_digest {
         return Err(crate::error::Error::Artifact(format!(
-            "blob digest mismatch: expected {}, got {}",
-            expected_digest, hash
+            "blob digest mismatch: expected {expected_digest}, got {hash}"
         )));
     }
     Ok(())

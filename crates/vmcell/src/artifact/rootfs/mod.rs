@@ -475,8 +475,7 @@ mod tests {
         let res = pack_erofs_with_injection(vec![], &inputs, &out, None).await;
         assert!(
             matches!(res, Err(Error::Artifact(_))),
-            "missing guest_agent must be a hard error, got {:?}",
-            res
+            "missing guest_agent must be a hard error, got {res:?}"
         );
     }
 }

@@ -39,7 +39,7 @@ where
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| format!("tokio build failed: {}", e))?;
+                .map_err(|e| format!("tokio build failed: {e}"))?;
             rt.block_on(f())
         })
         .join()
@@ -60,7 +60,7 @@ where
 {
     run_in_tokio(move || async move {
         let (connection, handle, _) =
-            rtnetlink::new_connection().map_err(|e| format!("rtnetlink connect failed: {}", e))?;
+            rtnetlink::new_connection().map_err(|e| format!("rtnetlink connect failed: {e}"))?;
         tokio::spawn(connection);
         f(handle).await
     })
@@ -139,20 +139,19 @@ pub struct RtNetlink;
 
 impl Netlink for RtNetlink {
     fn add_netns(&self, name: &str) -> Result<()> {
-        netns_rs::NetNs::new(name)
-            .map_err(|e| Error::Network(format!("netns add failed: {}", e)))?;
+        netns_rs::NetNs::new(name).map_err(|e| Error::Network(format!("netns add failed: {e}")))?;
         Ok(())
     }
 
     fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<Option<tun_tap::Iface>> {
         let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
+            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
         let tn = tap_name.to_string();
 
         let tap = ns
             .run(move |_| tun_tap::Iface::without_packet_info(&tn, tun_tap::Mode::Tap))
-            .map_err(|e| Error::Network(format!("ns run tap fail: {:?}", e)))?
-            .map_err(|e| Error::Network(format!("tap create fail: {}", e)))?;
+            .map_err(|e| Error::Network(format!("ns run tap fail: {e:?}")))?
+            .map_err(|e| Error::Network(format!("tap create fail: {e}")))?;
 
         // Make the tap persistent, then release our fd: a non-multi-queue tap can be
         // opened by only one process, and the VMM must be the opener (otherwise CH
@@ -163,7 +162,7 @@ impl Netlink for RtNetlink {
         {
             use std::os::fd::AsRawFd;
             crate::net_sys::set_tun_persist(tap.as_raw_fd())
-                .map_err(|e| Error::Network(format!("TUNSETPERSIST on tap failed: {}", e)))?;
+                .map_err(|e| Error::Network(format!("TUNSETPERSIST on tap failed: {e}")))?;
         }
         drop(tap);
 
@@ -179,8 +178,8 @@ impl Netlink for RtNetlink {
                     .execute()
                     .try_next()
                     .await
-                    .map_err(|e| format!("get link err: {}", e))?
-                    .ok_or_else(|| format!("link {} not found", tap_name))?
+                    .map_err(|e| format!("get link err: {e}"))?
+                    .ok_or_else(|| format!("link {tap_name} not found"))?
                     .header
                     .index;
 
@@ -189,7 +188,7 @@ impl Netlink for RtNetlink {
                     .add(link_idx, std::net::IpAddr::V4(ip), 30)
                     .execute()
                     .await
-                    .map_err(|e| format!("addr add err: {}", e))?;
+                    .map_err(|e| format!("addr add err: {e}"))?;
 
                 handle
                     .link()
@@ -197,7 +196,7 @@ impl Netlink for RtNetlink {
                     .up()
                     .execute()
                     .await
-                    .map_err(|e| format!("link up err: {}", e))?;
+                    .map_err(|e| format!("link up err: {e}"))?;
 
                 let lo_idx = handle
                     .link()
@@ -206,7 +205,7 @@ impl Netlink for RtNetlink {
                     .execute()
                     .try_next()
                     .await
-                    .map_err(|e| format!("get lo err: {}", e))?
+                    .map_err(|e| format!("get lo err: {e}"))?
                     .ok_or_else(|| "lo not found".to_string())?
                     .header
                     .index;
@@ -217,7 +216,7 @@ impl Netlink for RtNetlink {
                     .up()
                     .execute()
                     .await
-                    .map_err(|e| format!("lo up err: {}", e))?;
+                    .map_err(|e| format!("lo up err: {e}"))?;
 
                 Ok(())
             })
@@ -228,21 +227,21 @@ impl Netlink for RtNetlink {
             // there is no handle to return — the VMM opens the interface by name.
             Ok(Ok(())) => Ok(None),
             Ok(Err(e)) => Err(Error::Network(e)),
-            Err(e) => Err(Error::Network(format!("ns run err: {:?}", e))),
+            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
         }
     }
 
     fn delete_netns(&self, name: &str) -> Result<()> {
         let ns = netns_rs::NetNs::get(name)
-            .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
+            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
         ns.remove()
-            .map_err(|e| Error::Network(format!("netns remove failed: {}", e)))?;
+            .map_err(|e| Error::Network(format!("netns remove failed: {e}")))?;
         Ok(())
     }
 
     fn setup_tproxy_routing(&self, netns: &str) -> Result<()> {
         let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Network(format!("netns get failed: {}", e)))?;
+            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
         let inner_res = ns
             .run(|_| {
                 run_with_rtnetlink(|handle| async move {
@@ -253,7 +252,7 @@ impl Netlink for RtNetlink {
                         .execute()
                         .try_next()
                         .await
-                        .map_err(|e| format!("get lo err: {}", e))?
+                        .map_err(|e| format!("get lo err: {e}"))?
                         .ok_or_else(|| "lo not found".to_string())?
                         .header
                         .index;
@@ -270,7 +269,7 @@ impl Netlink for RtNetlink {
                         .push(netlink_packet_route::rule::RuleAttribute::FwMark(1));
                     rule.execute()
                         .await
-                        .map_err(|e| format!("rule add err: {}", e))?;
+                        .map_err(|e| format!("rule add err: {e}"))?;
 
                     let mut route = handle.route().add();
                     let msg = route.message_mut();
@@ -292,12 +291,12 @@ impl Netlink for RtNetlink {
                     route
                         .execute()
                         .await
-                        .map_err(|e| format!("route add err: {}", e))?;
+                        .map_err(|e| format!("route add err: {e}"))?;
 
                     Ok(())
                 })
             })
-            .map_err(|e| Error::Network(format!("ns run err: {:?}", e)))?;
+            .map_err(|e| Error::Network(format!("ns run err: {e:?}")))?;
         if let Err(e) = inner_res {
             return Err(Error::Network(e));
         }
@@ -310,7 +309,7 @@ pub struct DefaultNftApplier;
 impl NftApplier for DefaultNftApplier {
     fn apply_rules(&self, netns: &str, rules: &str) -> Result<()> {
         let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Subprocess(format!("netns get failed: {}", e)))?;
+            .map_err(|e| Error::Subprocess(format!("netns get failed: {e}")))?;
         let rules_str = rules.to_string();
 
         let inner_res = ns.run(move |_| {
@@ -321,12 +320,12 @@ impl NftApplier for DefaultNftApplier {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
-                .map_err(|e| format!("nft spawn failed: {}", e))?;
+                .map_err(|e| format!("nft spawn failed: {e}"))?;
 
             if let Some(mut stdin) = child.stdin.take() {
                 stdin
                     .write_all(rules_str.as_bytes())
-                    .map_err(|e| format!("nft write failed: {}", e))?;
+                    .map_err(|e| format!("nft write failed: {e}"))?;
                 // `stdin` is dropped here, closing the pipe so nft sees EOF.
             }
 
@@ -334,7 +333,7 @@ impl NftApplier for DefaultNftApplier {
             // diagnosable instead of an opaque "failed".
             let output = child
                 .wait_with_output()
-                .map_err(|e| format!("nft wait failed: {}", e))?;
+                .map_err(|e| format!("nft wait failed: {e}"))?;
             if !output.status.success() {
                 let code = output
                     .status
@@ -354,7 +353,7 @@ impl NftApplier for DefaultNftApplier {
         match inner_res {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(Error::Subprocess(e)),
-            Err(e) => Err(Error::Subprocess(format!("ns run err: {}", e))),
+            Err(e) => Err(Error::Subprocess(format!("ns run err: {e}"))),
         }
     }
 }
@@ -521,7 +520,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    pub struct FakeNetlink {
+    pub(super) struct FakeNetlink {
         pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         /// Records the vmid forwarded to each `setup_tap` call, in order, so a
         /// test can assert that `create()` passes the requested vmid into the
@@ -533,7 +532,7 @@ mod tests {
     }
 
     impl FakeNetlink {
-        pub fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 setup_tap_vmids: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -543,7 +542,7 @@ mod tests {
 
         /// A fake whose `setup_tap` fails (after recording its call), used to
         /// exercise `create()`'s cleanup-on-failure path.
-        pub fn new_failing_setup_tap() -> Self {
+        pub(super) fn new_failing_setup_tap() -> Self {
             Self {
                 fail_setup_tap: true,
                 ..Self::new()
@@ -556,7 +555,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("add_netns({})", name));
+                .push(format!("add_netns({name})"));
             Ok(())
         }
         fn setup_tap(
@@ -568,7 +567,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("setup_tap({}, {})", netns, tap_name));
+                .push(format!("setup_tap({netns}, {tap_name})"));
             self.setup_tap_vmids.lock().unwrap().push(vmid);
             if self.fail_setup_tap {
                 return Err(Error::Network("injected setup_tap failure".to_string()));
@@ -579,26 +578,26 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("delete_netns({})", name));
+                .push(format!("delete_netns({name})"));
             Ok(())
         }
         fn setup_tproxy_routing(&self, netns: &str) -> Result<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("setup_tproxy_routing({})", netns));
+                .push(format!("setup_tproxy_routing({netns})"));
             Ok(())
         }
     }
 
     #[allow(dead_code)]
-    pub struct FakeNftApplier {
+    pub(super) struct FakeNftApplier {
         pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[allow(dead_code)]
     impl FakeNftApplier {
-        pub fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
@@ -610,7 +609,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("apply_rules({})", netns));
+                .push(format!("apply_rules({netns})"));
             Ok(())
         }
     }
@@ -677,8 +676,7 @@ mod tests {
         // pin its absence explicitly so a re-introduced QUIC hole reddens loudly.
         assert!(
             !rules.contains("udp dport 443"),
-            "QUIC (UDP/443) must remain un-accepted so all egress stays interceptable: {}",
-            rules
+            "QUIC (UDP/443) must remain un-accepted so all egress stays interceptable: {rules}"
         );
     }
 
@@ -820,9 +818,7 @@ mod tests {
             assert_eq!(
                 host.to_string(),
                 expected_host,
-                "vmid {} must map to host {}",
-                vmid,
-                expected_host
+                "vmid {vmid} must map to host {expected_host}"
             );
         }
 
@@ -831,8 +827,7 @@ mod tests {
         for vmid in [0u32, 255u32] {
             assert!(
                 crate::net::ip_math(vmid).is_err(),
-                "vmid {} must be rejected by the /30 host-IP math",
-                vmid
+                "vmid {vmid} must be rejected by the /30 host-IP math"
             );
         }
     }
