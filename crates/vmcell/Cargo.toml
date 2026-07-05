@@ -208,7 +208,7 @@ http = { version = "1", optional = true }
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
 vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.1.0" }
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # `test-util` enables `#[tokio::test(start_paused = true)]` for the deterministic
 # EXP-D shutdown-timing tests (L-ORCH-5). Test-only: dev-deps do not affect the
 # production build or the feature powerset.
