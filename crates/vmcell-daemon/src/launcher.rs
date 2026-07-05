@@ -32,6 +32,11 @@ pub struct LaunchSpec {
     /// When `Some`, restore from this snapshot directory (a copy of the named artifact snapshot)
     /// instead of a cold boot.
     pub restore_from: Option<PathBuf>,
+    /// Extra read-only virtio-blk devices (design v22 §E4), with the artifact names already
+    /// resolved to absolute paths and any `io_limit` translated (§E5).
+    pub extra_disks: Vec<vmcell::BlockDevice>,
+    /// Append-only extra kernel command-line arguments (design v22 §E2.1).
+    pub extra_kernel_args: Vec<String>,
 }
 
 /// An owned, live VM the registry holds. Ops borrow `&mut self` (one vsock control channel per VM,
@@ -188,7 +193,7 @@ fn net_config(mode: NetMode) -> vmcell::config::NetConfig {
 #[async_trait]
 impl VmLauncher for MicroVmLauncher {
     async fn launch(&self, spec: &LaunchSpec) -> DaemonResult<Box<dyn VmHandle>> {
-        let cfg = vmcell::config::VmConfig::builder(
+        let mut builder = vmcell::config::VmConfig::builder(
             spec.kernel.clone(),
             vmcell::config::RootfsSource::Erofs {
                 image: spec.rootfs.clone(),
@@ -198,8 +203,17 @@ impl VmLauncher for MicroVmLauncher {
         .mem_mib(spec.mem_mib)
         .net(net_config(spec.net))
         .snapshotting(spec.snapshotting)
-        .resource_prefix(&self.resource_prefix)
-        .build()?;
+        .resource_prefix(&self.resource_prefix);
+        for disk in &spec.extra_disks {
+            builder = builder.with_extra_disk(disk.clone());
+        }
+        for arg in &spec.extra_kernel_args {
+            builder = builder.with_kernel_arg(arg.clone());
+        }
+        // Bad extra-disk / extra-arg knobs (a nonexistent path can't happen — the
+        // registry resolved them — but an empty/duplicate/over-cap io_limit or a
+        // reserved kernel arg) surface here as a typed config error mapped to 400.
+        let cfg = builder.build()?;
 
         // Restore from a snapshot (via CoW so the named artifact is preserved and re-restorable,
         // design v20 §9.4) or cold-boot. Both then bring the agent up: for a cold boot that confirms

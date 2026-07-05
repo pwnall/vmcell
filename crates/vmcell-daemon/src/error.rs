@@ -99,13 +99,17 @@ impl From<serde_json::Error> for DaemonError {
 
 impl From<vmcell::Error> for DaemonError {
     /// Maps a `vmcell::Error` to the closest daemon kind. `Unsupported`/`CapabilityUnavailable`
-    /// (the two matchable vmcell conditions, design v20 §10.3) map to `Unsupported` (501); every
-    /// other variant renders its `Display` under `Internal` (500) — never the `Debug` form.
+    /// (the two matchable vmcell conditions, design v20 §10.3) map to `Unsupported` (501); a
+    /// `Config` validation failure is a **client** error (the request carried a bad knob — a
+    /// reserved kernel arg, a `0` io_limit, `vcpus == 0`) so it maps to `BadRequest` (400), not a
+    /// misleading 500; every other variant renders its `Display` under `Internal` (500) — never
+    /// the `Debug` form.
     fn from(e: vmcell::Error) -> Self {
         match e {
             vmcell::Error::Unsupported { .. } | vmcell::Error::CapabilityUnavailable { .. } => {
                 Self::Unsupported(e.to_string())
             }
+            vmcell::Error::Config(_) => Self::BadRequest(e.to_string()),
             other => Self::Internal(other.to_string()),
         }
     }
@@ -186,5 +190,16 @@ mod tests {
             !msg.contains("Unsupported {"),
             "must not be the Debug struct-dump: {msg}"
         );
+    }
+
+    // A vmcell `Config` validation failure is a client-supplied bad knob (a reserved
+    // kernel arg, a 0 io_limit), so it maps to BadRequest (400) — not a misleading
+    // Internal 500. Buggy impl: the `other => Internal` arm swallows Config as a 500.
+    #[test]
+    fn wrapped_config_error_maps_to_bad_request() {
+        let ve = vmcell::Error::Config("mem_mib must be >= 64".into());
+        let de: DaemonError = ve.into();
+        assert_eq!(de.kind().status_code(), 400, "a bad config knob is a 400");
+        assert!(de.message().contains("mem_mib"));
     }
 }

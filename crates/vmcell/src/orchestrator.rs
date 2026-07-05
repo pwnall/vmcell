@@ -338,6 +338,11 @@ pub struct MicroVm<V: Vmm> {
     /// construction, so `agent()`'s connect cadence and `shutdown()`'s grace
     /// window honor the caller-selected profile rather than hard-coded constants.
     timeouts: crate::config::Timeouts,
+    /// `true` when the VM boots a custom `init=` (§E2.2) that replaces the vmcell
+    /// guest agent, so there is **no** vsock control plane. Set from `cfg.init` at
+    /// construction; makes [`MicroVm::agent`] fail loud immediately rather than hang
+    /// connecting to a listener that will never answer.
+    control_plane_disabled: bool,
 }
 
 /// A guard that deletes the cgroup slice on drop unless disarmed.
@@ -847,27 +852,33 @@ impl<V: Vmm> MicroVm<V> {
         // healthy transport answers well within the budget, so this adds no wait on
         // the common path. Re-spawn recreates on the SAME per-VM resources
         // (netns/tap/cgroup/CID/dir); `spawn_qemu` pre-cleans stale sockets.
-        let clamped = cfg.timeouts.clamped();
-        let mut respawns = 0u32;
-        while let Err(e) = instance
-            .verify_control_plane(CONTROL_PLANE_PROBE_BUDGET, &clamped)
-            .await
-        {
-            if respawns >= MAX_CONTROL_PLANE_RESPAWNS {
-                return Err(crate::error::Error::Vmm(format!(
-                    "guest control plane did not come up after {MAX_CONTROL_PLANE_RESPAWNS} \
-                     re-spawns: {e}"
-                )));
+        // A custom `init=` (§E2.2) replaces the guest agent, so there is no agent vsock
+        // transport to health-gate — skip the probe (which QEMU uses to catch a wedged
+        // `vhost-device-vsock` bring-up); otherwise a custom-init QEMU VM would re-spawn
+        // to exhaustion against a listener that never comes up. CH/FC probes are no-ops.
+        if cfg.init.is_none() {
+            let clamped = cfg.timeouts.clamped();
+            let mut respawns = 0u32;
+            while let Err(e) = instance
+                .verify_control_plane(CONTROL_PLANE_PROBE_BUDGET, &clamped)
+                .await
+            {
+                if respawns >= MAX_CONTROL_PLANE_RESPAWNS {
+                    return Err(crate::error::Error::Vmm(format!(
+                        "guest control plane did not come up after {MAX_CONTROL_PLANE_RESPAWNS} \
+                         re-spawns: {e}"
+                    )));
+                }
+                respawns += 1;
+                tracing::warn!(
+                    "control-plane bring-up failed (re-spawn {respawns}/{MAX_CONTROL_PLANE_RESPAWNS}): {e}"
+                );
+                // `Drop` reaps the VMM process group + external daemon and unlinks their
+                // sockets before the fresh spawn re-binds them.
+                drop(instance);
+                instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
+                instance.boot().await?;
             }
-            respawns += 1;
-            tracing::warn!(
-                "control-plane bring-up failed (re-spawn {respawns}/{MAX_CONTROL_PLANE_RESPAWNS}): {e}"
-            );
-            // `Drop` reaps the VMM process group + external daemon and unlinks their
-            // sockets before the fresh spawn re-binds them.
-            drop(instance);
-            instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
-            instance.boot().await?;
         }
         // Success: ownership of the slice transfers to the returned MicroVm,
         // whose Drop deletes it in the documented teardown order.
@@ -891,6 +902,7 @@ impl<V: Vmm> MicroVm<V> {
             // `cfg.timeouts` after `build()` down to a busy-spin; clamping here
             // guarantees the connect/accept/grace cadences honor their floors.
             timeouts: cfg.timeouts.clamped(),
+            control_plane_disabled: cfg.init.is_some(),
         })
     }
 
@@ -1091,6 +1103,7 @@ impl<V: Vmm> MicroVm<V> {
             // `cfg.timeouts` after `build()` down to a busy-spin; clamping here
             // guarantees the connect/accept/grace cadences honor their floors.
             timeouts: cfg.timeouts.clamped(),
+            control_plane_disabled: cfg.init.is_some(),
         };
         Ok((vm, cow_support))
     }
@@ -1116,6 +1129,18 @@ impl<V: Vmm> MicroVm<V> {
         timeout: Option<std::time::Duration>,
         clock: &dyn Clock,
     ) -> Result<&mut AgentClient> {
+        // Fail loud, not hang: a custom `init=` (§E2.2) replaces the vmcell guest agent,
+        // so there is no vsock control plane — no `Ready` handshake, `exec`, or resync.
+        // Returning immediately here beats blocking for the full connect timeout on a
+        // listener that will never answer (§12.2 fail-loud).
+        if self.control_plane_disabled {
+            return Err(crate::error::Error::Agent(
+                "the vsock control plane is unavailable: this VM boots a custom init= that \
+                 replaces the vmcell guest agent (no Ready handshake, exec, or resync). Observe \
+                 it via the serial log, a shared directory, an extra block device, or networking."
+                    .into(),
+            ));
+        }
         if self.agent_client.is_none() {
             let client = AgentClient::connect(
                 self.instance
@@ -1890,6 +1915,7 @@ mod tests {
             cid: None,
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
+            control_plane_disabled: false,
         }
     }
 
@@ -2475,6 +2501,7 @@ mod tests {
             cid: None,
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
+            control_plane_disabled: false,
         };
         let usage = vm.usage().await.unwrap();
         assert!(
@@ -2534,6 +2561,7 @@ mod tests {
             cid: None,
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
+            control_plane_disabled: false,
         };
         (vm, peer)
     }
@@ -2696,6 +2724,7 @@ mod tests {
             }),
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
+            control_plane_disabled: false,
         };
         drop(vm);
 
@@ -2928,6 +2957,7 @@ mod tests {
             cid: None,
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
+            control_plane_disabled: false,
         };
 
         vm.shutdown().await.expect("shutdown ok");
@@ -3081,7 +3111,51 @@ mod tests {
                 shutdown_grace: grace,
                 ..crate::config::Timeouts::default()
             },
+            control_plane_disabled: false,
         }
+    }
+
+    // §E2.2: a custom `init=` replaces the guest agent, so `agent()` must fail LOUD
+    // immediately (a typed `Error::Agent` naming the cause) instead of blocking for the
+    // full connect timeout on a listener that will never answer (§12.2 fail-loud).
+    // Inverse: drop the `control_plane_disabled` early-return in `agent()` and this
+    // either hangs (the 1 s timeout) or returns a connect error, not the custom-init
+    // one — reddening the message assertion.
+    #[tokio::test]
+    async fn agent_fails_loud_when_control_plane_disabled() {
+        let mut vm = MicroVm::<crate::vmm::FakeVmm> {
+            vmid: None,
+            instance: Some(crate::vmm::FakeVmInstance {
+                vsock_path: std::path::PathBuf::from("/tmp/vmcell-noagent-vsock.sock"),
+                serial: std::path::PathBuf::from("/tmp/vmcell-noagent-serial.log"),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+            netns: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: None,
+            cgroup_name: None,
+            cgroup_fs: None,
+            agent_client: None,
+            restored: false,
+            restore_reseed_applied: None,
+            cid: None,
+            tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
+            control_plane_disabled: true,
+        };
+        let err = vm
+            .agent(Some(std::time::Duration::from_secs(1)), &RealClock)
+            .await
+            .expect_err("agent() must fail loud when a custom init disabled the control plane");
+        assert!(
+            matches!(err, crate::error::Error::Agent(_)),
+            "expected a typed Agent error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("custom init"),
+            "the error must name the custom-init cause: {err}"
+        );
     }
 
     // EXP-D (c): the adaptive step's exact thresholds — <= 50 ms -> 5 ms,

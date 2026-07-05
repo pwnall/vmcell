@@ -81,6 +81,33 @@ impl NetMode {
     }
 }
 
+/// The wire form of a [`vmcell::DiskIoLimit`](vmcell::config::DiskIoLimit) — disk-I/O
+/// fault injection (design v22 §E5). At least one cap must be set and any set cap must
+/// be `> 0`; the library's `build()` enforces both fail-loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiskIoLimitDto {
+    /// Read+write bandwidth cap in bytes/second (`None` = unlimited).
+    #[serde(default)]
+    pub bandwidth_bytes_per_sec: Option<u64>,
+    /// Read+write IOPS cap (`None` = unlimited).
+    #[serde(default)]
+    pub iops: Option<u64>,
+}
+
+/// An extra virtio-blk device for a created VM (design v22 §E4), backed by an artifact
+/// in the store. The store is **immutable** (create-only, no update), so an extra disk
+/// is attached **read-only** — a shared store artifact must not be mutated out from
+/// under other VMs (a writable-scratch-from-artifact copy is forward work). An optional
+/// `io_limit` injects disk-I/O faults (§E5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtraDiskSpec {
+    /// Artifact name of the disk image (resolved against the store like `kernel`/`rootfs`).
+    pub name: String,
+    /// Optional I/O rate limit (disk-I/O fault injection).
+    #[serde(default)]
+    pub io_limit: Option<DiskIoLimitDto>,
+}
+
 /// Create-and-boot a VM (`POST /v1/vms`). Mirrors `vmcell run`/`create` (design v21 §D5.1), but
 /// `kernel`/`rootfs` are artifact **names** resolved against the daemon's store — never host paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +142,18 @@ pub struct CreateVmRequest {
     /// the registry. Ignored when `command` is absent.
     #[serde(default)]
     pub ephemeral: bool,
+    /// Extra read-only virtio-blk devices from the store, enumerated in the guest as
+    /// `/dev/vdb`, `/dev/vdc`, … (design v22 §E4). A live VM pins these artifacts (delete
+    /// is refused while in use). Optionally throttled for disk-I/O fault injection (§E5).
+    #[serde(default)]
+    pub extra_disks: Vec<ExtraDiskSpec>,
+    /// Append-only extra kernel command-line arguments (design v22 §E2.1). Cannot
+    /// override a boot token vmcell owns — rejected fail-loud at build. (A custom `init=`
+    /// override is deliberately **not** exposed here: it replaces the guest agent, so the
+    /// daemon — which owns the VM through the vsock control plane — could not `exec` or
+    /// `stats` it. Use the library directly for a custom-init VM.)
+    #[serde(default)]
+    pub extra_kernel_args: Vec<String>,
 }
 
 const fn default_vcpus() -> u8 {
@@ -138,6 +177,8 @@ impl CreateVmRequest {
             restore_from: None,
             command: None,
             ephemeral: false,
+            extra_disks: Vec::new(),
+            extra_kernel_args: Vec::new(),
         }
     }
 
@@ -145,6 +186,23 @@ impl CreateVmRequest {
     #[must_use]
     pub fn with_net(mut self, net: NetMode) -> Self {
         self.net = net;
+        self
+    }
+
+    /// Attaches an extra read-only disk artifact by name (builder-style, §E4).
+    #[must_use]
+    pub fn with_extra_disk(mut self, name: impl Into<String>) -> Self {
+        self.extra_disks.push(ExtraDiskSpec {
+            name: name.into(),
+            io_limit: None,
+        });
+        self
+    }
+
+    /// Appends one append-only extra kernel arg (builder-style, §E2.1).
+    #[must_use]
+    pub fn with_kernel_arg(mut self, arg: impl Into<String>) -> Self {
+        self.extra_kernel_args.push(arg.into());
         self
     }
 
@@ -463,5 +521,32 @@ mod tests {
         assert_eq!(req.mem_mib, 512);
         assert_eq!(req.command, None);
         assert!(!req.ephemeral);
+        // v22 additive fields default empty (an older client omitting them still parses).
+        assert!(req.extra_disks.is_empty());
+        assert!(req.extra_kernel_args.is_empty());
+    }
+
+    // v22 §E4/§E5: an extra-disk spec with an io_limit parses, and the io_limit fields
+    // default to None (bandwidth-only / iops-only / unlimited all expressible).
+    #[test]
+    fn extra_disk_spec_parses_with_io_limit() {
+        let req: CreateVmRequest = serde_json::from_str(
+            r#"{"kernel":"k","rootfs":"r","extra_disks":[
+                 {"name":"data.img"},
+                 {"name":"slow.img","io_limit":{"bandwidth_bytes_per_sec":1048576}}
+               ],"extra_kernel_args":["mitigations=off"]}"#,
+        )
+        .expect("parse");
+        assert_eq!(req.extra_disks.len(), 2);
+        assert_eq!(req.extra_disks[0].name, "data.img");
+        assert_eq!(req.extra_disks[0].io_limit, None);
+        assert_eq!(
+            req.extra_disks[1].io_limit,
+            Some(DiskIoLimitDto {
+                bandwidth_bytes_per_sec: Some(1_048_576),
+                iops: None,
+            })
+        );
+        assert_eq!(req.extra_kernel_args, vec!["mitigations=off"]);
     }
 }

@@ -415,6 +415,35 @@ impl Qemu {
             crate::config::RootfsSource::VirtioFs { .. } => {}
         }
 
+        // Extra virtio-blk devices (§E1), attached AFTER the root `virtio-blk-pci` so
+        // they enumerate `/dev/vdb`, `/dev/vdc`, … in order and never shift the root
+        // off `/dev/vda`. Each is a split-form drive/device pair with its own id.
+        // `readonly=on` only for read-only disks; `file.locking=off` matches the root.
+        for (i, disk) in cfg.extra_disks.iter().enumerate() {
+            let ro = if disk.readonly { ",readonly=on" } else { "" };
+            // Disk-I/O fault injection (§E5): QEMU's per-drive throttling takes the rate
+            // directly (bytes/s, ops/s) — no token-bucket conversion, unset caps omitted.
+            let mut throttle = String::new();
+            if let Some(limit) = &disk.io_limit {
+                if let Some(bps) = limit.bandwidth_bytes_per_sec {
+                    throttle.push_str(&format!(",throttling.bps-total={bps}"));
+                }
+                if let Some(iops) = limit.iops {
+                    throttle.push_str(&format!(",throttling.iops-total={iops}"));
+                }
+            }
+            cmd.arg("-drive")
+                .arg(format!(
+                    "file={},format=raw,id=extra{},if=none{},file.locking=off{}",
+                    disk.image.display(),
+                    i,
+                    ro,
+                    throttle,
+                ))
+                .arg("-device")
+                .arg(format!("virtio-blk-pci,drive=extra{i}"));
+        }
+
         for (i, (share, daemon)) in cfg.shares.iter().zip(fs_daemons.iter()).enumerate() {
             cmd.arg("-chardev")
                 .arg(format!(

@@ -23,7 +23,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use url::Url;
 use vmcell_daemon_client::DaemonClient;
-use vmcell_daemon_client::dto::{CreateVmRequest, ExecRequestDto, NetMode};
+use vmcell_daemon_client::dto::{CreateVmRequest, ErrorKind, ExecRequestDto, NetMode};
 
 // ---- environment discovery ----
 
@@ -331,6 +331,62 @@ async fn boots_vm_and_execs_data_plane() {
         d.client("").ls().await.expect("ls").is_empty(),
         "ephemeral VM torn down"
     );
+}
+
+// design v22 §E4: an extra virtio-blk device attached over the HTTP API — the full path
+// (upload → CreateVmRequest.extra_disks → resolve/pin → attach → guest read). Asserts on
+// the DATA PLANE (the marker read off /dev/vdb in-guest) AND that the disk artifact is
+// pinned while the VM is live (delete-in-use → 409), releasing on teardown.
+#[tokio::test]
+#[ignore = "boots a real VM; needs KVM + blessed runner + artifacts (run via `just test-daemon`)"]
+async fn extra_disk_over_api_data_plane_and_delete_in_use() {
+    let d = Daemon::start(Auth::Open).await;
+    let c = d.client("");
+
+    // Upload a small raw disk image with a marker at offset 0.
+    let mut img = vec![0u8; 4096];
+    img[..9].copy_from_slice(b"VMCELLAPI");
+    c.upload_artifact("data.img", img)
+        .await
+        .expect("upload disk artifact");
+
+    // Create a VM with the extra disk and read the marker back off /dev/vdb in-guest.
+    let created = c
+        .create_vm(CreateVmRequest::create("vmlinux", "rootfs.erofs").with_extra_disk("data.img"))
+        .await
+        .expect("create with extra disk");
+    let vm = created.vm;
+    let out = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "head -c 9 /dev/vdb".into(),
+            ]),
+        )
+        .await
+        .expect("read /dev/vdb");
+    assert_eq!(out.code, 0, "read exit code");
+    assert_eq!(
+        out.stdout().expect("decode"),
+        b"VMCELLAPI",
+        "extra-disk marker must be readable off /dev/vdb over the API"
+    );
+
+    // The disk artifact is pinned while the VM is live: delete is refused with 409 InUse.
+    let del = c.delete_artifact("data.img").await;
+    assert_eq!(
+        del.err().and_then(|e| e.kind()),
+        Some(ErrorKind::InUse),
+        "deleting an in-use extra-disk artifact must be refused (409 InUse)"
+    );
+
+    c.destroy(&vm.id).await.expect("destroy");
+    // Teardown releases the pin, so the artifact is now deletable.
+    c.delete_artifact("data.img")
+        .await
+        .expect("delete after the VM is gone");
 }
 
 #[tokio::test]

@@ -116,11 +116,97 @@ struct ChPayload {
     cmdline: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct ChDisk {
     path: PathBuf,
     readonly: bool,
     direct: bool,
+    /// CH's explicit image format. Always `"Raw"` here — every image vmcell attaches
+    /// (erofs root, ext4 `Block` root, extra raw block devices) is a raw image. Set
+    /// explicitly because CH v52 **auto-detects** an unspecified image as raw and then
+    /// **disables sector-0 writes** as a qcow2-misdetection safeguard — which silently
+    /// makes a *writable* raw disk reject writes to its first sector (the ext4
+    /// superblock region, or a guest write to `/dev/vdb` offset 0). Declaring `Raw`
+    /// keeps the whole disk writable and drops CH's deprecation warnings.
+    image_type: &'static str,
+    /// Optional I/O rate limiter (disk-I/O fault injection, §E5). Omitted when the disk
+    /// is unthrottled so the JSON matches CH's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limiter_config: Option<ChRateLimiter>,
+}
+
+/// The one image format vmcell attaches — every image is a raw block image (§E1 /
+/// the CH sector-0-write fix above).
+const CH_RAW_IMAGE_TYPE: &str = "Raw";
+
+/// CH's per-disk `rate_limiter_config` — independent bandwidth (bytes/s) and ops (IOPS)
+/// token buckets (§E5). Each is omitted when its cap is unset.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct ChRateLimiter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bandwidth: Option<ChTokenBucket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ops: Option<ChTokenBucket>,
+}
+
+/// A CH token bucket: `size` tokens refilled every `refill_time` ms (→ `size` per
+/// second at [`crate::config::IO_LIMIT_REFILL_TIME_MS`]).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct ChTokenBucket {
+    size: u64,
+    refill_time: u64,
+}
+
+/// Builds CH's `rate_limiter_config` from a [`DiskIoLimit`](crate::config::DiskIoLimit),
+/// using the shared `size = rate`, `refill_time = IO_LIMIT_REFILL_TIME_MS` conversion
+/// (one law, one predicate — Firecracker builds the identical bucket, §E5).
+fn ch_rate_limiter(limit: &crate::config::DiskIoLimit) -> ChRateLimiter {
+    let bucket = |rate: u64| ChTokenBucket {
+        size: rate,
+        refill_time: crate::config::IO_LIMIT_REFILL_TIME_MS,
+    };
+    ChRateLimiter {
+        bandwidth: limit.bandwidth_bytes_per_sec.map(bucket),
+        ops: limit.iops.map(bucket),
+    }
+}
+
+/// Builds the CH `disks[]` list: the **root disk first** (array index 0 = `/dev/vda`,
+/// its `readonly` set from the rootfs kind), then the extra virtio-blk devices in
+/// order (`/dev/vdb`, `/dev/vdc`, …, each honoring its own `readonly`, §E1.2). CH
+/// enumerates disks purely by array order, so this ordering is the load-bearing
+/// contract with the cmdline's `root=/dev/vda`. Pure, so the ordering is unit-testable
+/// without a running VMM. A virtio-fs rootfs contributes no disk (unreachable here —
+/// `create()` rejects it up front, VMM-1 — kept for match exhaustiveness).
+fn build_ch_disks(cfg: &VmConfig) -> Vec<ChDisk> {
+    let mut disks = Vec::with_capacity(1 + cfg.extra_disks.len());
+    match &cfg.rootfs {
+        crate::config::RootfsSource::Erofs { image } => disks.push(ChDisk {
+            path: image.clone(),
+            readonly: true,
+            direct: false,
+            image_type: CH_RAW_IMAGE_TYPE,
+            rate_limiter_config: None,
+        }),
+        crate::config::RootfsSource::Block { image, overlay } => disks.push(ChDisk {
+            path: overlay.as_ref().unwrap_or(image).clone(),
+            readonly: false,
+            direct: false,
+            image_type: CH_RAW_IMAGE_TYPE,
+            rate_limiter_config: None,
+        }),
+        crate::config::RootfsSource::VirtioFs { .. } => {}
+    }
+    for disk in &cfg.extra_disks {
+        disks.push(ChDisk {
+            path: disk.image.clone(),
+            readonly: disk.readonly,
+            direct: false,
+            image_type: CH_RAW_IMAGE_TYPE,
+            rate_limiter_config: disk.io_limit.as_ref().map(ch_rate_limiter),
+        });
+    }
+    disks
 }
 
 #[derive(Serialize)]
@@ -510,25 +596,7 @@ impl Vmm for CloudHypervisor {
             });
         }
 
-        match &cfg.rootfs {
-            crate::config::RootfsSource::Erofs { image } => {
-                ch_cfg.disks.push(ChDisk {
-                    path: image.clone(),
-                    readonly: true,
-                    direct: false,
-                });
-            }
-            crate::config::RootfsSource::Block { image, overlay } => {
-                ch_cfg.disks.push(ChDisk {
-                    path: overlay.as_ref().unwrap_or(image).clone(),
-                    readonly: false,
-                    direct: false,
-                });
-            }
-            // Unreachable: `create()` rejects a virtio-fs rootfs up front via
-            // `reject_virtio_fs_rootfs` (VMM-1). Kept for match exhaustiveness.
-            crate::config::RootfsSource::VirtioFs { .. } => {}
-        }
+        ch_cfg.disks = build_ch_disks(cfg);
 
         instance
             .api_request("PUT", "/api/v1/vm.create", Some(&ch_cfg))
@@ -811,6 +879,123 @@ mod tests {
         assert!(
             json.contains("\"payload\":{\"kernel\":\"/vmlinux\",\"cmdline\":\"console=ttyS0\"}")
         );
+    }
+
+    // §E1.2: the root disk is always disks[0] (/dev/vda) and extra virtio-blk devices
+    // follow it in order (/dev/vdb, /dev/vdc, …), each with its own readonly flag.
+    // Buggy impls this guards: extras pushed BEFORE the root (root shifts off /dev/vda
+    // → the guest cannot mount root=/dev/vda), extras dropped, or the readonly flag
+    // ignored.
+    #[test]
+    fn build_ch_disks_puts_root_first_then_extras() {
+        use crate::config::{BlockDevice, RootfsSource, VmConfig};
+
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(BlockDevice::read_only("/img/ro.raw"))
+        .with_extra_disk(BlockDevice::read_write("/img/rw.raw"))
+        .build()
+        .unwrap();
+
+        let disks = build_ch_disks(&cfg);
+        assert_eq!(
+            disks,
+            vec![
+                // /dev/vda — the erofs root, read-only.
+                ChDisk {
+                    path: PathBuf::from("/rootfs.erofs"),
+                    readonly: true,
+                    direct: false,
+                    image_type: CH_RAW_IMAGE_TYPE,
+                    rate_limiter_config: None,
+                },
+                // /dev/vdb — the first extra disk, read-only.
+                ChDisk {
+                    path: PathBuf::from("/img/ro.raw"),
+                    readonly: true,
+                    direct: false,
+                    image_type: CH_RAW_IMAGE_TYPE,
+                    rate_limiter_config: None,
+                },
+                // /dev/vdc — the second extra disk, read-write.
+                ChDisk {
+                    path: PathBuf::from("/img/rw.raw"),
+                    readonly: false,
+                    direct: false,
+                    image_type: CH_RAW_IMAGE_TYPE,
+                    rate_limiter_config: None,
+                },
+            ]
+        );
+
+        // No extra disks ⇒ just the root disk (default path unchanged).
+        let plain = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert_eq!(build_ch_disks(&plain).len(), 1);
+
+        // The explicit `image_type=Raw` must reach CH's JSON (it stops CH v52 from
+        // auto-detecting raw and disabling sector-0 writes on a writable disk). A
+        // renamed/dropped field silences CH's format and reddens here.
+        let json = serde_json::to_string(&disks[0]).unwrap();
+        assert!(
+            json.contains("\"image_type\":\"Raw\""),
+            "disk config must declare image_type=Raw: {json}"
+        );
+        // An unthrottled disk omits rate_limiter_config entirely (matches CH's default).
+        assert!(
+            !json.contains("rate_limiter_config"),
+            "unthrottled disk must omit rate_limiter_config: {json}"
+        );
+    }
+
+    // §E5: a DiskIoLimit becomes CH's `rate_limiter_config` token buckets — bandwidth
+    // (bytes/s) and ops (IOPS) each `{ size: rate, refill_time: 1000 }`, and an unset
+    // cap is omitted. Buggy impls: wrong refill_time (so `size` no longer means per-
+    // second), a swapped bandwidth/ops key, or emitting a cap that was None.
+    #[test]
+    fn build_ch_disks_maps_io_limit_to_rate_limiter() {
+        use crate::config::{BlockDevice, DiskIoLimit, RootfsSource, VmConfig};
+
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(
+            BlockDevice::read_only("/img/slow.raw")
+                .with_io_limit(DiskIoLimit::bandwidth(2_000_000)),
+        )
+        .build()
+        .unwrap();
+
+        let disks = build_ch_disks(&cfg);
+        // disks[1] is the throttled extra disk (disks[0] is the root).
+        let rl = disks[1]
+            .rate_limiter_config
+            .as_ref()
+            .expect("throttled disk must carry a rate limiter");
+        assert_eq!(
+            rl.bandwidth,
+            Some(ChTokenBucket {
+                size: 2_000_000,
+                refill_time: 1000,
+            }),
+            "bandwidth bucket must be size=rate, refill_time=1000ms (→ bytes/second)"
+        );
+        assert_eq!(rl.ops, None, "an unset IOPS cap must be omitted");
+        // The root disk stays unthrottled.
+        assert_eq!(disks[0].rate_limiter_config, None);
     }
 
     // The serial/console device pair must move in lockstep with the cmdline

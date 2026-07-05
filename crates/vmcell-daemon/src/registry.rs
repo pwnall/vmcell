@@ -33,6 +33,9 @@ struct VmSlot {
     vmid: u32,
     kernel: String,
     rootfs: String,
+    /// The extra-disk artifact names this VM pins (design v22 §E4) — read lock-free by
+    /// the delete-in-use guard, like `kernel`/`rootfs`.
+    extra_disks: Vec<String>,
     vcpus: u8,
     mem_mib: u32,
     inner: Mutex<VmInner>,
@@ -160,6 +163,23 @@ impl Registry {
             }
             None => None,
         };
+        // Resolve each extra-disk artifact name to a read-only BlockDevice (the store is
+        // immutable, §E4), translating any io_limit (§E5). The names are pinned on the
+        // slot below so `is_artifact_in_use` refuses to delete a disk a live VM uses.
+        let mut extra_disks = Vec::with_capacity(req.extra_disks.len());
+        for spec in &req.extra_disks {
+            let path = self.resolve_existing(&spec.name, "disk")?;
+            let mut disk = vmcell::BlockDevice::read_only(path);
+            if let Some(limit) = &spec.io_limit {
+                disk = disk.with_io_limit(vmcell::config::DiskIoLimit::new(
+                    limit.bandwidth_bytes_per_sec,
+                    limit.iops,
+                ));
+            }
+            extra_disks.push(disk);
+        }
+        let pinned_disks: Vec<String> = req.extra_disks.iter().map(|d| d.name.clone()).collect();
+
         let spec = LaunchSpec {
             kernel: kernel_path,
             rootfs: rootfs_path,
@@ -168,6 +188,8 @@ impl Registry {
             net: req.net,
             snapshotting: req.snapshotting,
             restore_from,
+            extra_disks,
+            extra_kernel_args: req.extra_kernel_args.clone(),
         };
         let handle = self.launcher.launch(&spec).await?;
         let id = self.mint_id();
@@ -176,6 +198,7 @@ impl Registry {
             vmid: handle.vmid(),
             kernel: req.kernel.clone(),
             rootfs: req.rootfs.clone(),
+            extra_disks: pinned_disks,
             vcpus: req.vcpus,
             mem_mib: req.mem_mib,
             inner: Mutex::new(VmInner {
@@ -299,14 +322,15 @@ impl Registry {
         }
     }
 
-    /// Whether any owned VM pins `artifact_name` as its kernel or rootfs — read lock-free off the
-    /// immutable slot fields (design v21 §D3.2, the delete-in-use guard).
+    /// Whether any owned VM pins `artifact_name` as its kernel, rootfs, or one of its
+    /// extra disks (design v22 §E4) — read lock-free off the immutable slot fields
+    /// (design v21 §D3.2, the delete-in-use guard).
     pub async fn is_artifact_in_use(&self, artifact_name: &str) -> bool {
-        self.vms
-            .lock()
-            .await
-            .values()
-            .any(|s| s.kernel == artifact_name || s.rootfs == artifact_name)
+        self.vms.lock().await.values().any(|s| {
+            s.kernel == artifact_name
+                || s.rootfs == artifact_name
+                || s.extra_disks.iter().any(|d| d == artifact_name)
+        })
     }
 
     /// Graceful ordered teardown of every VM (a clean daemon shutdown). Each VM runs its own
@@ -517,6 +541,45 @@ mod tests {
         assert_eq!(shutdowns.load(Ordering::SeqCst), 2, "every VM torn down");
         assert!(reg.is_empty().await);
         assert!(!reg.is_artifact_in_use("vmlinux").await, "pins released");
+    }
+
+    // §E4: an extra-disk artifact is resolved and PINNED by the live VM, so the
+    // delete-in-use guard refuses it; the pin releases on teardown. Buggy impl:
+    // `is_artifact_in_use` ignores extra disks and the disk is deletable out from
+    // under the running VM.
+    #[tokio::test]
+    async fn create_with_extra_disk_resolves_and_pins_it() {
+        let (reg, _s, _d) = registry();
+        reg.artifacts()
+            .create("data.img", b"diskbytes")
+            .expect("seed disk artifact");
+        let created = reg
+            .create(create_req().with_extra_disk("data.img"))
+            .await
+            .expect("create with extra disk");
+        assert!(
+            reg.is_artifact_in_use("data.img").await,
+            "an extra disk a live VM uses must be pinned"
+        );
+        reg.destroy(&created.info.id).await.expect("destroy");
+        assert!(
+            !reg.is_artifact_in_use("data.img").await,
+            "the extra-disk pin releases on teardown"
+        );
+    }
+
+    // §E4: a missing extra-disk artifact is a fail-loud BadRequest at create (the same
+    // "upload it first" contract as kernel/rootfs), not a late launch error.
+    #[tokio::test]
+    async fn create_rejects_missing_extra_disk_artifact() {
+        let (reg, _s, _d) = registry();
+        assert!(
+            matches!(
+                reg.create(create_req().with_extra_disk("nope.img")).await,
+                Err(DaemonError::BadRequest(_))
+            ),
+            "a missing extra-disk artifact must fail loud"
+        );
     }
 
     #[tokio::test]

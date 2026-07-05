@@ -13,13 +13,25 @@ docs/implementation-notes.md "v15 implementation pass" for the per-item deviatio
 suites were not re-run this pass (correct-by-construction; run `just bless` + `just
 test-privileged` once after a runner rebuild to confirm).
 
+### v22 design items — IMPLEMENTED (2026-07-05)
+
+Both "Easy" items below are implemented (design `docs/58-claude-design-v22.md`) and validated on
+the KVM host. `VmConfig` gained `extra_disks: Vec<BlockDevice>`, `extra_kernel_args: Vec<String>`
+(append-only, one-predicate reserved-token guard), and `init: Option<PathBuf>` (genuine `init=`
+override, control plane forgone fail-loud). **Pass 2** added disk-I/O fault injection
+(`BlockDevice::io_limit`, bandwidth+IOPS throttling on all three backends) and the **daemon-API
+exposure** (`CreateVmRequest.extra_disks`/`extra_kernel_args`; extra disks read-only + pinned;
+`init` deliberately library-only). CLI `run`/`create` gained `--disk`/`--disk-rw`/`--append`.
+KVM-validated (all green): `extra_block` (+ snapshot-composition) CH+FC+QEMU, `custom_init` CH,
+`extra_block_io_throttle` CH+FC+QEMU, and the daemon `extra_disk_over_api` HTTP path. See
+docs/implementation-notes.md "v22" for the justified deviations. **Forward work:** writable-
+scratch-from-artifact over the daemon (copy-on-attach), and disk error/latency injection
+(QEMU-`blkdebug`).
+
+* Arbitrary extra virtio-blk devices + disk-I/O fault injection [V:high/E:med] — DONE
+* Custom init + append-only boot-args passthrough [V:med/E:low] — DONE
+
 ## Need design
-
-Easy
-
-* Deterministic clock control over vsock (set/freeze/forward-jump) [V:high/E:med]
-* Arbitrary extra virtio-blk devices + disk I/O fault injection [V:high/E:med]
-* Custom init + append-only boot-args passthrough [V:med/E:low]
 
 More difficult
 
@@ -38,6 +50,9 @@ is which to pull forward. V/E = value/effort.
 
 Adopt-now (cheap, high-value, extend an existing seam):
 
+* Disk I/O fault injection [V:high/E:med] — PARTIAL: throttling (bandwidth+IOPS) done in v22
+  (`BlockDevice::io_limit`, all backends); error/latency injection (QEMU-`blkdebug`) still open
+* Deterministic clock control over vsock (set/freeze/forward-jump) [V:high/E:med]
 * Egress + model cassettes: deterministic record/replay over the MITM proxy [V:high/E:med]
 * Declarative per-sandbox egress policy + full attempted-connection audit [V:high/E:med]
 * Post-restore secrets injection (never persisted to snapshot/erofs) [V:high/E:med]

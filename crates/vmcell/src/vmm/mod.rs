@@ -1216,6 +1216,25 @@ mod tests {
         .build()
         .expect("build eligible config");
         assert!(!config_has_vhost_user_device(&eligible, &res_with(None)));
+
+        // §E1.3: an extra PLAIN virtio-blk device is NOT a vhost-user device, so it
+        // must stay snapshot-eligible ("plain virtio-blk composes with snapshot",
+        // v20 §17/§5.1). A false positive here would wrongly disqualify snapshot.
+        // Inverse: add an `extra_disks` term to `config_has_vhost_user_device` and
+        // this reddens.
+        let with_extra_disk = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .with_extra_disk(crate::config::BlockDevice::read_write("/img/data.raw"))
+        .build()
+        .expect("build config with an extra disk");
+        assert!(
+            !config_has_vhost_user_device(&with_extra_disk, &res_with(None)),
+            "a plain extra virtio-blk device must not disqualify snapshot eligibility"
+        );
     }
 
     // Guards the shared console self-guard: VirtioConsole on a backend that does not

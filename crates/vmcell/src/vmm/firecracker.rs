@@ -579,7 +579,36 @@ impl Vmm for Firecracker {
             path_on_host: PathBuf,
             is_root_device: bool,
             is_read_only: bool,
+            /// Optional I/O rate limiter (disk-I/O fault injection, §E5). Omitted when
+            /// the drive is unthrottled (FC's default).
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rate_limiter: Option<FcRateLimiter>,
         }
+        // FC's `rate_limiter` — bandwidth (bytes/s) and ops (IOPS) token buckets, the
+        // SAME shape and `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS` conversion as
+        // Cloud Hypervisor (one law, one predicate, §E5).
+        #[derive(Serialize)]
+        struct FcRateLimiter {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            bandwidth: Option<FcTokenBucket>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ops: Option<FcTokenBucket>,
+        }
+        #[derive(Serialize)]
+        struct FcTokenBucket {
+            size: u64,
+            refill_time: u64,
+        }
+        let fc_rate_limiter = |limit: &crate::config::DiskIoLimit| {
+            let bucket = |rate: u64| FcTokenBucket {
+                size: rate,
+                refill_time: crate::config::IO_LIMIT_REFILL_TIME_MS,
+            };
+            FcRateLimiter {
+                bandwidth: limit.bandwidth_bytes_per_sec.map(bucket),
+                ops: limit.iops.map(bucket),
+            }
+        };
 
         let rootfs_path = match &cfg.rootfs {
             crate::config::RootfsSource::Erofs { image } => image.clone(),
@@ -605,9 +634,32 @@ impl Vmm for Firecracker {
                     path_on_host: rootfs_path,
                     is_root_device: true,
                     is_read_only: is_ro,
+                    rate_limiter: None,
                 }),
             )
             .await?;
+
+        // Extra virtio-blk devices (§E1), PUT AFTER the root drive so they enumerate
+        // `/dev/vdb`, `/dev/vdc`, … in order and never displace `/dev/vda`. Each is a
+        // non-root drive on its own virtio-mmio slot; FC's MMIO region is finite, so a
+        // very large list surfaces fail-loud as the backend's typed API error here,
+        // never a silent drop.
+        for (i, disk) in cfg.extra_disks.iter().enumerate() {
+            let drive_id = format!("extra{i}");
+            instance
+                .api_request(
+                    "PUT",
+                    &format!("/drives/{drive_id}"),
+                    Some(&Drive {
+                        drive_id,
+                        path_on_host: disk.image.clone(),
+                        is_root_device: false,
+                        is_read_only: disk.readonly,
+                        rate_limiter: disk.io_limit.as_ref().map(fc_rate_limiter),
+                    }),
+                )
+                .await?;
+        }
 
         // Configure Network
         if let Some(tap) = &res.tap_name {

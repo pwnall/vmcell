@@ -56,6 +56,30 @@ pub struct VmConfig {
     /// [`crate::naming`]. Defaults to [`crate::naming::DEFAULT_RESOURCE_PREFIX`] (`"vmcell"`). The
     /// orphan sweep must be run with the SAME prefix (§v21) or it will not match this VM's leaks.
     pub resource_prefix: String,
+    /// Extra virtio-blk devices attached **after** the root disk, enumerated by the
+    /// guest as `/dev/vdb`, `/dev/vdc`, … in order (§E1). Raw block devices — the
+    /// guest workload owns any filesystem/mount; the agent does not auto-mount them.
+    /// Plain virtio-blk composes with snapshotting (§12.1); an extra disk's
+    /// [`image`](BlockDevice::image) must live at a **stable path** to survive a
+    /// restore. Default empty.
+    pub extra_disks: Vec<BlockDevice>,
+    /// Append-only extra kernel command-line arguments, appended **after** every
+    /// token vmcell owns (§E2.1). An extra arg can add a boot parameter but can never
+    /// override one vmcell controls; [`VmConfigBuilder::build`] rejects any arg whose
+    /// key is reserved or starts with `vmcell_`, or that is not a single whitespace-
+    /// free token. Default empty.
+    pub extra_kernel_args: Vec<String>,
+    /// Optional `init=` override (§E2.2). `None` boots the vmcell guest agent as
+    /// PID 1 (the vsock control plane). `Some(path)` boots a **custom PID 1**, which
+    /// **replaces the agent** — so the VM has no control plane
+    /// ([`crate::orchestrator::MicroVm::agent`] fails loud) and cannot snapshot
+    /// ([`VmConfigBuilder::build`] rejects
+    /// `snapshotting` + a custom init, since the post-restore resync needs the agent).
+    /// Observe such a VM via the serial log, a writable extra disk/share, or
+    /// networking. A custom init also loses the agent's tmpfs overlay over the RO
+    /// erofs root, so it usually pairs with a writable rootfs or extra disk. Default
+    /// `None`.
+    pub init: Option<PathBuf>,
 }
 
 /// Per-VM hot-path timing knobs, gathered so a workload can pick a profile in one
@@ -221,15 +245,26 @@ pub(crate) fn build_kernel_cmdline(
     // (~2 ms; no RAID device can exist). Neither affects virtio/vsock/virtio-fs/erofs,
     // `ip=` autoconfig, panic capture, or the in-kernel crypto itself (self-tests are
     // a boot-time QA pass, not a runtime dependency).
+    // The `init=` token: the fixed vmcell guest agent (the default control-plane
+    // PID 1) unless the caller overrides it (§E2.2). This is the ONE place either
+    // `init=` token is constructed — a backend never string-builds it. A custom
+    // init replaces the agent, so it forgoes the vsock control plane; the
+    // consequence is honored fail-loud in the orchestrator, not here (see
+    // `MicroVm::agent`). `build()` validated the override is a single safe token.
+    let init = cfg.init.as_deref().map_or_else(
+        || DEFAULT_INIT.to_string(),
+        |p| p.to_string_lossy().into_owned(),
+    );
     let mut s = format!(
         "console={} loglevel={} random.trust_cpu=on random.trust_bootloader=on \
          cryptomgr.notests raid=noautodetect \
-         root=/dev/vda rootfstype={} ro {} panic=1 {}init=/usr/sbin/vmcell-guest-agent vmcell_vmid={}",
+         root=/dev/vda rootfstype={} ro {} panic=1 {}init={} vmcell_vmid={}",
         cfg.console_mode.console(),
         cfg.kernel_verbosity.loglevel(),
         rootfstype,
         rootflags,
         backend_extra,
+        init,
         vmid,
     );
     if !matches!(cfg.net, NetConfig::None) {
@@ -251,7 +286,111 @@ pub(crate) fn build_kernel_cmdline(
     }
     push_share_args(&mut s, &cfg.shares);
     push_guest_timeout_args(&mut s, &cfg.timeouts);
+    // Append-only caller args go LAST — after every token vmcell owns — so they can
+    // add a boot parameter but never clobber one (§E2.1). `build()` already rejected
+    // any arg whose key is reserved or `vmcell_`-prefixed, so this is a safe splice.
+    push_extra_kernel_args(&mut s, &cfg.extra_kernel_args);
     Ok(s)
+}
+
+/// The default `init=` target: the vmcell guest agent that serves the vsock control
+/// plane as PID 1 (§4.3). A caller may override it via [`VmConfig::init`], which
+/// replaces the agent and therefore forgoes the control plane (§E2.2).
+pub(crate) const DEFAULT_INIT: &str = "/usr/sbin/vmcell-guest-agent";
+
+/// The kernel-cmdline keys that [`build_kernel_cmdline`] owns and that
+/// [`VmConfig::extra_kernel_args`] may therefore **not** set (append-only, §E2.1).
+///
+/// Kept in lockstep with the tokens the builder emits by the
+/// `extra_kernel_args_cannot_clobber_reserved_tokens` coverage test: every token the
+/// builder produces has a reserved key here (or the `vmcell_` prefix), so a caller
+/// arg can never silently override a load-bearing boot parameter.
+const RESERVED_CMDLINE_KEYS: &[&str] = &[
+    "console",
+    "loglevel",
+    "random.trust_cpu",
+    "random.trust_bootloader",
+    "cryptomgr.notests",
+    "raid",
+    "root",
+    "rootfstype",
+    "rootflags",
+    "ro",
+    "panic",
+    "init",
+    "ip",
+    "kvm-intel.nested",
+    "kvm-amd.nested",
+    "noxsave",
+];
+
+/// Whether `arg` collides with a boot token vmcell owns — its key is in
+/// [`RESERVED_CMDLINE_KEYS`] or starts with `vmcell_` (every guest-agent-trusted
+/// token, §8.3). The single predicate behind the append-only contract (§E2.1); the
+/// key is the text before the first `=` (or the whole bare token).
+pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
+    let key = arg.split('=').next().unwrap_or(arg);
+    // The guest agent trusts every `vmcell_*` token (shares, accept/rebind cadence);
+    // a caller arg spoofing one would mis-mount a share or busy-spin PID 1.
+    key.starts_with("vmcell_") || RESERVED_CMDLINE_KEYS.contains(&key)
+}
+
+/// Appends the validated append-only caller args to `cmdline`, one whitespace-
+/// separated token each (§E2.1). No args ⇒ nothing appended.
+pub(crate) fn push_extra_kernel_args(cmdline: &mut String, args: &[String]) {
+    for arg in args {
+        cmdline.push(' ');
+        cmdline.push_str(arg);
+    }
+}
+
+/// Validates a caller-supplied `init=` override path (§E2.2): valid UTF-8, absolute,
+/// and a single cmdline token (no whitespace or control characters — a space would
+/// forge a second boot token).
+///
+/// # Errors
+/// Returns a human-readable reason when the path is empty, not UTF-8, not absolute,
+/// or carries whitespace/control characters.
+fn validate_init_path(init: &std::path::Path) -> Result<(), String> {
+    let s = init.to_str().ok_or_else(|| {
+        format!("init path {init:?} must be valid UTF-8 (it is encoded on the kernel cmdline)")
+    })?;
+    if s.is_empty() {
+        return Err("init path cannot be empty".to_string());
+    }
+    if !init.is_absolute() {
+        return Err(format!("init path {s:?} must be an absolute path"));
+    }
+    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "init path {s:?} may not contain whitespace or control characters (it is a single kernel cmdline token)"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one append-only caller kernel arg (§E2.1): non-empty, a single cmdline
+/// token (no whitespace/control characters), and not colliding with a reserved token
+/// vmcell owns ([`is_reserved_cmdline_arg`]).
+///
+/// # Errors
+/// Returns a human-readable reason when the arg is empty, carries whitespace/control
+/// characters, or would clobber a reserved boot token.
+fn validate_extra_kernel_arg(arg: &str) -> Result<(), String> {
+    if arg.is_empty() {
+        return Err("extra kernel argument cannot be empty".to_string());
+    }
+    if arg.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "extra kernel argument {arg:?} may not contain whitespace or control characters (it is a single kernel cmdline token)"
+        ));
+    }
+    if is_reserved_cmdline_arg(arg) {
+        return Err(format!(
+            "extra kernel argument {arg:?} collides with a boot token vmcell owns (append-only: extra args cannot override console/loglevel/root/rootfstype/init/ip/panic/kvm-*.nested or any vmcell_* token — use the dedicated VmConfig field, e.g. `init`, where one exists)"
+        ));
+    }
+    Ok(())
 }
 
 /// Options for the root filesystem backing the VM.
@@ -276,6 +415,116 @@ pub enum RootfsSource {
         dir: PathBuf,
     },
 }
+
+/// An extra virtio-blk device attached to the VM in addition to the root disk
+/// ([`VmConfig::extra_disks`], §E1).
+///
+/// The guest kernel enumerates extra disks as `/dev/vdb`, `/dev/vdc`, … in
+/// attachment order; the root disk is always `/dev/vda`. vmcell attaches the **raw**
+/// block device only — the guest workload owns any partitioning, filesystem, or
+/// mount (the guest agent does not auto-mount extra disks).
+///
+/// Plain virtio-blk is **not** a vhost-user device, so extra disks compose with
+/// snapshotting (§12.1). A block device's contents live on disk, *outside* the
+/// memory snapshot, so the [`image`](BlockDevice::image) path must be **stable across
+/// a restore** (CH/FC restore reconstruct devices from the paths recorded at snapshot
+/// time), i.e. not inside the per-VM scratch dir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BlockDevice {
+    /// Host path to the backing image file.
+    pub image: PathBuf,
+    /// Whether the device is attached read-only.
+    pub readonly: bool,
+    /// Optional I/O rate limit (disk-I/O fault injection, §E5). `None` = unlimited.
+    pub io_limit: Option<DiskIoLimit>,
+}
+
+impl BlockDevice {
+    /// A read-only extra virtio-blk device backed by `image`.
+    #[must_use]
+    pub fn read_only(image: impl Into<PathBuf>) -> Self {
+        Self {
+            image: image.into(),
+            readonly: true,
+            io_limit: None,
+        }
+    }
+
+    /// A read-write extra virtio-blk device backed by `image`.
+    #[must_use]
+    pub fn read_write(image: impl Into<PathBuf>) -> Self {
+        Self {
+            image: image.into(),
+            readonly: false,
+            io_limit: None,
+        }
+    }
+
+    /// Attaches an I/O rate limit to this device (disk-I/O fault injection, §E5), to
+    /// simulate a slow or pressured disk. Validated at [`VmConfigBuilder::build`].
+    #[must_use]
+    pub fn with_io_limit(mut self, limit: DiskIoLimit) -> Self {
+        self.io_limit = Some(limit);
+        self
+    }
+}
+
+/// An I/O rate limit for a [`BlockDevice`] — the portable form of disk-I/O fault
+/// injection (§E5), simulating a slow/pressured disk to test a workload's timeout /
+/// retry / backpressure behavior. Each backend enforces it with its native token-bucket
+/// rate limiter (Cloud Hypervisor `rate_limiter_config`, Firecracker `rate_limiter`,
+/// QEMU `throttling.*`), so it composes with snapshotting like any plain virtio-blk.
+///
+/// At least one of the two caps must be set (a limit that limits nothing is rejected at
+/// [`VmConfigBuilder::build`]); a set cap must be `> 0` (a `0` cap would wedge all I/O).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct DiskIoLimit {
+    /// Read+write bandwidth cap in **bytes per second** (`None` = unlimited).
+    pub bandwidth_bytes_per_sec: Option<u64>,
+    /// Read+write **IOPS** cap — operations per second (`None` = unlimited).
+    pub iops: Option<u64>,
+}
+
+impl DiskIoLimit {
+    /// A limit with explicit bandwidth (bytes/second) and/or IOPS caps; `None` leaves
+    /// that dimension unlimited. Construction seam for callers outside this crate (the
+    /// struct is `#[non_exhaustive]`).
+    #[must_use]
+    pub fn new(bandwidth_bytes_per_sec: Option<u64>, iops: Option<u64>) -> Self {
+        Self {
+            bandwidth_bytes_per_sec,
+            iops,
+        }
+    }
+
+    /// A bandwidth-only cap of `bytes_per_sec` bytes/second.
+    #[must_use]
+    pub fn bandwidth(bytes_per_sec: u64) -> Self {
+        Self {
+            bandwidth_bytes_per_sec: Some(bytes_per_sec),
+            iops: None,
+        }
+    }
+
+    /// An IOPS-only cap of `iops` operations/second.
+    #[must_use]
+    pub fn iops(iops: u64) -> Self {
+        Self {
+            bandwidth_bytes_per_sec: None,
+            iops: Some(iops),
+        }
+    }
+}
+
+/// The token-bucket refill window (milliseconds) every backend uses to express a
+/// [`DiskIoLimit`] rate: a bucket of `size = rate` tokens refilled every
+/// `IO_LIMIT_REFILL_TIME_MS` yields exactly `rate` tokens/second. The ONE conversion
+/// shared by the CH and Firecracker rate-limiter builders (one law, one predicate), so
+/// they can never express the same `DiskIoLimit` as different rates. QEMU takes the
+/// per-second rate directly (`throttling.bps-total`/`iops-total`).
+pub(crate) const IO_LIMIT_REFILL_TIME_MS: u64 = 1000;
 
 /// Guest kernel console log verbosity, mapped to the `loglevel=` boot parameter.
 ///
@@ -601,6 +850,9 @@ impl VmConfig {
             timeouts: Timeouts::default(),
             console_mode: ConsoleMode::Uart,
             resource_prefix: crate::naming::DEFAULT_RESOURCE_PREFIX.to_string(),
+            extra_disks: vec![],
+            extra_kernel_args: vec![],
+            init: None,
         }
     }
 }
@@ -625,6 +877,9 @@ pub struct VmConfigBuilder {
     timeouts: Timeouts,
     console_mode: ConsoleMode,
     resource_prefix: String,
+    extra_disks: Vec<BlockDevice>,
+    extra_kernel_args: Vec<String>,
+    init: Option<PathBuf>,
 }
 
 impl VmConfigBuilder {
@@ -632,6 +887,33 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn with_share(mut self, share: Share) -> Self {
         self.shares.push(share);
+        self
+    }
+
+    /// Attaches an extra virtio-blk device ([`BlockDevice`], §E1), enumerated by the
+    /// guest as the next `/dev/vd*` after the root disk in call order. Validated at
+    /// [`build`](Self::build).
+    #[must_use]
+    pub fn with_extra_disk(mut self, disk: BlockDevice) -> Self {
+        self.extra_disks.push(disk);
+        self
+    }
+
+    /// Appends one append-only extra kernel command-line argument
+    /// ([`VmConfig::extra_kernel_args`], §E2.1). Rejected at [`build`](Self::build) if
+    /// it collides with a reserved token vmcell owns or is not a single safe token.
+    #[must_use]
+    pub fn with_kernel_arg(mut self, arg: impl Into<String>) -> Self {
+        self.extra_kernel_args.push(arg.into());
+        self
+    }
+
+    /// Overrides the guest `init=` target ([`VmConfig::init`], §E2.2). A custom init
+    /// **replaces** the vmcell guest agent, forgoing the vsock control plane; validated
+    /// at [`build`](Self::build), which also rejects it combined with `snapshotting`.
+    #[must_use]
+    pub fn init(mut self, init: impl Into<PathBuf>) -> Self {
+        self.init = Some(init.into());
         self
     }
 
@@ -821,6 +1103,19 @@ impl VmConfigBuilder {
         }
 
         if self.snapshotting {
+            // A custom init replaces the vmcell guest agent (§E2.2), and the mandatory
+            // post-restore resync — clock, entropy reseed, MAC/IP rotation (§12.4) —
+            // runs *through* that agent. A restored custom-init clone would be stranded
+            // on frozen identity with no way to fix it from inside (silently dead
+            // egress / correlated RNG), the exact §12.4 trap. Reject fail-loud here.
+            if self.init.is_some() {
+                return Err(crate::error::Error::Config(
+                    "a custom init cannot be combined with snapshotting (the mandatory \
+                     post-restore resync requires the vmcell guest agent, which a custom \
+                     init replaces)"
+                        .into(),
+                ));
+            }
             if let RootfsSource::VirtioFs { .. } = self.rootfs {
                 return Err(crate::error::Error::Config(
                     "virtio-fs rootfs cannot be combined with snapshotting".into(),
@@ -960,6 +1255,62 @@ impl VmConfigBuilder {
             }
         }
 
+        // Extra virtio-blk device images: absolute, non-empty, no duplicate backing
+        // file (§E1.4). Existence is deliberately NOT checked here (consistent with
+        // the rootfs/share paths — the image may be created later); a bad path fails
+        // loud at `create()`. A duplicate image is a rw corruption footgun (two
+        // attachments of one file), so it is rejected at the boundary.
+        let mut extra_disk_images = std::collections::HashSet::new();
+        for disk in &self.extra_disks {
+            if disk.image.as_os_str().is_empty() {
+                return Err(crate::error::Error::Config(
+                    "extra disk image path cannot be empty".into(),
+                ));
+            }
+            if disk.image.is_relative() {
+                return Err(crate::error::Error::Config(format!(
+                    "extra disk image {:?} must be an absolute path",
+                    disk.image
+                )));
+            }
+            if !extra_disk_images.insert(disk.image.clone()) {
+                return Err(crate::error::Error::Config(format!(
+                    "duplicate extra disk image: {}",
+                    disk.image.display()
+                )));
+            }
+            // Disk-I/O fault injection (§E5): a limit must actually limit something, and
+            // a set cap must be > 0 — a 0-byte/s or 0-IOPS bucket would wedge all I/O
+            // (never refills), a silent deadlock. Reject both fail-loud at the boundary.
+            if let Some(limit) = &disk.io_limit {
+                if limit.bandwidth_bytes_per_sec.is_none() && limit.iops.is_none() {
+                    return Err(crate::error::Error::Config(format!(
+                        "extra disk {} has an io_limit that limits nothing (set bandwidth_bytes_per_sec and/or iops)",
+                        disk.image.display()
+                    )));
+                }
+                if limit.bandwidth_bytes_per_sec == Some(0) || limit.iops == Some(0) {
+                    return Err(crate::error::Error::Config(format!(
+                        "extra disk {} io_limit cap must be > 0 (a 0 cap would wedge all I/O)",
+                        disk.image.display()
+                    )));
+                }
+            }
+        }
+
+        // A custom `init=` override is a single load-bearing cmdline token selecting
+        // PID 1, so it is validated at the boundary (§E2.2): absolute, UTF-8, no
+        // whitespace/control chars that could forge a second boot token.
+        if let Some(init) = &self.init {
+            validate_init_path(init).map_err(crate::error::Error::Config)?;
+        }
+
+        // Append-only extra kernel args: each a single safe token whose key does not
+        // collide with a reserved boot token vmcell owns (§E2.1).
+        for arg in &self.extra_kernel_args {
+            validate_extra_kernel_arg(arg).map_err(crate::error::Error::Config)?;
+        }
+
         // The resource prefix becomes part of a netns / interface / cgroup / directory name, so an
         // invalid one is rejected fail-loud at construction (never silently sanitized).
         crate::naming::validate_resource_prefix(&self.resource_prefix)
@@ -982,6 +1333,9 @@ impl VmConfigBuilder {
             timeouts: self.timeouts,
             console_mode: self.console_mode,
             resource_prefix: self.resource_prefix,
+            extra_disks: self.extra_disks,
+            extra_kernel_args: self.extra_kernel_args,
+            init: self.init,
         })
     }
 }
@@ -1894,5 +2248,447 @@ mod tests {
         .unwrap();
         assert_eq!(virtio_cfg.console_mode, ConsoleMode::VirtioConsole);
         assert_ne!(virtio_cfg.console_mode, ConsoleMode::Uart);
+    }
+
+    // §E1: BlockDevice constructors set the readonly flag; a swapped arm (read_only
+    // marking rw, or vice versa) reddens here.
+    #[test]
+    fn block_device_constructors() {
+        let ro = BlockDevice::read_only("/img/data.raw");
+        assert_eq!(ro.image, PathBuf::from("/img/data.raw"));
+        assert!(ro.readonly);
+        let rw = BlockDevice::read_write("/img/scratch.raw");
+        assert!(!rw.readonly);
+    }
+
+    // §E1: the builder carries extra_disks onto the built config in order, default
+    // empty. Buggy impl: the builder drops the field.
+    #[test]
+    fn builder_carries_extra_disks() {
+        let empty = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert!(empty.extra_disks.is_empty());
+
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(BlockDevice::read_only("/img/a.raw"))
+        .with_extra_disk(BlockDevice::read_write("/img/b.raw"))
+        .build()
+        .unwrap();
+        assert_eq!(cfg.extra_disks.len(), 2);
+        assert_eq!(cfg.extra_disks[0].image, PathBuf::from("/img/a.raw"));
+        assert!(cfg.extra_disks[0].readonly);
+        assert_eq!(cfg.extra_disks[1].image, PathBuf::from("/img/b.raw"));
+        assert!(!cfg.extra_disks[1].readonly);
+    }
+
+    // §E1.4: build() rejects an empty / relative / duplicate extra-disk image. Buggy
+    // impl: any of these reaches create() and fails late (or attaches one file twice).
+    #[test]
+    fn reject_bad_extra_disk_image() {
+        let mk = |disk: BlockDevice| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_extra_disk(disk)
+            .build()
+        };
+        for (disk, needle) in [
+            (BlockDevice::read_only(""), "cannot be empty"),
+            (BlockDevice::read_only("rel/img.raw"), "absolute path"),
+        ] {
+            let err = mk(disk).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)) && err.to_string().contains(needle),
+                "expected {needle:?}, got {err}"
+            );
+        }
+        // Duplicate backing file across two attachments is a rw corruption footgun.
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(BlockDevice::read_write("/img/dup.raw"))
+        .with_extra_disk(BlockDevice::read_only("/img/dup.raw"))
+        .build()
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::Config(_))
+                && err.to_string().contains("duplicate extra disk image"),
+            "{err}"
+        );
+    }
+
+    // §E1.4 positive control: a valid extra disk with an absolute path builds — the
+    // over-rejection inverse (rejecting every extra disk) reddens here.
+    #[test]
+    fn accept_valid_extra_disk() {
+        VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(BlockDevice::read_only("/img/data.raw"))
+        .build()
+        .expect("a valid absolute extra-disk image must build");
+    }
+
+    // §E5: DiskIoLimit constructors set the intended cap and leave the other unset; a
+    // swapped arm (bandwidth() setting iops) reddens here.
+    #[test]
+    fn disk_io_limit_constructors() {
+        let bw = DiskIoLimit::bandwidth(1_048_576);
+        assert_eq!(bw.bandwidth_bytes_per_sec, Some(1_048_576));
+        assert_eq!(bw.iops, None);
+        let ops = DiskIoLimit::iops(500);
+        assert_eq!(ops.iops, Some(500));
+        assert_eq!(ops.bandwidth_bytes_per_sec, None);
+    }
+
+    // §E5: `with_io_limit` carries the limit onto the built disk; default is None.
+    #[test]
+    fn builder_carries_disk_io_limit() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(BlockDevice::read_only("/img/plain.raw"))
+        .with_extra_disk(
+            BlockDevice::read_write("/img/slow.raw")
+                .with_io_limit(DiskIoLimit::bandwidth(2_000_000)),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(cfg.extra_disks[0].io_limit, None);
+        assert_eq!(
+            cfg.extra_disks[1].io_limit,
+            Some(DiskIoLimit::bandwidth(2_000_000))
+        );
+    }
+
+    // §E5: build() rejects an io_limit that limits nothing, or a 0 cap (which would
+    // wedge all I/O — a silent deadlock). A genuine cap builds. Buggy impl: either is
+    // accepted and the VM boots with a dead or no-op limiter.
+    #[test]
+    fn reject_bad_disk_io_limit() {
+        let mk = |limit: DiskIoLimit| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_extra_disk(BlockDevice::read_only("/img/d.raw").with_io_limit(limit))
+            .build()
+        };
+        // Limits nothing.
+        assert!(matches!(
+            mk(DiskIoLimit::default()),
+            Err(crate::error::Error::Config(_))
+        ));
+        // Zero caps.
+        assert!(matches!(
+            mk(DiskIoLimit::bandwidth(0)),
+            Err(crate::error::Error::Config(_))
+        ));
+        assert!(matches!(
+            mk(DiskIoLimit::iops(0)),
+            Err(crate::error::Error::Config(_))
+        ));
+        // A real cap (both fields) builds.
+        mk(DiskIoLimit {
+            bandwidth_bytes_per_sec: Some(1_000_000),
+            iops: Some(1000),
+        })
+        .expect("a genuine io_limit must build");
+    }
+
+    // §E2.2: the builder carries the init override and defaults to None. Buggy impl:
+    // the builder drops the field.
+    #[test]
+    fn builder_carries_init_override() {
+        let default_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert_eq!(default_cfg.init, None);
+
+        let custom = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .init("/bin/sh")
+        .build()
+        .unwrap();
+        assert_eq!(custom.init, Some(PathBuf::from("/bin/sh")));
+    }
+
+    // §E2.2: `validate_init_path` rejects a relative path, whitespace, and control
+    // chars (a space forges a second cmdline token); accepts a clean absolute path.
+    #[test]
+    fn init_path_validation() {
+        validate_init_path(std::path::Path::new("/sbin/my-init"))
+            .expect("a clean absolute init path is valid");
+        for bad in [
+            "rel/init",
+            "/bin/sh -c evil",
+            "/bin/\tsh",
+            "/bin/sh\nroot=/dev/x",
+        ] {
+            assert!(
+                validate_init_path(std::path::Path::new(bad)).is_err(),
+                "init path {bad:?} must be rejected"
+            );
+        }
+    }
+
+    // §E2.2: build() rejects snapshotting + a custom init (the post-restore resync
+    // needs the agent a custom init replaces). Buggy impl: the combination builds and
+    // a restored clone silently strands on frozen identity.
+    #[test]
+    fn reject_snapshot_with_custom_init() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .init("/bin/sh")
+        .snapshotting(true)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string()
+                .contains("custom init cannot be combined with snapshotting"),
+            "{err}"
+        );
+        // A custom init WITHOUT snapshotting must still build (over-rejection inverse).
+        VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .init("/bin/sh")
+        .build()
+        .expect("a custom init without snapshotting must build");
+    }
+
+    // §E2.1: `is_reserved_cmdline_arg` flags every token vmcell owns (by exact key or
+    // the vmcell_ prefix) and lets a genuine custom arg through. Buggy impl: a missing
+    // reserved key lets an extra arg clobber a load-bearing token.
+    #[test]
+    fn reserved_cmdline_arg_predicate() {
+        for reserved in [
+            "console=hvc0",
+            "root=/dev/evil",
+            "init=/bin/evil",
+            "ip=1.2.3.4",
+            "panic=0",
+            "loglevel=8",
+            "kvm-intel.nested=1",
+            "ro",
+            "vmcell_share=x:/x:rw",
+            "vmcell_vmid=9",
+            "vmcell_accept_poll_ms=0",
+        ] {
+            assert!(
+                is_reserved_cmdline_arg(reserved),
+                "{reserved:?} must be treated as reserved"
+            );
+        }
+        for allowed in [
+            "mitigations=off",
+            "nokaslr",
+            "systemd.unit=rescue.target",
+            "foo.bar=baz",
+        ] {
+            assert!(
+                !is_reserved_cmdline_arg(allowed),
+                "{allowed:?} must be allowed as an append-only arg"
+            );
+        }
+    }
+
+    // §E2.1: build() rejects an extra arg that clobbers a reserved token, spoofs a
+    // vmcell_ token, or carries whitespace; accepts a genuine custom arg.
+    #[test]
+    fn reject_bad_extra_kernel_arg() {
+        let mk = |arg: &str| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_kernel_arg(arg)
+            .build()
+        };
+        for bad in [
+            "root=/dev/evil",
+            "init=/bin/evil",
+            "vmcell_share=x:/x:rw",
+            "has space",
+            "",
+        ] {
+            let err = mk(bad).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)),
+                "extra arg {bad:?} must be rejected: {err}"
+            );
+        }
+        // A genuine append-only arg is accepted and carried in order.
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_kernel_arg("mitigations=off")
+        .with_kernel_arg("nokaslr")
+        .build()
+        .expect("valid append-only args must build");
+        assert_eq!(cfg.extra_kernel_args, vec!["mitigations=off", "nokaslr"]);
+    }
+
+    // §E2.2: the init override replaces the default `init=` token — exactly one
+    // `init=`, and `root=`/`vmcell_vmid=` stay intact. Buggy impls: appending a second
+    // `init=` alongside the default (a clobber + boot hazard), or ignoring the override.
+    #[test]
+    fn build_kernel_cmdline_honors_init_override() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .init("/bin/sh")
+        .network_disabled()
+        .build()
+        .unwrap();
+        let c = build_kernel_cmdline(&cfg, 7, "").unwrap();
+        assert!(c.contains("init=/bin/sh"), "override missing: {c}");
+        assert!(
+            !c.contains("init=/usr/sbin/vmcell-guest-agent"),
+            "default init must be replaced, not kept: {c}"
+        );
+        assert_eq!(
+            c.matches("init=").count(),
+            1,
+            "exactly one init= token expected: {c}"
+        );
+        assert!(c.contains("root=/dev/vda"), "root token must remain: {c}");
+        assert!(c.contains("vmcell_vmid=7"), "vmid token must remain: {c}");
+
+        // The default (no override) still emits the guest agent (existing contract).
+        let default_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .network_disabled()
+        .build()
+        .unwrap();
+        assert!(
+            build_kernel_cmdline(&default_cfg, 1, "")
+                .unwrap()
+                .contains(&format!("init={DEFAULT_INIT}")),
+            "default init token must be the guest agent"
+        );
+    }
+
+    // §E2.1: append-only args land AFTER every reserved token, in order. Buggy impl:
+    // args spliced before the reserved block, or dropped.
+    #[test]
+    fn build_kernel_cmdline_appends_extra_args_last() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_kernel_arg("mitigations=off")
+        .with_kernel_arg("nokaslr")
+        .network_disabled()
+        .build()
+        .unwrap();
+        let c = build_kernel_cmdline(&cfg, 1, "").unwrap();
+        assert!(
+            c.ends_with(" mitigations=off nokaslr"),
+            "extra args not last: {c}"
+        );
+        // The reserved tokens come strictly before the appended args.
+        let init_at = c.find("init=").expect("init token present");
+        let extra_at = c.find("mitigations=off").expect("extra arg present");
+        assert!(
+            init_at < extra_at,
+            "extra args must follow the reserved block: {c}"
+        );
+    }
+
+    // §E2.1 the ONE-LAW GATE: every token `build_kernel_cmdline` emits has a reserved
+    // key (or the vmcell_ prefix), so `is_reserved_cmdline_arg` — and hence the
+    // append-only guard — can never fall out of sync with the builder. Add a new
+    // builder token without reserving its key ⇒ this reddens.
+    #[test]
+    fn extra_kernel_args_cannot_clobber_reserved_tokens() {
+        // A config that exercises every conditional token: block rootfs (rootflags),
+        // privileged net (ip=), a share (vmcell_share=), nested (kvm-*.nested=).
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Block {
+                image: PathBuf::from("/rootfs.img"),
+                overlay: None,
+            },
+        )
+        .net(NetConfig::Privileged {
+            egress: Egress::Open,
+            host_services_port: None,
+        })
+        .with_share(Share::new(
+            "data",
+            "/tmp/data",
+            Access::ReadWrite,
+            CachePolicy::Auto,
+        ))
+        .nested_virt(true)
+        .build()
+        .unwrap();
+        // `noxsave ` is the FC backend_extra fragment — include it so its key is
+        // covered too.
+        let c = build_kernel_cmdline(&cfg, 5, "noxsave ").unwrap();
+        for token in c.split_ascii_whitespace() {
+            assert!(
+                is_reserved_cmdline_arg(token),
+                "builder token {token:?} is not reserved — an append-only arg with this \
+                 key could clobber it. Add its key to RESERVED_CMDLINE_KEYS.\ncmdline: {c}"
+            );
+        }
     }
 }

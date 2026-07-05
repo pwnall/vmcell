@@ -132,6 +132,78 @@ as they stabilize.
   shared-process model but passes under **nextest**, which is process-per-test — the project's runner.)
   **Still unrun:** the QEMU/Firecracker snapshot tiers (v20 §16: unwired), filtered-egress, concurrent-load.
 
+## v22 — extra virtio-blk devices + custom init / append-only boot-args
+
+Design: `docs/58-claude-design-v22.md`. Graduates the two v20 §17 forward-work items. Fold into the
+design body and delete here as they stabilize.
+
+- **(a) `init=` override is a GENUINE PID-1 replacement, not an agent-supervised entrypoint.** v20 §17
+  names the item "optional `init=` override". Taken literally, overriding `init=` replaces the vmcell
+  guest agent (PID 1), which *is* the vsock control plane — so a custom-init VM has **no** `Ready`
+  handshake, `exec`, or resync. We considered reinterpreting "custom init" as an agent-supervised
+  entrypoint (`vmcell_init=`, agent stays PID 1, forks the program), which preserves the control plane.
+  *Reason we did NOT:* that is a different capability (and `exec` already forks a program under the live
+  agent), and the design says `init=` **override**. So we ship the genuine override and honor its
+  consequence **fail-loud**, not silently: `MicroVm::agent()` returns a typed `Error::Agent` immediately
+  (§12.2) instead of hanging; `MicroVm::start()` skips the QEMU control-plane health probe when there is
+  no agent to probe; and `build()` **rejects `snapshotting` + a custom init** (the mandatory
+  post-restore resync runs through the agent, §12.4). A custom-init VM is observed out-of-band (serial
+  log / writable share or extra disk / net). See design §E2.2.
+
+- **(b) CH disks are declared `image_type=Raw` explicitly (surfaced by the writable-extra-disk test).**
+  CH v52 **auto-detects** an unspecified disk image as raw and then **disables sector-0 writes** as a
+  qcow2-misdetection safeguard — silently rejecting a guest write to sector 0 of a *writable* raw disk
+  (`ReadOnly`). The extra-rw-disk KVM test caught this (the `/dev/vdc` round-trip failed on CH while FC
+  and QEMU passed). *Fix:* `build_ch_disks` sets `image_type: "Raw"` on every disk (all vmcell images —
+  erofs root, ext4 `Block` root, extra raw disks — are raw). This also removes CH's deprecation warnings
+  and pre-empts the **same latent bug on the writable `Block` rootfs path** (a sector-0 superblock write
+  would have been silently dropped). One-law: `CH_RAW_IMAGE_TYPE` const, pinned by a serialization
+  assertion. See design §E1.2.
+
+- **Validated on the KVM host (2026-07-05, this env).** `tests/extra_block.rs` (`vmm_matrix_test!`) —
+  **CH + Firecracker + QEMU all green**: two extra disks attach after the root (`/dev/vdb` read-only
+  seeded marker read back in-guest; `/dev/vdc` read-write marker round-tripped), proving attach,
+  `vda`-first ordering, the readonly flag, and raw exposure on the **data plane**.
+  `extra_block_survives_snapshot` (CH + FC; QEMU skips — no snapshot) — green: a marker written to a
+  writable extra disk survives a real snapshot→restore into a fresh vmid and reads back off `/dev/vdb`,
+  the data-plane proof of "plain virtio-blk composes with snapshot" (V:high headline). `tests/custom_init.rs`
+  (CH) — green: `init=/bin/sh` at Verbose verbosity, the kernel serial log shows `Run /bin/sh as init
+  process`, and `agent()` fails loud with the custom-init error. Run via
+  `systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh … just test-privileged`
+  filtered to these tests.
+
+### v22 pass 2 — daemon exposure + disk-I/O fault injection (2026-07-05)
+
+- **(c) Disk-I/O fault injection is I/O throttling (bandwidth + IOPS), not error injection.** `BlockDevice`
+  gained `io_limit: Option<DiskIoLimit>`, wired to each backend's native rate limiter (CH
+  `rate_limiter_config`, FC `rate_limiter`, QEMU `throttling.*`). *Reason error injection (EIO) was NOT
+  chosen for v1:* it is QEMU-`blkdebug`-only, so it would be a capability the **primary** backend (CH)
+  cannot honor — a second-class feature. Throttling works on all three backends including CH, and is the
+  portable "slow/pressured disk" fault. CH+FC share one `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS`
+  token-bucket conversion (one law). Validated on KVM (`extra_block_io_throttle`, CH+FC+QEMU: a 1 MiB/s cap
+  floors a 4 MiB read at ~3 s). Error/latency injection stays forward work. See design §E5.
+
+- **(d) The daemon exposes `extra_disks` (read-only) + `extra_kernel_args`, but NOT `init`, and extra disks
+  are read-only.** *Reasons, both forced by the daemon's model:* (i) the daemon owns the VM through the
+  vsock control plane (brings the agent up to mark `Ready`, serves `exec`/`stats`), which a custom `init=`
+  drops — so exposing it would create un-`exec`-able VMs; it stays library-only. (ii) The artifact store is
+  create-only/immutable (§D3.2), so a *writable* extra disk over a shared store artifact would let one VM
+  mutate an artifact another reads — extra disks are attached read-only (a copy-on-attach writable scratch
+  is a follow-up). A live VM pins its extra-disk artifacts (delete-in-use guard extended). See design §E4.
+
+- **(e) `vmcell::Error::Config` now maps to daemon `BadRequest` (400), not `Internal` (500).** Threading
+  `extra_kernel_args`/`io_limit` into the launcher's `VmConfig::build()` meant a client-supplied bad knob
+  (a reserved kernel arg, a `0` io_limit) surfaced as `Error::Config` → previously the catch-all
+  `Internal` 500. A config-validation failure IS a client error, so it now maps to 400 — also fixing the
+  pre-existing case of `vcpus == 0`/`mem_mib` under floor over the API. Pinned by
+  `wrapped_config_error_maps_to_bad_request`.
+
+- **Validated on KVM (2026-07-05):** the daemon `extra_disk_over_api_data_plane_and_delete_in_use`
+  integration test (`just test-daemon`) drove the full HTTP path — upload a marked image, `POST /v1/vms`
+  with `extra_disks`, read the marker off `/dev/vdb` in-guest, and confirm delete-in-use → 409 until the VM
+  is destroyed. **Still forward work:** writable-scratch-from-artifact over the daemon (copy-on-attach), and
+  disk error/latency injection (QEMU-`blkdebug`).
+
 ## Automated quality gates (docs/56) — wire-crate cast lints are `not(test)`-scoped
 
 - **The B10 wire-crate cast lints (`clippy::cast_possible_truncation` / `cast_sign_loss` /

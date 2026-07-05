@@ -121,6 +121,17 @@ enum Commands {
         /// Guest RAM in MiB (default 512).
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
+        /// Extra read-only virtio-blk device image (repeatable); enumerated in the
+        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§E1).
+        #[arg(long = "disk")]
+        disk: Vec<PathBuf>,
+        /// Extra read-write virtio-blk device image (repeatable).
+        #[arg(long = "disk-rw")]
+        disk_rw: Vec<PathBuf>,
+        /// Append-only extra kernel command-line argument (repeatable); cannot
+        /// override a reserved boot token vmcell owns (§E2.1).
+        #[arg(long = "append")]
+        append: Vec<String>,
         /// Command (and args) to run in the guest. Defaults to `/bin/true`.
         ///
         /// `allow_hyphen_values` lets the guest argv carry its own flags without a
@@ -144,6 +155,17 @@ enum Commands {
         /// Guest RAM in MiB (default 512).
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
+        /// Extra read-only virtio-blk device image (repeatable); enumerated in the
+        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§E1).
+        #[arg(long = "disk")]
+        disk: Vec<PathBuf>,
+        /// Extra read-write virtio-blk device image (repeatable).
+        #[arg(long = "disk-rw")]
+        disk_rw: Vec<PathBuf>,
+        /// Append-only extra kernel command-line argument (repeatable); cannot
+        /// override a reserved boot token vmcell owns (§E2.1).
+        #[arg(long = "append")]
+        append: Vec<String>,
     },
     /// Boot a micro-VM and write a warm snapshot into a directory, then tear it
     /// down (snapshot-eligible config only; v15 §10.2).
@@ -419,9 +441,13 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             rootfs,
             vcpus,
             mem_mib,
+            disk,
+            disk_rw,
+            append,
             cmd,
         } => {
-            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            let disks = extra_disks_from(disk, disk_rw);
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &disks, append).await?;
             let argv = if cmd.is_empty() {
                 vec!["/bin/true".to_string()]
             } else {
@@ -451,8 +477,12 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             rootfs,
             vcpus,
             mem_mib,
+            disk,
+            disk_rw,
+            append,
         } => {
-            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            let disks = extra_disks_from(disk, disk_rw);
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &disks, append).await?;
             let vmid = vm.vmid();
             // Confirm the guest agent handshakes — i.e. the VM actually booted —
             // before teardown. A failure here is a real error, not a fake success.
@@ -468,7 +498,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             vcpus,
             mem_mib,
         } => {
-            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &[], &[]).await?;
             // Bring the agent up so the snapshot captures an agent-ready VM.
             vm.agent(None, &vmcell::orchestrator::RealClock).await?;
             std::fs::create_dir_all(out).map_err(vmcell::Error::Io)?;
@@ -483,7 +513,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             vcpus,
             mem_mib,
         } => {
-            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib).await?;
+            let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &[], &[]).await?;
             vm.agent(None, &vmcell::orchestrator::RealClock).await?;
             let usage = vm.usage().await?;
             println!("{}", format_usage_json(&usage));
@@ -558,6 +588,17 @@ fn validate_oci_digest(digest: &str) -> vmcell::Result<()> {
     Ok(())
 }
 
+/// Builds the extra virtio-blk device list from the CLI's `--disk` (read-only) and
+/// `--disk-rw` (read-write) path lists, read-only disks first (§E1). The guest
+/// enumerates them `/dev/vdb`, `/dev/vdc`, … in this order after the root disk.
+fn extra_disks_from(read_only: &[PathBuf], read_write: &[PathBuf]) -> Vec<vmcell::BlockDevice> {
+    read_only
+        .iter()
+        .map(vmcell::BlockDevice::read_only)
+        .chain(read_write.iter().map(vmcell::BlockDevice::read_write))
+        .collect()
+}
+
 /// Creates and boots an ephemeral micro-VM from an erofs rootfs, owned by the
 /// returned handle (its `Drop`/`shutdown` performs the ordered teardown).
 ///
@@ -570,16 +611,24 @@ async fn ephemeral_vm(
     rootfs: &std::path::Path,
     vcpus: u8,
     mem_mib: u32,
+    extra_disks: &[vmcell::BlockDevice],
+    extra_kernel_args: &[String],
 ) -> vmcell::Result<vmcell::MicroVm<vmcell::CloudHypervisor>> {
-    let cfg = vmcell::config::VmConfig::builder(
+    let mut builder = vmcell::config::VmConfig::builder(
         kernel.to_path_buf(),
         vmcell::config::RootfsSource::Erofs {
             image: rootfs.to_path_buf(),
         },
     )
     .vcpus(vcpus)
-    .mem_mib(mem_mib)
-    .build()?;
+    .mem_mib(mem_mib);
+    for disk in extra_disks {
+        builder = builder.with_extra_disk(disk.clone());
+    }
+    for arg in extra_kernel_args {
+        builder = builder.with_kernel_arg(arg.clone());
+    }
+    let cfg = builder.build()?;
     let vmm = vmcell::CloudHypervisor::new(ch_bin());
     let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
     let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
