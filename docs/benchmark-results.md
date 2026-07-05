@@ -4,15 +4,115 @@ Performance results for the `vmcell` framework: hot-path overheads (micro-benchm
 KVM lifecycle/density/size metrics (macro-benchmarks). Per design §13.7 these are **tracked metrics,
 not pass/fail gates** — absolute numbers are hardware-bound and only meaningful with their substrate.
 
-> **Canonical numbers: the 2026-07-02 post-investigation matrix** (directly below) — the
-> 2026-07-01 profile-matrix baseline plus the `docs/45` experiment pass (EXP-A…E, incl. the
-> Firecracker warm-restore unlock). The historical pass sections further down record how the
-> system got here (CH cold 642→330 ms, CH restore 166→84→60 ms); the detailed sub-analyses
-> (kernel sweep, eager/lazy, footprint, suspend-size) were measured **pre-pass**: their
-> *relative* conclusions still hold, but their absolute cold/restore ms are superseded by the
-> tables below.
+> **Canonical numbers: the 2026-07-04 full backend×mode matrix** (directly below) — every
+> applicable metric on all three backends, which confirms the 2026-07-02 post-investigation
+> matrix (unchanged within run-to-run noise) and extends it to the coverage that was missing
+> (FC phase-budget, FC/QEMU vsock-rtt + footprint, FC suspend-size, QEMU latency + phase-budget).
+> The 2026-07-02 section beneath it is the prior canonical; the 2026-07-01 profile-matrix baseline
+> plus the `docs/45` experiment pass (EXP-A…E, incl. the Firecracker warm-restore unlock) sit
+> below that. The historical pass sections further down record how the system got here (CH cold
+> 642→330 ms, CH restore 166→84→60 ms); the detailed sub-analyses (kernel sweep, eager/lazy) were
+> measured **pre-pass**: their *relative* conclusions still hold, but their absolute cold/restore
+> ms are superseded by the tables below.
 
-## Post-investigation matrix (2026-07-02 — after the docs/45 experiment pass) — CANONICAL
+## Full backend×mode matrix (2026-07-04, HEAD `c6eeefc`) — CANONICAL
+
+Every applicable metric on every backend, run via `scripts/perf-matrix.sh` (a superset of
+`perf-baseline.sh`; backends self-skip modes they cannot serve). Same substrate/method as the
+2026-07-02 matrix: freq-pinned at the 2.2 GHz base via the blessed runner under a delegated cgroup
+scope, warm-cache, mem=256 MiB, `default` profile. N=20 (latency) / N=12 (phase-budget) / N=200
+(vsock-rtt) / 8 concurrent (footprint). **Purpose:** re-validate after the v20/v21 wave (artifact
+validator, builder extraction, `vmcelld` daemon + client, magic-resource-naming removal) and fill
+the coverage gaps (FC phase-budget, FC/QEMU vsock-rtt + footprint, FC suspend-size, QEMU metrics).
+**Verdict: those changes did not move the hot path** — they are build tooling, a control-plane layer
+over the same `MicroVm`, and a rename; no lifecycle-path code changed, and every headline p50 lands
+within noise of 2026-07-02.
+
+**Time-to-ready (latency mode), p50 / p95 ms:**
+
+| Backend | cold | restore |
+| --- | --- | --- |
+| **Cloud Hypervisor** | 308 / 325 | **57 / 64** |
+| **Firecracker** | 774 / 786 | **26 / 30** |
+| **QEMU** (`q35`) | **960 / 1078** (18/20 — flake dropped 2, below) | N/A (`snapshot_restore=false`) |
+
+**Phase-budget, p50 ms (`default` profile: create + connect + graceful `shutdown()` teardown):**
+
+| Backend | path | create | connect | exec | teardown | TOTAL |
+| --- | --- | --- | --- | --- | --- | --- |
+| **CH** | COLD | 44 | 275 | 4 | 263 | **~583** |
+| **CH** | RESTORE | 53 | 3 | 5 | 261 | **~320** |
+| **FC** | COLD | 47 | 733 | 5 | 281 | **~1063** |
+| **FC** | RESTORE | 16 | 9 | 8 | **43** | **~76** |
+| **QEMU** | COLD | 126 | 849 | 5 | 293 | **~1270** (n=12, 3rd attempt) |
+
+- **FC restore e2e (~76 ms) beats CH restore e2e (~320 ms) on the `default` profile, entirely on
+  teardown** (FC 43 ms vs CH 261 ms). The FC guest actually powers off within the grace window, so
+  `has_exited()` reaps it early; the CH guest does not exit within the 250 ms default grace, so CH
+  pins at the grace ceiling and force-kills. This is a profile artifact, not a CH defect — the
+  `throughput` profile (50 ms grace) collapses CH teardown to ~96 ms (see the throughput table).
+- Cold path is guest-boot-bound on every backend (`connect` dominates: CH 47%, FC 69%, QEMU 67%).
+  QEMU's `create` (126 ms) is ~3× CH/FC — the QEMU launch + `q35` machine model setup.
+
+**Datapath — vsock exec round-trip (`/bin/true`), µs:**
+
+| Backend | p50 | p95 | p99 | max |
+| --- | --- | --- | --- | --- |
+| **Cloud Hypervisor** | 853 | 1028 | 1455 | 2338 |
+| **Firecracker** | 734 | 839 | 1046 | 1341 |
+| **QEMU** | **711** | 818 | 868 | 1347 |
+
+A sub-millisecond control-plane floor on all three backends (incl. in-guest fork/exec/reap). p50s
+sit within ~140 µs of each other; the CH tail this run reflects shared-host load (the 07-01 CH
+figure was p50 711 / p99 1013).
+
+**Suspend-state size on disk (256 MiB guest):** CH 268.5 MB and FC 268.4 MB, both **100%
+memory-file** (state ~52 KiB CH / ~14 KiB FC). Snapshot size tracks guest RAM exactly. QEMU skips
+(`snapshot_restore=false`).
+
+**Guest-RAM footprint & density (8 concurrent, 256 MiB), per-guest resident:**
+
+| Backend | guest RAM (per guest) | VMM overhead (per guest) | KSM dedup over run |
+| --- | --- | --- | --- |
+| **CH** (shared memfd) | ≈57 MiB `RssShmem` | ≈0–1 MiB `RssAnon` | **0** (shared pages can't merge) |
+| **CH `--ksm-mergeable`** | ≈58 MiB `RssAnon` (private) | — | **≈382 MiB** (`pages_sharing` +97,935) |
+| **FC** (private anon) | ≈57 MiB `RssAnon` | (in the anon line) | 0 (not mergeable) |
+| **QEMU** (memfd + heavier VMM) | ≈59 MiB `RssShmem` | **≈21 MiB `RssAnon`** | 0 |
+
+Guest RAM is demand-paged (~57–59 of 256 MiB touched) and dead-linear per added guest on every
+backend. QEMU carries the heaviest resident VMM overhead (~21 MiB/guest vs CH/FC ~0–6). The opt-in
+CH `ksm_mergeable` lever still dedups the bulk of identical-guest RAM (~382 MiB here); it is CH-only
+(needs `mergeable=on` + `shared=off`) and off by default.
+
+### Firecracker restore-teardown exit line is benign (diagnosed 2026-07-04)
+
+Every FC **restore** iteration prints one `Error: RunWithApi(MicroVMStoppedWithError(GenericError))`
+to the console (exactly warmup+iterations lines per restore run; **zero** for cold, CH, or QEMU).
+It is **not a fault**: FC's stderr is inherited (`firecracker.rs`, deliberate — surfaces real FC
+panics/errors loud), and this is FC's own `main()` returning `Err(..)` as it exits. The graceful
+`SendCtrlAltDel` teardown drives the restored guest to reset; FC reports that reset with exit code
+`GenericError`(=1) where a cold guest's clean power-off yields `Ok`. Evidence it is benign: restore
+produces fully valid samples (agent connects + exec succeeds every iteration; 26 ms p50), FC's `main`
+returns the error and the **process exits on its own** (a Rust `Error:` print, not our uncatchable
+SIGKILL — so `has_exited()` reaps it, `kill()` is skipped), and a single cold+restore run leaves
+**zero residue** (no leaked `firecracker` processes, no leaked netns, scratch cleaned). Not
+suppressed, because muting FC stderr would also hide real FC failures. It correlates with FC's fast
+43 ms restore teardown above (the guest exits promptly rather than sitting at the grace ceiling).
+
+### QEMU agent-timeout flake resurfaced (open)
+
+CH and FC dropped **zero** iterations across the entire matrix; **QEMU** did not. This run: latency
+dropped 2/20 (iters 4, 16), and phase-budget — which `break`s the phase loop on the first
+agent-connect timeout, so it needs 12 *consecutive* clean iterations — failed on attempts 1–2
+(broke at iter 5, then iter 3) before a clean n=12 on attempt 3; footprint (which `break`s guest
+boot on any failure, hard-`bail`ing only when the *first* guest fails) aborted once on guest 0, then
+passed. This is the known "Agent … timed out" flake (nextest absorbs it with `retries=2`; the bench
+harness does not retry). It is **QEMU-specific and still intermittent** — the 2026-07-02 EXP-E claim
+that the AGENT-2 reaper-race fix left "QEMU drops zero bench iterations" **does not reproduce here**.
+Per the AGENTS.md "environmental is a hypothesis, not a diagnosis" rule this stays **open**: the
+mechanism (why QEMU specifically still times out on guest-agent connect) is not yet pinned to a cause.
+
+## Post-investigation matrix (2026-07-02 — after the docs/45 experiment pass) — PRIOR CANONICAL
 
 The docs/45 investigation (EXP-A…E) landed on top of the 2026-07-01 baseline below. Same
 substrate/method. What changed: readiness-poll unification (EXP-A), `cryptomgr.notests

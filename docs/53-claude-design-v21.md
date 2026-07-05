@@ -26,8 +26,10 @@
 > `destroy` are no longer "deferred, fail loud" — they **move to the daemon** and the CLI verbs are
 > retired), **§16** (the `impd`-daemon gap closes for the core verbs; residuals recorded), and **§17**
 > (the daemon graduates from "design-now-build-later" to built; the warm-pool manager and setup broker
-> remain future). `vmcell` gains **no** new public surface and **no** dependency edge — the daemon
-> depends on `vmcell`, never the reverse — so `vmcell` stays **0.5.0**. New members version from
+> remain future). `vmcell` gains **no** dependency edge (the daemon depends on `vmcell`, never the
+> reverse) but does gain one small public surface — a **configurable resource prefix** (§D4.1: `VmConfig
+> ::resource_prefix` + the `vmcell::naming` module, replacing the hard-coded `vmcell-*` names used for
+> naming and leaked-resource sweeping) — so `vmcell` bumps **0.5.0 → 0.6.0**. New members version from
 > **0.1.0**; `vmcell-test-runner` bumps **0.2.0 → 0.3.0** for the `vmcell-privilege` extraction (a
 > `cargo semver-checks` non-event — it exports no library API — but the version tracks the refactor).
 
@@ -104,7 +106,7 @@ Amends v20 §10.1. The workspace gains five members (the `[workspace]` root stay
 ```
   vmcell-privilege ◀── vmcell-test-runner        (lean tier; no vmcell edge)
         ▲
-        └────────────── vmcell-daemon ──▶ vmcell (0.5.0, host stack; cloud-hypervisor+metrics+pipeline)
+        └────────────── vmcell-daemon ──▶ vmcell (0.6.0, host stack; cloud-hypervisor+metrics+pipeline)
                              ▲
                              │  (DTOs re-exported, no server code)
                         vmcell-daemon-client ◀── vmcelld-ctl
@@ -310,6 +312,28 @@ after the guest agent handshakes, so "ready" is derived from the VM, not a hopef
 `command` it then `exec`s and, if `ephemeral`, `destroy`s — the `run` one-shot, reusing the same
 `exec`/`destroy` paths.
 
+### D4.1 The configurable resource prefix — one option for naming *and* sweeping
+
+A VM leaks four host resources if it dies ungracefully: a **netns**, a **tap**, a **cgroup slice**, and a
+**scratch dir**. Their names were four hard-coded `vmcell-*` string literals, and the sweep filtered by
+three more — seven copies of one prefix that had to stay in lockstep or the sweep would silently miss a
+leak. v21 collapses them into **one option**. The new `vmcell::naming` module is the single place that
+composes every name from a prefix (`<prefix>-net-<vmid>`, `<prefix>-tap-<vmid>`, `<prefix>-vm-<vmid>`,
+`<prefix>-vm-<pid>-<vmid>`) and every sweep filter (`<prefix>-net-`, `<prefix>-vm-`); a unit test pins
+that each produced name **starts with** its sweep filter for any prefix (one law, one predicate). The
+prefix lives on `VmConfig::resource_prefix` (builder `.resource_prefix()`, default
+`DEFAULT_RESOURCE_PREFIX = "vmcell"`, validated `[A-Za-z0-9]`≤6 at `build()` so it is safe in an
+interface/netns/cgroup/dir name), and `HostOrphanScanner::new(prefix)` matches by the same value.
+
+In `vmcelld` it is **one CLI flag**, `--resource-prefix` (default `vmcell`), threaded to *both* the
+launcher (so its VMs are named with it) and the start-up sweep (so it reclaims exactly those names). Two
+daemons with distinct prefixes therefore never sweep each other's resources — validated on KVM: a daemon
+run with `--resource-prefix acme` names its VM's netns `acme-net-<vmid>`, reclaims a planted `acme-net-*`
+orphan, and leaves a `vmcell-net-*` orphan from another tool untouched (§D10). The default reproduces the
+historical `vmcell-*` names exactly, so this is a non-behavioral change at the default. (The VMID lock
+dir `/tmp/vmcell-vmid` is deliberately *not* prefixed — it is not swept and is a cross-process rendezvous
+that must be stable regardless of prefix.)
+
 ---
 
 ## D5. The HTTP REST API and its OpenAPI document
@@ -509,7 +533,7 @@ unit-test that the client library does not already cover, and its tests are argu
 The integrator invited API changes "if this effort uncovers issues." Because the daemon **owns** its VM
 handles (§D4) rather than detaching them, it needs **no** new vmcell primitive — the single-process
 ownership model is reused in-process. What it uncovered is one forced client-side divergence (paths →
-upload) and two clarifications; `vmcell`'s public API is unchanged (so `vmcell` stays 0.5.0).
+upload), the resource-prefix addition (§D4.1, the vmcell 0.5.0→0.6.0 bump), and two clarifications.
 
 1. **Artifact paths become artifact names + an upload API (the forced client divergence).** `vmcell`'s
    entry points take `kernel: PathBuf` / `rootfs: PathBuf` (host paths, v20 §10.2). Over a network
@@ -609,7 +633,8 @@ cgroup scope (`with-delegated-scope.sh`) so `limits_enforced` sees real enforcem
 (fail-loud if the runner/artifacts/caps are absent). Manual poking, by contrast, launches `vmcelld`
 *through* the runner (`just daemon`).
 
-**Validated on the KVM host (2026-07-04), 10/10 green.** The suite passed: `/healthz` + artifact list;
+**Validated on the KVM host (2026-07-04), 11/11 green** (+ the `vmcell` unit suite 326/326 via nextest).
+The suite passed: `/healthz` + artifact list;
 `POST /v1/vms` **booted a real Cloud Hypervisor micro-VM** and `exec` returned `exit 0` with the guest's
 stdout (`id -un`=root, `uname -r`=6.12.94 — genuine data-plane reads); the full
 `create`→`list`→`exec`→`stats`→`destroy`→`list`-empty lifecycle; bearer auth 401/403/200 with the
@@ -619,8 +644,10 @@ and honestly false without (both `limits_enforced` and `mem_read_ok` track deleg
 planted orphan netns (`vmcell-net-*`); **`destroy` removed the per-VM scratch dir** (`<temp>/vmcell-vm-
 <pid>-<vmid>`, the ordered-teardown residue check); **snapshot → restore-by-name** preserved a guest tmpfs
 marker across the memory round-trip; **privileged tap networking** gave the VM a host netns and the guest
-`eth0` a `10.200.x/30` + default route; and the **`vmcelld-ctl` CLI** drove `run`/`ls`/`artifact ls`
-against a live daemon. **Still open** (forward work for the suite): the QEMU/Firecracker snapshot tiers
+`eth0` a `10.200.x/30` + default route; the **`vmcelld-ctl` CLI** drove `run`/`ls`/`artifact ls` against a
+live daemon; and a **custom `--resource-prefix acme`** named the VM's netns `acme-net-*`, swept only
+`acme-*`, and left a `vmcell-*` orphan untouched (§D4.1 isolation). **Still open** (forward work for the
+suite): the QEMU/Firecracker snapshot tiers
 (v20 §16 already list these as unwired), filtered-egress validation, and a concurrent-load / density run.
 
 **CI gates added** (each can go red): the KVM-free tests above run in the default `just ci`; the

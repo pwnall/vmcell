@@ -106,17 +106,31 @@ as they stabilize.
   reddened. A default route is a row with Destination `00000000` (0.0.0.0) and a non-zero Gateway; the
   test now parses that (`has_default_route`) and asserts `eth0` is `state up` with `inet 10.200.x/30`.
 
+- **(g) One configurable resource prefix for naming AND sweeping (`vmcell` 0.5.0→0.6.0).** The
+  hard-coded `vmcell-*` names (netns/tap/cgroup/scratch) and the sweep's three filters were seven copies
+  of one prefix. Collapsed into the new `vmcell::naming` module (one law: a test pins each produced name
+  starts-with its sweep filter), a `VmConfig::resource_prefix` (default `"vmcell"`, `[A-Za-z0-9]`≤6,
+  validated at `build()`), and `HostOrphanScanner::new(prefix)`. `vmcelld` exposes it as one
+  `--resource-prefix` flag threaded to both the launcher and the start-up sweep. `NetNamespace::create`
+  and `VmTempDir::create` gained a `prefix` param (the 0.6.0-driving API change). The VMID lock dir
+  `/tmp/vmcell-vmid` is intentionally NOT prefixed (not swept; a stable cross-process rendezvous). See
+  §D4.1.
+
 - **Validated on the KVM host (2026-07-04), this env (KVM rw via ACL, CH at `~/.cargo/bin`, runner
   blessed, artifacts built).** `crates/vmcelld/tests/integration.rs` (run via `just test-daemon`, under a
-  systemd-delegated scope) — **10/10 green**: healthz + artifact list; real CH micro-VM boot + `exec`
-  data-plane (`exit 0`, guest stdout, `id -un`=root, `uname -r`=6.12.94); full create/list/exec/stats/
-  destroy lifecycle; bearer auth 401/403/200; `limits_enforced` true under delegation (`mem_current_mib`
-  64) and honestly false without; start-up sweep reclaims a planted orphan netns; destroy removes the
-  per-VM scratch dir; **snapshot → restore-by-name preserves a guest tmpfs marker**; **privileged tap net**
-  gives a host netns + guest `eth0` `10.200.x/30` + default route; **`vmcelld-ctl`** drives
-  `run`/`ls`/`artifact ls`. A harness bug was fixed en route: `Daemon::Drop` must `SIGTERM` (graceful
-  `shutdown_all`) then fall back to `SIGKILL`, else a panicking test orphans its CH VMs. **Still unrun:**
-  the QEMU/Firecracker snapshot tiers (v20 §16: unwired), filtered-egress, and a concurrent-load run.
+  systemd-delegated scope) — **11/11 green** (+ `vmcell` unit suite 326/326 via nextest): healthz +
+  artifact list; real CH micro-VM boot + `exec` data-plane (`exit 0`, guest stdout, `id -un`=root,
+  `uname -r`=6.12.94); full create/list/exec/stats/destroy lifecycle; bearer auth 401/403/200;
+  `limits_enforced` true under delegation (`mem_current_mib` 64) and honestly false without; start-up
+  sweep reclaims a planted orphan netns; destroy removes the per-VM scratch dir; **snapshot →
+  restore-by-name preserves a guest tmpfs marker**; **privileged tap net** gives a host netns + guest
+  `eth0` `10.200.x/30` + default route; **`vmcelld-ctl`** drives `run`/`ls`/`artifact ls`; **custom
+  `--resource-prefix acme`** names the VM's netns `acme-net-*`, sweeps only `acme-*`, and leaves a
+  `vmcell-*` orphan untouched (isolation). A harness bug was fixed en route: `Daemon::Drop` must
+  `SIGTERM` (graceful `shutdown_all`) then fall back to `SIGKILL`, else a panicking test orphans its CH
+  VMs. (Note: one `vmcell` lib unit test races on `/tmp/vmcell-vm-<pid>-*` under `cargo test --lib`'s
+  shared-process model but passes under **nextest**, which is process-per-test — the project's runner.)
+  **Still unrun:** the QEMU/Firecracker snapshot tiers (v20 §16: unwired), filtered-egress, concurrent-load.
 
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
