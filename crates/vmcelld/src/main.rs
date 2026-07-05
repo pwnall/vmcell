@@ -59,6 +59,12 @@ struct Cli {
     /// The `cloud-hypervisor` binary path (else `$VMCELL_CH_BIN`, else `cloud-hypervisor`).
     #[arg(long)]
     ch_bin: Option<String>,
+
+    /// Prefix for this daemon's swept host-resource names (netns/tap/cgroup/scratch). Both the VMs it
+    /// creates and its start-up orphan sweep use this one value, so two daemons with distinct prefixes
+    /// never sweep each other's resources. `[A-Za-z0-9]`, ≤ 6 chars (v21).
+    #[arg(long, default_value = "vmcell")]
+    resource_prefix: String,
 }
 
 fn main() {
@@ -121,6 +127,13 @@ fn run() -> Result<(), i32> {
         .or_else(|| std::env::var("VMCELL_CH_BIN").ok())
         .unwrap_or_else(|| "cloud-hypervisor".to_string());
 
+    // Reject a malformed resource prefix up front (it becomes part of netns/interface/cgroup/dir
+    // names). One value drives both VM naming and the sweep, so they can never disagree (v21).
+    if let Err(e) = vmcell_daemon::naming::validate_resource_prefix(&cli.resource_prefix) {
+        eprintln!("vmcelld: {e}");
+        return Err(1);
+    }
+
     let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
         Ok(a) => a,
         Err(e) => {
@@ -129,9 +142,10 @@ fn run() -> Result<(), i32> {
         }
     };
 
-    // Start-up orphan sweep (v21 §D4): reclaim netns/cgroup/scratch a previously hard-killed daemon
-    // leaked, BEFORE we own any VM. We hold the caps (blessed above) that netns delete needs.
-    let report = startup_sweep();
+    // Start-up orphan sweep (v21 §D4): reclaim netns/cgroup/scratch (matching `--resource-prefix`) a
+    // previously hard-killed daemon leaked, BEFORE we own any VM. We hold the caps (blessed above)
+    // that netns delete needs.
+    let report = startup_sweep(&cli.resource_prefix);
     if !report.netns.is_empty()
         || !report.cgroup_slices.is_empty()
         || !report.scratch_dirs.is_empty()
@@ -144,7 +158,7 @@ fn run() -> Result<(), i32> {
         );
     }
 
-    let launcher = MicroVmLauncher::new(ch_bin);
+    let launcher = MicroVmLauncher::new(ch_bin, &cli.resource_prefix);
     let registry = Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
     let state = AppState {
         registry: registry.clone(),

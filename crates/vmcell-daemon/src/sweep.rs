@@ -10,15 +10,18 @@
 /// What the start-up sweep reclaimed, for logging.
 pub type SweepReport = vmcell::orchestrator::SweepReport;
 
-/// Reclaims leaked netns / cgroup slices / scratch dirs from a previously-crashed daemon.
+/// Reclaims leaked netns / cgroup slices / scratch dirs whose names carry `resource_prefix`, from a
+/// previously-crashed daemon.
 ///
 /// Called once at start-up with an empty live-vmid set (before any VM exists), so it only ever deletes
-/// genuine orphans. Requires the privileged caps the daemon already holds (netns delete needs
-/// `CAP_NET_ADMIN`). Failures on individual resources are logged by `sweep_orphans`, not fatal.
+/// genuine orphans. The prefix MUST be the one the daemon's VMs are named with (design v21) or the
+/// sweep matches nothing; both come from `vmcelld`'s single `--resource-prefix`. Requires the
+/// privileged caps the daemon holds (netns delete needs `CAP_NET_ADMIN`). Per-resource failures are
+/// logged by `sweep_orphans`, not fatal.
 #[must_use]
-pub fn startup_sweep() -> SweepReport {
+pub fn startup_sweep(resource_prefix: &str) -> SweepReport {
     vmcell::orchestrator::sweep_orphans(
-        &vmcell::orchestrator::HostOrphanScanner,
+        &vmcell::orchestrator::HostOrphanScanner::new(resource_prefix),
         &vmcell::net::tap::RtNetlink,
         &vmcell::metrics::DefaultCgroupFs,
         &std::collections::BTreeSet::new(),

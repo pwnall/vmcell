@@ -630,7 +630,11 @@ impl<V: Vmm> MicroVm<V> {
                 // drop of a requested feature.
                 debug_assert!(host_services_port.is_none());
                 let _ = host_services_port;
-                let ns = NetNamespace::create(vmid, Box::new(crate::net::tap::RtNetlink))?;
+                let ns = NetNamespace::create(
+                    &cfg.resource_prefix,
+                    vmid,
+                    Box::new(crate::net::tap::RtNetlink),
+                )?;
                 tap_name = Some(ns.tap_name.clone());
                 netns_name = Some(ns.name.clone());
 
@@ -652,7 +656,7 @@ impl<V: Vmm> MicroVm<V> {
                         // tracked as follow-up — see implementation-notes.md.
                         let px = EgressProxy::start_transparent(crate::proxy::ProxyConfig {
                             port: 0,
-                            netns: Some(format!("vmcell-net-{}", vmid)),
+                            netns: Some(crate::naming::netns_name(&cfg.resource_prefix, vmid)),
                             doubles: proxy_cfg.doubles.clone(),
                             blocked_domains: proxy_cfg.blocked_domains.clone(),
                         })
@@ -721,10 +725,11 @@ impl<V: Vmm> MicroVm<V> {
         // in `metrics` (M-ORCH-4/H-HOST-3) — not an inline `split("0::")` over the
         // whole file, which folds trailing lines into the path on a hybrid v1/v2
         // hierarchy.
-        let mut cgroup_name = format!("vmcell-vm-{}", vmid);
+        let leaf = crate::naming::cgroup_slice_name(&cfg.resource_prefix, vmid);
+        let mut cgroup_name = leaf.clone();
         if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup") {
             if let Some(base) = crate::metrics::cgroup_base_from_proc(&cgroup_str) {
-                cgroup_name = format!("{}/vmcell-vm-{}", base, vmid);
+                cgroup_name = format!("{base}/{leaf}");
             }
         }
 
@@ -809,7 +814,7 @@ impl<V: Vmm> MicroVm<V> {
         // Create the single owned per-VM scratch dir EARLY — before networking —
         // so its guard reclaims it even if setup or create/boot fails partway, and
         // so the smoltcp NAT socket can live inside it.
-        let tmp_dir = crate::vmm::VmTempDir::create(vmid.vmid).await?;
+        let tmp_dir = crate::vmm::VmTempDir::create(&cfg.resource_prefix, vmid.vmid).await?;
         let mut env = Self::setup_env(
             vmid.vmid,
             tmp_dir.path(),
@@ -984,7 +989,7 @@ impl<V: Vmm> MicroVm<V> {
             allocator: vmid_alloc,
         };
         // Create the single owned per-VM scratch dir EARLY (see `start()`).
-        let tmp_dir = crate::vmm::VmTempDir::create(vmid.vmid).await?;
+        let tmp_dir = crate::vmm::VmTempDir::create(&cfg.resource_prefix, vmid.vmid).await?;
 
         // Zygote fan-out (§9.4): a clone restores from its OWN copy of the
         // suspend image, never the shared master. The CH backend rewrites the
@@ -1395,13 +1400,42 @@ pub trait OrphanScanner: Send + Sync {
 /// **correct-by-construction, not KVM/privilege-validated here**; the unit tests
 /// drive [`sweep_orphans`] through a recording fake instead. Deeply-nested
 /// delegated cgroup slices are found by a bounded recursive walk.
-#[derive(Debug, Default, Clone)]
-pub struct HostOrphanScanner;
+///
+/// Matches names by the **same prefix** the VM naming uses ([`crate::naming`]) — an operator running
+/// `vmcelld --resource-prefix acme` sweeps `acme-*`, never `vmcell-*` from another tool. Build it with
+/// [`HostOrphanScanner::new`] (the default prefix reproduces the historical `vmcell-*` behavior).
+#[derive(Debug, Clone)]
+pub struct HostOrphanScanner {
+    /// The resource prefix; netns are matched by `<prefix>-net-`, cgroup slices and scratch dirs by
+    /// `<prefix>-vm-`.
+    prefix: String,
+}
+
+impl Default for HostOrphanScanner {
+    fn default() -> Self {
+        Self::new(crate::naming::DEFAULT_RESOURCE_PREFIX)
+    }
+}
 
 impl HostOrphanScanner {
-    /// Bounded recursive walk of the cgroup-v2 tree under `root`, collecting the
-    /// paths (relative to `/sys/fs/cgroup`) of directories named `vmcell-vm-*`.
-    fn walk_cgroup_slices(root: &std::path::Path, rel: &str, depth: u8, out: &mut Vec<String>) {
+    /// Builds a scanner that matches resources named with `prefix` (§v21). Use
+    /// [`crate::naming::DEFAULT_RESOURCE_PREFIX`] for the historical `vmcell-*` names.
+    #[must_use]
+    pub fn new(prefix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Bounded recursive walk of the cgroup-v2 tree under `root`, collecting the paths (relative to
+    /// `/sys/fs/cgroup`) of directories named `<vm_prefix>*` (`vm_prefix` = `<prefix>-vm-`).
+    fn walk_cgroup_slices(
+        vm_prefix: &str,
+        root: &std::path::Path,
+        rel: &str,
+        depth: u8,
+        out: &mut Vec<String>,
+    ) {
         if depth == 0 {
             return;
         }
@@ -1418,34 +1452,43 @@ impl HostOrphanScanner {
             } else {
                 format!("{}/{}", rel, name)
             };
-            if name.starts_with("vmcell-vm-") {
+            if name.starts_with(vm_prefix) {
                 out.push(child_rel);
-                // A per-VM slice has no vmcell children; no need to descend.
+                // A per-VM slice has no matching children; no need to descend.
                 continue;
             }
-            Self::walk_cgroup_slices(&entry.path(), &child_rel, depth - 1, out);
+            Self::walk_cgroup_slices(vm_prefix, &entry.path(), &child_rel, depth - 1, out);
         }
     }
 }
 
 impl OrphanScanner for HostOrphanScanner {
     fn scan_netns(&self) -> Vec<String> {
+        let netns_prefix = crate::naming::netns_sweep_prefix(&self.prefix);
         let Ok(dir) = std::fs::read_dir("/var/run/netns") else {
             return Vec::new();
         };
         dir.flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("vmcell-net-"))
+            .filter(|n| n.starts_with(&netns_prefix))
             .collect()
     }
 
     fn scan_cgroup_slices(&self) -> Vec<String> {
+        let vm_prefix = crate::naming::vm_resource_sweep_prefix(&self.prefix);
         let mut out = Vec::new();
-        Self::walk_cgroup_slices(std::path::Path::new("/sys/fs/cgroup"), "", 4, &mut out);
+        Self::walk_cgroup_slices(
+            &vm_prefix,
+            std::path::Path::new("/sys/fs/cgroup"),
+            "",
+            4,
+            &mut out,
+        );
         out
     }
 
     fn scan_scratch_dirs(&self) -> Vec<std::path::PathBuf> {
+        let vm_prefix = crate::naming::vm_resource_sweep_prefix(&self.prefix);
         let base = std::env::temp_dir();
         let Ok(dir) = std::fs::read_dir(&base) else {
             return Vec::new();
@@ -1456,7 +1499,7 @@ impl OrphanScanner for HostOrphanScanner {
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("vmcell-vm-"))
+                    .is_some_and(|n| n.starts_with(&vm_prefix))
             })
             .collect()
     }
@@ -1788,8 +1831,9 @@ mod tests {
             serial: std::path::PathBuf::from("/tmp/vmcell-order-serial.log"),
             calls: log.clone(),
         };
-        let netns = NetNamespace::create(7, Box::new(TimelineNetlink { log: log.clone() }))
-            .expect("fake netns create must succeed with a recording netlink");
+        let netns =
+            NetNamespace::create("vmcell", 7, Box::new(TimelineNetlink { log: log.clone() }))
+                .expect("fake netns create must succeed with a recording netlink");
         MicroVm::<crate::vmm::FakeVmm> {
             vmid: None,
             instance: Some(instance),
@@ -2813,6 +2857,7 @@ mod tests {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
         let netns = NetNamespace::create(
+            "vmcell",
             11,
             Box::new(ShutdownOrderNetlink {
                 log: log.clone(),

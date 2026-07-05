@@ -174,18 +174,18 @@ pub struct VmTempDir {
 /// construction here is what makes `(pid, vmid)` prop-exercisable without a real
 /// process id.
 #[must_use]
-pub(crate) fn per_vm_scratch_dir(base: &Path, pid: u32, vmid: u32) -> PathBuf {
-    base.join(format!("vmcell-vm-{pid}-{vmid}"))
+pub(crate) fn per_vm_scratch_dir(prefix: &str, base: &Path, pid: u32, vmid: u32) -> PathBuf {
+    base.join(crate::naming::scratch_dir_name(prefix, pid, vmid))
 }
 
 impl VmTempDir {
-    /// Creates the per-VM temporary directory `/tmp/vmcell-vm-{pid}-{vmid}/` and
-    /// returns a guard that removes it on drop.
+    /// Creates the per-VM temporary directory `<temp>/<prefix>-vm-{pid}-{vmid}/` and returns a guard
+    /// that removes it on drop. `prefix` is the VM's [`resource_prefix`](crate::config::VmConfig).
     ///
     /// # Errors
     /// Returns an error if the directory cannot be created.
-    pub async fn create(vmid: u32) -> Result<Self> {
-        let path = per_vm_scratch_dir(&std::env::temp_dir(), std::process::id(), vmid);
+    pub async fn create(prefix: &str, vmid: u32) -> Result<Self> {
+        let path = per_vm_scratch_dir(prefix, &std::env::temp_dir(), std::process::id(), vmid);
         tokio::fs::create_dir_all(&path).await?;
         Ok(Self { path })
     }
@@ -1297,14 +1297,14 @@ mod tests {
         for leaf in ["api.sock", "vsock.sock", "serial.log"] {
             // vmid must participate (guards a PID-only regression).
             assert_ne!(
-                per_vm_scratch_dir(base, 5, 1).join(leaf),
-                per_vm_scratch_dir(base, 5, 2).join(leaf),
+                per_vm_scratch_dir("vmcell", base, 5, 1).join(leaf),
+                per_vm_scratch_dir("vmcell", base, 5, 2).join(leaf),
                 "{leaf}: distinct vmids under one pid must not collide"
             );
             // The delimiter must participate (guards a `{pid}{vmid}` regression).
             assert_ne!(
-                per_vm_scratch_dir(base, 1, 23).join(leaf),
-                per_vm_scratch_dir(base, 12, 3).join(leaf),
+                per_vm_scratch_dir("vmcell", base, 1, 23).join(leaf),
+                per_vm_scratch_dir("vmcell", base, 12, 3).join(leaf),
                 "{leaf}: (1,23) and (12,3) must not collide"
             );
         }
@@ -1320,8 +1320,8 @@ mod tests {
         ) {
             prop_assume!((pid1, vmid1) != (pid2, vmid2));
             let base = Path::new("/tmp");
-            let d1 = per_vm_scratch_dir(base, pid1, vmid1);
-            let d2 = per_vm_scratch_dir(base, pid2, vmid2);
+            let d1 = per_vm_scratch_dir("vmcell", base, pid1, vmid1);
+            let d2 = per_vm_scratch_dir("vmcell", base, pid2, vmid2);
             for leaf in ["api.sock", "vsock.sock", "serial.log"] {
                 prop_assert_ne!(
                     d1.join(leaf),

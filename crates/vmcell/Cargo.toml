@@ -12,7 +12,7 @@ name = "vmcell"
 # dropped its `source: RootfsBuildSource` and `cid_alloc` fields (now OCI-only; the enum
 # `RootfsBuildSource` was removed), and `PrebuiltKernelStage` + `resolve_builder_base`
 # became `pub` for the builder crates. The CLI moved to the `vmcell-cli` crate.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 # MSRV kept at 1.85 (deliberate — see docs/implementation-notes.md). NOTE: the committed
 # Cargo.lock pins `time` 0.3.47 (the RUSTSEC-2026-0009 fix), whose own MSRV is 1.88, so a

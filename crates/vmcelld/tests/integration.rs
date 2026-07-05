@@ -164,8 +164,15 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Spawns `vmcelld` as a direct child (inheriting this test's ambient caps) and waits for `/healthz`.
+    /// Spawns `vmcelld` as a direct child (inheriting this test's ambient caps) with the default
+    /// resource prefix (`vmcell`) and waits for `/healthz`.
     async fn start(auth: Auth) -> Daemon {
+        Self::start_with_prefix(auth, "vmcell").await
+    }
+
+    /// Like [`start`](Self::start) but with an explicit `--resource-prefix` (for the custom-prefix
+    /// test).
+    async fn start_with_prefix(auth: Auth, resource_prefix: &str) -> Daemon {
         require_preconditions();
         let store = tempfile::tempdir().expect("tempdir");
         // Symlink the artifacts into the store (no 150 MB copy per test); the store reads through
@@ -190,6 +197,8 @@ impl Daemon {
             .arg(format!("127.0.0.1:{port}"))
             .arg("--ch-bin")
             .arg(ch_bin())
+            .arg("--resource-prefix")
+            .arg(resource_prefix)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
 
@@ -703,4 +712,57 @@ async fn vmcelld_ctl_drives_the_daemon() {
         "artifact ls should list vmlinux: {}",
         String::from_utf8_lossy(&arts.stdout)
     );
+}
+
+/// The configurable resource prefix (§v21): a daemon run with `--resource-prefix acme` names its VMs'
+/// host resources `acme-*` AND sweeps only `acme-*` — never another prefix's. This is the whole point
+/// of the option (one value drives both naming and the sweep), and the isolation property.
+#[tokio::test]
+#[ignore = "creates netns + boots a real VM; run via `just test-daemon` (needs caps)"]
+async fn custom_resource_prefix_names_and_sweeps_in_isolation() {
+    require_preconditions();
+    let mine = "acme-net-60002"; // an orphan under THIS daemon's prefix — must be swept
+    let other = "vmcell-net-60003"; // an orphan under a DIFFERENT prefix — must be left alone
+    for ns in [mine, other] {
+        let _ = Command::new("ip").args(["netns", "delete", ns]).status();
+        assert!(
+            Command::new("ip")
+                .args(["netns", "add", ns])
+                .status()
+                .expect("ip netns add")
+                .success(),
+            "create orphan netns {ns}"
+        );
+    }
+
+    // The daemon's start-up sweep (with prefix `acme`) runs before it serves.
+    let d = Daemon::start_with_prefix(Auth::Open, "acme").await;
+    assert!(
+        !netns_exists(mine),
+        "the sweep must reclaim the acme-* orphan"
+    );
+    assert!(
+        netns_exists(other),
+        "the sweep must NOT touch a different prefix's netns (isolation)"
+    );
+
+    // A VM booted under this daemon is named with the custom prefix, not the default.
+    let c = d.client("");
+    let vm = c
+        .create_vm(CreateVmRequest::create("vmlinux", "rootfs.erofs").with_net(NetMode::Privileged))
+        .await
+        .expect("create with privileged net")
+        .vm;
+    assert!(
+        netns_exists(&format!("acme-net-{}", vm.vmid)),
+        "the VM's netns must use the acme prefix"
+    );
+    assert!(
+        !netns_exists(&format!("vmcell-net-{}", vm.vmid)),
+        "the VM's netns must NOT use the default vmcell prefix"
+    );
+
+    c.destroy(&vm.id).await.expect("destroy");
+    // Clean up the control orphan we planted under the other prefix.
+    let _ = Command::new("ip").args(["netns", "delete", other]).status();
 }

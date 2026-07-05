@@ -55,6 +55,11 @@ pub mod server;
 #[cfg(feature = "server")]
 pub mod sweep;
 
+/// Re-export the resource-naming helpers so the daemon binary (`vmcelld`) can validate its
+/// `--resource-prefix` without a direct `vmcell` dependency (design v21).
+#[cfg(feature = "server")]
+pub use vmcell::naming;
+
 #[cfg(feature = "server")]
 pub use error::{DaemonError, DaemonResult};
 #[cfg(feature = "server")]

@@ -56,7 +56,9 @@ pub fn record_capability_skip(vmm: &str, capability: &str) {
 
 /// Reaps orphaned `vmcell-net-*` network namespaces before a privileged/netns test. Test-only.
 pub fn clean_vmcell_netns() {
-    let removed = vmcell::net::cleanup_orphan_netns("vmcell-net-");
+    // Match by the same one-law filter the VM naming produces (default prefix), not a hard-coded string.
+    let netns_prefix = vmcell::naming::netns_sweep_prefix(vmcell::naming::DEFAULT_RESOURCE_PREFIX);
+    let removed = vmcell::net::cleanup_orphan_netns(&netns_prefix);
     if !removed.is_empty() {
         println!(
             "clean_vmcell_netns: reaped orphaned namespaces: {:?}",

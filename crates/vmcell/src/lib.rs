@@ -32,6 +32,8 @@
 pub mod agent;
 /// Error and Result types.
 pub mod error;
+/// The one place that composes swept per-VM host resource names from a configurable prefix (§v21).
+pub mod naming;
 
 /// Artifact building stages and pipeline.
 #[cfg(feature = "host-common")]

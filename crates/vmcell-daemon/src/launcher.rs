@@ -69,18 +69,23 @@ pub struct MicroVmLauncher {
     cids: Arc<vmcell::vmm::CidAllocator>,
     vmids: vmcell::orchestrator::VmidAllocator,
     cgroup_factory: Box<dyn Fn() -> Box<dyn vmcell::metrics::CgroupFs> + Send + Sync>,
+    /// The prefix every VM's swept host resources are named with (must match the start-up sweep's,
+    /// design v21).
+    resource_prefix: String,
 }
 
 impl MicroVmLauncher {
     /// Builds a launcher over the `cloud-hypervisor` binary at `ch_bin`, with fresh process-global
-    /// allocators and the default (real sysfs) cgroup backend.
+    /// allocators, the default (real sysfs) cgroup backend, and `resource_prefix` for VM resource
+    /// naming (use [`vmcell::naming::DEFAULT_RESOURCE_PREFIX`] for the default `vmcell-*` names).
     #[must_use]
-    pub fn new(ch_bin: String) -> Self {
+    pub fn new(ch_bin: String, resource_prefix: impl Into<String>) -> Self {
         Self {
             vmm: vmcell::CloudHypervisor::new(ch_bin),
             cids: Arc::new(vmcell::vmm::CidAllocator::new()),
             vmids: vmcell::orchestrator::VmidAllocator::shared(),
             cgroup_factory: Box::new(|| Box::new(vmcell::metrics::DefaultCgroupFs)),
+            resource_prefix: resource_prefix.into(),
         }
     }
 }
@@ -193,6 +198,7 @@ impl VmLauncher for MicroVmLauncher {
         .mem_mib(spec.mem_mib)
         .net(net_config(spec.net))
         .snapshotting(spec.snapshotting)
+        .resource_prefix(&self.resource_prefix)
         .build()?;
 
         // Restore from a snapshot (via CoW so the named artifact is preserved and re-restorable,

@@ -390,13 +390,14 @@ impl std::fmt::Debug for NetNamespace {
 }
 
 impl NetNamespace {
-    /// Creates a new network namespace and TAP interface for the given VM ID.
+    /// Creates a new network namespace and TAP interface for the given VM ID, named from `prefix`
+    /// (`<prefix>-net-<vmid>` / `<prefix>-tap-<vmid>`, composed via [`crate::naming`]).
     ///
     /// # Errors
     /// Returns an error if the `rtnetlink` operations fail.
-    pub fn create(vmid: u32, netlink: Box<dyn Netlink>) -> Result<Self> {
-        let name = format!("vmcell-net-{}", vmid);
-        let tap_name = format!("vmcell-tap-{}", vmid);
+    pub fn create(prefix: &str, vmid: u32, netlink: Box<dyn Netlink>) -> Result<Self> {
+        let name = crate::naming::netns_name(prefix, vmid);
+        let tap_name = crate::naming::tap_name(prefix, vmid);
 
         netlink.add_netns(&name)?;
 
@@ -618,8 +619,8 @@ mod tests {
         #[test]
         fn test_path_injectivity(vmid1 in 1u32..255, vmid2 in 1u32..255) {
             prop_assume!(vmid1 != vmid2);
-            let ns1 = NetNamespace::create(vmid1, Box::new(FakeNetlink::new())).unwrap();
-            let ns2 = NetNamespace::create(vmid2, Box::new(FakeNetlink::new())).unwrap();
+            let ns1 = NetNamespace::create("vmcell", vmid1, Box::new(FakeNetlink::new())).unwrap();
+            let ns2 = NetNamespace::create("vmcell", vmid2, Box::new(FakeNetlink::new())).unwrap();
 
             assert_ne!(ns1.name, ns2.name);
             assert_ne!(ns1.tap_name, ns2.tap_name);
@@ -706,7 +707,7 @@ mod tests {
     fn emit_proxy_rules_applies_ruleset_and_sets_up_routing_in_order() {
         let netlink = FakeNetlink::new();
         let netlink_calls = netlink.calls.clone();
-        let ns = NetNamespace::create(7, Box::new(netlink)).unwrap();
+        let ns = NetNamespace::create("vmcell", 7, Box::new(netlink)).unwrap();
 
         let applier = FakeNftApplier::new();
         let applier_calls = applier.calls.clone();
@@ -752,7 +753,7 @@ mod tests {
     fn delete_is_idempotent_single_teardown() {
         let netlink = FakeNetlink::new();
         let calls = netlink.calls.clone();
-        let mut ns = NetNamespace::create(5, Box::new(netlink)).unwrap();
+        let mut ns = NetNamespace::create("vmcell", 5, Box::new(netlink)).unwrap();
 
         ns.delete().unwrap();
         ns.delete().unwrap(); // second explicit call: must be a no-op
@@ -780,7 +781,7 @@ mod tests {
         let netlink = FakeNetlink::new_failing_setup_tap();
         let calls = netlink.calls.clone();
 
-        let res = NetNamespace::create(11, Box::new(netlink));
+        let res = NetNamespace::create("vmcell", 11, Box::new(netlink));
         assert!(res.is_err(), "create must propagate the setup_tap failure");
 
         let c = calls.lock().unwrap();
@@ -806,7 +807,7 @@ mod tests {
         for (vmid, expected_host) in [(1u32, "10.200.2.1"), (254u32, "10.200.1.1")] {
             let netlink = FakeNetlink::new();
             let vmids = netlink.setup_tap_vmids.clone();
-            let ns = NetNamespace::create(vmid, Box::new(netlink)).unwrap();
+            let ns = NetNamespace::create("vmcell", vmid, Box::new(netlink)).unwrap();
 
             // create() forwards exactly the requested vmid (not a constant) into
             // setup_tap, and stores the same vmid on the namespace.

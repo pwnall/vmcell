@@ -52,6 +52,10 @@ pub struct VmConfig {
     /// virtio-pci probe. The cmdline `console=` token and the per-backend device
     /// wiring are both derived from this field so they can never desync.
     pub console_mode: ConsoleMode,
+    /// The prefix for this VM's swept host-resource names (netns/tap/cgroup/scratch), composed via
+    /// [`crate::naming`]. Defaults to [`crate::naming::DEFAULT_RESOURCE_PREFIX`] (`"vmcell"`). The
+    /// orphan sweep must be run with the SAME prefix (§v21) or it will not match this VM's leaks.
+    pub resource_prefix: String,
 }
 
 /// Per-VM hot-path timing knobs, gathered so a workload can pick a profile in one
@@ -597,6 +601,7 @@ impl VmConfig {
             kernel_verbosity: KernelVerbosity::Balanced,
             timeouts: Timeouts::default(),
             console_mode: ConsoleMode::Uart,
+            resource_prefix: crate::naming::DEFAULT_RESOURCE_PREFIX.to_string(),
         }
     }
 }
@@ -620,6 +625,7 @@ pub struct VmConfigBuilder {
     kernel_verbosity: KernelVerbosity,
     timeouts: Timeouts,
     console_mode: ConsoleMode,
+    resource_prefix: String,
 }
 
 impl VmConfigBuilder {
@@ -627,6 +633,15 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn with_share(mut self, share: Share) -> Self {
         self.shares.push(share);
+        self
+    }
+
+    /// Sets the prefix for this VM's swept host-resource names (netns/tap/cgroup/scratch); default
+    /// [`crate::naming::DEFAULT_RESOURCE_PREFIX`]. Run the orphan sweep with the same prefix (§v21).
+    /// Validated at [`build`](Self::build).
+    #[must_use]
+    pub fn resource_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.resource_prefix = prefix.into();
         self
     }
 
@@ -946,6 +961,11 @@ impl VmConfigBuilder {
             }
         }
 
+        // The resource prefix becomes part of a netns / interface / cgroup / directory name, so an
+        // invalid one is rejected fail-loud at construction (never silently sanitized).
+        crate::naming::validate_resource_prefix(&self.resource_prefix)
+            .map_err(crate::error::Error::Config)?;
+
         Ok(VmConfig {
             kernel: self.kernel,
             rootfs: self.rootfs,
@@ -962,6 +982,7 @@ impl VmConfigBuilder {
             kernel_verbosity: self.kernel_verbosity,
             timeouts: self.timeouts,
             console_mode: self.console_mode,
+            resource_prefix: self.resource_prefix,
         })
     }
 }
