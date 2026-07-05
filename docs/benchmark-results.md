@@ -99,18 +99,32 @@ SIGKILL — so `has_exited()` reaps it, `kill()` is skipped), and a single cold+
 suppressed, because muting FC stderr would also hide real FC failures. It correlates with FC's fast
 43 ms restore teardown above (the guest exits promptly rather than sitting at the grace ceiling).
 
-### QEMU agent-timeout flake resurfaced (open)
+### QEMU agent-timeout flake — root-caused and fixed (2026-07-04)
 
-CH and FC dropped **zero** iterations across the entire matrix; **QEMU** did not. This run: latency
-dropped 2/20 (iters 4, 16), and phase-budget — which `break`s the phase loop on the first
-agent-connect timeout, so it needs 12 *consecutive* clean iterations — failed on attempts 1–2
-(broke at iter 5, then iter 3) before a clean n=12 on attempt 3; footprint (which `break`s guest
-boot on any failure, hard-`bail`ing only when the *first* guest fails) aborted once on guest 0, then
-passed. This is the known "Agent … timed out" flake (nextest absorbs it with `retries=2`; the bench
-harness does not retry). It is **QEMU-specific and still intermittent** — the 2026-07-02 EXP-E claim
-that the AGENT-2 reaper-race fix left "QEMU drops zero bench iterations" **does not reproduce here**.
-Per the AGENTS.md "environmental is a hypothesis, not a diagnosis" rule this stays **open**: the
-mechanism (why QEMU specifically still times out on guest-agent connect) is not yet pinned to a cause.
+CH and FC dropped **zero** iterations across the entire matrix; **QEMU** did not (latency 2/20;
+phase-budget, which `break`s its loop on the first timeout, needed 3 attempts for a clean n=12;
+footprint aborted once on guest 0). Investigated with a purpose-built repro harness
+(`crates/vmcell/tests/qemu_vsock_flake_repro.rs`) and reproduced at **~11% (13/120 boots)**.
+
+**Root cause (mechanism, evidence-backed).** QEMU's vsock rides an **external `vhost-device-vsock`
+daemon** over a **`vhost-user-vsock`** virtqueue (CH/FC terminate vsock *inside* the VMM — hence
+QEMU-only). That bring-up **races**: on ~11% of boots the data path comes up **wedged for the VM's
+entire life** — the daemon is alive and *accepts* the host `CONNECT`, but never reaches the guest
+listener (a raw CONNECT probe returns `<no reply within 500ms>`, persistently), while the guest is
+healthy (boots, no panic under `panic=1`, agent running). Because it is persistent-per-instance, the
+host's 10 s of retries all fail. Ruled out with evidence: not the guest agent, not a guest hang, not
+the re-bind idle window, not the host-facing UDS.
+
+**Fix.** A post-boot **control-plane health-gate** in `MicroVm::start`
+(`VmInstance::verify_control_plane`; QEMU override, default no-op for CH/FC). After boot it probes the
+vsock path with a bounded budget (reusing `AgentClient::connect`, so the handshake lives in one
+place); a wedged VM is **re-spawned** on the same per-VM resources (up to 4×, then fails loud) instead
+of being handed back to time out ~10 s later at `agent()`. `spawn_qemu` pre-cleans stale sockets so
+re-spawn is safe. **Validated 120/120 QEMU boots green** post-fix (P of that by luck without the fix
+≈ 8e-7); full privileged suite 72/72 across all backends. The repro test is the committed red→green
+gate (`#[ignore]`d; runs in `just test-privileged` via `--run-ignored all`, not in the KVM-free
+`just ci`). *Measurement note:* QEMU `start()` now waits for the control plane to come live, so in a
+future phase-budget re-run its cost shifts from `connect` into `create` (TOTAL unchanged).
 
 ## Post-investigation matrix (2026-07-02 — after the docs/45 experiment pass) — PRIOR CANONICAL
 

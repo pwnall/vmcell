@@ -2,13 +2,14 @@
 //! prefix (design v21; AGENTS.md "one law, one predicate").
 //!
 //! A VM leaks four kinds of host resource if it dies ungracefully: a network namespace, a tap
-//! interface, a cgroup slice, and a scratch directory. The orphan sweep ([`crate::orchestrator::
-//! sweep_orphans`]) reclaims them by matching their names — so the **naming sites and the sweep
-//! filters must agree on the prefix**, or the sweep silently misses leaks. Both derive from the
-//! functions here, and [`prefix_matches_its_names`] (a unit test) pins that agreement.
+//! interface, a cgroup slice, and a scratch directory. The orphan sweep
+//! ([`crate::orchestrator::sweep_orphans`]) reclaims them by matching their names — so the **naming
+//! sites and the sweep filters must agree on the prefix**, or the sweep silently misses leaks. Both
+//! derive from the functions here, and `prefix_matches_its_names` (a unit test) pins that agreement.
 //!
 //! The prefix is configurable so an operator can run isolated fleets (or avoid colliding with another
-//! tool) without patching the code; it defaults to [`DEFAULT_RESOURCE_PREFIX`] (`"vmcell"`), the value
+//! tool) without patching the code; it defaults to [`crate::naming::DEFAULT_RESOURCE_PREFIX`]
+//! (`"vmcell"`), the value
 //! that was hard-coded before it became an option.
 
 /// The default resource-name prefix (`"vmcell"`) — the value hard-coded before this became an option.

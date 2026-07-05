@@ -271,6 +271,16 @@ impl Qemu {
         let vhost_vsock = res.tmp_dir.join("vhost-vsock.sock"); // qemu connects here
         let serial_path = res.tmp_dir.join("serial.log");
 
+        // Re-spawn safety: `MicroVm::start`'s control-plane health-gate recreates a
+        // QEMU VM on the SAME per-VM dir after a raced vsock bring-up
+        // (`verify_control_plane`). The prior instance's `Drop` reaps the processes
+        // but a stale *bound* socket left in the dir would make the fresh daemon/QEMU
+        // fail to bind. Pre-clean like FC does for its api socket; a no-op (and thus
+        // harmless) on the first spawn, when nothing exists yet.
+        for stale in [&qmp_socket, &vsock_path, &vhost_vsock] {
+            let _ = tokio::fs::remove_file(stale).await;
+        }
+
         let mut std_vsock_cmd = std::process::Command::new("vhost-device-vsock");
         std_vsock_cmd
             .arg("--guest-cid")
@@ -657,6 +667,33 @@ impl VmInstance for QemuInstance {
 
     fn serial_log(&self) -> &Path {
         &self.serial_path
+    }
+
+    /// Probes QEMU's external `vhost-device-vsock` data path by doing the real agent
+    /// handshake with a bounded budget (reusing `AgentClient::connect`, so the
+    /// `CONNECT`/`OK`/`Ready` protocol lives in exactly one place). A healthy boot
+    /// binds its guest listener and answers `Ready` in well under the budget; a
+    /// wedged vhost-user bring-up never answers, so this returns `Timeout` and the
+    /// orchestrator re-spawns (see the trait doc). The probe client is dropped — the
+    /// caller's lazy `agent()` reconnects, which the guest re-accepts on its still
+    /// bound listener.
+    async fn verify_control_plane(
+        &self,
+        budget: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
+    ) -> Result<()> {
+        let serial = crate::vmm::RealSerialLog {
+            path: self.serial_path.clone(),
+        };
+        crate::agent::AgentClient::connect(
+            &self.vsock_path,
+            crate::vmm::AGENT_VSOCK_PORT,
+            budget,
+            timeouts,
+            &serial,
+        )
+        .await
+        .map(|_client| ())
     }
 }
 

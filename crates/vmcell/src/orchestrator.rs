@@ -10,6 +10,17 @@ use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+/// Bounded budget for the post-boot control-plane health-gate (`start`). A healthy
+/// transport answers well within this, so only a wedged one spends the whole budget
+/// before triggering a re-spawn. Sized above a healthy QEMU cold time-to-ready
+/// (~0.7 s p50) with margin, well under the 10 s agent deadline it prevents.
+const CONTROL_PLANE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Max control-plane re-spawns in `start` before failing loud. QEMU's vhost-user
+/// vsock bring-up wedges ~11% of boots *independently*, so N re-spawns cut the
+/// residual to ~0.11^(N+1); 4 → ~1.6e-5 per VM (CH/FC never enter this path).
+const MAX_CONTROL_PLANE_RESPAWNS: u32 = 4;
+
 /// A trait for providing time.
 pub trait Clock: Send + Sync {
     /// Returns the current time.
@@ -828,6 +839,39 @@ impl<V: Vmm> MicroVm<V> {
         info!("Booting instance...");
         instance.boot().await?;
         info!("Instance booted.");
+
+        // Post-boot control-plane health-gate. Default (CH/FC) is a no-op: their
+        // vsock is internal to the VMM and cannot half-initialize. QEMU's vsock is an
+        // external `vhost-device-vsock` daemon over a `vhost-user-vsock` virtqueue
+        // whose bring-up races (~11% of boots wedge the data path for the VM's life;
+        // docs/benchmark-results.md "QEMU agent-timeout flake"). `verify_control_plane`
+        // probes it with a bounded budget; a wedged VM is re-spawned rather than
+        // handed back to reveal the wedge ~10 s later as an agent-connect timeout. A
+        // healthy transport answers well within the budget, so this adds no wait on
+        // the common path. Re-spawn recreates on the SAME per-VM resources
+        // (netns/tap/cgroup/CID/dir); `spawn_qemu` pre-cleans stale sockets.
+        let clamped = cfg.timeouts.clamped();
+        let mut respawns = 0u32;
+        while let Err(e) = instance
+            .verify_control_plane(CONTROL_PLANE_PROBE_BUDGET, &clamped)
+            .await
+        {
+            if respawns >= MAX_CONTROL_PLANE_RESPAWNS {
+                return Err(crate::error::Error::Vmm(format!(
+                    "guest control plane did not come up after {MAX_CONTROL_PLANE_RESPAWNS} \
+                     re-spawns: {e}"
+                )));
+            }
+            respawns += 1;
+            tracing::warn!(
+                "control-plane bring-up failed (re-spawn {respawns}/{MAX_CONTROL_PLANE_RESPAWNS}): {e}"
+            );
+            // `Drop` reaps the VMM process group + external daemon and unlinks their
+            // sockets before the fresh spawn re-binds them.
+            drop(instance);
+            instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
+            instance.boot().await?;
+        }
         // Success: ownership of the slice transfers to the returned MicroVm,
         // whose Drop deletes it in the documented teardown order.
         env.cgroup_guard.disarm();
@@ -1081,7 +1125,7 @@ impl<V: Vmm> MicroVm<V> {
                     .as_ref()
                     .expect("instance missing")
                     .vsock_path(),
-                5000,
+                crate::vmm::AGENT_VSOCK_PORT,
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
                 &self.timeouts,
                 &crate::vmm::RealSerialLog {

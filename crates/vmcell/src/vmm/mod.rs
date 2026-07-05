@@ -642,6 +642,12 @@ pub trait Vmm: Send + Sync {
     fn id(&self) -> &str;
 }
 
+/// The vsock port the guest agent listens on and the host connects to. One
+/// definition shared by the orchestrator's agent connect and the QEMU
+/// control-plane health-gate probe (AGENTS.md "one law, one predicate") — the
+/// guest agent's own `VSOCK_PORT` is its mirror on the other side of the boundary.
+pub(crate) const AGENT_VSOCK_PORT: u32 = 5000;
+
 /// Represents a running or created VM instance.
 pub trait VmInstance: Send {
     /// Boots the VM from a created state.
@@ -701,6 +707,34 @@ pub trait VmInstance: Send {
     fn guest_cid(&self) -> u32;
     /// Returns the path to the VM's serial log file.
     fn serial_log(&self) -> &Path;
+
+    /// Bounded post-boot check that the guest control-plane (vsock) transport is
+    /// actually carrying traffic, so [`MicroVm::start`](crate::MicroVm::start) can
+    /// re-spawn a VM whose transport came up half-wired instead of returning it.
+    ///
+    /// Default: `Ok(())`. Cloud Hypervisor and Firecracker terminate vsock *inside*
+    /// the VMM process, so the device cannot half-initialize — there is nothing to
+    /// probe. QEMU overrides this: its vsock rides an **external**
+    /// `vhost-device-vsock` daemon over a `vhost-user-vsock` virtqueue whose
+    /// bring-up races. On the measured host ~11% of QEMU boots leave that data path
+    /// wedged for the VM's entire life — the daemon accepts the host `CONNECT` but
+    /// never reaches the guest listener — surfacing only ~10 s later as an agent
+    /// connection timeout. Returning `Err` here lets the orchestrator recreate the
+    /// VM instead. See `docs/benchmark-results.md` ("QEMU agent-timeout flake") and
+    /// `tests/qemu_vsock_flake_repro.rs`.
+    ///
+    /// `budget` bounds the probe; a healthy transport answers well before it, so a
+    /// healthy boot pays only its real connect latency, not the whole budget.
+    ///
+    /// # Errors
+    /// Returns an error if the control plane is not confirmed live within `budget`.
+    async fn verify_control_plane(
+        &self,
+        _budget: std::time::Duration,
+        _timeouts: &crate::config::Timeouts,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A fake VMM for testing without booting a real VM.
