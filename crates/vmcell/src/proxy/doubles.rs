@@ -110,7 +110,7 @@ impl ProxyHandler {
             let response = Response::builder()
                 .status(403)
                 .body(hudsucker::Body::from(format!(
-                    "Blocked by Imp Proxy: {host}\n"
+                    "Blocked by vmcell Proxy: {host}\n"
                 )))
                 .expect("Valid response builder");
             return RequestOrResponse::Response(response);

@@ -223,7 +223,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let blocked_stderr = String::from_utf8_lossy(&blocked_outcome.stderr);
     let blocked_stdout = String::from_utf8_lossy(&blocked_outcome.stdout);
     assert!(
-        blocked_stderr.contains("403") && blocked_stdout.contains("Blocked by Imp Proxy"),
+        blocked_stderr.contains("403") && blocked_stdout.contains("Blocked by vmcell Proxy"),
         "Did not receive 403 Forbidden for blocked domain: {blocked_stderr}\nSTDOUT: {blocked_stdout}"
     );
 

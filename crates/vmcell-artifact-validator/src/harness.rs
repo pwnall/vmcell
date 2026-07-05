@@ -1,6 +1,6 @@
 //! Reusable VM-boot and host-capability primitives, **extracted** from vmcell's
 //! `tests/common/mod.rs` so the validator and the integration tests share one implementation
-//! (design v20; AGENTS.md "don't triplicate; extract"). The test crate re-exports these.
+//! (design; AGENTS.md "don't triplicate; extract"). The test crate re-exports these.
 
 use std::path::PathBuf;
 

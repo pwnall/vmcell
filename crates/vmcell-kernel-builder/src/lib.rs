@@ -1,4 +1,4 @@
-//! In-VM guest-kernel builder (design v20 §8.5).
+//! In-VM guest-kernel builder (design §8.5).
 //!
 //! Where `vmcell`'s bootstrap kernel producers run on the host (`KernelStage` compiles
 //! with `make`, `PrebuiltKernelStage` downloads a pinned prebuilt), this crate compiles a
@@ -377,7 +377,7 @@ impl Stage for InVmKernelStage {
         );
 
         // The builder VM boots on the PRIVILEGED network path with open egress so apt can
-        // install the toolchain (§8.5 / v20 §16). This is a build-time developer/CI operation;
+        // install the toolchain (§8.5 / §16). This is a build-time developer/CI operation;
         // CAP_NET_ADMIN is acceptable there.
         let cfg = VmConfig::builder(
             seed_kernel,

@@ -7,7 +7,7 @@
 //! share the blessing precondition ([`ensure_blessed_or_explain`]) and its remediation message; only
 //! the runner uses the uid-drop transition ([`plan_privilege_transition`]/
 //! [`apply_privilege_transition`]). Keeping the predicates here means a fix or a test reddens for both
-//! callers, never one silently diverging from a copied second implementation (design v21 §D2).
+//! callers, never one silently diverging from a copied second implementation (design §18.2).
 //!
 //! No crate-level `forbid(unsafe_code)`: the transition uses raw capability/syscall FFI, audited via
 //! `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn`.
@@ -52,7 +52,7 @@ pub fn probe_supported_caps() -> Vec<Cap> {
 }
 
 /// The three capabilities the vmcell privileged operating mode needs
-/// (`cap_net_admin,cap_sys_admin,cap_dac_override`, design v20 §6.4/§12.8):
+/// (`cap_net_admin,cap_sys_admin,cap_dac_override`, design §6.4/§12.8):
 ///
 /// - `CAP_NET_ADMIN` — netns / tap / rtnetlink / nft bring-up.
 /// - `CAP_SYS_ADMIN` — mount + cgroup + assorted VMM operations.
@@ -84,7 +84,7 @@ pub fn blessing_remediation(uid: u32, exe: &Path, missing: &[Cap]) -> String {
         "error: this vmcell binary is missing {missing_list} in its effective set (uid={uid}, no file caps).\n\
          It was almost certainly rebuilt. Restore its privileges (one-time, until next rebuild):\n\n\
          sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {}\n\n\
-         Then re-run. See design v20 §12.8 / v21 §D2.",
+         Then re-run. See design §12.8 / §18.2.",
         shell_single_quote(exe)
     )
 }
@@ -218,7 +218,7 @@ pub struct UidDrop {
 }
 
 /// A PURE description of the privilege transition, computed off the live process so every
-/// step is unit-testable against its buggy inverse (design v20 §12.8 churn-fix #3). Only
+/// step is unit-testable against its buggy inverse (design §12.8 churn-fix #3). Only
 /// the thin [`apply_privilege_transition`] performs syscalls.
 ///
 /// The daemon does **not** use this — it retains its caps unchanged. Only the transient

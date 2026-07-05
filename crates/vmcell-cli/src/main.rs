@@ -38,7 +38,7 @@ struct Cli {
     command: Commands,
 }
 
-/// Which kernel builder produces the `vmlinux` for `build` (design v20 §8.5).
+/// Which kernel builder produces the `vmlinux` for `build` (design §8.5).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
 enum KernelSource {
     /// Download + SHA-verify a digest-pinned prebuilt `vmlinux` (the fast, no-toolchain
@@ -50,7 +50,7 @@ enum KernelSource {
     InVm,
 }
 
-/// Which rootfs builder produces the erofs for `build` (design v20 §5.4).
+/// Which rootfs builder produces the erofs for `build` (design §5.4).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
 enum RootfsSourceKind {
     /// Pull + unpack a digest-pinned OCI base image on the HOST (the bootstrap source).
@@ -122,14 +122,14 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
         /// Extra read-only virtio-blk device image (repeatable); enumerated in the
-        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§E1).
+        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§19.1).
         #[arg(long = "disk")]
         disk: Vec<PathBuf>,
         /// Extra read-write virtio-blk device image (repeatable).
         #[arg(long = "disk-rw")]
         disk_rw: Vec<PathBuf>,
         /// Append-only extra kernel command-line argument (repeatable); cannot
-        /// override a reserved boot token vmcell owns (§E2.1).
+        /// override a reserved boot token vmcell owns (§19.2.1).
         #[arg(long = "append")]
         append: Vec<String>,
         /// Command (and args) to run in the guest. Defaults to `/bin/true`.
@@ -156,14 +156,14 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
         /// Extra read-only virtio-blk device image (repeatable); enumerated in the
-        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§E1).
+        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§19.1).
         #[arg(long = "disk")]
         disk: Vec<PathBuf>,
         /// Extra read-write virtio-blk device image (repeatable).
         #[arg(long = "disk-rw")]
         disk_rw: Vec<PathBuf>,
         /// Append-only extra kernel command-line argument (repeatable); cannot
-        /// override a reserved boot token vmcell owns (§E2.1).
+        /// override a reserved boot token vmcell owns (§19.2.1).
         #[arg(long = "append")]
         append: Vec<String>,
     },
@@ -202,14 +202,14 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
     },
-    /// Deferred to the `impd` daemon (§16.2): a standalone exec needs a cross-process
+    /// Deferred to the `vmcelld` daemon (§18): a standalone exec needs a cross-process
     /// VM registry, which collides with the ordered-Drop-owns-cleanup invariant.
     Exec,
-    /// Deferred to the `impd` daemon (§16.2): listing VMs needs a cross-process registry.
+    /// Deferred to the `vmcelld` daemon (§18): listing VMs needs a cross-process registry.
     Ls,
-    /// Deferred to the `impd` daemon (§16.2): removing a VM by id needs a cross-process registry.
+    /// Deferred to the `vmcelld` daemon (§18): removing a VM by id needs a cross-process registry.
     Rm,
-    /// Deferred to the `impd` daemon (§16.2): destroying a VM by id needs a cross-process
+    /// Deferred to the `vmcelld` daemon (§18): destroying a VM by id needs a cross-process
     /// registry. Within one process the owning handle's drop/`shutdown` already destroys it.
     Destroy,
 }
@@ -242,8 +242,8 @@ async fn async_main() -> vmcell::Result<()> {
     dispatch(&cli.command).await
 }
 
-/// Builds the typed error returned by a subcommand that is deferred to the `impd`
-/// daemon (§16.2) because it needs a cross-process VM registry.
+/// Builds the typed error returned by a subcommand that is deferred to the `vmcelld`
+/// daemon (§18) because it needs a cross-process VM registry.
 ///
 /// These subcommands must fail loud — a typed, matchable error that drives a
 /// non-zero exit — rather than printing fake success. Printing "Removing VM..." and
@@ -253,7 +253,7 @@ fn deferred_to_daemon(subcommand: &str) -> vmcell::Error {
     vmcell::Error::Unsupported {
         vmm: "vmcell".to_string(),
         feature: format!(
-            "subcommand `{subcommand}` needs a cross-process VM registry; deferred to the impd daemon (§16.2)"
+            "subcommand `{subcommand}` needs a cross-process VM registry; deferred to the vmcelld daemon (§18)"
         ),
     }
 }
@@ -589,7 +589,7 @@ fn validate_oci_digest(digest: &str) -> vmcell::Result<()> {
 }
 
 /// Builds the extra virtio-blk device list from the CLI's `--disk` (read-only) and
-/// `--disk-rw` (read-write) path lists, read-only disks first (§E1). The guest
+/// `--disk-rw` (read-write) path lists, read-only disks first (§19.1). The guest
 /// enumerates them `/dev/vdb`, `/dev/vdc`, … in this order after the root disk.
 fn extra_disks_from(read_only: &[PathBuf], read_write: &[PathBuf]) -> Vec<vmcell::BlockDevice> {
     read_only
@@ -603,7 +603,7 @@ fn extra_disks_from(read_only: &[PathBuf], read_write: &[PathBuf]) -> Vec<vmcell
 /// returned handle (its `Drop`/`shutdown` performs the ordered teardown).
 ///
 /// The VM does not outlive the calling process — a persistent, cross-invocation VM
-/// needs the `impd` daemon's registry (§16.2), which collides with the
+/// needs the `vmcelld` daemon's registry (§18), which collides with the
 /// ordered-Drop-owns-cleanup invariant. So each VM-lifecycle CLI verb owns its VM's
 /// full lifecycle: create → operate → teardown.
 async fn ephemeral_vm(

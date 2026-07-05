@@ -1,4 +1,4 @@
-//! `vmcelld` — the blessed vmcell control-plane daemon binary (design v21 §D2/§D6).
+//! `vmcelld` — the blessed vmcell control-plane daemon binary (design §18.2/§18.6).
 //!
 //! Blessed exactly like `vmcell-test-runner` (file-caps installed by `just bless`), but it **retains**
 //! the three privileged caps for the life of the server instead of dropping-and-exec'ing: it runs the
@@ -42,7 +42,7 @@ struct Cli {
     artifacts_dir: PathBuf,
 
     /// TCP address to bind, e.g. `127.0.0.1:8787` (loopback by default — the setup broker / UDS bind
-    /// are forward work, v21 §D12).
+    /// are forward work, §18.9).
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: String,
 
@@ -95,14 +95,14 @@ fn run() -> Result<(), i32> {
     let cli = Cli::parse();
 
     // Blessing precondition (shared with the test-runner): the three privileged caps must be in the
-    // EFFECTIVE set, or euid 0. On success we RETAIN them (no uid drop, no exec) — v21 §D2.
+    // EFFECTIVE set, or euid 0. On success we RETAIN them (no uid drop, no exec) — §18.2.
     if let Err(remediation) = vmcell_privilege::ensure_blessed_or_explain(&PRIVILEGED_CAPS) {
         eprintln!("{remediation}");
         return Err(1);
     }
 
     // Auth policy: an owner-only key file, or the explicit dev bypass. A control plane with no auth
-    // is never an accident (v21 §D6) — refuse to start otherwise.
+    // is never an accident (§18.6) — refuse to start otherwise.
     let auth = match (&cli.api_key_file, cli.allow_unauthenticated) {
         (Some(path), _) => match load_api_key_file(path) {
             Ok(key) => AuthPolicy::Key(key),
@@ -148,7 +148,7 @@ fn run() -> Result<(), i32> {
         }
     };
 
-    // Start-up orphan sweep (v21 §D4): reclaim netns/cgroup/scratch (matching `--resource-prefix`) a
+    // Start-up orphan sweep (§18.4): reclaim netns/cgroup/scratch (matching `--resource-prefix`) a
     // previously hard-killed daemon leaked, BEFORE we own any VM. We hold the caps (blessed above)
     // that netns delete needs.
     let report = startup_sweep(&cli.resource_prefix);

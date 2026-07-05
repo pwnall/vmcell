@@ -5,7 +5,7 @@
 # `rootless`/`TestVm` spellings, an `imp-*` internal prefix) fails CI instead of silently landing.
 #
 # Flagged tokens (in src/ tests/ benches/ by default; any file kind, not just *.rs):
-#   * `TestVm`                                         (renamed harness type → VmCell/Imp)
+#   * `TestVm`                                         (renamed harness type → VmCell)
 #   * `[Rr]ootless`                                    (renamed network/integration tier → unprivileged)
 #   * `imp[_-]testing` / `Imp-testing`                 (old crate / project name → vmcell)
 #   * `imp-guest-agent` / `imp-test-runner` / `imp-guest-tools`   (old binary names → vmcell-*)
@@ -14,11 +14,15 @@
 #                                                       imp-vsock/imp-serial/imp-smoltcp/imp-bench/...
 #                                                       internal hyphen-prefix family → vmcell-*)
 #   * `imp_(vmid|host_paths|netns)`                    (old internal identifiers)
+#   * `Imp` / `Imp's`                                  (standalone capitalized origin-harness name →
+#                                                       "a hypothetical agent-harness testing project")
 #
-# Deliberately NOT flagged (per §10.7-C): the capitalized standalone word `Imp` (the origin test
-# harness, retained by design) — `Imp` and `Imp's` are fine — and the ordinary English words
-# `implementation` / `import`. Every banned `imp` pattern requires a trailing `-`/`_` (or the
-# uppercase `IMP_` env form), so none of those legitimate spellings can match.
+# Deliberately NOT flagged: the ordinary English words `implementation` / `import` / `impl`. The
+# standalone `Imp` pattern matches only the exact word `Imp` bounded by non-word characters, and the
+# lowercase `imp` patterns require a trailing `-`/`_` (or the uppercase `IMP_` env form) — so
+# `Implementation` / `Import` / `impl` (where `Imp`/`imp` is followed by a word character) never match.
+# The capitalized standalone `Imp` origin-harness name is now flagged too: the project moved to the
+# generic "hypothetical agent-harness testing project" phrasing, retiring the old §10.7-C exemption.
 #
 # Line comments are stripped before pattern-matching (`//` for Rust/C sources, `#` for non-.rs files
 # like the justfile / shell / toml), so prose in a comment that mentions a banned word (e.g. a note
@@ -78,7 +82,8 @@ for f in "${files[@]}"; do
        || code ~ /imp-guest-agent|imp-test-runner|imp-guest-tools/ \
        || code ~ /IMP_KERNEL|IMP_ROOTFS|IMP_ARTIFACTS_DIR|IMP_CH_BIN/ \
        || code ~ /(^|[^A-Za-z0-9_])imp-/ \
-       || code ~ /imp_(vmid|host_paths|netns)/) {
+       || code ~ /imp_(vmid|host_paths|netns)/ \
+       || code ~ /(^|[^A-Za-z0-9_])Imp([^A-Za-z0-9_]|$)/) {
         print FN ":" NR ": " trim(line)
       }
     }
@@ -93,4 +98,4 @@ if [[ -n "${violations//[$'\n']/}" ]]; then
   printf '%s\n' "$violations" | grep -vE '^[[:space:]]*$'
   exit 1
 fi
-echo "ok: no legacy imp-testing/rootless/TestVm/imp-* tokens (scanned: ${dirs[*]})"
+echo "ok: no legacy imp-testing/rootless/TestVm/imp-*/Imp tokens (scanned: ${dirs[*]})"

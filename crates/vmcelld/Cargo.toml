@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcelld: the blessed vmcell control-plane daemon binary (thin wrapper over vmcell-daemon; design v21 §D)"
+description = "vmcelld: the blessed vmcell control-plane daemon binary (thin wrapper over vmcell-daemon; design §D)"
 publish = false
 
 # Thin binary wrapper (AGENTS.md "functionality in the library, binary is the wrapper"): it blesses
-# (refuse-to-start without the three caps, RETAINING them — no uid drop/exec, v21 §D2), parses the
+# (refuse-to-start without the three caps, RETAINING them — no uid drop/exec, §18.2), parses the
 # server config, and runs `vmcell-daemon`'s server. All logic lives in the library.
 [[bin]]
 name = "vmcelld"

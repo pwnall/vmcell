@@ -1,8 +1,8 @@
-//! The daemon's flat artifact store: **create / list / delete; no update** (design v21 §D3).
+//! The daemon's flat artifact store: **create / list / delete; no update** (design §18.3).
 //!
 //! Not the `vmcell` artifact *pipeline* (which builds kernels/rootfs) — a content store the VM APIs
 //! draw their `kernel`/`rootfs` inputs from. Every name goes through [`resolve_artifact_path`]
-//! (invariant §D9.1); no method constructs `dir.join(name)` itself. Create is atomic (temp file +
+//! (invariant §12.13); no method constructs `dir.join(name)` itself. Create is atomic (temp file +
 //! no-clobber rename) so a truncated upload never leaves a half-written artifact a later boot reads;
 //! create over an existing name is rejected (the "no update" guard), never a silent overwrite.
 
@@ -39,7 +39,7 @@ impl ArtifactStore {
         &self.dir
     }
 
-    /// Resolves a name to its on-disk path (the single validated join, invariant §D9.1).
+    /// Resolves a name to its on-disk path (the single validated join, invariant §12.13).
     ///
     /// # Errors
     /// Returns [`DaemonError::InvalidName`] if the name is not a safe single component.
@@ -146,7 +146,7 @@ impl ArtifactStore {
     }
 
     /// Deletes an artifact. (The "is it pinned by a live VM?" check is the caller's — the handler
-    /// consults the registry before calling this, design v21 §D3.2.)
+    /// consults the registry before calling this, design §18.3.2.)
     ///
     /// # Errors
     /// [`DaemonError::InvalidName`] / [`DaemonError::NotFound`] / [`DaemonError::Internal`].

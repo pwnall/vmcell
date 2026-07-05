@@ -7,7 +7,7 @@ name = "vmcell"
 # seam) gained an `ipv4: Option<Ipv4Reconfig>` param for H-VMM-1 guest-IP rotation on
 # restore, and `AgentClient::reconnect`'s params were reordered to match `connect`
 # (N-GUEST-3). `ResyncOutcome` gained `ip_applied` (additive, `#[non_exhaustive]`).
-# 0.4 → 0.5: intentional breaking change (design v20 §5.4/§8.5) — the in-VM builders were
+# 0.4 → 0.5: intentional breaking change (design §5.4/§8.5) — the in-VM builders were
 # extracted to the `vmcell-rootfs-builder` / `vmcell-kernel-builder` crates. `RootfsStage`
 # dropped its `source: RootfsBuildSource` and `cid_alloc` fields (now OCI-only; the enum
 # `RootfsBuildSource` was removed), and `PrebuiltKernelStage` + `resolve_builder_base`
@@ -18,14 +18,14 @@ edition = "2024"
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Micro-VM-per-test integration & evaluation platform for the Imp agentic harness"
+description = "Micro-VM-per-test integration & evaluation platform for a hypothetical agentic harness"
 publish = false
 
 [lib]
 name = "vmcell"
 path = "src/lib.rs"
 
-# The `vmcell` CLI binary moved to the `vmcell-cli` crate (design v20 §10.1): it is the
+# The `vmcell` CLI binary moved to the `vmcell-cli` crate (design §10.1): it is the
 # composition root that wires the in-VM builder crates, which depend on `vmcell` — keeping it
 # here would form a dependency cycle. `bench-vm` stays: it only *consumes* built artifacts.
 [[bin]]
@@ -204,7 +204,7 @@ http = { version = "1", optional = true }
 
 [dev-dependencies]
 # The integration tests reuse the extracted contract checks + boot harness from the
-# validator (design v20 §5.4/§8.5). This is a dev-dependency cycle (`vmcell(dev) →
+# validator (design §5.4/§8.5). This is a dev-dependency cycle (`vmcell(dev) →
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
 vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.1.0" }

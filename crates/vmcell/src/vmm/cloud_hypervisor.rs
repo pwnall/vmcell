@@ -129,18 +129,18 @@ struct ChDisk {
     /// superblock region, or a guest write to `/dev/vdb` offset 0). Declaring `Raw`
     /// keeps the whole disk writable and drops CH's deprecation warnings.
     image_type: &'static str,
-    /// Optional I/O rate limiter (disk-I/O fault injection, §E5). Omitted when the disk
+    /// Optional I/O rate limiter (disk-I/O fault injection, §19.5). Omitted when the disk
     /// is unthrottled so the JSON matches CH's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limiter_config: Option<ChRateLimiter>,
 }
 
-/// The one image format vmcell attaches — every image is a raw block image (§E1 /
+/// The one image format vmcell attaches — every image is a raw block image (§19.1 /
 /// the CH sector-0-write fix above).
 const CH_RAW_IMAGE_TYPE: &str = "Raw";
 
 /// CH's per-disk `rate_limiter_config` — independent bandwidth (bytes/s) and ops (IOPS)
-/// token buckets (§E5). Each is omitted when its cap is unset.
+/// token buckets (§19.5). Each is omitted when its cap is unset.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct ChRateLimiter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,7 +159,7 @@ struct ChTokenBucket {
 
 /// Builds CH's `rate_limiter_config` from a [`DiskIoLimit`](crate::config::DiskIoLimit),
 /// using the shared `size = rate`, `refill_time = IO_LIMIT_REFILL_TIME_MS` conversion
-/// (one law, one predicate — Firecracker builds the identical bucket, §E5).
+/// (one law, one predicate — Firecracker builds the identical bucket, §19.5).
 fn ch_rate_limiter(limit: &crate::config::DiskIoLimit) -> ChRateLimiter {
     let bucket = |rate: u64| ChTokenBucket {
         size: rate,
@@ -173,7 +173,7 @@ fn ch_rate_limiter(limit: &crate::config::DiskIoLimit) -> ChRateLimiter {
 
 /// Builds the CH `disks[]` list: the **root disk first** (array index 0 = `/dev/vda`,
 /// its `readonly` set from the rootfs kind), then the extra virtio-blk devices in
-/// order (`/dev/vdb`, `/dev/vdc`, …, each honoring its own `readonly`, §E1.2). CH
+/// order (`/dev/vdb`, `/dev/vdc`, …, each honoring its own `readonly`, §19.1.2). CH
 /// enumerates disks purely by array order, so this ordering is the load-bearing
 /// contract with the cmdline's `root=/dev/vda`. Pure, so the ordering is unit-testable
 /// without a running VMM. A virtio-fs rootfs contributes no disk (unreachable here —
@@ -881,7 +881,7 @@ mod tests {
         );
     }
 
-    // §E1.2: the root disk is always disks[0] (/dev/vda) and extra virtio-blk devices
+    // §19.1.2: the root disk is always disks[0] (/dev/vda) and extra virtio-blk devices
     // follow it in order (/dev/vdb, /dev/vdc, …), each with its own readonly flag.
     // Buggy impls this guards: extras pushed BEFORE the root (root shifts off /dev/vda
     // → the guest cannot mount root=/dev/vda), extras dropped, or the readonly flag
@@ -958,7 +958,7 @@ mod tests {
         );
     }
 
-    // §E5: a DiskIoLimit becomes CH's `rate_limiter_config` token buckets — bandwidth
+    // §19.5: a DiskIoLimit becomes CH's `rate_limiter_config` token buckets — bandwidth
     // (bytes/s) and ops (IOPS) each `{ size: rate, refill_time: 1000 }`, and an unset
     // cap is omitted. Buggy impls: wrong refill_time (so `size` no longer means per-
     // second), a swapped bandwidth/ops key, or emitting a cap that was None.

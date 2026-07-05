@@ -15,7 +15,7 @@ test-privileged` once after a runner rebuild to confirm).
 
 ### v22 design items — IMPLEMENTED (2026-07-05)
 
-Both "Easy" items below are implemented (design `docs/58-claude-design-v22.md`) and validated on
+Both "Easy" items below are implemented (design `docs/59-claude-design-v23.md` §19) and validated on
 the KVM host. `VmConfig` gained `extra_disks: Vec<BlockDevice>`, `extra_kernel_args: Vec<String>`
 (append-only, one-predicate reserved-token guard), and `init: Option<PathBuf>` (genuine `init=`
 override, control plane forgone fail-loud). **Pass 2** added disk-I/O fault injection

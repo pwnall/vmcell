@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcell control-plane daemon library: artifact store, cross-process VM registry, and the HTTP REST API (v21 §D)"
+description = "vmcell control-plane daemon library: artifact store, cross-process VM registry, and the HTTP REST API (§D)"
 publish = false
 
 # The daemon library carries the well-tested logic; `vmcelld` is the thin blessed binary wrapper
-# (v21 §D1.1). The `client` consumer (`vmcell-daemon-client`) sets `default-features = false` to link
+# (§18.1). The `client` consumer (`vmcell-daemon-client`) sets `default-features = false` to link
 # ONLY the wire DTOs + the artifact-name predicate (serde + std), never the axum/vmcell server stack —
-# so the wire schema is single-sourced without the client pulling the whole server (v21 §D1.1).
+# so the wire schema is single-sourced without the client pulling the whole server (§18.1).
 [lib]
 name = "vmcell_daemon"
 path = "src/lib.rs"

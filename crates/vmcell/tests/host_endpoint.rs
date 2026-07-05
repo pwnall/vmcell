@@ -78,7 +78,7 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // The IP-PNP contract (guest eth0 carries its (vmid%254)+1 /30 address, zero-netlink, via
-    // the `ip=` cmdline) is the extracted `checks::net_ip_pnp` the validator runs (v20 §8.3/§12.3).
+    // the `ip=` cmdline) is the extracted `checks::net_ip_pnp` the validator runs (§8.3/§12.3).
     vmcell_artifact_validator::checks::net_ip_pnp(&mut vm)
         .await
         .expect("guest IP-PNP must configure eth0");

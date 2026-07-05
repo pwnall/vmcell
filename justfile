@@ -5,7 +5,7 @@ set shell := ["bash", "-uc"]
 runner := ".vmcell-bin/debug/vmcell-test-runner"
 runner-release := ".vmcell-bin/release/vmcell-test-runner"
 
-# v21 §D2: `vmcelld` is NOT blessed on the dev hot path. It gets its caps by being LAUNCHED THROUGH the
+# §18.2: `vmcelld` is NOT blessed on the dev hot path. It gets its caps by being LAUNCHED THROUGH the
 # blessed runner (`just daemon`, and integration tests), which raises the three caps into the ambient
 # set and execs `vmcelld` — so the ever-changing daemon rebuilds with no `setcap` churn. Only the runner
 # (which rarely changes) carries file-caps. A standalone/production `vmcelld` is capped by the service
@@ -58,8 +58,8 @@ bless:
     bless_one target/debug/vmcell-test-runner {{runner}}
     bless_one target/release/vmcell-test-runner {{runner-release}}
 
-# Run `vmcelld` for manual poking (v21 §D), LAUNCHED THROUGH the blessed runner so it gets its caps
-# without being blessed itself (§D2) — so it rebuilds with no `setcap` churn. Requires `just bless`
+# Run `vmcelld` for manual poking (§D), LAUNCHED THROUGH the blessed runner so it gets its caps
+# without being blessed itself (§18.2) — so it rebuilds with no `setcap` churn. Requires `just bless`
 # first (blesses the runner). Uses --allow-unauthenticated for a loopback dev bind ONLY; pass
 # --api-key-file for anything real.
 daemon artifacts_dir="/tmp/vmcell-artifacts" bind="127.0.0.1:8787":
@@ -89,7 +89,7 @@ test-privileged:
         cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all \
         -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'
 
-# v21 §D10: daemon integration tests. The TEST BINARY is wrapped by the blessed runner (nextest
+# §14: daemon integration tests. The TEST BINARY is wrapped by the blessed runner (nextest
 # target-runner), so it holds the caps and can plant privileged pre-existing state (an orphan netns for
 # the start-up-sweep test) and inspect per-VM teardown residue; it then spawns `vmcelld` DIRECTLY,
 # which inherits the caps via the ambient set (the inverse of `just daemon`, which launches `vmcelld`
@@ -138,7 +138,7 @@ ci:
     # lean-test-runner invariant: same host-stack ban + standalone compile for the privileged-window member.
     if cargo tree -e no-dev -p vmcell-test-runner | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-test-runner invariant violated — host stack leaked into the test-runner build"; exit 1; fi
     cargo clippy -p vmcell-test-runner --all-targets
-    # lean-privilege invariant (v21 §D1.1): the shared blessing/capability crate is linked by BOTH the
+    # lean-privilege invariant (§18.1): the shared blessing/capability crate is linked by BOTH the
     # runner and the daemon, so it must stay as lean as the runner — no host async stack.
     if cargo tree -e no-dev -p vmcell-privilege | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-privilege invariant violated — host stack leaked into vmcell-privilege"; exit 1; fi
     cargo clippy -p vmcell-privilege --all-targets

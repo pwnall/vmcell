@@ -338,7 +338,7 @@ pub struct MicroVm<V: Vmm> {
     /// construction, so `agent()`'s connect cadence and `shutdown()`'s grace
     /// window honor the caller-selected profile rather than hard-coded constants.
     timeouts: crate::config::Timeouts,
-    /// `true` when the VM boots a custom `init=` (§E2.2) that replaces the vmcell
+    /// `true` when the VM boots a custom `init=` (§19.2.2) that replaces the vmcell
     /// guest agent, so there is **no** vsock control plane. Set from `cfg.init` at
     /// construction; makes [`MicroVm::agent`] fail loud immediately rather than hang
     /// connecting to a listener that will never answer.
@@ -852,7 +852,7 @@ impl<V: Vmm> MicroVm<V> {
         // healthy transport answers well within the budget, so this adds no wait on
         // the common path. Re-spawn recreates on the SAME per-VM resources
         // (netns/tap/cgroup/CID/dir); `spawn_qemu` pre-cleans stale sockets.
-        // A custom `init=` (§E2.2) replaces the guest agent, so there is no agent vsock
+        // A custom `init=` (§19.2.2) replaces the guest agent, so there is no agent vsock
         // transport to health-gate — skip the probe (which QEMU uses to catch a wedged
         // `vhost-device-vsock` bring-up); otherwise a custom-init QEMU VM would re-spawn
         // to exhaustion against a listener that never comes up. CH/FC probes are no-ops.
@@ -1129,7 +1129,7 @@ impl<V: Vmm> MicroVm<V> {
         timeout: Option<std::time::Duration>,
         clock: &dyn Clock,
     ) -> Result<&mut AgentClient> {
-        // Fail loud, not hang: a custom `init=` (§E2.2) replaces the vmcell guest agent,
+        // Fail loud, not hang: a custom `init=` (§19.2.2) replaces the vmcell guest agent,
         // so there is no vsock control plane — no `Ready` handshake, `exec`, or resync.
         // Returning immediately here beats blocking for the full connect timeout on a
         // listener that will never answer (§12.2 fail-loud).
@@ -3115,7 +3115,7 @@ mod tests {
         }
     }
 
-    // §E2.2: a custom `init=` replaces the guest agent, so `agent()` must fail LOUD
+    // §19.2.2: a custom `init=` replaces the guest agent, so `agent()` must fail LOUD
     // immediately (a typed `Error::Agent` naming the cause) instead of blocking for the
     // full connect timeout on a listener that will never answer (§12.2 fail-loud).
     // Inverse: drop the `control_plane_disabled` early-return in `agent()` and this

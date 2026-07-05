@@ -1,10 +1,10 @@
-//! A typed Rust client for `vmcelld` (design v21 §D7).
+//! A typed Rust client for `vmcelld` (design §18.7).
 //!
 //! The API mirrors the `vmcell` entry points as closely as the network boundary allows: `run` /
 //! `create` / `exec` / `stats` / `snapshot` / `ls` / `destroy` map one-to-one to the CLI verbs, with
 //! `kernel`/`rootfs` given as artifact **names** (not host paths). The one forced divergence the
 //! integrator anticipated is that a host path becomes an **upload**: [`DaemonClient::upload_artifact`]
-//! (design v21 §D8). DTOs are re-exported from `vmcell-daemon` (linked without its server stack), so a
+//! (design §18.8). DTOs are re-exported from `vmcell-daemon` (linked without its server stack), so a
 //! request the client serializes and the daemon deserializes are the SAME type.
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use url::Url;
 
-// Re-export the wire schema so callers use one set of types with the daemon (design v21 §D7.1).
+// Re-export the wire schema so callers use one set of types with the daemon (design §18.7.1).
 pub use vmcell_daemon::dto;
 pub use vmcell_daemon::name;
 
@@ -60,7 +60,7 @@ impl UploadBody {
         match self {
             Self::Bytes(b) => Ok(b),
             // v1 reads the file into memory; streaming a large image is a small follow-up
-            // (`reqwest::Body::wrap_stream`), recorded in design v21 §D12.
+            // (`reqwest::Body::wrap_stream`), recorded in design §18.9.
             Self::Path(p) => std::fs::read(&p)
                 .map_err(|e| ClientError::Io(format!("cannot read {}: {e}", p.display()))),
         }
@@ -68,7 +68,7 @@ impl UploadBody {
 }
 
 /// A client error. Server-side conditions are surfaced as the SAME matchable kinds the daemon names
-/// (design v21 §D5.3), so a caller branches on `AlreadyExists`/`NotFound`/… rather than a raw status.
+/// (design §18.5.3), so a caller branches on `AlreadyExists`/`NotFound`/… rather than a raw status.
 #[derive(Debug)]
 pub enum ClientError {
     /// A typed error the daemon returned, with its kind and message.
@@ -153,7 +153,7 @@ impl DaemonClient {
             .map_err(|e| ClientError::Url(format!("{path}: {e}")))
     }
 
-    // ---- artifact store (paths -> upload, the design v21 §D8 divergence) ----
+    // ---- artifact store (paths -> upload, the design §18.8 divergence) ----
 
     /// Uploads an artifact (create; the daemon rejects an existing name — "no update").
     ///
@@ -205,7 +205,7 @@ impl DaemonClient {
 
     // ---- VM lifecycle (one-to-one with the vmcell CLI verbs) ----
 
-    /// Creates a VM from a full request (design v21 §D5.1). Returns the VM info and, if `command`
+    /// Creates a VM from a full request (design §18.5.1). Returns the VM info and, if `command`
     /// was set, the captured exec outcome.
     ///
     /// # Errors
@@ -386,7 +386,7 @@ mod tests {
     }
 
     // The typed-error round-trip: a daemon ErrorBody parses back to the same matchable kind, so a
-    // caller can branch on it (design v21 §D5.3). RED if the kind is dropped.
+    // caller can branch on it (design §18.5.3). RED if the kind is dropped.
     #[test]
     fn api_error_recovers_matchable_kind() {
         let body = serde_json::to_string(&ErrorBody {

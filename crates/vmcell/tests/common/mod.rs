@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 //! Shared integration-test harness. The generally-reusable VM-boot + capability primitives were
-//! **extracted** into `vmcell_artifact_validator::harness` (design v20 §5.4/§8.5) so the artifact
+//! **extracted** into `vmcell_artifact_validator::harness` (design §5.4/§8.5) so the artifact
 //! validator and these tests share one implementation; they are re-exported here so the existing
 //! `common::…` call sites keep working. The genuinely test-only helpers (skip manifest, netns/nft
 //! residue tooling) and the `vmm_matrix_test!` / `require_cap!` macros stay here.

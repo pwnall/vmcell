@@ -10,7 +10,7 @@ publish = false
 # Deliberately dependency-thin: `vmcell-privilege` (itself rustix + capctl + libc only) plus
 # rustix — never the vmcell library and no async/host stack. Every dep here runs inside the
 # privileged window. The blessing/transition predicates live in `vmcell-privilege` so the daemon
-# shares one copy (v21 §D2); this crate keeps only the exec-target confinement, which the daemon
+# shares one copy (§18.2); this crate keeps only the exec-target confinement, which the daemon
 # has no analogue for. The CI lean-test-runner assertion enforces the ban structurally (v15 §12.8 #4).
 [[bin]]
 name = "vmcell-test-runner"

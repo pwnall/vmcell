@@ -1,8 +1,7 @@
-# Imp Testing
+# Agent-Harness Testing
 
-This project is an end-to-end integration testing and evaluation platform for an
-AI agentic harness. The agentic harness is named Imp, so this project is named
-Imp Testing.
+This project is an end-to-end integration testing and evaluation platform for a
+hypothetical AI agentic harness.
 
 Each integration test will run in its own micro-VM. Desired benefits:
 

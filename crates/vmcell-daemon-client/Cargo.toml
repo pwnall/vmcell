@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Typed Rust client for vmcelld, mirroring the vmcell entry points over HTTP (design v21 §D7)"
+description = "Typed Rust client for vmcelld, mirroring the vmcell entry points over HTTP (design §18.7)"
 publish = false
 
 [lib]
@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # `default-features = false` links ONLY the wire DTOs + the name predicate from the daemon — never
-# its axum/vmcell server stack (design v21 §D1.1). One type on both sides of the wire.
+# its axum/vmcell server stack (design §18.1). One type on both sides of the wire.
 vmcell-daemon = { path = "../vmcell-daemon", version = "0.1.0", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

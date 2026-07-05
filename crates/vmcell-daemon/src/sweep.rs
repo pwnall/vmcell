@@ -1,4 +1,4 @@
-//! Start-up orphan sweep (design v21 §D4).
+//! Start-up orphan sweep (design §18.4).
 //!
 //! The daemon **owns** its VMs and releases their resources on `Drop`/`shutdown` — but a hard-killed
 //! daemon (SIGKILL, power loss) never runs those, leaking netns/cgroup/scratch keyed by the dead VMs'
@@ -14,7 +14,7 @@ pub type SweepReport = vmcell::orchestrator::SweepReport;
 /// previously-crashed daemon.
 ///
 /// Called once at start-up with an empty live-vmid set (before any VM exists), so it only ever deletes
-/// genuine orphans. The prefix MUST be the one the daemon's VMs are named with (design v21) or the
+/// genuine orphans. The prefix MUST be the one the daemon's VMs are named with (design) or the
 /// sweep matches nothing; both come from `vmcelld`'s single `--resource-prefix`. Requires the
 /// privileged caps the daemon holds (netns delete needs `CAP_NET_ADMIN`). Per-resource failures are
 /// logged by `sweep_orphans`, not fatal.

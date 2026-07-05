@@ -10,7 +10,7 @@ publish = false
 # Deliberately dependency-thin: rustix + capctl + libc only, never the vmcell library and no
 # async/host stack — every function here runs inside (or gates entry to) the privileged window,
 # and both the runner (transient exec) and the daemon (long-lived, retains caps) link it. The CI
-# lean assertion enforces this structurally (design v21 §D1.1) the same way it does for the runner.
+# lean assertion enforces this structurally (design §18.1) the same way it does for the runner.
 [dependencies]
 rustix = { version = "0.38", features = ["process"] }
 capctl = "0.2.4"

@@ -1,5 +1,5 @@
 //! Validate custom-built vmcell artifacts (kernel, rootfs) against the artifact↔system
-//! contract (design v20 §5.4, §8.5, §12) by booting real test micro-VMs.
+//! contract (design §5.4, §8.5, §12) by booting real test micro-VMs.
 //!
 //! A developer pairs a custom artifact with a known-good counterpart — a custom `vmlinux`
 //! with a trusted `rootfs.erofs`, or vice versa — and calls [`validate`]. It boots micro-VMs

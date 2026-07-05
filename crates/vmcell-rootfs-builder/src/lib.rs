@@ -1,4 +1,4 @@
-//! In-VM `mmdebstrap` rootfs builder (design v20 §5.4).
+//! In-VM `mmdebstrap` rootfs builder (design §5.4).
 //!
 //! Where `vmcell`'s bootstrap rootfs source pulls and unpacks an OCI base image on the host
 //! ([`vmcell::artifact::rootfs::RootfsStage`]), this crate builds a full-apt Debian rootfs by
@@ -16,7 +16,7 @@
 //! `apt`/`mmdebstrap` need a live Debian mirror, so the builder VM boots on the **privileged**
 //! network path (`NetConfig::Privileged { egress: Egress::Open }`, netns + tap + nft
 //! masquerade) — a build-time developer/CI operation where `CAP_NET_ADMIN` is acceptable
-//! (v20 §16). apt still performs the full in-guest gpg chain verification against the base
+//! (§16). apt still performs the full in-guest gpg chain verification against the base
 //! image's `debian-archive-keyring`.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty

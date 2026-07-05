@@ -579,14 +579,14 @@ impl Vmm for Firecracker {
             path_on_host: PathBuf,
             is_root_device: bool,
             is_read_only: bool,
-            /// Optional I/O rate limiter (disk-I/O fault injection, §E5). Omitted when
+            /// Optional I/O rate limiter (disk-I/O fault injection, §19.5). Omitted when
             /// the drive is unthrottled (FC's default).
             #[serde(skip_serializing_if = "Option::is_none")]
             rate_limiter: Option<FcRateLimiter>,
         }
         // FC's `rate_limiter` — bandwidth (bytes/s) and ops (IOPS) token buckets, the
         // SAME shape and `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS` conversion as
-        // Cloud Hypervisor (one law, one predicate, §E5).
+        // Cloud Hypervisor (one law, one predicate, §19.5).
         #[derive(Serialize)]
         struct FcRateLimiter {
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -639,7 +639,7 @@ impl Vmm for Firecracker {
             )
             .await?;
 
-        // Extra virtio-blk devices (§E1), PUT AFTER the root drive so they enumerate
+        // Extra virtio-blk devices (§19.1), PUT AFTER the root drive so they enumerate
         // `/dev/vdb`, `/dev/vdc`, … in order and never displace `/dev/vda`. Each is a
         // non-root drive on its own virtio-mmio slot; FC's MMIO region is finite, so a
         // very large list surfaces fail-loud as the backend's typed API error here,

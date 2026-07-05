@@ -1,4 +1,4 @@
-//! The single artifact-name predicate (design v21 §D3.1 / invariant §D9.1).
+//! The single artifact-name predicate (design §18.3.1 / invariant §12.13).
 //!
 //! Artifact names map **directly** to files: name `k1` is the file `<artifacts-dir>/k1`. That makes
 //! this a **security boundary** of the same class as the test-runner's exec-target confinement — a
@@ -12,10 +12,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// The maximum artifact-name length in bytes. Well under `NAME_MAX` (255 on most Linux
-/// filesystems) so `<dir>/<name>` never hits a path-length limit, and long enough for
-/// any real `vmlinux-<version>` / `rootfs-<profile>.erofs` name.
-pub const MAX_ARTIFACT_NAME_LEN: usize = 128;
+/// The maximum artifact-name length in bytes — `NAME_MAX` (255 on most Linux filesystems), the
+/// ceiling for a single filename component `<name>` under the store dir (design §18.3.1). The store's
+/// atomic upload creates its temp file with an independent random name (`NamedTempFile::new_in`), so
+/// the artifact name may use the whole component budget without a temp-suffix overflow.
+pub const MAX_ARTIFACT_NAME_LEN: usize = 255;
 
 /// Why an artifact name was rejected. Carries the offending name for a clear operator message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +98,7 @@ pub fn validate_artifact_name(name: &str) -> Result<(), InvalidName> {
 }
 
 /// The ONLY function that turns a client-supplied artifact name into a path. Every store op and every
-/// VM-API artifact reference resolves through it (invariant §D9.1); no caller constructs
+/// VM-API artifact reference resolves through it (invariant §12.13); no caller constructs
 /// `dir.join(name)` on a client string directly.
 ///
 /// On success the result is exactly `dir.join(name)` with `name` a single validated component — no

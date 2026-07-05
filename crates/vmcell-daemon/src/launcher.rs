@@ -1,9 +1,9 @@
-//! The `VmLauncher`/`VmHandle` seam in front of `MicroVm::start` (design v21 §D4/§D10).
+//! The `VmLauncher`/`VmHandle` seam in front of `MicroVm::start` (design §18.4/§14).
 //!
 //! The registry drives VMs through these traits, not `MicroVm` directly, so its logic (id minting,
 //! the state machine, ordered teardown, in-use pinning) is unit-testable against a recording **fake**
 //! with no KVM or root — the same "injectable side-effect trait with a real impl and a recording
-//! fake" discipline the library uses (design v20 §10.6). The real [`MicroVmLauncher`] is a thin
+//! fake" discipline the library uses (design §10.6). The real [`MicroVmLauncher`] is a thin
 //! adapter; all the tested logic lives in the registry above it.
 
 use crate::dto::{ExecOutcomeDto, ExecRequestDto, NetMode, ResourceUsageDto};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// A resolved request to boot one VM — absolute artifact paths (the names already resolved against
-/// the store, invariant §D9.1) plus the config knobs.
+/// the store, invariant §12.13) plus the config knobs.
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
     /// Absolute path to the `vmlinux` kernel image.
@@ -32,15 +32,15 @@ pub struct LaunchSpec {
     /// When `Some`, restore from this snapshot directory (a copy of the named artifact snapshot)
     /// instead of a cold boot.
     pub restore_from: Option<PathBuf>,
-    /// Extra read-only virtio-blk devices (design v22 §E4), with the artifact names already
-    /// resolved to absolute paths and any `io_limit` translated (§E5).
+    /// Extra read-only virtio-blk devices (design §19.4), with the artifact names already
+    /// resolved to absolute paths and any `io_limit` translated (§19.5).
     pub extra_disks: Vec<vmcell::BlockDevice>,
-    /// Append-only extra kernel command-line arguments (design v22 §E2.1).
+    /// Append-only extra kernel command-line arguments (design §19.2.1).
     pub extra_kernel_args: Vec<String>,
 }
 
 /// An owned, live VM the registry holds. Ops borrow `&mut self` (one vsock control channel per VM,
-/// so ops on ONE VM serialize — correct, design v21 §D4); `shutdown` consumes it (ordered teardown).
+/// so ops on ONE VM serialize — correct, design §18.4); `shutdown` consumes it (ordered teardown).
 #[async_trait]
 pub trait VmHandle: Send {
     /// The internal network VMID octet (informational; the registry exposes an opaque id instead).
@@ -67,7 +67,7 @@ pub trait VmLauncher: Send + Sync {
 }
 
 /// The real launcher: wraps `MicroVm::start` on the Cloud Hypervisor backend, holding the daemon's
-/// process-global allocators (design v21 §D8.2 — the daemon is finally the single home for the
+/// process-global allocators (design §18.8 — the daemon is finally the single home for the
 /// process-global `VmidAllocator`/`CidAllocator`).
 pub struct MicroVmLauncher {
     vmm: vmcell::CloudHypervisor,
@@ -75,7 +75,7 @@ pub struct MicroVmLauncher {
     vmids: vmcell::orchestrator::VmidAllocator,
     cgroup_factory: Box<dyn Fn() -> Box<dyn vmcell::metrics::CgroupFs> + Send + Sync>,
     /// The prefix every VM's swept host resources are named with (must match the start-up sweep's,
-    /// design v21).
+    /// design).
     resource_prefix: String,
 }
 
@@ -96,7 +96,7 @@ impl MicroVmLauncher {
 }
 
 /// Converts a `vmcell::ResourceUsage` to its wire DTO (field-for-field, including the honest
-/// `*_read_ok` flags, design v20 §7.2).
+/// `*_read_ok` flags, design §7.2).
 #[must_use]
 pub fn usage_to_dto(u: &vmcell::ResourceUsage) -> ResourceUsageDto {
     ResourceUsageDto {
@@ -174,7 +174,7 @@ impl VmHandle for MicroVmHandle {
 }
 
 /// Maps the daemon's [`NetMode`] to a `vmcell::NetConfig`. Egress is `Open` (no interception proxy);
-/// filtered egress is a future knob (design v20 §6.1/H-NET-4).
+/// filtered egress is a future knob (design §6.1/H-NET-4).
 fn net_config(mode: NetMode) -> vmcell::config::NetConfig {
     use vmcell::config::{Egress, NetConfig};
     match mode {
@@ -216,8 +216,8 @@ impl VmLauncher for MicroVmLauncher {
         let cfg = builder.build()?;
 
         // Restore from a snapshot (via CoW so the named artifact is preserved and re-restorable,
-        // design v20 §9.4) or cold-boot. Both then bring the agent up: for a cold boot that confirms
-        // it booted; for a restore it drives the mandatory first post-restore resync (design v20 §12.4).
+        // design §9.4) or cold-boot. Both then bring the agent up: for a cold boot that confirms
+        // it booted; for a restore it drives the mandatory first post-restore resync (design §12.4).
         let mut vm = if let Some(dir) = &spec.restore_from {
             let (vm, _cow) = vmcell::MicroVm::restore_cow(
                 &self.vmm,
@@ -239,7 +239,7 @@ impl VmLauncher for MicroVmLauncher {
             )
             .await?
         };
-        // A registered VM in `Ready` is genuinely ready (design v21 §D4 "derived from the handle").
+        // A registered VM in `Ready` is genuinely ready (design §18.4 "derived from the handle").
         vm.agent(None, &vmcell::orchestrator::RealClock).await?;
         Ok(Box::new(MicroVmHandle { vm }))
     }

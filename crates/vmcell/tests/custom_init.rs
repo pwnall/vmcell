@@ -3,7 +3,7 @@ use vmcell::orchestrator::RealClock;
 
 mod common;
 
-// §E2.2: a custom `init=` override boots a different PID 1 (replacing the vmcell guest
+// §19.2.2: a custom `init=` override boots a different PID 1 (replacing the vmcell guest
 // agent), so the vsock control plane is gone. This is a DATA-PLANE proof on the primary
 // backend: boot with `init=/bin/sh` at Verbose verbosity (loglevel=7, so the kernel's
 // `KERN_INFO` init-exec line prints) and assert the serial log shows the kernel ran the

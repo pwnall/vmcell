@@ -57,19 +57,19 @@ pub struct VmConfig {
     /// orphan sweep must be run with the SAME prefix (§v21) or it will not match this VM's leaks.
     pub resource_prefix: String,
     /// Extra virtio-blk devices attached **after** the root disk, enumerated by the
-    /// guest as `/dev/vdb`, `/dev/vdc`, … in order (§E1). Raw block devices — the
+    /// guest as `/dev/vdb`, `/dev/vdc`, … in order (§19.1). Raw block devices — the
     /// guest workload owns any filesystem/mount; the agent does not auto-mount them.
     /// Plain virtio-blk composes with snapshotting (§12.1); an extra disk's
     /// [`image`](BlockDevice::image) must live at a **stable path** to survive a
     /// restore. Default empty.
     pub extra_disks: Vec<BlockDevice>,
     /// Append-only extra kernel command-line arguments, appended **after** every
-    /// token vmcell owns (§E2.1). An extra arg can add a boot parameter but can never
+    /// token vmcell owns (§19.2.1). An extra arg can add a boot parameter but can never
     /// override one vmcell controls; [`VmConfigBuilder::build`] rejects any arg whose
     /// key is reserved or starts with `vmcell_`, or that is not a single whitespace-
     /// free token. Default empty.
     pub extra_kernel_args: Vec<String>,
-    /// Optional `init=` override (§E2.2). `None` boots the vmcell guest agent as
+    /// Optional `init=` override (§19.2.2). `None` boots the vmcell guest agent as
     /// PID 1 (the vsock control plane). `Some(path)` boots a **custom PID 1**, which
     /// **replaces the agent** — so the VM has no control plane
     /// ([`crate::orchestrator::MicroVm::agent`] fails loud) and cannot snapshot
@@ -246,7 +246,7 @@ pub(crate) fn build_kernel_cmdline(
     // `ip=` autoconfig, panic capture, or the in-kernel crypto itself (self-tests are
     // a boot-time QA pass, not a runtime dependency).
     // The `init=` token: the fixed vmcell guest agent (the default control-plane
-    // PID 1) unless the caller overrides it (§E2.2). This is the ONE place either
+    // PID 1) unless the caller overrides it (§19.2.2). This is the ONE place either
     // `init=` token is constructed — a backend never string-builds it. A custom
     // init replaces the agent, so it forgoes the vsock control plane; the
     // consequence is honored fail-loud in the orchestrator, not here (see
@@ -287,7 +287,7 @@ pub(crate) fn build_kernel_cmdline(
     push_share_args(&mut s, &cfg.shares);
     push_guest_timeout_args(&mut s, &cfg.timeouts);
     // Append-only caller args go LAST — after every token vmcell owns — so they can
-    // add a boot parameter but never clobber one (§E2.1). `build()` already rejected
+    // add a boot parameter but never clobber one (§19.2.1). `build()` already rejected
     // any arg whose key is reserved or `vmcell_`-prefixed, so this is a safe splice.
     push_extra_kernel_args(&mut s, &cfg.extra_kernel_args);
     Ok(s)
@@ -295,11 +295,11 @@ pub(crate) fn build_kernel_cmdline(
 
 /// The default `init=` target: the vmcell guest agent that serves the vsock control
 /// plane as PID 1 (§4.3). A caller may override it via [`VmConfig::init`], which
-/// replaces the agent and therefore forgoes the control plane (§E2.2).
+/// replaces the agent and therefore forgoes the control plane (§19.2.2).
 pub(crate) const DEFAULT_INIT: &str = "/usr/sbin/vmcell-guest-agent";
 
 /// The kernel-cmdline keys that [`build_kernel_cmdline`] owns and that
-/// [`VmConfig::extra_kernel_args`] may therefore **not** set (append-only, §E2.1).
+/// [`VmConfig::extra_kernel_args`] may therefore **not** set (append-only, §19.2.1).
 ///
 /// Kept in lockstep with the tokens the builder emits by the
 /// `extra_kernel_args_cannot_clobber_reserved_tokens` coverage test: every token the
@@ -326,7 +326,7 @@ const RESERVED_CMDLINE_KEYS: &[&str] = &[
 
 /// Whether `arg` collides with a boot token vmcell owns — its key is in
 /// [`RESERVED_CMDLINE_KEYS`] or starts with `vmcell_` (every guest-agent-trusted
-/// token, §8.3). The single predicate behind the append-only contract (§E2.1); the
+/// token, §8.3). The single predicate behind the append-only contract (§19.2.1); the
 /// key is the text before the first `=` (or the whole bare token).
 pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
     let key = arg.split('=').next().unwrap_or(arg);
@@ -336,7 +336,7 @@ pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
 }
 
 /// Appends the validated append-only caller args to `cmdline`, one whitespace-
-/// separated token each (§E2.1). No args ⇒ nothing appended.
+/// separated token each (§19.2.1). No args ⇒ nothing appended.
 pub(crate) fn push_extra_kernel_args(cmdline: &mut String, args: &[String]) {
     for arg in args {
         cmdline.push(' ');
@@ -344,7 +344,7 @@ pub(crate) fn push_extra_kernel_args(cmdline: &mut String, args: &[String]) {
     }
 }
 
-/// Validates a caller-supplied `init=` override path (§E2.2): valid UTF-8, absolute,
+/// Validates a caller-supplied `init=` override path (§19.2.2): valid UTF-8, absolute,
 /// and a single cmdline token (no whitespace or control characters — a space would
 /// forge a second boot token).
 ///
@@ -369,7 +369,7 @@ fn validate_init_path(init: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates one append-only caller kernel arg (§E2.1): non-empty, a single cmdline
+/// Validates one append-only caller kernel arg (§19.2.1): non-empty, a single cmdline
 /// token (no whitespace/control characters), and not colliding with a reserved token
 /// vmcell owns ([`is_reserved_cmdline_arg`]).
 ///
@@ -417,7 +417,7 @@ pub enum RootfsSource {
 }
 
 /// An extra virtio-blk device attached to the VM in addition to the root disk
-/// ([`VmConfig::extra_disks`], §E1).
+/// ([`VmConfig::extra_disks`], §19.1).
 ///
 /// The guest kernel enumerates extra disks as `/dev/vdb`, `/dev/vdc`, … in
 /// attachment order; the root disk is always `/dev/vda`. vmcell attaches the **raw**
@@ -436,7 +436,7 @@ pub struct BlockDevice {
     pub image: PathBuf,
     /// Whether the device is attached read-only.
     pub readonly: bool,
-    /// Optional I/O rate limit (disk-I/O fault injection, §E5). `None` = unlimited.
+    /// Optional I/O rate limit (disk-I/O fault injection, §19.5). `None` = unlimited.
     pub io_limit: Option<DiskIoLimit>,
 }
 
@@ -461,7 +461,7 @@ impl BlockDevice {
         }
     }
 
-    /// Attaches an I/O rate limit to this device (disk-I/O fault injection, §E5), to
+    /// Attaches an I/O rate limit to this device (disk-I/O fault injection, §19.5), to
     /// simulate a slow or pressured disk. Validated at [`VmConfigBuilder::build`].
     #[must_use]
     pub fn with_io_limit(mut self, limit: DiskIoLimit) -> Self {
@@ -471,7 +471,7 @@ impl BlockDevice {
 }
 
 /// An I/O rate limit for a [`BlockDevice`] — the portable form of disk-I/O fault
-/// injection (§E5), simulating a slow/pressured disk to test a workload's timeout /
+/// injection (§19.5), simulating a slow/pressured disk to test a workload's timeout /
 /// retry / backpressure behavior. Each backend enforces it with its native token-bucket
 /// rate limiter (Cloud Hypervisor `rate_limiter_config`, Firecracker `rate_limiter`,
 /// QEMU `throttling.*`), so it composes with snapshotting like any plain virtio-blk.
@@ -890,7 +890,7 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Attaches an extra virtio-blk device ([`BlockDevice`], §E1), enumerated by the
+    /// Attaches an extra virtio-blk device ([`BlockDevice`], §19.1), enumerated by the
     /// guest as the next `/dev/vd*` after the root disk in call order. Validated at
     /// [`build`](Self::build).
     #[must_use]
@@ -900,7 +900,7 @@ impl VmConfigBuilder {
     }
 
     /// Appends one append-only extra kernel command-line argument
-    /// ([`VmConfig::extra_kernel_args`], §E2.1). Rejected at [`build`](Self::build) if
+    /// ([`VmConfig::extra_kernel_args`], §19.2.1). Rejected at [`build`](Self::build) if
     /// it collides with a reserved token vmcell owns or is not a single safe token.
     #[must_use]
     pub fn with_kernel_arg(mut self, arg: impl Into<String>) -> Self {
@@ -908,7 +908,7 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Overrides the guest `init=` target ([`VmConfig::init`], §E2.2). A custom init
+    /// Overrides the guest `init=` target ([`VmConfig::init`], §19.2.2). A custom init
     /// **replaces** the vmcell guest agent, forgoing the vsock control plane; validated
     /// at [`build`](Self::build), which also rejects it combined with `snapshotting`.
     #[must_use]
@@ -1103,7 +1103,7 @@ impl VmConfigBuilder {
         }
 
         if self.snapshotting {
-            // A custom init replaces the vmcell guest agent (§E2.2), and the mandatory
+            // A custom init replaces the vmcell guest agent (§19.2.2), and the mandatory
             // post-restore resync — clock, entropy reseed, MAC/IP rotation (§12.4) —
             // runs *through* that agent. A restored custom-init clone would be stranded
             // on frozen identity with no way to fix it from inside (silently dead
@@ -1256,7 +1256,7 @@ impl VmConfigBuilder {
         }
 
         // Extra virtio-blk device images: absolute, non-empty, no duplicate backing
-        // file (§E1.4). Existence is deliberately NOT checked here (consistent with
+        // file (§19.1.4). Existence is deliberately NOT checked here (consistent with
         // the rootfs/share paths — the image may be created later); a bad path fails
         // loud at `create()`. A duplicate image is a rw corruption footgun (two
         // attachments of one file), so it is rejected at the boundary.
@@ -1279,7 +1279,7 @@ impl VmConfigBuilder {
                     disk.image.display()
                 )));
             }
-            // Disk-I/O fault injection (§E5): a limit must actually limit something, and
+            // Disk-I/O fault injection (§19.5): a limit must actually limit something, and
             // a set cap must be > 0 — a 0-byte/s or 0-IOPS bucket would wedge all I/O
             // (never refills), a silent deadlock. Reject both fail-loud at the boundary.
             if let Some(limit) = &disk.io_limit {
@@ -1299,14 +1299,14 @@ impl VmConfigBuilder {
         }
 
         // A custom `init=` override is a single load-bearing cmdline token selecting
-        // PID 1, so it is validated at the boundary (§E2.2): absolute, UTF-8, no
+        // PID 1, so it is validated at the boundary (§19.2.2): absolute, UTF-8, no
         // whitespace/control chars that could forge a second boot token.
         if let Some(init) = &self.init {
             validate_init_path(init).map_err(crate::error::Error::Config)?;
         }
 
         // Append-only extra kernel args: each a single safe token whose key does not
-        // collide with a reserved boot token vmcell owns (§E2.1).
+        // collide with a reserved boot token vmcell owns (§19.2.1).
         for arg in &self.extra_kernel_args {
             validate_extra_kernel_arg(arg).map_err(crate::error::Error::Config)?;
         }
@@ -2250,7 +2250,7 @@ mod tests {
         assert_ne!(virtio_cfg.console_mode, ConsoleMode::Uart);
     }
 
-    // §E1: BlockDevice constructors set the readonly flag; a swapped arm (read_only
+    // §19.1: BlockDevice constructors set the readonly flag; a swapped arm (read_only
     // marking rw, or vice versa) reddens here.
     #[test]
     fn block_device_constructors() {
@@ -2261,7 +2261,7 @@ mod tests {
         assert!(!rw.readonly);
     }
 
-    // §E1: the builder carries extra_disks onto the built config in order, default
+    // §19.1: the builder carries extra_disks onto the built config in order, default
     // empty. Buggy impl: the builder drops the field.
     #[test]
     fn builder_carries_extra_disks() {
@@ -2292,7 +2292,7 @@ mod tests {
         assert!(!cfg.extra_disks[1].readonly);
     }
 
-    // §E1.4: build() rejects an empty / relative / duplicate extra-disk image. Buggy
+    // §19.1.4: build() rejects an empty / relative / duplicate extra-disk image. Buggy
     // impl: any of these reaches create() and fails late (or attaches one file twice).
     #[test]
     fn reject_bad_extra_disk_image() {
@@ -2334,7 +2334,7 @@ mod tests {
         );
     }
 
-    // §E1.4 positive control: a valid extra disk with an absolute path builds — the
+    // §19.1.4 positive control: a valid extra disk with an absolute path builds — the
     // over-rejection inverse (rejecting every extra disk) reddens here.
     #[test]
     fn accept_valid_extra_disk() {
@@ -2349,7 +2349,7 @@ mod tests {
         .expect("a valid absolute extra-disk image must build");
     }
 
-    // §E5: DiskIoLimit constructors set the intended cap and leave the other unset; a
+    // §19.5: DiskIoLimit constructors set the intended cap and leave the other unset; a
     // swapped arm (bandwidth() setting iops) reddens here.
     #[test]
     fn disk_io_limit_constructors() {
@@ -2361,7 +2361,7 @@ mod tests {
         assert_eq!(ops.bandwidth_bytes_per_sec, None);
     }
 
-    // §E5: `with_io_limit` carries the limit onto the built disk; default is None.
+    // §19.5: `with_io_limit` carries the limit onto the built disk; default is None.
     #[test]
     fn builder_carries_disk_io_limit() {
         let cfg = VmConfig::builder(
@@ -2384,7 +2384,7 @@ mod tests {
         );
     }
 
-    // §E5: build() rejects an io_limit that limits nothing, or a 0 cap (which would
+    // §19.5: build() rejects an io_limit that limits nothing, or a 0 cap (which would
     // wedge all I/O — a silent deadlock). A genuine cap builds. Buggy impl: either is
     // accepted and the VM boots with a dead or no-op limiter.
     #[test]
@@ -2421,7 +2421,7 @@ mod tests {
         .expect("a genuine io_limit must build");
     }
 
-    // §E2.2: the builder carries the init override and defaults to None. Buggy impl:
+    // §19.2.2: the builder carries the init override and defaults to None. Buggy impl:
     // the builder drops the field.
     #[test]
     fn builder_carries_init_override() {
@@ -2447,7 +2447,7 @@ mod tests {
         assert_eq!(custom.init, Some(PathBuf::from("/bin/sh")));
     }
 
-    // §E2.2: `validate_init_path` rejects a relative path, whitespace, and control
+    // §19.2.2: `validate_init_path` rejects a relative path, whitespace, and control
     // chars (a space forges a second cmdline token); accepts a clean absolute path.
     #[test]
     fn init_path_validation() {
@@ -2466,7 +2466,7 @@ mod tests {
         }
     }
 
-    // §E2.2: build() rejects snapshotting + a custom init (the post-restore resync
+    // §19.2.2: build() rejects snapshotting + a custom init (the post-restore resync
     // needs the agent a custom init replaces). Buggy impl: the combination builds and
     // a restored clone silently strands on frozen identity.
     #[test]
@@ -2499,7 +2499,7 @@ mod tests {
         .expect("a custom init without snapshotting must build");
     }
 
-    // §E2.1: `is_reserved_cmdline_arg` flags every token vmcell owns (by exact key or
+    // §19.2.1: `is_reserved_cmdline_arg` flags every token vmcell owns (by exact key or
     // the vmcell_ prefix) and lets a genuine custom arg through. Buggy impl: a missing
     // reserved key lets an extra arg clobber a load-bearing token.
     #[test]
@@ -2535,7 +2535,7 @@ mod tests {
         }
     }
 
-    // §E2.1: build() rejects an extra arg that clobbers a reserved token, spoofs a
+    // §19.2.1: build() rejects an extra arg that clobbers a reserved token, spoofs a
     // vmcell_ token, or carries whitespace; accepts a genuine custom arg.
     #[test]
     fn reject_bad_extra_kernel_arg() {
@@ -2576,7 +2576,7 @@ mod tests {
         assert_eq!(cfg.extra_kernel_args, vec!["mitigations=off", "nokaslr"]);
     }
 
-    // §E2.2: the init override replaces the default `init=` token — exactly one
+    // §19.2.2: the init override replaces the default `init=` token — exactly one
     // `init=`, and `root=`/`vmcell_vmid=` stay intact. Buggy impls: appending a second
     // `init=` alongside the default (a clobber + boot hazard), or ignoring the override.
     #[test]
@@ -2623,7 +2623,7 @@ mod tests {
         );
     }
 
-    // §E2.1: append-only args land AFTER every reserved token, in order. Buggy impl:
+    // §19.2.1: append-only args land AFTER every reserved token, in order. Buggy impl:
     // args spliced before the reserved block, or dropped.
     #[test]
     fn build_kernel_cmdline_appends_extra_args_last() {
@@ -2652,7 +2652,7 @@ mod tests {
         );
     }
 
-    // §E2.1 the ONE-LAW GATE: every token `build_kernel_cmdline` emits has a reserved
+    // §19.2.1 the ONE-LAW GATE: every token `build_kernel_cmdline` emits has a reserved
     // key (or the vmcell_ prefix), so `is_reserved_cmdline_arg` — and hence the
     // append-only guard — can never fall out of sync with the builder. Add a new
     // builder token without reserving its key ⇒ this reddens.

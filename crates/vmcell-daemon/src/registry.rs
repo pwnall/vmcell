@@ -1,8 +1,8 @@
-//! The VM registry — the daemon's **owned**, in-process table of live VMs (design v21 §D4).
+//! The VM registry — the daemon's **owned**, in-process table of live VMs (design §18.4).
 //!
 //! The daemon is the single owner of every VM it starts: it holds the `MicroVm` handle (through the
 //! [`VmHandle`] seam), so the VMM process and its netns/tap/cgroup/scratch stay alive as long as the
-//! handle is held, and **`Drop` releases them** in order (v20 §12.10 — the invariant is preserved, not
+//! handle is held, and **`Drop` releases them** in order (§12.10 — the invariant is preserved, not
 //! abandoned). `destroy` is the graceful path (`MicroVm::shutdown`); dropping the registry (daemon
 //! exit) runs each VM's ordered `Drop`. A hard-killed daemon leaks resources, which the **start-up
 //! orphan sweep** (`vmcell::orchestrator::sweep_orphans`, wired in `vmcelld`) reclaims on the next boot.
@@ -33,7 +33,7 @@ struct VmSlot {
     vmid: u32,
     kernel: String,
     rootfs: String,
-    /// The extra-disk artifact names this VM pins (design v22 §E4) — read lock-free by
+    /// The extra-disk artifact names this VM pins (design §19.4) — read lock-free by
     /// the delete-in-use guard, like `kernel`/`rootfs`.
     extra_disks: Vec<String>,
     vcpus: u8,
@@ -108,7 +108,7 @@ impl Registry {
 
     /// Resolves a kernel/rootfs artifact name to an existing file path, or a typed error.
     fn resolve_existing(&self, name: &str, role: &str) -> DaemonResult<PathBuf> {
-        let path = self.artifacts.path_for(name)?; // validates the name (invariant §D9.1)
+        let path = self.artifacts.path_for(name)?; // validates the name (invariant §12.13)
         if !path.is_file() {
             return Err(DaemonError::BadRequest(format!(
                 "{role} artifact {name:?} does not exist in the store; upload it first"
@@ -126,7 +126,7 @@ impl Registry {
             .ok_or_else(|| DaemonError::NotFound(format!("no vm {id}")))
     }
 
-    /// Creates and boots a VM the registry then **owns** (design v21 §D5.1). With a `command`, also
+    /// Creates and boots a VM the registry then **owns** (design §18.5.1). With a `command`, also
     /// execs it; with `ephemeral`, tears it down after — the `run` one-shot.
     ///
     /// # Errors
@@ -140,7 +140,7 @@ impl Registry {
         {
             return Err(DaemonError::BadRequest("command must be non-empty".into()));
         }
-        // Fail loud early on a snapshot-ineligible request (design v20 §12.1), rather than deferring to
+        // Fail loud early on a snapshot-ineligible request (design §12.1), rather than deferring to
         // the config builder's `Error`.
         if req.snapshotting && !req.net.snapshot_eligible() {
             return Err(DaemonError::BadRequest(format!(
@@ -149,7 +149,7 @@ impl Registry {
             )));
         }
         // Resolve a `restore_from` prefix to its snapshot directory in the store (the same validated
-        // single-component join as any artifact, invariant §D9.1).
+        // single-component join as any artifact, invariant §12.13).
         let restore_from = match &req.restore_from {
             Some(prefix) => {
                 validate_artifact_name(prefix)?;
@@ -164,7 +164,7 @@ impl Registry {
             None => None,
         };
         // Resolve each extra-disk artifact name to a read-only BlockDevice (the store is
-        // immutable, §E4), translating any io_limit (§E5). The names are pinned on the
+        // immutable, §19.4), translating any io_limit (§19.5). The names are pinned on the
         // slot below so `is_artifact_in_use` refuses to delete a disk a live VM uses.
         let mut extra_disks = Vec::with_capacity(req.extra_disks.len());
         for spec in &req.extra_disks {
@@ -271,10 +271,10 @@ impl Registry {
     ///
     /// # Errors
     /// [`DaemonError::InvalidName`] for a bad prefix, [`DaemonError::NotFound`]/[`DaemonError::Conflict`],
-    /// or the mapped snapshot error (`Unsupported` for an ineligible config, design v20 §12.1).
+    /// or the mapped snapshot error (`Unsupported` for an ineligible config, design §12.1).
     pub async fn snapshot(&self, id: &VmId, artifact_prefix: &str) -> DaemonResult<SnapshotInfo> {
         // The prefix names a subdirectory of the artifact store — validate it as a single safe
-        // component (invariant §D9.1) so a snapshot cannot escape the store.
+        // component (invariant §12.13) so a snapshot cannot escape the store.
         validate_artifact_name(artifact_prefix)?;
         let out_dir = self.artifacts.dir().join(artifact_prefix);
         std::fs::create_dir_all(&out_dir).map_err(|e| {
@@ -323,8 +323,8 @@ impl Registry {
     }
 
     /// Whether any owned VM pins `artifact_name` as its kernel, rootfs, or one of its
-    /// extra disks (design v22 §E4) — read lock-free off the immutable slot fields
-    /// (design v21 §D3.2, the delete-in-use guard).
+    /// extra disks (design §19.4) — read lock-free off the immutable slot fields
+    /// (design §18.3.2, the delete-in-use guard).
     pub async fn is_artifact_in_use(&self, artifact_name: &str) -> bool {
         self.vms.lock().await.values().any(|s| {
             s.kernel == artifact_name
@@ -543,7 +543,7 @@ mod tests {
         assert!(!reg.is_artifact_in_use("vmlinux").await, "pins released");
     }
 
-    // §E4: an extra-disk artifact is resolved and PINNED by the live VM, so the
+    // §19.4: an extra-disk artifact is resolved and PINNED by the live VM, so the
     // delete-in-use guard refuses it; the pin releases on teardown. Buggy impl:
     // `is_artifact_in_use` ignores extra disks and the disk is deletable out from
     // under the running VM.
@@ -568,7 +568,7 @@ mod tests {
         );
     }
 
-    // §E4: a missing extra-disk artifact is a fail-loud BadRequest at create (the same
+    // §19.4: a missing extra-disk artifact is a fail-loud BadRequest at create (the same
     // "upload it first" contract as kernel/rootfs), not a late launch error.
     #[tokio::test]
     async fn create_rejects_missing_extra_disk_artifact() {

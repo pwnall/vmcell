@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Self-test for scripts/ban-legacy-terms.sh (design v14 §10.7 regression gate). Builds a fixture
-# tree and asserts the scanner goes RED on each retired token and GREEN on clean code, on the
-# retained capitalized `Imp` harness, on `implementation`/`import`, and on a per-line exemption.
+# tree and asserts the scanner goes RED on each retired token — including the standalone capitalized
+# `Imp` origin-harness name — and GREEN on clean code, on the English words
+# `implementation`/`import`/`impl`, and on a per-line exemption.
 # This is the "red on the inverse" guard: drop any banned pattern from the scanner and a fixture
 # below stops being flagged; break comment-stripping and the prose fixture trips; break the
 # exemption marker and the exempted fixture trips.
@@ -22,10 +23,12 @@ printf 'fn b() { let _ = "imp-guest-agent"; }\n'             > "$work/src/binnam
 printf 'fn k() { let _ = std::env::var("IMP_KERNEL"); }\n'   > "$work/src/envvar.rs"
 printf 'fn t() { let _ = "imp-tap0"; }\n'                    > "$work/src/prefix.rs"
 printf 'fn v() { let _ = imp_vmid(5); }\n'                   > "$work/src/ident.rs"
+printf 'struct Imp;\nconst H: &str = "Imp'"'"'s cell";\n'   > "$work/src/cap_imp.rs"
 
 # --- MUST NOT be flagged ------------------------------------------------------------------
-# The retained capitalized harness `Imp` (§10.7-C), plus the English words implementation/import.
-printf 'struct Imp;\nimpl Imp { fn go(&self) {} }\nfn implementation_detail() {}\nfn importer() {}\n// Imp'"'"'s harness retained per §10.7-C\n' > "$work/src/origin.rs"
+# The ordinary English words implementation/import/impl — never flagged, because `Imp`/`imp` is
+# followed by a word character (so the standalone-`Imp` and `imp-`/`imp_` patterns can't match).
+printf 'fn implementation_detail() {}\nfn importer() {}\nimpl Foo {}\nstruct Foo;\n' > "$work/src/origin.rs"
 # Clean renamed code.
 printf 'struct VmCell;\nfn spawn() { let _ = "vmcell-vm-spawn"; }\n'        > "$work/src/clean.rs"
 # A genuinely-justified legacy mention carrying the per-line exemption marker.
@@ -55,6 +58,7 @@ expect_flag binname.rs
 expect_flag envvar.rs
 expect_flag prefix.rs
 expect_flag ident.rs
+expect_flag cap_imp.rs
 expect_clean origin.rs
 expect_clean clean.rs
 expect_clean exempt.rs
@@ -62,7 +66,7 @@ expect_clean prose.rs
 
 # Cross-check: a fully-clean tree exits 0 with the "ok:" line.
 mkdir -p "$work/clean"
-printf 'struct Imp;\nfn implementation_detail() {}\nfn spawn() { let _ = "vmcell"; }\n' > "$work/clean/a.rs"
+printf 'struct VmCell;\nfn implementation_detail() {}\nfn spawn() { let _ = "vmcell"; }\n' > "$work/clean/a.rs"
 set +e
 clean_out="$("$ban" "$work/clean" 2>&1)"
 clean_rc=$?

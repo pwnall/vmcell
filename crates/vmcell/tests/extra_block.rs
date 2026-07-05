@@ -3,7 +3,7 @@ use vmcell::orchestrator::RealClock;
 
 mod common;
 
-// §E1: extra virtio-blk devices are attached AFTER the root disk, so they enumerate
+// §19.1: extra virtio-blk devices are attached AFTER the root disk, so they enumerate
 // `/dev/vdb`, `/dev/vdc`, … in order. This is a DATA-PLANE test (AGENTS.md "assert on
 // the data plane"): it reads a marker written into a read-only extra image back off
 // `/dev/vdb` in-guest, and round-trips a marker through a read-write extra disk
@@ -80,7 +80,7 @@ async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-// §E5: disk-I/O fault injection — a DiskIoLimit throttles the device's bandwidth. This
+// §19.5: disk-I/O fault injection — a DiskIoLimit throttles the device's bandwidth. This
 // is a self-calibrating DATA-PLANE test: read an un-throttled disk (/dev/vdb) and a
 // throttled one (/dev/vdc, 1 MiB/s) of the same size in the same VM, and assert the
 // throttled read is both slow in absolute terms AND much slower than the un-throttled
@@ -168,7 +168,7 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-// §E1.3: "plain virtio-blk composes with snapshot" (v20 §17) — the V:high headline
+// §19.1.3: "plain virtio-blk composes with snapshot" (§17) — the V:high headline
 // claim, proven on the DATA PLANE. A marker written into a writable extra disk before
 // snapshot must be readable off `/dev/vdb` after a restore into a fresh VM. Extra disks
 // are plain virtio-blk (not vhost-user), so they do NOT disqualify snapshot (§12.1);

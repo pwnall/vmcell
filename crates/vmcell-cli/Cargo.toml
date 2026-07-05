@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "The vmcell command-line tool: the composition root that wires vmcell with the in-VM builder crates"
 publish = false
 
-# The `vmcell` command. This is the composition root (design v20 §10.1): it depends on
+# The `vmcell` command. This is the composition root (design §10.1): it depends on
 # `vmcell` AND the two in-VM builder crates and assembles the artifact `Pipeline`, choosing
 # bootstrap vs in-VM builders per `--rootfs-source` / `--kernel-source`. It lives OUTSIDE the
 # `vmcell` package so the dependency graph stays acyclic (a CLI in `vmcell` that constructed

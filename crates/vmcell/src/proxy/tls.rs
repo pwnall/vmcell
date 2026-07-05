@@ -117,7 +117,7 @@ impl CaManager {
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             let mut dn = DistinguishedName::new();
             dn.push(DnType::OrganizationName, "vmcell Framework");
-            dn.push(DnType::CommonName, "Imp MITM CA");
+            dn.push(DnType::CommonName, "vmcell MITM CA");
             params.distinguished_name = dn;
             let cert = params
                 .self_signed(&key_pair)

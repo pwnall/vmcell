@@ -1217,9 +1217,9 @@ mod tests {
         .expect("build eligible config");
         assert!(!config_has_vhost_user_device(&eligible, &res_with(None)));
 
-        // §E1.3: an extra PLAIN virtio-blk device is NOT a vhost-user device, so it
+        // §19.1.3: an extra PLAIN virtio-blk device is NOT a vhost-user device, so it
         // must stay snapshot-eligible ("plain virtio-blk composes with snapshot",
-        // v20 §17/§5.1). A false positive here would wrongly disqualify snapshot.
+        // §17/§5.1). A false positive here would wrongly disqualify snapshot.
         // Inverse: add an `extra_disks` term to `config_has_vhost_user_device` and
         // this reddens.
         let with_extra_disk = VmConfig::builder(

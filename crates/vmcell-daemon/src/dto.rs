@@ -1,5 +1,5 @@
 //! The request/response wire types (DTOs) — the schema shared by the daemon server and the
-//! `vmcell-daemon-client` (design v21 §D5/§D7). Compiled with **no** feature gate so a request the
+//! `vmcell-daemon-client` (design §18.5/§18.7). Compiled with **no** feature gate so a request the
 //! client serializes and the server deserializes are the SAME Rust type — the wire schema is
 //! single-sourced (invariant: one law, one predicate for the schema).
 //!
@@ -10,7 +10,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-/// An opaque, server-minted VM handle id (design v21 §D4). Readable prefix + randomness so ids are
+/// An opaque, server-minted VM handle id (design §18.4). Readable prefix + randomness so ids are
 /// unguessable and never reused within a process. NOT the network VMID (that is an internal octet).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -29,7 +29,7 @@ impl std::str::FromStr for VmId {
     }
 }
 
-/// The lifecycle state of a registered VM (design v21 §D4). Derived from the handle, not a hopeful
+/// The lifecycle state of a registered VM (design §18.4). Derived from the handle, not a hopeful
 /// label — `Ready` means the agent handshake succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,7 +58,7 @@ pub struct ArtifactInfo {
     pub sha256: String,
 }
 
-/// The guest networking mode for a created VM (design v21 §D5.1). The daemon holds the caps for the
+/// The guest networking mode for a created VM (design §18.5.1). The daemon holds the caps for the
 /// privileged path, so all three are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -74,7 +74,7 @@ pub enum NetMode {
 }
 
 impl NetMode {
-    /// Whether a VM with this net mode can be snapshotted (no vhost-user device, design v20 §12.1).
+    /// Whether a VM with this net mode can be snapshotted (no vhost-user device, design §12.1).
     #[must_use]
     pub const fn snapshot_eligible(self) -> bool {
         !matches!(self, Self::Unprivileged)
@@ -82,7 +82,7 @@ impl NetMode {
 }
 
 /// The wire form of a [`vmcell::DiskIoLimit`](vmcell::config::DiskIoLimit) — disk-I/O
-/// fault injection (design v22 §E5). At least one cap must be set and any set cap must
+/// fault injection (design §19.5). At least one cap must be set and any set cap must
 /// be `> 0`; the library's `build()` enforces both fail-loud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DiskIoLimitDto {
@@ -94,11 +94,11 @@ pub struct DiskIoLimitDto {
     pub iops: Option<u64>,
 }
 
-/// An extra virtio-blk device for a created VM (design v22 §E4), backed by an artifact
+/// An extra virtio-blk device for a created VM (design §19.4), backed by an artifact
 /// in the store. The store is **immutable** (create-only, no update), so an extra disk
 /// is attached **read-only** — a shared store artifact must not be mutated out from
 /// under other VMs (a writable-scratch-from-artifact copy is forward work). An optional
-/// `io_limit` injects disk-I/O faults (§E5).
+/// `io_limit` injects disk-I/O faults (§19.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtraDiskSpec {
     /// Artifact name of the disk image (resolved against the store like `kernel`/`rootfs`).
@@ -108,7 +108,7 @@ pub struct ExtraDiskSpec {
     pub io_limit: Option<DiskIoLimitDto>,
 }
 
-/// Create-and-boot a VM (`POST /v1/vms`). Mirrors `vmcell run`/`create` (design v21 §D5.1), but
+/// Create-and-boot a VM (`POST /v1/vms`). Mirrors `vmcell run`/`create` (design §18.5.1), but
 /// `kernel`/`rootfs` are artifact **names** resolved against the daemon's store — never host paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateVmRequest {
@@ -126,7 +126,7 @@ pub struct CreateVmRequest {
     #[serde(default)]
     pub net: NetMode,
     /// Boot a **snapshot-eligible** VM (so it can later be snapshotted). Rejected fail-loud with a
-    /// non-eligible config (e.g. `net: unprivileged`, design v20 §12.1).
+    /// non-eligible config (e.g. `net: unprivileged`, design §12.1).
     #[serde(default)]
     pub snapshotting: bool,
     /// Restore from a snapshot in the artifact store under this prefix (written by
@@ -143,11 +143,11 @@ pub struct CreateVmRequest {
     #[serde(default)]
     pub ephemeral: bool,
     /// Extra read-only virtio-blk devices from the store, enumerated in the guest as
-    /// `/dev/vdb`, `/dev/vdc`, … (design v22 §E4). A live VM pins these artifacts (delete
-    /// is refused while in use). Optionally throttled for disk-I/O fault injection (§E5).
+    /// `/dev/vdb`, `/dev/vdc`, … (design §19.4). A live VM pins these artifacts (delete
+    /// is refused while in use). Optionally throttled for disk-I/O fault injection (§19.5).
     #[serde(default)]
     pub extra_disks: Vec<ExtraDiskSpec>,
-    /// Append-only extra kernel command-line arguments (design v22 §E2.1). Cannot
+    /// Append-only extra kernel command-line arguments (design §19.2.1). Cannot
     /// override a boot token vmcell owns — rejected fail-loud at build. (A custom `init=`
     /// override is deliberately **not** exposed here: it replaces the guest agent, so the
     /// daemon — which owns the VM through the vsock control plane — could not `exec` or
@@ -189,7 +189,7 @@ impl CreateVmRequest {
         self
     }
 
-    /// Attaches an extra read-only disk artifact by name (builder-style, §E4).
+    /// Attaches an extra read-only disk artifact by name (builder-style, §19.4).
     #[must_use]
     pub fn with_extra_disk(mut self, name: impl Into<String>) -> Self {
         self.extra_disks.push(ExtraDiskSpec {
@@ -199,7 +199,7 @@ impl CreateVmRequest {
         self
     }
 
-    /// Appends one append-only extra kernel arg (builder-style, §E2.1).
+    /// Appends one append-only extra kernel arg (builder-style, §19.2.1).
     #[must_use]
     pub fn with_kernel_arg(mut self, arg: impl Into<String>) -> Self {
         self.extra_kernel_args.push(arg.into());
@@ -250,7 +250,7 @@ pub struct VmInfo {
     pub mem_mib: u32,
 }
 
-/// The response to `POST /v1/vms` (design v21 §D5.1). Always carries the VM's info; when the request
+/// The response to `POST /v1/vms` (design §18.5.1). Always carries the VM's info; when the request
 /// included a `command`, also carries the captured `exec` outcome (and, if `ephemeral`, the VM has
 /// already been torn down).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,7 +335,7 @@ impl ExecOutcomeDto {
 }
 
 /// Resource usage (`GET /v1/vms/{id}/stats`). Mirrors `vmcell::ResourceUsage` field-for-field,
-/// including the honest `*_read_ok` capability flags (design v20 §7.2 — a flag reflects empirically
+/// including the honest `*_read_ok` capability flags (design §7.2 — a flag reflects empirically
 /// validated behavior, not a hopeful default).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceUsageDto {
@@ -367,7 +367,7 @@ pub struct SnapshotRequest {
 }
 
 /// The result of a `POST /v1/vms/{id}/snapshot` — the artifact names the snapshot landed under, so a
-/// later `create` can restore by name (design v21 §D5.1).
+/// later `create` can restore by name (design §18.5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotInfo {
     /// The artifact-store subdirectory prefix the snapshot was written under.
@@ -376,7 +376,7 @@ pub struct SnapshotInfo {
     pub files: Vec<String>,
 }
 
-/// A structured error body (design v21 §D5.3). `error` is the machine-matchable kind
+/// A structured error body (design §18.5.3). `error` is the machine-matchable kind
 /// ([`ErrorKind`]); `message` is the human `Display` — never a `Debug` struct-dump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
@@ -387,7 +387,7 @@ pub struct ErrorBody {
 }
 
 /// The machine-matchable error kinds carried in [`ErrorBody::error`] and mapped to HTTP status by
-/// the server (design v21 §D5.3). Kept as a small enum with a stable string form so the client can
+/// the server (design §18.5.3). Kept as a small enum with a stable string form so the client can
 /// branch on the same conditions the server names — matchability across the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -526,7 +526,7 @@ mod tests {
         assert!(req.extra_kernel_args.is_empty());
     }
 
-    // v22 §E4/§E5: an extra-disk spec with an io_limit parses, and the io_limit fields
+    // §19.4/§19.5: an extra-disk spec with an io_limit parses, and the io_limit fields
     // default to None (bandwidth-only / iops-only / unlimited all expressible).
     #[test]
     fn extra_disk_spec_parses_with_io_limit() {

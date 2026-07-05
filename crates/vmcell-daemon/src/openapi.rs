@@ -1,5 +1,5 @@
-//! The served OpenAPI 3.1 document, generated from ONE route table (design v21 §D5.2 / invariant
-//! §D9.4).
+//! The served OpenAPI 3.1 document, generated from ONE route table (design §18.5.2 / invariant
+//! §12.16).
 //!
 //! [`API_ROUTES`] is the single source of truth: the axum router ([`crate::server`]) mounts exactly
 //! these routes and the OpenAPI document is built from them, so the served spec cannot drift from the
@@ -25,7 +25,7 @@ pub struct RouteDef {
     pub summary: &'static str,
 }
 
-/// The single source of truth for the API surface (design v21 §D5.1).
+/// The single source of truth for the API surface (design §18.5.1).
 pub const API_ROUTES: &[RouteDef] = &[
     RouteDef {
         method: "PUT",
@@ -120,7 +120,7 @@ pub const API_ROUTES: &[RouteDef] = &[
     },
 ];
 
-/// The exact set of unauthenticated route paths (design v21 §D9.3). Everything else is guarded.
+/// The exact set of unauthenticated route paths (design §12.15). Everything else is guarded.
 pub const OPEN_ROUTES: &[&str] = &["/healthz", "/openapi.json"];
 
 /// Converts an OpenAPI-style path (`/v1/vms/{id}`) to the axum 0.7 form (`/v1/vms/:id`).
@@ -140,7 +140,7 @@ pub fn axum_path(openapi_path: &str) -> String {
 }
 
 /// Builds the OpenAPI 3.1 document from [`API_ROUTES`] — the single generator, so the doc and the
-/// router share one table (invariant §D9.4).
+/// router share one table (invariant §12.16).
 #[must_use]
 pub fn openapi_document() -> Value {
     let mut paths = serde_json::Map::new();
@@ -152,7 +152,7 @@ pub fn openapi_document() -> Value {
         op.insert("summary".into(), json!(r.summary));
         op.insert(
             "responses".into(),
-            json!({ "default": { "description": "See the design doc (v21 §D5)." } }),
+            json!({ "default": { "description": "See the design doc (§18.5)." } }),
         );
         if r.authenticated {
             op.insert("security".into(), json!([{ "bearerAuth": [] }]));
@@ -166,7 +166,7 @@ pub fn openapi_document() -> Value {
         "openapi": "3.1.0",
         "info": {
             "title": "vmcelld control-plane API",
-            "description": "The vmcell daemon HTTP REST API (design v21 §D).",
+            "description": "The vmcell daemon HTTP REST API (design §D).",
             "version": "1",
         },
         "paths": Value::Object(paths),
@@ -183,7 +183,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    // The document's path set equals the route table's path set (invariant §D9.4). RED on the
+    // The document's path set equals the route table's path set (invariant §12.16). RED on the
     // inverse: a route added to the table but not the doc, or vice versa.
     #[test]
     fn document_paths_match_route_table() {
@@ -213,7 +213,7 @@ mod tests {
     }
 
     // Every authenticated operation carries the bearer security requirement, and the ONLY open
-    // routes are the two named ones (invariant §D9.3). RED on a route that forgot auth.
+    // routes are the two named ones (invariant §12.15). RED on a route that forgot auth.
     #[test]
     fn auth_coverage_matches_open_route_set() {
         let doc = openapi_document();

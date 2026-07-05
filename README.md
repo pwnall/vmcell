@@ -1,6 +1,6 @@
 # vmcell
 
-An end-to-end integration-testing and evaluation platform for the Imp agentic harness.
+An end-to-end integration-testing and evaluation platform for a hypothetical agentic harness.
 Each test runs in a fresh micro-VM for structural isolation, hermetic state, and production fidelity.
 Driven entirely from a single Rust library, organized as a cargo **workspace**: the `vmcell` library
 (plus its CLI) and four lean member crates — `vmcell-protocol` (the shared wire enum),
@@ -24,7 +24,7 @@ out. Build it with `cargo build` (the default feature set) and run subcommands w
 | `stats --kernel K --rootfs R` | Boot a micro-VM, sample resource usage, print it as JSON, tear down. |
 | `bundle [-o manifest.json]` | Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel/rootfs/CA/pins.json). |
 | `verify-bundle [-m manifest.json]` | Re-hash every artifact in a manifest and fail loud on any mismatch. |
-| `exec` / `ls` / `rm` / `destroy` | Deferred to the future `impd` daemon (need a cross-process VM registry); these fail loud with a typed error. |
+| `exec` / `ls` / `rm` / `destroy` | Deferred to the `vmcelld` daemon (§18) (need a cross-process VM registry); these fail loud with a typed error. |
 
 ## Development
 

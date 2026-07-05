@@ -166,7 +166,7 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Test OOM-kill (TESTS-FEATURES-1): the host cgroup cap (256 MiB) is the binding limit
     // below the 512 MiB guest RAM, so a runaway allocation trips the HOST OOM killer
     // (memory.events oom_kill). This is the extracted `checks::metrics_mem_limit_ooms` the
-    // validator runs (v20 §7) — one implementation of the OOM-observation.
+    // validator runs (§7) — one implementation of the OOM-observation.
     vmcell_artifact_validator::checks::metrics_mem_limit_ooms(&mut vm)
         .await
         .expect("host cgroup memory cap must be the binding OOM limit");

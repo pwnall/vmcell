@@ -1,5 +1,5 @@
 //! The one place that composes every **swept per-VM host resource name** from a single configurable
-//! prefix (design v21; AGENTS.md "one law, one predicate").
+//! prefix (design; AGENTS.md "one law, one predicate").
 //!
 //! A VM leaks four kinds of host resource if it dies ungracefully: a network namespace, a tap
 //! interface, a cgroup slice, and a scratch directory. The orphan sweep

@@ -55,7 +55,7 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
     std::fs::create_dir_all(&out_dir).unwrap();
 
     // Seed the read-only share with the exact content the shared `checks::virtiofs_shares`
-    // expects (v20 §5.2); the RO-read / RO-write-EROFS / RW-visible contract lives in that one
+    // expects (§5.2); the RO-read / RO-write-EROFS / RW-visible contract lives in that one
     // extracted function the validator also runs.
     std::fs::write(in_dir.join("input.txt"), "hello world").unwrap();
 

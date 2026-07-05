@@ -64,29 +64,29 @@ what remains forward work.
 
 ## v21 — control-plane daemon (`vmcelld`) + client
 
-Design: `docs/53-claude-design-v21.md`. New crates: `vmcell-privilege`, `vmcell-daemon`, `vmcelld`,
-`vmcell-daemon-client`, `vmcelld-ctl`. Fold the settled entries into the design body and delete them here
-as they stabilize.
+Design: `docs/59-claude-design-v23.md` §18 (unified; was `docs/historical/53-claude-design-v21.md`). New
+crates: `vmcell-privilege`, `vmcell-daemon`, `vmcelld`, `vmcell-daemon-client`, `vmcelld-ctl`. Fold the
+settled entries into the design body and delete them here as they stabilize.
 
 - **(a) The daemon OWNS its VMs (holds the `MicroVm` handles); it is not stateless.** An earlier draft
   explored a stateless daemon (detached VMs + on-disk descriptors + reattach). *Reason it was dropped:* it
   needed a new vmcell detach/reattach primitive AND abandoned the "`Drop` releases resources" invariant.
   The owning model reuses the single-process `MicroVm` ownership in-process, needs **no** vmcell change,
   and keeps teardown-is-ownership intact; crash recovery is the **start-up `sweep_orphans`** (empty live
-  set) instead of reattach. See §D4.
+  set) instead of reattach. See §18.4.
 
 - **(b) `vmcelld` is NOT blessed on the dev hot path — it is launched through the blessed
   `vmcell-test-runner`, which confers the caps via the ambient set.** `just bless` blesses only the runner
   (which rarely changes); `vmcell-daemon`/`vmcelld` rebuild with no `setcap` churn. *Reason:* the same
   file-cap-churn problem the runner already solved for the ever-changing test binaries. Standalone/prod
-  `vmcelld` uses systemd `AmbientCapabilities=` or a one-off `setcap`. See §D2.
+  `vmcelld` uses systemd `AmbientCapabilities=` or a one-off `setcap`. See §18.2.
 
 - **(c) INVERTED launch for integration vs. manual.** Integration tests wrap the **test binary** with the
   runner (nextest target-runner) so the test itself holds the caps, and spawn `vmcelld` **directly** (it
   inherits the ambient caps). *Reason:* a privileged test can plant privileged pre-existing state (an
   orphan netns for the start-up-sweep test) and inspect per-VM teardown residue — things a
   `vmcelld`-via-runner spawn from an unprivileged test cannot. Manual poking (`just daemon`) still launches
-  `vmcelld` *through* the runner (no privileged test process to inherit from). See §D10, `just test-daemon`.
+  `vmcelld` *through* the runner (no privileged test process to inherit from). See §14, `just test-daemon`.
 
 - **(d) `mem_read_ok`/`limits_enforced` both mean "the memory controller is delegated into the per-VM
   slice" — memory metrics are UNREADABLE (not just unenforced) without a delegated cgroup scope.** An
@@ -97,9 +97,9 @@ as they stabilize.
 - **(e) Snapshot/restore/net knobs on the daemon API.** `CreateVmRequest` gained `net`
   (`none`/`privileged`/`unprivileged`), `snapshotting`, and `restore_from` (a store prefix). The launcher
   maps `NetMode`→`NetConfig`, sets `.snapshotting()`, and dispatches cold-boot vs. **`restore_cow`** (so
-  the named snapshot is preserved and re-restorable, design v20 §9.4). *Reason:* the daemon defaulted to
+  the named snapshot is preserved and re-restorable, design §9.4). *Reason:* the daemon defaulted to
   `NetConfig::None` + no snapshotting, so snapshot/restore and real guest networking were unreachable
-  through the API. See §D5.1.
+  through the API. See §18.5.1.
 
 - **(f) Guest-tools `ip route` prints the RAW `/proc/net/route` table (hex, tab-separated), not the
   `default via …` form.** The privileged-net test first asserted `ip route` contained `"default"` and
@@ -114,7 +114,7 @@ as they stabilize.
   `--resource-prefix` flag threaded to both the launcher and the start-up sweep. `NetNamespace::create`
   and `VmTempDir::create` gained a `prefix` param (the 0.6.0-driving API change). The VMID lock dir
   `/tmp/vmcell-vmid` is intentionally NOT prefixed (not swept; a stable cross-process rendezvous). See
-  §D4.1.
+  §18.4.1.
 
 - **Validated on the KVM host (2026-07-04), this env (KVM rw via ACL, CH at `~/.cargo/bin`, runner
   blessed, artifacts built).** `crates/vmcelld/tests/integration.rs` (run via `just test-daemon`, under a
@@ -130,14 +130,14 @@ as they stabilize.
   `SIGTERM` (graceful `shutdown_all`) then fall back to `SIGKILL`, else a panicking test orphans its CH
   VMs. (Note: one `vmcell` lib unit test races on `/tmp/vmcell-vm-<pid>-*` under `cargo test --lib`'s
   shared-process model but passes under **nextest**, which is process-per-test — the project's runner.)
-  **Still unrun:** the QEMU/Firecracker snapshot tiers (v20 §16: unwired), filtered-egress, concurrent-load.
+  **Still unrun:** the QEMU/Firecracker snapshot tiers (§16: unwired), filtered-egress, concurrent-load.
 
 ## v22 — extra virtio-blk devices + custom init / append-only boot-args
 
-Design: `docs/58-claude-design-v22.md`. Graduates the two v20 §17 forward-work items. Fold into the
-design body and delete here as they stabilize.
+Design: `docs/59-claude-design-v23.md` §19 (unified; was `docs/historical/58-claude-design-v22.md`).
+Graduates the two §17 forward-work items. Fold into the design body and delete here as they stabilize.
 
-- **(a) `init=` override is a GENUINE PID-1 replacement, not an agent-supervised entrypoint.** v20 §17
+- **(a) `init=` override is a GENUINE PID-1 replacement, not an agent-supervised entrypoint.** §17
   names the item "optional `init=` override". Taken literally, overriding `init=` replaces the vmcell
   guest agent (PID 1), which *is* the vsock control plane — so a custom-init VM has **no** `Ready`
   handshake, `exec`, or resync. We considered reinterpreting "custom init" as an agent-supervised
@@ -148,7 +148,7 @@ design body and delete here as they stabilize.
   (§12.2) instead of hanging; `MicroVm::start()` skips the QEMU control-plane health probe when there is
   no agent to probe; and `build()` **rejects `snapshotting` + a custom init** (the mandatory
   post-restore resync runs through the agent, §12.4). A custom-init VM is observed out-of-band (serial
-  log / writable share or extra disk / net). See design §E2.2.
+  log / writable share or extra disk / net). See design §19.2.2.
 
 - **(b) CH disks are declared `image_type=Raw` explicitly (surfaced by the writable-extra-disk test).**
   CH v52 **auto-detects** an unspecified disk image as raw and then **disables sector-0 writes** as a
@@ -158,7 +158,7 @@ design body and delete here as they stabilize.
   erofs root, ext4 `Block` root, extra raw disks — are raw). This also removes CH's deprecation warnings
   and pre-empts the **same latent bug on the writable `Block` rootfs path** (a sector-0 superblock write
   would have been silently dropped). One-law: `CH_RAW_IMAGE_TYPE` const, pinned by a serialization
-  assertion. See design §E1.2.
+  assertion. See design §19.1.2.
 
 - **Validated on the KVM host (2026-07-05, this env).** `tests/extra_block.rs` (`vmm_matrix_test!`) —
   **CH + Firecracker + QEMU all green**: two extra disks attach after the root (`/dev/vdb` read-only
@@ -181,15 +181,15 @@ design body and delete here as they stabilize.
   cannot honor — a second-class feature. Throttling works on all three backends including CH, and is the
   portable "slow/pressured disk" fault. CH+FC share one `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS`
   token-bucket conversion (one law). Validated on KVM (`extra_block_io_throttle`, CH+FC+QEMU: a 1 MiB/s cap
-  floors a 4 MiB read at ~3 s). Error/latency injection stays forward work. See design §E5.
+  floors a 4 MiB read at ~3 s). Error/latency injection stays forward work. See design §19.5.
 
 - **(d) The daemon exposes `extra_disks` (read-only) + `extra_kernel_args`, but NOT `init`, and extra disks
   are read-only.** *Reasons, both forced by the daemon's model:* (i) the daemon owns the VM through the
   vsock control plane (brings the agent up to mark `Ready`, serves `exec`/`stats`), which a custom `init=`
   drops — so exposing it would create un-`exec`-able VMs; it stays library-only. (ii) The artifact store is
-  create-only/immutable (§D3.2), so a *writable* extra disk over a shared store artifact would let one VM
+  create-only/immutable (§18.3.2), so a *writable* extra disk over a shared store artifact would let one VM
   mutate an artifact another reads — extra disks are attached read-only (a copy-on-attach writable scratch
-  is a follow-up). A live VM pins its extra-disk artifacts (delete-in-use guard extended). See design §E4.
+  is a follow-up). A live VM pins its extra-disk artifacts (delete-in-use guard extended). See design §19.4.
 
 - **(e) `vmcell::Error::Config` now maps to daemon `BadRequest` (400), not `Internal` (500).** Threading
   `extra_kernel_args`/`io_limit` into the launcher's `VmConfig::build()` meant a client-supplied bad knob

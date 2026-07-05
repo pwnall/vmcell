@@ -4,12 +4,12 @@
 //!
 //! The target is any binary confined under `target/`: a nextest test binary (the original use), **or**
 //! another workspace binary such as **`vmcelld`** launched by an integration test or `just daemon`
-//! (v21 §D2). Launching `vmcelld` this way confers the three caps via the **ambient** set without
+//! (§18.2). Launching `vmcelld` this way confers the three caps via the **ambient** set without
 //! blessing `vmcelld` itself, so the daemon — which changes constantly — rebuilds with no `setcap`
 //! churn, exactly the reason this runner was introduced for the ever-changing test binaries (§12.8).
 //!
 //! The blessing precondition and the pure privilege-transition plan live in `vmcell-privilege`, so
-//! this crate and the daemon (`vmcelld`) share one copy of the security-critical cap logic (v21 §D2).
+//! this crate and the daemon (`vmcelld`) share one copy of the security-critical cap logic (§18.2).
 //! What stays here is the exec-target **confinement** — the boundary that makes launching an arbitrary
 //! `target/` binary safe — plus the thin `main` that wires the shared pieces and performs the `execvp`.
 //!
@@ -163,7 +163,7 @@ fn main() {
     };
 
     // The blessing precondition (shared with the daemon): the three privileged caps must be in the
-    // EFFECTIVE set, or euid 0. Same remediation message for both callers (v21 §D2).
+    // EFFECTIVE set, or euid 0. Same remediation message for both callers (§18.2).
     let need = PRIVILEGED_CAPS;
     if let Err(e) = ensure_blessed_or_explain(&need) {
         eprintln!("{e}");
@@ -318,7 +318,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp.join("vmcell-priv1-attacker"));
     }
 
-    // v21 §D2: the runner is used as a cap-conferring launcher for `vmcelld`, not only test binaries.
+    // §18.2: the runner is used as a cap-conferring launcher for `vmcelld`, not only test binaries.
     // The confinement must accept `target/<profile>/vmcelld` under the trusted root (so an integration
     // test can `vmcell-test-runner target/debug/vmcelld …`), while still rejecting a `vmcelld` outside
     // it. RED if a change ever special-cased "test binaries" (e.g. a `deps/` or name filter) and locked
@@ -341,7 +341,7 @@ mod tests {
             std::fs::write(&vmcelld, b"#!/bin/true").expect("write vmcelld");
             assert!(
                 confine_target_under(vmcelld.to_str().expect("utf8"), &trusted_root).is_ok(),
-                "the runner must accept target/{profile}/vmcelld so it can launch the daemon (§D2)"
+                "the runner must accept target/{profile}/vmcelld so it can launch the daemon (§18.2)"
             );
         }
 
