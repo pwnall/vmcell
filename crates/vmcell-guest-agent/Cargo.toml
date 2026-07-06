@@ -1,6 +1,6 @@
 [package]
 name = "vmcell-guest-agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -20,12 +20,15 @@ path = "src/main.rs"
 
 [dependencies]
 # Explicit `version` alongside `path` keeps the cargo-deny `wildcards = "deny"` gate happy.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.3.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.4.0" }
 postcard = { version = "1", features = ["use-std"] }
 vsock = "0.5"
 # `event` powers the event-driven vsock accept loop (poll(2) on the listener fd,
-# OPP-2); a feature on the existing dep, so the lean-agent graph gains no crate.
-rustix = { version = "0.38", features = ["fs", "mount", "process", "net", "time", "event"] }
+# OPP-2). `pty`/`termios`/`stdio` power interactive PTY sessions (design 62 §22):
+# `openpt`/`ptsname`/`unlockpt`, `tcsetwinsize`/`Winsize`, and the async-signal-safe
+# `setsid`/`ioctl_tiocsctty`/`dup2_std*` login-tty sequence in the child `pre_exec`.
+# All are features on the existing dep, so the lean-agent graph gains no crate.
+rustix = { version = "0.38", features = ["fs", "mount", "process", "net", "time", "event", "pty", "termios", "stdio"] }
 signal-hook = "0.3"
 libc = "0.2"
 tracing = "0.1"

@@ -947,9 +947,17 @@ impl<V: Vmm> MicroVm<V> {
     ) -> Result<Self> {
         // Single-use restore does not copy the dir, so no overlay store is passed
         // (`None`); the caller's dir is restored in place.
-        Self::restore_inner(vmm, snapshot_dir, cfg, cid_alloc, vmid_alloc, cgroup_fs, None)
-            .await
-            .map(|(vm, _cow)| vm)
+        Self::restore_inner(
+            vmm,
+            snapshot_dir,
+            cfg,
+            cid_alloc,
+            vmid_alloc,
+            cgroup_fs,
+            None,
+        )
+        .await
+        .map(|(vm, _cow)| vm)
     }
 
     /// Restores one clone from a zygote suspend image, copy-on-write-copying the
@@ -1231,6 +1239,50 @@ impl<V: Vmm> MicroVm<V> {
             .agent_client
             .as_mut()
             .expect("agent_client was populated above"))
+    }
+
+    /// Opens a fresh control-plane connection for **interactive sessions** — PTY /
+    /// pipe sessions, streaming stdin, and multiplexed concurrent execs
+    /// (design 62 §22) — returning a [`SessionMux`](crate::agent::session::SessionMux).
+    ///
+    /// This dials a *second* vsock connection to the guest agent, independent of
+    /// the cached one-shot [`agent`](MicroVm::agent) client, so one-shot exec and
+    /// sessions never share a stream. The returned mux owns that connection;
+    /// dropping it closes the connection, and the guest tears down every session it
+    /// opened (§12.27). Takes `&self` (no caching) — a caller may hold several
+    /// muxes if it wants isolated connections.
+    ///
+    /// # Panics
+    /// Panics if the VM instance is missing (e.g. after shutdown).
+    ///
+    /// # Errors
+    /// Returns an [`Error::Agent`](crate::error::Error::Agent) immediately when
+    /// this VM boots a custom `init=` that replaces the guest agent (no control
+    /// plane, §19.2.2), or if the connection or `Ready` handshake does not complete
+    /// within `timeout`.
+    pub async fn connect_sessions(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<crate::agent::session::SessionMux> {
+        if self.control_plane_disabled {
+            return Err(crate::error::Error::Agent(
+                "the vsock control plane is unavailable: this VM boots a custom init= that \
+                 replaces the vmcell guest agent (no interactive sessions). Observe it via the \
+                 serial log, a shared directory, an extra block device, or networking."
+                    .into(),
+            ));
+        }
+        let instance = self.instance.as_ref().expect("instance missing");
+        crate::agent::session::SessionMux::connect(
+            instance.vsock_path(),
+            crate::vmm::AGENT_VSOCK_PORT,
+            timeout.unwrap_or(std::time::Duration::from_secs(10)),
+            &self.timeouts,
+            &crate::vmm::RealSerialLog {
+                path: instance.serial_log().to_path_buf(),
+            },
+        )
+        .await
     }
 
     /// Whether the one-shot post-restore CSPRNG reseed actually applied (the

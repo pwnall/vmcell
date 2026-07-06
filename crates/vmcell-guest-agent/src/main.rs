@@ -38,15 +38,34 @@ use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_change, unmount,
 };
 use rustix::process::{WaitOptions, pivot_root, wait};
+use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vmcell_guest_agent::{ReaperCoordinator, exit_code_from_termination, netif};
-use vmcell_protocol::{self as protocol, ExecRequest, MAX_FRAME_BYTES, Message};
+use vmcell_protocol::{
+    self as protocol, ExecRequest, MAX_FRAME_BYTES, Message, SessionId, SessionSpec,
+};
 use vsock::{VsockAddr, VsockListener, VsockStream};
+
+/// The single per-connection writer (§12.28): every frame — the initial `Ready`,
+/// one-shot exec/put-file/resync output, and all interactive-session frames from
+/// every pump/waiter thread — is emitted through this one `send_framed` under one
+/// lock, so no two threads write the vsock concurrently and multiplexed session
+/// frames never interleave-corrupt on the wire. The write half is a `try_clone`d
+/// handle sharing the socket with the read half the dispatch loop owns.
+type Writer = Arc<Mutex<VsockStream>>;
+
+/// The per-connection session table: `SessionId` → its live [`SessionHandle`]
+/// (design 62 §22). The dispatch loop inserts on `OpenSession` and looks up on
+/// `Stdin`/`Winsize`/`CloseSession`; each session's waiter thread removes its own
+/// entry on exit; connection teardown drains and kills whatever is left (§12.27).
+type Sessions = Arc<Mutex<HashMap<SessionId, SessionHandle>>>;
 
 /// Reaps every currently-exited child with `WNOHANG`, recording each status in
 /// the shared [`ReaperCoordinator`] so the matching per-exec waiter can claim
@@ -226,6 +245,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Fatal core mount (§4.3): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: devtmpfs failed: {}", e);
         return Err(e.into());
+    }
+
+    // devpts at /dev/pts powers interactive PTY sessions (design 62 §22):
+    // `/dev/ptmx` allocates a master and `ptsname` resolves the slave under
+    // /dev/pts. Best-effort and NOT in the fatal core-mount set {overlay, /proc,
+    // /dev} (§4.3) — only PTY *sessions* need it (they fail loud with
+    // `SessionExit(127)` if it is absent); one-shot exec, pipe sessions, and the
+    // vsock control plane do not. So a failure is logged and tolerated like the
+    // sysfs/share/loopback mounts (returning Err from PID 1 kernel-panics the
+    // guest). `newinstance` is legacy/ignored on modern kernels; the standard
+    // `gid=5,mode=620,ptmxmode=666` gives the usual /dev/pts semantics.
+    if let Err(e) = std::fs::create_dir_all("/dev/pts") {
+        tracing::warn!(
+            "vmcell-guest-agent: could not create /dev/pts mount point: {}; PTY sessions unavailable",
+            e
+        );
+    } else if let Err(e) = mount(
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        MountFlags::empty(),
+        "gid=5,mode=620,ptmxmode=666",
+    ) {
+        tracing::warn!(
+            "vmcell-guest-agent: devpts mount failed: {}; PTY sessions unavailable (pipe sessions and exec unaffected)",
+            e
+        );
     }
 
     // Mount the virtio-fs shares the host configured, decoded from the kernel
@@ -601,7 +647,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                     // POLLIN: the (still non-blocking) listener should have a
                     // connection ready.
                     match listener.accept() {
-                        Ok((mut s, _)) => {
+                        Ok((s, _)) => {
                             deadline = next_deadline(
                                 deadline,
                                 Instant::now(),
@@ -611,7 +657,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                             tracing::info!("vmcell-guest-agent: accepted connection");
                             let conn_reaper = Arc::clone(reaper);
                             std::thread::spawn(move || {
-                                if let Err(e) = handle_connection(&mut s, &conn_reaper) {
+                                if let Err(e) = serve_connection(s, &conn_reaper) {
                                     // A clean host disconnect surfaces as
                                     // `read_framed`'s `UnexpectedEof` (the length
                                     // prefix's `read_exact` hits EOF between
@@ -687,29 +733,82 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
     }
 }
 
-fn handle_connection(
-    stream: &mut VsockStream,
+/// Postcard-encodes and frames one [`Message`] through the single per-connection
+/// [`Writer`] (§12.28). Locking mirrors the reaper's poison policy (recover the
+/// guard rather than propagate a poison panic through PID 1).
+fn send_msg(writer: &Writer, msg: &Message) -> std::io::Result<()> {
+    let bytes = postcard::to_stdvec(msg).map_err(std::io::Error::other)?;
+    let mut stream = writer.lock().unwrap_or_else(|e| e.into_inner());
+    send_framed(&mut *stream, &bytes)
+}
+
+/// Serves one accepted connection: sends `Ready`, runs the dispatch loop, and —
+/// however the loop ends — tears down every session it left open (§12.27).
+///
+/// The stream is split into a read half (owned by [`serve_loop`]) and a
+/// `try_clone`d write half behind the single [`Writer`], so a session pump can
+/// emit output while the loop is blocked reading the next frame, without two
+/// threads ever writing the socket at once (§12.28).
+fn serve_connection(
+    stream: VsockStream,
     reaper: &Arc<ReaperCoordinator>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ready_msg = postcard::to_stdvec(&Message::Ready)?;
-    send_framed(stream, &ready_msg)?;
+    let writer: Writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let mut read_stream = stream;
 
+    send_msg(&writer, &Message::Ready)?;
+    let result = serve_loop(&mut read_stream, &writer, &sessions, reaper);
+    // Connection owns its sessions (§12.27): before returning, kill every
+    // still-open session's process group so no interactive session outlives the
+    // connection that opened it. Draining the table also drops each handle,
+    // closing its stdin pipe / PTY master fds.
+    teardown_sessions(&sessions);
+    result
+}
+
+/// The per-connection dispatch loop: reads one framed [`Message`] at a time and
+/// routes it. It never blocks on a running child — one-shot `Exec` is still
+/// synchronous (drains to `Exit` before the next read, the one-shot contract),
+/// while `OpenSession` spawns a session and returns immediately so many sessions
+/// multiplex over the one connection (design 62 §22).
+fn serve_loop(
+    read_stream: &mut VsockStream,
+    writer: &Writer,
+    sessions: &Sessions,
+    reaper: &Arc<ReaperCoordinator>,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let req_bytes = read_framed(stream)?;
+        let req_bytes = read_framed(read_stream)?;
         let msg: Message = postcard::from_bytes(&req_bytes)?;
 
         match msg {
-            Message::Exec(req) => handle_exec(req, stream, reaper)?,
-            Message::PutFile { dst, bytes } => handle_put_file(&dst, &bytes, stream)?,
+            Message::Exec(req) => handle_exec(req, writer, reaper)?,
+            Message::PutFile { dst, bytes } => handle_put_file(&dst, &bytes, writer)?,
             Message::Resync {
                 unix_secs,
                 unix_nanos,
                 mac,
                 ipv4,
-            } => handle_resync(unix_secs, unix_nanos, mac, ipv4, stream)?,
-            // Ready/Stdout/Stderr/Exit are guest→host frames; receiving one (or
-            // any future variant) means the peer desynced. Log it loudly and
-            // close the connection so the host reconnects on a fresh stream,
+            } => handle_resync(unix_secs, unix_nanos, mac, ipv4, writer)?,
+            // Interactive-session control (design 62 §22). These never fail the
+            // connection: a bad open reports `SessionExit(127)` to the host, and a
+            // frame for an unknown/closed session is dropped at debug — the session
+            // simply already ended.
+            Message::OpenSession { session, spec } => {
+                run_session(session, spec, writer, sessions, reaper);
+            }
+            Message::Stdin { session, data } => route_stdin(sessions, session, &data),
+            Message::StdinEof { session } => route_stdin_eof(sessions, session),
+            Message::Winsize {
+                session,
+                rows,
+                cols,
+            } => route_winsize(sessions, session, rows, cols),
+            Message::CloseSession { session } => close_session(sessions, session),
+            // Ready/Stdout/Stderr/Exit and the guest→host session frames are
+            // guest→host only; receiving one means the peer desynced. Log it loudly
+            // and close the connection so the host reconnects on a fresh stream,
             // rather than silently swallowing it and looping on a skewed stream
             // (AGENT-5).
             other => {
@@ -720,6 +819,20 @@ fn handle_connection(
                 return Ok(());
             }
         }
+    }
+}
+
+/// Kills every still-open session's process group and drops its fds (§12.27),
+/// invoked once the connection's dispatch loop has ended for any reason.
+fn teardown_sessions(sessions: &Sessions) {
+    let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    for (id, handle) in table.drain() {
+        tracing::info!(
+            "vmcell-guest-agent: connection ending; killing session {:?} (pid {})",
+            id,
+            handle.pid
+        );
+        kill_group(handle.pid);
     }
 }
 
@@ -768,7 +881,7 @@ fn read_framed<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
 fn handle_put_file(
     dst: &str,
     bytes: &[u8],
-    stream: &mut VsockStream,
+    writer: &Writer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result = (|| -> std::io::Result<()> {
         if let Some(parent) = std::path::Path::new(dst).parent() {
@@ -779,8 +892,7 @@ fn handle_put_file(
     })();
 
     let code = if result.is_ok() { 0 } else { 1 };
-    let exit_msg = postcard::to_stdvec(&Message::Exit(code))?;
-    send_framed(stream, &exit_msg)?;
+    send_msg(writer, &Message::Exit(code))?;
     Ok(())
 }
 
@@ -835,7 +947,7 @@ fn handle_resync(
     unix_nanos: u32,
     mac: Option<[u8; 6]>,
     ipv4: Option<protocol::Ipv4Reconfig>,
-    stream: &mut VsockStream,
+    writer: &Writer,
 ) -> std::io::Result<()> {
     // 1. Clock (MANDATORY): set CLOCK_REALTIME to the host instant. Never `?` — a
     //    failure is reported in the ack, not propagated.
@@ -905,63 +1017,71 @@ fn handle_resync(
         mac_applied,
         ip_applied,
     };
-    let bytes = postcard::to_stdvec(&ack).map_err(std::io::Error::other)?;
-    send_framed(stream, &bytes)?;
+    send_msg(writer, &ack)?;
     Ok(())
 }
 
-fn handle_exec(
-    req: ExecRequest,
-    stream: &mut VsockStream,
-    reaper: &Arc<ReaperCoordinator>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // `split_first` is the non-panicking form of the "argv[0] is the program, argv[1..] the
-    // args" split, and folds in the empty-argv guard (indexing_slicing is denied in PID-1 code).
-    let Some((program, args)) = req.argv.split_first() else {
-        let exit_msg = postcard::to_stdvec(&Message::Exit(1))?;
-        send_framed(stream, &exit_msg)?;
-        return Ok(());
-    };
+/// Augments a base PATH with the `/vmcell-tools` guest-helper dir (ip/curl/kvm-ok,
+/// baked into the rootfs) ahead of the request-provided or inherited PATH — the
+/// **one** PATH law shared by the one-shot [`handle_exec`] and interactive
+/// [`run_session`] paths (AGENTS.md "one law, one predicate"). PID 1 may inherit a
+/// minimal/empty PATH, so an empty base falls back to the standard system dirs.
+fn child_path(req_path: Option<String>) -> String {
+    let base_path = req_path
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    if base_path.is_empty() {
+        "/vmcell-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+    } else {
+        format!("/vmcell-tools:{base_path}")
+    }
+}
 
+/// Builds the child [`Command`] from an [`ExecRequest`] — program + args, cwd, and
+/// the environment with the `/vmcell-tools`-augmented PATH ([`child_path`]) — the
+/// shared command-construction law for both the one-shot and session paths.
+/// Returns `None` for an empty argv (the non-panicking split; `indexing_slicing`
+/// is denied in PID-1 code). Does **not** set stdio or the process group — those
+/// are path-specific (pipes vs PTY) and set by the caller.
+fn build_command(req: &ExecRequest) -> Option<Command> {
+    let (program, args) = req.argv.split_first()?;
     let mut cmd = Command::new(program);
     cmd.args(args);
-    // Run the child as its own process-group leader so the timeout path can
-    // signal the whole group (`kill(-pgid)`), tearing down any subprocesses it
-    // spawned rather than only the leader.
-    cmd.process_group(0);
-
-    if let Some(cwd) = req.cwd {
+    if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
     }
-
     let mut req_path: Option<String> = None;
-    for (k, v) in req.env {
-        if k == "PATH" {
+    for (k, v) in &req.env {
+        if k.as_str() == "PATH" {
             req_path = Some(v.clone());
         }
         cmd.env(k, v);
     }
+    cmd.env("PATH", child_path(req_path));
+    Some(cmd)
+}
 
-    // Surface the `/vmcell-tools` guest-helper dir (ip/curl/kvm-ok, baked into the
-    // rootfs) on the child's PATH, ahead of the request-provided or inherited
-    // PATH. PID 1 may inherit a minimal/empty PATH, so fall back to the standard
-    // system directories.
-    let base_path = req_path
-        .or_else(|| std::env::var("PATH").ok())
-        .unwrap_or_default();
-    let child_path = if base_path.is_empty() {
-        "/vmcell-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
-    } else {
-        format!("/vmcell-tools:{base_path}")
+fn handle_exec(
+    req: ExecRequest,
+    writer: &Writer,
+    reaper: &Arc<ReaperCoordinator>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut cmd) = build_command(&req) else {
+        send_msg(writer, &Message::Exit(1))?;
+        return Ok(());
     };
-    cmd.env("PATH", child_path);
+    // Run the child as its own process-group leader so the timeout path can
+    // signal the whole group (`kill(-pgid)`), tearing down any subprocesses it
+    // spawned rather than only the leader.
+    cmd.process_group(0);
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // Point the child's stdin at /dev/null (M-GUEST-1). PID 1's own fd 0 is the
     // serial console (`/dev/console`), from which no input ever arrives, so a
     // command that reads stdin (`cat`, `wc`, a `sh` heredoc) would block on the
-    // console and run out its timeout instead of seeing EOF immediately.
+    // console and run out its timeout instead of seeing EOF immediately. (The
+    // interactive-session path, design 62 §22, is where streamed stdin lives.)
     cmd.stdin(Stdio::null());
 
     // AGENT-2: capture the reservation epoch BEFORE the spawn. An instant child
@@ -1043,10 +1163,7 @@ fn handle_exec(
             std::thread::spawn(move || {
                 std::thread::sleep(timeout);
                 if !has_exited_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    use rustix::process::{Pid, Signal, kill_process_group};
-                    if let Some(p) = Pid::from_raw(pid.cast_signed()) {
-                        let _ = kill_process_group(p, Signal::Kill);
-                    }
+                    kill_group(pid);
                     let _ = tx_timeout.send(Message::Stderr(b"Command timed out\n".to_vec()));
                 }
             });
@@ -1064,8 +1181,7 @@ fn handle_exec(
             });
 
             for msg in rx {
-                let bytes = postcard::to_stdvec(&msg)?;
-                send_framed(stream, &bytes)?;
+                send_msg(writer, &msg)?;
                 if let Message::Exit(_) = msg {
                     break;
                 }
@@ -1073,15 +1189,505 @@ fn handle_exec(
         }
         Err(e) => {
             let err_msg = format!("Failed to spawn command: {e}");
-            let msg = postcard::to_stdvec(&Message::Stderr(err_msg.into_bytes()))?;
-            send_framed(stream, &msg)?;
-
-            let exit_msg = postcard::to_stdvec(&Message::Exit(127))?;
-            send_framed(stream, &exit_msg)?;
+            send_msg(writer, &Message::Stderr(err_msg.into_bytes()))?;
+            send_msg(writer, &Message::Exit(127))?;
         }
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// Interactive sessions (design 62 §22): PTY / pipe sessions, streaming stdin,
+// window resize, and multiplexed concurrent execs over one connection.
+// ===========================================================================
+
+/// Where a session's streamed stdin is delivered (design 62 §22). A pipe session
+/// writes to the child's stdin pipe (dropping it on `StdinEof` closes it → the
+/// child reads EOF); a PTY session writes to the pseudo-terminal master (bytes
+/// arrive as terminal input). The PTY master `Arc<OwnedFd>` is shared with
+/// [`SessionHandle::pty_master`] so `Stdin` and `Winsize` use the same fd.
+enum StdinSink {
+    /// A pipe session's child-stdin write end.
+    Pipe(std::process::ChildStdin),
+    /// A PTY session's pseudo-terminal master.
+    Pty(Arc<OwnedFd>),
+}
+
+/// The live state of one interactive session, keyed by [`SessionId`] in the
+/// per-connection [`Sessions`] table.
+struct SessionHandle {
+    /// The stdin sink, or `None` once closed (pipe `StdinEof`) or never opened.
+    stdin: Arc<Mutex<Option<StdinSink>>>,
+    /// The PTY master for `Winsize`, or `None` for a pipe session.
+    pty_master: Option<Arc<OwnedFd>>,
+    /// The child's process-group id (== its pid: `setsid` for a PTY session,
+    /// `process_group(0)` for a pipe session), used by `CloseSession`/timeout/
+    /// connection-teardown to `kill(-pgid)` the whole group.
+    pid: u32,
+}
+
+/// Maps a `rows`×`cols` window into the kernel [`Winsize`](rustix::termios::Winsize)
+/// the guest installs via `TIOCSWINSZ`.
+///
+/// Split out as a pure function so the field mapping (`rows`→`ws_row`,
+/// `cols`→`ws_col`) is unit-tested: a swapped assignment reddens
+/// `winsize_from_maps_rows_and_cols` without a live PTY (mirrors
+/// [`resync_timespec`]).
+fn winsize_from(rows: u16, cols: u16) -> rustix::termios::Winsize {
+    rustix::termios::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
+
+/// `SIGKILL`s a process group by its leader pid (`kill(-pgid)`), the shared
+/// group-kill law used by the one-shot timeout, session `CloseSession`/timeout,
+/// and connection teardown (§12.27). A non-existent group is a silent no-op.
+fn kill_group(pid: u32) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    if let Some(p) = Pid::from_raw(pid.cast_signed()) {
+        let _ = kill_process_group(p, Signal::Kill);
+    }
+}
+
+/// Reports a session that could not be opened (bad argv, spawn or PTY-allocation
+/// failure) the same way the one-shot path reports a spawn failure — one
+/// terminal-frame convention (§12.26): `SessionStderr{msg}` then
+/// `SessionExit{127}`.
+fn open_failed(writer: &Writer, session: SessionId, msg: &str) {
+    tracing::warn!(
+        "vmcell-guest-agent: session {:?} open failed: {}",
+        session,
+        msg
+    );
+    let _ = send_msg(
+        writer,
+        &Message::SessionStderr {
+            session,
+            data: msg.as_bytes().to_vec(),
+        },
+    );
+    let _ = send_msg(writer, &Message::SessionExit { session, code: 127 });
+}
+
+/// Registers a session's handle in the per-connection table. A reused id (the
+/// host is authoritative and monotonic, so this should not happen) kills the
+/// displaced session rather than leaking it.
+fn register_session(sessions: &Sessions, id: SessionId, handle: SessionHandle) {
+    let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = table.insert(id, handle) {
+        tracing::warn!(
+            "vmcell-guest-agent: session id {:?} reused; killing the displaced session",
+            id
+        );
+        kill_group(old.pid);
+    }
+}
+
+/// Spawns a reader thread that pumps a child stream to the host, wrapping each
+/// chunk into the session-tagged [`Message`] `wrap` produces and emitting it
+/// through the single [`Writer`] (§12.28). Ends on EOF, any read error (a PTY
+/// master returns `EIO` once the child closes its slave — end of stream), or a
+/// write failure (the connection died).
+fn spawn_pump<R, F>(mut reader: R, writer: Writer, wrap: F) -> JoinHandle<()>
+where
+    R: Read + Send + 'static,
+    F: Fn(Vec<u8>) -> Message + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // `read` guarantees n <= buf.len(); `get(..n)` is the non-panicking
+                    // spelling of that (indexing_slicing is denied in PID-1 code).
+                    let chunk = buf.get(..n).unwrap_or_default().to_vec();
+                    if send_msg(&writer, &wrap(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Arms an optional kill thread for a session: if `timeout` is `Some`, `SIGKILL`
+/// the process group after it elapses unless the child already exited. `None`
+/// leaves the session **persistent** (design 62 §22.2.1) — bounded instead by
+/// `CloseSession`, the child exiting, or connection teardown (§12.27).
+fn arm_session_timeout(timeout: Option<Duration>, pid: u32, has_exited: Arc<AtomicBool>) {
+    let Some(t) = timeout else {
+        return;
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(t);
+        if !has_exited.load(Ordering::Relaxed) {
+            kill_group(pid);
+        }
+    });
+}
+
+/// Spawns the waiter thread that claims a session's exit code from the shared
+/// reaper, then — after **joining the pump(s)** so all output precedes the exit
+/// (§12.26) — emits the terminal `SessionExit` and removes the session from the
+/// table. No `child.wait()` here, so the reaper's status cannot be stolen (the
+/// false-127 race).
+fn spawn_session_waiter(
+    reaper: &Arc<ReaperCoordinator>,
+    pid: u32,
+    has_exited: Arc<AtomicBool>,
+    pumps: Vec<JoinHandle<()>>,
+    writer: Writer,
+    session: SessionId,
+    sessions: Sessions,
+) {
+    let reaper = Arc::clone(reaper);
+    std::thread::spawn(move || {
+        let code = reaper.wait_for(pid);
+        has_exited.store(true, Ordering::Relaxed);
+        for pump in pumps {
+            let _ = pump.join();
+        }
+        let _ = send_msg(&writer, &Message::SessionExit { session, code });
+        sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session);
+    });
+}
+
+/// Opens an interactive session (design 62 §22): builds the command, then
+/// dispatches to the PTY or pipe path per `spec.pty`.
+fn run_session(
+    session: SessionId,
+    spec: SessionSpec,
+    writer: &Writer,
+    sessions: &Sessions,
+    reaper: &Arc<ReaperCoordinator>,
+) {
+    let Some(cmd) = build_command(&spec.command) else {
+        open_failed(writer, session, "empty argv");
+        return;
+    };
+    let timeout = spec.command.timeout;
+    match spec.pty {
+        Some(pty) => run_pty_session(session, cmd, pty, timeout, writer, sessions, reaper),
+        None => run_pipe_session(session, cmd, timeout, writer, sessions, reaper),
+    }
+}
+
+/// Runs a pipe (non-PTY) session: piped stdin/stdout/stderr, streamable stdin,
+/// separate `SessionStdout`/`SessionStderr` channels.
+fn run_pipe_session(
+    session: SessionId,
+    mut cmd: Command,
+    timeout: Option<Duration>,
+    writer: &Writer,
+    sessions: &Sessions,
+    reaper: &Arc<ReaperCoordinator>,
+) {
+    cmd.process_group(0);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let epoch = reaper.pre_spawn_epoch();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            open_failed(writer, session, &format!("failed to spawn command: {e}"));
+            return;
+        }
+    };
+    let stdin = child.stdin.take();
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        open_failed(writer, session, "failed to capture child stdio");
+        kill_group(child.id());
+        return;
+    };
+    let pid = child.id();
+    reaper.reserve(pid, epoch);
+
+    register_session(
+        sessions,
+        session,
+        SessionHandle {
+            stdin: Arc::new(Mutex::new(stdin.map(StdinSink::Pipe))),
+            pty_master: None,
+            pid,
+        },
+    );
+
+    let out = spawn_pump(stdout, Arc::clone(writer), move |data| {
+        Message::SessionStdout { session, data }
+    });
+    let err = spawn_pump(stderr, Arc::clone(writer), move |data| {
+        Message::SessionStderr { session, data }
+    });
+    let has_exited = Arc::new(AtomicBool::new(false));
+    arm_session_timeout(timeout, pid, Arc::clone(&has_exited));
+    spawn_session_waiter(
+        reaper,
+        pid,
+        has_exited,
+        vec![out, err],
+        Arc::clone(writer),
+        session,
+        Arc::clone(sessions),
+    );
+}
+
+/// Allocates a pseudo-terminal pair: the `CLOEXEC` master (kept by the agent) and
+/// the slave path from `ptsname` (opened by the caller for the child). `grantpt`
+/// is a Linux no-op but is called for POSIX faithfulness; `unlockpt` is required.
+fn open_pty() -> rustix::io::Result<(OwnedFd, std::ffi::CString)> {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let slave_path = ptsname(&master, Vec::new())?;
+    Ok((master, slave_path))
+}
+
+/// The `login_tty` sequence, run in the child's `pre_exec` (design 62 §22): make
+/// the child a session leader (`setsid`, so its pgid == its pid and it has no
+/// controlling terminal), adopt the pty slave as its controlling terminal
+/// (`TIOCSCTTY`), and wire the slave onto stdin/stdout/stderr. Every call is an
+/// async-signal-safe raw syscall via `rustix`; the slave is `CLOEXEC`, so after
+/// these `dup2`s it closes at `execve`, leaving only fds 0/1/2 on the terminal.
+fn login_tty(slave_fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: `slave_fd` is the pty slave fd, opened by the parent and inherited
+    // into this child across the `fork` that `Command::spawn` performed; it is a
+    // live, valid fd here. We only borrow it non-owningly for the syscalls below
+    // (no close), so no aliasing OwnedFd exists.
+    let slave = unsafe { BorrowedFd::borrow_raw(slave_fd) };
+    rustix::process::setsid()?;
+    rustix::process::ioctl_tiocsctty(slave)?;
+    rustix::stdio::dup2_stdin(slave)?;
+    rustix::stdio::dup2_stdout(slave)?;
+    rustix::stdio::dup2_stderr(slave)?;
+    Ok(())
+}
+
+/// Runs a PTY session: allocate a controlling-terminal pseudo-terminal, run the
+/// command as a session leader on it (`isatty()` true, resizable), and pump the
+/// single merged master stream back as `SessionStdout` (§12.29).
+fn run_pty_session(
+    session: SessionId,
+    mut cmd: Command,
+    pty: protocol::PtyConfig,
+    timeout: Option<Duration>,
+    writer: &Writer,
+    sessions: &Sessions,
+    reaper: &Arc<ReaperCoordinator>,
+) {
+    use rustix::fs::{Mode, OFlags};
+
+    let (master, slave_path) = match open_pty() {
+        Ok(v) => v,
+        Err(e) => {
+            open_failed(writer, session, &format!("pty allocation failed: {e}"));
+            return;
+        }
+    };
+    // Open the slave CLOEXEC: it is inherited into the child by the fork (CLOEXEC
+    // does not affect fork), used by `login_tty` in `pre_exec`, then closed at
+    // `execve` — so the exec'd program keeps only fds 0/1/2 on the terminal.
+    let slave = match rustix::fs::open(
+        slave_path.as_c_str(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            open_failed(writer, session, &format!("pty slave open failed: {e}"));
+            return;
+        }
+    };
+    // Best-effort initial window size before the child starts.
+    if let Err(e) = rustix::termios::tcsetwinsize(&master, winsize_from(pty.rows, pty.cols)) {
+        tracing::debug!("vmcell-guest-agent: initial winsize failed: {}", e);
+    }
+
+    // No `process_group(0)`: `setsid` in `login_tty` creates the new session and
+    // process group (a would-be group leader cannot `setsid`, so the two are
+    // mutually exclusive). The pgid still ends == the child pid.
+    let slave_raw = slave.as_raw_fd();
+    // SAFETY: the pre_exec closure runs only `login_tty`, which performs solely
+    // async-signal-safe syscalls (setsid/TIOCSCTTY/dup2) on the inherited slave
+    // fd and allocates nothing — the async-signal-safety obligation of `pre_exec`.
+    unsafe {
+        cmd.pre_exec(move || login_tty(slave_raw));
+    }
+
+    let epoch = reaper.pre_spawn_epoch();
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            open_failed(writer, session, &format!("failed to spawn command: {e}"));
+            return;
+        }
+    };
+    // The parent must drop its slave so the master EOFs (Linux: `EIO`) once the
+    // child — the last slave holder — exits, letting the pump end (§12.29).
+    drop(slave);
+
+    let pid = child.id();
+    reaper.reserve(pid, epoch);
+
+    // One master fd read by the pump; a shared `Arc<OwnedFd>` for stdin writes +
+    // winsize. `try_clone` is `F_DUPFD_CLOEXEC`, so the pump's copy is CLOEXEC too.
+    let master_read = match master.try_clone() {
+        Ok(m) => std::fs::File::from(m),
+        Err(e) => {
+            open_failed(writer, session, &format!("pty master clone failed: {e}"));
+            kill_group(pid);
+            return;
+        }
+    };
+    let master_arc = Arc::new(master);
+    register_session(
+        sessions,
+        session,
+        SessionHandle {
+            stdin: Arc::new(Mutex::new(Some(StdinSink::Pty(Arc::clone(&master_arc))))),
+            pty_master: Some(Arc::clone(&master_arc)),
+            pid,
+        },
+    );
+
+    let pump = spawn_pump(master_read, Arc::clone(writer), move |data| {
+        Message::SessionStdout { session, data }
+    });
+    let has_exited = Arc::new(AtomicBool::new(false));
+    arm_session_timeout(timeout, pid, Arc::clone(&has_exited));
+    spawn_session_waiter(
+        reaper,
+        pid,
+        has_exited,
+        vec![pump],
+        Arc::clone(writer),
+        session,
+        Arc::clone(sessions),
+    );
+}
+
+/// Writes `data` to a session's stdin sink, looping partial writes (B10: counts
+/// are handled).
+fn write_stdin_sink(sink: &mut StdinSink, data: &[u8]) -> std::io::Result<()> {
+    match sink {
+        StdinSink::Pipe(w) => w.write_all(data),
+        StdinSink::Pty(fd) => write_all_fd(fd, data),
+    }
+}
+
+/// `write(2)`s all of `data` to a fd, looping short writes and retrying `EINTR`.
+fn write_all_fd(fd: &OwnedFd, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        match rustix::io::write(fd, data) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => data = data.get(n..).unwrap_or_default(),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Routes a `Stdin` frame to its session (design 62 §22). Clones the session's
+/// stdin `Arc` and releases the table lock before writing, so a blocked write
+/// never stalls the dispatch loop. A frame for an unknown/closed session is
+/// dropped at debug — the session simply already ended.
+fn route_stdin(sessions: &Sessions, session: SessionId, data: &[u8]) {
+    let stdin = {
+        let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match table.get(&session) {
+            Some(h) => Arc::clone(&h.stdin),
+            None => {
+                tracing::debug!(
+                    "vmcell-guest-agent: stdin for unknown/closed session {:?}; dropping {} bytes",
+                    session,
+                    data.len()
+                );
+                return;
+            }
+        }
+    };
+    let mut guard = stdin.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(sink) = guard.as_mut()
+        && let Err(e) = write_stdin_sink(sink, data)
+    {
+        tracing::debug!(
+            "vmcell-guest-agent: stdin write to session {:?} failed: {}",
+            session,
+            e
+        );
+    }
+}
+
+/// Routes a `StdinEof` frame (design 62 §22): closes a **pipe** session's stdin
+/// (dropping the `ChildStdin` → the child reads EOF); a no-op for a PTY session
+/// (closing the master would tear down output — a PTY caller ends input in-band).
+fn route_stdin_eof(sessions: &Sessions, session: SessionId) {
+    let stdin = {
+        let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match table.get(&session) {
+            Some(h) => Arc::clone(&h.stdin),
+            None => return,
+        }
+    };
+    let mut guard = stdin.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(guard.as_ref(), Some(StdinSink::Pipe(_))) {
+        *guard = None;
+    }
+}
+
+/// Routes a `Winsize` frame (design 62 §22): installs the new window on a PTY
+/// session's master (`TIOCSWINSZ`, delivering `SIGWINCH`); a debug no-op for a
+/// pipe session.
+fn route_winsize(sessions: &Sessions, session: SessionId, rows: u16, cols: u16) {
+    let master = {
+        let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match table.get(&session) {
+            Some(h) => h.pty_master.clone(),
+            None => return,
+        }
+    };
+    match master {
+        Some(master) => {
+            if let Err(e) = rustix::termios::tcsetwinsize(&*master, winsize_from(rows, cols)) {
+                tracing::debug!(
+                    "vmcell-guest-agent: winsize for session {:?} failed: {}",
+                    session,
+                    e
+                );
+            }
+        }
+        None => tracing::debug!(
+            "vmcell-guest-agent: winsize for non-pty session {:?}; ignoring",
+            session
+        ),
+    }
+}
+
+/// Routes a `CloseSession` frame (design 62 §22): `SIGKILL`s the session's
+/// process group. The waiter observes the resulting exit, emits `SessionExit`,
+/// and removes the entry — so no double-remove here.
+fn close_session(sessions: &Sessions, session: SessionId) {
+    let pid = {
+        let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match table.get(&session) {
+            Some(h) => h.pid,
+            None => return,
+        }
+    };
+    kill_group(pid);
 }
 
 #[cfg(test)]
@@ -1392,5 +1998,72 @@ mod tests {
             std::io::ErrorKind::UnexpectedEof,
             "a frame at exactly the cap must pass the cap check, not be rejected as too large"
         );
+    }
+
+    // design 62 §22 / §22.6: the rows→ws_row, cols→ws_col field mapping the PTY
+    // winsize install consumes. RED on a rows↔cols swap (mirrors
+    // `resync_timespec_maps_fields`), without a live PTY.
+    #[test]
+    fn winsize_from_maps_rows_and_cols() {
+        let ws = winsize_from(40, 100);
+        assert_eq!(ws.ws_row, 40, "rows must map to ws_row");
+        assert_eq!(ws.ws_col, 100, "cols must map to ws_col");
+        assert_ne!(
+            ws.ws_row, 100,
+            "a rows↔cols swap must not put cols in ws_row"
+        );
+        // Pixel dims are unset (character-cell terminal).
+        assert_eq!(ws.ws_xpixel, 0);
+        assert_eq!(ws.ws_ypixel, 0);
+    }
+
+    // design 62 §22.6: `child_path` is the ONE PATH law shared by handle_exec and
+    // run_session — it must prepend `/vmcell-tools` so the guest-helper shims
+    // (ip/curl/kvm-ok) resolve. RED if a session path dropped the prefix.
+    #[test]
+    fn child_path_prepends_vmcell_tools() {
+        // A request-provided PATH is honored, with /vmcell-tools ahead of it.
+        assert_eq!(
+            child_path(Some("/usr/bin:/bin".to_string())),
+            "/vmcell-tools:/usr/bin:/bin"
+        );
+        // An empty base falls back to the standard system dirs, still /vmcell-tools first.
+        assert_eq!(
+            child_path(Some(String::new())),
+            "/vmcell-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        assert!(
+            child_path(Some("/opt/bin".to_string())).starts_with("/vmcell-tools:"),
+            "the guest-tools dir must be first on PATH"
+        );
+    }
+
+    // AGENT-3 extended to the channelized session frames (design 62 §22.6): a
+    // guest-encoded `SessionStdout{id, payload}` frames through `send_framed`,
+    // decodes through the host's REAL LengthDelimitedCodec, and postcard-decodes
+    // back to the same Message — proving the id-keyed frames cross the hand-rolled
+    // framing boundary intact. RED on a framing/endianness/cap regression.
+    #[test]
+    fn session_frame_round_trips_through_real_codec() {
+        let msg = Message::SessionStdout {
+            session: SessionId(7),
+            data: b"multiplexed \x00\x01\xfe\xff output".to_vec(),
+        };
+        let encoded = postcard::to_stdvec(&msg).expect("postcard encode");
+        let mut wire = Vec::new();
+        send_framed(&mut wire, &encoded).expect("send_framed");
+
+        let mut codec = LengthDelimitedCodec::new();
+        let mut src = BytesMut::from(&wire[..]);
+        let frame = codec
+            .decode(&mut src)
+            .expect("codec decode")
+            .expect("a complete frame");
+        let decoded: Message = postcard::from_bytes(&frame).expect("postcard decode");
+        assert_eq!(
+            decoded, msg,
+            "session frame must round-trip through the codec"
+        );
+        assert!(src.is_empty(), "codec must consume exactly one guest frame");
     }
 }

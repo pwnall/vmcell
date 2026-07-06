@@ -8,9 +8,17 @@
 
 More difficult
 
-* Persistent interactive sessions: PTY + streaming stdin + multiplexed exec [V:high/E:med]
 * Observability: OTLP spans/metrics + per-step quotas + balloon/memory.high
   pressure + a typed, subscribable event stream [V:high/E:med]
+
+## Designed and implemented
+
+* Persistent interactive sessions: PTY + streaming stdin + multiplexed exec
+  [V:high/E:med] — shipped in v26 (`docs/62-claude-design-v26.md` §22): eight
+  append-only channelized `Message` variants, a guest non-blocking dispatch loop
+  with one per-connection writer + PTY/pipe/stdin/winsize sessions +
+  connection-owns-its-sessions teardown, and a host `agent::session` multiplexer.
+  Daemon streaming sessions + a raw-mode interactive CLI are §22.7 forward work.
 
 ## Need directional decision
 
@@ -20,12 +28,12 @@ is which to pull forward. V/E = value/effort.
 
 Adopt-now (cheap, high-value, extend an existing seam):
 
+* Network fault injection: netem (L3/L4) + nft partition + L7 egress chaos [V:high/E:med]
+* Declarative per-sandbox egress policy + full attempted-connection audit [V:high/E:med]
 * Disk I/O fault injection [V:high/E:med] — PARTIAL: throttling (bandwidth+IOPS) done in v22
   (`BlockDevice::io_limit`, all backends); error/latency injection (QEMU-`blkdebug`) still open
-* Network fault injection: netem (L3/L4) + nft partition + L7 egress chaos [V:high/E:med]
 * Deterministic clock control over vsock (set/freeze/forward-jump) [V:high/E:med]
 * Egress + model cassettes: deterministic record/replay over the MITM proxy [V:high/E:med]
-* Declarative per-sandbox egress policy + full attempted-connection audit [V:high/E:med]
 * Post-restore secrets injection (never persisted to snapshot/erofs) [V:high/E:med]
 * Structured serial fault capture (panic/oops/KASAN/lockdep -> typed Error) [V:high/E:low]
 

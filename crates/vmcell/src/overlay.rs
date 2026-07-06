@@ -184,7 +184,9 @@ mod tests {
         std::fs::create_dir_all(&master).expect("mk master");
         std::fs::write(master.join("f"), vec![0x5Au8; 4096]).expect("f");
         let store = ReflinkOverlayStore;
-        let clone_support = store.clone_tree(&master, &root.path().join("c")).expect("clone");
+        let clone_support = store
+            .clone_tree(&master, &root.path().join("c"))
+            .expect("clone");
         let probe_support = store.probe(root.path());
         assert_eq!(
             clone_support, probe_support,
@@ -202,7 +204,11 @@ mod tests {
         std::fs::create_dir_all(&src).expect("mk src");
         let dst = root.path().join("dst");
         let got = store.clone_tree(&src, &dst).expect("clone_tree");
-        assert_eq!(got, CowSupport::FullCopy, "must honor the configured report");
+        assert_eq!(
+            got,
+            CowSupport::FullCopy,
+            "must honor the configured report"
+        );
         assert!(dst.is_dir(), "the double materializes an empty dst dir");
         let calls = store.calls();
         assert_eq!(calls.len(), 1);

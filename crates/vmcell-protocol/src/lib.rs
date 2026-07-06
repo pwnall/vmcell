@@ -80,6 +80,68 @@ pub struct Ipv4Reconfig {
     pub gateway: [u8; 4],
 }
 
+/// A stable identity for one interactive session on a host↔guest connection
+/// (design 62 §22).
+///
+/// The host is authoritative for the ids on its own connection: `SessionMux`
+/// hands out monotonically increasing values, and every session data/control
+/// frame carries the id so the guest and host can multiplex many concurrent
+/// sessions over one vsock connection. `Copy`/`Ord`/`Hash` so it keys the
+/// per-connection session tables on both ends.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(pub u64);
+
+/// The initial window size of a PTY session's pseudo-terminal (design 62 §22).
+///
+/// Carried in [`SessionSpec::pty`] as the terminal's `rows`×`cols` at open time;
+/// the host can change it mid-session with [`Message::Winsize`]. `u16` matches the
+/// kernel `struct winsize` (`ws_row`/`ws_col`) the guest installs via `TIOCSWINSZ`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyConfig {
+    /// Number of character rows.
+    pub rows: u16,
+    /// Number of character columns.
+    pub cols: u16,
+}
+
+/// What to run in an interactive session, and how (design 62 §22).
+///
+/// Reuses [`ExecRequest`] for the command line, environment, working directory,
+/// and optional kill deadline — one shape for "what to run", not a second copy.
+/// `pty: Some(_)` allocates a controlling-terminal pseudo-terminal (merged
+/// stdout+stderr, `isatty()` true in-guest, resizable); `pty: None` uses pipes
+/// (separate stdout/stderr, streamable stdin).
+///
+/// The embedded [`ExecRequest::timeout`] keeps its uniform meaning — *an optional
+/// kill deadline; `None` = no deadline* (§22.2.1). Unlike the one-shot `exec()`
+/// path (which fills `None → DEFAULT_EXEC_TIMEOUT` before sending so a runaway
+/// child cannot outlive an abandoned host wait), the session path leaves `None`
+/// as `None`: an interactive session is *persistent* and is bounded instead by
+/// [`Message::CloseSession`], the child exiting, or connection teardown.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionSpec {
+    /// The command to run (argv/env/cwd/optional kill deadline).
+    pub command: ExecRequest,
+    /// `Some` allocates a PTY with this initial window size; `None` uses pipes.
+    pub pty: Option<PtyConfig>,
+}
+
+impl SessionSpec {
+    /// Creates a pipe (non-PTY) session spec for the given command.
+    #[must_use]
+    pub fn new(command: ExecRequest) -> Self {
+        Self { command, pty: None }
+    }
+
+    /// Turns this into a PTY session with the given initial window size.
+    #[must_use]
+    pub fn with_pty(mut self, rows: u16, cols: u16) -> Self {
+        self.pty = Some(PtyConfig { rows, cols });
+        self
+    }
+}
+
 /// A message exchanged between the host and the guest agent.
 ///
 /// **Append-only.** `postcard` encodes each variant by its zero-based
@@ -87,6 +149,11 @@ pub struct Ipv4Reconfig {
 /// variants must be *appended* and existing ones never reordered or removed, or
 /// the host and guest would disagree on the discriminant. `#[non_exhaustive]`
 /// keeps out-of-crate matches from silently breaking when a variant is appended.
+/// The one-shot exec path (`Exec`/`Stdout`/`Stderr`/`Exit`, indices 1–4) is
+/// distinct from the channelized interactive-session path (`OpenSession`…
+/// `SessionExit`, indices 8–15, design 62 §22): the former carries no
+/// [`SessionId`] and runs one exchange per connection; the latter multiplexes
+/// many concurrent sessions, each frame keyed by its id.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
@@ -149,6 +216,81 @@ pub enum Message {
         /// Whether the best-effort `eth0` IPv4 address + default-route rotation
         /// applied (H-VMM-1). Appended after `mac_applied`.
         ip_applied: bool,
+    },
+    /// Host→guest: open a new interactive session (design 62 §22). The guest
+    /// spawns the command per `spec` (PTY or pipes), registers it under
+    /// `session`, and streams `SessionStdout`/`SessionStderr` then a terminal
+    /// `SessionExit`, all keyed by `session`. A failed open is reported as
+    /// `SessionStderr` + `SessionExit(127)` (the one-shot spawn-failure
+    /// convention); there is no separate open-ack, so the host may send `Stdin`/
+    /// `Winsize` for `session` immediately after (the single ordered stream
+    /// guarantees this frame is processed first).
+    OpenSession {
+        /// The host-chosen id for the new session.
+        session: SessionId,
+        /// What to run, and whether on a PTY.
+        spec: SessionSpec,
+    },
+    /// Host→guest: feed stdin bytes to a running session (design 62 §22). For a
+    /// pipe session the bytes go to the child's stdin; for a PTY session they go
+    /// to the master (arriving as terminal input). Bounded by `MAX_FRAME_BYTES`.
+    Stdin {
+        /// The target session.
+        session: SessionId,
+        /// The stdin bytes to deliver.
+        data: Vec<u8>,
+    },
+    /// Host→guest: close a session's stdin (design 62 §22). For a pipe session
+    /// the child's stdin write end is dropped, so the child reads EOF; for a PTY
+    /// session this is a no-op (closing the master would tear down output — a PTY
+    /// caller ends input with an in-band EOT or `CloseSession`).
+    StdinEof {
+        /// The target session.
+        session: SessionId,
+    },
+    /// Host→guest: resize a PTY session's window (design 62 §22). Installs the
+    /// new `rows`×`cols` via `TIOCSWINSZ`, delivering `SIGWINCH` to the session's
+    /// foreground process group. A no-op for a pipe session.
+    Winsize {
+        /// The target session.
+        session: SessionId,
+        /// New number of character rows.
+        rows: u16,
+        /// New number of character columns.
+        cols: u16,
+    },
+    /// Host→guest: terminate a session (design 62 §22). The guest `SIGKILL`s the
+    /// session's process group; the resulting exit is reported as the session's
+    /// terminal `SessionExit`.
+    CloseSession {
+        /// The target session.
+        session: SessionId,
+    },
+    /// Guest→host: standard output (or merged PTY output) from a session
+    /// (design 62 §22).
+    SessionStdout {
+        /// The originating session.
+        session: SessionId,
+        /// The output bytes.
+        data: Vec<u8>,
+    },
+    /// Guest→host: standard error from a *pipe* session (design 62 §22). A PTY
+    /// session merges stderr into `SessionStdout`, so it never emits this.
+    SessionStderr {
+        /// The originating session.
+        session: SessionId,
+        /// The error-stream bytes.
+        data: Vec<u8>,
+    },
+    /// Guest→host: a session's exit code — its **terminal** frame (design 62
+    /// §22). Exactly one is sent per opened session, after all output, and no
+    /// further frame carries that `session`.
+    SessionExit {
+        /// The session that exited.
+        session: SessionId,
+        /// The process exit code (`128 + signal` for a signal-terminated child,
+        /// `127` for a failed spawn/PTY-allocation).
+        code: i32,
     },
 }
 
@@ -309,6 +451,47 @@ mod tests {
                 mac_applied: true,
                 ip_applied: true,
             },
+            // Interactive-session variants (design 62 §22). A dropped/reordered
+            // field or a rows↔cols swap reddens the `assert_eq!` below.
+            Message::OpenSession {
+                session: SessionId(7),
+                spec: SessionSpec::new(
+                    ExecRequest::new(vec!["cat".to_string()])
+                        .with_env(vec![("TERM".to_string(), "xterm".to_string())]),
+                )
+                .with_pty(40, 100),
+            },
+            Message::OpenSession {
+                session: SessionId(0),
+                spec: SessionSpec::new(ExecRequest::new(vec!["sh".to_string()])),
+            },
+            Message::Stdin {
+                session: SessionId(3),
+                data: vec![0x68, 0x69, 0x0a],
+            },
+            Message::StdinEof {
+                session: SessionId(3),
+            },
+            Message::Winsize {
+                session: SessionId(3),
+                rows: 50,
+                cols: 120,
+            },
+            Message::CloseSession {
+                session: SessionId(9),
+            },
+            Message::SessionStdout {
+                session: SessionId(1),
+                data: vec![1, 2, 3],
+            },
+            Message::SessionStderr {
+                session: SessionId(2),
+                data: vec![4, 5, 6],
+            },
+            Message::SessionExit {
+                session: SessionId(1),
+                code: 137,
+            },
         ];
 
         for msg in msgs {
@@ -316,6 +499,96 @@ mod tests {
             let decoded: Message = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(msg, decoded);
         }
+    }
+
+    // Append-only wire discipline (§4.1 / design 62 §22): postcard encodes an enum
+    // variant as a LEB128 varint of its zero-based declaration index, which for
+    // 0..=15 is a single leading byte equal to the index. This pins each variant to
+    // its discriminant, so reordering or removing a variant — which would silently
+    // desync the host and guest — reddens here, KVM-free. RED on any reorder.
+    #[test]
+    fn variant_discriminants_are_append_only_stable() {
+        fn tag(msg: &Message) -> u8 {
+            postcard::to_stdvec(msg).unwrap()[0]
+        }
+        // Indices 0–7: the original one-shot + resync path — must never move.
+        assert_eq!(tag(&Message::Ready), 0);
+        assert_eq!(tag(&Message::Exec(ExecRequest::new(vec![]))), 1);
+        assert_eq!(tag(&Message::Stdout(vec![])), 2);
+        assert_eq!(tag(&Message::Stderr(vec![])), 3);
+        assert_eq!(tag(&Message::Exit(0)), 4);
+        assert_eq!(
+            tag(&Message::PutFile {
+                dst: String::new(),
+                bytes: vec![],
+            }),
+            5
+        );
+        assert_eq!(
+            tag(&Message::Resync {
+                unix_secs: 0,
+                unix_nanos: 0,
+                mac: None,
+                ipv4: None,
+            }),
+            6
+        );
+        assert_eq!(
+            tag(&Message::ResyncAck {
+                clock_error: None,
+                reseed_applied: false,
+                mac_applied: false,
+                ip_applied: false,
+            }),
+            7
+        );
+        // Indices 8–15: the appended interactive-session variants (design 62 §22).
+        let sid = SessionId(1);
+        assert_eq!(
+            tag(&Message::OpenSession {
+                session: sid,
+                spec: SessionSpec::new(ExecRequest::new(vec![])),
+            }),
+            8
+        );
+        assert_eq!(
+            tag(&Message::Stdin {
+                session: sid,
+                data: vec![],
+            }),
+            9
+        );
+        assert_eq!(tag(&Message::StdinEof { session: sid }), 10);
+        assert_eq!(
+            tag(&Message::Winsize {
+                session: sid,
+                rows: 0,
+                cols: 0,
+            }),
+            11
+        );
+        assert_eq!(tag(&Message::CloseSession { session: sid }), 12);
+        assert_eq!(
+            tag(&Message::SessionStdout {
+                session: sid,
+                data: vec![],
+            }),
+            13
+        );
+        assert_eq!(
+            tag(&Message::SessionStderr {
+                session: sid,
+                data: vec![],
+            }),
+            14
+        );
+        assert_eq!(
+            tag(&Message::SessionExit {
+                session: sid,
+                code: 0,
+            }),
+            15
+        );
     }
 
     #[test]
@@ -390,6 +663,55 @@ mod tests {
                         ip_applied,
                     }
                 }),
+            // Interactive-session variants (design 62 §22).
+            (
+                any::<u64>(),
+                any::<Vec<String>>(),
+                any::<Vec<(String, String)>>(),
+                any::<Option<String>>(),
+                prop::option::of((any::<u16>(), any::<u16>())),
+            )
+                .prop_map(|(id, argv, env, cwd, pty)| Message::OpenSession {
+                    session: SessionId(id),
+                    spec: SessionSpec {
+                        command: ExecRequest {
+                            argv,
+                            env,
+                            cwd,
+                            timeout: None,
+                        },
+                        pty: pty.map(|(rows, cols)| PtyConfig { rows, cols }),
+                    },
+                }),
+            (any::<u64>(), any::<Vec<u8>>()).prop_map(|(id, data)| Message::Stdin {
+                session: SessionId(id),
+                data,
+            }),
+            any::<u64>().prop_map(|id| Message::StdinEof {
+                session: SessionId(id),
+            }),
+            (any::<u64>(), any::<u16>(), any::<u16>()).prop_map(|(id, rows, cols)| {
+                Message::Winsize {
+                    session: SessionId(id),
+                    rows,
+                    cols,
+                }
+            }),
+            any::<u64>().prop_map(|id| Message::CloseSession {
+                session: SessionId(id),
+            }),
+            (any::<u64>(), any::<Vec<u8>>()).prop_map(|(id, data)| Message::SessionStdout {
+                session: SessionId(id),
+                data,
+            }),
+            (any::<u64>(), any::<Vec<u8>>()).prop_map(|(id, data)| Message::SessionStderr {
+                session: SessionId(id),
+                data,
+            }),
+            (any::<u64>(), any::<i32>()).prop_map(|(id, code)| Message::SessionExit {
+                session: SessionId(id),
+                code,
+            }),
         ]
     }
 

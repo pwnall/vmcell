@@ -113,19 +113,19 @@ pub use config::{
 };
 pub use error::{Error, Result};
 #[cfg(feature = "host-common")]
+pub use lineage::{Lineage, LineageAllocator, LineageId};
+#[cfg(feature = "host-common")]
 pub use metrics::ResourceUsage;
 #[cfg(feature = "host-common")]
 pub use net::tap::NetNamespace;
 #[cfg(feature = "host-common")]
 pub use orchestrator::MicroVm;
 #[cfg(feature = "host-common")]
+pub use overlay::{OverlayStore, ReflinkOverlayStore};
+#[cfg(feature = "host-common")]
 pub use proxy::EgressProxy;
 #[cfg(feature = "host-common")]
 pub use reflink::CowSupport;
-#[cfg(feature = "host-common")]
-pub use overlay::{OverlayStore, ReflinkOverlayStore};
-#[cfg(feature = "host-common")]
-pub use lineage::{Lineage, LineageAllocator, LineageId};
 #[cfg(feature = "firecracker")]
 pub use vmm::Firecracker;
 #[cfg(feature = "qemu")]

@@ -132,6 +132,17 @@ enum Commands {
         /// override a reserved boot token vmcell owns (§19.2.1).
         #[arg(long = "append")]
         append: Vec<String>,
+        /// Run the command in a PTY (controlling-terminal) interactive session so
+        /// in-guest programs see a real terminal (`isatty` true, line editing);
+        /// implies `--stdin`. Local raw-mode / `SIGWINCH` forwarding is best-effort
+        /// (design 62 §22.7); a fixed 24×80 initial window is used.
+        #[arg(long)]
+        tty: bool,
+        /// Stream this CLI's stdin into the guest command (an interactive pipe
+        /// session, design 62 §22) instead of the default one-shot `/dev/null`
+        /// stdin.
+        #[arg(long)]
+        stdin: bool,
         /// Command (and args) to run in the guest. Defaults to `/bin/true`.
         ///
         /// `allow_hyphen_values` lets the guest argv carry its own flags without a
@@ -444,6 +455,8 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             disk,
             disk_rw,
             append,
+            tty,
+            stdin,
             cmd,
         } => {
             let disks = extra_disks_from(disk, disk_rw);
@@ -453,14 +466,21 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             } else {
                 cmd.clone()
             };
-            let agent = vm.agent(None, &vmcell::orchestrator::RealClock).await?;
-            let outcome = agent.exec(vmcell::ExecRequest::new(argv)).await?;
-            use std::io::Write as _;
-            // Best-effort relay of the guest command's captured output. A broken pipe
-            // (the consumer closed stdout/stderr) must not abort the run or mask the
-            // guest's real exit code, which we propagate below via `process::exit`.
-            let _ = std::io::stdout().write_all(&outcome.stdout);
-            let _ = std::io::stderr().write_all(&outcome.stderr);
+            // `--tty`/`--stdin` (design 62 §22) route through an interactive session
+            // that streams this CLI's stdin; the default path is the one-shot exec.
+            let code = if *tty || *stdin {
+                run_interactive_session(&vm, argv, *tty).await?
+            } else {
+                let agent = vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+                let outcome = agent.exec(vmcell::ExecRequest::new(argv)).await?;
+                use std::io::Write as _;
+                // Best-effort relay of the guest command's captured output. A broken pipe
+                // (the consumer closed stdout/stderr) must not abort the run or mask the
+                // guest's real exit code, which we propagate below via `process::exit`.
+                let _ = std::io::stdout().write_all(&outcome.stdout);
+                let _ = std::io::stderr().write_all(&outcome.stderr);
+                outcome.code
+            };
             vm.shutdown().await?;
             // The CLI propagates the guest command's exit code (§10.2). Teardown has
             // already run (shutdown consumed `vm`), so process::exit leaks nothing.
@@ -470,7 +490,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                 clippy::disallowed_methods,
                 reason = "ordered teardown already ran (shutdown consumed vm); relay the guest's exit code"
             )]
-            std::process::exit(outcome.code);
+            std::process::exit(code);
         }
         Commands::Create {
             kernel,
@@ -586,6 +606,71 @@ fn validate_oci_digest(digest: &str) -> vmcell::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Runs `argv` in an interactive session (design 62 §22), streaming this CLI's
+/// stdin into the guest command and relaying its output, and returns the guest
+/// exit code.
+///
+/// With `tty`, a controlling-terminal PTY session is used (fixed 24×80 initial
+/// window; local raw-mode / `SIGWINCH` forwarding is best-effort forward work,
+/// §22.7) — in-guest programs see a real terminal. Without it, a pipe session
+/// carries separate stdout/stderr. The `select!` loop reads guest output and this
+/// CLI's stdin concurrently; `recv()` and the stdin read are both cancellation-safe.
+async fn run_interactive_session(
+    vm: &vmcell::MicroVm<vmcell::CloudHypervisor>,
+    argv: Vec<String>,
+    tty: bool,
+) -> vmcell::Result<i32> {
+    use std::io::Write as _;
+    use tokio::io::AsyncReadExt as _;
+    use vmcell::agent::session::{SessionEvent, SessionSpecBuilder};
+
+    let mux = vm.connect_sessions(None).await?;
+    let mut builder = SessionSpecBuilder::new(argv);
+    if tty {
+        // A fixed classic default; dynamic sizing + resize forwarding is §22.7.
+        builder = builder.pty(24, 80);
+    }
+    let mut session = mux.open(builder.build()).await?;
+
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 4096];
+    let mut stdin_open = true;
+    loop {
+        tokio::select! {
+            event = session.recv() => match event {
+                Some(SessionEvent::Stdout(data)) => {
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&data);
+                    let _ = out.flush();
+                }
+                Some(SessionEvent::Stderr(data)) => {
+                    let mut err = std::io::stderr();
+                    let _ = err.write_all(&data);
+                    let _ = err.flush();
+                }
+                Some(SessionEvent::Exit(code)) => return Ok(code),
+                // The connection dropped before an exit — surface the sentinel -1.
+                None => return Ok(-1),
+                // `SessionEvent` is non-exhaustive; ignore any future event kind.
+                Some(_) => {}
+            },
+            read = stdin.read(&mut buf), if stdin_open => match read {
+                // Local EOF (Ctrl-D / piped input exhausted): close the guest stdin.
+                Ok(0) => {
+                    let _ = session.close_stdin().await;
+                    stdin_open = false;
+                }
+                Ok(n) => {
+                    // `read` guarantees n <= buf.len(); `get(..n)` is the non-panicking form.
+                    let _ = session.write_stdin(buf.get(..n).unwrap_or_default()).await;
+                }
+                // A local stdin read error: stop forwarding, keep relaying output.
+                Err(_) => stdin_open = false,
+            },
+        }
+    }
 }
 
 /// Builds the extra virtio-blk device list from the CLI's `--disk` (read-only) and

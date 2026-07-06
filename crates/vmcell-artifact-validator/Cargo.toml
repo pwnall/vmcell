@@ -15,7 +15,7 @@ path = "src/lib.rs"
 # The validator boots real vmcell micro-VMs and drives the guest agent, and reuses vmcell's
 # capability descriptors + net math. It needs the host stack: a backend, metrics, pipeline
 # (for artifact_path helpers). `vmcell` has no dependency on this crate.
-vmcell = { path = "../vmcell", version = "0.8.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.9.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"
 tracing = "0.1"

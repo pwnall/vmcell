@@ -410,6 +410,81 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   prints `NOT READY` (naming the failed check). **This note is kept deliberately** (not folded away yet) so
   future development can show whether the wording change actually breaks the reflex.)**
 
+## v26 — persistent interactive sessions (design §22)
+
+- **(a) The one-shot exec path is byte-for-byte unchanged; sessions are a separate channelized layer.**
+  Rather than retrofit a `SessionId` onto `Message::{Exec,Stdout,Stderr,Exit}` (a wire break plus a rewrite
+  of the heavily-tested one-shot handler + `AgentClient::exec`), v26 **appends** eight new variants
+  (`OpenSession`…`SessionExit`, indices 8–15) and adds a parallel host `agent::session` multiplexer on its
+  **own** connection. The one-shot `Exec` stays id-less and synchronous. *Reason:* the one-shot path carries
+  the most gates in the repo (desync discipline, reaper epochs, framing interop); a session layer beside it
+  keeps all of them intact and makes the wire change purely additive (`#[non_exhaustive]` enum → 0.x minor,
+  semver-checks-clean). A discriminant-stability unit test pins the append-only order KVM-free.
+
+- **(b) `ExecRequest.timeout` keeps ONE meaning across both paths ("a deadline, or none").** The one-shot
+  *host* still fills `None → DEFAULT_EXEC_TIMEOUT` before sending (a runaway one-shot child cannot outlive
+  the abandoned host wait); the session path leaves `None` as `None` — an interactive session is persistent,
+  bounded by `CloseSession` / child exit / connection teardown, not a default timeout. This is a policy the
+  host applies before the byte leaves, not a second interpretation in the guest, so no field is read two
+  ways (§22.2.1).
+
+- **(c) One per-connection writer, via `VsockStream::try_clone()` behind a mutex (§12.28).** The guest
+  connection handler was request/response (`handle_connection` drove one exec to completion before the next
+  read). It is now a non-blocking dispatch loop owning the read half, with a `try_clone`d write half behind
+  `Arc<Mutex<VsockStream>>` that every frame — one-shot output, put-file/resync acks, and all session pump
+  output — routes through (`send_msg`). *Reason:* multiplexed session frames from concurrent pump threads
+  must not interleave-corrupt on the wire, and one writer is the simplest guarantee. `handle_exec`/
+  `handle_put_file`/`handle_resync` keep their exact behavior; they just write through the shared writer.
+
+- **(d) PTY sessions run `setsid`+`TIOCSCTTY`+`dup2` in `pre_exec`; the master is `CLOEXEC`, the slave is
+  opened `CLOEXEC` and closed in the parent after spawn.** The child adopts the pty slave as its controlling
+  terminal via the canonical `login_tty` sequence (async-signal-safe rustix syscalls only, one SAFETY-doc'd
+  `BorrowedFd::borrow_raw`). The parent drops its slave so the master EOFs (`EIO`) when the child exits,
+  ending the pump. A pipe session keeps `process_group(0)` + three pipes as before. *Reason:* this is the
+  standard, minimal way to give an in-guest program a real terminal (`isatty` true, resizable) without a
+  helper binary or netlink.
+
+- **(e) `devpts` is mounted best-effort at `/dev/pts`, NOT in the fatal core-mount set.** PTY allocation
+  needs it, but one-shot exec, pipe sessions, and the vsock control plane do not — so a failed mount logs
+  and continues (only PTY sessions then fail loud with `SessionExit(127)`), exactly like the sysfs/share/
+  loopback mounts. Returning `Err` from PID 1 would kernel-panic the guest.
+
+- **(f) `child_path`/`build_command` extracted as the ONE command-construction law for both paths.** The
+  `/vmcell-tools`-augmented PATH and argv/env/cwd assembly are shared by `handle_exec` and `run_session`
+  (AGENTS.md "one law"); a `child_path_prepends_vmcell_tools` unit test reddens if a session drops the shim
+  dir. `kill_group` is the shared `kill(-pgid)` law (one-shot timeout, session `CloseSession`/timeout,
+  connection teardown §12.27).
+
+- **KVM validation — DONE on this host (2026-07-06).** The new `tests/session.rs` (4 data-plane tests ×
+  CH+FC+QEMU = 12, + 2 host demux unit tests) is **14/14 green** through the blessed runner under the
+  delegated scope: PTY `isatty`+initial-window+mid-session-resize with a pipe-session negative control
+  (§12.29); streaming stdin round-trip through `cat`+EOF (§22.2); two ~27 KiB self-identifying streams
+  multiplexed over one connection with zero cross-attribution (§12.28); a persistent `sleep` session's pid
+  gone after the mux drops (§12.27, existed-before/gone-after via `/proc/<pid>/cmdline`). Sessions need only
+  the vsock agent (no snapshot), so **no `require_cap!` skips** — every case runs on all three backends.
+  `just test-unprivileged` is **4/4 green**. KVM-free gates green: protocol round-trip +
+  discriminant-stability + proptest over all 8 new variants; guest `winsize_from`/`child_path`/
+  session-frame-codec-interop unit tests; host demux interleave-and-drop-post-exit test; `clippy -D warnings`
+  (workspace + each reduced backend + guest-agent lean-tree unchanged), rustdoc, `cargo deny`/`machete`,
+  `semver-checks` (vmcell 0.8.0→0.9.0, vmcell-protocol 0.3.0→0.4.0, both clean). Three key gates were
+  **red-on-inverse verified** (swap two appended enum variants → discriminant test reddens; id-ignoring demux
+  → multiplex test reddens; rows↔cols swap → `winsize_from` test reddens).
+
+- **(g) A pre-existing host-environmental failure cluster, control-proven NOT this change.** The full
+  privileged suite showed 6 reds — `nested_virt`/`nested_virt_disabled` (CH+QEMU: `kvm-ok exited 1`,
+  nested `/dev/kvm` not exposed) and `snapshot_restore`'s post-restore CSPRNG reseed (CH+FC:
+  `reseed_applied: Some(false)`, `/dev/hwrng` unavailable). Both classes are **guest-hardware passthrough**
+  (nested-KVM + virtio-rng), share zero code with the session change, and ride the same exec/boot/agent path
+  93 other privileged tests (+ all 14 session tests) pass on. Per the rubric ("environmental is a hypothesis,
+  not a diagnosis"), I ran the **control**: `git stash` the whole v26 change, rebuild the rootfs from the
+  **unmodified** agent, re-run the 6 tests — they **fail identically** (same 6, same `Some(false)`, same
+  `/dev/kvm` message). Mechanism, named: the host kernel log shows recurring `kvm_intel` EPT-violation /
+  TDP-page-fault traces (48× today, clustered minutes before each run) on this Lenovo host — degraded
+  nested-KVM + device passthrough. This is a legitimate `NOT READY` host condition for those capability tests
+  (AGENTS.md rule 5: forward-work is legitimate when the host can't run a check and the failed check is
+  named), **not** a session regression. It clears on a host with healthy KVM; re-run `just test-privileged`
+  there to reconfirm the reseed + nested-virt tiers.
+
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.

@@ -140,7 +140,9 @@ impl Lineage {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(crate::error::Error::Io)?;
-        let zygote = Zygote::suspend(vm, cfg, dir).await?.with_overlay_store(store);
+        let zygote = Zygote::suspend(vm, cfg, dir)
+            .await?
+            .with_overlay_store(store);
         Ok(Self::root(zygote, allocator))
     }
 
@@ -408,10 +410,14 @@ mod tests {
         write_master(&master);
         let store = RecordingOverlayStore::new();
         let store_arc: Arc<dyn OverlayStore> = Arc::new(store.clone());
-        let lineage =
-            Lineage::from_snapshot_dir(master.clone(), erofs_cfg(), LineageAllocator::new(), store_arc)
-                .await
-                .expect("root lineage");
+        let lineage = Lineage::from_snapshot_dir(
+            master.clone(),
+            erofs_cfg(),
+            LineageAllocator::new(),
+            store_arc,
+        )
+        .await
+        .expect("root lineage");
 
         let vmm = FakeVmm::default();
         let vm = lineage
@@ -429,7 +435,10 @@ mod tests {
         assert_eq!(calls.len(), 1, "fork must materialize exactly one CoW copy");
         let (src, dst) = &calls[0];
         assert_eq!(src, &master, "the copy source must be the master (§12.24)");
-        assert_ne!(dst, &master, "the copy dst must be a PRIVATE dir, never the master");
+        assert_ne!(
+            dst, &master,
+            "the copy dst must be a PRIVATE dir, never the master"
+        );
         assert!(
             dst.ends_with("zygote-snapshot"),
             "the dst must be the per-VM CoW copy, got {}",
@@ -468,11 +477,21 @@ mod tests {
 
         let b1_dir = root_dir.path().join("b1");
         let b1 = root.branch(&mut child, b1_dir).await.expect("branch");
-        assert_eq!(b1.parent(), Some(root.id()), "branch parent is the branched node");
+        assert_eq!(
+            b1.parent(),
+            Some(root.id()),
+            "branch parent is the branched node"
+        );
         assert_eq!(b1.generation(), 1, "branch generation is parent + 1");
         assert_eq!(b1.ancestry(), &[root.id()], "branch ancestry is [root]");
-        assert!(root.is_ancestor_of(&b1), "root is an ancestor of its branch");
-        assert!(!b1.is_ancestor_of(&root), "is_ancestor_of is antisymmetric (§12.25)");
+        assert!(
+            root.is_ancestor_of(&b1),
+            "root is an ancestor of its branch"
+        );
+        assert!(
+            !b1.is_ancestor_of(&root),
+            "is_ancestor_of is antisymmetric (§12.25)"
+        );
         assert_ne!(b1.id(), root.id(), "a branch has a distinct id");
     }
 
@@ -486,15 +505,19 @@ mod tests {
         let master = root_dir.path().join("root");
         write_master(&master);
         let alloc = LineageAllocator::new();
-        let root =
-            Lineage::from_snapshot_dir(master, erofs_cfg(), alloc, recording_store())
-                .await
-                .expect("root");
+        let root = Lineage::from_snapshot_dir(master, erofs_cfg(), alloc, recording_store())
+            .await
+            .expect("root");
         let vmm = FakeVmm::default();
         let cids = Arc::new(CidAllocator::new());
 
         let mut c0 = root
-            .fork(&vmm, cids.clone(), shared_vmids(), Box::new(FakeCgroupFs::new()))
+            .fork(
+                &vmm,
+                cids.clone(),
+                shared_vmids(),
+                Box::new(FakeCgroupFs::new()),
+            )
             .await
             .expect("fork c0");
         let b1 = root
@@ -503,7 +526,12 @@ mod tests {
             .expect("branch b1");
 
         let mut c1 = b1
-            .fork(&vmm, cids.clone(), shared_vmids(), Box::new(FakeCgroupFs::new()))
+            .fork(
+                &vmm,
+                cids.clone(),
+                shared_vmids(),
+                Box::new(FakeCgroupFs::new()),
+            )
             .await
             .expect("fork c1");
         let b2 = b1
@@ -511,7 +539,10 @@ mod tests {
             .await
             .expect("branch b2");
 
-        assert_eq!((root.generation(), b1.generation(), b2.generation()), (0, 1, 2));
+        assert_eq!(
+            (root.generation(), b1.generation(), b2.generation()),
+            (0, 1, 2)
+        );
         assert_eq!(root.ancestry(), &[] as &[LineageId]);
         assert_eq!(b1.ancestry(), &[root.id()]);
         assert_eq!(b2.ancestry(), &[root.id(), b1.id()]);
@@ -577,7 +608,8 @@ mod tests {
         .build()
         .expect("valid non-snapshotting config with a share");
         let res =
-            Lineage::from_snapshot_dir(master, cfg, LineageAllocator::new(), recording_store()).await;
+            Lineage::from_snapshot_dir(master, cfg, LineageAllocator::new(), recording_store())
+                .await;
         assert!(
             matches!(res, Err(crate::error::Error::Unsupported { .. })),
             "a vhost-user device must be rejected at construction, got {res:?}"
@@ -603,20 +635,34 @@ mod tests {
                 .expect("tree 1 root");
         // Tree 2: root → fork a child → branch it, so b1's ancestry is [tree2-root],
         // whose id collides with `a`'s (both L1 from independent allocators).
-        let t2 = Lineage::from_snapshot_dir(m2, erofs_cfg(), LineageAllocator::new(), recording_store())
-            .await
-            .expect("tree 2 root");
-        assert_eq!(a.id(), t2.id(), "distinct allocators both start at L1 — ids collide");
+        let t2 =
+            Lineage::from_snapshot_dir(m2, erofs_cfg(), LineageAllocator::new(), recording_store())
+                .await
+                .expect("tree 2 root");
+        assert_eq!(
+            a.id(),
+            t2.id(),
+            "distinct allocators both start at L1 — ids collide"
+        );
         let vmm = FakeVmm::default();
         let mut child = t2
-            .fork(&vmm, Arc::new(CidAllocator::new()), shared_vmids(), Box::new(FakeCgroupFs::new()))
+            .fork(
+                &vmm,
+                Arc::new(CidAllocator::new()),
+                shared_vmids(),
+                Box::new(FakeCgroupFs::new()),
+            )
             .await
             .expect("fork in tree 2");
         let b1 = t2
             .branch(&mut child, root.path().join("t2-b1"))
             .await
             .expect("branch in tree 2");
-        assert_eq!(b1.ancestry(), &[t2.id()], "b1 ancestry is the (colliding) id");
+        assert_eq!(
+            b1.ancestry(),
+            &[t2.id()],
+            "b1 ancestry is the (colliding) id"
+        );
         assert!(
             !a.is_ancestor_of(&b1),
             "a node from a DIFFERENT allocator family must never be an ancestor (§12.25), \
@@ -635,22 +681,39 @@ mod tests {
         write_master(&master);
         let store = RecordingOverlayStore::new();
         let store_arc: Arc<dyn OverlayStore> = Arc::new(store.clone());
-        let lineage =
-            Lineage::from_snapshot_dir(master.clone(), erofs_cfg(), LineageAllocator::new(), store_arc)
-                .await
-                .expect("root lineage");
+        let lineage = Lineage::from_snapshot_dir(
+            master.clone(),
+            erofs_cfg(),
+            LineageAllocator::new(),
+            store_arc,
+        )
+        .await
+        .expect("root lineage");
         let vmm = FakeVmm::default();
         let cids = Arc::new(CidAllocator::new());
         for _ in 0..2 {
             lineage
-                .fork(&vmm, cids.clone(), shared_vmids(), Box::new(FakeCgroupFs::new()))
+                .fork(
+                    &vmm,
+                    cids.clone(),
+                    shared_vmids(),
+                    Box::new(FakeCgroupFs::new()),
+                )
                 .await
                 .expect("fork");
         }
         let calls = store.calls();
-        assert_eq!(calls.len(), 2, "each fork materializes exactly one CoW copy");
+        assert_eq!(
+            calls.len(),
+            2,
+            "each fork materializes exactly one CoW copy"
+        );
         let dsts: std::collections::HashSet<_> = calls.iter().map(|(_, d)| d.clone()).collect();
-        assert_eq!(dsts.len(), 2, "two forks must use two DISTINCT private dirs (§12.24)");
+        assert_eq!(
+            dsts.len(),
+            2,
+            "two forks must use two DISTINCT private dirs (§12.24)"
+        );
         for (src, dst) in &calls {
             assert_eq!(src, &master, "every copy source is the master");
             assert_ne!(dst, &master, "every copy dst is private, never the master");
@@ -669,22 +732,34 @@ mod tests {
         write_master(&master);
         let store = RecordingOverlayStore::new();
         let store_arc: Arc<dyn OverlayStore> = Arc::new(store.clone());
-        let lineage =
-            Lineage::from_snapshot_dir(master.clone(), erofs_cfg(), LineageAllocator::new(), store_arc)
-                .await
-                .expect("root lineage");
+        let lineage = Lineage::from_snapshot_dir(
+            master.clone(),
+            erofs_cfg(),
+            LineageAllocator::new(),
+            store_arc,
+        )
+        .await
+        .expect("root lineage");
         let vmm = FakeVmm::default(); // rotates host paths → concurrent fan-out allowed
         let clones = lineage
-            .fork_many(&vmm, 3, Arc::new(CidAllocator::new()), shared_vmids(), || {
-                Box::new(FakeCgroupFs::new())
-            })
+            .fork_many(
+                &vmm,
+                3,
+                Arc::new(CidAllocator::new()),
+                shared_vmids(),
+                || Box::new(FakeCgroupFs::new()),
+            )
             .await
             .expect("fork_many of 3");
         assert_eq!(clones.len(), 3);
         let vmids: std::collections::HashSet<u32> = clones.iter().map(|c| c.vmid()).collect();
         assert_eq!(vmids.len(), 3, "each clone gets a distinct vmid");
         let calls = store.calls();
-        assert_eq!(calls.len(), 3, "each clone materializes through the store (§12.24)");
+        assert_eq!(
+            calls.len(),
+            3,
+            "each clone materializes through the store (§12.24)"
+        );
         let dsts: std::collections::HashSet<_> = calls.iter().map(|(_, d)| d.clone()).collect();
         assert_eq!(dsts.len(), 3, "each clone into its OWN private dir");
     }
@@ -708,18 +783,37 @@ mod tests {
         .expect("root");
         let vmm = FakeVmm::default();
         let mut child = root
-            .fork(&vmm, Arc::new(CidAllocator::new()), shared_vmids(), Box::new(FakeCgroupFs::new()))
+            .fork(
+                &vmm,
+                Arc::new(CidAllocator::new()),
+                shared_vmids(),
+                Box::new(FakeCgroupFs::new()),
+            )
             .await
             .expect("fork a child");
         let vmid_before = child.vmid();
 
-        let b1 = root.branch(&mut child, root_dir.path().join("b1")).await.expect("first branch");
+        let b1 = root
+            .branch(&mut child, root_dir.path().join("b1"))
+            .await
+            .expect("first branch");
         // The child survived the first branch — its identity is intact and it can be
         // branched again into a sibling node.
-        assert_eq!(child.vmid(), vmid_before, "branch must not change the live child's identity");
-        let b1b = root.branch(&mut child, root_dir.path().join("b1b")).await.expect("second branch");
+        assert_eq!(
+            child.vmid(),
+            vmid_before,
+            "branch must not change the live child's identity"
+        );
+        let b1b = root
+            .branch(&mut child, root_dir.path().join("b1b"))
+            .await
+            .expect("second branch");
 
-        assert_ne!(b1.id(), b1b.id(), "two branches of one child are distinct nodes");
+        assert_ne!(
+            b1.id(),
+            b1b.id(),
+            "two branches of one child are distinct nodes"
+        );
         assert_eq!(b1.parent(), Some(root.id()));
         assert_eq!(b1b.parent(), Some(root.id()));
         assert_eq!((b1.generation(), b1b.generation()), (1, 1));
@@ -744,13 +838,27 @@ mod tests {
         .expect("root");
         let vmm = FakeVmm::default();
         let mut child = root
-            .fork(&vmm, Arc::new(CidAllocator::new()), shared_vmids(), Box::new(FakeCgroupFs::new()))
+            .fork(
+                &vmm,
+                Arc::new(CidAllocator::new()),
+                shared_vmids(),
+                Box::new(FakeCgroupFs::new()),
+            )
             .await
             .expect("fork a child");
         // A nested, non-existent destination: branch must create it and its parents.
         let fresh = root_dir.path().join("nested/deeper/b1");
-        assert!(!fresh.exists(), "precondition: the target dir does not exist yet");
-        let _b1 = root.branch(&mut child, &fresh).await.expect("branch into a fresh dir");
-        assert!(fresh.is_dir(), "branch must create the target dir (and parents) if absent");
+        assert!(
+            !fresh.exists(),
+            "precondition: the target dir does not exist yet"
+        );
+        let _b1 = root
+            .branch(&mut child, &fresh)
+            .await
+            .expect("branch into a fresh dir");
+        assert!(
+            fresh.is_dir(),
+            "branch must create the target dir (and parents) if absent"
+        );
     }
 }

@@ -19,6 +19,7 @@
 //! verbatim-rebind (FC) tiers — the sequential single-lineage shape both support.
 
 use std::sync::Arc;
+use vmcell::ReflinkOverlayStore;
 use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
 use vmcell::lineage::{Lineage, LineageAllocator};
@@ -26,7 +27,6 @@ use vmcell::metrics::DefaultCgroupFs;
 use vmcell::orchestrator::{MicroVm, RealClock, VmidAllocator};
 use vmcell::overlay::OverlayStore;
 use vmcell::vmm::{CidAllocator, VmInstance, Vmm};
-use vmcell::ReflinkOverlayStore;
 
 mod common;
 
@@ -64,7 +64,8 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     };
 
     let id = uuid::Uuid::new_v4();
-    let scratch = std::env::temp_dir().join(format!("vmcell-lineage-{}-{}", std::process::id(), id));
+    let scratch =
+        std::env::temp_dir().join(format!("vmcell-lineage-{}-{}", std::process::id(), id));
     // `fork_from_vm` / `branch` create these dirs themselves — do NOT pre-create
     // them, so the test also proves that dir-creation behavior.
     let root_dir = scratch.join("root");
@@ -117,7 +118,11 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     let wrote = exec(&mut child, &["sh", "-c", "echo diverged > /tmp/marker"]).await;
     assert_eq!(wrote.0, 0, "writing the divergence marker must succeed");
     let readback = exec(&mut child, &["cat", "/tmp/marker"]).await;
-    assert_eq!(readback.1.trim(), "diverged", "marker must be present in the diverged child");
+    assert_eq!(
+        readback.1.trim(),
+        "diverged",
+        "marker must be present in the diverged child"
+    );
 
     // 3. branch() the DIVERGED child into a new node b1 (child stays live). Assert
     //    the lineage metadata (§12.25).
@@ -128,9 +133,16 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     assert_eq!(b1.generation(), 1, "branch is generation 1");
     assert_eq!(b1.parent(), Some(root.id()), "branch parent is the root");
     assert_eq!(b1.ancestry(), &[root.id()], "branch ancestry is [root]");
-    assert!(root.is_ancestor_of(&b1), "root is an ancestor of its branch");
+    assert!(
+        root.is_ancestor_of(&b1),
+        "root is an ancestor of its branch"
+    );
     // The child survived the branch (branch takes &mut, never consumes it).
-    assert_eq!(child.vmid(), child_vmid, "branch must not disturb the live child's identity");
+    assert_eq!(
+        child.vmid(),
+        child_vmid,
+        "branch must not disturb the live child's identity"
+    );
     child.shutdown().await.expect("shutdown the branched child");
 
     // 4. THE PROOF: a fork from b1 SEES the marker (branch captured the diverged
@@ -140,7 +152,10 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     //    baked-path lineage would collide (§9.4) — the single-lineage shape.
     let mut from_branch = fork_one(&b1, vmm, &cid_alloc, &vmid_alloc, "b1-child").await;
     let seen = exec(&mut from_branch, &["cat", "/tmp/marker"]).await;
-    assert_eq!(seen.0, 0, "a fork from the branch must find the marker (exit 0)");
+    assert_eq!(
+        seen.0, 0,
+        "a fork from the branch must find the marker (exit 0)"
+    );
     assert_eq!(
         seen.1.trim(),
         "diverged",
@@ -191,7 +206,9 @@ async fn exec<V: Vmm>(vm: &mut MicroVm<V>, argv: &[&str]) -> (i32, String) {
         .agent(None, &RealClock)
         .await
         .expect("agent")
-        .exec(ExecRequest::new(argv.iter().map(|s| (*s).to_string()).collect()))
+        .exec(ExecRequest::new(
+            argv.iter().map(|s| (*s).to_string()).collect(),
+        ))
         .await
         .expect("exec");
     (out.code, String::from_utf8_lossy(&out.stdout).to_string())

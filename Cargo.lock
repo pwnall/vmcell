@@ -3279,6 +3279,7 @@ checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
 dependencies = [
  "bitflags 2.13.0",
  "errno",
+ "itoa",
  "libc",
  "linux-raw-sys 0.4.15",
  "windows-sys 0.59.0",
@@ -4573,7 +4574,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "am-fs-erofs",
  "anyhow",
@@ -4703,7 +4704,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-guest-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes 1.12.0",
  "libc",
@@ -4749,7 +4750,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "postcard",
  "proptest",

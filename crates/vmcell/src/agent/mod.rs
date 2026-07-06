@@ -9,7 +9,17 @@
 
 /// The framed wire protocol shared by the host and the guest agent.
 pub use vmcell_protocol as protocol;
-pub use vmcell_protocol::{ExecOutcome, ExecRequest, MAX_FRAME_BYTES};
+pub use vmcell_protocol::{
+    ExecOutcome, ExecRequest, MAX_FRAME_BYTES, PtyConfig, SessionId, SessionSpec,
+};
+
+/// Host-side interactive-session multiplexer (design 62 §22): PTY / pipe sessions,
+/// streaming stdin, window resize, and multiplexed concurrent execs over one
+/// connection, beside the one-shot [`AgentClient`].
+#[cfg(feature = "host-common")]
+pub mod session;
+#[cfg(feature = "host-common")]
+pub use session::{Session, SessionEvent, SessionMux, SessionSpecBuilder};
 
 #[cfg(feature = "host-common")]
 use crate::error::{Error, Result};
@@ -106,6 +116,33 @@ impl AgentClient {
         timeouts: &crate::config::Timeouts,
         serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<Self> {
+        let stream = Self::connect_framed(vsock_path, port, timeout, timeouts, serial_log).await?;
+        Ok(Self {
+            stream,
+            desynced: false,
+        })
+    }
+
+    /// Connects the raw framed control-plane stream, retrying with backoff until
+    /// the guest answers `Ready` (the one connect/handshake law, §12.5).
+    ///
+    /// Split out of [`AgentClient::connect`] so the session multiplexer
+    /// ([`session::SessionMux`]) opens its own connection through the **same**
+    /// fragile handshake — the byte-by-byte `OK` line (never a buffered reader,
+    /// which would swallow the first framed payload) and the `Ready` frame — with
+    /// exactly one implementation (AGENTS.md "one law, one predicate").
+    ///
+    /// # Errors
+    /// Returns [`Error::Timeout`] if no `Ready` handshake completes within
+    /// `timeout`, or [`Error::Agent`] if a kernel panic is detected in the serial
+    /// log while waiting.
+    pub(crate) async fn connect_framed(
+        vsock_path: &Path,
+        port: u32,
+        timeout: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
+        serial_log: &dyn crate::vmm::SerialLog,
+    ) -> Result<Framed<UnixStream, LengthDelimitedCodec>> {
         let deadline = tokio::time::Instant::now() + timeout;
         // Poll floor while the VMM host-side socket is still absent. Kept small
         // because a failed local AF_UNIX connect is cheap, so a tighter cadence
@@ -197,10 +234,7 @@ impl AgentClient {
 
             match msg {
                 Message::Ready => {
-                    return Ok(Self {
-                        stream: framed,
-                        desynced: false,
-                    });
+                    return Ok(framed);
                 }
                 other => {
                     tracing::trace!("Agent connect received unexpected message: {:?}", other);

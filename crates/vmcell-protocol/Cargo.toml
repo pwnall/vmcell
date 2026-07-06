@@ -3,7 +3,11 @@ name = "vmcell-protocol"
 # 0.2 → 0.3: intentional breaking change — `Message::Resync` gained an `ipv4` field and
 # `Message::ResyncAck` gained `ip_applied` (H-VMM-1 guest-IP rotation on restore), plus a
 # new `Ipv4Reconfig` type. A 0.x minor bump is the SemVer slot for a pre-1.0 break.
-version = "0.3.0"
+# 0.3 → 0.4: additive interactive-session layer (design 62 §22) — eight append-only
+# channelized `Message` variants (`OpenSession`…`SessionExit`) plus `SessionId`/`SessionSpec`/
+# `PtyConfig`. Additive on a `#[non_exhaustive]` enum, but a minor bump keeps the shared-crate
+# version legible across the host and guest.
+version = "0.4.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

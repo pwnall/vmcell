@@ -22,7 +22,7 @@ name = "vmcell"
 # `LineageAllocator`) modules; `MicroVm::restore_cow` gained a final
 # `Arc<dyn OverlayStore>` seam param (the one breaking change, a minor pre-1.0 bump);
 # `Zygote` gained `with_overlay_store`.
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -146,7 +146,7 @@ thiserror = "2"
 # the framed postcard wire enum, shared with the guest agent (v15 §10.1). The explicit
 # `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
 # path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.3.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.4.0" }
 
 # host common
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
