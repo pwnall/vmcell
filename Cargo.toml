@@ -23,6 +23,11 @@ members = [
     # mirrors the vmcell entry points over HTTP; `vmcelld-ctl` is its CLI. `vmcell` has no edge to
     # any of these — the daemon depends on `vmcell`, never the reverse.
     "crates/vmcell-privilege",
+    # v24 §20.5: the setup broker — a minimal privileged spawn helper that holds the three caps and
+    # performs netns/tap/nft/cgroup setup + the jailed VMM spawn for a cap-dropped parent (the
+    # daemon/API mode's privilege boundary). Depends on `vmcell` (net/metrics subset) +
+    # `vmcell-privilege`; NEVER the daemon's web stack. `vmcell` has no edge to it.
+    "crates/vmcell-broker",
     "crates/vmcell-daemon",
     "crates/vmcelld",
     "crates/vmcell-daemon-client",

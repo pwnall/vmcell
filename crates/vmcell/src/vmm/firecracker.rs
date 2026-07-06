@@ -239,7 +239,13 @@ impl Firecracker {
         // Firecracker expects the socket to not exist before it creates it.
         let _ = tokio::fs::remove_file(&api_socket).await;
 
-        let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
+        // §20.3/§20.4: FC's built-in seccomp filter is on unless `--no-seccomp` (Disabled);
+        // the jailer-equivalent hardening is applied in build_vmm_cmd's forked-child window.
+        let seccomp_args = crate::vmm::seccomp::vmm_seccomp_args("firecracker", cfg.vmm_seccomp)?;
+        let jail = crate::vmm::jail::jail_spec_from_config(&cfg.jail)?;
+        let mut cmd =
+            crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
+        cmd.args(&seccomp_args);
 
         let log_file = std::fs::File::create(&serial_path)?;
         let mut process = cmd

@@ -397,7 +397,14 @@ impl CloudHypervisor {
         let vsock_path = res.tmp_dir.join("vsock.sock");
         let serial_path = res.tmp_dir.join("serial.log");
 
-        let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
+        // §20.3/§20.4: the VMM's own seccomp flag (one predicate) + the jailer-equivalent
+        // pre-exec hardening applied in build_vmm_cmd's forked-child window.
+        let seccomp_args =
+            crate::vmm::seccomp::vmm_seccomp_args("cloud-hypervisor", cfg.vmm_seccomp)?;
+        let jail = crate::vmm::jail::jail_spec_from_config(&cfg.jail)?;
+        let mut cmd =
+            crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
+        cmd.args(&seccomp_args);
 
         // The guest CID a restored snapshot baked in (populated from config.json in the
         // restore branch below); `None` on a cold create (M-VMM-3).

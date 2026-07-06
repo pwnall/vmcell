@@ -10,6 +10,12 @@ pub mod cloud_hypervisor;
 
 pub use cloud_hypervisor::{ChInstance, CloudHypervisor};
 
+/// Jailer-equivalent pre-exec hardening of the VMM child (design §20.4).
+pub mod jail;
+
+/// The VMM subprocess's own seccomp-BPF confinement — one predicate, three backends (§20.3).
+pub mod seccomp;
+
 #[cfg(feature = "firecracker")]
 /// Firecracker VMM backend implementation.
 pub mod firecracker;
@@ -224,42 +230,58 @@ pub(crate) fn remove_vm_tmp_dir(dir: &Path) {
     }
 }
 
-/// Builds a Tokio command for the VMM, handling network namespaces and process groups.
-pub fn build_vmm_cmd(binary_path: &Path, netns_name: Option<&str>) -> tokio::process::Command {
+/// Builds a Tokio command for the VMM, handling network namespaces, the jailer-equivalent
+/// pre-exec hardening (design §20.4), and process groups.
+///
+/// The single `pre_exec` closure enters the netns (when `netns_name` is `Some`) and then
+/// applies `jail` to the VMM child — the order is load-bearing: `setns` needs the caps the
+/// child still holds pre-exec, and the jail (`no_new_privs` + rlimits + seccomp) is applied
+/// after. Both are async-signal-safe (only `open`/`setns`/`close` on a pre-allocated string,
+/// and [`jail::apply_jail`]'s raw `prctl`/`setrlimit`/`seccomp` on already-allocated inputs).
+/// The closure is installed only when there is netns or non-no-op jail work to do.
+pub fn build_vmm_cmd(
+    binary_path: &Path,
+    netns_name: Option<&str>,
+    jail: &crate::vmm::jail::JailSpec,
+) -> tokio::process::Command {
     let mut std_cmd = std::process::Command::new(binary_path);
     use std::os::unix::process::CommandExt;
     std_cmd.process_group(0);
-    if let Some(netns) = netns_name {
-        let netns_path = format!("/var/run/netns/{netns}\0");
-        // The closure passed to `pre_exec` runs post-fork/pre-exec and calls only async-signal-safe
-        // syscalls (`open`/`setns`/`close`) on the pre-allocated, NUL-terminated `netns_path` string —
-        // no allocation, no non-reentrant libc call — so it is sound in the forked child. Defined
-        // outside the `unsafe` block so each syscall carries its own one-op `unsafe` + SAFETY note.
-        let enter_netns = move || -> std::io::Result<()> {
-            // SAFETY: `open(2)` on the pre-allocated NUL-terminated `netns_path`; async-signal-safe.
-            let fd = unsafe {
-                libc::open(
-                    netns_path.as_ptr() as *const libc::c_char,
-                    libc::O_RDONLY | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: `setns(2)` on the fd opened just above; async-signal-safe.
-            if unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0 {
-                let err = std::io::Error::last_os_error();
-                // SAFETY: close the fd opened above on the error path; async-signal-safe.
+
+    // Pre-allocate the NUL-terminated netns path (or empty) BEFORE the closure, so nothing
+    // allocates in the post-fork window.
+    let netns_path: Option<String> = netns_name.map(|n| format!("/var/run/netns/{n}\0"));
+    let jail = jail.clone();
+
+    if netns_path.is_some() || !jail.is_noop() {
+        let pre_exec = move || -> std::io::Result<()> {
+            if let Some(path) = &netns_path {
+                // SAFETY: `open(2)` on the pre-allocated NUL-terminated `path`; async-signal-safe.
+                let fd = unsafe {
+                    libc::open(
+                        path.as_ptr() as *const libc::c_char,
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: `setns(2)` on the fd opened just above; async-signal-safe.
+                if unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0 {
+                    let err = std::io::Error::last_os_error();
+                    // SAFETY: close the fd opened above on the error path; async-signal-safe.
+                    unsafe { libc::close(fd) };
+                    return Err(err);
+                }
+                // SAFETY: close the fd opened above on the success path; async-signal-safe.
                 unsafe { libc::close(fd) };
-                return Err(err);
             }
-            // SAFETY: close the fd opened above on the success path; async-signal-safe.
-            unsafe { libc::close(fd) };
-            Ok(())
+            // Jailer-equivalent hardening AFTER the netns join (setns still needs the caps).
+            crate::vmm::jail::apply_jail(&jail)
         };
-        // SAFETY: `pre_exec` runs `enter_netns` post-fork/pre-exec; it is async-signal-safe (above).
+        // SAFETY: `pre_exec` runs `pre_exec` post-fork/pre-exec; it is async-signal-safe (above).
         unsafe {
-            std_cmd.pre_exec(enter_netns);
+            std_cmd.pre_exec(pre_exec);
         }
     }
     tokio::process::Command::from(std_cmd)

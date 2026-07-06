@@ -80,6 +80,131 @@ pub struct VmConfig {
     /// erofs root, so it usually pairs with a writable rootfs or extra disk. Default
     /// `None`.
     pub init: Option<PathBuf>,
+    /// The VMM subprocess's own seccomp-BPF confinement (design §20.3). Default
+    /// [`VmmSeccomp::Enforcing`] runs each backend under its audited native filter
+    /// (`cloud-hypervisor --seccomp true`, Firecracker's built-in filter, `qemu
+    /// -sandbox on,…`). The one predicate [`crate::vmm::seccomp::vmm_seccomp_args`]
+    /// maps this to the per-backend flag and returns [`crate::error::Error::Unsupported`]
+    /// for a policy a backend cannot honor (e.g. [`VmmSeccomp::Log`] on Firecracker/QEMU),
+    /// never a silent downgrade. [`VmmSeccomp::Disabled`] is a deliberate, logged opt-out.
+    pub vmm_seccomp: VmmSeccomp,
+    /// Jailer-equivalent pre-exec hardening applied to the VMM child (design §20.4):
+    /// `no_new_privs`, ambient-capability clear, non-dumpable, and rlimits, plus an
+    /// optional coarse seccomp deny-list. Default [`JailConfig::default`] is the
+    /// hardened profile ([`JailConfig::hardened`]). The pure config here is compiled to
+    /// a runtime `JailSpec` and applied by [`crate::vmm::jail::apply_jail`] in the
+    /// forked-child pre-exec window, shared by the in-process spawn and the setup
+    /// broker (one law, §12.22).
+    pub jail: JailConfig,
+}
+
+/// The VMM subprocess's own seccomp-BPF confinement policy (design §20.3 / §12.21).
+///
+/// [`crate::vmm::seccomp::vmm_seccomp_args`] is the single predicate that turns this
+/// into a backend's native CLI flag; a policy a backend cannot honor is a typed
+/// [`crate::error::Error::Unsupported`], not a silent fallback (§7.2 capability honesty).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum VmmSeccomp {
+    /// Enforce the backend's audited seccomp filter, killing on a disallowed syscall.
+    /// The default — vmcell never leaves a backend unconfined by default (§12.2).
+    #[default]
+    Enforcing,
+    /// Observe-only: log disallowed syscalls instead of killing (debugging a filter
+    /// false-positive). Only Cloud Hypervisor supports it (`--seccomp log`); on
+    /// Firecracker/QEMU it is [`crate::error::Error::Unsupported`].
+    Log,
+    /// No VMM seccomp. A deliberate, logged opt-out — never a silent default. The one
+    /// legitimate reason is a QEMU workload whose feature needs `spawn` (which
+    /// `-sandbox …,spawn=deny` blocks).
+    Disabled,
+}
+
+/// Jailer-equivalent pre-exec hardening applied to the VMM child (design §20.4).
+///
+/// Pure, serializable configuration (no compiled BPF): [`crate::vmm::jail::apply_jail`]
+/// compiles the optional deny-list once, pre-fork, and applies the rest in the
+/// async-signal-safe child window. Mirrors the hardening Firecracker's `jailer` applies
+/// to the VMM (minus the chroot/uid-drop increment, forward work §20.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JailConfig {
+    /// `prctl(PR_SET_NO_NEW_PRIVS, 1)` — the child (and anything it execs) can never
+    /// gain privileges via a setuid/file-cap binary. Required before a seccomp filter.
+    pub no_new_privs: bool,
+    /// `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)` — clear the ambient capability set.
+    /// **Default `false`, opt-in** (§20.9): in vmcell's current architecture the VMM *inherits*
+    /// `CAP_NET_ADMIN` (via the ambient set on the `vmcell-test-runner` path) and **needs** it —
+    /// a restored Cloud Hypervisor's `TapSetMac` and Firecracker's tap re-open both `EPERM`
+    /// without it (validated on a KVM host). Clearing the VMM's caps is safe only once the tap is
+    /// handed over fully configured (the fd-passing / uid-drop jailer increment), so this stays an
+    /// opt-in for that future path rather than a default.
+    pub clear_ambient_caps: bool,
+    /// `prctl(PR_SET_DUMPABLE, 0)` — mark the VMM non-dumpable (blocks a same-uid
+    /// `ptrace` of the process holding guest memory, and reinforces `rlimit_core`).
+    pub non_dumpable: bool,
+    /// `RLIMIT_CORE` — default `Some(0)`: a VMM core dump writes guest memory
+    /// (potentially secrets) to disk, exactly the §12.18 surface, so no core is allowed.
+    pub rlimit_core: Option<u64>,
+    /// `RLIMIT_FSIZE` — default `None` (unset): a snapshot-eligible VM writes a
+    /// guest-RAM-sized suspend file, so a naïve `fsize=0` would break snapshot.
+    pub rlimit_fsize: Option<u64>,
+    /// `RLIMIT_NOFILE` — default `None`; set for a tighter open-fd ceiling on the VMM.
+    pub rlimit_nofile: Option<u64>,
+    /// Apply a coarse, default-allow seccomp **deny-list** (design §20.4) of syscalls a
+    /// booting VMM never needs and an escape would want (`mount`, `ptrace`, `bpf`,
+    /// `kexec_load`, module ops, `setns`, …) → `EPERM`. Ships **opt-in, default
+    /// `false`**: the backend's own native filter ([`VmmSeccomp`]) is the shipped
+    /// default confinement, and a host-applied filter on a live VMM is not yet
+    /// KVM-host-validated (§20.9). The filter-application mechanism itself is gated
+    /// KVM-free against a stand-in child.
+    pub seccomp_deny_list: bool,
+}
+
+impl JailConfig {
+    /// The hardened default: `no_new_privs` + `non_dumpable` + `RLIMIT_CORE=0`, no fsize/nofile
+    /// cap, no host seccomp deny-list (the backend's native filter is the shipped default, §20.4).
+    ///
+    /// **`clear_ambient_caps` defaults to `false`** (empirically forced, §20.9): in vmcell's
+    /// current architecture the VMM inherits `CAP_NET_ADMIN` (via the ambient set on the runner
+    /// path) and **needs** it for privileged tap operations — a restored Cloud Hypervisor's
+    /// `TapSetMac` and Firecracker's tap re-open both `EPERM` without it (validated on a KVM host:
+    /// clearing ambient broke `*_survives_snapshot` restore-with-tap). Clearing the VMM's caps is
+    /// safe only once the tap is handed over fully configured (the fd-passing / uid-drop jailer
+    /// increment, §20.9); until then the field stays an opt-in for that future path.
+    #[must_use]
+    pub const fn hardened() -> Self {
+        Self {
+            no_new_privs: true,
+            clear_ambient_caps: false,
+            non_dumpable: true,
+            rlimit_core: Some(0),
+            rlimit_fsize: None,
+            rlimit_nofile: None,
+            seccomp_deny_list: false,
+        }
+    }
+
+    /// A no-op jail (every hardening off) — for tests that spawn a stand-in needing the
+    /// unrestricted inherited environment, and the buggy inverse the hardening gate checks.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            no_new_privs: false,
+            clear_ambient_caps: false,
+            non_dumpable: false,
+            rlimit_core: None,
+            rlimit_fsize: None,
+            rlimit_nofile: None,
+            seccomp_deny_list: false,
+        }
+    }
+}
+
+impl Default for JailConfig {
+    fn default() -> Self {
+        Self::hardened()
+    }
 }
 
 /// Per-VM hot-path timing knobs, gathered so a workload can pick a profile in one
@@ -853,6 +978,8 @@ impl VmConfig {
             extra_disks: vec![],
             extra_kernel_args: vec![],
             init: None,
+            vmm_seccomp: VmmSeccomp::default(),
+            jail: JailConfig::default(),
         }
     }
 }
@@ -880,9 +1007,27 @@ pub struct VmConfigBuilder {
     extra_disks: Vec<BlockDevice>,
     extra_kernel_args: Vec<String>,
     init: Option<PathBuf>,
+    vmm_seccomp: VmmSeccomp,
+    jail: JailConfig,
 }
 
 impl VmConfigBuilder {
+    /// Sets the VMM subprocess's own seccomp policy ([`VmConfig::vmm_seccomp`], §20.3).
+    /// Default [`VmmSeccomp::Enforcing`].
+    #[must_use]
+    pub fn vmm_seccomp(mut self, policy: VmmSeccomp) -> Self {
+        self.vmm_seccomp = policy;
+        self
+    }
+
+    /// Sets the jailer-equivalent pre-exec hardening for the VMM child
+    /// ([`VmConfig::jail`], §20.4). Default [`JailConfig::hardened`].
+    #[must_use]
+    pub fn jail(mut self, jail: JailConfig) -> Self {
+        self.jail = jail;
+        self
+    }
+
     /// Adds a shared directory.
     #[must_use]
     pub fn with_share(mut self, share: Share) -> Self {
@@ -1336,6 +1481,8 @@ impl VmConfigBuilder {
             extra_disks: self.extra_disks,
             extra_kernel_args: self.extra_kernel_args,
             init: self.init,
+            vmm_seccomp: self.vmm_seccomp,
+            jail: self.jail,
         })
     }
 }

@@ -3435,6 +3435,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4564,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "am-fs-erofs",
  "anyhow",
@@ -4598,6 +4607,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rtnetlink",
  "rustls",
+ "seccompiler",
  "serde",
  "serde_json",
  "serial_test",
@@ -4635,6 +4645,18 @@ dependencies = [
  "tokio 1.52.3",
  "tracing",
  "vmcell",
+]
+
+[[package]]
+name = "vmcell-broker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "postcard",
+ "serde",
+ "tun-tap",
+ "vmcell",
+ "vmcell-privilege",
 ]
 
 [[package]]
@@ -4718,7 +4740,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-privilege"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "capctl",
  "libc",

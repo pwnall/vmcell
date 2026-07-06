@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 vmcell-daemon = { path = "../vmcell-daemon", version = "0.1.0" }
-vmcell-privilege = { path = "../vmcell-privilege", version = "0.1.0" }
+vmcell-privilege = { path = "../vmcell-privilege", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tracing = "0.1"

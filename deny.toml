@@ -14,6 +14,21 @@ private = { ignore = true }
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Machine-enforced licensing gate for the seccomp layer (design §20.6). The `[licenses]` allow-list
+# above inspects each Rust crate's `license` field — it canNOT see a C library pulled in through a
+# `build.rs`/`pkg-config` `-sys` crate. `libseccomp`/`libseccomp-sys`/`syscallz` have PERMISSIVE Rust
+# metadata but LINK the LGPL-2.1 `libseccomp` C library, so the license gate would pass GREEN while
+# the build links copyleft — the "copyleft banned for linked libraries" rule violated invisibly.
+# `seccomp`/`seccomp-sys` are LGPL-2.1 outright. We ban all five by NAME so reaching for the
+# ergonomic-looking wrapper reddens here; the sanctioned seccomp path is `seccompiler`
+# (Apache-2.0 OR BSD-3-Clause, pure Rust, no C linkage — the lib CH/FC themselves use).
+deny = [
+    { name = "libseccomp", reason = "links the LGPL-2.1 libseccomp C library (invisible to the license gate); use seccompiler (§20.6)" },
+    { name = "libseccomp-sys", reason = "-sys crate that links the LGPL-2.1 libseccomp C library; use seccompiler (§20.6)" },
+    { name = "seccomp-sys", reason = "-sys crate that links the LGPL-2.1 libseccomp C library; use seccompiler (§20.6)" },
+    { name = "seccomp", reason = "LGPL-2.1 crate + links libseccomp; use seccompiler (§20.6)" },
+    { name = "syscallz", reason = "pulls seccomp-sys → the LGPL-2.1 libseccomp C library; use seccompiler (§20.6)" },
+]
 
 [advisories]
 yanked = "deny"

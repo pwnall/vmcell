@@ -336,7 +336,14 @@ impl Qemu {
             fs_daemons.push(daemon);
         }
 
-        let mut cmd = crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref());
+        // §20.3/§20.4: QEMU had NO `-sandbox` — it ran unconfined. Enforcing now emits the
+        // libseccomp sandbox (a QEMU built without libseccomp errors fail-loud on it, the
+        // desired behavior); the jailer-equivalent hardening is applied in build_vmm_cmd.
+        let seccomp_args = crate::vmm::seccomp::vmm_seccomp_args("qemu", cfg.vmm_seccomp)?;
+        let jail = crate::vmm::jail::jail_spec_from_config(&cfg.jail)?;
+        let mut cmd =
+            crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
+        cmd.args(&seccomp_args);
 
         cmd.arg("-M")
             .arg("q35,memory-backend=mem")

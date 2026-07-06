@@ -221,6 +221,85 @@ Graduates the two §17 forward-work items. Fold into the design body and delete 
   it is a safety-discipline lint, not a production-strictness one. Retire this entry if the template
   is updated to say `not(test)`.
 
+## v24 — privileged-window hardening (VMM seccomp + jailer-equivalent + setup broker)
+
+Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22 shape). New crate:
+`vmcell-broker`. Fold settled entries into the design body and delete here as they stabilize.
+
+- **(a) The jailer-equivalent lives in `vmcell::vmm::jail`, NOT `vmcell-privilege`; `vmcell` does not
+  gain a `vmcell-privilege` edge.** An earlier design draft placed `JailSpec` in `vmcell-privilege`.
+  *Reason it moved:* the jail is only ever applied where a VMM is spawned (`build_vmm_cmd` + the
+  broker's `SpawnVmm`), both of which already link `vmcell`'s host stack; putting it in
+  `vmcell-privilege` would have forced the seccomp/host-side machinery onto the **lean**
+  `vmcell-test-runner` (which links `vmcell-privilege` but never spawns a VMM), breaking its lean-tree
+  assertion. `vmcell-privilege` gains only the pure `plan_broker_parent_drop`/`apply_broker_parent_drop`
+  (capctl-only, no new dep). `vmcell::vmm::jail` owns `seccompiler`. Design already reconciled.
+
+- **(b) `seccompiler` (Apache-2.0 OR BSD-3-Clause) is a NEW dep on `vmcell` (behind `host-common`), and
+  the LGPL `libseccomp` family is banned by NAME in `deny.toml`.** The B9 "privileged window is
+  dependency-thin (rustix+capctl+libc)" rule governs `vmcell-privilege`/`vmcell-test-runner`, which stay
+  unchanged (lean-tree assertion confirms `seccompiler` is absent from the runner). `seccompiler` is the
+  pure-Rust rust-vmm seccomp compiler CH and FC use internally, so it is the sanctioned choice; the
+  alternatives (`libseccomp`/`syscallz`) have permissive Rust metadata but LINK the LGPL-2.1 libseccomp
+  C library — invisible to `cargo deny`'s license gate, so the ban catches it by name (§20.6). A defect
+  class (a licensing hole tooling reports green on) turned into a gate that can go red.
+
+- **(c) The seccompiler VMM-child deny-list ships OPT-IN, default OFF (`JailConfig::seccomp_deny_list`
+  = false).** *Reason:* a host-applied filter on a live VMM cannot be validated on a KVM host in this
+  environment, and shipping it enabled-by-default unvalidated would violate "host-facing claims are
+  validated by executing on a KVM host". The default confinement is the backend's own native filter
+  (Layer 1). The filter-application *mechanism* is fully gated KVM-free: `tests/jail_hardening.rs` forks
+  a stand-in, applies the deny-list, and asserts `unshare(0)→EPERM` while `getpid` still works (red on
+  an empty filter). Design §20.4/§20.9.
+
+- **(d) The broker's `SpawnVmm` (the jailed fork→setns→jail→execve→pidfd path) refuses fail-loud as
+  forward work; `vmcelld` is NOT cut over to fork-broker-then-drop this pass.** *Reason:* the setns
+  constraint (an unprivileged parent can never join a broker-created netns) makes a half-wired broker
+  broken — the cutover is all-or-nothing deep surgery (invert the daemon's launcher through `BrokerClient`)
+  best landed as its own change with its own live validation, not bundled here. What ships is the
+  complete, fake-tested component: protocol + framed codec (round-trip + over-cap reject), the
+  setup/cgroup/teardown/sweep dispatch against the injected `Netlink`/`NftApplier`/`CgroupFs`/
+  `OrphanScanner` seams (call-order / residue-gone / sweep-only-dead), the parent cap-drop plan, and the
+  socketpair+fork+pdeathsig transport (Health round-trip). The retain-caps single-process daemon (§12.14)
+  stays the default. Design §20.5/§20.9.
+
+- **(e) QEMU gains `-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`
+  (Enforcing) — it previously ran with NO `-sandbox`, unconfined.** A QEMU built without libseccomp errors
+  fail-loud on `-sandbox on`, which is the *desired* behavior (refuse rather than run unconfined). The one
+  legitimate opt-out is a QEMU workload whose feature needs `spawn` — `VmmSeccomp::Disabled`, logged.
+  `VmmSeccomp::Log` is CH-only; on FC/QEMU it is a typed `Error::Unsupported`, never a silent downgrade.
+
+- **(f) Module-doc (`//!`) intra-doc links to a module's own items need FULL crate paths.** rustdoc under
+  `RUSTDOCFLAGS=-D warnings` reports `[\`JailSpec\`]` in `vmm/jail.rs`'s `//!` doc as "no item in scope";
+  `[\`JailSpec\`](crate::vmm::jail::JailSpec)` resolves. A rustdoc quirk for inner module docs, not a code
+  issue — noted so the next author does not re-hit it.
+
+- **(g) `JailConfig::hardened()` defaults `clear_ambient_caps` to FALSE — a KVM-host finding.** The first
+  draft cleared the VMM child's ambient set on the (wrong) theory that the VMM "already runs with no
+  caps." On the `vmcell-test-runner` path the three caps live in the **ambient** set, so the exec'd VMM
+  **inherits** them and **needs** `CAP_NET_ADMIN`: the privileged suite reddened all six restore-with-tap
+  tests (`snapshot_restore`/`extra_block_survives_snapshot`/`zygote_fan_out` × CH+FC) with
+  `TapSetMac`(CH)/tap-open(FC) `EPERM`. Cold boot survived (it doesn't re-set the tap MAC that way);
+  restore did not. Fix: default `clear_ambient_caps` off (the field stays an opt-in for the future
+  fd-passing/uid-drop path where the VMM needs no caps). `no_new_privs`/`RLIMIT_CORE=0`/`non_dumpable`
+  stay on — validated non-breaking. This is the "defaults get the strictest scrutiny" + "validate on a
+  KVM host" discipline catching a real regression static review would have missed. Design §20.4/§20.9.
+
+- **Validated on THIS KVM host (`just test-privileged`, delegated scope; runner blessed, CH at
+  `~/.cargo/bin`, artifacts built).** The privileged suite runs every VM through the hardened path
+  (`JailConfig::hardened()` + `VmmSeccomp::Enforcing`). First run surfaced deviation (g): **78 passed / 6
+  failed** — the 6 the `clear_ambient` bug broke. After the fix, re-run **84/84 green** (CH + FC + QEMU
+  cold boot, `exec`, privileged tap + nft TPROXY egress, host-endpoint, metrics/limits, nested virt,
+  extra disks/throttle, shares, snapshot→restore, zygote fan-out) — so CH `--seccomp true`, FC's built-in
+  filter, QEMU `-sandbox on,…`, and the jailer-equivalent hardening are all confirmed non-breaking on a
+  live VMM across all three backends. **`just ci`-equivalent gates also green (no KVM needed):** fmt;
+  `clippy --workspace --all-targets --all-features -D warnings`; reduced-host per-backend clippy; `cargo
+  deny` (seccompiler allow-listed, LGPL bans clean); rustdoc; lean-tree assertions (agent/runner lean,
+  `seccompiler` absent from the runner, broker excludes `vmcell-daemon`/axum); `cargo semver-checks`;
+  feature-powerset (204/204); `cargo nextest run --all-features` (482 passed). **Still forward work
+  (§20.9):** the `vmcelld` broker cutover, the seccompiler deny-list + `clear_ambient` defaults (blocked
+  on the fd-passing/uid-drop increment), and the QEMU/FC snapshot tiers already unwired pre-v24.
+
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.

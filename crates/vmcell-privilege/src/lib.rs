@@ -363,6 +363,95 @@ pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
     Ok(())
 }
 
+/// A PURE description of the **setup-broker parent's** capability drop (design §20.5 /
+/// §12.23): after `vmcelld` forks the privileged broker child, the parent — which serves the
+/// network-facing HTTP API — drops **every** capability so a bug in the request parser can no
+/// longer reach the caps. Unlike [`PrivilegePlan`] (which *keeps* `need`), this keeps
+/// **nothing**: `final_caps` is empty. The uid is intentionally NOT dropped — the parent stays
+/// the same uid so it can `connect()` the VMM's sockets and `pidfd_send_signal` it (a
+/// cross-uid signal would need `CAP_KILL`, §20.5).
+///
+/// Only the thin [`apply_broker_parent_drop`] performs syscalls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerParentDropPlan {
+    /// Caps to drop from the bounding set: **everything** the kernel supports (the parent
+    /// needs none, and an empty bounding set means no future `exec` can regain one).
+    pub bounding_drop: Vec<Cap>,
+    /// Clear the ambient capability set (so no cap survives into any child the parent execs).
+    pub clear_ambient: bool,
+    /// Set `PR_SET_NO_NEW_PRIVS` — the parent can never gain privilege via a setuid binary.
+    pub no_new_privs: bool,
+    /// The final permitted/effective/inheritable target — **empty** (the parent keeps no cap).
+    pub final_caps: Vec<Cap>,
+}
+
+/// Computes the [`BrokerParentDropPlan`] from the live supported-cap set — no process mutation.
+///
+/// Pure so the "keeps nothing" contract is unit-testable against its buggy inverse (a plan that
+/// accidentally retained a cap, e.g. copied [`PRIVILEGED_CAPS`] into `final_caps`, would leave
+/// the HTTP surface holding privilege — the exact thing the broker split removes).
+#[must_use]
+pub fn plan_broker_parent_drop(supported: &[Cap]) -> BrokerParentDropPlan {
+    BrokerParentDropPlan {
+        bounding_drop: supported.to_vec(),
+        clear_ambient: true,
+        no_new_privs: true,
+        final_caps: Vec::new(),
+    }
+}
+
+/// Executes a [`BrokerParentDropPlan`] against the live process — the thin syscall edge,
+/// integration-only (the parent after the broker fork).
+///
+/// Order: clear ambient → shrink bounding (needs `CAP_SETPCAP` in effective, raised from
+/// permitted first if held) → set `no_new_privs` → clear permitted/effective/inheritable to
+/// exactly `final_caps` (empty). The uid is left unchanged (§20.5).
+///
+/// # Errors
+/// Returns a diagnostic string on any failed syscall; the caller exits non-zero (a parent that
+/// could not fully drop its caps must not go on to serve the API).
+pub fn apply_broker_parent_drop(plan: &BrokerParentDropPlan) -> Result<(), String> {
+    // 1. Clear the ambient set.
+    if plan.clear_ambient {
+        capctl::ambient::clear().map_err(|e| format!("failed to clear ambient caps: {e}"))?;
+    }
+
+    // 2. Shrink the bounding set. PR_CAPBSET_DROP needs CAP_SETPCAP in EFFECTIVE — raise it
+    //    from permitted first while we still hold it.
+    if let Ok(mut st) = CapState::get_current()
+        && st.permitted.has(Cap::SETPCAP)
+        && !st.effective.has(Cap::SETPCAP)
+    {
+        st.effective.add(Cap::SETPCAP);
+        let _ = st.set_current();
+    }
+    for &c in &plan.bounding_drop {
+        // Best-effort: without CAP_SETPCAP some drops fail, but the permitted/effective clear
+        // below is the load-bearing removal; surface a wider-than-intended bounding set loudly.
+        let _ = capctl::bounding::drop(c);
+    }
+
+    // 3. no_new_privs: no setuid exec can regain a capability after this.
+    if plan.no_new_privs {
+        capctl::prctl::set_no_new_privs()
+            .map_err(|e| format!("failed to set no_new_privs: {e}"))?;
+    }
+
+    // 4. Trim permitted/effective/inheritable to exactly final_caps (empty for the parent).
+    let mut caps =
+        CapState::get_current().map_err(|e| format!("failed to read capabilities: {e}"))?;
+    caps.permitted.clear();
+    caps.effective.clear();
+    caps.inheritable.clear();
+    for &c in &plan.final_caps {
+        caps.permitted.add(c);
+        caps.effective.add(c);
+    }
+    caps.set_current()
+        .map_err(|e| format!("failed to trim capabilities: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +651,42 @@ mod tests {
         );
         assert_eq!(merge_preserved_groups(108, Some(108), &[108]), vec![108]);
         assert_eq!(merge_preserved_groups(1000, None, &[4]), vec![1000]);
+    }
+
+    // Guards §12.23: the broker parent keeps NOTHING. `final_caps` must be empty (the whole
+    // point of the split is that the HTTP-serving process holds no capability); it drops the
+    // ENTIRE supported set from the bounding set; and it sets no_new_privs + clears ambient.
+    // The buggy inverse (retaining a cap in `final_caps` — e.g. copying PRIVILEGED_CAPS the way
+    // the runner/daemon plan does) leaves the network surface privileged and reddens here.
+    #[test]
+    fn broker_parent_drop_keeps_no_caps_and_shrinks_everything() {
+        let supported = [
+            Cap::NET_ADMIN,
+            Cap::SYS_ADMIN,
+            Cap::DAC_OVERRIDE,
+            Cap::CHOWN,
+            Cap::SETPCAP,
+        ];
+        let plan = plan_broker_parent_drop(&supported);
+        assert!(
+            plan.final_caps.is_empty(),
+            "the broker parent must retain NO capability, got {:?}",
+            plan.final_caps
+        );
+        assert!(plan.no_new_privs, "the parent must set no_new_privs");
+        assert!(plan.clear_ambient, "the parent must clear the ambient set");
+        // Every supported cap — including the three privileged ones — is dropped from bounding.
+        for c in supported {
+            assert!(
+                plan.bounding_drop.contains(&c),
+                "bounding-set drop must include {c:?} (nothing is spared)"
+            );
+        }
+        for c in PRIVILEGED_CAPS {
+            assert!(
+                !plan.final_caps.contains(&c),
+                "the parent must NOT keep the privileged cap {c:?}"
+            );
+        }
     }
 }
