@@ -389,7 +389,10 @@ pub struct ErrorBody {
 /// The machine-matchable error kinds carried in [`ErrorBody::error`] and mapped to HTTP status by
 /// the server (design §18.5.3). Kept as a small enum with a stable string form so the client can
 /// branch on the same conditions the server names — matchability across the boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are used only by the internal setup-broker `WireError` (postcard over
+/// the broker socket, §20.5) — not by any JSON response, which carries `kind.as_str()` as a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {
     /// 404 — no such vm/artifact.
     NotFound,

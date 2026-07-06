@@ -550,13 +550,67 @@ impl Drop for BrokerChild {
     }
 }
 
-/// Forks a broker child serving [`RealBrokerBackend`], returning the parent's [`BrokerClient`] and
-/// the child handle. **The caller must then drop its capabilities**
-/// ([`apply_broker_parent_drop`]) — this function does not, so a test can fork a broker without
-/// mutating the test process's caps.
+/// Which side of a [`fork_privileged_child`] the caller is now running on.
+#[derive(Debug)]
+pub enum ForkSide {
+    /// The original (parent) process: keep serving, holding the child handle for reap-on-drop.
+    Parent {
+        /// The parent's end of the control socket.
+        sock: UnixStream,
+        /// The forked child, reaped on drop.
+        child: BrokerChild,
+    },
+    /// The forked (child) process: it has `PR_SET_PDEATHSIG=SIGKILL` set and holds the child's end
+    /// of the control socket. The child must do its work and terminate with `_exit` (never return
+    /// through the parent's stack).
+    Child {
+        /// The child's end of the control socket.
+        sock: UnixStream,
+    },
+}
+
+/// The generic privilege-separation fork: makes a `socketpair`, `fork`s, and returns which
+/// [`ForkSide`] the caller is on. The child gets `PR_SET_PDEATHSIG=SIGKILL` (dies with the parent).
+/// The caller decides what each side does — the thin [`spawn_broker_with`] serves a [`BrokerServer`]
+/// in the child; the daemon (`vmcell-daemon`) runs its own async registry-serve in the child and
+/// drops caps + serves HTTP in the parent (the §20.5/§12.23 cutover).
 ///
-/// MUST be called before the parent spawns any thread / async runtime (fork-with-threads is
-/// unsafe), per design §20.5.
+/// MUST be called **before** the caller spawns any thread / async runtime (fork-with-threads is
+/// unsafe): after the fork, the child inherits only the calling thread, so any code that could block
+/// on a lock held by another thread would deadlock (§20.5).
+///
+/// The caller drops its own capabilities on the [`ForkSide::Parent`] branch
+/// ([`apply_broker_parent_drop`]); this function does not, so a test can fork without mutating the
+/// test process's caps.
+///
+/// # Errors
+/// The `socketpair`/`fork` I/O error.
+pub fn fork_privileged_child() -> io::Result<ForkSide> {
+    let (parent_sock, child_sock) = UnixStream::pair()?;
+    // SAFETY: `fork(2)`; both branches below are the standard post-fork split — the child closes the
+    // parent's socket end and sets pdeathsig, the parent closes the child's end. Called before any
+    // thread/runtime exists (§20.5), so no inherited-lock hazard.
+    match unsafe { libc::fork() } {
+        -1 => Err(io::Error::last_os_error()),
+        0 => {
+            drop(parent_sock);
+            // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL)` — no pointer args; the broker dies if the
+            // parent does (AGENTS.md helper-daemon rule).
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+            Ok(ForkSide::Child { sock: child_sock })
+        }
+        pid => {
+            drop(child_sock);
+            Ok(ForkSide::Parent {
+                sock: parent_sock,
+                child: BrokerChild { pid, reaped: false },
+            })
+        }
+    }
+}
+
+/// Forks a broker child serving [`RealBrokerBackend`], returning the parent's [`BrokerClient`] and
+/// the child handle. **The caller must then drop its capabilities** ([`apply_broker_parent_drop`]).
 ///
 /// # Errors
 /// The `socketpair`/`fork` I/O error.
@@ -572,32 +626,15 @@ pub fn spawn_broker() -> io::Result<(BrokerClient, BrokerChild)> {
 pub fn spawn_broker_with<B: BrokerBackend + 'static>(
     backend: B,
 ) -> io::Result<(BrokerClient, BrokerChild)> {
-    let (parent_sock, child_sock) = UnixStream::pair()?;
-    // SAFETY: `fork(2)`; the child branch below runs the broker and never returns to the caller
-    // (it `_exit`s). In production this is called before any thread/runtime exists (§20.5); the
-    // child does no work that would deadlock on an inherited lock beyond the serve loop it owns.
-    match unsafe { libc::fork() } {
-        -1 => Err(io::Error::last_os_error()),
-        0 => {
-            // Child = broker. Close the parent's end and die with the parent.
-            drop(parent_sock);
-            // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL)` — no pointer args; makes the broker die
-            // if the parent does (AGENTS.md helper-daemon rule).
-            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+    match fork_privileged_child()? {
+        ForkSide::Child { sock } => {
             let mut server = BrokerServer::new(backend);
-            let _ = serve(&mut server, child_sock);
-            // SAFETY: `_exit` is async-signal-safe and skips at-exit handlers — correct for a
-            // forked child that must not run the parent's teardown.
+            let _ = serve(&mut server, sock);
+            // SAFETY: `_exit` is async-signal-safe and skips at-exit handlers — correct for a forked
+            // child that must not run the parent's teardown.
             unsafe { libc::_exit(0) };
         }
-        pid => {
-            // Parent. Close the child's end; return the client + handle.
-            drop(child_sock);
-            Ok((
-                BrokerClient::new(parent_sock),
-                BrokerChild { pid, reaped: false },
-            ))
-        }
+        ForkSide::Parent { sock, child } => Ok((BrokerClient::new(sock), child)),
     }
 }
 

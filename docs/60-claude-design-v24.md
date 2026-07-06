@@ -16,14 +16,17 @@
 >    `RLIMIT_FSIZE`/`RLIMIT_NOFILE`), an **opt-in** ambient-capability clear, `PR_SET_DUMPABLE=0`, and an **optional**
 >    coarse host-side seccomp deny-list built with **seccompiler**. The pure `JailSpec` lives in
 >    `vmcell::vmm::jail`; the async-signal-safe `apply_jail` is the only impure edge.
-> 3. **Setup broker** — the privilege boundary for the daemon/API mode. The verified Linux constraint
->    (`setns(CLONE_NEWNET)` needs `CAP_SYS_ADMIN` in the netns's owning user namespace, so an
->    unprivileged process can **never** join a broker-created netns) forces the **spawner model**: a
->    minimal privileged `vmcell-broker` child holds the three caps, performs netns/tap/nft/cgroup setup
->    **and** the jailed VMM spawn, and hands a **pidfd** back over a `SOCK_SEQPACKET` socketpair to a
->    **cap-dropped** parent that serves the HTTP surface. Ships as a complete, fake-tested crate +
->    binary + `BrokerClient`; the `vmcelld` cutover (drop-caps-and-broker instead of retain-caps §12.14)
->    is the one **KVM-host-validated** step that remains.
+> 3. **Setup broker** — the privilege boundary for the daemon/API mode, **built and KVM-validated**. The
+>    verified Linux constraint (`setns(CLONE_NEWNET)` needs `CAP_SYS_ADMIN` in the netns's owning user
+>    namespace, so an unprivileged process can **never** join a broker-created netns) means the caps must
+>    live with whoever performs VM operations. `vmcelld` now `fork`s: the **broker child** keeps the three
+>    caps and **owns the VM `Registry`** (netns/tap/nft/cgroup + the jailed spawn), the **parent drops
+>    ALL caps** and serves the HTTP API, forwarding every VM op to the broker over a framed, multiplexed
+>    JSON RPC (the `VmEngine` seam). A bug in the HTTP request parser can no longer reach the caps
+>    (§12.23). Validated `just test-daemon` **12/12** with the parent holding no capabilities.
+>    `--no-setup-broker` selects the retain-caps single-process fallback (§12.14). The lower-level
+>    `vmcell-broker` primitives (SetupNetwork/SpawnVmm/…, for the future *thin* broker where the parent
+>    drives the VMM directly) also ship, fake-tested.
 >
 > **Licensing (called out because it is load-bearing here).** The seccomp layer uses **seccompiler**
 > (`Apache-2.0 OR BSD-3-Clause`, both allow-listed) — the pure-Rust rust-vmm library **Cloud Hypervisor
@@ -36,15 +39,16 @@
 >
 > **Amends:** **§2.2** (a new "Privileged-window hardening" row), **§10.1** (one new workspace member,
 > `vmcell-broker`), **§10.2** (`VmConfig` gains `vmm_seccomp` + `jail`), **§12** (new invariants
-> **§12.21–§12.23**), **§14** (new gates), **§16** (the hardening moves from a forward-work bullet to
-> "built, with the daemon cutover as the remaining KVM step"), **§17** (privileged-window hardening
-> struck from the backlog), and **§18.2** (the setup broker is built; the retain-caps single-process form
-> remains the default until the cutover is host-validated). Version bumps: `vmcell` **0.6.0 → 0.7.0**
+> **§12.21–§12.23**), **§14** (new gates), **§16** (the hardening moves from forward-work to built +
+> KVM-validated), **§17** (privileged-window hardening struck from the backlog), and **§18.2 / §12.14**
+> (the setup broker is built, KVM-validated, and the **default** for `vmcelld`; the retain-caps
+> single-process form is now the `--no-setup-broker` fallback). Version bumps: `vmcell` **0.6.0 → 0.7.0**
 > (the additive `vmm_seccomp`/`jail` config + the `vmm::seccomp`/`vmm::jail` modules + the `build_vmm_cmd`
 > `JailSpec` param), `vmcell-privilege` **0.1.0 → 0.2.0** (the broker parent cap-drop plan), and
-> `vmcell-broker` versions from **0.1.0**. `vmcell-daemon` is unchanged this pass — routing its launcher
-> through `BrokerClient` is part of the KVM-validated cutover (§20.9). All new library surface is additive
-> and `cargo semver-checks`-clean on the existing types.
+> `vmcell-broker` versions from **0.1.0**. `vmcell-daemon` gains the `bridge` module (the `VmEngine` RPC)
+> — additive, behind the default-on `server` feature, so the `default-features = false` client is
+> unaffected — and `vmcelld` gains the fork/cap-drop split. All new library surface is additive and
+> `cargo semver-checks`-clean on the existing types.
 
 ---
 
@@ -98,7 +102,7 @@ Each layer is independently useful and independently gated; none depends on the 
 |---|---|---|
 | 1 · VMM seccomp | `VmmSeccomp` config + `vmm_seccomp_args` predicate wired into all three backend spawns; golden-args + `Unsupported`-combo tests | confirm a seccomp'd guest boots on each backend on a KVM host |
 | 2 · jailer-equivalent | `JailSpec` + `apply_jail` in `build_vmm_cmd`; a **root-free, KVM-free** gate reads a stand-in child's `/proc/self/status`; **live-validated on a KVM host** (`no_new_privs`+`RLIMIT_CORE=0`+`non_dumpable` non-breaking across all 3 backends' cold/restore/egress paths; `clear_ambient` defaulted OFF after it broke restore-with-tap, §20.9) | the `clear_ambient`/seccomp-deny-list defaults flip only with the fd-passing/uid-drop increment |
-| 3 · setup broker | full `vmcell-broker` crate: framed protocol (codec round-trip + over-cap reject), parent **priv-drop plan** (pure, red-on-inverse), broker dispatch against the injected `Netlink`/`NftApplier`/`CgroupFs` seams, socketpair+fork+pdeathsig transport, `BrokerClient` | the `vmcelld` cutover from retain-caps (§12.14) to fork-broker-then-drop; the live spawner path |
+| 3 · setup broker | **the `vmcelld` cutover ships and is KVM-validated (`just test-daemon` 12/12)**: broker child owns the `Registry`, cap-dropped parent forwards VM ops over the multiplexed `VmEngine` JSON RPC; plus the `vmcell-broker` primitives (protocol/codec, dispatch-vs-fakes, priv-drop plan, fork+pdeathsig transport) | the *thin* broker (parent drives the VMM behind `SpawnVmm`+pidfd, shrinking the privileged code); an `SCM_RIGHTS` tap-fd/pidfd path |
 
 ### 20.3 Layer 1 — the VMM's own seccomp filter (one predicate, three backends)
 
@@ -287,14 +291,39 @@ net-privileged + metrics subset — **not** the axum/hyper server stack, which l
 unprivileged parent), so the code that runs at privilege is exactly the audited netns/nft/cgroup/spawn
 core and nothing web-facing.
 
-**What ships and what is the remaining KVM step.** The crate, the protocol + codec, the priv-drop plan,
-the dispatch-against-fakes, the socketpair+fork+pdeathsig transport, and `BrokerClient` all ship and are
-gated in `just ci`. The **`vmcelld` cutover** — replacing the retain-caps model (§12.14, §18.2) with
-fork-broker-then-drop, and routing `MicroVmLauncher` through `BrokerClient` — is deep surgery whose live
-correctness (a real seccomp'd VMM booting inside a broker-`setns`ed netns, driven by a cap-dropped
-parent) can only be validated on a KVM host, which this environment is not. So v24 ships the broker as a
-complete, fake-tested component and a documented opt-in, and records the cutover as the single remaining
-host-validated step (§20.9) — the same honest posture §18.9 uses for the daemon's live boot path.
+**The shipped `vmcelld` cutover — the "engine-owning" (fat) broker.** The thin-broker primitives above
+(`SetupNetwork`/`SpawnVmm`/…, where the parent would drive the VMM's api socket + a passed pidfd) are the
+*minimal-privileged-code* ideal, but they require splitting `MicroVm`'s in-process ownership (its
+`V::Instance` owns the VMM `Child`) across the boundary — a deep `MicroVm`/`Vmm` refactor. The cutover
+that **ships** realizes the same §12.23 invariant with far less risk and no `vmcell` surgery: the broker
+child **owns the whole VM `Registry`** (VM ops need the caps for netns/tap/nft/cgroup + the jailed spawn),
+and the cap-dropped parent forwards each VM operation to it over a framed, **multiplexed** JSON RPC (the
+`VmEngine` seam in `vmcell-daemon::bridge`). Concretely: `vmcelld` runs the blessing precondition, then
+`vmcell_broker::fork_privileged_child()` (the reusable fork+socketpair+pdeathsig transport); the **child**
+keeps the caps, runs the start-up orphan sweep, and `serve_engine`s the `Registry`; the **parent**
+`apply_broker_parent_drop`s (empty effective/permitted/inheritable/ambient + `no_new_privs`; the bounding
+shrink is a warned no-op without `CAP_SETPCAP`, the same file-cap-path limitation the runner has), then
+serves axum. Artifact CRUD stays in the parent — it is unprivileged file I/O under `--artifacts-dir` (same
+uid) — with only the delete-in-use guard crossing to the engine. The RPC is multiplexed (per-request
+`u64` id, a background reply reader, per-request `oneshot`s), so a long `exec` on one VM never blocks
+another VM's ops — the `Registry`'s per-VM concurrency survives the boundary. **JSON, not postcard**,
+because the reused daemon DTOs carry `#[serde(skip_serializing_if)]`/`default` fields that only round-trip
+in a self-describing format (and it is the format the HTTP API already speaks). `--no-setup-broker` selects
+the retain-caps single-process fallback (§12.14).
+
+**Validated on a KVM host (`just test-daemon`, 12/12).** The whole HTTP surface now runs cap-dropped and
+forwards to the broker: bearer auth, boot+`exec` data plane, full create/exec/stats/destroy lifecycle,
+snapshot→restore-by-name, privileged tap net + guest default route, extra disks + delete-in-use, the
+start-up orphan sweep, `--resource-prefix` isolation, per-VM scratch-dir residue, and `vmcelld-ctl` —
+all green with the parent holding **no** usable capabilities. **Remaining forward work (§20.9):** the
+*thin* broker (move VMM-driving to the parent behind `SpawnVmm`+pidfd, so the privileged code shrinks to
+the setns/spawn primitive) and an `SCM_RIGHTS` tap-fd/pidfd path; the fat cutover already removes the caps
+from the network surface, which is the load-bearing §12.23 win.
+
+**What ships in `vmcell-broker` itself.** The low-level primitives above (protocol + codec, the
+dispatch-against-fakes, the priv-drop plan, the socketpair+fork+pdeathsig transport, `BrokerClient`) all
+ship and are gated KVM-free — they are the foundation the thin-broker refinement will build the live
+spawner path on, and the fork+cap-drop transport the fat cutover already reuses.
 
 ### 20.6 Licensing — why seccompiler, and the LGPL trap made machine-enforceable
 
@@ -388,12 +417,19 @@ set. Defaulting `clear_ambient_caps` off makes the full suite green again (the V
 genuinely needs). This is exactly the "defaults get the strictest scrutiny" + "validate on a KVM host"
 discipline catching a regression static review would have missed.
 
+**The `vmcelld` broker cutover — SHIPPED and KVM-validated (`just test-daemon` 12/12).** `vmcelld` forks
+by default: the broker child keeps the caps and owns the `Registry`; the parent drops **all** caps and
+serves HTTP, forwarding VM ops over the `VmEngine` JSON RPC (§20.5). `--no-setup-broker` is the retain-caps
+fallback. Realized as the "engine-owning" (fat) broker rather than the thin `SpawnVmm`+pidfd model, which
+would have needed a cross-process `MicroVm` refactor; both satisfy §12.23.
+
 **Forward work (each a real edge, not a hedge):**
 
-- **The `vmcelld` broker cutover (the headline remaining step).** Replace §12.14's retain-caps model with
-  fork-broker-then-drop and route `MicroVmLauncher` through `BrokerClient`. Ships opt-in
-  (`--setup-broker`) once validated; the retain-caps single-process form stays the default until then.
-  Only validatable on a KVM host.
+- **The *thin* broker (minimize the privileged code surface).** Move VMM-driving to the parent behind the
+  `vmcell-broker` `SpawnVmm`+pidfd primitives (a cross-process `MicroVm`/`Vmm` refactor), so the privileged
+  broker shrinks from "owns the whole registry" to "the setns/spawn primitive." The shipped fat cutover
+  already achieves the load-bearing §12.23 win (caps off the network surface); this is a code-surface
+  refinement, plus an `SCM_RIGHTS` tap-fd/pidfd path.
 - **The seccompiler deny-list on by default.** Ships opt-in until a KVM host confirms each backend boots
   cleanly under it; a default-allow deny-list is low-risk but unvalidated on a live VMM.
 - **`clear_ambient_caps` on by default** — blocked until the VMM no longer needs its inherited
@@ -426,10 +462,12 @@ discipline catching a regression static review would have missed.
 - **§12** — new invariants **§12.21–§12.23** (§20.7).
 - **§14** — new gates (§20.8).
 - **§16 (open decisions)** — the privileged-window-hardening bullet moves from forward-work to: "Layers
-  1–2 built and wired; Layer 3 (broker) built and fake/transport-gated; the `vmcelld` cutover is the
-  remaining KVM-validated step (§20.9)."
+  1–2 built and KVM-validated; Layer 3 (broker) built, KVM-validated (`just test-daemon` 12/12), and the
+  **default** for `vmcelld`; the *thin*-broker code-surface refinement is the remaining step (§20.9)."
 - **§17 (future capabilities)** — strike "privileged-window hardening (each VMM's own seccomp, a
   jailer-equivalent, and a setup broker)" from the Design-now-build-later list; it is §20.
-- **§18.2** — the "§17 setup broker … stays forward work" sentence is superseded: the broker is built
-  (§20.5); the retain-caps single-process form (§12.14) remains the **default** until the cutover is
-  host-validated, at which point the broker becomes the recommended and then default privilege boundary.
+- **§18.2 / §12.14** — the "§17 setup broker … stays forward work" sentence is superseded: the broker is
+  **built, KVM-validated, and the default** for `vmcelld` (§20.5). The retain-caps single-process form
+  (§12.14) is now the **fallback** (`--no-setup-broker`), not the default — so §12.14's "the daemon
+  retains caps" describes the fallback, while the default is fork-broker-then-drop with the HTTP surface
+  holding no capabilities (§12.23).

@@ -1,19 +1,20 @@
 //! The axum HTTP server: state, router, handlers, and the bearer-auth layer (design §18.5/§18.6).
 //!
-//! Handlers are thin adapters over the [`Registry`] and the artifact store; every failure returns a
+//! Handlers are thin adapters over the [`Registry`](crate::registry::Registry) and the artifact store; every failure returns a
 //! typed [`DaemonError`] whose one `IntoResponse` maps it to a status + structured body (§18.5.3). The
 //! auth layer wraps every route except the two open ones (invariant §12.15). The registry **owns** its
 //! VMs (design §18.4): a clean shutdown calls `shutdown_all`, and dropping the state runs each VM's
 //! ordered `Drop`; a hard kill relies on the next boot's start-up orphan sweep.
 
+use crate::artifact_store::ArtifactStore;
 use crate::auth::{AuthPolicy, authorize};
+use crate::bridge::VmEngine;
 use crate::dto::{
     ArtifactInfo, CreateVmRequest, CreateVmResponse, ExecOutcomeDto, ExecRequestDto,
     ResourceUsageDto, SnapshotInfo, SnapshotRequest, VmId, VmInfo,
 };
 use crate::error::{DaemonError, DaemonResult};
 use crate::openapi::openapi_document;
-use crate::registry::Registry;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Request, State};
 use axum::http::{StatusCode, header};
@@ -24,10 +25,18 @@ use axum::{Json, Router};
 use std::sync::Arc;
 
 /// The shared handler state (cheaply `Clone` — everything is behind an `Arc` or is `Copy`).
+///
+/// The **VM engine** and the **artifact store** are separate seams (design §20.5 / §12.23): VM
+/// operations go through the [`VmEngine`] (a [`crate::bridge::BrokerClientEngine`] forwarding to the
+/// capped broker in the split cutover, or a [`crate::registry::Registry`] directly in a
+/// single-process daemon), while artifact CRUD is unprivileged file I/O the parent does itself —
+/// only the delete-in-use guard crosses to the engine.
 #[derive(Clone)]
 pub struct AppState {
-    /// The owned VM registry + artifact store.
-    pub registry: Arc<Registry>,
+    /// The VM engine (VM lifecycle ops + the delete-in-use guard).
+    pub engine: Arc<dyn VmEngine>,
+    /// The artifact store (unprivileged file CRUD under `--artifacts-dir`).
+    pub artifacts: Arc<ArtifactStore>,
     /// The bearer-auth policy.
     pub auth: AuthPolicy,
     /// The per-upload body-size ceiling (bytes).
@@ -85,30 +94,32 @@ async fn create_artifact(
     AxPath(name): AxPath<String>,
     body: Bytes,
 ) -> DaemonResult<Json<ArtifactInfo>> {
-    Ok(Json(state.registry.artifacts().create(&name, &body)?))
+    Ok(Json(state.artifacts.create(&name, &body)?))
 }
 
 async fn list_artifacts(State(state): State<AppState>) -> DaemonResult<Json<Vec<ArtifactInfo>>> {
-    Ok(Json(state.registry.artifacts().list()?))
+    Ok(Json(state.artifacts.list()?))
 }
 
 async fn get_artifact(
     State(state): State<AppState>,
     AxPath(name): AxPath<String>,
 ) -> DaemonResult<Json<ArtifactInfo>> {
-    Ok(Json(state.registry.artifacts().info(&name)?))
+    Ok(Json(state.artifacts.info(&name)?))
 }
 
 async fn delete_artifact(
     State(state): State<AppState>,
     AxPath(name): AxPath<String>,
 ) -> DaemonResult<StatusCode> {
-    if state.registry.is_artifact_in_use(&name).await {
+    // The delete-in-use guard needs the live VM table, which the (capped) engine owns — so this one
+    // artifact op crosses to the engine; the actual file delete is unprivileged and stays local.
+    if state.engine.is_artifact_in_use(&name).await? {
         return Err(DaemonError::InUse(format!(
             "artifact {name:?} is pinned by a live VM; destroy the VM first"
         )));
     }
-    state.registry.artifacts().delete(&name)?;
+    state.artifacts.delete(&name)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -118,22 +129,18 @@ async fn create_vm(
     State(state): State<AppState>,
     Json(req): Json<CreateVmRequest>,
 ) -> DaemonResult<Json<CreateVmResponse>> {
-    let created = state.registry.create(req).await?;
-    Ok(Json(CreateVmResponse {
-        vm: created.info,
-        exec: created.exec,
-    }))
+    Ok(Json(state.engine.create(req).await?))
 }
 
 async fn list_vms(State(state): State<AppState>) -> DaemonResult<Json<Vec<VmInfo>>> {
-    Ok(Json(state.registry.list().await))
+    Ok(Json(state.engine.list().await?))
 }
 
 async fn get_vm(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> DaemonResult<Json<VmInfo>> {
-    Ok(Json(state.registry.get(&VmId(id)).await?))
+    Ok(Json(state.engine.get(&VmId(id)).await?))
 }
 
 async fn exec_vm(
@@ -141,14 +148,14 @@ async fn exec_vm(
     AxPath(id): AxPath<String>,
     Json(req): Json<ExecRequestDto>,
 ) -> DaemonResult<Json<ExecOutcomeDto>> {
-    Ok(Json(state.registry.exec(&VmId(id), req).await?))
+    Ok(Json(state.engine.exec(&VmId(id), req).await?))
 }
 
 async fn stats_vm(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> DaemonResult<Json<ResourceUsageDto>> {
-    Ok(Json(state.registry.stats(&VmId(id)).await?))
+    Ok(Json(state.engine.stats(&VmId(id)).await?))
 }
 
 async fn snapshot_vm(
@@ -158,7 +165,7 @@ async fn snapshot_vm(
 ) -> DaemonResult<Json<SnapshotInfo>> {
     Ok(Json(
         state
-            .registry
+            .engine
             .snapshot(&VmId(id), &req.artifact_prefix)
             .await?,
     ))
@@ -168,7 +175,7 @@ async fn destroy_vm(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
 ) -> DaemonResult<StatusCode> {
-    state.registry.destroy(&VmId(id)).await?;
+    state.engine.destroy(&VmId(id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -182,7 +189,7 @@ async fn openapi_handler() -> Json<serde_json::Value> {
     Json(openapi_document())
 }
 
-/// Serves the API on `listener` until the process exits. The caller owns the [`Registry`] and is
+/// Serves the API on `listener` until the process exits. The caller owns the [`Registry`](crate::registry::Registry) and is
 /// responsible for a graceful `shutdown_all` on a clean exit (the owned VMs otherwise tear down when
 /// the `Arc<Registry>` is dropped).
 ///
@@ -216,10 +223,17 @@ mod tests {
 
     fn app() -> Router {
         let dir = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
-        let artifacts = ArtifactStore::open(dir.path().join("artifacts"), 1 << 20).expect("art");
-        let registry = Registry::new(Box::new(UnusedLauncher), artifacts, 1);
+        let art_dir = dir.path().join("artifacts");
+        // The engine (registry) and the parent's artifact store are separate seams over the same
+        // dir (design §20.5) — the wiring tests only exercise routing/auth, so no VM is launched.
+        let registry = Registry::new(
+            Box::new(UnusedLauncher),
+            ArtifactStore::open(&art_dir, 1 << 20).expect("registry store"),
+            1,
+        );
         let state = AppState {
-            registry: Arc::new(registry),
+            engine: Arc::new(registry),
+            artifacts: Arc::new(ArtifactStore::open(&art_dir, 1 << 20).expect("parent store")),
             auth: AuthPolicy::Key(ApiKey::from_secret(b"secret")),
             max_artifact_bytes: 1 << 20,
         };

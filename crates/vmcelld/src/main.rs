@@ -1,10 +1,13 @@
-//! `vmcelld` — the blessed vmcell control-plane daemon binary (design §18.2/§18.6).
+//! `vmcelld` — the blessed vmcell control-plane daemon binary (design §18.2 / §20.5).
 //!
-//! Blessed exactly like `vmcell-test-runner` (file-caps installed by `just bless`), but it **retains**
-//! the three privileged caps for the life of the server instead of dropping-and-exec'ing: it runs the
-//! shared blessing precondition ([`vmcell_privilege::ensure_blessed_or_explain`]) and, on success,
-//! keeps its caps and serves. If a cap is missing it prints the same `setcap …+ep` remediation and
-//! exits non-zero — **refuse to start if privileges are missing**.
+//! **Privilege-separated by default (the §20.5 setup-broker cutover).** `vmcelld` runs the shared
+//! blessing precondition ([`vmcell_privilege::ensure_blessed_or_explain`]) and then **forks**: the
+//! **broker child** keeps the three privileged caps and owns the VM [`Registry`] (netns/tap/nft/cgroup
+//! and the jailed VMM spawn all need caps), while the **parent drops ALL caps**
+//! ([`vmcell_privilege::apply_broker_parent_drop`]) and serves the network-facing HTTP API,
+//! forwarding every VM op to the broker over the framed [`vmcell_daemon::bridge`] RPC. So a bug in
+//! the HTTP request parser can never reach the caps, and the cap-holder never parses attacker input
+//! (§12.23). `--no-setup-broker` falls back to the single-process retain-caps model (§12.14).
 //!
 //! `print_stdout`/`print_stderr` are NOT denied — a daemon binary logs startup/fatal diagnostics.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
@@ -25,8 +28,10 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use vmcell_broker::ForkSide;
 use vmcell_daemon::artifact_store::ArtifactStore;
 use vmcell_daemon::auth::{AuthPolicy, load_api_key_file};
+use vmcell_daemon::bridge::{BrokerClientEngine, VmEngine, serve_engine};
 use vmcell_daemon::launcher::MicroVmLauncher;
 use vmcell_daemon::registry::Registry;
 use vmcell_daemon::server::{AppState, serve};
@@ -41,8 +46,8 @@ struct Cli {
     #[arg(long)]
     artifacts_dir: PathBuf,
 
-    /// TCP address to bind, e.g. `127.0.0.1:8787` (loopback by default — the setup broker / UDS bind
-    /// are forward work, §18.9).
+    /// TCP address to bind, e.g. `127.0.0.1:8787` (loopback by default; the cap-dropped HTTP parent
+    /// binds it — the broker child never touches the network).
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: String,
 
@@ -68,6 +73,11 @@ struct Cli {
     /// never sweep each other's resources. `[A-Za-z0-9]`, ≤ 6 chars (v21).
     #[arg(long, default_value = "vmcell")]
     resource_prefix: String,
+
+    /// Fall back to the single-process retain-caps model (§12.14): no broker fork, the caps stay in
+    /// the HTTP-serving process. The setup-broker split (§20.5) is the default.
+    #[arg(long)]
+    no_setup_broker: bool,
 }
 
 fn main() {
@@ -80,11 +90,10 @@ fn main() {
 
     if let Err(code) = run() {
         // expect(disallowed_methods): top-level terminator. Either the config/blessing check failed
-        // before any owned resource exists, or the server future returned after `shutdown_all`/`Drop`
-        // already tore the owned VMs down; a non-zero shell status is the required contract.
+        // before any owned resource exists, or the server future returned after graceful teardown.
         #[expect(
             clippy::disallowed_methods,
-            reason = "top-level terminator; owned VMs already torn down (shutdown_all/Drop) or none exist yet"
+            reason = "top-level terminator; owned VMs already torn down or none exist yet"
         )]
         std::process::exit(code);
     }
@@ -95,43 +104,12 @@ fn run() -> Result<(), i32> {
     let cli = Cli::parse();
 
     // Blessing precondition (shared with the test-runner): the three privileged caps must be in the
-    // EFFECTIVE set, or euid 0. On success we RETAIN them (no uid drop, no exec) — §18.2.
+    // EFFECTIVE set, or euid 0. Checked BEFORE the fork so both the broker child (which keeps them)
+    // and the parent (which drops them) start from a known-blessed state.
     if let Err(remediation) = vmcell_privilege::ensure_blessed_or_explain(&PRIVILEGED_CAPS) {
         eprintln!("{remediation}");
         return Err(1);
     }
-
-    // Auth policy: an owner-only key file, or the explicit dev bypass. A control plane with no auth
-    // is never an accident (§18.6) — refuse to start otherwise.
-    let auth = match (&cli.api_key_file, cli.allow_unauthenticated) {
-        (Some(path), _) => match load_api_key_file(path) {
-            Ok(key) => AuthPolicy::Key(key),
-            Err(e) => {
-                eprintln!("vmcelld: {e}");
-                return Err(1);
-            }
-        },
-        (None, true) => {
-            tracing::warn!(
-                "vmcelld: starting with --allow-unauthenticated; the API is UNPROTECTED. Use only \
-                 on a loopback dev bind."
-            );
-            AuthPolicy::Unauthenticated
-        }
-        (None, false) => {
-            eprintln!(
-                "vmcelld: refusing to start without authentication. Pass --api-key-file <path> \
-                 (owner-only perms) or, for a loopback dev bind only, --allow-unauthenticated."
-            );
-            return Err(1);
-        }
-    };
-
-    let ch_bin = cli
-        .ch_bin
-        .clone()
-        .or_else(|| std::env::var("VMCELL_CH_BIN").ok())
-        .unwrap_or_else(|| "cloud-hypervisor".to_string());
 
     // Reject a malformed resource prefix up front (it becomes part of netns/interface/cgroup/dir
     // names). One value drives both VM naming and the sweep, so they can never disagree (v21).
@@ -140,6 +118,179 @@ fn run() -> Result<(), i32> {
         return Err(1);
     }
 
+    let ch_bin = cli
+        .ch_bin
+        .clone()
+        .or_else(|| std::env::var("VMCELL_CH_BIN").ok())
+        .unwrap_or_else(|| "cloud-hypervisor".to_string());
+
+    if cli.no_setup_broker {
+        // Single-process retain-caps fallback (§12.14): the HTTP surface keeps the caps.
+        return run_single_process(&cli, ch_bin);
+    }
+
+    // The setup-broker split (§20.5): fork BEFORE any thread/runtime exists (fork-with-threads is
+    // unsafe). The child keeps the caps and owns the registry; the parent drops all caps and serves.
+    match vmcell_broker::fork_privileged_child() {
+        Ok(ForkSide::Child { sock }) => run_broker_child(&cli, ch_bin, sock),
+        Ok(ForkSide::Parent { sock, child }) => run_http_parent(&cli, sock, child),
+        Err(e) => {
+            eprintln!("vmcelld: cannot fork the setup broker: {e}");
+            Err(1)
+        }
+    }
+}
+
+/// The **broker child**: keeps the three caps, owns the VM [`Registry`], runs the start-up orphan
+/// sweep, and serves the [`vmcell_daemon::bridge`] RPC over `sock`. Never returns — it `_exit`s so a
+/// forked child does not run the parent's at-exit handlers.
+fn run_broker_child(cli: &Cli, ch_bin: String, sock: std::os::unix::net::UnixStream) -> ! {
+    let code = run_broker_child_inner(cli, ch_bin, sock);
+    // SAFETY: `_exit` is async-signal-safe and skips at-exit handlers — the forked child must not run
+    // the parent's teardown. The registry (and its VMs) already dropped inside `block_on` above.
+    unsafe { libc::_exit(code) }
+}
+
+fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::UnixStream) -> i32 {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vmcelld broker: cannot build async runtime: {e}");
+            return 1;
+        }
+    };
+    runtime.block_on(async move {
+        // Start-up orphan sweep (§18.4): reclaim leaks (matching `--resource-prefix`) a previously
+        // hard-killed daemon left, BEFORE we own any VM. The broker holds the caps netns delete needs.
+        let report = startup_sweep(&cli.resource_prefix);
+        if !report.netns.is_empty()
+            || !report.cgroup_slices.is_empty()
+            || !report.scratch_dirs.is_empty()
+        {
+            tracing::info!(
+                netns = report.netns.len(),
+                cgroup_slices = report.cgroup_slices.len(),
+                scratch_dirs = report.scratch_dirs.len(),
+                "vmcelld broker: reclaimed leaked resources from a prior daemon"
+            );
+        }
+
+        let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("vmcelld broker: {e}");
+                return 1;
+            }
+        };
+        let launcher = MicroVmLauncher::new(ch_bin, &cli.resource_prefix);
+        let registry: Arc<dyn VmEngine> =
+            Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
+
+        if let Err(e) = sock.set_nonblocking(true) {
+            eprintln!("vmcelld broker: cannot set the control socket nonblocking: {e}");
+            return 1;
+        }
+        let sock = match tokio::net::UnixStream::from_std(sock) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("vmcelld broker: cannot adopt the control socket: {e}");
+                return 1;
+            }
+        };
+        tracing::info!("vmcelld broker: serving (holds caps; owns the registry)");
+        // Serves until the parent sends `ShutdownAll` (VMs torn down, then returns) or closes the
+        // channel (then dropping `registry` at end of scope runs each VM's ordered teardown).
+        serve_engine(registry, sock).await;
+        0
+    })
+}
+
+/// The **HTTP parent**: drops ALL capabilities (§12.23), then serves the axum API and the local
+/// artifact store, forwarding VM ops to the broker over `sock`.
+fn run_http_parent(
+    cli: &Cli,
+    sock: std::os::unix::net::UnixStream,
+    child: vmcell_broker::BrokerChild,
+) -> Result<(), i32> {
+    // Drop EVERY capability before binding the network socket — the HTTP surface holds none (§12.23).
+    let plan = vmcell_privilege::plan_broker_parent_drop(&vmcell_privilege::probe_supported_caps());
+    if let Err(e) = vmcell_privilege::apply_broker_parent_drop(&plan) {
+        eprintln!("vmcelld: the HTTP parent could not drop its capabilities: {e}");
+        return Err(1);
+    }
+
+    // Auth policy: an owner-only key file, or the explicit dev bypass (§18.6).
+    let auth = auth_policy(cli)?;
+    let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            eprintln!("vmcelld: {e}");
+            return Err(1);
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vmcelld: cannot build async runtime: {e}");
+            return Err(1);
+        }
+    };
+    let bind = cli.bind.clone();
+    let max = usize::try_from(cli.max_artifact_bytes).unwrap_or(usize::MAX);
+    // Hold the child handle so it is reaped (its `Drop` kills+reaps) after the runtime returns.
+    let _child = child;
+    runtime.block_on(async move {
+        if let Err(e) = sock.set_nonblocking(true) {
+            eprintln!("vmcelld: cannot set the broker socket nonblocking: {e}");
+            return Err(1);
+        }
+        let sock = match tokio::net::UnixStream::from_std(sock) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("vmcelld: cannot adopt the broker socket: {e}");
+                return Err(1);
+            }
+        };
+        let engine: Arc<dyn VmEngine> = BrokerClientEngine::new(sock);
+        let state = AppState {
+            engine: engine.clone(),
+            artifacts,
+            auth,
+            max_artifact_bytes: max,
+        };
+        let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
+            eprintln!("vmcelld: cannot bind {bind}: {e}");
+            1
+        })?;
+        tracing::info!(bind = %bind, "vmcelld serving (HTTP parent; no capabilities)");
+        let serve_result = tokio::select! {
+            r = serve(state, listener) => r.map_err(|e| { eprintln!("vmcelld: server error: {e}"); 1 }),
+            _ = shutdown_signal() => {
+                tracing::info!("vmcelld: shutdown signal received; asking the broker to tear down VMs");
+                Ok(())
+            }
+        };
+        // Always ask the broker to gracefully tear down its VMs before we let its handle reap it.
+        engine.shutdown_all().await;
+        serve_result
+    })
+}
+
+/// The single-process retain-caps fallback (§12.14): the HTTP surface keeps the three caps and owns
+/// the registry directly — no broker, no privilege separation. Selected with `--no-setup-broker`.
+fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
+    tracing::warn!(
+        "vmcelld: --no-setup-broker; the HTTP surface RETAINS the three caps (no privilege \
+         separation). Prefer the default setup-broker split (§20.5)."
+    );
+    let auth = auth_policy(cli)?;
     let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
         Ok(a) => a,
         Err(e) => {
@@ -148,9 +299,6 @@ fn run() -> Result<(), i32> {
         }
     };
 
-    // Start-up orphan sweep (§18.4): reclaim netns/cgroup/scratch (matching `--resource-prefix`) a
-    // previously hard-killed daemon leaked, BEFORE we own any VM. We hold the caps (blessed above)
-    // that netns delete needs.
     let report = startup_sweep(&cli.resource_prefix);
     if !report.netns.is_empty()
         || !report.cgroup_slices.is_empty()
@@ -165,9 +313,18 @@ fn run() -> Result<(), i32> {
     }
 
     let launcher = MicroVmLauncher::new(ch_bin, &cli.resource_prefix);
-    let registry = Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
+    let registry: Arc<dyn VmEngine> =
+        Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
+    let parent_artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            eprintln!("vmcelld: {e}");
+            return Err(1);
+        }
+    };
     let state = AppState {
-        registry: registry.clone(),
+        engine: registry.clone(),
+        artifacts: parent_artifacts,
         auth,
         max_artifact_bytes: usize::try_from(cli.max_artifact_bytes).unwrap_or(usize::MAX),
     };
@@ -182,14 +339,13 @@ fn run() -> Result<(), i32> {
             return Err(1);
         }
     };
+    let bind = cli.bind.clone();
     runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(&cli.bind).await.map_err(|e| {
-            eprintln!("vmcelld: cannot bind {}: {e}", cli.bind);
+        let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
+            eprintln!("vmcelld: cannot bind {bind}: {e}");
             1
         })?;
-        tracing::info!(bind = %cli.bind, artifacts = %cli.artifacts_dir.display(), "vmcelld serving");
-        // Serve until a shutdown signal, then gracefully tear down every owned VM (the ordered
-        // `MicroVm::shutdown` path). A hard kill skips this and relies on the next boot's sweep.
+        tracing::info!(bind = %bind, "vmcelld serving (single-process, retains caps)");
         tokio::select! {
             r = serve(state, listener) => r.map_err(|e| { eprintln!("vmcelld: server error: {e}"); 1 }),
             _ = shutdown_signal() => {
@@ -199,6 +355,34 @@ fn run() -> Result<(), i32> {
             }
         }
     })
+}
+
+/// Resolves the bearer-auth policy from the CLI: an owner-only key file, or the explicit dev bypass.
+/// A control plane with no auth is never an accident (§18.6) — refuse to start otherwise.
+fn auth_policy(cli: &Cli) -> Result<AuthPolicy, i32> {
+    match (&cli.api_key_file, cli.allow_unauthenticated) {
+        (Some(path), _) => match load_api_key_file(path) {
+            Ok(key) => Ok(AuthPolicy::Key(key)),
+            Err(e) => {
+                eprintln!("vmcelld: {e}");
+                Err(1)
+            }
+        },
+        (None, true) => {
+            tracing::warn!(
+                "vmcelld: starting with --allow-unauthenticated; the API is UNPROTECTED. Use only \
+                 on a loopback dev bind."
+            );
+            Ok(AuthPolicy::Unauthenticated)
+        }
+        (None, false) => {
+            eprintln!(
+                "vmcelld: refusing to start without authentication. Pass --api-key-file <path> \
+                 (owner-only perms) or, for a loopback dev bind only, --allow-unauthenticated."
+            );
+            Err(1)
+        }
+    }
 }
 
 /// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM.

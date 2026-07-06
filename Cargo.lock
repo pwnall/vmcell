@@ -4673,7 +4673,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4788,6 +4788,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "vmcell-broker",
  "vmcell-daemon",
  "vmcell-daemon-client",
  "vmcell-privilege",

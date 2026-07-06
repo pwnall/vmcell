@@ -260,12 +260,6 @@ impl Daemon {
     fn client(&self, key: &str) -> DaemonClient {
         DaemonClient::new(Url::parse(&self.base).expect("url"), key).expect("client")
     }
-
-    /// The `vmcelld` process id — used to construct the per-VM scratch-dir path
-    /// (`<temp>/vmcell-vm-<pid>-<vmid>`) for residue checks.
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
 }
 
 impl Drop for Daemon {
@@ -540,7 +534,12 @@ async fn startup_sweep_reclaims_orphan_netns() {
 
 /// Owning-and-`Drop` teardown (§18.4): a VM's per-VM scratch dir (`<temp>/vmcell-vm-<pid>-<vmid>`) exists
 /// while it is owned and is **gone after `destroy`** — the AGENTS.md residue rule, exercised end-to-end
-/// through the daemon. Uses the daemon's own pid, so it is independent of the net mode.
+/// through the daemon.
+///
+/// Matched by the **vmid octet**, not a predicted pid: under the setup-broker split (§20.5) the VM is
+/// created by the broker **child** (a fork of vmcelld), so the scratch dir carries the broker's pid,
+/// not `d.pid()`. The daemon's start-up sweep (empty live set) clears any prior test's same-vmid dir,
+/// so exactly this VM's dir matches.
 #[tokio::test]
 #[ignore = "boots a real VM; run via `just test-daemon`"]
 async fn destroy_removes_per_vm_scratch_dir() {
@@ -548,18 +547,34 @@ async fn destroy_removes_per_vm_scratch_dir() {
     let c = d.client("");
     let vm = c.create("vmlinux", "rootfs.erofs").await.expect("create");
 
-    let scratch = std::env::temp_dir().join(format!("vmcell-vm-{}-{}", d.pid(), vm.vmid));
+    // Per-VM scratch dirs are `<temp>/vmcell-vm-<pid>-<vmid>`; find this VM's by its vmid suffix (the
+    // leading `-` delimiter avoids a `-45` matching a `-145`), independent of which process created it.
+    let temp = std::env::temp_dir();
+    let suffix = format!("-{}", vm.vmid);
+    let scratch_dirs = |suffix: &str| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&temp)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("vmcell-vm-") && n.ends_with(suffix))
+            })
+            .collect()
+    };
     assert!(
-        scratch.is_dir(),
-        "per-VM scratch dir {} should exist while the VM is owned",
-        scratch.display()
+        scratch_dirs(&suffix).iter().any(|p| p.is_dir()),
+        "per-VM scratch dir for vmid {} should exist while the VM is owned",
+        vm.vmid
     );
 
     c.destroy(&vm.id).await.expect("destroy");
     assert!(
-        !scratch.exists(),
-        "per-VM scratch dir {} must be gone after destroy (ordered teardown)",
-        scratch.display()
+        scratch_dirs(&suffix).is_empty(),
+        "per-VM scratch dir for vmid {} must be gone after destroy (ordered teardown)",
+        vm.vmid
     );
 }
 

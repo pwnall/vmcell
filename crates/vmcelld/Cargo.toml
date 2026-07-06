@@ -15,8 +15,12 @@ name = "vmcelld"
 path = "src/main.rs"
 
 [dependencies]
-vmcell-daemon = { path = "../vmcell-daemon", version = "0.1.0" }
+vmcell-daemon = { path = "../vmcell-daemon", version = "0.2.0" }
 vmcell-privilege = { path = "../vmcell-privilege", version = "0.2.0" }
+# The setup-broker cutover (§20.5): `fork_privileged_child` splits vmcelld into the capped broker
+# child (owns the registry) and the cap-dropped HTTP parent; `libc` for the child's `_exit`.
+vmcell-broker = { path = "../vmcell-broker", version = "0.1.0" }
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tracing = "0.1"

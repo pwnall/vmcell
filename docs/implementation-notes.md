@@ -300,6 +300,51 @@ Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22
   (§20.9):** the `vmcelld` broker cutover, the seccompiler deny-list + `clear_ambient` defaults (blocked
   on the fd-passing/uid-drop increment), and the QEMU/FC snapshot tiers already unwired pre-v24.
 
+### v24 pass 2 — the `vmcelld` broker cutover (the §20.9 headline step)
+
+Design: `docs/60-claude-design-v24.md` §20.5 (updated). `vmcelld` now forks by default: the broker child
+keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and forwards VM ops.
+
+- **(h) Shipped the "engine-owning" (fat) broker, NOT the thin `SpawnVmm`+pidfd model §20.5 first
+  described.** *Reason:* the thin model (broker does only netns/spawn, parent drives the VMM's api
+  socket + a passed pidfd) requires splitting `MicroVm` across the process boundary — its `V::Instance`
+  owns the VMM `Child`, so "parent drives the VMM" is a deep `MicroVm`/`Vmm` refactor. The fat cutover
+  realizes the **same §12.23 invariant** (caps off the network surface) with **no `vmcell` surgery**: the
+  broker child owns the whole `Registry`; the parent forwards `create`/`exec`/`stats`/`snapshot`/`destroy`
+  over the new `VmEngine` RPC (`vmcell-daemon::bridge`). The thin broker (shrink the *privileged code*
+  surface) is recorded as the remaining refinement (§20.9). Both satisfy §12.23; the fat one is far lower
+  risk and validatable now. The `vmcell-broker` thin primitives (SetupNetwork/SpawnVmm/…) stay as that
+  refinement's foundation + the reusable `fork_privileged_child` transport the fat cutover uses.
+
+- **(i) The bridge RPC is JSON (`serde_json`), NOT postcard.** First cut used postcard; `create` hung
+  while `get`/`list` passed. *Root cause:* the reused daemon DTOs carry `#[serde(skip_serializing_if)]` /
+  `default` fields — fine for self-describing JSON but **byte-misaligning** in postcard (non-self-
+  describing), so the reply frame was unparseable and the request never resolved. JSON is self-describing,
+  handles the attributes, and is the format the HTTP API already speaks. A KVM-free unit test
+  (`bridge::tests`) now round-trips every op incl. `create`, so a format regression reddens.
+
+- **(j) The parent drops effective/permitted/inheritable/ambient caps + `no_new_privs`; the bounding-set
+  shrink is a warned no-op without `CAP_SETPCAP`.** The runner raises only NET_ADMIN/SYS_ADMIN/DAC_OVERRIDE
+  (not SETPCAP), so `apply_broker_parent_drop`'s bounding drop warns — the **same** file-cap-path
+  limitation the runner has (B9). Dropping your *own* effective/permitted needs no SETPCAP, so the parent
+  still ends with **no usable capabilities** (empty effective set + `no_new_privs`), which is the §12.23
+  win; the wide bounding set is inert under `no_new_privs`.
+
+- **(k) `destroy_removes_per_vm_scratch_dir` now matches the scratch dir by vmid, not by `d.pid()`.** The
+  per-VM scratch dir is `<temp>/vmcell-vm-<pid>-<vmid>`; the fork means the **broker child** (not the
+  vmcelld process the test spawned) creates it, so its pid is not `d.pid()`. The test globs
+  `vmcell-vm-*-<vmid>` (the `-` delimiter avoids `-45` matching `-145`); the daemon's start-up sweep clears
+  any prior same-vmid dir, so exactly this VM's matches. The residue rule (exists-before, gone-after) is
+  unchanged — only the discovery.
+
+- **Validated on THIS KVM host (`just test-daemon`, 12/12).** Every VM lifecycle op now runs through the
+  cap-dropped HTTP parent → the forked broker: bearer auth (401/403/200), boot + `exec` data plane, full
+  create/exec/stats/destroy, snapshot → restore-by-name, privileged tap net + guest default route, extra
+  disks + delete-in-use (409), start-up orphan-netns sweep, `--resource-prefix` isolation, per-VM
+  scratch-dir residue, and `vmcelld-ctl` — all green with the parent holding no usable caps. KVM-free
+  gates green too: `bridge::tests` (RPC round-trip, error-status round-trip, multiplex-not-serialized,
+  over-cap reject), `vmcell-broker` fork/transport tests, clippy `-D warnings`.
+
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.

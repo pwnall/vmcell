@@ -1,6 +1,6 @@
 [package]
 name = "vmcell-daemon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,9 @@ path = "src/lib.rs"
 
 [features]
 default = ["server"]
-# The full daemon: axum router + handlers, VM registry, auth, and the vmcell host stack.
+# The full daemon: axum router + handlers, VM registry, auth, the vmcell host stack, and the
+# setup-broker bridge (the privilege-separated `vmcelld` cutover, §20.5 — the broker child owns the
+# registry, the cap-dropped parent serves HTTP over the `VmEngine` RPC).
 server = [
     "dep:axum",
     "dep:tower",
@@ -39,7 +41,7 @@ base64 = "0.22"
 # Server-only.
 axum = { version = "0.7", optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util"], optional = true }
 async-trait = { version = "0.1", optional = true }
 subtle = { version = "2", optional = true }
 sha2 = { version = "0.10", optional = true }
