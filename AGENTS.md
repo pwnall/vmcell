@@ -33,8 +33,12 @@ only snapshot-eligible mode).
    non-gating so they never short-circuit other gates.
 4. Enumerate what the suite structurally cannot reach — error branches, non-default configs and
    flows, defaults, window-filling payloads, security inverses — and cover it or record it.
-5. Host-facing claims are validated by executing the suites on a KVM host. Green static review
-   proves little; a capability-flag change re-validates empirically, not in the descriptor.
+5. Host-facing claims are validated by executing the suites on a KVM host — **and the dev host is that
+   host.** Run `scripts/review-preflight-priv.sh` first; when it prints `READY` (built+blessed runner,
+   KVM, artifacts, delegatable scope) actually run the suites — do **not** defer them as "forward work"
+   or write "to be validated on a KVM host." "Forward work / not yet validated" is legitimate **only**
+   when preflight prints `NOT READY`, and then you name the check that failed. Green static review proves
+   little; a capability-flag change re-validates empirically, not in the descriptor.
 
 ## Writing code
 
@@ -104,9 +108,11 @@ only snapshot-eligible mode).
 ## Done means
 
 - `just ci` green locally (it is the CI definition; both set `RUSTFLAGS=-D warnings`).
-- For host-facing changes: `scripts/review-preflight-priv.sh`, then both operating-mode suites
-  green on a KVM host (`just test-privileged` + the unprivileged suite), all three backends, and
-  the skip manifest reviewed.
+- For host-facing changes: run `scripts/review-preflight-priv.sh` (this dev host is KVM-capable and it
+  prints `READY`), then get both operating-mode suites green **here, now** (`just test-privileged` + the
+  unprivileged suite), all three backends, and the skip manifest reviewed. Preflight `READY` means run
+  it — not "record it as a KVM-host follow-up." Only a `NOT READY` preflight defers the run (fix the
+  named gap: unblessed runner → `just bless` in a TTY; missing artifacts → build them).
 - New public API: rustdoc complete (`missing_docs` denies), `cargo semver-checks` clean.
 - The privileged runner is re-blessed after rebuilds (`just bless`; blessing is stripped on rewrite
   by design).

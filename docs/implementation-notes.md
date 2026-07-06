@@ -400,13 +400,15 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   `scripts/review-preflight-priv.sh` prints `READY` and
   `systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-privileged`
   just works (no sudo). My own `imp-testing-validation-runbook` memory even says verbatim *"Do NOT assume
-  'can't run KVM here' — check first."* I assumed anyway. **Future work: audit `AGENTS.md` for wording that
-  nudges toward this deferral** — e.g. the "Done means" phrase "validated by executing the suites **on a KVM
-  host**" can read as "some other special host" rather than "this one," and the design-doc culture of
-  listing "KVM-host validation … forward work" as an honest-hedge template trains the reflex to hedge
-  instead of run. This did not used to be a problem; something in the current framing makes the suite feel
-  out of reach when it is one command away. The fix is process, not code: run the preflight first, and only
-  call something "forward work" after the runner/preflight actually says it can't run here.)**
+  'can't run KVM here' — check first."* I assumed anyway. The diagnosis: the "Done means" phrase
+  "validated by executing the suites **on a KVM host**" read as "some other special host" rather than "this
+  one," and the design-doc culture of listing "KVM-host validation … forward work" as an honest-hedge
+  template trained the reflex to hedge instead of run — something the current framing made feel out of
+  reach when it is one command away. **Fix applied (2026-07-06):** hardened `AGENTS.md` rule 5 and the
+  "Done means" host-facing bullet — the dev host **is** the KVM host; `scripts/review-preflight-priv.sh`
+  `READY` means run the suites now, and "forward work / not validated" is legitimate **only** when preflight
+  prints `NOT READY` (naming the failed check). **This note is kept deliberately** (not folded away yet) so
+  future development can show whether the wording change actually breaks the reflex.)**
 
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
