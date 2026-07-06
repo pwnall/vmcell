@@ -230,7 +230,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # EXP-D shutdown-timing tests (L-ORCH-5). Test-only: dev-deps do not affect the
 # production build or the feature powerset.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
-axum = "0.7"
+axum = "0.8"
 assert_cmd = "2"
 predicates = "3"
 serial_test = "3"
