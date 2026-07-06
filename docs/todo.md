@@ -8,8 +8,6 @@
 
 More difficult
 
-* Single-snapshot copy-on-write clone + fork()/branch() with lineage handles
-  (new injectable OverlayStore seam) [V:high/E:high]
 * Persistent interactive sessions: PTY + streaming stdin + multiplexed exec [V:high/E:med]
 * Observability: OTLP spans/metrics + per-step quotas + balloon/memory.high
   pressure + a typed, subscribable event stream [V:high/E:med]

@@ -83,6 +83,10 @@ pub mod orchestrator;
 #[cfg(feature = "host-common")]
 mod reflink;
 
+/// The `OverlayStore` seam: how a snapshot dir is copy-on-write cloned (§21.2).
+#[cfg(feature = "host-common")]
+pub mod overlay;
+
 /// Egress proxy implementation.
 #[cfg(feature = "host-common")]
 pub mod proxy;
@@ -90,6 +94,10 @@ pub mod proxy;
 /// Zygote suspend/resume fan-out: mint many identical VMs from one suspend image.
 #[cfg(feature = "host-common")]
 pub mod zygote;
+
+/// Fork/branch lineage handles over the zygote fan-out (§21.4).
+#[cfg(feature = "host-common")]
+pub mod lineage;
 
 /// VMM interface and backend implementations.
 #[cfg(feature = "host-common")]
@@ -114,6 +122,10 @@ pub use orchestrator::MicroVm;
 pub use proxy::EgressProxy;
 #[cfg(feature = "host-common")]
 pub use reflink::CowSupport;
+#[cfg(feature = "host-common")]
+pub use overlay::{OverlayStore, ReflinkOverlayStore};
+#[cfg(feature = "host-common")]
+pub use lineage::{Lineage, LineageAllocator, LineageId};
 #[cfg(feature = "firecracker")]
 pub use vmm::Firecracker;
 #[cfg(feature = "qemu")]

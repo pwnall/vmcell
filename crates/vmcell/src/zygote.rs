@@ -57,6 +57,10 @@ pub struct Zygote {
     /// The snapshot-eligible config clones restore with (with `vmid` cleared so
     /// each clone allocates a fresh one).
     cfg: VmConfig,
+    /// The seam each clone's copy-on-write copy is materialized through (§21.2).
+    /// Defaults to [`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore);
+    /// override with [`Zygote::with_overlay_store`].
+    store: Arc<dyn crate::overlay::OverlayStore>,
 }
 
 impl Zygote {
@@ -110,7 +114,26 @@ impl Zygote {
         // Clones always get a fresh vmid; the zygote's own vmid (if any) describes
         // the ancestor, not its children (§9.4).
         cfg.vmid = None;
-        Self { master_dir, cfg }
+        Self {
+            master_dir,
+            cfg,
+            store: Arc::new(crate::overlay::ReflinkOverlayStore),
+        }
+    }
+
+    /// Uses `store` to materialize each clone's copy-on-write copy instead of the
+    /// default [`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore) (§21.2).
+    #[must_use]
+    pub fn with_overlay_store(mut self, store: Arc<dyn crate::overlay::OverlayStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// The [`OverlayStore`](crate::overlay::OverlayStore) this zygote's clones
+    /// materialize through — propagated to a branch node so a whole lineage shares
+    /// one store (§21.4).
+    pub(crate) fn overlay_store(&self) -> Arc<dyn crate::overlay::OverlayStore> {
+        self.store.clone()
     }
 
     /// The immutable master snapshot directory.
@@ -158,6 +181,7 @@ impl Zygote {
             cid_alloc,
             vmid_alloc,
             cgroup_fs,
+            self.store.clone(),
         )
         .await?;
         tracing::debug!(
@@ -227,6 +251,7 @@ impl Zygote {
                 cid_alloc.clone(),
                 vmid_alloc.clone(),
                 cg,
+                self.store.clone(),
             )
         });
         let results = futures::future::join_all(futs).await;

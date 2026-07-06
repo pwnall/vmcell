@@ -345,6 +345,69 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   gates green too: `bridge::tests` (RPC round-trip, error-status round-trip, multiplex-not-serialized,
   over-cap reject), `vmcell-broker` fork/transport tests, clippy `-D warnings`.
 
+## v25 — the OverlayStore seam + fork/branch lineage (design §21)
+
+- **(a) The "single-snapshot copy-on-write clone" was already built; v25 adds only the seam + lineage.**
+  The roadmap item bundled three things; the reflink CoW clone + zygote fan-out (`Zygote`,
+  `MicroVm::restore_cow`, `reflink.rs`, §9.4/§12.12) already shipped. v25 does **not** re-implement it — it
+  lifts the CoW copy behind the injectable `overlay::OverlayStore` seam and adds the `lineage::Lineage`
+  fork/branch handle on top of `Zygote`. Scoping recorded so a reader does not expect new clone mechanics.
+
+- **(b) The seam method is `clone_tree`, not the design's tentative `clone_into`.** `clone_into` collides
+  with the blanket `ToOwned::clone_into(&self, &mut Self::Owned)` on any `Arc<dyn OverlayStore>` call site
+  (method resolution picks `ToOwned`'s, a confusing `E0061`). Renamed to `clone_tree` (also clearer — it
+  mirrors the internal `clone_tree_cow`). The design doc uses `clone_tree` to match.
+
+- **(c) `restore_inner` folds `overlay_store` + a `cow: bool` into one `Option<Arc<dyn OverlayStore>>`.**
+  Adding both as separate params made it an 8-arg fn, tripping `clippy::too_many_arguments` (threshold 7,
+  no override, and the codebase carries **zero** `too_many_arguments` suppressions — the convention is to
+  not exceed it, never to `#[allow]` it). `Some(store)` = CoW-copy through it, `None` = single-use in
+  place; the presence of a store *is* the CoW flag, which is also cleaner than a parallel bool. The public
+  `restore_cow` keeps its explicit `Arc<dyn OverlayStore>` param (7 args, at the limit).
+
+- **(d) `Lineage` is the lineage handle; no field was added to `MicroVm`.** A forked VM does not carry a
+  back-pointer to its lineage — the `Lineage` value does. `Lineage::branch(child, dir)` takes the running
+  descendant explicitly (the git-branch model: the caller says where the branch diverges). This keeps the
+  300-line `MicroVm` struct and its nine construction sites untouched, and all CoW/fan-out mechanics
+  delegate to `Zygote` (one law).
+
+- **(e) `Lineage::fork_from_vm` / `branch` create the target snapshot dir — a real bug the LIVE test
+  caught.** The first draft mirrored `Zygote::suspend`'s "caller creates the dir" contract, so a `branch`
+  into a not-yet-created dir fails-loud in the backend: CH `"Destination is not a directory"`, FC
+  `"Cannot perform open on the snapshot backing file: No such file or directory"`. Both `fork_from_vm` and
+  `branch` are "suspend into a location" verbs, so they now `create_dir_all` the destination first. This
+  was **not** caught by the unit tests (the `FakeVmm` snapshot is a no-op that never opens the dir) — only
+  by running the real VM suite, which is exactly why the host-run is non-optional (AGENTS.md "Green static
+  review proves little"). A KVM-free `branch_creates_a_missing_target_dir` unit gate now guards it (red on
+  dropping the `create_dir_all`).
+
+- **KVM validation — DONE on this host (2026-07-06).** Both operating-mode suites green under the delegated
+  scope through the blessed runner: **`just test-privileged` 87 passed / 5 skipped** (CH+FC+QEMU; incl. the
+  new `fork_branch_lineage` live test on CH+FC, plus `zygote_fan_out`, `snapshot_restore`, and
+  `extra_block_survives_snapshot` which exercise `restore_cow` through the new `OverlayStore` seam on real
+  micro-VMs) and **`just test-unprivileged` 4 passed**. The new `tests/lineage.rs` boots a VM, roots a
+  lineage, forks a live clone (exec on the data plane; guest MAC == `mac_math(vmid)`), writes a marker to
+  diverge it, `branch`es it, and proves a fork from the branch **sees** the marker while a fork from the
+  root does **not** (a data-plane positive/negative control, not a proxy signal). KVM-free gates also green:
+  `overlay`/`lineage` unit tests (each **red-on-inverse verified**: drop generation-increment → chain
+  reddens; bypass the store → seam test reddens; drop the allocator guard → cross-family ancestry reddens),
+  `clippy -D warnings` (incl. reduced single-backend features), `missing_docs` rustdoc, `cargo
+  semver-checks` (0.7.0 → 0.8.0, clean), full `vmcell` lib nextest.
+
+- **(PROCESS NOTE — a recurring mistake to stop making.** I repeatedly framed the privileged suite as
+  hard-to-run / "forward work" and deferred it, when in fact **the capability test runner is built and
+  blessed, this host is fully KVM-capable, and the environment is entirely set up to run it** —
+  `scripts/review-preflight-priv.sh` prints `READY` and
+  `systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-privileged`
+  just works (no sudo). My own `imp-testing-validation-runbook` memory even says verbatim *"Do NOT assume
+  'can't run KVM here' — check first."* I assumed anyway. **Future work: audit `AGENTS.md` for wording that
+  nudges toward this deferral** — e.g. the "Done means" phrase "validated by executing the suites **on a KVM
+  host**" can read as "some other special host" rather than "this one," and the design-doc culture of
+  listing "KVM-host validation … forward work" as an honest-hedge template trains the reflex to hedge
+  instead of run. This did not used to be a problem; something in the current framing makes the suite feel
+  out of reach when it is one command away. The fix is process, not code: run the preflight first, and only
+  call something "forward work" after the runner/preflight actually says it can't run here.)**
+
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.

@@ -945,17 +945,11 @@ impl<V: Vmm> MicroVm<V> {
         vmid_alloc: VmidAllocator,
         cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
     ) -> Result<Self> {
-        Self::restore_inner(
-            vmm,
-            snapshot_dir,
-            cfg,
-            cid_alloc,
-            vmid_alloc,
-            cgroup_fs,
-            false,
-        )
-        .await
-        .map(|(vm, _cow)| vm)
+        // Single-use restore does not copy the dir, so no overlay store is passed
+        // (`None`); the caller's dir is restored in place.
+        Self::restore_inner(vmm, snapshot_dir, cfg, cid_alloc, vmid_alloc, cgroup_fs, None)
+            .await
+            .map(|(vm, _cow)| vm)
     }
 
     /// Restores one clone from a zygote suspend image, copy-on-write-copying the
@@ -972,6 +966,13 @@ impl<V: Vmm> MicroVm<V> {
     /// `capabilities().restore_rotates_host_paths` (§3.3) — enforced by
     /// [`Zygote::spawn_clones`](crate::Zygote::spawn_clones), not here.
     ///
+    /// The copy-on-write copy of the suspend directory is materialized through the
+    /// injected [`OverlayStore`](crate::overlay::OverlayStore) seam (§12.24) —
+    /// [`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore) in production;
+    /// a recording double in tests. The store is the single clone-materialization
+    /// law, so a caller can swap the backing store (e.g. a shared content-addressed
+    /// overlay pool) without touching this path.
+    ///
     /// # Errors
     /// Returns an error if the copy-on-write copy, network setup, proxy start, or
     /// VM restore fails. The eligibility re-checks of [`MicroVm::restore`] apply
@@ -984,16 +985,28 @@ impl<V: Vmm> MicroVm<V> {
         cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
         vmid_alloc: VmidAllocator,
         cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
+        overlay_store: std::sync::Arc<dyn crate::overlay::OverlayStore>,
     ) -> Result<(Self, crate::reflink::CowSupport)> {
-        Self::restore_inner(vmm, zygote_dir, cfg, cid_alloc, vmid_alloc, cgroup_fs, true).await
+        Self::restore_inner(
+            vmm,
+            zygote_dir,
+            cfg,
+            cid_alloc,
+            vmid_alloc,
+            cgroup_fs,
+            Some(overlay_store),
+        )
+        .await
     }
 
-    /// Shared body of [`MicroVm::restore`] (single-use, `cow = false`) and
-    /// [`MicroVm::restore_cow`] (`cow = true`). When `cow`, the snapshot dir is
-    /// reflink-copied into this VM's scratch dir first and the backend restores
-    /// from that private copy; otherwise the caller's dir is used directly. The
-    /// returned [`CowSupport`](crate::reflink::CowSupport) is only meaningful when
-    /// `cow` (the single-use path returns `FullCopy` as an ignored placeholder).
+    /// Shared body of [`MicroVm::restore`] (single-use, `overlay_store = None`) and
+    /// [`MicroVm::restore_cow`] (`overlay_store = Some(store)`). When a store is
+    /// given, the snapshot dir is copy-on-write-copied into this VM's scratch dir
+    /// through it first and the backend restores from that private copy; otherwise
+    /// the caller's dir is used directly. The returned
+    /// [`CowSupport`](crate::reflink::CowSupport) is only meaningful in the CoW case
+    /// (the single-use path returns `FullCopy` as an ignored placeholder). Folding
+    /// "is this CoW" and "which store" into one `Option` keeps this to one flag.
     async fn restore_inner(
         vmm: &V,
         snapshot_dir: &std::path::Path,
@@ -1001,7 +1014,7 @@ impl<V: Vmm> MicroVm<V> {
         cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
         vmid_alloc: VmidAllocator,
         cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
-        cow: bool,
+        overlay_store: Option<std::sync::Arc<dyn crate::overlay::OverlayStore>>,
     ) -> Result<(Self, crate::reflink::CowSupport)> {
         // §3.3 boundary 2 (ORCH-4): the restore-path re-check of the
         // snapshot-eligibility law returns `Error::Unsupported { vmm, feature }`
@@ -1056,9 +1069,22 @@ impl<V: Vmm> MicroVm<V> {
         // as `CowSupport`. The single-use `restore` path (`cow == false`) hands
         // the caller's dir to the backend directly, preserving its documented
         // in-place rewrite behavior.
-        let (effective_dir, cow_support) = if cow {
+        let (effective_dir, cow_support) = if let Some(store) = overlay_store {
             let clone_dir = tmp_dir.path().join("zygote-snapshot");
-            let support = crate::reflink::clone_tree_cow(snapshot_dir, &clone_dir).await?;
+            // Materialize the private copy through the injected OverlayStore seam
+            // (§12.24). A full byte copy can be large, so run it on a blocking
+            // thread — the store's methods are synchronous by design (object-safe
+            // as `dyn`), and this keeps a big copy off the async runtime, the same
+            // discipline the bare function used.
+            let src = snapshot_dir.to_path_buf();
+            let dst = clone_dir.clone();
+            let support = tokio::task::spawn_blocking(move || store.clone_tree(&src, &dst))
+                .await
+                .map_err(|e| {
+                    crate::error::Error::Io(std::io::Error::other(format!(
+                        "overlay clone task panicked: {e}"
+                    )))
+                })??;
             (std::borrow::Cow::Owned(clone_dir), support)
         } else {
             (

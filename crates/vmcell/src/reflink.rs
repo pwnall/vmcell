@@ -73,29 +73,20 @@ impl CowSupport {
 /// skipped — a snapshot dir never contains one.
 ///
 /// Returns the aggregate [`CowSupport`]: `Reflink` only if every regular file in
-/// the tree reflinked. The (potentially large) copy runs on a blocking thread so
-/// it never stalls the async runtime.
+/// the tree reflinked.
+///
+/// This is the low-level primitive behind [`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore).
+/// It runs synchronously and may do a large byte copy, so callers invoke it on a
+/// blocking thread — the [`OverlayStore`](crate::overlay::OverlayStore) seam call
+/// is wrapped in `spawn_blocking` by the orchestrator. Kept unit-testable without
+/// a tokio runtime.
 ///
 /// # Errors
 /// [`Error::Io`] if `src` is not a readable directory, `dst` already exists or
 /// cannot be created, or any entry copy fails. A `src`/`dst` split across two
 /// filesystems still succeeds via the full-copy fallback (`FICLONE` `EXDEV` is
 /// not surfaced as an error); only a genuine I/O failure fails.
-pub(crate) async fn clone_tree_cow(src: &Path, dst: &Path) -> Result<CowSupport> {
-    let src = src.to_path_buf();
-    let dst = dst.to_path_buf();
-    tokio::task::spawn_blocking(move || clone_tree_cow_blocking(&src, &dst))
-        .await
-        .map_err(|e| {
-            Error::Io(io::Error::other(format!(
-                "zygote cow-clone task panicked: {e}"
-            )))
-        })?
-}
-
-/// Synchronous worker for [`clone_tree_cow`]; separated so the reflink logic is
-/// unit-testable without a tokio runtime and runs on a blocking thread.
-fn clone_tree_cow_blocking(src: &Path, dst: &Path) -> Result<CowSupport> {
+pub(crate) fn clone_tree_cow_blocking(src: &Path, dst: &Path) -> Result<CowSupport> {
     if dst.exists() {
         return Err(Error::Io(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -194,7 +185,7 @@ mod tests {
         std::fs::write(master.join("sub/state"), b"frozen").expect("state");
 
         let clone = root.path().join("clone");
-        let support = clone_tree_cow(&master, &clone).await.expect("clone");
+        let support = clone_tree_cow_blocking(&master, &clone).expect("clone");
         // Depending on the test filesystem this is Reflink or FullCopy — both are
         // valid; we only require a faithful copy, asserted next.
         assert!(matches!(
@@ -230,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn clone_tree_rejects_missing_master() {
         let root = tempfile::tempdir().expect("tempdir");
-        let res = clone_tree_cow(&root.path().join("nope"), &root.path().join("out")).await;
+        let res = clone_tree_cow_blocking(&root.path().join("nope"), &root.path().join("out"));
         assert!(
             matches!(res, Err(Error::Io(_))),
             "missing master must Io-error"
@@ -247,7 +238,7 @@ mod tests {
         std::fs::write(master.join("f"), b"x").expect("f");
         let target = root.path().join("t");
         std::fs::create_dir_all(&target).expect("pre-existing target");
-        let res = clone_tree_cow(&master, &target).await;
+        let res = clone_tree_cow_blocking(&master, &target);
         assert!(
             matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::AlreadyExists),
             "existing target must be rejected, got {res:?}"
@@ -304,7 +295,7 @@ mod tests {
         std::fs::create_dir_all(&master).expect("mk master");
         std::fs::write(master.join("f"), vec![0x5Au8; 4096]).expect("f");
         let clone = root.path().join("c");
-        let clone_support = clone_tree_cow(&master, &clone).await.expect("clone");
+        let clone_support = clone_tree_cow_blocking(&master, &clone).expect("clone");
         let probe_support = probe_reflink(root.path());
         assert_eq!(
             clone_support, probe_support,
@@ -324,7 +315,7 @@ mod tests {
         std::os::unix::fs::symlink("config.json", master.join("link")).expect("symlink");
 
         let clone = root.path().join("c");
-        clone_tree_cow(&master, &clone).await.expect("clone");
+        clone_tree_cow_blocking(&master, &clone).expect("clone");
 
         let meta = std::fs::symlink_metadata(clone.join("link")).expect("lstat clone link");
         assert!(
@@ -346,7 +337,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let file_src = root.path().join("a-file");
         std::fs::write(&file_src, b"not a dir").expect("write file src");
-        let res = clone_tree_cow(&file_src, &root.path().join("out")).await;
+        let res = clone_tree_cow_blocking(&file_src, &root.path().join("out"));
         assert!(
             matches!(res, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::InvalidInput),
             "a non-directory src must be rejected with InvalidInput, got {res:?}"

@@ -226,6 +226,10 @@ impl VmLauncher for MicroVmLauncher {
                 self.cids.clone(),
                 self.vmids.clone(),
                 (self.cgroup_factory)(),
+                // The daemon restores named artifacts through the production reflink
+                // store; the OverlayStore seam is injectable here too (a non-default
+                // store is design §21.8 forward work).
+                std::sync::Arc::new(vmcell::ReflinkOverlayStore),
             )
             .await?;
             vm
