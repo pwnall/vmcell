@@ -29,7 +29,7 @@ vsock = "0.5"
 # `setsid`/`ioctl_tiocsctty`/`dup2_std*` login-tty sequence in the child `pre_exec`.
 # All are features on the existing dep, so the lean-agent graph gains no crate.
 rustix = { version = "0.38", features = ["fs", "mount", "process", "net", "time", "event", "pty", "termios", "stdio"] }
-signal-hook = "0.3"
+signal-hook = "0.4"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
