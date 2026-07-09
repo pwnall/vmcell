@@ -1632,7 +1632,7 @@ impl<V: Vmm> MicroVm<V> {
     pub fn vmid(&self) -> u32;
     pub fn proxy(&self) -> Option<&EgressProxy>;          // the egress-proxy handle, if egress is filtered
     pub async fn agent(&mut self, timeout: Option<Duration>, clock: &dyn Clock) -> Result<&mut AgentClient>; // None => 10 s; clock drives the first post-restore resync
-    pub async fn connect_sessions(&mut self, timeout: Option<Duration>, serial_log: &dyn SerialLog) -> Result<SessionMux>; // a 2nd control-plane connection for interactive sessions (§22.4); fail-loud with custom init=
+    pub async fn connect_sessions(&self, timeout: Option<Duration>) -> Result<SessionMux>; // a 2nd control-plane connection for interactive sessions (§22.4); builds its own RealSerialLog internally; fail-loud with custom init=
     pub async fn usage(&self) -> Result<ResourceUsage>;   // reads the cgroup slice
     pub async fn pause(&mut self) -> Result<()>;
     pub async fn resume(&mut self) -> Result<()>;
@@ -3988,8 +3988,8 @@ hardening increment (§20.9), not shipped half-done.
 compiled once (pre-fork, so the allocation is off the async-signal-safe path) with seccompiler: a small
 set of syscalls a booting VMM never needs and an escape would want — `mount`, `umount2`, `pivot_root`,
 `kexec_load`, `kexec_file_load`, `init_module`, `finit_module`, `delete_module`, `ptrace`,
-`process_vm_writev`, `bpf`, `perf_event_open`, `add_key`, `keyctl`, `request_key`, `setns`, `unshare` —
-each `→ EPERM`, everything else allowed. A default-allow deny-list is far safer to ship than a
+`process_vm_writev`, `bpf`, `perf_event_open`, `add_key`, `keyctl`, `request_key`, `setns`, `unshare`,
+`reboot`, `swapon`, `swapoff` — each `→ EPERM`, everything else allowed. A default-allow deny-list is far safer to ship than a
 default-deny allow-list (it cannot break the VMM unless the VMM legitimately needs a blocked *dangerous*
 syscall), but because it still cannot be **live-validated on a KVM host in this environment**, it ships
 **opt-in, default off** — the VMM's own native filter (Layer 1) is the shipped default confinement. Its
@@ -4607,8 +4607,8 @@ processes. Per-session queues are **unbounded** and fed only by the *trusted hos
 is the sandboxed workload; the host chose to open and must drain each session) — a deliberate,
 recorded trade (§16), not the untrusted-server-accumulation class the rubric flags.
 
-`MicroVm::connect_sessions(timeout, serial_log) -> Result<SessionMux>` is the ergonomic entry: it dials a
-second control-plane connection on the same VM. It refuses fail-loud with the existing
+`MicroVm::connect_sessions(timeout) -> Result<SessionMux>` is the ergonomic entry: it dials a
+second control-plane connection on the same VM (constructing the `RealSerialLog` that `SessionMux::connect` takes, itself). It refuses fail-loud with the existing
 control-plane-disabled `Error::Agent` when a custom `init=` has replaced the agent (§19.2.2), exactly as
 `agent()` does.
 

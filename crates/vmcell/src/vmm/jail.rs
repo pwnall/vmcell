@@ -41,6 +41,7 @@ pub const DENIED_SYSCALLS: &[(&str, i64)] = &[
     ("umount2", libc::SYS_umount2),
     ("pivot_root", libc::SYS_pivot_root),
     ("kexec_load", libc::SYS_kexec_load),
+    ("kexec_file_load", libc::SYS_kexec_file_load),
     ("init_module", libc::SYS_init_module),
     ("finit_module", libc::SYS_finit_module),
     ("delete_module", libc::SYS_delete_module),
@@ -245,26 +246,44 @@ pub fn apply_jail(spec: &JailSpec) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    // Guards §12.22: the deny-list must actually contain the dangerous syscalls, and compile
-    // to a non-empty BPF program. The inverse (an empty list, or dropping `mount`/`ptrace`)
-    // reddens here; the behavioral "mount → EPERM" proof is the KVM-free stand-in
-    // integration test (tests/jail_hardening.rs).
+    // Guards §12.22 / §20.4: the shipped deny-list is EXACTLY the documented set, and compiles
+    // to a non-empty BPF program. Pinned as an exact membership so the filter cannot silently
+    // drift from design §20.4 in either direction — dropping a syscall (e.g. `kexec_file_load`,
+    // the file-based kexec variant that stays reachable if only `kexec_load` is blocked) OR
+    // adding an undocumented one reddens here. The behavioral "mount → EPERM" proof is the
+    // KVM-free stand-in integration test (tests/jail_hardening.rs).
     #[test]
-    fn deny_list_covers_dangerous_syscalls_and_compiles() {
-        let names: Vec<&str> = DENIED_SYSCALLS.iter().map(|&(n, _)| n).collect();
-        for must in [
+    fn deny_list_is_exactly_the_documented_set_and_compiles() {
+        use std::collections::BTreeSet;
+        let expected: BTreeSet<&str> = [
             "mount",
-            "ptrace",
-            "bpf",
+            "umount2",
+            "pivot_root",
             "kexec_load",
+            "kexec_file_load",
             "init_module",
+            "finit_module",
+            "delete_module",
+            "ptrace",
+            "process_vm_writev",
+            "bpf",
+            "perf_event_open",
+            "add_key",
+            "keyctl",
+            "request_key",
             "setns",
-        ] {
-            assert!(
-                names.contains(&must),
-                "the VMM deny-list must block {must}, has {names:?}"
-            );
-        }
+            "unshare",
+            "reboot",
+            "swapon",
+            "swapoff",
+        ]
+        .into_iter()
+        .collect();
+        let actual: BTreeSet<&str> = DENIED_SYSCALLS.iter().map(|&(n, _)| n).collect();
+        assert_eq!(
+            actual, expected,
+            "the VMM deny-list must exactly match design §20.4 (guarded both directions)"
+        );
         let bpf = build_vmm_deny_filter().expect("deny-list must compile on this arch");
         assert!(
             !bpf.is_empty(),
