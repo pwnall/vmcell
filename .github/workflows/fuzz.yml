@@ -1,9 +1,11 @@
 name: fuzz-nightly
 
 # Non-blocking by construction: it is scheduled (gates no PR), but a red run is visible on the
-# Actions tab and any crash uploads its reproducer. Covers the rubric B10 decode surfaces — today
-# the framed postcard `Message` decoder (fuzz/fuzz_targets/protocol_decode.rs); add a target per new
-# parser guest or network bytes reach (CH REST/chunked response, OCI/tar layer ingest).
+# Actions tab and any crash uploads its reproducer. Covers the rubric B10 decode surfaces — the
+# framed postcard `Message` guest-wire decoder (protocol_decode) and the broker's cross-privilege
+# framed `BrokerRequest` decoder (broker_frame; a panic there is a crash in the cap-holding process).
+# `cargo fuzz list` auto-discovers every `[[bin]]`, so a new target runs with no workflow edit. Add a
+# target per new parser guest or network bytes reach (CH REST/chunked response, OCI/tar layer ingest).
 
 on:
   schedule:

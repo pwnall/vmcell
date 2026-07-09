@@ -28,6 +28,7 @@ deny = [
     { name = "seccomp-sys", reason = "-sys crate that links the LGPL-2.1 libseccomp C library; use seccompiler (§20.6)" },
     { name = "seccomp", reason = "LGPL-2.1 crate + links libseccomp; use seccompiler (§20.6)" },
     { name = "syscallz", reason = "pulls seccomp-sys → the LGPL-2.1 libseccomp C library; use seccompiler (§20.6)" },
+    { name = "birdcage", reason = "alternative sandbox crate (seccomp/landlock); banned by name so seccompiler stays the single sanctioned sandbox/seccomp dependency (§20.6, rubric B13)" },
 ]
 
 [advisories]

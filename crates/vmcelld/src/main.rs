@@ -9,7 +9,11 @@
 //! the HTTP request parser can never reach the caps, and the cap-holder never parses attacker input
 //! (§12.23). `--no-setup-broker` falls back to the single-process retain-caps model (§12.14).
 //!
-//! `print_stdout`/`print_stderr` are NOT denied — a daemon binary logs startup/fatal diagnostics.
+//! A daemon logs through `tracing`, never `print`/`eprintln` (full-family, v3) — so
+//! `print_stdout`/`print_stderr` are denied. The subscriber is installed as the very first line of
+//! `main`, so every startup and fatal diagnostic (blessing, auth, bind, fork, cap-drop) goes through
+//! `tracing::{error,warn,info}!` onto the same stderr, keeping the whole daemon one
+//! consistently-formatted stream instead of interleaving raw `eprintln` with structured events.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
@@ -28,6 +32,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::print_stdout,                   // v3: a daemon logs via tracing, never stdout
+        clippy::print_stderr,                   // v3: a daemon logs via tracing, never stderr
         clippy::dbg_macro,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
@@ -116,14 +122,14 @@ fn run() -> Result<(), i32> {
     // EFFECTIVE set, or euid 0. Checked BEFORE the fork so both the broker child (which keeps them)
     // and the parent (which drops them) start from a known-blessed state.
     if let Err(remediation) = vmcell_privilege::ensure_blessed_or_explain(&PRIVILEGED_CAPS) {
-        eprintln!("{remediation}");
+        tracing::error!("{remediation}");
         return Err(1);
     }
 
     // Reject a malformed resource prefix up front (it becomes part of netns/interface/cgroup/dir
     // names). One value drives both VM naming and the sweep, so they can never disagree (v21).
     if let Err(e) = vmcell_daemon::naming::validate_resource_prefix(&cli.resource_prefix) {
-        eprintln!("vmcelld: {e}");
+        tracing::error!("vmcelld: {e}");
         return Err(1);
     }
 
@@ -144,7 +150,7 @@ fn run() -> Result<(), i32> {
         Ok(ForkSide::Child { sock }) => run_broker_child(&cli, ch_bin, sock),
         Ok(ForkSide::Parent { sock, child }) => run_http_parent(&cli, sock, child),
         Err(e) => {
-            eprintln!("vmcelld: cannot fork the setup broker: {e}");
+            tracing::error!("vmcelld: cannot fork the setup broker: {e}");
             Err(1)
         }
     }
@@ -167,7 +173,7 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("vmcelld broker: cannot build async runtime: {e}");
+            tracing::error!("vmcelld broker: cannot build async runtime: {e}");
             return 1;
         }
     };
@@ -190,7 +196,7 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
         let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("vmcelld broker: {e}");
+                tracing::error!("vmcelld broker: {e}");
                 return 1;
             }
         };
@@ -199,13 +205,13 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
             Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
 
         if let Err(e) = sock.set_nonblocking(true) {
-            eprintln!("vmcelld broker: cannot set the control socket nonblocking: {e}");
+            tracing::error!("vmcelld broker: cannot set the control socket nonblocking: {e}");
             return 1;
         }
         let sock = match tokio::net::UnixStream::from_std(sock) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("vmcelld broker: cannot adopt the control socket: {e}");
+                tracing::error!("vmcelld broker: cannot adopt the control socket: {e}");
                 return 1;
             }
         };
@@ -227,7 +233,7 @@ fn run_http_parent(
     // Drop EVERY capability before binding the network socket — the HTTP surface holds none (§12.23).
     let plan = vmcell_privilege::plan_broker_parent_drop(&vmcell_privilege::probe_supported_caps());
     if let Err(e) = vmcell_privilege::apply_broker_parent_drop(&plan) {
-        eprintln!("vmcelld: the HTTP parent could not drop its capabilities: {e}");
+        tracing::error!("vmcelld: the HTTP parent could not drop its capabilities: {e}");
         return Err(1);
     }
 
@@ -236,7 +242,7 @@ fn run_http_parent(
     let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
         Ok(a) => Arc::new(a),
         Err(e) => {
-            eprintln!("vmcelld: {e}");
+            tracing::error!("vmcelld: {e}");
             return Err(1);
         }
     };
@@ -247,7 +253,7 @@ fn run_http_parent(
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("vmcelld: cannot build async runtime: {e}");
+            tracing::error!("vmcelld: cannot build async runtime: {e}");
             return Err(1);
         }
     };
@@ -257,13 +263,13 @@ fn run_http_parent(
     let _child = child;
     runtime.block_on(async move {
         if let Err(e) = sock.set_nonblocking(true) {
-            eprintln!("vmcelld: cannot set the broker socket nonblocking: {e}");
+            tracing::error!("vmcelld: cannot set the broker socket nonblocking: {e}");
             return Err(1);
         }
         let sock = match tokio::net::UnixStream::from_std(sock) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("vmcelld: cannot adopt the broker socket: {e}");
+                tracing::error!("vmcelld: cannot adopt the broker socket: {e}");
                 return Err(1);
             }
         };
@@ -275,12 +281,12 @@ fn run_http_parent(
             max_artifact_bytes: max,
         };
         let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
-            eprintln!("vmcelld: cannot bind {bind}: {e}");
+            tracing::error!("vmcelld: cannot bind {bind}: {e}");
             1
         })?;
         tracing::info!(bind = %bind, "vmcelld serving (HTTP parent; no capabilities)");
         let serve_result = tokio::select! {
-            r = serve(state, listener) => r.map_err(|e| { eprintln!("vmcelld: server error: {e}"); 1 }),
+            r = serve(state, listener) => r.map_err(|e| { tracing::error!("vmcelld: server error: {e}"); 1 }),
             _ = shutdown_signal() => {
                 tracing::info!("vmcelld: shutdown signal received; asking the broker to tear down VMs");
                 Ok(())
@@ -303,7 +309,7 @@ fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
     let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("vmcelld: {e}");
+            tracing::error!("vmcelld: {e}");
             return Err(1);
         }
     };
@@ -327,7 +333,7 @@ fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
     let parent_artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
         Ok(a) => Arc::new(a),
         Err(e) => {
-            eprintln!("vmcelld: {e}");
+            tracing::error!("vmcelld: {e}");
             return Err(1);
         }
     };
@@ -344,19 +350,19 @@ fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("vmcelld: cannot build async runtime: {e}");
+            tracing::error!("vmcelld: cannot build async runtime: {e}");
             return Err(1);
         }
     };
     let bind = cli.bind.clone();
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
-            eprintln!("vmcelld: cannot bind {bind}: {e}");
+            tracing::error!("vmcelld: cannot bind {bind}: {e}");
             1
         })?;
         tracing::info!(bind = %bind, "vmcelld serving (single-process, retains caps)");
         tokio::select! {
-            r = serve(state, listener) => r.map_err(|e| { eprintln!("vmcelld: server error: {e}"); 1 }),
+            r = serve(state, listener) => r.map_err(|e| { tracing::error!("vmcelld: server error: {e}"); 1 }),
             _ = shutdown_signal() => {
                 tracing::info!("vmcelld: shutdown signal received; tearing down owned VMs");
                 registry.shutdown_all().await;
@@ -373,7 +379,7 @@ fn auth_policy(cli: &Cli) -> Result<AuthPolicy, i32> {
         (Some(path), _) => match load_api_key_file(path) {
             Ok(key) => Ok(AuthPolicy::Key(key)),
             Err(e) => {
-                eprintln!("vmcelld: {e}");
+                tracing::error!("vmcelld: {e}");
                 Err(1)
             }
         },
@@ -385,7 +391,7 @@ fn auth_policy(cli: &Cli) -> Result<AuthPolicy, i32> {
             Ok(AuthPolicy::Unauthenticated)
         }
         (None, false) => {
-            eprintln!(
+            tracing::error!(
                 "vmcelld: refusing to start without authentication. Pass --api-key-file <path> \
                  (owner-only perms) or, for a loopback dev bind only, --allow-unauthenticated."
             );

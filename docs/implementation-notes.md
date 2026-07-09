@@ -488,6 +488,63 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   named), **not** a session regression. It clears on a host with healthy KVM; re-run `just test-privileged`
   there to reconfirm the reseed + nested-virt tiers.
 
+## Automated quality gates (docs/70 v3) — daemon/broker/jail gate reconciliation
+
+The v3 quality-gate doc (`docs/historical/70-claude-fable-automated-quality-v3.md`) writes several gate
+bodies against an assumed API/tree; four landed with a justified correction to the built reality (the
+doc itself notes this is expected — the `protocol_decode` fuzz target already re-based `decode_frame`
+onto the real postcard entry point). All four are green-on-clean and red-on-inverse (self-tested where
+a self-test applies).
+
+- **(a) The P3 artifact-path ban is scoped to the daemon crate and allow-lists `name.rs`, not
+  `artifact_store.rs`.** *Diverged from:* the v3 script's `root=crates` default + `allow_file=
+  crates/vmcell-daemon/src/artifact_store.rs`. *Reality:* `resolve_artifact_path` lives in
+  `crates/vmcell-daemon/src/name.rs` (not `artifact_store.rs`), and P3/B12 is specifically about the
+  daemon turning a **client-supplied** artifact name into a path — so the scan is scoped to
+  `crates/vmcell-daemon/src`, not all of `crates/`. Scanning the whole workspace with the doc's
+  `(dir|path|artifacts_dir|base).join([a-z_]` pattern produced **17 hits**, all legitimate: internal
+  `dir.join(name)` in vmcell's artifact pipeline (`artifact/rootfs`, `snapshot`, `metrics` test code)
+  and `dir.join(format!(…))` / `base.join(crate::naming::…())` computed joins — none is a client
+  string. The shipped pattern requires a **bare-identifier** argument closed by `)` (so `format!(…)`,
+  `crate::…`, and string literals don't match), a **method-call receiver** exclusion (so
+  `store.dir().join(prefix)` — the daemon's own two legitimate sites — doesn't match), and strips line
+  comments first. Net: zero hits on the clean daemon tree, fires on the inline `dir.join(name)` bug
+  (`scripts/test-ban-artifact-path-join.sh`). `resolve_artifact_path`'s own `Ok(dir.join(name))` is the
+  one sanctioned site, exempted by basename.
+
+- **(b) The broker web-stack gate asserts `vmcell-daemon` + `axum` absent, NOT `hyper`.** *Diverged
+  from:* the v3/AGENTS.md "assert axum/hyper absent from vmcell-broker" phrasing. *Reality:* `hyper`
+  enters `vmcell-broker` **transitively and legitimately** via `vmcell`'s egress proxy (`hudsucker`)
+  and HTTP clients (`reqwest`/`oci-client`) — all part of the net/proxy subset the broker needs for
+  nft/TPROXY setup — so `-i hyper` is present on the clean tree and asserting its absence reddens CI.
+  The **meaningful** P2/§12.23 boundary ("the network-input HTTP surface must not share the
+  cap-holder") is the daemon's HTTP **server**: `axum` + the `vmcell-daemon` crate that owns it. Both
+  are absent from the broker (positive control: `vmcelld`, which legitimately links the web stack,
+  shows both present), so the gate is green-on-clean and fires if either leaks into the cap-holder.
+
+- **(c) `vmcelld` reclassified print-by-contract → full family (v3): 22 `eprintln!` → `tracing::error!`.**
+  The `tracing_subscriber` is installed as the first line of `main`, so every fatal diagnostic
+  (blessing, auth, bind, fork, cap-drop; and the post-fork broker child, which already used
+  `tracing::info!`) has a live subscriber — the conversion just makes the whole daemon one
+  consistently-formatted stderr stream instead of interleaving raw `eprintln` with structured events.
+  *Accepted nuance:* unlike a raw `eprintln`, a `tracing::error!` event is `RUST_LOG`-filterable, so
+  `RUST_LOG=off` would silence even fatal startup errors — the deliberate consequence of "a daemon
+  logs via tracing, not stdout" (v3), and the reason `vmcell-cli`/`vmcelld-ctl` stay print-by-contract.
+
+- **(d) The `broker_frame` fuzz target decodes `postcard::from_bytes::<BrokerRequest>`, not
+  `vmcell_broker::decode_frame`.** *Diverged from:* the v3 target's placeholder `decode_frame`/name.
+  *Reality:* `vmcell-broker` has no `decode_frame`; its framed codec is length-prefixed **postcard**
+  (`recv_msg::<T>` = `read_frame` bounded by `MAX_BROKER_FRAME_BYTES` + `postcard::from_bytes`). The
+  target mirrors `protocol_decode.rs`: guard `len ≤ MAX_BROKER_FRAME_BYTES`, then decode the payload
+  the privileged child feeds to postcard. (The daemon↔broker *engine* channel is JSON — a separate
+  surface in `vmcell_daemon::bridge`, per Appendix A reversal 10 — not this broker-crate codec.)
+
+- **(e) The CI broker check uses `if … then exit 1`, not the doc's `! cargo tree | grep -q .`
+  two-liner.** Under `set -e`/`bash -e`, a leading `!` exempts the pipeline from `set -e`, so two
+  stacked `! … | grep` lines would let a hit on the first line be masked by a clean second line. The
+  `if/then/exit` form (matching the repo's other tree assertions) fails immediately and keeps local ≡
+  CI (gate meta-rule 3).
+
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.

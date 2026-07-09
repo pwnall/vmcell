@@ -147,6 +147,17 @@ ci:
     # runner and the daemon, so it must stay as lean as the runner — no host async stack.
     if cargo tree --locked -e no-dev -p vmcell-privilege | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-privilege invariant violated — host stack leaked into vmcell-privilege"; exit 1; fi
     cargo clippy --locked -p vmcell-privilege --all-targets
+    # B9/design §12.4 (erratum-aware): the broker OWNS the engine — tokio + rtnetlink are LEGITIMATE
+    # (it does the netns/tap/nft setup itself), so it is NOT governed by the full lean-tree ban above.
+    # Its lean boundary is the network-facing WEB SERVER, which lives in `vmcell-daemon` (axum). Assert
+    # the broker links NEITHER `vmcell-daemon` NOR `axum`, so the HTTP surface that parses network
+    # input can never share the cap-holding process (§12.23 / P2). NOTE: `hyper` is deliberately NOT
+    # asserted absent — it enters transitively and LEGITIMATELY through vmcell's egress proxy
+    # (hudsucker) and HTTP clients (reqwest/oci-client), which the broker's net subset needs. The
+    # meaningful marker of the *server* stack is axum + the vmcell-daemon crate. (Corrects the
+    # v3/AGENTS.md "axum/hyper" phrasing to the built tree — see implementation-notes.md.)
+    if cargo tree --locked -p vmcell-broker -e no-dev -i vmcell-daemon 2>/dev/null | grep -q .; then echo "vmcell-broker must not link vmcell-daemon (the web/server crate must not share the cap-holder)"; exit 1; fi
+    if cargo tree --locked -p vmcell-broker -e no-dev -i axum 2>/dev/null | grep -q .; then echo "vmcell-broker must not link axum (network-input server stack must not share the cap-holder)"; exit 1; fi
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).
     cargo clippy --locked -p vmcell-guest-tools --all-targets
     # Reduced-host-feature smoke (fast per-backend feedback before the full powerset below). After the
@@ -173,6 +184,12 @@ ci:
     # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the guest agent + its red-on-inverse self-test.
     ./scripts/ban-agent-ip-shellout.sh
     ./scripts/test-ban-agent-ip-shellout.sh
+    # P3/B12: the ONLY function that turns a client-supplied artifact name into a path is
+    # resolve_artifact_path (crates/vmcell-daemon/src/name.rs). A daemon handler that builds
+    # `<artifacts_dir>.join(<client name>)` itself is a traversal hole — grep-ban it in the daemon
+    # crate; the self-test proves the ban fires on the bug and passes on the sanctioned validator.
+    ./scripts/ban-artifact-path-join.sh
+    ./scripts/test-ban-artifact-path-join.sh
     # The privileged-review preflight's three-way verdict (bless-only sentinel) — self-test only.
     # The real preflight probes a KVM host and runs at review time (not here), but its classifier —
     # bless-remediable (exit 2, BLOCKED-ON-BLESS) vs environmental (exit 1, NOT READY) — is

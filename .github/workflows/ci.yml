@@ -88,6 +88,24 @@ jobs:
       - name: guest-tools build+clippy     # guest userspace helper; build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes)
         run: cargo clippy --locked -p vmcell-guest-tools --all-targets -- -D warnings
 
+      - name: broker web-stack exclusion (vmcell-daemon/axum absent from the cap-holder)   # B9/§12.4 erratum-aware
+        run: |
+          # The broker OWNS the engine — tokio + rtnetlink are LEGITIMATE (it does netns/tap/nft
+          # setup), so it is NOT governed by the full lean-tree ban. Its lean boundary is the
+          # network-facing WEB SERVER, which lives in vmcell-daemon (axum): assert the broker links
+          # NEITHER vmcell-daemon NOR axum, so the HTTP surface that parses network input never shares
+          # the cap-holding process (§12.23 / P2). `hyper` is NOT asserted absent — it enters
+          # legitimately through vmcell's egress proxy (hudsucker) + HTTP clients (reqwest/oci-client);
+          # the *server*-stack marker is axum + vmcell-daemon (corrects the v3 "axum/hyper" phrasing to
+          # the built tree — see implementation-notes.md). if/then form (not `! … | grep`): a leading
+          # `!` is exempt from `set -e`, so a two-liner would mask the first hit behind a clean second.
+          if cargo tree --locked -p vmcell-broker -e no-dev -i vmcell-daemon 2>/dev/null | grep -q .; then
+            echo "::error::vmcell-broker must not link vmcell-daemon (the web/server crate must not share the cap-holder)"; exit 1
+          fi
+          if cargo tree --locked -p vmcell-broker -e no-dev -i axum 2>/dev/null | grep -q .; then
+            echo "::error::vmcell-broker must not link axum (network-input server stack must not share the cap-holder)"; exit 1
+          fi
+
       - name: reduced-host-feature builds (blocking)   # fast per-backend smoke before the full powerset
         run: |
           # After the §10.5 host-stack collapse, each shipping backend in isolation pulls the full,
@@ -113,6 +131,8 @@ jobs:
           ./scripts/test-ban-legacy-terms.sh   # the rename gate's own red-on-inverse self-test
           ./scripts/ban-agent-ip-shellout.sh       # AGENT-4/TEST-5: guest agent must never shell out to `ip` (zero-netlink §4.3)
           ./scripts/test-ban-agent-ip-shellout.sh  # the ip-shellout gate's own red-on-inverse self-test
+          ./scripts/ban-artifact-path-join.sh      # P3/B12: no inline `<dir>.join(client)` outside resolve_artifact_path (daemon crate)
+          ./scripts/test-ban-artifact-path-join.sh # the artifact-path gate's own red-on-inverse self-test
           ./scripts/test-review-preflight-priv.sh  # preflight three-way verdict (bless-only sentinel): classifier red-on-inverse self-test
 
       - name: shellcheck (scripts are load-bearing)   # ban scripts, preflight, bless, delegated-scope are security-adjacent bash
@@ -181,3 +201,12 @@ jobs:
           # v15 §12.8: the blessed runner lives at the stable ./.vmcell-bin/ path `just bless` installs.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.vmcell-bin/debug/vmcell-test-runner
         run: cargo nextest run --locked --profile integration -p vmcell --features firecracker,qemu --run-ignored all -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'
+
+      # KVM job only: the daemon end-to-end suite boots real Cloud Hypervisor VMs THROUGH `vmcelld`.
+      # `just test-daemon` wraps the test binary with the (already-blessed) runner so it holds the
+      # caps and spawns `vmcelld` in a systemd-delegated cgroup scope, then asserts the HTTP surface +
+      # data plane over `vmcell-daemon-client`. The KVM-free daemon gates (auth, OpenAPI parity, the
+      # name-validator inverse battery, delete-in-use) run in the ordinary `test-unit` job — they need
+      # no runner. Mirrors `just test-daemon`.
+      - name: daemon end-to-end suite (inverted runner; boots vmcelld → real CH VMs)
+        run: just test-daemon

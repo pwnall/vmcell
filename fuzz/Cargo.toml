@@ -17,12 +17,23 @@ libfuzzer-sys = "0.4"
 # The real wire type; path points at the repo's `crates/` layout (docs/51 wrote `../vmcell-protocol`,
 # aligned here to the actual member path).
 vmcell-protocol = { path = "../crates/vmcell-protocol" }
-# postcard is the actual decode surface (`vmcell-protocol` has no `decode_frame`; the doc's name was a
-# placeholder — the honest entry point is a framed postcard `Message`).
+# The broker's cross-privilege frame type (`BrokerRequest`) + its `MAX_BROKER_FRAME_BYTES` cap, for
+# the `broker_frame` target (rubric B10). Pulls `vmcell` transitively — fine here: the fuzz crate is
+# workspace-excluded and only builds under `cargo fuzz` on nightly.
+vmcell-broker = { path = "../crates/vmcell-broker" }
+# postcard is the actual decode surface for BOTH targets (`vmcell-protocol`/`vmcell-broker` have no
+# `decode_frame`; the doc's name was a placeholder — the honest entry points are the framed postcard
+# `Message` / `BrokerRequest`).
 postcard = { version = "1", features = ["use-std"] }
 
 [[bin]]
 name = "protocol_decode"
 path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "broker_frame"
+path = "fuzz_targets/broker_frame.rs"
 test = false
 doc = false

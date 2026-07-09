@@ -30,17 +30,13 @@ fail-fast = false
 serial-host = { max-threads = 1 }
 
 [[profile.integration.overrides]]
-# M-TEST-5: POSITIVELY select every vmcell integration-test binary (current AND future) so a newly
-# added VM-booting test auto-joins serial-host instead of silently running unserialized and racing on
-# netns / cgroups / nft (the old hand-maintained allowlist had no completeness guard). N-TEST-2:
-# `proptests` is pure in-memory property testing (no host state), so it is excluded to keep its
-# parallelism — a new VM test still auto-joins because it will not be named `proptests`.
-filter = 'package(vmcell) & kind(test) & !binary(proptests)'
-test-group = 'serial-host'
-
-[[profile.integration.overrides]]
-# v21 §D10: each `vmcelld` integration test spawns a real daemon that boots a Cloud Hypervisor
-# micro-VM (netns / cgroup / tap host state) — serialize them alongside the `vmcell` VM tests so a
-# concurrent `--run-ignored` run does not race on host state.
-filter = 'package(vmcelld) & kind(test)'
+# M-TEST-5 / v3 workspace-glob: POSITIVELY select EVERY vmcell-* member's integration-test binary
+# (current AND future) so a newly added VM-booting test — in `vmcell`, `vmcelld`, `vmcell-daemon`, or
+# any future member — auto-joins serial-host instead of silently running unserialized and racing on
+# netns / cgroups / nft. `package(~vmcell)` (substring match) subsumes the old per-package names
+# (`package(vmcell)` PLUS the separate `package(vmcelld)` override), each of which silently denied new
+# members. The mild cost — serializing a few cheap KVM-free daemon integration tests — buys that
+# auto-inclusion. N-TEST-2: `proptests` is pure in-memory property testing (no host state), so it is
+# excluded to keep its parallelism; a new VM test still auto-joins because it will not be `proptests`.
+filter = 'package(~vmcell) & kind(test) & !binary(proptests)'
 test-group = 'serial-host'
