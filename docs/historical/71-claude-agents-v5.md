@@ -21,11 +21,14 @@ netns/tap/nft, the only snapshot-eligible mode).
 - `implementation-notes.md` — recorded, justified deviations, and the as-built reconciliation of
   the **0.9→0.10 delta pass** (design §18). Do not "fix" entries listed there; record new justified
   deviations there instead of silently diverging. Retire an entry when it is empirically disproven.
-- `docs/99-claude-fable-code-review-rubric-v9.md` — every rule below is expanded there with its
-  defect history. Its **Retired rules** section lists two former demands v28 supersedes — don't
-  re-open them. (`9` represents an arbitrary digit, use the newest version you find)
-- `docs/benchmark-results.md` — measured perf levers.
-- `docs/99-claude-fable-design-v99.md` — architecture; **§13** lists the cross-cutting invariants,
+- `docs/68-claude-fable-code-review-rubric.md` — every rule below is expanded there with its defect
+  history. Its **Retired rules** section lists two former demands v28 supersedes — don't re-open
+  them.
+- `docs/52` (gates implementation report) — doc↔code deviations recorded there with reasoning are
+  settled; do not re-litigate without new evidence.
+- `docs/45-*.md` + `docs/benchmark-results.md` — measured perf levers. Do not re-derive refuted
+  levers. Tail figures published before 2026-07-03 use the old broken percentile estimator.
+- `docs/67-claude-fable-design-v28.md` — architecture; **§13** lists the cross-cutting invariants,
   lettered S/C/L/F/P/G, each with an owner and a gate; **Appendix A** records the load-bearing
   reversals (cite them, don't re-argue); **§17** is the open-gaps register.
 
@@ -36,9 +39,9 @@ Design §18 directs **eleven changes that are specified but not yet built** (one
 divergence is a finding **only** in the change that claims to implement that delta. A change
 implementing a delta lands **with the delta's named gate**, reconciles the result in
 `implementation-notes.md`, and updates in-code `§` references per design Appendix E. Two design-doc
-errata `docs/historical/70` (quality gates) is authoritative over: the §9.7 Rust-1.85/1.88 toolchain
-note (the MSRV is 1.96.1, single-sourced) and the §15.2 phrasing that the broker excludes
-tokio/rtnetlink (it excludes only the **web** stack — axum/hyper — and owns the engine).
+errata `docs/69` (quality gates) is authoritative over: the §9.7 Rust-1.85/1.88 toolchain note (the
+MSRV is 1.96.1, single-sourced) and the §15.2 phrasing that the broker excludes tokio/rtnetlink (it
+excludes only the **web** stack — axum/hyper — and owns the engine).
 
 ## Non-negotiable rules
 
@@ -215,8 +218,8 @@ tokio/rtnetlink (it excludes only the **web** stack — axum/hyper — and owns 
 ## Performance claims
 
 - Benchmarks are tracked metrics, not gates; only relative invariants graduate to guards.
-- Check the `docs/historical/45` refuted-lever table before proposing a lever; only interleaved
-  same-session deltas are evidence; name the budget a change must not regress.
+- Check the `docs/45` refuted-lever table before proposing a lever; only interleaved same-session
+  deltas are evidence; name the budget a change must not regress.
 - "Environmental" is a hypothesis, not a diagnosis: a flake explanation without a mechanism stays
   open. Tail figures from before 2026-07-03 use the broken `floor(n·q)` estimator — not comparable.
 
