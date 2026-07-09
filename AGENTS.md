@@ -16,11 +16,10 @@ only snapshot-eligible mode).
 - `implementation-notes.md` — recorded, justified deviations. Do not "fix" entries listed there;
   record new justified deviations there instead of silently diverging. Retire an entry when it is
   empirically disproven.
-- `docs/99-claude-fable-code-review-rubric-v99.md` — every rule below is expanded there with its
+- `docs/99-claude-fable-code-review-rubric-v9.md` — every rule below is expanded there with its
   defect history. (`9` represents an arbitrary digit, use the newest version you find)
 - `docs/benchmark-results.md` — measured perf levers. Do not re-derive refuted levers.
-- `docs/99-claude-design-v99.md` — architecture; pay particular attention to the list of
-  cross-cutting invariants with owners.
+- `docs/99-claude-design-v99.md` — architecture; §12 lists cross-cutting invariants with owners.
 
 ## Non-negotiable rules
 
@@ -33,12 +32,10 @@ only snapshot-eligible mode).
    non-gating so they never short-circuit other gates.
 4. Enumerate what the suite structurally cannot reach — error branches, non-default configs and
    flows, defaults, window-filling payloads, security inverses — and cover it or record it.
-5. Host-facing claims are validated by executing the suites on a KVM host — **and the dev host is that
-   host.** Run `scripts/review-preflight-priv.sh` first; when it prints `READY` (built+blessed runner,
-   KVM, artifacts, delegatable scope) actually run the suites — do **not** defer them as "forward work"
-   or write "to be validated on a KVM host." "Forward work / not yet validated" is legitimate **only**
-   when preflight prints `NOT READY`, and then you name the check that failed. Green static review proves
-   little; a capability-flag change re-validates empirically, not in the descriptor.
+5. Host-facing claims are validated by executing the suites. KVM capability is **probed**
+   (preflight), never presumed absent — the box you are on usually qualifies, and the blessed
+   runner lets you run the privileged suite unprivileged. Green static review proves little; a
+   capability-flag change re-validates empirically, not in the descriptor.
 
 ## Writing code
 
@@ -105,14 +102,25 @@ only snapshot-eligible mode).
   tables when the harness changes.
 - Residue checks assert the artifact existed before drop, then that it is gone.
 
+## Running the privileged suites — probe, don't presume
+
+- "Am I on a KVM host?" is answered by `scripts/review-preflight-priv.sh`, never by assumption.
+  Hesitating instead of probing is the exact failure mode the preflight exists to remove.
+- The blessed runner exists so that *you*, unprivileged, can run the privileged suite: nextest
+  invokes `.vmcell-bin/release/vmcell-test-runner`, which holds the three file capabilities — no
+  sudo, no root shell; cargo and the tests stay yours.
+- Preflight green → run `just test-privileged` and the unprivileged suite yourself.
+- Preflight failing only on blessing (runner missing, stale stamp, not `+ep`) → ask the maintainer
+  to run `just bless` (one sudo), then rerun preflight and the suites. Never attempt the bless
+  yourself; never silently skip.
+- Only a genuinely absent facility (`/dev/kvm`, a missing backend binary) downgrades you to
+  static-only — say so explicitly and mark every runtime claim unverified.
+
 ## Done means
 
 - `just ci` green locally (it is the CI definition; both set `RUSTFLAGS=-D warnings`).
-- For host-facing changes: run `scripts/review-preflight-priv.sh` (this dev host is KVM-capable and it
-  prints `READY`), then get both operating-mode suites green **here, now** (`just test-privileged` + the
-  unprivileged suite), all three backends, and the skip manifest reviewed. Preflight `READY` means run
-  it — not "record it as a KVM-host follow-up." Only a `NOT READY` preflight defers the run (fix the
-  named gap: unblessed runner → `just bless` in a TTY; missing artifacts → build them).
+- For host-facing changes: both operating-mode suites green per the section above, all three
+  backends, and the skip manifest reviewed.
 - New public API: rustdoc complete (`missing_docs` denies), `cargo semver-checks` clean.
 - The privileged runner is re-blessed after rebuilds (`just bless`; blessing is stripped on rewrite
   by design).
@@ -120,8 +128,7 @@ only snapshot-eligible mode).
 ## Performance claims
 
 - Benchmarks are tracked metrics, not gates; only relative invariants graduate to guards.
-- Check the `docs/45` refuted-lever table before proposing a lever; only interleaved same-session
-  deltas are evidence; name the budget a change must not regress.
+- Only interleaved same-session deltas are evidence; name the budget a change must not regress.
 - "Environmental" is a hypothesis, not a diagnosis: a flake explanation without a mechanism stays open.
 
 ## Docs and dependencies
@@ -130,9 +137,9 @@ only snapshot-eligible mode).
 - Dependencies: permissive licenses only (cargo-deny allow-list enforces); `cargo deny` ignores
   carry a per-crate rationale; vendored patches (`vendor/vhost*`) keep exact `=` pins — a caret
   requirement silently drops the patch.
-- Toolchain: `rust-toolchain.toml` pins 1.96.1 (the latest stable) and the declared `rust-version`
-  **equals** it (one `[workspace.package]` fact). An understated MSRV lets MSRV-aware resolvers hand
-  consumers older, potentially-vulnerable dependency versions instead of the advisory-clean ones the
-  lockfile pins. Build `--locked`; never `cargo update` on a toolchain older than the pinned floor.
+- Toolchain: `rust-toolchain.toml` pins 1.96.1 and the declared `rust-version` **equals** it (one
+  `[workspace.package]` fact). An understated MSRV lets MSRV-aware resolvers re-resolve older
+  consumers onto vulnerable dependency versions (the `time 0.3.45` class). Build `--locked`; never
+  `cargo update` on an older toolchain.
 - No unused dependencies (`cargo machete`; macro-only false positives get a per-crate ignore).
   Third-party GitHub Actions stay pinned to full commit SHAs; Dependabot moves the pins.
