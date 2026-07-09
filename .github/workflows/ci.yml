@@ -47,8 +47,10 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
 
+      # --locked on every resolving cargo step below: a stale Cargo.lock fails CI instead of being
+      # silently regenerated, so dependency bumps land only via reviewed dependabot PRs (mirrors `just ci`).
       - name: clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features
+        run: cargo clippy --locked --workspace --all-targets --all-features
 
       # NOTE on ordering: the reachable supply-chain / lean-target / API gates run FIRST. The
       # `cargo hack --feature-powerset` step runs LAST and is now BLOCKING — the §10.5 host-stack
@@ -63,28 +65,28 @@ jobs:
           # v15: the lean boundary is now a per-MEMBER structural property (§12.8 #4), so the
           # check targets the crate directly (`-p vmcell-guest-agent`) instead of a feature slice
           # of the old single package — no host module can leak in by construction.
-          if cargo tree -e no-dev -p vmcell-guest-agent \
+          if cargo tree --locked -e no-dev -p vmcell-guest-agent \
                | grep -E '── (tokio|hyper|rtnetlink) v'; then
             echo "::error::lean-agent invariant violated — host stack leaked into the agent build"
             exit 1
           fi
           # Graph inspection is not enough: actually compile the agent member so a broken
           # agent build (e.g. an un-gated host dep) is caught here, not on a KVM host.
-          cargo clippy -p vmcell-guest-agent --all-targets -- -D warnings
+          cargo clippy --locked -p vmcell-guest-agent --all-targets -- -D warnings
 
       - name: lean-test-runner invariant   # privileged-window member must omit the host async stack AND compile standalone
         run: |
           # Mirrors lean-agent: the test-runner runs with elevated caps, so the same async host
           # stack (tokio/hyper/rtnetlink) must not leak in.
-          if cargo tree -e no-dev -p vmcell-test-runner \
+          if cargo tree --locked -e no-dev -p vmcell-test-runner \
                | grep -E '── (tokio|hyper|rtnetlink) v'; then
             echo "::error::lean-test-runner invariant violated — host stack leaked into the test-runner build"
             exit 1
           fi
-          cargo clippy -p vmcell-test-runner --all-targets -- -D warnings
+          cargo clippy --locked -p vmcell-test-runner --all-targets -- -D warnings
 
       - name: guest-tools build+clippy     # guest userspace helper; build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes)
-        run: cargo clippy -p vmcell-guest-tools --all-targets -- -D warnings
+        run: cargo clippy --locked -p vmcell-guest-tools --all-targets -- -D warnings
 
       - name: reduced-host-feature builds (blocking)   # fast per-backend smoke before the full powerset
         run: |
@@ -96,7 +98,7 @@ jobs:
           # comprehensive guard; this loop is fast per-backend feedback.
           for feat in cloud-hypervisor firecracker qemu; do
             echo "::group::clippy --no-default-features --features $feat"
-            cargo clippy -p vmcell --no-default-features --features "$feat" --all-targets -- -D warnings
+            cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets -- -D warnings
             echo "::endgroup::"
           done
 
@@ -111,6 +113,7 @@ jobs:
           ./scripts/test-ban-legacy-terms.sh   # the rename gate's own red-on-inverse self-test
           ./scripts/ban-agent-ip-shellout.sh       # AGENT-4/TEST-5: guest agent must never shell out to `ip` (zero-netlink §4.3)
           ./scripts/test-ban-agent-ip-shellout.sh  # the ip-shellout gate's own red-on-inverse self-test
+          ./scripts/test-review-preflight-priv.sh  # preflight three-way verdict (bless-only sentinel): classifier red-on-inverse self-test
 
       - name: shellcheck (scripts are load-bearing)   # ban scripts, preflight, bless, delegated-scope are security-adjacent bash
         run: shellcheck scripts/*.sh
@@ -130,7 +133,7 @@ jobs:
 
       # ---- Feature-powerset: LAST and BLOCKING (former C-GATE-1 debt, closed by the §10.5 collapse). ----
       - name: clippy feature-powerset (blocking; must be GREEN after the §10.5 collapse)
-        run: cargo hack --feature-powerset --depth 2 clippy -p vmcell --all-targets
+        run: cargo hack --locked --feature-powerset --depth 2 clippy -p vmcell --all-targets
 
   # ---- Fast tests: unit, codec, property. No KVM. DEFAULT (non-ignored) set only. ----
   test-unit:
@@ -144,7 +147,7 @@ jobs:
       - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
         with: { tool: "cargo-nextest" }
       - name: nextest (unit/codec/prop)
-        run: cargo nextest run --all-features
+        run: cargo nextest run --locked --all-features
 
   # ---- Integration matrix: needs /dev/kvm. Runs the #[ignore]'d suite so it is NOT CI-invisible. ----
   test-integration:
@@ -160,10 +163,10 @@ jobs:
         with: { tool: "cargo-nextest,just" }
 
       - name: build VM artifacts
-        run: cargo run -p vmcell-cli --bin vmcell -- build --kernel-source host-make
+        run: cargo run --locked -p vmcell-cli --bin vmcell -- build --kernel-source host-make
 
       - name: unprivileged suite (no elevation — keeps the unprivileged path honest)
-        run: cargo nextest run --profile integration -p vmcell --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
+        run: cargo nextest run --locked --profile integration -p vmcell --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
       # Bless grants the runner cap_net_admin,cap_sys_admin (debug + release) so the privileged
       # suite runs under the capability wrapper instead of broad `sudo -E` — mirrors `just test-privileged`.
@@ -177,4 +180,4 @@ jobs:
         env:
           # v15 §12.8: the blessed runner lives at the stable ./.vmcell-bin/ path `just bless` installs.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.vmcell-bin/debug/vmcell-test-runner
-        run: cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'
+        run: cargo nextest run --locked --profile integration -p vmcell --features firecracker,qemu --run-ignored all -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'

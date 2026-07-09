@@ -29,6 +29,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
         clippy::dbg_macro,
         clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
         clippy::allow_attributes_without_reason  // B11: every suppression states why
@@ -335,11 +337,22 @@ pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
         }
     }
     if bounding_drop_failures > 0 {
-        eprintln!(
-            "vmcell-privilege: warning: could not drop {bounding_drop_failures} bounding-set \
-             capabilities (PR_CAPBSET_DROP needs CAP_SETPCAP in the effective set); the bounding \
-             set is wider than intended"
-        );
+        // Best-effort security-boundary warning: a wider-than-intended bounding set is a hardening
+        // regression the operator must see, so it goes straight to stderr rather than depending on a
+        // logger the caller may not have wired up on this pre-`main` cap-drop path. The #[expect]
+        // wraps a block, not the macro directly — an attribute on a bare macro-call statement is
+        // silently ignored by rustc (unused_attributes), which would leave print_stderr firing.
+        #[expect(
+            clippy::print_stderr,
+            reason = "best-effort cap-drop-failure warning on the privilege boundary; must reach the operator without depending on a logger"
+        )]
+        {
+            eprintln!(
+                "vmcell-privilege: warning: could not drop {bounding_drop_failures} bounding-set \
+                 capabilities (PR_CAPBSET_DROP needs CAP_SETPCAP in the effective set); the bounding \
+                 set is wider than intended"
+            );
+        }
     }
 
     // 4. Raise ambient last, after the bounding set is shrunk and uid is dropped.

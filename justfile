@@ -19,8 +19,8 @@ runner-release := ".vmcell-bin/release/vmcell-test-runner"
 bless:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build -p vmcell-test-runner
-    cargo build --release -p vmcell-test-runner
+    cargo build --locked -p vmcell-test-runner
+    cargo build --locked --release -p vmcell-test-runner
     bless_one() {
       local built="$1" stable="$2"
       local dir; dir="$(dirname "$stable")"
@@ -63,14 +63,14 @@ bless:
 # first (blesses the runner). Uses --allow-unauthenticated for a loopback dev bind ONLY; pass
 # --api-key-file for anything real.
 daemon artifacts_dir="/tmp/vmcell-artifacts" bind="127.0.0.1:8787":
-    cargo build -p vmcelld
+    cargo build --locked -p vmcelld
     mkdir -p {{artifacts_dir}}
     {{justfile_directory()}}/{{runner}} {{justfile_directory()}}/target/debug/vmcelld \
         --artifacts-dir {{artifacts_dir}} --bind {{bind}} --allow-unauthenticated
 
 # Fast inner loop: unit + codec + property tests. No KVM, no privileges.
 test-unit:
-    cargo nextest run --all-features
+    cargo nextest run --locked --all-features
 
 # Privileged integration suite via the capability runner. `just bless` installs it 0700 (owner-only)
 # — that mode is the security boundary (PRIV-1); on a shared host use a dedicated group + 0750.
@@ -86,7 +86,7 @@ test-unit:
 # `just ci`, so no coverage is lost by excluding them here.
 test-privileged:
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
-        cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all \
+        cargo nextest run --locked --profile integration -p vmcell --features firecracker,qemu --run-ignored all \
         -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'
 
 # §14: daemon integration tests. The TEST BINARY is wrapped by the blessed runner (nextest
@@ -97,17 +97,17 @@ test-privileged:
 # the HTTP surface + data plane over `vmcell-daemon-client`. Runs under a systemd-delegated cgroup scope
 # so the `limits_enforced` assertion sees real enforcement. Requires `just bless` (runner) + artifacts.
 test-daemon:
-    cargo build -p vmcelld -p vmcelld-ctl
+    cargo build --locked -p vmcelld -p vmcelld-ctl
     systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh \
         env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
-        cargo nextest run --profile integration -p vmcelld --run-ignored all
+        cargo nextest run --locked --profile integration -p vmcelld --run-ignored all
 
 # Unprivileged integration suite under no elevation (keeps the unprivileged path honest).
 test-unprivileged:
     # `--features qemu` (additive over the default set) builds QEMU's unprivileged
     # NAT leg too, so the M-TEST-8 `vmm_matrix_test!` exercises the smoltcp NAT on
     # both CH and QEMU rather than the CH leg alone.
-    cargo nextest run --profile integration -p vmcell --features qemu --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
+    cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide
@@ -121,29 +121,34 @@ ci:
     export RUSTFLAGS="-D warnings"
     set -e
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets --all-features
+    # --locked policy: every RESOLVING cargo command below (build/clippy/nextest/run/tree/hack + the
+    # doc gate) pins the lockfile, so a PR that bumps a dep but forgets to commit Cargo.lock fails here
+    # instead of silently regenerating it — dep bumps then land only through reviewed dependabot PRs.
+    # fmt/deny/machete/semver-checks don't accept --locked and don't mutate the lock; a resolving step
+    # above them already catches any drift.
+    cargo clippy --locked --workspace --all-targets --all-features
     cargo deny check
     # M-VEND-3: assert the carried vhost patch is actually applied. A caret version
     # bump would silently drop the `[patch.crates-io]` (only a "Patch was not used"
     # warning), regressing the QEMU-unprivileged SET_VRING_ENABLE quirk with a green
     # build. `cargo tree` prints a path dep with its path in parens, so require both
     # to resolve from vendor/.
-    if ! cargo tree -e normal --all-features 2>/dev/null | grep -qE 'vhost v0\.16\.0 \(.*vendor/vhost\)'; then echo "M-VEND-3: vhost 0.16.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
-    if ! cargo tree -e normal --all-features 2>/dev/null | grep -qE 'vhost-user-backend v0\.22\.0 \(.*vendor/vhost-user-backend\)'; then echo "M-VEND-3: vhost-user-backend 0.22.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
+    if ! cargo tree --locked -e normal --all-features 2>/dev/null | grep -qE 'vhost v0\.16\.0 \(.*vendor/vhost\)'; then echo "M-VEND-3: vhost 0.16.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
+    if ! cargo tree --locked -e normal --all-features 2>/dev/null | grep -qE 'vhost-user-backend v0\.22\.0 \(.*vendor/vhost-user-backend\)'; then echo "M-VEND-3: vhost-user-backend 0.22.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
     # lean-agent invariant: the guest PID-1 member must omit the host stack AND compile standalone.
     # v15: the lean boundary is now a per-MEMBER structural property (§12.8 #4), so the check
     # targets the crate directly (`-p`) rather than a feature slice of the old single package.
-    if cargo tree -e no-dev -p vmcell-guest-agent | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-agent invariant violated — host stack leaked into the agent build"; exit 1; fi
-    cargo clippy -p vmcell-guest-agent --all-targets
+    if cargo tree --locked -e no-dev -p vmcell-guest-agent | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-agent invariant violated — host stack leaked into the agent build"; exit 1; fi
+    cargo clippy --locked -p vmcell-guest-agent --all-targets
     # lean-test-runner invariant: same host-stack ban + standalone compile for the privileged-window member.
-    if cargo tree -e no-dev -p vmcell-test-runner | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-test-runner invariant violated — host stack leaked into the test-runner build"; exit 1; fi
-    cargo clippy -p vmcell-test-runner --all-targets
+    if cargo tree --locked -e no-dev -p vmcell-test-runner | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-test-runner invariant violated — host stack leaked into the test-runner build"; exit 1; fi
+    cargo clippy --locked -p vmcell-test-runner --all-targets
     # lean-privilege invariant (§18.1): the shared blessing/capability crate is linked by BOTH the
     # runner and the daemon, so it must stay as lean as the runner — no host async stack.
-    if cargo tree -e no-dev -p vmcell-privilege | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-privilege invariant violated — host stack leaked into vmcell-privilege"; exit 1; fi
-    cargo clippy -p vmcell-privilege --all-targets
+    if cargo tree --locked -e no-dev -p vmcell-privilege | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-privilege invariant violated — host stack leaked into vmcell-privilege"; exit 1; fi
+    cargo clippy --locked -p vmcell-privilege --all-targets
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).
-    cargo clippy -p vmcell-guest-tools --all-targets
+    cargo clippy --locked -p vmcell-guest-tools --all-targets
     # Reduced-host-feature smoke (fast per-backend feedback before the full powerset below). After the
     # §10.5 host-stack collapse, each shipping backend in isolation pulls the full, coherent host stack
     # (host-common → net/proxy/metrics/pipeline), so a single-backend build compiles — including `qemu`,
@@ -152,7 +157,7 @@ ci:
     # constructible — the CFG-1 class is closed by construction (its code fix remains as defense-in-depth).
     for feat in cloud-hypervisor firecracker qemu; do \
       echo "== reduced-host-feature clippy: --no-default-features --features $feat =="; \
-      cargo clippy -p vmcell --no-default-features --features "$feat" --all-targets; \
+      cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets; \
     done
     # rustdoc gate (docs/51): RUSTDOCFLAGS=-D warnings turns EVERY rustdoc lint into a hard error —
     # broken/private intra-doc links, unresolved links — for the whole public surface. clippy does
@@ -168,6 +173,11 @@ ci:
     # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the guest agent + its red-on-inverse self-test.
     ./scripts/ban-agent-ip-shellout.sh
     ./scripts/test-ban-agent-ip-shellout.sh
+    # The privileged-review preflight's three-way verdict (bless-only sentinel) — self-test only.
+    # The real preflight probes a KVM host and runs at review time (not here), but its classifier —
+    # bless-remediable (exit 2, BLOCKED-ON-BLESS) vs environmental (exit 1, NOT READY) — is
+    # host-independent and must go red if it ever misroutes a bless-fixable failure to static-only.
+    ./scripts/test-review-preflight-priv.sh
     # ---- Toolchain honesty + non-Rust-surface gates (rubric Part D) ----
     # Toolchain honesty: the declared MSRV (`[workspace.package] rust-version`) equals the pinned
     # `rust-toolchain.toml` channel (the latest stable). An UNDERSTATED rust-version lets MSRV-aware
@@ -189,7 +199,7 @@ ci:
     cargo machete
     # Docs are a first-class artifact in this repo.
     typos
-    cargo nextest run --all-features
+    cargo nextest run --locked --all-features
     # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main
     # merge-base). Runs on the pinned toolchain — 1.96.1 satisfies cargo-semver-checks' rustc floor.
     baseline="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse main 2>/dev/null || true)"
@@ -198,4 +208,4 @@ ci:
     # every ≤2-feature config must compile+clippy clean under -D warnings. This is the comprehensive
     # guard that the collapse holds; a newly mis-gated module regresses it back to RED and fails here.
     echo "== feature-powerset (BLOCKING; must be GREEN after the §10.5 collapse) =="
-    cargo hack --feature-powerset --depth 2 clippy -p vmcell --all-targets
+    cargo hack --locked --feature-powerset --depth 2 clippy -p vmcell --all-targets

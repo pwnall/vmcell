@@ -406,9 +406,12 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   template trained the reflex to hedge instead of run — something the current framing made feel out of
   reach when it is one command away. **Fix applied (2026-07-06):** hardened `AGENTS.md` rule 5 and the
   "Done means" host-facing bullet — the dev host **is** the KVM host; `scripts/review-preflight-priv.sh`
-  `READY` means run the suites now, and "forward work / not validated" is legitimate **only** when preflight
-  prints `NOT READY` (naming the failed check). **This note is kept deliberately** (not folded away yet) so
-  future development can show whether the wording change actually breaks the reflex.)**
+  `READY` means run the suites now. (Update, v5 bless-only sentinel: the verdict is now three-way —
+  `READY`/exit 0 → run; `BLOCKED-ON-BLESS`/exit 2 → ask the maintainer for one `just bless` then run,
+  **never** a static-only downgrade; `NOT READY`/exit 1 → a genuinely absent facility, the *only* case
+  where "forward work / not validated" is legitimate, naming the failed check.) **This note is kept
+  deliberately** (not folded away yet) so future development can show whether the wording change actually
+  breaks the reflex.)**
 
 ## v26 — persistent interactive sessions (design §22)
 

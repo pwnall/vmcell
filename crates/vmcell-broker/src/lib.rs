@@ -40,6 +40,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
         clippy::dbg_macro,
         clippy::allow_attributes,
         clippy::allow_attributes_without_reason
