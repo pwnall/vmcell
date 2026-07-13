@@ -1,4 +1,4 @@
-//! Zygote suspend/resume fan-out integration test (§9.4).
+//! Zygote suspend/resume fan-out integration test (§8.4, The zygote fan-out and the OverlayStore seam).
 //!
 //! Boots one VM to agent-ready, **suspends** it into a zygote, then mints many
 //! identical clones by copy-on-write-copying the suspend image. Asserts the
@@ -9,9 +9,9 @@
 //!   distinct host vsock path, and a working `exec` — all alive at once.
 //! - The zygote **master is immutable**: its `config.json` is byte-identical
 //!   after the fan-out, even though the single-use restore path rewrites that
-//!   file in place (§9.1, §12.12) — proof each clone restored from its own copy.
+//!   file in place (§8.1, The warm-snapshot path and the eligibility law, §13, Cross-cutting invariants) — proof each clone restored from its own copy.
 //! - On a verbatim-rebind backend (FC): a concurrent fan-out (N>1) is a typed
-//!   `Error::Unsupported`, while a single clone still works (§9.4 gate).
+//!   `Error::Unsupported`, while a single clone still works (§8.4, The zygote fan-out and the OverlayStore seam, gate).
 //!
 //! `#[ignore = "needs KVM"]` via `vmm_matrix_test!`; skips backends without
 //! `snapshot_restore` visibly (H-TEST-3), never silently.
@@ -32,7 +32,7 @@ vmm_matrix_test!(zygote_fan_out, |vmm| {
 
 async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
     // Reap any orphaned vmcell-net-* namespaces so a leak from a prior aborted run
-    // cannot collide with a clone's vmid (no sudo; capability runner, §12.8).
+    // cannot collide with a clone's vmid (no sudo; capability runner, §13, Cross-cutting invariants).
     common::clean_vmcell_netns();
     if !common::has_cap_net_admin() {
         panic!(
@@ -44,7 +44,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
     let kernel = common::get_vmlinux();
     let rootfs = common::get_rootfs();
     // Snapshot-eligible base config: erofs rootfs, privileged (tap) network, no
-    // vhost-user device (§12.1). One factory so every clone restores with the same
+    // vhost-user device (§13, Cross-cutting invariants). One factory so every clone restores with the same
     // config (with a fresh vmid injected by the orchestrator).
     let base_cfg = || {
         let mut cfg = VmConfig::builder(
@@ -87,7 +87,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
 
     // Capture the master's config.json bytes to prove immutability across cloning
     // (the CH single-use restore path rewrites this file in place; the zygote path
-    // must not, §12.12). FC snapshots have no config.json — `None` there.
+    // must not, §13, Cross-cutting invariants). FC snapshots have no config.json — `None` there.
     let master_cfg_before = std::fs::read(master_dir.join("config.json")).ok();
 
     println!("zygote CoW support: {:?}", zygote.probe_cow_support());

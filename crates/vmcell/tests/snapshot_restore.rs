@@ -30,13 +30,13 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     }
 
     // `mut`: block 2 swaps `env.clock` for an injected `FakeClock` before restore so the one-shot
-    // post-restore resync is driven by a controlled time (design §18 delta 1 folded the clock seam
+    // post-restore resync is driven by a controlled time (design §18, Delta register: changes from the validated v27 build — delta 1 folded the clock seam
     // into `HostEnv`; `agent()` no longer takes a clock argument).
     let mut env = vmcell::HostEnv::hermetic();
 
     // 1. Create a VM and take a snapshot
     {
-        // TESTS-LIFECYCLE-6: gate on the effective CAP_NET_ADMIN (the §12.8
+        // TESTS-LIFECYCLE-6: gate on the effective CAP_NET_ADMIN (the §13 (Cross-cutting invariants)
         // capability runner grants it ambiently), not euid==0.
         if !common::has_cap_net_admin() {
             panic!(
@@ -113,7 +113,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // snapshot froze. A restore that does NOT reseed will resume from this
         // identical frozen state and replay these same bytes; the orchestrator's
         // native post-restore reseed (a 32-byte /dev/hwrng → /dev/urandom copy in
-        // the agent's `handle_resync`, design 44 §5) is what must perturb them.
+        // the agent's `handle_resync`, §8.2, Restore correctness: a restored VM is not a fresh VM) is what must perturb them.
         // NOTE: the test never issues its own reseed — it only
         // reads /dev/urandom here and after restore and asserts they differ.
         let ref_rng = vm
@@ -195,7 +195,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
         // Drive the one-shot post-restore clock resync from an INJECTED FakeClock (≈ pre_time +
         // 1000s), captured on `env.clock` BEFORE restore. The orchestrator fires the resync on the
-        // FIRST agent() after restore using the clock captured at construction (design §18 delta 1
+        // FIRST agent() after restore using the clock captured at construction (design §18, Delta register: changes from the validated v27 build — delta 1
         // — agent() no longer takes a clock arg); a resync that ignored the injected clock would
         // land near real wall-clock time (≈ pre_time). The assertion near the end proves it.
         let pre_time: i64 = std::fs::read_to_string(snapshot_dir.join("pre_time.txt"))

@@ -1,4 +1,4 @@
-//! KVM-free, root-free gates for the setup broker (design §20.5 / §12.23). The protocol codec
+//! KVM-free, root-free gates for the setup broker (design §12.4, Layer 3 — the setup broker (network surface never holds caps)). The protocol codec
 //! (round-trip + over-cap reject), the dispatch logic against recording fakes (call-order,
 //! teardown, sweep-only-dead, spawn-forward-work), and both transports (threaded + forked).
 
@@ -147,7 +147,7 @@ impl BrokerBackend for FakeBackend {
 
 // ---- codec ----------------------------------------------------------------------------------
 
-// Guards §12.23 (framing): every request/reply variant round-trips through the length-prefixed
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)) framing: every request/reply variant round-trips through the length-prefixed
 // postcard codec. Inverse: a codec that mis-frames (wrong length, truncation) reddens here.
 #[test]
 fn codec_round_trips_requests_and_replies() {
@@ -209,7 +209,7 @@ fn codec_round_trips_requests_and_replies() {
     }
 }
 
-// Guards §12.23 (over-cap reject BEFORE allocation): a length prefix larger than the cap is
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)) over-cap reject BEFORE allocation: a length prefix larger than the cap is
 // rejected without allocating that many bytes. Inverse: a reader that trusts the length would
 // try to allocate/read `MAX+1` bytes (here it would then block on EOF); this asserts the typed
 // InvalidData reject fires first.
@@ -236,7 +236,7 @@ fn write_frame_rejects_over_cap_payload() {
 
 // ---- dispatch -------------------------------------------------------------------------------
 
-// Guards §12.23: SetupNetwork drives the netns create through the injected netlink (add_netns
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): SetupNetwork drives the netns create through the injected netlink (add_netns
 // then setup_tap, in order) and, with a proxy_port, emits the nft ruleset. Inverse: a dispatch
 // that skipped the netlink seam (or reordered create) reddens on the call log.
 #[test]
@@ -282,7 +282,7 @@ fn dispatch_setup_network_calls_netlink_then_nft() {
     );
 }
 
-// Guards §12.23: CreateCgroup writes the slice; Teardown deletes both the netns (owned from a
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): CreateCgroup writes the slice; Teardown deletes both the netns (owned from a
 // prior SetupNetwork) and the cgroup slice, in that reverse order. Inverse: a teardown that
 // dropped the cgroup delete (a leak) reddens on the missing delete_slice.
 #[test]
@@ -335,7 +335,7 @@ fn dispatch_create_cgroup_then_teardown_deletes_netns_and_cgroup() {
     );
 }
 
-// Guards §12.23: Sweep reclaims only the DEAD ids (not in live_vmids). With scanner netns for
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): Sweep reclaims only the DEAD ids (not in live_vmids). With scanner netns for
 // vmids 1,2,3 and live={2}, only 1 and 3 are reaped. Inverse: a sweep that ignored live_vmids
 // would reap 2 as well (reddening the "must not reap the live id" assertion).
 #[test]
@@ -370,7 +370,7 @@ fn dispatch_sweep_reaps_only_dead_ids() {
     }
 }
 
-// Guards §20.9 honesty: the live jailed-VMM spawn is forward work, so SpawnVmm refuses fail-loud
+// Guards §17 (Open gaps and future capabilities) honesty: the live jailed-VMM spawn is forward work, so SpawnVmm refuses fail-loud
 // rather than pretending to spawn. Inverse: a handler that returned Done (a silent no-op) reddens.
 #[test]
 fn dispatch_spawn_vmm_refuses_as_forward_work() {
@@ -383,7 +383,7 @@ fn dispatch_spawn_vmm_refuses_as_forward_work() {
     });
     match reply {
         BrokerReply::Error(msg) => assert!(
-            msg.contains("forward step") || msg.contains("§20.9"),
+            msg.contains("forward step") || msg.contains("§17"),
             "SpawnVmm must refuse fail-loud as forward work, got: {msg}"
         ),
         other => panic!("SpawnVmm must not silently succeed, got {other:?}"),
@@ -392,7 +392,7 @@ fn dispatch_spawn_vmm_refuses_as_forward_work() {
 
 // ---- transports -----------------------------------------------------------------------------
 
-// Guards §12.23: the whole serve loop + framing over a REAL socketpair (threaded, no fork
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): the whole serve loop + framing over a REAL socketpair (threaded, no fork
 // hazard). Client drives Health -> SetupNetwork -> Shutdown and the broker thread ends cleanly.
 #[test]
 fn threaded_transport_round_trips_over_socketpair() {
@@ -423,9 +423,9 @@ fn threaded_transport_round_trips_over_socketpair() {
     handle.join().expect("broker thread");
 }
 
-// Guards §12.23: the real fork transport ([`spawn_broker_with`]) — the child forks, serves, and
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): the real fork transport ([`spawn_broker_with`]) — the child forks, serves, and
 // answers Health over the pair; shutdown + reap leave no zombie. Health touches no backend, so
-// this is root-free. (Only the LIVE cap-drop + jailed spawn are the KVM step, §20.9.)
+// this is root-free. (Only the LIVE cap-drop + jailed spawn are the KVM step, §17, Open gaps and future capabilities.)
 #[test]
 fn fork_transport_health_round_trips_and_reaps() {
     let (mut client, mut child) = spawn_broker_with(FakeBackend::new()).expect("fork broker");

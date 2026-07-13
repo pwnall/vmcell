@@ -104,7 +104,7 @@ criterion_group!(
 );
 
 // Custom entry point (instead of `criterion_main!`) so the micro-benchmarks run
-// under the same CPU-frequency pin as the macro harness (design §13.2). The guard
+// under the same CPU-frequency pin as the macro harness (design §14, Hard-won lessons). The guard
 // pins every online CPU to `performance` (turbo off) for the run and restores the
 // prior settings on drop. It is a logged no-op without CAP_DAC_OVERRIDE, so to
 // actually pin run `cargo bench` through `vmcell-test-runner` or as root.

@@ -1,6 +1,6 @@
 //! CPU-frequency pinning for benchmark noise-floor discipline.
 //!
-//! Latency benchmarks (design §13.2) are only meaningful with a controlled noise
+//! Latency benchmarks (design §14, Hard-won lessons) are only meaningful with a controlled noise
 //! floor; an unpinned CPU whose frequency scales between its minimum and turbo
 //! ceiling adds variance that swamps the signal. This module reads the kernel's
 //! cpufreq scaling settings, pins every online CPU to the `performance` governor
@@ -271,7 +271,7 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
     /// offer `performance`, is skipped with a `warn!` rather than aborting the
     /// benchmark. A CPU already on `performance` is left as-is and not recorded.
     /// Even a failure to *enumerate* the online CPUs degrades to a `warn!` and an
-    /// empty no-op guard rather than aborting (CFG-4): §7.1 lists cpufreq as the
+    /// empty no-op guard rather than aborting (CFG-4): §7.1 (What is read and enforced) lists cpufreq as the
     /// best-effort exception that degrades **visibly**, never fatal. A benchmark is
     /// a tracked metric, not a pass/fail gate, so it must never fail to *run*
     /// because the noise floor could not be pinned.
@@ -281,7 +281,7 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
     /// and degraded to a no-op guard. The `Result` is retained for signature
     /// stability and forward-compatibility with any future genuinely-fatal sub-case.
     pub fn engage(sysfs: S) -> Result<Self, CpuFreqError> {
-        // §7.1 best-effort exception (CFG-4): a failure to enumerate the online CPUs
+        // §7.1 (What is read and enforced) best-effort exception (CFG-4): a failure to enumerate the online CPUs
         // is NOT fatal — warn and degrade to an empty no-op guard (nothing pinned,
         // nothing to restore) instead of propagating the error and aborting the
         // benchmark, which was the single remaining intentional fatal path.
@@ -290,7 +290,7 @@ impl<S: CpuFreqSysfs> CpuFreqPin<S> {
             Err(e) => {
                 warn!(
                     "cpufreq: cannot enumerate online CPUs ({e}); frequency NOT pinned — \
-                     benchmark numbers will carry scaling noise (best-effort, §7.1)"
+                     benchmark numbers will carry scaling noise (best-effort, §7.1, What is read and enforced)"
                 );
                 return Ok(Self {
                     sysfs,
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(fake.governor(0), "ondemand", "left untouched");
     }
 
-    // CFG-4 (§7.1): a failure to *enumerate* the online CPUs must degrade to a
+    // CFG-4 (§7.1, What is read and enforced): a failure to *enumerate* the online CPUs must degrade to a
     // logged no-op guard, NOT propagate an error — cpufreq is the best-effort
     // benchmark knob that degrades visibly, never aborts. Goes red on the old
     // `let online = sysfs.online_cpus()?;` (which returned `Err` here, so `.expect`

@@ -11,11 +11,13 @@
 //! **one** parameter instead of the three-to-five positional injected arguments that grew by one per
 //! feature, removes the per-clone `make_cgroups` closures from the fan-out APIs, and lets `agent()`
 //! drop its clock seam (the post-restore resync reads the clock captured here at construction). This
-//! bundle is directed by design §18 (deltas 1–2) and is the one breaking change of the 0.10 pass.
+//! bundle is directed by design §18 (Delta register: changes from the validated v27 build) (deltas
+//! 1–2) and is the one breaking change of the 0.10 pass.
 //!
 //! The allocators are process-global **by design**: under `cargo test`'s in-process parallelism,
 //! per-test allocators hand concurrent tests identical IDs and collide on temp-dir paths and socket
-//! names. [`HostEnv::shared`] is the productized pair (the daemon is its natural single home, §11.1);
+//! names. [`HostEnv::shared`] is the productized pair (the daemon is its natural single home, §11.1,
+//! What it adds, and where it sits);
 //! [`HostEnv::hermetic`] gives in-process allocators for tests, which substitute recording fakes
 //! field-by-field (every field is `pub`).
 //!
@@ -47,11 +49,13 @@ pub struct HostEnv {
     pub vmids: VmidAllocator,
     /// The cgroup-v2 backend every VM's slice is created/limited/read through.
     pub cgroups: Arc<dyn CgroupFs>,
-    /// The clock that drives the mandatory first post-restore resync (§8.2). The `+ RefUnwindSafe`
+    /// The clock that drives the mandatory first post-restore resync (§8.2, Restore correctness: a
+    /// restored VM is not a fresh VM). The `+ RefUnwindSafe`
     /// bound keeps `HostEnv` (and anything embedding it) `UnwindSafe`/`RefUnwindSafe` — a bare
     /// `dyn Clock` trait object silently drops those auto-traits; both `Clock` impls satisfy it.
     pub clock: Arc<dyn Clock + std::panic::RefUnwindSafe>,
-    /// The seam every copy-on-write clone materializes through (invariant S4, §8.4).
+    /// The seam every copy-on-write clone materializes through (invariant S4, §8.4, The zygote
+    /// fan-out and the OverlayStore seam).
     pub overlay: Arc<dyn OverlayStore>,
 }
 
@@ -75,7 +79,8 @@ impl HostEnv {
     ///
     /// # Errors
     /// Currently infallible, but returns [`Result`](crate::Result) so a future fallible start-up
-    /// probe (e.g. the §11 daemon's one-time host-capability check) can be folded in without a
+    /// probe (e.g. the §11, The control-plane daemon (vmcelld) daemon's one-time host-capability
+    /// check) can be folded in without a
     /// signature break.
     pub fn shared() -> crate::Result<Self> {
         Ok(Self {

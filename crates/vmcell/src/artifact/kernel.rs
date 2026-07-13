@@ -48,7 +48,7 @@ pub struct KernelStage {
     /// dimension).
     pub label: Option<String>,
     /// Optional ordered set of named KConfig fragments to layer onto the base config
-    /// (v15 §8.3 — the kernel config-fragment matrix: KASAN/KCOV/LOCKDEP/`slub_debug`/a
+    /// (v15 §5.2, The config fragment — the kernel config-fragment matrix: KASAN/KCOV/LOCKDEP/`slub_debug`/a
     /// driver). Each name is resolved to its KConfig text from the pins
     /// `kernel_fragments` registry (`kernel_fragments_<NAME>`) and appended before
     /// `make olddefconfig`. The cache key is content-addressed per (base + **sorted**
@@ -60,7 +60,7 @@ pub struct KernelStage {
 
 impl KernelStage {
     /// The fragment names for this stage, **sorted** and de-duplicated, so the cache
-    /// key and the config-append order are independent of the request order (§8.3).
+    /// key and the config-append order are independent of the request order (§5.2, The config fragment).
     fn sorted_fragments(&self) -> Vec<String> {
         let mut names: Vec<String> = self.fragments.clone().unwrap_or_default();
         names.sort();
@@ -136,7 +136,7 @@ impl Stage for KernelStage {
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         // Bump when this stage's build logic changes so stale kernels are not served.
-        // v15: bumped to 2 with the config-fragment matrix (§8.3).
+        // v15: bumped to 2 with the config-fragment matrix (§5.2, The config fragment).
         const STAGE_VERSION: u32 = 2;
         // Unambiguous field separator: without it, label||url||sha||config are a flat
         // byte stream where e.g. (label="x", url="A") and (label="", url="xA") collide
@@ -171,7 +171,7 @@ impl Stage for KernelStage {
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
-        // Fold the config fragments in SORTED order (§8.3): the same set requested in any
+        // Fold the config fragments in SORTED order (§5.2, The config fragment): the same set requested in any
         // order must hash identically, and BOTH the fragment NAME and its KConfig CONTENT
         // (from the pins registry) must travel, so editing a fragment's text invalidates the
         // key. The per-fragment SEP plus the count keep distinct sets from colliding.
@@ -339,7 +339,7 @@ impl Stage for KernelStage {
         let mut current_config = tokio::fs::read_to_string(&config_path).await?;
         current_config.push('\n');
         current_config.push_str(microvm_config);
-        // Layer the requested KConfig fragments (§8.3) in SORTED order, so the on-disk
+        // Layer the requested KConfig fragments (§5.2, The config fragment) in SORTED order, so the on-disk
         // `.config` is deterministic regardless of request order. Each fragment's text comes
         // from the pins `kernel_fragments` registry; a missing fragment is a HARD ERROR —
         // never a silent skip that builds a kernel without the requested instrumentation.
@@ -367,7 +367,7 @@ impl Stage for KernelStage {
             .await?;
         if !status.success() {
             // Fail loud with the base + fragment context: `olddefconfig` returns non-zero when
-            // a fragment's KConfig conflicts with the base or a dependency is missing (§8.3).
+            // a fragment's KConfig conflicts with the base or a dependency is missing (§5.2, The config fragment).
             return Err(Error::Artifact(format!(
                 "make olddefconfig failed (kernel `{}`, fragments {:?}): a requested KConfig \
                  fragment is incompatible with the base config or a dependency is unmet",
@@ -452,14 +452,14 @@ fn symlink_escapes(link_path: &Path, target: &Path) -> bool {
 }
 
 /// A pipeline stage that fetches a **prebuilt** `vmlinux` — the bootstrap kernel seed
-/// (§8.5). Where [`KernelStage`] compiles from source on the host, this stage downloads a
+/// (§5.4, The guest-kernel contract and the bootstrap seed). Where [`KernelStage`] compiles from source on the host, this stage downloads a
 /// digest-pinned prebuilt kernel and verifies it against `kernel_prebuilt_sha256`, then
 /// registers it under the `kernel` artifact key exactly like the compiled path.
 ///
 /// This is the fast bootstrap seed: it needs no toolchain and no builder VM, so it is the
 /// seed that lets the in-VM `vmcell-kernel-builder` boot its own builder VM (the
-/// seed-kernel chicken-and-egg, §8.5). It is only usable when a prebuilt kernel that
-/// satisfies the §8.3 built-in config is pinned; otherwise [`KernelStage`] (host-`make`)
+/// seed-kernel chicken-and-egg, §5.4, The guest-kernel contract and the bootstrap seed). It is only usable when a prebuilt kernel that
+/// satisfies the §5.2 (The config fragment) built-in config is pinned; otherwise [`KernelStage`] (host-`make`)
 /// remains the guaranteed fallback seed.
 pub struct PrebuiltKernelStage {
     /// The HTTP client used to download the prebuilt kernel.
@@ -500,7 +500,7 @@ impl Stage for PrebuiltKernelStage {
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
-        // Optional archive-extraction identity (§8.5): a prebuilt shipped inside a tar
+        // Optional archive-extraction identity (§5.4, The guest-kernel contract and the bootstrap seed): a prebuilt shipped inside a tar
         // (e.g. the Kata kernel) is keyed on the archive member path + the archive's own
         // digest, so re-pointing either invalidates the extracted kernel.
         hasher.update(SEP);
@@ -538,7 +538,7 @@ impl Stage for PrebuiltKernelStage {
         let downloaded = self.http_client.get(url).await?;
 
         // The final `vmlinux` bytes: either the download directly, or a member extracted from a
-        // verified archive (the Kata kernel ships inside a `.tar.zst`, §8.5).
+        // verified archive (the Kata kernel ships inside a `.tar.zst`, §5.4, The guest-kernel contract and the bootstrap seed).
         let vmlinux_bytes = match inputs.pins.get("kernel_prebuilt_archive_member") {
             None => downloaded,
             Some(member) => {
@@ -570,7 +570,7 @@ impl Stage for PrebuiltKernelStage {
         let got = sha256_hex(&vmlinux_bytes);
         if &got != expected_sha {
             // Provenance hard stop: a prebuilt kernel is opaque bytes, so an intact digest
-            // is the *only* integrity check — never accept a mismatch (§11.2, §8.5).
+            // is the *only* integrity check — never accept a mismatch (§10.2, The stage model and the five cache-key rules, §5.4, The guest-kernel contract and the bootstrap seed).
             return Err(Error::Artifact(format!(
                 "prebuilt kernel hash mismatch: expected {expected_sha}, got {got} (url {url})"
             )));
@@ -756,7 +756,7 @@ mod tests {
         );
     }
 
-    // ---- §8.3 kernel config-fragment matrix: cache-key behaviors (pure) ----
+    // ---- §5.2 (The config fragment) kernel config-fragment matrix: cache-key behaviors (pure) ----
 
     fn frag_stage(fragments: Option<Vec<&str>>) -> KernelStage {
         KernelStage {
@@ -780,7 +780,7 @@ mod tests {
         i
     }
 
-    // §8.3: the fragment set is content-addressed by its SORTED form, so requesting the
+    // §5.2 (The config fragment): the fragment set is content-addressed by its SORTED form, so requesting the
     // same fragments in a different order MUST hit the same cache key. The inverse —
     // folding fragments in request order — makes [KASAN,LOCKDEP] != [LOCKDEP,KASAN].
     #[test]
@@ -795,7 +795,7 @@ mod tests {
         );
     }
 
-    // §8.3: the fragment SET is part of the key. A KASAN kernel must not share a cache
+    // §5.2 (The config fragment): the fragment SET is part of the key. A KASAN kernel must not share a cache
     // entry with the plain kernel (the inverse — ignoring fragments — collides them).
     #[test]
     fn test_kernel_cache_key_distinguishes_fragment_set() {
@@ -809,7 +809,7 @@ mod tests {
         );
     }
 
-    // §8.3: validity is content-addressed — editing a fragment's KConfig text (same name)
+    // §5.2 (The config fragment): validity is content-addressed — editing a fragment's KConfig text (same name)
     // must invalidate the key, or a stale instrumented kernel is re-served.
     #[test]
     fn test_kernel_cache_key_tracks_fragment_content() {
@@ -971,7 +971,7 @@ mod tests {
         );
     }
 
-    // §8.5 prebuilt bootstrap seed: a downloaded prebuilt kernel whose bytes do not match
+    // §5.4 (The guest-kernel contract and the bootstrap seed) prebuilt bootstrap seed: a downloaded prebuilt kernel whose bytes do not match
     // the pinned SHA is a provenance HARD STOP (the digest is the only integrity check on
     // opaque prebuilt bytes). Dropping the check would write the wrong bytes and return Ok
     // -> the mismatch assertion goes red.
@@ -1007,7 +1007,7 @@ mod tests {
         );
     }
 
-    // §8.5: a matching prebuilt is written and registered under the `kernel` artifact key
+    // §5.4 (The guest-kernel contract and the bootstrap seed): a matching prebuilt is written and registered under the `kernel` artifact key
     // (so downstream consumers / a VM find it). The inverse (registering nothing, or a
     // different key) reddens the artifact-key assertion.
     #[tokio::test]
@@ -1039,7 +1039,7 @@ mod tests {
         );
     }
 
-    // §8.5: a missing prebuilt pin is a fail-loud error, never a silent success (the
+    // §5.4 (The guest-kernel contract and the bootstrap seed): a missing prebuilt pin is a fail-loud error, never a silent success (the
     // host-make builder is the fallback seed, chosen by the caller — not by a silent skip).
     #[tokio::test]
     async fn test_prebuilt_kernel_missing_pin_errors() {
@@ -1057,7 +1057,7 @@ mod tests {
         );
     }
 
-    /// Builds a single-member `.tar.zst` in memory (mirrors how the Kata kernel ships, §8.5).
+    /// Builds a single-member `.tar.zst` in memory (mirrors how the Kata kernel ships, §5.4, The guest-kernel contract and the bootstrap seed).
     fn make_tar_zst(member: &str, content: &[u8]) -> Vec<u8> {
         let mut tar_bytes = Vec::new();
         {
@@ -1074,7 +1074,7 @@ mod tests {
         zstd::stream::encode_all(std::io::Cursor::new(tar_bytes), 0).expect("zstd")
     }
 
-    // §8.5: a prebuilt shipped inside a `.tar.zst` (the Kata case) is verified against the
+    // §5.4 (The guest-kernel contract and the bootstrap seed): a prebuilt shipped inside a `.tar.zst` (the Kata case) is verified against the
     // ARCHIVE digest, the named member extracted, then re-verified against the member digest —
     // and written out. The inverse (writing the whole archive as the kernel) reddens the
     // content assertion.
@@ -1115,7 +1115,7 @@ mod tests {
         );
     }
 
-    // §8.5: a tampered archive (bytes not matching `archive_sha256`) is a provenance hard stop
+    // §5.4 (The guest-kernel contract and the bootstrap seed): a tampered archive (bytes not matching `archive_sha256`) is a provenance hard stop
     // before extraction — the archive digest is the integrity check on opaque compressed bytes.
     #[tokio::test]
     async fn test_prebuilt_kernel_archive_sha_mismatch_hard_stops() {
@@ -1149,7 +1149,7 @@ mod tests {
         assert!(!out.exists());
     }
 
-    // §8.5: a member absent from the archive is a hard error, never a silent empty/whole-archive
+    // §5.4 (The guest-kernel contract and the bootstrap seed): a member absent from the archive is a hard error, never a silent empty/whole-archive
     // write.
     #[tokio::test]
     async fn test_prebuilt_kernel_archive_missing_member_errors() {

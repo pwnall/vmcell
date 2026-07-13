@@ -6,7 +6,7 @@ mod common;
 
 // The boot contract (kernel banner → agent-ready → exec round-trip) is the extracted
 // `checks::*` the artifact validator runs; this test drives them on the built artifacts so a
-// regression in either reddens here AND in the validator (single source of truth, §8.5).
+// regression in either reddens here AND in the validator (single source of truth, §5.4, The guest-kernel contract and the bootstrap seed).
 vmm_matrix_test!(boot, |vmm| {
     test_boot_impl(&vmm).await;
 });

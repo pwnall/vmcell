@@ -1,6 +1,6 @@
 //! Guest PID-1 agent support library: the zombie-reaper / exec-waiter coordination.
 //!
-//! Extracted into the guest-agent member crate (v15 §10.1) so this PID-1 logic —
+//! Extracted into the guest-agent member crate (v15 §9.1, Workspace layout) so this PID-1 logic —
 //! and its unit tests — compile without any host async stack. The thin binary in
 //! `main.rs` drives a [`ReaperCoordinator`]; the host never links this code (it
 //! shares only the [`vmcell_protocol`] wire enum).
@@ -226,7 +226,7 @@ impl ReaperCoordinator {
     /// This records a status the caller reaped *outside* the coordinator lock.
     /// The PID-1 reaper must instead use [`ReaperCoordinator::drain_reaped`],
     /// which performs the reap and the record under one lock so a reused pid
-    /// cannot be reserved between them (the residual PID-reuse race, §4.3).
+    /// cannot be reserved between them (the residual PID-reuse race, §3.4, The guest: vmcell-guest-agent as PID 1).
     pub fn record_exit(&self, pid: u32, code: i32) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.record(pid, code, self.max_statuses);
@@ -332,7 +332,7 @@ impl Default for ReaperCoordinator {
 mod reaper_tests {
     //! Default-suite (KVM-free) tests for the false-127 reaper coordination.
     //! Each guards a specific documented inverse so the contract cannot silently
-    //! regress; see §4.3 / AGENTS.md "PID-1 reaper vs. waiter".
+    //! regress; see §3.4 (The guest: vmcell-guest-agent as PID 1) / AGENTS.md "PID-1 reaper vs. waiter".
     use super::{ReaperCoordinator, exit_code_from_termination};
     use std::sync::Arc;
     use std::time::Duration;
@@ -422,7 +422,7 @@ mod reaper_tests {
 
     #[test]
     fn reserved_pid_discards_stale_grandchild_status_under_reuse() {
-        // PID-reuse mis-delivery guard (§4.3 reaper-vs-waiter). A re-parented
+        // PID-reuse mis-delivery guard (§3.4, The guest: vmcell-guest-agent as PID 1; reaper-vs-waiter). A re-parented
         // grandchild exits and is reaped under pid X but never claimed, leaving a
         // lingering status. The kernel later reuses pid X for an exec child. The
         // exec path reserves pid X immediately after spawn; the new waiter must

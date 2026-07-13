@@ -90,7 +90,8 @@ pub enum Error {
     /// not delegated to the per-VM slice, so a requested `memory.max`/`cpu.max`
     /// limit would be silently ignored.
     ///
-    /// Per the §7.1 fail-loud capability contract this is returned (matchable,
+    /// Per the §7.2 (The fail-loud capability contract and HostCapabilities)
+    /// fail-loud capability contract this is returned (matchable,
     /// carrying the missing capability and its remediation) instead of logging a
     /// warning and returning `Ok`, so a caller never receives a VM whose
     /// requested limits were not applied.

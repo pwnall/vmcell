@@ -34,16 +34,16 @@ pub struct VmConfig {
     /// guest pages (CH `mergeable=on`). KSM only merges private-anonymous pages,
     /// so enabling this also disables memory sharing (`shared=off`), making it
     /// incompatible with vhost-user paths (unprivileged net, virtio-fs). A
-    /// density-vs-CPU trade measured in §13.5.
+    /// density-vs-CPU trade measured in §8.3 (Density levers).
     pub ksm_mergeable: bool,
     /// Guest kernel console log verbosity (`loglevel=`). Default
-    /// [`KernelVerbosity::Balanced`] is the §15 perf-optimal; raise it only for
+    /// [`KernelVerbosity::Balanced`] is the §16 (Performance) perf-optimal; raise it only for
     /// debugging / a test that asserts on a specific kernel log line.
     pub kernel_verbosity: KernelVerbosity,
     /// Per-VM hot-path timing knobs (connect cadence, teardown grace, guest
     /// accept/re-bind polls). Default [`Timeouts::default`] is the shipped
     /// balanced profile; [`Timeouts::low_latency`] / [`Timeouts::throughput`]
-    /// are ready-made presets (§10).
+    /// are ready-made presets (§9.4, Timeouts and the lifecycle nuances).
     pub timeouts: Timeouts,
     /// Guest console device driving `serial.log`. Default [`ConsoleMode::Uart`]
     /// (8250 `ttyS0`) is alive from the first instruction, so it captures early
@@ -54,22 +54,22 @@ pub struct VmConfig {
     pub console_mode: ConsoleMode,
     /// The prefix for this VM's swept host-resource names (netns/tap/cgroup/scratch), composed via
     /// [`crate::naming`]. Defaults to [`crate::naming::DEFAULT_RESOURCE_PREFIX`] (`"vmcell"`). The
-    /// orphan sweep must be run with the SAME prefix (§v21) or it will not match this VM's leaks.
+    /// orphan sweep must be run with the SAME prefix (§13, Cross-cutting invariants) or it will not match this VM's leaks.
     pub resource_prefix: String,
     /// Extra virtio-blk devices attached **after** the root disk, enumerated by the
-    /// guest as `/dev/vdb`, `/dev/vdc`, … in order (§19.1). Raw block devices — the
+    /// guest as `/dev/vdb`, `/dev/vdc`, … in order (§4.6, Extra virtio-blk devices and disk-I/O throttling). Raw block devices — the
     /// guest workload owns any filesystem/mount; the agent does not auto-mount them.
-    /// Plain virtio-blk composes with snapshotting (§12.1); an extra disk's
+    /// Plain virtio-blk composes with snapshotting (§13, Cross-cutting invariants); an extra disk's
     /// [`image`](BlockDevice::image) must live at a **stable path** to survive a
     /// restore. Default empty.
     pub extra_disks: Vec<BlockDevice>,
     /// Append-only extra kernel command-line arguments, appended **after** every
-    /// token vmcell owns (§19.2.1). An extra arg can add a boot parameter but can never
+    /// token vmcell owns (§5.3, The kernel command line). An extra arg can add a boot parameter but can never
     /// override one vmcell controls; [`VmConfigBuilder::build`] rejects any arg whose
     /// key is reserved or starts with `vmcell_`, or that is not a single whitespace-
     /// free token. Default empty.
     pub extra_kernel_args: Vec<String>,
-    /// Optional `init=` override (§19.2.2). `None` boots the vmcell guest agent as
+    /// Optional `init=` override (§5.3, The kernel command line). `None` boots the vmcell guest agent as
     /// PID 1 (the vsock control plane). `Some(path)` boots a **custom PID 1**, which
     /// **replaces the agent** — so the VM has no control plane
     /// ([`crate::orchestrator::MicroVm::agent`] fails loud) and cannot snapshot
@@ -80,7 +80,7 @@ pub struct VmConfig {
     /// erofs root, so it usually pairs with a writable rootfs or extra disk. Default
     /// `None`.
     pub init: Option<PathBuf>,
-    /// The VMM subprocess's own seccomp-BPF confinement (design §20.3). Default
+    /// The VMM subprocess's own seccomp-BPF confinement (design §12.2, Layer 1 — the VMM's own seccomp filter). Default
     /// [`VmmSeccomp::Enforcing`] runs each backend under its audited native filter
     /// (`cloud-hypervisor --seccomp true`, Firecracker's built-in filter, `qemu
     /// -sandbox on,…`). The one predicate [`crate::vmm::seccomp::vmm_seccomp_args`]
@@ -88,26 +88,26 @@ pub struct VmConfig {
     /// for a policy a backend cannot honor (e.g. [`VmmSeccomp::Log`] on Firecracker/QEMU),
     /// never a silent downgrade. [`VmmSeccomp::Disabled`] is a deliberate, logged opt-out.
     pub vmm_seccomp: VmmSeccomp,
-    /// Jailer-equivalent pre-exec hardening applied to the VMM child (design §20.4):
+    /// Jailer-equivalent pre-exec hardening applied to the VMM child (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)):
     /// `no_new_privs`, ambient-capability clear, non-dumpable, and rlimits, plus an
     /// optional coarse seccomp deny-list. Default [`JailConfig::default`] is the
     /// hardened profile ([`JailConfig::hardened`]). The pure config here is compiled to
     /// a runtime `JailSpec` and applied by [`crate::vmm::jail::apply_jail`] in the
     /// forked-child pre-exec window, shared by the in-process spawn and the setup
-    /// broker (one law, §12.22).
+    /// broker (one law, §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
     pub jail: JailConfig,
 }
 
-/// The VMM subprocess's own seccomp-BPF confinement policy (design §20.3 / §12.21).
+/// The VMM subprocess's own seccomp-BPF confinement policy (design §12.2, Layer 1 — the VMM's own seccomp filter).
 ///
 /// [`crate::vmm::seccomp::vmm_seccomp_args`] is the single predicate that turns this
 /// into a backend's native CLI flag; a policy a backend cannot honor is a typed
-/// [`crate::error::Error::Unsupported`], not a silent fallback (§7.2 capability honesty).
+/// [`crate::error::Error::Unsupported`], not a silent fallback (§7.2, The fail-loud capability contract and HostCapabilities; capability honesty).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum VmmSeccomp {
     /// Enforce the backend's audited seccomp filter, killing on a disallowed syscall.
-    /// The default — vmcell never leaves a backend unconfined by default (§12.2).
+    /// The default — vmcell never leaves a backend unconfined by default (§12.2, Layer 1 — the VMM's own seccomp filter).
     #[default]
     Enforcing,
     /// Observe-only: log disallowed syscalls instead of killing (debugging a filter
@@ -120,12 +120,12 @@ pub enum VmmSeccomp {
     Disabled,
 }
 
-/// Jailer-equivalent pre-exec hardening applied to the VMM child (design §20.4).
+/// Jailer-equivalent pre-exec hardening applied to the VMM child (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
 ///
 /// Pure, serializable configuration (no compiled BPF): [`crate::vmm::jail::apply_jail`]
 /// compiles the optional deny-list once, pre-fork, and applies the rest in the
 /// async-signal-safe child window. Mirrors the hardening Firecracker's `jailer` applies
-/// to the VMM (minus the chroot/uid-drop increment, forward work §20.9).
+/// to the VMM (minus the chroot/uid-drop increment, forward work §17, Open gaps and future capabilities).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct JailConfig {
@@ -133,7 +133,7 @@ pub struct JailConfig {
     /// gain privileges via a setuid/file-cap binary. Required before a seccomp filter.
     pub no_new_privs: bool,
     /// `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)` — clear the ambient capability set.
-    /// **Default `false`, opt-in** (§20.9): in vmcell's current architecture the VMM *inherits*
+    /// **Default `false`, opt-in** (§17, Open gaps and future capabilities): in vmcell's current architecture the VMM *inherits*
     /// `CAP_NET_ADMIN` (via the ambient set on the `vmcell-test-runner` path) and **needs** it —
     /// a restored Cloud Hypervisor's `TapSetMac` and Firecracker's tap re-open both `EPERM`
     /// without it (validated on a KVM host). Clearing the VMM's caps is safe only once the tap is
@@ -144,34 +144,34 @@ pub struct JailConfig {
     /// `ptrace` of the process holding guest memory, and reinforces `rlimit_core`).
     pub non_dumpable: bool,
     /// `RLIMIT_CORE` — default `Some(0)`: a VMM core dump writes guest memory
-    /// (potentially secrets) to disk, exactly the §12.18 surface, so no core is allowed.
+    /// (potentially secrets) to disk, exactly the §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)) surface, so no core is allowed.
     pub rlimit_core: Option<u64>,
     /// `RLIMIT_FSIZE` — default `None` (unset): a snapshot-eligible VM writes a
     /// guest-RAM-sized suspend file, so a naïve `fsize=0` would break snapshot.
     pub rlimit_fsize: Option<u64>,
     /// `RLIMIT_NOFILE` — default `None`; set for a tighter open-fd ceiling on the VMM.
     pub rlimit_nofile: Option<u64>,
-    /// Apply a coarse, default-allow seccomp **deny-list** (design §20.4) of syscalls a
+    /// Apply a coarse, default-allow seccomp **deny-list** (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)) of syscalls a
     /// booting VMM never needs and an escape would want (`mount`, `ptrace`, `bpf`,
     /// `kexec_load`, module ops, `setns`, …) → `EPERM`. Ships **opt-in, default
     /// `false`**: the backend's own native filter ([`VmmSeccomp`]) is the shipped
     /// default confinement, and a host-applied filter on a live VMM is not yet
-    /// KVM-host-validated (§20.9). The filter-application mechanism itself is gated
+    /// KVM-host-validated (§17, Open gaps and future capabilities). The filter-application mechanism itself is gated
     /// KVM-free against a stand-in child.
     pub seccomp_deny_list: bool,
 }
 
 impl JailConfig {
     /// The hardened default: `no_new_privs` + `non_dumpable` + `RLIMIT_CORE=0`, no fsize/nofile
-    /// cap, no host seccomp deny-list (the backend's native filter is the shipped default, §20.4).
+    /// cap, no host seccomp deny-list (the backend's native filter is the shipped default, §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
     ///
-    /// **`clear_ambient_caps` defaults to `false`** (empirically forced, §20.9): in vmcell's
+    /// **`clear_ambient_caps` defaults to `false`** (empirically forced, §17, Open gaps and future capabilities): in vmcell's
     /// current architecture the VMM inherits `CAP_NET_ADMIN` (via the ambient set on the runner
     /// path) and **needs** it for privileged tap operations — a restored Cloud Hypervisor's
     /// `TapSetMac` and Firecracker's tap re-open both `EPERM` without it (validated on a KVM host:
     /// clearing ambient broke `*_survives_snapshot` restore-with-tap). Clearing the VMM's caps is
     /// safe only once the tap is handed over fully configured (the fd-passing / uid-drop jailer
-    /// increment, §20.9); until then the field stays an opt-in for that future path.
+    /// increment, §17, Open gaps and future capabilities); until then the field stays an opt-in for that future path.
     #[must_use]
     pub const fn hardened() -> Self {
         Self {
@@ -245,7 +245,7 @@ pub struct Timeouts {
 }
 
 impl Default for Timeouts {
-    /// The shipped balanced profile (the §15 post-optimization-pass values).
+    /// The shipped balanced profile (the §16, Performance — post-optimization-pass values).
     fn default() -> Self {
         Self {
             connect_backoff_floor: std::time::Duration::from_millis(20),
@@ -318,7 +318,7 @@ impl Timeouts {
     }
 }
 
-/// Appends the guest-side timing tokens to a kernel `cmdline` (§8.3). The guest
+/// Appends the guest-side timing tokens to a kernel `cmdline` (§5.3, The kernel command line). The guest
 /// agent parses `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` (whole ms,
 /// clamped guest-side) to tune its accept/re-bind cadence per VM without a rootfs
 /// rebuild; absent tokens fall back to the agent's compiled defaults.
@@ -334,7 +334,7 @@ pub(crate) fn push_guest_timeout_args(cmdline: &mut String, timeouts: &Timeouts)
 /// all three backends (`console`, `loglevel`, RNG-trust, root/rootfs, `panic`,
 /// `init`, `vmcell_vmid`, optional `ip=`/nested/shares, and the guest timing
 /// tokens). Centralizing it fixes the prior triplication where QEMU's inline
-/// cmdline silently omitted `loglevel=` (paying the full 8250 UART tax, §8.3).
+/// cmdline silently omitted `loglevel=` (paying the full 8250 UART tax, §5.3, The kernel command line).
 /// `backend_extra` carries the one genuine per-backend fragment (Firecracker's
 /// `noxsave ` FPU guard), inserted before `init=` exactly where it was.
 ///
@@ -360,7 +360,7 @@ pub(crate) fn build_kernel_cmdline(
     // `ip=` autoconfig, panic capture, or the in-kernel crypto itself (self-tests are
     // a boot-time QA pass, not a runtime dependency).
     // The `init=` token: the fixed vmcell guest agent (the default control-plane
-    // PID 1) unless the caller overrides it (§19.2.2). This is the ONE place either
+    // PID 1) unless the caller overrides it (§5.3, The kernel command line). This is the ONE place either
     // `init=` token is constructed — a backend never string-builds it. A custom
     // init replaces the agent, so it forgoes the vsock control plane; the
     // consequence is honored fail-loud in the orchestrator, not here (see
@@ -401,19 +401,19 @@ pub(crate) fn build_kernel_cmdline(
     push_share_args(&mut s, &cfg.shares);
     push_guest_timeout_args(&mut s, &cfg.timeouts);
     // Append-only caller args go LAST — after every token vmcell owns — so they can
-    // add a boot parameter but never clobber one (§19.2.1). `build()` already rejected
+    // add a boot parameter but never clobber one (§5.3, The kernel command line). `build()` already rejected
     // any arg whose key is reserved or `vmcell_`-prefixed, so this is a safe splice.
     push_extra_kernel_args(&mut s, &cfg.extra_kernel_args);
     Ok(s)
 }
 
 /// The default `init=` target: the vmcell guest agent that serves the vsock control
-/// plane as PID 1 (§4.3). A caller may override it via [`VmConfig::init`], which
-/// replaces the agent and therefore forgoes the control plane (§19.2.2).
+/// plane as PID 1 (§3.4, The guest: vmcell-guest-agent as PID 1). A caller may override it via [`VmConfig::init`], which
+/// replaces the agent and therefore forgoes the control plane (§5.3, The kernel command line).
 pub(crate) const DEFAULT_INIT: &str = "/usr/sbin/vmcell-guest-agent";
 
 /// The kernel-cmdline keys that [`build_kernel_cmdline`] owns and that
-/// [`VmConfig::extra_kernel_args`] may therefore **not** set (append-only, §19.2.1).
+/// [`VmConfig::extra_kernel_args`] may therefore **not** set (append-only, §5.3, The kernel command line).
 ///
 /// Kept in lockstep with the tokens the builder emits by the
 /// `extra_kernel_args_cannot_clobber_reserved_tokens` coverage test: every token the
@@ -440,7 +440,7 @@ const RESERVED_CMDLINE_KEYS: &[&str] = &[
 
 /// Whether `arg` collides with a boot token vmcell owns — its key is in
 /// [`RESERVED_CMDLINE_KEYS`] or starts with `vmcell_` (every guest-agent-trusted
-/// token, §8.3). The single predicate behind the append-only contract (§19.2.1); the
+/// token, §5.3, The kernel command line). The single predicate behind the append-only contract (§5.3, The kernel command line); the
 /// key is the text before the first `=` (or the whole bare token).
 pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
     let key = arg.split('=').next().unwrap_or(arg);
@@ -450,7 +450,7 @@ pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
 }
 
 /// Appends the validated append-only caller args to `cmdline`, one whitespace-
-/// separated token each (§19.2.1). No args ⇒ nothing appended.
+/// separated token each (§5.3, The kernel command line). No args ⇒ nothing appended.
 pub(crate) fn push_extra_kernel_args(cmdline: &mut String, args: &[String]) {
     for arg in args {
         cmdline.push(' ');
@@ -458,7 +458,7 @@ pub(crate) fn push_extra_kernel_args(cmdline: &mut String, args: &[String]) {
     }
 }
 
-/// Validates a caller-supplied `init=` override path (§19.2.2): valid UTF-8, absolute,
+/// Validates a caller-supplied `init=` override path (§5.3, The kernel command line): valid UTF-8, absolute,
 /// and a single cmdline token (no whitespace or control characters — a space would
 /// forge a second boot token).
 ///
@@ -483,7 +483,7 @@ fn validate_init_path(init: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates one append-only caller kernel arg (§19.2.1): non-empty, a single cmdline
+/// Validates one append-only caller kernel arg (§5.3, The kernel command line): non-empty, a single cmdline
 /// token (no whitespace/control characters), and not colliding with a reserved token
 /// vmcell owns ([`is_reserved_cmdline_arg`]).
 ///
@@ -526,7 +526,7 @@ pub enum RootfsSource {
 }
 
 /// An extra virtio-blk device attached to the VM in addition to the root disk
-/// ([`VmConfig::extra_disks`], §19.1).
+/// ([`VmConfig::extra_disks`], §4.6, Extra virtio-blk devices and disk-I/O throttling).
 ///
 /// The guest kernel enumerates extra disks as `/dev/vdb`, `/dev/vdc`, … in
 /// attachment order; the root disk is always `/dev/vda`. vmcell attaches the **raw**
@@ -534,7 +534,7 @@ pub enum RootfsSource {
 /// mount (the guest agent does not auto-mount extra disks).
 ///
 /// Plain virtio-blk is **not** a vhost-user device, so extra disks compose with
-/// snapshotting (§12.1). A block device's contents live on disk, *outside* the
+/// snapshotting (§13, Cross-cutting invariants). A block device's contents live on disk, *outside* the
 /// memory snapshot, so the [`image`](BlockDevice::image) path must be **stable across
 /// a restore** (CH/FC restore reconstruct devices from the paths recorded at snapshot
 /// time), i.e. not inside the per-VM scratch dir.
@@ -545,7 +545,7 @@ pub struct BlockDevice {
     pub image: PathBuf,
     /// Whether the device is attached read-only.
     pub readonly: bool,
-    /// Optional I/O rate limit (disk-I/O fault injection, §19.5). `None` = unlimited.
+    /// Optional I/O rate limit (disk-I/O fault injection, §4.6, Extra virtio-blk devices and disk-I/O throttling). `None` = unlimited.
     pub io_limit: Option<DiskIoLimit>,
 }
 
@@ -570,7 +570,7 @@ impl BlockDevice {
         }
     }
 
-    /// Attaches an I/O rate limit to this device (disk-I/O fault injection, §19.5), to
+    /// Attaches an I/O rate limit to this device (disk-I/O fault injection, §4.6, Extra virtio-blk devices and disk-I/O throttling), to
     /// simulate a slow or pressured disk. Validated at [`VmConfigBuilder::build`].
     #[must_use]
     pub fn with_io_limit(mut self, limit: DiskIoLimit) -> Self {
@@ -580,7 +580,7 @@ impl BlockDevice {
 }
 
 /// An I/O rate limit for a [`BlockDevice`] — the portable form of disk-I/O fault
-/// injection (§19.5), simulating a slow/pressured disk to test a workload's timeout /
+/// injection (§4.6, Extra virtio-blk devices and disk-I/O throttling), simulating a slow/pressured disk to test a workload's timeout /
 /// retry / backpressure behavior. Each backend enforces it with its native token-bucket
 /// rate limiter (Cloud Hypervisor `rate_limiter_config`, Firecracker `rate_limiter`,
 /// QEMU `throttling.*`), so it composes with snapshotting like any plain virtio-blk.
@@ -638,8 +638,8 @@ pub(crate) const IO_LIMIT_REFILL_TIME_MS: u64 = 1000;
 /// Guest kernel console log verbosity, mapped to the `loglevel=` boot parameter.
 ///
 /// Kernel `printk` to the legacy 8250 `ttyS0` UART is a **per-byte PIO trap → VM
-/// exit** (§8.3), so verbose boot logging is a real cold-boot cost — the single
-/// largest lever in the §15 latency pass. This knob lets debugging and specific
+/// exit** (§5.3, The kernel command line), so verbose boot logging is a real cold-boot cost — the single
+/// largest lever in the §16 (Performance) latency pass. This knob lets debugging and specific
 /// tests opt into a verbose log without making every VM pay the exit tax. Panic
 /// capture ([`contains_panic`](crate::vmm::SerialLog::contains_panic), KERN_EMERG)
 /// works at every level.
@@ -684,7 +684,7 @@ impl KernelVerbosity {
 #[non_exhaustive]
 pub enum ConsoleMode {
     /// Legacy 8250 `ttyS0`: alive from the first instruction (early-boot + panic
-    /// capture, §12.10) but per-byte PIO VM-exits. The safe default.
+    /// capture, §5.3, The kernel command line) but per-byte PIO VM-exits. The safe default.
     #[default]
     Uart,
     /// virtio-console `hvc0`: batched via virtqueue (~no exit tax) — but only
@@ -734,7 +734,7 @@ pub struct Share {
     /// In-guest mount point for this share. Defaults to `/<tag>`; override with
     /// [`Share::with_guest_path`] to decouple the mount path from the virtio-fs
     /// tag. Must be absolute and free of `:`/whitespace (it is encoded on the
-    /// kernel command line, §5.2); [`VmConfigBuilder::build`] rejects violations.
+    /// kernel command line, §4.5, Shared directories (virtio-fs)); [`VmConfigBuilder::build`] rejects violations.
     pub guest_path: PathBuf,
 }
 
@@ -766,7 +766,7 @@ impl Share {
     /// `data` mounted at `/srv/data` — decoupling the mount point from the
     /// virtio-fs tag for more generic workloads. The path must be absolute and
     /// contain neither `:` nor whitespace (it is encoded on the kernel command
-    /// line, §5.2); [`VmConfigBuilder::build`] enforces this.
+    /// line, §4.5, Shared directories (virtio-fs)); [`VmConfigBuilder::build`] enforces this.
     #[must_use]
     pub fn with_guest_path(mut self, guest_path: impl Into<PathBuf>) -> Self {
         self.guest_path = guest_path.into();
@@ -779,7 +779,7 @@ impl Share {
 /// The guest agent (PID 1) has no host-side view of [`VmConfig`], so the shares
 /// it must mount — their tag, mount point, and access mode — travel on the kernel
 /// command line as one `vmcell_share=<tag>:<guest_path>:<ro|rw>` token per share
-/// (§5.2: tags and mount points are caller-defined, not built into the runner).
+/// (§4.5, Shared directories (virtio-fs): tags and mount points are caller-defined, not built into the runner).
 /// The agent reads `/proc/cmdline`, mounts each `tag` at its `guest_path` over
 /// virtiofs (default `/<tag>`), and uses a read-only mount for `ro` shares. Tags
 /// and guest paths are validated by [`VmConfigBuilder::build`] to be encodable
@@ -831,7 +831,7 @@ pub enum NetConfig {
     /// Privileged mode using TAP and netns (requires root/CAP_NET_ADMIN).
     ///
     /// No `host_services_port`: host-service reachability is implemented **only** on the
-    /// [`NetConfig::Unprivileged`] smoltcp NAT (§6.2, design §18 delta 4). The privileged TPROXY
+    /// [`NetConfig::Unprivileged`] smoltcp NAT (§6.2, NetConfig and the two datapaths, design §18, Delta register — delta 4). The privileged TPROXY
     /// ruleset policy-drops everything but the web TPROXY and the proxy port, so the field would be
     /// a no-op here — the invalid state is made *unrepresentable* rather than accepted then
     /// rejected at `build()`.
@@ -995,7 +995,7 @@ pub struct VmConfigBuilder {
 }
 
 impl VmConfigBuilder {
-    /// Sets the VMM subprocess's own seccomp policy ([`VmConfig::vmm_seccomp`], §20.3).
+    /// Sets the VMM subprocess's own seccomp policy ([`VmConfig::vmm_seccomp`], §12.2, Layer 1 — the VMM's own seccomp filter).
     /// Default [`VmmSeccomp::Enforcing`].
     #[must_use]
     pub fn vmm_seccomp(mut self, policy: VmmSeccomp) -> Self {
@@ -1004,7 +1004,7 @@ impl VmConfigBuilder {
     }
 
     /// Sets the jailer-equivalent pre-exec hardening for the VMM child
-    /// ([`VmConfig::jail`], §20.4). Default [`JailConfig::hardened`].
+    /// ([`VmConfig::jail`], §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)). Default [`JailConfig::hardened`].
     #[must_use]
     pub fn jail(mut self, jail: JailConfig) -> Self {
         self.jail = jail;
@@ -1018,7 +1018,7 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Attaches an extra virtio-blk device ([`BlockDevice`], §19.1), enumerated by the
+    /// Attaches an extra virtio-blk device ([`BlockDevice`], §4.6, Extra virtio-blk devices and disk-I/O throttling), enumerated by the
     /// guest as the next `/dev/vd*` after the root disk in call order. Validated at
     /// [`build`](Self::build).
     #[must_use]
@@ -1028,7 +1028,7 @@ impl VmConfigBuilder {
     }
 
     /// Appends one append-only extra kernel command-line argument
-    /// ([`VmConfig::extra_kernel_args`], §19.2.1). Rejected at [`build`](Self::build) if
+    /// ([`VmConfig::extra_kernel_args`], §5.3, The kernel command line). Rejected at [`build`](Self::build) if
     /// it collides with a reserved token vmcell owns or is not a single safe token.
     #[must_use]
     pub fn with_kernel_arg(mut self, arg: impl Into<String>) -> Self {
@@ -1036,7 +1036,7 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Overrides the guest `init=` target ([`VmConfig::init`], §19.2.2). A custom init
+    /// Overrides the guest `init=` target ([`VmConfig::init`], §5.3, The kernel command line). A custom init
     /// **replaces** the vmcell guest agent, forgoing the vsock control plane; validated
     /// at [`build`](Self::build), which also rejects it combined with `snapshotting`.
     #[must_use]
@@ -1046,7 +1046,7 @@ impl VmConfigBuilder {
     }
 
     /// Sets the prefix for this VM's swept host-resource names (netns/tap/cgroup/scratch); default
-    /// [`crate::naming::DEFAULT_RESOURCE_PREFIX`]. Run the orphan sweep with the same prefix (§v21).
+    /// [`crate::naming::DEFAULT_RESOURCE_PREFIX`]. Run the orphan sweep with the same prefix (§13, Cross-cutting invariants).
     /// Validated at [`build`](Self::build).
     #[must_use]
     pub fn resource_prefix(mut self, prefix: impl Into<String>) -> Self {
@@ -1110,7 +1110,7 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Enables KSM-mergeable (private-anonymous) guest memory (§13.5). See
+    /// Enables KSM-mergeable (private-anonymous) guest memory (§8.3, Density levers). See
     /// [`VmConfig::ksm_mergeable`] for the sharing trade-off.
     #[must_use]
     pub fn ksm_mergeable(mut self, mergeable: bool) -> Self {
@@ -1166,9 +1166,9 @@ impl VmConfigBuilder {
     /// - a share with an empty mount tag, or two shares sharing a mount tag;
     /// - `snapshotting` combined with any vhost-user device — a virtio-fs
     ///   rootfs, any virtio-fs data share, or unprivileged (vhost-user-net)
-    ///   networking — which violates the §3.3 snapshot-eligibility law;
+    ///   networking — which violates the §8.1 (The warm-snapshot path and the eligibility law) snapshot-eligibility law;
     /// - `ksm_mergeable` combined with any vhost-user device (it sets CH
-    ///   `shared=off`, mutually exclusive with the vhost-user paths — §13.5).
+    ///   `shared=off`, mutually exclusive with the vhost-user paths — §8.3, Density levers).
     ///
     /// This validates internal consistency only; it does **not** check that the
     /// kernel, rootfs, or share paths exist on disk.
@@ -1231,11 +1231,11 @@ impl VmConfigBuilder {
         }
 
         if self.snapshotting {
-            // A custom init replaces the vmcell guest agent (§19.2.2), and the mandatory
-            // post-restore resync — clock, entropy reseed, MAC/IP rotation (§12.4) —
+            // A custom init replaces the vmcell guest agent (§5.3, The kernel command line), and the mandatory
+            // post-restore resync — clock, entropy reseed, MAC/IP rotation (§13, Cross-cutting invariants) —
             // runs *through* that agent. A restored custom-init clone would be stranded
             // on frozen identity with no way to fix it from inside (silently dead
-            // egress / correlated RNG), the exact §12.4 trap. Reject fail-loud here.
+            // egress / correlated RNG), the exact §13 trap. Reject fail-loud here.
             if self.init.is_some() {
                 return Err(crate::error::Error::Config(
                     "a custom init cannot be combined with snapshotting (the mandatory \
@@ -1248,14 +1248,14 @@ impl VmConfigBuilder {
             // vhost-user device attached. A virtio-fs data `Share` is served
             // by virtiofsd (a vhost-user device), so reject it here. (A
             // virtio-fs *rootfs* was the other vhost-user boundary case; design
-            // §18 delta 5 removed that variant, making the combination
+            // §18 (Delta register) delta 5 removed that variant, making the combination
             // unrepresentable rather than rejected here.)
             if !self.shares.is_empty() {
                 return Err(crate::error::Error::Config(
                     "virtio-fs data shares cannot be combined with snapshotting".into(),
                 ));
             }
-            // Snapshot-eligibility law (§3.3), third boundary case: the unprivileged
+            // Snapshot-eligibility law (§8.1, The warm-snapshot path and the eligibility law), third boundary case: the unprivileged
             // network path is an in-process vhost-user-net device, so it is
             // mutually exclusive with snapshotting just like virtiofsd above.
             if matches!(self.net, NetConfig::Unprivileged { .. }) {
@@ -1266,7 +1266,7 @@ impl VmConfigBuilder {
             }
         }
 
-        // §13.5 KSM lever: `ksm_mergeable` sets CH `mergeable=on, shared=off`,
+        // §8.3 (Density levers) KSM lever: `ksm_mergeable` sets CH `mergeable=on, shared=off`,
         // and KSM only merges private-anonymous pages — so `shared=off` is
         // mutually exclusive with every vhost-user path. Enforce here (boundary
         // 1) so an invalid combination never becomes a `VmConfig` and instead
@@ -1296,7 +1296,7 @@ impl VmConfigBuilder {
             }
         }
 
-        // (Design §18 delta 4: `host_services_port` now lives only on
+        // (Design §18, Delta register — delta 4: `host_services_port` now lives only on
         // `NetConfig::Unprivileged`, so a privileged config carrying it is unrepresentable — the
         // former accept-then-reject at this boundary is gone.)
 
@@ -1309,7 +1309,7 @@ impl VmConfigBuilder {
                 ));
             }
             // The mount plan reaches the guest agent as
-            // `vmcell_share=<tag>:<guest_path>:<ro|rw>` kernel-cmdline tokens (§5.2),
+            // `vmcell_share=<tag>:<guest_path>:<ro|rw>` kernel-cmdline tokens (§4.5, Shared directories (virtio-fs)),
             // parsed by splitting on whitespace and then on ':'. A `:` or whitespace
             // in the tag or the guest path would corrupt that encoding and silently
             // mis-mount (or drop) the share, so reject it at the boundary rather than
@@ -1366,7 +1366,7 @@ impl VmConfigBuilder {
         }
 
         // Extra virtio-blk device images: absolute, non-empty, no duplicate backing
-        // file (§19.1.4). Existence is deliberately NOT checked here (consistent with
+        // file (§4.6, Extra virtio-blk devices and disk-I/O throttling). Existence is deliberately NOT checked here (consistent with
         // the rootfs/share paths — the image may be created later); a bad path fails
         // loud at `create()`. A duplicate image is a rw corruption footgun (two
         // attachments of one file), so it is rejected at the boundary.
@@ -1389,7 +1389,7 @@ impl VmConfigBuilder {
                     disk.image.display()
                 )));
             }
-            // Disk-I/O fault injection (§19.5): a limit must actually limit something, and
+            // Disk-I/O fault injection (§4.6, Extra virtio-blk devices and disk-I/O throttling): a limit must actually limit something, and
             // a set cap must be > 0 — a 0-byte/s or 0-IOPS bucket would wedge all I/O
             // (never refills), a silent deadlock. Reject both fail-loud at the boundary.
             if let Some(limit) = &disk.io_limit {
@@ -1409,14 +1409,14 @@ impl VmConfigBuilder {
         }
 
         // A custom `init=` override is a single load-bearing cmdline token selecting
-        // PID 1, so it is validated at the boundary (§19.2.2): absolute, UTF-8, no
+        // PID 1, so it is validated at the boundary (§5.3, The kernel command line): absolute, UTF-8, no
         // whitespace/control chars that could forge a second boot token.
         if let Some(init) = &self.init {
             validate_init_path(init).map_err(crate::error::Error::Config)?;
         }
 
         // Append-only extra kernel args: each a single safe token whose key does not
-        // collide with a reserved boot token vmcell owns (§19.2.1).
+        // collide with a reserved boot token vmcell owns (§5.3, The kernel command line).
         for arg in &self.extra_kernel_args {
             validate_extra_kernel_arg(arg).map_err(crate::error::Error::Config)?;
         }
@@ -1472,7 +1472,7 @@ mod tests {
         assert!(!cfg.nested_virt);
     }
 
-    // Guards the §13.3 eager-vs-lazy restore toggle: the builder must carry the
+    // Guards the §8.2 (Restore correctness: a restored VM is not a fresh VM) eager-vs-lazy restore toggle: the builder must carry the
     // selected `RestoreMode` onto the built config, and default to `Default`.
     // Buggy impl: builder drops the field (always `Default`) — the `Eager`
     // assertion below would then fail.
@@ -1501,7 +1501,7 @@ mod tests {
         assert_ne!(eager_cfg.restore_mode, RestoreMode::Default);
     }
 
-    // Guards the §13.5 KSM density lever: the builder must carry `ksm_mergeable`
+    // Guards the §8.3 (Density levers) KSM density lever: the builder must carry `ksm_mergeable`
     // onto the built config and default to `false` (so normal VMs keep shared
     // memory). Buggy impl: builder drops the field — the `true` assertion fails.
     #[test]
@@ -1587,7 +1587,7 @@ mod tests {
         mk(&|b| b.mem_mib(64)).expect("mem_mib 64 is at the floor");
     }
 
-    // Design §18 delta 4: `host_services_port` lives only on `NetConfig::Unprivileged` — a
+    // Design §18 (Delta register) delta 4: `host_services_port` lives only on `NetConfig::Unprivileged` — a
     // privileged config carrying it is now a COMPILE error (the field was removed from the
     // `Privileged` variant), so the former "rejected on privileged" negative test is deleted as
     // unreachable. What remains is the positive control: the unprivileged path accepts the port.
@@ -1630,7 +1630,7 @@ mod tests {
     }
 
     // The Erofs rootfs still builds a bootable `rootfstype=erofs` cmdline line
-    // (the VirtioFs variant this test also guarded against is gone — design §18
+    // (the VirtioFs variant this test also guarded against is gone — design §18 (Delta register)
     // delta 5 — making that rejection a compile-time unrepresentable state).
     #[test]
     fn erofs_rootfs_cmdline_build() {
@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     // A tag is encoded on the kernel cmdline as `vmcell_share=<tag>:<ro|rw>`
-    // (§5.2); `:` or whitespace in a tag would corrupt that token and silently
+    // (§4.5, Shared directories (virtio-fs)); `:` or whitespace in a tag would corrupt that token and silently
     // mis-mount or drop the share, so `build()` must reject it at the boundary.
     // Buggy impl this guards: accepting any non-empty tag, then discovering the
     // breakage as a missing mount in-guest.
@@ -1858,7 +1858,7 @@ mod tests {
     }
 
     // Conversely, an ordinary caller-defined tag (with '-' and '.') builds fine —
-    // tags are caller-defined (§5.2), not restricted to the old `imp-*` set.
+    // tags are caller-defined (§4.5, Shared directories (virtio-fs)), not restricted to the old `imp-*` set.
     #[test]
     fn test_accept_custom_share_tag() {
         let cfg = VmConfig::builder(
@@ -1972,7 +1972,7 @@ mod tests {
         );
     }
 
-    // M-RESTORE-3: the §3.3 snapshot-eligibility law's third boundary case.
+    // M-RESTORE-3: the §8.1 (The warm-snapshot path and the eligibility law) snapshot-eligibility law's third boundary case.
     // Buggy impl: build() rejects snapshot + virtio-fs rootfs and snapshot +
     // data share but lets the unprivileged vhost-user-net path through, so this VM
     // would reach the backend and fail late attaching a vhost-user device.
@@ -2095,7 +2095,7 @@ mod tests {
         assert!(cfg.ksm_mergeable);
     }
 
-    // §8.3 UART tax lever: each verbosity maps to its `loglevel=` number. Buggy
+    // §5.3 (The kernel command line) UART tax lever: each verbosity maps to its `loglevel=` number. Buggy
     // impl this guards: an off-by-one or a swapped arm (e.g. Balanced→7, or
     // Verbose→6) — any wrong mapping turns one of these equalities red.
     #[test]
@@ -2106,7 +2106,7 @@ mod tests {
         assert_eq!(KernelVerbosity::Debug.loglevel(), 8);
     }
 
-    // §10 timing presets: `low_latency` tightens the connect/accept cadence but
+    // §9.4 (Timeouts and the lifecycle nuances) timing presets: `low_latency` tightens the connect/accept cadence but
     // leaves teardown graceful, and `throughput` cuts the graceful-shutdown grace.
     // Buggy impls this guards: a preset that forgets to lower a knob (equal to
     // default), or `low_latency` that also cuts `shutdown_grace` (the excluded
@@ -2258,7 +2258,7 @@ mod tests {
         );
     }
 
-    // §12.10 console knob: each mode maps to its `console=` token. Buggy impl this
+    // §5.3 (The kernel command line) console knob: each mode maps to its `console=` token. Buggy impl this
     // guards: a swapped arm (Uart→hvc0 or VirtioConsole→ttyS0) reddens an equality.
     #[test]
     fn console_mode_mapping() {
@@ -2295,7 +2295,7 @@ mod tests {
         assert_ne!(virtio_cfg.console_mode, ConsoleMode::Uart);
     }
 
-    // §19.1: BlockDevice constructors set the readonly flag; a swapped arm (read_only
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): BlockDevice constructors set the readonly flag; a swapped arm (read_only
     // marking rw, or vice versa) reddens here.
     #[test]
     fn block_device_constructors() {
@@ -2306,7 +2306,7 @@ mod tests {
         assert!(!rw.readonly);
     }
 
-    // §19.1: the builder carries extra_disks onto the built config in order, default
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): the builder carries extra_disks onto the built config in order, default
     // empty. Buggy impl: the builder drops the field.
     #[test]
     fn builder_carries_extra_disks() {
@@ -2337,7 +2337,7 @@ mod tests {
         assert!(!cfg.extra_disks[1].readonly);
     }
 
-    // §19.1.4: build() rejects an empty / relative / duplicate extra-disk image. Buggy
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): build() rejects an empty / relative / duplicate extra-disk image. Buggy
     // impl: any of these reaches create() and fails late (or attaches one file twice).
     #[test]
     fn reject_bad_extra_disk_image() {
@@ -2379,7 +2379,7 @@ mod tests {
         );
     }
 
-    // §19.1.4 positive control: a valid extra disk with an absolute path builds — the
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling) positive control: a valid extra disk with an absolute path builds — the
     // over-rejection inverse (rejecting every extra disk) reddens here.
     #[test]
     fn accept_valid_extra_disk() {
@@ -2394,7 +2394,7 @@ mod tests {
         .expect("a valid absolute extra-disk image must build");
     }
 
-    // §19.5: DiskIoLimit constructors set the intended cap and leave the other unset; a
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): DiskIoLimit constructors set the intended cap and leave the other unset; a
     // swapped arm (bandwidth() setting iops) reddens here.
     #[test]
     fn disk_io_limit_constructors() {
@@ -2406,7 +2406,7 @@ mod tests {
         assert_eq!(ops.bandwidth_bytes_per_sec, None);
     }
 
-    // §19.5: `with_io_limit` carries the limit onto the built disk; default is None.
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): `with_io_limit` carries the limit onto the built disk; default is None.
     #[test]
     fn builder_carries_disk_io_limit() {
         let cfg = VmConfig::builder(
@@ -2429,7 +2429,7 @@ mod tests {
         );
     }
 
-    // §19.5: build() rejects an io_limit that limits nothing, or a 0 cap (which would
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): build() rejects an io_limit that limits nothing, or a 0 cap (which would
     // wedge all I/O — a silent deadlock). A genuine cap builds. Buggy impl: either is
     // accepted and the VM boots with a dead or no-op limiter.
     #[test]
@@ -2466,7 +2466,7 @@ mod tests {
         .expect("a genuine io_limit must build");
     }
 
-    // §19.2.2: the builder carries the init override and defaults to None. Buggy impl:
+    // §5.3 (The kernel command line): the builder carries the init override and defaults to None. Buggy impl:
     // the builder drops the field.
     #[test]
     fn builder_carries_init_override() {
@@ -2492,7 +2492,7 @@ mod tests {
         assert_eq!(custom.init, Some(PathBuf::from("/bin/sh")));
     }
 
-    // §19.2.2: `validate_init_path` rejects a relative path, whitespace, and control
+    // §5.3 (The kernel command line): `validate_init_path` rejects a relative path, whitespace, and control
     // chars (a space forges a second cmdline token); accepts a clean absolute path.
     #[test]
     fn init_path_validation() {
@@ -2511,7 +2511,7 @@ mod tests {
         }
     }
 
-    // §19.2.2: build() rejects snapshotting + a custom init (the post-restore resync
+    // §5.3 (The kernel command line): build() rejects snapshotting + a custom init (the post-restore resync
     // needs the agent a custom init replaces). Buggy impl: the combination builds and
     // a restored clone silently strands on frozen identity.
     #[test]
@@ -2544,7 +2544,7 @@ mod tests {
         .expect("a custom init without snapshotting must build");
     }
 
-    // §19.2.1: `is_reserved_cmdline_arg` flags every token vmcell owns (by exact key or
+    // §5.3 (The kernel command line): `is_reserved_cmdline_arg` flags every token vmcell owns (by exact key or
     // the vmcell_ prefix) and lets a genuine custom arg through. Buggy impl: a missing
     // reserved key lets an extra arg clobber a load-bearing token.
     #[test]
@@ -2580,7 +2580,7 @@ mod tests {
         }
     }
 
-    // §19.2.1: build() rejects an extra arg that clobbers a reserved token, spoofs a
+    // §5.3 (The kernel command line): build() rejects an extra arg that clobbers a reserved token, spoofs a
     // vmcell_ token, or carries whitespace; accepts a genuine custom arg.
     #[test]
     fn reject_bad_extra_kernel_arg() {
@@ -2621,7 +2621,7 @@ mod tests {
         assert_eq!(cfg.extra_kernel_args, vec!["mitigations=off", "nokaslr"]);
     }
 
-    // §19.2.2: the init override replaces the default `init=` token — exactly one
+    // §5.3 (The kernel command line): the init override replaces the default `init=` token — exactly one
     // `init=`, and `root=`/`vmcell_vmid=` stay intact. Buggy impls: appending a second
     // `init=` alongside the default (a clobber + boot hazard), or ignoring the override.
     #[test]
@@ -2668,7 +2668,7 @@ mod tests {
         );
     }
 
-    // §19.2.1: append-only args land AFTER every reserved token, in order. Buggy impl:
+    // §5.3 (The kernel command line): append-only args land AFTER every reserved token, in order. Buggy impl:
     // args spliced before the reserved block, or dropped.
     #[test]
     fn build_kernel_cmdline_appends_extra_args_last() {
@@ -2697,7 +2697,7 @@ mod tests {
         );
     }
 
-    // §19.2.1 the ONE-LAW GATE: every token `build_kernel_cmdline` emits has a reserved
+    // §5.3 (The kernel command line) the ONE-LAW GATE: every token `build_kernel_cmdline` emits has a reserved
     // key (or the vmcell_ prefix), so `is_reserved_cmdline_arg` — and hence the
     // append-only guard — can never fall out of sync with the builder. Add a new
     // builder token without reserving its key ⇒ this reddens.

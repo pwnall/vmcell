@@ -1,7 +1,7 @@
-//! Live (KVM) integration tests for interactive sessions (design 62 §22): PTY +
-//! controlling terminal + winsize (§12.29), streaming stdin (§22.2), multiplexed
-//! concurrent exec over one connection (§12.28), and connection-owns-its-sessions
-//! teardown (§12.27). Sessions ride the vsock agent only (no snapshot), so every
+//! Live (KVM) integration tests for interactive sessions (§3, The control plane: vsock, the host clients, and the guest agent): PTY +
+//! controlling terminal + winsize (§13, Cross-cutting invariants), streaming stdin (§3.3, Interactive-session wire semantics), multiplexed
+//! concurrent exec over one connection (§13, Cross-cutting invariants), and connection-owns-its-sessions
+//! teardown (§13, Cross-cutting invariants). Sessions ride the vsock agent only (no snapshot), so every
 //! case runs on **all three** backends via `vmm_matrix_test!` — no `require_cap!`
 //! skips. Every assertion is on the **data plane** (guest output / process
 //! residue), not a proxy signal (rubric A10).
@@ -46,7 +46,7 @@ async fn boot_and_connect<V: vmcell::vmm::Vmm>(
     (vm, mux)
 }
 
-// §12.29: a PTY session is a controlling-terminal session leader — `isatty()` true
+// §13 (Cross-cutting invariants): a PTY session is a controlling-terminal session leader — `isatty()` true
 // in-guest, the initial window installed, and a mid-session resize delivered
 // (SIGWINCH). A pipe session is the negative control (`not a tty`). Data-plane:
 // `test -t` / `stty size` output. RED if the PTY setup drops setsid/TIOCSCTTY (no
@@ -129,7 +129,7 @@ async fn session_pty_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     vm.shutdown().await.expect("shutdown");
 }
 
-// §22.2 / rubric A10: streaming stdin round-trips through a running command. `cat`
+// §3.3 (Interactive-session wire semantics) / rubric A10: streaming stdin round-trips through a running command. `cat`
 // echoes each streamed chunk; `close_stdin` (EOF) drives it to exit 0. RED if
 // stdin is not delivered (the one-shot path nails it to /dev/null) or EOF is lost.
 vmm_matrix_test!(session_streaming_stdin, |vmm| {
@@ -161,7 +161,7 @@ async fn session_stdin_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     vm.shutdown().await.expect("shutdown");
 }
 
-// §12.28: two sessions multiplexed over ONE connection. Each emits a large,
+// §13 (Cross-cutting invariants): two sessions multiplexed over ONE connection. Each emits a large,
 // self-identifying, window-filling stream; both must arrive intact with ZERO
 // cross-attribution and no torn frames. RED if the guest's single-writer discipline
 // is broken (interleaved frames corrupt) or the host demux ignores the id.
@@ -211,7 +211,7 @@ async fn session_mux_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     vm.shutdown().await.expect("shutdown");
 }
 
-// §12.27: a connection owns its sessions. A persistent `sleep` session's process
+// §13 (Cross-cutting invariants): a connection owns its sessions. A persistent `sleep` session's process
 // group is killed when the mux (connection) drops — the process is gone. Data-plane
 // residue: the pid existed (it echoed itself and was sleeping), then is gone
 // (its /proc cmdline no longer names `sleep`). RED if teardown does not kill.
@@ -250,7 +250,7 @@ async fn session_teardown_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .unwrap_or_else(|| panic!("could not parse pid from {text:?}"));
 
     // Drop the session AND the mux → the connection closes → the guest kills every
-    // still-open session's process group (§12.27).
+    // still-open session's process group (§13, Cross-cutting invariants).
     drop(persistent);
     drop(mux);
     // Let the guest observe EOF, kill the group, and reap.
@@ -274,7 +274,7 @@ async fn session_teardown_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let text = String::from_utf8_lossy(&outcome.stdout);
     assert!(
         !text.contains("sleep"),
-        "the persistent session's process group must be killed when its connection drops (§12.27); \
+        "the persistent session's process group must be killed when its connection drops (§13, Cross-cutting invariants); \
          pid {pid} still runs `sleep`: {text:?}"
     );
 

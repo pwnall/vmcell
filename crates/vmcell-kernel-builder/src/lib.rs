@@ -1,4 +1,4 @@
-//! In-VM guest-kernel builder (design §8.5).
+//! In-VM guest-kernel builder (design §5.4, The guest-kernel contract and the bootstrap seed).
 //!
 //! Where `vmcell`'s bootstrap kernel producers run on the host (`KernelStage` compiles
 //! with `make`, `PrebuiltKernelStage` downloads a pinned prebuilt), this crate compiles a
@@ -11,9 +11,9 @@
 //! into a `vmcell` [`vmcell::artifact::Pipeline`] in place of a bootstrap kernel stage. It
 //! depends on `vmcell` for VM lifecycle and reuses `vmcell`'s shared build utilities (the
 //! OCI builder-base packer, the `HttpClient` seam, the blake3 hash helpers); `vmcell` has no
-//! dependency on this crate (§10.1).
+//! dependency on this crate (§9.1, Workspace layout).
 //!
-//! ## The seed-kernel chicken-and-egg (§8.5)
+//! ## The seed-kernel chicken-and-egg (§5.4, The guest-kernel contract and the bootstrap seed)
 //! Booting the builder VM needs a *pre-existing* working `vmlinux` — the **seed** — which
 //! this stage reads from the `kernel` upstream artifact. That seed is produced by one of
 //! `vmcell`'s bootstrap kernel stages (a pinned prebuilt, or the host-`make` compile), so the
@@ -58,7 +58,7 @@ use vmcell::vmm::CidAllocator;
 use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
 use vmcell::{ExecOutcome, ExecRequest};
 
-/// A pipeline stage that compiles a `vmlinux` **inside a builder micro-VM** (§8.5).
+/// A pipeline stage that compiles a `vmlinux` **inside a builder micro-VM** (§5.4, The guest-kernel contract and the bootstrap seed).
 ///
 /// Produces the `kernel` artifact exactly like the bootstrap kernel stages, so downstream
 /// consumers cannot tell how it was built. Requires a seed kernel (the `kernel` upstream
@@ -71,14 +71,14 @@ pub struct InVmKernelStage {
     /// pin. A labelled stage builds `vmlinux-<label>` under a distinct cache + artifact key.
     pub label: Option<String>,
     /// Optional ordered set of named KConfig fragments layered onto the base config, resolved
-    /// from the `kernel_fragments` pins registry (§8.3). Canonicalized to sorted order so the
+    /// from the `kernel_fragments` pins registry (§5.2, The config fragment). Canonicalized to sorted order so the
     /// same set in any order hits the same cache.
     pub fragments: Option<Vec<String>>,
     /// CID allocator for the builder VM this stage boots.
     pub cid_alloc: Arc<CidAllocator>,
 }
 
-/// The fragment names, **sorted** and de-duplicated (§8.3): the on-disk `.config` append order
+/// The fragment names, **sorted** and de-duplicated (§5.2, The config fragment): the on-disk `.config` append order
 /// and the cache key are independent of the request order.
 fn sorted_fragments(fragments: &Option<Vec<String>>) -> Vec<String> {
     let mut names = fragments.clone().unwrap_or_default();
@@ -127,7 +127,7 @@ fn artifact_key(label: &Option<String>) -> String {
 /// The full concatenated KConfig text appended after `make defconfig kvm_guest.config`: the
 /// base `kernel_microvm_config` plus each requested fragment's text, in **sorted** order. A
 /// requested fragment missing from the pins registry is a hard error — never a silent skip
-/// that builds a kernel without the requested instrumentation (§8.3).
+/// that builds a kernel without the requested instrumentation (§5.2, The config fragment).
 ///
 /// # Errors
 /// [`Error::Artifact`] if a requested fragment name is absent from the pins.
@@ -151,7 +151,7 @@ fn kconfig_append(inputs: &StageInputs, fragments: &[String]) -> Result<String> 
 }
 
 /// The ordered guest command sequence that extracts the shared source, installs a toolchain,
-/// and compiles `vmlinux` (§8.5). Kept a **pure** function so the sequence is unit-testable
+/// and compiles `vmlinux` (§5.4, The guest-kernel contract and the bootstrap seed). Kept a **pure** function so the sequence is unit-testable
 /// without a VM. `nproc` is passed so the build parallelism is explicit/testable.
 ///
 /// The shared read-only source tarball is at `/vmcell-src/linux.tar.xz`, the KConfig append at
@@ -206,7 +206,7 @@ fn build_commands() -> Vec<(&'static str, Vec<String>, Duration)> {
         (
             "make vmlinux",
             sh("cd /build && make -j\"$(nproc)\" vmlinux"),
-            // A cold kernel build is long (a KASAN build can be ~45–90 min, §8.4); bound it
+            // A cold kernel build is long (a KASAN build can be ~45–90 min, §5.5, Kernel as a benchmark dimension); bound it
             // generously rather than fall through a timeout to a false success.
             Duration::from_secs(7200),
         ),
@@ -220,7 +220,7 @@ fn build_commands() -> Vec<(&'static str, Vec<String>, Duration)> {
 
 /// Turns a guest [`ExecOutcome`] into a fail-loud [`Result`]: a non-zero exit at any step is a
 /// hard [`Error::Artifact`] carrying the step name + stderr, never an "any-result → success"
-/// swallow (§8.5, AGENTS.md failure-handling).
+/// swallow (§5.4, The guest-kernel contract and the bootstrap seed, AGENTS.md failure-handling).
 ///
 /// # Errors
 /// [`Error::Artifact`] when `outcome.code != 0`.
@@ -279,7 +279,7 @@ impl Stage for InVmKernelStage {
                 .map(String::as_bytes)
                 .unwrap_or_default(),
         );
-        // Fold the fragment set (name + KConfig content) in SORTED order (§8.3): the same set
+        // Fold the fragment set (name + KConfig content) in SORTED order (§5.2, The config fragment): the same set
         // in any order hashes identically, and editing a fragment's text invalidates the key.
         let fragments = sorted_fragments(&self.fragments);
         hasher.update(SEP);
@@ -310,12 +310,12 @@ impl Stage for InVmKernelStage {
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
-        // The seed kernel that boots the builder VM (the chicken-and-egg, §8.5). Missing is a
+        // The seed kernel that boots the builder VM (the chicken-and-egg, §5.4, The guest-kernel contract and the bootstrap seed). Missing is a
         // hard error — never a boot from a fallback path.
         let seed_kernel = inputs.artifacts.get("kernel").cloned().ok_or_else(|| {
             Error::Artifact(
                 "in-VM kernel builder needs a seed `kernel` artifact to boot its builder VM \
-                 (produce one with the prebuilt or host-make bootstrap stage first, §8.5)"
+                 (produce one with the prebuilt or host-make bootstrap stage first, §8.5, Lineage: fork and branch)"
                     .into(),
             )
         })?;
@@ -377,7 +377,7 @@ impl Stage for InVmKernelStage {
         );
 
         // The builder VM boots on the PRIVILEGED network path with open egress so apt can
-        // install the toolchain (§8.5 / §16). This is a build-time developer/CI operation;
+        // install the toolchain (§5.4, The guest-kernel contract and the bootstrap seed / §16, Performance). This is a build-time developer/CI operation;
         // CAP_NET_ADMIN is acceptable there.
         let cfg = VmConfig::builder(
             seed_kernel,
@@ -394,7 +394,7 @@ impl Stage for InVmKernelStage {
 
         let vmm = CloudHypervisor::new(vmcell::artifact::ch_binary_path());
         // Bundle the builder's shared CID allocator with fresh (in-process) vmid +
-        // default cgroup/clock/overlay seams into one `HostEnv` (design §18 delta 1).
+        // default cgroup/clock/overlay seams into one `HostEnv` (design §18, Delta register: changes from the validated v27 build, delta 1).
         let mut env = vmcell::HostEnv::hermetic();
         env.cids = self.cid_alloc.clone();
         let mut vm = MicroVm::start(&vmm, cfg, &env).await?;
@@ -500,7 +500,7 @@ mod tests {
         assert!(check_step("make vmlinux", &ok).is_ok());
     }
 
-    // §8.3: requesting a fragment absent from the pins is a hard error, not a silent skip that
+    // §5.2 (The config fragment): requesting a fragment absent from the pins is a hard error, not a silent skip that
     // builds an uninstrumented kernel.
     #[test]
     fn test_kconfig_append_missing_fragment_errors() {
@@ -508,7 +508,7 @@ mod tests {
         assert!(matches!(res, Err(Error::Artifact(_))));
     }
 
-    // §8.3: the append text folds the base config + each fragment's KConfig content.
+    // §5.2 (The config fragment): the append text folds the base config + each fragment's KConfig content.
     #[test]
     fn test_kconfig_append_includes_base_and_fragments() {
         let text = kconfig_append(&inputs(), &["KASAN".to_string()]).expect("append");
@@ -516,7 +516,7 @@ mod tests {
         assert!(text.contains("CONFIG_KASAN=y"));
     }
 
-    // §8.3: the fragment set is content-addressed by its SORTED form — the same set in any
+    // §5.2 (The config fragment): the fragment set is content-addressed by its SORTED form — the same set in any
     // order hits the same cache key; the inverse (request-order folding) would differ.
     #[test]
     fn test_cache_key_fragment_order_invariant() {

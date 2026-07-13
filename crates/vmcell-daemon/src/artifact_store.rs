@@ -1,8 +1,8 @@
-//! The daemon's flat artifact store: **create / list / delete; no update** (design §18.3).
+//! The daemon's flat artifact store: **create / list / delete; no update** (design §11.3, The artifact store).
 //!
 //! Not the `vmcell` artifact *pipeline* (which builds kernels/rootfs) — a content store the VM APIs
 //! draw their `kernel`/`rootfs` inputs from. Every name goes through [`resolve_artifact_path`]
-//! (invariant §12.13); no method constructs `dir.join(name)` itself. Create is atomic (temp file +
+//! (invariant §13, Cross-cutting invariants); no method constructs `dir.join(name)` itself. Create is atomic (temp file +
 //! no-clobber rename) so a truncated upload never leaves a half-written artifact a later boot reads;
 //! create over an existing name is rejected (the "no update" guard), never a silent overwrite.
 
@@ -39,7 +39,7 @@ impl ArtifactStore {
         &self.dir
     }
 
-    /// Resolves a name to its on-disk path (the single validated join, invariant §12.13).
+    /// Resolves a name to its on-disk path (the single validated join, invariant §13, Cross-cutting invariants).
     ///
     /// # Errors
     /// Returns [`DaemonError::InvalidName`] if the name is not a safe single component.
@@ -105,7 +105,7 @@ impl ArtifactStore {
         })?;
         // Compute the digest ONCE, at upload, and persist it in a `<name>.sha256` sidecar so
         // `list`/`info` read it back in O(1) instead of re-hashing the whole body (delta 10,
-        // §11.3). The sidecar path is derived from the already-validated `path`, never from client
+        // §11.3, The artifact store). The sidecar path is derived from the already-validated `path`, never from client
         // input, so it stays anchored inside the artifacts dir.
         let digest = hex_sha256(bytes);
         write_sidecar(&path, &digest)?;
@@ -165,7 +165,7 @@ impl ArtifactStore {
     }
 
     /// Deletes an artifact. (The "is it pinned by a live VM?" check is the caller's — the handler
-    /// consults the registry before calling this, design §18.3.2.)
+    /// consults the registry before calling this, design §11.3.2, The artifact store.)
     ///
     /// # Errors
     /// [`DaemonError::InvalidName`] / [`DaemonError::NotFound`] / [`DaemonError::Internal`].
@@ -183,7 +183,7 @@ impl ArtifactStore {
     }
 }
 
-/// The reserved suffix for digest sidecars (delta 10, §11.3). `<artifact>.sha256` holds the hex
+/// The reserved suffix for digest sidecars (delta 10, §11.3, The artifact store). `<artifact>.sha256` holds the hex
 /// SHA-256 computed once at upload so `list`/`info` read it back in O(1) instead of re-hashing the
 /// whole body on every call. A client cannot create an artifact whose name ends in this suffix (it
 /// would shadow a real artifact's sidecar and vanish from `list`).
@@ -192,7 +192,7 @@ const SHA256_SIDECAR_SUFFIX: &str = ".sha256";
 /// The sidecar path for an artifact, derived by **appending** the suffix to the already-validated,
 /// dir-anchored artifact path. `with_extension` would REPLACE (`rootfs.erofs` -> `rootfs.sha256`)
 /// and collide across artifacts, so append. Anchored on trusted data (the resolved path), never on
-/// client input (invariant §12.13).
+/// client input (invariant §13, Cross-cutting invariants).
 fn sidecar_path(artifact_path: &Path) -> PathBuf {
     let mut s = artifact_path.as_os_str().to_owned();
     s.push(SHA256_SIDECAR_SUFFIX);

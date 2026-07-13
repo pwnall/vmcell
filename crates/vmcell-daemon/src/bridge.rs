@@ -1,4 +1,4 @@
-//! The setup-broker bridge — the privilege-separated `vmcelld` cutover (design §20.5 / §12.23).
+//! The setup-broker bridge — the privilege-separated `vmcelld` cutover (design §12.4, Layer 3 — the setup broker (network surface never holds caps)).
 //!
 //! `setns(CLONE_NEWNET)` needs `CAP_SYS_ADMIN` in the netns's owning user namespace, so an
 //! unprivileged process can never perform the privileged VM operations (netns/tap/nft/cgroup +
@@ -6,7 +6,7 @@
 //! and **owns the [`Registry`]**, and drops **all** caps in the **parent** that serves the
 //! network-facing HTTP API. The parent forwards every VM operation to the broker over a framed,
 //! multiplexed RPC on the `socketpair`; a bug in the HTTP request parser can no longer reach the
-//! caps, and the cap-holder never parses attacker-controlled network input (§12.23).
+//! caps, and the cap-holder never parses attacker-controlled network input (§12.4, Layer 3 — the setup broker (network surface never holds caps)).
 //!
 //! Artifact CRUD is **not** here: it is unprivileged file I/O under `--artifacts-dir` (same uid),
 //! so the parent does it directly against its own [`ArtifactStore`](crate::artifact_store::ArtifactStore); only the delete-in-use guard

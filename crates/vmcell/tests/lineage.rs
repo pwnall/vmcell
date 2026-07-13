@@ -1,17 +1,18 @@
-//! fork()/branch() lineage integration test (§21.4).
+//! fork()/branch() lineage integration test (§8.5, Lineage: fork and branch).
 //!
 //! Boots one VM to agent-ready, roots a [`Lineage`] by suspending it, then
 //! exercises the fork/branch handle on real micro-VMs and asserts on the **data
 //! plane** (exec output), not proxy signals:
 //!
 //! - `Lineage::fork` mints a live child (a CoW clone materialized through the
-//!   injected `OverlayStore` seam, §12.24); it execs correctly and gets a distinct
-//!   vmid / `mac_math(vmid)` identity (§9.2).
+//!   injected `OverlayStore` seam, §13, Cross-cutting invariants); it execs
+//!   correctly and gets a distinct vmid / `mac_math(vmid)` identity (§8.2,
+//!   Restore correctness: a restored VM is not a fresh VM).
 //! - `Lineage::branch` freezes a **diverged** running child (one that wrote a
 //!   marker file into its tmpfs) into a new node; a fork from that node **sees the
 //!   marker** while a fork from the root does **not** — proving branch captured the
 //!   child's current state, and that the lineage is a real tree of provenance
-//!   (§12.25), not a flat re-clone of the original.
+//!   (§13, Cross-cutting invariants), not a flat re-clone of the original.
 //!
 //! `#[ignore = "needs KVM"]` via `vmm_matrix_test!`; skips backends without
 //! `snapshot_restore` visibly (H-TEST-3), never silently. Every fork here is a
@@ -42,7 +43,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
 
     let kernel = common::get_vmlinux();
     let rootfs = common::get_rootfs();
-    // Snapshot-eligible base: erofs rootfs, privileged tap net, no vhost-user (§12.1).
+    // Snapshot-eligible base: erofs rootfs, privileged tap net, no vhost-user (§13, Cross-cutting invariants).
     let base_cfg = || {
         let mut cfg = VmConfig::builder(
             kernel.clone(),
@@ -112,7 +113,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     );
 
     // 3. branch() the DIVERGED child into a new node b1 (child stays live). Assert
-    //    the lineage metadata (§12.25).
+    //    the lineage metadata (§13, Cross-cutting invariants).
     let b1 = root
         .branch(&mut child, &b1_dir)
         .await
@@ -136,7 +137,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     //    state); a fork from the ROOT does NOT (root is the pre-divergence image).
     //    Kept SEQUENTIAL (each fork torn down before the next) so the chain also
     //    holds on the verbatim-rebind (FC) tier, where two live restores from one
-    //    baked-path lineage would collide (§9.4) — the single-lineage shape.
+    //    baked-path lineage would collide (§8.4, The zygote fan-out and the OverlayStore seam) — the single-lineage shape.
     let mut from_branch = fork_one(&b1, vmm, &env, "b1-child").await;
     let seen = exec(&mut from_branch, &["cat", "/tmp/marker"]).await;
     assert_eq!(

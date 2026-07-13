@@ -21,7 +21,8 @@ pub struct ResourceUsage {
     /// Whether the `memory` controller is delegated into this cgroup — the honest
     /// proxy for "the hard memory cap took effect", **not** a guarantee that every
     /// requested limit (cpu/pids/io) is enforced (M-HOST-5). Renamed from the former
-    /// `limits_enforced` (design §18 delta 3): the old name over-claimed a
+    /// `limits_enforced` (design §18, Delta register: changes from the validated v27
+    /// build, delta 3): the old name over-claimed a
     /// whole-`ResourceLimits` guarantee, but a read that holds only the cgroup *name*
     /// cannot know which controllers were requested, so it reports the **one** — the
     /// memory controller — whose silent absence lets the memory cap not fire; a caller
@@ -30,30 +31,33 @@ pub struct ResourceUsage {
     /// `true` only when the `memory` controller is delegated into this cgroup
     /// (`cgroup.controllers` lists it), meaning the limit writes took effect.
     /// `false` when no controller is delegated — reads then fall back to bare
-    /// sysfs values and the caller must not assume enforcement (§7.1 rule 3).
+    /// sysfs values and the caller must not assume enforcement (§7.2, The fail-loud
+    /// capability contract and HostCapabilities, rule 3).
     /// A `ResourceUsage::default()` (no cgroup attached) is honestly `false`.
     ///
     /// Network byte counters are intentionally absent: cgroup v2 has no network
     /// accounting and the read path holds only the cgroup name, not the VM's
     /// netns/interface handle, so an always-zero `net_*` field would be a lie
-    /// (§7.1 / rubric B8). See the "Net counters omitted from `ResourceUsage`"
+    /// (§7.1, What is read and enforced / rubric B8). See the "Net counters omitted
+    /// from `ResourceUsage`"
     /// deviation in `docs/implementation-notes.md`.
     pub mem_limit_enforced: bool,
     /// Whether the memory counters (`mem_current_mib`, `mem_peak_mib`) were read
-    /// and parsed successfully (§7.1 rule 3: an unread counter is the same lie as a
-    /// missing one). `false` when `memory.current`/`memory.peak` are absent or fail
+    /// and parsed successfully (§7.1, What is read and enforced, rule 3: an unread
+    /// counter is the same lie as a missing one). `false` when
+    /// `memory.current`/`memory.peak` are absent or fail
     /// to parse, so the caller can tell a real `0` from an unreadable counter. A
     /// `ResourceUsage::default()` is honestly `false`.
     pub mem_read_ok: bool,
     /// Whether the CPU counter (`cpu_usec`) was read and parsed successfully.
     /// `false` when `cpu.stat` is absent or lacks a parseable `usage_usec` line,
-    /// distinguishing a real `0` from an unreadable counter (§7.1 rule 3). A
-    /// `ResourceUsage::default()` is honestly `false`.
+    /// distinguishing a real `0` from an unreadable counter (§7.1, What is read and
+    /// enforced, rule 3). A `ResourceUsage::default()` is honestly `false`.
     pub cpu_read_ok: bool,
     /// Whether the I/O byte counters (`io_read_bytes`, `io_write_bytes`) were read
     /// successfully. `false` when `io.stat` is absent, distinguishing a real `0`
-    /// from an unreadable counter (§7.1 rule 3). A `ResourceUsage::default()` is
-    /// honestly `false`.
+    /// from an unreadable counter (§7.1, What is read and enforced, rule 3). A
+    /// `ResourceUsage::default()` is honestly `false`.
     pub io_read_ok: bool,
 }
 
@@ -84,7 +88,8 @@ pub trait CgroupFs: Send + Sync + std::fmt::Debug {
 /// Parses `/proc/self/cgroup` contents into the base (unified, v2) cgroup path the
 /// per-VM slice is created *under*, stripping the supervisor's own `/supervisor`
 /// leaf so the VM slice becomes a **sibling** of the supervisor, not a child
-/// (§12.7 "no internal processes"). Returns `None` when there is no `0::` unified
+/// (§13, Cross-cutting invariants, "no internal processes"). Returns `None` when
+/// there is no `0::` unified
 /// entry or the resulting base is empty.
 ///
 /// This is the single home for the derivation (AGENTS.md: "cgroup logic lives in
@@ -165,7 +170,8 @@ fn controller_listed(listing: &str, controller: &str) -> bool {
 /// malformed `io.max` device) — a caller bug that must surface as
 /// [`crate::error::Error::Cgroup`] so its remediation is "fix the limit", not
 /// "enable delegation". Every other errno (`EACCES`/`EPERM`/`EROFS`, or anything
-/// unexpected) is treated as the §7.1 capability/permission failure and stays
+/// unexpected) is treated as the §7.2 (The fail-loud capability contract and
+/// HostCapabilities) capability/permission failure and stays
 /// [`crate::error::Error::CapabilityUnavailable`]. Kept pure so the errno split is
 /// unit-testable without provoking a real `EINVAL` from the filesystem (M-HOST-4).
 fn classify_limit_write_err(
@@ -189,13 +195,15 @@ fn classify_limit_write_err(
 }
 
 /// Applies a single *requested functional* cgroup limit under `cgroup_root`, failing
-/// loud per the §7.1 capability contract: confirm `controller` is delegated on the
+/// loud per the §7.2 (The fail-loud capability contract and HostCapabilities): confirm
+/// `controller` is delegated on the
 /// parent's `subtree_control` (enabling it there first if absent), then write `value`.
 /// A requested limit that cannot be enforced — because the controller is not
 /// delegated, or the control file rejects the write — returns
 /// [`crate::error::Error::CapabilityUnavailable`] rather than logging a warning and
 /// skipping it (which would hand back a VM running unbounded). This is *not*
-/// best-effort; only the explicitly-listed §7.1 benchmark knobs (cpufreq/KSM) may
+/// best-effort; only the explicitly-listed §7.2 (The fail-loud capability contract and
+/// HostCapabilities) benchmark knobs (cpufreq/KSM) may
 /// degrade with a `warn!`.
 ///
 /// `cgroup_root` is injected (default `/sys/fs/cgroup`) so the write path is
@@ -288,7 +296,7 @@ fn parse_cpu_usage_usec(contents: &str) -> Option<u64> {
 
 /// Reads a [`ResourceUsage`] snapshot from a cgroup-v2 directory at `base_path`,
 /// surfacing per-metric availability so the caller can tell a real `0` from an
-/// unreadable counter (§7.1 rule 3: "an unread counter is the same lie as a missing
+/// unreadable counter (§7.1, What is read and enforced, rule 3: "an unread counter is the same lie as a missing
 /// one"). Reads are best-effort: an absent or unparseable control file leaves the
 /// corresponding value at `0` and its `*_read_ok` flag `false`. Factored out of
 /// [`DefaultCgroupFs::read_stats`] so the availability contract is unit-testable
@@ -337,7 +345,7 @@ fn read_stats_at(base_path: &str) -> ResourceUsage {
         usage.cpu_read_ok = true;
     }
 
-    // mem_limit_enforced (§7.1 rule 3): the memory controller is delegated into this
+    // mem_limit_enforced (§7.1, What is read and enforced, rule 3): the memory controller is delegated into this
     // cgroup iff it is listed in `cgroup.controllers`. When it is absent the limit
     // writes were rejected and the values above are bare sysfs fallbacks, so the
     // caller must not assume enforcement. Honestly `false` if the file is missing.
@@ -493,7 +501,8 @@ struct FakeCgroupState {
     pub slices: std::collections::HashMap<String, crate::config::ResourceLimits>,
     pub tasks: std::collections::HashMap<String, Vec<u32>>,
     /// Cgroup controllers modelled as delegated to the slice. A requested limit
-    /// whose controller is absent here must fail loud (§7.1), mirroring the real
+    /// whose controller is absent here must fail loud (§7.2, The fail-loud capability
+    /// contract and HostCapabilities), mirroring the real
     /// `DefaultCgroupFs` `subtree_control` check.
     pub delegated: std::collections::HashSet<String>,
 }
@@ -526,7 +535,8 @@ impl FakeCgroupFs {
     /// Models a controller that is **not** delegated into the slice, so a requested
     /// limit needing it must fail loud with
     /// [`crate::error::Error::CapabilityUnavailable`] instead of a silent `Ok`
-    /// (§7.1). Drives the fail-loud unit test.
+    /// (§7.2, The fail-loud capability contract and HostCapabilities). Drives the
+    /// fail-loud unit test.
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned.
@@ -566,7 +576,8 @@ impl FakeCgroupFs {
 impl CgroupFs for FakeCgroupFs {
     fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        // Model the §7.1 fail-loud contract: a requested limit whose controller is
+        // Model the §7.2 (The fail-loud capability contract and HostCapabilities)
+        // fail-loud contract: a requested limit whose controller is
         // not delegated cannot be enforced, so return CapabilityUnavailable and do
         // NOT record the slice as created (a silent `Ok` here is the exact bug).
         for (requested, controller, file) in [
@@ -771,7 +782,8 @@ mod tests {
         assert!(!controller_listed("", "memory"));
     }
 
-    // H-FAILLOUD-1 (§7.1 rule 2): a *requested* limit whose controller is not
+    // H-FAILLOUD-1 (§7.2, The fail-loud capability contract and HostCapabilities,
+    // rule 2): a *requested* limit whose controller is not
     // delegated must fail loud with a matchable CapabilityUnavailable and must NOT
     // be recorded as created. Goes red on the old `Ok(())`-unconditional create_slice.
     #[test]
@@ -813,7 +825,7 @@ mod tests {
         assert!(fs.has_slice("vmcell-vm-1"));
     }
 
-    // §7.1 rule 3: when no control files exist, every per-metric availability flag
+    // §7.1 (What is read and enforced) rule 3: when no control files exist, every per-metric availability flag
     // must be `false` so a caller can distinguish an unreadable counter from a real 0
     // ("an unread counter is the same lie as a missing one"). Goes red on an impl that
     // hardcodes the flags true or never sets them off the always-zero values.
@@ -1004,7 +1016,8 @@ mod tests {
 
     // M-HOST-4 part B: a limit write rejected for a bad VALUE (EINVAL — e.g. a
     // `cpu.max` quota below the kernel floor) is a caller bug that must map to
-    // `Error::Cgroup`, while a permission/read-only failure keeps the §7.1
+    // `Error::Cgroup`, while a permission/read-only failure keeps the §7.2 (The
+    // fail-loud capability contract and HostCapabilities)
     // `CapabilityUnavailable` remediation. Goes RED on the old "every write error →
     // CapabilityUnavailable" mapping (EINVAL would then match CapabilityUnavailable).
     #[test]

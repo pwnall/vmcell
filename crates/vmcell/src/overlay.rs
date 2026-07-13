@@ -1,7 +1,7 @@
 //! The `OverlayStore` seam: how a suspend/snapshot directory is copy-on-write
-//! cloned into a clone's own private copy (§21.2).
+//! cloned into a clone's own private copy (§8.4, The zygote fan-out and the OverlayStore seam).
 //!
-//! The zygote fan-out (§9.4) and fork/branch lineage (§21.4) mint clones by
+//! The zygote fan-out (§8.4, The zygote fan-out and the OverlayStore seam) and fork/branch lineage (§8.5, Lineage: fork and branch) mint clones by
 //! copy-on-write-copying a suspend directory and restoring each private copy.
 //! That copy is the one clone-materialization step, and this module makes it an
 //! **injectable seam** — a trait with a production implementation and a recording
@@ -13,7 +13,7 @@
 //!
 //! **Scope: the suspend directory, not a rootfs disk.** A snapshot-eligible VM has
 //! a shared erofs read-only rootfs base (no per-VM copy) plus a fresh in-guest
-//! tmpfs overlay (§5.1); the only per-clone writable host state is the suspend
+//! tmpfs overlay (§4.1, The erofs read-only base + tmpfs overlay); the only per-clone writable host state is the suspend
 //! directory (the guest-RAM memory file + the backend's `config.json`/sidecar). So
 //! this seam is scoped precisely to CoW-cloning **that** directory. It deliberately
 //! does not reach into per-backend block-device attachment.
@@ -26,9 +26,9 @@ use std::path::Path;
 /// private, independent copy.
 ///
 /// The one seam every copy-on-write restore path materializes a clone through
-/// (§12.24). Implementors clone a directory tree such that the copy is a faithful,
+/// (§13, Cross-cutting invariants). Implementors clone a directory tree such that the copy is a faithful,
 /// **independent** copy — writing the copy never touches the source (the master),
-/// which is the §12.12 immutability contract — and report whether the copy was a
+/// which is the §13 (Cross-cutting invariants) immutability contract — and report whether the copy was a
 /// cheap block-level reflink or a full byte copy ([`CowSupport`]).
 ///
 /// The methods are **synchronous** so the trait is object-safe as
@@ -78,7 +78,7 @@ impl OverlayStore for ReflinkOverlayStore {
 /// A recording [`OverlayStore`] test double: records every `(src, dst)` it is asked
 /// to clone and returns a configurable [`CowSupport`], so a test can prove a
 /// restore path materializes each clone through the seam into a **private** `dst`
-/// (never the master) with no reflink filesystem and no VMM (§12.24).
+/// (never the master) with no reflink filesystem and no VMM (§13, Cross-cutting invariants).
 ///
 /// Not part of the public API (crate-visible under `cfg(test)` only), matching the
 /// recording-double convention used for the other seams.
@@ -142,7 +142,7 @@ mod tests {
     use super::*;
 
     // The production store makes a FAITHFUL, INDEPENDENT copy: writing the clone
-    // must not mutate the master (the §12.12 immutability contract routed through
+    // must not mutate the master (the §13 (Cross-cutting invariants) immutability contract routed through
     // the seam). The inverse — a store that hardlinks/shares the inode — reddens
     // because mutating the clone changes the master's bytes.
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(
             std::fs::read(master.join("config.json")).expect("read master cfg"),
             b"{\"vsock\":1}",
-            "writing the clone must not mutate the master (§12.12), even through the seam"
+            "writing the clone must not mutate the master (§13, Cross-cutting invariants), even through the seam"
         );
     }
 

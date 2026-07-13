@@ -1,15 +1,15 @@
-//! Jailer-equivalent: pre-exec hardening applied to the VMM child (design §20.4,
-//! invariant §12.22).
+//! Jailer-equivalent: pre-exec hardening applied to the VMM child (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail),
+//! invariant §13, Cross-cutting invariants).
 //!
 //! Firecracker's `jailer` is a privileged pre-exec wrapper (cgroup + netns + chroot +
 //! uid-drop, then `execve`), and Firecracker itself installs `PR_SET_NO_NEW_PRIVS` +
-//! seccomp **after** exec. vmcell already owns the netns + cgroup setup (§6.4); this module
+//! seccomp **after** exec. vmcell already owns the netns + cgroup setup (§6.1, The two operating modes); this module
 //! adds the rest — the hardening applied to the forked VMM child in the existing
 //! `build_vmm_cmd` `pre_exec` window (where the netns `setns` already happens), plus the
 //! `no_new_privs` + optional seccomp the VMM would otherwise do for itself (belt-and-braces,
 //! since we cannot audit every backend's self-hardening).
 //!
-//! The split mirrors `plan_privilege_transition`/`apply_privilege_transition` (§18.2): a
+//! The split mirrors `plan_privilege_transition`/`apply_privilege_transition` (§11.2, Privilege and blessing): a
 //! pure [`JailSpec`](crate::vmm::jail::JailSpec) compiled from the serializable
 //! [`JailConfig`](crate::config::JailConfig), and one thin, **async-signal-safe**
 //! [`apply_jail`](crate::vmm::jail::apply_jail) edge — the only impure part, and the one that runs
@@ -19,7 +19,7 @@
 //! (allocating, pre-`fork`) so the apply edge only *loads* it.
 //!
 //! One law, two callers: `apply_jail` is invoked from the in-process spawn (`build_vmm_cmd`)
-//! and from the setup broker's `SpawnVmm` (§20.5), never a second copy.
+//! and from the setup broker's `SpawnVmm` (§12.4, Layer 3 — the setup broker (network surface never holds caps)), never a second copy.
 
 use crate::config::JailConfig;
 use crate::error::{Error, Result};
@@ -27,7 +27,7 @@ use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The coarse, default-allow seccomp **deny-list** (design §20.4): syscalls a booting VMM
+/// The coarse, default-allow seccomp **deny-list** (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): syscalls a booting VMM
 /// never needs and an escape would want. A default-allow deny-list cannot break the VMM
 /// unless it legitimately needs one of these *dangerous* syscalls (it does not), which is
 /// why it is far safer to ship than a default-deny allow-list. Each `→ EPERM`.
@@ -59,7 +59,7 @@ pub const DENIED_SYSCALLS: &[(&str, i64)] = &[
     ("swapoff", libc::SYS_swapoff),
 ];
 
-/// Builds the coarse VMM deny-list BPF program with seccompiler (design §20.6 — the
+/// Builds the coarse VMM deny-list BPF program with seccompiler (design §12.5, The licensing constraint on seccomp crates — the
 /// rust-vmm library CH/FC use, `Apache-2.0 OR BSD-3-Clause`, no C linkage). Default action
 /// is **Allow** (a mismatch, i.e. any syscall not in [`DENIED_SYSCALLS`], is permitted); a
 /// match returns `EPERM`. Built pre-`fork` (allocation is fine here); the async-signal-safe
@@ -184,7 +184,7 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Resul
 }
 
 /// Applies `spec` to the calling thread in the forked child, **pre-exec** — the only impure,
-/// async-signal-safe edge (design §20.4 / §12.22).
+/// async-signal-safe edge (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail) / §13, Cross-cutting invariants).
 ///
 /// Order is load-bearing: rlimits → non-dumpable → clear-ambient → no-new-privs → seccomp.
 /// `seccomp(SECCOMP_SET_MODE_FILTER)` requires `no_new_privs` first (seccompiler's
@@ -246,9 +246,9 @@ pub fn apply_jail(spec: &JailSpec) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    // Guards §12.22 / §20.4: the shipped deny-list is EXACTLY the documented set, and compiles
+    // Guards §13 (Cross-cutting invariants) / §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): the shipped deny-list is EXACTLY the documented set, and compiles
     // to a non-empty BPF program. Pinned as an exact membership so the filter cannot silently
-    // drift from design §20.4 in either direction — dropping a syscall (e.g. `kexec_file_load`,
+    // drift from design §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)) in either direction — dropping a syscall (e.g. `kexec_file_load`,
     // the file-based kexec variant that stays reachable if only `kexec_load` is blocked) OR
     // adding an undocumented one reddens here. The behavioral "mount → EPERM" proof is the
     // KVM-free stand-in integration test (tests/jail_hardening.rs).
@@ -282,7 +282,7 @@ mod tests {
         let actual: BTreeSet<&str> = DENIED_SYSCALLS.iter().map(|&(n, _)| n).collect();
         assert_eq!(
             actual, expected,
-            "the VMM deny-list must exactly match design §20.4 (guarded both directions)"
+            "the VMM deny-list must exactly match design §12.3 (Layer 2 — the jailer-equivalent), guarded both directions"
         );
         let bpf = build_vmm_deny_filter().expect("deny-list must compile on this arch");
         assert!(
@@ -291,7 +291,7 @@ mod tests {
         );
     }
 
-    // Guards §12.22: `jail_spec_from_config` maps every flag through, and only builds a
+    // Guards §13 (Cross-cutting invariants): `jail_spec_from_config` maps every flag through, and only builds a
     // filter when the deny-list is requested. Inverse: a mapping that dropped `non_dumpable`
     // or built a filter unconditionally reddens.
     #[test]
@@ -301,13 +301,13 @@ mod tests {
         assert!(
             !hardened.clear_ambient_caps,
             "clear_ambient_caps is opt-in (default off): the VMM needs its inherited CAP_NET_ADMIN \
-             for privileged tap ops on restore (§20.9, validated on a KVM host)"
+             for privileged tap ops on restore (§17, Open gaps and future capabilities; validated on a KVM host)"
         );
         assert!(hardened.non_dumpable);
         assert_eq!(hardened.rlimit_core, Some(0));
         assert!(
             hardened.seccomp.is_none(),
-            "the deny-list is opt-in; the hardened default must NOT carry a filter (§20.4)"
+            "the deny-list is opt-in; the hardened default must NOT carry a filter (§12.3, Layer 2 — the jailer-equivalent)"
         );
         assert!(!hardened.is_noop());
 

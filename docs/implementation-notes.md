@@ -19,13 +19,13 @@ follow-up, the `docs/45` investigation, and the `docs/46` review-fix pass):
   subprocess execs;
 - the tunable **`KernelVerbosity` / `ConsoleMode` / `Timeouts`** knobs and the shared `build_kernel_cmdline`
   builder, the **event-driven `poll(2)` guest accept loop**, and the **adaptive shutdown-grace poll**;
-- the `docs/46` recorded gaps now documented in the body/§16: `Egress::Open` has no arbitrary egress, the
+- the `docs/46` recorded gaps now documented in the body/§17 (Open gaps and future capabilities): `Egress::Open` has no arbitrary egress, the
   privileged `host_services_port` is rejected fail-loud, the `mkfs.erofs` fallback is unwired, the proxy CA
   is per-artifacts-dir, the mmdebstrap keyring is the base-image's, `limits_enforced` means "memory
   controller delegated", the snapshot cache key folds the pinned CH identity, and the carried `vhost`
   patch is vendored in-tree.
 
-See design §12 ("Cross-cutting invariants") for the rules and §16 ("Open decisions and known gaps") for
+See design §13 (Cross-cutting invariants) ("Cross-cutting invariants") for the rules and §17 (Open gaps and future capabilities) ("Open decisions and known gaps") for
 what remains forward work.
 
 ## v20 — builder extraction (rootfs + kernel in-VM builders out of `vmcell`)
@@ -40,31 +40,31 @@ what remains forward work.
   validated: a **Kata Containers** prebuilt `vmlinux.container` (Linux 6.18.35, from
   `kata-static-3.32.0-amd64.tar.zst`) boots under Cloud Hypervisor to PID 1 + overlay; a Firecracker CI
   microVM kernel omits `CONFIG_EROFS_FS`/`FUSE_FS` and panics `VFS: Unable to mount root fs`. Host-`make`
-  `KernelStage` is the guaranteed fallback seed. See design §8.3, §8.5, §16.
+  `KernelStage` is the guaranteed fallback seed. See design §5.2 (The config fragment), §5.4 (The guest-kernel contract and the bootstrap seed), §17 (Open gaps and future capabilities).
 
 - **(b) In-VM `mmdebstrap` rootfs source un-deferred, moved to `vmcell-rootfs-builder`, on the privileged
   network path.** v19 recorded this source as "library-present but deferred". It is now wired and lives in a
   **new crate**. *Reason:* `mmdebstrap` + apt need **real outbound egress**, which only the privileged/tap
   path with `Egress::Open` provides. Extraction keeps the heavy in-VM machinery out of the library while
   reusing `vmcell`'s `resolve_builder_base` and the shared `pack_erofs_with_injection` tail (every rootfs
-  source is identically injected, §5.4). Selected via `vmcell-cli --rootfs-source mmdebstrap`. §8.2, §10.1, §16.
+  source is identically injected, §4.3 — The rootfs-construction contract). Selected via `vmcell-cli --rootfs-source mmdebstrap`. §4.2 (Rootfs sources and the one packer), §9.1 (Workspace layout), §17 (Open gaps and future capabilities).
 
 - **(c) CLI moved out of the `vmcell` package into a new `vmcell-cli` composition-root crate.** *Reason:* the
   builder crates depend on `vmcell`; a CLI *inside* `vmcell` referencing them would form a
   `vmcell → builder → vmcell` **cycle**. `vmcell-cli` depends on `vmcell` + both builders and is the only
   crate that names a builder, keeping the graph a directed acyclic star. Drove the `vmcell` **0.4.0 → 0.5.0**
-  bump. See §10.1, §11, §16.
+  bump. See §9.1 (Workspace layout), §10 (The artifact build pipeline), §17 (Open gaps and future capabilities).
 
 - **(d) `hash_*` / `ch_binary_path` / `resolve_builder_base` / `pack_erofs_with_injection` /
   `fold_rootfs_injection_identity` promoted to `pub` so the builder crates reuse one implementation.** The
   extracted builders must reuse the **exact** erofs inject+pack tail, injected-content identity fold,
   builder-base resolution, CH binary discovery, HTTP client, and content-hash functions — duplicating any is
   where per-builder divergence bugs hide. Exposing one implementation via `pub` makes the reuse structural.
-  Other half of the 0.5.0 bump. See §5.4, §10.1.
+  Other half of the 0.5.0 bump. See §4.3 (The rootfs-construction contract), §9.1 (Workspace layout).
 
 ## v21 — control-plane daemon (`vmcelld`) + client
 
-Design: `docs/59-claude-design-v23.md` §18 (unified; was `docs/historical/53-claude-design-v21.md`). New
+Design: `docs/59-claude-design-v23.md` §11 (The control-plane daemon — vmcelld) (unified; was `docs/historical/53-claude-design-v21.md`). New
 crates: `vmcell-privilege`, `vmcell-daemon`, `vmcelld`, `vmcell-daemon-client`, `vmcelld-ctl`. Fold the
 settled entries into the design body and delete them here as they stabilize.
 
@@ -73,33 +73,33 @@ settled entries into the design body and delete them here as they stabilize.
   needed a new vmcell detach/reattach primitive AND abandoned the "`Drop` releases resources" invariant.
   The owning model reuses the single-process `MicroVm` ownership in-process, needs **no** vmcell change,
   and keeps teardown-is-ownership intact; crash recovery is the **start-up `sweep_orphans`** (empty live
-  set) instead of reattach. See §18.4.
+  set) instead of reattach. See §11.4 (The VM registry and the start-up sweep).
 
 - **(b) `vmcelld` is NOT blessed on the dev hot path — it is launched through the blessed
   `vmcell-test-runner`, which confers the caps via the ambient set.** `just bless` blesses only the runner
   (which rarely changes); `vmcell-daemon`/`vmcelld` rebuild with no `setcap` churn. *Reason:* the same
   file-cap-churn problem the runner already solved for the ever-changing test binaries. Standalone/prod
-  `vmcelld` uses systemd `AmbientCapabilities=` or a one-off `setcap`. See §18.2.
+  `vmcelld` uses systemd `AmbientCapabilities=` or a one-off `setcap`. See §11.2 (Privilege and blessing).
 
 - **(c) INVERTED launch for integration vs. manual.** Integration tests wrap the **test binary** with the
   runner (nextest target-runner) so the test itself holds the caps, and spawn `vmcelld` **directly** (it
   inherits the ambient caps). *Reason:* a privileged test can plant privileged pre-existing state (an
   orphan netns for the start-up-sweep test) and inspect per-VM teardown residue — things a
   `vmcelld`-via-runner spawn from an unprivileged test cannot. Manual poking (`just daemon`) still launches
-  `vmcelld` *through* the runner (no privileged test process to inherit from). See §14, `just test-daemon`.
+  `vmcelld` *through* the runner (no privileged test process to inherit from). See §15 (Testing strategy), `just test-daemon`.
 
 - **(d) `mem_read_ok`/`limits_enforced` both mean "the memory controller is delegated into the per-VM
   slice" — memory metrics are UNREADABLE (not just unenforced) without a delegated cgroup scope.** An
   integration test initially asserted `mem_read_ok` unconditionally and reddened without delegation
   (`memory.current` doesn't exist in a non-delegated slice). The test now asserts both flags **track**
-  delegation (`stats_limits_enforced_matches_delegation`). Honest §7.2 behavior, not a bug.
+  delegation (`stats_limits_enforced_matches_delegation`). Honest §7.2 (The fail-loud capability contract and HostCapabilities) behavior, not a bug.
 
 - **(e) Snapshot/restore/net knobs on the daemon API.** `CreateVmRequest` gained `net`
   (`none`/`privileged`/`unprivileged`), `snapshotting`, and `restore_from` (a store prefix). The launcher
   maps `NetMode`→`NetConfig`, sets `.snapshotting()`, and dispatches cold-boot vs. **`restore_cow`** (so
-  the named snapshot is preserved and re-restorable, design §9.4). *Reason:* the daemon defaulted to
+  the named snapshot is preserved and re-restorable, design §8.4 — The zygote fan-out and the OverlayStore seam). *Reason:* the daemon defaulted to
   `NetConfig::None` + no snapshotting, so snapshot/restore and real guest networking were unreachable
-  through the API. See §18.5.1.
+  through the API. See §11.5 (The HTTP REST API and its OpenAPI document).
 
 - **(f) Guest-tools `ip route` prints the RAW `/proc/net/route` table (hex, tab-separated), not the
   `default via …` form.** The privileged-net test first asserted `ip route` contained `"default"` and
@@ -114,7 +114,7 @@ settled entries into the design body and delete them here as they stabilize.
   `--resource-prefix` flag threaded to both the launcher and the start-up sweep. `NetNamespace::create`
   and `VmTempDir::create` gained a `prefix` param (the 0.6.0-driving API change). The VMID lock dir
   `/tmp/vmcell-vmid` is intentionally NOT prefixed (not swept; a stable cross-process rendezvous). See
-  §18.4.1.
+  §11.4 (The VM registry and the start-up sweep).
 
 - **Validated on the KVM host (2026-07-04), this env (KVM rw via ACL, CH at `~/.cargo/bin`, runner
   blessed, artifacts built).** `crates/vmcelld/tests/integration.rs` (run via `just test-daemon`, under a
@@ -130,14 +130,14 @@ settled entries into the design body and delete them here as they stabilize.
   `SIGTERM` (graceful `shutdown_all`) then fall back to `SIGKILL`, else a panicking test orphans its CH
   VMs. (Note: one `vmcell` lib unit test races on `/tmp/vmcell-vm-<pid>-*` under `cargo test --lib`'s
   shared-process model but passes under **nextest**, which is process-per-test — the project's runner.)
-  **Still unrun:** the QEMU/Firecracker snapshot tiers (§16: unwired), filtered-egress, concurrent-load.
+  **Still unrun:** the QEMU/Firecracker snapshot tiers (§17 — Open gaps and future capabilities: unwired), filtered-egress, concurrent-load.
 
 ## v22 — extra virtio-blk devices + custom init / append-only boot-args
 
-Design: `docs/59-claude-design-v23.md` §19 (unified; was `docs/historical/58-claude-design-v22.md`).
-Graduates the two §17 forward-work items. Fold into the design body and delete here as they stabilize.
+Design: `docs/59-claude-design-v23.md` §4.6 (Extra virtio-blk devices and disk-I/O throttling) (unified; was `docs/historical/58-claude-design-v22.md`).
+Graduates the two §17 (Open gaps and future capabilities) forward-work items. Fold into the design body and delete here as they stabilize.
 
-- **(a) `init=` override is a GENUINE PID-1 replacement, not an agent-supervised entrypoint.** §17
+- **(a) `init=` override is a GENUINE PID-1 replacement, not an agent-supervised entrypoint.** §17 (Open gaps and future capabilities)
   names the item "optional `init=` override". Taken literally, overriding `init=` replaces the vmcell
   guest agent (PID 1), which *is* the vsock control plane — so a custom-init VM has **no** `Ready`
   handshake, `exec`, or resync. We considered reinterpreting "custom init" as an agent-supervised
@@ -145,10 +145,10 @@ Graduates the two §17 forward-work items. Fold into the design body and delete 
   *Reason we did NOT:* that is a different capability (and `exec` already forks a program under the live
   agent), and the design says `init=` **override**. So we ship the genuine override and honor its
   consequence **fail-loud**, not silently: `MicroVm::agent()` returns a typed `Error::Agent` immediately
-  (§12.2) instead of hanging; `MicroVm::start()` skips the QEMU control-plane health probe when there is
+  (§13 — Cross-cutting invariants) instead of hanging; `MicroVm::start()` skips the QEMU control-plane health probe when there is
   no agent to probe; and `build()` **rejects `snapshotting` + a custom init** (the mandatory
-  post-restore resync runs through the agent, §12.4). A custom-init VM is observed out-of-band (serial
-  log / writable share or extra disk / net). See design §19.2.2.
+  post-restore resync runs through the agent, §13 — Cross-cutting invariants). A custom-init VM is observed out-of-band (serial
+  log / writable share or extra disk / net). See design §5.3 (The kernel command line).
 
 - **(b) CH disks are declared `image_type=Raw` explicitly (surfaced by the writable-extra-disk test).**
   CH v52 **auto-detects** an unspecified disk image as raw and then **disables sector-0 writes** as a
@@ -158,7 +158,7 @@ Graduates the two §17 forward-work items. Fold into the design body and delete 
   erofs root, ext4 `Block` root, extra raw disks — are raw). This also removes CH's deprecation warnings
   and pre-empts the **same latent bug on the writable `Block` rootfs path** (a sector-0 superblock write
   would have been silently dropped). One-law: `CH_RAW_IMAGE_TYPE` const, pinned by a serialization
-  assertion. See design §19.1.2.
+  assertion. See design §4.6 (Extra virtio-blk devices and disk-I/O throttling).
 
 - **Validated on the KVM host (2026-07-05, this env).** `tests/extra_block.rs` (`vmm_matrix_test!`) —
   **CH + Firecracker + QEMU all green**: two extra disks attach after the root (`/dev/vdb` read-only
@@ -181,15 +181,15 @@ Graduates the two §17 forward-work items. Fold into the design body and delete 
   cannot honor — a second-class feature. Throttling works on all three backends including CH, and is the
   portable "slow/pressured disk" fault. CH+FC share one `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS`
   token-bucket conversion (one law). Validated on KVM (`extra_block_io_throttle`, CH+FC+QEMU: a 1 MiB/s cap
-  floors a 4 MiB read at ~3 s). Error/latency injection stays forward work. See design §19.5.
+  floors a 4 MiB read at ~3 s). Error/latency injection stays forward work. See design §4.6 (Extra virtio-blk devices and disk-I/O throttling).
 
 - **(d) The daemon exposes `extra_disks` (read-only) + `extra_kernel_args`, but NOT `init`, and extra disks
   are read-only.** *Reasons, both forced by the daemon's model:* (i) the daemon owns the VM through the
   vsock control plane (brings the agent up to mark `Ready`, serves `exec`/`stats`), which a custom `init=`
   drops — so exposing it would create un-`exec`-able VMs; it stays library-only. (ii) The artifact store is
-  create-only/immutable (§18.3.2), so a *writable* extra disk over a shared store artifact would let one VM
+  create-only/immutable (§11.3 — The artifact store), so a *writable* extra disk over a shared store artifact would let one VM
   mutate an artifact another reads — extra disks are attached read-only (a copy-on-attach writable scratch
-  is a follow-up). A live VM pins its extra-disk artifacts (delete-in-use guard extended). See design §19.4.
+  is a follow-up). A live VM pins its extra-disk artifacts (delete-in-use guard extended). See design §11 (The control-plane daemon — vmcelld).
 
 - **(e) `vmcell::Error::Config` now maps to daemon `BadRequest` (400), not `Internal` (500).** Threading
   `extra_kernel_args`/`io_limit` into the launcher's `VmConfig::build()` meant a client-supplied bad knob
@@ -223,7 +223,7 @@ Graduates the two §17 forward-work items. Fold into the design body and delete 
 
 ## v24 — privileged-window hardening (VMM seccomp + jailer-equivalent + setup broker)
 
-Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22 shape). New crate:
+Design: `docs/60-claude-design-v24.md` §12 (Privilege hardening: confining the VMM) (an amendment on v23, in the v21/v22 shape). New crate:
 `vmcell-broker`. Fold settled entries into the design body and delete here as they stabilize.
 
 - **(a) The jailer-equivalent lives in `vmcell::vmm::jail`, NOT `vmcell-privilege`; `vmcell` does not
@@ -241,7 +241,7 @@ Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22
   unchanged (lean-tree assertion confirms `seccompiler` is absent from the runner). `seccompiler` is the
   pure-Rust rust-vmm seccomp compiler CH and FC use internally, so it is the sanctioned choice; the
   alternatives (`libseccomp`/`syscallz`) have permissive Rust metadata but LINK the LGPL-2.1 libseccomp
-  C library — invisible to `cargo deny`'s license gate, so the ban catches it by name (§20.6). A defect
+  C library — invisible to `cargo deny`'s license gate, so the ban catches it by name (§12.5 — The licensing constraint on seccomp crates). A defect
   class (a licensing hole tooling reports green on) turned into a gate that can go red.
 
 - **(c) The seccompiler VMM-child deny-list ships OPT-IN, default OFF (`JailConfig::seccomp_deny_list`
@@ -250,7 +250,7 @@ Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22
   validated by executing on a KVM host". The default confinement is the backend's own native filter
   (Layer 1). The filter-application *mechanism* is fully gated KVM-free: `tests/jail_hardening.rs` forks
   a stand-in, applies the deny-list, and asserts `unshare(0)→EPERM` while `getpid` still works (red on
-  an empty filter). Design §20.4/§20.9.
+  an empty filter). Design §12.3 Layer 2 — the jailer-equivalent (JailSpec + apply_jail) / §17 (Open gaps and future capabilities).
 
 - **(d) The broker's `SpawnVmm` (the jailed fork→setns→jail→execve→pidfd path) refuses fail-loud as
   forward work; `vmcelld` is NOT cut over to fork-broker-then-drop this pass.** *Reason:* the setns
@@ -260,8 +260,8 @@ Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22
   complete, fake-tested component: protocol + framed codec (round-trip + over-cap reject), the
   setup/cgroup/teardown/sweep dispatch against the injected `Netlink`/`NftApplier`/`CgroupFs`/
   `OrphanScanner` seams (call-order / residue-gone / sweep-only-dead), the parent cap-drop plan, and the
-  socketpair+fork+pdeathsig transport (Health round-trip). The retain-caps single-process daemon (§12.14)
-  stays the default. Design §20.5/§20.9.
+  socketpair+fork+pdeathsig transport (Health round-trip). The retain-caps single-process daemon (§13 — Cross-cutting invariants)
+  stays the default. Design §12.4 Layer 3 — the setup broker (network surface never holds caps) / §17 (Open gaps and future capabilities).
 
 - **(e) QEMU gains `-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`
   (Enforcing) — it previously ran with NO `-sandbox`, unconfined.** A QEMU built without libseccomp errors
@@ -283,7 +283,7 @@ Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22
   restore did not. Fix: default `clear_ambient_caps` off (the field stays an opt-in for the future
   fd-passing/uid-drop path where the VMM needs no caps). `no_new_privs`/`RLIMIT_CORE=0`/`non_dumpable`
   stay on — validated non-breaking. This is the "defaults get the strictest scrutiny" + "validate on a
-  KVM host" discipline catching a real regression static review would have missed. Design §20.4/§20.9.
+  KVM host" discipline catching a real regression static review would have missed. Design §12.3 Layer 2 — the jailer-equivalent (JailSpec + apply_jail) / §17 (Open gaps and future capabilities).
 
 - **Validated on THIS KVM host (`just test-privileged`, delegated scope; runner blessed, CH at
   `~/.cargo/bin`, artifacts built).** The privileged suite runs every VM through the hardened path
@@ -297,22 +297,22 @@ Design: `docs/60-claude-design-v24.md` §20 (an amendment on v23, in the v21/v22
   deny` (seccompiler allow-listed, LGPL bans clean); rustdoc; lean-tree assertions (agent/runner lean,
   `seccompiler` absent from the runner, broker excludes `vmcell-daemon`/axum); `cargo semver-checks`;
   feature-powerset (204/204); `cargo nextest run --all-features` (482 passed). **Still forward work
-  (§20.9):** the `vmcelld` broker cutover, the seccompiler deny-list + `clear_ambient` defaults (blocked
+  (§17 — Open gaps and future capabilities):** the `vmcelld` broker cutover, the seccompiler deny-list + `clear_ambient` defaults (blocked
   on the fd-passing/uid-drop increment), and the QEMU/FC snapshot tiers already unwired pre-v24.
 
-### v24 pass 2 — the `vmcelld` broker cutover (the §20.9 headline step)
+### v24 pass 2 — the `vmcelld` broker cutover (the §17 — Open gaps and future capabilities headline step)
 
-Design: `docs/60-claude-design-v24.md` §20.5 (updated). `vmcelld` now forks by default: the broker child
+Design: `docs/60-claude-design-v24.md` §12.4 Layer 3 — the setup broker (network surface never holds caps) (updated). `vmcelld` now forks by default: the broker child
 keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and forwards VM ops.
 
-- **(h) Shipped the "engine-owning" (fat) broker, NOT the thin `SpawnVmm`+pidfd model §20.5 first
+- **(h) Shipped the "engine-owning" (fat) broker, NOT the thin `SpawnVmm`+pidfd model §12.4 (Layer 3 — the setup broker — network surface never holds caps) first
   described.** *Reason:* the thin model (broker does only netns/spawn, parent drives the VMM's api
   socket + a passed pidfd) requires splitting `MicroVm` across the process boundary — its `V::Instance`
   owns the VMM `Child`, so "parent drives the VMM" is a deep `MicroVm`/`Vmm` refactor. The fat cutover
-  realizes the **same §12.23 invariant** (caps off the network surface) with **no `vmcell` surgery**: the
+  realizes the **same §13 (Cross-cutting invariants) invariant** (caps off the network surface) with **no `vmcell` surgery**: the
   broker child owns the whole `Registry`; the parent forwards `create`/`exec`/`stats`/`snapshot`/`destroy`
   over the new `VmEngine` RPC (`vmcell-daemon::bridge`). The thin broker (shrink the *privileged code*
-  surface) is recorded as the remaining refinement (§20.9). Both satisfy §12.23; the fat one is far lower
+  surface) is recorded as the remaining refinement (§17 — Open gaps and future capabilities). Both satisfy §13 (Cross-cutting invariants); the fat one is far lower
   risk and validatable now. The `vmcell-broker` thin primitives (SetupNetwork/SpawnVmm/…) stay as that
   refinement's foundation + the reusable `fork_privileged_child` transport the fat cutover uses.
 
@@ -327,7 +327,7 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   shrink is a warned no-op without `CAP_SETPCAP`.** The runner raises only NET_ADMIN/SYS_ADMIN/DAC_OVERRIDE
   (not SETPCAP), so `apply_broker_parent_drop`'s bounding drop warns — the **same** file-cap-path
   limitation the runner has (B9). Dropping your *own* effective/permitted needs no SETPCAP, so the parent
-  still ends with **no usable capabilities** (empty effective set + `no_new_privs`), which is the §12.23
+  still ends with **no usable capabilities** (empty effective set + `no_new_privs`), which is the §13 (Cross-cutting invariants)
   win; the wide bounding set is inert under `no_new_privs`.
 
 - **(k) `destroy_removes_per_vm_scratch_dir` now matches the scratch dir by vmid, not by `d.pid()`.** The
@@ -345,11 +345,11 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   gates green too: `bridge::tests` (RPC round-trip, error-status round-trip, multiplex-not-serialized,
   over-cap reject), `vmcell-broker` fork/transport tests, clippy `-D warnings`.
 
-## v25 — the OverlayStore seam + fork/branch lineage (design §21)
+## v25 — the OverlayStore seam + fork/branch lineage (design §8 — Snapshot, restore, and cloning)
 
 - **(a) The "single-snapshot copy-on-write clone" was already built; v25 adds only the seam + lineage.**
   The roadmap item bundled three things; the reflink CoW clone + zygote fan-out (`Zygote`,
-  `MicroVm::restore_cow`, `reflink.rs`, §9.4/§12.12) already shipped. v25 does **not** re-implement it — it
+  `MicroVm::restore_cow`, `reflink.rs`, §8.4 — The zygote fan-out and the OverlayStore seam / §13 — Cross-cutting invariants) already shipped. v25 does **not** re-implement it — it
   lifts the CoW copy behind the injectable `overlay::OverlayStore` seam and adds the `lineage::Lineage`
   fork/branch handle on top of `Zygote`. Scoping recorded so a reader does not expect new clone mechanics.
 
@@ -413,7 +413,7 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   deliberately** (not folded away yet) so future development can show whether the wording change actually
   breaks the reflex.)**
 
-## v26 — persistent interactive sessions (design §22)
+## v26 — persistent interactive sessions (design §3 — The control plane: vsock, the host clients, and the guest agent)
 
 - **(a) The one-shot exec path is byte-for-byte unchanged; sessions are a separate channelized layer.**
   Rather than retrofit a `SessionId` onto `Message::{Exec,Stdout,Stderr,Exit}` (a wire break plus a rewrite
@@ -429,9 +429,9 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   the abandoned host wait); the session path leaves `None` as `None` — an interactive session is persistent,
   bounded by `CloseSession` / child exit / connection teardown, not a default timeout. This is a policy the
   host applies before the byte leaves, not a second interpretation in the guest, so no field is read two
-  ways (§22.2.1).
+  ways (§3.3 — Interactive-session wire semantics).
 
-- **(c) One per-connection writer, via `VsockStream::try_clone()` behind a mutex (§12.28).** The guest
+- **(c) One per-connection writer, via `VsockStream::try_clone()` behind a mutex (§13 — Cross-cutting invariants).** The guest
   connection handler was request/response (`handle_connection` drove one exec to completion before the next
   read). It is now a non-blocking dispatch loop owning the read half, with a `try_clone`d write half behind
   `Arc<Mutex<VsockStream>>` that every frame — one-shot output, put-file/resync acks, and all session pump
@@ -456,14 +456,14 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   `/vmcell-tools`-augmented PATH and argv/env/cwd assembly are shared by `handle_exec` and `run_session`
   (AGENTS.md "one law"); a `child_path_prepends_vmcell_tools` unit test reddens if a session drops the shim
   dir. `kill_group` is the shared `kill(-pgid)` law (one-shot timeout, session `CloseSession`/timeout,
-  connection teardown §12.27).
+  connection teardown §13 — Cross-cutting invariants).
 
 - **KVM validation — DONE on this host (2026-07-06).** The new `tests/session.rs` (4 data-plane tests ×
   CH+FC+QEMU = 12, + 2 host demux unit tests) is **14/14 green** through the blessed runner under the
   delegated scope: PTY `isatty`+initial-window+mid-session-resize with a pipe-session negative control
-  (§12.29); streaming stdin round-trip through `cat`+EOF (§22.2); two ~27 KiB self-identifying streams
-  multiplexed over one connection with zero cross-attribution (§12.28); a persistent `sleep` session's pid
-  gone after the mux drops (§12.27, existed-before/gone-after via `/proc/<pid>/cmdline`). Sessions need only
+  (§13 — Cross-cutting invariants); streaming stdin round-trip through `cat`+EOF (§3.3 — Interactive-session wire semantics); two ~27 KiB self-identifying streams
+  multiplexed over one connection with zero cross-attribution (§13 — Cross-cutting invariants); a persistent `sleep` session's pid
+  gone after the mux drops (§13 — Cross-cutting invariants, existed-before/gone-after via `/proc/<pid>/cmdline`). Sessions need only
   the vsock agent (no snapshot), so **no `require_cap!` skips** — every case runs on all three backends.
   `just test-unprivileged` is **4/4 green**. KVM-free gates green: protocol round-trip +
   discriminant-stability + proptest over all 8 new variants; guest `winsize_from`/`child_path`/
@@ -517,7 +517,7 @@ a self-test applies).
   enters `vmcell-broker` **transitively and legitimately** via `vmcell`'s egress proxy (`hudsucker`)
   and HTTP clients (`reqwest`/`oci-client`) — all part of the net/proxy subset the broker needs for
   nft/TPROXY setup — so `-i hyper` is present on the clean tree and asserting its absence reddens CI.
-  The **meaningful** P2/§12.23 boundary ("the network-input HTTP surface must not share the
+  The **meaningful** P2/§13 (Cross-cutting invariants) boundary ("the network-input HTTP surface must not share the
   cap-holder") is the daemon's HTTP **server**: `axum` + the `vmcell-daemon` crate that owns it. Both
   are absent from the broker (positive control: `vmcelld`, which legitimately links the web stack,
   shows both present), so the gate is green-on-clean and fires if either leaks into the cap-holder.
@@ -549,16 +549,16 @@ a self-test applies).
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.
 
-## v28 — the 0.9 → 0.10 delta register (design §18), as built
+## v28 — the 0.9 → 0.10 delta register (design §18 — Delta register: changes from the validated v27 build), as built
 
-The eleven §18 deltas landed as one breaking pass. Per-item as-built record, flagging where the
+The eleven §18 (Delta register: changes from the validated v27 build) deltas landed as one breaking pass. Per-item as-built record, flagging where the
 built reality diverged from the delta's stated premise (a divergence is only a finding in the change
 that implements the delta — AGENTS.md).
 
 - **Delta 1 (`HostEnv` bundle).** New `crates/vmcell/src/env.rs`: `HostEnv { cids, vmids, cgroups,
   clock, overlay }`, `#[non_exhaustive]`, `Clone`, manual `Debug` (`Clock` is not `Debug`),
   `shared()`/`hermetic()`. `clock` carries `+ RefUnwindSafe` (matching `VmidAllocator`'s established
-  discipline so the bundle stays unwind-safe; both `Clock` impls satisfy it) — the §9.3 sketch elides
+  discipline so the bundle stays unwind-safe; both `Clock` impls satisfy it) — the §9.3 (The public API surface) sketch elides
   this bound. Threaded `&HostEnv` through `start`/`restore`/`restore_cow`/`setup_env`/
   `Zygote::spawn_clone(s)`/`Lineage::fork`/`fork_many`; `MicroVm` stores one `env` and its teardown
   deletes the cgroup slice through `env.cgroups` (the standalone `cgroup_fs` field is gone).
@@ -567,7 +567,7 @@ that implements the delta — AGENTS.md).
   `cid_alloc` via `env.cids`; `SnapshotStage` keeps its allocator fields — which must stay
   `RefUnwindSafe` — and builds a transient `HostEnv` in `run()`).
   - **Deviation (justified): `agent()` keeps its optional `timeout`.** Delta 1 removes the *clock*
-    seam from `agent()` (the gate — "no seam arguments" — is met) but §9.3's "no arguments / 10 s
+    seam from `agent()` (the gate — "no seam arguments" — is met) but §9.3 (The public API surface)'s "no arguments / 10 s
     floor constant" would drop the per-call connect budget too. `Timeouts` carries **no** overall
     agent-connect budget field, and the artifact-validator legitimately needs 60–180 s connect
     windows for slow builder-VM boots / restore-under-load (`checks.rs`); hardcoding the 10 s floor
@@ -635,7 +635,7 @@ that implements the delta — AGENTS.md).
   never silent-unlimited), `virtio_fs_shares_available`, `can_boot_vm`. Consumed at start-up by the
   daemon's `MicroVmLauncher::new` (probe + log). Gate: a fake-host descriptor drives every decision
   (well-provisioned vs no-CAP_NET_ADMIN / undelegated-memory / threaded / no-KVM). The metrics
-  `create_slice` keeps its own authoritative EACCES/EINVAL errno split (§7.2 rule 2); the descriptor
+  `create_slice` keeps its own authoritative EACCES/EINVAL errno split (§7.2 — The fail-loud capability contract and HostCapabilities, rule 2); the descriptor
   is the queryable single source, not a replacement for that per-write typed error.
 
 - **Delta 9 (`FakeVmm` fault menu).** `FakeVmm` gained a `FaultMenu`

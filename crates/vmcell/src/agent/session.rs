@@ -1,16 +1,16 @@
-//! Host-side interactive-session multiplexer (design 62 §22).
+//! Host-side interactive-session multiplexer (§3, The control plane: vsock, the host clients, and the guest agent).
 //!
 //! [`SessionMux`] owns its **own** vsock connection to the guest agent — separate
 //! from the one-shot [`AgentClient`], so the two never share a
 //! stream — and multiplexes many concurrent [`Session`]s over it, each keyed by a
 //! [`SessionId`]. It reuses the one [`AgentClient`]
-//! connect/handshake law (§12.5), then splits the framed stream into a background
+//! connect/handshake law (§13, Cross-cutting invariants), then splits the framed stream into a background
 //! reader task (demuxes guest→host
 //! `SessionStdout`/`SessionStderr`/`SessionExit` to per-session channels) and a
 //! writer task (serializes every host→guest frame — the host mirror of the guest's
-//! single-writer discipline, §12.28). Dropping the `SessionMux` closes the
+//! single-writer discipline, §13, Cross-cutting invariants). Dropping the `SessionMux` closes the
 //! connection, which the guest observes as the read-loop end that triggers
-//! connection-owns-its-sessions teardown (§12.27), so a forgotten `close()` still
+//! connection-owns-its-sessions teardown (§13, Cross-cutting invariants), so a forgotten `close()` still
 //! cannot leak guest processes.
 
 use std::collections::HashMap;
@@ -35,10 +35,10 @@ type FrameSink = SplitSink<FramedStream, ::bytes::Bytes>;
 /// `SessionId` → the sender feeding that session's [`Session::recv`] channel.
 type Registry = Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<SessionEvent>>>>;
 
-/// An output or terminal event delivered to a [`Session`] (design 62 §22).
+/// An output or terminal event delivered to a [`Session`] (§3, The control plane: vsock, the host clients, and the guest agent).
 ///
 /// A session yields zero-or-more `Stdout`/`Stderr` events then exactly one `Exit`
-/// — after which [`Session::recv`] returns `None` (§12.26). A PTY session merges
+/// — after which [`Session::recv`] returns `None` (§13, Cross-cutting invariants). A PTY session merges
 /// its output into `Stdout`, so it never yields `Stderr`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -51,7 +51,7 @@ pub enum SessionEvent {
     Exit(i32),
 }
 
-/// Ergonomic builder for a [`SessionSpec`] (design 62 §22.4).
+/// Ergonomic builder for a [`SessionSpec`] (§3.3, Interactive-session wire semantics).
 ///
 /// A thin convenience over `SessionSpec { command: ExecRequest{..}, pty }`: set the
 /// argv, then optionally an environment, working directory, kill deadline, and
@@ -89,7 +89,7 @@ impl SessionSpecBuilder {
 
     /// Sets an optional kill deadline. Unset (the default) means the session is
     /// **persistent** — bounded by [`Session::close`], the child exiting, or the
-    /// connection closing (design 62 §22.2.1), not a timeout.
+    /// connection closing (§3.3, Interactive-session wire semantics), not a timeout.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.command = self.command.with_timeout(timeout);
@@ -116,7 +116,7 @@ impl SessionSpecBuilder {
 }
 
 /// A multiplexing connection to the guest agent for interactive sessions
-/// (design 62 §22). See the [module docs](self).
+/// (§3, The control plane: vsock, the host clients, and the guest agent). See the [module docs](self).
 #[derive(Debug)]
 pub struct SessionMux {
     /// Outgoing frames to the writer task (host mirror of the single-writer law).
@@ -130,7 +130,7 @@ pub struct SessionMux {
 impl SessionMux {
     /// Connects a fresh session-multiplexing connection to the guest agent, using
     /// the same connect/handshake law as [`AgentClient`]
-    /// (§12.5).
+    /// (§13, Cross-cutting invariants).
     ///
     /// # Errors
     /// Returns an error if the connection or `Ready` handshake does not complete
@@ -169,7 +169,7 @@ impl SessionMux {
     ///
     /// There is no open-ack round-trip: the single ordered stream guarantees the
     /// guest processes this `OpenSession` before any `Stdin`/`Winsize` the caller
-    /// sends next (design 62 §22.2). A failed open surfaces as the session's
+    /// sends next (§3.3, Interactive-session wire semantics). A failed open surfaces as the session's
     /// `SessionEvent::Exit(127)`.
     ///
     /// # Errors
@@ -205,13 +205,13 @@ impl Drop for SessionMux {
     fn drop(&mut self) {
         // Abort both tasks so the split sink AND stream drop, closing the
         // connection even while `Session` handles still hold `write_tx` clones.
-        // The guest sees the read-loop EOF and tears down its sessions (§12.27).
+        // The guest sees the read-loop EOF and tears down its sessions (§13, Cross-cutting invariants).
         self.reader.abort();
         self.writer.abort();
     }
 }
 
-/// A handle to one interactive session on a [`SessionMux`] (design 62 §22).
+/// A handle to one interactive session on a [`SessionMux`] (§3, The control plane: vsock, the host clients, and the guest agent).
 ///
 /// Send input with [`write_stdin`](Session::write_stdin) /
 /// [`close_stdin`](Session::close_stdin), resize a PTY with
@@ -234,7 +234,7 @@ impl Session {
     }
 
     // The mutating methods are `async` (though the current unbounded send does not
-    // await) so a future switch to a bounded, backpressuring channel (§22.7) is not
+    // await) so a future switch to a bounded, backpressuring channel (§17, Open gaps and future capabilities) is not
     // an API break.
 
     /// Streams stdin bytes to the running command (pipe: to its stdin; PTY: as
@@ -319,7 +319,7 @@ impl Session {
 }
 
 /// Delivers a demuxed event to its session's channel, dropping (at debug) a frame
-/// for an unknown/closed session — e.g. a stray frame after `SessionExit` (§12.26).
+/// for an unknown/closed session — e.g. a stray frame after `SessionExit` (§13, Cross-cutting invariants).
 fn deliver(registry: &Registry, session: SessionId, ev: SessionEvent) {
     let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = reg.get(&session) {
@@ -377,7 +377,7 @@ async fn reader_task(mut stream: SplitStream<FramedStream>, registry: Registry) 
 }
 
 /// The background writer task: serializes every host→guest frame onto the one
-/// sink (the host single-writer law, §12.28).
+/// sink (the host single-writer law, §13, Cross-cutting invariants).
 async fn writer_task(mut sink: FrameSink, mut rx: mpsc::UnboundedReceiver<Message>) {
     while let Some(msg) = rx.recv().await {
         let bytes = match postcard::to_stdvec(&msg) {
@@ -404,7 +404,7 @@ mod tests {
         c
     }
 
-    // §12.26 / §22.6: the multiplexing demux. Two sessions over one connection;
+    // §13 (Cross-cutting invariants) / §3.3 (Interactive-session wire semantics): the multiplexing demux. Two sessions over one connection;
     // the guest (here a hand-driven UnixStream peer) emits INTERLEAVED, id-keyed
     // frames plus a STRAY frame after a session's SessionExit. Each `Session`
     // handle must receive exactly and only its own frames, in order, ending at its

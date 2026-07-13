@@ -1,13 +1,13 @@
-//! `vmcelld` — the blessed vmcell control-plane daemon binary (design §18.2 / §20.5).
+//! `vmcelld` — the blessed vmcell control-plane daemon binary (design §11.2 (Privilege and blessing) / §12.4 (Layer 3 — the setup broker (network surface never holds caps))).
 //!
-//! **Privilege-separated by default (the §20.5 setup-broker cutover).** `vmcelld` runs the shared
+//! **Privilege-separated by default (the §12.4 (Layer 3 — the setup broker (network surface never holds caps)) setup-broker cutover).** `vmcelld` runs the shared
 //! blessing precondition ([`vmcell_privilege::ensure_blessed_or_explain`]) and then **forks**: the
 //! **broker child** keeps the three privileged caps and owns the VM [`Registry`] (netns/tap/nft/cgroup
 //! and the jailed VMM spawn all need caps), while the **parent drops ALL caps**
 //! ([`vmcell_privilege::apply_broker_parent_drop`]) and serves the network-facing HTTP API,
 //! forwarding every VM op to the broker over the framed [`vmcell_daemon::bridge`] RPC. So a bug in
 //! the HTTP request parser can never reach the caps, and the cap-holder never parses attacker input
-//! (§12.23). `--no-setup-broker` falls back to the single-process retain-caps model (§12.14).
+//! (§12.4, Layer 3 — the setup broker (network surface never holds caps)). `--no-setup-broker` falls back to the single-process retain-caps model (§11.2, Privilege and blessing).
 //!
 //! A daemon logs through `tracing`, never `print`/`eprintln` (full-family, v3) — so
 //! `print_stdout`/`print_stderr` are denied. The subscriber is installed as the very first line of
@@ -89,8 +89,8 @@ struct Cli {
     #[arg(long, default_value = "vmcell")]
     resource_prefix: String,
 
-    /// Fall back to the single-process retain-caps model (§12.14): no broker fork, the caps stay in
-    /// the HTTP-serving process. The setup-broker split (§20.5) is the default.
+    /// Fall back to the single-process retain-caps model (§11.2, Privilege and blessing): no broker fork, the caps stay in
+    /// the HTTP-serving process. The setup-broker split (§12.4, Layer 3 — the setup broker (network surface never holds caps)) is the default.
     #[arg(long)]
     no_setup_broker: bool,
 }
@@ -140,11 +140,11 @@ fn run() -> Result<(), i32> {
         .unwrap_or_else(|| "cloud-hypervisor".to_string());
 
     if cli.no_setup_broker {
-        // Single-process retain-caps fallback (§12.14): the HTTP surface keeps the caps.
+        // Single-process retain-caps fallback (§11.2, Privilege and blessing): the HTTP surface keeps the caps.
         return run_single_process(&cli, ch_bin);
     }
 
-    // The setup-broker split (§20.5): fork BEFORE any thread/runtime exists (fork-with-threads is
+    // The setup-broker split (§12.4, Layer 3 — the setup broker (network surface never holds caps)): fork BEFORE any thread/runtime exists (fork-with-threads is
     // unsafe). The child keeps the caps and owns the registry; the parent drops all caps and serves.
     match vmcell_broker::fork_privileged_child() {
         Ok(ForkSide::Child { sock }) => run_broker_child(&cli, ch_bin, sock),
@@ -178,7 +178,7 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
         }
     };
     runtime.block_on(async move {
-        // Start-up orphan sweep (§18.4): reclaim leaks (matching `--resource-prefix`) a previously
+        // Start-up orphan sweep (§11.4, The VM registry and the start-up sweep): reclaim leaks (matching `--resource-prefix`) a previously
         // hard-killed daemon left, BEFORE we own any VM. The broker holds the caps netns delete needs.
         let report = startup_sweep(&cli.resource_prefix);
         if !report.netns.is_empty()
@@ -229,21 +229,21 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
     })
 }
 
-/// The **HTTP parent**: drops ALL capabilities (§12.23), then serves the axum API and the local
+/// The **HTTP parent**: drops ALL capabilities (§12.4, Layer 3 — the setup broker (network surface never holds caps)), then serves the axum API and the local
 /// artifact store, forwarding VM ops to the broker over `sock`.
 fn run_http_parent(
     cli: &Cli,
     sock: std::os::unix::net::UnixStream,
     child: vmcell_broker::BrokerChild,
 ) -> Result<(), i32> {
-    // Drop EVERY capability before binding the network socket — the HTTP surface holds none (§12.23).
+    // Drop EVERY capability before binding the network socket — the HTTP surface holds none (§12.4, Layer 3 — the setup broker (network surface never holds caps)).
     let plan = vmcell_privilege::plan_broker_parent_drop(&vmcell_privilege::probe_supported_caps());
     if let Err(e) = vmcell_privilege::apply_broker_parent_drop(&plan) {
         tracing::error!("vmcelld: the HTTP parent could not drop its capabilities: {e}");
         return Err(1);
     }
 
-    // Auth policy: an owner-only key file, or the explicit dev bypass (§18.6).
+    // Auth policy: an owner-only key file, or the explicit dev bypass (§11.6, Authentication — a bearer API key).
     let auth = auth_policy(cli)?;
     let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
         Ok(a) => Arc::new(a),
@@ -304,12 +304,12 @@ fn run_http_parent(
     })
 }
 
-/// The single-process retain-caps fallback (§12.14): the HTTP surface keeps the three caps and owns
+/// The single-process retain-caps fallback (§11.2, Privilege and blessing): the HTTP surface keeps the three caps and owns
 /// the registry directly — no broker, no privilege separation. Selected with `--no-setup-broker`.
 fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
     tracing::warn!(
         "vmcelld: --no-setup-broker; the HTTP surface RETAINS the three caps (no privilege \
-         separation). Prefer the default setup-broker split (§20.5)."
+         separation). Prefer the default setup-broker split (§12.4, Layer 3 — the setup broker)."
     );
     let auth = auth_policy(cli)?;
     let artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {
@@ -385,7 +385,7 @@ fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
 }
 
 /// Resolves the bearer-auth policy from the CLI: an owner-only key file, or the explicit dev bypass.
-/// A control plane with no auth is never an accident (§18.6) — refuse to start otherwise.
+/// A control plane with no auth is never an accident (§11.6, Authentication — a bearer API key) — refuse to start otherwise.
 fn auth_policy(cli: &Cli) -> Result<AuthPolicy, i32> {
     match (&cli.api_key_file, cli.allow_unauthenticated) {
         (Some(path), _) => match load_api_key_file(path) {

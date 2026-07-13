@@ -1,8 +1,8 @@
-//! The vmcell control-plane daemon library (design §D).
+//! The vmcell control-plane daemon library (design §11, The control-plane daemon (`vmcelld`)).
 //!
 //! An **owning** daemon: it holds the `MicroVm` handles for the VMs it starts (through the
 //! [`launcher::VmHandle`] seam), so their VMM processes and netns/tap/cgroup/scratch stay alive while
-//! held and are released **on `Drop`** in order (§12.10 — the invariant is preserved). A
+//! held and are released **on `Drop`** in order (§13, Cross-cutting invariants; the invariant is preserved). A
 //! hard-killed daemon leaks resources; the next boot's **start-up orphan sweep**
 //! (`vmcell::orchestrator::sweep_orphans`, wired in `vmcelld`) reclaims them. It also manages a flat
 //! [`artifact_store::ArtifactStore`] (create/list/delete; no update) whose names are a restricted set
@@ -11,7 +11,7 @@
 //!
 //! The `server` feature (default) pulls the axum/vmcell host stack. A client links this crate with
 //! `default-features = false` to get only the wire [`dto`] types and the [`name`] predicate — the
-//! schema is single-sourced without the client pulling the server (design §18.1).
+//! schema is single-sourced without the client pulling the server (design §11.1, What it adds, and where it sits).
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(

@@ -4,12 +4,14 @@
 //!
 //! The target is any binary confined under `target/`: a nextest test binary (the original use), **or**
 //! another workspace binary such as **`vmcelld`** launched by an integration test or `just daemon`
-//! (§18.2). Launching `vmcelld` this way confers the three caps via the **ambient** set without
-//! blessing `vmcelld` itself, so the daemon — which changes constantly — rebuilds with no `setcap`
-//! churn, exactly the reason this runner was introduced for the ever-changing test binaries (§12.8).
+//! (§11.2, Privilege and blessing). Launching `vmcelld` this way confers the three caps via the
+//! **ambient** set without blessing `vmcelld` itself, so the daemon — which changes constantly —
+//! rebuilds with no `setcap` churn, exactly the reason this runner was introduced for the
+//! ever-changing test binaries (§15.5, The capability test runner).
 //!
 //! The blessing precondition and the pure privilege-transition plan live in `vmcell-privilege`, so
-//! this crate and the daemon (`vmcelld`) share one copy of the security-critical cap logic (§18.2).
+//! this crate and the daemon (`vmcelld`) share one copy of the security-critical cap logic
+//! (§11.2, Privilege and blessing).
 //! What stays here is the exec-target **confinement** — the boundary that makes launching an arbitrary
 //! `target/` binary safe — plus the thin `main` that wires the shared pieces and performs the `execvp`.
 //!
@@ -96,7 +98,7 @@ fn confine_under(candidate: &Path, target_root: &Path) -> Result<(), String> {
 /// never from the untrusted exec argument.
 ///
 /// The blessed runner is installed to a stable path *outside* `target/`, namely
-/// `<workspace>/.vmcell-bin/<profile>/vmcell-test-runner` (justfile / §12.8 churn-fix #1). The
+/// `<workspace>/.vmcell-bin/<profile>/vmcell-test-runner` (justfile / §15.5, The capability test runner, churn-fix #1). The
 /// trusted workspace root is therefore the parent of the `.vmcell-bin` ancestor, and every
 /// legitimate exec target (a test binary nextest hands us, or `vmcelld`; always under `<workspace>/target/…`)
 /// must descend from `<workspace>/target`. Anchoring on the runner's own location is the security
@@ -163,7 +165,7 @@ fn main() {
     };
 
     // The blessing precondition (shared with the daemon): the three privileged caps must be in the
-    // EFFECTIVE set, or euid 0. Same remediation message for both callers (§18.2).
+    // EFFECTIVE set, or euid 0. Same remediation message for both callers (§11.2, Privilege and blessing).
     let need = PRIVILEGED_CAPS;
     if let Err(e) = ensure_blessed_or_explain(&need) {
         eprintln!("{e}");
@@ -318,7 +320,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp.join("vmcell-priv1-attacker"));
     }
 
-    // §18.2: the runner is used as a cap-conferring launcher for `vmcelld`, not only test binaries.
+    // §11.2 (Privilege and blessing): the runner is used as a cap-conferring launcher for `vmcelld`, not only test binaries.
     // The confinement must accept `target/<profile>/vmcelld` under the trusted root (so an integration
     // test can `vmcell-test-runner target/debug/vmcelld …`), while still rejecting a `vmcelld` outside
     // it. RED if a change ever special-cased "test binaries" (e.g. a `deps/` or name filter) and locked
@@ -341,7 +343,7 @@ mod tests {
             std::fs::write(&vmcelld, b"#!/bin/true").expect("write vmcelld");
             assert!(
                 confine_target_under(vmcelld.to_str().expect("utf8"), &trusted_root).is_ok(),
-                "the runner must accept target/{profile}/vmcelld so it can launch the daemon (§18.2)"
+                "the runner must accept target/{profile}/vmcelld so it can launch the daemon (§11.2, Privilege and blessing)"
             );
         }
 

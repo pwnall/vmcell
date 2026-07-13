@@ -16,7 +16,7 @@ struct Args {
     backend: String,
 
     /// Benchmark mode. `latency` preserves the original cold/warm boot bench.
-    /// Others answer the design's open §13 questions.
+    /// Others answer the design's open §16 (Performance) questions.
     #[arg(long, default_value = "latency")]
     mode: String,
 
@@ -38,19 +38,19 @@ struct Args {
     /// Directory (must be on a real FS, NOT tmpfs) for the `latency` warm-restore,
     /// `suspend-size`, and `phase-budget` snapshots — a RAM-backed tmpfs would
     /// mis-measure suspend size and make warm-restore latency systematically
-    /// optimistic (RAM-backed reads; design §13.1 snap-dir caveat).
+    /// optimistic (RAM-backed reads; design §16, Performance, snap-dir caveat).
     #[arg(long, default_value = "./target/vmcell-bench-snap")]
     snap_dir: String,
 
     /// Memory-restore strategy for the warm-restore path (CH `prefault`):
     /// `default` (VMM default), `eager` (`prefault=on`), or `lazy`
-    /// (`prefault=off`, userfaultfd demand-paging). Drives the §13.3
+    /// (`prefault=off`, userfaultfd demand-paging). Drives the §16 (Performance)
     /// eager-vs-lazy benchmark; harmless for non-restore modes.
     #[arg(long, default_value = "default", value_parser = parse_restore_mode)]
     restore_mode: RestoreMode,
 
     /// Mark guest memory KSM-mergeable (CH `mergeable=on`, implies `shared=off`)
-    /// so the `footprint` mode can measure KSM dedup (§13.5). Off by default.
+    /// so the `footprint` mode can measure KSM dedup (§16, Performance). Off by default.
     #[arg(long, default_value_t = false)]
     ksm_mergeable: bool,
 
@@ -221,7 +221,7 @@ async fn run_bench<V: Vmm>(
     // CLI-5 / N-BIN-5: honor `--snap-dir` for the warm-restore snapshot, resolved on
     // the workspace root (not the process CWD) so it lands on the same real FS as the
     // artifacts, instead of `temp_dir()` (commonly tmpfs / RAM-backed), which makes
-    // warm-restore latency systematically optimistic (§13.1 snap-dir caveat).
+    // warm-restore latency systematically optimistic (§16, Performance, snap-dir caveat).
     let snap_dir = resolve_snap_dir(&args.snap_dir).join(format!(
         "latency-{}-{}",
         args.backend,
@@ -229,7 +229,7 @@ async fn run_bench<V: Vmm>(
     ));
     if is_restore && is_tmpfs(&snap_dir) {
         println!(
-            "warning: snap-dir {} is on tmpfs; warm-restore latency will be optimistic (§13.1)",
+            "warning: snap-dir {} is on tmpfs; warm-restore latency will be optimistic (§16, Performance)",
             snap_dir.display()
         );
     }
@@ -382,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
     // are visible (and provably not silently defaulted from a rejected typo).
     println!("{}", resolved_knobs_line(&args));
 
-    // Pin CPU frequency for the whole run (design §13.2 noise floor): every online
+    // Pin CPU frequency for the whole run (design §16, Performance, noise floor): every online
     // CPU is set to the `performance` governor with turbo disabled, and the prior
     // settings are restored when this guard drops — including on panic. Held until
     // `main` returns. Degrades to a logged no-op without CAP_DAC_OVERRIDE, so run
@@ -537,7 +537,7 @@ fn validate_vm_params(args: &Args) -> anyhow::Result<()> {
 }
 
 /// Dispatches to the requested benchmark mode. `latency` preserves the original
-/// cold/warm behaviour exactly (the dry-test path); the rest answer §13.
+/// cold/warm behaviour exactly (the dry-test path); the rest answer §16 (Performance).
 ///
 /// # Errors
 /// Returns an error for an unknown `--mode` so a typo exits non-zero rather than
@@ -556,8 +556,8 @@ async fn run_mode<V: Vmm>(
             if vmm.capabilities().snapshot_restore {
                 run_bench(vmm, "Warm Restore", args, allocator.clone(), true).await?;
             } else {
-                // CLI-4 / §13.2 visible-skip: a no-snapshot backend (e.g. FC/QEMU in
-                // the unprivileged+vsock tier, §3.3) can't run Warm Restore. Print the
+                // CLI-4 / §16 (Performance) visible-skip: a no-snapshot backend (e.g. FC/QEMU in
+                // the unprivileged+vsock tier, §2.5, The capability matrix) can't run Warm Restore. Print the
                 // reason rather than silently dropping the benchmark; a genuine
                 // capability skip is success (Ok), not a failure (M-BIN-1).
                 println!("Warm Restore: backend {backend} has no snapshot support; skipping");
@@ -576,7 +576,7 @@ async fn run_mode<V: Vmm>(
 }
 
 // ----------------------------------------------------------------------------
-// Shared helpers for the §13 benchmark modes.
+// Shared helpers for the §16 (Performance) benchmark modes.
 // ----------------------------------------------------------------------------
 
 /// The kernel artifact filename for an optional version label (`vmlinux` or
@@ -608,7 +608,7 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Resolves `--snap-dir` to an absolute, CWD-independent path anchored on the
-/// workspace root (N-BIN-5): artifacts anchor there too (§11), so an out-of-root
+/// workspace root (N-BIN-5): artifacts anchor there too (§10, The artifact build pipeline), so an out-of-root
 /// invocation must not measure a *different* filesystem for the warm-restore snapshot
 /// than for the artifacts. An absolute `--snap-dir` is honored verbatim.
 fn resolve_snap_dir(raw: &str) -> PathBuf {
@@ -650,7 +650,7 @@ fn path_fstype(mountinfo: &str, path: &Path) -> Option<String> {
 }
 
 /// Best-effort check whether `path` lives on a tmpfs mount (RAM-backed), which makes
-/// warm-restore latency systematically optimistic (§13.1). Consults
+/// warm-restore latency systematically optimistic (§16, Performance). Consults
 /// `/proc/self/mountinfo`; a non-Linux/unreadable table degrades to `false`.
 fn is_tmpfs(path: &Path) -> bool {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -674,7 +674,7 @@ fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
 /// Builds the standard network-disabled erofs VM config used by every mode,
 /// applying the run's `--mem-mib`, `--restore-mode`, `--profile` timeouts,
 /// `--kernel-verbosity`, and `--console` from `args`. `ksm_mergeable` stays an
-/// explicit argument because only `footprint` opts into it (§13.5); every other
+/// explicit argument because only `footprint` opts into it (§16, Performance); every other
 /// mode passes `false`.
 fn build_cfg(args: &Args, kernel: PathBuf, rootfs: PathBuf, ksm_mergeable: bool) -> VmConfig {
     VmConfig::builder(kernel, RootfsSource::Erofs { image: rootfs })
@@ -914,7 +914,7 @@ fn mean_u64(v: &[u64]) -> u64 {
 }
 
 // ----------------------------------------------------------------------------
-// §13.3 — footprint: per-guest RAM, shared erofs page cache, KSM dedup.
+// §16 (Performance) — footprint: per-guest RAM, shared erofs page cache, KSM dedup.
 // ----------------------------------------------------------------------------
 async fn run_footprint<V: Vmm>(
     vmm: &V,
@@ -1140,7 +1140,7 @@ async fn run_footprint<V: Vmm>(
 }
 
 // ----------------------------------------------------------------------------
-// §13.6 — suspend-size: snapshot bytes + memory-file share, vs guest RAM.
+// §16 (Performance) — suspend-size: snapshot bytes + memory-file share, vs guest RAM.
 // ----------------------------------------------------------------------------
 async fn run_suspend_size<V: Vmm>(
     vmm: &V,
@@ -1243,7 +1243,7 @@ async fn run_suspend_size<V: Vmm>(
 }
 
 // ----------------------------------------------------------------------------
-// §13.4 — phase-budget: per-phase distribution + share, restore and cold.
+// §16 (Performance) — phase-budget: per-phase distribution + share, restore and cold.
 // ----------------------------------------------------------------------------
 async fn build_baseline_snapshot<V: Vmm>(
     vmm: &V,
@@ -1343,7 +1343,7 @@ async fn phase_budget_path<V: Vmm>(
         let t_exec = t2.elapsed();
 
         let t3 = Instant::now();
-        // Teardown is deliberately on the budget (§13.4): we time it, and `Drop`
+        // Teardown is deliberately on the budget (§16, Performance): we time it, and `Drop`
         // still guarantees the real teardown if `shutdown` errors.
         let _ = vm.shutdown().await;
         let t_teardown = t3.elapsed();
@@ -1425,7 +1425,7 @@ async fn run_phase_budget<V: Vmm>(
 }
 
 // ----------------------------------------------------------------------------
-// §13.5 — vsock-rtt: control-plane exec round-trip latency floor.
+// §16 (Performance) — vsock-rtt: control-plane exec round-trip latency floor.
 // ----------------------------------------------------------------------------
 async fn run_vsock_rtt<V: Vmm>(
     vmm: &V,

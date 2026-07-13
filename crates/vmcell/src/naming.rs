@@ -59,14 +59,14 @@ pub fn tap_name(prefix: &str, vmid: u32) -> String {
 }
 
 /// The cgroup slice **leaf** name for `vmid`: `<prefix>-vm-<vmid>` (an ancestor path may be prepended
-/// by the caller for sibling placement, §12.7).
+/// by the caller for sibling placement, §13, Cross-cutting invariants).
 #[must_use]
 pub fn cgroup_slice_name(prefix: &str, vmid: u32) -> String {
     format!("{prefix}-vm-{vmid}")
 }
 
 /// The per-VM scratch-directory name: `<prefix>-vm-<pid>-<vmid>` (both ids so two processes' VMs never
-/// collide, §12.3/§12.7).
+/// collide, §13, Cross-cutting invariants).
 #[must_use]
 pub fn scratch_dir_name(prefix: &str, pid: u32, vmid: u32) -> String {
     format!("{prefix}-vm-{pid}-{vmid}")

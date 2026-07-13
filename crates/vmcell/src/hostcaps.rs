@@ -1,4 +1,4 @@
-//! The one-probe host-capability descriptor (`HostCapabilities`), design §7.2 rule 1 / §18 delta 8.
+//! The one-probe host-capability descriptor (`HostCapabilities`), design §7.2 (The fail-loud capability contract and HostCapabilities) rule 1 / §18 (Delta register: changes from the validated v27 build) delta 8.
 //!
 //! An earlier stance — "unprivileged delegation degrades gracefully" — invited **silent no-ops**: a
 //! caller asks for a 256 MiB cap, the controller isn't delegated, the write fails, and the VM runs
@@ -8,19 +8,19 @@
 //! selection, the daemon's `main`, and the test harness) — the effective capability set, KVM-group
 //! access, `/var/run/netns` reachability, which cgroup controllers the current scope delegates, and
 //! whether the scope is a non-threaded `domain` leaf. Per-op checks read the descriptor instead of
-//! re-probing (this consolidates the previously scattered per-op checks — §18 delta 8).
+//! re-probing (this consolidates the previously scattered per-op checks — §18 delta 8, Delta register: changes from the validated v27 build).
 
 use std::collections::BTreeSet;
 
-/// `CAP_NET_ADMIN` — the capability the privileged tap/netns datapath needs (§6.1). Bit index in the
+/// `CAP_NET_ADMIN` — the capability the privileged tap/netns datapath needs (§6.1, The two operating modes). Bit index in the
 /// `/proc/self/status` `CapEff` mask.
 const CAP_NET_ADMIN: u32 = 12;
 /// `CAP_SYS_ADMIN` — the capability `virtiofsd` needs to enter its mount namespace for a data share
-/// (§4.5).
+/// (§4.5, Shared directories (virtio-fs)).
 const CAP_SYS_ADMIN: u32 = 21;
 
 /// A single-probe snapshot of what the host actually offers, the one source of truth per-op checks
-/// read instead of re-probing (design §7.2 rule 1, §18 delta 8).
+/// read instead of re-probing (design §7.2 rule 1, The fail-loud capability contract and HostCapabilities; §18 delta 8, Delta register: changes from the validated v27 build).
 ///
 /// Build one at start-up with [`HostCapabilities::probe`]; tests construct a fake-host descriptor
 /// directly (every field is `pub`) and assert that it drives the mode-selection and fail-loud
@@ -28,21 +28,21 @@ const CAP_SYS_ADMIN: u32 = 21;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HostCapabilities {
-    /// Effective `CAP_NET_ADMIN` — required for the privileged tap + netns network path (§6.1).
+    /// Effective `CAP_NET_ADMIN` — required for the privileged tap + netns network path (§6.1, The two operating modes).
     pub cap_net_admin: bool,
     /// Effective `CAP_SYS_ADMIN` — required for `virtiofsd`'s mount namespace, so virtio-fs data
-    /// shares can mount (§4.5).
+    /// shares can mount (§4.5, Shared directories (virtio-fs)).
     pub cap_sys_admin: bool,
     /// `/dev/kvm` is present and openable read-write — the hard precondition for booting any VM.
     pub kvm_accessible: bool,
     /// The `/var/run/netns` bind-mount directory is reachable — the privileged datapath keeps its
-    /// per-VM namespaces there (§6.1).
+    /// per-VM namespaces there (§6.1, The two operating modes).
     pub netns_reachable: bool,
-    /// The cgroup-v2 controllers the current scope delegates into its subtree (§7.3). A *requested*
-    /// limit needing an absent controller must fail loud (§7.2 rule 2), never run unlimited.
+    /// The cgroup-v2 controllers the current scope delegates into its subtree (§7.3, cgroup delegation mechanics). A *requested*
+    /// limit needing an absent controller must fail loud (§7.2 rule 2, The fail-loud capability contract and HostCapabilities), never run unlimited.
     pub delegated_controllers: BTreeSet<String>,
     /// The current cgroup scope is a non-threaded `domain` leaf. A threaded scope rejects
-    /// `cgroup.procs` regardless of `CAP_SYS_ADMIN`, so no per-VM slice can hold the VMM (§7.3).
+    /// `cgroup.procs` regardless of `CAP_SYS_ADMIN`, so no per-VM slice can hold the VMM (§7.3, cgroup delegation mechanics).
     pub domain_leaf: bool,
 }
 
@@ -63,7 +63,7 @@ impl HostCapabilities {
         }
     }
 
-    /// Whether the **privileged** (tap + netns) networking datapath is available (§6.1): effective
+    /// Whether the **privileged** (tap + netns) networking datapath is available (§6.1, The two operating modes): effective
     /// `CAP_NET_ADMIN` **and** a reachable netns directory. Mode selection falls back to the
     /// unprivileged smoltcp NAT when this is `false` — the decision that keeps the box usable
     /// without root.
@@ -73,23 +73,23 @@ impl HostCapabilities {
     }
 
     /// Whether a *requested* limit for `controller` (`"memory"`/`"cpu"`/`"io"`/`"pids"`) can be
-    /// enforced: the scope is a non-threaded `domain` leaf **and** delegates that controller (§7.3).
+    /// enforced: the scope is a non-threaded `domain` leaf **and** delegates that controller (§7.3, cgroup delegation mechanics).
     /// A requested limit on a host where this is `false` must fail loud with
-    /// [`Error::CapabilityUnavailable`](crate::error::Error::CapabilityUnavailable) (§7.2 rule 2),
+    /// [`Error::CapabilityUnavailable`](crate::error::Error::CapabilityUnavailable) (§7.2 rule 2, The fail-loud capability contract and HostCapabilities),
     /// never silently run unlimited.
     #[must_use]
     pub fn controller_enforceable(&self, controller: &str) -> bool {
         self.domain_leaf && self.delegated_controllers.contains(controller)
     }
 
-    /// Whether a *requested* **memory** limit can be enforced (the binding cap for guest RAM, §7.3).
+    /// Whether a *requested* **memory** limit can be enforced (the binding cap for guest RAM, §7.3, cgroup delegation mechanics).
     #[must_use]
     pub fn memory_limit_enforceable(&self) -> bool {
         self.controller_enforceable("memory")
     }
 
     /// Whether virtio-fs data shares can mount (`virtiofsd` needs `CAP_SYS_ADMIN` for its mount
-    /// namespace, §4.5).
+    /// namespace, §4.5, Shared directories (virtio-fs)).
     #[must_use]
     pub fn virtio_fs_shares_available(&self) -> bool {
         self.cap_sys_admin
@@ -103,7 +103,7 @@ impl HostCapabilities {
 }
 
 /// Probes the process's **effective** capability set for capability `bit` via `/proc/self/status`
-/// `CapEff:` — the §12.8-consistent gate: the capability runner grants caps ambiently without a
+/// `CapEff:` — the §13-consistent gate (Cross-cutting invariants): the capability runner grants caps ambiently without a
 /// full-root uid, so a `geteuid()==0` gate checks the wrong thing.
 fn has_effective_cap(bit: u32) -> bool {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
@@ -182,10 +182,10 @@ mod tests {
         names.iter().map(|s| (*s).to_string()).collect()
     }
 
-    // Delta 8 gate (§18): a probe on a **fake-host** descriptor drives the mode-selection and
+    // Delta 8 gate (§18, Delta register: changes from the validated v27 build): a probe on a **fake-host** descriptor drives the mode-selection and
     // fail-loud decisions — the single source of truth per-op checks read. RED on the inverse (a
     // decision that ignores a field: e.g. reporting a memory limit enforceable on an undelegated or
-    // threaded scope, which is the silent-unlimited no-op §7.2 exists to prevent).
+    // threaded scope, which is the silent-unlimited no-op §7.2 (The fail-loud capability contract and HostCapabilities) exists to prevent).
     #[test]
     fn descriptor_drives_mode_selection_and_fail_loud() {
         let full = HostCapabilities {
@@ -222,7 +222,7 @@ mod tests {
         );
 
         // Undelegated memory → a requested memory limit is UNENFORCEABLE and must fail loud, never
-        // silently run the guest unlimited (§7.2 rule 2).
+        // silently run the guest unlimited (§7.2 rule 2, The fail-loud capability contract and HostCapabilities).
         let no_mem = HostCapabilities {
             delegated_controllers: controllers(&["cpu", "pids"]),
             ..full.clone()

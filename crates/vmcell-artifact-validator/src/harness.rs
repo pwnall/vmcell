@@ -48,7 +48,7 @@ pub fn qemu_bin() -> String {
 }
 
 /// Probes the process's **effective** capability set for capability `bit` via `/proc/self/status`
-/// `CapEff:` — the §12.8-consistent gate: the capability runner grants caps ambiently without a
+/// `CapEff:` — the §13 (Cross-cutting invariants)-consistent gate: the capability runner grants caps ambiently without a
 /// full-root uid, so a `geteuid()==0` gate checks the wrong thing.
 #[must_use]
 pub fn has_effective_cap(bit: u32) -> bool {
@@ -92,7 +92,7 @@ pub fn has_kvm() -> bool {
 }
 
 /// Whether the **memory** cgroup-v2 controller is delegated into this process's subtree — the
-/// precondition for the per-VM memory-limit contract (§7). Best-effort: reads the current
+/// precondition for the per-VM memory-limit contract (§7, Resource monitoring and limits). Best-effort: reads the current
 /// cgroup base from `/proc/self/cgroup` (via vmcell's canonical parser) and checks that base's
 /// `cgroup.subtree_control` advertises `memory`. A non-delegated host → the metrics checks skip
 /// with reason rather than fail.

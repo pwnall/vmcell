@@ -1,5 +1,5 @@
 //! Minimal interface-configuration helpers for the guest agent's native
-//! post-restore resync (design 44 §5).
+//! post-restore resync (§8.2, Restore correctness: a restored VM is not a fresh VM).
 //!
 //! Just enough of the `SIOCSIFHWADDR` MAC-set path to rotate `eth0`'s hardware
 //! address in-process on restore, so PID 1 no longer spawns the multi-MB

@@ -1,9 +1,9 @@
 //! Fork/branch lineage: handles over the zygote fan-out that record provenance.
 //!
-//! The zygote fan-out (§9.4) mints many identical VMs from one immutable suspend
+//! The zygote fan-out (§8.4, The zygote fan-out and the OverlayStore seam) mints many identical VMs from one immutable suspend
 //! image, flat: no recorded parent→child relationship, and no first-class way to
 //! freeze a clone that has *diverged* (run some work) into a **new** fork point.
-//! This module adds that layer (§21.4):
+//! This module adds that layer (§8.5, Lineage: fork and branch):
 //!
 //! - A [`Lineage`] is **the lineage handle** — an immutable snapshot node carrying
 //!   its identity ([`LineageId`]), parent, generation, and ancestry.
@@ -12,7 +12,7 @@
 //!   parent is this one. A chain `root → b1 → b2` is a tree of provenance, each
 //!   node itself a self-contained single-snapshot zygote.
 //!
-//! Every node is a flat, complete snapshot (no backing chain, §21.3), so a restore
+//! Every node is a flat, complete snapshot (no backing chain, §8.6, One snapshot per node, not a backing chain), so a restore
 //! never walks lineage depth, and `fork`/`branch` invent **no** new identity,
 //! eligibility, or copy-on-write logic — they delegate to [`Zygote`], which is the
 //! one home for all of it (AGENTS.md "one law, one predicate").
@@ -84,7 +84,7 @@ impl Default for LineageAllocator {
     }
 }
 
-/// A node in a fork/branch lineage — **the lineage handle** (§21.4).
+/// A node in a fork/branch lineage — **the lineage handle** (§8.5, Lineage: fork and branch).
 ///
 /// Immutable: an immutable suspended snapshot (wrapped [`Zygote`]) plus the
 /// ancestry that produced it. [`fork`](Lineage::fork) mints a live child VM at this
@@ -124,7 +124,7 @@ impl Lineage {
     ///
     /// # Errors
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) if `cfg` is not
-    /// snapshot-eligible (a vhost-user device, §12.1); [`Error::Io`](crate::error::Error::Io)
+    /// snapshot-eligible (a vhost-user device, §13, Cross-cutting invariants); [`Error::Io`](crate::error::Error::Io)
     /// if `dir` cannot be created; otherwise any error from taking the snapshot.
     pub async fn fork_from_vm<V: Vmm>(
         vm: &mut MicroVm<V>,
@@ -144,12 +144,12 @@ impl Lineage {
     }
 
     /// Adopts an already-built snapshot directory (e.g. a `SnapshotStage` artifact,
-    /// §11.1) as a lineage root.
+    /// §10.1, Artifacts produced) as a lineage root.
     ///
     /// # Errors
     /// [`Error::Io`](crate::error::Error::Io) if `dir` is not an existing directory,
     /// or [`Error::Unsupported`](crate::error::Error::Unsupported) if `cfg` is not
-    /// snapshot-eligible (§12.1).
+    /// snapshot-eligible (§13, Cross-cutting invariants).
     pub async fn from_snapshot_dir(
         dir: impl Into<PathBuf>,
         cfg: VmConfig,
@@ -198,7 +198,7 @@ impl Lineage {
 
     /// Whether `self` is a (strict) ancestor of `other` — i.e. `other` descends from
     /// `self` in the **same** lineage family. Antisymmetric and transitive by
-    /// construction (§12.25).
+    /// construction (§13, Cross-cutting invariants).
     ///
     /// Two nodes minted by **distinct** [`LineageAllocator`]s are always
     /// incomparable (never a false-positive ancestry), even if their ids collide by
@@ -222,7 +222,7 @@ impl Lineage {
     }
 
     /// Best-effort probe of whether this node's filesystem gives cheap block-level
-    /// copy-on-write for its clones (§9.4).
+    /// copy-on-write for its clones (§8.4, The zygote fan-out and the OverlayStore seam).
     #[must_use]
     pub fn probe_cow_support(&self) -> CowSupport {
         self.zygote.probe_cow_support()
@@ -232,23 +232,23 @@ impl Lineage {
     ///
     /// Delegates to [`Zygote::spawn_clone`]; works on any snapshot backend. The
     /// returned VM is live and resumed, with a fresh vmid (hence distinct IP/MAC,
-    /// §9.2); its first `agent()` call runs the mandatory post-restore resync.
+    /// §8.2, Restore correctness: a restored VM is not a fresh VM); its first `agent()` call runs the mandatory post-restore resync.
     ///
     /// # Errors
-    /// Any error from the copy-on-write copy, network setup, or restore (§9.4).
+    /// Any error from the copy-on-write copy, network setup, or restore (§8.4, The zygote fan-out and the OverlayStore seam).
     pub async fn fork<V: Vmm>(&self, vmm: &V, env: &HostEnv) -> Result<MicroVm<V>> {
         self.zygote.spawn_clone(vmm, env).await
     }
 
     /// Mints `count` live children **concurrently** at this node.
     ///
-    /// Delegates to [`Zygote::spawn_clones`], so the §9.4 all-or-nothing teardown
+    /// Delegates to [`Zygote::spawn_clones`], so the §8.4 (The zygote fan-out and the OverlayStore seam) all-or-nothing teardown
     /// and the concurrent-fan-out gate on `restore_rotates_host_paths` apply
     /// unchanged.
     ///
     /// # Errors
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) when `count > 1` and
-    /// the backend does not rotate host paths on restore (§9.4); otherwise the
+    /// the backend does not rotate host paths on restore (§8.4, The zygote fan-out and the OverlayStore seam); otherwise the
     /// first clone error.
     pub async fn fork_many<V: Vmm>(
         &self,
@@ -264,11 +264,11 @@ impl Lineage {
     /// node's id).
     ///
     /// Snapshots `child` into `dir` and returns the new node; `child` stays live and
-    /// the caller owns `dir`'s lifecycle (like a zygote master, §12.12). `dir` is
+    /// the caller owns `dir`'s lifecycle (like a zygote master, §13, Cross-cutting invariants). `dir` is
     /// **created if it does not exist**. Every node's clones materialize through the
     /// process-wide `env.overlay` supplied at [`fork`](Lineage::fork) time, so a
     /// whole lineage uses one seam by construction (invariant S4). Snapshot-eligibility
-    /// (§12.1) is re-checked through the same `check_clone_eligible` predicate the
+    /// (§13, Cross-cutting invariants) is re-checked through the same `check_clone_eligible` predicate the
     /// zygote uses (one law).
     ///
     /// # Errors
@@ -287,7 +287,7 @@ impl Lineage {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(crate::error::Error::Io)?;
-        // `Zygote::suspend` re-checks eligibility (§12.1) and snapshots the child.
+        // `Zygote::suspend` re-checks eligibility (§13, Cross-cutting invariants) and snapshots the child.
         // The overlay store is no longer carried on the node — it is supplied from
         // `env.overlay` at fork time (invariant S4), so the whole lineage shares one
         // store by construction.
@@ -320,9 +320,9 @@ mod tests {
 
     // One process-global VMID allocator shared across these tests: fork() mints real
     // per-VM scratch dirs keyed on vmid, so fresh per-test allocators would collide
-    // under `cargo test`'s in-process parallelism (§10.2, same reason as the zygote
+    // under `cargo test`'s in-process parallelism (§9.8, Testability seams, same reason as the zygote
     // tests). nextest runs each test in its own process, so this is inert there.
-    static SHARED_VMIDS: std::sync::OnceLock<VmidAllocator> = std::sync::OnceLock::new(); // allow-global-state: process-global VMID allocator; §10.2 requires one shared allocator per test-runner process to avoid concurrent-test scratch-dir collisions
+    static SHARED_VMIDS: std::sync::OnceLock<VmidAllocator> = std::sync::OnceLock::new(); // allow-global-state: process-global VMID allocator; §9.8 (Testability seams) requires one shared allocator per test-runner process to avoid concurrent-test scratch-dir collisions
     fn shared_vmids() -> VmidAllocator {
         SHARED_VMIDS.get_or_init(VmidAllocator::new).clone()
     }
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(ids.len(), 8, "every id must be distinct");
     }
 
-    // A root has generation 0, no parent, and an empty ancestry (§12.25). The
+    // A root has generation 0, no parent, and an empty ancestry (§13, Cross-cutting invariants). The
     // inverse (a non-zero root generation, or a non-empty ancestry) reddens.
     #[tokio::test]
     async fn root_has_generation_zero_no_parent_empty_ancestry() {
@@ -370,7 +370,7 @@ mod tests {
     }
 
     // fork() materializes the clone through the injected OverlayStore into a PRIVATE
-    // dir, never the master (§12.24). The inverse — a restore path that skips the
+    // dir, never the master (§13, Cross-cutting invariants). The inverse — a restore path that skips the
     // seam and hands the backend the master directly — records zero clone_into calls
     // (or a dst == master), reddening both asserts.
     #[tokio::test]
@@ -396,7 +396,10 @@ mod tests {
         let calls = store.calls();
         assert_eq!(calls.len(), 1, "fork must materialize exactly one CoW copy");
         let (src, dst) = &calls[0];
-        assert_eq!(src, &master, "the copy source must be the master (§12.24)");
+        assert_eq!(
+            src, &master,
+            "the copy source must be the master (§13, Cross-cutting invariants)"
+        );
         assert_ne!(
             dst, &master,
             "the copy dst must be a PRIVATE dir, never the master"
@@ -410,7 +413,7 @@ mod tests {
 
     // branch() extends the lineage: the new node's parent is the branched node, its
     // generation is +1, and its ancestry is the parent's ancestry plus the parent
-    // (§12.25). The inverse (parent None, generation unchanged, ancestry not
+    // (§13, Cross-cutting invariants). The inverse (parent None, generation unchanged, ancestry not
     // extended) reddens each assert.
     #[tokio::test]
     async fn branch_extends_lineage() {
@@ -443,14 +446,14 @@ mod tests {
         );
         assert!(
             !b1.is_ancestor_of(&root),
-            "is_ancestor_of is antisymmetric (§12.25)"
+            "is_ancestor_of is antisymmetric (§13, Cross-cutting invariants)"
         );
         assert_ne!(b1.id(), root.id(), "a branch has a distinct id");
     }
 
     // A 3-node chain root → b1 → b2: generations 0/1/2, ancestries []/[root]/
     // [root,b1], and is_ancestor_of is transitive (root ancestor of b2). No node is
-    // its own ancestor (§12.25). The inverse of the ancestry-extension rule breaks
+    // its own ancestor (§13, Cross-cutting invariants). The inverse of the ancestry-extension rule breaks
     // the transitive check.
     #[tokio::test]
     async fn three_node_chain_generations_and_ancestry() {
@@ -487,7 +490,7 @@ mod tests {
         assert_eq!(b1.ancestry(), &[root.id()]);
         assert_eq!(b2.ancestry(), &[root.id(), b1.id()]);
 
-        // Transitivity + antisymmetry + no-self-ancestor (§12.25).
+        // Transitivity + antisymmetry + no-self-ancestor (§13, Cross-cutting invariants).
         assert!(root.is_ancestor_of(&b1) && root.is_ancestor_of(&b2));
         assert!(b1.is_ancestor_of(&b2));
         assert!(!b2.is_ancestor_of(&root) && !b2.is_ancestor_of(&b1));
@@ -522,7 +525,7 @@ mod tests {
     }
 
     // Eligibility is re-checked at the lineage boundary via the shared predicate: a
-    // vhost-user config (a data share) is rejected at construction (§12.1), before
+    // vhost-user config (a data share) is rejected at construction (§13, Cross-cutting invariants), before
     // any snapshot. The inverse (skipping the check) would mint an unrestorable node.
     #[tokio::test]
     async fn ineligible_config_rejected_at_construction() {
@@ -594,12 +597,12 @@ mod tests {
         );
         assert!(
             !a.is_ancestor_of(&b1),
-            "a node from a DIFFERENT allocator family must never be an ancestor (§12.25), \
+            "a node from a DIFFERENT allocator family must never be an ancestor (§13, Cross-cutting invariants), \
              even when ids collide"
         );
     }
 
-    // §12.24 for repeated forks at one node: EVERY clone materializes through the
+    // §13 (Cross-cutting invariants) for repeated forks at one node: EVERY clone materializes through the
     // store into its OWN private dir. Two forks must record two DISTINCT dsts, both
     // non-master. The inverse — a restore path that reused one clone dir — records a
     // duplicate dst and reddens the distinctness assert.
@@ -632,7 +635,7 @@ mod tests {
         assert_eq!(
             dsts.len(),
             2,
-            "two forks must use two DISTINCT private dirs (§12.24)"
+            "two forks must use two DISTINCT private dirs (§13, Cross-cutting invariants)"
         );
         for (src, dst) in &calls {
             assert_eq!(src, &master, "every copy source is the master");
@@ -641,7 +644,7 @@ mod tests {
     }
 
     // fork_many (the concurrent path) materializes EACH clone through the store into
-    // its own private dir and hands each a distinct vmid. Covers the §12.24 seam on
+    // its own private dir and hands each a distinct vmid. Covers the §13 (Cross-cutting invariants) seam on
     // the fan-out path, delegated to Zygote::spawn_clones (the gate/all-or-nothing
     // are its own tests). The inverse (a fan-out that bypassed the store) records
     // zero calls.
@@ -672,7 +675,7 @@ mod tests {
         assert_eq!(
             calls.len(),
             3,
-            "each clone materializes through the store (§12.24)"
+            "each clone materializes through the store (§13, Cross-cutting invariants)"
         );
         let dsts: std::collections::HashSet<_> = calls.iter().map(|(_, d)| d.clone()).collect();
         assert_eq!(dsts.len(), 3, "each clone into its OWN private dir");

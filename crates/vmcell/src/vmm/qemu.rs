@@ -171,7 +171,7 @@ impl QemuInstance {
 /// typed [`Error::Vmm`] instead of silently degrading to the root-only internal
 /// kernel vsock.
 ///
-/// The external daemon is QEMU's unprivileged control plane (§3.2). A missing or broken
+/// The external daemon is QEMU's unprivileged control plane (§2.4, QEMU q35 — the fallback and most-proven nester). A missing or broken
 /// `vhost-device-vsock` binary is a loud misconfiguration that must surface here — the
 /// old silent `.ok()` fallback only re-emerged later as an opaque agent-handshake
 /// timeout, violating the "checked before a timeout masks it" rule (M-VMM-2).
@@ -292,7 +292,7 @@ impl Qemu {
         std_vsock_cmd.process_group(0);
 
         // The external vhost-device-vsock daemon IS QEMU's unprivileged control plane
-        // (§3.2). A spawn failure (e.g. a missing/broken binary) fails loud and typed
+        // (§2.4, QEMU q35 — the fallback and most-proven nester). A spawn failure (e.g. a missing/broken binary) fails loud and typed
         // here — it does NOT silently degrade to the root-only internal kernel vsock,
         // which would only re-emerge later as an opaque agent-handshake timeout
         // (M-VMM-2).
@@ -336,7 +336,7 @@ impl Qemu {
             fs_daemons.push(daemon);
         }
 
-        // §20.3/§20.4: QEMU had NO `-sandbox` — it ran unconfined. Enforcing now emits the
+        // §12.2 (Layer 1 — the VMM's own seccomp filter)/§12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): QEMU had NO `-sandbox` — it ran unconfined. Enforcing now emits the
         // libseccomp sandbox (a QEMU built without libseccomp errors fail-loud on it, the
         // desired behavior); the jailer-equivalent hardening is applied in build_vmm_cmd.
         let seccomp_args = crate::vmm::seccomp::vmm_seccomp_args("qemu", cfg.vmm_seccomp)?;
@@ -419,13 +419,13 @@ impl Qemu {
             }
         }
 
-        // Extra virtio-blk devices (§19.1), attached AFTER the root `virtio-blk-pci` so
+        // Extra virtio-blk devices (§4.6, Extra virtio-blk devices and disk-I/O throttling), attached AFTER the root `virtio-blk-pci` so
         // they enumerate `/dev/vdb`, `/dev/vdc`, … in order and never shift the root
         // off `/dev/vda`. Each is a split-form drive/device pair with its own id.
         // `readonly=on` only for read-only disks; `file.locking=off` matches the root.
         for (i, disk) in cfg.extra_disks.iter().enumerate() {
             let ro = if disk.readonly { ",readonly=on" } else { "" };
-            // Disk-I/O fault injection (§19.5): QEMU's per-drive throttling takes the rate
+            // Disk-I/O fault injection (§4.6, Extra virtio-blk devices and disk-I/O throttling): QEMU's per-drive throttling takes the rate
             // directly (bytes/s, ops/s) — no token-bucket conversion, unset caps omitted.
             let mut throttle = String::new();
             if let Some(limit) = &disk.io_limit {
@@ -486,7 +486,7 @@ impl Qemu {
             .arg(&cmdline);
 
         // VMM-5: no `-incoming defer` here. QEMU snapshot/restore is `snapshot_restore:
-        // false` in every config (§3.2), so `restore()` returns `Unsupported` before
+        // false` in every config (§2.4, QEMU q35 — the fallback and most-proven nester), so `restore()` returns `Unsupported` before
         // ever spawning — the migration-incoming branch was dead code (create() only
         // cold-boots). Removed rather than gated behind the off capability.
 
@@ -598,7 +598,7 @@ impl Vmm for Qemu {
             virtio_console: true,
             // Honest-false: QEMU restore() is unwired (returns Unsupported), so
             // no path rotation exists to advertise. Revisit with the privileged
-            // in-kernel-vhost-vsock wiring (§16).
+            // in-kernel-vhost-vsock wiring (§17, Open gaps and future capabilities).
             restore_rotates_host_paths: false,
         }
     }

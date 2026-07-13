@@ -1,4 +1,4 @@
-//! Start-up orphan sweep (design §18.4).
+//! Start-up orphan sweep (design §11.4, The VM registry and the start-up sweep).
 //!
 //! The daemon **owns** its VMs and releases their resources on `Drop`/`shutdown` — but a hard-killed
 //! daemon (SIGKILL, power loss) never runs those, leaking netns/cgroup/scratch keyed by the dead VMs'

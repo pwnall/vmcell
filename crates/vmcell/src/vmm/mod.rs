@@ -10,10 +10,10 @@ pub mod cloud_hypervisor;
 
 pub use cloud_hypervisor::{ChInstance, CloudHypervisor};
 
-/// Jailer-equivalent pre-exec hardening of the VMM child (design §20.4).
+/// Jailer-equivalent pre-exec hardening of the VMM child (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
 pub mod jail;
 
-/// The VMM subprocess's own seccomp-BPF confinement — one predicate, three backends (§20.3).
+/// The VMM subprocess's own seccomp-BPF confinement — one predicate, three backends (§12.2, Layer 1 — the VMM's own seccomp filter).
 pub mod seccomp;
 
 #[cfg(feature = "firecracker")]
@@ -176,7 +176,7 @@ pub struct VmTempDir {
 /// e.g., `(1, 23)` and `(12, 3)` never collapse to the same directory, so every
 /// per-VM path derived from it (`api.sock`/`vsock.sock`/`serial.log`) is unique
 /// per `(pid, vmid)`. This is the property the path-injectivity prop test pins
-/// (design §12.3 / §12.7 — "Temp-dir collision on PID-only path"); isolating the
+/// (design §13, Cross-cutting invariants — "Temp-dir collision on PID-only path"); isolating the
 /// construction here is what makes `(pid, vmid)` prop-exercisable without a real
 /// process id.
 #[must_use]
@@ -231,7 +231,7 @@ pub(crate) fn remove_vm_tmp_dir(dir: &Path) {
 }
 
 /// Builds a Tokio command for the VMM, handling network namespaces, the jailer-equivalent
-/// pre-exec hardening (design §20.4), and process groups.
+/// pre-exec hardening (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)), and process groups.
 ///
 /// The single `pre_exec` closure enters the netns (when `netns_name` is `Some`) and then
 /// applies `jail` to the VMM child — the order is load-bearing: `setns` needs the caps the
@@ -437,13 +437,13 @@ pub(crate) fn reject_unsupported_console(
 /// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
 /// because it has a vhost-user device attached (a virtio-fs data share served by
 /// virtiofsd, the unprivileged `vhost-user-net` NAT, or an external `vhost-user-net`
-/// socket). The snapshot-eligibility law (§3.3) requires every backend to self-guard
+/// socket). The snapshot-eligibility law (§8.1, The warm-snapshot path and the eligibility law) requires every backend to self-guard
 /// `snapshot()`/`restore()` against such a VM rather than assume the caller checked.
 ///
 /// This is the ONE shared predicate for all backends (M-VMM-5): the former per-backend
 /// copies had already diverged — the Firecracker copy never grew the virtio-fs *rootfs*
 /// term the CH copy carried, so a virtio-fs-rootfs restore slipped its guard (H-VMM-3).
-/// Centralizing it makes that class of divergence impossible. (Design §18 delta 5
+/// Centralizing it makes that class of divergence impossible. (Design §18 delta 5, Delta register: changes from the validated v27 build
 /// later removed the virtio-fs-rootfs variant entirely, making that boundary case
 /// unrepresentable rather than a runtime check.)
 pub(crate) fn has_vhost_user_device(
@@ -455,7 +455,7 @@ pub(crate) fn has_vhost_user_device(
 }
 
 /// Returns `true` when `cfg`/`res` describe a VM that carries any vhost-user device and
-/// is therefore **not** snapshot-eligible (§3.3). Covers the boundary cases at
+/// is therefore **not** snapshot-eligible (§8.1, The warm-snapshot path and the eligibility law). Covers the boundary cases at
 /// `restore()`/`snapshot()`: a virtio-fs data share (backed by virtiofsd), the
 /// unprivileged `vhost-user-net` NAT, and an external `vhost-user-net` socket.
 pub(crate) fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
@@ -567,13 +567,13 @@ pub struct VmmCapabilities {
     /// True if `restore()` gives the restored VM **fresh host-side socket paths**
     /// inside its own scratch dir. Cloud Hypervisor does: its restore config
     /// rewrite moves the vsock/serial paths into the new VM's tmp dir before
-    /// launch (§9.2). Firecracker does not: `PUT /snapshot/load` re-binds the
+    /// launch (§8.2, Restore correctness: a restored VM is not a fresh VM). Firecracker does not: `PUT /snapshot/load` re-binds the
     /// snapshot's recorded host vsock UDS path **verbatim** — no load-time
     /// override exists in FC v1.16. Consequences when `false`: every restore of
     /// a snapshot lineage shares the ONE baked host vsock path, so (a) restoring
     /// while the snapshotted VM (or a prior restore of it) is still alive is
     /// rejected by the backend's pre-restore liveness guard, and (b) concurrent
-    /// restores from one snapshot lineage are unsupported (the design §16
+    /// restores from one snapshot lineage are unsupported (the design §17, Open gaps and future capabilities
     /// single-snapshot-CoW gap covers both backends anyway).
     pub restore_rotates_host_paths: bool,
 }
@@ -584,7 +584,7 @@ pub struct VmmCapabilities {
 /// Firecracker. Every implementation **self-checks** unsupported operations against
 /// its [`capabilities`](Vmm::capabilities) and returns
 /// [`Error::Unsupported`](crate::error::Error::Unsupported) with a typed feature name
-/// rather than assuming the caller validated first (design §3.1).
+/// rather than assuming the caller validated first (design §2.1, The trait and the capability descriptor).
 pub trait Vmm: Send + Sync {
     /// The associated instance type representing a running VM.
     type Instance: VmInstance;
@@ -613,7 +613,7 @@ pub trait Vmm: Send + Sync {
     /// The returned instance is **paused**: the caller continues with
     /// [`resume`](VmInstance::resume), **never** [`boot`](VmInstance::boot) — the guest
     /// is already running inside the snapshot and is resumed from its paused point, not
-    /// cold-booted (design §3.1). Device topology is reconstructed from the snapshot;
+    /// cold-booted (design §2.1, The trait and the capability descriptor). Device topology is reconstructed from the snapshot;
     /// `cfg` is consulted only for timeouts, console-mode validation, and capability
     /// self-checks.
     ///
@@ -622,7 +622,7 @@ pub trait Vmm: Send + Sync {
     ///   not advertise `capabilities().snapshot_restore`.
     /// - [`Error::Unsupported`](crate::error::Error::Unsupported) when `cfg`/`res` carry
     ///   any vhost-user device (a virtio-fs share or rootfs, unprivileged networking, or
-    ///   an external vhost-user-net socket) — the snapshot-eligibility law (§3.3)
+    ///   an external vhost-user-net socket) — the snapshot-eligibility law (§8.1, The warm-snapshot path and the eligibility law)
     ///   rejects such a VM before restore.
     /// - Snapshot I/O, parse, or VMM-start errors.
     async fn restore(
@@ -739,7 +739,7 @@ pub trait VmInstance: Send {
     }
 }
 
-/// A scriptable fault menu for [`FakeVmm`] (design §18 delta 9, §9.8) — drives the orchestrator's
+/// A scriptable fault menu for [`FakeVmm`] (design §18 delta 9, Delta register: changes from the validated v27 build, §9.8, Testability seams) — drives the orchestrator's
 /// failure / retry / timeout paths at the `Vmm`/`VmInstance` seam itself, not only through the
 /// surrounding seams. Every field defaults to "no fault", so `FakeVmm::default()` is a healthy
 /// backend.
@@ -769,7 +769,7 @@ pub struct FaultMenu {
 pub struct FakeVmm {
     /// Records calls made to the fake VMM.
     pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// The scriptable fault menu (design §18 delta 9); default = a healthy backend.
+    /// The scriptable fault menu (design §18 delta 9, Delta register: changes from the validated v27 build); default = a healthy backend.
     pub faults: FaultMenu,
     /// Control-plane probe counter shared with every instance this fake creates, so
     /// [`FaultMenu::wedge_control_plane_for`] spans the respawns that each build a fresh instance.
@@ -777,7 +777,7 @@ pub struct FakeVmm {
 }
 
 impl FakeVmm {
-    /// A fake backend scripted with `faults` (design §18 delta 9).
+    /// A fake backend scripted with `faults` (design §18 delta 9, Delta register: changes from the validated v27 build).
     #[must_use]
     pub fn with_faults(faults: FaultMenu) -> Self {
         Self {
@@ -810,7 +810,7 @@ pub struct FakeVmInstance {
     pub serial: PathBuf,
     /// Records calls made to the fake instance.
     pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// The fault menu inherited from the creating [`FakeVmm`] (design §18 delta 9).
+    /// The fault menu inherited from the creating [`FakeVmm`] (design §18 delta 9, Delta register: changes from the validated v27 build).
     pub faults: FaultMenu,
     /// Shared with the creating [`FakeVmm`] so the control-plane wedge counter spans respawns.
     pub control_plane_probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1271,9 +1271,9 @@ mod tests {
         .expect("build eligible config");
         assert!(!config_has_vhost_user_device(&eligible, &res_with(None)));
 
-        // §19.1.3: an extra PLAIN virtio-blk device is NOT a vhost-user device, so it
+        // §4.6 (Extra virtio-blk devices and disk-I/O throttling): an extra PLAIN virtio-blk device is NOT a vhost-user device, so it
         // must stay snapshot-eligible ("plain virtio-blk composes with snapshot",
-        // §17/§5.1). A false positive here would wrongly disqualify snapshot.
+        // §17, Open gaps and future capabilities / §8.1, The warm-snapshot path and the eligibility law). A false positive here would wrongly disqualify snapshot.
         // Inverse: add an `extra_disks` term to `config_has_vhost_user_device` and
         // this reddens.
         let with_extra_disk = VmConfig::builder(
@@ -1399,7 +1399,7 @@ mod tests {
         }
     }
 
-    // Design §12.3 / §12.7: the per-VM scratch dir — and every per-VM socket/serial
+    // Design §13 (Cross-cutting invariants): the per-VM scratch dir — and every per-VM socket/serial
     // path derived from it — must be INJECTIVE in (pid, vmid). These are the
     // DETERMINISTIC regression cases for the two documented buggy inverses, which a
     // random proptest almost never stumbles on (concatenation collisions are sparse

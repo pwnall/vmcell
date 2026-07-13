@@ -1,4 +1,4 @@
-//! The single artifact-name predicate (design §18.3.1 / invariant §12.13).
+//! The single artifact-name predicate (design §11.3, The artifact store / invariant §13, Cross-cutting invariants).
 //!
 //! Artifact names map **directly** to files: name `k1` is the file `<artifacts-dir>/k1`. That makes
 //! this a **security boundary** of the same class as the test-runner's exec-target confinement — a
@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 /// The maximum artifact-name length in bytes — `NAME_MAX` (255 on most Linux filesystems), the
-/// ceiling for a single filename component `<name>` under the store dir (design §18.3.1). The store's
+/// ceiling for a single filename component `<name>` under the store dir (design §11.3, The artifact store). The store's
 /// atomic upload creates its temp file with an independent random name (`NamedTempFile::new_in`), so
 /// the artifact name may use the whole component budget without a temp-suffix overflow.
 pub const MAX_ARTIFACT_NAME_LEN: usize = 255;
@@ -98,7 +98,7 @@ pub fn validate_artifact_name(name: &str) -> Result<(), InvalidName> {
 }
 
 /// The ONLY function that turns a client-supplied artifact name into a path. Every store op and every
-/// VM-API artifact reference resolves through it (invariant §12.13); no caller constructs
+/// VM-API artifact reference resolves through it (invariant §13, Cross-cutting invariants); no caller constructs
 /// `dir.join(name)` on a client string directly.
 ///
 /// On success the result is exactly `dir.join(name)` with `name` a single validated component — no

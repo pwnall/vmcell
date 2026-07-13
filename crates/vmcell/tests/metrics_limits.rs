@@ -98,7 +98,7 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         "memory controller delegated but memory.current is 0"
     );
     assert!(stats_before.mem_peak_mib > 0, "Peak memory should be > 0");
-    // §7.1 rule 3: the read path must honestly report enforcement. The controller is
+    // §7.1 (What is read and enforced) rule 3: the read path must honestly report enforcement. The controller is
     // delegated here (memory.max read back above), so mem_limit_enforced must be true; a
     // read path that never sets the flag leaves it false and this goes red.
     assert!(
@@ -159,7 +159,7 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Test OOM-kill (TESTS-FEATURES-1): the host cgroup cap (256 MiB) is the binding limit
     // below the 512 MiB guest RAM, so a runaway allocation trips the HOST OOM killer
     // (memory.events oom_kill). This is the extracted `checks::metrics_mem_limit_ooms` the
-    // validator runs (§7) — one implementation of the OOM-observation.
+    // validator runs (§7, Resource monitoring and limits) — one implementation of the OOM-observation.
     vmcell_artifact_validator::checks::metrics_mem_limit_ooms(&mut vm)
         .await
         .expect("host cgroup memory cap must be the binding OOM limit");

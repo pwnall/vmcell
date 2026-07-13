@@ -129,18 +129,18 @@ struct ChDisk {
     /// superblock region, or a guest write to `/dev/vdb` offset 0). Declaring `Raw`
     /// keeps the whole disk writable and drops CH's deprecation warnings.
     image_type: &'static str,
-    /// Optional I/O rate limiter (disk-I/O fault injection, §19.5). Omitted when the disk
+    /// Optional I/O rate limiter (disk-I/O fault injection, §4.6, Extra virtio-blk devices and disk-I/O throttling). Omitted when the disk
     /// is unthrottled so the JSON matches CH's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limiter_config: Option<ChRateLimiter>,
 }
 
-/// The one image format vmcell attaches — every image is a raw block image (§19.1 /
-/// the CH sector-0-write fix above).
+/// The one image format vmcell attaches — every image is a raw block image (§4.6, Extra
+/// virtio-blk devices and disk-I/O throttling / the CH sector-0-write fix above).
 const CH_RAW_IMAGE_TYPE: &str = "Raw";
 
 /// CH's per-disk `rate_limiter_config` — independent bandwidth (bytes/s) and ops (IOPS)
-/// token buckets (§19.5). Each is omitted when its cap is unset.
+/// token buckets (§4.6, Extra virtio-blk devices and disk-I/O throttling). Each is omitted when its cap is unset.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct ChRateLimiter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,7 +159,7 @@ struct ChTokenBucket {
 
 /// Builds CH's `rate_limiter_config` from a [`DiskIoLimit`](crate::config::DiskIoLimit),
 /// using the shared `size = rate`, `refill_time = IO_LIMIT_REFILL_TIME_MS` conversion
-/// (one law, one predicate — Firecracker builds the identical bucket, §19.5).
+/// (one law, one predicate — Firecracker builds the identical bucket, §4.6, Extra virtio-blk devices and disk-I/O throttling).
 fn ch_rate_limiter(limit: &crate::config::DiskIoLimit) -> ChRateLimiter {
     let bucket = |rate: u64| ChTokenBucket {
         size: rate,
@@ -173,7 +173,7 @@ fn ch_rate_limiter(limit: &crate::config::DiskIoLimit) -> ChRateLimiter {
 
 /// Builds the CH `disks[]` list: the **root disk first** (array index 0 = `/dev/vda`,
 /// its `readonly` set from the rootfs kind), then the extra virtio-blk devices in
-/// order (`/dev/vdb`, `/dev/vdc`, …, each honoring its own `readonly`, §19.1.2). CH
+/// order (`/dev/vdb`, `/dev/vdc`, …, each honoring its own `readonly`, §4.6, Extra virtio-blk devices and disk-I/O throttling). CH
 /// enumerates disks purely by array order, so this ordering is the load-bearing
 /// contract with the cmdline's `root=/dev/vda`. Pure, so the ordering is unit-testable
 /// without a running VMM. A virtio-fs rootfs contributes no disk (unreachable here —
@@ -396,7 +396,7 @@ impl CloudHypervisor {
         let vsock_path = res.tmp_dir.join("vsock.sock");
         let serial_path = res.tmp_dir.join("serial.log");
 
-        // §20.3/§20.4: the VMM's own seccomp flag (one predicate) + the jailer-equivalent
+        // §12.2 (Layer 1 — the VMM's own seccomp filter) / §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): the VMM's own seccomp flag (one predicate) + the jailer-equivalent
         // pre-exec hardening applied in build_vmm_cmd's forked-child window.
         let seccomp_args =
             crate::vmm::seccomp::vmm_seccomp_args("cloud-hypervisor", cfg.vmm_seccomp)?;
@@ -438,7 +438,7 @@ impl CloudHypervisor {
             )?;
             tokio::fs::write(&config_path, serde_json::to_string(&config)?).await?;
 
-            // §13.3 eager-vs-lazy restore: CH v52's `--restore` accepts a
+            // §8.3 (Density levers) eager-vs-lazy restore: CH v52's `--restore` accepts a
             // `prefault=on|off` modifier on the `source_url`. `on` eagerly faults
             // all guest memory in at restore time; `off` selects lazy/userfaultfd
             // demand-paging. `Default` omits the modifier and uses CH's own default.
@@ -560,7 +560,7 @@ impl Vmm for CloudHypervisor {
                 // KSM only deduplicates private-anonymous guest memory, so the
                 // `mergeable` (KSM) lever requires `shared=off`. Default keeps
                 // shared memory (the vhost-user paths need it); only the opt-in
-                // §13.5 KSM-density benchmark flips both.
+                // §8.3 (Density levers) KSM-density benchmark flips both.
                 shared: !cfg.ksm_mergeable,
                 mergeable: cfg.ksm_mergeable,
             },
@@ -690,7 +690,7 @@ impl Vmm for CloudHypervisor {
             nested_virt: true,
             virtio_console: true,
             // CH's restore config rewrite moves the vsock/serial paths into the
-            // restored VM's OWN fresh scratch dir before launch (§9.2), so every
+            // restored VM's OWN fresh scratch dir before launch (§8.2, Restore correctness: a restored VM is not a fresh VM), so every
             // restore gets rotated host-side socket paths.
             restore_rotates_host_paths: true,
         }
@@ -703,7 +703,7 @@ impl Vmm for CloudHypervisor {
 
 impl VmInstance for ChInstance {
     async fn boot(&mut self) -> Result<()> {
-        // §3.1 / M-VMM-4: a restored VM is returned paused and resumed via `resume()`,
+        // §2.1 (The trait and the capability descriptor) / M-VMM-4: a restored VM is returned paused and resumed via `resume()`,
         // NEVER booted. Silently remapping boot()->vm.resume papered over the misuse;
         // fail loud and typed instead, mirroring Firecracker.
         if self.restored {
@@ -882,7 +882,7 @@ mod tests {
         );
     }
 
-    // §19.1.2: the root disk is always disks[0] (/dev/vda) and extra virtio-blk devices
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): the root disk is always disks[0] (/dev/vda) and extra virtio-blk devices
     // follow it in order (/dev/vdb, /dev/vdc, …), each with its own readonly flag.
     // Buggy impls this guards: extras pushed BEFORE the root (root shifts off /dev/vda
     // → the guest cannot mount root=/dev/vda), extras dropped, or the readonly flag
@@ -959,7 +959,7 @@ mod tests {
         );
     }
 
-    // §19.5: a DiskIoLimit becomes CH's `rate_limiter_config` token buckets — bandwidth
+    // §4.6 (Extra virtio-blk devices and disk-I/O throttling): a DiskIoLimit becomes CH's `rate_limiter_config` token buckets — bandwidth
     // (bytes/s) and ops (IOPS) each `{ size: rate, refill_time: 1000 }`, and an unset
     // cap is omitted. Buggy impls: wrong refill_time (so `size` no longer means per-
     // second), a swapped bandwidth/ops key, or emitting a cap that was None.

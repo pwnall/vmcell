@@ -315,7 +315,8 @@ pub struct MicroVm<V: Vmm> {
     proxy: Option<EgressProxy>,
     /// The name of the cgroup for this VM.
     cgroup_name: Option<String>,
-    /// The process-wide seam bundle this VM was spawned with (§9.3, design §18
+    /// The process-wide seam bundle this VM was spawned with (§9.3, The public API
+    /// surface; design §18, Delta register: changes from the validated v27 build,
     /// deltas 1–2). Holds the [`CgroupFs`](crate::metrics::CgroupFs) its slice is
     /// deleted through on teardown and the [`Clock`] that drives the first
     /// post-restore resync in [`MicroVm::agent`]. Replaces the former standalone
@@ -343,7 +344,7 @@ pub struct MicroVm<V: Vmm> {
     /// construction, so `agent()`'s connect cadence and `shutdown()`'s grace
     /// window honor the caller-selected profile rather than hard-coded constants.
     timeouts: crate::config::Timeouts,
-    /// `true` when the VM boots a custom `init=` (§19.2.2) that replaces the vmcell
+    /// `true` when the VM boots a custom `init=` (§5.3, The kernel command line) that replaces the vmcell
     /// guest agent, so there is **no** vsock control plane. Set from `cfg.init` at
     /// construction; makes [`MicroVm::agent`] fail loud immediately rather than hang
     /// connecting to a listener that will never answer.
@@ -385,8 +386,9 @@ impl Drop for CgroupGuard {
 /// the `cgroup_guard` disarmed) before the instance is built; on any mid-construction
 /// failure (`create`/`boot`/`restore`/`resume`) the **explicit [`Drop`]** below
 /// releases the un-taken resources through the shared [`release_net_before_netns`]
-/// helper — the SAME ordered net teardown `teardown_post_instance` uses (design §18
-/// delta 7, L1, §9.4). Making the order explicit (not a fragile field-declaration
+/// helper — the SAME ordered net teardown `teardown_post_instance` uses (design §18,
+/// Delta register: changes from the validated v27 build, delta 7, L1, §9.4,
+/// Timeouts and the lifecycle nuances). Making the order explicit (not a fragile field-declaration
 /// order) means a field reorder can no longer silently delete the netns before the
 /// proxy running inside it. `cid_guard` is `Option` so the success path can `take()`
 /// it out (a field of a type that implements `Drop` cannot be moved out).
@@ -401,8 +403,9 @@ struct EnvSetup {
 }
 
 /// The single ordered net teardown both the success path ([`MicroVm::teardown_post_instance`]) and
-/// the mid-`start()` error path ([`EnvSetup`]'s [`Drop`]) route through (design §18 delta 7, L1,
-/// §9.4). The egress proxy and the smoltcp NAT hold sockets/threads INSIDE the netns, so they are
+/// the mid-`start()` error path ([`EnvSetup`]'s [`Drop`]) route through (design §18, Delta register:
+/// changes from the validated v27 build, delta 7, L1, §9.4, Timeouts and the lifecycle nuances).
+/// The egress proxy and the smoltcp NAT hold sockets/threads INSIDE the netns, so they are
 /// released BEFORE the netns is deleted — deleting a netns while a process still holds interfaces in
 /// it hangs/leaks. One helper, never a second copy: a field reorder cannot silently invert this.
 fn release_net_before_netns(
@@ -489,8 +492,8 @@ fn parse_mac_bytes(s: &str) -> Option<[u8; 6]> {
 ///
 /// M-RESTORE-1: a snapshot resumes at the frozen instant, so the guest clock,
 /// CSPRNG state, and network identity must be refreshed on **every** restore
-/// (§9.2). This now drives a single **native** in-agent resync round-trip
-/// (design 44 §5) instead of three subprocess execs. The round-trip is propagated
+/// (§8.2, Restore correctness: a restored VM is not a fresh VM). This now drives a single **native** in-agent resync round-trip
+/// (§8.2, Restore correctness: a restored VM is not a fresh VM) instead of three subprocess execs. The round-trip is propagated
 /// (`?`) so a transient transport failure leaves `*restored` **set** and the next
 /// `agent()` call retries the whole resync, instead of being cleared up front (the
 /// bug, which permanently skipped clock/RNG/MAC resync after one transient error).
@@ -510,7 +513,7 @@ async fn maybe_resync_after_restore<E: GuestResync>(
         return Ok(());
     }
 
-    // Host instant for the mandatory clock resync (§9.2): the guest cannot fix a
+    // Host instant for the mandatory clock resync (§8.2, Restore correctness: a restored VM is not a fresh VM): the guest cannot fix a
     // frozen RTC from inside. Carried as whole secs + sub-second nanos on the wire.
     // L-ORCH-4: a pre-1970 host clock must fail loud — the mandatory resync is the
     // one step the design insists never silently degrades, so `unwrap_or_default()`
@@ -526,9 +529,9 @@ async fn maybe_resync_after_restore<E: GuestResync>(
     let unix_secs = since_epoch.as_secs();
     let unix_nanos = since_epoch.subsec_nanos();
 
-    // ORCH-1 / §9.2: MAC rotation is the ONLY in-guest identity change the restore
+    // ORCH-1 / §8.2 (Restore correctness: a restored VM is not a fresh VM): MAC rotation is the ONLY in-guest identity change the restore
     // path performs — applied natively via `SIOCSIFHWADDR` (no in-guest netlink),
-    // keeping the zero-netlink-in-PID-1 contract (§4.3).
+    // keeping the zero-netlink-in-PID-1 contract (§3.4, The guest: vmcell-guest-agent as PID 1).
     // `mac_math` centralizes the vmid→MAC mapping as a string; convert it to the
     // six bytes the wire protocol carries without duplicating that mapping.
     let mac_str = crate::net::mac_math(vmid)
@@ -537,7 +540,8 @@ async fn maybe_resync_after_restore<E: GuestResync>(
         crate::error::Error::Agent(format!("mac math produced an unparseable MAC: {mac_str}"))
     })?;
 
-    // H-VMM-1: the IP address IS rotated on restore (superseding the old §9.2
+    // H-VMM-1: the IP address IS rotated on restore (superseding the old §8.2
+    // (Restore correctness: a restored VM is not a fresh VM)
     // "do not rotate the guest IP" note). A snapshot is a *zygote* — resumed into
     // many concurrent children, each needing a distinct network identity — so the
     // vmid rotates and the guest's frozen `ip=` no longer matches its rotated
@@ -567,12 +571,12 @@ async fn maybe_resync_after_restore<E: GuestResync>(
         .await?;
 
     if let Some(err) = outcome.clock_error {
-        // ORCH-3 / M-RESTORE-1: the clock resync is mandatory (§9.2) — a guest-side
+        // ORCH-3 / M-RESTORE-1: the clock resync is mandatory (§8.2, Restore correctness: a restored VM is not a fresh VM) — a guest-side
         // clock-set failure is a *surfaced, typed* failure, not a warning. We
         // return here **before** clearing `*restored`, so the flag stays set and
         // the next `agent()` call retries the whole resync (identical to the old
         // non-zero-exit path). Clearing it here (silent-Ok-on-failure) would leave
-        // time-sensitive restored tests seeing a frozen wall clock (§7.1 defect).
+        // time-sensitive restored tests seeing a frozen wall clock (§7.1, What is read and enforced, defect).
         return Err(crate::error::Error::Agent(format!(
             "mandatory post-restore clock resync failed: {err}"
         )));
@@ -619,7 +623,7 @@ impl<V: Vmm> MicroVm<V> {
 
     /// Gets a mutable reference to the underlying VMM instance.
     ///
-    /// **`pub(crate)` (design §18 delta 6, the M-ORCH-5 finding):** exposing the raw
+    /// **`pub(crate)` (design §18, Delta register: changes from the validated v27 build, delta 6, the M-ORCH-5 finding):** exposing the raw
     /// [`VmInstance`](crate::vmm::VmInstance) publicly let a caller bypass the orchestrator's
     /// ordered teardown and identity bookkeeping — a footgun with no legitimate external use.
     /// External callers reach for the safe [`MicroVm`] methods instead ([`kill`](MicroVm::kill) for
@@ -688,7 +692,7 @@ impl<V: Vmm> MicroVm<V> {
                 // `egress` is consumed below only under `feature = "proxy"`; the
                 // discard silences the unused binding when the proxy is compiled
                 // out (it is a config selector, not a resource). `host_services_port`
-                // is not a privileged-path field any more (design §18 delta 4).
+                // is not a privileged-path field any more (design §18, Delta register: changes from the validated v27 build, delta 4).
                 let _ = egress;
                 let ns = NetNamespace::create(
                     &cfg.resource_prefix,
@@ -780,7 +784,7 @@ impl<V: Vmm> MicroVm<V> {
             crate::config::NetConfig::None => {}
         }
 
-        // §12.7 sibling placement: create the per-VM slice as a sibling of the
+        // §13 (Cross-cutting invariants) sibling placement: create the per-VM slice as a sibling of the
         // supervisor's own leaf, using the shared, unit-tested line-based parser
         // in `metrics` (M-ORCH-4/H-HOST-3) — not an inline `split("0::")` over the
         // whole file, which folds trailing lines into the path on a hybrid v1/v2
@@ -847,7 +851,7 @@ impl<V: Vmm> MicroVm<V> {
     /// // Erofs is the supported, snapshot-compatible rootfs; a virtio-fs *rootfs*
     /// // is rejected by every backend, so the example uses erofs (L-ORCH-1).
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
-    /// // One process-wide seam bundle, built once and threaded by reference (§9.3).
+    /// // One process-wide seam bundle, built once and threaded by reference (§9.3, The public API surface).
     /// let env = HostEnv::shared().unwrap();
     /// let vm = MicroVm::start(&vmm, cfg, &env).await.unwrap();
     /// # }
@@ -884,7 +888,7 @@ impl<V: Vmm> MicroVm<V> {
         // healthy transport answers well within the budget, so this adds no wait on
         // the common path. Re-spawn recreates on the SAME per-VM resources
         // (netns/tap/cgroup/CID/dir); `spawn_qemu` pre-cleans stale sockets.
-        // A custom `init=` (§19.2.2) replaces the guest agent, so there is no agent vsock
+        // A custom `init=` (§5.3, The kernel command line) replaces the guest agent, so there is no agent vsock
         // transport to health-gate — skip the probe (which QEMU uses to catch a wedged
         // `vhost-device-vsock` bring-up); otherwise a custom-init QEMU VM would re-spawn
         // to exhaustion against a listener that never comes up. CH/FC probes are no-ops.
@@ -944,10 +948,10 @@ impl<V: Vmm> MicroVm<V> {
     /// `snapshot_dir` directly, and the CH backend rewrites that dir's
     /// `config.json` in place (FC reads its per-dir sidecar), so restoring more
     /// than one VM from one dir — or restoring concurrently — races and corrupts
-    /// it (§9.1). To mint *many* identical VMs from one suspend image without that
+    /// it (§8.1, The warm-snapshot path and the eligibility law). To mint *many* identical VMs from one suspend image without that
     /// hazard, capture a [`Zygote`](crate::Zygote) and use its copy-on-write
     /// fan-out (or [`MicroVm::restore_cow`] for a single CoW clone), which restores
-    /// each clone from its own private copy and leaves the master untouched (§9.4).
+    /// each clone from its own private copy and leaves the master untouched (§8.4, The zygote fan-out and the OverlayStore seam).
     ///
     /// # Errors
     /// Returns an error if network setup, proxy start, or VM restore fails.
@@ -982,7 +986,7 @@ impl<V: Vmm> MicroVm<V> {
     /// Restores one clone from a zygote suspend image, copy-on-write-copying the
     /// suspend data into this clone's own scratch dir **before** restore so the
     /// master image is never mutated and concurrent clones never race on the
-    /// backend's in-place `config.json` rewrite (§9.4). Returns the clone and
+    /// backend's in-place `config.json` rewrite (§8.4, The zygote fan-out and the OverlayStore seam). Returns the clone and
     /// whether the copy used a block-level reflink or a full byte copy
     /// ([`CowSupport`](crate::CowSupport)).
     ///
@@ -990,11 +994,11 @@ impl<V: Vmm> MicroVm<V> {
     /// callers want [`Zygote`](crate::Zygote), which owns the immutable master and
     /// gates concurrent fan-out on the backend capability. A single CoW clone
     /// works on any snapshot backend; concurrent fan-out needs
-    /// `capabilities().restore_rotates_host_paths` (§3.3) — enforced by
+    /// `capabilities().restore_rotates_host_paths` (§2.5, The capability matrix) — enforced by
     /// [`Zygote::spawn_clones`](crate::Zygote::spawn_clones), not here.
     ///
     /// The copy-on-write copy of the suspend directory is materialized through the
-    /// injected [`OverlayStore`](crate::overlay::OverlayStore) seam (§12.24) —
+    /// injected [`OverlayStore`](crate::overlay::OverlayStore) seam (§13, Cross-cutting invariants) —
     /// [`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore) in production;
     /// a recording double in tests. The store is the single clone-materialization
     /// law, so a caller can swap the backing store (e.g. a shared content-addressed
@@ -1033,7 +1037,7 @@ impl<V: Vmm> MicroVm<V> {
         env: &HostEnv,
         cow: bool,
     ) -> Result<(Self, crate::reflink::CowSupport)> {
-        // §3.3 boundary 2 (ORCH-4): the restore-path re-check of the
+        // §2.5 (The capability matrix) boundary 2 (ORCH-4): the restore-path re-check of the
         // snapshot-eligibility law returns `Error::Unsupported { vmm, feature }`
         // (a capability rejection a caller can match on), NOT the generic
         // `Error::Config` — a config a snapshot-eligible VMM cannot honor is an
@@ -1066,14 +1070,14 @@ impl<V: Vmm> MicroVm<V> {
         // Create the single owned per-VM scratch dir EARLY (see `start()`).
         let tmp_dir = crate::vmm::VmTempDir::create(&cfg.resource_prefix, vmid.vmid).await?;
 
-        // Zygote fan-out (§9.4): a clone restores from its OWN copy of the
+        // Zygote fan-out (§8.4, The zygote fan-out and the OverlayStore seam): a clone restores from its OWN copy of the
         // suspend image, never the shared master. The CH backend rewrites the
         // snapshot's `config.json` in place per restore (FC reads a per-dir
         // sidecar), so restoring N clones from one dir races and corrupts it
-        // (§9.1); a per-clone copy removes the race AND keeps the zygote master
-        // immutable (§12.12). The copy lives INSIDE this VM's scratch dir, so the
+        // (§8.1, The warm-snapshot path and the eligibility law); a per-clone copy removes the race AND keeps the zygote master
+        // immutable (§13, Cross-cutting invariants). The copy lives INSIDE this VM's scratch dir, so the
         // `tmp_dir` guard's Drop reclaims it with everything else (teardown order,
-        // §12.10). On a reflink-capable filesystem the copy is a near-instant
+        // §13, Cross-cutting invariants). On a reflink-capable filesystem the copy is a near-instant
         // block-level clone; otherwise it degrades to a full byte copy — reported
         // as `CowSupport`. The single-use `restore` path (`cow == false`) hands
         // the caller's dir to the backend directly, preserving its documented
@@ -1142,7 +1146,7 @@ impl<V: Vmm> MicroVm<V> {
     /// first use.
     ///
     /// On the **first** call after a snapshot restore this also performs the
-    /// one-shot guest resync — clock, CSPRNG reseed, and network identity (§9.2);
+    /// one-shot guest resync — clock, CSPRNG reseed, and network identity (§8.2, Restore correctness: a restored VM is not a fresh VM);
     /// see `maybe_resync_after_restore` (private). The `restored` flag is cleared only
     /// after the mandatory clock resync succeeds, so a transient first-exec
     /// failure retries on the next call rather than permanently skipping the
@@ -1158,10 +1162,10 @@ impl<V: Vmm> MicroVm<V> {
         &mut self,
         timeout: Option<std::time::Duration>,
     ) -> Result<&mut AgentClient> {
-        // Fail loud, not hang: a custom `init=` (§19.2.2) replaces the vmcell guest agent,
+        // Fail loud, not hang: a custom `init=` (§5.3, The kernel command line) replaces the vmcell guest agent,
         // so there is no vsock control plane — no `Ready` handshake, `exec`, or resync.
         // Returning immediately here beats blocking for the full connect timeout on a
-        // listener that will never answer (§12.2 fail-loud).
+        // listener that will never answer (§13, Cross-cutting invariants, fail-loud).
         if self.control_plane_disabled {
             return Err(crate::error::Error::Agent(
                 "the vsock control plane is unavailable: this VM boots a custom init= that \
@@ -1203,7 +1207,7 @@ impl<V: Vmm> MicroVm<V> {
             // be redundant.
             let vmid = self.vmid.as_ref().expect("vmid missing").vmid;
             // The clock that drives the mandatory post-restore resync comes from the
-            // `HostEnv` captured at construction (design §18 delta 1 — `agent()` no
+            // `HostEnv` captured at construction (design §18, Delta register: changes from the validated v27 build, delta 1 — `agent()` no
             // longer takes a clock seam). Clone the `Arc` first so this immutable
             // borrow of `self.env` ends before `self.agent_client` is borrowed `&mut`.
             let clock = self.env.clock.clone();
@@ -1243,13 +1247,13 @@ impl<V: Vmm> MicroVm<V> {
 
     /// Opens a fresh control-plane connection for **interactive sessions** — PTY /
     /// pipe sessions, streaming stdin, and multiplexed concurrent execs
-    /// (design 62 §22) — returning a [`SessionMux`](crate::agent::session::SessionMux).
+    /// (§3.2, The host side: AgentClient and SessionMux) — returning a [`SessionMux`](crate::agent::session::SessionMux).
     ///
     /// This dials a *second* vsock connection to the guest agent, independent of
     /// the cached one-shot [`agent`](MicroVm::agent) client, so one-shot exec and
     /// sessions never share a stream. The returned mux owns that connection;
     /// dropping it closes the connection, and the guest tears down every session it
-    /// opened (§12.27). Takes `&self` (no caching) — a caller may hold several
+    /// opened (§13, Cross-cutting invariants). Takes `&self` (no caching) — a caller may hold several
     /// muxes if it wants isolated connections.
     ///
     /// # Panics
@@ -1258,7 +1262,7 @@ impl<V: Vmm> MicroVm<V> {
     /// # Errors
     /// Returns an [`Error::Agent`](crate::error::Error::Agent) immediately when
     /// this VM boots a custom `init=` that replaces the guest agent (no control
-    /// plane, §19.2.2), or if the connection or `Ready` handshake does not complete
+    /// plane, §5.3, The kernel command line), or if the connection or `Ready` handshake does not complete
     /// within `timeout`.
     pub async fn connect_sessions(
         &self,
@@ -1311,7 +1315,7 @@ impl<V: Vmm> MicroVm<V> {
             // No cgroup is attached, so no requested limit is being enforced —
             // surface that honestly (`mem_limit_enforced: false`) rather than handing
             // back an all-zero usage that implies a measured, enforced state
-            // (§7.1 rule 3 / H-FAILLOUD-1). `ResourceUsage::default()` already has
+            // (§7.1, What is read and enforced, rule 3 / H-FAILLOUD-1). `ResourceUsage::default()` already has
             // the flag `false`; spell it out so the intent cannot silently drift.
             Ok(ResourceUsage {
                 mem_limit_enforced: false,
@@ -1322,7 +1326,7 @@ impl<V: Vmm> MicroVm<V> {
 
     /// Pauses the running VM.
     ///
-    /// Promoted to a first-class `MicroVm` method in v15 (§10.2) — previously
+    /// Promoted to a first-class `MicroVm` method in v15 (§9.3, The public API surface) — previously
     /// reachable only via the raw instance accessor (now `pub(crate)`, delta 6) — so
     /// the library, CLI, and daemon share one lifecycle-verb surface. Required before
     /// [`MicroVm::snapshot`] when driving the pause→snapshot→resume cycle by hand.
@@ -1335,7 +1339,7 @@ impl<V: Vmm> MicroVm<V> {
 
     /// Resumes a paused VM (after [`MicroVm::pause`] or a snapshot restore).
     ///
-    /// Promoted to a first-class `MicroVm` method in v15 (§10.2).
+    /// Promoted to a first-class `MicroVm` method in v15 (§9.3, The public API surface).
     ///
     /// # Errors
     /// Returns an error if the backend fails to resume the VM.
@@ -1346,9 +1350,9 @@ impl<V: Vmm> MicroVm<V> {
     /// Writes a snapshot of the VM into `dir` (the backend pauses internally, writes
     /// the snapshot, then resumes).
     ///
-    /// Promoted to a first-class `MicroVm` method in v15 (§10.2). Snapshot-eligible
+    /// Promoted to a first-class `MicroVm` method in v15 (§9.3, The public API surface). Snapshot-eligible
     /// VMs only: a vhost-user device (virtio-fs data share or unprivileged net) is
-    /// rejected at `VmConfig::build()` (the §3.3 law), and a backend that does not
+    /// rejected at `VmConfig::build()` (the §2.5, The capability matrix, law), and a backend that does not
     /// advertise `snapshot_restore` returns [`crate::error::Error::Unsupported`].
     ///
     /// On success, any cached agent connection is invalidated: the next
@@ -1495,8 +1499,8 @@ impl<V: Vmm> Drop for MicroVm<V> {
 /// `throughput`-profile grace (50 ms) on the old fixed 20 ms grid quantized up
 /// to ~60 ms even when ceiling-bound, and an in-window exit paid up to 20 ms of
 /// detection latency; the 5 ms floor is at most ~10 wakeups in a 50 ms window —
-/// finer detection, not a busy-spin. (Deliberate deviation from design 44's
-/// "the poll step stays 20 ms" note — recorded in `implementation-notes.md`.)
+/// finer detection, not a busy-spin. (Deliberate deviation from the §9.4, Timeouts
+/// and the lifecycle nuances "the poll step stays 20 ms" note — recorded in `implementation-notes.md`.)
 fn shutdown_poll_step(grace: std::time::Duration) -> std::time::Duration {
     use std::time::Duration;
     if grace <= Duration::from_millis(50) {
@@ -1563,7 +1567,7 @@ impl Default for HostOrphanScanner {
 }
 
 impl HostOrphanScanner {
-    /// Builds a scanner that matches resources named with `prefix` (§v21). Use
+    /// Builds a scanner that matches resources named with `prefix` (§13, Cross-cutting invariants). Use
     /// [`crate::naming::DEFAULT_RESOURCE_PREFIX`] for the historical `vmcell-*` names.
     #[must_use]
     pub fn new(prefix: impl Into<String>) -> Self {
@@ -1891,7 +1895,7 @@ mod tests {
         assert_eq!(b.allocate().unwrap(), (2000 % 254) + 1);
     }
 
-    // ---- Full teardown-order assertion (design §12.4 / §12.3) ----
+    // ---- Full teardown-order assertion (design §13, Cross-cutting invariants) ----
     //
     // The design mandates asserting the FULL `MicroVm::Drop` order — VMM instance
     // (which owns the VMM process group AND its virtiofsd/vhost-vsock daemons) ->
@@ -2047,7 +2051,7 @@ mod tests {
         assert_full_teardown_order(&calls);
     }
 
-    // Delta 7 gate (§18, L1): the mid-`start()` error path — `EnvSetup`'s **explicit** `Drop` —
+    // Delta 7 gate (§18, Delta register: changes from the validated v27 build, L1): the mid-`start()` error path — `EnvSetup`'s **explicit** `Drop` —
     // emits the SAME ordered net → cgroup teardown as the success path, routed through the one
     // shared `release_net_before_netns` helper (never a second copy). Build an `EnvSetup` with a
     // recording netns + cgroup and drop it; the netns must be deleted BEFORE the cgroup slice, just
@@ -2215,7 +2219,7 @@ mod tests {
         );
     }
 
-    // Delta 9 (§18): the `FakeVmm` fault menu drives the orchestrator's mid-`start()` failure paths
+    // Delta 9 (§18, Delta register: changes from the validated v27 build): the `FakeVmm` fault menu drives the orchestrator's mid-`start()` failure paths
     // at the `Vmm`/`VmInstance` seam itself (not only through the surrounding seams). A scripted
     // `create` OR `boot` failure must propagate AND leave zero residue — every cgroup slice created
     // in `setup_env` is deleted on the error path (the `CgroupGuard`). RED on the inverse (a slice
@@ -2407,7 +2411,7 @@ mod tests {
         .expect("valid config");
         let env = HostEnv::hermetic();
         let res = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env).await;
-        // ORCH-4 / §3.3 boundary 2: a vhost-user device on the restore path is an
+        // ORCH-4 / §2.5 (The capability matrix) boundary 2: a vhost-user device on the restore path is an
         // `Unsupported` capability rejection, not a generic `Config` error.
         assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
     }
@@ -2729,7 +2733,7 @@ mod tests {
         );
     }
 
-    // v15 §10.2: pause/resume/snapshot are promoted to first-class MicroVm methods.
+    // v15 §9.3 (The public API surface): pause/resume/snapshot are promoted to first-class MicroVm methods.
     // Each must FORWARD to the underlying VmInstance. The FakeVmInstance records every
     // call it receives, so the inverse — a no-op MicroVm method that silently does not
     // delegate — leaves the corresponding instance call unrecorded and goes red here.
@@ -3341,9 +3345,9 @@ mod tests {
         }
     }
 
-    // §19.2.2: a custom `init=` replaces the guest agent, so `agent()` must fail LOUD
+    // §5.3 (The kernel command line): a custom `init=` replaces the guest agent, so `agent()` must fail LOUD
     // immediately (a typed `Error::Agent` naming the cause) instead of blocking for the
-    // full connect timeout on a listener that will never answer (§12.2 fail-loud).
+    // full connect timeout on a listener that will never answer (§13, Cross-cutting invariants, fail-loud).
     // Inverse: drop the `control_plane_disabled` early-return in `agent()` and this
     // either hangs (the 1 s timeout) or returns a connect error, not the custom-init
     // one — reddening the message assertion.

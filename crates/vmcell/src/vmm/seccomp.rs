@@ -1,5 +1,5 @@
 //! The VMM subprocess's own seccomp-BPF confinement — one predicate, three backends
-//! (design §20.3 / invariant §12.21).
+//! (design §12.2, Layer 1 — the VMM's own seccomp filter / invariant §13, Cross-cutting invariants).
 //!
 //! Every backend ships an audited seccomp-BPF filter; the job here is to enable the
 //! strictest practical one on each backend, **fail loud** when a policy cannot be
@@ -11,7 +11,7 @@
 //!
 //! The verified native semantics this encodes:
 //! - **Cloud Hypervisor** `--seccomp <true|false|log>` (default `true`); passed
-//!   **explicitly** so a future CH default flip cannot silently disable it (§12.2).
+//!   **explicitly** so a future CH default flip cannot silently disable it (§12.2, Layer 1 — the VMM's own seccomp filter).
 //! - **Firecracker** ships a built-in advanced filter that is on unless `--no-seccomp` is
 //!   passed; it has **no** observe-only mode.
 //! - **QEMU** `-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`
@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 
 /// The QEMU `-sandbox` argument enabling the strictest practical libseccomp sandbox: deny
 /// obsolete syscalls, privilege elevation, process spawning, and resource control. One
-/// const so the QEMU cmd builder and the golden test name the identical spec (§12.21).
+/// const so the QEMU cmd builder and the golden test name the identical spec (§13, Cross-cutting invariants).
 pub const QEMU_SANDBOX_SPEC: &str =
     "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny";
 
@@ -32,7 +32,7 @@ pub const QEMU_SANDBOX_SPEC: &str =
 /// Returns [`Error::Unsupported`] (matchable, typed) for a policy a backend cannot honor —
 /// [`VmmSeccomp::Log`] on Firecracker/QEMU (neither has an observe-only mode) and any
 /// unknown backend — rather than silently downgrading to a weaker or stronger policy
-/// (§7.2 capability honesty). An empty vector means "the backend's default is already the
+/// (§7.2, The fail-loud capability contract and HostCapabilities capability honesty). An empty vector means "the backend's default is already the
 /// requested policy" (Firecracker's built-in filter under [`VmmSeccomp::Enforcing`];
 /// QEMU's no-sandbox default under [`VmmSeccomp::Disabled`]).
 ///
@@ -71,7 +71,7 @@ pub fn vmm_seccomp_args(backend: &str, policy: VmmSeccomp) -> Result<Vec<String>
 mod tests {
     use super::*;
 
-    // Guards §12.21: the one-law golden mapping. Every (backend, policy) pair that is
+    // Guards §13 (Cross-cutting invariants): the one-law golden mapping. Every (backend, policy) pair that is
     // supported emits the exact native flag; wiring the wrong flag, dropping a backend, or
     // regressing the QEMU sandbox spec reddens here. The inverse (e.g. CH Enforcing not
     // passing `--seccomp true`, so a CH default flip could silently disable it) fails.
@@ -121,7 +121,7 @@ mod tests {
         assert!(QEMU_SANDBOX_SPEC.contains("obsolete=deny"));
     }
 
-    // Guards §12.21 fail-loud: a policy a backend cannot honor is a typed Unsupported, not a
+    // Guards §13 (Cross-cutting invariants) fail-loud: a policy a backend cannot honor is a typed Unsupported, not a
     // silent fallback. Firecracker and QEMU have no observe-only mode, so `Log` must error —
     // the inverse (silently falling back to Enforcing) would leave a caller who asked to
     // DEBUG a filter running under a killing filter, unaware.

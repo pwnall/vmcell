@@ -1,4 +1,5 @@
-//! KVM-free gates for the setup-broker bridge (design §20.5 / §12.23): the `VmEngine` RPC
+//! KVM-free gates for the setup-broker bridge (design §12.4, Layer 3 — the setup broker (network
+//! surface never holds caps); v27 §20.5 / §12.23): the `VmEngine` RPC
 //! round-trips over a real socketpair, errors preserve their HTTP status across the boundary, the
 //! multiplex serves concurrent requests, and the framed codec rejects an over-cap length.
 
@@ -89,7 +90,7 @@ fn serve_fake(slow_get_ms: u64) -> BrokerClientEngine {
         .expect("sole owner")
 }
 
-// Guards §12.23: every op forwards to the broker and its reply round-trips over the real
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): every op forwards to the broker and its reply round-trips over the real
 // socketpair. Inverse: a codec / reply-matching bug reddens on the wrong value or a hang.
 #[tokio::test]
 async fn engine_rpc_round_trips_every_op() {
@@ -142,7 +143,7 @@ async fn engine_rpc_round_trips_every_op() {
     );
 }
 
-// Guards §12.23: a typed error crosses the boundary with its HTTP status intact (a `NotFound`
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): a typed error crosses the boundary with its HTTP status intact (a `NotFound`
 // stays a 404 with its message), so the parent maps it to the correct HTTP response. Inverse: a
 // WireError that dropped the kind would surface as a 500.
 #[tokio::test]
@@ -164,7 +165,7 @@ async fn error_round_trips_with_status_and_message() {
     );
 }
 
-// Guards §12.23 (the multiplex): a slow op does NOT block a fast one — a `get` that sleeps 300 ms
+// Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)) (the multiplex): a slow op does NOT block a fast one — a `get` that sleeps 300 ms
 // runs concurrently with a `list` that must return promptly. Inverse: a single-Mutex channel would
 // serialize them and the fast `list` would wait behind the slow `get`.
 #[tokio::test]

@@ -100,7 +100,7 @@ async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, cid: u32) -> Result<
 /// TOCTOU, honestly: the probe and the unlink are not atomic — a restore racing
 /// this window can still lose. This is a *misuse guard* catching the realistic
 /// sequential mistake (restoring while the lineage is alive), not a security
-/// boundary; the single-lineage constraint (design §16) is the real contract.
+/// boundary; the single-lineage constraint (design §17, Open gaps and future capabilities) is the real contract.
 async fn reject_live_baked_vsock(path: &Path) -> Result<()> {
     if tokio::fs::try_exists(path).await.unwrap_or(false) {
         // Only `Ok(Ok(_))` — a listener actually accepted the probe — rejects.
@@ -191,7 +191,7 @@ pub struct FcInstance {
     cid: u32,
     pgid: Option<u32>,
     /// True if an external vhost-user-net device is attached. Such a VM is not
-    /// snapshot-eligible (§3.3); `snapshot()` self-guards on it. Always `false` on
+    /// snapshot-eligible (§2.5, The capability matrix); `snapshot()` self-guards on it. Always `false` on
     /// FC today because `create()` rejects every vhost-user device up front, but the
     /// field keeps the snapshot guard correct by construction. Mirrors CH.
     vhost_user_net: bool,
@@ -239,7 +239,7 @@ impl Firecracker {
         // Firecracker expects the socket to not exist before it creates it.
         let _ = tokio::fs::remove_file(&api_socket).await;
 
-        // §20.3/§20.4: FC's built-in seccomp filter is on unless `--no-seccomp` (Disabled);
+        // §12.2 (Layer 1 — the VMM's own seccomp filter)/§12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): FC's built-in seccomp filter is on unless `--no-seccomp` (Disabled);
         // the jailer-equivalent hardening is applied in build_vmm_cmd's forked-child window.
         let seccomp_args = crate::vmm::seccomp::vmm_seccomp_args("firecracker", cfg.vmm_seccomp)?;
         let jail = crate::vmm::jail::jail_spec_from_config(&cfg.jail)?;
@@ -329,7 +329,7 @@ fn cache_decision(probe: T2Probe) -> Option<Option<String>> {
 ///
 /// A T2 CPU template masks the extended-state CPUID bits so the guest `glibc` never
 /// dispatches to the AVX/AVX-512 routines whose XSAVE area can mismatch on restore
-/// (design §138). `noxsave` is the **fallback** for hosts where the template does not
+/// (design §2.3, Firecracker — the density tier and the fastest restore). `noxsave` is the **fallback** for hosts where the template does not
 /// fit; applying it *with* a template needlessly disables the guest AVX2 the template
 /// leaves usable, so it is emitted **only when no template was applied**. Returned with a
 /// trailing space so it composes cleanly into the boot-args when non-empty and vanishes
@@ -580,14 +580,14 @@ impl Vmm for Firecracker {
             path_on_host: PathBuf,
             is_root_device: bool,
             is_read_only: bool,
-            /// Optional I/O rate limiter (disk-I/O fault injection, §19.5). Omitted when
+            /// Optional I/O rate limiter (disk-I/O fault injection, §4.6, Extra virtio-blk devices and disk-I/O throttling). Omitted when
             /// the drive is unthrottled (FC's default).
             #[serde(skip_serializing_if = "Option::is_none")]
             rate_limiter: Option<FcRateLimiter>,
         }
         // FC's `rate_limiter` — bandwidth (bytes/s) and ops (IOPS) token buckets, the
         // SAME shape and `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS` conversion as
-        // Cloud Hypervisor (one law, one predicate, §19.5).
+        // Cloud Hypervisor (one law, one predicate, §4.6, Extra virtio-blk devices and disk-I/O throttling).
         #[derive(Serialize)]
         struct FcRateLimiter {
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -634,7 +634,7 @@ impl Vmm for Firecracker {
             )
             .await?;
 
-        // Extra virtio-blk devices (§19.1), PUT AFTER the root drive so they enumerate
+        // Extra virtio-blk devices (§4.6, Extra virtio-blk devices and disk-I/O throttling), PUT AFTER the root drive so they enumerate
         // `/dev/vdb`, `/dev/vdc`, … in order and never displace `/dev/vda`. Each is a
         // non-root drive on its own virtio-mmio slot; FC's MMIO region is finite, so a
         // very large list surfaces fail-loud as the backend's typed API error here,
@@ -680,7 +680,7 @@ impl Vmm for Firecracker {
 
         // Configure the entropy device (virtio-rng -> guest /dev/hwrng). The
         // guest agent's post-restore CSPRNG reseed reads 32 bytes of /dev/hwrng
-        // into /dev/urandom (design §9.2); CH always carries an rng device, but
+        // into /dev/urandom (design §8.2, Restore correctness: a restored VM is not a fresh VM); CH always carries an rng device, but
         // FC only attaches one when explicitly configured — without it the
         // restored guest replays the snapshot-frozen entropy pool and the resync
         // ack reports `reseed_applied: false`. The device is snapshot-supported
@@ -1217,7 +1217,7 @@ mod tests {
              baked path verbatim"
         );
         // CH, by contrast, rewrites the restore config so the vsock lands in the NEW
-        // VM's scratch dir (§9.2) — the rotation semantics the integration test's
+        // VM's scratch dir (§8.2, Restore correctness: a restored VM is not a fresh VM) — the rotation semantics the integration test's
         // `assert_ne` branch encodes.
         assert!(
             crate::vmm::cloud_hypervisor::CloudHypervisor::new("/usr/bin/cloud-hypervisor")

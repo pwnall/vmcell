@@ -1,4 +1,4 @@
-//! Bearer API-key authentication (design §18.6 / invariant §12.15/§12.18).
+//! Bearer API-key authentication (design §11.6, Authentication — a bearer API key / invariant §13, Cross-cutting invariants).
 //!
 //! A pre-shared **opaque** API key presented as an HTTP Bearer token (`Authorization: Bearer <key>`,
 //! the RFC 6750 transport) — NOT a full OAuth authorization-server flow (the daemon is a local,
@@ -58,7 +58,7 @@ pub enum AuthPolicy {
     /// Every non-open route requires the bearer key.
     Key(ApiKey),
     /// Auth disabled — only reachable via the explicit `--allow-unauthenticated` dev flag, logged
-    /// loudly at every request (design §18.6).
+    /// loudly at every request (design §11.6, Authentication — a bearer API key).
     Unauthenticated,
 }
 
@@ -101,7 +101,7 @@ pub fn authorize(policy: &AuthPolicy, auth_header: Option<&str>) -> Result<(), D
     }
 }
 
-/// Loads an API key from a file, refusing a **group- or other-readable** file (design §18.6/§12.18):
+/// Loads an API key from a file, refusing a **group- or other-readable** file (design §11.6, Authentication — a bearer API key / §13, Cross-cutting invariants):
 /// a control-plane secret must not be world-readable. Trailing whitespace/newline is trimmed so an
 /// `echo "$key" > keyfile` works.
 ///
@@ -158,7 +158,7 @@ mod tests {
         assert_eq!(extract_bearer(None), None);
     }
 
-    // Positive control + the two failure modes (design §18.6): correct → Ok, wrong → Forbidden,
+    // Positive control + the two failure modes (design §11.6, Authentication — a bearer API key): correct → Ok, wrong → Forbidden,
     // absent → Unauthorized. RED on the inverse (an `authorize` that accepts a wrong key, or
     // conflates absent with wrong).
     #[test]

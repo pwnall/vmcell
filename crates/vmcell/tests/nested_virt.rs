@@ -106,7 +106,7 @@ async fn test_nested_virt_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     };
 
     // The positive nested-virt contract is the extracted `checks::nested_kvm_ok` the validator
-    // runs (§8.5); driving it here keeps one implementation.
+    // runs (§4.4, The in-rootfs guest-tools helper); driving it here keeps one implementation.
     vmcell_artifact_validator::checks::nested_kvm_ok(agent)
         .await
         .expect("nested /dev/kvm must be exposed with nested_virt = true");

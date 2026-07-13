@@ -53,7 +53,7 @@ use vmcell_protocol::{
 };
 use vsock::{VsockAddr, VsockListener, VsockStream};
 
-/// The single per-connection writer (§12.28): every frame — the initial `Ready`,
+/// The single per-connection writer (§13, Cross-cutting invariants): every frame — the initial `Ready`,
 /// one-shot exec/put-file/resync output, and all interactive-session frames from
 /// every pump/waiter thread — is emitted through this one `send_framed` under one
 /// lock, so no two threads write the vsock concurrently and multiplexed session
@@ -62,9 +62,9 @@ use vsock::{VsockAddr, VsockListener, VsockStream};
 type Writer = Arc<Mutex<VsockStream>>;
 
 /// The per-connection session table: `SessionId` → its live [`SessionHandle`]
-/// (design 62 §22). The dispatch loop inserts on `OpenSession` and looks up on
+/// (§3, The control plane: vsock, the host clients, and the guest agent). The dispatch loop inserts on `OpenSession` and looks up on
 /// `Stdin`/`Winsize`/`CloseSession`; each session's waiter thread removes its own
-/// entry on exit; connection teardown drains and kills whatever is left (§12.27).
+/// entry on exit; connection teardown drains and kills whatever is left (§13, Cross-cutting invariants).
 type Sessions = Arc<Mutex<HashMap<SessionId, SessionHandle>>>;
 
 /// Reaps every currently-exited child with `WNOHANG`, recording each status in
@@ -80,7 +80,7 @@ fn drain_zombies(reaper: &ReaperCoordinator) {
     // `drain_reaped`) so a fork that reuses a just-freed pid cannot `reserve` it
     // *between* the reap and the record — closing the residual PID-reuse race
     // where a stale grandchild status is stamped past the reservation epoch and
-    // mis-delivered as the reused child's exit (AGENT-1, §4.3).
+    // mis-delivered as the reused child's exit (AGENT-1, §3.4, The guest: vmcell-guest-agent as PID 1).
     reaper.drain_reaped(|| match wait(WaitOptions::NOHANG) {
         Ok(Some((pid, status))) => {
             let pid = pid.as_raw_nonzero().get().cast_unsigned();
@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("vmcell-guest-agent: starting");
 
     // Mount setup. `/sys` is NOT in the fatal core-mount set ({overlay, /proc,
-    // /dev}, §4.3): its *mount* failure is tolerated below (:127-138), so its
+    // /dev}, §3.4, The guest: vmcell-guest-agent as PID 1): its *mount* failure is tolerated below (:127-138), so its
     // mount-point creation must be tolerated too — a fatal `?` here would
     // kernel-panic PID 1 ("Attempted to kill init") on a policy the agent
     // otherwise treats as best-effort (AGENT-6).
@@ -182,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("/mnt")?;
 
     if let Err(e) = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "") {
-        // Fatal core mount (§4.3): failure returns Err and kernel-panics PID 1, so
+        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): failure returns Err and kernel-panics PID 1, so
         // log it at error — louder than the tolerated best-effort failures (sysfs,
         // shares, loopback) that log at warn (N-GUEST-1: the levels were inverted).
         tracing::error!("vmcell-guest-agent: mount tmpfs failed: {}", e);
@@ -199,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MountFlags::empty(),
         "lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work",
     ) {
-        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: overlay failed: {}", e);
         return Err(e.into());
     }
@@ -211,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("oldroot")?;
 
     if let Err(e) = pivot_root(".", "oldroot") {
-        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: pivot_root failed: {}", e);
         return Err(e.into());
     }
@@ -225,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_dir_all("oldroot")?;
 
     // /sys is NOT part of the fatal core-mount set — that set is EXACTLY
-    // {overlay, /proc, /dev} (§4.3). The vsock control plane, the
+    // {overlay, /proc, /dev} (§3.4, The guest: vmcell-guest-agent as PID 1). The vsock control plane, the
     // overlay/pivot_root sequence, and restore-path MAC rotation (ioctls) do not
     // require sysfs, so a failed sysfs mount is logged and tolerated like the
     // share-mount / loopback paths below. Returning Err from PID 1's main would
@@ -237,20 +237,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if let Err(e) = mount("proc", "/proc", "proc", MountFlags::empty(), "") {
-        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: proc failed: {}", e);
         return Err(e.into());
     }
     if let Err(e) = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "") {
-        // Fatal core mount (§4.3): error level (N-GUEST-1).
+        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: devtmpfs failed: {}", e);
         return Err(e.into());
     }
 
-    // devpts at /dev/pts powers interactive PTY sessions (design 62 §22):
+    // devpts at /dev/pts powers interactive PTY sessions (§3, The control plane: vsock, the host clients, and the guest agent):
     // `/dev/ptmx` allocates a master and `ptsname` resolves the slave under
     // /dev/pts. Best-effort and NOT in the fatal core-mount set {overlay, /proc,
-    // /dev} (§4.3) — only PTY *sessions* need it (they fail loud with
+    // /dev} (§3.4, The guest: vmcell-guest-agent as PID 1) — only PTY *sessions* need it (they fail loud with
     // `SessionExit(127)` if it is absent); one-shot exec, pipe sessions, and the
     // vsock control plane do not. So a failure is logged and tolerated like the
     // sysfs/share/loopback mounts (returning Err from PID 1 kernel-panics the
@@ -277,7 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Mount the virtio-fs shares the host configured, decoded from the kernel
     // command line (`vmcell_share=<tag>:<guest_path>:<ro|rw>` tokens emitted by
     // `config::push_share_args`). Tags are caller-defined, not built into the
-    // agent (§5.2): the agent honours whatever `VmConfig.shares` specified rather
+    // agent (§4.5, Shared directories (virtio-fs)): the agent honours whatever `VmConfig.shares` specified rather
     // than a hardcoded `imp-*` list. A share is optional — a config may attach
     // none (the benchmark / exec-only paths do), and virtiofsd may not be attached
     // for a declared tag, so a failed mount is logged and skipped, never
@@ -375,7 +375,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // are pruned so the status map stays bounded.
     let reaper = Arc::new(ReaperCoordinator::new());
 
-    // Per-VM guest timeout tuning from the (untrusted) kernel cmdline (§8.3): the
+    // Per-VM guest timeout tuning from the (untrusted) kernel cmdline (§5.3, The kernel command line): the
     // host emits `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` from
     // `cfg.timeouts` so the bind-retry / re-bind cadence is tunable without a
     // rootfs rebuild. Absent/garbage tokens fall back to the compiled defaults
@@ -447,7 +447,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // returning init kernel-panics the guest ("Attempted to kill init"), which
     // the host then flags via `contains_panic()`. On SIGTERM (normal teardown
     // signals the guest before force-killing the VMM group) perform an orderly
-    // power-off instead of falling out of `main` (AGENT-2, §4.3).
+    // power-off instead of falling out of `main` (AGENT-2, §3.4, The guest: vmcell-guest-agent as PID 1).
     power_off_never_returns()
 }
 
@@ -480,7 +480,7 @@ fn power_off_never_returns() -> ! {
 /// vsock control-plane port the host's `AgentClient` connects to.
 const VSOCK_PORT: u32 = 5000;
 /// Compiled **default** retry cadence for a *failed vsock `bind`*, used when the
-/// host does not emit `vmcell_accept_poll_ms=` on the cmdline (§8.3).
+/// host does not emit `vmcell_accept_poll_ms=` on the cmdline (§5.3, The kernel command line).
 ///
 /// **Semantic change (OPP-2):** the accept path itself is now event-driven — a
 /// blocking `poll(2)` on the listener fd wakes sub-millisecond on connection
@@ -490,9 +490,9 @@ const VSOCK_PORT: u32 = 5000;
 /// `vmcell_accept_poll_ms=0` must not turn the bind-retry loop into a busy-spin.
 const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// Compiled **default** re-bind idle window, used when the host does not emit
-/// `vmcell_rebind_idle_ms=` on the cmdline (§8.3): re-bind the listener after this
+/// `vmcell_rebind_idle_ms=` on the cmdline (§5.3, The kernel command line): re-bind the listener after this
 /// much idle time with no new connection. Bounds the post-restore "deaf listener"
-/// window (§9.2): on CH `--restore` the pre-snapshot listener stops yielding
+/// window (§8.2, Restore correctness: a restored VM is not a fresh VM): on CH `--restore` the pre-snapshot listener stops yielding
 /// accepts, and the guest only re-attaches to the re-created vhost-vsock device by
 /// re-binding. Re-binding is harmless during normal operation (accepted
 /// connections keep their own fds), so a shorter idle only tightens the worst-case
@@ -540,7 +540,7 @@ enum AcceptOutcome {
 /// accept restarts the idle window; a spurious wakeup or `EINTR` leaves the
 /// deadline untouched.
 ///
-/// The untouched-deadline half is the load-bearing part (§9.2/§12.4): a
+/// The untouched-deadline half is the load-bearing part (§8.2, Restore correctness: a restored VM is not a fresh VM / §13, Cross-cutting invariants): a
 /// post-restore *deaf* listener never delivers a real accept, but `poll` can
 /// still wake (signals, stray revents). If those wakes extended the deadline,
 /// the idle window would never elapse and the listener would never re-bind.
@@ -627,7 +627,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
         // Idle window starts at the (re)bind; only a successful accept restarts
         // it. Once it elapses with no accepted connection — or an arm below
         // `break`s on a listener-level failure — fall out, drop this listener,
-        // and re-bind on the current device (§9.2).
+        // and re-bind on the current device (§8.2, Restore correctness: a restored VM is not a fresh VM).
         let mut deadline = Instant::now() + rebind_idle;
         while let Some(remaining) = remaining_idle(deadline, Instant::now()) {
             let mut fds = [PollFd::new(&listener, PollFlags::IN)];
@@ -734,7 +734,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
 }
 
 /// Postcard-encodes and frames one [`Message`] through the single per-connection
-/// [`Writer`] (§12.28). Locking mirrors the reaper's poison policy (recover the
+/// [`Writer`] (§13, Cross-cutting invariants). Locking mirrors the reaper's poison policy (recover the
 /// guard rather than propagate a poison panic through PID 1).
 fn send_msg(writer: &Writer, msg: &Message) -> std::io::Result<()> {
     let bytes = postcard::to_stdvec(msg).map_err(std::io::Error::other)?;
@@ -743,12 +743,12 @@ fn send_msg(writer: &Writer, msg: &Message) -> std::io::Result<()> {
 }
 
 /// Serves one accepted connection: sends `Ready`, runs the dispatch loop, and —
-/// however the loop ends — tears down every session it left open (§12.27).
+/// however the loop ends — tears down every session it left open (§13, Cross-cutting invariants).
 ///
 /// The stream is split into a read half (owned by [`serve_loop`]) and a
 /// `try_clone`d write half behind the single [`Writer`], so a session pump can
 /// emit output while the loop is blocked reading the next frame, without two
-/// threads ever writing the socket at once (§12.28).
+/// threads ever writing the socket at once (§13, Cross-cutting invariants).
 fn serve_connection(
     stream: VsockStream,
     reaper: &Arc<ReaperCoordinator>,
@@ -759,7 +759,7 @@ fn serve_connection(
 
     send_msg(&writer, &Message::Ready)?;
     let result = serve_loop(&mut read_stream, &writer, &sessions, reaper);
-    // Connection owns its sessions (§12.27): before returning, kill every
+    // Connection owns its sessions (§13, Cross-cutting invariants): before returning, kill every
     // still-open session's process group so no interactive session outlives the
     // connection that opened it. Draining the table also drops each handle,
     // closing its stdin pipe / PTY master fds.
@@ -771,7 +771,7 @@ fn serve_connection(
 /// routes it. It never blocks on a running child — one-shot `Exec` is still
 /// synchronous (drains to `Exit` before the next read, the one-shot contract),
 /// while `OpenSession` spawns a session and returns immediately so many sessions
-/// multiplex over the one connection (design 62 §22).
+/// multiplex over the one connection (§3, The control plane: vsock, the host clients, and the guest agent).
 fn serve_loop(
     read_stream: &mut VsockStream,
     writer: &Writer,
@@ -791,7 +791,7 @@ fn serve_loop(
                 mac,
                 ipv4,
             } => handle_resync(unix_secs, unix_nanos, mac, ipv4, writer)?,
-            // Interactive-session control (design 62 §22). These never fail the
+            // Interactive-session control (§3, The control plane: vsock, the host clients, and the guest agent). These never fail the
             // connection: a bad open reports `SessionExit(127)` to the host, and a
             // frame for an unknown/closed session is dropped at debug — the session
             // simply already ended.
@@ -822,7 +822,7 @@ fn serve_loop(
     }
 }
 
-/// Kills every still-open session's process group and drops its fds (§12.27),
+/// Kills every still-open session's process group and drops its fds (§13, Cross-cutting invariants),
 /// invoked once the connection's dispatch loop has ended for any reason.
 fn teardown_sessions(sessions: &Sessions) {
     let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -935,9 +935,9 @@ fn reseed_urandom_from_hwrng() -> std::io::Result<()> {
 /// Handles a [`Message::Resync`] post-restore resync natively — replacing the
 /// three subprocess execs (`date` / `head -c 32 /dev/hwrng` / `ip link set`) —
 /// and always replies with a [`Message::ResyncAck`] carrying each step's outcome
-/// (design 44 §5).
+/// (§8.2, Restore correctness: a restored VM is not a fresh VM).
 ///
-/// The clock set is **mandatory** (§9.2): a failure is reported via `clock_error`
+/// The clock set is **mandatory** (§8.2, Restore correctness: a restored VM is not a fresh VM): a failure is reported via `clock_error`
 /// but NEVER propagated with `?` or a panic — the ack must always be sent so the
 /// host gets a definitive answer and decides (it treats a `Some(clock_error)` as a
 /// hard, retryable failure). The CSPRNG reseed and MAC rotation are best-effort
@@ -1081,7 +1081,7 @@ fn handle_exec(
     // serial console (`/dev/console`), from which no input ever arrives, so a
     // command that reads stdin (`cat`, `wc`, a `sh` heredoc) would block on the
     // console and run out its timeout instead of seeing EOF immediately. (The
-    // interactive-session path, design 62 §22, is where streamed stdin lives.)
+    // interactive-session path, §3, The control plane: vsock, the host clients, and the guest agent, is where streamed stdin lives.)
     cmd.stdin(Stdio::null());
 
     // AGENT-2: capture the reservation epoch BEFORE the spawn. An instant child
@@ -1145,7 +1145,7 @@ fn handle_exec(
             // cannot have its lingering, unclaimed exit status mis-delivered to
             // this child as a false result: `reserve` clears a status recorded at
             // or before the epoch, and the waiter's `wait_for(pid)` below only
-            // accepts one recorded strictly after it (§4.3 PID-1 reaper-vs-waiter
+            // accepts one recorded strictly after it (§3.4, The guest: vmcell-guest-agent as PID 1; the PID-1 reaper-vs-waiter
             // contract). A status recorded after the epoch — this child's own,
             // when it exited and was drained before this line ran — survives the
             // reservation and is delivered immediately (AGENT-2).
@@ -1198,11 +1198,11 @@ fn handle_exec(
 }
 
 // ===========================================================================
-// Interactive sessions (design 62 §22): PTY / pipe sessions, streaming stdin,
+// Interactive sessions (§3, The control plane: vsock, the host clients, and the guest agent): PTY / pipe sessions, streaming stdin,
 // window resize, and multiplexed concurrent execs over one connection.
 // ===========================================================================
 
-/// Where a session's streamed stdin is delivered (design 62 §22). A pipe session
+/// Where a session's streamed stdin is delivered (§3, The control plane: vsock, the host clients, and the guest agent). A pipe session
 /// writes to the child's stdin pipe (dropping it on `StdinEof` closes it → the
 /// child reads EOF); a PTY session writes to the pseudo-terminal master (bytes
 /// arrive as terminal input). The PTY master `Arc<OwnedFd>` is shared with
@@ -1245,7 +1245,7 @@ fn winsize_from(rows: u16, cols: u16) -> rustix::termios::Winsize {
 
 /// `SIGKILL`s a process group by its leader pid (`kill(-pgid)`), the shared
 /// group-kill law used by the one-shot timeout, session `CloseSession`/timeout,
-/// and connection teardown (§12.27). A non-existent group is a silent no-op.
+/// and connection teardown (§13, Cross-cutting invariants). A non-existent group is a silent no-op.
 fn kill_group(pid: u32) {
     use rustix::process::{Pid, Signal, kill_process_group};
     if let Some(p) = Pid::from_raw(pid.cast_signed()) {
@@ -1255,7 +1255,7 @@ fn kill_group(pid: u32) {
 
 /// Reports a session that could not be opened (bad argv, spawn or PTY-allocation
 /// failure) the same way the one-shot path reports a spawn failure — one
-/// terminal-frame convention (§12.26): `SessionStderr{msg}` then
+/// terminal-frame convention (§13, Cross-cutting invariants): `SessionStderr{msg}` then
 /// `SessionExit{127}`.
 fn open_failed(writer: &Writer, session: SessionId, msg: &str) {
     tracing::warn!(
@@ -1289,7 +1289,7 @@ fn register_session(sessions: &Sessions, id: SessionId, handle: SessionHandle) {
 
 /// Spawns a reader thread that pumps a child stream to the host, wrapping each
 /// chunk into the session-tagged [`Message`] `wrap` produces and emitting it
-/// through the single [`Writer`] (§12.28). Ends on EOF, any read error (a PTY
+/// through the single [`Writer`] (§13, Cross-cutting invariants). Ends on EOF, any read error (a PTY
 /// master returns `EIO` once the child closes its slave — end of stream), or a
 /// write failure (the connection died).
 fn spawn_pump<R, F>(mut reader: R, writer: Writer, wrap: F) -> JoinHandle<()>
@@ -1319,8 +1319,8 @@ where
 
 /// Arms an optional kill thread for a session: if `timeout` is `Some`, `SIGKILL`
 /// the process group after it elapses unless the child already exited. `None`
-/// leaves the session **persistent** (design 62 §22.2.1) — bounded instead by
-/// `CloseSession`, the child exiting, or connection teardown (§12.27).
+/// leaves the session **persistent** (§3.3, Interactive-session wire semantics) — bounded instead by
+/// `CloseSession`, the child exiting, or connection teardown (§13, Cross-cutting invariants).
 fn arm_session_timeout(timeout: Option<Duration>, pid: u32, has_exited: Arc<AtomicBool>) {
     let Some(t) = timeout else {
         return;
@@ -1335,7 +1335,7 @@ fn arm_session_timeout(timeout: Option<Duration>, pid: u32, has_exited: Arc<Atom
 
 /// Spawns the waiter thread that claims a session's exit code from the shared
 /// reaper, then — after **joining the pump(s)** so all output precedes the exit
-/// (§12.26) — emits the terminal `SessionExit` and removes the session from the
+/// (§13, Cross-cutting invariants) — emits the terminal `SessionExit` and removes the session from the
 /// table. No `child.wait()` here, so the reaper's status cannot be stolen (the
 /// false-127 race).
 fn spawn_session_waiter(
@@ -1362,7 +1362,7 @@ fn spawn_session_waiter(
     });
 }
 
-/// Opens an interactive session (design 62 §22): builds the command, then
+/// Opens an interactive session (§3, The control plane: vsock, the host clients, and the guest agent): builds the command, then
 /// dispatches to the PTY or pipe path per `spec.pty`.
 fn run_session(
     session: SessionId,
@@ -1455,7 +1455,7 @@ fn open_pty() -> rustix::io::Result<(OwnedFd, std::ffi::CString)> {
     Ok((master, slave_path))
 }
 
-/// The `login_tty` sequence, run in the child's `pre_exec` (design 62 §22): make
+/// The `login_tty` sequence, run in the child's `pre_exec` (§3, The control plane: vsock, the host clients, and the guest agent): make
 /// the child a session leader (`setsid`, so its pgid == its pid and it has no
 /// controlling terminal), adopt the pty slave as its controlling terminal
 /// (`TIOCSCTTY`), and wire the slave onto stdin/stdout/stderr. Every call is an
@@ -1477,7 +1477,7 @@ fn login_tty(slave_fd: RawFd) -> std::io::Result<()> {
 
 /// Runs a PTY session: allocate a controlling-terminal pseudo-terminal, run the
 /// command as a session leader on it (`isatty()` true, resizable), and pump the
-/// single merged master stream back as `SessionStdout` (§12.29).
+/// single merged master stream back as `SessionStdout` (§13, Cross-cutting invariants).
 fn run_pty_session(
     session: SessionId,
     mut cmd: Command,
@@ -1535,7 +1535,7 @@ fn run_pty_session(
         }
     };
     // The parent must drop its slave so the master EOFs (Linux: `EIO`) once the
-    // child — the last slave holder — exits, letting the pump end (§12.29).
+    // child — the last slave holder — exits, letting the pump end (§13, Cross-cutting invariants).
     drop(slave);
 
     let pid = child.id();
@@ -1600,7 +1600,7 @@ fn write_all_fd(fd: &OwnedFd, mut data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Routes a `Stdin` frame to its session (design 62 §22). Clones the session's
+/// Routes a `Stdin` frame to its session (§3, The control plane: vsock, the host clients, and the guest agent). Clones the session's
 /// stdin `Arc` and releases the table lock before writing, so a blocked write
 /// never stalls the dispatch loop. A frame for an unknown/closed session is
 /// dropped at debug — the session simply already ended.
@@ -1631,7 +1631,7 @@ fn route_stdin(sessions: &Sessions, session: SessionId, data: &[u8]) {
     }
 }
 
-/// Routes a `StdinEof` frame (design 62 §22): closes a **pipe** session's stdin
+/// Routes a `StdinEof` frame (§3, The control plane: vsock, the host clients, and the guest agent): closes a **pipe** session's stdin
 /// (dropping the `ChildStdin` → the child reads EOF); a no-op for a PTY session
 /// (closing the master would tear down output — a PTY caller ends input in-band).
 fn route_stdin_eof(sessions: &Sessions, session: SessionId) {
@@ -1648,7 +1648,7 @@ fn route_stdin_eof(sessions: &Sessions, session: SessionId) {
     }
 }
 
-/// Routes a `Winsize` frame (design 62 §22): installs the new window on a PTY
+/// Routes a `Winsize` frame (§3, The control plane: vsock, the host clients, and the guest agent): installs the new window on a PTY
 /// session's master (`TIOCSWINSZ`, delivering `SIGWINCH`); a debug no-op for a
 /// pipe session.
 fn route_winsize(sessions: &Sessions, session: SessionId, rows: u16, cols: u16) {
@@ -1676,7 +1676,7 @@ fn route_winsize(sessions: &Sessions, session: SessionId, rows: u16, cols: u16) 
     }
 }
 
-/// Routes a `CloseSession` frame (design 62 §22): `SIGKILL`s the session's
+/// Routes a `CloseSession` frame (§3, The control plane: vsock, the host clients, and the guest agent): `SIGKILL`s the session's
 /// process group. The waiter observes the resulting exit, emits `SessionExit`,
 /// and removes the entry — so no double-remove here.
 fn close_session(sessions: &Sessions, session: SessionId) {
@@ -1733,7 +1733,7 @@ mod tests {
         assert!(parse_share_mounts("").is_empty());
     }
 
-    // §8.3: the guest-tuning cmdline tokens are UNTRUSTED and must be clamped into
+    // §5.3 (The kernel command line): the guest-tuning cmdline tokens are UNTRUSTED and must be clamped into
     // `[floor, ceil]`, falling back to the compiled default when absent/garbage.
     // The clamp is load-bearing: an un-clamped parse would let
     // `vmcell_accept_poll_ms=0` busy-spin PID 1's bind-retry loop (0ms sleep; since
@@ -1800,7 +1800,7 @@ mod tests {
     // an impl that resets the deadline on either (`SpuriousReadable => now +
     // rebind_idle`): a post-restore deaf listener never yields a real accept but
     // its poll can still wake, so a resetting policy re-arms the window forever
-    // and the §9.2 re-bind never fires.
+    // and the §8.2 (Restore correctness: a restored VM is not a fresh VM) re-bind never fires.
     #[test]
     fn spurious_wakeup_and_eintr_do_not_reset_the_deadline() {
         let start = Instant::now();
@@ -2000,7 +2000,7 @@ mod tests {
         );
     }
 
-    // design 62 §22 / §22.6: the rows→ws_row, cols→ws_col field mapping the PTY
+    // §3 (The control plane: vsock, the host clients, and the guest agent) / §3.3 (Interactive-session wire semantics): the rows→ws_row, cols→ws_col field mapping the PTY
     // winsize install consumes. RED on a rows↔cols swap (mirrors
     // `resync_timespec_maps_fields`), without a live PTY.
     #[test]
@@ -2017,7 +2017,7 @@ mod tests {
         assert_eq!(ws.ws_ypixel, 0);
     }
 
-    // design 62 §22.6: `child_path` is the ONE PATH law shared by handle_exec and
+    // §3.3 (Interactive-session wire semantics): `child_path` is the ONE PATH law shared by handle_exec and
     // run_session — it must prepend `/vmcell-tools` so the guest-helper shims
     // (ip/curl/kvm-ok) resolve. RED if a session path dropped the prefix.
     #[test]
@@ -2038,7 +2038,7 @@ mod tests {
         );
     }
 
-    // AGENT-3 extended to the channelized session frames (design 62 §22.6): a
+    // AGENT-3 extended to the channelized session frames (§3.3, Interactive-session wire semantics): a
     // guest-encoded `SessionStdout{id, payload}` frames through `send_framed`,
     // decodes through the host's REAL LengthDelimitedCodec, and postcard-decodes
     // back to the same Message — proving the id-keyed frames cross the hand-rolled

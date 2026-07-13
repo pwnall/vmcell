@@ -1,4 +1,4 @@
-//! Daemon integration tests (design §14).
+//! Daemon integration tests (design §15, Testing strategy).
 //!
 //! **The test binary itself runs under the blessed `vmcell-test-runner`** (nextest's target-runner,
 //! wired by `just test-daemon`), so it holds the three caps in its effective/ambient set. It then
@@ -8,7 +8,7 @@
 //! artifact store with the built kernel/rootfs and drives the daemon over HTTP, dogfooding
 //! `vmcell-daemon-client`; the VM-booting ones start **real Cloud Hypervisor micro-VMs** and assert on
 //! the data plane. (Manual poking, by contrast, launches `vmcelld` *through* the runner — `just
-//! daemon` — since there is no privileged test process to inherit from; §18.2.)
+//! daemon` — since there is no privileged test process to inherit from; §11.2, Privilege and blessing.)
 //!
 //! `#[ignore]` by default: they need KVM, the **blessed** runner (`just bless`), and built artifacts
 //! (`target/vmcell-artifacts/{vmlinux,rootfs.erofs}`). Run them via `just test-daemon`, which wraps the
@@ -106,7 +106,7 @@ fn require_preconditions() {
         have_privileged_caps(),
         "this test binary lacks cap_net_admin/cap_sys_admin/cap_dac_override in its effective set. \
          Run via `just test-daemon`, which runs the suite under the blessed runner (nextest \
-         target-runner) so the test binary — and the `vmcelld` it spawns — are privileged (§14)."
+         target-runner) so the test binary — and the `vmcelld` it spawns — are privileged (§14, Hard-won lessons)."
     );
     for a in ["vmlinux", "rootfs.erofs"] {
         let p = artifacts_dir().join(a);
@@ -189,7 +189,7 @@ impl Daemon {
         // Spawn `vmcelld` DIRECTLY (not through the runner): the test binary already holds the caps
         // (it runs under the runner as nextest's target-runner), so the child `vmcelld` inherits them
         // via the ambient set. Spawning directly means the test owns the daemon's process tree for
-        // setup/teardown inspection (§14).
+        // setup/teardown inspection (§15, Testing strategy).
         let mut cmd = Command::new(vmcelld_bin());
         cmd.arg("--artifacts-dir")
             .arg(store.path())
@@ -327,7 +327,7 @@ async fn boots_vm_and_execs_data_plane() {
     );
 }
 
-// design §19.4: an extra virtio-blk device attached over the HTTP API — the full path
+// design §11 (The control-plane daemon (vmcelld)): an extra virtio-blk device attached over the HTTP API — the full path
 // (upload → CreateVmRequest.extra_disks → resolve/pin → attach → guest read). Asserts on
 // the DATA PLANE (the marker read off /dev/vdb in-guest) AND that the disk artifact is
 // pinned while the VM is live (delete-in-use → 409), releasing on teardown.
@@ -468,7 +468,7 @@ async fn stats_limits_enforced_matches_delegation() {
     let stats = c.stats(&vm.id).await.expect("stats");
 
     // Both `mem_limit_enforced` and `mem_read_ok` mean exactly "the memory controller is delegated into
-    // the per-VM slice" (§7.2): under a delegated scope (`just test-daemon`) the daemon creates a slice
+    // the per-VM slice" (§7.2, The fail-loud capability contract and HostCapabilities): under a delegated scope (`just test-daemon`) the daemon creates a slice
     // with `memory.*` present, so both are true and a real memory reading is visible; without
     // delegation those files don't exist, so both are honestly false (the daemon never claims
     // enforcement it lacks — that honesty is the property under test). Assert both track delegation.
@@ -493,7 +493,7 @@ async fn stats_limits_enforced_matches_delegation() {
     c.destroy(&vm.id).await.expect("destroy");
 }
 
-/// The start-up orphan sweep (§18.4) — a payoff of the inverted pattern: the **test** is privileged, so
+/// The start-up orphan sweep (§11.4, The VM registry and the start-up sweep) — a payoff of the inverted pattern: the **test** is privileged, so
 /// it can plant a leaked netns (the residue a hard-killed daemon leaves) and assert the next daemon's
 /// start-up sweep reclaims it. `vmcell-net-<vmid>` is the exact shape `sweep_orphans` matches.
 #[tokio::test]
@@ -532,11 +532,11 @@ async fn startup_sweep_reclaims_orphan_netns() {
         .status();
 }
 
-/// Owning-and-`Drop` teardown (§18.4): a VM's per-VM scratch dir (`<temp>/vmcell-vm-<pid>-<vmid>`) exists
+/// Owning-and-`Drop` teardown (§11.4, The VM registry and the start-up sweep): a VM's per-VM scratch dir (`<temp>/vmcell-vm-<pid>-<vmid>`) exists
 /// while it is owned and is **gone after `destroy`** — the AGENTS.md residue rule, exercised end-to-end
 /// through the daemon.
 ///
-/// Matched by the **vmid octet**, not a predicted pid: under the setup-broker split (§20.5) the VM is
+/// Matched by the **vmid octet**, not a predicted pid: under the setup-broker split (§12.4, Layer 3 — the setup broker (network surface never holds caps)) the VM is
 /// created by the broker **child** (a fork of vmcelld), so the scratch dir carries the broker's pid,
 /// not `d.pid()`. The daemon's start-up sweep (empty live set) clears any prior test's same-vmid dir,
 /// so exactly this VM's dir matches.
@@ -594,7 +594,7 @@ fn has_default_route(raw: &str) -> bool {
     })
 }
 
-/// Snapshot + restore-by-name (§18.5.1): boot a snapshot-eligible VM (privileged net + `snapshotting`),
+/// Snapshot + restore-by-name (§11.5, The HTTP REST API and its OpenAPI document): boot a snapshot-eligible VM (privileged net + `snapshotting`),
 /// write a marker into its tmpfs, snapshot it into the store under a prefix, then **restore by name**
 /// into a fresh VM and prove the marker survived — a genuine memory-image round-trip through the
 /// daemon, and the payoff of the artifact store being the snapshot exchange surface.
@@ -658,7 +658,7 @@ async fn snapshot_then_restore_by_name_preserves_guest_state() {
     c.destroy(&restored.id).await.expect("destroy restored");
 }
 
-/// Privileged tap networking (§18.5.1): a VM created with `net: privileged` gets a host **netns**
+/// Privileged tap networking (§11.5, The HTTP REST API and its OpenAPI document): a VM created with `net: privileged` gets a host **netns**
 /// (`vmcell-net-<vmid>`, which the privileged test can observe) and the guest gets a **default route**
 /// (the agent configures `eth0` from the kernel cmdline). Both sides confirm the privileged path ran.
 #[tokio::test]
@@ -722,7 +722,7 @@ async fn privileged_net_gives_host_netns_and_guest_default_route() {
     );
 }
 
-/// The `vmcelld-ctl` CLI end-to-end (§18.7.2): drive a live daemon through the shipped binary — `run`
+/// The `vmcelld-ctl` CLI end-to-end (§11.7, The client library and CLI): drive a live daemon through the shipped binary — `run`
 /// relays the guest stdout + exit code, `ls`/`artifact ls` return JSON. Folds the CLI path (previously
 /// only manually checked) into the automated suite.
 #[tokio::test]
@@ -785,7 +785,7 @@ async fn vmcelld_ctl_drives_the_daemon() {
     );
 }
 
-/// The configurable resource prefix (§v21): a daemon run with `--resource-prefix acme` names its VMs'
+/// The configurable resource prefix (§11.4, The VM registry and the start-up sweep): a daemon run with `--resource-prefix acme` names its VMs'
 /// host resources `acme-*` AND sweeps only `acme-*` — never another prefix's. This is the whole point
 /// of the option (one value drives both naming and the sweep), and the isolation property.
 #[tokio::test]

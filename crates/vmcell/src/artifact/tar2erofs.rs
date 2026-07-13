@@ -29,8 +29,9 @@ fn build_node_map<'a, R: Read + 'a>(
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
     // NOTE: the injected files/symlinks (guest-agent, CA, guest-tools) are inserted AFTER
-    // the layer merge below — see the tail of this function (H-ART-3 / design v17 §8.2:
-    // "inject ... then stream the tree"). Injecting before the merge let an upper layer's
+    // the layer merge below — see the tail of this function (H-ART-3 / design §4.2,
+    // Rootfs sources and the one packer: "inject ... then stream the tree"). Injecting
+    // before the merge let an upper layer's
     // content or a `.wh.` whiteout silently clobber the baked agent or CA.
 
     for mut archive in archives {
@@ -197,8 +198,9 @@ fn build_node_map<'a, R: Read + 'a>(
         }
     }
 
-    // Inject the agent/CA/guest-tools AFTER every layer is merged (H-ART-3 / design v17
-    // §8.2: "inject ... then stream the tree"). Injecting last makes the injected files
+    // Inject the agent/CA/guest-tools AFTER every layer is merged (H-ART-3 / design §4.2,
+    // Rootfs sources and the one packer: "inject ... then stream the tree"). Injecting last
+    // makes the injected files
     // authoritative: an upper layer's content or a `.wh.` whiteout can no longer clobber the
     // baked guest-agent or the CA under `usr/local/share/ca-certificates/`.
     for (dest_path, src_path) in injected_files {
@@ -251,7 +253,7 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
 ) -> crate::error::Result<Vec<u8>> {
     let mut entries = build_node_map(archives, injected_files, injected_symlinks)?;
 
-    // Fail loud on a base image without glibc (§7.1 / oci2erofs §8.2). One pass over the
+    // Fail loud on a base image without glibc (§4.2, Rootfs sources and the one packer / oci2erofs §8.2). One pass over the
     // merged path set for `libc.so.6` under any `lib*` dir (lib64, lib/<triple>, usr/lib...).
     // The default guest-agent is built `-C target-feature=+crt-static` (guest_agent stage),
     // so it does not itself need libc6 — but the guest-tools helper and every user `exec`

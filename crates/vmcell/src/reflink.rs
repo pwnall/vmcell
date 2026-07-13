@@ -1,19 +1,19 @@
-//! Copy-on-write cloning of zygote suspend images (§9.4).
+//! Copy-on-write cloning of zygote suspend images (§8.4, The zygote fan-out and the OverlayStore seam).
 //!
-//! The zygote fan-out (§9.4) mints many identical VMs from one suspended
+//! The zygote fan-out (§8.4, The zygote fan-out and the OverlayStore seam) mints many identical VMs from one suspended
 //! **zygote** image by copy-on-write-copying its suspend/resume data per clone
 //! and restoring each private copy. On a reflink-capable host filesystem (XFS,
 //! Btrfs, bcachefs) the copy is a near-instant block-level `FICLONE` that shares
 //! physical storage with the master until a clone writes; on any other
 //! filesystem (ext4, tmpfs) it degrades to a full byte copy — correct, just not
 //! free. Reflinking is what makes an N-VM warm pool cost ≈N×dirtied pages
-//! instead of N×guest-RAM on disk (§9.3).
+//! instead of N×guest-RAM on disk (§8.3, Density levers).
 //!
 //! Making each clone restore from its **own** copy is also what un-breaks the
 //! single-use snapshot: the CH backend rewrites `config.json` in place per
 //! restore and FC reads a per-dir sidecar, so two restores from one shared dir
-//! race and corrupt it (§9.1). A per-clone copy removes the race *and* keeps the
-//! zygote master immutable (§12.12) — the copy diverges, the master never does.
+//! race and corrupt it (§8.1, The warm-snapshot path and the eligibility law). A per-clone copy removes the race *and* keeps the
+//! zygote master immutable (§13, Cross-cutting invariants) — the copy diverges, the master never does.
 
 // The one unsafe operation this needs — the `FICLONE` ioctl — lives inside the
 // vetted, permissively-licensed `reflink-copy` crate, which also owns the
@@ -30,7 +30,7 @@ use std::path::Path;
 /// Reported for observability: a `FullCopy` pool over a large guest-RAM image is
 /// materially more expensive (both time and disk) than a `Reflink` one, so a
 /// caller building a big warm pool on a non-reflink filesystem can warn or pick
-/// a different scratch location (§9.4).
+/// a different scratch location (§8.4, The zygote fan-out and the OverlayStore seam).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CowSupport {
@@ -67,7 +67,7 @@ impl CowSupport {
 /// regular file is reflinked where the filesystem supports it and full-copied
 /// otherwise (via [`reflink_copy::reflink_or_copy`]), so the clone is always a
 /// faithful, independent copy — writing to it never touches the master, which is
-/// the zygote-immutability contract (§12.12). Subdirectories are recreated and
+/// the zygote-immutability contract (§13, Cross-cutting invariants). Subdirectories are recreated and
 /// symlinks are recreated as symlinks; the flat CH/FC snapshot dirs contain
 /// neither, but the walk is robust to both. Special files (sockets/fifos) are
 /// skipped — a snapshot dir never contains one.
@@ -172,7 +172,7 @@ mod tests {
 
     // A clone must be a FAITHFUL, INDEPENDENT copy: same tree, same bytes, and a
     // later write to the clone must NOT touch the master (the zygote-immutability
-    // contract, §12.12). The inverse — a clone that hardlinks/shares the inode —
+    // contract, §13, Cross-cutting invariants). The inverse — a clone that hardlinks/shares the inode —
     // goes red here because mutating the clone changes the master's bytes.
     #[tokio::test]
     async fn clone_tree_is_faithful_and_independent() {
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(
             std::fs::read(master.join("config.json")).expect("read master cfg"),
             b"{\"vsock\":1}",
-            "writing the clone must not mutate the zygote master (immutability, §12.12)"
+            "writing the clone must not mutate the zygote master (immutability, §13, Cross-cutting invariants)"
         );
     }
 

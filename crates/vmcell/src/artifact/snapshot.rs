@@ -36,12 +36,12 @@ impl Stage for SnapshotStage {
         const STAGE_VERSION: u32 = 1;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
-        // Fold the pinned Cloud Hypervisor build identity (M-ART-7 / §16): a snapshot is only
+        // Fold the pinned Cloud Hypervisor build identity (M-ART-7 / §10.2, The stage model and the five cache-key rules): a snapshot is only
         // valid for the exact CH build that produced it — CH does not guarantee cross-version
         // snapshot compatibility — so a CH upgrade must invalidate stale snapshots at build
         // time, not at first `restore()`. The pin travels via Stage 0 (`cloud_hypervisor` in
         // pins.json / resolved_pins). virtiofsd is not folded: a snapshot-eligible VM has no
-        // vhost-user device (§3.3), so the snapshot itself never runs virtiofsd.
+        // vhost-user device (§8.1, The warm-snapshot path and the eligibility law), so the snapshot itself never runs virtiofsd.
         hasher.update(b"ch\0");
         hasher.update(
             inputs
@@ -77,7 +77,7 @@ impl Stage for SnapshotStage {
         let vmm = CloudHypervisor::new(ch_binary);
 
         // Bundle this stage's injected allocators with the default cgroup/clock/
-        // overlay seams into one `HostEnv` (design §18 delta 1). The stage keeps the
+        // overlay seams into one `HostEnv` (design §18, Delta register: changes from the validated v27 build, delta 1). The stage keeps the
         // allocators as separate fields (they must stay `RefUnwindSafe`), building
         // the transient bundle here for the spawn call.
         let env = crate::env::HostEnv {
@@ -101,7 +101,7 @@ impl Stage for SnapshotStage {
         // Go through the first-class `MicroVm::snapshot` verb (M-ART-2), not
         // `instance_mut().snapshot()`: the former invalidates the cached `AgentClient` after
         // a successful snapshot (so the resumed VM stays usable on every backend) and is the
-        // self-guarding entry point aligned with the §3.3 snapshot-eligibility law.
+        // self-guarding entry point aligned with the §8.1 (The warm-snapshot path and the eligibility law) snapshot-eligibility law.
         vm.snapshot(out).await?;
 
         vm.shutdown().await?;
@@ -111,7 +111,7 @@ impl Stage for SnapshotStage {
 }
 
 /// Builds the snapshot stage's [`VmConfig`], declaring `snapshotting(true)` (M-ART-2) so the
-/// §3.3 snapshot-eligibility guards in `config::build()` engage (a virtio-fs rootfs/share or
+/// §8.1 (The warm-snapshot path and the eligibility law) snapshot-eligibility guards in `config::build()` engage (a virtio-fs rootfs/share or
 /// unprivileged vhost-user-net is rejected). `network_disabled` keeps the boot vhost-user-free.
 fn snapshot_vm_config(kernel: PathBuf, rootfs_image: PathBuf) -> Result<VmConfig> {
     VmConfig::builder(
@@ -211,7 +211,7 @@ mod tests {
         );
     }
 
-    // M-ART-2: the snapshot stage must declare `snapshotting(true)` so the §3.3 snapshot-
+    // M-ART-2: the snapshot stage must declare `snapshotting(true)` so the §8.1 (The warm-snapshot path and the eligibility law) snapshot-
     // eligibility guards in `config::build()` engage. The buggy config (no snapshotting flag)
     // leaves `cfg.snapshotting == false` -> red here. (config::build() separately rejects
     // Unprivileged + snapshotting; that negative test lives in config.rs.)
@@ -228,7 +228,7 @@ mod tests {
         );
     }
 
-    // M-ART-7: a Cloud Hypervisor version bump must invalidate the snapshot cache key (§16:
+    // M-ART-7: a Cloud Hypervisor version bump must invalidate the snapshot cache key (§10.2, The stage model and the five cache-key rules:
     // CH does not guarantee cross-version snapshot compatibility). The buggy version (no CH
     // fold) leaves the two keys equal -> red here.
     #[test]

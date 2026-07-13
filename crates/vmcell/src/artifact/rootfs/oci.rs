@@ -157,8 +157,9 @@ async fn build_rootfs_with(
     out: &Path,
     agent_musl: Option<&Path>,
 ) -> Result<StageOutputs> {
-    // Digest-pinned pulls only: a tag (or any non-`sha256:` reference) is the §11.2
-    // provenance hard stop and is rejected BEFORE any network I/O — never a tag fallback.
+    // Digest-pinned pulls only: a tag (or any non-`sha256:` reference) is the §10.2 (The
+    // stage model and the five cache-key rules) provenance hard stop and is rejected BEFORE
+    // any network I/O — never a tag fallback.
     if !digest.starts_with("sha256:") {
         return Err(crate::error::Error::Artifact(format!(
             "OCI pull requires a digest starting with 'sha256:', got {digest}"
@@ -438,8 +439,9 @@ mod tests {
         )
     }
 
-    // ART-3: a tag (non-`sha256:`) reference is the §11.2 provenance hard stop and must be
-    // rejected BEFORE any pull. A tag-fallback pull that reached the puller reddens the
+    // ART-3: a tag (non-`sha256:`) reference is the §10.2 (The stage model and the five
+    // cache-key rules) provenance hard stop and must be rejected BEFORE any pull. A
+    // tag-fallback pull that reached the puller reddens the
     // `resolve_calls == 0` assertion.
     #[tokio::test]
     async fn test_oci_tag_digest_rejected() {

@@ -1,4 +1,4 @@
-//! Jailer-equivalent hardening gate (design §20.4 / invariant §12.22).
+//! Jailer-equivalent hardening gate (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail) / invariant §13, Cross-cutting invariants).
 //!
 //! These are the **non-theater** gates for Layer 2: they exercise the real pre-exec syscalls
 //! (`build_vmm_cmd`'s `apply_jail`) and go **red on the inverse** — with neither KVM nor root,
@@ -42,7 +42,7 @@ fn core_soft_limit(limits: &str) -> Option<String> {
         .and_then(|l| l.split_whitespace().nth(4).map(str::to_string))
 }
 
-// Guards §12.22: `apply_jail` sets PR_SET_NO_NEW_PRIVS and installs RLIMIT_CORE on the
+// Guards §13 (Cross-cutting invariants): `apply_jail` sets PR_SET_NO_NEW_PRIVS and installs RLIMIT_CORE on the
 // spawned child, and the INVERSE (a disabled jail) leaves both untouched — so deleting the
 // prctl or the setrlimit in `apply_jail` reddens this. Root-free, KVM-free.
 //
@@ -90,7 +90,7 @@ async fn apply_jail_sets_no_new_privs_and_the_core_rlimit() {
     );
 }
 
-// Guards §12.22 (the seccomp deny-list, §20.4): the compiled deny-list, applied to a forked
+// Guards §13 (Cross-cutting invariants) (the seccomp deny-list, §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): the compiled deny-list, applied to a forked
 // child, turns a normally-succeeding no-op `unshare(0)` into EPERM, while leaving an allowed
 // syscall (`getpid`) working. The INVERSE (no filter) lets `unshare(0)` succeed — proving the
 // gate fails on the inverse. Root-free (unprivileged no-op unshare + a default-allow filter),

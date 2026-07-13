@@ -1,7 +1,7 @@
 # Benchmark Results
 
 Performance results for the `vmcell` framework: hot-path overheads (micro-benchmarks) and
-KVM lifecycle/density/size metrics (macro-benchmarks). Per design §13.7 these are **tracked metrics,
+KVM lifecycle/density/size metrics (macro-benchmarks). Per design §16 (Performance) these are **tracked metrics,
 not pass/fail gates** — absolute numbers are hardware-bound and only meaningful with their substrate.
 
 > **Canonical numbers: the 2026-07-04 full backend×mode matrix** (directly below) — every
@@ -167,7 +167,7 @@ freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matr
 | Backend | `default` cold | `low_latency` cold | `default` restore | `low_latency` restore |
 | --- | --- | --- | --- | --- |
 | **Cloud Hypervisor** | 318 / 332 | **290 / 308** | 66 / 74 | **54 / 66** |
-| **Firecracker** | 778 / 806 | 760 / 775 | N/A (`snapshot_restore` off, §3.2) | N/A |
+| **Firecracker** | 778 / 806 | 760 / 775 | N/A (`snapshot_restore` off, §2.3 — Firecracker — the density tier and the fastest restore) | N/A |
 | **QEMU** (`q35`) | 1003 / 1138 | 993 / 1097 | N/A | N/A |
 
 **End-to-end lifecycle (phase-budget TOTAL: create+connect+exec+graceful teardown), p50 ms:**
@@ -225,7 +225,7 @@ current numbers are in the profile-matrix section above):
 | Backend | Cold p50 / p95 | Warm restore p50 / p95 |
 | --- | --- | --- |
 | **Cloud Hypervisor** | **330 / 346** | **84 / 94** (now 66 with native resync) |
-| **Firecracker** | **776 / 787** | N/A (`snapshot_restore` gated off, §3.2) |
+| **Firecracker** | **776 / 787** | N/A (`snapshot_restore` gated off, §2.3 — Firecracker — the density tier and the fastest restore) |
 | **QEMU** (`q35`) | ~1400 (pre shared-cmdline; now ~1003) | N/A (`snapshot_restore=false`) |
 
 - Warm restore is **~3.9× faster than cold** on CH — the per-test lever holds, now at **84 ms**. The
@@ -237,9 +237,9 @@ current numbers are in the profile-matrix section above):
   comparison suggested 6.12.94 restored ~2× slower than 6.6.9 (≈76 ms), but that was **not
   apples-to-apples** — the 6.6.9 figure came from a quieter earlier session. A **direct, interleaved
   6.6.143-vs-6.12.94 sweep** (same harness, same session) shows warm restore within **~2%** (CH 168 vs
-  171 ms; FC 138 vs 134 ms) — so the gap was host-load noise, not a kernel cost. The §6 distro-aligned
+  171 ms; FC 138 vs 134 ms) — so the gap was host-load noise, not a kernel cost. The §5.1 (The base and the pin) distro-aligned
   6.12.94 pin carries no measurable hot-path penalty.
-- **Design §13.1 reference** (research-era figures): CH 324 ms cold / 47 ms restore — hardware- and
+- **Design §16 reference** (Performance; research-era figures): CH 324 ms cold / 47 ms restore — hardware- and
   pin-dependent; the *relative* invariants reproduce, the absolute ms do not. The optimization pass
   narrows the gap to those figures substantially (330 ms cold / 84 ms restore here).
 
@@ -269,7 +269,7 @@ What changed (each measured independently, all kept):
    single lever: **CH cold −270 ms / FC −180 ms** at the more-aggressive `quiet loglevel=3` first tried,
    of which `loglevel=6` keeps all but ~43 ms (CH) — the ~43 ms is the cost of the retained
    notice/warn lines, paid to keep the serial log non-empty for debugging + panic capture. (An empty
-   serial log broke `boot.rs` and would blind a boot-failure post-mortem; §12.10 panic capture depends
+   serial log broke `boot.rs` and would blind a boot-failure post-mortem; §13 — Cross-cutting invariants — panic capture depends
    on it.)
 2. **Guest vsock accept poll `ACCEPT_POLL` 100→20 ms** (+ `REBIND_IDLE` 1 s→250 ms). The 100 ms poll
    sat directly on the critical path — the host blocks for `Ready` between its completed CONNECT/OK
@@ -349,7 +349,7 @@ datapath.** Warm restore is within ~2% on both backends, the restore-`connect` p
 session flagged is only ~8% higher on 6.12 (not 2×), and per-guest RAM differs by ~2 MiB. The
 **earlier 6.6.9-vs-6.12.94 ~2× restore gap was cross-session host-load noise**, not a real kernel
 effect — exactly what making the kernel a first-class dimension was built to settle. The
-distro-aligned (§6) 6.12.94 pin is free of any measurable hot-path cost; 6.6.143 is kept in the
+distro-aligned (§5.1 — The base and the pin) 6.12.94 pin is free of any measurable hot-path cost; 6.6.143 is kept in the
 registry as a tracked alternative.
 
 ## Macro — Eager vs lazy restore (CH, `prefault`)
@@ -413,7 +413,7 @@ poll dropped to 20 ms — the resync (clock/RNG/MAC) execs now dominate that sma
 **Teardown caveat.** This budget measures the *graceful* `MicroVm::shutdown()` (`request_shutdown`
 → poll `has_exited` up to the 250 ms grace → force-kill), so its ~283 ms is the grace ceiling, not a
 leak. The **fast per-test teardown is the `Drop` path** (force-kill the VMM process group + reap,
-**~27 ms**, §12.10) — a consumer that lets the `MicroVm` drop (RAII) pays that, not the graceful
+**~27 ms**, §13 — Cross-cutting invariants) — a consumer that lets the `MicroVm` drop (RAII) pays that, not the graceful
 grace. The optimization pass halved the graceful path (531→283 ms) and left the fast `Drop` path
 untouched.
 
@@ -424,7 +424,7 @@ untouched.
 poll-cadence levers touch connect/accept, not the established-stream exec RTT); not an `exec`
 bottleneck.
 
-## Artifact sizes (§13.6) — OCI base vs mmdebstrap *(kernel-independent; unchanged)*
+## Artifact sizes (§16 — Performance) — OCI base vs mmdebstrap *(kernel-independent; unchanged)*
 
 Packed **erofs** (the booted artifact; the pipeline ships **uncompressed** — `am-fs-erofs` emits no
 compressed nodes):
@@ -436,9 +436,9 @@ compressed nodes):
 | mmdebstrap minbase (trixie) | 120.2 MB | — | — |
 
 The OCI base is **~52% smaller** (the official image strips locale/doc/man via `dpkg path-exclude`),
-**inverting** the §13.6 hypothesis. Build wall-clock: mmdebstrap minbase 13–18 s; OCI assemble 0.4 s.
+**inverting** the §16 (Performance) hypothesis. Build wall-clock: mmdebstrap minbase 13–18 s; OCI assemble 0.4 s.
 
-## Guest agent: musl vs glibc (§13.3) *(unchanged)*
+## Guest agent: musl vs glibc (§16 — Performance) *(unchanged)*
 
 | Variant | stripped | linkage | rootfs-independent |
 | --- | --- | --- | --- |
@@ -450,6 +450,6 @@ toolchain-availability + rootfs-independence, not size → keep glibc-dynamic de
 
 ---
 *Full analysis, methodology, and the open-question resolutions are in `implementation-notes.md`
-("Benchmark results — resolving the §13 / §15 open questions" and the later fix sections). The detailed
-in-notes §13 tables were the first pass on the then-pinned 6.6.9 kernel; this doc is the canonical
+("Benchmark results — resolving the §16 (Performance) / §15 (Testing strategy) open questions" and the later fix sections). The detailed
+in-notes §16 (Performance) tables were the first pass on the then-pinned 6.6.9 kernel; this doc is the canonical
 re-run on the committed 6.12.94 pin.*

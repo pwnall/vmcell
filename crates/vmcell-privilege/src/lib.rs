@@ -7,7 +7,7 @@
 //! share the blessing precondition ([`ensure_blessed_or_explain`]) and its remediation message; only
 //! the runner uses the uid-drop transition ([`plan_privilege_transition`]/
 //! [`apply_privilege_transition`]). Keeping the predicates here means a fix or a test reddens for both
-//! callers, never one silently diverging from a copied second implementation (design §18.2).
+//! callers, never one silently diverging from a copied second implementation (design §11.2, Privilege and blessing).
 //!
 //! No crate-level `forbid(unsafe_code)`: the transition uses raw capability/syscall FFI, audited via
 //! `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn`.
@@ -54,7 +54,7 @@ pub fn probe_supported_caps() -> Vec<Cap> {
 }
 
 /// The three capabilities the vmcell privileged operating mode needs
-/// (`cap_net_admin,cap_sys_admin,cap_dac_override`, design §6.4/§12.8):
+/// (`cap_net_admin,cap_sys_admin,cap_dac_override`, design §6.1, The two operating modes / §13, Cross-cutting invariants):
 ///
 /// - `CAP_NET_ADMIN` — netns / tap / rtnetlink / nft bring-up.
 /// - `CAP_SYS_ADMIN` — mount + cgroup + assorted VMM operations.
@@ -86,7 +86,7 @@ pub fn blessing_remediation(uid: u32, exe: &Path, missing: &[Cap]) -> String {
         "error: this vmcell binary is missing {missing_list} in its effective set (uid={uid}, no file caps).\n\
          It was almost certainly rebuilt. Restore its privileges (one-time, until next rebuild):\n\n\
          sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {}\n\n\
-         Then re-run. See design §12.8 / §18.2.",
+         Then re-run. See design §13 (Cross-cutting invariants) / §11.2 (Privilege and blessing).",
         shell_single_quote(exe)
     )
 }
@@ -220,7 +220,7 @@ pub struct UidDrop {
 }
 
 /// A PURE description of the privilege transition, computed off the live process so every
-/// step is unit-testable against its buggy inverse (design §12.8 churn-fix #3). Only
+/// step is unit-testable against its buggy inverse (design §13, Cross-cutting invariants, churn-fix #3). Only
 /// the thin [`apply_privilege_transition`] performs syscalls.
 ///
 /// The daemon does **not** use this — it retains its caps unchanged. Only the transient
@@ -376,13 +376,13 @@ pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
     Ok(())
 }
 
-/// A PURE description of the **setup-broker parent's** capability drop (design §20.5 /
-/// §12.23): after `vmcelld` forks the privileged broker child, the parent — which serves the
+/// A PURE description of the **setup-broker parent's** capability drop (design §12.4,
+/// Layer 3 — the setup broker (network surface never holds caps)): after `vmcelld` forks the privileged broker child, the parent — which serves the
 /// network-facing HTTP API — drops **every** capability so a bug in the request parser can no
 /// longer reach the caps. Unlike [`PrivilegePlan`] (which *keeps* `need`), this keeps
 /// **nothing**: `final_caps` is empty. The uid is intentionally NOT dropped — the parent stays
 /// the same uid so it can `connect()` the VMM's sockets and `pidfd_send_signal` it (a
-/// cross-uid signal would need `CAP_KILL`, §20.5).
+/// cross-uid signal would need `CAP_KILL`, §12.4, Layer 3 — the setup broker (network surface never holds caps)).
 ///
 /// Only the thin [`apply_broker_parent_drop`] performs syscalls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,7 +418,7 @@ pub fn plan_broker_parent_drop(supported: &[Cap]) -> BrokerParentDropPlan {
 ///
 /// Order: clear ambient → shrink bounding (needs `CAP_SETPCAP` in effective, raised from
 /// permitted first if held) → set `no_new_privs` → clear permitted/effective/inheritable to
-/// exactly `final_caps` (empty). The uid is left unchanged (§20.5).
+/// exactly `final_caps` (empty). The uid is left unchanged (§12.4, Layer 3 — the setup broker (network surface never holds caps)).
 ///
 /// # Errors
 /// Returns a diagnostic string on any failed syscall; the caller exits non-zero (a parent that
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(merge_preserved_groups(1000, None, &[4]), vec![1000]);
     }
 
-    // Guards §12.23: the broker parent keeps NOTHING. `final_caps` must be empty (the whole
+    // Guards §12.4, Layer 3 — the setup broker (network surface never holds caps): the broker parent keeps NOTHING. `final_caps` must be empty (the whole
     // point of the split is that the HTTP-serving process holds no capability); it drops the
     // ENTIRE supported set from the bounding set; and it sets no_new_privs + clears ambient.
     // The buggy inverse (retaining a cap in `final_caps` — e.g. copying PRIVILEGED_CAPS the way

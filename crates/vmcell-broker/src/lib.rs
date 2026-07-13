@@ -1,5 +1,6 @@
-//! vmcell setup broker — the privilege boundary for the daemon/API mode (design §20.5,
-//! invariant §12.23).
+//! vmcell setup broker — the privilege boundary for the daemon/API mode (design §12.4, Layer 3 —
+//! the setup broker (network surface never holds caps); invariant §13, Cross-cutting
+//! invariants).
 //!
 //! `setns(CLONE_NEWNET)` needs `CAP_SYS_ADMIN` in the netns's owning user namespace, so an
 //! unprivileged process can **never** join a broker-created netns. This forces the **spawner
@@ -18,9 +19,10 @@
 //! **Ships now (gated in `just ci`):** the framed protocol + codec (round-trip + over-cap
 //! reject), the setup/teardown/cgroup/sweep dispatch (fake-tested), the parent cap-drop plan
 //! ([`vmcell_privilege::plan_broker_parent_drop`]), and the fork transport ([`spawn_broker`]).
-//! **Forward work (KVM-host-validated, §20.9):** [`BrokerRequest::SpawnVmm`]'s live
+//! **Forward work (KVM-host-validated, §17, Open gaps and future capabilities):**
+//! [`BrokerRequest::SpawnVmm`]'s live
 //! fork→`setns`→jail→`execve`→pidfd path, and the `vmcelld` cutover from the retain-caps model
-//! (§12.14) to fork-broker-then-drop.
+//! (§13, Cross-cutting invariants) to fork-broker-then-drop.
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)]
@@ -142,7 +144,7 @@ impl BrokerLimits {
 
 /// The fixed, audited menu of privileged operations the broker performs. Every variant's fields
 /// are validated at the boundary before any side effect — that validation is the broker's whole
-/// security value (§12.23).
+/// security value (§13, Cross-cutting invariants).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum BrokerRequest {
     /// Liveness check — no side effect, no caps needed.
@@ -166,7 +168,8 @@ pub enum BrokerRequest {
         limits: BrokerLimits,
     },
     /// Spawn the jailed VMM into `netns`/`cgroup` (fork→setns→jail→execve→pidfd). The live path
-    /// is the KVM-host-validated forward step (§20.9); today the handler refuses fail-loud.
+    /// is the KVM-host-validated forward step (§17, Open gaps and future capabilities); today
+    /// the handler refuses fail-loud.
     SpawnVmm {
         /// The VM's internal id.
         vmid: u32,
@@ -185,7 +188,7 @@ pub enum BrokerRequest {
         prefix: String,
     },
     /// Reclaim leaked netns/cgroup/scratch for `prefix`, sparing every id in `live_vmids` (the
-    /// start-up orphan sweep, §18.4).
+    /// start-up orphan sweep, §11.4, The VM registry and the start-up sweep).
     Sweep {
         /// The resource prefix whose leaks to reclaim.
         prefix: String,
@@ -303,7 +306,7 @@ pub fn recv_msg<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
 
 /// The privileged primitives the broker performs, injected so the dispatch logic is unit-testable
 /// against recording fakes with no root (the orchestrator's "injectable side-effect trait with a
-/// real impl and a recording fake" discipline, design §10.6).
+/// real impl and a recording fake" discipline, design §9.8, Testability seams).
 pub trait BrokerBackend: Send {
     /// A fresh netlink handle for a netns create/sweep (each `NetNamespace` owns its own).
     fn new_netlink(&self) -> Box<dyn Netlink>;
@@ -409,7 +412,7 @@ impl<B: BrokerBackend> BrokerServer<B> {
             }
             BrokerRequest::SpawnVmm { .. } => BrokerReply::Error(
                 "the jailed-VMM spawner (fork→setns→jail→execve→pidfd) is the KVM-host-validated \
-                 forward step — design §20.9"
+                 forward step — design §17 (Open gaps and future capabilities)"
                     .to_string(),
             ),
             BrokerRequest::Teardown { vmid, prefix } => {
@@ -483,7 +486,8 @@ pub fn serve<B: BrokerBackend>(
 // ---------------------------------------------------------------------------------------------
 
 /// The parent-side handle to a running broker: a framed request/reply channel over the socket
-/// pair. Blocking (the parent calls it from a `spawn_blocking` context when wired, §20.9).
+/// pair. Blocking (the parent calls it from a `spawn_blocking` context when wired, §17, Open
+/// gaps and future capabilities).
 #[derive(Debug)]
 pub struct BrokerClient {
     sock: UnixStream,
@@ -575,11 +579,13 @@ pub enum ForkSide {
 /// [`ForkSide`] the caller is on. The child gets `PR_SET_PDEATHSIG=SIGKILL` (dies with the parent).
 /// The caller decides what each side does — the thin [`spawn_broker_with`] serves a [`BrokerServer`]
 /// in the child; the daemon (`vmcell-daemon`) runs its own async registry-serve in the child and
-/// drops caps + serves HTTP in the parent (the §20.5/§12.23 cutover).
+/// drops caps + serves HTTP in the parent (the §12.4, Layer 3 — the setup broker (network
+/// surface never holds caps) / §13, Cross-cutting invariants cutover).
 ///
 /// MUST be called **before** the caller spawns any thread / async runtime (fork-with-threads is
 /// unsafe): after the fork, the child inherits only the calling thread, so any code that could block
-/// on a lock held by another thread would deadlock (§20.5).
+/// on a lock held by another thread would deadlock (§12.4, Layer 3 — the setup broker (network
+/// surface never holds caps)).
 ///
 /// The caller drops its own capabilities on the [`ForkSide::Parent`] branch
 /// ([`apply_broker_parent_drop`]); this function does not, so a test can fork without mutating the
@@ -591,7 +597,8 @@ pub fn fork_privileged_child() -> io::Result<ForkSide> {
     let (parent_sock, child_sock) = UnixStream::pair()?;
     // SAFETY: `fork(2)`; both branches below are the standard post-fork split — the child closes the
     // parent's socket end and sets pdeathsig, the parent closes the child's end. Called before any
-    // thread/runtime exists (§20.5), so no inherited-lock hazard.
+    // thread/runtime exists (§12.4, Layer 3 — the setup broker (network surface never holds
+    // caps)), so no inherited-lock hazard.
     match unsafe { libc::fork() } {
         -1 => Err(io::Error::last_os_error()),
         0 => {

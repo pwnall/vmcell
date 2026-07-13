@@ -3,7 +3,7 @@
 //! This is the *only* code the host (`vmcell::agent::AgentClient`) and the guest
 //! PID-1 agent (`vmcell-guest-agent`) share — extracting it into its own crate is
 //! what lets the guest agent be a standalone, host-stack-free workspace member
-//! (v15 §10.1). It defines the messages exchanged over the vsock connection and
+//! (§8.1, Workspace layout). It defines the messages exchanged over the vsock connection and
 //! the framing bound both ends must agree on.
 #![forbid(unsafe_code)]
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
@@ -81,7 +81,7 @@ pub struct Ipv4Reconfig {
 }
 
 /// A stable identity for one interactive session on a host↔guest connection
-/// (design 62 §22).
+/// (§3.3, Interactive-session wire semantics).
 ///
 /// The host is authoritative for the ids on its own connection: `SessionMux`
 /// hands out monotonically increasing values, and every session data/control
@@ -91,7 +91,7 @@ pub struct Ipv4Reconfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub u64);
 
-/// The initial window size of a PTY session's pseudo-terminal (design 62 §22).
+/// The initial window size of a PTY session's pseudo-terminal (§3.3, Interactive-session wire semantics).
 ///
 /// Carried in [`SessionSpec::pty`] as the terminal's `rows`×`cols` at open time;
 /// the host can change it mid-session with [`Message::Winsize`]. `u16` matches the
@@ -104,7 +104,7 @@ pub struct PtyConfig {
     pub cols: u16,
 }
 
-/// What to run in an interactive session, and how (design 62 §22).
+/// What to run in an interactive session, and how (§3.3, Interactive-session wire semantics).
 ///
 /// Reuses [`ExecRequest`] for the command line, environment, working directory,
 /// and optional kill deadline — one shape for "what to run", not a second copy.
@@ -113,7 +113,7 @@ pub struct PtyConfig {
 /// (separate stdout/stderr, streamable stdin).
 ///
 /// The embedded [`ExecRequest::timeout`] keeps its uniform meaning — *an optional
-/// kill deadline; `None` = no deadline* (§22.2.1). Unlike the one-shot `exec()`
+/// kill deadline; `None` = no deadline* (§3.3, Interactive-session wire semantics). Unlike the one-shot `exec()`
 /// path (which fills `None → DEFAULT_EXEC_TIMEOUT` before sending so a runaway
 /// child cannot outlive an abandoned host wait), the session path leaves `None`
 /// as `None`: an interactive session is *persistent* and is bounded instead by
@@ -151,7 +151,7 @@ impl SessionSpec {
 /// keeps out-of-crate matches from silently breaking when a variant is appended.
 /// The one-shot exec path (`Exec`/`Stdout`/`Stderr`/`Exit`, indices 1–4) is
 /// distinct from the channelized interactive-session path (`OpenSession`…
-/// `SessionExit`, indices 8–15, design 62 §22): the former carries no
+/// `SessionExit`, indices 8–15, §3.3, Interactive-session wire semantics): the former carries no
 /// [`SessionId`] and runs one exchange per connection; the latter multiplexes
 /// many concurrent sessions, each frame keyed by its id.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -174,7 +174,7 @@ pub enum Message {
         /// File contents.
         bytes: Vec<u8>,
     },
-    /// Host→guest one-shot post-restore resync request (design 44 §5).
+    /// Host→guest one-shot post-restore resync request (§8.2, Restore correctness: a restored VM is not a fresh VM).
     ///
     /// A snapshot resumes at the frozen instant, so the host drives one native
     /// in-agent resync — replacing the three post-restore subprocess execs
@@ -199,7 +199,7 @@ pub enum Message {
         ipv4: Option<Ipv4Reconfig>,
     },
     /// Guest→host acknowledgement of a [`Message::Resync`], reporting each step's
-    /// outcome (design 44 §5).
+    /// outcome (§8.2, Restore correctness: a restored VM is not a fresh VM).
     ///
     /// The clock set is mandatory: `clock_error` is `Some(msg)` iff it failed
     /// (the host treats that as a hard, retryable failure and does not clear its
@@ -217,7 +217,7 @@ pub enum Message {
         /// applied (H-VMM-1). Appended after `mac_applied`.
         ip_applied: bool,
     },
-    /// Host→guest: open a new interactive session (design 62 §22). The guest
+    /// Host→guest: open a new interactive session (§3.3, Interactive-session wire semantics). The guest
     /// spawns the command per `spec` (PTY or pipes), registers it under
     /// `session`, and streams `SessionStdout`/`SessionStderr` then a terminal
     /// `SessionExit`, all keyed by `session`. A failed open is reported as
@@ -231,7 +231,7 @@ pub enum Message {
         /// What to run, and whether on a PTY.
         spec: SessionSpec,
     },
-    /// Host→guest: feed stdin bytes to a running session (design 62 §22). For a
+    /// Host→guest: feed stdin bytes to a running session (§3.3, Interactive-session wire semantics). For a
     /// pipe session the bytes go to the child's stdin; for a PTY session they go
     /// to the master (arriving as terminal input). Bounded by `MAX_FRAME_BYTES`.
     Stdin {
@@ -240,7 +240,7 @@ pub enum Message {
         /// The stdin bytes to deliver.
         data: Vec<u8>,
     },
-    /// Host→guest: close a session's stdin (design 62 §22). For a pipe session
+    /// Host→guest: close a session's stdin (§3.3, Interactive-session wire semantics). For a pipe session
     /// the child's stdin write end is dropped, so the child reads EOF; for a PTY
     /// session this is a no-op (closing the master would tear down output — a PTY
     /// caller ends input with an in-band EOT or `CloseSession`).
@@ -248,7 +248,7 @@ pub enum Message {
         /// The target session.
         session: SessionId,
     },
-    /// Host→guest: resize a PTY session's window (design 62 §22). Installs the
+    /// Host→guest: resize a PTY session's window (§3.3, Interactive-session wire semantics). Installs the
     /// new `rows`×`cols` via `TIOCSWINSZ`, delivering `SIGWINCH` to the session's
     /// foreground process group. A no-op for a pipe session.
     Winsize {
@@ -259,7 +259,7 @@ pub enum Message {
         /// New number of character columns.
         cols: u16,
     },
-    /// Host→guest: terminate a session (design 62 §22). The guest `SIGKILL`s the
+    /// Host→guest: terminate a session (§3.3, Interactive-session wire semantics). The guest `SIGKILL`s the
     /// session's process group; the resulting exit is reported as the session's
     /// terminal `SessionExit`.
     CloseSession {
@@ -267,14 +267,14 @@ pub enum Message {
         session: SessionId,
     },
     /// Guest→host: standard output (or merged PTY output) from a session
-    /// (design 62 §22).
+    /// (§3.3, Interactive-session wire semantics).
     SessionStdout {
         /// The originating session.
         session: SessionId,
         /// The output bytes.
         data: Vec<u8>,
     },
-    /// Guest→host: standard error from a *pipe* session (design 62 §22). A PTY
+    /// Guest→host: standard error from a *pipe* session (§3.3, Interactive-session wire semantics). A PTY
     /// session merges stderr into `SessionStdout`, so it never emits this.
     SessionStderr {
         /// The originating session.
@@ -282,8 +282,8 @@ pub enum Message {
         /// The error-stream bytes.
         data: Vec<u8>,
     },
-    /// Guest→host: a session's exit code — its **terminal** frame (design 62
-    /// §22). Exactly one is sent per opened session, after all output, and no
+    /// Guest→host: a session's exit code — its **terminal** frame (§3.3,
+    /// Interactive-session wire semantics). Exactly one is sent per opened session, after all output, and no
     /// further frame carries that `session`.
     SessionExit {
         /// The session that exited.
@@ -451,7 +451,7 @@ mod tests {
                 mac_applied: true,
                 ip_applied: true,
             },
-            // Interactive-session variants (design 62 §22). A dropped/reordered
+            // Interactive-session variants (§3.3, Interactive-session wire semantics). A dropped/reordered
             // field or a rows↔cols swap reddens the `assert_eq!` below.
             Message::OpenSession {
                 session: SessionId(7),
@@ -501,7 +501,7 @@ mod tests {
         }
     }
 
-    // Append-only wire discipline (§4.1 / design 62 §22): postcard encodes an enum
+    // Append-only wire discipline (§3.1, The wire protocol / §3.3, Interactive-session wire semantics): postcard encodes an enum
     // variant as a LEB128 varint of its zero-based declaration index, which for
     // 0..=15 is a single leading byte equal to the index. This pins each variant to
     // its discriminant, so reordering or removing a variant — which would silently
@@ -542,7 +542,7 @@ mod tests {
             }),
             7
         );
-        // Indices 8–15: the appended interactive-session variants (design 62 §22).
+        // Indices 8–15: the appended interactive-session variants (§3.3, Interactive-session wire semantics).
         let sid = SessionId(1);
         assert_eq!(
             tag(&Message::OpenSession {
@@ -663,7 +663,7 @@ mod tests {
                         ip_applied,
                     }
                 }),
-            // Interactive-session variants (design 62 §22).
+            // Interactive-session variants (§3.3, Interactive-session wire semantics).
             (
                 any::<u64>(),
                 any::<Vec<String>>(),

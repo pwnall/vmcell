@@ -1,4 +1,4 @@
-//! Reproducible fetch-and-verify manifest for the vmcell-owned artifacts (v15 §11).
+//! Reproducible fetch-and-verify manifest for the vmcell-owned artifacts (v15 §10, The artifact build pipeline).
 //!
 //! Scope (deliberately narrow): a digest-pinned manifest of the artifacts vmcell *controls*
 //! — the guest kernel, the erofs rootfs, the proxy CA, and `pins.json` — so a consumer can
@@ -32,7 +32,7 @@ pub struct ManifestEntry {
 }
 
 /// A digest-pinned manifest of the vmcell-owned artifacts, for reproducible
-/// fetch-and-verify (v15 §11).
+/// fetch-and-verify (v15 §10, The artifact build pipeline).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct ArtifactManifest {
@@ -90,7 +90,7 @@ impl ArtifactManifest {
     /// Re-hashes every entry (resolving relative paths against `base`) and FAILS HARD on the
     /// first digest mismatch — a tampered artifact (or one swapped under an otherwise-intact
     /// manifest) is rejected, never trusted on the strength of the manifest's recorded digest
-    /// alone (§11.2 / verify what you ingest). An absolute entry path is used as-is (legacy).
+    /// alone (§10.2, The stage model and the five cache-key rules / verify what you ingest). An absolute entry path is used as-is (legacy).
     ///
     /// # Errors
     /// Returns [`Error::Artifact`] on any digest mismatch, or [`Error::Io`] if an entry's
@@ -145,7 +145,7 @@ impl ArtifactManifest {
 mod tests {
     use super::*;
 
-    // §11 / verify-what-you-ingest: an intact manifest verifies, but a TAMPERED artifact
+    // §10 (The artifact build pipeline) / verify-what-you-ingest: an intact manifest verifies, but a TAMPERED artifact
     // (bytes changed under the same path, manifest digest unchanged) must be rejected. The
     // inverse — trusting the manifest's recorded digest without re-hashing the file — would
     // accept the tampered bytes and goes red here.

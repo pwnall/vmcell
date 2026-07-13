@@ -1,4 +1,4 @@
-//! In-VM `mmdebstrap` rootfs builder (design §5.4).
+//! In-VM `mmdebstrap` rootfs builder (design §4.3, The rootfs-construction contract).
 //!
 //! Where `vmcell`'s bootstrap rootfs source pulls and unpacks an OCI base image on the host
 //! ([`vmcell::artifact::rootfs::RootfsStage`]), this crate builds a full-apt Debian rootfs by
@@ -6,17 +6,17 @@
 //! `mmdebstrap` against the pinned `snapshot.debian.org` archive over the guest agent. The
 //! resulting rootfs tar is packed to the final erofs by `vmcell`'s shared inject+CA tail
 //! [`vmcell::artifact::rootfs::pack_erofs_with_injection`], so it is injected and made
-//! byte-deterministic exactly like the OCI source (§5.4).
+//! byte-deterministic exactly like the OCI source (§4.3, The rootfs-construction contract).
 //!
 //! It is a [`vmcell::artifact::Stage`] so `vmcell-cli` can wire it into a `vmcell`
 //! [`vmcell::artifact::Pipeline`] in place of the OCI [`vmcell::artifact::rootfs::RootfsStage`].
-//! It depends on `vmcell`; `vmcell` has no dependency on this crate (§10.1).
+//! It depends on `vmcell`; `vmcell` has no dependency on this crate (§9.1, Workspace layout).
 //!
 //! ## Networking
 //! `apt`/`mmdebstrap` need a live Debian mirror, so the builder VM boots on the **privileged**
 //! network path (`NetConfig::Privileged { egress: Egress::Open }`, netns + tap + nft
 //! masquerade) — a build-time developer/CI operation where `CAP_NET_ADMIN` is acceptable
-//! (§16). apt still performs the full in-guest gpg chain verification against the base
+//! (§17, Open gaps and future capabilities). apt still performs the full in-guest gpg chain verification against the base
 //! image's `debian-archive-keyring`.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
@@ -61,7 +61,7 @@ use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
 use vmcell::{ExecOutcome, ExecRequest};
 
 /// A pipeline stage that builds a Debian rootfs with `mmdebstrap` inside a builder micro-VM
-/// (§5.4), producing the `rootfs` erofs artifact exactly like the OCI bootstrap source.
+/// (§4.3, The rootfs-construction contract), producing the `rootfs` erofs artifact exactly like the OCI bootstrap source.
 pub struct MmdebstrapRootfsStage {
     /// The Debian release suite to bootstrap (e.g. `"trixie"`).
     pub release: String,
@@ -72,7 +72,7 @@ pub struct MmdebstrapRootfsStage {
 /// The `deb` source line pointing at the pinned `snapshot.debian.org` archive. Kept a **pure**
 /// function so the pin-driven mirror string is unit-testable. `[check-valid-until=no]` disables
 /// only the Valid-Until freshness window (required for old snapshot timestamps), NEVER signature
-/// verification; `http://` is safe because the content is gpg-signed (§11.2).
+/// verification; `http://` is safe because the content is gpg-signed (§10.3, External access, signing, and determinism scope).
 fn mirror_line(timestamp: &str, release: &str) -> String {
     format!(
         "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/{timestamp}/ {release} main"
@@ -111,7 +111,7 @@ impl Stage for MmdebstrapRootfsStage {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
         // The shared injected-content identity (agent + CA + guest-agent source), ONE
-        // implementation reused from `vmcell` (§5.4). mmdebstrap always uses the default
+        // implementation reused from `vmcell` (§4.3, The rootfs-construction contract). mmdebstrap always uses the default
         // glibc agent (its Debian rootfs ships libc6), so no musl override.
         fold_rootfs_injection_identity(&mut hasher, inputs, None);
         hasher.update(b"mmdebstrap");
@@ -193,7 +193,7 @@ impl Stage for MmdebstrapRootfsStage {
 
         let vmm = CloudHypervisor::new(vmcell::artifact::ch_binary_path());
         // Bundle the builder's shared CID allocator with fresh (in-process) vmid +
-        // default cgroup/clock/overlay seams into one `HostEnv` (design §18 delta 1).
+        // default cgroup/clock/overlay seams into one `HostEnv` (design §18, Delta register: changes from the validated v27 build, delta 1).
         let mut env = vmcell::HostEnv::hermetic();
         env.cids = self.cid_alloc.clone();
         let mut vm = MicroVm::start(&vmm, cfg, &env).await?;

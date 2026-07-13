@@ -1,6 +1,6 @@
 //! Zygote suspend/resume fan-out: mint many identical VMs from one suspend image.
 //!
-//! Booting a guest kernel to "agent-ready" is the dominant per-VM cost (§15).
+//! Booting a guest kernel to "agent-ready" is the dominant per-VM cost (§16, Performance).
 //! When a workload needs *many* identical VMs — a warm serverless pool, a fan-out
 //! of agent sandboxes, a batch of test cells — paying that boot cost per VM is
 //! wasteful. The **zygote** pattern pays it once:
@@ -13,14 +13,14 @@
 //!    copy is a near-instant block-level clone; otherwise a full byte copy
 //!    ([`CowSupport`]).
 //! 3. Each clone gets a **fresh identity** — its own vmid (hence a distinct
-//!    IP/MAC, §9.2), its own netns/cgroup/vsock socket, and the mandatory
+//!    IP/MAC, §8.2, Restore correctness: a restored VM is not a fresh VM), its own netns/cgroup/vsock socket, and the mandatory
 //!    post-restore resync (clock/entropy/MAC/IP) on its first `agent()` call — so
 //!    concurrent clones never collide on the host.
 //!
 //! Because each clone restores from its **own** copy, the zygote master is never
-//! mutated (§12.12) and N clones never race on the backend's single-use in-place
-//! `config.json` rewrite (§9.1). Concurrent fan-out therefore requires a backend
-//! that rotates host paths per restore (`restore_rotates_host_paths`, §3.3): CH
+//! mutated (§13, Cross-cutting invariants) and N clones never race on the backend's single-use in-place
+//! `config.json` rewrite (§8.1, The warm-snapshot path and the eligibility law). Concurrent fan-out therefore requires a backend
+//! that rotates host paths per restore (`restore_rotates_host_paths`, §2.5, The capability matrix): CH
 //! does (its restore config rewrite moves every host path into the clone's own
 //! scratch dir), Firecracker does not (it re-binds the vsock UDS baked into the
 //! binary snapshot state verbatim, so two concurrent FC clones would fight over
@@ -40,13 +40,13 @@ use std::path::{Path, PathBuf};
 ///
 /// A `Zygote` owns an **immutable** snapshot directory (the *master*) plus the
 /// snapshot-eligible [`VmConfig`] its clones restore with. Cloning never mutates
-/// the master — each clone restores from its own copy-on-write copy (§9.4). The
+/// the master — each clone restores from its own copy-on-write copy (§8.4, The zygote fan-out and the OverlayStore seam). The
 /// master's directory lifecycle is the caller's (typically a pipeline snapshot
 /// artifact); dropping a `Zygote` does **not** delete it.
 ///
 /// The zygote ignores any [`VmConfig::vmid`] on the config it was built with:
 /// every clone is allocated a **fresh** vmid so clones get distinct IP/MAC
-/// identities and never collide (§9.2). Pass the process-wide [`HostEnv`] to the
+/// identities and never collide (§8.2, Restore correctness: a restored VM is not a fresh VM). Pass the process-wide [`HostEnv`] to the
 /// spawn methods so N clones draw N distinct ids and share one `OverlayStore` (S4).
 #[derive(Debug, Clone)]
 pub struct Zygote {
@@ -71,7 +71,7 @@ impl Zygote {
     /// # Errors
     /// [`Error::Unsupported`] if `cfg` is not snapshot-eligible (carries a
     /// vhost-user device — a virtio-fs data share or unprivileged networking,
-    /// §12.1); otherwise any error from taking the snapshot.
+    /// §13, Cross-cutting invariants); otherwise any error from taking the snapshot.
     pub async fn suspend<V: Vmm>(
         vm: &mut MicroVm<V>,
         cfg: VmConfig,
@@ -84,14 +84,14 @@ impl Zygote {
     }
 
     /// Adopts an already-built zygote snapshot directory (e.g. the `SnapshotStage`
-    /// pipeline artifact, §11.1) plus the config its clones restore with.
+    /// pipeline artifact, §10.1, Artifacts produced) plus the config its clones restore with.
     ///
     /// `master_dir` must be an existing directory. The config's `vmid` is cleared
     /// (each clone allocates a fresh one).
     ///
     /// # Errors
     /// [`Error::Io`] if `master_dir` is not an existing directory, or
-    /// [`Error::Unsupported`] if `cfg` is not snapshot-eligible (§12.1).
+    /// [`Error::Unsupported`] if `cfg` is not snapshot-eligible (§13, Cross-cutting invariants).
     pub async fn from_snapshot_dir(master_dir: impl Into<PathBuf>, cfg: VmConfig) -> Result<Self> {
         let master_dir = master_dir.into();
         check_clone_eligible(&cfg)?;
@@ -107,7 +107,7 @@ impl Zygote {
 
     fn from_parts(master_dir: PathBuf, mut cfg: VmConfig) -> Self {
         // Clones always get a fresh vmid; the zygote's own vmid (if any) describes
-        // the ancestor, not its children (§9.4).
+        // the ancestor, not its children (§8.4, The zygote fan-out and the OverlayStore seam).
         cfg.vmid = None;
         Self { master_dir, cfg }
     }
@@ -126,7 +126,7 @@ impl Zygote {
 
     /// Best-effort probe of whether the master's filesystem supports reflink, for
     /// an up-front cost signal before minting a pool. A `FullCopy` result means
-    /// every clone will pay a full byte copy of the suspend image (§9.4).
+    /// every clone will pay a full byte copy of the suspend image (§8.4, The zygote fan-out and the OverlayStore seam).
     #[must_use]
     pub fn probe_cow_support(&self) -> CowSupport {
         crate::reflink::probe_reflink(&self.master_dir)
@@ -139,10 +139,10 @@ impl Zygote {
     /// backend re-binds baked paths, as long as no sibling is live). For a
     /// *concurrent* pool use [`Zygote::spawn_clones`], which gates on the backend
     /// capability. The returned VM is live and resumed; its first `agent()` call
-    /// runs the mandatory post-restore resync (§9.2).
+    /// runs the mandatory post-restore resync (§8.2, Restore correctness: a restored VM is not a fresh VM).
     ///
     /// # Errors
-    /// Any error from the copy-on-write copy, network setup, or restore (§9.4).
+    /// Any error from the copy-on-write copy, network setup, or restore (§8.4, The zygote fan-out and the OverlayStore seam).
     pub async fn spawn_clone<V: Vmm>(&self, vmm: &V, env: &HostEnv) -> Result<MicroVm<V>> {
         let (vm, cow) = MicroVm::restore_cow(vmm, &self.master_dir, self.cfg.clone(), env).await?;
         tracing::debug!(
@@ -162,14 +162,14 @@ impl Zygote {
     /// distinct IP/MAC) and CIDs from one shared, process-global source.
     ///
     /// **All-or-nothing:** if any clone fails, the ones that already came up are
-    /// torn down (their ordered `Drop`, §12.10) and the first error is returned —
+    /// torn down (their ordered `Drop`, §13, Cross-cutting invariants) and the first error is returned —
     /// no half-built pool leaks.
     ///
     /// # Errors
     /// [`Error::Unsupported`] when `count > 1` and the backend does not rotate
     /// host paths on restore (`restore_rotates_host_paths == false`, e.g.
     /// Firecracker) — concurrent clones would fight over one baked host path
-    /// (§9.4). Otherwise, the first clone error (copy, network, or restore).
+    /// (§8.4, The zygote fan-out and the OverlayStore seam). Otherwise, the first clone error (copy, network, or restore).
     pub async fn spawn_clones<V: Vmm>(
         &self,
         vmm: &V,
@@ -179,7 +179,7 @@ impl Zygote {
         if count == 0 {
             return Ok(Vec::new());
         }
-        // Fan-out gate (§9.4): a backend that re-binds baked host paths verbatim
+        // Fan-out gate (§8.4, The zygote fan-out and the OverlayStore seam): a backend that re-binds baked host paths verbatim
         // (`restore_rotates_host_paths == false`) cannot give two *concurrent*
         // clones distinct vsock paths — CoW-copying the dir does not change the
         // path baked into the binary snapshot state. Fail loud and typed rather
@@ -190,7 +190,7 @@ impl Zygote {
             return Err(Error::Unsupported {
                 vmm: vmm.id().to_string(),
                 feature: "concurrent zygote fan-out (backend re-binds baked host paths verbatim; \
-                          §9.4 — use one clone at a time, or the CH tier)"
+                          §9.4, use one clone at a time, or the CH tier)"
                     .to_string(),
             });
         }
@@ -204,7 +204,7 @@ impl Zygote {
         let results = futures::future::join_all(futs).await;
 
         // All-or-nothing: gather the live clones; on the first error, drop the
-        // successes (ordered teardown, §12.10) and surface it — never a partial,
+        // successes (ordered teardown, §13, Cross-cutting invariants) and surface it — never a partial,
         // leaking pool.
         let mut vms = Vec::with_capacity(count);
         let mut reflinked = 0usize;
@@ -241,7 +241,7 @@ impl Zygote {
 }
 
 /// Fail-fast snapshot-eligibility check for a clone config (the config-only subset
-/// of the §12.1 law; the per-clone restore boundary re-checks with the resources
+/// of the §13 (Cross-cutting invariants) law; the per-clone restore boundary re-checks with the resources
 /// in hand). Rejecting here avoids minting copy-on-write copies for a pool that
 /// could never restore.
 fn check_clone_eligible(cfg: &VmConfig) -> Result<()> {
@@ -281,10 +281,10 @@ mod tests {
     // process-global `vmcell-vm-{pid}-{vmid}` scratch dir (idempotent
     // `create_dir_all`) and on the per-clone CoW target inside it — the design
     // mandates ONE shared allocator per test-runner process for exactly this reason
-    // (§10.2). nextest runs each test in its own process, so this is inert there;
+    // (§9.3, The public API surface). nextest runs each test in its own process, so this is inert there;
     // it only de-flakes `cargo test --lib`. CID sharing is unneeded — the scratch
     // dir is keyed on vmid only, and the fake instance never opens a real vsock.
-    static SHARED_VMIDS: std::sync::OnceLock<VmidAllocator> = std::sync::OnceLock::new(); // allow-global-state: process-global VMID allocator; §10.2 requires one shared allocator per test-runner process to avoid concurrent-test scratch-dir collisions
+    static SHARED_VMIDS: std::sync::OnceLock<VmidAllocator> = std::sync::OnceLock::new(); // allow-global-state: process-global VMID allocator; §9.3 (The public API surface) requires one shared allocator per test-runner process to avoid concurrent-test scratch-dir collisions
     fn shared_vmids() -> VmidAllocator {
         SHARED_VMIDS.get_or_init(VmidAllocator::new).clone()
     }
@@ -409,7 +409,7 @@ mod tests {
     // The headline fan-out property: N clones each restore from their OWN private
     // copy of the master (never the shared master dir), and each gets a distinct
     // vmid. The buggy inverse — handing the master dir to every restore (the
-    // single-use race, §9.1) — goes red because every recorded restore dir would
+    // single-use race, §8.1, The warm-snapshot path and the eligibility law) — goes red because every recorded restore dir would
     // equal the master and they would not be distinct.
     #[tokio::test]
     async fn fan_out_restores_each_clone_from_its_own_cow_copy() {
@@ -433,7 +433,7 @@ mod tests {
             .expect("fan-out of 4 clones");
         assert_eq!(clones.len(), 4);
 
-        // Distinct vmids => distinct network identity (IP/MAC) per clone (§9.2).
+        // Distinct vmids => distinct network identity (IP/MAC) per clone (§8.2, Restore correctness: a restored VM is not a fresh VM).
         let vmids: HashSet<u32> = clones.iter().map(|c| c.vmid()).collect();
         assert_eq!(vmids.len(), 4, "each clone must get a distinct vmid");
 
@@ -454,14 +454,14 @@ mod tests {
             );
         }
 
-        // The master is untouched by the fan-out (immutability, §12.12).
+        // The master is untouched by the fan-out (immutability, §13, Cross-cutting invariants).
         assert_eq!(
             std::fs::read(master.join("config.json")).expect("read master after"),
             master_before
         );
     }
 
-    // The concurrent-fan-out gate (§9.4): a backend that re-binds baked host paths
+    // The concurrent-fan-out gate (§8.4, The zygote fan-out and the OverlayStore seam): a backend that re-binds baked host paths
     // verbatim (`restore_rotates_host_paths == false`, e.g. Firecracker) cannot run
     // >1 concurrent clone. The inverse — letting them through — would collide on one
     // baked socket path. A single clone is still allowed.
@@ -584,7 +584,7 @@ mod tests {
         );
     }
 
-    // All-or-nothing (§9.4 / §12.10): when one clone in a fan-out fails, the ones
+    // All-or-nothing (§8.4, The zygote fan-out and the OverlayStore seam / §13, Cross-cutting invariants): when one clone in a fan-out fails, the ones
     // that already came up are torn down in order and the error is surfaced — no
     // half-built pool leaks. Injects a failure on the first restore of a 4-clone
     // fan-out; the other 3 come up (each records `resume`) and must then all be

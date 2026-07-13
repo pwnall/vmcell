@@ -1,9 +1,9 @@
-//! The axum HTTP server: state, router, handlers, and the bearer-auth layer (design §18.5/§18.6).
+//! The axum HTTP server: state, router, handlers, and the bearer-auth layer (design §11.5, The HTTP REST API and its OpenAPI document / §11.6, Authentication — a bearer API key).
 //!
 //! Handlers are thin adapters over the [`Registry`](crate::registry::Registry) and the artifact store; every failure returns a
-//! typed [`DaemonError`] whose one `IntoResponse` maps it to a status + structured body (§18.5.3). The
-//! auth layer wraps every route except the two open ones (invariant §12.15). The registry **owns** its
-//! VMs (design §18.4): a clean shutdown calls `shutdown_all`, and dropping the state runs each VM's
+//! typed [`DaemonError`] whose one `IntoResponse` maps it to a status + structured body (§11.5, The HTTP REST API and its OpenAPI document). The
+//! auth layer wraps every route except the two open ones (invariant §13, Cross-cutting invariants). The registry **owns** its
+//! VMs (design §11.4, The VM registry and the start-up sweep): a clean shutdown calls `shutdown_all`, and dropping the state runs each VM's
 //! ordered `Drop`; a hard kill relies on the next boot's start-up orphan sweep.
 
 use crate::artifact_store::ArtifactStore;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 /// The shared handler state (cheaply `Clone` — everything is behind an `Arc` or is `Copy`).
 ///
-/// The **VM engine** and the **artifact store** are separate seams (design §20.5 / §12.23): VM
+/// The **VM engine** and the **artifact store** are separate seams (design §12.4, Layer 3 — the setup broker (network surface never holds caps) / §13, Cross-cutting invariants): VM
 /// operations go through the [`VmEngine`] (a [`crate::bridge::BrokerClientEngine`] forwarding to the
 /// capped broker in the split cutover, or a [`crate::registry::Registry`] directly in a
 /// single-process daemon), while artifact CRUD is unprivileged file I/O the parent does itself —
@@ -44,7 +44,7 @@ pub struct AppState {
 }
 
 /// Builds the full router: the authenticated routes behind the bearer layer, plus the two open
-/// meta routes. The routes mounted here are exactly [`crate::openapi::API_ROUTES`] (invariant §12.16).
+/// meta routes. The routes mounted here are exactly [`crate::openapi::API_ROUTES`] (invariant §13, Cross-cutting invariants).
 pub fn build_router(state: AppState) -> Router {
     let max_body = state.max_artifact_bytes;
     let protected = Router::new()
@@ -59,7 +59,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/vms/:id/stats", get(stats_vm))
         .route("/v1/vms/:id/snapshot", post(snapshot_vm))
         // Auth is a route-layer over exactly these routes — the open routes below are NOT wrapped
-        // (invariant §12.15: authenticated by default, two named opt-outs).
+        // (invariant §13, Cross-cutting invariants: authenticated by default, two named opt-outs).
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))
         // Raise the body limit so a multi-MB kernel/rootfs upload is accepted; the store enforces the
         // real per-artifact cap. Applied only to the protected (upload-bearing) subtree.
@@ -73,7 +73,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// The bearer-auth middleware: reads the `Authorization` header and enforces the policy, returning a
-/// typed 401/403 before the handler runs. Applied to every protected route (invariant §12.15).
+/// typed 401/403 before the handler runs. Applied to every protected route (invariant §13, Cross-cutting invariants).
 async fn auth_layer(
     State(state): State<AppState>,
     req: Request,
@@ -225,7 +225,7 @@ mod tests {
         let dir = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
         let art_dir = dir.path().join("artifacts");
         // The engine (registry) and the parent's artifact store are separate seams over the same
-        // dir (design §20.5) — the wiring tests only exercise routing/auth, so no VM is launched.
+        // dir (design §12.4, Layer 3 — the setup broker (network surface never holds caps)) — the wiring tests only exercise routing/auth, so no VM is launched.
         let registry = Registry::new(
             Box::new(UnusedLauncher),
             ArtifactStore::open(&art_dir, 1 << 20).expect("registry store"),
@@ -250,7 +250,7 @@ mod tests {
     }
 
     // Open routes are reachable WITHOUT a token; protected routes are 401 without one, 403 with a
-    // wrong one, and reachable with the right one. This is the wiring proof for invariant §12.15.
+    // wrong one, and reachable with the right one. This is the wiring proof for invariant §13 (Cross-cutting invariants).
     #[tokio::test]
     async fn healthz_is_open_and_vms_requires_auth() {
         assert_eq!(status_of("/healthz", None).await, StatusCode::OK);

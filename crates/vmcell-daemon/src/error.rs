@@ -1,10 +1,10 @@
-//! The one daemon error type and its single HTTP-status mapping (design §18.5.3 / §12.13–§12.18).
+//! The one daemon error type and its single HTTP-status mapping (design §11.5.3, The HTTP REST API and its OpenAPI document / §13, Cross-cutting invariants).
 //!
-//! Mirrors the `vmcell` error discipline (design §10.3): no `Error::Other(String)` catch-all —
+//! Mirrors the `vmcell` error discipline (design §9.5, The error type): no `Error::Other(String)` catch-all —
 //! the caller-relevant conditions are typed and matchable. Exactly one `IntoResponse` impl maps a
 //! `DaemonError` to a status + a structured [`ErrorBody`] (one law, one predicate for the mapping),
 //! so no handler hand-rolls a status. A wrapped `vmcell::Error` renders its `Display`, never its
-//! `Debug` struct-dump (the L-BIN-4 lesson, design §11).
+//! `Debug` struct-dump (the L-BIN-4 lesson, design §14, Hard-won lessons).
 
 use crate::dto::{ErrorBody, ErrorKind};
 use crate::name::InvalidName;
@@ -99,7 +99,7 @@ impl From<serde_json::Error> for DaemonError {
 
 impl From<vmcell::Error> for DaemonError {
     /// Maps a `vmcell::Error` to the closest daemon kind. `Unsupported`/`CapabilityUnavailable`
-    /// (the two matchable vmcell conditions, design §10.3) map to `Unsupported` (501); a
+    /// (the two matchable vmcell conditions, design §9.5, The error type) map to `Unsupported` (501); a
     /// `Config` validation failure is a **client** error (the request carried a bad knob — a
     /// reserved kernel arg, a `0` io_limit, `vcpus == 0`) so it maps to `BadRequest` (400), not a
     /// misleading 500; every other variant renders its `Display` under `Internal` (500) — never

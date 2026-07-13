@@ -46,7 +46,7 @@
 pub mod agent;
 /// Error and Result types.
 pub mod error;
-/// The one place that composes swept per-VM host resource names from a configurable prefix (§v21).
+/// The one place that composes swept per-VM host resource names from a configurable prefix (§13, Cross-cutting invariants).
 pub mod naming;
 
 /// Artifact building stages and pipeline.
@@ -58,7 +58,7 @@ pub mod artifact;
 pub mod config;
 
 /// The process-wide seam bundle (`HostEnv`), threaded by reference to every VM-spawning entry point
-/// (§9.3, design §18 deltas 1–2).
+/// (§9.3, The public API surface, design §18, Delta register: changes from the validated v27 build, deltas 1–2).
 #[cfg(feature = "host-common")]
 pub mod env;
 
@@ -70,7 +70,7 @@ pub mod cpufreq;
 #[cfg(feature = "host-common")]
 pub mod fs;
 
-/// The one-probe host-capability descriptor (`HostCapabilities`), §7.2 / design §18 delta 8.
+/// The one-probe host-capability descriptor (`HostCapabilities`), §7.2 (The fail-loud capability contract and HostCapabilities) / design §18 (Delta register: changes from the validated v27 build) delta 8.
 #[cfg(feature = "host-common")]
 pub mod hostcaps;
 
@@ -88,11 +88,11 @@ mod net_sys;
 #[cfg(feature = "host-common")]
 pub mod orchestrator;
 
-/// Copy-on-write cloning of zygote suspend images (§9.4).
+/// Copy-on-write cloning of zygote suspend images (§8.4, The zygote fan-out and the OverlayStore seam).
 #[cfg(feature = "host-common")]
 mod reflink;
 
-/// The `OverlayStore` seam: how a snapshot dir is copy-on-write cloned (§21.2).
+/// The `OverlayStore` seam: how a snapshot dir is copy-on-write cloned (§8.4, The zygote fan-out and the OverlayStore seam).
 #[cfg(feature = "host-common")]
 pub mod overlay;
 
@@ -104,7 +104,7 @@ pub mod proxy;
 #[cfg(feature = "host-common")]
 pub mod zygote;
 
-/// Fork/branch lineage handles over the zygote fan-out (§21.4).
+/// Fork/branch lineage handles over the zygote fan-out (§8.5, Lineage: fork and branch).
 #[cfg(feature = "host-common")]
 pub mod lineage;
 

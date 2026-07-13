@@ -38,11 +38,11 @@ struct Cli {
     command: Commands,
 }
 
-/// Which kernel builder produces the `vmlinux` for `build` (design §8.5).
+/// Which kernel builder produces the `vmlinux` for `build` (design §5.4, The guest-kernel contract and the bootstrap seed).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
 enum KernelSource {
     /// Download + SHA-verify a digest-pinned prebuilt `vmlinux` (the fast, no-toolchain
-    /// bootstrap seed; the pinned Kata kernel is validated to boot §8.5).
+    /// bootstrap seed; the pinned Kata kernel is validated to boot §5.4, The guest-kernel contract and the bootstrap seed).
     Prebuilt,
     /// Compile from the pinned source with `make` on the HOST (the guaranteed fallback seed).
     HostMake,
@@ -50,7 +50,7 @@ enum KernelSource {
     InVm,
 }
 
-/// Which rootfs builder produces the erofs for `build` (design §5.4).
+/// Which rootfs builder produces the erofs for `build` (design §4.3, The rootfs-construction contract).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
 enum RootfsSourceKind {
     /// Pull + unpack a digest-pinned OCI base image on the HOST (the bootstrap source).
@@ -63,10 +63,10 @@ enum RootfsSourceKind {
 enum Commands {
     /// Build the kernel + rootfs + agent + tools artifacts into the artifacts dir.
     Build {
-        /// Which kernel builder to use for the `vmlinux` seed (§8.5).
+        /// Which kernel builder to use for the `vmlinux` seed (§5.4, The guest-kernel contract and the bootstrap seed).
         #[arg(long, value_enum, default_value_t = KernelSource::Prebuilt)]
         kernel_source: KernelSource,
-        /// Which rootfs builder to use for the erofs (§5.4).
+        /// Which rootfs builder to use for the erofs (§4.3, The rootfs-construction contract).
         #[arg(long, value_enum, default_value_t = RootfsSourceKind::Oci)]
         rootfs_source: RootfsSourceKind,
         /// Debian release suite for the `mmdebstrap` rootfs source (ignored for `oci`).
@@ -76,11 +76,11 @@ enum Commands {
     /// Build every kernel in the pins `kernels` registry to `vmlinux-<label>`.
     BuildKernels {
         /// Compile each kernel inside a builder micro-VM (`vmcell-kernel-builder`) instead of
-        /// on the host — the in-VM path needs a seed kernel already present (§8.5).
+        /// on the host — the in-VM path needs a seed kernel already present (§5.4, The guest-kernel contract and the bootstrap seed).
         #[arg(long)]
         in_vm: bool,
     },
-    /// Convert any digest-pinned OCI image into an erofs rootfs (build-time; v15 §8.2).
+    /// Convert any digest-pinned OCI image into an erofs rootfs (build-time; v15 §4.2, Rootfs sources and the one packer).
     /// The base MUST be pinned by digest (`IMAGE@sha256:...`), never a tag.
     Oci2Erofs {
         /// The digest-pinned base image, e.g. `debian:trixie-slim@sha256:<hex>`.
@@ -94,20 +94,20 @@ enum Commands {
         agent_musl: Option<PathBuf>,
     },
     /// Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel,
-    /// rootfs, proxy CA, pins.json) for reproducibility (v15 §11).
+    /// rootfs, proxy CA, pins.json) for reproducibility (v15 §10, The artifact build pipeline).
     Bundle {
         /// Output path for the manifest JSON (default `<artifacts_dir>/manifest.json`).
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
-    /// Re-hash every artifact in a manifest and fail loud on any digest mismatch (v15 §11).
+    /// Re-hash every artifact in a manifest and fail loud on any digest mismatch (v15 §10, The artifact build pipeline).
     VerifyBundle {
         /// Manifest JSON to verify (default `<artifacts_dir>/manifest.json`).
         #[arg(short, long)]
         manifest: Option<PathBuf>,
     },
     /// Create a fresh micro-VM, run a command in it over vsock, then tear it down,
-    /// exiting with the guest command's exit code (v15 §10.2).
+    /// exiting with the guest command's exit code (v15 §9.3, The public API surface).
     Run {
         /// Path to the `vmlinux` direct-boot kernel image.
         #[arg(long)]
@@ -122,24 +122,24 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
         /// Extra read-only virtio-blk device image (repeatable); enumerated in the
-        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§19.1).
+        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§4.6, Extra virtio-blk devices and disk-I/O throttling).
         #[arg(long = "disk")]
         disk: Vec<PathBuf>,
         /// Extra read-write virtio-blk device image (repeatable).
         #[arg(long = "disk-rw")]
         disk_rw: Vec<PathBuf>,
         /// Append-only extra kernel command-line argument (repeatable); cannot
-        /// override a reserved boot token vmcell owns (§19.2.1).
+        /// override a reserved boot token vmcell owns (§5.3, The kernel command line).
         #[arg(long = "append")]
         append: Vec<String>,
         /// Run the command in a PTY (controlling-terminal) interactive session so
         /// in-guest programs see a real terminal (`isatty` true, line editing);
         /// implies `--stdin`. Local raw-mode / `SIGWINCH` forwarding is best-effort
-        /// (design 62 §22.7); a fixed 24×80 initial window is used.
+        /// (§17, Open gaps and future capabilities); a fixed 24×80 initial window is used.
         #[arg(long)]
         tty: bool,
         /// Stream this CLI's stdin into the guest command (an interactive pipe
-        /// session, design 62 §22) instead of the default one-shot `/dev/null`
+        /// session, §3, The control plane: vsock, the host clients, and the guest agent) instead of the default one-shot `/dev/null`
         /// stdin.
         #[arg(long)]
         stdin: bool,
@@ -152,7 +152,7 @@ enum Commands {
         cmd: Vec<String>,
     },
     /// Create + boot a fresh micro-VM and confirm its agent is ready, then tear it
-    /// down (a boot smoke test; v15 §10.2).
+    /// down (a boot smoke test; v15 §9.3, The public API surface).
     Create {
         /// Path to the `vmlinux` direct-boot kernel image.
         #[arg(long)]
@@ -167,19 +167,19 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
         /// Extra read-only virtio-blk device image (repeatable); enumerated in the
-        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§19.1).
+        /// guest as `/dev/vdb`, `/dev/vdc`, … after the root disk (§4.6, Extra virtio-blk devices and disk-I/O throttling).
         #[arg(long = "disk")]
         disk: Vec<PathBuf>,
         /// Extra read-write virtio-blk device image (repeatable).
         #[arg(long = "disk-rw")]
         disk_rw: Vec<PathBuf>,
         /// Append-only extra kernel command-line argument (repeatable); cannot
-        /// override a reserved boot token vmcell owns (§19.2.1).
+        /// override a reserved boot token vmcell owns (§5.3, The kernel command line).
         #[arg(long = "append")]
         append: Vec<String>,
     },
     /// Boot a micro-VM and write a warm snapshot into a directory, then tear it
-    /// down (snapshot-eligible config only; v15 §10.2).
+    /// down (snapshot-eligible config only; v15 §9.3, The public API surface).
     Snapshot {
         /// Path to the `vmlinux` direct-boot kernel image.
         #[arg(long)]
@@ -198,7 +198,7 @@ enum Commands {
         mem_mib: u32,
     },
     /// Boot a micro-VM, sample its resource usage, print it as JSON, then tear it
-    /// down (v15 §10.2).
+    /// down (v15 §9.3, The public API surface).
     Stats {
         /// Path to the `vmlinux` direct-boot kernel image.
         #[arg(long)]
@@ -213,14 +213,14 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
     },
-    /// Removed (design §11): a standalone exec needs a cross-process VM registry, which collides
+    /// Removed (design §11, The control-plane daemon (vmcelld)): a standalone exec needs a cross-process VM registry, which collides
     /// with the ordered-Drop-owns-cleanup invariant. Use `vmcelld-ctl exec` against a running daemon.
     Exec,
-    /// Removed (design §11): listing VMs needs a cross-process registry. Use `vmcelld-ctl ls`.
+    /// Removed (design §11, The control-plane daemon (vmcelld)): listing VMs needs a cross-process registry. Use `vmcelld-ctl ls`.
     Ls,
-    /// Removed (design §11): removing a VM by id needs a cross-process registry. Use `vmcelld-ctl rm`.
+    /// Removed (design §11, The control-plane daemon (vmcelld)): removing a VM by id needs a cross-process registry. Use `vmcelld-ctl rm`.
     Rm,
-    /// Removed (design §11): destroying a VM by id needs a cross-process registry (within one
+    /// Removed (design §11, The control-plane daemon (vmcelld)): destroying a VM by id needs a cross-process registry (within one
     /// process the owning handle's drop/`shutdown` already destroys it). Use `vmcelld-ctl rm`.
     Destroy,
 }
@@ -254,9 +254,9 @@ async fn async_main() -> vmcell::Result<()> {
 }
 
 /// Builds the typed redirect error for a cross-process lifecycle verb that was **removed** from
-/// the CLI (design §18 delta 11): `exec`/`ls`/`rm`/`destroy` genuinely belong to the daemon, which
+/// the CLI (design §18 delta 11, Delta register: changes from the validated v27 build): `exec`/`ls`/`rm`/`destroy` genuinely belong to the daemon, which
 /// **owns** VMs across process boundaries — a capability a single-shot CLI structurally cannot have
-/// (§10, §11). The message points the user at `vmcelld-ctl`, the daemon's control client.
+/// (§9, The Rust library (vmcell); §11, The control-plane daemon (vmcelld)). The message points the user at `vmcelld-ctl`, the daemon's control client.
 ///
 /// These verbs must fail loud — a typed, matchable error that drives a non-zero exit — rather than
 /// printing fake success. Printing "Removing VM..." and returning `Ok(())` while doing nothing is
@@ -273,7 +273,7 @@ fn moved_to_vmcelld_ctl(subcommand: &str) -> vmcell::Error {
 
 /// Builds the kernel [`Stage`](vmcell::artifact::Stage) selected by `source` — a `vmcell`
 /// bootstrap producer (prebuilt download or host-`make`) or the in-VM `vmcell-kernel-builder`.
-/// This is the composition-root wiring that keeps the dependency graph acyclic (§10.1): only
+/// This is the composition-root wiring that keeps the dependency graph acyclic (§9.1, Workspace layout): only
 /// `vmcell-cli` names the builder crates.
 fn kernel_stage(
     source: KernelSource,
@@ -301,7 +301,7 @@ fn kernel_stage(
 }
 
 /// Builds the rootfs [`Stage`](vmcell::artifact::Stage) selected by `source` — the `vmcell`
-/// OCI bootstrap producer or the in-VM `vmcell-rootfs-builder` mmdebstrap source (§5.4).
+/// OCI bootstrap producer or the in-VM `vmcell-rootfs-builder` mmdebstrap source (§4.3, The rootfs-construction contract).
 fn rootfs_stage(
     source: RootfsSourceKind,
     release: String,
@@ -468,7 +468,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             } else {
                 cmd.clone()
             };
-            // `--tty`/`--stdin` (design 62 §22) route through an interactive session
+            // `--tty`/`--stdin` (§3, The control plane: vsock, the host clients, and the guest agent) route through an interactive session
             // that streams this CLI's stdin; the default path is the one-shot exec.
             let code = if *tty || *stdin {
                 run_interactive_session(&vm, argv, *tty).await?
@@ -484,7 +484,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                 outcome.code
             };
             vm.shutdown().await?;
-            // The CLI propagates the guest command's exit code (§10.2). Teardown has
+            // The CLI propagates the guest command's exit code (§9.3, The public API surface). Teardown has
             // already run (shutdown consumed `vm`), so process::exit leaks nothing.
             // expect(disallowed_methods): ordered teardown already completed above; exiting with
             // the guest's own code is the documented CLI contract.
@@ -556,7 +556,7 @@ fn ch_bin() -> String {
 }
 
 /// Resolves the committed `pins.json` at the workspace root, independent of the
-/// process CWD (L-BIN-10). Artifacts anchor on the workspace root (design §11), so a
+/// process CWD (L-BIN-10). Artifacts anchor on the workspace root (design §10, The artifact build pipeline), so a
 /// bare `PathBuf::from("pins.json")` would read pins from a *different* location than
 /// the artifacts when the tool is run from `crates/vmcell/`. Mirrors the library's
 /// `workspace_root` ascent (the `vmcell-protocol` marker); falls back to a
@@ -610,13 +610,13 @@ fn validate_oci_digest(digest: &str) -> vmcell::Result<()> {
     Ok(())
 }
 
-/// Runs `argv` in an interactive session (design 62 §22), streaming this CLI's
+/// Runs `argv` in an interactive session (§3, The control plane: vsock, the host clients, and the guest agent), streaming this CLI's
 /// stdin into the guest command and relaying its output, and returns the guest
 /// exit code.
 ///
 /// With `tty`, a controlling-terminal PTY session is used (fixed 24×80 initial
 /// window; local raw-mode / `SIGWINCH` forwarding is best-effort forward work,
-/// §22.7) — in-guest programs see a real terminal. Without it, a pipe session
+/// §17, Open gaps and future capabilities) — in-guest programs see a real terminal. Without it, a pipe session
 /// carries separate stdout/stderr. The `select!` loop reads guest output and this
 /// CLI's stdin concurrently; `recv()` and the stdin read are both cancellation-safe.
 async fn run_interactive_session(
@@ -631,7 +631,7 @@ async fn run_interactive_session(
     let mux = vm.connect_sessions(None).await?;
     let mut builder = SessionSpecBuilder::new(argv);
     if tty {
-        // A fixed classic default; dynamic sizing + resize forwarding is §22.7.
+        // A fixed classic default; dynamic sizing + resize forwarding is §17 (Open gaps and future capabilities).
         builder = builder.pty(24, 80);
     }
     let mut session = mux.open(builder.build()).await?;
@@ -676,7 +676,7 @@ async fn run_interactive_session(
 }
 
 /// Builds the extra virtio-blk device list from the CLI's `--disk` (read-only) and
-/// `--disk-rw` (read-write) path lists, read-only disks first (§19.1). The guest
+/// `--disk-rw` (read-write) path lists, read-only disks first (§4.6, Extra virtio-blk devices and disk-I/O throttling). The guest
 /// enumerates them `/dev/vdb`, `/dev/vdc`, … in this order after the root disk.
 fn extra_disks_from(read_only: &[PathBuf], read_write: &[PathBuf]) -> Vec<vmcell::BlockDevice> {
     read_only
@@ -690,7 +690,7 @@ fn extra_disks_from(read_only: &[PathBuf], read_write: &[PathBuf]) -> Vec<vmcell
 /// returned handle (its `Drop`/`shutdown` performs the ordered teardown).
 ///
 /// The VM does not outlive the calling process — a persistent, cross-invocation VM
-/// needs the `vmcelld` daemon's registry (§18), which collides with the
+/// needs the `vmcelld` daemon's registry (§11, The control-plane daemon (vmcelld)), which collides with the
 /// ordered-Drop-owns-cleanup invariant. So each VM-lifecycle CLI verb owns its VM's
 /// full lifecycle: create → operate → teardown.
 async fn ephemeral_vm(
@@ -718,7 +718,7 @@ async fn ephemeral_vm(
     let cfg = builder.build()?;
     let vmm = vmcell::CloudHypervisor::new(ch_bin());
     // One-shot CLI process booting one VM: in-process (hermetic) allocators suffice
-    // (the design §18 delta-1 seam bundle; `shared()` is the daemon's home).
+    // (the design §18 delta-1 seam bundle, Delta register: changes from the validated v27 build; `shared()` is the daemon's home).
     let env = vmcell::HostEnv::hermetic();
     vmcell::MicroVm::start(&vmm, cfg, &env).await
 }
@@ -744,9 +744,9 @@ fn format_usage_json(u: &vmcell::ResourceUsage) -> String {
 }
 
 /// Runs the full rootfs pipeline against an arbitrary digest-pinned OCI base image and
-/// writes the resulting erofs to `output` (v15 §8.2).
+/// writes the resulting erofs to `output` (v15 §4.2, Rootfs sources and the one packer).
 ///
-/// The image MUST be digest-pinned (`IMAGE@sha256:DIGEST`): a tag is a §11.2 provenance hard
+/// The image MUST be digest-pinned (`IMAGE@sha256:DIGEST`): a tag is a §10.2 (The stage model and the five cache-key rules) provenance hard
 /// stop and is rejected up front. A base lacking libc6 fails loud during packing unless
 /// `agent_musl` supplies a static-musl agent (which needs no glibc). The pipeline is the SAME
 /// inject+pack tail as `vmcell build` — verify-every-blob → whiteouts → inject agent/CA/tools

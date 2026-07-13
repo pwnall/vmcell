@@ -1,8 +1,8 @@
-//! `vmcelld-ctl` — a CLI over [`vmcell_daemon_client`] (design §18.7.2).
+//! `vmcelld-ctl` — a CLI over [`vmcell_daemon_client`] (design §11.7, The client library and CLI).
 //!
 //! Argument marshaling + output formatting only; every operation is a `DaemonClient` call. `run`/
 //! `exec` relay the guest's captured stdout/stderr and propagate its exit code, exactly as `vmcell
-//! run` does (design §11).
+//! run` does (design §11, The control-plane daemon (vmcelld)).
 //!
 //! `print_stdout`/`print_stderr` are NOT denied — a CLI writes results to stdout/stderr.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
@@ -150,7 +150,8 @@ fn main() {
     };
     let code = rt.block_on(async_main());
     // expect(disallowed_methods): the async body returned and its Drops ran; the CLI must exit with
-    // the guest's own code (run/exec) or 0/1 — a non-zero shell status is the contract (design §11).
+    // the guest's own code (run/exec) or 0/1 — a non-zero shell status is the contract (design §11,
+    // The control-plane daemon (vmcelld)).
     #[expect(
         clippy::disallowed_methods,
         reason = "async body returned and its Drops ran; relay the guest's exit code as the shell status"
@@ -236,7 +237,8 @@ async fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
     }
 }
 
-/// Relays a captured exec outcome to stdout/stderr and returns the guest's exit code (design §11).
+/// Relays a captured exec outcome to stdout/stderr and returns the guest's exit code (design §11,
+/// The control-plane daemon (vmcelld)).
 fn relay_and_code(
     outcome: &vmcell_daemon_client::dto::ExecOutcomeDto,
 ) -> Result<i32, Box<dyn std::error::Error>> {

@@ -3,7 +3,7 @@
 //! This module provides the `RootfsStage` pipeline step, which creates a minimal root
 //! filesystem for the virtual machines from an **OCI registry pull** — the in-`vmcell`
 //! bootstrap rootfs source (host-native, no VM). The full-apt **`mmdebstrap`-inside-a-VM**
-//! source now lives in the separate `vmcell-rootfs-builder` crate (§5.4 / §8.2), which
+//! source now lives in the separate `vmcell-rootfs-builder` crate (§4.3, The rootfs-construction contract / §4.2, Rootfs sources and the one packer), which
 //! calls [`pack_erofs_with_injection`](crate::artifact::rootfs::pack_erofs_with_injection) and
 //! [`resolve_builder_base`](crate::artifact::rootfs::resolve_builder_base) here so every rootfs
 //! source shares one inject/CA/erofs tail.
@@ -18,14 +18,14 @@ use std::path::Path;
 pub mod oci;
 
 /// A pipeline stage that builds a root filesystem from an OCI base image (the in-`vmcell`
-/// bootstrap source, §8.2). The in-VM `mmdebstrap` source is `vmcell-rootfs-builder`.
+/// bootstrap source, §4.2, Rootfs sources and the one packer). The in-VM `mmdebstrap` source is `vmcell-rootfs-builder`.
 pub struct RootfsStage {
-    /// Explicit `(image, digest)` override for the OCI source (v15 `oci2erofs`, §8.2):
+    /// Explicit `(image, digest)` override for the OCI source (v15 `oci2erofs`, §4.2, Rootfs sources and the one packer):
     /// `Some` ignores the pinned `rootfs_image`/`rootfs_digest` and pulls this digest-pinned
     /// base instead. `None` uses the pins (the default `vmcell build`).
     pub image_override: Option<(String, String)>,
     /// Static-musl guest agent to inject instead of the pipeline's default glibc agent
-    /// (`oci2erofs --agent-musl`, §8.2). When `Some`, the libc6-presence guard is skipped.
+    /// (`oci2erofs --agent-musl`, §4.2, Rootfs sources and the one packer). When `Some`, the libc6-presence guard is skipped.
     pub agent_musl: Option<std::path::PathBuf>,
 }
 
@@ -50,7 +50,7 @@ impl Stage for RootfsStage {
         hasher.update(&STAGE_VERSION.to_le_bytes());
         // Fold the identity of everything the shared inject+pack tail bakes in (the optional
         // static-musl agent override, the deployment CA, the guest-agent source closure) —
-        // ONE implementation, shared with the out-of-crate in-VM rootfs builders (§5.4).
+        // ONE implementation, shared with the out-of-crate in-VM rootfs builders (§4.3, The rootfs-construction contract).
         fold_rootfs_injection_identity(&mut hasher, inputs, self.agent_musl.as_deref());
         hasher.update(b"oci");
         // oci2erofs: the CLI-provided digest-pinned base is an INPUT (not a pin) and
@@ -93,7 +93,7 @@ impl Stage for RootfsStage {
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
-        // oci2erofs (§8.2): the CLI override pulls an explicit digest-pinned base;
+        // oci2erofs (§4.2, Rootfs sources and the one packer): the CLI override pulls an explicit digest-pinned base;
         // the default `vmcell build` resolves the pinned Debian image from the pins.
         let (image, digest) = match &self.image_override {
             Some((i, d)) => (i.clone(), d.clone()),
@@ -119,7 +119,7 @@ impl Stage for RootfsStage {
 ///
 /// Every rootfs builder folds this identically: the in-`vmcell` OCI [`RootfsStage`] and the
 /// out-of-crate in-VM sources (`vmcell-rootfs-builder`). Kept here so there is exactly ONE
-/// implementation of the injected-content identity (§5.4; AGENTS.md "don't triplicate;
+/// implementation of the injected-content identity (§4.3, The rootfs-construction contract; AGENTS.md "don't triplicate;
 /// extract") — a musl-agent/CA/agent rebuild then invalidates the cached erofs from any source.
 ///
 /// Callers fold their own `STAGE_VERSION`, source discriminator, source-specific pins, and
@@ -224,7 +224,7 @@ pub async fn pack_erofs_with_injection(
 ) -> Result<StageOutputs> {
     let out_buf = out.to_path_buf();
 
-    // The injected agent. A user-supplied static-musl binary (`--agent-musl`, oci2erofs §8.2)
+    // The injected agent. A user-supplied static-musl binary (`--agent-musl`, oci2erofs §4.2, Rootfs sources and the one packer)
     // overrides the pipeline's default glibc agent artifact; otherwise a missing default agent
     // is a hard error, never a boot from a world-writable, attacker-plantable `/tmp` path.
     let agent_path = match agent_musl {

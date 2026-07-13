@@ -5,7 +5,7 @@
 //! [`vmcell_protocol`] crate; the PID-1 reaper coordination lives in the
 //! `vmcell-guest-agent` member crate. Re-exporting the protocol here keeps the
 //! public `vmcell::agent::protocol` / `vmcell::{ExecOutcome, ExecRequest}` surface
-//! stable across the v15 workspace split (§10.1).
+//! stable across the v15 workspace split (§9.1, Workspace layout).
 
 /// The framed wire protocol shared by the host and the guest agent.
 pub use vmcell_protocol as protocol;
@@ -13,7 +13,7 @@ pub use vmcell_protocol::{
     ExecOutcome, ExecRequest, MAX_FRAME_BYTES, PtyConfig, SessionId, SessionSpec,
 };
 
-/// Host-side interactive-session multiplexer (design 62 §22): PTY / pipe sessions,
+/// Host-side interactive-session multiplexer (§3.2, The host side: AgentClient and SessionMux): PTY / pipe sessions,
 /// streaming stdin, window resize, and multiplexed concurrent execs over one
 /// connection, beside the one-shot [`AgentClient`].
 #[cfg(feature = "host-common")]
@@ -38,7 +38,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// The per-step outcome of a native post-restore [`AgentClient::resync`]
-/// (design 44 §5).
+/// (§8.2, Restore correctness: a restored VM is not a fresh VM).
 ///
 /// Mirrors the guest's `ResyncAck`: `clock_error` is `Some(msg)` iff the
 /// mandatory guest clock set failed (the orchestrator treats that as a hard,
@@ -124,7 +124,7 @@ impl AgentClient {
     }
 
     /// Connects the raw framed control-plane stream, retrying with backoff until
-    /// the guest answers `Ready` (the one connect/handshake law, §12.5).
+    /// the guest answers `Ready` (the one connect/handshake law, §13, Cross-cutting invariants).
     ///
     /// Split out of [`AgentClient::connect`] so the session multiplexer
     /// ([`session::SessionMux`]) opens its own connection through the **same**
@@ -460,7 +460,7 @@ impl AgentClient {
         Self::finish_request(&mut self.desynced, result, "put_file timed out")
     }
 
-    /// Performs the one-shot native post-restore resync (design 44 §5): sets the
+    /// Performs the one-shot native post-restore resync (§8.2, Restore correctness: a restored VM is not a fresh VM): sets the
     /// guest clock to the host instant, best-effort reseeds the guest CSPRNG, and
     /// best-effort rotates the guest `eth0` MAC — one request, one ack — replacing
     /// the three post-restore subprocess execs (`date` / `head` / `ip`).

@@ -7,7 +7,7 @@
 
 use crate::error::Result;
 #[cfg(feature = "pipeline")]
-/// Reproducible fetch-and-verify manifest for the vmcell-owned artifacts (v15 §11).
+/// Reproducible fetch-and-verify manifest for the vmcell-owned artifacts (v15 §10, The artifact build pipeline).
 pub mod bundle;
 #[cfg(feature = "pipeline")]
 /// Guest agent building stage.
@@ -75,7 +75,7 @@ pub fn rootfs_path() -> PathBuf {
 /// (the snapshot stage and the mmdebstrap builder stage) reads the **same** env var.
 /// Previously the snapshot stage read `CLOUD_HYPERVISOR_PATH` while the builder read
 /// `VMCELL_CH_BIN`, so overriding one left the other on the default — the kind of
-/// per-call-site drift §11.1 consolidation and the `VMCELL_*` namespacing of §10.7-C
+/// per-call-site drift §10.1 (Artifacts produced) consolidation and the `VMCELL_*` namespacing of §9.7-C (Features and build shapes)
 /// exist to prevent.
 ///
 /// Public so out-of-crate artifact builders (`vmcell-rootfs-builder`,
@@ -347,7 +347,7 @@ fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, St
             pins_map.insert("kernel_microvm_config".to_string(), cfg.to_string());
         }
     }
-    // Flatten the prebuilt-kernel bootstrap pin (§8.5): a digest-pinned `vmlinux` the
+    // Flatten the prebuilt-kernel bootstrap pin (§5.4, The guest-kernel contract and the bootstrap seed): a digest-pinned `vmlinux` the
     // in-`vmcell` `PrebuiltKernelBuilder` downloads and SHA-verifies as the bootstrap
     // seed (the seed the in-VM `vmcell-kernel-builder` boots its builder VM on). Emitted
     // only when present; absent → the prebuilt bootstrap fails loud and host-make is the
@@ -360,7 +360,7 @@ fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, St
             pins_map.insert("kernel_prebuilt_sha256".to_string(), sha.to_string());
         }
         // Optional archive extraction: many prebuilt `vmlinux` binaries (e.g. the validated
-        // Kata Containers kernel, §8.5) ship *inside* a compressed tar. When `archive_member`
+        // Kata Containers kernel, §5.4, The guest-kernel contract and the bootstrap seed) ship *inside* a compressed tar. When `archive_member`
         // is set, the download is a `.tar.zst`/`.tar` archive verified against `archive_sha256`;
         // the named member is extracted and re-verified against `sha256`. Both digests fold
         // into the cache key so re-pointing either invalidates the artifact.
@@ -385,7 +385,7 @@ fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, St
             }
         }
     }
-    // Flatten the kernel config-fragment registry (§8.3): each `kernel_fragments.<NAME>` →
+    // Flatten the kernel config-fragment registry (§5.2, The config fragment): each `kernel_fragments.<NAME>` →
     // a `kernel_fragments_<NAME>` pin holding that fragment's KConfig text, which a
     // `KernelStage` with `fragments = [NAME, ...]` layers onto the base config (content-
     // addressed, so editing a fragment's text invalidates the cache).
@@ -404,7 +404,7 @@ fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, St
             pins_map.insert("rootfs_digest".to_string(), dig.to_string());
         }
     }
-    // Emit the CH/virtiofsd build identity for the snapshot pool (§16 / M-ART-7): a snapshot
+    // Emit the CH/virtiofsd build identity for the snapshot pool (§10.2, The stage model and the five cache-key rules / M-ART-7): a snapshot
     // is only valid for the exact CH build that produced it, so the snapshot stage folds the
     // `cloud_hypervisor` pin into its cache key. Emitted only when present in pins.json.
     for key in ["cloud_hypervisor", "virtiofsd"] {
@@ -448,7 +448,7 @@ fn guest_agent_src_hash(path: &Path) -> Result<String> {
 }
 
 /// The workspace root — the anchor for the artifacts dir and the guest-agent /
-/// guest-tools source closures (v15 §10.1). Ascends from `CARGO_MANIFEST_DIR` (the
+/// guest-tools source closures (v15 §9.1, Workspace layout). Ascends from `CARGO_MANIFEST_DIR` (the
 /// `vmcell` crate dir under the workspace) — or, when that is unset, the **absolute**
 /// process CWD — to the directory that owns the member crates, so the resolved paths
 /// are stable regardless of where the binary runs.
@@ -564,7 +564,7 @@ pub(crate) fn guest_agent_closure_hash(ws_root: &Path) -> Result<String> {
 /// reqwest/rustls, so a dependency bump changes the **built** helper while the
 /// `.rs` source is byte-identical. Hashing only the source (the old behavior) left
 /// the cache key unchanged on a bump, so the stage hit cache and a stale
-/// `ip`/`curl`/`kvm-ok` helper was re-baked into the rootfs (§11.2 caching rules
+/// `ip`/`curl`/`kvm-ok` helper was re-baked into the rootfs (§10.2, The stage model and the five cache-key rules — caching rules
 /// 3-4). The closure must travel as one identity.
 ///
 /// # Errors
@@ -926,7 +926,7 @@ mod tests {
         );
     }
 
-    // §8.5: the `kernel_prebuilt` bootstrap block flattens to `kernel_prebuilt_url` /
+    // §5.4 (The guest-kernel contract and the bootstrap seed): the `kernel_prebuilt` bootstrap block flattens to `kernel_prebuilt_url` /
     // `kernel_prebuilt_sha256`; a doc with no such block leaves the keys absent (so the
     // prebuilt bootstrap fails loud rather than fetching from an empty URL).
     #[test]
@@ -985,7 +985,7 @@ mod tests {
         );
     }
 
-    // §8.3: each `kernel_fragments.<NAME>` must flatten to a `kernel_fragments_<NAME>` pin
+    // §5.2 (The config fragment): each `kernel_fragments.<NAME>` must flatten to a `kernel_fragments_<NAME>` pin
     // carrying that fragment's KConfig text, so a `KernelStage` with `fragments=[NAME]` can
     // resolve it. A buggy impl that ignores `kernel_fragments` returns None for these keys
     // and the kernel build would then fail loud on the missing fragment.
@@ -1121,7 +1121,7 @@ mod tests {
         );
     }
 
-    // Guards §11.2 caching rules 3-4 for vmcell-guest-tools: the helper links
+    // Guards §10.2 (The stage model and the five cache-key rules) caching rules 3-4 for vmcell-guest-tools: the helper links
     // reqwest/rustls, so a dependency bump changes Cargo.lock but NOT the `.rs`
     // source. The closure hash must fold Cargo.lock so the bump invalidates the
     // key. The buggy source-only hash (the old `if let Ok(content)` over just the

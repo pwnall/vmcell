@@ -133,7 +133,7 @@ impl EgressProxy {
 
     /// Starts the egress proxy on a **transparent** (`IP_TRANSPARENT`) listener,
     /// the front-end a privileged nftables `TPROXY` ruleset redirects into
-    /// (§6.3).
+    /// (§6.4, The transparent egress proxy).
     ///
     /// Identical to [`start`](Self::start) except the listener is created with
     /// `IP_TRANSPARENT` set before `bind` (see [`bind_transparent_listener`]),
@@ -397,7 +397,7 @@ impl EgressProxy {
     }
 
     /// Returns the CA certificate PEM as bytes, for baking into the guest trust
-    /// store (design §10.2: `ca_cert_pem(&self) -> &[u8]`). The PEM is UTF-8, so a
+    /// store (design §9.3, The public API surface: `ca_cert_pem(&self) -> &[u8]`). The PEM is UTF-8, so a
     /// caller needing text can `str::from_utf8` it.
     #[must_use]
     pub fn ca_cert_pem(&self) -> &[u8] {
@@ -510,7 +510,7 @@ fn bind_ipv4(fd: std::os::unix::io::RawFd, addr: &std::net::SocketAddrV4) -> Res
 /// option a privileged nftables `TPROXY` egress front-end requires.
 ///
 /// A privileged egress ruleset (`tproxy to :<port> meta mark set 1 accept`,
-/// §6.3) redirects the guest's packets to this local socket while preserving
+/// §6.4, The transparent egress proxy) redirects the guest's packets to this local socket while preserving
 /// the *original* destination addressing. The kernel only delivers such
 /// redirected packets to a listening socket that carries `IP_TRANSPARENT`, and
 /// the non-local bind a TPROXY front-end performs is itself rejected without it.
@@ -582,7 +582,7 @@ pub fn bind_transparent_listener(addr: SocketAddr) -> Result<std::net::TcpListen
 /// `IP_TRANSPARENT` (see [`bind_transparent_listener`]), so the accepted
 /// connection's local address is the address the guest dialed. This returns
 /// that local address — the guest's intended destination, which is the value
-/// the egress filter logs and matches on (§6.3).
+/// the egress filter logs and matches on (§6.4, The transparent egress proxy).
 ///
 /// # Errors
 /// Returns [`Error::Proxy`] if the stream's local address cannot be read.

@@ -2,7 +2,7 @@ use vmcell::config::{BlockDevice, DiskIoLimit, RootfsSource, VmConfig};
 
 mod common;
 
-// §19.1: extra virtio-blk devices are attached AFTER the root disk, so they enumerate
+// §4.6 (Extra virtio-blk devices and disk-I/O throttling): extra virtio-blk devices are attached AFTER the root disk, so they enumerate
 // `/dev/vdb`, `/dev/vdc`, … in order. This is a DATA-PLANE test (AGENTS.md "assert on
 // the data plane"): it reads a marker written into a read-only extra image back off
 // `/dev/vdb` in-guest, and round-trips a marker through a read-write extra disk
@@ -77,7 +77,7 @@ async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-// §19.5: disk-I/O fault injection — a DiskIoLimit throttles the device's bandwidth. This
+// §4.6 (Extra virtio-blk devices and disk-I/O throttling): disk-I/O fault injection — a DiskIoLimit throttles the device's bandwidth. This
 // is a self-calibrating DATA-PLANE test: read an un-throttled disk (/dev/vdb) and a
 // throttled one (/dev/vdc, 1 MiB/s) of the same size in the same VM, and assert the
 // throttled read is both slow in absolute terms AND much slower than the un-throttled
@@ -163,10 +163,10 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-// §19.1.3: "plain virtio-blk composes with snapshot" (§17) — the V:high headline
+// §4.6 (Extra virtio-blk devices and disk-I/O throttling): "plain virtio-blk composes with snapshot" (§17, Open gaps and future capabilities) — the V:high headline
 // claim, proven on the DATA PLANE. A marker written into a writable extra disk before
 // snapshot must be readable off `/dev/vdb` after a restore into a fresh VM. Extra disks
-// are plain virtio-blk (not vhost-user), so they do NOT disqualify snapshot (§12.1);
+// are plain virtio-blk (not vhost-user), so they do NOT disqualify snapshot (§13, Cross-cutting invariants);
 // CH/FC restore reconstruct the disk from the snapshot config at its recorded (stable)
 // path, so the extra image lives OUTSIDE the per-VM scratch dir. Skips QEMU (no
 // snapshot); the `snapshot_restore` capability-honesty pin lives in snapshot_restore.rs.
@@ -178,7 +178,7 @@ vmm_matrix_test!(extra_block_survives_snapshot, |vmm| {
 async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     use vmcell::orchestrator::MicroVm;
 
-    // Snapshot runs the privileged tap path (design §12.1), which needs CAP_NET_ADMIN —
+    // Snapshot runs the privileged tap path (design §13, Cross-cutting invariants), which needs CAP_NET_ADMIN —
     // granted ambiently by the capability runner. Reap orphan netns first (no sudo).
     common::clean_vmcell_netns();
     if !common::has_cap_net_admin() {
