@@ -1,5 +1,6 @@
 use crate::agent::AgentClient;
 use crate::config::VmConfig;
+use crate::env::HostEnv;
 use crate::error::Result;
 use crate::metrics::ResourceUsage;
 use crate::net::NetNamespace;
@@ -314,8 +315,12 @@ pub struct MicroVm<V: Vmm> {
     proxy: Option<EgressProxy>,
     /// The name of the cgroup for this VM.
     cgroup_name: Option<String>,
-    /// The cgroup file system implementation.
-    cgroup_fs: Option<Arc<dyn crate::metrics::CgroupFs>>,
+    /// The process-wide seam bundle this VM was spawned with (§9.3, design §18
+    /// deltas 1–2). Holds the [`CgroupFs`](crate::metrics::CgroupFs) its slice is
+    /// deleted through on teardown and the [`Clock`] that drives the first
+    /// post-restore resync in [`MicroVm::agent`]. Replaces the former standalone
+    /// `cgroup_fs` field (a subset of what `env` already carries).
+    env: HostEnv,
     /// The cached agent client connection, if any.
     agent_client: Option<AgentClient>,
     /// Whether the VM was restored from a snapshot.
@@ -376,22 +381,57 @@ impl Drop for CgroupGuard {
 }
 
 /// Transient holder for the resources `setup_env` allocates before the VMM
-/// instance exists. On the happy path each field is moved into `MicroVm` (and the
-/// guards disarmed) before the instance is built; on any mid-construction failure
-/// (`create`/`boot`/`restore`/`resume`) the un-moved fields drop **in declaration
-/// order**, which is therefore **load-bearing** (H-ORCH-1): it mirrors
-/// `teardown_post_instance` exactly — proxy and the smoltcp NAT (which hold
-/// sockets/threads *inside* the netns) drop **before** the netns, then cgroup,
-/// then cid. Deleting the netns while the proxy still runs inside it hangs/leaks,
-/// so this order must not be reshuffled.
+/// instance exists. On the happy path each resource is `take()`n into `MicroVm` (and
+/// the `cgroup_guard` disarmed) before the instance is built; on any mid-construction
+/// failure (`create`/`boot`/`restore`/`resume`) the **explicit [`Drop`]** below
+/// releases the un-taken resources through the shared [`release_net_before_netns`]
+/// helper — the SAME ordered net teardown `teardown_post_instance` uses (design §18
+/// delta 7, L1, §9.4). Making the order explicit (not a fragile field-declaration
+/// order) means a field reorder can no longer silently delete the netns before the
+/// proxy running inside it. `cid_guard` is `Option` so the success path can `take()`
+/// it out (a field of a type that implements `Drop` cannot be moved out).
 struct EnvSetup {
     proxy: Option<EgressProxy>,
     #[cfg(feature = "net-unprivileged")]
     smoltcp: Option<SmoltcpProcess>,
     netns: Option<NetNamespace>,
     cgroup_guard: CgroupGuard,
-    cid_guard: CidGuard,
+    cid_guard: Option<CidGuard>,
     res: PerVmResources,
+}
+
+/// The single ordered net teardown both the success path ([`MicroVm::teardown_post_instance`]) and
+/// the mid-`start()` error path ([`EnvSetup`]'s [`Drop`]) route through (design §18 delta 7, L1,
+/// §9.4). The egress proxy and the smoltcp NAT hold sockets/threads INSIDE the netns, so they are
+/// released BEFORE the netns is deleted — deleting a netns while a process still holds interfaces in
+/// it hangs/leaks. One helper, never a second copy: a field reorder cannot silently invert this.
+fn release_net_before_netns(
+    proxy: &mut Option<EgressProxy>,
+    #[cfg(feature = "net-unprivileged")] smoltcp: &mut Option<SmoltcpProcess>,
+    netns: &mut Option<NetNamespace>,
+) {
+    #[cfg(feature = "net-unprivileged")]
+    drop(smoltcp.take());
+    drop(proxy.take());
+    // `NetNamespace::Drop` performs the single idempotent teardown, surfacing a genuine failure via
+    // the NET-8 warning; dropping the taken value tears it down exactly once.
+    drop(netns.take());
+}
+
+impl Drop for EnvSetup {
+    fn drop(&mut self) {
+        // Mid-`start()` error path: release the net resources (proxy/smoltcp before the netns)
+        // through the shared helper, then the struct's own fields drop in declaration order —
+        // `cgroup_guard` (armed → deletes the slice) before `cid_guard` (releases the CID). On the
+        // success path these were `take()`n / disarmed, so this is a no-op. Same net → cgroup → cid
+        // order as `teardown_post_instance`.
+        release_net_before_netns(
+            &mut self.proxy,
+            #[cfg(feature = "net-unprivileged")]
+            &mut self.smoltcp,
+            &mut self.netns,
+        );
+    }
 }
 
 /// Minimal guest-resync seam the one-shot post-restore resync needs.
@@ -579,20 +619,36 @@ impl<V: Vmm> MicroVm<V> {
 
     /// Gets a mutable reference to the underlying VMM instance.
     ///
-    /// # Invariant (M-ORCH-5)
-    /// Do **not** drive the VM's lifecycle through this accessor. In particular
-    /// **do not call [`crate::vmm::VmInstance::snapshot`] directly** — use
-    /// [`MicroVm::snapshot`], which additionally invalidates the cached
-    /// [`AgentClient`] (backends such as Firecracker sever established vsock
-    /// connections across snapshot; the EXP-E fix). Calling `snapshot()` here
-    /// bypasses that guard and leaves a stale, silently-broken cached client.
-    /// This accessor exists for read-mostly probes (`serial_log`, `vsock_path`,
-    /// `guest_cid`) and the explicit `kill()` teardown.
+    /// **`pub(crate)` (design §18 delta 6, the M-ORCH-5 finding):** exposing the raw
+    /// [`VmInstance`](crate::vmm::VmInstance) publicly let a caller bypass the orchestrator's
+    /// ordered teardown and identity bookkeeping — a footgun with no legitimate external use.
+    /// External callers reach for the safe [`MicroVm`] methods instead ([`kill`](MicroVm::kill) for
+    /// a hard teardown; [`snapshot`](MicroVm::snapshot) — which additionally invalidates the cached
+    /// [`AgentClient`], the EXP-E fix — never `instance().snapshot()`; `instance()` for read-only
+    /// probes).
     ///
     /// # Panics
     /// Panics if the instance is missing.
-    pub fn instance_mut(&mut self) -> &mut V::Instance {
+    pub(crate) fn instance_mut(&mut self) -> &mut V::Instance {
         self.instance.as_mut().expect("instance missing")
+    }
+
+    /// Force-kills the underlying VMM process **now**, skipping the graceful shutdown handshake.
+    ///
+    /// Unlike [`shutdown`](MicroVm::shutdown) (graceful, consuming), this leaves the `MicroVm`
+    /// alive, so a caller/test can then inspect residue or drive the daemon's orphan sweep against a
+    /// process that died without its ordered teardown. The remaining per-VM resources are still
+    /// released by `Drop` in the documented order. The safe public entry point that replaces the
+    /// former `instance_mut().kill()` (delta 6). A hard kill that skips `Drop` entirely is reclaimed
+    /// by the daemon's start-up sweep (AGENTS.md).
+    ///
+    /// # Errors
+    /// Returns an error if the VMM process cannot be killed.
+    ///
+    /// # Panics
+    /// Panics if the instance is missing (e.g. after `shutdown`).
+    pub async fn kill(&mut self) -> Result<()> {
+        self.instance_mut().kill().await
     }
 
     /// Gets the network namespace associated with this VM, if any.
@@ -615,8 +671,7 @@ impl<V: Vmm> MicroVm<V> {
         vmid: u32,
         tmp_dir: &std::path::Path,
         cfg: &VmConfig,
-        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
-        cgroup_fs: Arc<dyn crate::metrics::CgroupFs>,
+        env: &HostEnv,
     ) -> Result<EnvSetup> {
         let mut netns = None;
         #[cfg(feature = "net-unprivileged")]
@@ -629,20 +684,12 @@ impl<V: Vmm> MicroVm<V> {
         let mut vhost_user_socket = None;
 
         match &cfg.net {
-            crate::config::NetConfig::Privileged {
-                egress,
-                host_services_port,
-            } => {
+            crate::config::NetConfig::Privileged { egress } => {
                 // `egress` is consumed below only under `feature = "proxy"`; the
                 // discard silences the unused binding when the proxy is compiled
-                // out (it is a config selector, not a resource).
+                // out (it is a config selector, not a resource). `host_services_port`
+                // is not a privileged-path field any more (design §18 delta 4).
                 let _ = egress;
-                // H-ORCH-3/H-NET-2: `host_services_port` is not implemented on the
-                // privileged path. `config::build()` rejects `Some(_)` here, so it
-                // is always `None` — this is a validated-away no-op, not a silent
-                // drop of a requested feature.
-                debug_assert!(host_services_port.is_none());
-                let _ = host_services_port;
                 let ns = NetNamespace::create(
                     &cfg.resource_prefix,
                     vmid,
@@ -746,20 +793,21 @@ impl<V: Vmm> MicroVm<V> {
             cgroup_name = format!("{base}/{leaf}");
         }
 
-        cgroup_fs.create_slice(&cgroup_name, &cfg.limits)?;
+        env.cgroups.create_slice(&cgroup_name, &cfg.limits)?;
         // Armed immediately: any failure below (CID allocation, create/boot/
         // restore/resume in the caller) now releases the slice instead of
         // leaking it.
         let cgroup_guard = CgroupGuard {
             name: cgroup_name.clone(),
-            fs: cgroup_fs.clone(),
+            fs: env.cgroups.clone(),
             armed: true,
         };
 
-        let guest_cid = cid_alloc.allocate()?;
+        let cids = env.cids.clone();
+        let guest_cid = cids.allocate()?;
         let cid_guard = CidGuard {
             cid: guest_cid,
-            allocator: cid_alloc,
+            allocator: cids,
         };
 
         let res = PerVmResources {
@@ -774,7 +822,7 @@ impl<V: Vmm> MicroVm<V> {
 
         Ok(EnvSetup {
             res,
-            cid_guard,
+            cid_guard: Some(cid_guard),
             cgroup_guard,
             netns,
             #[cfg(feature = "net-unprivileged")]
@@ -790,54 +838,38 @@ impl<V: Vmm> MicroVm<V> {
     ///
     /// # Examples
     /// ```rust
-    /// # use std::sync::Arc;
     /// # use std::path::PathBuf;
-    /// # use vmcell::orchestrator::{MicroVm, VmidAllocator};
+    /// # use vmcell::{HostEnv, MicroVm};
     /// # use vmcell::config::{VmConfig, RootfsSource};
-    /// # use vmcell::vmm::CidAllocator;
     /// # use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
     /// # async fn run() {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// // Erofs is the supported, snapshot-compatible rootfs; a virtio-fs *rootfs*
     /// // is rejected by every backend, so the example uses erofs (L-ORCH-1).
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
-    /// let cid_alloc = std::sync::Arc::new(CidAllocator::new());
-    /// let vmid_alloc = VmidAllocator::new();
-    /// let vm = MicroVm::start(&vmm, cfg, cid_alloc.clone(), vmid_alloc, Box::new(vmcell::metrics::DefaultCgroupFs::default())).await.unwrap();
+    /// // One process-wide seam bundle, built once and threaded by reference (§9.3).
+    /// let env = HostEnv::shared().unwrap();
+    /// let vm = MicroVm::start(&vmm, cfg, &env).await.unwrap();
     /// # }
     /// ```
-    pub async fn start(
-        vmm: &V,
-        cfg: VmConfig,
-        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
-    ) -> Result<Self> {
-        let cgroup_fs: Arc<dyn crate::metrics::CgroupFs> = Arc::from(cgroup_fs);
+    pub async fn start(vmm: &V, cfg: VmConfig, env: &HostEnv) -> Result<Self> {
         // Honor an explicitly-configured VMID by reserving it through the
         // allocator; otherwise allocate the next free one.
         let vmid_value = match cfg.vmid {
-            Some(v) => vmid_alloc.reserve(v)?,
-            None => vmid_alloc.allocate()?,
+            Some(v) => env.vmids.reserve(v)?,
+            None => env.vmids.allocate()?,
         };
         let vmid = VmidGuard {
             vmid: vmid_value,
-            allocator: vmid_alloc,
+            allocator: env.vmids.clone(),
         };
         // Create the single owned per-VM scratch dir EARLY — before networking —
         // so its guard reclaims it even if setup or create/boot fails partway, and
         // so the smoltcp NAT socket can live inside it.
         let tmp_dir = crate::vmm::VmTempDir::create(&cfg.resource_prefix, vmid.vmid).await?;
-        let mut env = Self::setup_env(
-            vmid.vmid,
-            tmp_dir.path(),
-            &cfg,
-            cid_alloc.clone(),
-            cgroup_fs.clone(),
-        )
-        .await?;
+        let mut staged = Self::setup_env(vmid.vmid, tmp_dir.path(), &cfg, env).await?;
 
-        let mut instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
+        let mut instance = vmm.create(&cfg, &staged.res, &*env.cgroups).await?;
         info!("Booting instance...");
         instance.boot().await?;
         info!("Instance booted.");
@@ -876,26 +908,26 @@ impl<V: Vmm> MicroVm<V> {
                 // `Drop` reaps the VMM process group + external daemon and unlinks their
                 // sockets before the fresh spawn re-binds them.
                 drop(instance);
-                instance = vmm.create(&cfg, &env.res, &*cgroup_fs).await?;
+                instance = vmm.create(&cfg, &staged.res, &*env.cgroups).await?;
                 instance.boot().await?;
             }
         }
         // Success: ownership of the slice transfers to the returned MicroVm,
         // whose Drop deletes it in the documented teardown order.
-        env.cgroup_guard.disarm();
+        staged.cgroup_guard.disarm();
         Ok(Self {
             vmid: Some(vmid),
             instance: Some(instance),
-            netns: env.netns,
+            netns: staged.netns.take(),
             #[cfg(feature = "net-unprivileged")]
-            smoltcp: env.smoltcp,
-            proxy: env.proxy,
-            cgroup_name: Some(env.res.cgroup_name.clone()),
-            cgroup_fs: Some(cgroup_fs),
+            smoltcp: staged.smoltcp.take(),
+            proxy: staged.proxy.take(),
+            cgroup_name: Some(staged.res.cgroup_name.clone()),
+            env: env.clone(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
-            cid: Some(env.cid_guard),
+            cid: staged.cid_guard.take(),
             tmp_dir: Some(tmp_dir),
             // M-ORCH-3: re-clamp at the orchestrator boundary. The builder/presets
             // clamp, but `Timeouts`' fields are `pub`, so a caller can mutate
@@ -922,42 +954,29 @@ impl<V: Vmm> MicroVm<V> {
     ///
     /// # Examples
     /// ```rust
-    /// # use std::sync::Arc;
     /// # use std::path::PathBuf;
-    /// # use vmcell::orchestrator::{MicroVm, VmidAllocator};
+    /// # use vmcell::{HostEnv, MicroVm};
     /// # use vmcell::config::{VmConfig, RootfsSource};
-    /// # use vmcell::vmm::CidAllocator;
     /// # use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
     /// # async fn run() {
     /// let vmm = CloudHypervisor::new("cloud-hypervisor");
     /// let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), RootfsSource::Erofs { image: PathBuf::from("/rootfs.erofs") }).build().unwrap();
-    /// let cid_alloc = std::sync::Arc::new(CidAllocator::new());
-    /// let vmid_alloc = VmidAllocator::new();
+    /// let env = HostEnv::shared().unwrap();
     /// let snap_dir = PathBuf::from("/tmp/snap");
-    /// let vm = MicroVm::restore(&vmm, &snap_dir, cfg, cid_alloc.clone(), vmid_alloc, Box::new(vmcell::metrics::DefaultCgroupFs::default())).await.unwrap();
+    /// let vm = MicroVm::restore(&vmm, &snap_dir, cfg, &env).await.unwrap();
     /// # }
     /// ```
     pub async fn restore(
         vmm: &V,
         snapshot_dir: &std::path::Path,
         cfg: VmConfig,
-        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
+        env: &HostEnv,
     ) -> Result<Self> {
-        // Single-use restore does not copy the dir, so no overlay store is passed
-        // (`None`); the caller's dir is restored in place.
-        Self::restore_inner(
-            vmm,
-            snapshot_dir,
-            cfg,
-            cid_alloc,
-            vmid_alloc,
-            cgroup_fs,
-            None,
-        )
-        .await
-        .map(|(vm, _cow)| vm)
+        // Single-use restore does not copy the dir (`cow = false`); the caller's dir
+        // is restored in place.
+        Self::restore_inner(vmm, snapshot_dir, cfg, env, false)
+            .await
+            .map(|(vm, _cow)| vm)
     }
 
     /// Restores one clone from a zygote suspend image, copy-on-write-copying the
@@ -990,52 +1009,35 @@ impl<V: Vmm> MicroVm<V> {
         vmm: &V,
         zygote_dir: &std::path::Path,
         cfg: VmConfig,
-        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
-        overlay_store: std::sync::Arc<dyn crate::overlay::OverlayStore>,
+        env: &HostEnv,
     ) -> Result<(Self, crate::reflink::CowSupport)> {
-        Self::restore_inner(
-            vmm,
-            zygote_dir,
-            cfg,
-            cid_alloc,
-            vmid_alloc,
-            cgroup_fs,
-            Some(overlay_store),
-        )
-        .await
+        // CoW clone (`cow = true`): the suspend dir is copied through `env.overlay`
+        // (invariant S4) into this VM's scratch dir before restore, so the master
+        // image is never mutated and concurrent clones never race on the backend's
+        // in-place `config.json` rewrite.
+        Self::restore_inner(vmm, zygote_dir, cfg, env, true).await
     }
 
-    /// Shared body of [`MicroVm::restore`] (single-use, `overlay_store = None`) and
-    /// [`MicroVm::restore_cow`] (`overlay_store = Some(store)`). When a store is
-    /// given, the snapshot dir is copy-on-write-copied into this VM's scratch dir
-    /// through it first and the backend restores from that private copy; otherwise
-    /// the caller's dir is used directly. The returned
+    /// Shared body of [`MicroVm::restore`] (single-use, `cow = false`) and
+    /// [`MicroVm::restore_cow`] (`cow = true`). When `cow`, the snapshot dir is
+    /// copy-on-write-copied into this VM's scratch dir through the process-wide
+    /// `env.overlay` store first and the backend restores from that private copy;
+    /// otherwise the caller's dir is used directly. The returned
     /// [`CowSupport`](crate::reflink::CowSupport) is only meaningful in the CoW case
-    /// (the single-use path returns `FullCopy` as an ignored placeholder). Folding
-    /// "is this CoW" and "which store" into one `Option` keeps this to one flag.
+    /// (the single-use path returns `FullCopy` as an ignored placeholder). One store
+    /// for the whole process — no second injection path (invariant S4).
     async fn restore_inner(
         vmm: &V,
         snapshot_dir: &std::path::Path,
         cfg: VmConfig,
-        cid_alloc: std::sync::Arc<crate::vmm::CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        cgroup_fs: Box<dyn crate::metrics::CgroupFs>,
-        overlay_store: Option<std::sync::Arc<dyn crate::overlay::OverlayStore>>,
+        env: &HostEnv,
+        cow: bool,
     ) -> Result<(Self, crate::reflink::CowSupport)> {
         // §3.3 boundary 2 (ORCH-4): the restore-path re-check of the
         // snapshot-eligibility law returns `Error::Unsupported { vmm, feature }`
         // (a capability rejection a caller can match on), NOT the generic
         // `Error::Config` — a config a snapshot-eligible VMM cannot honor is an
         // unsupported capability, not a malformed config.
-        if matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
-            return Err(crate::error::Error::Unsupported {
-                vmm: vmm.id().to_string(),
-                feature: "snapshot restore with a virtio-fs rootfs (vhost-user device)".into(),
-            });
-        }
-
         if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
             return Err(crate::error::Error::Unsupported {
                 vmm: vmm.id().to_string(),
@@ -1053,14 +1055,13 @@ impl<V: Vmm> MicroVm<V> {
             });
         }
 
-        let cgroup_fs: Arc<dyn crate::metrics::CgroupFs> = Arc::from(cgroup_fs);
         let vmid_value = match cfg.vmid {
-            Some(v) => vmid_alloc.reserve(v)?,
-            None => vmid_alloc.allocate()?,
+            Some(v) => env.vmids.reserve(v)?,
+            None => env.vmids.allocate()?,
         };
         let vmid = VmidGuard {
             vmid: vmid_value,
-            allocator: vmid_alloc,
+            allocator: env.vmids.clone(),
         };
         // Create the single owned per-VM scratch dir EARLY (see `start()`).
         let tmp_dir = crate::vmm::VmTempDir::create(&cfg.resource_prefix, vmid.vmid).await?;
@@ -1077,13 +1078,15 @@ impl<V: Vmm> MicroVm<V> {
         // as `CowSupport`. The single-use `restore` path (`cow == false`) hands
         // the caller's dir to the backend directly, preserving its documented
         // in-place rewrite behavior.
-        let (effective_dir, cow_support) = if let Some(store) = overlay_store {
+        let (effective_dir, cow_support) = if cow {
             let clone_dir = tmp_dir.path().join("zygote-snapshot");
-            // Materialize the private copy through the injected OverlayStore seam
-            // (§12.24). A full byte copy can be large, so run it on a blocking
-            // thread — the store's methods are synchronous by design (object-safe
-            // as `dyn`), and this keeps a big copy off the async runtime, the same
-            // discipline the bare function used.
+            // Materialize the private copy through the process-wide OverlayStore
+            // seam (`env.overlay`, invariant S4 — one store for the whole process,
+            // no second injection path). A full byte copy can be large, so run it
+            // on a blocking thread — the store's methods are synchronous by design
+            // (object-safe as `dyn`), and this keeps a big copy off the async
+            // runtime, the same discipline the bare function used.
+            let store = env.overlay.clone();
             let src = snapshot_dir.to_path_buf();
             let dst = clone_dir.clone();
             let support = tokio::task::spawn_blocking(move || store.clone_tree(&src, &dst))
@@ -1101,36 +1104,29 @@ impl<V: Vmm> MicroVm<V> {
             )
         };
 
-        let mut env = Self::setup_env(
-            vmid.vmid,
-            tmp_dir.path(),
-            &cfg,
-            cid_alloc.clone(),
-            cgroup_fs.clone(),
-        )
-        .await?;
+        let mut staged = Self::setup_env(vmid.vmid, tmp_dir.path(), &cfg, env).await?;
 
         info!("Restoring instance...");
         let mut instance = vmm
-            .restore(&effective_dir, &cfg, &env.res, &*cgroup_fs)
+            .restore(&effective_dir, &cfg, &staged.res, &*env.cgroups)
             .await?;
         info!("Resuming instance...");
         instance.resume().await?;
         info!("Instance resumed.");
-        env.cgroup_guard.disarm();
+        staged.cgroup_guard.disarm();
         let vm = Self {
             vmid: Some(vmid),
             instance: Some(instance),
-            netns: env.netns,
+            netns: staged.netns.take(),
             #[cfg(feature = "net-unprivileged")]
-            smoltcp: env.smoltcp,
-            proxy: env.proxy,
-            cgroup_name: Some(env.res.cgroup_name.clone()),
-            cgroup_fs: Some(cgroup_fs),
+            smoltcp: staged.smoltcp.take(),
+            proxy: staged.proxy.take(),
+            cgroup_name: Some(staged.res.cgroup_name.clone()),
+            env: env.clone(),
             agent_client: None,
             restored: true,
             restore_reseed_applied: None,
-            cid: Some(env.cid_guard),
+            cid: staged.cid_guard.take(),
             tmp_dir: Some(tmp_dir),
             // M-ORCH-3: re-clamp at the orchestrator boundary. The builder/presets
             // clamp, but `Timeouts`' fields are `pub`, so a caller can mutate
@@ -1161,7 +1157,6 @@ impl<V: Vmm> MicroVm<V> {
     pub async fn agent(
         &mut self,
         timeout: Option<std::time::Duration>,
-        clock: &dyn Clock,
     ) -> Result<&mut AgentClient> {
         // Fail loud, not hang: a custom `init=` (§19.2.2) replaces the vmcell guest agent,
         // so there is no vsock control plane — no `Ready` handshake, `exec`, or resync.
@@ -1207,6 +1202,11 @@ impl<V: Vmm> MicroVm<V> {
             // until that fresh listener accepts. A second, overlapping connect would
             // be redundant.
             let vmid = self.vmid.as_ref().expect("vmid missing").vmid;
+            // The clock that drives the mandatory post-restore resync comes from the
+            // `HostEnv` captured at construction (design §18 delta 1 — `agent()` no
+            // longer takes a clock seam). Clone the `Arc` first so this immutable
+            // borrow of `self.env` ends before `self.agent_client` is borrowed `&mut`.
+            let clock = self.env.clock.clone();
             // The client is guaranteed present: it was cached above if `None`
             // (N-ORCH-1 — the prior `ok_or_else` error arm was unreachable).
             let client = self
@@ -1220,7 +1220,7 @@ impl<V: Vmm> MicroVm<V> {
                 &mut self.restored,
                 &mut self.restore_reseed_applied,
                 client,
-                clock,
+                &*clock,
                 vmid,
             )
             .await
@@ -1305,16 +1305,16 @@ impl<V: Vmm> MicroVm<V> {
     /// # Errors
     /// Returns an error if metrics collection fails.
     pub async fn usage(&self) -> Result<ResourceUsage> {
-        if let (Some(cg_name), Some(fs)) = (&self.cgroup_name, &self.cgroup_fs) {
-            fs.read_stats(cg_name)
+        if let Some(cg_name) = &self.cgroup_name {
+            self.env.cgroups.read_stats(cg_name)
         } else {
             // No cgroup is attached, so no requested limit is being enforced —
-            // surface that honestly (`limits_enforced: false`) rather than handing
+            // surface that honestly (`mem_limit_enforced: false`) rather than handing
             // back an all-zero usage that implies a measured, enforced state
             // (§7.1 rule 3 / H-FAILLOUD-1). `ResourceUsage::default()` already has
             // the flag `false`; spell it out so the intent cannot silently drift.
             Ok(ResourceUsage {
-                limits_enforced: false,
+                mem_limit_enforced: false,
                 ..ResourceUsage::default()
             })
         }
@@ -1323,8 +1323,8 @@ impl<V: Vmm> MicroVm<V> {
     /// Pauses the running VM.
     ///
     /// Promoted to a first-class `MicroVm` method in v15 (§10.2) — previously
-    /// reachable only via [`MicroVm::instance_mut`] — so the library, CLI, and a
-    /// future daemon share one lifecycle-verb surface. Required before
+    /// reachable only via the raw instance accessor (now `pub(crate)`, delta 6) — so
+    /// the library, CLI, and daemon share one lifecycle-verb surface. Required before
     /// [`MicroVm::snapshot`] when driving the pause→snapshot→resume cycle by hand.
     ///
     /// # Errors
@@ -1347,7 +1347,7 @@ impl<V: Vmm> MicroVm<V> {
     /// the snapshot, then resumes).
     ///
     /// Promoted to a first-class `MicroVm` method in v15 (§10.2). Snapshot-eligible
-    /// VMs only: a vhost-user device (virtio-fs rootfs/share or unprivileged net) is
+    /// VMs only: a vhost-user device (virtio-fs data share or unprivileged net) is
     /// rejected at `VmConfig::build()` (the §3.3 law), and a backend that does not
     /// advertise `snapshot_restore` returns [`crate::error::Error::Unsupported`].
     ///
@@ -1389,19 +1389,20 @@ impl<V: Vmm> MicroVm<V> {
     /// second call (e.g. `Drop` running after `shutdown()` already ran) is a
     /// no-op.
     fn teardown_post_instance(&mut self) {
-        // The egress proxy (privileged transparent/explicit front-end) and the
-        // smoltcp NAT (unprivileged path) hold sockets/threads INSIDE the netns,
-        // so they MUST be released before the netns is deleted.
-        #[cfg(feature = "net-unprivileged")]
-        drop(self.smoltcp.take());
-        drop(self.proxy.take());
-        // Netns after proxy/smoltcp, before cgroup (the documented order).
-        // `NetNamespace::delete()` is idempotent and `NetNamespace::Drop`
-        // performs the single teardown, surfacing a *genuine* failure via the
-        // NET-8 warning; dropping the taken value tears it down exactly once.
-        drop(self.netns.take());
-        if let (Some(cg_name), Some(fs)) = (self.cgroup_name.take(), self.cgroup_fs.take()) {
-            let _ = fs.delete_slice(&cg_name);
+        // The egress proxy and the smoltcp NAT hold sockets/threads INSIDE the netns, so they are
+        // released before the netns is deleted — through the SAME shared helper `EnvSetup`'s Drop
+        // uses (delta 7), so the success and mid-`start()` error paths cannot diverge on this order.
+        release_net_before_netns(
+            &mut self.proxy,
+            #[cfg(feature = "net-unprivileged")]
+            &mut self.smoltcp,
+            &mut self.netns,
+        );
+        // The cgroup backend lives on the captured `HostEnv` (no longer a standalone
+        // `cgroup_fs` field); `cgroup_name.take()` is the once-only guard so a second
+        // teardown (Drop after shutdown) is a no-op.
+        if let Some(cg_name) = self.cgroup_name.take() {
+            let _ = self.env.cgroups.delete_slice(&cg_name);
         }
         drop(self.cid.take());
         drop(self.vmid.take());
@@ -1974,6 +1975,8 @@ mod tests {
             vsock_path: std::path::PathBuf::from("/tmp/vmcell-order-vsock.sock"),
             serial: std::path::PathBuf::from("/tmp/vmcell-order-serial.log"),
             calls: log.clone(),
+            faults: Default::default(),
+            control_plane_probes: Default::default(),
         };
         let netns =
             NetNamespace::create("vmcell", 7, Box::new(TimelineNetlink { log: log.clone() }))
@@ -1986,7 +1989,10 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: Some("vmcell-vm-7".to_string()),
-            cgroup_fs: Some(std::sync::Arc::new(TimelineCgroupFs { log })),
+            env: HostEnv {
+                cgroups: std::sync::Arc::new(TimelineCgroupFs { log }),
+                ..HostEnv::hermetic()
+            },
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -2039,6 +2045,61 @@ mod tests {
         assert!(result.is_err(), "the closure must have panicked");
         let calls = log.lock().unwrap_or_else(|e| e.into_inner());
         assert_full_teardown_order(&calls);
+    }
+
+    // Delta 7 gate (§18, L1): the mid-`start()` error path — `EnvSetup`'s **explicit** `Drop` —
+    // emits the SAME ordered net → cgroup teardown as the success path, routed through the one
+    // shared `release_net_before_netns` helper (never a second copy). Build an `EnvSetup` with a
+    // recording netns + cgroup and drop it; the netns must be deleted BEFORE the cgroup slice, just
+    // like `assert_full_teardown_order` requires of the success/panic paths. RED on the inverse (a
+    // field reorder, or a hand-copied order that deletes the netns after the cgroup / the proxy
+    // after the netns).
+    #[cfg(feature = "net-privileged")]
+    #[test]
+    fn env_setup_drop_releases_netns_before_cgroup_like_the_success_path() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let netns =
+                NetNamespace::create("vmcell", 8, Box::new(TimelineNetlink { log: log.clone() }))
+                    .expect("recording netns create must succeed");
+            let staged = EnvSetup {
+                proxy: None,
+                #[cfg(feature = "net-unprivileged")]
+                smoltcp: None,
+                netns: Some(netns),
+                cgroup_guard: CgroupGuard {
+                    name: "vmcell-vm-8".to_string(),
+                    fs: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
+                    armed: true,
+                },
+                cid_guard: Some(CidGuard {
+                    cid: 3,
+                    allocator: std::sync::Arc::new(crate::vmm::CidAllocator::new()),
+                }),
+                res: PerVmResources {
+                    cgroup_name: "vmcell-vm-8".to_string(),
+                    tap_name: None,
+                    netns_name: None,
+                    vhost_user_socket: None,
+                    vmid: 8,
+                    guest_cid: 3,
+                    tmp_dir: std::env::temp_dir().join("vmcell-envsetup-drop-order-test"),
+                },
+            };
+            drop(staged);
+        }
+        let calls = log.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = |needle: &str| {
+            calls
+                .iter()
+                .position(|c| c == needle)
+                .unwrap_or_else(|| panic!("{needle} not recorded; timeline: {calls:?}"))
+        };
+        assert!(
+            idx("netns_delete") < idx("cgroup_delete"),
+            "the error-path EnvSetup::drop must release the netns before the cgroup slice — the same \
+             order as the success path (delta 7): {calls:?}"
+        );
     }
 
     /// A CgroupFs fake that records create/delete calls, used to prove the
@@ -2135,17 +2196,12 @@ mod tests {
     async fn test_cgroup_slice_deleted_on_create_failure() {
         let vmm = CreateFailVmm;
         let cfg = erofs_cfg();
-        let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
-        let vmid_alloc = VmidAllocator::new();
         let recorder = RecordingCgroupFs::default();
-        let res = MicroVm::<CreateFailVmm>::start(
-            &vmm,
-            cfg,
-            cid_alloc,
-            vmid_alloc,
-            Box::new(recorder.clone()),
-        )
-        .await;
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(recorder.clone()),
+            ..HostEnv::hermetic()
+        };
+        let res = MicroVm::<CreateFailVmm>::start(&vmm, cfg, &env).await;
         assert!(res.is_err(), "create failure must propagate");
         let created = recorder.created.lock().unwrap_or_else(|e| e.into_inner());
         let deleted = recorder.deleted.lock().unwrap_or_else(|e| e.into_inner());
@@ -2159,6 +2215,122 @@ mod tests {
         );
     }
 
+    // Delta 9 (§18): the `FakeVmm` fault menu drives the orchestrator's mid-`start()` failure paths
+    // at the `Vmm`/`VmInstance` seam itself (not only through the surrounding seams). A scripted
+    // `create` OR `boot` failure must propagate AND leave zero residue — every cgroup slice created
+    // in `setup_env` is deleted on the error path (the `CgroupGuard`). RED on the inverse (a slice
+    // created without a RAII guard leaks on the fault).
+    #[tokio::test]
+    async fn fault_menu_mid_start_faults_tear_down_ordered() {
+        use crate::vmm::{FakeVmm, FaultMenu};
+        for faults in [
+            FaultMenu {
+                fail_create: true,
+                ..Default::default()
+            },
+            FaultMenu {
+                fail_boot: true,
+                ..Default::default()
+            },
+        ] {
+            let vmm = FakeVmm::with_faults(faults);
+            let recorder = RecordingCgroupFs::default();
+            let env = HostEnv {
+                cgroups: std::sync::Arc::new(recorder.clone()),
+                ..HostEnv::hermetic()
+            };
+            let res = MicroVm::start(&vmm, erofs_cfg(), &env).await;
+            assert!(res.is_err(), "a scripted mid-start fault must propagate");
+            let created = recorder.created.lock().unwrap_or_else(|e| e.into_inner());
+            let deleted = recorder.deleted.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!created.is_empty(), "setup_env should have created a slice");
+            assert_eq!(
+                *created, *deleted,
+                "every created slice must be deleted on the fault path"
+            );
+        }
+    }
+
+    // Delta 9: a scripted `restore` fault leaves zero residue on the restore path, exactly like the
+    // start path (the shared `restore_inner` teardown).
+    #[tokio::test]
+    async fn fault_menu_fail_restore_tears_down() {
+        use crate::vmm::{FakeVmm, FaultMenu};
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            fail_restore: true,
+            ..Default::default()
+        });
+        let recorder = RecordingCgroupFs::default();
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(recorder.clone()),
+            ..HostEnv::hermetic()
+        };
+        let res = MicroVm::restore(
+            &vmm,
+            std::path::Path::new("/tmp/fake-snap"),
+            erofs_cfg(),
+            &env,
+        )
+        .await;
+        assert!(res.is_err(), "a scripted restore fault must propagate");
+        let created = recorder.created.lock().unwrap_or_else(|e| e.into_inner());
+        let deleted = recorder.deleted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!created.is_empty(), "setup_env should have created a slice");
+        assert_eq!(
+            *created, *deleted,
+            "every created slice must be deleted on the fault path"
+        );
+    }
+
+    // Delta 9: a control socket wedged for the first N probes is recovered by `start()`'s respawn
+    // loop — the exact QEMU vhost-user-vsock bring-up flake the loop exists for. `wedge=2` succeeds
+    // on the 3rd spawn; assert the fake was `create`d 3 times. RED on the inverse (no respawn:
+    // `start()` returns the wedged VM or fails on the first probe).
+    #[tokio::test]
+    async fn fault_menu_wedged_control_plane_respawns_then_recovers() {
+        use crate::vmm::{FakeVmm, FaultMenu};
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            wedge_control_plane_for: 2,
+            ..Default::default()
+        });
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(crate::metrics::FakeCgroupFs::new()),
+            ..HostEnv::hermetic()
+        };
+        MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("start must recover after the control plane un-wedges");
+        let calls = vmm.calls.lock().unwrap_or_else(|e| e.into_inner());
+        let creates = calls.iter().filter(|c| c.as_str() == "create").count();
+        assert_eq!(
+            creates, 3,
+            "wedge_control_plane_for=2 → recover on the 3rd spawn: {calls:?}"
+        );
+    }
+
+    // Delta 9: a permanently-wedged control socket fails LOUD after the bounded respawns, never
+    // hanging or handing back a half-wired VM. RED on the inverse (unbounded respawn / silent
+    // success).
+    #[tokio::test]
+    async fn fault_menu_permanently_wedged_fails_after_max_respawns() {
+        use crate::vmm::{FakeVmm, FaultMenu};
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            wedge_control_plane_for: (MAX_CONTROL_PLANE_RESPAWNS as usize) + 5,
+            ..Default::default()
+        });
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(crate::metrics::FakeCgroupFs::new()),
+            ..HostEnv::hermetic()
+        };
+        let err = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect_err("a permanently wedged control plane must fail loud");
+        assert!(
+            err.to_string().contains("control plane did not come up"),
+            "expected the bounded-respawn fail-loud, got: {err}"
+        );
+    }
+
     // CONFIG-ERROR-ORCH-5. Buggy impl: start() ignores cfg.vmid and always
     // allocates a fresh VMID.
     #[tokio::test]
@@ -2166,17 +2338,10 @@ mod tests {
         let vmm = crate::vmm::FakeVmm::default();
         let mut cfg = erofs_cfg();
         cfg.vmid = Some(7);
-        let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
-        let vmid_alloc = VmidAllocator::new();
-        let vm = MicroVm::start(
-            &vmm,
-            cfg,
-            cid_alloc,
-            vmid_alloc,
-            Box::new(crate::metrics::FakeCgroupFs::new()),
-        )
-        .await
-        .expect("start should succeed with fakes");
+        let env = HostEnv::hermetic();
+        let vm = MicroVm::start(&vmm, cfg, &env)
+            .await
+            .expect("start should succeed with fakes");
         assert_eq!(vm.vmid(), 7);
     }
 
@@ -2187,18 +2352,10 @@ mod tests {
         let vmm = crate::vmm::FakeVmm::default();
         let mut cfg = erofs_cfg();
         cfg.vmid = Some(7);
-        let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
-        let vmid_alloc = VmidAllocator::new();
+        let env = HostEnv::hermetic();
         // Someone already holds VMID 7 on this shared allocator.
-        vmid_alloc.reserve(7).expect("pre-reservation");
-        let res = MicroVm::start(
-            &vmm,
-            cfg,
-            cid_alloc,
-            vmid_alloc.clone(),
-            Box::new(crate::metrics::FakeCgroupFs::new()),
-        )
-        .await;
+        env.vmids.reserve(7).expect("pre-reservation");
+        let res = MicroVm::start(&vmm, cfg, &env).await;
         assert!(
             matches!(res, Err(crate::error::Error::Exhaustion(_))),
             "a conflicting explicit VMID must be rejected"
@@ -2217,15 +2374,10 @@ mod tests {
         cfg.timeouts.connect_backoff_floor = Duration::ZERO;
         cfg.timeouts.guest_accept_poll = Duration::ZERO;
         cfg.timeouts.api_socket_poll = Duration::ZERO;
-        let vm = MicroVm::start(
-            &vmm,
-            cfg,
-            std::sync::Arc::new(crate::vmm::CidAllocator::new()),
-            VmidAllocator::new(),
-            Box::new(crate::metrics::FakeCgroupFs::new()),
-        )
-        .await
-        .expect("start with fakes");
+        let env = HostEnv::hermetic();
+        let vm = MicroVm::start(&vmm, cfg, &env)
+            .await
+            .expect("start with fakes");
         assert!(vm.timeouts.connect_backoff_floor >= Duration::from_millis(1));
         assert!(vm.timeouts.guest_accept_poll >= Duration::from_millis(1));
         assert!(vm.timeouts.api_socket_poll >= Duration::from_millis(1));
@@ -2253,17 +2405,8 @@ mod tests {
         ))
         .build()
         .expect("valid config");
-        let cid_alloc = std::sync::Arc::new(crate::vmm::CidAllocator::new());
-        let vmid_alloc = VmidAllocator::new();
-        let res = MicroVm::restore(
-            &vmm,
-            std::path::Path::new("/fake/snap"),
-            cfg,
-            cid_alloc,
-            vmid_alloc,
-            Box::new(crate::metrics::FakeCgroupFs::new()),
-        )
-        .await;
+        let env = HostEnv::hermetic();
+        let res = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env).await;
         // ORCH-4 / §3.3 boundary 2: a vhost-user device on the restore path is an
         // `Unsupported` capability rejection, not a generic `Config` error.
         assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
@@ -2493,7 +2636,7 @@ mod tests {
         );
     }
 
-    /// A `CgroupFs` whose `read_stats` reports a configurable `limits_enforced`,
+    /// A `CgroupFs` whose `read_stats` reports a configurable `mem_limit_enforced`,
     /// so `usage()` can be shown to surface the real enforcement state rather than
     /// a rosy constant.
     #[derive(Debug, Clone)]
@@ -2510,7 +2653,7 @@ mod tests {
         }
         fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
             Ok(ResourceUsage {
-                limits_enforced: self.enforced,
+                mem_limit_enforced: self.enforced,
                 ..ResourceUsage::default()
             })
         }
@@ -2521,20 +2664,18 @@ mod tests {
 
     async fn start_with_cgroup(fs: EnforcementCgroupFs) -> MicroVm<crate::vmm::FakeVmm> {
         let vmm = crate::vmm::FakeVmm::default();
-        MicroVm::start(
-            &vmm,
-            erofs_cfg(),
-            std::sync::Arc::new(crate::vmm::CidAllocator::new()),
-            VmidAllocator::new(),
-            Box::new(fs),
-        )
-        .await
-        .expect("start should succeed with fakes")
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(fs),
+            ..HostEnv::hermetic()
+        };
+        MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("start should succeed with fakes")
     }
 
     // H-FAILLOUD-1 (surfacing). When the cgroup reports limits NOT enforced (an
     // undelegated controller — the VM is effectively running unbounded), usage()
-    // must surface limits_enforced=false. Buggy impl that returns
+    // must surface mem_limit_enforced=false. Buggy impl that returns
     // ResourceUsage::default() unconditionally (ignoring read_stats) or hardcodes
     // true goes red here, while the inverse (enforced) test below stays green —
     // proving usage() reflects the real flag, not a constant.
@@ -2543,7 +2684,7 @@ mod tests {
         let vm = start_with_cgroup(EnforcementCgroupFs { enforced: false }).await;
         let usage = vm.usage().await.unwrap();
         assert!(
-            !usage.limits_enforced,
+            !usage.mem_limit_enforced,
             "usage() must honestly surface that the requested limits are NOT enforced"
         );
     }
@@ -2553,13 +2694,13 @@ mod tests {
         let vm = start_with_cgroup(EnforcementCgroupFs { enforced: true }).await;
         let usage = vm.usage().await.unwrap();
         assert!(
-            usage.limits_enforced,
+            usage.mem_limit_enforced,
             "usage() must surface enforced limits as true (control for the false case)"
         );
     }
 
     // H-FAILLOUD-1 (surfacing). The no-cgroup-attached branch (orchestrator
-    // usage() else arm) must report limits_enforced=false, not imply an all-zero,
+    // usage() else arm) must report mem_limit_enforced=false, not imply an all-zero,
     // measured-and-enforced usage. Buggy impl returning a usage with the flag
     // forced true (or omitting the field's honest default) goes red.
     #[tokio::test]
@@ -2572,7 +2713,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            cgroup_fs: None,
+            env: HostEnv::hermetic(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -2583,7 +2724,7 @@ mod tests {
         };
         let usage = vm.usage().await.unwrap();
         assert!(
-            !usage.limits_enforced,
+            !usage.mem_limit_enforced,
             "with no cgroup attached, usage() must report limits as unenforced"
         );
     }
@@ -2632,7 +2773,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            cgroup_fs: None,
+            env: HostEnv::hermetic(),
             agent_client: Some(AgentClient::from_stream_for_tests(local)),
             restored: false,
             restore_reseed_applied: None,
@@ -2656,6 +2797,8 @@ mod tests {
             vsock_path: std::path::PathBuf::from("/tmp/vmcell-snap-inval-vsock.sock"),
             serial: std::path::PathBuf::from("/tmp/vmcell-snap-inval-serial.log"),
             calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            faults: Default::default(),
+            control_plane_probes: Default::default(),
         };
         let (mut vm, _peer) = vm_with_seeded_agent_client::<crate::vmm::FakeVmm>(instance);
         vm.snapshot(std::path::Path::new("/tmp/vmcell-snap-inval"))
@@ -2792,7 +2935,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            cgroup_fs: None,
+            env: HostEnv::hermetic(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -3018,6 +3161,8 @@ mod tests {
             vsock_path: std::path::PathBuf::from("/tmp/vmcell-shutdown-vsock.sock"),
             serial: std::path::PathBuf::from("/tmp/vmcell-shutdown-serial.log"),
             calls: log.clone(),
+            faults: Default::default(),
+            control_plane_probes: Default::default(),
         };
 
         let vm = MicroVm::<crate::vmm::FakeVmm> {
@@ -3028,7 +3173,10 @@ mod tests {
             smoltcp: None,
             proxy: Some(proxy),
             cgroup_name: Some("vmcell-vm-11".to_string()),
-            cgroup_fs: Some(std::sync::Arc::new(TimelineCgroupFs { log: log.clone() })),
+            env: HostEnv {
+                cgroups: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
+                ..HostEnv::hermetic()
+            },
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -3179,7 +3327,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            cgroup_fs: None,
+            env: HostEnv::hermetic(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -3207,13 +3355,15 @@ mod tests {
                 vsock_path: std::path::PathBuf::from("/tmp/vmcell-noagent-vsock.sock"),
                 serial: std::path::PathBuf::from("/tmp/vmcell-noagent-serial.log"),
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                faults: Default::default(),
+                control_plane_probes: Default::default(),
             }),
             netns: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            cgroup_fs: None,
+            env: HostEnv::hermetic(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -3223,7 +3373,7 @@ mod tests {
             control_plane_disabled: true,
         };
         let err = vm
-            .agent(Some(std::time::Duration::from_secs(1)), &RealClock)
+            .agent(Some(std::time::Duration::from_secs(1)))
             .await
             .expect_err("agent() must fail loud when a custom init disabled the control plane");
         assert!(

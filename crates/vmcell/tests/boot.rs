@@ -1,6 +1,5 @@
 use std::time::Duration;
 use vmcell::config::{RootfsSource, VmConfig};
-use vmcell::orchestrator::RealClock;
 use vmcell_artifact_validator::checks;
 
 mod common;
@@ -30,7 +29,7 @@ async fn test_boot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .expect("kernel must print the Linux banner");
 
     let agent = vm
-        .agent(Some(Duration::from_secs(60)), &RealClock)
+        .agent(Some(Duration::from_secs(60)))
         .await
         .expect("agent must reach ready");
     checks::agent_exec_roundtrip(agent)

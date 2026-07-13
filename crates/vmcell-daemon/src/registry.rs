@@ -421,7 +421,7 @@ mod tests {
                 cpu_usec: 1,
                 io_read_bytes: 0,
                 io_write_bytes: 0,
-                limits_enforced: true,
+                mem_limit_enforced: true,
                 mem_read_ok: true,
                 cpu_read_ok: true,
                 io_read_ok: true,

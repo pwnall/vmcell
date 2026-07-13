@@ -47,7 +47,7 @@ subtle = { version = "2", optional = true }
 sha2 = { version = "0.10", optional = true }
 tempfile = { version = "3", optional = true }
 tracing = { version = "0.1", optional = true }
-vmcell = { path = "../vmcell", version = "0.9.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"], optional = true }
+vmcell = { path = "../vmcell", version = "0.10.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"], optional = true }
 
 [package.metadata.cargo-machete]
 # False positive: async-trait is a proc-macro used via #[async_trait]

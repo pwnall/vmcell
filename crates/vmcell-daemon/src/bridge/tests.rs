@@ -58,7 +58,7 @@ impl VmEngine for FakeEngine {
             cpu_usec: 1,
             io_read_bytes: 0,
             io_write_bytes: 0,
-            limits_enforced: true,
+            mem_limit_enforced: true,
             mem_read_ok: true,
             cpu_read_ok: true,
             io_read_ok: true,
@@ -121,7 +121,7 @@ async fn engine_rpc_round_trips_every_op() {
             .stats(&VmId("vm-1".into()))
             .await
             .expect("stats")
-            .limits_enforced
+            .mem_limit_enforced
     );
     assert_eq!(
         client

@@ -16,7 +16,7 @@ use vmcell::agent::AgentClient;
 use vmcell::config::{
     Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig, VmConfigBuilder,
 };
-use vmcell::orchestrator::{MicroVm, RealClock};
+use vmcell::orchestrator::MicroVm;
 use vmcell::vmm::{VmInstance, Vmm};
 
 use crate::harness::{cgroup_memory_delegated, try_start_vm};
@@ -221,7 +221,7 @@ pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
     let (_, guest_ip, _) = vmcell::net::ip_math(vm.vmid())
         .map_err(|e| format!("ip_math({}) failed: {e}", vm.vmid()))?;
     let agent = vm
-        .agent(Some(Duration::from_secs(60)), &RealClock)
+        .agent(Some(Duration::from_secs(60)))
         .await
         .map_err(|e| format!("agent connect failed: {e}"))?;
     let addr = exec(agent, &["ip", "a"]).await?;
@@ -326,9 +326,9 @@ pub async fn metrics_usage_readable<V: Vmm>(vm: &MicroVm<V>) -> Result<(), Strin
         .usage()
         .await
         .map_err(|e| format!("usage() failed: {e}"))?;
-    if !usage.limits_enforced {
+    if !usage.mem_limit_enforced {
         return Err(
-            "memory controller delegated but ResourceUsage::limits_enforced is false".into(),
+            "memory controller delegated but ResourceUsage::mem_limit_enforced is false".into(),
         );
     }
     if usage.mem_peak_mib == 0 {
@@ -348,27 +348,15 @@ pub async fn metrics_usage_readable<V: Vmm>(vm: &MicroVm<V>) -> Result<(), Strin
 /// # Errors
 /// Returns `Err` if any concurrent VM fails to boot/exec or two VMs collide on vmid / guest-CID / vsock path.
 pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<(), String> {
-    use vmcell::orchestrator::VmidAllocator;
-    use vmcell::vmm::CidAllocator;
-
     let cfg = base_cfg(a)
         .network_disabled()
         .build()
         .map_err(|e| format!("config build failed: {e}"))?;
-    let cid_alloc = std::sync::Arc::new(CidAllocator::new());
-    let vmid_alloc = VmidAllocator::new();
+    let env = vmcell::HostEnv::hermetic();
 
     // Drive N starts CONCURRENTLY on the shared allocators (join_all polls in place, so the
     // futures may borrow `vmm` — no `'static`/`spawn` needed).
-    let starts = (0..3).map(|_| {
-        MicroVm::start(
-            vmm,
-            cfg.clone(),
-            cid_alloc.clone(),
-            vmid_alloc.clone(),
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-    });
+    let starts = (0..3).map(|_| MicroVm::start(vmm, cfg.clone(), &env));
     let mut vms = Vec::new();
     for res in futures::future::join_all(starts).await {
         vms.push(res.map_err(|e| format!("concurrent VM start failed: {e}"))?);
@@ -393,7 +381,7 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
     }
     for mut vm in vms {
         let agent = vm
-            .agent(Some(Duration::from_secs(180)), &RealClock)
+            .agent(Some(Duration::from_secs(180)))
             .await
             .map_err(|e| format!("concurrent VM agent connect failed: {e}"))?;
         let out = exec(agent, &["true"]).await?;
@@ -412,9 +400,6 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
 /// # Errors
 /// Returns `Err` if snapshot or restore fails, or the restored VM does not return to agent-ready and exec.
 pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<(), String> {
-    use vmcell::orchestrator::VmidAllocator;
-    use vmcell::vmm::CidAllocator;
-
     let mut cfg = base_cfg(a)
         .network_disabled()
         .build()
@@ -422,18 +407,12 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
     // Snapshot-eligible: net=None → no vhost-user device (§12.1); set the flag on the built
     // config (the pair is already vhost-user-free, so this stays valid).
     cfg.snapshotting = true;
-    let cid_alloc = std::sync::Arc::new(CidAllocator::new());
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg.clone(),
-        cid_alloc.clone(),
-        VmidAllocator::new(),
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .map_err(|e| format!("snapshot-source VM start failed: {e}"))?;
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg.clone(), &env)
+        .await
+        .map_err(|e| format!("snapshot-source VM start failed: {e}"))?;
     // Boot to agent-ready before snapshotting.
-    vm.agent(Some(Duration::from_secs(60)), &RealClock)
+    vm.agent(Some(Duration::from_secs(60)))
         .await
         .map_err(|e| format!("snapshot-source agent connect failed: {e}"))?;
 
@@ -443,18 +422,11 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
         .map_err(|e| format!("snapshot() failed: {e}"))?;
     let _ = vm.shutdown().await;
 
-    let mut restored = MicroVm::restore(
-        vmm,
-        snap_dir.path(),
-        cfg,
-        cid_alloc,
-        VmidAllocator::new(),
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .map_err(|e| format!("restore() failed: {e}"))?;
+    let mut restored = MicroVm::restore(vmm, snap_dir.path(), cfg, &env)
+        .await
+        .map_err(|e| format!("restore() failed: {e}"))?;
     let agent = restored
-        .agent(Some(Duration::from_secs(60)), &RealClock)
+        .agent(Some(Duration::from_secs(60)))
         .await
         .map_err(|e| format!("restored VM did not reach agent-ready: {e}"))?;
     let out = exec(agent, &["true"]).await?;
@@ -477,7 +449,7 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), S
     // the binding signal is the host counter.
     {
         let agent = vm
-            .agent(Some(Duration::from_secs(60)), &RealClock)
+            .agent(Some(Duration::from_secs(60)))
             .await
             .map_err(|e| format!("agent connect failed: {e}"))?;
         let _ = exec(agent, &["tail", "/dev/zero"]).await;
@@ -571,7 +543,7 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
     );
 
     // agent-ready gates every guest probe; if it fails, record it and stop the guest checks.
-    match vm.agent(Some(Duration::from_secs(60)), &RealClock).await {
+    match vm.agent(Some(Duration::from_secs(60))).await {
         Ok(_) => record(outcomes, "boot.agent_ready", Level::Core, Ok(())),
         Err(e) => {
             record(
@@ -598,7 +570,7 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
 
 /// Runs the guest-facing Core checks against `vm`'s cached agent, returning (id, result) pairs.
 async fn guest_core_checks<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<(&'static str, Result<(), String>)> {
-    let agent = match vm.agent(Some(Duration::from_secs(60)), &RealClock).await {
+    let agent = match vm.agent(Some(Duration::from_secs(60))).await {
         Ok(a) => a,
         Err(e) => {
             return vec![(
@@ -714,7 +686,7 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                         Err(format!("boot: {e}")),
                     ),
                     Ok(mut vm) => {
-                        let res = match vm.agent(Some(Duration::from_secs(60)), &RealClock).await {
+                        let res = match vm.agent(Some(Duration::from_secs(60))).await {
                             Ok(agent) => nested_kvm_ok(agent).await,
                             Err(e) => Err(format!("agent connect: {e}")),
                         };
@@ -757,7 +729,7 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                     ),
                     Ok(mut vm) => {
                         // Let it consume some memory first.
-                        let _ = vm.agent(Some(Duration::from_secs(60)), &RealClock).await;
+                        let _ = vm.agent(Some(Duration::from_secs(60))).await;
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         record(
                             outcomes,
@@ -851,7 +823,7 @@ async fn run_shares_check<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
             Err(format!("boot: {e}")),
         ),
         Ok(mut vm) => {
-            let res = match vm.agent(Some(Duration::from_secs(60)), &RealClock).await {
+            let res = match vm.agent(Some(Duration::from_secs(60))).await {
                 Ok(agent) => virtiofs_shares(agent, &out_dir).await,
                 Err(e) => Err(format!("agent connect: {e}")),
             };

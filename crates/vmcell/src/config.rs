@@ -345,17 +345,6 @@ pub(crate) fn build_kernel_cmdline(
     vmid: u32,
     backend_extra: &str,
 ) -> Result<String, crate::error::Error> {
-    // Self-guard (L-ORCH-2): a virtio-fs rootfs has no `/dev/vda`, so emitting the
-    // `root=/dev/vda rootfstype=ext4` line below would build an unbootable cmdline
-    // that kernel-panics the guest. Every backend rejects a virtio-fs rootfs up
-    // front today, but this shared builder must not silently depend on "the caller
-    // checked first" (AGENTS.md contract-self-guard).
-    if let RootfsSource::VirtioFs { .. } = &cfg.rootfs {
-        return Err(crate::error::Error::Config(
-            "virtio-fs rootfs cannot be booted from the kernel cmdline (no /dev/vda block device)"
-                .into(),
-        ));
-    }
     let rootfstype = match &cfg.rootfs {
         RootfsSource::Erofs { .. } => "erofs",
         _ => "ext4",
@@ -533,11 +522,6 @@ pub enum RootfsSource {
         image: PathBuf,
         /// Optional writable overlay file.
         overlay: Option<PathBuf>,
-    },
-    /// Root filesystem mounted via virtio-fs.
-    VirtioFs {
-        /// Path to the host directory serving as root.
-        dir: PathBuf,
     },
 }
 
@@ -845,16 +829,15 @@ pub enum CachePolicy {
 #[non_exhaustive]
 pub enum NetConfig {
     /// Privileged mode using TAP and netns (requires root/CAP_NET_ADMIN).
+    ///
+    /// No `host_services_port`: host-service reachability is implemented **only** on the
+    /// [`NetConfig::Unprivileged`] smoltcp NAT (§6.2, design §18 delta 4). The privileged TPROXY
+    /// ruleset policy-drops everything but the web TPROXY and the proxy port, so the field would be
+    /// a no-op here — the invalid state is made *unrepresentable* rather than accepted then
+    /// rejected at `build()`.
     Privileged {
         /// Egress proxy configuration.
         egress: Egress,
-        /// Must be `None`: host-service reachability is only implemented on the
-        /// [`NetConfig::Unprivileged`] NAT path. `config::build()` rejects
-        /// `Some(_)` here rather than silently ignoring it (H-ORCH-3/H-NET-2) —
-        /// the privileged TPROXY ruleset policy-drops everything but the web
-        /// TPROXY and the proxy port, so a host-service port would not reach the
-        /// guest anyway.
-        host_services_port: Option<u16>,
     },
     /// Unprivileged mode using an in-process smoltcp stack plus a vhost-user-net
     /// NAT, requiring no extra Linux capabilities (passt was deliberately rejected).
@@ -1261,15 +1244,12 @@ impl VmConfigBuilder {
                         .into(),
                 ));
             }
-            if let RootfsSource::VirtioFs { .. } = self.rootfs {
-                return Err(crate::error::Error::Config(
-                    "virtio-fs rootfs cannot be combined with snapshotting".into(),
-                ));
-            }
             // Snapshot-eligibility law: a snapshot-eligible VM must have no
             // vhost-user device attached. A virtio-fs data `Share` is served
-            // by virtiofsd (a vhost-user device), so reject it here as well as
-            // for the virtio-fs *rootfs* above.
+            // by virtiofsd (a vhost-user device), so reject it here. (A
+            // virtio-fs *rootfs* was the other vhost-user boundary case; design
+            // §18 delta 5 removed that variant, making the combination
+            // unrepresentable rather than rejected here.)
             if !self.shares.is_empty() {
                 return Err(crate::error::Error::Config(
                     "virtio-fs data shares cannot be combined with snapshotting".into(),
@@ -1293,11 +1273,6 @@ impl VmConfigBuilder {
         // fails late at the backend, which sets `shared: !ksm_mergeable` while
         // still attaching the vhost-user device.
         if self.ksm_mergeable {
-            if let RootfsSource::VirtioFs { .. } = self.rootfs {
-                return Err(crate::error::Error::Config(
-                    "ksm_mergeable cannot be combined with a virtio-fs rootfs (vhost-user)".into(),
-                ));
-            }
             if !self.shares.is_empty() {
                 return Err(crate::error::Error::Config(
                     "ksm_mergeable cannot be combined with virtio-fs data shares (vhost-user)"
@@ -1321,19 +1296,9 @@ impl VmConfigBuilder {
             }
         }
 
-        // H-ORCH-3/H-NET-2: `host_services_port` is only wired on the unprivileged
-        // NAT path. On the privileged path the field is dropped, so accepting
-        // `Some(_)` would be a silent no-op (the §12.2 fail-loud violation). Reject
-        // it at the boundary with a typed error instead.
-        if let NetConfig::Privileged {
-            host_services_port: Some(_),
-            ..
-        } = self.net
-        {
-            return Err(crate::error::Error::Config(
-                "host_services_port is only supported on Unprivileged networking".into(),
-            ));
-        }
+        // (Design §18 delta 4: `host_services_port` now lives only on
+        // `NetConfig::Unprivileged`, so a privileged config carrying it is unrepresentable — the
+        // former accept-then-reject at this boundary is gone.)
 
         let mut tags = std::collections::HashSet::new();
         let mut guest_paths = std::collections::HashSet::new();
@@ -1496,8 +1461,8 @@ mod tests {
     fn test_builder_defaults() {
         let cfg = VmConfig::builder(
             PathBuf::from("/vmlinux"),
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/rootfs"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
             },
         )
         .build()
@@ -1570,8 +1535,8 @@ mod tests {
     fn test_builder_methods() {
         let cfg = VmConfig::builder(
             PathBuf::from("/vmlinux"),
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/rootfs"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
             },
         )
         .with_share(Share::new(
@@ -1587,23 +1552,6 @@ mod tests {
         assert_eq!(cfg.shares.len(), 1);
         assert_eq!(cfg.shares[0].tag, "test");
         assert!(matches!(cfg.net, NetConfig::None));
-    }
-
-    #[test]
-    fn test_reject_virtio_fs_snapshot() {
-        let err = VmConfig::builder(
-            PathBuf::from("/vmlinux"),
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/rootfs"),
-            },
-        )
-        .snapshotting(true)
-        .build()
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("virtio-fs rootfs cannot be combined with snapshotting")
-        );
     }
 
     #[test]
@@ -1639,26 +1587,12 @@ mod tests {
         mk(&|b| b.mem_mib(64)).expect("mem_mib 64 is at the floor");
     }
 
-    // H-ORCH-3/H-NET-2: `host_services_port` is only wired on the unprivileged NAT
-    // path; on the privileged path it was silently dropped (a §12.2 fail-loud
-    // violation). Buggy impl this guards: `build()` accepts the combination.
+    // Design §18 delta 4: `host_services_port` lives only on `NetConfig::Unprivileged` — a
+    // privileged config carrying it is now a COMPILE error (the field was removed from the
+    // `Privileged` variant), so the former "rejected on privileged" negative test is deleted as
+    // unreachable. What remains is the positive control: the unprivileged path accepts the port.
     #[test]
-    fn reject_privileged_with_host_services_port() {
-        let err = VmConfig::builder(
-            PathBuf::from("/vmlinux"),
-            RootfsSource::Erofs {
-                image: PathBuf::from("/rootfs.erofs"),
-            },
-        )
-        .net(NetConfig::Privileged {
-            egress: Egress::Open,
-            host_services_port: Some(8080),
-        })
-        .build()
-        .unwrap_err();
-        assert!(matches!(err, crate::error::Error::Config(_)));
-        assert!(err.to_string().contains("host_services_port"));
-        // The unprivileged path with the same port must still build.
+    fn unprivileged_host_services_port_is_supported() {
         VmConfig::builder(
             PathBuf::from("/vmlinux"),
             RootfsSource::Erofs {
@@ -1695,23 +1629,11 @@ mod tests {
         }
     }
 
-    // L-ORCH-2: the shared cmdline builder must self-guard against a virtio-fs
-    // rootfs (no `/dev/vda`) rather than emitting an unbootable
-    // `root=/dev/vda rootfstype=ext4` line. Buggy impl: the `_ => "ext4"` arm
-    // silently produces the panicking cmdline.
+    // The Erofs rootfs still builds a bootable `rootfstype=erofs` cmdline line
+    // (the VirtioFs variant this test also guarded against is gone — design §18
+    // delta 5 — making that rejection a compile-time unrepresentable state).
     #[test]
-    fn reject_virtio_fs_rootfs_cmdline_build() {
-        let cfg = VmConfig::builder(
-            PathBuf::from("/vmlinux"),
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/rootfs"),
-            },
-        )
-        .build()
-        .unwrap();
-        let err = build_kernel_cmdline(&cfg, 1, "").unwrap_err();
-        assert!(matches!(err, crate::error::Error::Config(_)));
-        // An erofs rootfs still builds a bootable line.
+    fn erofs_rootfs_cmdline_build() {
         let ok = VmConfig::builder(
             PathBuf::from("/vmlinux"),
             RootfsSource::Erofs {
@@ -2092,35 +2014,12 @@ mod tests {
         )
         .net(NetConfig::Privileged {
             egress: Egress::Open,
-            host_services_port: None,
         })
         .snapshotting(true)
         .build()
         .unwrap();
         assert!(cfg.snapshotting);
         assert!(matches!(cfg.net, NetConfig::Privileged { .. }));
-    }
-
-    // M-CONFIG-1: ksm_mergeable (CH shared=off) is mutually exclusive with a
-    // virtio-fs rootfs (virtiofsd, a vhost-user device). Buggy impl: build()
-    // accepts the combination and it fails late at the VMM.
-    #[test]
-    fn test_reject_ksm_mergeable_with_virtio_fs_rootfs() {
-        let err = VmConfig::builder(
-            PathBuf::from("/vmlinux"),
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/rootfs"),
-            },
-        )
-        .ksm_mergeable(true)
-        .build()
-        .unwrap_err();
-        assert!(matches!(err, crate::error::Error::Config(_)));
-        assert!(
-            err.to_string()
-                .contains("ksm_mergeable cannot be combined with a virtio-fs rootfs"),
-            "unexpected error: {err}"
-        );
     }
 
     // M-CONFIG-1: ksm_mergeable is mutually exclusive with a virtio-fs data
@@ -2189,7 +2088,6 @@ mod tests {
         )
         .net(NetConfig::Privileged {
             egress: Egress::Open,
-            host_services_port: None,
         })
         .ksm_mergeable(true)
         .build()
@@ -2816,7 +2714,6 @@ mod tests {
         )
         .net(NetConfig::Privileged {
             egress: Egress::Open,
-            host_services_port: None,
         })
         .with_share(Share::new(
             "data",

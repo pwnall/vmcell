@@ -213,15 +213,15 @@ enum Commands {
         #[arg(long, default_value_t = 512)]
         mem_mib: u32,
     },
-    /// Deferred to the `vmcelld` daemon (§18): a standalone exec needs a cross-process
-    /// VM registry, which collides with the ordered-Drop-owns-cleanup invariant.
+    /// Removed (design §11): a standalone exec needs a cross-process VM registry, which collides
+    /// with the ordered-Drop-owns-cleanup invariant. Use `vmcelld-ctl exec` against a running daemon.
     Exec,
-    /// Deferred to the `vmcelld` daemon (§18): listing VMs needs a cross-process registry.
+    /// Removed (design §11): listing VMs needs a cross-process registry. Use `vmcelld-ctl ls`.
     Ls,
-    /// Deferred to the `vmcelld` daemon (§18): removing a VM by id needs a cross-process registry.
+    /// Removed (design §11): removing a VM by id needs a cross-process registry. Use `vmcelld-ctl rm`.
     Rm,
-    /// Deferred to the `vmcelld` daemon (§18): destroying a VM by id needs a cross-process
-    /// registry. Within one process the owning handle's drop/`shutdown` already destroys it.
+    /// Removed (design §11): destroying a VM by id needs a cross-process registry (within one
+    /// process the owning handle's drop/`shutdown` already destroys it). Use `vmcelld-ctl rm`.
     Destroy,
 }
 
@@ -253,18 +253,20 @@ async fn async_main() -> vmcell::Result<()> {
     dispatch(&cli.command).await
 }
 
-/// Builds the typed error returned by a subcommand that is deferred to the `vmcelld`
-/// daemon (§18) because it needs a cross-process VM registry.
+/// Builds the typed redirect error for a cross-process lifecycle verb that was **removed** from
+/// the CLI (design §18 delta 11): `exec`/`ls`/`rm`/`destroy` genuinely belong to the daemon, which
+/// **owns** VMs across process boundaries — a capability a single-shot CLI structurally cannot have
+/// (§10, §11). The message points the user at `vmcelld-ctl`, the daemon's control client.
 ///
-/// These subcommands must fail loud — a typed, matchable error that drives a
-/// non-zero exit — rather than printing fake success. Printing "Removing VM..." and
-/// returning `Ok(())` while doing nothing is the "skip == pass" failure in CLI form:
-/// it impersonates a completed operation.
-fn deferred_to_daemon(subcommand: &str) -> vmcell::Error {
+/// These verbs must fail loud — a typed, matchable error that drives a non-zero exit — rather than
+/// printing fake success. Printing "Removing VM..." and returning `Ok(())` while doing nothing is
+/// the "skip == pass" failure in CLI form: it impersonates a completed operation.
+fn moved_to_vmcelld_ctl(subcommand: &str) -> vmcell::Error {
     vmcell::Error::Unsupported {
         vmm: "vmcell".to_string(),
         feature: format!(
-            "subcommand `{subcommand}` needs a cross-process VM registry; deferred to the vmcelld daemon (§18)"
+            "`vmcell {subcommand}` was removed: a cross-process VM registry belongs to the daemon — \
+             run `vmcelld-ctl {subcommand}` against a running vmcelld instead (§11)"
         ),
     }
 }
@@ -471,7 +473,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             let code = if *tty || *stdin {
                 run_interactive_session(&vm, argv, *tty).await?
             } else {
-                let agent = vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+                let agent = vm.agent(None).await?;
                 let outcome = agent.exec(vmcell::ExecRequest::new(argv)).await?;
                 use std::io::Write as _;
                 // Best-effort relay of the guest command's captured output. A broken pipe
@@ -506,7 +508,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             let vmid = vm.vmid();
             // Confirm the guest agent handshakes — i.e. the VM actually booted —
             // before teardown. A failure here is a real error, not a fake success.
-            vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+            vm.agent(None).await?;
             println!("vmcell: VM booted and agent ready (vmid {vmid})");
             vm.shutdown().await?;
             Ok(())
@@ -520,7 +522,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
         } => {
             let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &[], &[]).await?;
             // Bring the agent up so the snapshot captures an agent-ready VM.
-            vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+            vm.agent(None).await?;
             std::fs::create_dir_all(out).map_err(vmcell::Error::Io)?;
             vm.snapshot(out).await?;
             println!("vmcell: snapshot written to {}", out.display());
@@ -534,16 +536,16 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             mem_mib,
         } => {
             let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &[], &[]).await?;
-            vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+            vm.agent(None).await?;
             let usage = vm.usage().await?;
             println!("{}", format_usage_json(&usage));
             vm.shutdown().await?;
             Ok(())
         }
-        Commands::Exec => Err(deferred_to_daemon("exec")),
-        Commands::Ls => Err(deferred_to_daemon("ls")),
-        Commands::Rm => Err(deferred_to_daemon("rm")),
-        Commands::Destroy => Err(deferred_to_daemon("destroy")),
+        Commands::Exec => Err(moved_to_vmcelld_ctl("exec")),
+        Commands::Ls => Err(moved_to_vmcelld_ctl("ls")),
+        Commands::Rm => Err(moved_to_vmcelld_ctl("rm")),
+        Commands::Destroy => Err(moved_to_vmcelld_ctl("destroy")),
     }
 }
 
@@ -715,16 +717,10 @@ async fn ephemeral_vm(
     }
     let cfg = builder.build()?;
     let vmm = vmcell::CloudHypervisor::new(ch_bin());
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    vmcell::MicroVm::start(
-        &vmm,
-        cfg,
-        cid_alloc,
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
+    // One-shot CLI process booting one VM: in-process (hermetic) allocators suffice
+    // (the design §18 delta-1 seam bundle; `shared()` is the daemon's home).
+    let env = vmcell::HostEnv::hermetic();
+    vmcell::MicroVm::start(&vmm, cfg, &env).await
 }
 
 /// Renders [`vmcell::ResourceUsage`] as a single-line JSON object. Hand-formatted
@@ -733,14 +729,14 @@ async fn ephemeral_vm(
 fn format_usage_json(u: &vmcell::ResourceUsage) -> String {
     format!(
         "{{\"mem_peak_mib\":{},\"mem_current_mib\":{},\"cpu_usec\":{},\
-         \"io_read_bytes\":{},\"io_write_bytes\":{},\"limits_enforced\":{},\
+         \"io_read_bytes\":{},\"io_write_bytes\":{},\"mem_limit_enforced\":{},\
          \"mem_read_ok\":{},\"cpu_read_ok\":{},\"io_read_ok\":{}}}",
         u.mem_peak_mib,
         u.mem_current_mib,
         u.cpu_usec,
         u.io_read_bytes,
         u.io_write_bytes,
-        u.limits_enforced,
+        u.mem_limit_enforced,
         u.mem_read_ok,
         u.cpu_read_ok,
         u.io_read_ok,
@@ -818,9 +814,11 @@ async fn oci2erofs(
 mod tests {
     use super::*;
 
-    // Buggy impl this guards: the daemon-deferred verbs (exec/ls/rm/destroy) printing
-    // fake success and returning Ok(()), impersonating a completed operation. Each
-    // must instead surface a typed, matchable error so the process exits non-zero.
+    // Delta 11 gate. Buggy impls this guards: (a) the removed cross-process verbs
+    // (exec/ls/rm/destroy) printing fake success and returning Ok(()), impersonating a
+    // completed operation; (b) a redirect that no longer points the user at `vmcelld-ctl`
+    // (the daemon control client that owns those verbs). Each must surface a typed,
+    // matchable error whose message names `vmcelld-ctl`, so the process exits non-zero.
     // (run/create/snapshot/stats are now implemented and own a real VM lifecycle, so
     // they are NOT in this set — they boot a VM and so are exercised by the KVM suite.)
     #[test]
@@ -854,6 +852,13 @@ mod tests {
             assert!(
                 !shown.contains("Unsupported {"),
                 "Display must not be the Debug struct-dump, got: {shown}"
+            );
+            // Delta 11: the removed verbs redirect the user at `vmcelld-ctl` (the daemon's
+            // control client), where the real exec/ls/rm live. RED on the inverse (a message
+            // that points only at "the vmcelld daemon" generically, or omits the ctl tool).
+            assert!(
+                shown.contains("vmcelld-ctl"),
+                "the redirect must name `vmcelld-ctl`, got: {shown}"
             );
         }
     }

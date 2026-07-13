@@ -10,7 +10,6 @@ use std::time::Duration;
 use vmcell::ExecRequest;
 use vmcell::agent::session::{SessionEvent, SessionSpecBuilder};
 use vmcell::config::{RootfsSource, VmConfig};
-use vmcell::orchestrator::RealClock;
 
 mod common;
 
@@ -37,7 +36,7 @@ async fn boot_and_connect<V: vmcell::vmm::Vmm>(
 ) -> (vmcell::MicroVm<V>, vmcell::agent::session::SessionMux) {
     let mut vm = common::start_vm(vmm, base_cfg()).await;
     // Confirm the guest agent is up before dialing a second (session) connection.
-    vm.agent(Some(Duration::from_secs(60)), &RealClock)
+    vm.agent(Some(Duration::from_secs(60)))
         .await
         .expect("agent must reach ready");
     let mux = vm
@@ -261,7 +260,7 @@ async fn session_teardown_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // no longer names `sleep` (robust against pid reuse — a reused pid would run our
     // own check command, never `sleep`).
     let agent = vm
-        .agent(Some(Duration::from_secs(30)), &RealClock)
+        .agent(Some(Duration::from_secs(30)))
         .await
         .expect("agent for residue check");
     let outcome = agent

@@ -30,7 +30,6 @@
 
 use std::time::{Duration, Instant};
 use vmcell::config::{RootfsSource, VmConfig};
-use vmcell::orchestrator::RealClock;
 use vmcell::vmm::VmInstance;
 
 mod common;
@@ -95,7 +94,7 @@ async fn qemu_vsock_flake_repro() {
         let serial_path = vm.instance().serial_log().to_path_buf();
 
         let t = Instant::now();
-        match vm.agent(Some(AGENT_TIMEOUT), &RealClock).await {
+        match vm.agent(Some(AGENT_TIMEOUT)).await {
             Ok(_) => {
                 ok += 1;
                 connect_ms.push(t.elapsed().as_millis());

@@ -55,7 +55,7 @@ use vmcell::artifact::rootfs::{
 use vmcell::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use vmcell::config::{Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig};
 use vmcell::error::{Error, Result};
-use vmcell::orchestrator::{MicroVm, RealClock, VmidAllocator};
+use vmcell::orchestrator::MicroVm;
 use vmcell::vmm::CidAllocator;
 use vmcell::vmm::cloud_hypervisor::CloudHypervisor;
 use vmcell::{ExecOutcome, ExecRequest};
@@ -188,23 +188,19 @@ impl Stage for MmdebstrapRootfsStage {
         .with_share(out_share)
         .net(NetConfig::Privileged {
             egress: Egress::Open,
-            host_services_port: None,
         })
         .build()?;
 
         let vmm = CloudHypervisor::new(vmcell::artifact::ch_binary_path());
-        let mut vm = MicroVm::start(
-            &vmm,
-            cfg,
-            self.cid_alloc.clone(),
-            VmidAllocator::new(),
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-        .await?;
+        // Bundle the builder's shared CID allocator with fresh (in-process) vmid +
+        // default cgroup/clock/overlay seams into one `HostEnv` (design §18 delta 1).
+        let mut env = vmcell::HostEnv::hermetic();
+        env.cids = self.cid_alloc.clone();
+        let mut vm = MicroVm::start(&vmm, cfg, &env).await?;
 
         let release = self.release.clone();
         let build_res = async {
-            let agent = vm.agent(None, &RealClock).await?;
+            let agent = vm.agent(None).await?;
 
             let update = agent
                 .exec(

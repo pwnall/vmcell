@@ -100,17 +100,10 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         egress: Egress::Filtered(proxy_cfg),
         host_services_port: Some(host_port),
     };
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start VM");
 
     let proxy_port = vm.proxy().as_ref().unwrap().port;
     let vmid = vm.vmid();
@@ -120,10 +113,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let gateway = gateway_ip.to_string();
 
     println!("Connecting agent...");
-    let agent = vm
-        .agent(None, &vmcell::orchestrator::RealClock)
-        .await
-        .unwrap();
+    let agent = vm.agent(None).await.unwrap();
     println!("Agent connected.");
 
     let out_a = agent
@@ -375,20 +365,12 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .unwrap();
     cfg.net = vmcell::config::NetConfig::Privileged {
         egress: Egress::Filtered(proxy_cfg),
-        host_services_port: None,
     };
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc,
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start privileged Filtered VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start privileged Filtered VM");
 
     // The privileged Filtered path wires an IP_TRANSPARENT proxy (H-PROXY-1) behind
     // the nft TPROXY ruleset (policy drop; tproxy tcp/80,443; drop the rest). The
@@ -406,13 +388,7 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let (gateway_ip, _g, _c) = vmcell::net::ip_math(vmid).expect("ip_math");
     let gateway = gateway_ip.to_string();
 
-    let agent = match vm
-        .agent(
-            Some(std::time::Duration::from_secs(120)),
-            &vmcell::orchestrator::RealClock,
-        )
-        .await
-    {
+    let agent = match vm.agent(Some(std::time::Duration::from_secs(120))).await {
         Ok(a) => a,
         Err(e) => {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();

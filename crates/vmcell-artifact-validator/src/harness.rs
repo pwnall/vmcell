@@ -4,8 +4,6 @@
 
 use std::path::PathBuf;
 
-use vmcell::orchestrator::VmidAllocator;
-use vmcell::vmm::CidAllocator;
 use vmcell::{MicroVm, VmConfig, Vmm};
 
 /// The built `vmlinux` artifact path (`VMCELL_KERNEL` or `target/vmcell-artifacts/vmlinux`),
@@ -121,16 +119,8 @@ pub fn cgroup_memory_delegated() -> bool {
 /// # Errors
 /// Propagates any [`vmcell::Error`] from [`MicroVm::start`].
 pub async fn try_start_vm<V: Vmm>(vmm: &V, cfg: VmConfig) -> vmcell::Result<MicroVm<V>> {
-    let cid_alloc = std::sync::Arc::new(CidAllocator::new());
-    let vmid_alloc = VmidAllocator::new();
-    MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc,
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
+    let env = vmcell::HostEnv::hermetic();
+    MicroVm::start(vmm, cfg, &env).await
 }
 
 /// Boots a VM from `cfg`, panicking on failure — the ergonomic form the integration tests use

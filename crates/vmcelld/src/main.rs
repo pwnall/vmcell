@@ -200,7 +200,13 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
                 return 1;
             }
         };
-        let launcher = MicroVmLauncher::new(ch_bin, &cli.resource_prefix);
+        let launcher = match MicroVmLauncher::new(ch_bin, &cli.resource_prefix) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("vmcelld: {e}");
+                return 1;
+            }
+        };
         let registry: Arc<dyn VmEngine> =
             Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
 
@@ -327,7 +333,13 @@ fn run_single_process(cli: &Cli, ch_bin: String) -> Result<(), i32> {
         );
     }
 
-    let launcher = MicroVmLauncher::new(ch_bin, &cli.resource_prefix);
+    let launcher = match MicroVmLauncher::new(ch_bin, &cli.resource_prefix) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("vmcelld: {e}");
+            return Err(1);
+        }
+    };
     let registry: Arc<dyn VmEngine> =
         Arc::new(Registry::new(Box::new(launcher), artifacts, id_seed()));
     let parent_artifacts = match ArtifactStore::open(&cli.artifacts_dir, cli.max_artifact_bytes) {

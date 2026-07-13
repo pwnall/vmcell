@@ -1,5 +1,4 @@
 use vmcell::config::{KernelVerbosity, RootfsSource, VmConfig};
-use vmcell::orchestrator::RealClock;
 
 mod common;
 
@@ -36,7 +35,7 @@ async fn custom_init_boots_and_disables_control_plane() {
 
     // The kernel's own boot log is the data plane here (as with the `Linux version`
     // banner check): it names the init it exec'd. Poll the serial log for it.
-    let log = vmcell::vmm::VmInstance::serial_log(vm.instance_mut()).to_path_buf();
+    let log = vmcell::vmm::VmInstance::serial_log(vm.instance()).to_path_buf();
     let mut ran_custom_init = false;
     for _ in 0..150 {
         if let Ok(content) = tokio::fs::read_to_string(&log).await
@@ -56,7 +55,7 @@ async fn custom_init_boots_and_disables_control_plane() {
     // The control plane is gone (a custom init replaced the agent), so `agent()` must
     // fail loud immediately rather than hang connecting to a nonexistent listener.
     let err = vm
-        .agent(Some(std::time::Duration::from_secs(2)), &RealClock)
+        .agent(Some(std::time::Duration::from_secs(2)))
         .await
         .expect_err("agent() must fail loud with a custom init");
     assert!(
@@ -64,7 +63,5 @@ async fn custom_init_boots_and_disables_control_plane() {
         "expected a fail-loud custom-init Agent error, got {err:?}"
     );
 
-    vmcell::vmm::VmInstance::kill(vm.instance_mut())
-        .await
-        .unwrap();
+    vm.kill().await.unwrap();
 }

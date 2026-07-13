@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use std::time::Instant;
 
+use vmcell::HostEnv;
 use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{RestoreMode, RootfsSource, VmConfig};
 use vmcell::orchestrator::{MicroVm, VmidAllocator};
-use vmcell::vmm::{CidAllocator, VmInstance, Vmm};
+use vmcell::vmm::{VmInstance, Vmm};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Macro-benchmarking harness for vmcell VMs")]
@@ -214,7 +215,8 @@ async fn run_bench<V: Vmm>(
     }
 
     let cfg = build_cfg(args, kernel_path, rootfs_path, false);
-    let cid_allocator = std::sync::Arc::new(CidAllocator::new());
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator.clone();
 
     // CLI-5 / N-BIN-5: honor `--snap-dir` for the warm-restore snapshot, resolved on
     // the workspace root (not the process CWD) so it lands on the same real FS as the
@@ -237,21 +239,13 @@ async fn run_bench<V: Vmm>(
 
     if is_restore {
         println!("Creating baseline snapshot for restore benchmark...");
-        let mut base_vm = match MicroVm::start(
-            vmm,
-            cfg.clone(),
-            cid_allocator.clone(),
-            allocator.clone(),
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-        .await
-        {
+        let mut base_vm = match MicroVm::start(vmm, cfg.clone(), &env).await {
             Ok(vm) => vm,
             // M-BIN-1: a baseline-snapshot failure is an attempted-and-failed run, not
             // a skip — fail loud so it can't masquerade as success.
             Err(e) => anyhow::bail!("{name}: failed to start base VM for snapshotting: {e}"),
         };
-        if let Err(e) = base_vm.agent(None, &vmcell::orchestrator::RealClock).await {
+        if let Err(e) = base_vm.agent(None).await {
             // Best-effort graceful teardown of the base VM; `MicroVm::Drop` is the
             // real, guaranteed teardown, so a shutdown error is not actionable here.
             let _ = base_vm.shutdown().await;
@@ -297,29 +291,14 @@ async fn run_bench<V: Vmm>(
 
         let start = Instant::now();
         let vm_res = if is_restore {
-            MicroVm::restore(
-                vmm,
-                &snap_dir,
-                cfg.clone(),
-                cid_allocator.clone(),
-                allocator.clone(),
-                Box::new(vmcell::metrics::DefaultCgroupFs),
-            )
-            .await
+            MicroVm::restore(vmm, &snap_dir, cfg.clone(), &env).await
         } else {
-            MicroVm::start(
-                vmm,
-                cfg.clone(),
-                cid_allocator.clone(),
-                allocator.clone(),
-                Box::new(vmcell::metrics::DefaultCgroupFs),
-            )
-            .await
+            MicroVm::start(vmm, cfg.clone(), &env).await
         };
 
         match vm_res {
             Ok(mut vm) => {
-                match vm.agent(None, &vmcell::orchestrator::RealClock).await {
+                match vm.agent(None).await {
                     Ok(_agent) => {
                         let elapsed = start.elapsed().as_millis();
                         if i >= args.warmup {
@@ -916,7 +895,7 @@ async fn pick_exec_cmd<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<String> {
         vec!["true".to_string()],
     ];
     for c in candidates {
-        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await
+        if let Ok(agent) = vm.agent(None).await
             && let Ok(o) = agent.exec(ExecRequest::new(c.clone())).await
             && o.code == 0
         {
@@ -952,7 +931,8 @@ async fn run_footprint<V: Vmm>(
     // >= 1 here (no silent `.max(1)` clamp).
     let count = args.count;
     let cfg = build_cfg(args, kernel, rootfs, args.ksm_mergeable);
-    let cid = std::sync::Arc::new(CidAllocator::new());
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator.clone();
 
     let ksm_shared_before = read_ksm("pages_shared");
     let ksm_sharing_before = read_ksm("pages_sharing");
@@ -964,22 +944,14 @@ async fn run_footprint<V: Vmm>(
     let mut step_anon: Vec<u64> = Vec::new();
     let mut step_shmem: Vec<u64> = Vec::new();
     for i in 0..count {
-        let mut vm = match MicroVm::start(
-            vmm,
-            cfg.clone(),
-            cid.clone(),
-            allocator.clone(),
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-        .await
-        {
+        let mut vm = match MicroVm::start(vmm, cfg.clone(), &env).await {
             Ok(v) => v,
             Err(e) => {
                 println!("footprint: boot {i} failed: {e}");
                 break;
             }
         };
-        if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
+        if let Err(e) = vm.agent(None).await {
             println!("footprint: agent connect {i} failed: {e}");
             // Best-effort teardown of the just-booted guest before bailing; `Drop`
             // guarantees the real teardown, so a shutdown error is not actionable.
@@ -1059,7 +1031,7 @@ async fn run_footprint<V: Vmm>(
             tot_file += read_proc_status_kb(pid, "RssFile").unwrap_or(0);
             tot_shmem += read_proc_status_kb(pid, "RssShmem").unwrap_or(0);
         }
-        if let Ok(agent) = v.agent(None, &vmcell::orchestrator::RealClock).await {
+        if let Ok(agent) = v.agent(None).await {
             if let Ok(o) = agent
                 .exec(ExecRequest::new(vec!["cat".into(), "/proc/meminfo".into()]))
                 .await
@@ -1187,7 +1159,8 @@ async fn run_suspend_size<V: Vmm>(
         return Ok(());
     }
     let cfg = build_cfg(args, kernel, rootfs, false);
-    let cid = std::sync::Arc::new(CidAllocator::new());
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator;
     let snap_dir = resolve_snap_dir(&args.snap_dir).join(format!(
         "suspend-{backend}-{}-{}",
         args.mem_mib,
@@ -1202,15 +1175,7 @@ async fn run_suspend_size<V: Vmm>(
         );
     }
 
-    let mut vm = match MicroVm::start(
-        vmm,
-        cfg,
-        cid,
-        allocator,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    {
+    let mut vm = match MicroVm::start(vmm, cfg, &env).await {
         Ok(v) => v,
         Err(e) => {
             // Best-effort removal of the (empty) snapshot dir before bailing.
@@ -1218,7 +1183,7 @@ async fn run_suspend_size<V: Vmm>(
             anyhow::bail!("suspend-size: boot failed: {e}");
         }
     };
-    if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
+    if let Err(e) = vm.agent(None).await {
         // Best-effort teardown + snapshot-dir cleanup; `Drop` guarantees the real
         // teardown and neither cleanup error is actionable.
         let _ = vm.shutdown().await;
@@ -1283,22 +1248,13 @@ async fn run_suspend_size<V: Vmm>(
 async fn build_baseline_snapshot<V: Vmm>(
     vmm: &V,
     cfg: &VmConfig,
-    cid: std::sync::Arc<CidAllocator>,
-    allocator: VmidAllocator,
+    env: &HostEnv,
     snap_dir: &Path,
 ) -> Result<(), String> {
-    let mut base = MicroVm::start(
-        vmm,
-        cfg.clone(),
-        cid,
-        allocator,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    base.agent(None, &vmcell::orchestrator::RealClock)
+    let mut base = MicroVm::start(vmm, cfg.clone(), env)
         .await
         .map_err(|e| e.to_string())?;
+    base.agent(None).await.map_err(|e| e.to_string())?;
     base.snapshot(snap_dir).await.map_err(|e| e.to_string())?;
     // Best-effort graceful shutdown of the baseline VM once its snapshot is written;
     // `Drop` guarantees teardown, so a shutdown error must not fail the (successful)
@@ -1324,8 +1280,7 @@ async fn phase_budget_path<V: Vmm>(
     backend: &str,
     args: &Args,
     cfg: &VmConfig,
-    cid: std::sync::Arc<CidAllocator>,
-    allocator: VmidAllocator,
+    env: &HostEnv,
     snap_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let label = if snap_dir.is_some() {
@@ -1350,27 +1305,8 @@ async fn phase_budget_path<V: Vmm>(
         }
         let t0 = Instant::now();
         let vm_res = match &snap_dir {
-            Some(d) => {
-                MicroVm::restore(
-                    vmm,
-                    d,
-                    cfg.clone(),
-                    cid.clone(),
-                    allocator.clone(),
-                    Box::new(vmcell::metrics::DefaultCgroupFs),
-                )
-                .await
-            }
-            None => {
-                MicroVm::start(
-                    vmm,
-                    cfg.clone(),
-                    cid.clone(),
-                    allocator.clone(),
-                    Box::new(vmcell::metrics::DefaultCgroupFs),
-                )
-                .await
-            }
+            Some(d) => MicroVm::restore(vmm, d, cfg.clone(), env).await,
+            None => MicroVm::start(vmm, cfg.clone(), env).await,
         };
         let t_create = t0.elapsed();
         let mut vm = match vm_res {
@@ -1382,10 +1318,7 @@ async fn phase_budget_path<V: Vmm>(
         };
 
         let t1 = Instant::now();
-        let connect_ok = vm
-            .agent(None, &vmcell::orchestrator::RealClock)
-            .await
-            .is_ok();
+        let connect_ok = vm.agent(None).await.is_ok();
         let t_connect = t1.elapsed();
         if !connect_ok {
             println!("phase-budget {label}: iter {i} connect failed");
@@ -1402,7 +1335,7 @@ async fn phase_budget_path<V: Vmm>(
             .unwrap_or_else(|| vec!["cat".into(), "/proc/uptime".into()]);
 
         let t2 = Instant::now();
-        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
+        if let Ok(agent) = vm.agent(None).await {
             // The exec *result* is intentionally unused: this phase measures the
             // exec-round-trip latency (t2..t_exec), not the command's exit/output.
             let _ = agent.exec(ExecRequest::new(argv)).await;
@@ -1455,20 +1388,12 @@ async fn run_phase_budget<V: Vmm>(
         anyhow::bail!("phase-budget: missing artifacts in {dir}");
     }
     let cfg = build_cfg(args, kernel, rootfs, false);
-    let cid = std::sync::Arc::new(CidAllocator::new());
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator;
 
     // Cold-boot path (opt-in budget). A zero-sample cold path is an attempted-and-
     // failed run → propagate (M-BIN-1).
-    phase_budget_path(
-        vmm,
-        backend,
-        args,
-        &cfg,
-        cid.clone(),
-        allocator.clone(),
-        None,
-    )
-    .await?;
+    phase_budget_path(vmm, backend, args, &cfg, &env, None).await?;
 
     // Restore path (the hot path) — build the baseline snapshot once.
     if vmm.capabilities().snapshot_restore {
@@ -1479,20 +1404,10 @@ async fn run_phase_budget<V: Vmm>(
         if let Err(e) = std::fs::create_dir_all(&snap_dir) {
             anyhow::bail!("phase-budget: cannot create snap dir: {e}");
         }
-        let baseline =
-            build_baseline_snapshot(vmm, &cfg, cid.clone(), allocator.clone(), &snap_dir).await;
+        let baseline = build_baseline_snapshot(vmm, &cfg, &env, &snap_dir).await;
         let restore_res = match baseline {
             Ok(()) => {
-                phase_budget_path(
-                    vmm,
-                    backend,
-                    args,
-                    &cfg,
-                    cid.clone(),
-                    allocator.clone(),
-                    Some(snap_dir.clone()),
-                )
-                .await
+                phase_budget_path(vmm, backend, args, &cfg, &env, Some(snap_dir.clone())).await
             }
             Err(e) => Err(anyhow::anyhow!(
                 "phase-budget: baseline snapshot failed: {e}"
@@ -1524,22 +1439,15 @@ async fn run_vsock_rtt<V: Vmm>(
         anyhow::bail!("vsock-rtt: missing artifacts in {dir}");
     }
     let cfg = build_cfg(args, kernel, rootfs, false);
-    let cid = std::sync::Arc::new(CidAllocator::new());
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator;
     let iters = args.iters();
 
-    let mut vm = match MicroVm::start(
-        vmm,
-        cfg,
-        cid,
-        allocator,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    {
+    let mut vm = match MicroVm::start(vmm, cfg, &env).await {
         Ok(v) => v,
         Err(e) => anyhow::bail!("vsock-rtt: boot failed: {e}"),
     };
-    if let Err(e) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
+    if let Err(e) = vm.agent(None).await {
         // Best-effort teardown before bailing; `Drop` guarantees teardown.
         let _ = vm.shutdown().await;
         anyhow::bail!("vsock-rtt: agent connect failed: {e}");
@@ -1547,7 +1455,7 @@ async fn run_vsock_rtt<V: Vmm>(
     let argv = pick_exec_cmd(&mut vm).await;
 
     for _ in 0..args.warmup {
-        if let Ok(agent) = vm.agent(None, &vmcell::orchestrator::RealClock).await {
+        if let Ok(agent) = vm.agent(None).await {
             // Warmup iteration: the exec result is discarded on purpose (it primes
             // caches / the vsock path and is not part of the measured sample).
             let _ = agent.exec(ExecRequest::new(argv.clone())).await;
@@ -1559,7 +1467,7 @@ async fn run_vsock_rtt<V: Vmm>(
     // `if r.is_ok()` drop, and surface the error rather than a bare `break`.
     let mut dropped = 0usize;
     for i in 0..iters {
-        let agent = match vm.agent(None, &vmcell::orchestrator::RealClock).await {
+        let agent = match vm.agent(None).await {
             Ok(a) => a,
             Err(e) => {
                 println!("vsock-rtt: iteration {i} agent-connect failed: {e}");

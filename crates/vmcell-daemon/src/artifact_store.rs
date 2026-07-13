@@ -63,6 +63,14 @@ impl ArtifactStore {
     /// - [`DaemonError::Internal`] — an I/O failure while writing or renaming.
     pub fn create(&self, name: &str, bytes: &[u8]) -> Result<ArtifactInfo, DaemonError> {
         let path = self.path_for(name)?;
+        // The `.sha256` suffix is reserved for digest sidecars (delta 10); an artifact with that
+        // name would shadow a real artifact's sidecar and vanish from `list`. Reject before disk
+        // (a 400, not a name-syntax error — the name is well-formed, just reserved).
+        if name.ends_with(SHA256_SIDECAR_SUFFIX) {
+            return Err(DaemonError::BadRequest(format!(
+                "artifact name {name:?} must not end in `{SHA256_SIDECAR_SUFFIX}` (reserved for digest sidecars)"
+            )));
+        }
         if bytes.len() as u64 > self.max_bytes {
             return Err(DaemonError::PayloadTooLarge(format!(
                 "artifact {name:?} is {} bytes; the per-upload cap is {} bytes",
@@ -95,10 +103,16 @@ impl ArtifactStore {
                 DaemonError::Internal(format!("cannot persist artifact {name:?}: {}", e.error))
             }
         })?;
+        // Compute the digest ONCE, at upload, and persist it in a `<name>.sha256` sidecar so
+        // `list`/`info` read it back in O(1) instead of re-hashing the whole body (delta 10,
+        // §11.3). The sidecar path is derived from the already-validated `path`, never from client
+        // input, so it stays anchored inside the artifacts dir.
+        let digest = hex_sha256(bytes);
+        write_sidecar(&path, &digest)?;
         Ok(ArtifactInfo {
             name: name.to_string(),
             size_bytes: bytes.len() as u64,
-            sha256: hex_sha256(bytes),
+            sha256: digest,
         })
     }
 
@@ -132,6 +146,11 @@ impl ArtifactStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            // Digest sidecars (delta 10) are internal bookkeeping, never bootable artifacts —
+            // exclude them from `list` output (create() forbids a client artifact of that name).
+            if name.ends_with(SHA256_SIDECAR_SUFFIX) {
+                continue;
+            }
             // Only names that would pass the predicate (so a NamedTempFile leftover `.tmp…` or an
             // out-of-band bad name is not offered as a bootable artifact).
             if self.path_for(&name).is_err() {
@@ -156,17 +175,75 @@ impl ArtifactStore {
             return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
         }
         std::fs::remove_file(&path)
-            .map_err(|e| DaemonError::Internal(format!("cannot delete artifact {name:?}: {e}")))
+            .map_err(|e| DaemonError::Internal(format!("cannot delete artifact {name:?}: {e}")))?;
+        // Best-effort: drop the digest sidecar too, so a later re-create writes a fresh one and
+        // `list` never surfaces an orphaned sidecar (delta 10).
+        let _ = std::fs::remove_file(sidecar_path(&path));
+        Ok(())
     }
 }
 
+/// The reserved suffix for digest sidecars (delta 10, §11.3). `<artifact>.sha256` holds the hex
+/// SHA-256 computed once at upload so `list`/`info` read it back in O(1) instead of re-hashing the
+/// whole body on every call. A client cannot create an artifact whose name ends in this suffix (it
+/// would shadow a real artifact's sidecar and vanish from `list`).
+const SHA256_SIDECAR_SUFFIX: &str = ".sha256";
+
+/// The sidecar path for an artifact, derived by **appending** the suffix to the already-validated,
+/// dir-anchored artifact path. `with_extension` would REPLACE (`rootfs.erofs` -> `rootfs.sha256`)
+/// and collide across artifacts, so append. Anchored on trusted data (the resolved path), never on
+/// client input (invariant §12.13).
+fn sidecar_path(artifact_path: &Path) -> PathBuf {
+    let mut s = artifact_path.as_os_str().to_owned();
+    s.push(SHA256_SIDECAR_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Writes the digest sidecar atomically (temp + rename in the same dir), overwriting any stale
+/// one. A truncated sidecar never survives a crash; a missing sidecar is tolerated by readers.
+fn write_sidecar(artifact_path: &Path, digest: &str) -> Result<(), DaemonError> {
+    let sidecar = sidecar_path(artifact_path);
+    let dir = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
+        DaemonError::Internal(format!("cannot create sidecar temp in {dir:?}: {e}"))
+    })?;
+    tmp.write_all(digest.as_bytes())
+        .map_err(|e| DaemonError::Internal(format!("cannot write sidecar {sidecar:?}: {e}")))?;
+    tmp.flush()
+        .map_err(|e| DaemonError::Internal(format!("cannot flush sidecar {sidecar:?}: {e}")))?;
+    tmp.persist(&sidecar).map_err(|e| {
+        DaemonError::Internal(format!("cannot persist sidecar {sidecar:?}: {}", e.error))
+    })?;
+    Ok(())
+}
+
+/// Reads an artifact's digest sidecar. `None` if absent or corrupt (not exactly 64 lowercase hex
+/// chars) — the reader then falls back to a one-time body re-hash.
+fn read_sidecar(artifact_path: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(sidecar_path(artifact_path)).ok()?;
+    let s = s.trim();
+    (s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_string())
+}
+
 fn artifact_info(name: &str, path: &Path) -> Result<ArtifactInfo, DaemonError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| DaemonError::Internal(format!("cannot read artifact {name:?}: {e}")))?;
+    // Size from metadata (no body read); digest from the sidecar written at upload (delta 10) —
+    // re-hashing the body only for a legacy/out-of-band artifact that has no sidecar. This is what
+    // makes `list` O(entries) instead of O(store bytes).
+    let meta = std::fs::metadata(path)
+        .map_err(|e| DaemonError::Internal(format!("cannot stat artifact {name:?}: {e}")))?;
+    let sha256 = match read_sidecar(path) {
+        Some(d) => d,
+        None => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                DaemonError::Internal(format!("cannot read artifact {name:?}: {e}"))
+            })?;
+            hex_sha256(&bytes)
+        }
+    };
     Ok(ArtifactInfo {
         name: name.to_string(),
-        size_bytes: bytes.len() as u64,
-        sha256: hex_sha256(&bytes),
+        size_bytes: meta.len(),
+        sha256,
     })
 }
 
@@ -270,6 +347,82 @@ mod tests {
         assert!(
             stray.is_empty(),
             "no temp residue after a successful create"
+        );
+    }
+
+    // Delta 10 gate: a `<name>.sha256` sidecar is written at upload and matches a fresh (streamed)
+    // hash of the bytes. RED on the inverse (a store that never writes the sidecar).
+    #[test]
+    fn create_writes_matching_sha256_sidecar() {
+        let (_d, store) = store();
+        let info = store.create("k", b"kernel-bytes").expect("create");
+        let sidecar = store.dir().join("k.sha256");
+        let on_disk = std::fs::read_to_string(&sidecar).expect("sidecar written at upload");
+        assert_eq!(
+            on_disk.trim(),
+            info.sha256,
+            "sidecar must hold the digest returned by create"
+        );
+        assert_eq!(
+            info.sha256,
+            hex_sha256(b"kernel-bytes"),
+            "and that digest is a real SHA-256 of the bytes"
+        );
+    }
+
+    // Delta 10 gate: `info` (and `list`) read the digest FROM the sidecar, never by re-hashing the
+    // body. RED on the inverse (a store that re-hashes the body on every read): corrupting only the
+    // sidecar to a different well-formed digest would be ignored and the body hash returned instead.
+    #[test]
+    fn info_reads_digest_from_sidecar_not_the_body() {
+        let (_d, store) = store();
+        store.create("k", b"body").expect("create");
+        let bogus = "a".repeat(64); // well-formed but wrong
+        std::fs::write(store.dir().join("k.sha256"), &bogus).expect("overwrite sidecar");
+        let info = store.info("k").expect("info");
+        assert_eq!(
+            info.sha256, bogus,
+            "info must serve the sidecar digest, not re-hash the body"
+        );
+    }
+
+    // Delta 10: `.sha256` sidecars never appear as artifacts, and a client cannot create a
+    // `.sha256`-suffixed name (it would shadow a real artifact's sidecar).
+    #[test]
+    fn list_excludes_sidecars_and_rejects_reserved_suffix() {
+        let (_d, store) = store();
+        store.create("a", b"1").expect("a");
+        store.create("b", b"22").expect("b");
+        let names: Vec<String> = store
+            .list()
+            .expect("list")
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a".to_string(), "b".to_string()],
+            "sidecars excluded"
+        );
+        assert!(matches!(
+            store.create("evil.sha256", b"x"),
+            Err(DaemonError::BadRequest(_))
+        ));
+    }
+
+    // Delta 10 residue: delete removes the sidecar too — no orphaned digest survives.
+    #[test]
+    fn delete_removes_the_sidecar() {
+        let (_d, store) = store();
+        store.create("r", b"rootfs").expect("create");
+        assert!(
+            store.dir().join("r.sha256").is_file(),
+            "sidecar exists before delete"
+        );
+        store.delete("r").expect("delete");
+        assert!(
+            !store.dir().join("r.sha256").exists(),
+            "sidecar gone after delete"
         );
     }
 }

@@ -57,6 +57,11 @@ pub mod artifact;
 #[cfg(feature = "host-common")]
 pub mod config;
 
+/// The process-wide seam bundle (`HostEnv`), threaded by reference to every VM-spawning entry point
+/// (§9.3, design §18 deltas 1–2).
+#[cfg(feature = "host-common")]
+pub mod env;
+
 /// CPU-frequency pinning for benchmark noise-floor discipline.
 #[cfg(feature = "host-common")]
 pub mod cpufreq;
@@ -64,6 +69,10 @@ pub mod cpufreq;
 /// virtio-fs daemon implementation.
 #[cfg(feature = "host-common")]
 pub mod fs;
+
+/// The one-probe host-capability descriptor (`HostCapabilities`), §7.2 / design §18 delta 8.
+#[cfg(feature = "host-common")]
+pub mod hostcaps;
 
 /// Resource usage metrics collection.
 #[cfg(feature = "host-common")]
@@ -111,7 +120,11 @@ pub use config::{
     BlockDevice, ConsoleMode, DiskIoLimit, KernelVerbosity, NetConfig, ResourceLimits, Share,
     Timeouts, VmConfig,
 };
+#[cfg(feature = "host-common")]
+pub use env::HostEnv;
 pub use error::{Error, Result};
+#[cfg(feature = "host-common")]
+pub use hostcaps::HostCapabilities;
 #[cfg(feature = "host-common")]
 pub use lineage::{Lineage, LineageAllocator, LineageId};
 #[cfg(feature = "host-common")]

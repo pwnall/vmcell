@@ -29,13 +29,12 @@
 //! confusing socket collision.
 
 use crate::config::VmConfig;
+use crate::env::HostEnv;
 use crate::error::{Error, Result};
-use crate::metrics::CgroupFs;
-use crate::orchestrator::{MicroVm, VmidAllocator};
+use crate::orchestrator::MicroVm;
 use crate::reflink::CowSupport;
-use crate::vmm::{CidAllocator, Vmm};
+use crate::vmm::Vmm;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// A suspended VM image from which many identical clones are minted cheaply.
 ///
@@ -47,8 +46,8 @@ use std::sync::Arc;
 ///
 /// The zygote ignores any [`VmConfig::vmid`] on the config it was built with:
 /// every clone is allocated a **fresh** vmid so clones get distinct IP/MAC
-/// identities and never collide (§9.2). Pass a *shared* [`VmidAllocator`] (and
-/// [`CidAllocator`]) to the spawn methods so N clones draw N distinct ids.
+/// identities and never collide (§9.2). Pass the process-wide [`HostEnv`] to the
+/// spawn methods so N clones draw N distinct ids and share one `OverlayStore` (S4).
 #[derive(Debug, Clone)]
 pub struct Zygote {
     /// The immutable master snapshot dir. Clones CoW-copy from it; it is never
@@ -57,10 +56,6 @@ pub struct Zygote {
     /// The snapshot-eligible config clones restore with (with `vmid` cleared so
     /// each clone allocates a fresh one).
     cfg: VmConfig,
-    /// The seam each clone's copy-on-write copy is materialized through (§21.2).
-    /// Defaults to [`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore);
-    /// override with [`Zygote::with_overlay_store`].
-    store: Arc<dyn crate::overlay::OverlayStore>,
 }
 
 impl Zygote {
@@ -75,7 +70,7 @@ impl Zygote {
     ///
     /// # Errors
     /// [`Error::Unsupported`] if `cfg` is not snapshot-eligible (carries a
-    /// vhost-user device — a virtio-fs rootfs/share or unprivileged networking,
+    /// vhost-user device — a virtio-fs data share or unprivileged networking,
     /// §12.1); otherwise any error from taking the snapshot.
     pub async fn suspend<V: Vmm>(
         vm: &mut MicroVm<V>,
@@ -114,26 +109,7 @@ impl Zygote {
         // Clones always get a fresh vmid; the zygote's own vmid (if any) describes
         // the ancestor, not its children (§9.4).
         cfg.vmid = None;
-        Self {
-            master_dir,
-            cfg,
-            store: Arc::new(crate::overlay::ReflinkOverlayStore),
-        }
-    }
-
-    /// Uses `store` to materialize each clone's copy-on-write copy instead of the
-    /// default [`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore) (§21.2).
-    #[must_use]
-    pub fn with_overlay_store(mut self, store: Arc<dyn crate::overlay::OverlayStore>) -> Self {
-        self.store = store;
-        self
-    }
-
-    /// The [`OverlayStore`](crate::overlay::OverlayStore) this zygote's clones
-    /// materialize through — propagated to a branch node so a whole lineage shares
-    /// one store (§21.4).
-    pub(crate) fn overlay_store(&self) -> Arc<dyn crate::overlay::OverlayStore> {
-        self.store.clone()
+        Self { master_dir, cfg }
     }
 
     /// The immutable master snapshot directory.
@@ -167,23 +143,8 @@ impl Zygote {
     ///
     /// # Errors
     /// Any error from the copy-on-write copy, network setup, or restore (§9.4).
-    pub async fn spawn_clone<V: Vmm>(
-        &self,
-        vmm: &V,
-        cid_alloc: Arc<CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        cgroup_fs: Box<dyn CgroupFs>,
-    ) -> Result<MicroVm<V>> {
-        let (vm, cow) = MicroVm::restore_cow(
-            vmm,
-            &self.master_dir,
-            self.cfg.clone(),
-            cid_alloc,
-            vmid_alloc,
-            cgroup_fs,
-            self.store.clone(),
-        )
-        .await?;
+    pub async fn spawn_clone<V: Vmm>(&self, vmm: &V, env: &HostEnv) -> Result<MicroVm<V>> {
+        let (vm, cow) = MicroVm::restore_cow(vmm, &self.master_dir, self.cfg.clone(), env).await?;
         tracing::debug!(
             cow = ?cow,
             master = %self.master_dir.display(),
@@ -195,10 +156,10 @@ impl Zygote {
     /// Mints `count` clones **concurrently**, each from its own copy-on-write copy
     /// of the master image, and returns them once all are live and resumed.
     ///
-    /// `make_cgroups` is called `count` times to build one [`CgroupFs`] per clone
-    /// (the common case is `|| Box::new(DefaultCgroupFs)`). Pass a *shared*
-    /// `vmid_alloc`/`cid_alloc` so the clones draw distinct vmids (hence distinct
-    /// IP/MAC) and CIDs.
+    /// Each clone draws its vmid/CID and its cgroup backend from the process-wide
+    /// [`HostEnv`], and materializes its private copy-on-write copy through
+    /// `env.overlay` (invariant S4) — so the clones get distinct vmids (hence
+    /// distinct IP/MAC) and CIDs from one shared, process-global source.
     ///
     /// **All-or-nothing:** if any clone fails, the ones that already came up are
     /// torn down (their ordered `Drop`, §12.10) and the first error is returned —
@@ -209,18 +170,12 @@ impl Zygote {
     /// host paths on restore (`restore_rotates_host_paths == false`, e.g.
     /// Firecracker) — concurrent clones would fight over one baked host path
     /// (§9.4). Otherwise, the first clone error (copy, network, or restore).
-    pub async fn spawn_clones<V, F>(
+    pub async fn spawn_clones<V: Vmm>(
         &self,
         vmm: &V,
         count: usize,
-        cid_alloc: Arc<CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        mut make_cgroups: F,
-    ) -> Result<Vec<MicroVm<V>>>
-    where
-        V: Vmm,
-        F: FnMut() -> Box<dyn CgroupFs>,
-    {
+        env: &HostEnv,
+    ) -> Result<Vec<MicroVm<V>>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -240,20 +195,12 @@ impl Zygote {
             });
         }
 
-        // Build one cgroup handle per clone up front (the factory is not `Send`
-        // across the concurrent restores), then restore all clones concurrently.
-        let cgroups: Vec<Box<dyn CgroupFs>> = (0..count).map(|_| make_cgroups()).collect();
-        let futs = cgroups.into_iter().map(|cg| {
-            MicroVm::restore_cow(
-                vmm,
-                &self.master_dir,
-                self.cfg.clone(),
-                cid_alloc.clone(),
-                vmid_alloc.clone(),
-                cg,
-                self.store.clone(),
-            )
-        });
+        // Restore all clones concurrently. Each draws its own fresh vmid/CID from
+        // the shared allocators in `env` (internally synchronized) and materializes
+        // its private CoW copy through `env.overlay` — one store for the whole
+        // process, no per-clone injection (invariant S4).
+        let futs =
+            (0..count).map(|_| MicroVm::restore_cow(vmm, &self.master_dir, self.cfg.clone(), env));
         let results = futures::future::join_all(futs).await;
 
         // All-or-nothing: gather the live clones; on the first error, drop the
@@ -298,9 +245,7 @@ impl Zygote {
 /// in hand). Rejecting here avoids minting copy-on-write copies for a pool that
 /// could never restore.
 fn check_clone_eligible(cfg: &VmConfig) -> Result<()> {
-    let feature = if matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
-        Some("a virtio-fs rootfs (vhost-user device)")
-    } else if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
+    let feature = if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
         Some("unprivileged (vhost-user-net) networking")
     } else if !cfg.shares.is_empty() {
         Some("a virtio-fs data share (vhost-user device)")
@@ -322,9 +267,11 @@ fn check_clone_eligible(cfg: &VmConfig) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::RootfsSource;
-    use crate::metrics::FakeCgroupFs;
+    use crate::metrics::CgroupFs;
+    use crate::orchestrator::VmidAllocator;
     use crate::vmm::{FakeVmInstance, PerVmResources, VmmCapabilities};
     use std::collections::HashSet;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -418,6 +365,8 @@ mod tests {
                 vsock_path: snapshot_dir.join("vsock.sock"),
                 serial: snapshot_dir.join("serial.log"),
                 calls: self.instance_calls.clone(),
+                faults: Default::default(),
+                control_plane_probes: Default::default(),
             })
         }
 
@@ -473,13 +422,13 @@ mod tests {
         let zygote = Zygote::from_snapshot_dir(master.clone(), erofs_cfg())
             .await
             .expect("build zygote");
-        let cid_alloc = Arc::new(CidAllocator::new());
-        let vmid_alloc = shared_vmids();
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
 
         let clones = zygote
-            .spawn_clones(&vmm, 4, cid_alloc, vmid_alloc, || {
-                Box::new(FakeCgroupFs::new())
-            })
+            .spawn_clones(&vmm, 4, &env)
             .await
             .expect("fan-out of 4 clones");
         assert_eq!(clones.len(), 4);
@@ -526,15 +475,13 @@ mod tests {
         let zygote = Zygote::from_snapshot_dir(master, erofs_cfg())
             .await
             .expect("build zygote");
-        let cid_alloc = Arc::new(CidAllocator::new());
-        let vmid_alloc = shared_vmids();
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
 
         // > 1 concurrent clone is rejected, typed.
-        let many = zygote
-            .spawn_clones(&vmm, 3, cid_alloc.clone(), vmid_alloc.clone(), || {
-                Box::new(FakeCgroupFs::new())
-            })
-            .await;
+        let many = zygote.spawn_clones(&vmm, 3, &env).await;
         assert!(
             matches!(many, Err(Error::Unsupported { .. })),
             "concurrent fan-out on a non-rotating backend must be Unsupported, got {many:?}"
@@ -542,9 +489,7 @@ mod tests {
 
         // Exactly one clone is fine even without host-path rotation.
         let one = zygote
-            .spawn_clones(&vmm, 1, cid_alloc, vmid_alloc, || {
-                Box::new(FakeCgroupFs::new())
-            })
+            .spawn_clones(&vmm, 1, &env)
             .await
             .expect("a single clone is allowed on any backend");
         assert_eq!(one.len(), 1);
@@ -560,14 +505,12 @@ mod tests {
         let zygote = Zygote::from_snapshot_dir(master, erofs_cfg())
             .await
             .expect("build zygote");
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
         let clones = zygote
-            .spawn_clones(
-                &vmm,
-                0,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                || Box::new(FakeCgroupFs::new()),
-            )
+            .spawn_clones(&vmm, 0, &env)
             .await
             .expect("zero clones");
         assert!(clones.is_empty());
@@ -589,15 +532,11 @@ mod tests {
         let zygote = Zygote::from_snapshot_dir(master.clone(), erofs_cfg())
             .await
             .expect("build zygote");
-        let vm = zygote
-            .spawn_clone(
-                &vmm,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
-            .await
-            .expect("single clone");
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+        let vm = zygote.spawn_clone(&vmm, &env).await.expect("single clone");
         let _ = vm.vmid();
         let dirs = vmm.restore_dirs.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(dirs.len(), 1);
@@ -663,15 +602,11 @@ mod tests {
             .await
             .expect("build zygote");
 
-        let res = zygote
-            .spawn_clones(
-                &vmm,
-                4,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                || Box::new(FakeCgroupFs::new()),
-            )
-            .await;
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+        let res = zygote.spawn_clones(&vmm, 4, &env).await;
         assert!(
             matches!(res, Err(Error::Vmm(_))),
             "the injected restore failure must surface as the pool error, got {res:?}"
@@ -695,29 +630,6 @@ mod tests {
             drops, resumes,
             "every clone that came up must be torn down on the failure path (no leak); \
              timeline: {calls:?}"
-        );
-    }
-
-    // Fail-fast eligibility, VirtioFs-rootfs arm: rejected at construction before any
-    // copy. The inverse (deleting the rootfs arm of `check_clone_eligible`) goes red.
-    #[tokio::test]
-    async fn virtio_fs_rootfs_rejected_at_construction() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let master = root.path().join("zygote");
-        write_master(&master);
-        let cfg = VmConfig::builder(
-            PathBuf::from("/vmlinux"),
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/srv/rootfs"),
-            },
-        )
-        .network_disabled()
-        .build()
-        .expect("a non-snapshotting virtio-fs-rootfs config builds");
-        let res = Zygote::from_snapshot_dir(master, cfg).await;
-        assert!(
-            matches!(res, Err(Error::Unsupported { .. })),
-            "a virtio-fs rootfs (vhost-user) must be rejected at construction, got {res:?}"
         );
     }
 

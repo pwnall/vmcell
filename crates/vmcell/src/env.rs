@@ -1,0 +1,104 @@
+//! The process-wide seam bundle (`HostEnv`).
+//!
+//! Every injected seam that is process-global — or that every VM in a process shares — lives in one
+//! struct, built **once** per process and passed by reference to every spawn entry point
+//! ([`MicroVm::start`](crate::MicroVm::start)/[`restore`](crate::MicroVm::restore)/
+//! [`restore_cow`](crate::MicroVm::restore_cow), [`Zygote::spawn_clone`](crate::Zygote::spawn_clone)/
+//! [`spawn_clones`](crate::Zygote::spawn_clones), [`Lineage::fork`](crate::Lineage::fork)/
+//! [`fork_many`](crate::Lineage::fork_many)).
+//!
+//! Bundling the allocators with the `CgroupFs`, `Clock`, and `OverlayStore` seams gives every spawn
+//! **one** parameter instead of the three-to-five positional injected arguments that grew by one per
+//! feature, removes the per-clone `make_cgroups` closures from the fan-out APIs, and lets `agent()`
+//! drop its clock seam (the post-restore resync reads the clock captured here at construction). This
+//! bundle is directed by design §18 (deltas 1–2) and is the one breaking change of the 0.10 pass.
+//!
+//! The allocators are process-global **by design**: under `cargo test`'s in-process parallelism,
+//! per-test allocators hand concurrent tests identical IDs and collide on temp-dir paths and socket
+//! names. [`HostEnv::shared`] is the productized pair (the daemon is its natural single home, §11.1);
+//! [`HostEnv::hermetic`] gives in-process allocators for tests, which substitute recording fakes
+//! field-by-field (every field is `pub`).
+//!
+//! One law follows (invariant S4): **every** copy-on-write clone materializes through
+//! [`HostEnv::overlay`] — there is no second way to inject a store that could drift from the one the
+//! rest of the process uses.
+
+use std::sync::Arc;
+
+use crate::metrics::{CgroupFs, DefaultCgroupFs};
+use crate::orchestrator::{Clock, RealClock, VmidAllocator};
+use crate::overlay::{OverlayStore, ReflinkOverlayStore};
+use crate::vmm::CidAllocator;
+
+/// The process-wide seam bundle passed by reference to every VM-spawning entry point.
+///
+/// Build one at start-up ([`shared`](HostEnv::shared) in production, [`hermetic`](HostEnv::hermetic)
+/// in tests) and thread `&env` everywhere. The fields are `pub` so a test can substitute a recording
+/// fake for any single seam over [`hermetic`](HostEnv::hermetic)'s in-process defaults.
+///
+/// `#[non_exhaustive]`: this bundle is designed to **grow** — a new process-global seam is added as a
+/// field here, not as a new positional argument on every spawn signature.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct HostEnv {
+    /// The CID allocator (guest vsock context IDs, `3..=254`).
+    pub cids: Arc<CidAllocator>,
+    /// The VMID allocator (`1..=254`; `shared()` for cross-process uniqueness, `new()` hermetic).
+    pub vmids: VmidAllocator,
+    /// The cgroup-v2 backend every VM's slice is created/limited/read through.
+    pub cgroups: Arc<dyn CgroupFs>,
+    /// The clock that drives the mandatory first post-restore resync (§8.2). The `+ RefUnwindSafe`
+    /// bound keeps `HostEnv` (and anything embedding it) `UnwindSafe`/`RefUnwindSafe` — a bare
+    /// `dyn Clock` trait object silently drops those auto-traits; both `Clock` impls satisfy it.
+    pub clock: Arc<dyn Clock + std::panic::RefUnwindSafe>,
+    /// The seam every copy-on-write clone materializes through (invariant S4, §8.4).
+    pub overlay: Arc<dyn OverlayStore>,
+}
+
+impl std::fmt::Debug for HostEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Clock` is not `Debug` (it is a minimal `Send + Sync` seam), so the bundle prints its
+        // `Debug`-able seams and elides the clock rather than deriving.
+        f.debug_struct("HostEnv")
+            .field("cids", &self.cids)
+            .field("vmids", &self.vmids)
+            .field("cgroups", &self.cgroups)
+            .field("overlay", &self.overlay)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostEnv {
+    /// The production bundle: a cross-process [`VmidAllocator::shared`] (so several processes on one
+    /// host draw distinct VMIDs), a fresh [`CidAllocator`], the real sysfs [`DefaultCgroupFs`], a
+    /// [`RealClock`], and the default [`ReflinkOverlayStore`].
+    ///
+    /// # Errors
+    /// Currently infallible, but returns [`Result`](crate::Result) so a future fallible start-up
+    /// probe (e.g. the §11 daemon's one-time host-capability check) can be folded in without a
+    /// signature break.
+    pub fn shared() -> crate::Result<Self> {
+        Ok(Self {
+            cids: Arc::new(CidAllocator::new()),
+            vmids: VmidAllocator::shared(),
+            cgroups: Arc::new(DefaultCgroupFs),
+            clock: Arc::new(RealClock),
+            overlay: Arc::new(ReflinkOverlayStore),
+        })
+    }
+
+    /// The hermetic bundle for tests: **in-process** allocators (no cross-process `/tmp` lock files),
+    /// plus the same real `CgroupFs`/`Clock`/`OverlayStore` defaults. A unit test substitutes a
+    /// recording fake for any field it asserts on (the fields are `pub`), e.g.
+    /// `HostEnv { cgroups: Arc::new(FakeCgroupFs::new()), ..HostEnv::hermetic() }`.
+    #[must_use]
+    pub fn hermetic() -> Self {
+        Self {
+            cids: Arc::new(CidAllocator::new()),
+            vmids: VmidAllocator::new(),
+            cgroups: Arc::new(DefaultCgroupFs),
+            clock: Arc::new(RealClock),
+            overlay: Arc::new(ReflinkOverlayStore),
+        }
+    }
+}

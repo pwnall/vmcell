@@ -37,17 +37,10 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Cap the host cgroup well below guest RAM.
     cfg.limits.mem_max_mib = Some(256);
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start VM");
 
     // Wait a bit for the VM to boot and consume some memory.
     sleep(Duration::from_secs(2)).await;
@@ -106,17 +99,17 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     );
     assert!(stats_before.mem_peak_mib > 0, "Peak memory should be > 0");
     // §7.1 rule 3: the read path must honestly report enforcement. The controller is
-    // delegated here (memory.max read back above), so limits_enforced must be true; a
+    // delegated here (memory.max read back above), so mem_limit_enforced must be true; a
     // read path that never sets the flag leaves it false and this goes red.
     assert!(
-        stats_before.limits_enforced,
-        "memory controller delegated but ResourceUsage::limits_enforced is false"
+        stats_before.mem_limit_enforced,
+        "memory controller delegated but ResourceUsage::mem_limit_enforced is false"
     );
 
     // Test CPU average computation.
     let start_time = std::time::Instant::now();
     let cpu_test_outcome = vm
-        .agent(None, &vmcell::orchestrator::RealClock)
+        .agent(None)
         .await
         .unwrap()
         .exec(vmcell::agent::protocol::ExecRequest::new(vec![

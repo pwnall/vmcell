@@ -18,12 +18,11 @@
 //! one home for all of it (AGENTS.md "one law, one predicate").
 
 use crate::config::VmConfig;
+use crate::env::HostEnv;
 use crate::error::Result;
-use crate::metrics::CgroupFs;
-use crate::orchestrator::{MicroVm, VmidAllocator};
-use crate::overlay::OverlayStore;
+use crate::orchestrator::MicroVm;
 use crate::reflink::CowSupport;
-use crate::vmm::{CidAllocator, Vmm};
+use crate::vmm::Vmm;
 use crate::zygote::Zygote;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -117,10 +116,11 @@ impl Lineage {
     /// Roots a lineage by **suspending** a live, agent-ready VM into `dir`
     /// (generation 0, no parent).
     ///
-    /// `cfg` must be the snapshot-eligible config `vm` was created with; `store` is
-    /// the [`OverlayStore`] this lineage's clones materialize their copy-on-write
-    /// copies through (§21.2). `dir` is **created if it does not exist** (the
-    /// backend writes the suspend image into it); the caller owns its lifecycle.
+    /// `cfg` must be the snapshot-eligible config `vm` was created with. Clones
+    /// materialize their copy-on-write copies through the process-wide `env.overlay`
+    /// supplied at [`fork`](Lineage::fork) time (invariant S4 — one store for the
+    /// whole process). `dir` is **created if it does not exist** (the backend writes
+    /// the suspend image into it); the caller owns its lifecycle.
     ///
     /// # Errors
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) if `cfg` is not
@@ -131,7 +131,6 @@ impl Lineage {
         cfg: VmConfig,
         dir: impl Into<PathBuf>,
         allocator: LineageAllocator,
-        store: Arc<dyn OverlayStore>,
     ) -> Result<Self> {
         let dir = dir.into();
         // The backend writes the suspend image into `dir`, which must exist first
@@ -140,9 +139,7 @@ impl Lineage {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(crate::error::Error::Io)?;
-        let zygote = Zygote::suspend(vm, cfg, dir)
-            .await?
-            .with_overlay_store(store);
+        let zygote = Zygote::suspend(vm, cfg, dir).await?;
         Ok(Self::root(zygote, allocator))
     }
 
@@ -157,11 +154,8 @@ impl Lineage {
         dir: impl Into<PathBuf>,
         cfg: VmConfig,
         allocator: LineageAllocator,
-        store: Arc<dyn OverlayStore>,
     ) -> Result<Self> {
-        let zygote = Zygote::from_snapshot_dir(dir, cfg)
-            .await?
-            .with_overlay_store(store);
+        let zygote = Zygote::from_snapshot_dir(dir, cfg).await?;
         Ok(Self::root(zygote, allocator))
     }
 
@@ -242,16 +236,8 @@ impl Lineage {
     ///
     /// # Errors
     /// Any error from the copy-on-write copy, network setup, or restore (§9.4).
-    pub async fn fork<V: Vmm>(
-        &self,
-        vmm: &V,
-        cid_alloc: Arc<CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        cgroup_fs: Box<dyn CgroupFs>,
-    ) -> Result<MicroVm<V>> {
-        self.zygote
-            .spawn_clone(vmm, cid_alloc, vmid_alloc, cgroup_fs)
-            .await
+    pub async fn fork<V: Vmm>(&self, vmm: &V, env: &HostEnv) -> Result<MicroVm<V>> {
+        self.zygote.spawn_clone(vmm, env).await
     }
 
     /// Mints `count` live children **concurrently** at this node.
@@ -264,21 +250,13 @@ impl Lineage {
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) when `count > 1` and
     /// the backend does not rotate host paths on restore (§9.4); otherwise the
     /// first clone error.
-    pub async fn fork_many<V, F>(
+    pub async fn fork_many<V: Vmm>(
         &self,
         vmm: &V,
         count: usize,
-        cid_alloc: Arc<CidAllocator>,
-        vmid_alloc: VmidAllocator,
-        make_cgroups: F,
-    ) -> Result<Vec<MicroVm<V>>>
-    where
-        V: Vmm,
-        F: FnMut() -> Box<dyn CgroupFs>,
-    {
-        self.zygote
-            .spawn_clones(vmm, count, cid_alloc, vmid_alloc, make_cgroups)
-            .await
+        env: &HostEnv,
+    ) -> Result<Vec<MicroVm<V>>> {
+        self.zygote.spawn_clones(vmm, count, env).await
     }
 
     /// **branch():** freezes a RUNNING descendant `child` into a **new** lineage
@@ -287,8 +265,9 @@ impl Lineage {
     ///
     /// Snapshots `child` into `dir` and returns the new node; `child` stays live and
     /// the caller owns `dir`'s lifecycle (like a zygote master, §12.12). `dir` is
-    /// **created if it does not exist**. The new node shares this node's
-    /// [`OverlayStore`], so a whole lineage uses one seam. Snapshot-eligibility
+    /// **created if it does not exist**. Every node's clones materialize through the
+    /// process-wide `env.overlay` supplied at [`fork`](Lineage::fork) time, so a
+    /// whole lineage uses one seam by construction (invariant S4). Snapshot-eligibility
     /// (§12.1) is re-checked through the same `check_clone_eligible` predicate the
     /// zygote uses (one law).
     ///
@@ -308,11 +287,11 @@ impl Lineage {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(crate::error::Error::Io)?;
-        // `Zygote::suspend` re-checks eligibility (§12.1) and snapshots the child;
-        // propagate this node's overlay store so the whole lineage uses one seam.
-        let zygote = Zygote::suspend(child, self.zygote.config().clone(), dir)
-            .await?
-            .with_overlay_store(self.zygote.overlay_store());
+        // `Zygote::suspend` re-checks eligibility (§12.1) and snapshots the child.
+        // The overlay store is no longer carried on the node — it is supplied from
+        // `env.overlay` at fork time (invariant S4), so the whole lineage shares one
+        // store by construction.
+        let zygote = Zygote::suspend(child, self.zygote.config().clone(), dir).await?;
         let id = self.allocator.next();
         // ancestry(child) = ancestry(self) ++ [self.id]  — root..parent inclusive.
         let mut ancestry = self.ancestry.to_vec();
@@ -335,7 +314,7 @@ impl Lineage {
 mod tests {
     use super::*;
     use crate::config::RootfsSource;
-    use crate::metrics::FakeCgroupFs;
+    use crate::orchestrator::VmidAllocator;
     use crate::overlay::RecordingOverlayStore;
     use crate::vmm::FakeVmm;
 
@@ -366,10 +345,6 @@ mod tests {
         std::fs::write(dir.join("mem_file"), vec![0u8; 2048]).expect("mem");
     }
 
-    fn recording_store() -> Arc<dyn OverlayStore> {
-        Arc::new(RecordingOverlayStore::new())
-    }
-
     // The allocator hands out distinct ids. The inverse (returning a constant) would
     // let two nodes share an id and corrupt `is_ancestor_of`.
     #[test]
@@ -386,14 +361,9 @@ mod tests {
         let root_dir = tempfile::tempdir().expect("tempdir");
         let master = root_dir.path().join("root");
         write_master(&master);
-        let lineage = Lineage::from_snapshot_dir(
-            master,
-            erofs_cfg(),
-            LineageAllocator::new(),
-            recording_store(),
-        )
-        .await
-        .expect("root lineage");
+        let lineage = Lineage::from_snapshot_dir(master, erofs_cfg(), LineageAllocator::new())
+            .await
+            .expect("root lineage");
         assert_eq!(lineage.generation(), 0);
         assert_eq!(lineage.parent(), None);
         assert!(lineage.ancestry().is_empty());
@@ -409,26 +379,18 @@ mod tests {
         let master = root_dir.path().join("root");
         write_master(&master);
         let store = RecordingOverlayStore::new();
-        let store_arc: Arc<dyn OverlayStore> = Arc::new(store.clone());
-        let lineage = Lineage::from_snapshot_dir(
-            master.clone(),
-            erofs_cfg(),
-            LineageAllocator::new(),
-            store_arc,
-        )
-        .await
-        .expect("root lineage");
+        let lineage =
+            Lineage::from_snapshot_dir(master.clone(), erofs_cfg(), LineageAllocator::new())
+                .await
+                .expect("root lineage");
 
         let vmm = FakeVmm::default();
-        let vm = lineage
-            .fork(
-                &vmm,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
-            .await
-            .expect("fork one child");
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            overlay: Arc::new(store.clone()),
+            ..HostEnv::hermetic()
+        };
+        let vm = lineage.fork(&vmm, &env).await.expect("fork one child");
         let _ = vm.vmid();
 
         let calls = store.calls();
@@ -455,25 +417,16 @@ mod tests {
         let root_dir = tempfile::tempdir().expect("tempdir");
         let master = root_dir.path().join("root");
         write_master(&master);
-        let root = Lineage::from_snapshot_dir(
-            master,
-            erofs_cfg(),
-            LineageAllocator::new(),
-            recording_store(),
-        )
-        .await
-        .expect("root lineage");
+        let root = Lineage::from_snapshot_dir(master, erofs_cfg(), LineageAllocator::new())
+            .await
+            .expect("root lineage");
 
         let vmm = FakeVmm::default();
-        let mut child = root
-            .fork(
-                &vmm,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
-            .await
-            .expect("fork a child to branch");
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+        let mut child = root.fork(&vmm, &env).await.expect("fork a child to branch");
 
         let b1_dir = root_dir.path().join("b1");
         let b1 = root.branch(&mut child, b1_dir).await.expect("branch");
@@ -505,35 +458,22 @@ mod tests {
         let master = root_dir.path().join("root");
         write_master(&master);
         let alloc = LineageAllocator::new();
-        let root = Lineage::from_snapshot_dir(master, erofs_cfg(), alloc, recording_store())
+        let root = Lineage::from_snapshot_dir(master, erofs_cfg(), alloc)
             .await
             .expect("root");
         let vmm = FakeVmm::default();
-        let cids = Arc::new(CidAllocator::new());
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
 
-        let mut c0 = root
-            .fork(
-                &vmm,
-                cids.clone(),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
-            .await
-            .expect("fork c0");
+        let mut c0 = root.fork(&vmm, &env).await.expect("fork c0");
         let b1 = root
             .branch(&mut c0, root_dir.path().join("b1"))
             .await
             .expect("branch b1");
 
-        let mut c1 = b1
-            .fork(
-                &vmm,
-                cids.clone(),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
-            .await
-            .expect("fork c1");
+        let mut c1 = b1.fork(&vmm, &env).await.expect("fork c1");
         let b2 = b1
             .branch(&mut c1, root_dir.path().join("b2"))
             .await
@@ -561,22 +501,19 @@ mod tests {
     async fn fork_from_vm_roots_a_lineage() {
         let vmm = FakeVmm::default();
         let vm_dir = tempfile::tempdir().expect("tempdir");
-        let mut vm = MicroVm::start(
-            &vmm,
-            erofs_cfg(),
-            Arc::new(CidAllocator::new()),
-            shared_vmids(),
-            Box::new(FakeCgroupFs::new()),
-        )
-        .await
-        .expect("start a live VM");
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+        let mut vm = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("start a live VM");
 
         let root = Lineage::fork_from_vm(
             &mut vm,
             erofs_cfg(),
             vm_dir.path().join("root"),
             LineageAllocator::new(),
-            recording_store(),
         )
         .await
         .expect("root a lineage from a live VM");
@@ -607,9 +544,7 @@ mod tests {
         ))
         .build()
         .expect("valid non-snapshotting config with a share");
-        let res =
-            Lineage::from_snapshot_dir(master, cfg, LineageAllocator::new(), recording_store())
-                .await;
+        let res = Lineage::from_snapshot_dir(master, cfg, LineageAllocator::new()).await;
         assert!(
             matches!(res, Err(crate::error::Error::Unsupported { .. })),
             "a vhost-user device must be rejected at construction, got {res:?}"
@@ -629,31 +564,25 @@ mod tests {
         let m2 = root.path().join("t2");
         write_master(&m2);
 
-        let a =
-            Lineage::from_snapshot_dir(m1, erofs_cfg(), LineageAllocator::new(), recording_store())
-                .await
-                .expect("tree 1 root");
+        let a = Lineage::from_snapshot_dir(m1, erofs_cfg(), LineageAllocator::new())
+            .await
+            .expect("tree 1 root");
         // Tree 2: root → fork a child → branch it, so b1's ancestry is [tree2-root],
         // whose id collides with `a`'s (both L1 from independent allocators).
-        let t2 =
-            Lineage::from_snapshot_dir(m2, erofs_cfg(), LineageAllocator::new(), recording_store())
-                .await
-                .expect("tree 2 root");
+        let t2 = Lineage::from_snapshot_dir(m2, erofs_cfg(), LineageAllocator::new())
+            .await
+            .expect("tree 2 root");
         assert_eq!(
             a.id(),
             t2.id(),
             "distinct allocators both start at L1 — ids collide"
         );
         let vmm = FakeVmm::default();
-        let mut child = t2
-            .fork(
-                &vmm,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
-            .await
-            .expect("fork in tree 2");
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+        let mut child = t2.fork(&vmm, &env).await.expect("fork in tree 2");
         let b1 = t2
             .branch(&mut child, root.path().join("t2-b1"))
             .await
@@ -680,27 +609,18 @@ mod tests {
         let master = root_dir.path().join("root");
         write_master(&master);
         let store = RecordingOverlayStore::new();
-        let store_arc: Arc<dyn OverlayStore> = Arc::new(store.clone());
-        let lineage = Lineage::from_snapshot_dir(
-            master.clone(),
-            erofs_cfg(),
-            LineageAllocator::new(),
-            store_arc,
-        )
-        .await
-        .expect("root lineage");
-        let vmm = FakeVmm::default();
-        let cids = Arc::new(CidAllocator::new());
-        for _ in 0..2 {
-            lineage
-                .fork(
-                    &vmm,
-                    cids.clone(),
-                    shared_vmids(),
-                    Box::new(FakeCgroupFs::new()),
-                )
+        let lineage =
+            Lineage::from_snapshot_dir(master.clone(), erofs_cfg(), LineageAllocator::new())
                 .await
-                .expect("fork");
+                .expect("root lineage");
+        let vmm = FakeVmm::default();
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            overlay: Arc::new(store.clone()),
+            ..HostEnv::hermetic()
+        };
+        for _ in 0..2 {
+            lineage.fork(&vmm, &env).await.expect("fork");
         }
         let calls = store.calls();
         assert_eq!(
@@ -731,24 +651,18 @@ mod tests {
         let master = root_dir.path().join("root");
         write_master(&master);
         let store = RecordingOverlayStore::new();
-        let store_arc: Arc<dyn OverlayStore> = Arc::new(store.clone());
-        let lineage = Lineage::from_snapshot_dir(
-            master.clone(),
-            erofs_cfg(),
-            LineageAllocator::new(),
-            store_arc,
-        )
-        .await
-        .expect("root lineage");
+        let lineage =
+            Lineage::from_snapshot_dir(master.clone(), erofs_cfg(), LineageAllocator::new())
+                .await
+                .expect("root lineage");
         let vmm = FakeVmm::default(); // rotates host paths → concurrent fan-out allowed
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            overlay: Arc::new(store.clone()),
+            ..HostEnv::hermetic()
+        };
         let clones = lineage
-            .fork_many(
-                &vmm,
-                3,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                || Box::new(FakeCgroupFs::new()),
-            )
+            .fork_many(&vmm, 3, &env)
             .await
             .expect("fork_many of 3");
         assert_eq!(clones.len(), 3);
@@ -773,24 +687,15 @@ mod tests {
         let root_dir = tempfile::tempdir().expect("tempdir");
         let master = root_dir.path().join("root");
         write_master(&master);
-        let root = Lineage::from_snapshot_dir(
-            master,
-            erofs_cfg(),
-            LineageAllocator::new(),
-            recording_store(),
-        )
-        .await
-        .expect("root");
-        let vmm = FakeVmm::default();
-        let mut child = root
-            .fork(
-                &vmm,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
+        let root = Lineage::from_snapshot_dir(master, erofs_cfg(), LineageAllocator::new())
             .await
-            .expect("fork a child");
+            .expect("root");
+        let vmm = FakeVmm::default();
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+        let mut child = root.fork(&vmm, &env).await.expect("fork a child");
         let vmid_before = child.vmid();
 
         let b1 = root
@@ -828,24 +733,15 @@ mod tests {
         let root_dir = tempfile::tempdir().expect("tempdir");
         let master = root_dir.path().join("root");
         write_master(&master);
-        let root = Lineage::from_snapshot_dir(
-            master,
-            erofs_cfg(),
-            LineageAllocator::new(),
-            recording_store(),
-        )
-        .await
-        .expect("root");
-        let vmm = FakeVmm::default();
-        let mut child = root
-            .fork(
-                &vmm,
-                Arc::new(CidAllocator::new()),
-                shared_vmids(),
-                Box::new(FakeCgroupFs::new()),
-            )
+        let root = Lineage::from_snapshot_dir(master, erofs_cfg(), LineageAllocator::new())
             .await
-            .expect("fork a child");
+            .expect("root");
+        let vmm = FakeVmm::default();
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+        let mut child = root.fork(&vmm, &env).await.expect("fork a child");
         // A nested, non-existent destination: branch must create it and its parents.
         let fresh = root_dir.path().join("nested/deeper/b1");
         assert!(

@@ -548,3 +548,118 @@ a self-test applies).
 **When you make a new deviation,** add a short entry here — *what* you diverged from and *why* — and,
 once it stabilizes, fold it into the design document and delete it from this log. Keep this file
 small: a growing log means the design doc has drifted from the code.
+
+## v28 — the 0.9 → 0.10 delta register (design §18), as built
+
+The eleven §18 deltas landed as one breaking pass. Per-item as-built record, flagging where the
+built reality diverged from the delta's stated premise (a divergence is only a finding in the change
+that implements the delta — AGENTS.md).
+
+- **Delta 1 (`HostEnv` bundle).** New `crates/vmcell/src/env.rs`: `HostEnv { cids, vmids, cgroups,
+  clock, overlay }`, `#[non_exhaustive]`, `Clone`, manual `Debug` (`Clock` is not `Debug`),
+  `shared()`/`hermetic()`. `clock` carries `+ RefUnwindSafe` (matching `VmidAllocator`'s established
+  discipline so the bundle stays unwind-safe; both `Clock` impls satisfy it) — the §9.3 sketch elides
+  this bound. Threaded `&HostEnv` through `start`/`restore`/`restore_cow`/`setup_env`/
+  `Zygote::spawn_clone(s)`/`Lineage::fork`/`fork_many`; `MicroVm` stores one `env` and its teardown
+  deletes the cgroup slice through `env.cgroups` (the standalone `cgroup_fs` field is gone).
+  `SnapshotStage`/the daemon launcher/the in-VM builders build the bundle at their existing seam
+  homes (the launcher via `shared()`, returning `DaemonResult` now; the builders keep their shared
+  `cid_alloc` via `env.cids`; `SnapshotStage` keeps its allocator fields — which must stay
+  `RefUnwindSafe` — and builds a transient `HostEnv` in `run()`).
+  - **Deviation (justified): `agent()` keeps its optional `timeout`.** Delta 1 removes the *clock*
+    seam from `agent()` (the gate — "no seam arguments" — is met) but §9.3's "no arguments / 10 s
+    floor constant" would drop the per-call connect budget too. `Timeouts` carries **no** overall
+    agent-connect budget field, and the artifact-validator legitimately needs 60–180 s connect
+    windows for slow builder-VM boots / restore-under-load (`checks.rs`); hardcoding the 10 s floor
+    would silently reintroduce the boot flakiness those timeouts were added to fix. So
+    `agent(&mut self, timeout: Option<Duration>)` retains the budget (10 s remains the `None`
+    default); only the clock seam is gone.
+
+- **Delta 2 (fold `OverlayStore` into `HostEnv`).** `Zygote` lost its `store` field,
+  `with_overlay_store`, and `overlay_store()`; `restore_cow`/`restore_inner` take a `cow: bool` and
+  materialize the CoW copy through `env.overlay` (invariant S4 — one store per process, no second
+  injection path). `Lineage::fork_from_vm`/`from_snapshot_dir` dropped their `store` parameter; a
+  whole lineage now shares one store by construction (supplied at fork time via `env.overlay`). The
+  `RecordingOverlayStore` fan-out unit tests were re-pointed to route the store through `env.overlay`
+  and their "copy source == master, dst is a private dir" assertions preserved — that IS the delta-2
+  gate ("the store came from env").
+
+- **Delta 3 (`limits_enforced` → `mem_limit_enforced`).** Renamed the `ResourceUsage` field and its
+  doc (dropped the stale "name retained for API stability" line). Also renamed the wire
+  `ResourceUsageDto` field (a field-for-field serde mirror; the served OpenAPI enumerates no
+  ResourceUsage schema, so no parity-doc churn) and the `vmcell stats` JSON key, for end-to-end
+  honesty in this breaking bump. The `CgroupFs`-fake enforcement tests (memory-controller-only
+  meaning) are the gate.
+
+- **Delta 4 (`host_services_port` → `Unprivileged` only).** Removed the field from
+  `NetConfig::Privileged` (the invalid state is now a compile error), deleted the `build()`
+  accept-then-reject block and the `reject_privileged_with_host_services_port` negative test as
+  unreachable; kept its Unprivileged-accepts-the-port half as a standalone positive control
+  (`unprivileged_host_services_port_is_supported`). Every Privileged construction site dropped the
+  (always-`None`) field.
+
+- **Delta 5 (remove `RootfsSource::VirtioFs`).** The variant is gone. It was more woven than the
+  delta's "no consumer" claim implied — it appeared in all three backends' rootfs-config match arms
+  (each rejecting it), the `config_has_vhost_user_device` S1 predicate, two `build()` checks,
+  `check_clone_eligible`, `restore_inner`, and ~10 rejection-verifying tests. All removed; the
+  backend matches are now exhaustive over `Erofs`/`Block`; `config_has_vhost_user_device` keeps its
+  virtio-fs-**share** and unprivileged-net terms (only the rootfs term dropped). Tests that
+  constructed `VirtioFs` to verify rejection were deleted (rejection is now compile-enforced), except
+  FC's `restore_rejects_virtio_fs_rootfs` — the only test exercising FC's restore-path vhost-user
+  self-guard — which was **converted** to a virtio-fs-**share** rejection so that live coverage
+  survives. Grep gate: zero `RootfsSource::VirtioFs` refs remain.
+
+- **Delta 6 (`instance_mut()` → `pub(crate)`).** Demoted. The delta's premise "none is known to use
+  it" was empirically false — five integration-test sites called it (four for a hard `kill()`
+  fault-injection, one read-only `serial_log()`). Reconciled by adding a safe public
+  `MicroVm::kill()` (force-kill now, leaving the rest to `Drop` — the "hard kill reclaimed by the
+  daemon sweep" scenario) that the four kill sites use, and pointing the read-only site at the pub
+  `instance()`. No legitimate use is lost while the raw `VmInstance` is no longer public.
+
+- **Delta 7 (`EnvSetup` explicit `Drop`).** `EnvSetup` has an explicit `Drop` that routes the
+  fragile net teardown (proxy/smoltcp before netns — the reshuffle hazard L1 names) through a shared
+  `release_net_before_netns` free function `teardown_post_instance` also calls (one helper, never a
+  second copy); the cgroup→cid order stays field-order (`cgroup_guard` before `cid_guard`). Because a
+  field of a `Drop` type cannot be moved out, `cid_guard` became `Option<CidGuard>` and the success
+  path `take()`s each resource out. Gate:
+  `env_setup_drop_releases_netns_before_cgroup_like_the_success_path` builds an `EnvSetup` with
+  recording netns+cgroup seams and asserts netns-delete precedes cgroup-delete — the same order
+  `assert_full_teardown_order` requires of the success/panic paths.
+
+- **Delta 8 (`HostCapabilities` probed once).** New `crate::hostcaps::HostCapabilities` — a
+  single-probe descriptor (`cap_net_admin`/`cap_sys_admin`, `kvm_accessible`, `netns_reachable`,
+  `delegated_controllers`, `domain_leaf`) read from `/proc/self/status`, `/dev/kvm`, `/run`, and the
+  current cgroup scope's `subtree_control`/`cgroup.type` (via the canonical `cgroup_base_from_proc`).
+  Decision methods encode the mode-selection + fail-loud rules: `privileged_net_available`,
+  `controller_enforceable`/`memory_limit_enforceable` (undelegated/threaded scope ⇒ unenforceable,
+  never silent-unlimited), `virtio_fs_shares_available`, `can_boot_vm`. Consumed at start-up by the
+  daemon's `MicroVmLauncher::new` (probe + log). Gate: a fake-host descriptor drives every decision
+  (well-provisioned vs no-CAP_NET_ADMIN / undelegated-memory / threaded / no-KVM). The metrics
+  `create_slice` keeps its own authoritative EACCES/EINVAL errno split (§7.2 rule 2); the descriptor
+  is the queryable single source, not a replacement for that per-write typed error.
+
+- **Delta 9 (`FakeVmm` fault menu).** `FakeVmm` gained a `FaultMenu`
+  (`fail_create`/`fail_boot`/`fail_restore`/`fail_resume`, `wedge_control_plane_for`,
+  `readiness_delay`) + `with_faults`, and a shared `control_plane_probes` counter so a wedge spans the
+  respawns `start()` mints from one `FakeVmm`. `FakeVmInstance` carries the menu + counter (both
+  `pub`; the five cross-module literals set them explicitly — `..Default::default()` is illegal
+  because `FakeVmInstance` has a `Drop`). New orchestrator tests drive each arm: create/boot/restore
+  faults leave zero cgroup residue (`created == deleted`), a wedge-for-2 recovers on the 3rd spawn, a
+  permanent wedge fails loud after the bounded respawns. The bespoke `CreateFailVmm` fake is now
+  superseded by `fail_create` but kept.
+
+- **Delta 10 (daemon SHA-256 sidecar).** `create()` writes a `<name>.sha256` sidecar (atomic
+  temp+rename) alongside the artifact; `info`/`list` take size from `metadata()` and the digest from
+  the sidecar (re-hashing the body only for a legacy artifact with no sidecar), making `list`
+  O(entries) not O(store bytes); `list` excludes `.sha256` files; `delete` removes the sidecar; a
+  client artifact whose name ends in `.sha256` is rejected (`BadRequest`, not the typed
+  `InvalidName` enum — the name is well-formed, just reserved) so it cannot shadow a real sidecar.
+  Gate: a test corrupts only the sidecar and asserts `info` returns the sidecar digest (proving no
+  body re-hash), plus sidecar-matches-hash, list-exclusion, and delete-residue tests.
+
+- **Delta 11 (remove CLI `exec`/`ls`/`rm`/`destroy` stubs).** The four verbs stay recognized by clap
+  but redirect: `moved_to_vmcelld_ctl(verb)` returns a typed `Unsupported` error naming
+  `vmcelld-ctl <verb>` (where the real verbs live) and drives a non-zero exit — deleting the stub's
+  pretense, not the recognizability, so the user gets a redirect rather than clap's cryptic
+  "unrecognized subcommand". The existing `daemon_deferred_subcommands_fail_loud` test was
+  strengthened to assert the message names `vmcelld-ctl` (the gate).

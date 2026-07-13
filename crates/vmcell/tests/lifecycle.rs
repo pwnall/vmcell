@@ -90,19 +90,12 @@ async fn test_lifecycle_force_kill_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .build()
         .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start VM");
 
-    vm.instance_mut().kill().await.expect("Failed to kill VM");
+    vm.kill().await.expect("Failed to kill VM");
 }
 
 // TESTS-LIFECYCLE-5: drive the FakeVmm-backed orchestrator across a start and a
@@ -124,19 +117,16 @@ async fn test_lifecycle_fake_vmm() {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    // Isolated, no-op-but-recording cgroup seam so this FakeVmm orchestration test
+    // stays hermetic (no real /sys/fs/cgroup writes), matching the prior explicit
+    // `RecordingCgroupFs::new()` arg on each start/restore call.
+    let mut env = vmcell::HostEnv::hermetic();
+    env.cgroups = Arc::new(RecordingCgroupFs::new());
 
     // --- cycle 1: cold start ---
-    let vm = MicroVm::start(
-        &fake,
-        cfg.clone(),
-        cid_alloc.clone(),
-        vmid_alloc.clone(),
-        Box::new(RecordingCgroupFs::new()),
-    )
-    .await
-    .expect("Failed to start fake VM");
+    let vm = MicroVm::start(&fake, cfg.clone(), &env)
+        .await
+        .expect("Failed to start fake VM");
 
     // Check that create and boot were called
     {
@@ -153,12 +143,12 @@ async fn test_lifecycle_fake_vmm() {
     );
     // start() allocated the lowest guest CID (3); the next free is therefore 4. A
     // buggy orchestrator that never allocated a CID would hand back 3 here.
-    let probe = cid_alloc.allocate().expect("cid available");
+    let probe = env.cids.allocate().expect("cid available");
     assert_eq!(
         probe, 4,
         "start() must have taken guest CID 3, leaving 4 next"
     );
-    cid_alloc.release(probe);
+    env.cids.release(probe);
 
     // Shutdown should call request_shutdown, kill, then drop the instance.
     vm.shutdown().await.expect("Failed to shutdown");
@@ -173,28 +163,22 @@ async fn test_lifecycle_fake_vmm() {
     // Drop released BOTH the CID and the VMID back to their allocators (the
     // no-op-release bug would leave them held).
     assert_eq!(
-        cid_alloc.allocate().expect("cid available"),
+        env.cids.allocate().expect("cid available"),
         3,
         "shutdown must release guest CID 3"
     );
-    cid_alloc.release(3);
+    env.cids.release(3);
     assert!(
-        vmid_alloc.reserve(vmid1).is_ok(),
+        env.vmids.reserve(vmid1).is_ok(),
         "shutdown must release VMID {vmid1}"
     );
-    vmid_alloc.release(vmid1);
+    env.vmids.release(vmid1);
 
     // --- cycle 2: restore, reusing the shared allocators ---
-    let mut restore_vm = MicroVm::restore(
-        &fake,
-        std::path::Path::new("/fake/snap"),
-        cfg.clone(),
-        cid_alloc.clone(),
-        vmid_alloc.clone(),
-        Box::new(RecordingCgroupFs::new()),
-    )
-    .await
-    .expect("Failed to restore fake VM");
+    let mut restore_vm =
+        MicroVm::restore(&fake, std::path::Path::new("/fake/snap"), cfg.clone(), &env)
+            .await
+            .expect("Failed to restore fake VM");
 
     {
         let calls = fake.calls.lock().unwrap();
@@ -205,22 +189,19 @@ async fn test_lifecycle_fake_vmm() {
     let vmid2 = restore_vm.vmid();
     assert!((1..=254).contains(&vmid2));
     // A fresh VMID allocation must not collide with the live restored VM's VMID.
-    let probe_vmid = vmid_alloc.allocate().expect("vmid available");
+    let probe_vmid = env.vmids.allocate().expect("vmid available");
     assert_ne!(probe_vmid, vmid2, "a live VMID must not be re-handed-out");
-    vmid_alloc.release(probe_vmid);
+    env.vmids.release(probe_vmid);
     // restore() also took the lowest free guest CID (3 again, cycle 1's was freed).
-    let probe_cid = cid_alloc.allocate().expect("cid available");
+    let probe_cid = env.cids.allocate().expect("cid available");
     assert_eq!(probe_cid, 4, "restore() must have taken guest CID 3");
-    cid_alloc.release(probe_cid);
+    env.cids.release(probe_cid);
 
     // Retry/timeout branch: the fake instance's vsock path does not exist, so the
     // agent connect loop must exhaust its deadline and surface a typed Timeout —
     // not hang (would trip the nextest timeout) and not falsely report success.
     let agent_res = restore_vm
-        .agent(
-            Some(std::time::Duration::from_secs(1)),
-            &vmcell::orchestrator::RealClock,
-        )
+        .agent(Some(std::time::Duration::from_secs(1)))
         .await;
     assert!(
         matches!(&agent_res, Err(vmcell::Error::Timeout(_))),
@@ -286,22 +267,14 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .unwrap();
     cfg.net = vmcell::config::NetConfig::Privileged {
         egress: vmcell::config::Egress::Open,
-        host_services_port: None,
     };
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let env = vmcell::HostEnv::hermetic();
 
     let (vmid, guest_cid, vsock_path, netns_path, cg_path, per_vm_dir) = {
-        let vm = MicroVm::start(
-            vmm,
-            cfg,
-            cid_alloc.clone(),
-            vmid_alloc.clone(),
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-        .await
-        .expect("Failed to start VM");
+        let vm = MicroVm::start(vmm, cfg, &env)
+            .await
+            .expect("Failed to start VM");
 
         let vmid = vm.vmid();
         let guest_cid = vm.instance().guest_cid();
@@ -389,18 +362,18 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     // 5. CID released back to the allocator (Drop releases the real instance).
     assert_eq!(
-        cid_alloc.allocate().expect("cid available"),
+        env.cids.allocate().expect("cid available"),
         guest_cid,
         "guest CID {guest_cid} was not released on Drop"
     );
-    cid_alloc.release(guest_cid);
+    env.cids.release(guest_cid);
 
     // 6. VMID released back to the allocator on Drop.
     assert!(
-        vmid_alloc.reserve(vmid).is_ok(),
+        env.vmids.reserve(vmid).is_ok(),
         "VMID {vmid} was not released on Drop"
     );
-    vmid_alloc.release(vmid);
+    env.vmids.release(vmid);
 }
 
 /// Asserts the teardown order recorded in `log`: the VMM instance `drop` event
@@ -450,19 +423,13 @@ async fn test_lifecycle_fake_vmm_drop_order_normal() {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
+    let mut env = vmcell::HostEnv::hermetic();
+    env.cgroups = Arc::new(RecordingCgroupFs::with_log(log.clone()));
 
     {
-        let _vm = MicroVm::start(
-            &fake,
-            cfg,
-            cid_alloc.clone(),
-            vmid_alloc,
-            Box::new(RecordingCgroupFs::with_log(log.clone())),
-        )
-        .await
-        .expect("Failed to start fake VM");
+        let _vm = MicroVm::start(&fake, cfg, &env)
+            .await
+            .expect("Failed to start fake VM");
         // _vm is dropped here, at the end of the scope.
     }
 
@@ -492,20 +459,14 @@ async fn test_lifecycle_fake_vmm_drop_order_on_panic() {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
     let cgroup_log = log.clone();
+    let mut env = vmcell::HostEnv::hermetic();
+    env.cgroups = Arc::new(RecordingCgroupFs::with_log(cgroup_log));
 
     let _ = tokio::spawn(async move {
-        let _vm = MicroVm::start(
-            &fake,
-            cfg,
-            cid_alloc.clone(),
-            vmid_alloc,
-            Box::new(RecordingCgroupFs::with_log(cgroup_log)),
-        )
-        .await
-        .expect("Failed to start fake VM");
+        let _vm = MicroVm::start(&fake, cfg, &env)
+            .await
+            .expect("Failed to start fake VM");
         panic!("simulate panic inside scope");
     })
     .await;
@@ -557,17 +518,10 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
         host_services_port: None,
     };
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start unprivileged VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start unprivileged VM");
 
     let vmid = vm.vmid();
     // The unprivileged NAT's vhost-user socket now lives INSIDE the single owned
@@ -578,13 +532,7 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
         std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
     let sock_path = per_vm_dir.join("smoltcp.sock");
 
-    let agent = match vm
-        .agent(
-            Some(std::time::Duration::from_secs(120)),
-            &vmcell::orchestrator::RealClock,
-        )
-        .await
-    {
+    let agent = match vm.agent(Some(std::time::Duration::from_secs(120))).await {
         Ok(a) => a,
         Err(e) => {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();

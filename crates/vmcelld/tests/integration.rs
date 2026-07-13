@@ -12,7 +12,7 @@
 //!
 //! `#[ignore]` by default: they need KVM, the **blessed** runner (`just bless`), and built artifacts
 //! (`target/vmcell-artifacts/{vmlinux,rootfs.erofs}`). Run them via `just test-daemon`, which wraps the
-//! test binary with the runner and runs under a systemd-delegated cgroup scope so the `limits_enforced`
+//! test binary with the runner and runs under a systemd-delegated cgroup scope so the `mem_limit_enforced`
 //! assertion sees enforcement. Without those preconditions the tests **fail loud** (a clear panic),
 //! never a silent skip.
 
@@ -467,16 +467,16 @@ async fn stats_limits_enforced_matches_delegation() {
     let vm = c.create("vmlinux", "rootfs.erofs").await.expect("create");
     let stats = c.stats(&vm.id).await.expect("stats");
 
-    // Both `limits_enforced` and `mem_read_ok` mean exactly "the memory controller is delegated into
+    // Both `mem_limit_enforced` and `mem_read_ok` mean exactly "the memory controller is delegated into
     // the per-VM slice" (§7.2): under a delegated scope (`just test-daemon`) the daemon creates a slice
     // with `memory.*` present, so both are true and a real memory reading is visible; without
     // delegation those files don't exist, so both are honestly false (the daemon never claims
     // enforcement it lacks — that honesty is the property under test). Assert both track delegation.
     let delegated = delegation_available();
     assert_eq!(
-        stats.limits_enforced, delegated,
-        "limits_enforced ({}) must match delegation ({delegated}): {stats:?}",
-        stats.limits_enforced
+        stats.mem_limit_enforced, delegated,
+        "mem_limit_enforced ({}) must match delegation ({delegated}): {stats:?}",
+        stats.mem_limit_enforced
     );
     assert_eq!(
         stats.mem_read_ok, delegated,

@@ -18,15 +18,11 @@
 //! **single** clone, so the chain works on both the host-path-rotating (CH) and
 //! verbatim-rebind (FC) tiers — the sequential single-lineage shape both support.
 
-use std::sync::Arc;
-use vmcell::ReflinkOverlayStore;
 use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
 use vmcell::lineage::{Lineage, LineageAllocator};
-use vmcell::metrics::DefaultCgroupFs;
-use vmcell::orchestrator::{MicroVm, RealClock, VmidAllocator};
-use vmcell::overlay::OverlayStore;
-use vmcell::vmm::{CidAllocator, VmInstance, Vmm};
+use vmcell::orchestrator::MicroVm;
+use vmcell::vmm::{VmInstance, Vmm};
 
 mod common;
 
@@ -58,7 +54,6 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
         .expect("valid base config");
         cfg.net = NetConfig::Privileged {
             egress: Egress::Open,
-            host_services_port: None,
         };
         cfg
     };
@@ -71,27 +66,19 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     let root_dir = scratch.join("root");
     let b1_dir = scratch.join("b1");
 
-    let cid_alloc = Arc::new(CidAllocator::new());
-    let vmid_alloc = VmidAllocator::new();
-    let store: Arc<dyn OverlayStore> = Arc::new(ReflinkOverlayStore);
+    let env = vmcell::HostEnv::hermetic();
     let alloc = LineageAllocator::new();
 
     // 1. Boot a base VM to agent-ready, then ROOT a lineage by suspending it.
-    let mut base = MicroVm::start(
-        vmm,
-        base_cfg(),
-        cid_alloc.clone(),
-        vmid_alloc.clone(),
-        Box::new(DefaultCgroupFs),
-    )
-    .await
-    .expect("start base VM");
-    if let Err(e) = base.agent(None, &RealClock).await {
+    let mut base = MicroVm::start(vmm, base_cfg(), &env)
+        .await
+        .expect("start base VM");
+    if let Err(e) = base.agent(None).await {
         let log = std::fs::read_to_string(base.instance().serial_log()).unwrap_or_default();
         println!("BASE SERIAL LOG:\n{log}");
         panic!("base agent connect failed: {e}");
     }
-    let root = Lineage::fork_from_vm(&mut base, base_cfg(), &root_dir, alloc, store)
+    let root = Lineage::fork_from_vm(&mut base, base_cfg(), &root_dir, alloc)
         .await
         .expect("root a lineage by suspending the base VM");
     base.shutdown().await.expect("shutdown base VM");
@@ -101,7 +88,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
 
     // 2. fork() a child from the root; exec on the DATA PLANE; then DIVERGE it by
     //    writing a marker into its tmpfs.
-    let mut child = fork_one(&root, vmm, &cid_alloc, &vmid_alloc, "root-child").await;
+    let mut child = fork_one(&root, vmm, &env, "root-child").await;
     let hello = exec(&mut child, &["echo", "hello"]).await;
     assert_eq!(hello.0, 0, "forked child exec must succeed");
     assert_eq!(hello.1.trim(), "hello", "forked child data plane");
@@ -150,7 +137,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     //    Kept SEQUENTIAL (each fork torn down before the next) so the chain also
     //    holds on the verbatim-rebind (FC) tier, where two live restores from one
     //    baked-path lineage would collide (§9.4) — the single-lineage shape.
-    let mut from_branch = fork_one(&b1, vmm, &cid_alloc, &vmid_alloc, "b1-child").await;
+    let mut from_branch = fork_one(&b1, vmm, &env, "b1-child").await;
     let seen = exec(&mut from_branch, &["cat", "/tmp/marker"]).await;
     assert_eq!(
         seen.0, 0,
@@ -163,7 +150,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     );
     from_branch.shutdown().await.expect("shutdown branch fork");
 
-    let mut from_root = fork_one(&root, vmm, &cid_alloc, &vmid_alloc, "root-child-2").await;
+    let mut from_root = fork_one(&root, vmm, &env, "root-child-2").await;
     let absent = exec(&mut from_root, &["cat", "/tmp/marker"]).await;
     assert_ne!(
         absent.0, 0,
@@ -178,21 +165,15 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
 async fn fork_one<V: Vmm>(
     node: &Lineage,
     vmm: &V,
-    cid_alloc: &Arc<CidAllocator>,
-    vmid_alloc: &VmidAllocator,
+    env: &vmcell::HostEnv,
     label: &str,
 ) -> MicroVm<V> {
     let mut vm = node
-        .fork(
-            vmm,
-            cid_alloc.clone(),
-            vmid_alloc.clone(),
-            Box::new(DefaultCgroupFs),
-        )
+        .fork(vmm, env)
         .await
         .unwrap_or_else(|e| panic!("fork {label} failed: {e}"));
     let log_path = vm.instance().serial_log().to_path_buf();
-    if let Err(e) = vm.agent(None, &RealClock).await {
+    if let Err(e) = vm.agent(None).await {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         println!("{label} SERIAL LOG:\n{log}");
         panic!("{label} agent connect failed: {e}");
@@ -203,7 +184,7 @@ async fn fork_one<V: Vmm>(
 /// Execs `argv` and returns `(exit_code, stdout_string)`.
 async fn exec<V: Vmm>(vm: &mut MicroVm<V>, argv: &[&str]) -> (i32, String) {
     let out = vm
-        .agent(None, &RealClock)
+        .agent(None)
         .await
         .expect("agent")
         .exec(ExecRequest::new(

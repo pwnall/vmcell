@@ -403,34 +403,6 @@ pub(crate) async fn register_and_await_ready(
     Ok(pgid)
 }
 
-/// Self-guard that rejects a virtio-fs **rootfs** for a backend that cannot boot one.
-///
-/// No backend supports a virtio-fs *rootfs* today: booting one would need virtiofsd
-/// wired as the root device plus a `rootfstype=virtiofs` kernel cmdline. A plain
-/// `VirtioFs`-rootfs config is nonetheless *buildable* — `config::build()` only
-/// rejects it when **also** snapshotting — so it reaches `create()`. Without this
-/// guard, CH/QEMU hit an empty match arm (no disk attached, no virtiofsd) while the
-/// cmdline falls through to `root=/dev/vda rootfstype=ext4` for a VM that has no
-/// `/dev/vda`, and the guest kernel-panics on a missing root — silently (VMM-1). Every
-/// backend's `create()` therefore self-guards with this instead of assuming the caller
-/// checked; it returns a typed [`Error::Unsupported`], mirroring Firecracker.
-///
-/// # Errors
-/// Returns [`Error::Unsupported`] `{ vmm, feature: "virtio_fs_rootfs" }` when `rootfs`
-/// is [`crate::config::RootfsSource::VirtioFs`]; `Ok(())` for every other rootfs.
-pub(crate) fn reject_virtio_fs_rootfs(
-    vmm: &str,
-    rootfs: &crate::config::RootfsSource,
-) -> Result<()> {
-    if matches!(rootfs, crate::config::RootfsSource::VirtioFs { .. }) {
-        return Err(crate::error::Error::Unsupported {
-            vmm: vmm.to_string(),
-            feature: "virtio_fs_rootfs".to_string(),
-        });
-    }
-    Ok(())
-}
-
 /// Self-guard that rejects [`ConsoleMode::VirtioConsole`](crate::config::ConsoleMode::VirtioConsole)
 /// on a backend whose capability descriptor does not advertise `virtio_console`
 /// (Firecracker).
@@ -463,7 +435,7 @@ pub(crate) fn reject_unsupported_console(
 }
 
 /// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
-/// because it has a vhost-user device attached (a virtio-fs share/rootfs served by
+/// because it has a vhost-user device attached (a virtio-fs data share served by
 /// virtiofsd, the unprivileged `vhost-user-net` NAT, or an external `vhost-user-net`
 /// socket). The snapshot-eligibility law (§3.3) requires every backend to self-guard
 /// `snapshot()`/`restore()` against such a VM rather than assume the caller checked.
@@ -471,7 +443,9 @@ pub(crate) fn reject_unsupported_console(
 /// This is the ONE shared predicate for all backends (M-VMM-5): the former per-backend
 /// copies had already diverged — the Firecracker copy never grew the virtio-fs *rootfs*
 /// term the CH copy carried, so a virtio-fs-rootfs restore slipped its guard (H-VMM-3).
-/// Centralizing it makes that class of divergence impossible.
+/// Centralizing it makes that class of divergence impossible. (Design §18 delta 5
+/// later removed the virtio-fs-rootfs variant entirely, making that boundary case
+/// unrepresentable rather than a runtime check.)
 pub(crate) fn has_vhost_user_device(
     virtio_fs_share: bool,
     unprivileged_net: bool,
@@ -481,13 +455,11 @@ pub(crate) fn has_vhost_user_device(
 }
 
 /// Returns `true` when `cfg`/`res` describe a VM that carries any vhost-user device and
-/// is therefore **not** snapshot-eligible (§3.3). Covers all three boundary cases at
-/// `restore()`/`snapshot()`: a virtio-fs data share **or** a virtio-fs *rootfs* (both
-/// backed by virtiofsd — the rootfs case the per-backend copies used to miss, H-VMM-3),
-/// the unprivileged `vhost-user-net` NAT, and an external `vhost-user-net` socket.
+/// is therefore **not** snapshot-eligible (§3.3). Covers the boundary cases at
+/// `restore()`/`snapshot()`: a virtio-fs data share (backed by virtiofsd), the
+/// unprivileged `vhost-user-net` NAT, and an external `vhost-user-net` socket.
 pub(crate) fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
-    let virtio_fs = !cfg.shares.is_empty()
-        || matches!(cfg.rootfs, crate::config::RootfsSource::VirtioFs { .. });
+    let virtio_fs = !cfg.shares.is_empty();
     has_vhost_user_device(
         virtio_fs,
         matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }),
@@ -767,16 +739,69 @@ pub trait VmInstance: Send {
     }
 }
 
+/// A scriptable fault menu for [`FakeVmm`] (design §18 delta 9, §9.8) — drives the orchestrator's
+/// failure / retry / timeout paths at the `Vmm`/`VmInstance` seam itself, not only through the
+/// surrounding seams. Every field defaults to "no fault", so `FakeVmm::default()` is a healthy
+/// backend.
+#[derive(Debug, Clone, Default)]
+pub struct FaultMenu {
+    /// [`Vmm::create`] returns `Err` (models a VMM that fails to spawn).
+    pub fail_create: bool,
+    /// [`VmInstance::boot`] returns `Err` (models a guest that fails to boot).
+    pub fail_boot: bool,
+    /// [`Vmm::restore`] returns `Err` (models a snapshot restore that fails).
+    pub fail_restore: bool,
+    /// [`VmInstance::resume`] returns `Err` (models a paused guest that will not resume).
+    pub fail_resume: bool,
+    /// [`VmInstance::verify_control_plane`] returns `Err` for the **first N** calls, then `Ok` —
+    /// modelling QEMU's occasionally-wedged vhost-user-vsock bring-up that `MicroVm::start`'s
+    /// respawn loop recovers from. The counter lives on the [`FakeVmm`] (shared with every instance
+    /// it creates), so it spans the respawns that each build a fresh instance. `0` = never wedged.
+    pub wedge_control_plane_for: usize,
+    /// An artificial delay applied inside `boot`/`verify_control_plane`, modelling slow readiness.
+    /// `None` (default) = no delay.
+    pub readiness_delay: Option<std::time::Duration>,
+}
+
 /// A fake VMM for testing without booting a real VM.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct FakeVmm {
     /// Records calls made to the fake VMM.
     pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The scriptable fault menu (design §18 delta 9); default = a healthy backend.
+    pub faults: FaultMenu,
+    /// Control-plane probe counter shared with every instance this fake creates, so
+    /// [`FaultMenu::wedge_control_plane_for`] spans the respawns that each build a fresh instance.
+    pub control_plane_probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeVmm {
+    /// A fake backend scripted with `faults` (design §18 delta 9).
+    #[must_use]
+    pub fn with_faults(faults: FaultMenu) -> Self {
+        Self {
+            faults,
+            ..Self::default()
+        }
+    }
+
+    /// Builds an instance carrying this fake's fault menu and its shared probe counter, so
+    /// `boot`/`resume`/`verify_control_plane` on the instance observe the same script — including
+    /// across the respawns `MicroVm::start` mints from the same `FakeVmm`.
+    fn instance(&self) -> FakeVmInstance {
+        FakeVmInstance {
+            vsock_path: PathBuf::from("/tmp/fake-vsock"),
+            serial: PathBuf::from("/tmp/fake-serial"),
+            calls: self.calls.clone(),
+            faults: self.faults.clone(),
+            control_plane_probes: self.control_plane_probes.clone(),
+        }
+    }
 }
 
 /// A fake VM instance for testing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct FakeVmInstance {
     /// Simulates a vsock path.
@@ -785,6 +810,10 @@ pub struct FakeVmInstance {
     pub serial: PathBuf,
     /// Records calls made to the fake instance.
     pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The fault menu inherited from the creating [`FakeVmm`] (design §18 delta 9).
+    pub faults: FaultMenu,
+    /// Shared with the creating [`FakeVmm`] so the control-plane wedge counter spans respawns.
+    pub control_plane_probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Vmm for FakeVmm {
@@ -799,11 +828,12 @@ impl Vmm for FakeVmm {
         if let Ok(mut lock) = self.calls.lock() {
             lock.push("create".to_string());
         }
-        Ok(FakeVmInstance {
-            vsock_path: PathBuf::from("/tmp/fake-vsock"),
-            serial: PathBuf::from("/tmp/fake-serial"),
-            calls: self.calls.clone(),
-        })
+        if self.faults.fail_create {
+            return Err(crate::error::Error::Vmm(
+                "scripted create failure (FakeVmm fault menu)".into(),
+            ));
+        }
+        Ok(self.instance())
     }
 
     async fn restore(
@@ -816,11 +846,12 @@ impl Vmm for FakeVmm {
         if let Ok(mut lock) = self.calls.lock() {
             lock.push("restore".to_string());
         }
-        Ok(FakeVmInstance {
-            vsock_path: PathBuf::from("/tmp/fake-vsock"),
-            serial: PathBuf::from("/tmp/fake-serial"),
-            calls: self.calls.clone(),
-        })
+        if self.faults.fail_restore {
+            return Err(crate::error::Error::Vmm(
+                "scripted restore failure (FakeVmm fault menu)".into(),
+            ));
+        }
+        Ok(self.instance())
     }
 
     fn capabilities(&self) -> VmmCapabilities {
@@ -848,6 +879,14 @@ impl VmInstance for FakeVmInstance {
     async fn boot(&mut self) -> Result<()> {
         if let Ok(mut lock) = self.calls.lock() {
             lock.push("boot".to_string());
+        }
+        if let Some(d) = self.faults.readiness_delay {
+            tokio::time::sleep(d).await;
+        }
+        if self.faults.fail_boot {
+            return Err(crate::error::Error::Vmm(
+                "scripted boot failure (FakeVmm fault menu)".into(),
+            ));
         }
         Ok(())
     }
@@ -880,6 +919,11 @@ impl VmInstance for FakeVmInstance {
         if let Ok(mut lock) = self.calls.lock() {
             lock.push("resume".to_string());
         }
+        if self.faults.fail_resume {
+            return Err(crate::error::Error::Vmm(
+                "scripted resume failure (FakeVmm fault menu)".into(),
+            ));
+        }
         Ok(())
     }
     async fn snapshot(&mut self, _dir: &Path) -> Result<()> {
@@ -896,6 +940,29 @@ impl VmInstance for FakeVmInstance {
     }
     fn serial_log(&self) -> &Path {
         &self.serial
+    }
+
+    async fn verify_control_plane(
+        &self,
+        _budget: std::time::Duration,
+        _timeouts: &crate::config::Timeouts,
+    ) -> Result<()> {
+        if let Some(d) = self.faults.readiness_delay {
+            tokio::time::sleep(d).await;
+        }
+        // Wedge the control plane for the first N probes (delta 9), then report healthy — models
+        // QEMU's occasionally-stuck vhost-user-vsock bring-up that `MicroVm::start`'s respawn loop
+        // recovers from. The counter is shared with the creating `FakeVmm`, so it spans respawns.
+        let n = self
+            .control_plane_probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n < self.faults.wedge_control_plane_for {
+            return Err(crate::error::Error::Vmm(format!(
+                "scripted wedged control plane (FakeVmm), probe {n} < {}",
+                self.faults.wedge_control_plane_for
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -934,45 +1001,6 @@ mod tests {
 
         // Idempotent: removing an already-gone dir is a no-op, not a panic/error.
         remove_vm_tmp_dir(&vm_dir);
-    }
-
-    // Guards VMM-1: the shared virtio-fs-rootfs self-guard every backend's `create()`
-    // calls. The buggy inverse (no guard — the empty `VirtioFs => {}` match arm CH/QEMU
-    // used to hit) silently builds an unbootable VM; here it makes the first assertion
-    // go red. An erofs/block rootfs must NOT trip the guard (the inverse over-rejection).
-    #[test]
-    fn reject_virtio_fs_rootfs_rejects_only_virtio_fs() {
-        use crate::config::RootfsSource;
-
-        let err = reject_virtio_fs_rootfs(
-            "cloud-hypervisor",
-            &RootfsSource::VirtioFs {
-                dir: PathBuf::from("/d"),
-            },
-        )
-        .expect_err("a virtio-fs rootfs must be rejected");
-        assert!(
-            matches!(&err, crate::error::Error::Unsupported { vmm, feature }
-                if vmm == "cloud-hypervisor" && feature == "virtio_fs_rootfs"),
-            "expected virtio_fs_rootfs Unsupported, got {err:?}"
-        );
-
-        // erofs and block roots are bootable — the guard must let them through.
-        reject_virtio_fs_rootfs(
-            "qemu",
-            &RootfsSource::Erofs {
-                image: PathBuf::from("/i"),
-            },
-        )
-        .expect("erofs rootfs must be accepted");
-        reject_virtio_fs_rootfs(
-            "firecracker",
-            &RootfsSource::Block {
-                image: PathBuf::from("/i"),
-                overlay: None,
-            },
-        )
-        .expect("block rootfs must be accepted");
     }
 
     /// Spawns a long-lived stand-in process in its own process group, returning the
@@ -1172,30 +1200,35 @@ mod tests {
     }
 
     // Guards M-VMM-5 / H-VMM-3: the ONE shared snapshot-eligibility predicate. The
-    // pure truth table plus the four config boundaries — including a virtio-fs
-    // *rootfs* (the term the FC copy used to miss). Inverse: drop the
-    // `RootfsSource::VirtioFs` term from `config_has_vhost_user_device` and the
-    // virtio-fs-rootfs assertion reddens.
+    // pure truth table plus the config boundaries — including a virtio-fs data
+    // share. Inverse: drop the `!cfg.shares.is_empty()` term from
+    // `config_has_vhost_user_device` and the virtio-fs-share assertion reddens.
     #[test]
     fn config_has_vhost_user_device_covers_all_boundaries() {
-        use crate::config::{Egress, NetConfig, RootfsSource};
+        use crate::config::{Access, CachePolicy, Egress, NetConfig, RootfsSource, Share};
 
         assert!(has_vhost_user_device(true, false, false));
         assert!(has_vhost_user_device(false, true, false));
         assert!(has_vhost_user_device(false, false, true));
         assert!(!has_vhost_user_device(false, false, false));
 
-        let virtio_fs_rootfs = VmConfig::builder(
+        let virtio_fs_share = VmConfig::builder(
             "/k",
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/d"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
             },
         )
+        .with_share(Share::new(
+            "data",
+            "/tmp/data",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
         .build()
-        .expect("build virtio-fs rootfs config");
+        .expect("build virtio-fs share config");
         assert!(
-            config_has_vhost_user_device(&virtio_fs_rootfs, &res_with(None)),
-            "a virtio-fs rootfs must be treated as a vhost-user device"
+            config_has_vhost_user_device(&virtio_fs_share, &res_with(None)),
+            "a virtio-fs data share must be treated as a vhost-user device"
         );
 
         let unprivileged = VmConfig::builder(
@@ -1233,7 +1266,6 @@ mod tests {
         )
         .net(NetConfig::Privileged {
             egress: Egress::default(),
-            host_services_port: None,
         })
         .build()
         .expect("build eligible config");

@@ -1,5 +1,4 @@
 use vmcell::config::{BlockDevice, DiskIoLimit, RootfsSource, VmConfig};
-use vmcell::orchestrator::RealClock;
 
 mod common;
 
@@ -46,7 +45,7 @@ async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     let mut vm = common::start_vm(vmm, cfg).await;
     let agent = vm
-        .agent(Some(std::time::Duration::from_secs(60)), &RealClock)
+        .agent(Some(std::time::Duration::from_secs(60)))
         .await
         .expect("agent must reach ready");
 
@@ -74,9 +73,7 @@ async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         "read-write extra disk /dev/vdc round-trip failed in-guest: stdout={stdout:?}"
     );
 
-    vmcell::vmm::VmInstance::kill(vm.instance_mut())
-        .await
-        .unwrap();
+    vm.kill().await.unwrap();
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -122,7 +119,7 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     let mut vm = common::start_vm(vmm, cfg).await;
     let agent = vm
-        .agent(Some(std::time::Duration::from_secs(60)), &RealClock)
+        .agent(Some(std::time::Duration::from_secs(60)))
         .await
         .expect("agent ready");
 
@@ -162,9 +159,7 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
          ({fast_ms}ms) on this host"
     );
 
-    vmcell::vmm::VmInstance::kill(vm.instance_mut())
-        .await
-        .unwrap();
+    vm.kill().await.unwrap();
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -181,7 +176,7 @@ vmm_matrix_test!(extra_block_survives_snapshot, |vmm| {
 });
 
 async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
-    use vmcell::orchestrator::{MicroVm, VmidAllocator};
+    use vmcell::orchestrator::MicroVm;
 
     // Snapshot runs the privileged tap path (design §12.1), which needs CAP_NET_ADMIN —
     // granted ambiently by the capability runner. Reap orphan netns first (no sudo).
@@ -201,8 +196,7 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let snapshot_dir = tmp.join("snap");
     std::fs::create_dir_all(&snapshot_dir).unwrap();
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = VmidAllocator::new();
+    let env = vmcell::HostEnv::hermetic();
 
     let mk_cfg = || {
         VmConfig::builder(
@@ -214,7 +208,6 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .with_extra_disk(BlockDevice::read_write(&disk_img))
         .net(vmcell::config::NetConfig::Privileged {
             egress: vmcell::config::Egress::Open,
-            host_services_port: None,
         })
         .build()
         .unwrap()
@@ -223,17 +216,11 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Block 1: boot with the extra disk, write a marker to /dev/vdb, snapshot.
     let original_vmid;
     {
-        let mut vm = MicroVm::start(
-            vmm,
-            mk_cfg(),
-            cid_alloc.clone(),
-            vmid_alloc.clone(),
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-        .await
-        .expect("start VM with extra disk");
+        let mut vm = MicroVm::start(vmm, mk_cfg(), &env)
+            .await
+            .expect("start VM with extra disk");
         let agent = vm
-            .agent(Some(std::time::Duration::from_secs(60)), &RealClock)
+            .agent(Some(std::time::Duration::from_secs(60)))
             .await
             .expect("agent ready");
         // `sync` so the guest write reaches the host image file before the snapshot
@@ -256,27 +243,20 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     // Reserve the original vmid so the restore is forced onto a fresh one (mirrors
     // snapshot_restore.rs: proves the extra disk survives independent of vmid rotation).
-    vmid_alloc
+    env.vmids
         .reserve(original_vmid)
         .expect("original vmid is free after shutdown");
 
     // Block 2: restore into a fresh VM and read the marker back off /dev/vdb.
     {
-        let mut vm = MicroVm::restore(
-            vmm,
-            &snapshot_dir,
-            mk_cfg(),
-            cid_alloc,
-            vmid_alloc,
-            Box::new(vmcell::metrics::DefaultCgroupFs),
-        )
-        .await
-        .expect("restore VM with extra disk");
+        let mut vm = MicroVm::restore(vmm, &snapshot_dir, mk_cfg(), &env)
+            .await
+            .expect("restore VM with extra disk");
         assert_ne!(vm.vmid(), original_vmid, "restore must get a fresh vmid");
 
         // First post-restore agent() call carries the mandatory resync (RealClock).
         let outcome = vm
-            .agent(Some(std::time::Duration::from_secs(60)), &RealClock)
+            .agent(Some(std::time::Duration::from_secs(60)))
             .await
             .expect("agent ready after restore")
             .exec(vmcell::ExecRequest::new(vec![

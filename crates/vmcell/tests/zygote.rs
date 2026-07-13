@@ -17,13 +17,11 @@
 //! `snapshot_restore` visibly (H-TEST-3), never silently.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use vmcell::Zygote;
 use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
-use vmcell::metrics::DefaultCgroupFs;
-use vmcell::orchestrator::{MicroVm, RealClock, VmidAllocator};
-use vmcell::vmm::{CidAllocator, VmInstance, Vmm};
+use vmcell::orchestrator::MicroVm;
+use vmcell::vmm::{VmInstance, Vmm};
 
 mod common;
 
@@ -59,7 +57,6 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
         .expect("valid base config");
         cfg.net = NetConfig::Privileged {
             egress: Egress::Open,
-            host_services_port: None,
         };
         cfg
     };
@@ -72,20 +69,13 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
     }
     std::fs::create_dir_all(&master_dir).unwrap();
 
-    let cid_alloc = Arc::new(CidAllocator::new());
-    let vmid_alloc = VmidAllocator::new();
+    let env = vmcell::HostEnv::hermetic();
 
     // 1. Boot a base VM to agent-ready, then SUSPEND it into a zygote.
-    let mut base = MicroVm::start(
-        vmm,
-        base_cfg(),
-        cid_alloc.clone(),
-        vmid_alloc.clone(),
-        Box::new(DefaultCgroupFs),
-    )
-    .await
-    .expect("start base VM");
-    if let Err(e) = base.agent(None, &RealClock).await {
+    let mut base = MicroVm::start(vmm, base_cfg(), &env)
+        .await
+        .expect("start base VM");
+    if let Err(e) = base.agent(None).await {
         let log = std::fs::read_to_string(base.instance().serial_log()).unwrap_or_default();
         println!("BASE SERIAL LOG:\n{log}");
         panic!("base agent connect failed: {e}");
@@ -106,9 +96,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
         // CH tier: mint a CONCURRENT pool.
         const N: usize = 3;
         let mut clones = zygote
-            .spawn_clones(vmm, N, cid_alloc.clone(), vmid_alloc.clone(), || {
-                Box::new(DefaultCgroupFs)
-            })
+            .spawn_clones(vmm, N, &env)
             .await
             .expect("concurrent zygote fan-out");
         assert_eq!(clones.len(), N, "fan-out must produce N live clones");
@@ -132,7 +120,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
 
             // Each clone is independently agent-reachable and execs correctly.
             let log_path = vm.instance().serial_log().to_path_buf();
-            let agent_res = vm.agent(None, &RealClock).await;
+            let agent_res = vm.agent(None).await;
             if let Err(e) = &agent_res {
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
                 println!("CLONE {i} SERIAL LOG:\n{log}");
@@ -153,7 +141,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
             // vmid: the in-guest MAC must equal mac_math(vmid). Distinct vmids ⇒
             // distinct MACs, so no two concurrent clones share an L2 identity.
             let mac_out = vm
-                .agent(None, &RealClock)
+                .agent(None)
                 .await
                 .unwrap()
                 .exec(ExecRequest::new(vec![
@@ -190,11 +178,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
     } else {
         // FC tier: concurrent fan-out is gated off (verbatim vsock rebind); a
         // single clone still works.
-        let many = zygote
-            .spawn_clones(vmm, 2, cid_alloc.clone(), vmid_alloc.clone(), || {
-                Box::new(DefaultCgroupFs)
-            })
-            .await;
+        let many = zygote.spawn_clones(vmm, 2, &env).await;
         // Don't `{:?}` the Ok arm — that would force `V::Instance: Debug`. A stray
         // Ok pool (the bug) is dropped here (ordered teardown) as the test panics.
         match many {
@@ -208,16 +192,11 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
         }
 
         let mut one = zygote
-            .spawn_clone(
-                vmm,
-                cid_alloc.clone(),
-                vmid_alloc.clone(),
-                Box::new(DefaultCgroupFs),
-            )
+            .spawn_clone(vmm, &env)
             .await
             .expect("a single zygote clone works on any snapshot backend");
         let out = one
-            .agent(None, &RealClock)
+            .agent(None)
             .await
             .expect("single clone agent")
             .exec(ExecRequest::new(vec!["echo".into(), "one".into()]))

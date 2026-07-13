@@ -350,7 +350,7 @@ pub struct ResourceUsageDto {
     /// Bytes written to disk/block devices.
     pub io_write_bytes: u64,
     /// Whether the memory controller is delegated (the hard cap took effect).
-    pub limits_enforced: bool,
+    pub mem_limit_enforced: bool,
     /// Whether the memory reads succeeded.
     pub mem_read_ok: bool,
     /// Whether the CPU reads succeeded.

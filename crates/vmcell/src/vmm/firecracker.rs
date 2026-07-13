@@ -474,11 +474,6 @@ impl Vmm for Firecracker {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
-        // VMM-1: reject a virtio-fs *rootfs* up front via the shared self-guard
-        // (mirrored across CH/QEMU/FC) rather than spawning a VMM and rejecting later
-        // at the drive-configuration step. The `RootfsSource::VirtioFs` arm further
-        // below stays as defense in depth.
-        crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
         // FC has no virtio-console device, so a VirtioConsole config must be rejected
         // BEFORE build_kernel_cmdline — otherwise the boot args would carry
         // `console=hvc0` with no `hvc0` device and `serial.log` would stay empty.
@@ -620,12 +615,6 @@ impl Vmm for Firecracker {
             crate::config::RootfsSource::Erofs { image } => image.clone(),
             crate::config::RootfsSource::Block { image, overlay } => {
                 overlay.as_ref().unwrap_or(image).clone()
-            }
-            crate::config::RootfsSource::VirtioFs { .. } => {
-                return Err(Error::Unsupported {
-                    vmm: "firecracker".to_string(),
-                    feature: "virtio_fs_rootfs".to_string(),
-                });
             }
         };
 
@@ -1057,36 +1046,6 @@ impl Drop for FcInstance {
 mod tests {
     use super::*;
 
-    // Guards VMM-1 for the FC `create()` path: a virtio-fs *rootfs* config reaches
-    // create(), which self-guards up front with a typed `Unsupported` (FC also keeps a
-    // defense-in-depth arm at the drive step). Inverse: an erofs rootfs must NOT trip
-    // the guard.
-    #[test]
-    fn create_rejects_virtio_fs_rootfs() {
-        use crate::config::RootfsSource;
-
-        let err = crate::vmm::reject_virtio_fs_rootfs(
-            Firecracker::new("/usr/bin/firecracker").id(),
-            &RootfsSource::VirtioFs {
-                dir: PathBuf::from("/d"),
-            },
-        )
-        .expect_err("FC create() must reject a virtio-fs rootfs");
-        assert!(
-            matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "firecracker" && feature == "virtio_fs_rootfs"),
-            "expected virtio_fs_rootfs Unsupported, got {err:?}"
-        );
-
-        crate::vmm::reject_virtio_fs_rootfs(
-            Firecracker::new("/usr/bin/firecracker").id(),
-            &RootfsSource::Erofs {
-                image: PathBuf::from("/i"),
-            },
-        )
-        .expect("an erofs rootfs must not trip the FC guard");
-    }
-
     // Guards VMM-4: the probe must distinguish a firm "T2 unsupported" (a 400 template
     // error) from a transient probe failure (a 500, a non-template 400, a timeout, a
     // transport error). The buggy inverse — the old code collapsed every `Err(_)` to
@@ -1278,23 +1237,29 @@ mod tests {
     }
 
     // Guards H-VMM-3: FC restore()'s snapshot-eligibility guard must reject a virtio-fs
-    // *rootfs* (a vhost-user device), not just data shares — via the SHARED
-    // `config_has_vhost_user_device` predicate. It returns BEFORE reading the sidecar or
-    // spawning, so no KVM/snapshot artifact is needed. Inverse (the old inline check
-    // that only looked at `cfg.shares`) falls through to the sidecar read and fails with
-    // an I/O error, not this typed vhost-user Unsupported — reddening the assert.
+    // data share (a vhost-user device) via the SHARED `config_has_vhost_user_device`
+    // predicate. It returns BEFORE reading the sidecar or spawning, so no KVM/snapshot
+    // artifact is needed. Inverse (an inline check that never consulted the shared
+    // predicate) falls through to the sidecar read and fails with an I/O error, not
+    // this typed vhost-user Unsupported — reddening the assert.
     #[tokio::test]
-    async fn restore_rejects_virtio_fs_rootfs() {
-        use crate::config::RootfsSource;
+    async fn restore_rejects_virtio_fs_share() {
+        use crate::config::{Access, CachePolicy, RootfsSource, Share};
         let fc = Firecracker::new("/usr/bin/firecracker");
         let cfg = VmConfig::builder(
             "/k",
-            RootfsSource::VirtioFs {
-                dir: PathBuf::from("/d"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
             },
         )
+        .with_share(Share::new(
+            "data",
+            "/tmp/data",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
         .build()
-        .expect("build virtio-fs rootfs config");
+        .expect("build virtio-fs share config");
         let res = PerVmResources {
             cgroup_name: "vmcell-test".to_string(),
             tap_name: Some("tap0".to_string()),
@@ -1308,7 +1273,7 @@ mod tests {
         let err = fc
             .restore(Path::new("/nonexistent-snapshot"), &cfg, &res, &cgroups)
             .await
-            .expect_err("FC restore must reject a virtio-fs rootfs");
+            .expect_err("FC restore must reject a virtio-fs data share");
         assert!(
             matches!(&err, Error::Unsupported { vmm, feature }
                 if vmm == "firecracker" && feature.contains("vhost-user")),

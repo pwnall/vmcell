@@ -76,19 +76,21 @@ impl Stage for SnapshotStage {
         let ch_binary = crate::artifact::ch_binary_path();
         let vmm = CloudHypervisor::new(ch_binary);
 
-        let cid_alloc = self.cid_alloc.clone();
-        let vmid_alloc = self.vmid_alloc.clone();
-        let mut vm = MicroVm::start(
-            &vmm,
-            cfg,
-            cid_alloc.clone(),
-            vmid_alloc,
-            Box::new(crate::metrics::DefaultCgroupFs),
-        )
-        .await?;
+        // Bundle this stage's injected allocators with the default cgroup/clock/
+        // overlay seams into one `HostEnv` (design §18 delta 1). The stage keeps the
+        // allocators as separate fields (they must stay `RefUnwindSafe`), building
+        // the transient bundle here for the spawn call.
+        let env = crate::env::HostEnv {
+            cids: self.cid_alloc.clone(),
+            vmids: self.vmid_alloc.clone(),
+            cgroups: std::sync::Arc::new(crate::metrics::DefaultCgroupFs),
+            clock: std::sync::Arc::new(crate::orchestrator::RealClock),
+            overlay: std::sync::Arc::new(crate::overlay::ReflinkOverlayStore),
+        };
+        let mut vm = MicroVm::start(&vmm, cfg, &env).await?;
 
         // Wait for VM to boot fully via vsock agent
-        let agent = vm.agent(None, &crate::orchestrator::RealClock).await?;
+        let agent = vm.agent(None).await?;
         let _ = agent
             .exec(ExecRequest::new(vec!["true".to_string()]))
             .await?;

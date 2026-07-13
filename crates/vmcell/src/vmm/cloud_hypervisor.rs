@@ -195,7 +195,6 @@ fn build_ch_disks(cfg: &VmConfig) -> Vec<ChDisk> {
             image_type: CH_RAW_IMAGE_TYPE,
             rate_limiter_config: None,
         }),
-        crate::config::RootfsSource::VirtioFs { .. } => {}
     }
     for disk in &cfg.extra_disks {
         disks.push(ChDisk {
@@ -493,11 +492,6 @@ impl Vmm for CloudHypervisor {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
-        // VMM-1: no CH build boots a virtio-fs *rootfs* (it would need virtiofsd as the
-        // root device + `rootfstype=virtiofs`). Reject it up front with a typed
-        // `Unsupported` instead of silently emitting `root=/dev/vda rootfstype=ext4`
-        // for a VM with no `/dev/vda`, which kernel-panics the guest on a missing root.
-        crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
         // The cmdline `console=` token and the serial/console device pair below are
         // both derived from `cfg.console_mode`; gate an unsupported mode up front so
         // they can never desync into a silent `serial.log`.
@@ -1040,38 +1034,6 @@ mod tests {
             cj.contains("\"mode\":\"File\"") && cj.contains("/tmp/serial.log"),
             "virtio-console console must be a File sink to serial.log: {cj}"
         );
-    }
-
-    // Guards VMM-1 for the CH `create()` path: a virtio-fs *rootfs* config is
-    // buildable (config::build() only rejects it when also snapshotting) and reaches
-    // create(), which must self-guard with a typed `Unsupported` rather than silently
-    // building an unbootable VM. The buggy inverse (the old empty `VirtioFs => {}` arm,
-    // no early guard) makes the first assertion go red; an erofs rootfs must NOT trip
-    // the guard (the over-rejection inverse).
-    #[test]
-    fn create_rejects_virtio_fs_rootfs() {
-        use crate::config::RootfsSource;
-
-        let err = crate::vmm::reject_virtio_fs_rootfs(
-            CloudHypervisor::new("/usr/bin/cloud-hypervisor").id(),
-            &RootfsSource::VirtioFs {
-                dir: PathBuf::from("/d"),
-            },
-        )
-        .expect_err("CH create() must reject a virtio-fs rootfs");
-        assert!(
-            matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "cloud-hypervisor" && feature == "virtio_fs_rootfs"),
-            "expected virtio_fs_rootfs Unsupported, got {err:?}"
-        );
-
-        crate::vmm::reject_virtio_fs_rootfs(
-            CloudHypervisor::new("/usr/bin/cloud-hypervisor").id(),
-            &RootfsSource::Erofs {
-                image: PathBuf::from("/i"),
-            },
-        )
-        .expect("an erofs rootfs must not trip the CH guard");
     }
 
     // Guards M-VMM-4: a restored CH VM is resumed via `resume()`, never booted; boot()

@@ -20,11 +20,12 @@ pub struct ResourceUsage {
     pub io_write_bytes: u64,
     /// Whether the `memory` controller is delegated into this cgroup — the honest
     /// proxy for "the hard memory cap took effect", **not** a guarantee that every
-    /// requested limit (cpu/pids/io) is enforced (M-HOST-5). The name is retained
-    /// for API stability, but a read that holds only the cgroup *name* cannot know
-    /// which controllers were requested, so it reports the one whose silent absence
-    /// lets the memory cap not fire; a caller needing per-controller enforcement
-    /// must consult the individual control files.
+    /// requested limit (cpu/pids/io) is enforced (M-HOST-5). Renamed from the former
+    /// `limits_enforced` (design §18 delta 3): the old name over-claimed a
+    /// whole-`ResourceLimits` guarantee, but a read that holds only the cgroup *name*
+    /// cannot know which controllers were requested, so it reports the **one** — the
+    /// memory controller — whose silent absence lets the memory cap not fire; a caller
+    /// needing per-controller enforcement must consult the individual control files.
     ///
     /// `true` only when the `memory` controller is delegated into this cgroup
     /// (`cgroup.controllers` lists it), meaning the limit writes took effect.
@@ -37,7 +38,7 @@ pub struct ResourceUsage {
     /// netns/interface handle, so an always-zero `net_*` field would be a lie
     /// (§7.1 / rubric B8). See the "Net counters omitted from `ResourceUsage`"
     /// deviation in `docs/implementation-notes.md`.
-    pub limits_enforced: bool,
+    pub mem_limit_enforced: bool,
     /// Whether the memory counters (`mem_current_mib`, `mem_peak_mib`) were read
     /// and parsed successfully (§7.1 rule 3: an unread counter is the same lie as a
     /// missing one). `false` when `memory.current`/`memory.peak` are absent or fail
@@ -336,12 +337,12 @@ fn read_stats_at(base_path: &str) -> ResourceUsage {
         usage.cpu_read_ok = true;
     }
 
-    // limits_enforced (§7.1 rule 3): the memory controller is delegated into this
+    // mem_limit_enforced (§7.1 rule 3): the memory controller is delegated into this
     // cgroup iff it is listed in `cgroup.controllers`. When it is absent the limit
     // writes were rejected and the values above are bare sysfs fallbacks, so the
     // caller must not assume enforcement. Honestly `false` if the file is missing.
     let controllers_path = format!("{base_path}/cgroup.controllers");
-    usage.limits_enforced = std::fs::read_to_string(controllers_path)
+    usage.mem_limit_enforced = std::fs::read_to_string(controllers_path)
         .map(|s| controller_listed(&s, "memory"))
         .unwrap_or(false);
 
@@ -601,7 +602,7 @@ impl CgroupFs for FakeCgroupFs {
             cpu_usec: 1000,
             io_read_bytes: 0,
             io_write_bytes: 0,
-            limits_enforced: true,
+            mem_limit_enforced: true,
             mem_read_ok: true,
             cpu_read_ok: true,
             io_read_ok: true,
@@ -835,7 +836,7 @@ mod tests {
             !usage.io_read_ok,
             "io_read_ok must be false when io.stat is absent"
         );
-        assert!(!usage.limits_enforced);
+        assert!(!usage.mem_limit_enforced);
         // The values themselves must be the honest 0, paired with the false flags.
         assert_eq!(usage.mem_current_mib, 0);
         assert_eq!(usage.cpu_usec, 0);
@@ -869,7 +870,7 @@ mod tests {
         assert_eq!(usage.cpu_usec, 123_456);
         assert_eq!(usage.io_read_bytes, 100);
         assert_eq!(usage.io_write_bytes, 200);
-        assert!(usage.limits_enforced);
+        assert!(usage.mem_limit_enforced);
     }
 
     // A half-readable memory controller (current present, peak missing) is not
@@ -1031,7 +1032,7 @@ mod tests {
         }
     }
 
-    // M-HOST-5: `limits_enforced` reports specifically whether the MEMORY controller
+    // M-HOST-5: `mem_limit_enforced` reports specifically whether the MEMORY controller
     // is delegated (the knob whose silent absence lets the hard memory cap not fire),
     // not "any requested controller is enforced". A cgroup delegating cpu+pids but
     // NOT memory must therefore report `false`; adding memory flips it `true`. Goes
@@ -1045,14 +1046,14 @@ mod tests {
         // cpu and pids delegated, memory NOT.
         std::fs::write(base.join("cgroup.controllers"), "cpu pids").expect("controllers");
         assert!(
-            !read_stats_at(&base.to_string_lossy()).limits_enforced,
-            "memory not delegated ⇒ limits_enforced must be false even if cpu/pids are"
+            !read_stats_at(&base.to_string_lossy()).mem_limit_enforced,
+            "memory not delegated ⇒ mem_limit_enforced must be false even if cpu/pids are"
         );
         // Now delegate memory too — the flag flips, proving the check is memory-specific.
         std::fs::write(base.join("cgroup.controllers"), "cpu memory pids").expect("controllers");
         assert!(
-            read_stats_at(&base.to_string_lossy()).limits_enforced,
-            "memory delegated ⇒ limits_enforced true"
+            read_stats_at(&base.to_string_lossy()).mem_limit_enforced,
+            "memory delegated ⇒ mem_limit_enforced true"
         );
     }
 

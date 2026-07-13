@@ -83,10 +83,7 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
 
     let mut vm = common::start_vm(backend, cfg).await;
     let agent = vm
-        .agent(
-            Some(std::time::Duration::from_secs(60)),
-            &vmcell::orchestrator::RealClock,
-        )
+        .agent(Some(std::time::Duration::from_secs(60)))
         .await
         .expect("Failed to connect to agent");
 
@@ -94,8 +91,6 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
         .await
         .expect("virtio-fs RO/RW share contract");
 
-    vmcell::vmm::VmInstance::kill(vm.instance_mut())
-        .await
-        .unwrap();
+    vm.kill().await.unwrap();
     let _ = std::fs::remove_dir_all(tmp);
 }

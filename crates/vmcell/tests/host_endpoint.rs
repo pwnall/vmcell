@@ -34,17 +34,10 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         host_services_port: Some(port),
     };
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start VM");
 
     // The guest gateway IP uses the centralized (vmid % 254) + 1 octet math, not
     // the raw vmid — using the raw vmid is an off-by-one that reaches no host.
@@ -86,10 +79,7 @@ async fn test_host_endpoint_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Give network time to settle, then exercise the NAT host-service forward (a vmcell
     // networking feature, not an artifact property — kept inline here).
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let agent = vm
-        .agent(None, &vmcell::orchestrator::RealClock)
-        .await
-        .expect("Failed to connect to agent");
+    let agent = vm.agent(None).await.expect("Failed to connect to agent");
 
     let outcome = agent
         .exec(ExecRequest::new(vec![

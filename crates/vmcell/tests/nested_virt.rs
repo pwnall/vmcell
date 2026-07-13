@@ -89,19 +89,12 @@ async fn test_nested_virt_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Enable nested virtualization
     cfg.nested_virt = true;
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start VM");
 
-    let agent = match vm.agent(None, &vmcell::orchestrator::RealClock).await {
+    let agent = match vm.agent(None).await {
         Ok(a) => a,
         Err(e) => {
             use vmcell::vmm::VmInstance;
@@ -150,19 +143,12 @@ async fn test_nested_virt_disabled_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Explicitly DISABLE nested virtualization (the lever under test).
     cfg.nested_virt = false;
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = MicroVm::start(
-        vmm,
-        cfg,
-        cid_alloc.clone(),
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(vmm, cfg, &env)
+        .await
+        .expect("Failed to start VM");
 
-    let agent = match vm.agent(None, &vmcell::orchestrator::RealClock).await {
+    let agent = match vm.agent(None).await {
         Ok(a) => a,
         Err(e) => {
             use vmcell::vmm::VmInstance;

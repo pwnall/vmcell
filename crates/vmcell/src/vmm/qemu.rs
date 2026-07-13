@@ -417,9 +417,6 @@ impl Qemu {
                     .arg("-device")
                     .arg("virtio-blk-pci,drive=rfs");
             }
-            // Unreachable: `create()` rejects a virtio-fs rootfs up front via
-            // `reject_virtio_fs_rootfs` (VMM-1). Kept for match exhaustiveness.
-            crate::config::RootfsSource::VirtioFs { .. } => {}
         }
 
         // Extra virtio-blk devices (§19.1), attached AFTER the root `virtio-blk-pci` so
@@ -548,11 +545,6 @@ impl Vmm for Qemu {
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
-        // VMM-1: no QEMU build boots a virtio-fs *rootfs* (it would need virtiofsd as
-        // the root device + `rootfstype=virtiofs`). Reject it up front with a typed
-        // `Unsupported` instead of silently emitting `root=/dev/vda rootfstype=ext4`
-        // for a VM with no `/dev/vda`, which kernel-panics the guest on a missing root.
-        crate::vmm::reject_virtio_fs_rootfs(self.id(), &cfg.rootfs)?;
         // The cmdline `console=` token and the serial/virtconsole device wiring in
         // `spawn_qemu` are both driven by `cfg.console_mode`; gate an unsupported
         // mode up front so they can never desync into a silent `serial.log`.
@@ -791,36 +783,6 @@ mod tests {
             has_s,
             "QEMU must launch with -S to freeze vCPUs until boot()"
         );
-    }
-
-    // Guards VMM-1 for the QEMU `create()` path: a virtio-fs *rootfs* config is
-    // buildable and reaches create(), which must self-guard with a typed `Unsupported`
-    // rather than silently building an unbootable VM (the old empty `VirtioFs => {}`
-    // arm). Inverse: an erofs rootfs must NOT trip the guard.
-    #[test]
-    fn create_rejects_virtio_fs_rootfs() {
-        use crate::config::RootfsSource;
-
-        let err = crate::vmm::reject_virtio_fs_rootfs(
-            Qemu::new("/usr/bin/qemu-system-x86_64").id(),
-            &RootfsSource::VirtioFs {
-                dir: PathBuf::from("/d"),
-            },
-        )
-        .expect_err("QEMU create() must reject a virtio-fs rootfs");
-        assert!(
-            matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "qemu" && feature == "virtio_fs_rootfs"),
-            "expected virtio_fs_rootfs Unsupported, got {err:?}"
-        );
-
-        crate::vmm::reject_virtio_fs_rootfs(
-            Qemu::new("/usr/bin/qemu-system-x86_64").id(),
-            &RootfsSource::Erofs {
-                image: PathBuf::from("/i"),
-            },
-        )
-        .expect("an erofs rootfs must not trip the QEMU guard");
     }
 
     // Guards VMM-5: QEMU `restore()` returns `Unsupported` *before spawning* — which is

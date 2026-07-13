@@ -10,7 +10,6 @@ use crate::dto::{ExecOutcomeDto, ExecRequestDto, NetMode, ResourceUsageDto};
 use crate::error::{DaemonError, DaemonResult};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// A resolved request to boot one VM — absolute artifact paths (the names already resolved against
@@ -71,27 +70,43 @@ pub trait VmLauncher: Send + Sync {
 /// process-global `VmidAllocator`/`CidAllocator`).
 pub struct MicroVmLauncher {
     vmm: vmcell::CloudHypervisor,
-    cids: Arc<vmcell::vmm::CidAllocator>,
-    vmids: vmcell::orchestrator::VmidAllocator,
-    cgroup_factory: Box<dyn Fn() -> Box<dyn vmcell::metrics::CgroupFs> + Send + Sync>,
+    /// The process-wide seam bundle (allocators + cgroup/clock/overlay), built once — the daemon is
+    /// its natural single home (design §18 deltas 1–2). Threaded by reference to every spawn.
+    env: vmcell::HostEnv,
     /// The prefix every VM's swept host resources are named with (must match the start-up sweep's,
     /// design).
     resource_prefix: String,
 }
 
 impl MicroVmLauncher {
-    /// Builds a launcher over the `cloud-hypervisor` binary at `ch_bin`, with fresh process-global
-    /// allocators, the default (real sysfs) cgroup backend, and `resource_prefix` for VM resource
-    /// naming (use [`vmcell::naming::DEFAULT_RESOURCE_PREFIX`] for the default `vmcell-*` names).
-    #[must_use]
-    pub fn new(ch_bin: String, resource_prefix: impl Into<String>) -> Self {
-        Self {
+    /// Builds a launcher over the `cloud-hypervisor` binary at `ch_bin`, with a process-wide
+    /// [`HostEnv`](vmcell::HostEnv) (cross-process VMID allocator, real sysfs cgroup backend,
+    /// reflink overlay store), and `resource_prefix` for VM resource naming (use
+    /// [`vmcell::naming::DEFAULT_RESOURCE_PREFIX`] for the default `vmcell-*` names).
+    ///
+    /// # Errors
+    /// Returns [`DaemonError::Internal`] if the process-wide `HostEnv` cannot be built (currently
+    /// infallible; the fallible signature future-proofs a start-up host-capability probe, §11.2).
+    pub fn new(ch_bin: String, resource_prefix: impl Into<String>) -> DaemonResult<Self> {
+        // Probe the host's capabilities ONCE at start-up (design §7.2 rule 1 / §18 delta 8), so the
+        // daemon logs exactly what it can enforce — a missing controller or netns is a visible boot
+        // signal, not a silent per-VM no-op later.
+        let caps = vmcell::HostCapabilities::probe();
+        tracing::info!(
+            cap_net_admin = caps.cap_net_admin,
+            cap_sys_admin = caps.cap_sys_admin,
+            kvm = caps.kvm_accessible,
+            netns = caps.netns_reachable,
+            domain_leaf = caps.domain_leaf,
+            memory_enforceable = caps.memory_limit_enforceable(),
+            "vmcelld host capabilities probed at start-up"
+        );
+        Ok(Self {
             vmm: vmcell::CloudHypervisor::new(ch_bin),
-            cids: Arc::new(vmcell::vmm::CidAllocator::new()),
-            vmids: vmcell::orchestrator::VmidAllocator::shared(),
-            cgroup_factory: Box::new(|| Box::new(vmcell::metrics::DefaultCgroupFs)),
+            env: vmcell::HostEnv::shared()
+                .map_err(|e| DaemonError::Internal(format!("cannot build host env: {e}")))?,
             resource_prefix: resource_prefix.into(),
-        }
+        })
     }
 }
 
@@ -105,7 +120,7 @@ pub fn usage_to_dto(u: &vmcell::ResourceUsage) -> ResourceUsageDto {
         cpu_usec: u.cpu_usec,
         io_read_bytes: u.io_read_bytes,
         io_write_bytes: u.io_write_bytes,
-        limits_enforced: u.limits_enforced,
+        mem_limit_enforced: u.mem_limit_enforced,
         mem_read_ok: u.mem_read_ok,
         cpu_read_ok: u.cpu_read_ok,
         io_read_ok: u.io_read_ok,
@@ -136,10 +151,7 @@ impl VmHandle for MicroVmHandle {
         if let Some(secs) = req.timeout_secs {
             er = er.with_timeout(Duration::from_secs(secs));
         }
-        let agent = self
-            .vm
-            .agent(None, &vmcell::orchestrator::RealClock)
-            .await?;
+        let agent = self.vm.agent(None).await?;
         let outcome = agent.exec(er).await?;
         Ok(ExecOutcomeDto::from_bytes(
             outcome.code,
@@ -181,7 +193,6 @@ fn net_config(mode: NetMode) -> vmcell::config::NetConfig {
         NetMode::None => NetConfig::None,
         NetMode::Privileged => NetConfig::Privileged {
             egress: Egress::Open,
-            host_services_port: None,
         },
         NetMode::Unprivileged => NetConfig::Unprivileged {
             egress: Egress::Open,
@@ -219,32 +230,15 @@ impl VmLauncher for MicroVmLauncher {
         // design §9.4) or cold-boot. Both then bring the agent up: for a cold boot that confirms
         // it booted; for a restore it drives the mandatory first post-restore resync (design §12.4).
         let mut vm = if let Some(dir) = &spec.restore_from {
-            let (vm, _cow) = vmcell::MicroVm::restore_cow(
-                &self.vmm,
-                dir,
-                cfg,
-                self.cids.clone(),
-                self.vmids.clone(),
-                (self.cgroup_factory)(),
-                // The daemon restores named artifacts through the production reflink
-                // store; the OverlayStore seam is injectable here too (a non-default
-                // store is design §21.8 forward work).
-                std::sync::Arc::new(vmcell::ReflinkOverlayStore),
-            )
-            .await?;
+            // Restore named artifacts through the process-wide overlay store carried on `self.env`
+            // (invariant S4), so the store snapshot stays re-restorable.
+            let (vm, _cow) = vmcell::MicroVm::restore_cow(&self.vmm, dir, cfg, &self.env).await?;
             vm
         } else {
-            vmcell::MicroVm::start(
-                &self.vmm,
-                cfg,
-                self.cids.clone(),
-                self.vmids.clone(),
-                (self.cgroup_factory)(),
-            )
-            .await?
+            vmcell::MicroVm::start(&self.vmm, cfg, &self.env).await?
         };
         // A registered VM in `Ready` is genuinely ready (design §18.4 "derived from the handle").
-        vm.agent(None, &vmcell::orchestrator::RealClock).await?;
+        vm.agent(None).await?;
         Ok(Box::new(MicroVmHandle { vm }))
     }
 }

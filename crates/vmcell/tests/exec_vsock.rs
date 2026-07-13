@@ -491,22 +491,12 @@ vmm_matrix_test!(put_file, |vmm| {
     .build()
     .unwrap();
 
-    let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-    let vmid_alloc = vmcell::orchestrator::VmidAllocator::new();
-    let mut vm = vmcell::MicroVm::start(
-        &vmm,
-        cfg,
-        cid_alloc,
-        vmid_alloc,
-        Box::new(vmcell::metrics::DefaultCgroupFs),
-    )
-    .await
-    .expect("Failed to start VM");
-
-    let agent = vm
-        .agent(None, &vmcell::orchestrator::RealClock)
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = vmcell::MicroVm::start(&vmm, cfg, &env)
         .await
-        .expect("Failed to connect to agent");
+        .expect("Failed to start VM");
+
+    let agent = vm.agent(None).await.expect("Failed to connect to agent");
 
     agent
         .put_file("/tmp/hello.txt", b"hello world from test", None)
