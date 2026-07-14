@@ -347,6 +347,38 @@ mod tests {
         );
     }
 
+    // proxy-cassette: the `record_to` cassette hook is request-line logging ONLY
+    // (no response body/status, excludes blocked hosts — NOT replay, which is §17
+    // forward work). This drives the fs-write branch of route_request, which no
+    // other test populates (record_path is None everywhere else) — the exact
+    // fake-blind fs effect class (AGENTS rule 4). RED on the inverse (dropping the
+    // writeln!): the cassette stays empty and the `contains` assert reddens.
+    #[test]
+    fn record_to_writes_forwarded_request_to_cassette() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cassette = dir.path().join("cassette.txt");
+        let handler = ProxyHandler {
+            doubles: Arc::new(std::sync::RwLock::new(Vec::new())),
+            blocked_domains: vec![],
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            record_path: Arc::new(std::sync::Mutex::new(Some(cassette.clone()))),
+        };
+        let req = Request::builder()
+            .method(hyper::Method::GET)
+            .uri("http://example.com/")
+            .body(hudsucker::Body::empty())
+            .expect("request builds");
+        match handler.route_request(req) {
+            RequestOrResponse::Request(_) => {}
+            RequestOrResponse::Response(_) => panic!("a forwarded request must not be synthesized"),
+        }
+        let recorded = std::fs::read_to_string(&cassette).expect("cassette written");
+        assert!(
+            recorded.contains("GET http://example.com/"),
+            "the cassette must record the forwarded request line: {recorded:?}"
+        );
+    }
+
     // Guards the meaningfulness of the CONNECT test: a non-CONNECT request that
     // matches a double must return the double's response.
     #[test]

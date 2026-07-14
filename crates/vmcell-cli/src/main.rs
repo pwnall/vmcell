@@ -545,7 +545,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
         Commands::Exec => Err(moved_to_vmcelld_ctl("exec")),
         Commands::Ls => Err(moved_to_vmcelld_ctl("ls")),
         Commands::Rm => Err(moved_to_vmcelld_ctl("rm")),
-        Commands::Destroy => Err(moved_to_vmcelld_ctl("destroy")),
+        Commands::Destroy => Err(moved_to_vmcelld_ctl("rm")),
     }
 }
 
@@ -803,7 +803,8 @@ async fn oci2erofs(
     let built = stage_dir.join("rootfs.erofs");
     let copy_res = std::fs::copy(&built, output).map_err(vmcell::Error::Io);
     // Best-effort cleanup of the staging dir regardless of the copy result; it is a
-    // per-pid scratch dir under the system temp dir, so a leftover is not actionable.
+    // per-pid scratch dir under the artifacts dir (a distinct sibling of the canonical
+    // rootfs, M-BIN-6), so a leftover is not actionable.
     let _ = std::fs::remove_dir_all(&stage_dir);
     copy_res?;
     println!("vmcell: wrote erofs rootfs to {}", output.display());
@@ -826,11 +827,16 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test runtime");
-        for command in [
-            Commands::Exec,
-            Commands::Ls,
-            Commands::Rm,
-            Commands::Destroy,
+        // Each removed verb must redirect to a subcommand `vmcelld-ctl` actually
+        // exposes: the CLI `destroy` maps to the daemon client's teardown verb `rm`
+        // (M3). A bare `contains("vmcelld-ctl")` stayed green even when the message
+        // said `vmcelld-ctl destroy`, which `vmcelld-ctl` has no subcommand for; this
+        // table asserts the exact verb so that regression reddens.
+        for (command, ctl_verb) in [
+            (Commands::Exec, "exec"),
+            (Commands::Ls, "ls"),
+            (Commands::Rm, "rm"),
+            (Commands::Destroy, "rm"),
         ] {
             let err = rt
                 .block_on(dispatch(&command))
@@ -853,12 +859,13 @@ mod tests {
                 !shown.contains("Unsupported {"),
                 "Display must not be the Debug struct-dump, got: {shown}"
             );
-            // Delta 11: the removed verbs redirect the user at `vmcelld-ctl` (the daemon's
-            // control client), where the real exec/ls/rm live. RED on the inverse (a message
-            // that points only at "the vmcelld daemon" generically, or omits the ctl tool).
+            // Delta 11: the removed verbs redirect the user at a `vmcelld-ctl` subcommand
+            // that actually exists (the daemon's control client), where the real
+            // exec/ls/rm live. RED on the inverse (a message naming `vmcelld-ctl destroy`,
+            // which `vmcelld-ctl` has no subcommand for, or one that omits the ctl tool).
             assert!(
-                shown.contains("vmcelld-ctl"),
-                "the redirect must name `vmcelld-ctl`, got: {shown}"
+                shown.contains(&format!("vmcelld-ctl {ctl_verb}")),
+                "the redirect must name `vmcelld-ctl {ctl_verb}`, got: {shown}"
             );
         }
     }

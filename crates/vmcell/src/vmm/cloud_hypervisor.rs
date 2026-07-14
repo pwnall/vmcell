@@ -216,6 +216,32 @@ struct ChFs {
     queue_size: usize,
 }
 
+/// Builds the CH `net` device list: one tap device (privileged net), one vhost-user
+/// client device with the vmid-derived MAC (unprivileged net), or none. Extracted
+/// (like `build_ch_disks`) so the tap-vs-vhost-user shaping is unit-testable without
+/// spawning CH.
+fn build_ch_net(res: &PerVmResources) -> Result<Vec<ChNet>> {
+    if let Some(tap) = &res.tap_name {
+        Ok(vec![ChNet {
+            tap: Some(tap.clone()),
+            mac: None,
+            vhost_user: None,
+            vhost_mode: None,
+            vhost_socket: None,
+        }])
+    } else if let Some(socket) = &res.vhost_user_socket {
+        Ok(vec![ChNet {
+            tap: None,
+            mac: Some(crate::net::mac_math(res.vmid)?),
+            vhost_user: Some(true),
+            vhost_mode: Some("Client".to_string()),
+            vhost_socket: Some(socket.clone()),
+        }])
+    } else {
+        Ok(vec![])
+    }
+}
+
 #[derive(Serialize)]
 struct ChNet {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -325,6 +351,15 @@ fn baked_cid_from_config(config: &serde_json::Value) -> Option<u32> {
         .and_then(|v| v.get("cid"))
         .and_then(serde_json::Value::as_u64)
         .and_then(|c| u32::try_from(c).ok())
+}
+
+/// The restored guest CID: a restored CH VM keeps the CID baked into its snapshot
+/// (`vsock.cid` in config.json), reported by `guest_cid()`; it falls back to the
+/// orchestrator's fresh allocation only when the snapshot's config.json lacked a
+/// readable `vsock.cid` (M-VMM-3). One predicate for the wiring the live restore test
+/// cannot pin (a sequential restore may legitimately be re-handed the freed CID).
+fn restored_cid(baked_cid: Option<u32>, fresh_cid: u32) -> u32 {
+    baked_cid.unwrap_or(fresh_cid)
 }
 
 /// Rewrites a CH restore `config.json` in place so its host-side paths point at the
@@ -579,23 +614,7 @@ impl Vmm for CloudHypervisor {
             },
         };
 
-        if let Some(tap) = &res.tap_name {
-            ch_cfg.net.push(ChNet {
-                tap: Some(tap.clone()),
-                mac: None,
-                vhost_user: None,
-                vhost_mode: None,
-                vhost_socket: None,
-            });
-        } else if let Some(socket) = &res.vhost_user_socket {
-            ch_cfg.net.push(ChNet {
-                tap: None,
-                mac: Some(crate::net::mac_math(res.vmid)?),
-                vhost_user: Some(true),
-                vhost_mode: Some("Client".to_string()),
-                vhost_socket: Some(socket.clone()),
-            });
-        }
+        ch_cfg.net = build_ch_net(res)?;
 
         ch_cfg.disks = build_ch_disks(cfg);
 
@@ -660,7 +679,7 @@ impl Vmm for CloudHypervisor {
         // A restored guest keeps the CID baked into its snapshot; report that, not the
         // orchestrator's fresh allocation (M-VMM-3). Fall back to the fresh CID only if
         // the snapshot's config.json lacked a readable `vsock.cid`.
-        let cid = baked_cid.unwrap_or(res.guest_cid);
+        let cid = restored_cid(baked_cid, res.guest_cid);
 
         let instance = ChInstance {
             process,
@@ -1145,6 +1164,72 @@ mod tests {
             baked_cid_from_config(&serde_json::json!({"vsock": {"cid": "not-a-number"}})),
             None
         );
+    }
+
+    // Pins the restored guest_cid() <- baked-CID WIRING (M-VMM-3), which the live restore
+    // test cannot assert (it only checks in-range because a freed CID may be re-handed).
+    // Inverse (return the fresh cid unconditionally) reddens the Some(baked) assert.
+    #[test]
+    fn restored_cid_prefers_baked_over_fresh() {
+        assert_eq!(restored_cid(Some(42), 7), 42, "a baked vsock.cid must win");
+        assert_eq!(
+            restored_cid(None, 7),
+            7,
+            "missing vsock.cid falls back to the fresh allocation"
+        );
+    }
+
+    // Shape-gate build_ch_net for BOTH net branches (like its four extracted siblings).
+    // Inverse (branch swap, dropped mac, or a local format! MAC diverging from mac_math)
+    // reddens the branch-specific / positive-identity asserts.
+    #[test]
+    fn build_ch_net_shapes_tap_and_vhost_user_branches() {
+        use crate::vmm::PerVmResources;
+        let base = |tap: Option<String>, sock: Option<PathBuf>, vmid: u32| PerVmResources {
+            cgroup_name: String::new(),
+            tap_name: tap,
+            netns_name: None,
+            vhost_user_socket: sock,
+            vmid,
+            guest_cid: 3,
+            tmp_dir: PathBuf::new(),
+        };
+
+        // Privileged (tap) branch: a single tap device, no mac / vhost fields.
+        let tap_net = build_ch_net(&base(Some("vmcell-tap0".into()), None, 7)).unwrap();
+        assert_eq!(tap_net.len(), 1);
+        let j = serde_json::to_string(&tap_net[0]).unwrap();
+        assert!(
+            j.contains("vmcell-tap0"),
+            "tap device must carry the tap name: {j}"
+        );
+        assert!(
+            !j.contains("vhost_user"),
+            "tap device must not set vhost_user: {j}"
+        );
+        assert!(!j.contains("mac"), "tap device must not set a mac: {j}");
+
+        // Unprivileged (vhost-user) branch: client mode + the vmid-derived MAC.
+        let vmid = 9;
+        let vu_net = build_ch_net(&base(
+            None,
+            Some(PathBuf::from("/run/vmcell/net.sock")),
+            vmid,
+        ))
+        .unwrap();
+        assert_eq!(vu_net.len(), 1);
+        let j = serde_json::to_string(&vu_net[0]).unwrap();
+        assert!(j.contains("\"vhost_user\":true"), "{j}");
+        assert!(j.contains("\"vhost_mode\":\"Client\""), "{j}");
+        assert!(j.contains("/run/vmcell/net.sock"), "{j}");
+        // Positive identity: the MAC is mac_math(vmid), recomputed (not a local format!).
+        assert_eq!(
+            vu_net[0].mac.as_deref(),
+            Some(crate::net::mac_math(vmid).unwrap().as_str())
+        );
+
+        // No networking: empty device list.
+        assert!(build_ch_net(&base(None, None, 1)).unwrap().is_empty());
     }
 
     // Guards M-VMM-10: the restore config rewrite must move vsock/serial host paths

@@ -156,6 +156,14 @@ pub mod backend {
     /// [`MAX_DYNAMIC_SOCKETS`]; `MAX_DYNAMIC_SOCKETS` is a multiple of this.
     const SYN_BURST: usize = 4;
 
+    /// Number of listening sockets pre-armed per **forwarded** port (invariant #4,
+    /// design §6.2). A single `TcpSocket` per port means one HTTP keep-alive
+    /// connection holds the only slot and silently wedges the link, so the pool is
+    /// sized for concurrent *and* keep-alive connections (≈16 per port). These are
+    /// the permanent forward-port listeners; the dynamic SYN-intercept pool is
+    /// bounded separately by [`MAX_DYNAMIC_SOCKETS`].
+    const FORWARD_PORT_POOL: usize = 16;
+
     /// Per-worker deadline for `SmoltcpProcess::Drop` to join a thread before
     /// detaching it, so a wedged worker cannot hang teardown forever (NET-3).
     const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -790,7 +798,7 @@ pub mod backend {
 
             let mut port_mappings: Vec<NatPortMapping> = Vec::new();
             for port in forward_ports {
-                for _ in 0..16 {
+                for _ in 0..FORWARD_PORT_POOL {
                     let rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
                     let tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
                     let socket = TcpSocket::new(rx_buffer, tx_buffer);
@@ -1095,6 +1103,28 @@ pub mod backend {
             assert_eq!(host_read_budget(65536, 40000, 8192), 8192);
             // Never underflows if the queue somehow exceeds capacity.
             assert_eq!(host_read_budget(1024, 2048, 8192), 0);
+        }
+
+        // Invariant #4 (design §6.2): the per-forward-port socket pool must hold MORE
+        // THAN ONE connection so an HTTP keep-alive connection cannot hold the only
+        // slot and wedge the link. A 'simplify to 0..1' refactor sets
+        // FORWARD_PORT_POOL = 1, reddening `> 1`; `>= 16` pins the documented
+        // ≈16-per-port sizing so a silent shrink below it also reddens.
+        #[test]
+        fn forward_port_pool_holds_more_than_one_connection_per_port() {
+            // Bind to a runtime local so the assertion is a real (fail-able) runtime
+            // check, not a compile-time constant assertion.
+            let pool = FORWARD_PORT_POOL;
+            assert!(
+                pool > 1,
+                "a single socket per forward port lets one HTTP keep-alive connection \
+                 hold the only slot and silently wedge the link (invariant #4)"
+            );
+            assert!(
+                pool >= 16,
+                "the forward-port pool must keep the design §6.2 ≈16-per-port sizing \
+                 for concurrent + keep-alive connections"
+            );
         }
 
         // NET-2: the host NAT MAC must never collide with any guest MAC produced

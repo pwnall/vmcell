@@ -251,15 +251,24 @@ fn write_ifru_sockaddr(ifru: &mut [u8; 24], addr: [u8; 4]) {
     ifru[4..8].copy_from_slice(&addr);
 }
 
+/// Maps the result of reading `/proc/net/route` to the default gateways to delete,
+/// **propagating** a read error rather than swallowing it. Swallowing it into an
+/// empty vec skips the stale-route deletion, so the new default is added alongside
+/// the old vmid's lingering `/30` default — intermittently blackholing post-restore
+/// egress. Pure over the read `Result` so the propagation is unit-testable.
+fn default_gateways_to_delete(read: std::io::Result<String>) -> std::io::Result<Vec<[u8; 4]>> {
+    read.map(|s| parse_default_gateways(&s))
+}
+
 /// Replaces the guest's default route with one via `gateway`, using only route
 /// ioctls (no netlink). Every existing default route is read from
 /// `/proc/net/route` and deleted (matching its exact old gateway), then the new
 /// default is added — so a rotated `/30` gateway from the old vmid does not linger
-/// as a dead route alongside the new one.
+/// as a dead route alongside the new one. A `/proc/net/route` read failure is
+/// propagated (via [`default_gateways_to_delete`]), never swallowed into an empty
+/// list: skipping the deletion would leave a stale default route blackholing egress.
 fn replace_default_route(fd: libc::c_int, gateway: [u8; 4]) -> std::io::Result<()> {
-    let existing = std::fs::read_to_string("/proc/net/route")
-        .map(|s| parse_default_gateways(&s))
-        .unwrap_or_default();
+    let existing = default_gateways_to_delete(std::fs::read_to_string("/proc/net/route"))?;
     for old_gw in existing {
         // SAFETY: `rtentry` is a C POD struct whose all-zero bit pattern is a valid, fully
         // initialized value; every field is overwritten below before the ioctl reads it.
@@ -356,6 +365,28 @@ mod tests {
         let none = "Iface\tDestination\tGateway\n\
                     eth0\t00C80A00\t00000000\n";
         assert!(parse_default_gateways(none).is_empty());
+    }
+
+    // ga-route: a `/proc/net/route` read failure must PROPAGATE, not collapse into
+    // an empty vec. Swallowing it skips deletion of the old vmid's stale default
+    // route, so the new default is added alongside it and post-restore egress
+    // intermittently blackholes. RED on the pre-fix `.unwrap_or_default()` swallow
+    // (which returns Ok(vec![])).
+    #[test]
+    fn default_gateways_to_delete_propagates_read_error() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(
+            default_gateways_to_delete(Err(err)).is_err(),
+            "a /proc/net/route read error must be propagated, not swallowed into an empty list"
+        );
+        // Ok arm still parses the default gateways (same fixture as the LE-hex test).
+        let route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     eth0\t00000000\t0102C80A\t0003\t0\t0\t0\t00000000\n";
+        assert_eq!(
+            default_gateways_to_delete(Ok(route.to_string())).unwrap(),
+            vec![[10, 200, 2, 1]],
+            "Ok read must decode the default gateway list"
+        );
     }
 
     // H-VMM-1: the `ifr_addr` byte layout `SIOCSIFADDR`/`SIOCSIFNETMASK` consume —

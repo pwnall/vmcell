@@ -1440,6 +1440,10 @@ impl VmConfigBuilder {
             restore_mode: self.restore_mode,
             ksm_mergeable: self.ksm_mergeable,
             kernel_verbosity: self.kernel_verbosity,
+            // Not re-`clamped()` here on purpose: clamping is single-sourced on the
+            // `.timeouts()` setter, and the orchestrator re-clamps at `start()`
+            // (M-ORCH-3) to catch post-`build()` mutation of this `pub` field. A
+            // `.clamped()` here would be a redundant third copy of that one law.
             timeouts: self.timeouts,
             console_mode: self.console_mode,
             resource_prefix: self.resource_prefix,
@@ -1642,10 +1646,14 @@ mod tests {
         )
         .build()
         .unwrap();
+        let c = build_kernel_cmdline(&ok, 1, "").unwrap();
+        assert!(c.contains("rootfstype=erofs"), "{c}");
+        // An Erofs root is read-only with no journal to replay, so `rootflags=noload`
+        // (a Block-rootfs token) must be ABSENT. A refactor emitting it
+        // unconditionally diverges from the RO erofs contract; this reddens on that.
         assert!(
-            build_kernel_cmdline(&ok, 1, "")
-                .unwrap()
-                .contains("rootfstype=erofs")
+            !c.contains("rootflags"),
+            "Erofs rootfs must not emit rootflags: {c}"
         );
     }
 
@@ -1680,6 +1688,31 @@ mod tests {
             ResourceLimits {
                 io_max: Some(IoMax {
                     device: "notadev".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            // Malformed maj:min sub-branches: empty major, empty minor, and a
+            // non-digit minor. A "simplify" to `split_once(':').is_some()` would
+            // accept `"8:x"` (it reaches the cgroup write as EINVAL, the exact
+            // M-HOST-4 masquerade), so each must red here.
+            ResourceLimits {
+                io_max: Some(IoMax {
+                    device: ":0".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ResourceLimits {
+                io_max: Some(IoMax {
+                    device: "8:".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ResourceLimits {
+                io_max: Some(IoMax {
+                    device: "8:x".into(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2509,6 +2542,17 @@ mod tests {
                 "init path {bad:?} must be rejected"
             );
         }
+        // A non-UTF-8 init path is unencodable on the kernel cmdline and must be
+        // rejected. Guards a regression from `to_str().ok_or_else(..)` to
+        // `to_string_lossy()`, which never fails and would silently emit U+FFFD.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/bin/\xff"));
+            assert!(
+                validate_init_path(non_utf8).is_err(),
+                "a non-UTF-8 init path must be rejected"
+            );
+        }
     }
 
     // §5.3 (The kernel command line): build() rejects snapshotting + a custom init (the post-restore resync
@@ -2734,5 +2778,23 @@ mod tests {
                  key could clobber it. Add its key to RESERVED_CMDLINE_KEYS.\ncmdline: {c}"
             );
         }
+        // Content/placement of the conditional tokens (a token being *reserved* does
+        // not prove it is *correct*). The `ip=` autoconfig token must carry the /30
+        // netmask and the exact host/guest IPs — recompute them through the one IP
+        // law, never a test-local literal, so dropping the netmask or a positional
+        // field reddens here even though the token key stays `ip`.
+        let (host_ip, guest_ip, _) = crate::net::ip_math(5).unwrap();
+        assert!(
+            c.contains(&format!(
+                " ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"
+            )),
+            "ip= autoconfig token (with /30 netmask) missing or malformed: {c}"
+        );
+        // A Block rootfs must carry `rootflags=noload`; emitting it unconditionally
+        // (or dropping it here) is a boot break the reserved-key check cannot see.
+        assert!(
+            c.contains("rootflags=noload"),
+            "Block rootfs must emit rootflags=noload: {c}"
+        );
     }
 }

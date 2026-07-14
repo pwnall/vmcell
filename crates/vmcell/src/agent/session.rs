@@ -28,7 +28,25 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use super::AgentClient;
 use crate::error::{Error, Result};
-use vmcell_protocol::{ExecOutcome, ExecRequest, Message, PtyConfig, SessionId, SessionSpec};
+use vmcell_protocol::{
+    ExecOutcome, ExecRequest, MAX_FRAME_BYTES, Message, PtyConfig, SessionId, SessionSpec,
+};
+
+/// Encodes a host→guest frame and enforces the shared `MAX_FRAME_BYTES` cap at
+/// the send boundary, the host mirror of the guest agent's `send_framed`
+/// encode-side check (§13, Cross-cutting invariants). An over-cap frame fails
+/// loud here — before it can reach the writer task, whose codec would otherwise
+/// reject it and silently kill host→guest input for every session on the mux.
+fn encode_frame(msg: &Message) -> Result<::bytes::Bytes> {
+    let bytes = postcard::to_stdvec(msg)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(Error::Agent(format!(
+            "session frame exceeds MAX_FRAME_BYTES ({} > {MAX_FRAME_BYTES})",
+            bytes.len()
+        )));
+    }
+    Ok(::bytes::Bytes::from(bytes))
+}
 
 type FramedStream = Framed<UnixStream, LengthDelimitedCodec>;
 type FrameSink = SplitSink<FramedStream, ::bytes::Bytes>;
@@ -120,7 +138,7 @@ impl SessionSpecBuilder {
 #[derive(Debug)]
 pub struct SessionMux {
     /// Outgoing frames to the writer task (host mirror of the single-writer law).
-    write_tx: mpsc::UnboundedSender<Message>,
+    write_tx: mpsc::UnboundedSender<::bytes::Bytes>,
     registry: Registry,
     next_id: AtomicU64,
     reader: JoinHandle<()>,
@@ -176,14 +194,23 @@ impl SessionMux {
     /// Returns [`Error::Agent`] if the underlying connection has already closed.
     pub async fn open(&self, spec: SessionSpec) -> Result<Session> {
         let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        // Encode + `MAX_FRAME_BYTES`-check BEFORE touching the registry, so an
+        // over-cap spec (huge argv/env) fails loud with zero registry residue.
+        let frame = encode_frame(&Message::OpenSession { session: id, spec })?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, event_tx);
-        self.write_tx
-            .send(Message::OpenSession { session: id, spec })
-            .map_err(|_| Error::Agent("session connection is closed".into()))?;
+        // Insert-before-send keeps the guest's first output routable; on a send
+        // failure remove the entry we just inserted so nothing is orphaned.
+        if self.write_tx.send(frame).is_err() {
+            self.registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return Err(Error::Agent("session connection is closed".into()));
+        }
         Ok(Session {
             id,
             event_rx,
@@ -198,6 +225,29 @@ impl SessionMux {
     /// As [`SessionMux::open`].
     pub async fn open_spec(&self, builder: SessionSpecBuilder) -> Result<Session> {
         self.open(builder.build()).await
+    }
+}
+
+#[cfg(test)]
+impl SessionMux {
+    /// Test-only: the number of live per-session registry entries, so the KVM-free
+    /// orphan gate can assert a failed `open` leaves zero residue.
+    fn registry_len(&self) -> usize {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Test-only: deterministically kill the writer task so its `write_rx` is
+    /// dropped, making a subsequent `write_tx.send` fail. Awaiting the aborted
+    /// handle guarantees the task has unwound (and thus dropped the receiver)
+    /// before we return, so the send-failure branch of `open`/`send` is reachable
+    /// without a race.
+    async fn kill_writer_for_test(&mut self) {
+        self.writer.abort();
+        let old = std::mem::replace(&mut self.writer, tokio::spawn(async {}));
+        let _ = old.await;
     }
 }
 
@@ -222,7 +272,7 @@ impl Drop for SessionMux {
 pub struct Session {
     id: SessionId,
     event_rx: mpsc::UnboundedReceiver<SessionEvent>,
-    write_tx: mpsc::UnboundedSender<Message>,
+    write_tx: mpsc::UnboundedSender<::bytes::Bytes>,
     exited: bool,
 }
 
@@ -280,8 +330,9 @@ impl Session {
     }
 
     fn send(&self, msg: Message) -> Result<()> {
+        let frame = encode_frame(&msg)?;
         self.write_tx
-            .send(msg)
+            .send(frame)
             .map_err(|_| Error::Agent("session connection is closed".into()))
     }
 
@@ -378,16 +429,12 @@ async fn reader_task(mut stream: SplitStream<FramedStream>, registry: Registry) 
 
 /// The background writer task: serializes every host→guest frame onto the one
 /// sink (the host single-writer law, §13, Cross-cutting invariants).
-async fn writer_task(mut sink: FrameSink, mut rx: mpsc::UnboundedReceiver<Message>) {
-    while let Some(msg) = rx.recv().await {
-        let bytes = match postcard::to_stdvec(&msg) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("session writer encode error: {}; closing", e);
-                break;
-            }
-        };
-        if let Err(e) = sink.send(::bytes::Bytes::from(bytes)).await {
+async fn writer_task(mut sink: FrameSink, mut rx: mpsc::UnboundedReceiver<::bytes::Bytes>) {
+    // Frames are already encoded and `MAX_FRAME_BYTES`-checked at the boundary
+    // (`encode_frame`), so this task is a pure sink: the only failure is a genuine
+    // transport EOF, which ends the loop.
+    while let Some(frame) = rx.recv().await {
+        if let Err(e) = sink.send(frame).await {
             tracing::debug!("session writer transport ended: {}", e);
             break;
         }
@@ -533,5 +580,113 @@ mod tests {
         assert_eq!(outcome.code, 3);
         assert_eq!(outcome.stdout, b"hello world");
         assert!(outcome.stderr.is_empty());
+    }
+
+    // M1 / M5d: an over-cap host→guest write must fail loud at the Session boundary
+    // (typed Error::Agent, matching the `# Errors` doc) and MUST NOT wedge the mux
+    // writer for other sessions. RED on the pre-fix code: the over-cap write returns
+    // Ok(()) (first assert fails) and the writer task dies on the encode-cap error in
+    // sink.send, so session 1's follow-up frame never reaches the guest peer (the
+    // `guest.next()` below times out). KVM-free (UnixStream::pair). Contrast the
+    // one-shot accept-below-cap gate host_codec_accepts_frame_above_default_8mib.
+    #[tokio::test]
+    async fn oversize_write_stdin_fails_loud_and_does_not_wedge_mux() {
+        let (client_io, server_io) = UnixStream::pair().expect("unix pair");
+        let mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        let mut guest = Framed::new(server_io, codec());
+
+        let s0 = mux
+            .open(SessionSpec::new(ExecRequest::new(vec!["a".into()])))
+            .await
+            .expect("open s0");
+        let s1 = mux
+            .open(SessionSpec::new(ExecRequest::new(vec!["b".into()])))
+            .await
+            .expect("open s1");
+        // Drain the two OpenSession frames the guest peer sees.
+        for _ in 0..2 {
+            let _ = guest.next().await.expect("open frame").expect("io");
+        }
+
+        // An encoded Message::Stdin whose data is MAX_FRAME_BYTES bytes exceeds the
+        // cap once postcard adds its variant/id/length overhead: must fail loud.
+        let oversize = vec![0u8; vmcell_protocol::MAX_FRAME_BYTES];
+        let err = s0
+            .write_stdin(&oversize)
+            .await
+            .expect_err("an over-cap write_stdin must fail loud, not return Ok(())");
+        assert!(
+            matches!(err, Error::Agent(_)),
+            "over-cap write must surface as Error::Agent (matching the `# Errors` doc); got {err:?}"
+        );
+
+        // The writer task must still be alive: a small write on ANOTHER session
+        // reaches the guest peer. Pre-fix, the writer died on the over-cap frame, so
+        // this frame never arrives and the `next()` below times out.
+        s1.write_stdin(b"ping")
+            .await
+            .expect("a small write after an over-cap write must still succeed");
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), guest.next())
+            .await
+            .expect("the mux writer must not be wedged by the earlier over-cap write")
+            .expect("a frame")
+            .expect("io");
+        match postcard::from_bytes::<Message>(&frame).expect("decode") {
+            Message::Stdin { session, data } => {
+                assert_eq!(session, SessionId(1));
+                assert_eq!(data, b"ping".to_vec());
+            }
+            other => panic!("expected Stdin for session 1, got {other:?}"),
+        }
+    }
+
+    // session-open-orphan: a mid-open failure (here an over-cap OpenSession spec,
+    // the reachable failure once encode happens at the boundary) must leave ZERO
+    // registry residue. RED on the pre-fix open (insert-before-any-check, no
+    // cleanup): the id-0 entry survives the failed open, so registry_len() == 1.
+    #[tokio::test]
+    async fn open_failure_leaves_no_registry_orphan() {
+        let (client_io, _server_io) = UnixStream::pair().expect("unix pair");
+        let mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        assert_eq!(mux.registry_len(), 0);
+
+        // An argv large enough that the encoded OpenSession exceeds MAX_FRAME_BYTES.
+        let big = String::from_utf8(vec![b'x'; vmcell_protocol::MAX_FRAME_BYTES]).unwrap();
+        let err = mux
+            .open(SessionSpec::new(ExecRequest::new(vec![big])))
+            .await
+            .expect_err("an over-cap OpenSession must fail loud");
+        assert!(matches!(err, Error::Agent(_)), "got {err:?}");
+        assert_eq!(
+            mux.registry_len(),
+            0,
+            "a failed open must leave no orphaned registry entry"
+        );
+    }
+
+    // session-open-orphan (send-failure branch): when the WRITER channel is closed
+    // (the writer task died), `open` inserts the registry entry, the send fails, and
+    // the entry must be removed before returning Err — zero residue. Uses a small
+    // in-cap spec so encode_frame succeeds and control reaches the send() branch
+    // (the over-cap test above stops at encode, before the insert). RED on the
+    // inverse (delete the remove-on-send-failure block): registry_len() == 1.
+    #[tokio::test]
+    async fn open_send_failure_leaves_no_registry_orphan() {
+        let (client_io, _server_io) = UnixStream::pair().expect("unix pair");
+        let mut mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        // Kill the writer so write_tx.send() fails deterministically.
+        mux.kill_writer_for_test().await;
+        assert_eq!(mux.registry_len(), 0);
+
+        let err = mux
+            .open(SessionSpec::new(ExecRequest::new(vec!["a".into()])))
+            .await
+            .expect_err("open must fail once the writer channel is closed");
+        assert!(matches!(err, Error::Agent(_)), "got {err:?}");
+        assert_eq!(
+            mux.registry_len(),
+            0,
+            "a failed send must remove the just-inserted entry (no orphan)"
+        );
     }
 }

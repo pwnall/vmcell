@@ -29,8 +29,10 @@ use std::sync::Arc;
 /// The **VM engine** and the **artifact store** are separate seams (design §12.4, Layer 3 — the setup broker (network surface never holds caps) / §13, Cross-cutting invariants): VM
 /// operations go through the [`VmEngine`] (a [`crate::bridge::BrokerClientEngine`] forwarding to the
 /// capped broker in the split cutover, or a [`crate::registry::Registry`] directly in a
-/// single-process daemon), while artifact CRUD is unprivileged file I/O the parent does itself —
-/// only the delete-in-use guard crosses to the engine.
+/// single-process daemon), while artifact create/list/get is unprivileged file I/O the parent does
+/// itself. Artifact **delete** crosses to the engine (`delete_artifact_if_unused`) so the
+/// delete-in-use check and the file delete are atomic under one hold of the VM-table lock — the
+/// engine's store points at the same `--artifacts-dir`.
 #[derive(Clone)]
 pub struct AppState {
     /// The VM engine (VM lifecycle ops + the delete-in-use guard).
@@ -112,14 +114,12 @@ async fn delete_artifact(
     State(state): State<AppState>,
     AxPath(name): AxPath<String>,
 ) -> DaemonResult<StatusCode> {
-    // The delete-in-use guard needs the live VM table, which the (capped) engine owns — so this one
-    // artifact op crosses to the engine; the actual file delete is unprivileged and stays local.
-    if state.engine.is_artifact_in_use(&name).await? {
-        return Err(DaemonError::InUse(format!(
-            "artifact {name:?} is pinned by a live VM; destroy the VM first"
-        )));
-    }
-    state.artifacts.delete(&name)?;
+    // The delete-in-use guard needs the live VM table, which the engine owns; the check and the
+    // delete must be ATOMIC or a concurrent `create` can pin the artifact in the gap and lose its
+    // disk out from under a just-booted VM. So the whole check-and-delete crosses to the engine,
+    // which runs both under one hold of the VM-table lock (the engine's store points at the same
+    // `--artifacts-dir`). No separate `state.artifacts.delete` here — that reopened the TOCTOU.
+    state.engine.delete_artifact_if_unused(&name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

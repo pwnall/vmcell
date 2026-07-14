@@ -379,7 +379,13 @@ impl<B: BrokerBackend> BrokerServer<B> {
                 proxy_port,
             } => match NetNamespace::create(&prefix, vmid, self.backend.new_netlink()) {
                 Ok(ns) => {
-                    let host_ip = ns.host_ip().unwrap_or_default();
+                    // Fail loud: an out-of-range vmid makes host_ip() (via ip_math) error; do not
+                    // mask it into an empty gateway. `ns` is dropped on this return, so its Drop
+                    // reclaims the just-created netns (no residue).
+                    let host_ip = match ns.host_ip() {
+                        Ok(ip) => ip,
+                        Err(e) => return BrokerReply::Error(format!("host ip: {e}")),
+                    };
                     if let Some(port) = proxy_port
                         && let Err(e) = ns.emit_proxy_rules(port, self.backend.nft())
                     {
@@ -533,15 +539,31 @@ impl BrokerChild {
         self.pid
     }
 
-    /// Waits for the broker child to exit (call after [`BrokerClient::shutdown`]).
-    pub fn reap(&mut self) {
+    /// Waits for the broker child to exit (call after [`BrokerClient::shutdown`]), returning its
+    /// exit code if it exited normally (`None` if killed by a signal or already reaped). Retries on
+    /// `EINTR` so a signal-interrupted wait never latches a still-live child as reaped (zombie).
+    pub fn reap(&mut self) -> Option<i32> {
         if self.reaped {
-            return;
+            return None;
         }
-        let mut status: libc::c_int = 0;
-        // SAFETY: waitpid on our own child pid with a valid status out-pointer.
-        unsafe { libc::waitpid(self.pid, &mut status, 0) };
-        self.reaped = true;
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid on our own child pid with a valid status out-pointer.
+            let rc = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            if rc > 0 {
+                self.reaped = true;
+                // `WIFEXITED`/`WEXITSTATUS` are safe const accessors over the status
+                // word `waitpid` just wrote; no `unsafe` needed.
+                let exited = libc::WIFEXITED(status);
+                let code = libc::WEXITSTATUS(status);
+                return if exited { Some(code) } else { None };
+            }
+            // Retry only a signal-interrupted wait; any other error (ECHILD/EINVAL) is terminal.
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                self.reaped = true;
+                return None;
+            }
+        }
     }
 }
 
@@ -585,7 +607,10 @@ pub enum ForkSide {
 /// MUST be called **before** the caller spawns any thread / async runtime (fork-with-threads is
 /// unsafe): after the fork, the child inherits only the calling thread, so any code that could block
 /// on a lock held by another thread would deadlock (§12.4, Layer 3 — the setup broker (network
-/// surface never holds caps)).
+/// surface never holds caps)). This is a **caller obligation** the signature cannot enforce; the
+/// broker's fork tests run under a multi-threaded harness but stay safe only because the child
+/// touches solely its own fake state and `_exit`s without ever acquiring a parent-held lock — do
+/// not extend the child's work with anything that could contend an inherited lock.
 ///
 /// The caller drops its own capabilities on the [`ForkSide::Parent`] branch
 /// ([`apply_broker_parent_drop`]); this function does not, so a test can fork without mutating the
@@ -638,10 +663,17 @@ pub fn spawn_broker_with<B: BrokerBackend + 'static>(
     match fork_privileged_child()? {
         ForkSide::Child { sock } => {
             let mut server = BrokerServer::new(backend);
-            let _ = serve(&mut server, sock);
+            // Fail loud: a framing/dispatch fault in the serve loop must not exit 0 (which the
+            // parent would read as a clean shutdown). Surface it as a non-zero exit — the only
+            // fail-loud channel a forked child has (no stderr/tracing here).
+            let code = if serve(&mut server, sock).is_ok() {
+                0
+            } else {
+                1
+            };
             // SAFETY: `_exit` is async-signal-safe and skips at-exit handlers — correct for a forked
             // child that must not run the parent's teardown.
-            unsafe { libc::_exit(0) };
+            unsafe { libc::_exit(code) };
         }
         ForkSide::Parent { sock, child } => Ok((BrokerClient::new(sock), child)),
     }

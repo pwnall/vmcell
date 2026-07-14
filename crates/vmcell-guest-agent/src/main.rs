@@ -435,7 +435,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 e
             );
             let term = Arc::new(AtomicBool::new(false));
-            let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term));
+            if let Err(e) =
+                signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))
+            {
+                // Doubly degraded: even the SIGTERM flag could not be installed, so the
+                // poll loop below will never observe SIGTERM. Log it — teardown
+                // force-kills the VMM group anyway, so PID 1 must not exit on this.
+                tracing::warn!(
+                    "vmcell-guest-agent: SIGTERM flag registration failed in degraded reaper: {}; relying on teardown force-kill",
+                    e
+                );
+            }
             while !term.load(std::sync::atomic::Ordering::Relaxed) {
                 drain_zombies(&reaper);
                 std::thread::sleep(std::time::Duration::from_millis(100));

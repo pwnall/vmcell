@@ -3,9 +3,10 @@
 //! client serializes and the server deserializes are the SAME Rust type — the wire schema is
 //! single-sourced (invariant: one law, one predicate for the schema).
 //!
-//! Every field carries a `#[serde(default)]` where a future field is likely, so an older client and
-//! a newer server (or vice versa) stay compatible additively — the `#[non_exhaustive]`-in-spirit rule
-//! for a JSON API.
+//! Additive/optional fields carry `#[serde(default)]`, so an older client that omits them and a
+//! newer server (or vice versa) stay compatible additively — the `#[non_exhaustive]`-in-spirit rule
+//! for a JSON API. The genuinely required inputs (`kernel`/`rootfs`, `argv`) are **not** defaulted:
+//! omitting them is a parse error, never a silent default.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,8 @@ pub enum VmState {
     Booting,
     /// Booted and agent-ready — accepts `exec`.
     Ready,
-    /// Paused (CPUs stopped) via `pause`.
+    /// Paused (CPUs stopped) via `pause`. Reserved: the daemon pause/resume routes are future work
+    /// (design future-work, "Pause/resume routes"); no current control-plane path produces this.
     Paused,
     /// A snapshot is in progress.
     Snapshotting,
@@ -390,7 +392,7 @@ pub struct ErrorBody {
 /// the server (design §11.5, The HTTP REST API and its OpenAPI document). Kept as a small enum with a stable string form so the client can
 /// branch on the same conditions the server names — matchability across the boundary.
 ///
-/// `Serialize`/`Deserialize` are used only by the internal setup-broker `WireError` (postcard over
+/// `Serialize`/`Deserialize` are used only by the internal setup-broker `WireError` (JSON over
 /// the broker socket, §12.4, Layer 3 — the setup broker (network surface never holds caps)) — not by any JSON response, which carries `kind.as_str()` as a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {

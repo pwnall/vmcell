@@ -1144,8 +1144,9 @@ violated:
    (`host_read_budget(send_capacity, send_queue, buf.len())`) so `send_slice` enqueues the *whole* read —
    `send_slice` enqueues only down to zero free buffer and `can_send()` is true with one free byte, so an
    unbounded 8 KiB read's unsent tail was silently **dropped**, corrupting any host→guest TCP stream large
-   enough to fill the guest receive window (pinned by a window-filling test that reddens on the old
-   unbounded read).
+   enough to fill the guest receive window (pinned by the window-filling data-plane test
+   `tests/nat_window_fill.rs` — a >64 KiB host→guest transfer with a digest compare — which reddens on
+   the old unbounded read).
 
 ### 6.3 Host-served endpoints
 
@@ -1169,8 +1170,10 @@ per-run CA would invalidate the guest trust chain on every run. A process-global
 dir returns the generate-once CA and its parsed authority (re-self-signing per `authority()` call would
 break the chain).
 
-Test doubles let a caller register `(Matcher, Responder)` pairs (and, for the eval layer, record/replay
-cassettes). HTTPS doubles must **ignore `hyper::Method::CONNECT`** — matching on the `CONNECT` itself
+Test doubles let a caller register `(Matcher, Responder)` pairs (and, for the eval layer, a `record_to`
+cassette that logs each **forwarded** request's method+URI, one line per request — request-line logging
+only: it captures neither responses nor blocked requests, so snapshot-and-replay cassettes remain §17
+forward work). HTTPS doubles must **ignore `hyper::Method::CONNECT`** — matching on the `CONNECT` itself
 breaks the tunnel and yields a TLS "unexpected eof." The host-side interface:
 
 ```rust
@@ -1180,7 +1183,7 @@ impl EgressProxy {
     pub fn ca_cert_pem(&self) -> &[u8];                               // baked into the rootfs trust store
     pub fn requests(&self) -> RequestLog;                             // observed requests, for assertions
     pub fn install_double(&self, matcher: Matcher, responder: Responder); // register a test double
-    pub fn record_to(&self, cassette: &Path);                         // record/replay (eval-layer hook)
+    pub fn record_to(&self, cassette: &Path);                         // request-line logging (replay is §17 forward work)
 }
 ```
 
@@ -1270,9 +1273,12 @@ precise and uniform (they also govern netns/tap in §6.1 and the sysfs knobs in 
    queryable **`HostCapabilities`** descriptor: one struct probed once at start-up (by mode selection, the
    daemon's main, and the test harness) recording what the host actually offers — the effective capability
    set, KVM-group access, `/var/run/netns` reachability, which cgroup controllers the current scope
-   delegates, and whether the scope is a non-threaded `domain` leaf. Per-op checks read the descriptor
-   instead of re-probing, so "what does this host support" has one answer and one probe. (This descriptor
-   is directed by this revision — §18, delta 8 — consolidating the previously scattered per-op checks.)
+   delegates, and whether the scope is a non-threaded `domain` leaf. As built, the descriptor is
+   **probed once at start-up and logged** (mode selection + the daemon's `MicroVmLauncher::new`); per-op
+   enforcement keeps its own authoritative fail-loud per-write check (e.g. `metrics::try_apply_limit_at` /
+   `classify_limit_write_err`), so the descriptor is the queryable single source, not a replacement for
+   that per-write typed error. (Directed by this revision — §18, delta 8; see implementation-notes.md,
+   Delta 8, for the as-built reconciliation.)
 2. **A *requested functional* op that needs an absent capability returns a typed error, not `Ok`.** Asking
    for a resource limit that cannot be enforced is `Err(Error::CapabilityUnavailable { op, needed })` —
    matchable, carrying the exact missing capability — surfaced before the VM is handed back. The typed

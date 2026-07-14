@@ -99,7 +99,30 @@ impl CaManager {
         let cert_path = dir.join("ca.pem");
         let key_path = dir.join("ca.key");
 
-        let (ca_cert_pem, key_pair, cert) = if cert_path.exists() && key_path.exists() {
+        // The CA is an atomic (ca.pem, ca.key) pair. Regenerate ONLY when BOTH are
+        // absent. If exactly one is present the on-disk CA is half-committed (a crash
+        // between the two publish renames, or one file separately lost): re-minting a
+        // fresh CA there would present an authority the *cached, already-baked* rootfs
+        // trust store does not trust, silently breaking every HTTPS intercept. A fresh
+        // cert cannot be re-derived from the surviving key either (different
+        // serial/validity/DER), so recovery is impossible from a partial pair — fail
+        // loud instead of silently regenerating (M-NET-6 CA lifetime; AGENTS fail-loud).
+        let cert_exists = cert_path.exists();
+        let key_exists = key_path.exists();
+        if cert_exists != key_exists {
+            let (present, missing) = if cert_exists {
+                ("ca.pem", "ca.key")
+            } else {
+                ("ca.key", "ca.pem")
+            };
+            return Err(Error::Proxy(format!(
+                "partial CA in {}: {present} present but {missing} missing; refusing to \
+                 silently regenerate the CA and break a baked rootfs trust chain",
+                dir.display()
+            )));
+        }
+
+        let (ca_cert_pem, key_pair, cert) = if cert_exists && key_exists {
             let cert_pem = std::fs::read_to_string(&cert_path)?;
             let key_pem = std::fs::read_to_string(&key_path)?;
 
@@ -285,6 +308,49 @@ mod tests {
         assert!(
             !dir_path.join("ca.key.tmp").exists(),
             "ca.key.tmp residue must not remain after the atomic rename"
+        );
+    }
+
+    // proxy-ca: the CA is an atomic (ca.pem, ca.key) pair. A half-committed pair
+    // (exactly one file present) must NOT silently regenerate a conflicting CA —
+    // that would invalidate an already-baked rootfs trust chain. Buggy impl
+    // guarded: the pre-fix `cert.exists() && key.exists()` gate takes the `else`
+    // (regenerate) arm whenever a file is missing, minting a fresh CA and renaming
+    // it over ca.pem. Both the `Err` arm and the `ca.pem` byte-identity assert then
+    // go red.
+    #[test]
+    fn partial_ca_on_disk_is_not_silently_regenerated() {
+        // Generate a real, complete CA to source valid ca.pem/ca.key bytes.
+        let src = tempfile::tempdir().expect("src tempdir");
+        let _ = CaManager::new_in(src.path().to_path_buf()).expect("seed CA");
+        let good_cert = std::fs::read(src.path().join("ca.pem")).expect("read src ca.pem");
+        let good_key = std::fs::read(src.path().join("ca.key")).expect("read src ca.key");
+
+        // Case 1: cert present, key absent (fresh dir => not in CA_CACHE => disk path).
+        let d1 = tempfile::tempdir().expect("d1");
+        std::fs::write(d1.path().join("ca.pem"), &good_cert).expect("place ca.pem");
+        let res1 = CaManager::new_in(d1.path().to_path_buf());
+        assert!(
+            matches!(res1, Err(Error::Proxy(_))),
+            "cert-present/key-absent must fail loud, not regenerate"
+        );
+        assert_eq!(
+            std::fs::read(d1.path().join("ca.pem")).expect("reread ca.pem"),
+            good_cert,
+            "ca.pem must not be overwritten by a silent CA regeneration"
+        );
+
+        // Case 2: key present, cert absent (the review's literal crash state).
+        let d2 = tempfile::tempdir().expect("d2");
+        std::fs::write(d2.path().join("ca.key"), &good_key).expect("place ca.key");
+        let res2 = CaManager::new_in(d2.path().to_path_buf());
+        assert!(
+            matches!(res2, Err(Error::Proxy(_))),
+            "key-present/cert-absent must fail loud, not regenerate"
+        );
+        assert!(
+            !d2.path().join("ca.pem").exists(),
+            "a half-committed CA must not be silently completed with a fresh cert"
         );
     }
 }

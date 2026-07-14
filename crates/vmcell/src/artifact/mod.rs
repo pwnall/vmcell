@@ -191,10 +191,11 @@ pub fn hash_file(path: &Path) -> Result<String> {
 /// Content hash of a stage output, whether it is a single **file** or a **directory**.
 ///
 /// A file hashes to exactly [`hash_file`] (so existing file sidecars stay valid). A
-/// directory (e.g. the `SnapshotStage` output — ART-1) hashes over a deterministic,
-/// sorted recursive walk — relative name + type + (files) mode + content, (symlinks)
-/// target — so the whole tree is content-addressed and a byte-corrupted file inside it is
-/// rejected on the cache-hit path exactly like a tampered single-file artifact. Using
+/// directory (e.g. the `SnapshotStage` output — ART-1) hashes over the root directory's
+/// own mode plus a deterministic, sorted recursive walk — relative name + type + (files)
+/// mode + content, (symlinks) target — so the whole tree is content-addressed and a
+/// byte-corrupted file inside it (or a `chmod` on the root itself) is rejected on the
+/// cache-hit path exactly like a tampered single-file artifact. Using
 /// `hash_file` on a directory `File::open`s it and reads → `EISDIR`, which silently
 /// defeated caching *and* tamper-verification for every directory output.
 ///
@@ -206,8 +207,14 @@ pub fn hash_file(path: &Path) -> Result<String> {
 pub fn hash_output(path: &Path) -> Result<String> {
     let meta = std::fs::symlink_metadata(path).map_err(crate::error::Error::Io)?;
     if meta.is_dir() {
+        use std::os::unix::fs::PermissionsExt;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"vmcell-dir-v1\0");
+        // Fold the ROOT directory's own mode (L-ART-5): a chmod on the snapshot root
+        // must change the hash, exactly like a chmod on any subdirectory inside the
+        // tree (`hash_dir_into` folds per-entry modes but not the top-level dir's).
+        hasher.update(b"m");
+        hasher.update(&meta.permissions().mode().to_le_bytes());
         hash_dir_into(&mut hasher, path)?;
         Ok(hasher.finalize().to_hex().to_string())
     } else {
@@ -1310,6 +1317,27 @@ mod tests {
         assert_ne!(
             h1, h2,
             "a directory-mode change inside the tree must change the hash (L-ART-5)"
+        );
+    }
+
+    // L-ART-5 (root): `hash_output` must fold the ROOT directory's own mode, so a
+    // chmod on the snapshot ROOT changes the tamper hash. The buggy version folds
+    // only per-entry modes (via `hash_dir_into`), leaving the root mode outside the
+    // hash -> the two hashes stay equal and this `assert_ne!` reddens.
+    #[test]
+    fn test_hash_output_folds_root_dir_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("snapshot");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state.bin"), b"state-v1").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let h1 = hash_output(&root).expect("hash");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let h2 = hash_output(&root).expect("hash");
+        assert_ne!(
+            h1, h2,
+            "a chmod on the snapshot ROOT must change the content hash (L-ART-5)"
         );
     }
 

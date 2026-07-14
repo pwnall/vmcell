@@ -315,7 +315,7 @@ impl Stage for InVmKernelStage {
         let seed_kernel = inputs.artifacts.get("kernel").cloned().ok_or_else(|| {
             Error::Artifact(
                 "in-VM kernel builder needs a seed `kernel` artifact to boot its builder VM \
-                 (produce one with the prebuilt or host-make bootstrap stage first, §8.5, Lineage: fork and branch)"
+                 (produce one with the prebuilt or host-make bootstrap stage first, §5.4, The guest-kernel contract and the bootstrap seed)"
                     .into(),
             )
         })?;

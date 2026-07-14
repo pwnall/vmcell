@@ -10,7 +10,9 @@
 //!
 //! Artifact CRUD is **not** here: it is unprivileged file I/O under `--artifacts-dir` (same uid),
 //! so the parent does it directly against its own [`ArtifactStore`](crate::artifact_store::ArtifactStore); only the delete-in-use guard
-//! (which needs the live VM table) crosses to the broker via [`VmEngine::is_artifact_in_use`].
+//! (which needs the live VM table) crosses to the broker — as the atomic
+//! [`VmEngine::delete_artifact_if_unused`] (the check + delete under one `vms`-lock hold);
+//! [`VmEngine::is_artifact_in_use`] is the read-only query variant sharing the same predicate.
 //!
 //! The RPC is multiplexed (each request carries a `u64` id; a background reader matches replies to
 //! per-request `oneshot`s), so a long-running `exec` on one VM does not block ops on another — the
@@ -61,6 +63,11 @@ pub trait VmEngine: Send + Sync {
     async fn destroy(&self, id: &VmId) -> DaemonResult<()>;
     /// Whether any live VM pins `name` (the delete-in-use guard).
     async fn is_artifact_in_use(&self, name: &str) -> DaemonResult<bool>;
+    /// Atomically deletes an artifact iff no live VM pins it — the delete-in-use guard and the file
+    /// delete run under one hold of the VM-table lock, closing the check-then-delete TOCTOU against
+    /// a concurrent `create`. The engine owns both the VM table and the store, so this stays on the
+    /// engine side (the parent's own `state.artifacts` points at the same dir).
+    async fn delete_artifact_if_unused(&self, name: &str) -> DaemonResult<()>;
     /// Graceful ordered teardown of every VM (clean shutdown).
     async fn shutdown_all(&self);
 }
@@ -94,6 +101,9 @@ impl VmEngine for Registry {
     }
     async fn is_artifact_in_use(&self, name: &str) -> DaemonResult<bool> {
         Ok(Registry::is_artifact_in_use(self, name).await)
+    }
+    async fn delete_artifact_if_unused(&self, name: &str) -> DaemonResult<()> {
+        Registry::delete_artifact_if_unused(self, name).await
     }
     async fn shutdown_all(&self) {
         Registry::shutdown_all(self).await;
@@ -154,6 +164,7 @@ enum EngineRequest {
     Snapshot(VmId, String),
     Destroy(VmId),
     IsArtifactInUse(String),
+    DeleteArtifactIfUnused(String),
     ShutdownAll,
 }
 
@@ -168,6 +179,7 @@ enum EngineReply {
     Snapshot(SnapshotInfo),
     Destroyed,
     InUse(bool),
+    ArtifactDeleted,
     ShutdownAllDone,
     Err(WireError),
 }
@@ -251,6 +263,12 @@ async fn dispatch(engine: &dyn VmEngine, req: EngineRequest) -> EngineReply {
             Ok(v) => EngineReply::InUse(v),
             Err(e) => err(&e),
         },
+        EngineRequest::DeleteArtifactIfUnused(name) => {
+            match engine.delete_artifact_if_unused(&name).await {
+                Ok(()) => EngineReply::ArtifactDeleted,
+                Err(e) => err(&e),
+            }
+        }
         EngineRequest::ShutdownAll => {
             engine.shutdown_all().await;
             EngineReply::ShutdownAllDone
@@ -435,6 +453,16 @@ impl VmEngine for BrokerClientEngine {
             .await?
         {
             EngineReply::InUse(v) => Ok(v),
+            EngineReply::Err(w) => Err(daemon_error_from_wire(w)),
+            other => Err(unexpected(&other)),
+        }
+    }
+    async fn delete_artifact_if_unused(&self, name: &str) -> DaemonResult<()> {
+        match self
+            .call(EngineRequest::DeleteArtifactIfUnused(name.to_string()))
+            .await?
+        {
+            EngineReply::ArtifactDeleted => Ok(()),
             EngineReply::Err(w) => Err(daemon_error_from_wire(w)),
             other => Err(unexpected(&other)),
         }

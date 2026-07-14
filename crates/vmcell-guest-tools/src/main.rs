@@ -565,7 +565,12 @@ fn run_curl(args: &[String]) -> i32 {
                 && let Some((host, port)) = url_host_port(&url, 443)
                 && probe_connect(&proxy, &host, port, max_time, verbose)
             {
-                return 0;
+                // The CONNECT tunnel established (2xx), so the proxy did NOT block
+                // the domain — reqwest's error was therefore post-CONNECT, i.e. a
+                // TLS-verify failure. Do not collapse that to exit 0 (gt-curl-tls):
+                // real curl exits 60 (CURLE_PEER_FAILED_VERIFICATION) on a cert
+                // verify failure; only -k/--insecure makes it a success.
+                return tunnel_established_exit(insecure);
             }
             // Print the full error source chain — reqwest's top-level Display is
             // just "error sending request for url (...)".
@@ -609,6 +614,16 @@ fn connect_succeeded(head: &str) -> bool {
     parse_status_code(head).is_some_and(|code| (200..300).contains(&code))
 }
 
+/// The curl exit code when an https-via-proxy request failed but the manual
+/// CONNECT re-probe found the tunnel *established* (2xx). The proxy did not block
+/// the domain, so reqwest's error was post-CONNECT — a TLS cert-verify failure.
+/// Real curl exits 60 (`CURLE_PEER_FAILED_VERIFICATION`) on a verify failure; only
+/// `-k`/`--insecure` turns that into success (exit 0). Never collapse a verify
+/// failure to 0 (gt-curl-tls, companion to H-GUEST-1).
+fn tunnel_established_exit(insecure: bool) -> i32 {
+    if insecure { 0 } else { 60 }
+}
+
 /// Performs a raw HTTP `CONNECT` to `proxy` for `host:port`, prints the proxy's
 /// response — status line + headers to stderr (verbose), body to stdout — the way
 /// curl does, and returns whether the tunnel was **established** (a 2xx status).
@@ -619,13 +634,25 @@ fn connect_succeeded(head: &str) -> bool {
 /// (H-GUEST-1: the banned any-error-to-success probe).
 fn probe_connect(proxy: &str, host: &str, port: u16, max_time: Option<u64>, verbose: bool) -> bool {
     use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
     let Some((phost, pport)) = url_host_port(proxy, 8080) else {
         return false;
     };
-    let Ok(mut stream) = std::net::TcpStream::connect((phost.as_str(), pport)) else {
+    // Bound the TCP connect by --max-time too (gt-maxtime): a blocking
+    // `TcpStream::connect` uses the OS default (~2 min) and ignores --max-time, so a
+    // firewalled proxy host would hang the fallback long past the deadline. Resolve
+    // then `connect_timeout` with the same deadline used for the read/write timeouts.
+    let timeout = Duration::from_secs(max_time.unwrap_or(10));
+    let Some(paddr) = (phost.as_str(), pport)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+    else {
         return false;
     };
-    let timeout = Duration::from_secs(max_time.unwrap_or(10));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&paddr, timeout) else {
+        return false;
+    };
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
@@ -868,6 +895,43 @@ mod tests {
         assert!(!connect_succeeded("HTTP/1.1 502 Bad Gateway"));
         assert!(!connect_succeeded("garbage-with-no-code"));
         assert!(!connect_succeeded(""));
+    }
+
+    // gt-curl-tls: an https-via-proxy failure whose CONNECT tunnel established (2xx)
+    // is a post-CONNECT TLS-verify failure. Without -k it must NOT collapse to exit 0
+    // (real curl -> 60); -k/--insecure accepts it (exit 0). RED on the pre-fix
+    // unconditional `return 0` at the fallback call site.
+    #[test]
+    fn tunnel_established_exit_60_without_insecure() {
+        assert_eq!(
+            tunnel_established_exit(false),
+            60,
+            "a post-CONNECT TLS-verify failure without -k must be curl exit 60, not 0"
+        );
+        assert_eq!(
+            tunnel_established_exit(true),
+            0,
+            "-k/--insecure accepts the established tunnel (exit 0)"
+        );
+    }
+
+    // gt-maxtime: --max-time must bound the fallback CONNECT's TCP connect. Point the
+    // proxy at an unroutable SYN-black-hole (RFC 5737 TEST-NET-1) with max_time=1 and
+    // assert the probe gives up promptly. RED on the pre-fix blocking
+    // `TcpStream::connect`, which ignores max_time and hangs ~2 min on a dropped SYN.
+    // CAVEAT: on hosts where 192.0.2.1 returns an immediate EHOSTUNREACH this becomes
+    // non-discriminating (green-on-both, not a false red); on this KVM host it
+    // black-holes the SYN, so the pre-fix connect hangs and this reddens.
+    #[test]
+    fn probe_connect_connect_is_bounded_by_max_time() {
+        let start = std::time::Instant::now();
+        let ok = probe_connect("http://192.0.2.1:9", "blocked.example", 443, Some(1), false);
+        let elapsed = start.elapsed();
+        assert!(!ok, "an unroutable proxy must not report a tunnel");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "connect must be bounded by --max-time (~1s), not the OS default; took {elapsed:?}"
+        );
     }
 
     #[test]

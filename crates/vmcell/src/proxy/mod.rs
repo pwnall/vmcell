@@ -425,7 +425,14 @@ impl EgressProxy {
         doubles.push(TestDouble { matcher, responder });
     }
 
-    /// Sets the cassette file path for recording.
+    /// Sets a cassette file that records each **forwarded** request's method+URI, one
+    /// line per request, for the eval layer.
+    ///
+    /// This is request-line logging only: it captures neither the response
+    /// (status/body) nor blocked (`403`) requests, so it does **not** support
+    /// replay — a snapshot-and-replay cassette is forward work (design §17). The
+    /// fs-write branch it drives is gated by
+    /// `doubles::tests::record_to_writes_forwarded_request_to_cassette`.
     pub fn record_to(&self, cassette: &std::path::Path) {
         let mut rp = self.record_path.lock().unwrap_or_else(|e| e.into_inner());
         *rp = Some(cassette.to_path_buf());

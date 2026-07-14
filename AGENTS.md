@@ -102,7 +102,9 @@ tokio/rtnetlink (it excludes only the **web** stack — axum/hyper — and owns 
 - Capability honesty (§7.2): `Unsupported`/`CapabilityUnavailable` for absent facilities, `Error`
   with errno for broken ones; `mem_limit_enforced` means exactly "memory controller delegated"
   (delta 3 — the deliberately narrow claim); `*_read_ok` reflect empirically validated behavior.
-  Per-op checks read the one start-up `HostCapabilities` descriptor (delta 8), never re-probe.
+  The one start-up `HostCapabilities` descriptor (delta 8) is probed once and logged; per-op
+  enforcement keeps its own authoritative fail-loud per-write check (it does not re-derive the
+  descriptor per op, nor silently re-probe).
 - Helper daemons and the broker child: spawn with `PR_SET_PDEATHSIG` + `CLOEXEC`; reap on every
   error path; a failed later spawn step reaps the earlier daemons.
 - PID-1 discipline in the guest agent (C1): never `exit`; reap children via the `ReaperCoordinator`

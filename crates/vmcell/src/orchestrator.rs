@@ -156,47 +156,61 @@ impl VmidAllocator {
     /// mode) or the claim succeeded; `false` when another **live** process already
     /// holds it.
     ///
-    /// The claim is atomic and self-healing (H-ORCH-4): the lock file is created
+    /// Correctness under contention (H-ORCH-4): the whole read→decide→(re)claim runs
+    /// while holding an **exclusive advisory lock** (`flock`) on a per-vmid
+    /// coordination file, so at most one claimer of a given vmid executes it at a
+    /// time — the liveness check and the claim are atomic against every other
+    /// claimer, closing the reclaim TOCTOU (an unconditional rename-by-path after a
+    /// snapshot read could dual-claim; so could a rename-back that clobbers a third
+    /// racer's fresh claim). The kernel releases the `flock` when its holder dies, so
+    /// a crashed *coordinator* cannot wedge the vmid; a lock file left by a crashed
+    /// *owner* still carries its pid, so the next claimer (under the coordination
+    /// lock) sees `/proc/<pid>` is absent and reclaims it. The lock file is created
     /// *already carrying* the owner pid (never the old create-then-write two-step
-    /// that could crash between the two and leave an empty, unreclaimable lock),
-    /// and reclaim of a dead/empty owner is serialized by an atomic `rename`, so
-    /// two racing processes cannot both pass the liveness check and dual-claim.
+    /// that could leave an empty, unreclaimable lock).
     fn try_claim_fs(&self, vmid: u32) -> bool {
+        use std::os::unix::io::AsRawFd;
         let Some(dir) = &self.lock_dir else {
             return true;
         };
         let _ = std::fs::create_dir_all(dir);
         let lock_path = dir.join(format!("{vmid}.lock"));
-        // Bounded retries absorb a concurrent reclaimer transitioning the lock.
-        for _ in 0..8 {
-            if Self::atomic_claim(dir, &lock_path, vmid) {
-                return true;
-            }
-            // The lock exists. Reclaim it iff its owner is dead, or it is empty /
-            // unparseable (a process that crashed mid-claim under the old path).
-            let contents = match std::fs::read_to_string(&lock_path) {
-                Ok(c) => c,
-                // Vanished between the failed link and the read — retry.
-                Err(_) => continue,
-            };
-            let owner_alive = contents
-                .trim()
-                .parse::<u32>()
-                .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
-                .unwrap_or(false);
+
+        // Serialize every cross-process claim/reclaim of THIS vmid on an exclusive
+        // advisory lock over a per-vmid coordination file. `flock` on two distinct
+        // open file descriptions is mutually exclusive even within one process, so
+        // this serializes threads (the blessed-runner suite) *and* processes.
+        let coord_path = dir.join(format!("{vmid}.coord"));
+        let Ok(coord) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&coord_path)
+        else {
+            // Cannot coordinate → refuse rather than risk a dual-claim.
+            return false;
+        };
+        // SAFETY: `flock(2)` on the valid open fd of `coord`; `coord` is borrowed for
+        // the whole scope so the fd stays open, and the exclusive lock is released
+        // when `coord` (its owning `File`) is dropped at the end of this function.
+        if unsafe { libc::flock(coord.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return false;
+        }
+
+        // Under the coordination lock. A lock file that exists blocks the claim only
+        // while its owner is alive; a dead/empty (crashed-owner) lock is reclaimed.
+        if lock_path.exists() {
+            let owner_alive = std::fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|c| c.trim().parse::<u32>().ok())
+                .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
             if owner_alive {
                 return false;
             }
-            // Dead/empty: atomically steal the right to reclaim by renaming the
-            // stale lock to a unique temp. Exactly one racer wins the rename; the
-            // losers get `ENOENT` and retry the claim from the top.
-            let steal = dir.join(format!("{vmid}.stale.{}", std::process::id()));
-            if std::fs::rename(&lock_path, &steal).is_ok() {
-                let _ = std::fs::remove_file(&steal);
-            }
-            // Whether we freed it or lost the race, loop and re-attempt the claim.
+            let _ = std::fs::remove_file(&lock_path);
         }
-        false
+        // The path is free and we exclusively hold the coordination lock: claim it.
+        Self::atomic_claim(dir, &lock_path, vmid)
     }
 
     /// Creates `lock_path` as a fresh hard link to a temp file already containing
@@ -1847,6 +1861,49 @@ mod tests {
         assert!(b.try_claim_fs(6), "a dead owner's lock must be reclaimable");
     }
 
+    // H-ORCH-4 (H1): the read→decide→claim must be atomic against other claimers of
+    // the same vmid. With a pre-existing dead lock and >=2 concurrent reclaimers
+    // landing on it (the multi-runner case `shared_at` exists for), exactly ONE must
+    // win. Any impl that decides reclaimability without holding the per-vmid
+    // coordination `flock` races: a naive exists-then-claim lets two racers both see
+    // the dead lock and claim, and the earlier rename-and-restore steal lets a third
+    // racer claim the momentarily-free path (empirically 3 winners). The
+    // single-threaded siblings above cannot exercise the interleave.
+    #[test]
+    fn shared_at_concurrent_reclaimers_have_exactly_one_winner() {
+        const THREADS: usize = 8;
+        const TRIALS: usize = 200;
+        const VMID: u32 = 7;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_path = dir.path().join(format!("{VMID}.lock"));
+        for _ in 0..TRIALS {
+            // Seed a definitively-dead owner: /proc/4294967295 can never exist.
+            std::fs::write(&lock_path, u32::MAX.to_string()).expect("seed dead lock");
+            let barrier = std::sync::Barrier::new(THREADS);
+            let wins = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..THREADS {
+                    s.spawn(|| {
+                        // Each thread has its OWN allocator (distinct in-process set)
+                        // sharing only the lock dir — the cross-process shape.
+                        let alloc = VmidAllocator::shared_at(dir.path());
+                        barrier.wait();
+                        if alloc.try_claim_fs(VMID) {
+                            wins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                wins.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "exactly one reclaimer may win a dead lock across {THREADS} racers"
+            );
+            // Clean up between trials so the next trial re-seeds a fresh dead lock.
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+
     // CONFIG-ERROR-ORCH-5 / DESIGN-DIVERGENCE-4. Buggy impl: reserve() does not
     // exist / does not honor a specific VMID, or fails to reject conflicts and
     // out-of-range values.
@@ -2286,6 +2343,68 @@ mod tests {
         );
     }
 
+    // Delta 9: a scripted `resume` fault fires AFTER a live instance is built (restore()
+    // succeeded), on the restore->resume path where cgroup/netns side effects already
+    // exist and the guards are still armed (the cgroup_guard is disarmed only AFTER a
+    // successful resume). It must still leave zero cgroup residue — a distinct teardown
+    // path the fail_restore test cannot reach (there no instance is ever built). RED on
+    // the inverse (disarming/omitting the CgroupGuard before resume: created != deleted).
+    #[tokio::test]
+    async fn fault_menu_fail_resume_tears_down() {
+        use crate::vmm::{FakeVmm, FaultMenu};
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            fail_resume: true,
+            ..Default::default()
+        });
+        let recorder = RecordingCgroupFs::default();
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(recorder.clone()),
+            ..HostEnv::hermetic()
+        };
+        let res = MicroVm::restore(
+            &vmm,
+            std::path::Path::new("/tmp/fake-snap"),
+            erofs_cfg(),
+            &env,
+        )
+        .await;
+        assert!(res.is_err(), "a scripted resume fault must propagate");
+        let created = recorder.created.lock().unwrap_or_else(|e| e.into_inner());
+        let deleted = recorder.deleted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!created.is_empty(), "setup_env should have created a slice");
+        assert_eq!(
+            *created, *deleted,
+            "every created slice must be deleted when resume fails after restore"
+        );
+    }
+
+    // Delta 9: `readiness_delay` is honored inside boot()/verify_control_plane() — drive
+    // it so it is not dead surface. A small delay must be observable end-to-end: start()
+    // still succeeds but takes at least the delay. RED on the inverse (boot/verify ignore
+    // readiness_delay: start() returns near-instantly, elapsed < the delay).
+    #[tokio::test]
+    async fn fault_menu_readiness_delay_is_honored() {
+        use crate::vmm::{FakeVmm, FaultMenu};
+        let delay = std::time::Duration::from_millis(50);
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            readiness_delay: Some(delay),
+            ..Default::default()
+        });
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(crate::metrics::FakeCgroupFs::new()),
+            ..HostEnv::hermetic()
+        };
+        let t0 = std::time::Instant::now();
+        MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("start must still succeed with a readiness delay");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= delay,
+            "readiness_delay must be honored in boot/verify_control_plane: elapsed {elapsed:?} < {delay:?}"
+        );
+    }
+
     // Delta 9: a control socket wedged for the first N probes is recovered by `start()`'s respawn
     // loop — the exact QEMU vhost-user-vsock bring-up flake the loop exists for. `wedge=2` succeeds
     // on the 3rd spawn; assert the fake was `create`d 3 times. RED on the inverse (no respawn:
@@ -2413,6 +2532,34 @@ mod tests {
         let res = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env).await;
         // ORCH-4 / §2.5 (The capability matrix) boundary 2: a vhost-user device on the restore path is an
         // `Unsupported` capability rejection, not a generic `Config` error.
+        assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
+    }
+
+    // C1 / ORCH-4 / §2.5 boundary 2 (M5b). Sibling of test_restore_rejects_data_shares:
+    // the OTHER vhost-user arm — unprivileged (vhost-user-net) networking — must be
+    // rejected on the restore path as an `Unsupported` capability, not a `Config`
+    // error. A non-snapshotting unprivileged config builds fine (config.rs only
+    // rejects Unprivileged+snapshotting when `snapshotting` is set), so the
+    // rejection must come from restore_inner's boundary-2 re-check. Buggy impl (that
+    // arm removed/weakened) lets an unprivileged-net config onto the snapshot path —
+    // reddening this exact-variant assertion.
+    #[tokio::test]
+    async fn test_restore_rejects_unprivileged_net() {
+        let vmm = crate::vmm::FakeVmm::default();
+        let cfg = VmConfig::builder(
+            std::path::PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: std::path::PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(crate::config::NetConfig::Unprivileged {
+            egress: crate::config::Egress::Open,
+            host_services_port: None,
+        })
+        .build()
+        .expect("valid non-snapshotting unprivileged config");
+        let env = HostEnv::hermetic();
+        let res = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env).await;
         assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
     }
 

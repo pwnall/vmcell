@@ -339,6 +339,17 @@ fn noxsave_fallback(has_cpu_template: bool) -> &'static str {
     if has_cpu_template { "" } else { "noxsave " }
 }
 
+/// Reaps a failed T2-probe child's process group and unlinks its API socket. On the
+/// `wait_for_socket`-failure branch no `FcInstance` owns the socket yet (the instance
+/// is built only after a successful wait), so its `Drop` never runs — without this,
+/// firecracker that created its socket then exited early orphans a
+/// `vmcell-fc-probe-*.socket` in the temp dir. Reap first (VMM process group before
+/// sockets), then unlink, mirroring `FcInstance::drop`.
+fn reap_and_unlink_probe(process: &mut tokio::process::Child, pgid: Option<u32>, socket: &Path) {
+    crate::vmm::reap_process_group(process, pgid);
+    let _ = std::fs::remove_file(socket);
+}
+
 async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     let tmp_dir = std::env::temp_dir();
     let counter = std::time::SystemTime::now()
@@ -385,7 +396,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     .await
     .is_err()
     {
-        crate::vmm::reap_process_group(&mut process, pgid);
+        reap_and_unlink_probe(&mut process, pgid, &api_socket);
         return T2Probe::Failed;
     }
 
@@ -1120,6 +1131,30 @@ mod tests {
         tokio::process::Command::from(std_cmd)
             .spawn()
             .expect("spawn sleep stand-in")
+    }
+
+    // The T2-probe `wait_for_socket`-failure branch must unlink its API socket: no
+    // FcInstance owns it there, so `Drop` never does. Residue check: the socket exists
+    // before, is gone after. RED on the inverse (reap-only, no remove_file): the file
+    // survives and `assert!(!socket.exists())` reddens.
+    #[tokio::test]
+    async fn reap_and_unlink_probe_removes_the_probe_socket() {
+        let socket = std::env::temp_dir().join(format!(
+            "vmcell-fc-probe-test-{}.socket",
+            std::process::id()
+        ));
+        std::fs::write(&socket, b"").expect("seed probe socket");
+        assert!(
+            socket.exists(),
+            "precondition: the probe socket exists before cleanup"
+        );
+        let mut child = spawn_group_standin();
+        let pgid = child.id();
+        reap_and_unlink_probe(&mut child, pgid, &socket);
+        assert!(
+            !socket.exists(),
+            "the failed-probe branch must unlink its API socket"
+        );
     }
 
     fn instance_with(restored: bool) -> FcInstance {

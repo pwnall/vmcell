@@ -7,8 +7,12 @@
 //! **one** answer and **one** probe, [`HostCapabilities`] records — probed once at start-up (by mode
 //! selection, the daemon's `main`, and the test harness) — the effective capability set, KVM-group
 //! access, `/var/run/netns` reachability, which cgroup controllers the current scope delegates, and
-//! whether the scope is a non-threaded `domain` leaf. Per-op checks read the descriptor instead of
-//! re-probing (this consolidates the previously scattered per-op checks — §18 delta 8, Delta register: changes from the validated v27 build).
+//! whether the scope is a non-threaded `domain` leaf. As built (§18 delta 8, Delta register: changes
+//! from the validated v27 build), the descriptor is **probed once at start-up and logged** as a
+//! visible boot-time capability signal (the daemon's `MicroVmLauncher::new`); per-op enforcement
+//! keeps its own authoritative fail-loud per-write check (`metrics::try_apply_limit_at` /
+//! `classify_limit_write_err`), so the descriptor is the queryable single source, not a replacement
+//! for that per-write typed error (see docs/implementation-notes.md, Delta 8).
 
 use std::collections::BTreeSet;
 
@@ -19,8 +23,8 @@ const CAP_NET_ADMIN: u32 = 12;
 /// (§4.5, Shared directories (virtio-fs)).
 const CAP_SYS_ADMIN: u32 = 21;
 
-/// A single-probe snapshot of what the host actually offers, the one source of truth per-op checks
-/// read instead of re-probing (design §7.2 rule 1, The fail-loud capability contract and HostCapabilities; §18 delta 8, Delta register: changes from the validated v27 build).
+/// A single-probe snapshot of what the host actually offers, probed once at start-up and logged as a
+/// boot-time capability signal (design §7.2 rule 1, The fail-loud capability contract and HostCapabilities; §18 delta 8, Delta register: changes from the validated v27 build). Per-op enforcement keeps its own authoritative fail-loud per-write check; this descriptor is the queryable single source, not a replacement for it.
 ///
 /// Build one at start-up with [`HostCapabilities::probe`]; tests construct a fake-host descriptor
 /// directly (every field is `pub`) and assert that it drives the mode-selection and fail-loud
@@ -130,11 +134,13 @@ fn kvm_accessible() -> bool {
 }
 
 /// Whether the `/var/run/netns` bind-mount directory is reachable (the privileged datapath keeps
-/// per-VM network namespaces there). `iproute2` creates it on demand, so its *parent* being a
-/// writable directory is the reachability signal.
+/// per-VM network namespaces there). `iproute2` creates it on demand, so its *parent* (`/run`, or
+/// `/var/run` when that is not a symlink to `/run`) **existing as a directory** is the conservative
+/// reachability signal — this does not probe writability (a `W_OK` check would false-negatively
+/// under-report on unprivileged-but-blessed hosts whose privileged datapath still sets up the netns).
 fn netns_reachable() -> bool {
-    // `/var/run` is conventionally a symlink to `/run`; either being a directory means the netns dir
-    // is creatable there.
+    // `/var/run` is conventionally a symlink to `/run`; either being a directory is the reachability
+    // signal (existence, not a writability probe — see the doc-comment).
     std::path::Path::new("/run").is_dir() || std::path::Path::new("/var/run").is_dir()
 }
 

@@ -50,9 +50,10 @@ pub trait VmHandle: Send {
     async fn usage(&mut self) -> DaemonResult<ResourceUsageDto>;
     /// Writes a warm snapshot into `dir` (snapshot-eligible configs only).
     async fn snapshot(&mut self, dir: &Path) -> DaemonResult<()>;
-    /// Pauses the guest (CPUs stopped).
+    /// Pauses the guest (CPUs stopped). Mirrors the library `VmInstance` seam; the daemon pause/resume
+    /// **routes** are future work (design future-work, "Pause/resume routes") — not yet reachable over REST.
     async fn pause(&mut self) -> DaemonResult<()>;
-    /// Resumes a paused guest.
+    /// Resumes a paused guest. Route-unwired (see `pause`).
     async fn resume(&mut self) -> DaemonResult<()>;
     /// Graceful ordered teardown (then verify-gone). Consumes the handle.
     async fn shutdown(self: Box<Self>) -> DaemonResult<()>;

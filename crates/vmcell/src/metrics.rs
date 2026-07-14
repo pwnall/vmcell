@@ -169,11 +169,15 @@ fn controller_listed(listing: &str, controller: &str) -> bool {
 /// the value itself (e.g. a `cpu.max` quota below the kernel's µs floor, or a
 /// malformed `io.max` device) — a caller bug that must surface as
 /// [`crate::error::Error::Cgroup`] so its remediation is "fix the limit", not
-/// "enable delegation". Every other errno (`EACCES`/`EPERM`/`EROFS`, or anything
-/// unexpected) is treated as the §7.2 (The fail-loud capability contract and
-/// HostCapabilities) capability/permission failure and stays
-/// [`crate::error::Error::CapabilityUnavailable`]. Kept pure so the errno split is
-/// unit-testable without provoking a real `EINVAL` from the filesystem (M-HOST-4).
+/// "enable delegation". `ENOENT`/`EOPNOTSUPP` mean the control file is *absent* or
+/// the facility is unsupported (e.g. `memory.swap.max` on a kernel without swap
+/// accounting / `swapaccount=0`) — also [`crate::error::Error::Cgroup`], because the
+/// controller is delegated and an "enable delegation" remediation would be wrong.
+/// Every other errno (`EACCES`/`EPERM`/`EROFS`, or anything unexpected) is the §7.2
+/// (The fail-loud capability contract and HostCapabilities) capability/permission
+/// failure and stays [`crate::error::Error::CapabilityUnavailable`]. Kept pure so the
+/// errno split is unit-testable without provoking a real errno from the filesystem
+/// (M-HOST-4).
 fn classify_limit_write_err(
     file: &str,
     path: &str,
@@ -185,6 +189,20 @@ fn classify_limit_write_err(
     if e.raw_os_error() == Some(libc::EINVAL) {
         Error::Cgroup(format!(
             "invalid limit value {value:?} for {path} ('{controller}' controller): {e}"
+        ))
+    } else if matches!(
+        e.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::EOPNOTSUPP)
+    ) {
+        // An ABSENT facility, not a delegation/permission fault: the control file does
+        // not exist (e.g. `memory.swap.max` on a kernel without swap accounting /
+        // `swapaccount=0`) or the kernel reports the operation unsupported. On such a
+        // host the controller IS delegated, so a `CapabilityUnavailable` "enable
+        // delegation" remediation would send the operator chasing the wrong fix. Surface
+        // it as `Error::Cgroup` ("fix the host"), matching the EINVAL treatment above.
+        Error::Cgroup(format!(
+            "control file {path} absent/unsupported for the '{controller}' controller \
+             (no swap accounting or facility not compiled in): {e}"
         ))
     } else {
         Error::CapabilityUnavailable {
@@ -1041,6 +1059,36 @@ mod tests {
                     Error::CapabilityUnavailable { .. }
                 ),
                 "errno {errno} must remain CapabilityUnavailable"
+            );
+        }
+    }
+
+    // M-HOST-4 part C: an ABSENT control file (ENOENT — e.g. `memory.swap.max` on a
+    // kernel without swap accounting / `swapaccount=0`) or an unsupported facility
+    // (EOPNOTSUPP) is NOT a delegation/permission fault. It must map to `Error::Cgroup`
+    // ("fix the host"), never `CapabilityUnavailable` ("enable delegation") — the
+    // controller is delegated on such a host, so the delegation remediation is wrong.
+    // Goes RED on the pre-fix classifier, where ENOENT falls into the else arm and
+    // returns CapabilityUnavailable.
+    #[test]
+    fn classify_limit_write_err_treats_absent_facility_as_unsupported() {
+        use crate::error::Error;
+        for errno in [libc::ENOENT, libc::EOPNOTSUPP] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            let classified = classify_limit_write_err(
+                "memory.swap.max",
+                "/p/memory.swap.max",
+                "memory",
+                "0",
+                &e,
+            );
+            assert!(
+                matches!(classified, Error::Cgroup(_)),
+                "errno {errno} (absent facility) must be Error::Cgroup, got {classified:?}"
+            );
+            assert!(
+                !matches!(classified, Error::CapabilityUnavailable { .. }),
+                "errno {errno} must NOT be CapabilityUnavailable (wrong 'enable delegation' remediation)"
             );
         }
     }

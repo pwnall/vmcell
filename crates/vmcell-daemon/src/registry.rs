@@ -48,6 +48,16 @@ struct VmInner {
 }
 
 impl VmSlot {
+    /// Whether this VM pins `artifact_name` as its kernel, rootfs, or one of its extra disks — the
+    /// single delete-in-use predicate (design §11.3, The artifact store; §11.4, The VM registry and
+    /// the start-up sweep). Read lock-free off the immutable identity fields. Every caller
+    /// (`is_artifact_in_use`, `delete_artifact_if_unused`) shares this one law — never a second copy.
+    fn pins(&self, artifact_name: &str) -> bool {
+        self.kernel == artifact_name
+            || self.rootfs == artifact_name
+            || self.extra_disks.iter().any(|d| d == artifact_name)
+    }
+
     async fn info(&self) -> VmInfo {
         VmInfo {
             id: self.id.clone(),
@@ -277,16 +287,24 @@ impl Registry {
         // component (invariant §13, Cross-cutting invariants) so a snapshot cannot escape the store.
         validate_artifact_name(artifact_prefix)?;
         let out_dir = self.artifacts.dir().join(artifact_prefix);
-        std::fs::create_dir_all(&out_dir).map_err(|e| {
-            DaemonError::Internal(format!("cannot create snapshot dir {out_dir:?}: {e}"))
-        })?;
 
+        // Resolve the VM and assert `Ready` BEFORE any filesystem mutation, so a NotFound/Conflict
+        // rejection leaves zero residue (the "mid-op faults leave zero residue" discipline). Only
+        // then create the snapshot dir, under the per-VM lock.
         let slot = self.slot(id).await?;
         let mut inner = slot.inner.lock().await;
         require_state(&inner, VmState::Ready, id)?;
+        std::fs::create_dir_all(&out_dir).map_err(|e| {
+            DaemonError::Internal(format!("cannot create snapshot dir {out_dir:?}: {e}"))
+        })?;
         inner.state = VmState::Snapshotting;
         let result = handle_mut(&mut inner, id)?.snapshot(&out_dir).await;
         inner.state = VmState::Ready; // still live whether or not the snapshot succeeded
+        if result.is_err() {
+            // A failed snapshot leaves no residue: drop the dir we just created if it is empty
+            // (a partial-write backend leaves files; those are preserved for diagnosis).
+            let _ = std::fs::remove_dir(&out_dir);
+        }
         result?;
 
         // Enumerate the artifacts CH wrote into the snapshot dir, so a later restore can name them.
@@ -326,11 +344,40 @@ impl Registry {
     /// extra disks (design §11.4, The VM registry and the start-up sweep) — read lock-free off the immutable slot fields
     /// (design §11.3, The artifact store; the delete-in-use guard).
     pub async fn is_artifact_in_use(&self, artifact_name: &str) -> bool {
-        self.vms.lock().await.values().any(|s| {
-            s.kernel == artifact_name
-                || s.rootfs == artifact_name
-                || s.extra_disks.iter().any(|d| d == artifact_name)
-        })
+        self.vms
+            .lock()
+            .await
+            .values()
+            .any(|s| s.pins(artifact_name))
+    }
+
+    /// Atomically deletes an artifact iff no live VM pins it. The in-use check and the file delete
+    /// run under a **single** hold of the `vms` lock, closing the delete-side check-then-act TOCTOU
+    /// the former two-step (`is_artifact_in_use` then `artifacts.delete`) had: a `create` that has
+    /// already inserted its pinning slot is seen and refused. Residual, accepted (single-tenant)
+    /// narrow window: `create` resolves the artifact and launches the VM **before** it takes this
+    /// lock to insert its slot (see `create`), so a `create` that has resolved-and-launched but not
+    /// yet inserted is not yet visible here and its on-disk artifact can still be deleted out from
+    /// under it. Closing that would require re-checking the resolved set under this lock after
+    /// launch; it is recorded rather than fixed (design §11.3, The artifact store; the delete-in-use
+    /// guard).
+    ///
+    /// # Errors
+    /// [`DaemonError::InUse`] if a live VM pins it; [`DaemonError::InvalidName`]/[`DaemonError::NotFound`]/
+    /// [`DaemonError::Internal`] from the store delete.
+    pub async fn delete_artifact_if_unused(&self, artifact_name: &str) -> DaemonResult<()> {
+        // Hold the vms lock across BOTH the in-use check and the file delete — the atomicity that
+        // closes the check-then-act window against a concurrent `create` (which re-takes this lock
+        // to insert its pinning slot).
+        let vms = self.vms.lock().await;
+        if vms.values().any(|s| s.pins(artifact_name)) {
+            return Err(DaemonError::InUse(format!(
+                "artifact {artifact_name:?} is pinned by a live VM; destroy the VM first"
+            )));
+        }
+        self.artifacts.delete(artifact_name)?;
+        drop(vms);
+        Ok(())
     }
 
     /// Graceful ordered teardown of every VM (a clean daemon shutdown). Each VM runs its own
@@ -596,6 +643,60 @@ mod tests {
             reg.snapshot(&created.info.id, "../escape").await,
             Err(DaemonError::InvalidName(_))
         ));
+    }
+
+    // A snapshot against a MISSING VM returns NotFound and leaves NO residue dir — a live (real-fs)
+    // gate the fs-blind FakeHandle cannot cover on its own. RED on the pre-fix ordering
+    // (`create_dir_all` before the slot lookup), which creates `snap-missing/` before returning
+    // NotFound; a leftover empty dir would shadow a later artifact/snapshot of the same name.
+    #[tokio::test]
+    async fn snapshot_on_missing_vm_leaves_no_residue_dir() {
+        let (reg, _s, _d) = registry();
+        let residue = reg.artifacts().dir().join("snap-missing");
+        let err = reg
+            .snapshot(&VmId("vm-nope".to_string()), "snap-missing")
+            .await
+            .expect_err("snapshot on a missing VM must fail");
+        assert!(matches!(err, DaemonError::NotFound(_)));
+        assert!(
+            !residue.exists(),
+            "a rejected snapshot must leave no residue dir (it would shadow a later artifact)"
+        );
+    }
+
+    // §11.3 (The artifact store), the delete-in-use guard, atomic form: an artifact a live VM pins
+    // is refused (InUse) and the file survives; after teardown the same delete succeeds and the file
+    // is gone (positive control). RED on the inverse (a delete that ignores the pin, or one that
+    // deletes the file before checking) — the file would vanish out from under the running VM.
+    #[tokio::test]
+    async fn delete_artifact_if_unused_refuses_pinned_then_allows_after_teardown() {
+        let (reg, _s, _d) = registry();
+        reg.artifacts()
+            .create("del-me", b"bytes")
+            .expect("seed disk");
+        let created = reg
+            .create(create_req().with_extra_disk("del-me"))
+            .await
+            .expect("create pinning del-me");
+        assert!(
+            matches!(
+                reg.delete_artifact_if_unused("del-me").await,
+                Err(DaemonError::InUse(_))
+            ),
+            "delete must refuse an artifact a live VM pins"
+        );
+        assert!(
+            reg.artifacts().exists("del-me"),
+            "refused delete leaves the file"
+        );
+        reg.destroy(&created.info.id).await.expect("destroy");
+        reg.delete_artifact_if_unused("del-me")
+            .await
+            .expect("delete after teardown");
+        assert!(
+            !reg.artifacts().exists("del-me"),
+            "unpinned delete removes the file"
+        );
     }
 
     #[tokio::test]

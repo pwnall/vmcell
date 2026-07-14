@@ -644,9 +644,12 @@ that implements the delta — AGENTS.md).
   respawns `start()` mints from one `FakeVmm`. `FakeVmInstance` carries the menu + counter (both
   `pub`; the five cross-module literals set them explicitly — `..Default::default()` is illegal
   because `FakeVmInstance` has a `Drop`). New orchestrator tests drive each arm: create/boot/restore
-  faults leave zero cgroup residue (`created == deleted`), a wedge-for-2 recovers on the 3rd spawn, a
-  permanent wedge fails loud after the bounded respawns. The bespoke `CreateFailVmm` fake is now
-  superseded by `fail_create` but kept.
+  faults leave zero cgroup residue (`created == deleted`), a scripted `fail_resume` after a live
+  restore also leaves zero residue (a distinct post-instance-built teardown path the `fail_restore`
+  test cannot reach), a `readiness_delay` is driven end-to-end through `start()` (elapsed ≥ delay), a
+  wedge-for-2 recovers on the 3rd spawn, a permanent wedge fails loud after the bounded respawns
+  (docs/72 M5c — the earlier claim "drives each arm" predated the `fail_resume`/`readiness_delay`
+  drivers). The bespoke `CreateFailVmm` fake is now superseded by `fail_create` but kept.
 
 - **Delta 10 (daemon SHA-256 sidecar).** `create()` writes a `<name>.sha256` sidecar (atomic
   temp+rename) alongside the artifact; `info`/`list` take size from `metadata()` and the digest from
@@ -658,8 +661,111 @@ that implements the delta — AGENTS.md).
   body re-hash), plus sidecar-matches-hash, list-exclusion, and delete-residue tests.
 
 - **Delta 11 (remove CLI `exec`/`ls`/`rm`/`destroy` stubs).** The four verbs stay recognized by clap
-  but redirect: `moved_to_vmcelld_ctl(verb)` returns a typed `Unsupported` error naming
-  `vmcelld-ctl <verb>` (where the real verbs live) and drives a non-zero exit — deleting the stub's
-  pretense, not the recognizability, so the user gets a redirect rather than clap's cryptic
-  "unrecognized subcommand". The existing `daemon_deferred_subcommands_fail_loud` test was
-  strengthened to assert the message names `vmcelld-ctl` (the gate).
+  but redirect: `moved_to_vmcelld_ctl(verb)` returns a typed `Unsupported` error naming the
+  `vmcelld-ctl` subcommand that actually exists for that operation, and drives a non-zero exit —
+  deleting the stub's pretense, not the recognizability, so the user gets a redirect rather than
+  clap's cryptic "unrecognized subcommand". `exec`/`ls`/`rm` name themselves; **`destroy` maps to
+  `vmcelld-ctl rm`** (`vmcelld-ctl`'s teardown verb is `rm`, not `destroy` — docs/72 M3 fixed the
+  redirect, which had named the non-existent `vmcelld-ctl destroy`). The
+  `daemon_deferred_subcommands_fail_loud` test is table-driven and asserts each message names the
+  **exact** `vmcelld-ctl` verb that operation exposes (the gate — a bare `contains("vmcelld-ctl")`
+  let the wrong-verb `destroy` redirect ship green).
+
+## v28 — the docs/72 review-fix pass, as built
+
+Fixes for `docs/historical/72-claude-code-review.md`. Each lands with its red-on-inverse gate; the
+Delta 9/11 notes above were corrected in the same pass. Justified deviations recorded here:
+
+- **(H1) Cross-process VMID reclaim is serialized by a per-vmid `flock`, not an in-place
+  steal.** `VmidAllocator::try_claim_fs` now holds an exclusive advisory `flock` on a per-vmid
+  coordination file (`{vmid}.coord`) across the whole read→liveness→(re)claim, making that sequence
+  atomic against every other claimer (threads *and* processes — `flock` on two distinct open file
+  descriptions is mutually exclusive even within one process). *Reason:* the review's proposed
+  rename-first "steal" approach still dual-claimed — a stealer removing a live/dead lock momentarily
+  frees the path, letting a third racer claim it and the stealer's rename-back then clobber that fresh
+  claim (empirically **3 winners** in the new gate). Only a coordination lock across the decision is
+  correct. The kernel releases the `flock` on holder death, so a crashed coordinator cannot wedge the
+  vmid; a crashed *owner*'s lock still carries its pid for the next claimer's liveness check. Gate:
+  `shared_at_concurrent_reclaimers_have_exactly_one_winner` (8 racers × 200 trials on a seeded dead
+  lock, exactly-one-winner) — RED on the pre-fix steal/naive variants. The `{vmid}.coord` files
+  persist in the lock dir (≤254, harmless mutexes); `release_fs` still removes only `{vmid}.lock`.
+
+- **(M1) The session mux encodes + `MAX_FRAME_BYTES`-checks at the `Session`/`SessionMux` boundary.**
+  `write_tx` now carries pre-encoded `::bytes::Bytes`; a new `encode_frame` fails loud
+  (`Error::Agent`) on an over-cap frame before enqueue — the host mirror of the guest agent's
+  `send_framed` cap (one law). `writer_task` is a pure sink (the encode-error break that silently
+  killed host→guest input for every session on the mux is gone). `SessionMux::open` encodes before
+  touching the registry and removes its entry on a send failure (no orphan). Gates:
+  `oversize_write_stdin_fails_loud_and_does_not_wedge_mux`, `open_failure_leaves_no_registry_orphan`
+  (both KVM-free, in `agent::session::tests`).
+
+- **(M5a) The invariant-#5 window-filling NAT gate now exists**: `tests/nat_window_fill.rs` drives a
+  >64 KiB host→guest transfer through the smoltcp NAT and digest-compares (live/unprivileged suite;
+  RED on the old unbounded `host_read_budget` read). `FORWARD_PORT_POOL` (invariant #4) is now a named
+  const with a guard test.
+
+- **(proxy-ca, M-NET-6) The CA `(ca.pem, ca.key)` pair is atomic: a half-committed pair is fail-loud.**
+  `CaManager::new_in` regenerates only when BOTH files are absent; exactly one present returns
+  `Error::Proxy` rather than silently minting a conflicting CA (which would invalidate an
+  already-baked rootfs trust chain — a fresh cert cannot be re-derived from the surviving key). Gate:
+  `partial_ca_on_disk_is_not_silently_regenerated`.
+
+- **(metrics-swap) The limit-write classifier distinguishes an absent facility from a permission
+  fault.** `classify_limit_write_err` now maps `ENOENT`/`EOPNOTSUPP` (e.g. `memory.swap.max` on a
+  kernel without swap accounting / `swapaccount=0`) to `Error::Cgroup` ("fix the host"), not
+  `CapabilityUnavailable` ("enable delegation") — the controller is delegated on such a host, so the
+  delegation remediation was wrong. Gate:
+  `classify_limit_write_err_treats_absent_facility_as_unsupported`.
+
+- **(artifact-hash-root) `hash_output` folds the root directory's own mode**, so a `chmod` on a
+  snapshot root is inside the tamper hash (previously only per-entry modes were folded). Gate:
+  `test_hash_output_folds_root_dir_mode`.
+
+- **(Accepted limitation) tar2erofs does not preserve PAX `SCHILY.xattr` records** (incl.
+  `security.capability`). Rationale: the guest agent and every in-guest `exec` run as root (§4.2), so
+  file capabilities are moot; the erofs `Node`/`XattrSpec` plumbing exists but is unused. Pinned by
+  `tar2erofs::tests::test_pax_xattrs_are_not_preserved`. Retire if xattr passthrough is implemented.
+
+- **(Accepted assumption) tar2erofs opaque-whiteout (`.wh..wh..opq`) is applied against the flat
+  merged map at marker-processing time, not per-layer**: a same-layer child written *before* the
+  marker in tar order is also cleared. Accepted because first-party producers (OCI merge, mmdebstrap)
+  emit the opaque marker as the directory's first entry. Pinned by
+  `tar2erofs::tests::test_opaque_marker_ordering_contract` (case A survives, case B — the footgun — is
+  cleared). Retire when per-layer whiteout application lands.
+
+- **(hostcaps doc-comments) corrected to the probe-and-log as-built** already recorded in Delta 8
+  (the module + struct doc-comments had overstated the descriptor as wired into per-op checks); the
+  design §7.2 and AGENTS.md phrasings were reconciled to match. `netns_reachable()`'s doc now states
+  the existence (not writability) signal the body actually implements.
+
+- **(proxy-cassette) `record_to` is request-line logging only** (no response, excludes blocked hosts,
+  no replay — replay stays §17 forward work); its previously-uncovered fs-write branch is now gated by
+  `doubles::tests::record_to_writes_forwarded_request_to_cassette`, and the design §6.4 over-claim was
+  downgraded.
+
+- **(fs-reap) the three open-coded `kill(-pgid)`+`waitpid` teardowns in `fs.rs`** (try_wait error,
+  socket-wait timeout, `Drop`) now route through the single-source `crate::vmm::reap_process_group`
+  (already gated by the existing `Drop`/readiness-failure reap tests).
+
+- **(M2) Daemon `Registry::snapshot` checks the VM/state before any filesystem mutation.** The
+  `NotFound`/`Conflict` (slot + `require_state(Ready)`) checks now precede `create_dir_all(out_dir)`,
+  and the just-created dir is removed if empty on the backend-failure path — restoring the "mid-op
+  faults leave zero residue" discipline (an early error no longer shadows a later artifact of the same
+  name). Gate: `registry::tests::snapshot_on_missing_vm_leaves_no_residue_dir` (real-fs, since the
+  `FakeHandle` is fs-blind).
+
+- **(server-toctou) Daemon artifact delete is now one atomic op.** `Registry::delete_artifact_if_unused`
+  runs the delete-in-use predicate (`VmSlot::pins`, single-sourced with `is_artifact_in_use` — one
+  law) and the store `delete` under one hold of the `vms` lock, closing the check-then-delete TOCTOU
+  where a concurrent `create_vm` could pin an artifact in the gap and lose its disk. Forwarded over the
+  broker by new wire variants `EngineRequest::DeleteArtifactIfUnused` / `EngineReply::ArtifactDeleted`;
+  the server handler makes one atomic call instead of the two-step check-then-delete. Gates:
+  `delete_artifact_if_unused_refuses_pinned_then_allows_after_teardown` + the extended bridge
+  wire-variant round-trip (Ok and InUse-across-boundary).
+
+- **(launcher-pause, recorded)** The daemon `VmHandle::pause`/`resume` and `VmState::Paused` are
+  defined and honored on the handle (mirroring the live library `VmInstance` seam) but have no REST
+  route, no registry caller, and `Paused` is never produced — the un-routed half of the design's
+  already-registered future-work item **"Pause/resume routes"** (§17). Annotated at-site and kept (not
+  removed) to preserve the handle/`VmInstance` mirror; a route would need `EngineRequest` wire variants
+  + broker forwarding + OpenAPI parity (P5). No new §17 entry required (already listed).

@@ -77,6 +77,15 @@ impl VmEngine for FakeEngine {
     async fn is_artifact_in_use(&self, name: &str) -> DaemonResult<bool> {
         Ok(name == "pinned")
     }
+    async fn delete_artifact_if_unused(&self, name: &str) -> DaemonResult<()> {
+        if name == "pinned" {
+            Err(DaemonError::InUse(format!(
+                "artifact {name:?} is pinned by a live VM; destroy the VM first"
+            )))
+        } else {
+            Ok(())
+        }
+    }
     async fn shutdown_all(&self) {}
 }
 
@@ -140,6 +149,22 @@ async fn engine_rpc_round_trips_every_op() {
             .is_artifact_in_use("other")
             .await
             .expect("not-in-use")
+    );
+
+    // The atomic delete-in-use guard round-trips too: an unpinned artifact deletes (Ok →
+    // `ArtifactDeleted`), and a pinned one refuses with its 409 status intact across the boundary.
+    client
+        .delete_artifact_if_unused("other")
+        .await
+        .expect("unpinned delete");
+    let pinned = client
+        .delete_artifact_if_unused("pinned")
+        .await
+        .expect_err("a pinned artifact must refuse deletion");
+    assert_eq!(
+        pinned.kind().status_code(),
+        409,
+        "InUse must survive the boundary as a 409"
     );
 }
 

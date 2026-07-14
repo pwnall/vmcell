@@ -59,6 +59,13 @@ fn build_node_map<'a, R: Read + 'a>(
                     let mut data = Vec::new();
                     file.read_to_end(&mut data)
                         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
+                    // Accepted limitation: PAX SCHILY.xattr records (incl.
+                    // `security.capability`) are intentionally NOT preserved — the
+                    // guest agent and every in-guest `exec` run as root (§4.2), so
+                    // file capabilities are moot; the erofs Node/XattrSpec plumbing
+                    // exists but is unused. Pinned by
+                    // `tests::test_pax_xattrs_are_not_preserved`. Retire this note if
+                    // xattr passthrough is implemented.
                     Node::File {
                         mode: mode | fs_erofs::inode::S_IFREG,
                         data,
@@ -180,6 +187,15 @@ fn build_node_map<'a, R: Read + 'a>(
             let file_name = path.file_name().unwrap_or_default().to_string_lossy();
             if let Some(target_name) = file_name.strip_prefix(".wh.") {
                 if file_name == ".wh..wh..opq" {
+                    // Accepted assumption (recorded): the opaque marker clears the
+                    // parent subtree's contents in the single flat merged map at the
+                    // moment it is processed, NOT per-layer. This assumes the producer
+                    // emits `.wh..wh..opq` as the directory's FIRST entry in a layer; a
+                    // same-layer child written before the marker in tar order would
+                    // also be cleared. vmcell's first-party sources (OCI merge,
+                    // mmdebstrap) satisfy this. Pinned by
+                    // `tests::test_opaque_marker_ordering_contract`; per-layer whiteout
+                    // application is forward work.
                     let parent = path.parent().unwrap_or(Path::new(""));
                     let parent_normalized = normalize_path(parent);
                     entries.retain(|k, _| {
@@ -213,7 +229,9 @@ fn build_node_map<'a, R: Read + 'a>(
             mtime: 0,
             mtime_nsec: 0,
         };
-        let mode = 0o755 | fs_erofs::inode::S_IFREG;
+        // Only injected binaries (guest-agent -> usr/sbin, guest-tools -> usr/bin) are
+        // executable; injected DATA files (the CA cert under ca-certificates/) are 0o644.
+        let mode = injected_file_mode(dest_path) | fs_erofs::inode::S_IFREG;
         let node = Node::File {
             mode,
             data: content,
@@ -254,7 +272,9 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
     let mut entries = build_node_map(archives, injected_files, injected_symlinks)?;
 
     // Fail loud on a base image without glibc (§4.2, Rootfs sources and the one packer / oci2erofs §8.2). One pass over the
-    // merged path set for `libc.so.6` under any `lib*` dir (lib64, lib/<triple>, usr/lib...).
+    // merged path set for a file named `libc.so.6` at ANY path in the tree (the scan keys
+    // on the file NAME, not on a `lib*`-parent-dir restriction — so lib64, lib/<triple>,
+    // usr/lib, or any other location all satisfy it).
     // The default guest-agent is built `-C target-feature=+crt-static` (guest_agent stage),
     // so it does not itself need libc6 — but the guest-tools helper and every user `exec`
     // workload in the Debian rootfs do (L-ART-8). The static-musl agent path
@@ -365,6 +385,17 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
         .map_err(|e: fs_erofs::error::Error| crate::error::Error::Artifact(e.to_string()))?;
 
     Ok(image)
+}
+
+/// Mode for an injected file, keyed on its destination path: binaries under a
+/// `bin`/`sbin` dir are executable (`0o755`), all other injected files — notably the
+/// deployment CA cert under `ca-certificates/` — are non-executable data (`0o644`).
+#[cfg(feature = "am-fs-erofs")]
+fn injected_file_mode(dest_path: &str) -> u16 {
+    let is_bin = Path::new(dest_path)
+        .components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some("bin" | "sbin")));
+    if is_bin { 0o755 } else { 0o644 }
 }
 
 #[cfg(feature = "am-fs-erofs")]
@@ -585,6 +616,144 @@ mod tests {
         h.set_mode(0o644);
         h.set_cksum();
         b.append_data(&mut h, path, body).unwrap();
+    }
+
+    // The injected CA cert is DATA, not an executable: it must be packed 0o644, while
+    // injected binaries (guest-agent/guest-tools under bin|sbin) stay 0o755. The buggy
+    // blanket-0o755 marks the CA executable -> the `== 0o644` assertion reddens.
+    #[test]
+    fn test_injected_ca_is_not_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = dir.path().join("ca.crt");
+        std::fs::write(&ca, b"-----CA-----").unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::write(&agent, b"AGENT").unwrap();
+        let empty = tar::Archive::new(std::io::Cursor::new({
+            let mut v = Vec::new();
+            tar::Builder::new(&mut v).finish().unwrap();
+            v
+        }));
+        let injected = vec![
+            (
+                "usr/local/share/ca-certificates/vmcell-ca.crt",
+                ca.as_path(),
+            ),
+            ("usr/sbin/vmcell-guest-agent", agent.as_path()),
+        ];
+        let map = build_node_map(vec![empty], injected, vec![]).expect("node map");
+        match map.get(&normalize_path(Path::new(
+            "usr/local/share/ca-certificates/vmcell-ca.crt",
+        ))) {
+            Some(Node::File { mode, .. }) => assert_eq!(
+                mode & 0o777,
+                0o644,
+                "the injected CA cert is data and must not be executable"
+            ),
+            other => panic!("expected the injected CA file node, got {other:?}"),
+        }
+        match map.get(&normalize_path(Path::new("usr/sbin/vmcell-guest-agent"))) {
+            Some(Node::File { mode, .. }) => assert_eq!(
+                mode & 0o777,
+                0o755,
+                "the injected agent binary must stay executable"
+            ),
+            other => panic!("expected the injected agent file node, got {other:?}"),
+        }
+    }
+
+    // Accepted limitation (recorded): the packer does NOT preserve PAX SCHILY.xattr
+    // records (including `security.capability`). The guest agent and every in-guest
+    // `exec` run as root (design §4.2), so file capabilities are moot — preserving
+    // them is forward work. This test PINS the current drop: it reddens the day xattr
+    // passthrough is added without also updating the documented limitation, forcing a
+    // conscious decision + doc/impl-notes reconciliation.
+    #[test]
+    fn test_pax_xattrs_are_not_preserved() {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            // A realistic security.capability value payload (opaque bytes here).
+            let caps: &[u8] = b"\x01\x00\x00\x02\x00\x20\x00\x00";
+            b.append_pax_extensions([("SCHILY.xattr.security.capability", caps)])
+                .unwrap();
+            let body = b"binary";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "usr/bin/ping", &body[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let map = build_node_map(vec![archive], vec![], vec![]).expect("node map");
+        match map.get(&normalize_path(Path::new("usr/bin/ping"))) {
+            Some(Node::File { xattrs, .. }) => assert!(
+                xattrs.is_empty(),
+                "PAX SCHILY.xattr records are intentionally dropped (accepted limitation); \
+                 if this now fails, xattr passthrough was added — update the recorded \
+                 limitation + implementation-notes before flipping this assertion"
+            ),
+            other => panic!("expected a regular file node, got {other:?}"),
+        }
+    }
+
+    // OCI opaque-whiteout ordering contract (recorded assumption). `.wh..wh..opq` clears
+    // the current contents of its parent subtree at the moment it is processed. vmcell's
+    // first-party producers emit the opaque marker as the directory's FIRST entry, so a
+    // sibling written AFTER it in the same layer survives (case A). A sibling written
+    // BEFORE it in tar order is (accepted footgun) also cleared (case B) — per-layer
+    // application that would spare same-layer earlier siblings is forward work.
+    #[test]
+    fn test_opaque_marker_ordering_contract() {
+        // Case A: marker FIRST, then the child -> child survives (the producer contract).
+        let mut a = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut a);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "opaquedir/.wh..wh..opq", std::io::empty())
+                .unwrap();
+            append_file(&mut b, "opaquedir/kept", b"k");
+            b.finish().unwrap();
+        }
+        let map = build_node_map(
+            vec![tar::Archive::new(std::io::Cursor::new(a))],
+            vec![],
+            vec![],
+        )
+        .expect("node map");
+        assert!(
+            map.contains_key(&normalize_path(Path::new("opaquedir/kept"))),
+            "a same-layer child written AFTER the opaque marker must survive (producer contract)"
+        );
+
+        // Case B (accepted footgun): child BEFORE the marker in tar order -> cleared.
+        // This pins the documented limitation; it reddens if the retain is made
+        // insertion/timestamp-aware without updating the recorded assumption.
+        let mut c = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut c);
+            append_file(&mut b, "opaquedir/early", b"e");
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "opaquedir/.wh..wh..opq", std::io::empty())
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let map = build_node_map(
+            vec![tar::Archive::new(std::io::Cursor::new(c))],
+            vec![],
+            vec![],
+        )
+        .expect("node map");
+        assert!(
+            !map.contains_key(&normalize_path(Path::new("opaquedir/early"))),
+            "documented footgun: a same-layer child BEFORE the opaque marker is cleared"
+        );
     }
 
     // H-ART-2: a tar HARDLINK entry (type byte '1') must be MATERIALIZED — the link path gets

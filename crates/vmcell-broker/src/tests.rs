@@ -49,10 +49,14 @@ impl Netlink for FakeNetlink {
 #[derive(Default)]
 struct FakeNft {
     log: Log,
+    fail: bool,
 }
 impl NftApplier for FakeNft {
     fn apply_rules(&self, netns: &str, _rules: &str) -> vmcell::error::Result<()> {
         self.log.push(format!("apply_rules:{netns}"));
+        if self.fail {
+            return Err(vmcell::error::Error::Network("fake: nft apply fail".into()));
+        }
         Ok(())
     }
 }
@@ -60,6 +64,7 @@ impl NftApplier for FakeNft {
 #[derive(Debug, Default)]
 struct FakeCgroups {
     log: Log,
+    fail: bool,
 }
 impl std::fmt::Debug for Log {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,6 +82,11 @@ impl CgroupFs for FakeCgroups {
     }
     fn delete_slice(&self, name: &str) -> vmcell::error::Result<()> {
         self.log.push(format!("delete_slice:{name}"));
+        if self.fail {
+            return Err(vmcell::error::Error::Cgroup(
+                "fake: cgroup delete fail".into(),
+            ));
+        }
         Ok(())
     }
     fn read_stats(&self, _name: &str) -> vmcell::error::Result<vmcell::ResourceUsage> {
@@ -123,6 +133,14 @@ impl FakeBackend {
     }
     fn with_scanner_netns(mut self, names: Vec<String>) -> Self {
         self.scanner_netns = names;
+        self
+    }
+    fn with_nft_fail(mut self) -> Self {
+        self.nft.fail = true;
+        self
+    }
+    fn with_cgroup_fail(mut self) -> Self {
+        self.cgroups.fail = true;
         self
     }
 }
@@ -174,6 +192,16 @@ fn codec_round_trips_requests_and_replies() {
                 }),
             },
         },
+        BrokerRequest::SpawnVmm {
+            vmid: 9,
+            argv: vec!["cloud-hypervisor".into(), "--api-socket".into()],
+            netns: "vmcell-net-9".into(),
+            cgroup: "vmcell-vm-9".into(),
+        },
+        BrokerRequest::Teardown {
+            vmid: 9,
+            prefix: "vmcell".into(),
+        },
         BrokerRequest::Sweep {
             prefix: "acme".into(),
             live_vmids: vec![1, 2, 3],
@@ -193,6 +221,9 @@ fn codec_round_trips_requests_and_replies() {
             tap: "vmcell-tap-7".into(),
             netns: "vmcell-net-7".into(),
             host_ip: "10.200.8.1".into(),
+        },
+        BrokerReply::CgroupReady {
+            name: "vmcell-vm-9.scope".into(),
         },
         BrokerReply::SweepDone {
             netns: vec!["vmcell-net-1".into()],
@@ -390,6 +421,97 @@ fn dispatch_spawn_vmm_refuses_as_forward_work() {
     }
 }
 
+// Guards SetupNetwork's nft-emit failure branch AND its netns-reclaim-on-failure residue: when
+// emit_proxy_rules errors, dispatch returns Error and the created netns is dropped (reclaimed),
+// NOT left registered. Inverse: a handler that inserted `ns` before emitting nft (leaking on
+// failure) shows no delete_netns in the log and reddens. Reachable only with the fake's fail-arm.
+#[test]
+fn dispatch_setup_network_nft_failure_reclaims_netns() {
+    let backend = FakeBackend::new().with_nft_fail();
+    let net_log = backend.net_log.clone();
+    let mut srv = BrokerServer::new(backend);
+
+    let reply = srv.dispatch(BrokerRequest::SetupNetwork {
+        vmid: 4,
+        prefix: "vmcell".into(),
+        proxy_port: Some(3128),
+    });
+    match reply {
+        BrokerReply::Error(msg) => assert!(
+            msg.contains("emit nft ruleset"),
+            "expected the nft-emit error, got: {msg}"
+        ),
+        other => panic!("nft failure must surface as Error, got {other:?}"),
+    }
+    assert!(
+        net_log
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_netns:")),
+        "the netns created before the nft failure must be reclaimed (delete_netns): {:?}",
+        net_log.calls()
+    );
+}
+
+// broker-hostip: an out-of-range vmid makes host_ip() (via ip_math, valid range
+// 1..=254) error; the broker must FAIL LOUD (BrokerReply::Error "host ip: ...")
+// rather than mask it into an empty gateway with unwrap_or_default(). RED on the
+// pre-fix unwrap_or_default(), which returned NetworkReady{host_ip:""}. proxy_port is
+// None so this isolates the NetworkReady host_ip path (not emit_proxy_rules), and the
+// created netns must still be reclaimed (ns dropped on the error return).
+#[test]
+fn dispatch_setup_network_out_of_range_vmid_fails_loud_on_host_ip() {
+    let backend = FakeBackend::new();
+    let net_log = backend.net_log.clone();
+    let mut srv = BrokerServer::new(backend);
+    let reply = srv.dispatch(BrokerRequest::SetupNetwork {
+        vmid: 0,
+        prefix: "vmcell".into(),
+        proxy_port: None,
+    });
+    match reply {
+        BrokerReply::Error(msg) => assert!(
+            msg.contains("host ip"),
+            "an out-of-range vmid must fail loud on host_ip, got: {msg}"
+        ),
+        other => {
+            panic!("out-of-range vmid must not yield an empty-gateway NetworkReady, got {other:?}")
+        }
+    }
+    assert!(
+        net_log
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_netns:")),
+        "the netns created before the host_ip failure must be reclaimed: {:?}",
+        net_log.calls()
+    );
+}
+
+// Guards Teardown's error-aggregation join: a failing cgroup delete must surface as Error (not a
+// silently-Done teardown). Inverse: a teardown that swallowed the delete_slice error reddens.
+#[test]
+fn dispatch_teardown_aggregates_delete_errors() {
+    let backend = FakeBackend::new().with_cgroup_fail();
+    let mut srv = BrokerServer::new(backend);
+    srv.dispatch(BrokerRequest::SetupNetwork {
+        vmid: 6,
+        prefix: "vmcell".into(),
+        proxy_port: None,
+    });
+    let reply = srv.dispatch(BrokerRequest::Teardown {
+        vmid: 6,
+        prefix: "vmcell".into(),
+    });
+    match reply {
+        BrokerReply::Error(msg) => assert!(
+            msg.contains("delete cgroup slice"),
+            "teardown must aggregate the cgroup delete error, got: {msg}"
+        ),
+        other => panic!("a failing delete must not report Done, got {other:?}"),
+    }
+}
+
 // ---- transports -----------------------------------------------------------------------------
 
 // Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): the whole serve loop + framing over a REAL socketpair (threaded, no fork
@@ -434,5 +556,24 @@ fn fork_transport_health_round_trips_and_reaps() {
         BrokerReply::Done
     );
     assert_eq!(client.shutdown().expect("shutdown"), BrokerReply::Done);
-    child.reap();
+    // reap() returns the decoded exit status, proving it actually reaped (WEXITSTATUS) rather
+    // than blind-latching. A clean serve loop exits 0. Inverse: a reap that returned None
+    // unconditionally (or latched before waitpid) reddens here.
+    assert_eq!(child.reap(), Some(0), "a clean broker child must exit 0");
+}
+
+// Guards the fail-loud rule for the forked serve loop: a framing fault in the child must
+// exit NON-ZERO, not swallow-and-_exit(0). Inverse: the pre-fix `let _ = serve(..); _exit(0)`
+// (or a status-discarding reap) reddens here — reap() would report Some(0)/None instead of Some(1).
+#[test]
+fn fork_transport_serve_error_exits_nonzero() {
+    let (mut client, mut child) = spawn_broker_with(FakeBackend::new()).expect("fork broker");
+    // A 2-byte body is an incomplete/invalid postcard varint for BrokerRequest, so the child's
+    // recv_msg returns InvalidData (NOT a clean UnexpectedEof) and serve() returns Err.
+    write_frame(&mut client.sock, &[0xFFu8, 0xFF]).expect("write malformed frame");
+    assert_eq!(
+        child.reap(),
+        Some(1),
+        "a serve() framing error must make the broker child exit non-zero (fail loud)"
+    );
 }
