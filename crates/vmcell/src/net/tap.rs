@@ -190,10 +190,16 @@ impl Netlink for RtNetlink {
                     .await
                     .map_err(|e| format!("addr add err: {e}"))?;
 
+                // rtnetlink 0.21: `link().set(..)` now takes a fully-built `LinkMessage`
+                // (the fluent `.set(idx).up()` builder was removed); build one with IFF_UP set.
                 handle
                     .link()
-                    .set(link_idx)
-                    .up()
+                    .set(
+                        rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
+                            .index(link_idx)
+                            .up()
+                            .build(),
+                    )
                     .execute()
                     .await
                     .map_err(|e| format!("link up err: {e}"))?;
@@ -212,8 +218,12 @@ impl Netlink for RtNetlink {
 
                 handle
                     .link()
-                    .set(lo_idx)
-                    .up()
+                    .set(
+                        rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
+                            .index(lo_idx)
+                            .up()
+                            .build(),
+                    )
                     .execute()
                     .await
                     .map_err(|e| format!("lo up err: {e}"))?;
@@ -271,7 +281,12 @@ impl Netlink for RtNetlink {
                         .await
                         .map_err(|e| format!("rule add err: {e}"))?;
 
-                    let mut route = handle.route().add();
+                    // rtnetlink 0.21: `route().add(..)` now requires a `RouteMessage`; pass a
+                    // default and overwrite every header field below, so the emitted netlink
+                    // bytes are identical to the pre-0.15 `add()` + `message_mut()` path.
+                    let mut route = handle
+                        .route()
+                        .add(netlink_packet_route::route::RouteMessage::default());
                     let msg = route.message_mut();
                     // Same as the rule above: an unset address family is rejected with
                     // EAFNOSUPPORT. This is an IPv4 local route into table 100.

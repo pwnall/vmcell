@@ -339,7 +339,10 @@ impl Stage for InVmKernelStage {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
         hasher.update(&bytes);
-        let got = format!("{:x}", hasher.finalize());
+        // sha2 0.11 / digest 0.11 return a `hybrid_array::Array` (no `LowerHex`), so format the
+        // 32 bytes as lowercase hex explicitly. Byte output is identical to the old `{:x}`.
+        let digest_bytes: [u8; 32] = hasher.finalize().into();
+        let got: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();
         if &got != expected_sha {
             return Err(Error::Artifact(format!(
                 "kernel source tarball hash mismatch: expected {expected_sha}, got {got} (url {url})"

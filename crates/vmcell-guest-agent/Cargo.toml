@@ -28,8 +28,8 @@ vsock = "0.5"
 # `openpt`/`ptsname`/`unlockpt`, `tcsetwinsize`/`Winsize`, and the async-signal-safe
 # `setsid`/`ioctl_tiocsctty`/`dup2_std*` login-tty sequence in the child `pre_exec`.
 # All are features on the existing dep, so the lean-agent graph gains no crate.
-rustix = { version = "0.38", features = ["fs", "mount", "process", "net", "time", "event", "pty", "termios", "stdio"] }
-signal-hook = "0.3"
+rustix = { version = "1", features = ["fs", "mount", "process", "net", "time", "event", "pty", "termios", "stdio"] }
+signal-hook = "0.4"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

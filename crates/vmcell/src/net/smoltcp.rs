@@ -109,12 +109,10 @@ pub mod backend {
     /// fallible prologue the NET-4 guard test drives.
     fn nat_addrs(vmid: u32) -> crate::error::Result<(Ipv4Address, Ipv4Address)> {
         let (host_gw_std, guest_ip_std, _) = crate::net::ip_math(vmid)?;
-        // smoltcp 0.11 provides `From<std::net::Ipv4Addr>`, so the shared std
-        // addresses convert directly rather than being rebuilt octet-by-octet.
-        Ok((
-            Ipv4Address::from(host_gw_std),
-            Ipv4Address::from(guest_ip_std),
-        ))
+        // smoltcp 0.13's `Ipv4Address` is a re-export of `core::net::Ipv4Addr`
+        // (== `std::net::Ipv4Addr`), so `ip_math`'s std addresses already ARE `Ipv4Address` —
+        // returned directly (an explicit `Ipv4Address::from` would be a useless self-conversion).
+        Ok((host_gw_std, guest_ip_std))
     }
 
     /// Computes the used length to report for an RX frame delivery (L-NET-2).
@@ -225,11 +223,13 @@ pub mod backend {
     /// Token for receiving packets in the `smoltcp` stack.
     pub struct RxTokenImpl(Vec<u8>);
     impl RxToken for RxTokenImpl {
-        fn consume<R, F>(mut self, f: F) -> R
+        // smoltcp 0.13 made `RxToken::consume` take `self` by value and an immutable
+        // `&[u8]` buffer (RX is read-only); only `TxToken` keeps the `&mut [u8]` form.
+        fn consume<R, F>(self, f: F) -> R
         where
-            F: FnOnce(&mut [u8]) -> R,
+            F: FnOnce(&[u8]) -> R,
         {
-            f(&mut self.0)
+            f(&self.0)
         }
     }
 
@@ -1169,18 +1169,22 @@ pub mod backend {
                 let (host_std, guest_std, _) = crate::net::ip_math(vmid).unwrap();
                 // Byte-for-byte equality with the shared /30 math.
                 assert_eq!(
-                    host_gw.0,
+                    host_gw.octets(),
                     host_std.octets(),
                     "host gw drifted for vmid {vmid}"
                 );
                 assert_eq!(
-                    guest_gw.0,
+                    guest_gw.octets(),
                     guest_std.octets(),
                     "guest gw drifted for vmid {vmid}"
                 );
                 // The host gateway is the /30 `.1` and the guest is the `.2`.
-                assert_eq!(host_gw.0[3], 1, "host gw must be the .1 of the /30");
-                assert_eq!(guest_gw.0[3], 2, "guest gw must be the .2 of the /30");
+                assert_eq!(host_gw.octets()[3], 1, "host gw must be the .1 of the /30");
+                assert_eq!(
+                    guest_gw.octets()[3],
+                    2,
+                    "guest gw must be the .2 of the /30"
+                );
             }
         }
 

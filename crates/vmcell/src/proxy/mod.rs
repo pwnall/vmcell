@@ -342,7 +342,7 @@ impl EgressProxy {
                 let proxy = match ProxyBuilder::new()
                     .with_listener(listener)
                     .with_ca(authority)
-                    .with_rustls_client(rustls::crypto::aws_lc_rs::default_provider())
+                    .with_rustls_connector(rustls::crypto::aws_lc_rs::default_provider())
                     .with_http_handler(handler)
                     .with_graceful_shutdown(shutdown_signal)
                     .build()

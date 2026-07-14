@@ -12,6 +12,6 @@ publish = false
 # and both the runner (transient exec) and the daemon (long-lived, retains caps) link it. The CI
 # lean assertion enforces this structurally (design §18.1) the same way it does for the runner.
 [dependencies]
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "1", features = ["process"] }
 capctl = "0.2.4"
 libc = "0.2"

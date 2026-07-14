@@ -14,5 +14,5 @@ name = "vmcell-guest-tools"
 path = "src/main.rs"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 libc = "0.2"

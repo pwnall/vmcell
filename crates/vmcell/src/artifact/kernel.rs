@@ -221,7 +221,9 @@ impl Stage for KernelStage {
         let sha256_hex = |bytes: &[u8]| -> String {
             let mut hasher = sha2::Sha256::new();
             hasher.update(bytes);
-            format!("{:x}", hasher.finalize())
+            // sha2 0.11 `finalize()` returns a `hybrid_array::Array` (no `LowerHex`).
+            let out: [u8; 32] = hasher.finalize().into();
+            out.iter().map(|b| format!("{b:02x}")).collect::<String>()
         };
 
         // (Re)fetch the tarball when it is missing OR its content does not match the
@@ -588,7 +590,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    // sha2 0.11 `finalize()` returns a `hybrid_array::Array` (no `LowerHex`).
+    let out: [u8; 32] = h.finalize().into();
+    out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Extracts a single regular-file member from a (optionally zstd-compressed) tar `archive`,
@@ -886,7 +890,8 @@ mod tests {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();
         h.update(bytes);
-        format!("{:x}", h.finalize())
+        let out: [u8; 32] = h.finalize().into();
+        out.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     fn kernel_inputs(sha: String) -> StageInputs {

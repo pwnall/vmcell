@@ -85,8 +85,10 @@ fn drain_zombies(reaper: &ReaperCoordinator) {
         Ok(Some((pid, status))) => {
             let pid = pid.as_raw_nonzero().get().cast_unsigned();
             let code = exit_code_from_termination(
-                status.terminating_signal().map(|s| s.cast_signed()),
-                status.exit_status().map(|c| c.cast_signed()),
+                // rustix 1.x `WaitStatus` signal/exit accessors already return
+                // `Option<i32>` (they were `Option<u32>` on 0.38), so no cast is needed.
+                status.terminating_signal(),
+                status.exit_status(),
             );
             Some((pid, code))
         }
@@ -181,7 +183,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("/proc")?;
     std::fs::create_dir_all("/mnt")?;
 
-    if let Err(e) = mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty(), "") {
+    if let Err(e) = mount(
+        "tmpfs",
+        "/mnt",
+        "tmpfs",
+        MountFlags::empty(),
+        None::<&core::ffi::CStr>,
+    ) {
         // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): failure returns Err and kernel-panics PID 1, so
         // log it at error — louder than the tolerated best-effort failures (sysfs,
         // shares, loopback) that log at warn (N-GUEST-1: the levels were inverted).
@@ -197,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/mnt/rootfs",
         "overlay",
         MountFlags::empty(),
-        "lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work",
+        Some(c"lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work"),
     ) {
         // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: overlay failed: {}", e);
@@ -230,18 +238,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // require sysfs, so a failed sysfs mount is logged and tolerated like the
     // share-mount / loopback paths below. Returning Err from PID 1's main would
     // kernel-panic the guest ("Attempted to kill init").
-    if let Err(e) = mount("sysfs", "/sys", "sysfs", MountFlags::empty(), "") {
+    if let Err(e) = mount(
+        "sysfs",
+        "/sys",
+        "sysfs",
+        MountFlags::empty(),
+        None::<&core::ffi::CStr>,
+    ) {
         tracing::warn!(
             "vmcell-guest-agent: sysfs mount failed: {}; continuing without /sys",
             e
         );
     }
-    if let Err(e) = mount("proc", "/proc", "proc", MountFlags::empty(), "") {
+    if let Err(e) = mount(
+        "proc",
+        "/proc",
+        "proc",
+        MountFlags::empty(),
+        None::<&core::ffi::CStr>,
+    ) {
         // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: proc failed: {}", e);
         return Err(e.into());
     }
-    if let Err(e) = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty(), "") {
+    if let Err(e) = mount(
+        "devtmpfs",
+        "/dev",
+        "devtmpfs",
+        MountFlags::empty(),
+        None::<&core::ffi::CStr>,
+    ) {
         // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
         tracing::error!("vmcell-guest-agent: devtmpfs failed: {}", e);
         return Err(e.into());
@@ -266,7 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/dev/pts",
         "devpts",
         MountFlags::empty(),
-        "gid=5,mode=620,ptmxmode=666",
+        Some(c"gid=5,mode=620,ptmxmode=666"),
     ) {
         tracing::warn!(
             "vmcell-guest-agent: devpts mount failed: {}; PTY sessions unavailable (pipe sessions and exec unaffected)",
@@ -304,7 +330,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             MountFlags::empty()
         };
-        if let Err(e) = mount(tag.as_str(), &mount_point as &str, "virtiofs", flags, "") {
+        if let Err(e) = mount(
+            tag.as_str(),
+            &mount_point as &str,
+            "virtiofs",
+            flags,
+            None::<&core::ffi::CStr>,
+        ) {
             tracing::warn!(
                 "vmcell-guest-agent: optional virtiofs share {} not attached: {}; continuing",
                 tag,
@@ -587,12 +619,18 @@ fn remaining_idle(deadline: Instant, now: Instant) -> Option<Duration> {
 /// busy-spins PID 1 until the deadline check catches up. Overshooting a sub-ms
 /// remainder by <1 ms is harmless — the deadline itself is enforced on
 /// [`Instant`]s by [`remaining_idle`], not by the poll timeout.
-fn poll_timeout_ms(remaining: Duration) -> i32 {
-    // Cap at i32::MAX (an over-long remainder), floor at 1 ms; both are correctness bounds, not a
-    // truncating `as` — `try_from` saturates instead of wrapping. Equivalent to the old clamp+cast.
-    i32::try_from(remaining.as_millis())
-        .unwrap_or(i32::MAX)
-        .max(1)
+fn poll_timeout(remaining: Duration) -> rustix::time::Timespec {
+    // Whole-millisecond clamp, floored at 1 ms — both are correctness bounds (see the doc above),
+    // now expressed as the `Timespec` that rustix 1.x `poll(2)` takes (it was a raw `i32` ms count
+    // on 0.38). `try_from` saturates the millisecond count at `i64::MAX` instead of wrapping, and
+    // the 1 ms floor keeps a sub-ms remainder from truncating to 0 (which would busy-spin PID 1).
+    let ms = i64::try_from(remaining.as_millis())
+        .unwrap_or(i64::MAX)
+        .max(1);
+    rustix::time::Timespec {
+        tv_sec: ms / 1_000,
+        tv_nsec: (ms % 1_000) * 1_000_000,
+    }
 }
 
 /// Serves the vsock control plane, re-binding the listener across snapshot
@@ -641,7 +679,10 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
         let mut deadline = Instant::now() + rebind_idle;
         while let Some(remaining) = remaining_idle(deadline, Instant::now()) {
             let mut fds = [PollFd::new(&listener, PollFlags::IN)];
-            match rustix::event::poll(&mut fds, poll_timeout_ms(remaining)) {
+            // rustix 1.x `poll` takes `Option<&Timespec>`; `Some(&ts)` preserves the finite
+            // timeout — `None` would block forever and defeat the idle-rebind deadline.
+            let timeout = poll_timeout(remaining);
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
                 // Timed out: loop back — the recomputed remainder hits zero (or
                 // re-polls a sub-ms tail once) and triggers the re-bind.
                 Ok(0) => {}
@@ -1259,7 +1300,7 @@ fn winsize_from(rows: u16, cols: u16) -> rustix::termios::Winsize {
 fn kill_group(pid: u32) {
     use rustix::process::{Pid, Signal, kill_process_group};
     if let Some(p) = Pid::from_raw(pid.cast_signed()) {
-        let _ = kill_process_group(p, Signal::Kill);
+        let _ = kill_process_group(p, Signal::KILL);
     }
 }
 
@@ -1868,19 +1909,25 @@ mod tests {
     // remainder truncates to 0 = "return immediately" and PID 1 busy-spins until
     // the deadline check catches up.
     #[test]
-    fn poll_timeout_ms_floors_at_one_ms_and_never_exceeds_remaining() {
+    fn poll_timeout_floors_at_one_ms_and_never_exceeds_remaining() {
+        // A sub-millisecond remainder floors to 1 ms (tv_nsec = 1_000_000), never 0.
+        let ts = poll_timeout(Duration::from_micros(300));
         assert_eq!(
-            poll_timeout_ms(Duration::from_micros(300)),
-            1,
+            (ts.tv_sec, ts.tv_nsec),
+            (0, 1_000_000),
             "a sub-millisecond remainder must floor to 1 ms, not truncate to 0"
         );
-        assert_eq!(poll_timeout_ms(Duration::from_millis(1)), 1);
+        assert_eq!(poll_timeout(Duration::from_millis(1)).tv_nsec, 1_000_000);
         // Whole-ms truncation: never over the remaining window by a full tick.
-        assert_eq!(poll_timeout_ms(Duration::from_micros(2500)), 2);
-        assert_eq!(poll_timeout_ms(Duration::from_millis(250)), 250);
-        // Absurdly large windows saturate at i32::MAX instead of wrapping negative
-        // (a negative poll timeout means "block forever" — the re-bind would die).
-        assert_eq!(poll_timeout_ms(Duration::from_secs(u64::MAX)), i32::MAX);
+        assert_eq!(poll_timeout(Duration::from_micros(2500)).tv_nsec, 2_000_000);
+        let ts = poll_timeout(Duration::from_millis(250));
+        assert_eq!((ts.tv_sec, ts.tv_nsec), (0, 250_000_000));
+        // Absurdly large windows saturate instead of wrapping negative (a negative
+        // timeout would mean "block forever" and the re-bind would never fire).
+        let ts = poll_timeout(Duration::from_secs(u64::MAX));
+        assert_eq!(ts.tv_sec, i64::MAX / 1_000);
+        assert_eq!(ts.tv_nsec, (i64::MAX % 1_000) * 1_000_000);
+        assert!(ts.tv_sec > 0 && ts.tv_nsec >= 0, "must not wrap negative");
     }
 
     // The (secs, nanos) → Timespec mapping the mandatory post-restore clock set

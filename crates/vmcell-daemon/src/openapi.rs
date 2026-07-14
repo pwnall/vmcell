@@ -123,22 +123,6 @@ pub const API_ROUTES: &[RouteDef] = &[
 /// The exact set of unauthenticated route paths (design §13, Cross-cutting invariants). Everything else is guarded.
 pub const OPEN_ROUTES: &[&str] = &["/healthz", "/openapi.json"];
 
-/// Converts an OpenAPI-style path (`/v1/vms/{id}`) to the axum 0.7 form (`/v1/vms/:id`).
-#[must_use]
-pub fn axum_path(openapi_path: &str) -> String {
-    openapi_path
-        .split('/')
-        .map(|seg| {
-            if let Some(inner) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                format!(":{inner}")
-            } else {
-                seg.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 /// Builds the OpenAPI 3.1 document from [`API_ROUTES`] — the single generator, so the doc and the
 /// router share one table (invariant §13, Cross-cutting invariants).
 #[must_use]
@@ -243,13 +227,6 @@ mod tests {
             table_open, open,
             "open route set must be exactly {OPEN_ROUTES:?}"
         );
-    }
-
-    #[test]
-    fn axum_path_converts_braces_to_colons() {
-        assert_eq!(axum_path("/v1/vms/{id}/exec"), "/v1/vms/:id/exec");
-        assert_eq!(axum_path("/v1/artifacts/{name}"), "/v1/artifacts/:name");
-        assert_eq!(axum_path("/healthz"), "/healthz");
     }
 
     #[test]

@@ -258,7 +258,11 @@ fn verify_blob_digest(blob: &[u8], expected_digest: &str) -> Result<()> {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(blob);
-    let hash = format!("sha256:{:x}", hasher.finalize());
+    // sha2 0.11 `finalize()` returns a `hybrid_array::Array` (no `LowerHex`); format the
+    // 32 bytes as lowercase hex explicitly (byte-identical to the old `{:x}`).
+    let out: [u8; 32] = hasher.finalize().into();
+    let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+    let hash = format!("sha256:{hex}");
     if hash != expected_digest {
         return Err(crate::error::Error::Artifact(format!(
             "blob digest mismatch: expected {expected_digest}, got {hash}"
@@ -316,7 +320,9 @@ mod tests {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();
         h.update(good);
-        let digest = format!("sha256:{:x}", h.finalize());
+        let out: [u8; 32] = h.finalize().into();
+        let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        let digest = format!("sha256:{hex}");
 
         // Correct cached content verifies.
         assert!(read_and_verify_cached_blob(&path, &digest).is_ok());
@@ -394,7 +400,9 @@ mod tests {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();
         h.update(bytes);
-        format!("sha256:{:x}", h.finalize())
+        let out: [u8; 32] = h.finalize().into();
+        let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        format!("sha256:{hex}")
     }
 
     fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {

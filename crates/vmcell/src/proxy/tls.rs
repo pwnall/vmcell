@@ -122,18 +122,13 @@ impl CaManager {
             )));
         }
 
-        let (ca_cert_pem, key_pair, cert) = if cert_exists && key_exists {
+        let (ca_cert_pem, key_pair) = if cert_exists && key_exists {
             let cert_pem = std::fs::read_to_string(&cert_path)?;
             let key_pem = std::fs::read_to_string(&key_path)?;
 
             let key_pair = KeyPair::from_pem(&key_pem).map_err(|e| Error::Proxy(e.to_string()))?;
-            let params = CertificateParams::from_ca_cert_pem(&cert_pem)
-                .map_err(|e| Error::Proxy(e.to_string()))?;
-            let cert = params
-                .self_signed(&key_pair)
-                .map_err(|e| Error::Proxy(e.to_string()))?;
 
-            (cert_pem, key_pair, cert)
+            (cert_pem, key_pair)
         } else {
             let key_pair = KeyPair::generate().map_err(|e| Error::Proxy(e.to_string()))?;
             let mut params = CertificateParams::default();
@@ -163,13 +158,17 @@ impl CaManager {
             std::fs::rename(&key_tmp, &key_path)?;
             std::fs::rename(&cert_tmp, &cert_path)?;
 
-            // Re-create key_pair as self_signed borrows it but we need an owned one for hudsucker
-            let key_pair2 = KeyPair::from_pem(&key_pem).map_err(|e| Error::Proxy(e.to_string()))?;
-
-            (cert_pem, key_pair2, cert)
+            (cert_pem, key_pair)
         };
 
-        let auth = RcgenAuthority::new(key_pair, cert, 1_000, aws_lc_rs::default_provider());
+        // hudsucker 0.24's `RcgenAuthority::new` takes a single rcgen `Issuer` (built from the CA
+        // cert PEM + signing key) instead of the old (key_pair, cert) pair. `from_ca_cert_pem`
+        // re-parses the persisted CA into an owned `Issuer<'static, KeyPair>`, preserving the exact
+        // signing identity baked into the rootfs trust store (M-NET-6). It consumes `key_pair`,
+        // which is unused afterward; needs rcgen's `x509-parser` feature (declared on our own edge).
+        let issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert_pem, key_pair)
+            .map_err(|e| Error::Proxy(e.to_string()))?;
+        let auth = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
 
         // Publish under this directory's key. We have held `cache` across the
         // whole generate-or-load, and the fast-path check above found no entry,

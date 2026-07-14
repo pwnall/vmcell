@@ -52,14 +52,14 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/artifacts", get(list_artifacts))
         .route(
-            "/v1/artifacts/:name",
+            "/v1/artifacts/{name}",
             put(create_artifact).get(get_artifact).delete(delete_artifact),
         )
         .route("/v1/vms", post(create_vm).get(list_vms))
-        .route("/v1/vms/:id", get(get_vm).delete(destroy_vm))
-        .route("/v1/vms/:id/exec", post(exec_vm))
-        .route("/v1/vms/:id/stats", get(stats_vm))
-        .route("/v1/vms/:id/snapshot", post(snapshot_vm))
+        .route("/v1/vms/{id}", get(get_vm).delete(destroy_vm))
+        .route("/v1/vms/{id}/exec", post(exec_vm))
+        .route("/v1/vms/{id}/stats", get(stats_vm))
+        .route("/v1/vms/{id}/snapshot", post(snapshot_vm))
         // Auth is a route-layer over exactly these routes — the open routes below are NOT wrapped
         // (invariant §13, Cross-cutting invariants: authenticated by default, two named opt-outs).
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))

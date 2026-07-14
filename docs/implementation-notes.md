@@ -769,3 +769,51 @@ Delta 9/11 notes above were corrected in the same pass. Justified deviations rec
   already-registered future-work item **"Pause/resume routes"** (§17). Annotated at-site and kept (not
   removed) to preserve the handle/`VmInstance` mirror; a route would need `EngineRequest` wire variants
   + broker forwarding + OpenAPI parity (P5). No new §17 entry required (already listed).
+
+## Dependency modernization — latest-stable bump pass (2026-07-14)
+
+Every direct dependency with a newer **stable** release was bumped to its latest, keeping the lockfile
+advisory-clean and `--locked`-buildable on the pinned 1.96.1 toolchain. `just ci` is green (536 tests,
+`cargo deny`, `semver-checks`, the ≤2-feature powerset); all three operating-mode suites were re-run on
+the KVM host (`just test-privileged` / `test-unprivileged` / `test-daemon`).
+
+- **Breaking-major bumps applied**, each with the source migration its new API required: `rustix`
+  0.38→1.1 (guest agent — `mount` data arg is now `Into<Option<&CStr>>`; `event::poll` takes
+  `Option<&Timespec>`; `WaitStatus::{exit_status,terminating_signal}` are `Option<i32>`;
+  `Signal::Kill`→`Signal::KILL`), `nix` 0.29→0.31, `netns-rs` 0.1→0.2, `signal-hook` 0.3→0.4,
+  `criterion` 0.5→0.8 (`std::hint::black_box`), `axum` 0.7→0.8 (route captures `:id`→`{id}`; the
+  now-obsolete `openapi::axum_path` colon-shim and the unused `vmcell` `axum` dev-dep were deleted),
+  `reqwest` 0.12→0.13 (feature `rustls-tls`→`rustls`), `sha2` 0.10→0.11 (`finalize()` returns a
+  `hybrid_array::Array` with no `LowerHex`, so the seven digest-hex sites format per-byte lowercase),
+  `smoltcp` 0.11→0.13 (`RxToken::consume` takes `&[u8]`; `wire::Ipv4Address` is now
+  `core::net::Ipv4Addr`), `hudsucker` 0.23→0.24 + `rcgen` 0.13→0.14 **in lockstep**
+  (`RcgenAuthority::new` now takes one `rcgen::Issuer` built via `Issuer::from_ca_cert_pem`;
+  `ProxyBuilder::with_rustls_client`→`with_rustls_connector`), and `rtnetlink` 0.14→0.21 +
+  `netlink-packet-route` 0.19→0.30 **in lockstep** (rtnetlink 0.21 pins `^0.30`, so 0.31 is excluded;
+  `link().set()` takes a built `LinkMessage` via `LinkMessageBuilder::<LinkUnspec>`, `route().add()`
+  takes a `RouteMessage::default()`). The CA signing identity (M-NET-6) and the emitted netlink bytes
+  are preserved across these migrations.
+
+- **Behavioral change worth flagging (compiler-invisible): TLS trust anchor.** `reqwest` 0.13's
+  `rustls` feature validates against the **platform certificate store** (`rustls-platform-verifier`,
+  aws-lc-rs provider), where 0.12's `rustls-tls` used the bundled webpki-roots. This affects the guest
+  `vmcell-guest-tools` "curl" and `vmcell-daemon-client`. The egress/MITM suite drives HTTPS
+  interception with `-k` (`danger_accept_invalid_certs`), so the change is inert for those assertions,
+  and the baked-CA/system-store trust model matches the guest; `egress_proxy` (all backends) and the
+  daemon-client suite pass unchanged. aws-lc-rs + rustls-platform-verifier were already resolved
+  transitively, so no new license/C-link surface enters (`cargo deny` green).
+
+- **Held back, with rationale.** `libc` (latest is `1.0.0-alpha`) and `rustls` (latest is `0.24.0-dev`)
+  are pre-releases — kept on latest stable (`0.2.x` / `0.23`). The vendored-`vhost` rust-vmm family —
+  `vhost`/`vhost-user-backend`/`vm-memory` (`=`-pinned to the carried `[patch.crates-io]`) and
+  `virtio-queue`/`vmm-sys-util`/`virtio-bindings` (anchored to what vendored `vhost-user-backend 0.22`
+  requires) — stays put: bumping forks the version and silently drops the QEMU-unprivileged
+  SET_VRING_ENABLE patch (the `ci` recipe asserts both resolve from `vendor/`).
+
+- **Environmental test-fault note (not a regression).** On this KVM host the `nested_virt::{cloud_hypervisor,qemu}`
+  and `snapshot_restore` (post-restore CSPRNG reseed) tests fail because the host's nested-KVM/RNG is
+  degraded this session (guest `kvm-ok` reports nested `/dev/kvm` not exposed; the `/dev/hwrng` reseed
+  does not apply). Confirmed **not** caused by this bump: a clean (pre-bump) checkout fails the identical
+  tests. The privileged runner (`.vmcell-bin/*`) was not rebuilt, so it still validates via its existing
+  blessing; a `just bless` re-blesses the new rustix-1 runner binary when convenient (its own runtime
+  behavior — cap-raise + exec via unchanged `geteuid`/`getgid` — is unaffected by the bump).

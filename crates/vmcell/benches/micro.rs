@@ -1,4 +1,5 @@
-use criterion::{Criterion, black_box, criterion_group};
+use criterion::{Criterion, criterion_group};
+use std::hint::black_box;
 use vmcell::agent::protocol::{ExecRequest, Message};
 use vmcell::artifact::{Stage, StageInputs, kernel::KernelStage};
 

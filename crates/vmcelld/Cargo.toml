@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # drive it over HTTP — dogfooding the client. `#[ignore]` by default (need KVM + blessed runner +
 # artifacts); run via `just test-daemon`.
 vmcell-daemon-client = { path = "../vmcell-daemon-client", version = "0.1.0" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 url = "2"
