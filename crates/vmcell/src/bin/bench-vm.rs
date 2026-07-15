@@ -214,7 +214,7 @@ async fn run_bench<V: Vmm>(
         anyhow::bail!("{name}: missing artifacts in {dir}");
     }
 
-    let cfg = build_cfg(args, kernel_path, rootfs_path, false);
+    let cfg = build_cfg(args, kernel_path, rootfs_path, false, is_restore);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator.clone();
 
@@ -556,9 +556,10 @@ async fn run_mode<V: Vmm>(
             if vmm.capabilities().snapshot_restore {
                 run_bench(vmm, "Warm Restore", args, allocator.clone(), true).await?;
             } else {
-                // CLI-4 / §16 (Performance) visible-skip: a no-snapshot backend (e.g. FC/QEMU in
-                // the unprivileged+vsock tier, §2.5, The capability matrix) can't run Warm Restore. Print the
-                // reason rather than silently dropping the benchmark; a genuine
+                // CLI-4 / §16 (Performance) visible-skip: a backend that does not advertise
+                // `snapshot_restore` can't run Warm Restore (all three shipped backends now do,
+                // §2.5, The capability matrix — this guards a re-gated or hypothetical backend).
+                // Print the reason rather than silently dropping the benchmark; a genuine
                 // capability skip is success (Ok), not a failure (M-BIN-1).
                 println!("Warm Restore: backend {backend} has no snapshot support; skipping");
             }
@@ -676,11 +677,24 @@ fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
 /// `--kernel-verbosity`, and `--console` from `args`. `ksm_mergeable` stays an
 /// explicit argument because only `footprint` opts into it (§16, Performance); every other
 /// mode passes `false`.
-fn build_cfg(args: &Args, kernel: PathBuf, rootfs: PathBuf, ksm_mergeable: bool) -> VmConfig {
+fn build_cfg(
+    args: &Args,
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    ksm_mergeable: bool,
+    snapshotting: bool,
+) -> VmConfig {
     VmConfig::builder(kernel, RootfsSource::Erofs { image: rootfs })
         .vcpus(1)
         .mem_mib(args.mem_mib)
         .network_disabled()
+        // Snapshot-taking modes (warm-restore, suspend-size, phase-budget) mark the VM
+        // snapshot-eligible, which for QEMU selects the in-kernel vhost-vsock transport
+        // (§2.4); a no-op for CH/FC. Non-snapshot modes leave the default (QEMU's
+        // external vhost-device-vsock), so a plain cold-boot benchmark needs no
+        // `/dev/vhost-vsock` access. `network_disabled` (NetConfig::None) is
+        // snapshot-compatible — it carries no vhost-user device.
+        .snapshotting(snapshotting)
         .restore_mode(args.restore_mode)
         .ksm_mergeable(ksm_mergeable)
         .timeouts(timeouts_for(&args.profile))
@@ -930,7 +944,7 @@ async fn run_footprint<V: Vmm>(
     // N-BIN-2: `--count 0` is rejected loudly in `validate_vm_params`, so `count` is
     // >= 1 here (no silent `.max(1)` clamp).
     let count = args.count;
-    let cfg = build_cfg(args, kernel, rootfs, args.ksm_mergeable);
+    let cfg = build_cfg(args, kernel, rootfs, args.ksm_mergeable, false);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator.clone();
 
@@ -1158,7 +1172,7 @@ async fn run_suspend_size<V: Vmm>(
         println!("suspend-size: backend {backend} has no snapshot support; skipping");
         return Ok(());
     }
-    let cfg = build_cfg(args, kernel, rootfs, false);
+    let cfg = build_cfg(args, kernel, rootfs, false, true);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator;
     let snap_dir = resolve_snap_dir(&args.snap_dir).join(format!(
@@ -1387,7 +1401,7 @@ async fn run_phase_budget<V: Vmm>(
         println!("phase-budget: No successful runs (missing artifacts in {dir})");
         anyhow::bail!("phase-budget: missing artifacts in {dir}");
     }
-    let cfg = build_cfg(args, kernel, rootfs, false);
+    let cfg = build_cfg(args, kernel, rootfs, false, true);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator;
 
@@ -1438,7 +1452,7 @@ async fn run_vsock_rtt<V: Vmm>(
         println!("vsock-rtt: No successful runs (missing artifacts in {dir})");
         anyhow::bail!("vsock-rtt: missing artifacts in {dir}");
     }
-    let cfg = build_cfg(args, kernel, rootfs, false);
+    let cfg = build_cfg(args, kernel, rootfs, false, false);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator;
     let iters = args.iters();

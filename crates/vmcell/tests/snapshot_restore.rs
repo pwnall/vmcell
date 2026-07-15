@@ -56,6 +56,10 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         cfg.net = vmcell::config::NetConfig::Privileged {
             egress: vmcell::config::Egress::Open,
         };
+        // QEMU snapshot needs the in-kernel vhost-vsock transport (§2.4), selected by
+        // snapshotting=true; a no-op flag for CH/FC (they snapshot regardless). Both the
+        // snapshot and the restore config carry it so the topology stays congruent.
+        cfg.snapshotting = true;
 
         let mut vm = MicroVm::start(vmm, cfg, &env)
             .await
@@ -177,6 +181,10 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         cfg.net = vmcell::config::NetConfig::Privileged {
             egress: vmcell::config::Egress::Open,
         };
+        // QEMU snapshot needs the in-kernel vhost-vsock transport (§2.4), selected by
+        // snapshotting=true; a no-op flag for CH/FC (they snapshot regardless). Both the
+        // snapshot and the restore config carry it so the topology stays congruent.
+        cfg.snapshotting = true;
 
         // M-TEST-RESTORE: hold the ORIGINAL vmid so the allocator is forced to hand
         // the restored VM a DIFFERENT one. MAC (`mac_math(vmid)`) and the vsock path
@@ -318,16 +326,32 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
                 "restored vsock path {new_vsock} must embed the rotated vmid {new_vmid}"
             );
         } else {
-            // Verbatim re-bind: every restore of this snapshot lineage shares the
-            // ONE baked host path. The agent reconnect above already proved the
-            // rebound path functional; a rotated path here would mean the backend
-            // diverged from its declared capability.
-            assert_eq!(
-                new_vsock,
-                original_vsock.as_str(),
-                "a restore_rotates_host_paths=false backend must re-bind the \
-                 snapshot's baked vsock path verbatim"
-            );
+            // Verbatim identity: a non-rotating backend re-binds the SAME baked
+            // host-side identity on every restore of the lineage. What "identity" means
+            // is per-transport, so assert on the one that is real for each: Firecracker
+            // re-binds the baked AF_UNIX vsock PATH verbatim; QEMU's in-kernel
+            // vhost-vsock is addressed by CID (its `vsock_path` is a vestigial,
+            // per-scratch-dir file that necessarily differs), so its verbatim identity
+            // is the baked guest CID (§2.4). The agent reconnect above already proved
+            // the rebound transport functional; a rotated identity here would mean the
+            // backend diverged from its declared capability.
+            match vm.instance().vsock_endpoint() {
+                vmcell::vmm::VsockEndpoint::Vsock { cid, .. } => {
+                    assert_eq!(
+                        cid, original_cid,
+                        "QEMU restore must reuse the baked guest CID (the in-kernel \
+                         vhost-vsock verbatim identity), got {cid} vs {original_cid}"
+                    );
+                }
+                vmcell::vmm::VsockEndpoint::Unix { .. } => {
+                    assert_eq!(
+                        new_vsock,
+                        original_vsock.as_str(),
+                        "an AF_UNIX non-rotating backend must re-bind the \
+                         snapshot's baked vsock path verbatim"
+                    );
+                }
+            }
         }
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();

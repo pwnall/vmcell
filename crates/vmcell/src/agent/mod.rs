@@ -27,15 +27,131 @@ use crate::error::{Error, Result};
 use vmcell_protocol::Message;
 
 #[cfg(feature = "host-common")]
+use crate::vmm::VsockEndpoint;
+#[cfg(feature = "host-common")]
 use futures::{SinkExt, StreamExt};
 #[cfg(feature = "host-common")]
 use std::path::Path;
 #[cfg(feature = "host-common")]
 use tokio::io::AsyncWriteExt;
 #[cfg(feature = "host-common")]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(feature = "host-common")]
 use tokio::net::UnixStream;
 #[cfg(feature = "host-common")]
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+/// The concrete control-plane byte stream: a host **AF_UNIX** socket (the hybrid
+/// `CONNECT`/`OK` transport Cloud Hypervisor, Firecracker, and QEMU's default
+/// external `vhost-device-vsock` daemon expose) or a host **AF_VSOCK** socket (a
+/// snapshot-eligible QEMU on the in-kernel `vhost-vsock-pci` device, §2.4, QEMU q35 — the fallback and most-proven nester).
+///
+/// Kept a single concrete enum — rather than genericizing `AgentClient<S>` — so
+/// `Framed<ControlStream, LengthDelimitedCodec>` stays **one** type and neither
+/// [`AgentClient`] nor [`session::SessionMux`] grows a type parameter that would
+/// ripple into every orchestrator signature. `Framed`'s `Sink`/`Stream` impls only
+/// need [`AsyncRead`] + [`AsyncWrite`], which this enum forwards to the active arm,
+/// so every request/exec path is transparent to the transport.
+#[cfg(feature = "host-common")]
+#[derive(Debug)]
+pub(crate) enum ControlStream {
+    /// AF_UNIX transport (hybrid `CONNECT <port>`/`OK` handshake before framing).
+    Unix(UnixStream),
+    /// AF_VSOCK transport (direct in-kernel vhost-vsock; no prologue before framing).
+    Vsock(tokio_vsock::VsockStream),
+}
+
+#[cfg(feature = "host-common")]
+impl AsyncRead for ControlStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ControlStream::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ControlStream::Vsock(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(feature = "host-common")]
+impl AsyncWrite for ControlStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ControlStream::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ControlStream::Vsock(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ControlStream::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+            ControlStream::Vsock(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ControlStream::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            ControlStream::Vsock(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+// `tokio_vsock::VsockStream` is not auto-`UnwindSafe`/`RefUnwindSafe`, but a transport
+// socket carries no panic-observable invariant — no more than tokio's `UnixStream`,
+// which *is* both. Asserting them here keeps the public `AgentClient` (and
+// `SessionMux`) exactly as unwind-safe as before the AF_VSOCK arm was added, so
+// swapping the concrete stream type stays a non-breaking change for downstream callers.
+#[cfg(feature = "host-common")]
+impl std::panic::UnwindSafe for ControlStream {}
+#[cfg(feature = "host-common")]
+impl std::panic::RefUnwindSafe for ControlStream {}
+
+/// The hybrid `CONNECT <port>`/`OK` prologue port for `endpoint`, or `None` when the
+/// transport needs no prologue.
+///
+/// AF_UNIX bridges (CH/FC/QEMU's external `vhost-device-vsock` daemon) require the
+/// Firecracker-style hybrid handshake before the guest's first frame; the in-kernel
+/// AF_VSOCK transport (§2.4, QEMU q35 — the fallback and most-proven nester) has no bridge, so `None` — the guest's first
+/// framed message is already `Ready`. One predicate so the two connect paths
+/// (one-shot and session mux) can never disagree on which transport handshakes.
+#[cfg(feature = "host-common")]
+fn hybrid_prologue_port(endpoint: &VsockEndpoint) -> Option<u32> {
+    match endpoint {
+        VsockEndpoint::Unix { port, .. } => Some(*port),
+        VsockEndpoint::Vsock { .. } => None,
+    }
+}
+
+/// Opens the raw transport socket for `endpoint` — AF_UNIX or AF_VSOCK — wrapping it
+/// as a [`ControlStream`]. The single point where the two transports diverge at the
+/// socket layer; everything above the returned stream is transport-agnostic.
+#[cfg(feature = "host-common")]
+async fn connect_control_stream(endpoint: &VsockEndpoint) -> std::io::Result<ControlStream> {
+    match endpoint {
+        VsockEndpoint::Unix { path, .. } => {
+            Ok(ControlStream::Unix(UnixStream::connect(path).await?))
+        }
+        VsockEndpoint::Vsock { cid, port } => {
+            let addr = tokio_vsock::VsockAddr::new(*cid, *port);
+            Ok(ControlStream::Vsock(
+                tokio_vsock::VsockStream::connect(addr).await?,
+            ))
+        }
+    }
+}
 
 /// The per-step outcome of a native post-restore [`AgentClient::resync`]
 /// (§8.2, Restore correctness: a restored VM is not a fresh VM).
@@ -64,7 +180,7 @@ pub struct ResyncOutcome {
 /// A client for communicating with the guest agent over vsock.
 #[derive(Debug)]
 pub struct AgentClient {
-    stream: Framed<UnixStream, LengthDelimitedCodec>,
+    stream: Framed<ControlStream, LengthDelimitedCodec>,
     /// Set when a request times out or the framed stream desynchronizes
     /// mid-exchange. A desynced stream may still hold a late frame from the
     /// abandoned request, so reusing it would read stale data and silently
@@ -116,7 +232,33 @@ impl AgentClient {
         timeouts: &crate::config::Timeouts,
         serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<Self> {
-        let stream = Self::connect_framed(vsock_path, port, timeout, timeouts, serial_log).await?;
+        Self::connect_endpoint(
+            &VsockEndpoint::Unix {
+                path: vsock_path.to_path_buf(),
+                port,
+            },
+            timeout,
+            timeouts,
+            serial_log,
+        )
+        .await
+    }
+
+    /// Connects to the guest agent over an explicit [`VsockEndpoint`] — the
+    /// transport-generic entry the orchestrator uses so a snapshot-eligible QEMU on
+    /// the AF_VSOCK transport (§2.4, QEMU q35 — the fallback and most-proven nester) is reached the same way as an AF_UNIX
+    /// backend. The public [`AgentClient::connect`] is the AF_UNIX convenience
+    /// wrapper over this.
+    ///
+    /// # Errors
+    /// As [`AgentClient::connect`].
+    pub(crate) async fn connect_endpoint(
+        endpoint: &VsockEndpoint,
+        timeout: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
+        serial_log: &dyn crate::vmm::SerialLog,
+    ) -> Result<Self> {
+        let stream = Self::connect_framed(endpoint, timeout, timeouts, serial_log).await?;
         Ok(Self {
             stream,
             desynced: false,
@@ -126,28 +268,32 @@ impl AgentClient {
     /// Connects the raw framed control-plane stream, retrying with backoff until
     /// the guest answers `Ready` (the one connect/handshake law, §13, Cross-cutting invariants).
     ///
-    /// Split out of [`AgentClient::connect`] so the session multiplexer
+    /// Split out of [`AgentClient::connect_endpoint`] so the session multiplexer
     /// ([`session::SessionMux`]) opens its own connection through the **same**
-    /// fragile handshake — the byte-by-byte `OK` line (never a buffered reader,
-    /// which would swallow the first framed payload) and the `Ready` frame — with
-    /// exactly one implementation (AGENTS.md "one law, one predicate").
+    /// handshake with exactly one implementation (AGENTS.md "one law, one
+    /// predicate"). The prologue branches on the endpoint: an AF_UNIX endpoint
+    /// speaks the fragile hybrid handshake — the byte-by-byte `OK` line (never a
+    /// buffered reader, which would swallow the first framed payload) — while an
+    /// AF_VSOCK endpoint (a snapshot-eligible QEMU on the in-kernel `vhost-vsock`
+    /// transport, §2.4, QEMU q35 — the fallback and most-proven nester) has no bridge and thus no prologue: it connects
+    /// and the guest's first frame **is** `Ready`. The framed `Ready` read after the
+    /// prologue is identical on both transports.
     ///
     /// # Errors
     /// Returns [`Error::Timeout`] if no `Ready` handshake completes within
     /// `timeout`, or [`Error::Agent`] if a kernel panic is detected in the serial
     /// log while waiting.
     pub(crate) async fn connect_framed(
-        vsock_path: &Path,
-        port: u32,
+        endpoint: &VsockEndpoint,
         timeout: std::time::Duration,
         timeouts: &crate::config::Timeouts,
         serial_log: &dyn crate::vmm::SerialLog,
-    ) -> Result<Framed<UnixStream, LengthDelimitedCodec>> {
+    ) -> Result<Framed<ControlStream, LengthDelimitedCodec>> {
         let deadline = tokio::time::Instant::now() + timeout;
         // Poll floor while the VMM host-side socket is still absent. Kept small
-        // because a failed local AF_UNIX connect is cheap, so a tighter cadence
-        // narrows the gap between "guest became ready" and "host noticed" without
-        // busy-spinning (the deadline + panic checks still run every iteration).
+        // because a failed local connect is cheap, so a tighter cadence narrows the
+        // gap between "guest became ready" and "host noticed" without busy-spinning
+        // (the deadline + panic checks still run every iteration).
         let mut backoff = timeouts.connect_backoff_floor;
 
         loop {
@@ -160,52 +306,58 @@ impl AgentClient {
                 return Err(Error::Agent("Panic detected in serial log".into()));
             }
 
-            let mut stream = match UnixStream::connect(vsock_path).await {
+            let mut stream = match connect_control_stream(endpoint).await {
                 Ok(s) => {
-                    // The VMM's host-side vsock socket is up, so we are now in the
-                    // "guest still booting / not yet listening" regime, where the
-                    // right cadence is a tight fixed poll — not the exponential
-                    // backoff that only makes sense while the socket was absent.
-                    // Reset to the floor so a few socket-absent iterations can't
-                    // inflate the guest-ready detection gap (EXP-HOST-BACKOFF-RESET).
+                    // The transport socket is up, so we are now in the "guest still
+                    // booting / not yet listening" regime, where the right cadence
+                    // is a tight fixed poll — not the exponential backoff that only
+                    // makes sense while the socket was absent. Reset to the floor so
+                    // a few socket-absent iterations can't inflate the guest-ready
+                    // detection gap (EXP-HOST-BACKOFF-RESET).
                     backoff = timeouts.connect_backoff_floor;
                     s
                 }
                 Err(e) => {
-                    tracing::trace!("Agent connect UnixStream::connect failed: {}", e);
+                    tracing::trace!("Agent connect control-stream connect failed: {}", e);
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, timeouts.connect_backoff_cap);
                     continue;
                 }
             };
 
-            let connect_msg = format!("CONNECT {port}\n");
-            if let Err(e) = stream.write_all(connect_msg.as_bytes()).await {
-                tracing::trace!("Agent connect write_all failed: {}", e);
-                continue;
-            }
+            // AF_UNIX bridges (CH/FC/QEMU's external `vhost-device-vsock` daemon)
+            // speak the Firecracker-style hybrid `CONNECT <port>`/`OK` prologue; the
+            // in-kernel AF_VSOCK transport has no bridge, so there is no prologue and
+            // the guest's first framed message is already `Ready`.
+            if let Some(port) = hybrid_prologue_port(endpoint) {
+                let connect_msg = format!("CONNECT {port}\n");
+                if let Err(e) = stream.write_all(connect_msg.as_bytes()).await {
+                    tracing::trace!("Agent connect write_all failed: {}", e);
+                    continue;
+                }
 
-            let mut resp = String::new();
-            let mut ok = false;
-            loop {
-                let mut byte = [0; 1];
-                use tokio::io::AsyncReadExt;
-                if let Ok(Ok(1)) =
-                    tokio::time::timeout(timeouts.connect_ok_read, stream.read(&mut byte)).await
-                {
-                    resp.push(byte[0] as char);
-                    if byte[0] == b'\n' {
-                        ok = resp.starts_with("OK ");
+                let mut resp = String::new();
+                let mut ok = false;
+                loop {
+                    let mut byte = [0; 1];
+                    use tokio::io::AsyncReadExt;
+                    if let Ok(Ok(1)) =
+                        tokio::time::timeout(timeouts.connect_ok_read, stream.read(&mut byte)).await
+                    {
+                        resp.push(byte[0] as char);
+                        if byte[0] == b'\n' {
+                            ok = resp.starts_with("OK ");
+                            break;
+                        }
+                    } else {
                         break;
                     }
-                } else {
-                    break;
                 }
-            }
-            if !ok {
-                tracing::trace!("Agent connect failed! resp was: {:?}", resp);
-                tokio::time::sleep(backoff).await;
-                continue;
+                if !ok {
+                    tracing::trace!("Agent connect failed! resp was: {:?}", resp);
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
             }
 
             let mut codec = LengthDelimitedCodec::new();
@@ -257,7 +409,7 @@ impl AgentClient {
         // Mirror `connect`: align the host frame cap with the guest's.
         codec.set_max_frame_length(MAX_FRAME_BYTES);
         Self {
-            stream: Framed::new(stream, codec),
+            stream: Framed::new(ControlStream::Unix(stream), codec),
             desynced: false,
         }
     }
@@ -532,7 +684,34 @@ impl AgentClient {
 
 #[cfg(all(test, feature = "host-common"))]
 mod tests {
-    use super::{AgentClient, Error, RequestFailure};
+    use super::{AgentClient, Error, RequestFailure, VsockEndpoint, hybrid_prologue_port};
+
+    // The transport-dispatch law: an AF_UNIX endpoint speaks the hybrid
+    // `CONNECT <port>`/`OK` prologue (so `Some(port)`), while the in-kernel AF_VSOCK
+    // transport has no bridge and takes the **no-CONNECT** branch (`None`). This is
+    // the KVM-free pin that a snapshot-eligible QEMU on AF_VSOCK does not emit a
+    // `CONNECT` line the guest's real vsock listener would never consume. RED on the
+    // buggy inverse (a Vsock arm returning `Some`, which would hang every AF_VSOCK
+    // connect on a handshake the guest never answers).
+    #[test]
+    fn hybrid_prologue_only_for_af_unix() {
+        assert_eq!(
+            hybrid_prologue_port(&VsockEndpoint::Unix {
+                path: std::path::PathBuf::from("/tmp/vsock.sock"),
+                port: 5000,
+            }),
+            Some(5000),
+            "AF_UNIX must speak the hybrid CONNECT/OK handshake",
+        );
+        assert_eq!(
+            hybrid_prologue_port(&VsockEndpoint::Vsock {
+                cid: 42,
+                port: 5000
+            }),
+            None,
+            "AF_VSOCK must take the no-CONNECT branch (guest's first frame is Ready)",
+        );
+    }
 
     // L-GUEST-1: finish_request desyncs only when a stale frame could still be in
     // flight. A `Clean` failure — a protocol-complete application error whose full

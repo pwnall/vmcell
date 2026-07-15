@@ -4,7 +4,7 @@
 
 use crate::config::VmConfig;
 use crate::error::{Error, Result};
-use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
+use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities, VsockEndpoint};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -41,6 +41,10 @@ pub struct QemuInstance {
     _fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
     _vsock_daemon: Option<Child>,
     cid: u32,
+    /// How the host reaches this VM's guest agent (returned by
+    /// [`VmInstance::vsock_endpoint`]): AF_VSOCK for a snapshot-eligible in-kernel
+    /// vsock VM, AF_UNIX for the external-daemon default.
+    endpoint: VsockEndpoint,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
     // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
@@ -112,7 +116,112 @@ fn check_qmp_reply(reply: &str) -> Result<()> {
     }
 }
 
+/// The QEMU migration stream (guest RAM + device state) written by `snapshot()` and
+/// read by `restore()` via `migrate`/`-incoming`.
+const SNAPSHOT_STATE_FILE: &str = "state.bin";
+/// The sidecar written beside [`SNAPSHOT_STATE_FILE`] (mirrors Firecracker's
+/// `vmcell_host_paths.json`, §2.3, Firecracker — the density tier and the fastest restore).
+const SNAPSHOT_SIDECAR_FILE: &str = "vmcell_qemu_snapshot.json";
+/// Upper bound on `migrate`/`migrate-incoming` completion. Migration writes/reads
+/// guest-RAM-sized bytes to a local file, so it completes far faster; this only bounds
+/// a wedged migration so it surfaces as a typed error instead of hanging.
+const MIGRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Sidecar written next to the QEMU migration stream at snapshot, read back at restore.
+///
+/// It carries only the identity value the fresh restore-time [`PerVmResources`] would
+/// otherwise change but that migration requires to match the source: the guest CID
+/// baked on the `vhost-vsock-pci` device. The guest's cached CID lives in the migrated
+/// RAM, so the destination `-device guest-cid=` must equal the source (§8.2, Restore correctness: a restored VM is not a fresh VM; the audit's
+/// "guest-cid must match on the destination `-device` line"). Everything else — RAM
+/// size, vCPUs, rootfs, disks, console, net — comes from the caller-supplied `cfg`,
+/// which must stay congruent across snapshot→restore exactly as it must for Cloud
+/// Hypervisor and Firecracker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QemuSnapshotSidecar {
+    /// The guest CID baked into the migration image's `vhost-vsock-pci` device.
+    guest_cid: u32,
+}
+
+/// Serializes the snapshot sidecar into `dir`. Called only after `migrate` reports
+/// `completed`; a write failure is propagated (never swallowed — M-RESTORE-2), since a
+/// snapshot without its sidecar cannot be restored.
+fn write_snapshot_sidecar(dir: &Path, sidecar: &QemuSnapshotSidecar) -> Result<()> {
+    let json = serde_json::to_vec(sidecar)
+        .map_err(|e| Error::Vmm(format!("failed to serialize QEMU snapshot sidecar: {e}")))?;
+    std::fs::write(dir.join(SNAPSHOT_SIDECAR_FILE), json).map_err(Error::Io)
+}
+
+/// Reads and parses the snapshot sidecar from `dir` — before spawning anything on the
+/// restore path, so a missing or corrupt sidecar fails loud with a clear error instead
+/// of a later opaque migration failure.
+fn read_snapshot_sidecar(dir: &Path) -> Result<QemuSnapshotSidecar> {
+    let path = dir.join(SNAPSHOT_SIDECAR_FILE);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        Error::Vmm(format!(
+            "failed to read QEMU snapshot sidecar {}: {e}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Vmm(format!("failed to parse QEMU snapshot sidecar: {e}")))
+}
+
+/// Reads QMP lines from `reader` past any asynchronous `{"event": ...}` notifications
+/// to the first command result (`{"return": ...}` or `{"error": ...}`), leaving it in
+/// `line`. The shared read-past-events discipline (M-VMM-3) that `qmp_command` inlines,
+/// factored out so the single-connection migration driver reuses it for `migrate` and
+/// each `query-migrate` poll.
+async fn read_qmp_result<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> Result<()> {
+    loop {
+        line.clear();
+        let n = reader.read_line(line).await.map_err(Error::Io)?;
+        if n == 0 {
+            return Err(Error::Qmp(
+                "QMP connection closed before a command result arrived".into(),
+            ));
+        }
+        if matches!(classify_qmp_line(line), QmpLine::Return | QmpLine::Error) {
+            return Ok(());
+        }
+    }
+}
+
 impl QemuInstance {
+    /// Builds the long-lived instance from a fresh [`SpawnedQemu`], taking ownership of
+    /// the VMM/daemon handles so its `Drop` becomes the single teardown owner. Shared
+    /// by `create` and `restore` so both construct the instance identically.
+    fn from_spawned(spawned: SpawnedQemu) -> Self {
+        let SpawnedQemu {
+            qmp_socket,
+            vsock_path,
+            serial_path,
+            process,
+            vsock_daemon,
+            fs_daemons,
+            pgid,
+            vsock_pgid,
+            cid,
+            endpoint,
+        } = spawned;
+        Self {
+            process,
+            qmp_socket,
+            vsock_path,
+            serial_path,
+            _fs_daemons: fs_daemons,
+            _vsock_daemon: vsock_daemon,
+            cid,
+            endpoint,
+            pgid,
+            vsock_pgid,
+            reaped: false,
+        }
+    }
+
     async fn qmp_command(&self, cmd: &str) -> Result<String> {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             let mut stream = UnixStream::connect(&self.qmp_socket).await?;
@@ -165,6 +274,74 @@ impl QemuInstance {
         let reply = self.qmp_command(cmd).await?;
         check_qmp_reply(&reply)
     }
+
+    /// Drives an outbound `migrate` (snapshot) or `migrate-incoming` (restore) plus its
+    /// `query-migrate` completion poll on **one** QMP connection.
+    ///
+    /// A single connection is deliberate: re-handshaking `qmp_capabilities` on every
+    /// `query-migrate` poll was a measured wiring gotcha (B15). The migration URI is a
+    /// plain `file:` target — never `exec:`, which QEMU's `-sandbox …,spawn=deny`
+    /// (`§12.2`, Layer 1 — the VMM's own seccomp filter) would kill, and never `fd:`, which the line-based QMP client can't do
+    /// `getfd`/SCM_RIGHTS for. Polls until `query-migrate` reports `completed`; a
+    /// `failed`/`cancelled` status or the [`MIGRATION_BUDGET`] elapsing is a typed
+    /// error, never a silent timeout-through.
+    async fn drive_migration(&self, execute_cmd: &str, budget: std::time::Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut stream = UnixStream::connect(&self.qmp_socket)
+            .await
+            .map_err(Error::Io)?;
+        let (r, mut w) = stream.split();
+        let mut reader = BufReader::new(r);
+        let mut line = String::new();
+
+        // Greeting, then negotiate capabilities once for the whole migrate+poll session.
+        reader.read_line(&mut line).await.map_err(Error::Io)?;
+        w.write_all(b"{\"execute\": \"qmp_capabilities\"}\n")
+            .await
+            .map_err(Error::Io)?;
+        line.clear();
+        reader.read_line(&mut line).await.map_err(Error::Io)?;
+
+        // Kick off the migration and confirm QEMU accepted the command.
+        w.write_all(execute_cmd.as_bytes())
+            .await
+            .map_err(Error::Io)?;
+        w.write_all(b"\n").await.map_err(Error::Io)?;
+        read_qmp_result(&mut reader, &mut line).await?;
+        check_qmp_reply(&line)?;
+
+        // Poll to a terminal status on the same connection.
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                return Err(Error::Vmm(
+                    "QEMU migration did not reach `completed` within the budget".into(),
+                ));
+            }
+            w.write_all(b"{\"execute\": \"query-migrate\"}\n")
+                .await
+                .map_err(Error::Io)?;
+            read_qmp_result(&mut reader, &mut line).await?;
+            let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| {
+                Error::Qmp(format!("query-migrate reply parse ({e}): {}", line.trim()))
+            })?;
+            let status = value
+                .get("return")
+                .and_then(|r| r.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            match status {
+                "completed" => return Ok(()),
+                "failed" | "cancelled" => {
+                    return Err(Error::Vmm(format!(
+                        "QEMU migration {status}: {}",
+                        line.trim()
+                    )));
+                }
+                // "setup" / "active" / "device" / "wait-unplug" / "" — still in flight.
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+    }
 }
 
 /// Requires QEMU's external `vhost-device-vsock` daemon: maps a spawn failure to a
@@ -181,6 +358,34 @@ fn require_vsock_daemon(spawn_result: std::io::Result<Child>) -> Result<Child> {
             "failed to spawn the external vhost-device-vsock daemon (QEMU unprivileged vsock control plane): {e}"
         ))
     })
+}
+
+/// Rejects a restore whose baked guest CID is still held by a live VM.
+///
+/// The in-kernel `vhost-vsock` CID is a **host-global** namespace, so restoring while
+/// the source (or a prior restore of the same lineage) is still running would collide
+/// when QEMU realizes `vhost-vsock-pci,guest-cid=<baked>` (the kernel's
+/// `VHOST_VSOCK_SET_GUEST_CID` returns `EADDRINUSE`). This is the AF_VSOCK analog of
+/// Firecracker's `reject_live_baked_vsock` (§2.3, Firecracker — the density tier and the fastest restore): a bounded connect to
+/// `(cid, AGENT_VSOCK_PORT)` — a live guest agent answers, yielding a clear typed error
+/// naming the CID; no listener (connect error/timeout) means the CID is free to reuse.
+/// `restore_rotates_host_paths: false` makes concurrent same-lineage restore
+/// `Unsupported` anyway (§17, Open gaps and future capabilities); this guards the misuse where the source is still alive.
+/// The connect→realize TOCTOU window is a misuse guard, not a security boundary.
+async fn reject_live_baked_cid(cid: u32) -> Result<()> {
+    let addr = tokio_vsock::VsockAddr::new(cid, crate::vmm::AGENT_VSOCK_PORT);
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio_vsock::VsockStream::connect(addr),
+    )
+    .await;
+    if let Ok(Ok(_stream)) = probe {
+        return Err(Error::Vmm(format!(
+            "cannot restore: guest CID {cid} is still in use by a live VM \
+             (in-kernel vhost-vsock is a host-global namespace) — tear the source down first"
+        )));
+    }
+    Ok(())
 }
 
 /// RAII guard that owns a healthy `vhost-device-vsock` daemon and reaps its process
@@ -238,6 +443,12 @@ struct SpawnedQemu {
     fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
+    /// The effective guest CID the vsock device was bound to (the baked CID on a
+    /// restore, `res.guest_cid` on create).
+    cid: u32,
+    /// How the host reaches this VM's guest agent — AF_VSOCK (in-kernel vsock) or
+    /// AF_UNIX (external daemon).
+    endpoint: VsockEndpoint,
 }
 
 /// Appends the config-independent QEMU machine flags that must be present on every
@@ -256,12 +467,46 @@ fn push_fixed_qemu_flags(cmd: &mut tokio::process::Command) {
         .arg("-S");
 }
 
+/// Selects the snapshot-eligible **in-kernel `vhost-vsock`** transport for a QEMU
+/// config, versus the default external `vhost-device-vsock` daemon.
+///
+/// A snapshot-eligible VM must carry no vhost-user device (the eligibility law S1,
+/// §8.1, The warm-snapshot path and the eligibility law), and the external vsock daemon *is* a vhost-user device — so a
+/// `snapshotting` VM instead attaches the in-kernel `vhost-vsock-pci` device, the
+/// only migratable QEMU vsock transport (§2.4, QEMU q35 — the fallback and most-proven nester). `snapshotting` is already
+/// privileged-gated at [`VmConfig::build`](crate::config) (no unprivileged net, no
+/// virtio-fs shares, no custom init), so it is a sound, **explicit, fail-loud**
+/// selector — the one the removed silent `.ok()` fallback lacked (M-VMM-2). Wrapped
+/// in one predicate so a future dedicated `vsock_transport` knob is a one-line
+/// change here.
+fn uses_in_kernel_vsock(cfg: &VmConfig) -> bool {
+    cfg.snapshotting
+}
+
+/// Per-spawn transport/lifecycle knobs shared by `create` and `restore`, so both
+/// drive the one [`Qemu::spawn_qemu`] builder instead of forking the argv
+/// construction (the source/destination topology must stay congruent for migration,
+/// so a second builder would be a divergence hazard).
+struct SpawnParams {
+    /// Attach the in-kernel `vhost-vsock-pci` device (the snapshot transport) instead
+    /// of the external `vhost-device-vsock` daemon.
+    in_kernel_vsock: bool,
+    /// The guest CID the vsock device binds. `create`: `res.guest_cid`. `restore`:
+    /// the CID baked into the snapshot — the device property must match the source,
+    /// so the resumed guest keeps its frozen CID (M-VMM-3).
+    guest_cid: u32,
+    /// `true` on the restore path: launch with `-incoming defer` so the caller drives
+    /// `migrate-incoming` over QMP, then `resume`. `false` on cold create.
+    incoming: bool,
+}
+
 impl Qemu {
     async fn spawn_qemu(
         &self,
         cfg: &VmConfig,
         res: &PerVmResources,
         cgroups: &dyn crate::metrics::CgroupFs,
+        params: &SpawnParams,
     ) -> Result<SpawnedQemu> {
         // The orchestrator owns the per-VM scratch dir; derive our socket and
         // serial-log paths inside it.
@@ -280,55 +525,64 @@ impl Qemu {
             let _ = tokio::fs::remove_file(stale).await;
         }
 
-        let mut std_vsock_cmd = std::process::Command::new("vhost-device-vsock");
-        std_vsock_cmd
-            .arg("--guest-cid")
-            .arg(res.guest_cid.to_string())
-            .arg("--socket")
-            .arg(&vhost_vsock)
-            .arg("--uds-path")
-            .arg(&vsock_path);
-        use std::os::unix::process::CommandExt;
-        std_vsock_cmd.process_group(0);
+        // The vsock transport forks here (one explicit, fail-loud selector — never a
+        // silent fallback, M-VMM-2). The default is the external `vhost-device-vsock`
+        // daemon (unprivileged, but a vhost-user device that can't migrate). A
+        // `snapshotting` VM instead uses the in-kernel `vhost-vsock-pci` device
+        // (attached below), which has no daemon: the guest is exposed on the host
+        // AF_VSOCK namespace and the host dials it by CID — nothing to spawn, wait for,
+        // or reap here.
+        let vsock_guard: Option<VsockDaemonGuard> = if params.in_kernel_vsock {
+            None
+        } else {
+            let mut std_vsock_cmd = std::process::Command::new("vhost-device-vsock");
+            std_vsock_cmd
+                .arg("--guest-cid")
+                .arg(params.guest_cid.to_string())
+                .arg("--socket")
+                .arg(&vhost_vsock)
+                .arg("--uds-path")
+                .arg(&vsock_path);
+            use std::os::unix::process::CommandExt;
+            std_vsock_cmd.process_group(0);
 
-        // The external vhost-device-vsock daemon IS QEMU's unprivileged control plane
-        // (§2.4, QEMU q35 — the fallback and most-proven nester). A spawn failure (e.g. a missing/broken binary) fails loud and typed
-        // here — it does NOT silently degrade to the root-only internal kernel vsock,
-        // which would only re-emerge later as an opaque agent-handshake timeout
-        // (M-VMM-2).
-        let mut vsock_daemon = require_vsock_daemon(
-            tokio::process::Command::from(std_vsock_cmd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn(),
-        )?;
+            // A spawn failure (e.g. a missing/broken binary) fails loud and typed here
+            // — it does NOT silently degrade to the in-kernel vsock, which would mask a
+            // daemon misconfiguration as a later agent-handshake timeout (M-VMM-2).
+            let mut vsock_daemon = require_vsock_daemon(
+                tokio::process::Command::from(std_vsock_cmd)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn(),
+            )?;
 
-        let vsock_pgid = vsock_daemon.id();
+            let vsock_pgid = vsock_daemon.id();
 
-        // Wait for the vhost-vsock socket to appear; on failure reap the daemon's
-        // group before the RAII guard takes ownership, so a half-started daemon never
-        // leaks.
-        if let Err(e) = crate::vmm::wait_for_socket(
-            &vhost_vsock,
-            &mut vsock_daemon,
-            1000,
-            cfg.timeouts.api_socket_poll.as_millis() as u64,
-        )
-        .await
-        {
-            crate::vmm::reap_process_group(&mut vsock_daemon, vsock_pgid);
-            return Err(Error::Vmm(format!(
-                "vhost-device-vsock failed to start: {e}"
-            )));
-        }
+            // Wait for the vhost-vsock socket to appear; on failure reap the daemon's
+            // group before the RAII guard takes ownership, so a half-started daemon
+            // never leaks.
+            if let Err(e) = crate::vmm::wait_for_socket(
+                &vhost_vsock,
+                &mut vsock_daemon,
+                1000,
+                cfg.timeouts.api_socket_poll.as_millis() as u64,
+            )
+            .await
+            {
+                crate::vmm::reap_process_group(&mut vsock_daemon, vsock_pgid);
+                return Err(Error::Vmm(format!(
+                    "vhost-device-vsock failed to start: {e}"
+                )));
+            }
 
-        // The daemon is healthy. Own it in an RAII guard so that EVERY subsequent
-        // fallible step (per-share virtio-fs daemon start below, the QEMU
-        // `cgroups.add_task`, and QMP readiness) reaps the vhost-device-vsock process
-        // group on error — the QemuInstance whose Drop would otherwise reap it is not
-        // constructed until the caller returns (H-QEMU-1).
-        let vsock_guard = VsockDaemonGuard::new(vsock_daemon, vsock_pgid);
+            // The daemon is healthy. Own it in an RAII guard so that EVERY subsequent
+            // fallible step (per-share virtio-fs daemon start below, the QEMU
+            // `cgroups.add_task`, and QMP readiness) reaps the vhost-device-vsock
+            // process group on error — the QemuInstance whose Drop would otherwise reap
+            // it is not constructed until the caller returns (H-QEMU-1).
+            Some(VsockDaemonGuard::new(vsock_daemon, vsock_pgid))
+        };
 
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
@@ -363,6 +617,17 @@ impl Qemu {
             .arg("-qmp")
             .arg(format!("unix:{},server,nowait", qmp_socket.display()));
 
+        // virtio-rng gives the guest `/dev/hwrng`. The post-restore CSPRNG reseed copies
+        // 32 bytes `/dev/hwrng` → `/dev/urandom` in-guest (§8.2, Restore correctness: a restored VM is not a fresh VM); without an entropy
+        // device that reseed reports `reseed_applied: false` and restored clones replay
+        // frozen CSPRNG state — the same reason Firecracker's create() attaches
+        // virtio-rng (§2.3, Firecracker — the density tier and the fastest restore). Present on every launch so the source and
+        // restore topologies stay congruent for migration.
+        cmd.arg("-object")
+            .arg("rng-random,filename=/dev/urandom,id=rng0")
+            .arg("-device")
+            .arg("virtio-rng-pci,rng=rng0");
+
         // Console wiring, driven by the SAME `cfg.console_mode` as the cmdline
         // `console=` token (`build_kernel_cmdline`) so the two move in lockstep — a
         // desync sinks the guest console nowhere and `serial.log` goes silent.
@@ -388,15 +653,22 @@ impl Qemu {
             }
         }
 
-        // QEMU's unprivileged control plane is always the external vhost-device-vsock
-        // daemon (required and confirmed healthy above), so attach it unconditionally.
-        // The old silent fallback to the root-only internal vhost-vsock-pci is gone
-        // (M-VMM-2): it had no config selector and only served to mask a daemon
-        // failure as a later agent-handshake timeout.
-        cmd.arg("-chardev")
-            .arg(format!("socket,id=vvsock,path={}", vhost_vsock.display()))
-            .arg("-device")
-            .arg("vhost-user-vsock-pci,chardev=vvsock");
+        // Attach the vsock device selected above. The in-kernel `vhost-vsock-pci`
+        // (snapshot-eligible, §2.4, QEMU q35 — the fallback and most-proven nester) is realized by QEMU against `/dev/vhost-vsock` — a
+        // root:kvm device, so a jailed QEMU needs the runner's `CAP_DAC_OVERRIDE` to
+        // open it; a permission failure surfaces loud at device realize, never a silent
+        // downgrade (M-VMM-2). Its `guest-cid` is a device *property* (not migrated),
+        // so restore reuses the baked CID here (§8.2). The default external daemon path
+        // stays the `vhost-user-vsock-pci` chardev pair.
+        if params.in_kernel_vsock {
+            cmd.arg("-device")
+                .arg(format!("vhost-vsock-pci,guest-cid={}", params.guest_cid));
+        } else {
+            cmd.arg("-chardev")
+                .arg(format!("socket,id=vvsock,path={}", vhost_vsock.display()))
+                .arg("-device")
+                .arg("vhost-user-vsock-pci,chardev=vvsock");
+        }
 
         match &cfg.rootfs {
             crate::config::RootfsSource::Erofs { image } => {
@@ -485,10 +757,14 @@ impl Qemu {
             .arg("-append")
             .arg(&cmdline);
 
-        // VMM-5: no `-incoming defer` here. QEMU snapshot/restore is `snapshot_restore:
-        // false` in every config (§2.4, QEMU q35 — the fallback and most-proven nester), so `restore()` returns `Unsupported` before
-        // ever spawning — the migration-incoming branch was dead code (create() only
-        // cold-boots). Removed rather than gated behind the off capability.
+        // Restore launches with `-incoming defer`: the guest state is not loaded at
+        // spawn — `restore()` drives `migrate-incoming` over QMP once QMP is ready and
+        // waits for `query-migrate` to complete before returning the paused instance
+        // (§8.1, The warm-snapshot path and the eligibility law). `-S` (always emitted) keeps the vCPUs stopped alongside it. On
+        // cold `create` this is absent.
+        if params.incoming {
+            cmd.arg("-incoming").arg("defer");
+        }
 
         let cmd_str = format!("{cmd:?}");
         // Debug level (not info): the full command line is diagnostic noise on every
@@ -518,10 +794,27 @@ impl Qemu {
         )
         .await?;
 
-        // All post-spawn fallible steps succeeded; disarm the guard and hand the
-        // daemon to the caller, which constructs the long-lived QemuInstance whose
-        // Drop now owns the daemon's teardown.
-        let (vsock_daemon, vsock_pgid) = vsock_guard.into_inner();
+        // All post-spawn fallible steps succeeded; disarm the guard (if any) and hand
+        // the daemon to the caller, which constructs the long-lived QemuInstance whose
+        // Drop now owns the daemon's teardown. In-kernel vsock has no daemon.
+        let (vsock_daemon, vsock_pgid) = match vsock_guard {
+            Some(g) => g.into_inner(),
+            None => (None, None),
+        };
+
+        // How the host reaches this VM's guest agent: in-kernel vsock is dialed by CID
+        // over AF_VSOCK; the external daemon bridges to the AF_UNIX `vsock.sock`.
+        let endpoint = if params.in_kernel_vsock {
+            VsockEndpoint::Vsock {
+                cid: params.guest_cid,
+                port: crate::vmm::AGENT_VSOCK_PORT,
+            }
+        } else {
+            VsockEndpoint::Unix {
+                path: vsock_path.clone(),
+                port: crate::vmm::AGENT_VSOCK_PORT,
+            }
+        };
 
         Ok(SpawnedQemu {
             qmp_socket,
@@ -532,6 +825,8 @@ impl Qemu {
             fs_daemons,
             pgid,
             vsock_pgid,
+            cid: params.guest_cid,
+            endpoint,
         })
     }
 }
@@ -550,55 +845,99 @@ impl Vmm for Qemu {
         // mode up front so they can never desync into a silent `serial.log`.
         crate::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
 
-        let SpawnedQemu {
-            qmp_socket,
-            vsock_path,
-            serial_path,
-            process,
-            vsock_daemon,
-            fs_daemons,
-            pgid,
-            vsock_pgid,
-        } = self.spawn_qemu(cfg, res, cgroups).await?;
-        Ok(QemuInstance {
-            process,
-            qmp_socket,
-            vsock_path,
-            serial_path,
-            _fs_daemons: fs_daemons,
-            _vsock_daemon: vsock_daemon,
-            cid: res.guest_cid,
-            pgid,
-            vsock_pgid,
-            reaped: false,
-        })
+        // Cold create: fresh CID, no `-incoming`. A `snapshotting` config selects the
+        // in-kernel vhost-vsock transport (§2.4, QEMU q35 — the fallback and most-proven nester) so the VM is snapshot-eligible.
+        let params = SpawnParams {
+            in_kernel_vsock: uses_in_kernel_vsock(cfg),
+            guest_cid: res.guest_cid,
+            incoming: false,
+        };
+        Ok(QemuInstance::from_spawned(
+            self.spawn_qemu(cfg, res, cgroups, &params).await?,
+        ))
     }
 
     async fn restore(
         &self,
-        _snapshot_dir: &Path,
+        snapshot_dir: &Path,
         cfg: &VmConfig,
-        _res: &PerVmResources,
-        _cgroups: &dyn crate::metrics::CgroupFs,
+        res: &PerVmResources,
+        cgroups: &dyn crate::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         crate::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
-        Err(Error::Unsupported {
-            vmm: "qemu".to_string(),
-            feature: "snapshot_restore".to_string(),
-        })
+
+        // Eligibility (S1, §8.1, The warm-snapshot path and the eligibility law), defense in depth alongside `config::build()` and the
+        // orchestrator re-check. The shared predicate catches a virtio-fs share or
+        // unprivileged net; the in-kernel-vsock requirement catches the case it can't
+        // see — a QEMU restore over the external `vhost-device-vsock` daemon, which is
+        // itself a non-migratable vhost-user device.
+        if crate::vmm::config_has_vhost_user_device(cfg, res) {
+            return Err(Error::Unsupported {
+                vmm: "qemu".to_string(),
+                feature: "snapshot restore with a vhost-user device (virtio-fs share or unprivileged net)"
+                    .to_string(),
+            });
+        }
+        if !uses_in_kernel_vsock(cfg) {
+            return Err(Error::Unsupported {
+                vmm: "qemu".to_string(),
+                feature: "snapshot restore requires the in-kernel vsock transport (set snapshotting=true)"
+                    .to_string(),
+            });
+        }
+
+        // Read the sidecar BEFORE spawning anything, so a missing/corrupt snapshot fails
+        // loud with a clear error rather than a later opaque migration failure.
+        let sidecar = read_snapshot_sidecar(snapshot_dir)?;
+        let baked_cid = sidecar.guest_cid;
+
+        // The baked CID is a host-global resource; reject if the source is still live.
+        reject_live_baked_cid(baked_cid).await?;
+
+        // Spawn a fresh, topology-congruent QEMU with `-incoming defer`, in-kernel vsock,
+        // and the **baked** guest CID (the device property must match the source, §8.2, Restore correctness: a restored VM is not a fresh VM).
+        let params = SpawnParams {
+            in_kernel_vsock: true,
+            guest_cid: baked_cid,
+            incoming: true,
+        };
+        let instance =
+            QemuInstance::from_spawned(self.spawn_qemu(cfg, res, cgroups, &params).await?);
+
+        // Drive the incoming migration on the now-ready QMP socket and wait for it to
+        // complete. The VM stays **paused** afterward (the source was paused during
+        // `migrate`, and `-incoming` loads into that state): the orchestrator resumes
+        // it via `resume()` — never `boot()` (§2.1, The trait and the capability descriptor). If this fails, `instance` drops
+        // and reaps QEMU, so no half-restored VM leaks.
+        let state = snapshot_dir.join(SNAPSHOT_STATE_FILE);
+        let migrate_incoming = format!(
+            "{{\"execute\": \"migrate-incoming\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
+            state.display()
+        );
+        instance
+            .drive_migration(&migrate_incoming, MIGRATION_BUDGET)
+            .await?;
+        Ok(instance)
     }
 
     fn capabilities(&self) -> VmmCapabilities {
         VmmCapabilities {
-            snapshot_restore: false,
+            // KVM-validated: a `snapshotting` QEMU on the in-kernel `vhost-vsock`
+            // transport migrates to a file and restores via `-incoming` (§2.4, QEMU q35 — the fallback and most-proven nester).
+            // Snapshot-eligible ONLY in that config — the external-daemon default
+            // returns `Unsupported` from snapshot()/restore(). A deliberate re-gate must
+            // flip this AND its capability-honesty test together (docs/45).
+            snapshot_restore: true,
+            // No UFFD/demand-paged restore backend for QEMU (§17, Open gaps and future capabilities).
             lazy_restore: false,
             virtio_fs_shares: true,
             unprivileged_vhost_user_net: true,
             nested_virt: true,
             virtio_console: true,
-            // Honest-false: QEMU restore() is unwired (returns Unsupported), so
-            // no path rotation exists to advertise. Revisit with the privileged
-            // in-kernel-vhost-vsock wiring (§17, Open gaps and future capabilities).
+            // Single-lineage: restore reuses the baked guest CID and does not rotate
+            // host-side identity, so concurrent same-lineage fan-out is `Unsupported`
+            // (mirrors Firecracker, §2.3, Firecracker — the density tier and the fastest restore). Rotating the host-global CID to
+            // enable concurrent QEMU zygote fan-out is recorded future work (§17, Open gaps and future capabilities).
             restore_rotates_host_paths: false,
         }
     }
@@ -673,15 +1012,60 @@ impl VmInstance for QemuInstance {
         }
     }
 
-    async fn snapshot(&mut self, _dir: &Path) -> Result<()> {
-        Err(Error::Unsupported {
-            vmm: "qemu".to_string(),
-            feature: "snapshot_restore".to_string(),
-        })
+    async fn snapshot(&mut self, dir: &Path) -> Result<()> {
+        // Eligibility (S1, §8.1, The warm-snapshot path and the eligibility law): only the in-kernel `vhost-vsock` transport is
+        // migratable. The external `vhost-device-vsock` daemon is a vhost-user device
+        // the VMM cannot migrate — and the shared `config_has_vhost_user_device`
+        // predicate does NOT see QEMU's own vsock daemon, so this endpoint check is
+        // QEMU's own snapshot-eligibility guard. A `Vsock` endpoint ⟹ the VM was built
+        // `snapshotting=true`, which `VmConfig::build()` already validated carries no
+        // other vhost-user device (no virtio-fs share, no unprivileged net, no custom
+        // init). A non-`Vsock` endpoint is a fail-loud typed `Unsupported`.
+        let cid = match self.endpoint {
+            VsockEndpoint::Vsock { cid, .. } => cid,
+            VsockEndpoint::Unix { .. } => {
+                return Err(Error::Unsupported {
+                    vmm: "qemu".to_string(),
+                    feature: "snapshot_restore (requires the in-kernel vsock transport; set snapshotting=true)"
+                        .to_string(),
+                });
+            }
+        };
+
+        // pause → migrate-to-file → poll `completed` → resume the source. Mirrors the
+        // CH/FC snapshot order (§8.1, The warm-snapshot path and the eligibility law); the orchestrator's `MicroVm::snapshot`
+        // invalidates the cached agent client afterward, which covers QEMU's
+        // pause/migrate severing the vsock connection.
+        self.qmp_command_checked("{\"execute\": \"stop\"}").await?;
+
+        let state = dir.join(SNAPSHOT_STATE_FILE);
+        let migrate_cmd = format!(
+            "{{\"execute\": \"migrate\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
+            state.display()
+        );
+        // Write the sidecar only after `migrate` reports `completed`; propagate a write
+        // failure (a snapshot without its sidecar can't be restored — M-RESTORE-2).
+        let result = match self.drive_migration(&migrate_cmd, MIGRATION_BUDGET).await {
+            Ok(()) => write_snapshot_sidecar(dir, &QemuSnapshotSidecar { guest_cid: cid }),
+            Err(e) => Err(e),
+        };
+
+        // Resume the source VM regardless (best-effort, warn-only — matches FC/CH); the
+        // snapshot `result` is what determines success.
+        if let Err(e) = self.qmp_command_checked("{\"execute\": \"cont\"}").await {
+            tracing::warn!("QEMU snapshot: failed to resume source after migrate: {e}");
+        }
+        result
     }
 
     fn vsock_path(&self) -> &Path {
         &self.vsock_path
+    }
+
+    fn vsock_endpoint(&self) -> VsockEndpoint {
+        // AF_VSOCK by CID for the in-kernel vsock transport (snapshot-eligible VMs),
+        // AF_UNIX over `vsock.sock` for the external-daemon default. Set once at spawn.
+        self.endpoint.clone()
     }
 
     fn guest_cid(&self) -> u32 {
@@ -693,30 +1077,33 @@ impl VmInstance for QemuInstance {
     }
 
     /// Probes QEMU's external `vhost-device-vsock` data path by doing the real agent
-    /// handshake with a bounded budget (reusing `AgentClient::connect`, so the
+    /// handshake with a bounded budget (reusing the one connect/handshake law, so the
     /// `CONNECT`/`OK`/`Ready` protocol lives in exactly one place). A healthy boot
     /// binds its guest listener and answers `Ready` in well under the budget; a
     /// wedged vhost-user bring-up never answers, so this returns `Timeout` and the
     /// orchestrator re-spawns (see the trait doc). The probe client is dropped — the
     /// caller's lazy `agent()` reconnects, which the guest re-accepts on its still
     /// bound listener.
+    ///
+    /// The in-kernel `vhost-vsock` transport (snapshot-eligible VMs) has no
+    /// vhost-user daemon and thus no bring-up race — it is a deterministic kernel
+    /// device, exactly like CH's/FC's in-VMM vsock — so it needs no probe and returns
+    /// `Ok(())` immediately (also avoiding a needless connect against a host-global
+    /// CID on the re-spawn path).
     async fn verify_control_plane(
         &self,
         budget: std::time::Duration,
         timeouts: &crate::config::Timeouts,
     ) -> Result<()> {
+        if let VsockEndpoint::Vsock { .. } = self.endpoint {
+            return Ok(());
+        }
         let serial = crate::vmm::RealSerialLog {
             path: self.serial_path.clone(),
         };
-        crate::agent::AgentClient::connect(
-            &self.vsock_path,
-            crate::vmm::AGENT_VSOCK_PORT,
-            budget,
-            timeouts,
-            &serial,
-        )
-        .await
-        .map(|_client| ())
+        crate::agent::AgentClient::connect_endpoint(&self.endpoint, budget, timeouts, &serial)
+            .await
+            .map(|_client| ())
     }
 }
 
@@ -785,13 +1172,26 @@ mod tests {
         );
     }
 
-    // Guards VMM-5: QEMU `restore()` returns `Unsupported` *before spawning* — which is
-    // exactly why the removed `-incoming defer` migration branch in `spawn_qemu` was
-    // dead code. This runs without KVM because restore() errors out immediately. The
-    // buggy inverse (a restore() that tried to spawn a `-incoming` VM) would need KVM
-    // and would not return this typed error first.
+    fn restore_test_res() -> PerVmResources {
+        PerVmResources {
+            cgroup_name: "vmcell-test".to_string(),
+            tap_name: Some("tap0".to_string()),
+            netns_name: None,
+            vhost_user_socket: None,
+            vmid: 1,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-1"),
+        }
+    }
+
+    // Eligibility (S1): a QEMU restore of a NON-snapshotting config would use the
+    // external `vhost-device-vsock` daemon — a non-migratable vhost-user device — so
+    // it is rejected fail-loud *before spawning* (the shared `config_has_vhost_user_
+    // device` predicate can't see QEMU's own daemon, so `uses_in_kernel_vsock` is the
+    // guard). KVM-free because restore errors out before `spawn_qemu`. RED inverse: a
+    // restore that spawned regardless would need KVM and not return this typed error.
     #[tokio::test]
-    async fn restore_is_unsupported_before_spawning() {
+    async fn restore_rejects_non_snapshotting_config_before_spawning() {
         use crate::config::{RootfsSource, VmConfig};
 
         let qemu = Qemu::new("/usr/bin/qemu-system-x86_64");
@@ -803,25 +1203,79 @@ mod tests {
         )
         .build()
         .expect("build config");
-        let res = PerVmResources {
-            cgroup_name: "vmcell-test".to_string(),
-            tap_name: Some("tap0".to_string()),
-            netns_name: None,
-            vhost_user_socket: None,
-            vmid: 1,
-            guest_cid: 3,
-            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-1"),
-        };
         let cgroups = crate::metrics::FakeCgroupFs::new();
 
         let err = qemu
-            .restore(Path::new("/nonexistent-snapshot"), &cfg, &res, &cgroups)
+            .restore(
+                Path::new("/nonexistent-snapshot"),
+                &cfg,
+                &restore_test_res(),
+                &cgroups,
+            )
             .await
-            .expect_err("QEMU restore must be Unsupported");
+            .expect_err("QEMU restore of a non-snapshotting config must be Unsupported");
         assert!(
             matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "qemu" && feature == "snapshot_restore"),
-            "expected snapshot_restore Unsupported, got {err:?}"
+                if vmm == "qemu" && feature.contains("in-kernel vsock")),
+            "expected an in-kernel-vsock Unsupported, got {err:?}"
+        );
+    }
+
+    // A snapshotting config whose snapshot dir has no sidecar fails loud when the
+    // sidecar is read — which happens BEFORE `spawn_qemu`, so this is KVM-free and
+    // proves the read-before-spawn ordering. RED inverse: reading the sidecar after
+    // spawning would need KVM and lose this clean pre-spawn error.
+    #[tokio::test]
+    async fn restore_reads_sidecar_before_spawning() {
+        use crate::config::{RootfsSource, VmConfig};
+
+        let qemu = Qemu::new("/usr/bin/qemu-system-x86_64");
+        let cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .snapshotting(true)
+        .build()
+        .expect("build snapshotting config");
+        let cgroups = crate::metrics::FakeCgroupFs::new();
+
+        let err = qemu
+            .restore(
+                Path::new("/nonexistent-snapshot-dir"),
+                &cfg,
+                &restore_test_res(),
+                &cgroups,
+            )
+            .await
+            .expect_err("QEMU restore with a missing sidecar must fail before spawning");
+        assert!(
+            matches!(&err, Error::Vmm(msg) if msg.contains("snapshot sidecar")),
+            "expected a sidecar-read Vmm error, got {err:?}"
+        );
+    }
+
+    // The capability-honesty gate (mirrors Firecracker's): QEMU snapshot_restore is
+    // KVM-validated ON via the in-kernel vhost-vsock + migrate/-incoming path, with
+    // lazy_restore and restore_rotates_host_paths honestly OFF. Any deliberate re-gate
+    // must flip the flag AND this test together (AGENTS.md: a capability change
+    // re-validates empirically; docs/45 records the reason).
+    #[test]
+    fn capabilities_are_honest_about_snapshot_restore() {
+        let caps = Qemu::new("/usr/bin/qemu-system-x86_64").capabilities();
+        assert!(
+            caps.snapshot_restore,
+            "QEMU snapshot_restore is KVM-validated ON (in-kernel vhost-vsock + migrate/-incoming, §2.4)"
+        );
+        assert!(
+            !caps.lazy_restore,
+            "QEMU has no UFFD/demand-paged restore backend (§17)"
+        );
+        assert!(
+            !caps.restore_rotates_host_paths,
+            "QEMU restore reuses the baked CID (single-lineage); rotating the host-global CID for \
+             concurrent fan-out is future work (§17)"
         );
     }
 

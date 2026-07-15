@@ -21,13 +21,17 @@ use std::time::Duration;
 
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+// Only the KVM-free demux tests construct raw sockets now; the live transport goes
+// through `ControlStream` (AF_UNIX or AF_VSOCK).
+#[cfg(test)]
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-use super::AgentClient;
+use super::{AgentClient, ControlStream};
 use crate::error::{Error, Result};
+use crate::vmm::VsockEndpoint;
 use vmcell_protocol::{
     ExecOutcome, ExecRequest, MAX_FRAME_BYTES, Message, PtyConfig, SessionId, SessionSpec,
 };
@@ -48,7 +52,7 @@ fn encode_frame(msg: &Message) -> Result<::bytes::Bytes> {
     Ok(::bytes::Bytes::from(bytes))
 }
 
-type FramedStream = Framed<UnixStream, LengthDelimitedCodec>;
+type FramedStream = Framed<ControlStream, LengthDelimitedCodec>;
 type FrameSink = SplitSink<FramedStream, ::bytes::Bytes>;
 /// `SessionId` → the sender feeding that session's [`Session::recv`] channel.
 type Registry = Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<SessionEvent>>>>;
@@ -160,8 +164,32 @@ impl SessionMux {
         timeouts: &crate::config::Timeouts,
         serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<Self> {
-        let framed =
-            AgentClient::connect_framed(vsock_path, port, timeout, timeouts, serial_log).await?;
+        Self::connect_endpoint(
+            &VsockEndpoint::Unix {
+                path: vsock_path.to_path_buf(),
+                port,
+            },
+            timeout,
+            timeouts,
+            serial_log,
+        )
+        .await
+    }
+
+    /// Connects a session multiplexer over an explicit [`VsockEndpoint`] — the
+    /// transport-generic entry the orchestrator uses so a snapshot-eligible QEMU on
+    /// the AF_VSOCK transport (§2.4, QEMU q35 — the fallback and most-proven nester) opens sessions the same way as an
+    /// AF_UNIX backend. The public [`SessionMux::connect`] is the AF_UNIX wrapper.
+    ///
+    /// # Errors
+    /// As [`SessionMux::connect`].
+    pub(crate) async fn connect_endpoint(
+        endpoint: &VsockEndpoint,
+        timeout: Duration,
+        timeouts: &crate::config::Timeouts,
+        serial_log: &dyn crate::vmm::SerialLog,
+    ) -> Result<Self> {
+        let framed = AgentClient::connect_framed(endpoint, timeout, timeouts, serial_log).await?;
         Ok(Self::from_framed(framed))
     }
 
@@ -460,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn demux_routes_interleaved_frames_per_session_and_drops_post_exit() {
         let (client_io, server_io) = UnixStream::pair().expect("unix pair");
-        let mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        let mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
         let mut guest = Framed::new(server_io, codec());
 
         // Open two sessions; the guest peer sees OpenSession{0}, OpenSession{1}.
@@ -549,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn wait_collects_output_until_exit() {
         let (client_io, server_io) = UnixStream::pair().expect("unix pair");
-        let mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        let mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
         let mut guest = Framed::new(server_io, codec());
 
         let mut s = mux
@@ -592,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn oversize_write_stdin_fails_loud_and_does_not_wedge_mux() {
         let (client_io, server_io) = UnixStream::pair().expect("unix pair");
-        let mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        let mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
         let mut guest = Framed::new(server_io, codec());
 
         let s0 = mux
@@ -647,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn open_failure_leaves_no_registry_orphan() {
         let (client_io, _server_io) = UnixStream::pair().expect("unix pair");
-        let mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        let mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
         assert_eq!(mux.registry_len(), 0);
 
         // An argv large enough that the encoded OpenSession exceeds MAX_FRAME_BYTES.
@@ -673,7 +701,7 @@ mod tests {
     #[tokio::test]
     async fn open_send_failure_leaves_no_registry_orphan() {
         let (client_io, _server_io) = UnixStream::pair().expect("unix pair");
-        let mut mux = SessionMux::from_framed(Framed::new(client_io, codec()));
+        let mut mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
         // Kill the writer so write_tx.send() fails deterministically.
         mux.kill_writer_for_test().await;
         assert_eq!(mux.registry_len(), 0);

@@ -209,6 +209,8 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .net(vmcell::config::NetConfig::Privileged {
             egress: vmcell::config::Egress::Open,
         })
+        // QEMU snapshot needs the in-kernel vhost-vsock transport (§2.4); no-op for CH/FC.
+        .snapshotting(true)
         .build()
         .unwrap()
     };

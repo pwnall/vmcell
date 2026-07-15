@@ -1189,21 +1189,16 @@ impl<V: Vmm> MicroVm<V> {
             ));
         }
         if self.agent_client.is_none() {
-            let client = AgentClient::connect(
-                self.instance
-                    .as_ref()
-                    .expect("instance missing")
-                    .vsock_path(),
-                crate::vmm::AGENT_VSOCK_PORT,
+            // Connect over the instance's own endpoint, so a snapshot-eligible QEMU
+            // on the in-kernel AF_VSOCK transport (§2.4, QEMU q35 — the fallback and most-proven nester) is reached by CID while
+            // CH/FC/QEMU-external stay on their AF_UNIX path — one connect law.
+            let instance = self.instance.as_ref().expect("instance missing");
+            let client = AgentClient::connect_endpoint(
+                &instance.vsock_endpoint(),
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
                 &self.timeouts,
                 &crate::vmm::RealSerialLog {
-                    path: self
-                        .instance
-                        .as_ref()
-                        .expect("instance missing")
-                        .serial_log()
-                        .to_path_buf(),
+                    path: instance.serial_log().to_path_buf(),
                 },
             )
             .await?;
@@ -1291,9 +1286,8 @@ impl<V: Vmm> MicroVm<V> {
             ));
         }
         let instance = self.instance.as_ref().expect("instance missing");
-        crate::agent::session::SessionMux::connect(
-            instance.vsock_path(),
-            crate::vmm::AGENT_VSOCK_PORT,
+        crate::agent::session::SessionMux::connect_endpoint(
+            &instance.vsock_endpoint(),
             timeout.unwrap_or(std::time::Duration::from_secs(10)),
             &self.timeouts,
             &crate::vmm::RealSerialLog {

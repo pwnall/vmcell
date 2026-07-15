@@ -157,6 +157,10 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter
 nix = { version = "0.31", optional = true, features = ["mount", "sched", "process", "signal", "user", "fs"] }
 uuid = { version = "1", optional = true, features = ["v4"] }
 tokio-util = { version = "0.7", optional = true, features = ["codec"] }
+# Async AF_VSOCK host transport: the control-plane client dials a snapshot-eligible
+# QEMU on the in-kernel `vhost-vsock-pci` device directly by CID (§2.4), where there
+# is no AF_UNIX bridge. Anticipated by design §9.6. MIT; permissive transitive set.
+tokio-vsock = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
 # seccompiler (rust-vmm): the pure-Rust seccomp-BPF compiler Cloud Hypervisor and Firecracker
 # themselves use, for the jailer-equivalent's optional VMM-child deny-list (design §20.4/§20.6).
@@ -261,7 +265,7 @@ host-common = [
     "dep:tokio", "dep:futures", "dep:bytes",
     "dep:tracing", "dep:tracing-subscriber",
     "dep:nix", "dep:uuid",
-    "dep:tokio-util", "dep:async-trait", "dep:libc", "dep:seccompiler",
+    "dep:tokio-util", "dep:tokio-vsock", "dep:async-trait", "dep:libc", "dep:seccompiler",
     "net-privileged", "net-unprivileged", "proxy", "metrics", "pipeline",
     # Shared host-service deps: the HTTP-over-Unix VMM client (`vmm/mod.rs`,
     # `proxy/doubles.rs`) and JSON (VMM config/bundle) are host-common code, so

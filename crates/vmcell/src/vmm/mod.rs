@@ -650,6 +650,36 @@ pub trait Vmm: Send + Sync {
 /// guest agent's own `VSOCK_PORT` is its mirror on the other side of the boundary.
 pub(crate) const AGENT_VSOCK_PORT: u32 = 5000;
 
+/// How the host reaches a VM's guest-agent vsock control plane.
+///
+/// Cloud Hypervisor, Firecracker, and QEMU's default external `vhost-device-vsock`
+/// daemon all bridge the guest's vsock onto a host **AF_UNIX** socket spoken with
+/// the Firecracker-style hybrid `CONNECT <port>`/`OK` prologue —
+/// [`VsockEndpoint::Unix`]. A snapshot-eligible QEMU instead attaches the in-kernel
+/// `vhost-vsock-pci` device (§2.4, QEMU q35 — the fallback and most-proven nester), which exposes the guest directly on the host's
+/// **AF_VSOCK** namespace at `(guest_cid, port)` — no AF_UNIX path and no hybrid
+/// handshake — [`VsockEndpoint::Vsock`]. The agent transport ([`crate::agent`])
+/// branches only its connect *prologue* on this; the framed protocol after the
+/// guest's first `Ready` frame is byte-identical on both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VsockEndpoint {
+    /// A host AF_UNIX socket path plus the hybrid-vsock port to `CONNECT` to.
+    Unix {
+        /// Host-side AF_UNIX socket the VMM (or its vsock daemon) listens on.
+        path: PathBuf,
+        /// The vsock port carried in the `CONNECT <port>` handshake line.
+        port: u32,
+    },
+    /// A host AF_VSOCK address — a direct in-kernel vhost-vsock connection with no
+    /// hybrid handshake.
+    Vsock {
+        /// The guest's vsock Context ID the host dials.
+        cid: u32,
+        /// The vsock port the guest agent listens on.
+        port: u32,
+    },
+}
+
 /// Represents a running or created VM instance.
 pub trait VmInstance: Send {
     /// Boots the VM from a created state.
@@ -705,6 +735,21 @@ pub trait VmInstance: Send {
     async fn snapshot(&mut self, dir: &Path) -> Result<()>;
     /// Returns the path to this instance's vsock control socket.
     fn vsock_path(&self) -> &Path;
+    /// Returns the endpoint the host uses to reach this instance's guest-agent
+    /// vsock control plane.
+    ///
+    /// Defaults to [`VsockEndpoint::Unix`] over [`vsock_path`](VmInstance::vsock_path)
+    /// with the shared internal agent vsock port — the AF_UNIX hybrid-vsock transport
+    /// every backend uses today. A backend whose control plane rides an AF_VSOCK transport
+    /// (a snapshot-eligible QEMU on the in-kernel `vhost-vsock-pci` device, §2.4, QEMU q35 — the fallback and most-proven nester)
+    /// overrides this to return [`VsockEndpoint::Vsock`] carrying its
+    /// [`guest_cid`](VmInstance::guest_cid).
+    fn vsock_endpoint(&self) -> VsockEndpoint {
+        VsockEndpoint::Unix {
+            path: self.vsock_path().to_path_buf(),
+            port: AGENT_VSOCK_PORT,
+        }
+    }
     /// Returns the unique vsock Context ID (CID) assigned to this VM.
     fn guest_cid(&self) -> u32;
     /// Returns the path to the VM's serial log file.
@@ -1001,6 +1046,27 @@ mod tests {
 
         // Idempotent: removing an already-gone dir is a no-op, not a panic/error.
         remove_vm_tmp_dir(&vm_dir);
+    }
+
+    // Pins the trait default: every backend that does NOT override `vsock_endpoint`
+    // keeps the AF_UNIX hybrid-vsock transport, derived from `vsock_path()` + the
+    // shared `AGENT_VSOCK_PORT`. A backend flipping to the AF_VSOCK transport (QEMU
+    // in-kernel vhost-vsock) must override this method; the buggy inverse (a QEMU
+    // that forgets to override, so the host dials a nonexistent AF_UNIX path) is
+    // exactly what an endpoint-mismatch would surface.
+    #[test]
+    fn fake_instance_vsock_endpoint_defaults_to_unix_path() {
+        // FRU (`..Default::default()`) can't move out of a `Drop` type, so set the
+        // one field we care about after constructing the default.
+        let mut inst = FakeVmInstance::default();
+        inst.vsock_path = PathBuf::from("/tmp/probe-vsock.sock");
+        assert_eq!(
+            inst.vsock_endpoint(),
+            VsockEndpoint::Unix {
+                path: PathBuf::from("/tmp/probe-vsock.sock"),
+                port: AGENT_VSOCK_PORT,
+            },
+        );
     }
 
     /// Spawns a long-lived stand-in process in its own process group, returning the

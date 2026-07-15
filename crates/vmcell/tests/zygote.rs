@@ -58,6 +58,8 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
         cfg.net = NetConfig::Privileged {
             egress: Egress::Open,
         };
+        // QEMU snapshot needs the in-kernel vhost-vsock transport (§2.4); no-op for CH/FC.
+        cfg.snapshotting = true;
         cfg
     };
 

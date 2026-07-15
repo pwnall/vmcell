@@ -4123,6 +4123,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-vsock"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b319ef9394889dab2e1b4f0085b45ba11d0c79dc9d1a9d1afc057d009d0f1c7"
+dependencies = [
+ "bytes 1.12.1",
+ "futures 0.3.32",
+ "libc",
+ "tokio 1.52.3",
+ "vsock",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4509,6 +4522,7 @@ dependencies = [
  "tokio 1.52.3",
  "tokio-rustls",
  "tokio-util",
+ "tokio-vsock",
  "tracing",
  "tracing-subscriber",
  "tracing-test",
