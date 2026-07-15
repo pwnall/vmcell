@@ -14,7 +14,7 @@
 #![cfg(feature = "qemu")]
 
 use vmcell::agent::protocol::ExecRequest;
-use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
+use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig, VsockTransport};
 use vmcell::orchestrator::MicroVm;
 use vmcell::vmm::{Qemu, VmInstance, VsockEndpoint};
 
@@ -90,6 +90,82 @@ async fn qemu_in_kernel_vsock_boot_and_exec() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "in-kernel-vsock-ok"
+    );
+
+    vm.shutdown().await.expect("graceful shutdown");
+}
+
+/// Task B (docs/qemu-follow-ups.md): a **non-snapshot** QEMU opts into the in-kernel
+/// vhost-vsock transport via `vsock_transport: InKernel`, decoupled from `snapshotting`.
+/// Proves the transport selection is no longer tied to `snapshotting`: the VM boots on
+/// AF_VSOCK (shedding the external-daemon bring-up flake) without being snapshot-eligible.
+/// RED on the inverse (the old `snapshotting`-only predicate): a non-snapshot VM would
+/// take the external-daemon AF_UNIX path and the `VsockEndpoint::Vsock` assert reddens.
+#[tokio::test]
+#[ignore = "needs KVM + /dev/vhost-vsock (blessed runner CAP_DAC_OVERRIDE) + CAP_NET_ADMIN"]
+async fn qemu_non_snapshot_in_kernel_vsock_via_transport_knob() {
+    common::clean_vmcell_netns();
+
+    if !common::has_cap_net_admin() {
+        panic!(
+            "SKIP: in-kernel vhost-vsock needs CAP_NET_ADMIN for privileged tap networking; \
+             not present in the effective capability set"
+        );
+    }
+
+    let kernel = common::get_vmlinux();
+    let rootfs = common::get_rootfs();
+    let vmm = Qemu::new(common::qemu_bin());
+
+    // NOT snapshotting: the in-kernel transport is selected purely by the transport knob.
+    let mut cfg = VmConfig::builder(kernel, RootfsSource::Erofs { image: rootfs })
+        .vsock_transport(VsockTransport::InKernel)
+        .build()
+        .expect("build non-snapshot in-kernel-vsock QEMU config");
+    assert!(
+        !cfg.snapshotting,
+        "this VM must NOT be snapshotting — the transport knob alone selects in-kernel"
+    );
+    cfg.net = NetConfig::Privileged {
+        egress: Egress::Open,
+    };
+
+    let env = vmcell::HostEnv::hermetic();
+    let mut vm = MicroVm::start(&vmm, cfg, &env)
+        .await
+        .expect("start non-snapshot in-kernel-vsock QEMU");
+
+    let endpoint = vm.instance().vsock_endpoint();
+    assert!(
+        matches!(endpoint, VsockEndpoint::Vsock { .. }),
+        "a non-snapshot QEMU with vsock_transport=InKernel must expose an AF_VSOCK \
+         endpoint, got {endpoint:?}"
+    );
+    let serial_path = vm.instance().serial_log().to_path_buf();
+
+    let agent = match vm.agent(None).await {
+        Ok(a) => a,
+        Err(e) => {
+            let log = std::fs::read_to_string(&serial_path).unwrap_or_default();
+            panic!("agent connect over AF_VSOCK failed: {e}\nSERIAL LOG:\n{log}");
+        }
+    };
+    let out = agent
+        .exec(ExecRequest::new(vec![
+            "echo".into(),
+            "non-snapshot-in-kernel-ok".into(),
+        ]))
+        .await
+        .expect("exec over AF_VSOCK");
+    assert_eq!(
+        out.code,
+        0,
+        "exec failed over AF_VSOCK: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "non-snapshot-in-kernel-ok"
     );
 
     vm.shutdown().await.expect("graceful shutdown");

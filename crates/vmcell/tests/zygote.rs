@@ -4,9 +4,10 @@
 //! identical clones by copy-on-write-copying the suspend image. Asserts the
 //! properties that make fan-out correct:
 //!
-//! - On a host-path-rotating backend (CH): a **concurrent** pool of N clones,
-//!   each with a distinct vmid, a distinct guest MAC (`mac_math(vmid)`), a
-//!   distinct host vsock path, and a working `exec` — all alive at once.
+//! - On a host-path-rotating backend (CH and QEMU): a **concurrent** pool of N
+//!   clones, each with a distinct vmid, a distinct guest MAC (`mac_math(vmid)`), a
+//!   distinct host-side control-plane identity (CH: the AF_UNIX vsock path; QEMU:
+//!   the in-kernel guest CID, §2.4), and a working `exec` — all alive at once.
 //! - The zygote **master is immutable**: its `config.json` is byte-identical
 //!   after the fan-out, even though the single-use restore path rewrites that
 //!   file in place (§8.1, The warm-snapshot path and the eligibility law, §13, Cross-cutting invariants) — proof each clone restored from its own copy.
@@ -21,7 +22,7 @@ use vmcell::Zygote;
 use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
 use vmcell::orchestrator::MicroVm;
-use vmcell::vmm::{VmInstance, Vmm};
+use vmcell::vmm::{VmInstance, Vmm, VsockEndpoint};
 
 mod common;
 
@@ -95,7 +96,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
     println!("zygote CoW support: {:?}", zygote.probe_cow_support());
 
     if Vmm::capabilities(vmm).restore_rotates_host_paths {
-        // CH tier: mint a CONCURRENT pool.
+        // Rotating tier (CH + QEMU): mint a CONCURRENT pool.
         const N: usize = 3;
         let mut clones = zygote
             .spawn_clones(vmm, N, &env)
@@ -106,9 +107,26 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
         let mut vmids: HashSet<u32> = HashSet::new();
         let mut macs: HashSet<String> = HashSet::new();
         let mut vsocks: HashSet<String> = HashSet::new();
+        let mut cids: HashSet<u32> = HashSet::new();
         for (i, vm) in clones.iter_mut().enumerate() {
             let vmid = vm.vmid();
             assert!(vmids.insert(vmid), "clone {i} vmid {vmid} must be distinct");
+
+            // Transport-real distinctness — each rotating backend rotates a different
+            // identity. CH rotates the AF_UNIX vsock PATH (its `guest_cid()` reports the
+            // SHARED baked CID from the snapshot config, M-VMM-3), so the path is CH's
+            // identity (asserted below). QEMU rotates the HOST-GLOBAL in-kernel guest
+            // CID, so two concurrent QEMU clones MUST hold distinct CIDs (restore
+            // programs a fresh `res.guest_cid`, §2.4). RED on the inverse (a restore that
+            // reused the baked CID): the second clone's `VHOST_VSOCK_SET_GUEST_CID` fails
+            // `EADDRINUSE` and `spawn_clones` above already errors; this pins it explicitly.
+            if let VsockEndpoint::Vsock { cid, .. } = vm.instance().vsock_endpoint() {
+                assert!(
+                    cids.insert(cid),
+                    "clone {i} guest CID {cid} must be distinct"
+                );
+            }
+
             let vsock = vm
                 .instance()
                 .vsock_path()

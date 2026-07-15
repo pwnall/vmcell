@@ -512,6 +512,33 @@ impl CidAllocator {
         ))
     }
 
+    /// Reserves a specific guest CID (`3..=254`), so a test — or a caller that must
+    /// pin a CID — can force a later [`allocate`](CidAllocator::allocate) to hand a
+    /// *different* one. Mirrors [`VmidAllocator::reserve`](crate::orchestrator::VmidAllocator::reserve);
+    /// CIDs are in-process only (no cross-process FS claim, unlike VMIDs).
+    ///
+    /// # Errors
+    /// Returns [`Error::Vmm`](crate::error::Error::Vmm) if `cid` is out of the guest
+    /// range `3..=254`, or [`Error::Exhaustion`](crate::error::Error::Exhaustion) if it
+    /// is already reserved.
+    pub fn reserve(&self, cid: u32) -> Result<u32> {
+        if !(3..=254).contains(&cid) {
+            return Err(crate::error::Error::Vmm(format!(
+                "cid {cid} out of range (must be 3..=254)"
+            )));
+        }
+        // Recover from a poisoned lock instead of panicking: the guarded `BTreeSet`
+        // of live CIDs has no cross-field invariant, so adopting the inner set is sound.
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.contains(&cid) {
+            return Err(crate::error::Error::Exhaustion(format!(
+                "CID {cid} already reserved"
+            )));
+        }
+        active.insert(cid);
+        Ok(cid)
+    }
+
     /// Releases a previously allocated CID.
     pub fn release(&self, cid: u32) {
         // Recover from a poisoned lock instead of panicking: the guarded `BTreeSet`
@@ -1412,6 +1439,39 @@ mod tests {
         alloc.release(cid1);
         let cid3 = alloc.allocate().unwrap();
         assert_eq!(cid1, cid3);
+    }
+
+    // `CidAllocator::reserve` pins a specific CID so a later `allocate` skips it
+    // (used by the restore/zygote tests to force CID rotation to a distinct value).
+    // RED on the inverse: a `reserve` that did not insert would let `allocate` hand
+    // back the reserved CID, failing the `assert_ne`; a missing range check would
+    // accept the out-of-range CID 2.
+    #[test]
+    fn test_cid_allocator_reserve() {
+        let alloc = CidAllocator::new();
+        assert_eq!(alloc.reserve(7).expect("reserve 7"), 7);
+        // Re-reserving a held CID is an exhaustion error, not a silent success.
+        assert!(matches!(
+            alloc.reserve(7),
+            Err(crate::error::Error::Exhaustion(_))
+        ));
+        // A subsequent allocate must NOT hand back the reserved CID.
+        for _ in 0..5 {
+            assert_ne!(
+                alloc.allocate().expect("allocate"),
+                7,
+                "reserved CID leaked"
+            );
+        }
+        // Releasing the reservation frees it for reuse.
+        alloc.release(7);
+        assert_eq!(alloc.reserve(7).expect("reserve after release"), 7);
+        // Out-of-range CIDs (the reserved 0..=2 and > 254) are rejected.
+        assert!(matches!(alloc.reserve(2), Err(crate::error::Error::Vmm(_))));
+        assert!(matches!(
+            alloc.reserve(255),
+            Err(crate::error::Error::Vmm(_))
+        ));
     }
 
     // Guards VMM-7: a poisoned mutex must be recovered, not panicked on. The buggy

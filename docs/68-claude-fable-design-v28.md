@@ -212,7 +212,7 @@ pub trait Vmm: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VmmCapabilities {
-    pub snapshot_restore: bool,            // CH ✓ · FC ✓ (single-lineage host paths, §2.3) · QEMU ✓ (in-kernel vhost-vsock, single-lineage, §2.4)
+    pub snapshot_restore: bool,            // CH ✓ · FC ✓ (single-lineage host paths, §2.3) · QEMU ✓ (in-kernel vhost-vsock, §2.4)
     pub lazy_restore: bool,                // demand-paged restore. CH ✓ (--restore … prefault=off) · FC ✗ · QEMU ✗
     pub virtio_fs_shares: bool,            // CH, QEMU ✓ · FC ✗ (block-only)
     pub unprivileged_vhost_user_net: bool, // smoltcp NAT via vhost-user-net: CH, QEMU ✓ · FC ✗
@@ -221,7 +221,8 @@ pub struct VmmCapabilities {
                                            //   loud+early on FC, before the cmdline is built (console=hvc0
                                            //   with no device would silence the log)
     pub restore_rotates_host_paths: bool,  // CH ✓ (restore config-rewrite moves host paths into the new
-                                           //   scratch dir) · FC ✗ (re-binds the baked vsock UDS verbatim) · QEMU ✗
+                                           //   scratch dir) · FC ✗ (re-binds the baked vsock UDS verbatim)
+                                           //   · QEMU ✓ (restore rotates the host-global guest CID, §2.4)
 }
 
 pub trait VmInstance: Send {
@@ -330,30 +331,36 @@ QEMU reports `snapshot_restore: true`, earned **only** in the snapshot-eligible 
 **unprivileged** external `vhost-device-vsock` daemon is a stateless vhost-user backend that cannot
 migrate (the eligibility law, §8.1), so a `snapshotting` VM instead attaches the privileged **in-kernel
 `vhost-vsock-pci`** device (`guest-cid=` on the device line) — QEMU 10.2 sets no migration blocker on it.
-The selector is `VmConfig::snapshotting` (already privileged-gated at `build()`), routed through one
+The selector is `VmConfig::vsock_transport` (`Auto | InKernel | ExternalDaemon`), routed through one
 `uses_in_kernel_vsock` predicate — an **explicit, fail-loud** choice, never the silent daemon-to-in-kernel
-fallback an earlier pass removed (the sin was the silence, not the device). `snapshot()` drives QMP
-`stop` → `migrate file:<dir>/state.bin` → poll `query-migrate` to `completed` (a `file:` URI, never
-`exec:`, which QEMU's `-sandbox …,spawn=deny` would kill); `restore()` spawns a topology-congruent VM with
-`-incoming defer`, drives `migrate-incoming`, polls to completion, and returns **paused** for the
-orchestrator to `resume()`. A sidecar (`vmcell_qemu_snapshot.json`) carries the one identity value a fresh
-`PerVmResources` would change but migration requires to match the source — the baked guest CID; everything
-else comes from the caller's congruent `cfg`. The external-daemon default (non-snapshotting) returns
-`Unsupported` from `snapshot()`/`restore()`. Because the in-kernel device exposes the guest on the host
-**AF_VSOCK** namespace (not the daemon's AF_UNIX bridge), the host agent client dials it by CID — the one
-place the control plane leaves the hybrid `CONNECT/OK` handshake (§3.2). `restore_rotates_host_paths`
-stays `false`: restore reuses the baked CID (single-lineage), so concurrent same-lineage fan-out is
-`Unsupported` and a pre-spawn live-CID guard rejects restoring while the source is still up (the in-kernel
-CID is host-global). Wiring the unprivileged smoltcp NAT to QEMU still requires the carried vendored
-`vhost`/`vhost-user-backend` patch (§9.6), orthogonal to the vsock snapshot path.
+fallback an earlier pass removed (the sin was the silence, not the device). `Auto` follows `snapshotting`
+(the unprivileged default keeps the external daemon for a non-snapshot VM); `InKernel` lets a privileged
+**non-snapshot** QEMU take the deterministic in-kernel transport, shedding the external daemon's ~11%
+bring-up flake; `build()` rejects `snapshotting` + `ExternalDaemon` (a non-migratable vhost-user device
+cannot back a snapshot). `snapshot()` drives QMP `stop` → `migrate file:<dir>/state.bin` → poll
+`query-migrate` to `completed` (a `file:` URI, never `exec:`, which QEMU's `-sandbox …,spawn=deny` would
+kill); `restore()` spawns a topology-congruent VM with `-incoming defer`, drives `migrate-incoming`, polls
+to completion, and returns **paused** for the orchestrator to `resume()`. No sidecar is carried — the
+migration stream (`state.bin`) is the whole snapshot; a pre-spawn `state.bin` existence check is the
+fail-loud-before-spawn guard. The external-daemon config returns `Unsupported` from `snapshot()`/`restore()`.
+Because the in-kernel device exposes the guest on the host **AF_VSOCK** namespace (not the daemon's AF_UNIX
+bridge), the host agent client dials it by CID — the one place the control plane leaves the hybrid
+`CONNECT/OK` handshake (§3.2). `restore_rotates_host_paths` is **`true`**: `restore()` programs a fresh
+allocator-unique `res.guest_cid` on the destination device (the `guest-cid` is a device property, not part
+of the migration stream), and the guest — which binds `VMADDR_CID_ANY:5000` — is reachable at the rotated
+CID even though its cached CID lives in migrated RAM (validated live; the earlier same-CID-only audit is
+superseded). Each concurrent clone thus holds its own host-global CID, so concurrent QEMU zygote fan-out is
+supported (§8.4); the kernel's `VHOST_VSOCK_SET_GUEST_CID` `EADDRINUSE` at realize is the fail-loud backstop.
+Wiring the unprivileged smoltcp NAT to QEMU still requires the carried vendored `vhost`/`vhost-user-backend`
+patch (§9.6), orthogonal to the vsock snapshot path.
 
 ### 2.5 The capability matrix
 
 | Capability | CH | Firecracker | QEMU |
 |---|---|---|---|
-| `snapshot_restore` | **✓** | **✓** *(single-lineage host paths)* | **✓** *(in-kernel vhost-vsock + `migrate`/`-incoming`, single-lineage, §2.4)* |
+| `snapshot_restore` | **✓** | **✓** *(single-lineage host paths)* | **✓** *(in-kernel vhost-vsock + `migrate`/`-incoming`, §2.4)* |
 | `lazy_restore` (demand-paged) | ✓ | ✗ | ✗ |
-| `restore_rotates_host_paths` | ✓ *(enables concurrent zygote fan-out, §8.4)* | ✗ *(verbatim baked vsock path — single-lineage)* | ✗ *(baked guest CID reused — single-lineage; host-global CID)* |
+| `restore_rotates_host_paths` | ✓ *(enables concurrent zygote fan-out, §8.4)* | ✗ *(verbatim baked vsock path — single-lineage)* | ✓ *(restore rotates the host-global guest CID — concurrent fan-out, §2.4/§8.4)* |
 | `virtio_fs_shares` | ✓ | ✗ (block-only) | ✓ |
 | `unprivileged_vhost_user_net` | ✓ | ✗ | ✓ |
 | `nested_virt` | ✓ | ✗ | ✓ |
@@ -2949,15 +2956,18 @@ failure.
 The exemplar suites, each written so its assertions **fail on the inverse**:
 
 - **`snapshot_restore.rs`** (the S2 battery, §8.2): reconnect across the **severed** vsock (the restore
-  re-creates the vhost-vsock device, so a test that reused the old connection would hang); assert a
-  **valid, live** CID, not `assert_ne!(orig, restored)` (which would fail *because* CID reuse is correct);
-  assert the MAC **and** IP both rotated (the IP check compares the little-endian default-gateway from
+  re-creates the vhost-vsock device, so a test that reused the old connection would hang); assert the
+  **transport-real** restored identity per backend inside a `restore_rotates_host_paths` branch — CH's
+  rotated AF_UNIX vsock path (embedding the new vmid), QEMU's rotated guest **CID** (`assert_ne!` vs the
+  source CID, made non-vacuous by reserving that CID up front), and FC's verbatim baked vsock path; assert
+  the MAC **and** IP both rotated (the IP check compares the little-endian default-gateway from
   `/proc/net/route`, since a "MAC-only" assertion passed while every clone sat on a dead `/30`); assert the
-  CSPRNG changed across restore **without** a test-issued reseed; assert `FakeClock` was read on the
-  **first** post-restore `agent()`; and a per-backend `restore_rotates_host_paths` branch that expects
-  concurrent fan-out on CH and a single-clone-only path on FC.
+  CSPRNG changed across restore **without** a test-issued reseed; and assert `FakeClock` was read on the
+  **first** post-restore `agent()`.
 - **`zygote.rs`** (the S3/S4 fan-out, §8.4): N concurrent clones each get a **distinct** vmid, a MAC equal
-  to `mac_math(vmid)`, and distinct vsock paths; the master `config.json` is **byte-identical** after the
+  to `mac_math(vmid)`, distinct vsock paths, and — for QEMU (the Vsock endpoint) — a distinct guest **CID**
+  (the host-global resource it rotates); concurrent fan-out on the rotating backends (CH **and** QEMU) and a
+  single-clone-only Unsupported path on FC; the master `config.json` is **byte-identical** after the
   fan-out; a non-rotating backend returns `Unsupported` for `count > 1` while a single clone succeeds; and
   the `RecordingOverlayStore` shows the fan-out targeted N distinct private dirs, none the master.
 - **One-liners that each pin one past bug:** `egress_proxy` (a double matches on the label **boundary**,
@@ -3113,13 +3123,15 @@ legitimate only when a preflight check names what is missing). Nothing here is l
 shipped design.
 
 **Backends & boot.** Firecracker UFFD lazy-restore is unwired (single-lineage verbatim-vsock only, §8.4).
-QEMU snapshot/restore over the in-kernel `vhost-vsock` transport is shipped single-lineage (§2.4);
-**concurrent** QEMU zygote fan-out (`restore_rotates_host_paths: true`) is deferred — it needs guest-CID
-rotation on restore, which would make QEMU the first backend to rotate a *host-global* resource (unlike
-CH's per-scratch-dir paths), so each concurrent clone gets a distinct in-kernel CID. A dedicated
-`VmConfig::vsock_transport` selector — decoupling in-kernel vhost-vsock from `snapshotting`, so a
-privileged non-snapshot QEMU could opt into the more-reliable in-kernel path and shed the ~11%
-external-daemon bring-up flake — is deferred behind the one `uses_in_kernel_vsock` predicate. `mkfs.erofs`
+QEMU snapshot/restore over the in-kernel `vhost-vsock` transport is shipped, and **concurrent** QEMU zygote
+fan-out (`restore_rotates_host_paths: true`) is now shipped too — `restore()` rotates the host-global guest
+CID to a fresh `res.guest_cid`, making QEMU the first backend to rotate a *host-global* resource (unlike
+CH's per-scratch-dir paths); the migrate-incoming-at-a-new-CID viability was proven live before enabling it
+(§2.4). The dedicated `VmConfig::vsock_transport` selector (`Auto | InKernel | ExternalDaemon`) — decoupling
+in-kernel vhost-vsock from `snapshotting` so a privileged non-snapshot QEMU can opt into the more-reliable
+in-kernel path and shed the ~11% external-daemon bring-up flake — is also shipped, behind the one
+`uses_in_kernel_vsock` predicate. Remaining QEMU gaps: QEMU UFFD lazy-restore (`lazy_restore: false`, no
+backend wired) and wiring the unprivileged smoltcp NAT (needs the vendored `vhost` patch, §9.6). `mkfs.erofs`
 shell fallback is designed but unimplemented — a missing packer input is fail-loud today (§4.2). Cross-version snapshot pinning: the
 snapshot cache key already folds CH build identity so a bump invalidates stale snapshots at build time
 (§10.2), but the *runtime* "restore under the CH it was taken on" advice is still just advice.

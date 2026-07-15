@@ -821,9 +821,13 @@ the KVM host (`just test-privileged` / `test-unprivileged` / `test-daemon`).
 ## QEMU suspend/resume — in-kernel vhost-vsock + `migrate`/`-incoming`, as built (2026-07-15)
 
 Wires QEMU snapshot/restore, flipping `snapshot_restore` **false → true** for QEMU (design §2.4 / §2.5).
-The Appendix-A-reversal-5 "validated but unwired" QEMU tier is now shipped, single-lineage. Validated live
-on this KVM host through the blessed runner (CAP_DAC_OVERRIDE opens `root:kvm 0660` `/dev/vhost-vsock`):
-`snapshot_restore`, `zygote_fan_out`, `fork_branch_lineage`, `extra_block_survives_snapshot`, and
+The Appendix-A-reversal-5 "validated but unwired" QEMU tier is now shipped. The follow-up pass (below,
+`docs/qemu-follow-ups.md`) then flipped `restore_rotates_host_paths` **false → true** (Task A: concurrent
+zygote fan-out via CID rotation) and decoupled the in-kernel transport from `snapshotting` (Task B:
+`vsock_transport`); this section is reconciled to that as-built state. Validated live on this KVM host
+through the blessed runner (CAP_DAC_OVERRIDE opens `root:kvm 0660` `/dev/vhost-vsock`): `snapshot_restore`,
+`zygote_fan_out` (QEMU now on the concurrent branch), `fork_branch_lineage`, `extra_block_survives_snapshot`,
+`qemu_restore_with_rotated_cid_reaches_agent`, `qemu_non_snapshot_in_kernel_vsock_via_transport_knob`, and
 `test_benchmark_qemu` all green for QEMU (and unregressed for CH/FC); `just ci` green.
 
 - **(a) The snapshot-eligible transport is the privileged in-kernel `vhost-vsock-pci`, not the external
@@ -831,9 +835,14 @@ on this KVM host through the blessed runner (CAP_DAC_OVERRIDE opens `root:kvm 06
   S1 eligibility law), and — a gap the shared `config_has_vhost_user_device` predicate can't see, since it
   doesn't know QEMU attaches its *own* vsock daemon — so QEMU's `snapshot()`/`restore()` self-guard on the
   **endpoint transport**: a non-`Vsock` endpoint is a fail-loud `Unsupported`. *Selector:* reuse
-  `VmConfig::snapshotting` via one private `uses_in_kernel_vsock(cfg)` predicate — explicit and fail-loud,
-  **not** the silent `.ok()` daemon→in-kernel fallback commit `c59bb21f` removed (M-VMM-2: the sin was the
-  silence, not the device). A dedicated `vsock_transport` selector is deferred (§17).
+  the one private `uses_in_kernel_vsock(cfg)` predicate — explicit and fail-loud, **not** the silent `.ok()`
+  daemon→in-kernel fallback commit `c59bb21f` removed (M-VMM-2: the sin was the silence, not the device).
+  *Selector (Task B, as built):* the dedicated `VmConfig::vsock_transport` (`Auto | InKernel |
+  ExternalDaemon`); `Auto` follows `snapshotting`, `InKernel` lets a privileged **non-snapshot** QEMU opt
+  into the deterministic in-kernel transport (shedding the ~11% external-daemon bring-up flake), and
+  `build()` rejects `snapshotting` + `ExternalDaemon` (a non-migratable vhost-user device cannot back a
+  snapshot). External stays the unprivileged default; in-kernel fails loud at device realize if
+  `/dev/vhost-vsock` cannot open (no silent fallback).
 
 - **(b) The host control plane gained an AF_VSOCK transport.** In-kernel vhost-vsock exposes the guest on
   the host AF_VSOCK namespace (dial by CID), not the daemon's AF_UNIX bridge, so `AgentClient`/`SessionMux`
@@ -852,35 +861,48 @@ on this KVM host through the blessed runner (CAP_DAC_OVERRIDE opens `root:kvm 06
   **one** QMP connection (no per-poll `qmp_capabilities` re-handshake — the B15 gotcha). A `completed`
   status returns Ok; `failed`/`cancelled`/budget-elapsed is a typed error, never a silent timeout-through.
 
-- **(d) A minimal sidecar (`vmcell_qemu_snapshot.json`) carries only the baked guest CID.** The device
-  `guest-cid=` must match the source (the guest's cached CID lives in migrated RAM, §8.2 / audit E3), and a
-  fresh `PerVmResources` would change it; everything else (RAM, vCPUs, rootfs, disks, console, net) comes
-  from the caller's congruent `cfg`, exactly as for CH/FC. Restore reuses the baked CID and reports it via
-  `guest_cid()`/`vsock_endpoint()` (M-VMM-3). The default virtio-net MAC is deterministic
-  (`52:54:00:12:34:56`), so no MAC is baked — the post-restore resync rotates the guest's runtime MAC.
+- **(d) No sidecar — the migration stream (`state.bin`) is the whole snapshot.** `restore()` binds a
+  **fresh** `res.guest_cid` (Task A rotation, see (e)), so the source CID is not persisted; the `guest-cid`
+  is a QEMU device *property*, not part of the migration stream. A pre-spawn `state.bin` existence check is
+  the fail-loud-before-spawn guard (replacing the former sidecar read). Everything else (RAM, vCPUs, rootfs,
+  disks, console, net) comes from the caller's congruent `cfg`, exactly as for CH/FC. The default virtio-net
+  MAC is deterministic (`52:54:00:12:34:56`), so no MAC is baked — the post-restore resync rotates the
+  guest's runtime MAC. *(Before Task A this was a `vmcell_qemu_snapshot.json` sidecar carrying the baked CID
+  that restore reused; rotation made it vacuous, so it was removed.)*
 
-- **(e) `restore_rotates_host_paths: false` (single-lineage), with a live-baked-CID guard.** The in-kernel
-  CID is a **host-global** namespace, so a pre-spawn bounded AF_VSOCK probe of `(baked_cid, 5000)` rejects
-  restoring while the source is still live (the AF_VSOCK analog of FC's `reject_live_baked_vsock`); the
-  kernel's `VHOST_VSOCK_SET_GUEST_CID` `EADDRINUSE` at realize is the fail-loud backstop. `zygote.rs`
-  correctly routes QEMU down the FC branch (single clone works, `count>1` is `Unsupported`). Concurrent
-  QEMU fan-out via CID rotation is future work (§17 — QEMU would be the first backend to rotate a
-  host-global resource). `lazy_restore` stays `false` (no UFFD).
+- **(e) `restore_rotates_host_paths: true` (Task A) — restore rotates the host-global guest CID.** The
+  in-kernel CID is a **host-global** namespace, so single-lineage restore (CID reuse) could not fan out
+  concurrently. The experiment that gated Task A (`docs/qemu-follow-ups.md`): snapshot at CID `X`, restore
+  with `-device guest-cid=Y` (`Y ≠ X`) — **empirically the migrate-incoming completes AND the guest agent
+  answers at `(Y, 5000)`**, even though the guest's cached CID (`X`) lives in migrated RAM (the guest binds
+  `VMADDR_CID_ANY:5000`, so its listener is CID-agnostic; the audit's E3 only ever proved *same*-CID
+  restore). So `restore()` now passes the fresh allocator-unique `res.guest_cid`; each concurrent clone
+  holds its own CID, and `zygote.rs` routes QEMU down the **CH (rotating) branch** — `count>1` fan-out works,
+  asserting distinct `guest_cid()` per clone. The kernel's `VHOST_VSOCK_SET_GUEST_CID` `EADDRINUSE` at
+  realize is the fail-loud backstop (and the red-on-inverse: a restore that reused the baked CID fails the
+  second concurrent clone with exactly this error). The former `reject_live_baked_cid` liveness probe is
+  **removed** — rotation makes a live-CID collision unrepresentable (every VM, create and restore, draws its
+  CID from the allocator). `lazy_restore` stays `false` (no UFFD).
 
 - **(f) `create()` now attaches virtio-rng on every QEMU launch** (`rng-random`/`virtio-rng-pci`) so the
   guest has `/dev/hwrng`; without it the post-restore CSPRNG reseed reports `reseed_applied: false` and
   restored clones replay frozen RNG state (the same reason FC's create attaches virtio-rng, §2.3). It does
   not shift block-device enumeration (`/dev/vd*` are virtio-blk).
 
-- **(g) Test/consumer fidelity.** The `snapshot_restore` matrix's verbatim-identity branch asserts on the
-  transport-real identity: QEMU's baked **guest CID** (its `vsock_path` is a vestigial per-scratch-dir file
-  that necessarily differs), FC's baked **vsock path**. The four snapshot matrix tests set
-  `snapshotting=true` (a no-op for CH/FC). `bench-vm` — the one downstream consumer keyed off
-  `capabilities().snapshot_restore` — gained a `snapshotting` arg to `build_cfg`, set true for the
-  snapshot-taking modes (warm-restore, suspend-size, phase-budget) and false for cold-boot/footprint/vsock-rtt,
-  so a plain cold-boot benchmark needs no `/dev/vhost-vsock`. `restore_is_unsupported_before_spawning` is
-  replaced by KVM-free negatives (eligibility rejection; sidecar-read-before-spawn) plus a QEMU
-  `capabilities_are_honest_about_snapshot_restore` gate. Gates: design §2.4/§2.5/§3.2/§17 updated.
+- **(g) Test/consumer fidelity.** With QEMU now rotating, the `snapshot_restore` matrix's identity branch
+  is endpoint-aware inside the *rotating* arm: CH asserts its rotated **vsock path** (embeds the new vmid),
+  QEMU asserts its rotated **guest CID** (its `vsock_path` is a vestigial per-scratch-dir file); FC stays in
+  the verbatim arm asserting its baked **vsock path**. The test reserves the source's CID (symmetric to its
+  existing vmid reservation) so the QEMU `assert_ne!(cid, original_cid)` is non-vacuous. `zygote_fan_out`'s
+  concurrent branch additionally asserts distinct `guest_cid()` per clone. A focused
+  `qemu_restore_with_rotated_cid_reaches_agent` (KVM) pins the rotation end-to-end, and
+  `qemu_non_snapshot_in_kernel_vsock_via_transport_knob` (KVM) pins Task B. KVM-free:
+  `uses_in_kernel_vsock_reads_transport`, `CidAllocator::reserve`, the `vsock_transport` build-validation
+  tests, the flipped `capabilities_are_honest_about_snapshot_restore`, and `restore_checks_state_file_before_spawning`
+  (replacing the sidecar-read negative). `bench-vm` — the one downstream consumer keyed off
+  `capabilities().snapshot_restore` — sets `snapshotting=true` for the snapshot-taking modes and false for
+  cold-boot/footprint/vsock-rtt, so a plain cold-boot benchmark needs no `/dev/vhost-vsock`. Gates: design
+  §2.4/§2.5/§3.2/§17 updated.
 
 - **(h) `memory-backend-file,share=on,mem-path=/dev/shm` migrates cleanly** — the restored guest resumed
   with correct RAM (route/clock/MAC all post-restore-correct), so no `x-ignore-shared`/`share=off` was

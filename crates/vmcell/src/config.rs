@@ -26,6 +26,13 @@ pub struct VmConfig {
     pub limits: ResourceLimits,
     /// Indicates if this VM is configured to be snapshot-eligible.
     pub snapshotting: bool,
+    /// Selects the QEMU guest-agent vsock transport (§2.4). Default
+    /// [`VsockTransport::Auto`] — in-kernel when `snapshotting`, else the unprivileged
+    /// external daemon. Set [`VsockTransport::InKernel`] to give a privileged
+    /// non-snapshot QEMU the deterministic in-kernel transport (shedding the
+    /// external-daemon bring-up flake). No effect on Cloud Hypervisor / Firecracker,
+    /// which always terminate vsock inside the VMM.
+    pub vsock_transport: VsockTransport,
     /// Optional explicitly-configured VMID.
     pub vmid: Option<u32>,
     /// Memory-restore strategy applied on the snapshot-restore path.
@@ -719,6 +726,45 @@ pub enum RestoreMode {
     Lazy,
 }
 
+/// Selects the QEMU guest-agent vsock transport (§2.4). QEMU is the only backend with
+/// a choice here — CH and Firecracker always terminate vsock inside the VMM.
+///
+/// The two transports differ in privilege and in snapshot-eligibility:
+///
+/// - [`ExternalDaemon`](VsockTransport::ExternalDaemon) — an out-of-VMM
+///   `vhost-device-vsock` daemon bridging to a host AF_UNIX socket. **Unprivileged**
+///   (no `/dev/vhost-vsock` needed), but it *is* a vhost-user device, so it is
+///   **not** snapshot-eligible, and its bring-up races (~11% of boots wedge the data
+///   path — `tests/qemu_vsock_flake_repro.rs`), which `verify_control_plane` recovers
+///   from by re-spawning.
+/// - [`InKernel`](VsockTransport::InKernel) — the in-kernel `vhost-vsock-pci` device,
+///   exposing the guest directly on the host AF_VSOCK namespace. **Requires
+///   `/dev/vhost-vsock` access** (`CAP_DAC_OVERRIDE` or `kvm`-group membership) and
+///   fails loud at device realize if it cannot open it (never a silent fallback,
+///   M-VMM-2). It carries no daemon, so it is deterministic (no bring-up race) and is
+///   the only migratable — hence snapshot-eligible — QEMU vsock transport.
+///
+/// A `snapshotting` VM is always driven onto `InKernel`: [`Auto`](VsockTransport::Auto)
+/// resolves to it, and [`VmConfigBuilder::build`] rejects `snapshotting` combined with
+/// an explicit `ExternalDaemon` (the invalid combination is fail-loud, not silently
+/// overridden). The one predicate `uses_in_kernel_vsock` reads this field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VsockTransport {
+    /// `InKernel` when `snapshotting`, else `ExternalDaemon` — the unprivileged
+    /// default that preserves the historical behavior.
+    #[default]
+    Auto,
+    /// Force the in-kernel `vhost-vsock-pci` transport (needs `/dev/vhost-vsock`).
+    /// Lets a **privileged non-snapshot** QEMU shed the external-daemon bring-up
+    /// flake without opting into snapshotting.
+    InKernel,
+    /// Force the external `vhost-device-vsock` daemon (unprivileged). Rejected by
+    /// `build()` when combined with `snapshotting` (a non-migratable vhost-user
+    /// device cannot back a snapshot).
+    ExternalDaemon,
+}
+
 /// A host directory shared with the guest VM via virtio-fs.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -951,6 +997,7 @@ impl VmConfig {
             nested_virt: false,
             limits: ResourceLimits::default(),
             snapshotting: false,
+            vsock_transport: VsockTransport::Auto,
             vmid: None,
             restore_mode: RestoreMode::Default,
             ksm_mergeable: false,
@@ -980,6 +1027,7 @@ pub struct VmConfigBuilder {
     nested_virt: bool,
     limits: ResourceLimits,
     snapshotting: bool,
+    vsock_transport: VsockTransport,
     vmid: Option<u32>,
     restore_mode: RestoreMode,
     ksm_mergeable: bool,
@@ -1093,6 +1141,17 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn snapshotting(mut self, snapshotting: bool) -> Self {
         self.snapshotting = snapshotting;
+        self
+    }
+
+    /// Selects the QEMU guest-agent vsock transport ([`VmConfig::vsock_transport`],
+    /// §2.4). Default [`VsockTransport::Auto`]. [`VsockTransport::InKernel`] opts a
+    /// privileged non-snapshot QEMU into the deterministic in-kernel transport;
+    /// [`build`](Self::build) rejects [`VsockTransport::ExternalDaemon`] combined with
+    /// `snapshotting`. No effect on Cloud Hypervisor / Firecracker.
+    #[must_use]
+    pub fn vsock_transport(mut self, transport: VsockTransport) -> Self {
+        self.vsock_transport = transport;
         self
     }
 
@@ -1231,6 +1290,19 @@ impl VmConfigBuilder {
         }
 
         if self.snapshotting {
+            // Snapshot requires the migratable in-kernel vsock transport (§2.4): the
+            // external `vhost-device-vsock` daemon is a non-migratable vhost-user
+            // device. `Auto` resolves to in-kernel for a snapshotting VM, but an
+            // *explicit* `ExternalDaemon` is a contradiction — reject it fail-loud
+            // rather than silently override the caller's request (M-VMM-2).
+            if matches!(self.vsock_transport, VsockTransport::ExternalDaemon) {
+                return Err(crate::error::Error::Config(
+                    "snapshotting requires the in-kernel vsock transport and cannot be \
+                     combined with vsock_transport = ExternalDaemon (the external \
+                     vhost-device-vsock daemon is a non-migratable vhost-user device)"
+                        .into(),
+                ));
+            }
             // A custom init replaces the vmcell guest agent (§5.3, The kernel command line), and the mandatory
             // post-restore resync — clock, entropy reseed, MAC/IP rotation (§13, Cross-cutting invariants) —
             // runs *through* that agent. A restored custom-init clone would be stranded
@@ -1436,6 +1508,7 @@ impl VmConfigBuilder {
             nested_virt: self.nested_virt,
             limits: self.limits,
             snapshotting: self.snapshotting,
+            vsock_transport: self.vsock_transport,
             vmid: self.vmid,
             restore_mode: self.restore_mode,
             ksm_mergeable: self.ksm_mergeable,
@@ -2053,6 +2126,76 @@ mod tests {
         .unwrap();
         assert!(cfg.snapshotting);
         assert!(matches!(cfg.net, NetConfig::Privileged { .. }));
+    }
+
+    // Task B: the default vsock transport is `Auto` and the builder carries an
+    // explicit choice onto the built config. RED on the inverse (a builder that drops
+    // the field, or a wrong default).
+    #[test]
+    fn vsock_transport_default_is_auto_and_builder_carries_it() {
+        let default_cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        assert_eq!(default_cfg.vsock_transport, VsockTransport::Auto);
+
+        let in_kernel = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .vsock_transport(VsockTransport::InKernel)
+        .build()
+        .unwrap();
+        assert_eq!(in_kernel.vsock_transport, VsockTransport::InKernel);
+    }
+
+    // Task B: snapshotting requires the migratable in-kernel transport, so an EXPLICIT
+    // `ExternalDaemon` is a fail-loud contradiction (not silently overridden). RED on
+    // the inverse (a build() that accepts the combination, or silently flips it).
+    #[test]
+    fn build_rejects_snapshotting_with_external_daemon_vsock() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .snapshotting(true)
+        .vsock_transport(VsockTransport::ExternalDaemon)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string().contains("ExternalDaemon"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Task B over-rejection guard: snapshotting with `Auto` (default) and with an
+    // explicit `InKernel` must BOTH build — only `ExternalDaemon` is the contradiction.
+    // RED on an over-broad reject that blocks the in-kernel/auto snapshot path.
+    #[test]
+    fn build_accepts_snapshotting_with_inkernel_and_auto() {
+        for transport in [VsockTransport::Auto, VsockTransport::InKernel] {
+            let cfg = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .snapshotting(true)
+            .vsock_transport(transport)
+            .build()
+            .unwrap_or_else(|e| panic!("snapshotting + {transport:?} must build, got {e}"));
+            assert!(cfg.snapshotting);
+            assert_eq!(cfg.vsock_transport, transport);
+        }
     }
 
     // M-CONFIG-1: ksm_mergeable is mutually exclusive with a virtio-fs data

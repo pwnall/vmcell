@@ -201,6 +201,21 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .reserve(original_vmid)
             .expect("original vmid is free after block 1 shutdown; reserving forces a new vmid");
 
+        // Symmetric to the vmid reservation: hold the source's (now-freed) guest CID so
+        // the restore path's fresh `cids.allocate()` is forced to hand a DIFFERENT one.
+        // This makes the QEMU CID-rotation assertion below non-vacuous — without it the
+        // freed CID could be re-handed and `new_cid` could coincidentally equal
+        // `original_cid`, so a `restore()` that reused the baked CID would slip the
+        // assert. Harmless for CH/FC, whose identity assert is path-based.
+        let original_cid: u32 = std::fs::read_to_string(snapshot_dir.join("original_cid.txt"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        env.cids
+            .reserve(original_cid)
+            .expect("original CID is free after block 1 shutdown; reserving forces a new CID");
+
         // Drive the one-shot post-restore clock resync from an INJECTED FakeClock (≈ pre_time +
         // 1000s), captured on `env.clock` BEFORE restore. The orchestrator fires the resync on the
         // FIRST agent() after restore using the clock captured at construction (design §18, Delta register: changes from the validated v27 build — delta 1
@@ -285,19 +300,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
              (hex {expected_gw_hex}); guest /proc/net/route:\n{route_table}"
         );
 
-        let original_cid: u32 = std::fs::read_to_string(snapshot_dir.join("original_cid.txt"))
-            .unwrap()
-            .parse()
-            .unwrap();
         let new_cid = vm.instance().guest_cid();
-        // The restore re-allocates a host-side guest CID (the agent reconnected
-        // over it above). The design's "restored clones don't collide" guarantee is
-        // enforced by the allocator's UNIQUENESS for *concurrent* live CIDs (see
-        // vmm::tests::test_cid_allocator_prop), NOT by forcing a different number on
-        // a *sequential* restore — here the original VM was already torn down, so
-        // the allocator may legitimately hand its freed CID back. Assert the real
-        // contract: a valid, live guest CID.
-        let _ = original_cid;
         assert!(
             (3..=254).contains(&new_cid),
             "restored VM must have a valid guest CID, got {new_cid}"
@@ -306,52 +309,55 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         let original_vsock =
             std::fs::read_to_string(snapshot_dir.join("original_vsock.txt")).unwrap();
         let new_vsock = vm.instance().vsock_path().to_str().unwrap();
-        // The host-side vsock path contract is per-backend, declared by
-        // `restore_rotates_host_paths` (the capability descriptor is the contract):
-        // CH's restore config-rewrite moves the socket into the NEW VM's scratch
-        // dir; FC's `PUT /snapshot/load` re-binds the snapshot's baked path
-        // VERBATIM (no load-time override exists in v1.16). Each branch asserts
-        // its backend's REAL semantics — the opposite outcome reddens either one.
+        // The host-side identity contract is per-backend, declared by
+        // `restore_rotates_host_paths` (the capability descriptor is the contract).
+        // What "identity" means is per-transport, so each branch asserts the one that
+        // is real for its backend — the opposite outcome reddens it.
         if vmcell::vmm::Vmm::capabilities(vmm).restore_rotates_host_paths {
-            assert_ne!(
-                original_vsock, new_vsock,
-                "Vsock path should be rotated after restore"
-            );
-            // M-TEST-RESTORE: assert the REAL socket path embeds the rotated vmid
-            // (vmcell-vm-{pid}-{new_vmid}), not merely that it differs — proving the
-            // path reflects the new identity rather than a coincidental string
-            // difference.
-            assert!(
-                new_vsock.contains(&format!("vmcell-vm-{}-{}", std::process::id(), new_vmid)),
-                "restored vsock path {new_vsock} must embed the rotated vmid {new_vmid}"
-            );
-        } else {
-            // Verbatim identity: a non-rotating backend re-binds the SAME baked
-            // host-side identity on every restore of the lineage. What "identity" means
-            // is per-transport, so assert on the one that is real for each: Firecracker
-            // re-binds the baked AF_UNIX vsock PATH verbatim; QEMU's in-kernel
-            // vhost-vsock is addressed by CID (its `vsock_path` is a vestigial,
-            // per-scratch-dir file that necessarily differs), so its verbatim identity
-            // is the baked guest CID (§2.4). The agent reconnect above already proved
-            // the rebound transport functional; a rotated identity here would mean the
-            // backend diverged from its declared capability.
             match vm.instance().vsock_endpoint() {
-                vmcell::vmm::VsockEndpoint::Vsock { cid, .. } => {
-                    assert_eq!(
-                        cid, original_cid,
-                        "QEMU restore must reuse the baked guest CID (the in-kernel \
-                         vhost-vsock verbatim identity), got {cid} vs {original_cid}"
+                // CH: the restore config-rewrite moves the AF_UNIX vsock socket into the
+                // NEW VM's scratch dir, so the path rotates and embeds the new vmid.
+                vmcell::vmm::VsockEndpoint::Unix { .. } => {
+                    assert_ne!(
+                        original_vsock, new_vsock,
+                        "Vsock path should be rotated after restore"
+                    );
+                    // M-TEST-RESTORE: assert the REAL socket path embeds the rotated
+                    // vmid, not merely that it differs — proving the path reflects the
+                    // new identity rather than a coincidental string difference.
+                    assert!(
+                        new_vsock.contains(&format!(
+                            "vmcell-vm-{}-{}",
+                            std::process::id(),
+                            new_vmid
+                        )),
+                        "restored vsock path {new_vsock} must embed the rotated vmid {new_vmid}"
                     );
                 }
-                vmcell::vmm::VsockEndpoint::Unix { .. } => {
-                    assert_eq!(
-                        new_vsock,
-                        original_vsock.as_str(),
-                        "an AF_UNIX non-rotating backend must re-bind the \
-                         snapshot's baked vsock path verbatim"
+                // QEMU in-kernel vhost-vsock: identity is the guest CID (its
+                // `vsock_path` is a vestigial per-scratch-dir file). Restore programs a
+                // FRESH `res.guest_cid`; block 2 reserved the source's CID, so the fresh
+                // one MUST differ — a restore that reused the baked CID (the inverse of
+                // the rotation change, §2.4) reddens the `assert_ne`.
+                vmcell::vmm::VsockEndpoint::Vsock { cid, .. } => {
+                    assert_ne!(
+                        cid, original_cid,
+                        "QEMU restore must rotate the guest CID off the source's baked \
+                         cid={original_cid} (§2.4), got {cid}"
                     );
                 }
             }
+        } else {
+            // FC: verbatim rebind of the snapshot's baked AF_UNIX vsock path
+            // (`PUT /snapshot/load` re-binds it verbatim; no load-time override exists
+            // in v1.16). The agent reconnect above already proved the rebound transport
+            // functional; a rotated path here would mean FC diverged from its capability.
+            assert_eq!(
+                new_vsock,
+                original_vsock.as_str(),
+                "an AF_UNIX non-rotating backend must re-bind the \
+                 snapshot's baked vsock path verbatim"
+            );
         }
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();
