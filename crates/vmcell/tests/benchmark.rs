@@ -36,6 +36,11 @@ fn test_benchmark_ch_dry() {
 #[test]
 #[ignore = "needs KVM"]
 fn test_benchmark_fc() {
+    // `bench-vm` resolves the default artifacts itself (this test shells out), so it does not go
+    // through the harness auto-build. Touch the getters first so the rootfs is built at most once
+    // per session (and the kernel's fail-loud fires) before bench-vm reads them.
+    let _kernel = common::get_vmlinux();
+    let _rootfs = common::get_rootfs();
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
     cmd.arg("--backend")
         .arg("firecracker")
@@ -52,6 +57,9 @@ fn test_benchmark_fc() {
 #[test]
 #[ignore = "needs KVM"]
 fn test_benchmark_qemu() {
+    // See `test_benchmark_fc`: shells out to bench-vm, so trigger the harness auto-build first.
+    let _kernel = common::get_vmlinux();
+    let _rootfs = common::get_rootfs();
     let mut cmd = Command::cargo_bin("bench-vm").unwrap();
     cmd.arg("--backend")
         .arg("qemu")

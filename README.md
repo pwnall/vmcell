@@ -157,7 +157,36 @@ Common recipes:
 Built VM artifacts (kernel, rootfs, proxy CA) default to `target/vmcell-artifacts`, overridable via
 `VMCELL_ARTIFACTS_DIR` (with `VMCELL_KERNEL` / `VMCELL_ROOTFS` overriding the individual kernel/rootfs paths).
 
-### 7. Packages supporting experiments
+### 7. Building the VM artifacts
+
+The KVM integration suites need built artifacts (guest kernel, erofs rootfs, proxy CA) in the
+artifacts dir. Build them once with the CLI:
+
+```sh
+# Fast: a digest-pinned prebuilt guest kernel (no kernel toolchain needed).
+cargo run -p vmcell-cli --bin vmcell -- build
+
+# Full privileged suite: compile the guest kernel on the host (uses the §1 kernel deps).
+cargo run -p vmcell-cli --bin vmcell -- build --kernel-source host-make
+```
+
+`--kernel-source` (default `prebuilt`) selects the guest-kernel seed. **This is an unprivileged
+build — no `sudo` / root step is involved either way.**
+
+- **`prebuilt`** downloads a digest-pinned, SHA256-verified `vmlinux` (Kata's) — no kernel toolchain,
+  one large one-time download. It boots and runs `just test-unit`, `just test-unprivileged`, and
+  `just test-daemon`, plus most of `just test-privileged`. But that image **omits `CONFIG_KVM_INTEL`
+  and `CONFIG_HW_RANDOM_VIRTIO`**, so six privileged tests fail on it: `nested_virt` /
+  `nested_virt_disabled` (CH + QEMU) need an openable guest `/dev/kvm`, and `snapshot_restore`'s
+  post-restore entropy reseed (CH + FC) needs guest `/dev/hwrng` from virtio-rng.
+- **`host-make`** compiles the pinned Linux source on the host (the `build-essential flex bison bc
+  libelf-dev libssl-dev` from §1) and appends vmcell's microvm KConfig, which sets both options —
+  `just test-privileged` then passes in full (102/102 on a KVM host). To keep the fast prebuilt
+  kernel as the default artifact and still run those six, build a host-make kernel under a label with
+  `vmcell build-kernels` and point `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for the
+  privileged run.
+
+### 8. Packages supporting experiments
 
 The groups above are everything the product needs to build and run. The packages below are **only**
 for the *optional* performance experiments and contested-fact benchmarks in the design doc §13 (the

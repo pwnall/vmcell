@@ -257,22 +257,13 @@ pub async fn pack_erofs_with_injection(
     let tools_path = inputs.artifacts.get("guest_tools").cloned();
 
     tokio::task::spawn_blocking(move || -> Result<StageOutputs> {
-        let mut injected_files = vec![("usr/sbin/vmcell-guest-agent", agent_path.as_path())];
+        // The CA is baked only under the `proxy` feature (it produced `ca_path` above).
         #[cfg(feature = "proxy")]
-        injected_files.push((
-            "usr/local/share/ca-certificates/vmcell-ca.crt",
-            ca_path.as_path(),
-        ));
-
-        let mut injected_symlinks: Vec<(&str, &str)> = Vec::new();
-        if let Some(tp) = tools_path.as_deref() {
-            injected_files.push(("vmcell-tools/vmcell-guest-tools", tp));
-            // busybox-style multicall links resolved on the exec PATH (the guest
-            // agent prepends /vmcell-tools).
-            injected_symlinks.push(("vmcell-tools/ip", "vmcell-guest-tools"));
-            injected_symlinks.push(("vmcell-tools/curl", "vmcell-guest-tools"));
-            injected_symlinks.push(("vmcell-tools/kvm-ok", "vmcell-guest-tools"));
-        }
+        let ca_opt: Option<&Path> = Some(ca_path.as_path());
+        #[cfg(not(feature = "proxy"))]
+        let ca_opt: Option<&Path> = None;
+        let (injected_files, injected_symlinks) =
+            rootfs_injection_manifest(agent_path.as_path(), ca_opt, tools_path.as_deref());
 
         let archives: Vec<tar::Archive<Box<dyn Read + Send>>> =
             tar_streams.into_iter().map(tar::Archive::new).collect();
@@ -289,6 +280,50 @@ pub async fn pack_erofs_with_injection(
     })
     .await
     .map_err(|e| Error::Artifact(e.to_string()))?
+}
+
+/// A `(dest_path, source_path)` file injected into the rootfs after every layer is merged.
+#[cfg(feature = "am-fs-erofs")]
+type InjectFile<'a> = (&'static str, &'a Path);
+/// A `(link_path, symlink_target)` injected into the rootfs.
+#[cfg(feature = "am-fs-erofs")]
+type InjectLink = (&'static str, &'static str);
+
+/// The rootfs injection manifest: the single list of `(dest_path, source_path)` files and
+/// `(link, target)` symlinks baked into every rootfs. Kept as ONE function so the SET of
+/// injected paths is testable KVM-free — the rootfs is a warm-cache artifact (CI reuses the
+/// image and never re-packs), so a dropped, mis-pathed, or wrong-moded injection is invisible
+/// until a fresh pack. Two such regressions have shipped this way (guest-tools packed 0o644 when
+/// it moved to `/vmcell-tools`; the `/etc/ssl/certs` trust store absent after the reqwest 0.13
+/// bump), so the manifest is pinned by `rootfs_injection_manifest_pins_truststore_and_tools`.
+///
+/// `ca` is `Some` only when the `proxy` feature baked a deployment CA. When present it is
+/// installed BOTH at the ca-certificates drop-in AND merged into the `/etc/ssl/certs` bundle the
+/// rustls stack reads at client-build time (gt-curl-truststore): without the bundle, guest-tools
+/// `curl` cannot even build a client, so plain-HTTP egress fails too. `tools` is `Some` when the
+/// GuestToolsStage produced the `ip`/`curl`/`kvm-ok` multicall; it lands under `/vmcell-tools`
+/// (executable via `injected_file_mode`) with the three names symlinked to it.
+#[cfg(feature = "am-fs-erofs")]
+fn rootfs_injection_manifest<'a>(
+    agent: &'a Path,
+    ca: Option<&'a Path>,
+    tools: Option<&'a Path>,
+) -> (Vec<InjectFile<'a>>, Vec<InjectLink>) {
+    let mut files: Vec<InjectFile<'a>> = vec![("usr/sbin/vmcell-guest-agent", agent)];
+    if let Some(ca) = ca {
+        files.push(("usr/local/share/ca-certificates/vmcell-ca.crt", ca));
+        files.push(("etc/ssl/certs/ca-certificates.crt", ca));
+    }
+    let mut symlinks: Vec<InjectLink> = Vec::new();
+    if let Some(tools) = tools {
+        files.push(("vmcell-tools/vmcell-guest-tools", tools));
+        // busybox-style multicall links resolved on the exec PATH (the guest agent prepends
+        // /vmcell-tools).
+        symlinks.push(("vmcell-tools/ip", "vmcell-guest-tools"));
+        symlinks.push(("vmcell-tools/curl", "vmcell-guest-tools"));
+        symlinks.push(("vmcell-tools/kvm-ok", "vmcell-guest-tools"));
+    }
+    (files, symlinks)
 }
 
 /// Shared logic to take a tar stream, inject the agent and CA, and pack it into erofs.
@@ -340,6 +375,53 @@ mod tests {
         b.artifacts.insert("guest_tools".to_string(), tools);
         b.artifacts.insert("guest_agent".to_string(), agent);
         assert_eq!(stage().cache_key(&a), stage().cache_key(&b));
+    }
+
+    // Pins the rootfs injection MANIFEST — the set, paths, and roles of injected files — KVM-free.
+    // The rootfs is a warm-cache artifact, so a dropped or mis-pathed injection is invisible until a
+    // fresh pack; both shipped regressions were exactly that (guest-tools packed non-executable when
+    // it moved to /vmcell-tools; the /etc/ssl/certs trust store absent after the reqwest 0.13 bump).
+    // Red-on-inverse: dropping the `etc/ssl/certs` push fails the trust-store assert; dropping the
+    // tools push fails the multicall asserts.
+    #[cfg(feature = "am-fs-erofs")]
+    #[test]
+    fn rootfs_injection_manifest_pins_truststore_and_tools() {
+        let agent = Path::new("/agent");
+        let ca = Path::new("/ca.pem");
+        let tools = Path::new("/tools");
+        let (files, symlinks) = rootfs_injection_manifest(agent, Some(ca), Some(tools));
+        let dests: Vec<&str> = files.iter().map(|(d, _)| *d).collect();
+
+        // The guest-agent (PID 1) is always injected.
+        assert!(dests.contains(&"usr/sbin/vmcell-guest-agent"));
+        // With a CA: BOTH the drop-in AND the /etc/ssl/certs bundle the rustls stack reads at
+        // client-build time. Missing the bundle => guest-tools curl can't build a client, so even
+        // plain-HTTP egress fails (gt-curl-truststore).
+        assert!(
+            dests.contains(&"etc/ssl/certs/ca-certificates.crt"),
+            "the CA must be merged into the /etc/ssl/certs trust-store bundle"
+        );
+        assert!(dests.contains(&"usr/local/share/ca-certificates/vmcell-ca.crt"));
+        // The guest-tools multicall + its three exec-PATH names.
+        assert!(dests.contains(&"vmcell-tools/vmcell-guest-tools"));
+        for name in ["ip", "curl", "kvm-ok"] {
+            let link = format!("vmcell-tools/{name}");
+            assert!(
+                symlinks
+                    .iter()
+                    .any(|(l, t)| *l == link && *t == "vmcell-guest-tools"),
+                "missing multicall symlink {link}"
+            );
+        }
+
+        // No CA (the non-proxy build) => no trust-store bundle injected.
+        let (files_np, _) = rootfs_injection_manifest(agent, None, Some(tools));
+        assert!(
+            !files_np
+                .iter()
+                .any(|(d, _)| *d == "etc/ssl/certs/ca-certificates.crt"),
+            "no CA => no trust-store bundle"
+        );
     }
 
     // ART-9: the OCI rootfs does NOT consume the kernel (it boots no VM), so a kernel

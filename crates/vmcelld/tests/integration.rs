@@ -112,7 +112,8 @@ fn require_preconditions() {
         let p = artifacts_dir().join(a);
         assert!(
             p.is_file(),
-            "artifact {a} missing at {}; build it with `vmcell build` (see the validation runbook)",
+            "artifact {a} missing at {}; build it with `vmcell build` (or run `just test-privileged` \
+             once, whose harness auto-builds; see the validation runbook)",
             p.display()
         );
     }

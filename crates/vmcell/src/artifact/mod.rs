@@ -68,6 +68,209 @@ pub fn rootfs_path() -> PathBuf {
         .unwrap_or_else(|| artifacts_dir().join("rootfs.erofs"))
 }
 
+/// Ensures the default test VM artifacts (guest-agent, guest-tools, erofs rootfs) are current,
+/// building them **at most once per test session**, driven by the same content hashes the build
+/// pipeline uses. The integration-test harness calls this from `get_vmlinux`/`get_rootfs`, so a
+/// source edit to the guest agent, guest tools, a dep bump, or the rootfs packer transparently
+/// re-packs the rootfs instead of the suite silently running against a **stale** image (the cache
+/// blind spot that shipped two packer regressions this cycle) or failing loud with "artifact
+/// missing".
+///
+/// The guest KERNEL is deliberately **not** built here: a host-`make` compile takes minutes, far
+/// past a per-test timeout, so it is built once out-of-band (`vmcell build --kernel-source
+/// host-make`) and this fails loud with that instruction if it is absent. The guest binaries and
+/// the erofs rootfs repack in seconds, well within a test's slow-timeout.
+///
+/// No-ops when `$VMCELL_ROOTFS` is set (the caller — e.g. `vmcell-artifact-validator` validating a
+/// custom candidate — manages its own rootfs).
+///
+/// Coordination (the "at most once" guarantee): a per-process `OnceLock` collapses repeat calls
+/// within a process; a cross-process advisory `flock` on `<dir>/.build.lock` serializes concurrent
+/// test runs so they never double-write the rootfs; and a `<dir>/.build.stamp` keyed on the input
+/// fingerprint lets a warm session skip the pipeline walk (and the 150 MB output re-hash) entirely.
+///
+/// # Errors
+/// Returns [`crate::Error::Artifact`] if the kernel is missing (with the one-command fix) or the
+/// build fails, and [`crate::Error::Io`] on a lock/stamp I/O failure.
+#[cfg(feature = "pipeline")]
+pub fn ensure_test_artifacts() -> crate::error::Result<()> {
+    // Process-global write-once memo of the build OUTCOME — this IS the "at most once per session"
+    // mechanism: repeat get_vmlinux/get_rootfs calls in a process reuse it (no borrowed state).
+    static ENSURED: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new(); // allow-global-state: write-once artifact-build memo; test-support only
+    // Cache the OUTCOME per process so the second call (get_rootfs after get_vmlinux, or the next
+    // test in a shared-process binary) is free. A failure is cached too — the first missing-kernel
+    // panic is the same on every subsequent call, without re-running the probe.
+    ENSURED
+        .get_or_init(ensure_test_artifacts_inner)
+        .clone()
+        .map_err(crate::error::Error::Artifact)
+}
+
+/// The uncached body of [`ensure_test_artifacts`]. Returns a raw message on error (not an [`Error`])
+/// so `OnceLock` can memoize it — the `Error` type is not `Clone` — and so the public wrapper adds
+/// exactly one `Artifact error:` prefix rather than nesting one.
+#[cfg(feature = "pipeline")]
+fn ensure_test_artifacts_inner() -> std::result::Result<(), String> {
+    // A caller-supplied rootfs is externally managed — never auto-build over it.
+    if std::env::var_os("VMCELL_ROOTFS").is_some() {
+        return Ok(());
+    }
+
+    // The kernel is built out-of-band (slow, rarely changes); require it, do not build it here.
+    let kernel = kernel_path();
+    if !kernel.exists() {
+        return Err(format!(
+            "guest kernel missing at {}. Build it once (slow, rarely changes): \
+             `cargo run -p vmcell-cli --bin vmcell -- build --kernel-source host-make`",
+            kernel.display()
+        ));
+    }
+
+    let dir = artifacts_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // Cross-process exclusive lock: two concurrent `just test-*` runs must not double-write the
+    // rootfs. Held until this function returns (the fresh-path releases it in microseconds).
+    let _lock = BuildLock::acquire(&dir.join(".build.lock")).map_err(|e| e.to_string())?;
+
+    // Cheap freshness stamp over EVERY input the fast stages consume (hashes ~10 MB of source, not
+    // the 150 MB outputs). A warm session matches on the first try and skips the pipeline entirely.
+    let fingerprint = fast_artifacts_fingerprint(&dir).map_err(|e| e.to_string())?;
+    let stamp_path = dir.join(".build.stamp");
+    let stamp = std::fs::read_to_string(&stamp_path).ok();
+    if artifacts_stamp_fresh(stamp.as_deref(), &fingerprint, rootfs_path().exists()) {
+        return Ok(());
+    }
+
+    // The fingerprint moved, so an input changed. A PACKER edit is invisible to the rootfs stage's
+    // own `cache_key` (it folds the agent/tools BINARIES + CA, not the packing logic), so invalidate
+    // its sidecar to force a re-pack; agent/tools SOURCE edits already flip their own stage keys.
+    let rootfs_sidecar = dir.join("rootfs.cache_key");
+    match std::fs::remove_file(&rootfs_sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+
+    build_fast_pipeline(&dir).map_err(|e| e.to_string())?;
+
+    std::fs::write(&stamp_path, &fingerprint).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The at-most-once skip decision: the built artifacts are fresh — and the pipeline may be skipped
+/// — iff the rootfs output EXISTS **and** the recorded stamp equals the current input fingerprint.
+/// Pure, so the "only skip when nothing changed AND the output is present" contract is unit-testable
+/// KVM-free (dropping the `rootfs_exists` guard would leave a deleted rootfs never rebuilt).
+#[cfg(feature = "pipeline")]
+fn artifacts_stamp_fresh(stamp: Option<&str>, fingerprint: &str, rootfs_exists: bool) -> bool {
+    rootfs_exists && stamp == Some(fingerprint)
+}
+
+/// The fingerprint of everything the fast (non-kernel) stages consume: the guest-agent and
+/// guest-tools SOURCE closures (which already fold `Cargo.lock`, so a dep bump like the reqwest one
+/// invalidates it), the resolved pins, the baked proxy CA, and the rootfs packer source. Any change
+/// here re-packs the rootfs. Reuses the pipeline's own closure/file hashers ("use our hashing").
+#[cfg(feature = "pipeline")]
+fn fast_artifacts_fingerprint(_dir: &Path) -> crate::error::Result<String> {
+    let ws = workspace_root();
+    let mut h = blake3::Hasher::new();
+    h.update(b"vmcell-test-artifacts-fingerprint-v1\0");
+    h.update(guest_agent_closure_hash(&ws)?.as_bytes());
+    h.update(b"\0");
+    h.update(guest_tools_closure_hash(&ws)?.as_bytes());
+    h.update(b"\0");
+    let pins = std::fs::read(ws.join("pins.json")).map_err(crate::error::Error::Io)?;
+    h.update(&pins);
+    h.update(b"\0");
+    #[cfg(feature = "proxy")]
+    {
+        let ca = crate::proxy::tls::CaManager::new()?;
+        h.update(ca.ca_cert_pem().as_bytes());
+    }
+    h.update(b"\0");
+    // Rootfs PACKER source — NOT folded by the rootfs `cache_key`, so hash it here so a packer edit
+    // re-packs (the blind spot behind this cycle's exec-bit + trust-store regressions). A read
+    // failure folds a distinct marker so the stale hash can never masquerade as unchanged.
+    for rel in [
+        "crates/vmcell/src/artifact/tar2erofs.rs",
+        "crates/vmcell/src/artifact/rootfs/mod.rs",
+        "crates/vmcell/src/artifact/rootfs/oci.rs",
+    ] {
+        match hash_file(&ws.join(rel)) {
+            Ok(fh) => h.update(fh.as_bytes()),
+            Err(_) => h.update(format!("missing-packer-src:{rel}\0").as_bytes()),
+        };
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
+
+/// Runs the kernel-less build pipeline (ResolvePins → guest-agent → guest-tools → rootfs) once,
+/// hash-gated. The OCI rootfs stage does not consume the kernel (ART-9), so omitting the slow
+/// kernel stage is sound. Executed on a fresh current-thread runtime in a dedicated OS thread: this
+/// fn is called from the SYNC harness while the test's own tokio runtime is active, and a direct
+/// `block_on` inside a runtime panics — a separate thread has no ambient runtime.
+#[cfg(feature = "pipeline")]
+fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
+    let dir = dir.to_path_buf();
+    let ws = workspace_root();
+    let joined = std::thread::scope(|s| {
+        s.spawn(move || -> crate::error::Result<()> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(crate::error::Error::Io)?;
+            rt.block_on(async move {
+                Pipeline::new(dir.clone())
+                    .add_stage(Box::new(ResolvePinsStage {
+                        pins_file: ws.join("pins.json"),
+                    }))
+                    .add_stage(Box::new(crate::artifact::guest_agent::GuestAgentStage {}))
+                    .add_stage(Box::new(crate::artifact::guest_tools::GuestToolsStage {}))
+                    .add_stage(Box::new(crate::artifact::rootfs::RootfsStage {
+                        image_override: None,
+                        agent_musl: None,
+                    }))
+                    .build(&Cache::default())
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .join()
+    });
+    match joined {
+        Ok(inner) => inner,
+        Err(_) => Err(crate::error::Error::Artifact(
+            "artifact build thread panicked".into(),
+        )),
+    }
+}
+
+/// An advisory `flock(LOCK_EX)` held for the lifetime of the value (nix's safe RAII `Flock`, which
+/// unlocks on drop — so this module keeps its `#![forbid(unsafe_code)]`). Serializes
+/// [`ensure_test_artifacts`] across concurrent test processes so they never race on the rootfs.
+#[cfg(feature = "pipeline")]
+struct BuildLock(
+    #[expect(dead_code, reason = "held only for its Drop, which releases the flock")]
+    nix::fcntl::Flock<std::fs::File>,
+);
+
+#[cfg(feature = "pipeline")]
+impl BuildLock {
+    fn acquire(path: &Path) -> crate::error::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(crate::error::Error::Io)?;
+        let locked = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, e)| crate::error::Error::Io(std::io::Error::from(e)))?;
+        Ok(Self(locked))
+    }
+}
+
 /// The cloud-hypervisor binary path: `$VMCELL_CH_BIN`, else bare `cloud-hypervisor`
 /// (resolved on `PATH`).
 ///
@@ -894,6 +1097,24 @@ impl Stage for ResolvePinsStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The at-most-once auto-build skip decision (`ensure_test_artifacts`). Fresh iff the rootfs
+    // output exists AND the stamp matches the current input fingerprint — so a source/dep/packer
+    // change (stamp mismatch) OR a deleted rootfs (output absent) both force a rebuild. Red-on-inverse:
+    // dropping the `rootfs_exists` guard makes the deleted-rootfs case wrongly "fresh"; dropping the
+    // stamp compare makes a changed input wrongly "fresh".
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn artifacts_stamp_fresh_requires_present_output_and_matching_stamp() {
+        let fp = "fingerprint-abc";
+        // Fresh: output present and stamp matches.
+        assert!(artifacts_stamp_fresh(Some(fp), fp, true));
+        // NOT fresh: output missing (a deleted rootfs must rebuild even with a matching stamp).
+        assert!(!artifacts_stamp_fresh(Some(fp), fp, false));
+        // NOT fresh: an input changed (stamp differs), or no stamp yet.
+        assert!(!artifacts_stamp_fresh(Some("stale"), fp, true));
+        assert!(!artifacts_stamp_fresh(None, fp, true));
+    }
 
     // Guards the consolidated artifacts-dir default: a buggy resolver that drops the
     // default (or points it at `/tmp/...`) goes red here. Exercises the PURE inner fn so

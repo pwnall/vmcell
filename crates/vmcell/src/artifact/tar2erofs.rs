@@ -229,7 +229,7 @@ fn build_node_map<'a, R: Read + 'a>(
             mtime: 0,
             mtime_nsec: 0,
         };
-        // Only injected binaries (guest-agent -> usr/sbin, guest-tools -> usr/bin) are
+        // Only injected binaries (guest-agent -> usr/sbin, guest-tools -> vmcell-tools) are
         // executable; injected DATA files (the CA cert under ca-certificates/) are 0o644.
         let mode = injected_file_mode(dest_path) | fs_erofs::inode::S_IFREG;
         let node = Node::File {
@@ -387,14 +387,24 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
     Ok(image)
 }
 
-/// Mode for an injected file, keyed on its destination path: binaries under a
-/// `bin`/`sbin` dir are executable (`0o755`), all other injected files — notably the
-/// deployment CA cert under `ca-certificates/` — are non-executable data (`0o644`).
+/// Mode for an injected file, keyed on its destination path: injected BINARIES are
+/// executable (`0o755`), every other injected file — notably the deployment CA cert under
+/// `ca-certificates/` — is non-executable data (`0o644`). The executable destinations are a
+/// `bin`/`sbin` component (the guest-agent lands in `usr/sbin`) OR the `vmcell-tools` dir that
+/// holds the guest-tools multicall (`ip`/`curl`/`kvm-ok`, exec'd off PATH via the symlinks the
+/// agent prepends). `vmcell-tools` MUST be in this set: guest-tools moved out of `usr/bin` to
+/// the dedicated `/vmcell-tools` dir, and a `bin`/`sbin`-only predicate silently packed it
+/// `0o644` → `EACCES` on every `ip`/`curl`/`kvm-ok` exec. That stayed invisible while the rootfs
+/// was a warm-cache artifact (CI reuses the cached image); only a fresh pack reddens, so the
+/// unit gate `injected_guest_tools_binary_is_executable` pins the mode KVM-free.
 #[cfg(feature = "am-fs-erofs")]
 fn injected_file_mode(dest_path: &str) -> u16 {
-    let is_bin = Path::new(dest_path)
-        .components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some("bin" | "sbin")));
+    let is_bin = Path::new(dest_path).components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some("bin" | "sbin" | "vmcell-tools")
+        )
+    });
     if is_bin { 0o755 } else { 0o644 }
 }
 
@@ -478,6 +488,36 @@ mod tests {
         assert!(
             pack_one("usr/bin/coreutils", false).is_ok(),
             "a libc6-less base must pack when require_libc6=false (static-musl agent)"
+        );
+    }
+
+    // The injected guest-tools multicall (`vmcell-tools/vmcell-guest-tools`, the target of the
+    // `ip`/`curl`/`kvm-ok` symlinks the agent puts on PATH) MUST be packed executable (0o755) —
+    // it is exec'd, not read. `injected_file_mode` keys on the dest path, and guest-tools moved
+    // out of `usr/bin` to `/vmcell-tools`; a `bin`/`sbin`-only predicate packs it 0o644 → EACCES
+    // on every `ip`/`curl`/`kvm-ok`, which stayed invisible behind the warm rootfs cache (only a
+    // fresh pack reddens the integration suite). This KVM-free unit gate reddens on that
+    // regression: dropping `vmcell-tools` from the executable set flips the first assert to 0o644.
+    // The paths mirror the injection sites in `artifact::rootfs::mod` (guest-tools + guest-agent)
+    // and `artifact::rootfs::oci` (the CA cert).
+    #[test]
+    fn injected_guest_tools_binary_is_executable() {
+        // Executable injected binaries.
+        assert_eq!(
+            injected_file_mode("vmcell-tools/vmcell-guest-tools"),
+            0o755,
+            "the guest-tools multicall must be executable; `ip`/`curl`/`kvm-ok` exec it off PATH"
+        );
+        assert_eq!(
+            injected_file_mode("usr/sbin/vmcell-guest-agent"),
+            0o755,
+            "the guest-agent (PID 1) must be executable"
+        );
+        // Non-executable injected DATA: the deployment CA cert.
+        assert_eq!(
+            injected_file_mode("usr/local/share/ca-certificates/vmcell-proxy-ca.pem"),
+            0o644,
+            "the injected CA cert is data, not a binary"
         );
     }
 

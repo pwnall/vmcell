@@ -9,10 +9,16 @@ use vmcell::{MicroVm, VmConfig, Vmm};
 /// The built `vmlinux` artifact path (`VMCELL_KERNEL` or `target/vmcell-artifacts/vmlinux`),
 /// asserting it exists — the tests' known-good kernel.
 ///
+/// First calls [`vmcell::artifact::ensure_test_artifacts`], which builds the guest-agent /
+/// guest-tools / rootfs **at most once per session** (hash-gated) and fails loud with a one-command
+/// fix if the kernel is not pre-built — so a source edit to the agent, tools, or packer no longer
+/// silently runs against a stale rootfs.
+///
 /// # Panics
-/// Panics if the resolved `vmlinux` artifact does not exist (build it first: `vmcell build`).
+/// Panics if the kernel is missing (with the one-command build instruction) or the auto-build fails.
 #[must_use]
 pub fn get_vmlinux() -> PathBuf {
+    ensure_artifacts_or_panic();
     let p = vmcell::artifact::kernel_path();
     assert!(p.exists(), "vmlinux artifact missing at {p:?}");
     p
@@ -20,13 +26,33 @@ pub fn get_vmlinux() -> PathBuf {
 
 /// The built erofs rootfs artifact path (`VMCELL_ROOTFS` or the default), asserting it exists.
 ///
+/// Auto-builds via [`vmcell::artifact::ensure_test_artifacts`] first (see [`get_vmlinux`]).
+///
 /// # Panics
-/// Panics if the resolved rootfs artifact does not exist (build it first: `vmcell build`).
+/// Panics if the kernel is missing (with the one-command build instruction) or the auto-build fails.
 #[must_use]
 pub fn get_rootfs() -> PathBuf {
+    ensure_artifacts_or_panic();
     let p = vmcell::artifact::rootfs_path();
     assert!(p.exists(), "rootfs artifact missing at {p:?}");
     p
+}
+
+/// Runs the at-most-once, hash-gated artifact build; a failure (missing kernel, or a build error)
+/// aborts the test with the underlying message — the fail-loud contract these getters have always
+/// had, now with an actionable instruction instead of a bare "artifact missing". Rendered via
+/// `assert!` (not a bare `panic!`) to match the getters' existing pattern and the crate's lints.
+fn ensure_artifacts_or_panic() {
+    let outcome = vmcell::artifact::ensure_test_artifacts();
+    assert!(
+        outcome.is_ok(),
+        "{}",
+        outcome
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    );
 }
 
 /// The Cloud Hypervisor binary (`VMCELL_CH_BIN` or `cloud-hypervisor`).
