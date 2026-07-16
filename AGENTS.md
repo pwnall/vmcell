@@ -11,10 +11,12 @@ and the **only** one in the `vmcell` lib; Firecracker, QEMU, and crosvm are seco
 their own crates (`vmcell-firecracker`, `vmcell-qemu`, `vmcell-crosvm`), each depending on `vmcell`
 for the one `Vmm` trait, the `VmmCapabilities` descriptor, and the shared
 jail/seccomp/spawn/console/eligibility helpers — `vmcell` has no production edge back (only a
-dev-dep, for the matrix tests). `vmcell-crosvm` (design v29 §2.5) is boot-first: its boot/lifecycle path is
-**validated live** (21/21 via `just test-crosvm`), but the crosvm binary is absent on CI, so its live
-matrix is that opt-in recipe, not `test-privileged`; snapshot/virtio-fs/unpriv-net/disk-throttle stay
-honest-false. Adding it bumped `vmcell` 0.11→0.12 (`VmmCapabilities` gained `disk_io_throttle`).
+dev-dep, for the matrix tests). `vmcell-crosvm` (design v29 §2.5) is **validated live** (21/21 via
+`just test-crosvm`, including snapshot/restore), but the crosvm binary is absent on CI, so its live matrix
+is that opt-in recipe, not `test-privileged`. Snapshot/restore is the **Firecracker baked-CID pattern**
+(crosvm requires the baked vsock CID on restore, so `restore_rotates_host_paths` is false — single-lineage,
+no concurrent fan-out); virtio-fs/unpriv-net/disk-throttle stay honest-false. Adding crosvm bumped `vmcell`
+0.11→0.12 (`VmmCapabilities` gained `disk_io_throttle`).
 Crates (under `crates/`): `vmcell` (host lib), `vmcell-firecracker` / `vmcell-qemu` /
 `vmcell-crosvm` (the secondary backends), `vmcell-bench` (the cross-backend `bench-vm` harness,
 wiring all four backends), `vmcell-cli`,

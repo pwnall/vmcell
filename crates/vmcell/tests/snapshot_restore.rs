@@ -348,16 +348,35 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
                 }
             }
         } else {
-            // FC: verbatim rebind of the snapshot's baked AF_UNIX vsock path
-            // (`PUT /snapshot/load` re-binds it verbatim; no load-time override exists
-            // in v1.16). The agent reconnect above already proved the rebound transport
-            // functional; a rotated path here would mean FC diverged from its capability.
-            assert_eq!(
-                new_vsock,
-                original_vsock.as_str(),
-                "an AF_UNIX non-rotating backend must re-bind the \
-                 snapshot's baked vsock path verbatim"
-            );
+            // A non-rotating backend re-binds the snapshot's baked host-side vsock identity verbatim;
+            // what "identity" is depends on the transport (symmetric to the rotating branch above).
+            match vm.instance().vsock_endpoint() {
+                // FC: verbatim rebind of the snapshot's baked AF_UNIX vsock path
+                // (`PUT /snapshot/load` re-binds it verbatim; no load-time override exists
+                // in v1.16). The agent reconnect above already proved the rebound transport
+                // functional; a rotated path here would mean FC diverged from its capability.
+                vmcell::vmm::VsockEndpoint::Unix { .. } => {
+                    assert_eq!(
+                        new_vsock,
+                        original_vsock.as_str(),
+                        "an AF_UNIX non-rotating backend must re-bind the \
+                         snapshot's baked vsock path verbatim"
+                    );
+                }
+                // crosvm in-kernel vhost-vsock: identity is the guest CID, but unlike QEMU crosvm
+                // BAKES the CID into the snapshot and rejects a rotated `--vsock cid=` on restore
+                // ("Virtio vsock incorrect cid for restore"), so `restore()` reuses the baked CID
+                // verbatim (`restore_rotates_host_paths: false`). Block 2 reserved the source's CID, so
+                // a backend that (wrongly) rotated it would hand a DIFFERENT one — this `assert_eq`
+                // reddens on that inverse. The reconnect above already proved the rebound CID live.
+                vmcell::vmm::VsockEndpoint::Vsock { cid, .. } => {
+                    assert_eq!(
+                        cid, original_cid,
+                        "a non-rotating AF_VSOCK backend (crosvm) must reuse the snapshot's baked \
+                         cid={original_cid} verbatim, got {cid}"
+                    );
+                }
+            }
         }
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();

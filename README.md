@@ -102,12 +102,13 @@ official prebuilt binary release** and no Debian/Ubuntu package, so it is built 
 only *spawned* as an external binary (never linked as a crate), so — exactly like the QEMU binary — it
 does **not** enter the workspace `Cargo.lock`, the `cargo deny` license scan, or the dependency tree.
 
-crosvm is **boot-first**: its boot/lifecycle path (boot, agent-exec, sessions, tap networking, cgroup
-limits) is validated live via the opt-in `just test-crosvm` matrix (21/21 on a KVM host with a
-source-built crosvm), while snapshot/virtio-fs/unprivileged-net stay honest-`false`. Its KVM-free gates
-(unit tests, capability-honesty pins, seccomp mapping, clippy) run in `just ci`; the live matrix needs
-KVM **and** a crosvm binary and is deliberately **not** part of `just test-privileged`, so a host without
-crosvm is unaffected — install this only to run the crosvm backend.
+crosvm's full path (boot, agent-exec, sessions, tap networking, cgroup limits, and **snapshot/restore**)
+is validated live via the opt-in `just test-crosvm` matrix (21/21 on a KVM host with a source-built
+crosvm); virtio-fs and unprivileged-net stay honest-`false`. Snapshot/restore follows the Firecracker
+baked-CID pattern (single-lineage, no concurrent fan-out). Its KVM-free gates (unit tests,
+capability-honesty pins, seccomp mapping, clippy) run in `just ci`; the live matrix needs KVM **and** a
+crosvm binary and is deliberately **not** part of `just test-privileged`, so a host without crosvm is
+unaffected — install this only to run the crosvm backend.
 
 Build from source (Debian / Ubuntu):
 

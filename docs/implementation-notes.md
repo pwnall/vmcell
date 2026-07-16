@@ -1174,3 +1174,46 @@ unprivileged-net reject, restore-Unsupported) run under `just test-unit` (`--all
 run under the `crosvm` feature; `cargo semver-checks -p vmcell` gates the 0.12.0 bump. Live (opt-in):
 `just test-crosvm` (21/21 on this KVM host) + `vmcell-bench`'s `test_benchmark_crosvm`. `cargo machete`
 clean (the template's `tempfile` dev-dep was dropped — crosvm tests need no tempdir).
+
+## crosvm snapshot/restore — the Firecracker baked-CID pattern (design v29 §2.5, 2026-07-16)
+
+Follow-up to the crosvm addition above (which shipped with `snapshot_restore: false` as the recorded
+deferral): snapshot/restore is now implemented and **validated live**. The `snapshot_restore`,
+`extra_block_survives_snapshot`, and `fork_branch_lineage` matrix legs pass for crosvm, and the four
+backends' `snapshot_restore` legs (CH/FC/QEMU/crosvm) all pass together. No `vmcell` API change (the
+capability *values* changed, not the struct), so no further version bump beyond the 0.12.0 above.
+
+- **Mechanism (mirrors QEMU's shape, FC's semantics).** `snapshot()` full-suspends (`crosvm suspend
+  --full` — crosvm requires all devices asleep), runs `crosvm snapshot take <dir>/crosvm-snapshot
+  <sock>` (single-file artifact), persists a CID sidecar, and resumes the source (best-effort, warn-only).
+  `restore()` fail-loud-checks the artifact + sidecar exist, then spawns `crosvm run --suspended --restore
+  <snap> …` with a fresh `res` (rotated vmid/tap/MAC); it returns a paused instance (`restored: true`).
+  The orchestrator's `resume()` issues the completing `crosvm resume --full` — a one-shot `restored` flag
+  consumed only on success (so a transient failure stays retryable). `create` and `restore` share one
+  `spawn(cfg, res, cgroups, restore_from, guest_cid)`; the only run-arg delta is `--restore <snap>`.
+
+- **The load-bearing empirical finding: crosvm BAKES the vsock CID and requires it on restore.** First
+  attempt rotated the CID (QEMU-style, `res.guest_cid`) and crosvm rejected it fail-loud: `restore failed
+  for device pcivirtio-vsock: Virtio vsock incorrect cid for restore: Expected: 4, Actual: 3`. So crosvm
+  is the **Firecracker** pattern, not QEMU's: `restore_rotates_host_paths: false`, and `restore()` reuses
+  the baked CID carried in a `crosvm-host-cid.txt` sidecar (the AF_VSOCK analogue of FC's
+  `HOST_PATHS_SIDECAR` — AF_VSOCK needs only the CID, no host UDS path; plain decimal text, no serde). The
+  vmid/MAC/IP still rotate to `res.vmid` via the post-restore resync (validated: the leg asserts
+  `post_mac == mac_math(new_vmid)` + rotated default route + injected-clock resync + RNG reseed). Only the
+  vsock CID stays baked, so **concurrent** restores from one lineage are unsupported (FC's constraint,
+  §17); sequential lineage works.
+
+- **The one non-Suspendable device (already handled).** The `--no-usb` from the boot work doubles as the
+  snapshot enabler: crosvm's default xhci controller is the one device that fails `Suspendable`; the
+  virtio block/net/vsock/serial set snapshots cleanly.
+
+- **Shared-test change.** `tests/snapshot_restore.rs`'s `restore_rotates_host_paths == false` branch was a
+  single AF_UNIX `assert_eq!(new_vsock, original_vsock)` (FC's shape). crosvm introduced a new (AF_VSOCK,
+  non-rotating) combination, so that branch now matches on `vsock_endpoint()` — `Unix` → the FC verbatim
+  path assert; `Vsock` → `assert_eq!(cid, original_cid)` (baked-CID reuse), symmetric to the rotating
+  branch's `assert_ne!`. Re-ran CH/FC/QEMU snapshot legs to confirm no regression.
+
+- **Gates.** crosvm arg-builder unit test extended (`--restore` present + rotated-`--vsock cid=` on the
+  restore variant, cold create carries no `--restore`); the restore-Unsupported unit test became
+  `restore_checks_snapshot_file_before_spawning` (KVM-free missing-artifact reject); the capability-honesty
+  test flipped `snapshot_restore` true / `restore_rotates_host_paths` false with the baked-CID rationale.

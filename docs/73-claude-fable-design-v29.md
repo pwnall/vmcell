@@ -16,10 +16,10 @@
 > **v29 adds a fourth VMM backend — crosvm** (the ChromeOS Rust VMM), a fourth *secondary* backend
 > alongside Firecracker and QEMU, in the new `vmcell-crosvm` crate. It is documented at **§2.5** (the other
 > backends renumber only the capability matrix, now §2.6); its seccomp posture is folded into §12.2, its
-> crate into §9.1, and its remaining open items into §17. crosvm ships **boot-first**: its snapshot,
-> virtio-fs, unprivileged-net, and disk-throttle capabilities are honest-**false**, but its boot/lifecycle
-> path (boot, vsock/agent, tap networking, sessions, cgroup limits, and every `require_cap!` skip) is
-> **validated live** on a KVM host with a source-built crosvm (the `just test-crosvm` matrix). The one
+> crate into §9.1, and its remaining open items into §17. Its full shipped path — boot, vsock/agent, tap
+> networking, sessions, cgroup limits, **snapshot/restore** (the Firecracker baked-CID pattern, §2.5), and
+> every `require_cap!` skip — is **validated live** on a KVM host with a source-built crosvm (the
+> `just test-crosvm` matrix); virtio-fs, unprivileged-net, and disk-throttle stay honest-**false**. The one
 > non-additive ripple: adding crosvm surfaced a per-backend divergence — it has no disk I/O rate limiter —
 > so `VmmCapabilities` gained a `disk_io_throttle` field, a breaking change to an exhaustive struct that
 > bumps **`vmcell` 0.11 → 0.12** (cargo-semver-checks-gated). No trait or existing-backend *behavior*
@@ -225,7 +225,7 @@ pub trait Vmm: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VmmCapabilities {
-    pub snapshot_restore: bool,            // CH ✓ · FC ✓ (single-lineage host paths, §2.3) · QEMU ✓ (in-kernel vhost-vsock, §2.4) · crosvm ✗ (v29 boot-first, §2.5)
+    pub snapshot_restore: bool,            // CH ✓ · FC ✓ (single-lineage host paths, §2.3) · QEMU ✓ (in-kernel vhost-vsock, §2.4) · crosvm ✓ (baked-CID, FC-pattern, §2.5)
     pub lazy_restore: bool,                // demand-paged restore. CH ✓ (--restore … prefault=off) · FC ✗ · QEMU ✗ · crosvm ✗
     pub virtio_fs_shares: bool,            // CH, QEMU ✓ · FC ✗ (block-only) · crosvm ✗ (has --shared-dir; unvalidated, §2.5)
     pub unprivileged_vhost_user_net: bool, // smoltcp NAT via vhost-user-net: CH, QEMU ✓ · FC ✗ · crosvm ✗ (unvalidated, §2.5)
@@ -236,7 +236,8 @@ pub struct VmmCapabilities {
     pub restore_rotates_host_paths: bool,  // CH ✓ (restore config-rewrite moves host paths into the new
                                            //   scratch dir) · FC ✗ (re-binds the baked vsock UDS verbatim)
                                            //   · QEMU ✓ (restore rotates the host-global guest CID, §2.4)
-                                           //   · crosvm ✗ (moot while snapshot_restore=false, §2.5)
+                                           //   · crosvm ✗ (crosvm bakes+requires the vsock CID on restore
+                                           //   — the FC pattern; reuses the baked CID, §2.5)
     pub disk_io_throttle: bool,            // per-drive I/O rate limit (§4.6): CH (rate_limiter_config),
                                            //   FC (rate_limiter), QEMU (throttling.*) ✓ · crosvm ✗
                                            //   (--block has no bandwidth/iops key) — rejects a throttled
@@ -402,30 +403,40 @@ AF_UNIX hybrid default — so `vsock_endpoint()` returns `VsockEndpoint::Vsock{c
 external vsock daemon to own. Validated live in the **privileged** mode; whether `/dev/vhost-vsock` is
 reachable in the **unprivileged** (KVM-group) mode is still an open question (§17).
 
-**crosvm is boot-first, and its boot/lifecycle path is now VALIDATED** — the full `vmm_matrix_test!` set
-(boot + agent-exec + put_file, sessions, concurrency, extra-block, privileged egress/host-endpoint,
-metrics/cgroup limits, and every `require_cap!` skip) passes on a KVM host with a source-built crosvm via
-the opt-in `just test-crosvm` (§15.4); it stays out of the default `test-privileged` because the binary is
-absent on CI. Capabilities are honest-conservative: `snapshot_restore=false` (upstream snapshot is
-experimental — limited device set, unstable CBOR — `restore()`/`snapshot()` return `Unsupported` fail-loud),
-`virtio_fs_shares=false` (crosvm has `--shared-dir type=fs` but it is in-process virtiofs, framed
-differently from the external-vhost-user `config_has_vhost_user_device` law, and unvalidated — `create()`
-rejects a share), `unprivileged_vhost_user_net=false`, `restore_rotates_host_paths=false`,
-`lazy_restore=false`, and **`disk_io_throttle=false`** (crosvm's `--block` has no bandwidth/iops key, unlike
-CH/FC/QEMU — the divergence that added the `disk_io_throttle` capability, §2.6; `create()` rejects a
-throttled disk fail-loud). `nested_virt=false` is a **hard** documented-unsupported (crosvm exposes no
-working guest `/dev/kvm`). Only `virtio_console=true` is a positive feature claim. Each `false` self-skips
-its matrix leg via `require_cap!` (recorded to the skip manifest, never a silent green) and carries a
-KVM-free honesty pin. Snapshot/zygote support, if crosvm's block+net+vsock devices all round-trip a
-snapshot on the pinned build, is the recorded follow-up (§17).
+**Snapshot/restore — the Firecracker pattern, not QEMU's.** `snapshot()` full-suspends the VM (crosvm
+requires all devices asleep to snapshot), runs `crosvm snapshot take <dir>/crosvm-snapshot <sock>`,
+persists a CID sidecar, and resumes the source; `restore()` spawns `crosvm run --suspended --restore
+<snap> …`, returns a paused instance, and the orchestrator's `resume()` issues the completing
+`crosvm resume --full` (a `restored` one-shot flag, consumed only on success). The load-bearing empirical
+finding: **crosvm bakes the vsock CID into the snapshot and rejects a rotated one on restore** ("Virtio
+vsock incorrect cid for restore: Expected N, Actual M", validated live). So — unlike QEMU's rotating CID —
+crosvm reuses the **baked** CID (carried in the `crosvm-host-cid.txt` sidecar, the AF_VSOCK analogue of
+FC's `HOST_PATHS_SIDECAR`), and `restore_rotates_host_paths` is **false**: the vmid/MAC/IP still rotate to
+`res.vmid` via the post-restore resync (§8.2), but the vsock CID does not, so restore-while-alive and
+concurrent restores from one lineage are unsupported (the §17 single-snapshot-CoW gap — exactly FC's
+constraint). The **one non-Suspendable device** is the default xhci USB controller, already dropped via
+`--no-usb`; the block/net/vsock/serial set snapshots cleanly.
+
+**All of crosvm's shipped path is VALIDATED live** — the full `vmm_matrix_test!` set (boot + agent-exec +
+put_file, sessions, concurrency, extra-block, privileged egress/host-endpoint, metrics/cgroup limits,
+**snapshot/restore + extra-block-survives-snapshot + fork/branch lineage**, and every `require_cap!` skip)
+passes on a KVM host with a source-built crosvm via the opt-in `just test-crosvm` (§15.4); it stays out of
+the default `test-privileged` because the binary is absent on CI. The remaining capabilities are
+honest-`false`: `virtio_fs_shares` (crosvm has in-process `--shared-dir type=fs`, framed differently from
+the external-vhost-user `config_has_vhost_user_device` law, unvalidated — `create()` rejects a share),
+`unprivileged_vhost_user_net`, `lazy_restore`, `restore_rotates_host_paths` (baked CID, above), and
+`disk_io_throttle` (crosvm's `--block` has no bandwidth/iops key, unlike CH/FC/QEMU — the divergence that
+added the `disk_io_throttle` capability, §2.6; `create()` rejects a throttled disk fail-loud). `nested_virt`
+is a **hard** documented-unsupported (no working guest `/dev/kvm`). Each `false` self-skips its matrix leg
+via `require_cap!` (recorded to the skip manifest, never a silent green) and carries a KVM-free honesty pin.
 
 ### 2.6 The capability matrix
 
-| Capability | CH | Firecracker | QEMU | crosvm *(v29, boot-validated)* |
+| Capability | CH | Firecracker | QEMU | crosvm *(v29, validated)* |
 |---|---|---|---|---|
-| `snapshot_restore` | **✓** | **✓** *(single-lineage host paths)* | **✓** *(in-kernel vhost-vsock + `migrate`/`-incoming`, §2.4)* | ✗ *(boot-first; upstream-experimental, §2.5)* |
+| `snapshot_restore` | **✓** | **✓** *(single-lineage host paths)* | **✓** *(in-kernel vhost-vsock + `migrate`/`-incoming`, §2.4)* | **✓** *(baked-CID reuse, FC-pattern, §2.5)* |
 | `lazy_restore` (demand-paged) | ✓ | ✗ | ✗ | ✗ |
-| `restore_rotates_host_paths` | ✓ *(enables concurrent zygote fan-out, §8.4)* | ✗ *(verbatim baked vsock path — single-lineage)* | ✓ *(restore rotates the host-global guest CID — concurrent fan-out, §2.4/§8.4)* | ✗ *(moot while snapshot_restore=false)* |
+| `restore_rotates_host_paths` | ✓ *(enables concurrent zygote fan-out, §8.4)* | ✗ *(verbatim baked vsock path — single-lineage)* | ✓ *(restore rotates the host-global guest CID — concurrent fan-out, §2.4/§8.4)* | ✗ *(baked vsock CID reused — single-lineage, FC-like, §2.5)* |
 | `virtio_fs_shares` | ✓ | ✗ (block-only) | ✓ | ✗ *(has `--shared-dir`; unvalidated)* |
 | `unprivileged_vhost_user_net` | ✓ | ✗ | ✓ | ✗ *(unvalidated)* |
 | `nested_virt` | ✓ | ✗ | ✓ | ✗ *(documented-unsupported)* |
@@ -3233,24 +3244,28 @@ snapshot cache key already folds CH build identity so a bump invalidates stale s
 
 **crosvm (v29).** Boot, lifecycle, vsock/agent, tap networking, sessions, and cgroup limits are **validated
 live** (§2.5, the `just test-crosvm` matrix); the CLI flag spellings and the seccomp/jail posture were
-confirmed against a source-built crosvm and pinned in arg-builder unit tests. What remains open:
-(1) **snapshot/restore** — whether crosvm's block + tap-net + in-kernel-vsock devices all implement
-`Suspendable` so `snapshot take`/`--restore` round-trips; this gates `snapshot_restore` and, with it,
-`restore_rotates_host_paths` and crosvm zygote fan-out. (The default xhci controller is *not* `Suspendable`
-— already dropped with `--no-usb`, §2.5.) (2) **vsock privilege** — in-kernel vhost-vsock is validated in
-the **privileged** mode; whether `/dev/vhost-vsock` is reachable in the **unprivileged** KVM-group mode (or
-needs a vhost-user-vsock AF_UNIX alternative) is untested. (3) **virtio-fs** — validate crosvm's in-process
-`--shared-dir type=fs` and reconcile its (non-external-vhost-user) framing with the
-`config_has_vhost_user_device` eligibility law before flipping `virtio_fs_shares`. (4) **unprivileged
-vhost-user-net** for the smoltcp NAT. (5) **disk I/O throttling** — crosvm's `--block` has no bandwidth/iops
-key, so `disk_io_throttle` is a hard `false` (§2.6); a future `blkdebug`-style shim is the only path.
-(6) **control transport** — the shipped choice re-invokes the crosvm binary as a client; linking
-`libcrosvm_control` (lower latency, a build/link step) is the recorded alternative. **Resolved during v29
-validation** (was open at design time): crosvm's own multiprocess sandbox is incompatible with the
-single-process supervision model (`/var/empty` jail failure), so it runs `--disable-sandbox` + the Layer-2
-jailer deny-list (on for `Enforcing`) — validated to boot, exec, and do tap/netns networking under the
-deny-list (§12.2). crosvm still runs its KVM-free gates in `just ci`; `just test-crosvm` is the opt-in live
-suite (kept out of `test-privileged` because the binary is absent on CI).
+confirmed against a source-built crosvm and pinned in arg-builder unit tests. **Snapshot/restore is now
+shipped** (§2.5, FC-pattern): `snapshot take`/`run --restore` round-trips the block/net/vsock/serial device
+set (USB is the one non-`Suspendable` device, dropped via `--no-usb`), validated by the
+`snapshot_restore` + `extra_block_survives_snapshot` + `fork_branch_lineage` matrix legs. What remains open:
+(1) **concurrent zygote fan-out** — crosvm bakes+requires the vsock CID on restore, so
+`restore_rotates_host_paths` is `false` and only *sequential* lineage works (concurrent restores from one
+snapshot collide on the baked CID — exactly FC's single-lineage constraint, §8.4). Lifting it needs a
+future crosvm that accepts a rotated `--vsock cid=` on restore. (2) **vsock privilege** — in-kernel
+vhost-vsock is validated in the **privileged** mode; whether `/dev/vhost-vsock` is reachable in the
+**unprivileged** KVM-group mode (or needs a vhost-user-vsock AF_UNIX alternative) is untested. (3)
+**virtio-fs** — validate crosvm's in-process `--shared-dir type=fs` and reconcile its
+(non-external-vhost-user) framing with the `config_has_vhost_user_device` eligibility law before flipping
+`virtio_fs_shares`. (4) **unprivileged vhost-user-net** for the smoltcp NAT. (5) **disk I/O throttling** —
+crosvm's `--block` has no bandwidth/iops key, so `disk_io_throttle` is a hard `false` (§2.6); a future
+`blkdebug`-style shim is the only path. (6) **control transport** — the shipped choice re-invokes the crosvm
+binary as a client; linking `libcrosvm_control` (lower latency, a build/link step) is the recorded
+alternative. **Resolved during v29 validation**: (a) crosvm's own multiprocess sandbox is incompatible with
+the single-process supervision model (`/var/empty` jail failure), so it runs `--disable-sandbox` + the
+Layer-2 jailer deny-list (on for `Enforcing`) — validated to boot, exec, and do tap/netns networking under
+the deny-list (§12.2); (b) snapshot/restore over the virtio device set works (baked-CID reuse). crosvm still
+runs its KVM-free gates in `just ci`; `just test-crosvm` is the opt-in live suite (kept out of
+`test-privileged` because the binary is absent on CI).
 
 **Storage & shares.** A per-share service-uid allocator for `virtiofsd` (§4.5). `fuse-backend-rs` as an
 in-process share backend is gated behind `experiment-fuse` but must enforce read-only before it can
