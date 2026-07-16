@@ -120,11 +120,11 @@ for all three backends) and the rewritten connect/handshake law (measured by the
 vsock-rtt on both the Unix and Vsock arms). The **follow-up probes below** (added 2026-07-15,
 collected every run) cover the surfaces this pass flagged as unreached — round 1: unprivileged
 smoltcp NAT egress (`net-egress`), CoW / zygote fan-out (`zygote`), the daemon HTTP + broker bridge
-(`perf-daemon.sh`); round 2: **privileged** networked start (netns + tap + 1 `nft` spawn + tproxy,
+(`--mode daemon-api`); round 2: **privileged** networked start (netns + tap + 1 `nft` spawn + tproxy,
 via `net-egress --net-mode privileged` under the blessed runner's `CAP_NET_ADMIN`), the **TLS-MITM
 egress proxy** per-connection cert mint + handshake (`--net-mode tls`/`privileged`), interactive
 **sessions** (`--mode session`: the `SessionMux` second handshake + per-session open), and the daemon
-**`restore_cow`** tree-copy (`perf-daemon.sh` `restore`). The **only** surface left deliberately
+**`restore_cow`** tree-copy (`--mode daemon-api` `restore`). The **only** surface left deliberately
 unmeasured is the MITM proxy→origin (upstream) TLS handshake: hudsucker pins `with_webpki_roots()` on
 the upstream leg, so a hermetic self-signed local origin is rejected and measuring it would require a
 webpki-trusted public origin over the host's internet (WAN latency + external dependency) — out of
@@ -133,10 +133,9 @@ scope for a controlled probe. Every other changed latency surface is now bounded
 ### Follow-up probes — egress, zygote fan-out, daemon API (2026-07-15)
 
 Three probes for the changed-but-unmeasured paths above, shipped in `scripts/perf-matrix.sh` so
-they run every matrix: `bench-vm --mode net-egress` and `--mode zygote` (per backend, self-skipping
-where unsupported) and the standalone `scripts/perf-daemon.sh`. Same freq-pinned substrate as the
-matrix above, **except the daemon probe** (a plain backgrounded process — read its `list` bridge
-floor and deltas, not its absolute create).
+they run every matrix: `bench-vm --mode net-egress`, `--mode zygote` (per backend, self-skipping
+where unsupported), and `--mode daemon-api`. Same freq-pinned substrate as the matrix above (the
+daemon probe was later moved out of a standalone script into the freq-pinned `daemon-api` mode).
 
 **Networked egress (`net-egress`; CH + QEMU — Firecracker has no unprivileged vhost-user-net, skips).**
 Unprivileged smoltcp NAT + `Egress::Open` to an in-process host endpoint; the guest curls it through
@@ -185,27 +184,31 @@ concurrently, plus time-to-agent-ready across all.
   52 MB migrate stream copies far less than CH's dense 256 MB. agent-ready across all clones is a few
   ms — they are already resumed by `spawn_clones`; the fan-out cost is the CoW copy + restore + resume.
 
-**Daemon API (`perf-daemon.sh`; CH).** vmcelld HTTP + broker-bridge overhead over the raw VMM op,
-via `curl -w %{time_total}` (daemon-side request latency, excluding curl startup). NOT freq-pinned.
+**Daemon API (`bench-vm --mode daemon-api`; CH).** vmcelld HTTP + broker-bridge overhead over the
+raw VMM op. A Rust bench mode (moved out of the former `perf-daemon.sh` — it spawns its own
+`vmcelld`, drives it over an async pooled `reqwest::Client`, and reports through the shared `pcts`),
+so it is **freq-pinned** like every mode and the pooled connection isolates the *pure* per-op cost.
+`restore` is the same mode's op (round-2 table below).
 
 | Op | p50 / p95 | what it isolates |
 | --- | --- | --- |
-| **list** | **0.6 / 0.9 ms** | pure HTTP + broker bridge, NO VMM work — the **bridge floor** |
-| **exec** | **2.9 / 3.8 ms** | bridge + in-guest vsock exec (~2 ms over the raw vsock-rtt ~0.7 ms) |
-| **create** | 199 / 207 ms | full cold-boot-to-agent-ready THROUGH the HTTP + broker (defaults vcpus=2/mem=512) |
-| **destroy** | 262 / 273 ms | teardown THROUGH the daemon (graceful grace, like the ~260 ms `shutdown()` path) |
+| **list** | **0.1 / 0.2 ms** | pure HTTP + broker bridge, NO VMM work, connection reused — the **bridge floor** |
+| **exec** | **0.9 / 1.0 ms** | bridge + in-guest vsock exec (~0.2 ms over the raw vsock-rtt ~0.7 ms) |
+| **create** | 321 / 336 ms | full cold-boot-to-agent-ready THROUGH the HTTP + broker (defaults vcpus=2/mem=512) |
+| **destroy** | 260 / 265 ms | teardown THROUGH the daemon (graceful grace, like the ~260 ms `shutdown()` path) |
 
-- **`list` (~0.6 ms) is the clean bridge floor**: every daemon op forwards parent→broker over a
-  length-prefixed JSON frame on top of HTTP routing/auth; with no VMM work behind it, that ~0.6 ms is
-  the per-op tax the daemon adds. `exec` shows it on top of the vsock datapath (~2 ms over the
-  library-direct vsock-rtt); `create`/`destroy` are dominated by the VM lifecycle they wrap, so their
-  absolute figures are boot/teardown-bound (and not freq-pinned) — read the bridge delta, not the
-  total. Percentiles are nearest-rank (matching `bench-vm`'s `pcts`).
+- **`list` (~0.1 ms) is the clean bridge floor**: every daemon op forwards parent→broker over a
+  length-prefixed JSON frame on top of HTTP routing/auth; with no VMM work behind it and the
+  connection pooled, that ~0.1 ms is the per-op tax the daemon adds. (The former bash probe spawned a
+  fresh `curl` per call, folding TCP-connect + process spawn into ~0.6 ms; the pooled client strips
+  that.) `exec` adds the vsock datapath (~0.2 ms over the library-direct vsock-rtt); `create`/`destroy`
+  are dominated by the VM lifecycle they wrap (now freq-pinned, so their absolutes sit at the 2.2 GHz
+  base) — read the bridge delta, not the total. Percentiles are the shared nearest-rank `pcts`.
 
 ### Follow-up probes, round 2 — privileged net, TLS-MITM, sessions, daemon restore (2026-07-15)
 
 The four surfaces round 1 left unmeasured, now collected every run: `bench-vm --mode net-egress
---net-mode {tls,privileged}`, `--mode session`, and a snapshot+restore loop in `scripts/perf-daemon.sh`.
+--net-mode {tls,privileged}`, `--mode session`, and the `restore` op of `bench-vm --mode daemon-api`.
 
 **Filtered / TLS-MITM egress (`net-egress --net-mode tls` and `--net-mode privileged`).** The guest
 makes an HTTPS request through the `Egress::Filtered` proxy, which mints a per-connection leaf cert
@@ -258,23 +261,24 @@ long-lived sessions, not reattach; the connect handshake is the closest analogue
   plus session-registry bookkeeping. Sub-millisecond on all three; QEMU is marginally higher (its
   vsock/agent path).
 
-**Daemon restore (`perf-daemon.sh` `restore`; CH; not freq-pinned).** Snapshot one VM once, then time N
-restores via `POST /v1/vms` with `restore_from` — the `restore_cow` reflink tree-copy path.
+**Daemon restore (`bench-vm --mode daemon-api` `restore`; CH; freq-pinned).** Snapshot one VM once,
+then time N restores via `POST /v1/vms` with `restore_from` — the `restore_cow` reflink tree-copy path.
+(Same mode + run as the daemon-API table above; broken out for the restore-specific analysis.)
 
 | Op | p50 / p95 | vs |
 | --- | --- | --- |
-| **restore** | **269 / 282 ms** | daemon `create` 180 ms; library-direct CH restore ~49 ms |
+| **restore** | **567 / 591 ms** | daemon `create` 321 ms; library-direct CH restore ~49 ms |
 
-- Daemon `restore` (269 ms) is **slower than the daemon `create`** (180 ms) here because `restore_cow`
+- Daemon `restore` (567 ms) is **slower than the daemon `create`** (321 ms) here because `restore_cow`
   byte-copies the whole memory image (**FullCopy** — the store dir is not on a reflink fs, same as the
   zygote/CoW finding) before restoring, whereas cold create boots fresh. On a reflink fs the copy is
   near-instant and restore would beat create. The gap over the library-direct restore (~49 ms) is the
-  FullCopy + the larger default geometry (512 MiB / 2 vCPU) + the HTTP/broker hop.
+  FullCopy + the larger default geometry (512 MiB / 2 vCPU) + the HTTP/broker hop + freq-pinning.
 
 ## Full backend×mode matrix (2026-07-04, HEAD `c6eeefc`) — PRIOR CANONICAL
 
-Every applicable metric on every backend, run via `scripts/perf-matrix.sh` (a superset of
-`perf-baseline.sh`; backends self-skip modes they cannot serve). Same substrate/method as the
+Every applicable metric on every backend, run via `scripts/perf-matrix.sh` (backends self-skip
+modes they cannot serve). Same substrate/method as the
 2026-07-02 matrix: freq-pinned at the 2.2 GHz base via the blessed runner under a delegated cgroup
 scope, warm-cache, mem=256 MiB, `default` profile. N=20 (latency) / N=12 (phase-budget) / N=200
 (vsock-rtt) / 8 concurrent (footprint). **Purpose:** re-validate after the v20/v21 wave (artifact

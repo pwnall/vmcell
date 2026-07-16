@@ -435,6 +435,13 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+    // `daemon-api` drives an already-spawned `vmcelld` over HTTP — it needs no local `Vmm`,
+    // so branch here (after the freq-pin engages, so the daemon's VM boots are freq-pinned)
+    // before the per-backend VMM construction. It ignores `--backend` (the daemon is CH).
+    if args.mode == "daemon-api" {
+        return run_daemon_api(&args).await;
+    }
+
     let allocator = VmidAllocator::new();
 
     match args.backend.as_str() {
@@ -516,6 +523,7 @@ const VALID_MODES: &[&str] = &[
     "net-egress",
     "zygote",
     "session",
+    "daemon-api",
 ];
 
 /// Validates `--mode` against [`VALID_MODES`].
@@ -2449,6 +2457,287 @@ async fn run_session<V: Vmm>(
             anyhow::bail!("session: no successful session opens");
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// daemon-api: the `vmcelld` HTTP + broker-bridge overhead over the raw VMM op. Spawns its
+// own `vmcelld` child (bench-vm runs under the blessed runner, so the daemon inherits the
+// caps via the ambient set), drives create/restore/exec/list/destroy over HTTP, and reports
+// through the shared `pcts` — replacing the former `scripts/perf-daemon.sh` (curl + a python
+// percentile reimplementation + curl-`%{time_total}` timing + python JSON id-parsing).
+// ----------------------------------------------------------------------------
+
+/// Owns the spawned `vmcelld` child and tears it down on drop: SIGTERM (so the daemon's
+/// signal handler runs `engine.shutdown_all()`, reaping every CH VM + the broker) → bounded
+/// wait → SIGKILL backstop → reap. Mirrors the `vmcelld` integration harness; a bare kill
+/// would orphan the live CH VMs.
+struct DaemonChild(std::process::Child);
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        // If the child was already reaped (e.g. the health-poll's `try_wait` collected it
+        // after an early daemon exit), its pid is freed and `Child::id()` is stale — do NOT
+        // signal it (that pid may have been recycled). This mirrors std's own `Child::kill`,
+        // which no-ops once the status is cached.
+        if matches!(self.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // SAFETY: `kill(2)` with a pid this process spawned and has NOT yet reaped (the guard
+        // above), plus a valid signal constant. It transfers no pointers and touches no memory.
+        unsafe {
+            libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM);
+        }
+        for _ in 0..50 {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// One timed HTTP request: `Instant` around send + a full body drain (the `curl
+/// %{time_total}` equivalent). Returns (elapsed µs, parsed JSON body — `Null` for an empty
+/// 204). A non-2xx status is a hard error (`error_for_status`), so a broken op fails loud.
+async fn daemon_timed(req: reqwest::RequestBuilder) -> anyhow::Result<(u128, serde_json::Value)> {
+    let t = Instant::now();
+    let resp = req.send().await?.error_for_status()?;
+    let body = resp.text().await?;
+    let us = t.elapsed().as_micros();
+    let v = if body.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&body)?
+    };
+    Ok((us, v))
+}
+
+/// `POST /v1/vms` with `body`, returning (elapsed µs, the created `vm.id`). Parses via
+/// `serde_json::Value` because the typed DTOs live in `vmcell-daemon`, which cannot be a
+/// dependency of `vmcell` (the `vmcell-daemon → vmcell` back-edge makes it a cyclic package).
+async fn daemon_create(
+    http: &reqwest::Client,
+    base: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<(u128, String)> {
+    let (us, v) = daemon_timed(
+        http.post(format!("{base}/v1/vms"))
+            .header("content-type", "application/json")
+            .body(body.to_string()),
+    )
+    .await?;
+    let id = v["vm"]["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("daemon-api: create response carried no vm.id"))?
+        .to_string();
+    Ok((us, id))
+}
+
+/// `DELETE /v1/vms/{id}`, returning the elapsed µs.
+async fn daemon_destroy(http: &reqwest::Client, base: &str, id: &str) -> anyhow::Result<u128> {
+    let (us, _) = daemon_timed(http.delete(format!("{base}/v1/vms/{id}"))).await?;
+    Ok(us)
+}
+
+/// Reports a daemon op's µs samples as ms (one decimal) through the shared nearest-rank
+/// `pcts` — the ONE percentile law (no second copy, unlike the retired python `pctl`).
+fn report_daemon_op(name: &str, samples: &mut [u128]) {
+    match pcts(samples) {
+        Some((p50, p95, p99, max)) => {
+            let ms = |us: u128| us as f64 / 1000.0;
+            println!(
+                "  {name:8}: count={} p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms",
+                samples.len(),
+                ms(p50),
+                ms(p95),
+                ms(p99),
+                ms(max)
+            );
+        }
+        None => println!("  {name:8}: No successful samples"),
+    }
+}
+
+/// §16 (Performance) — daemon-api: create/restore/exec/list/destroy latency through the
+/// `vmcelld` HTTP + broker bridge. `list` (no VMM work) is the pure bridge floor; `restore`
+/// exercises `restore_cow`. Spawns its own `vmcelld` (inheriting the runner's ambient caps),
+/// times each op with `Instant`, and reports via `pcts`.
+async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
+    // The daemon binary sits next to this one (same cargo profile dir: target/<profile>/).
+    let exe =
+        std::env::current_exe().map_err(|e| anyhow::anyhow!("daemon-api: current_exe: {e}"))?;
+    let vmcelld = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("daemon-api: current_exe has no parent dir"))?
+        .join("vmcelld");
+    if !vmcelld.exists() {
+        anyhow::bail!(
+            "daemon-api: vmcelld not built at {} (cargo build --locked --release -p vmcelld)",
+            vmcelld.display()
+        );
+    }
+
+    let (adir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
+    if !kernel.exists() || !rootfs.exists() {
+        println!("daemon-api: No successful runs (missing artifacts in {adir})");
+        anyhow::bail!("daemon-api: missing artifacts in {adir}");
+    }
+
+    // Private ephemeral artifact store: symlink the two prebuilt artifacts in (the store
+    // reads through symlinks — no copy). Dropped (cleaned) at function end.
+    let store = tempfile::tempdir().map_err(|e| anyhow::anyhow!("daemon-api: tempdir: {e}"))?;
+    for name in ["vmlinux", "rootfs.erofs"] {
+        std::os::unix::fs::symlink(PathBuf::from(&adir).join(name), store.path().join(name))
+            .map_err(|e| anyhow::anyhow!("daemon-api: symlink {name}: {e}"))?;
+    }
+
+    // Free ephemeral port so a stale/parallel daemon does not collide.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| anyhow::anyhow!("daemon-api: bind ephemeral port: {e}"))?;
+        l.local_addr()
+            .map_err(|e| anyhow::anyhow!("daemon-api: local_addr: {e}"))?
+            .port()
+    };
+    let base = format!("http://127.0.0.1:{port}");
+    let iters = args.iters();
+    let warmup = args.warmup;
+    let total = iters + warmup;
+
+    println!(
+        "=== DAEMON-API (vmcelld HTTP + broker bridge; port={port} n={iters} warmup={warmup}) ==="
+    );
+
+    // Launch vmcelld directly — bench-vm runs under the blessed runner, so the daemon inherits
+    // the three caps via the ambient set (the integration-harness path). Real broker split
+    // (no --no-setup-broker) so the bridge is what we measure.
+    let log = store.path().join("vmcelld.log");
+    let logf = std::fs::File::create(&log)
+        .map_err(|e| anyhow::anyhow!("daemon-api: create daemon log: {e}"))?;
+    let logf2 = logf
+        .try_clone()
+        .map_err(|e| anyhow::anyhow!("daemon-api: dup daemon log fd: {e}"))?;
+    let child = std::process::Command::new(&vmcelld)
+        .arg("--artifacts-dir")
+        .arg(store.path())
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--allow-unauthenticated")
+        .arg("--resource-prefix")
+        .arg("vmcd")
+        .stdout(logf)
+        .stderr(logf2)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("daemon-api: spawn vmcelld: {e}"))?;
+    // Owns teardown from here (SIGTERM → wait → SIGKILL), even on an early `?`.
+    let mut daemon = DaemonChild(child);
+
+    let http = reqwest::Client::new();
+
+    // Readiness: poll /healthz (20 s budget, matching the integration harness).
+    let mut healthy = false;
+    for _ in 0..80 {
+        if let Ok(r) = http.get(format!("{base}/healthz")).send().await
+            && r.status().is_success()
+        {
+            healthy = true;
+            break;
+        }
+        if matches!(daemon.0.try_wait(), Ok(Some(_))) {
+            anyhow::bail!(
+                "daemon-api: vmcelld exited before healthz (log: {})",
+                log.display()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    if !healthy {
+        anyhow::bail!(
+            "daemon-api: vmcelld not healthy in 20s (log: {})",
+            log.display()
+        );
+    }
+
+    let create_body = serde_json::json!({ "kernel": "vmlinux", "rootfs": "rootfs.erofs" });
+    let exec_body = serde_json::json!({ "argv": ["/bin/true"] });
+
+    // --- Lifecycle loop: create -> destroy, timing each (warmup excluded) ---
+    let mut create_us = Vec::with_capacity(iters);
+    let mut destroy_us = Vec::with_capacity(iters);
+    for i in 0..total {
+        let (cms, id) = daemon_create(&http, &base, &create_body).await?;
+        let dms = daemon_destroy(&http, &base, &id).await?;
+        if i >= warmup {
+            create_us.push(cms);
+            destroy_us.push(dms);
+        }
+    }
+
+    // --- Steady-op loop: one VM, N list + N exec (isolates the per-op bridge cost) ---
+    let (_, sid) = daemon_create(&http, &base, &create_body).await?;
+    for _ in 0..warmup {
+        let _ = daemon_timed(http.get(format!("{base}/v1/vms"))).await?;
+        let _ = daemon_timed(
+            http.post(format!("{base}/v1/vms/{sid}/exec"))
+                .header("content-type", "application/json")
+                .body(exec_body.to_string()),
+        )
+        .await?;
+    }
+    let mut list_us = Vec::with_capacity(iters);
+    let mut exec_us = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let (lms, _) = daemon_timed(http.get(format!("{base}/v1/vms"))).await?;
+        list_us.push(lms);
+        let (ems, _) = daemon_timed(
+            http.post(format!("{base}/v1/vms/{sid}/exec"))
+                .header("content-type", "application/json")
+                .body(exec_body.to_string()),
+        )
+        .await?;
+        exec_us.push(ems);
+    }
+    daemon_destroy(&http, &base, &sid).await?;
+
+    // --- Restore loop: snapshot one source VM once, then time N `restore_cow` restores ---
+    let (_, src_id) = daemon_create(
+        &http,
+        &base,
+        &serde_json::json!({ "kernel": "vmlinux", "rootfs": "rootfs.erofs", "snapshotting": true }),
+    )
+    .await?;
+    daemon_timed(
+        http.post(format!("{base}/v1/vms/{src_id}/snapshot"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({ "artifact_prefix": "snap0" }).to_string()),
+    )
+    .await?;
+    let restore_body = serde_json::json!({
+        "kernel": "vmlinux", "rootfs": "rootfs.erofs", "snapshotting": true, "restore_from": "snap0"
+    });
+    let mut restore_us = Vec::with_capacity(iters);
+    for i in 0..total {
+        let (rms, rid) = daemon_create(&http, &base, &restore_body).await?;
+        daemon_destroy(&http, &base, &rid).await?;
+        if i >= warmup {
+            restore_us.push(rms);
+        }
+    }
+    daemon_destroy(&http, &base, &src_id).await?;
+
+    report_daemon_op("create", &mut create_us);
+    report_daemon_op("restore", &mut restore_us);
+    report_daemon_op("exec", &mut exec_us);
+    report_daemon_op("list", &mut list_us);
+    report_daemon_op("destroy", &mut destroy_us);
+    println!("=== DAEMON-API done ===");
+
+    // Explicit graceful teardown (rather than waiting for the drop) so a hiccup surfaces here;
+    // `store` cleanup follows on its own drop.
+    drop(daemon);
+    Ok(())
 }
 
 #[cfg(test)]

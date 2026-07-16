@@ -931,7 +931,9 @@ backend, self-skipping where unsupported) and the standalone `scripts/perf-daemo
   it collapses to restore+resume on an XFS/Btrfs/bcachefs pair. `n>1` self-guards on
   `restore_rotates_host_paths` (FC → the single-clone control).
 
-- **`daemon-API` (`perf-daemon.sh`, CH).** Times `create`/`exec`/`list`/`destroy` with `curl -w %{time_total}`
+- **`daemon-API` (`perf-daemon.sh`, CH).** *(SUPERSEDED by the 2026-07-15 script-move below: this probe
+  is now the freq-pinned Rust `bench-vm --mode daemon-api`; the "NOT freq-pinned" and python-percentile
+  notes describe only the retired bash.)* Times `create`/`exec`/`list`/`destroy` with `curl -w %{time_total}`
   through a self-spawned `vmcelld` + broker. `list` (no VMM work) is the clean **bridge floor**; `exec`
   shows the bridge over the raw vsock datapath. NOT freq-pinned — read the `list` floor and deltas, not
   absolutes. Percentiles are nearest-rank (`ceil(n·q)-1`, matching `bench-vm`'s `pcts` — NOT the retired
@@ -999,3 +1001,38 @@ required-features bump; `just ci` green. Baseline in `docs/benchmark-results.md`
   module. The default feature set (and the `--features firecracker,qemu` perf build) already enable
   `proxy`, so every real build satisfies it; a proxy-less `cargo hack` combo now skips the bin instead of
   failing to compile.
+
+## Perf-script logic moved into the bench crate — daemon probe → Rust (2026-07-15)
+
+The bash probe scripts had accumulated non-trivial logic; moved it into the `vmcell` bench crate so
+the one-law rules apply and it is testable. `just ci` green.
+
+- **`scripts/perf-daemon.sh` (207 lines) → `bench-vm --mode daemon-api`** (`crates/vmcell/src/bin/bench-vm.rs`).
+  The script carried an ephemeral-port picker, artifact-store seeding, a daemon spawn/health-poll/
+  SIGTERM-teardown lifecycle, `curl -w %{time_total}` timing of five ops, python JSON id-parsing, and
+  **a python percentile heredoc reimplementing the Rust `pcts`** (a confirmed second copy of the
+  nearest-rank law — the exact "one law, one predicate" violation). The Rust mode collapses all of it
+  onto the shared `pcts` (via `report_daemon_op`), spawns/reaps `vmcelld` through a `DaemonChild` Drop
+  guard (SIGTERM → bounded wait → SIGKILL, mirroring the `vmcelld` integration harness), and drives the
+  HTTP with the async `reqwest::Client` + `serde_json`.
+  - **Why `serde_json::Value`, not the typed DTOs:** the DTOs live only in `vmcell-daemon`, and
+    `vmcell-daemon` has an (optional, `server`-gated) path dep back on `vmcell`, so
+    `vmcell → vmcell-daemon`/`vmcell-daemon-client` is a **cyclic package** (cargo errors even though
+    the back-edge is `default-features = false`-disabled). A `Value` mirror (`v["vm"]["id"].as_str()`)
+    is the cycle-free path — same shape the bash's `json.load(...)["vm"]["id"]` used.
+  - **Now freq-pinned + pooled.** It runs through `run-bench.sh` like every mode (was a standalone,
+    un-pinned script), so `vmcelld` inherits the runner's ambient caps by being spawned directly (the
+    integration-harness pattern, not a nested runner), and its VM boots are freq-pinned. The pooled
+    `reqwest::Client` keeps the connection alive, so `list`/`exec` measure the *pure* per-op bridge cost
+    (the bash spawned a fresh `curl` per call, folding in TCP connect + process spawn) — `list` drops
+    from ~0.6 ms to ~0.1 ms. Absolute create/restore rise (freq-pinned 2.2 GHz base vs the old
+    turbo-on script); the doc numbers are re-measured accordingly.
+- **`scripts/perf-baseline.sh` deleted** — dead (a strict subset of `perf-matrix.sh` with no caller;
+  the matrix header called it a superset). **`scripts/perf-matrix.sh` slimmed** — the inline daemon
+  block (its own tee/grep/`FAILED` copy) became one `run --mode daemon-api` call.
+- **What stays shell (irreducible):** `run-bench.sh` (`systemd-run --scope -p Delegate=yes` + the
+  blessed runner + freq-pin substrate — a process cannot put itself in a fresh scope or grant itself
+  file caps), `with-delegated-scope.sh` (cgroup-v2 subtree_control delegation from inside the scope),
+  and the `perf-matrix.sh` backend×mode loop (pure argv orchestration). A `bench-vm --mode all` was
+  rejected: per-mode process isolation — fresh address space / tokio runtime / delegated cgroup scope /
+  freq-pin, and a contained blast radius per mode — is a feature the shell loop provides for free.

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Full performance matrix: every applicable metric on every backend. Superset of
-# perf-baseline.sh (which is CH-latency/phase/vsock + FC-latency only). Backends
-# self-skip modes they cannot serve (QEMU has no snapshot -> suspend-size skips,
-# latency/phase-budget emit COLD only). Same substrate/method as perf-baseline.sh:
-# freq-pinned via the blessed runner under a delegated cgroup scope, warm-cache.
+# Full performance matrix: every applicable metric on every backend. Backends self-skip
+# modes they cannot serve (QEMU has no snapshot -> suspend-size skips, latency/phase-budget
+# emit COLD only). Substrate/method: freq-pinned via the blessed runner under a delegated
+# cgroup scope, warm-cache. Every mode — including daemon-api — is a `bench-vm` mode run
+# through run-bench.sh; there is no separate probe script.
 #
 # Usage: scripts/perf-matrix.sh [logfile]
 # Assumes: `just bless` installed the runner at .vmcell-bin/release/ and
@@ -52,18 +52,12 @@ done
 echo "==================== CH KSM-mergeable footprint ====================" | tee -a "$LOG"
 run --backend cloud-hypervisor --mode footprint --count 8 --ksm-mergeable
 
-# Daemon-API probe: the vmcelld HTTP + broker-bridge overhead over the raw VMM op — a
-# standalone script (spins up its own daemon), CH-only. Reuses the release runner like
-# run-bench.sh. Not freq-pinned (read the `list` bridge floor + deltas, not absolutes).
+# Daemon-API probe: the vmcelld HTTP + broker-bridge overhead over the raw VMM op. A
+# bench-vm mode (was scripts/perf-daemon.sh) — it spawns its own vmcelld, which inherits the
+# runner's ambient caps, drives create/restore/exec/list/destroy over HTTP, and reports
+# through the shared `pcts`. CH-only (the daemon backend is CH); freq-pinned like every mode.
 echo "==================== DAEMON-API probe (vmcelld HTTP + broker, CH) ====================" | tee -a "$LOG"
-echo "### scripts/perf-daemon.sh 20 3" | tee -a "$LOG"
-"$WS/scripts/perf-daemon.sh" 20 3 2>&1 | tee -a "$LOG" | grep -E "$KEEP"
-drc=${PIPESTATUS[0]}
-echo | tee -a "$LOG"
-if [ "$drc" -ne 0 ]; then
-  echo "!!! DAEMON-API probe FAILED (exit $drc)" | tee -a "$LOG"
-  FAILED=1
-fi
+run --backend cloud-hypervisor --mode daemon-api --iterations 20 --warmup 3
 
 if [ "$FAILED" -ne 0 ]; then
   echo "== FAILED @ $(date -Is): one or more benchmarks errored (full log: $LOG) ==" | tee -a "$LOG"
