@@ -389,7 +389,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     // leader-only, non-blocking `process.kill()` (which orphans the group).
     if crate::vmm::wait_for_socket(
         &api_socket,
-        &mut process,
+        Some(&mut process),
         1000,
         cfg.timeouts.api_socket_poll.as_millis() as u64,
     )

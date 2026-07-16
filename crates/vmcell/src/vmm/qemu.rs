@@ -560,7 +560,7 @@ impl Qemu {
             // never leaks.
             if let Err(e) = crate::vmm::wait_for_socket(
                 &vhost_vsock,
-                &mut vsock_daemon,
+                Some(&mut vsock_daemon),
                 1000,
                 cfg.timeouts.api_socket_poll.as_millis() as u64,
             )
@@ -736,6 +736,27 @@ impl Qemu {
                 .arg("-device")
                 .arg("virtio-net-pci,netdev=net0");
         } else if let Some(socket) = &res.vhost_user_socket {
+            // The smoltcp NAT (orchestrator) binds this UDS lazily from a background
+            // thread (`VhostUserDaemon::start` inside the thread, not `Listener::new`);
+            // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so
+            // it must not race the bind — otherwise boots die with
+            // "-chardev socket ...: Failed to connect ...: No such file or directory".
+            // Wait for the socket first: the same readiness gate the external vsock
+            // daemon gets above, but process-less (smoltcp is a thread, not a `Child`).
+            // CH's vhost-user-net frontend tolerates a not-yet-bound socket via its own
+            // client-side reconnect over its multi-second startup; QEMU does not. Normally
+            // the socket appears in <10 ms; the 2 s ceiling covers a bind thread scheduled
+            // late under a freq-pinned, many-thread load while abandoning a truly-failed
+            // smoltcp bring-up promptly (the ~10% flake the net-egress probe surfaced) so
+            // the caller's bounded retry recovers on a fresh VM. Fails loud on timeout; the
+            // mid-`start` teardown releases smoltcp.
+            crate::vmm::wait_for_socket(
+                socket,
+                None,
+                2000,
+                cfg.timeouts.api_socket_poll.as_millis() as u64,
+            )
+            .await?;
             cmd.arg("-chardev")
                 .arg(format!("socket,id=net0,path={}", socket.display()))
                 .arg("-netdev")

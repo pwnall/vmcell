@@ -300,7 +300,7 @@ pub fn build_vmm_cmd(
 ///   appear within `timeout_ms`.
 pub async fn wait_for_socket(
     socket_path: &Path,
-    process: &mut tokio::process::Child,
+    mut process: Option<&mut tokio::process::Child>,
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<()> {
@@ -318,8 +318,12 @@ pub async fn wait_for_socket(
             return Ok(());
         }
         // Fail fast on an early VMM exit so the real cause surfaces instead of a
-        // later, less-informative Timeout (M-VMM-8).
-        if let Some(status) = process.try_wait().unwrap_or(None) {
+        // later, less-informative Timeout (M-VMM-8). `None` when the socket's producer
+        // is an in-process thread (the smoltcp NAT) with no child to watch — then only
+        // the socket-existence + deadline checks apply.
+        if let Some(p) = process.as_deref_mut()
+            && let Some(status) = p.try_wait().unwrap_or(None)
+        {
             return Err(crate::error::Error::Vmm(format!(
                 "process exited early: {status}"
             )));
@@ -395,7 +399,8 @@ pub(crate) async fn register_and_await_ready(
         return Err(e);
     }
 
-    if let Err(e) = wait_for_socket(socket_path, process, timeout_ms, interval_ms).await {
+    if let Err(e) = wait_for_socket(socket_path, Some(&mut *process), timeout_ms, interval_ms).await
+    {
         reap_process_group(process, pgid);
         return Err(e);
     }
@@ -1164,7 +1169,7 @@ mod tests {
         let sock = dir.path().join("present.sock");
         std::fs::write(&sock, b"").expect("create stand-in socket path");
 
-        let result = wait_for_socket(&sock, &mut process, 100, 0).await;
+        let result = wait_for_socket(&sock, Some(&mut process), 100, 0).await;
 
         // Best-effort prompt reap on the success path (kill_on_drop covers panic);
         // the discarded results cannot affect the verdict, which is `result` below.
@@ -1190,7 +1195,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // A generous 5 s ceiling: the fail-fast path must return in well under it.
-        let result = wait_for_socket(&never, &mut process, 5000, 50).await;
+        let result = wait_for_socket(&never, Some(&mut process), 5000, 50).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -1218,10 +1223,32 @@ mod tests {
         let sock = dir.path().join("present.sock");
         std::fs::write(&sock, b"").expect("create stand-in socket path");
 
-        let result = wait_for_socket(&sock, &mut process, 100, 2000).await;
+        let result = wait_for_socket(&sock, Some(&mut process), 100, 2000).await;
         let _ = process.start_kill();
         let _ = process.wait().await;
         result.expect("interval > timeout must still check the present socket once");
+    }
+
+    // Guards the process-less (`None`) readiness path used for the smoltcp vhost-user-net
+    // socket (an in-process thread, no `Child` to watch): a present socket returns Ok and
+    // an absent one Times Out, with no `try_wait` on a non-existent process. Inverse:
+    // make the `process` param non-optional again and the smoltcp caller (qemu.rs) fails
+    // to compile, or an `unwrap` on the `None` process panics here.
+    #[tokio::test]
+    async fn wait_for_socket_process_less_present_ok_absent_times_out() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let present = dir.path().join("present.sock");
+        std::fs::write(&present, b"").expect("create stand-in socket path");
+        wait_for_socket(&present, None, 100, 5)
+            .await
+            .expect("a present socket must succeed with no process to watch");
+
+        let absent = dir.path().join("never.sock");
+        let result = wait_for_socket(&absent, None, 60, 5).await;
+        assert!(
+            matches!(result, Err(crate::error::Error::Timeout(_))),
+            "an absent socket with no process must Time Out, got {result:?}"
+        );
     }
 
     // Guards M-VMM-2: a control socket that accepts a connection but never speaks must

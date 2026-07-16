@@ -907,3 +907,57 @@ through the blessed runner (CAP_DAC_OVERRIDE opens `root:kvm 0660` `/dev/vhost-v
 - **(h) `memory-backend-file,share=on,mem-path=/dev/shm` migrates cleanly** — the restored guest resumed
   with correct RAM (route/clock/MAC all post-restore-correct), so no `x-ignore-shared`/`share=off` was
   needed for the erofs config (retiring a pre-implementation risk).
+
+## Coverage-gap perf probes — egress / zygote / daemon, + a QEMU vhost-user-net readiness gate (2026-07-15)
+
+Adds the three latency probes the 2026-07-15 perf pass named as unreached by the single-VM /
+no-network / library-direct `bench-vm` matrix (`docs/benchmark-results.md` coverage caveat), collected
+every run via `scripts/perf-matrix.sh`: `bench-vm --mode net-egress` and `--mode zygote` (per applicable
+backend, self-skipping where unsupported) and the standalone `scripts/perf-daemon.sh`. `just ci` green;
+`just test-privileged` re-run green (the one host-facing change is the QEMU readiness gate below).
+
+- **`net-egress` (CH + QEMU; FC self-skips — no `unprivileged_vhost_user_net`).** Boots with
+  `NetConfig::Unprivileged{ egress: Open, host_services_port }` to an in-process host responder (no
+  `python3 -m http.server` dependency; owned in a `Drop` guard), then curls it in-guest through the
+  smoltcp NAT and **asserts a returned egress byte** (`code==0 && !stdout.is_empty()` — the data-plane
+  law, not a proxy signal). Two metrics: NET-START (boot with the NAT on the path) and the in-guest
+  round-trip. Deliberately NOT `Privileged` (a directly-invoked bench lacks `CAP_NET_ADMIN` and would
+  leave netns residue).
+
+- **`zygote` (CH + QEMU concurrent; FC single-clone control).** Snapshots a base once, then times
+  `Zygote::spawn_clones` restoring + resuming N CoW clones, plus time-to-agent-ready across all. Prints
+  `probe_cow_support()` — **`FullCopy` on this host** (`$TMPDIR` tmpfs + `target/` ext4, neither
+  reflink-capable), so the per-clone figure is the non-reflink ceiling (the whole snapshot is byte-copied);
+  it collapses to restore+resume on an XFS/Btrfs/bcachefs pair. `n>1` self-guards on
+  `restore_rotates_host_paths` (FC → the single-clone control).
+
+- **`daemon-API` (`perf-daemon.sh`, CH).** Times `create`/`exec`/`list`/`destroy` with `curl -w %{time_total}`
+  through a self-spawned `vmcelld` + broker. `list` (no VMM work) is the clean **bridge floor**; `exec`
+  shows the bridge over the raw vsock datapath. NOT freq-pinned — read the `list` floor and deltas, not
+  absolutes. Percentiles are nearest-rank (`ceil(n·q)-1`, matching `bench-vm`'s `pcts` — NOT the retired
+  `floor(n·q)` estimator, a `<<< '' | pctl`-tested one-liner). Pitfall recorded: `python3 - "$1" <<HEREDOC`
+  makes the heredoc python's stdin, so `sys.stdin.read()` reads the *program* not the piped data and every
+  sample set reads empty — pass the program via `-c` so stdin stays the data.
+
+- **QEMU vhost-user-net startup race — fixed (readiness gate).** The `net-egress` probe surfaced a real
+  QEMU-backend bug the single-VM egress tests never hit: `spawn_qemu` waits for its external
+  `vhost-device-vsock` daemon socket (`wait_for_socket`) before launch, but did **not** wait for the
+  smoltcp `vhost-user-net` socket. The smoltcp NAT binds that UDS lazily from a background thread
+  (`VhostUserDaemon::start`, not `Listener::new`); QEMU's `-chardev socket` connects as a client at `exec`
+  with **no retry**, so it raced the bind and died `"-chardev socket …: Failed to connect …: No such file
+  or directory"` (~30% of boots). CH's vhost-user-net frontend tolerates a not-yet-bound socket via its own
+  client-side reconnect; QEMU does not. *Fix (one law):* `wait_for_socket` now takes `Option<&mut Child>`
+  (the smoltcp producer is an in-process thread, not a `Child` to watch for early exit), and `spawn_qemu`
+  gates the smoltcp socket the same way it already gates the vsock daemon — a fail-loud `Timeout` instead of
+  a raw QEMU crash. Red-on-inverse: `wait_for_socket_process_less_present_ok_absent_times_out`.
+
+- **DISCOVERED — smoltcp `vhost-user-net` bring-up flake (open; needs a dedicated fix).** Beyond the connect
+  race, ~10% of boots the smoltcp daemon **never binds its socket within the 2 s ceiling** — the daemon
+  thread intermittently fails/errors on start (sibling to the recorded ~11% external-`vhost-device-vsock`
+  bring-up flake, §QEMU-suspend note (a)). Latent because the existing egress tests boot a single VM; the
+  volume probe (13+ networked boots/run) exposes it. **Not root-caused here (out of scope for the perf pass).**
+  Mitigation in the probe: `net-egress` retries a transient boot failure on a fresh VM (bounded
+  `NET_BOOT_RETRIES`, like the QEMU vsock re-spawn), printing `recovered N transient smoltcp-bringup boot
+  failure(s)` so it is surfaced, not hidden. Follow-up owner: make `SmoltcpProcess::start` block until the
+  UDS is bound (signal readiness from the daemon thread) instead of deferring the bind — that would retire
+  both the connect race and this flake at the source.

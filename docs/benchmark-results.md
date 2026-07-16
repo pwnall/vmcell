@@ -4,18 +4,203 @@ Performance results for the `vmcell` framework: hot-path overheads (micro-benchm
 KVM lifecycle/density/size metrics (macro-benchmarks). Per design §16 (Performance) these are **tracked metrics,
 not pass/fail gates** — absolute numbers are hardware-bound and only meaningful with their substrate.
 
-> **Canonical numbers: the 2026-07-04 full backend×mode matrix** (directly below) — every
-> applicable metric on all three backends, which confirms the 2026-07-02 post-investigation
-> matrix (unchanged within run-to-run noise) and extends it to the coverage that was missing
-> (FC phase-budget, FC/QEMU vsock-rtt + footprint, FC suspend-size, QEMU latency + phase-budget).
-> The 2026-07-02 section beneath it is the prior canonical; the 2026-07-01 profile-matrix baseline
-> plus the `docs/45` experiment pass (EXP-A…E, incl. the Firecracker warm-restore unlock) sit
-> below that. The historical pass sections further down record how the system got here (CH cold
-> 642→330 ms, CH restore 166→84→60 ms); the detailed sub-analyses (kernel sweep, eager/lazy) were
-> measured **pre-pass**: their *relative* conclusions still hold, but their absolute cold/restore
-> ms are superseded by the tables below.
+> **Canonical numbers: the 2026-07-15 full backend×mode matrix** (directly below) — the re-run
+> after the QEMU suspend/resume + session-persistence + security-hardening rounds, which adds the
+> first QEMU restore/suspend numbers and confirms no latency regression on CH/FC. The
+> **2026-07-04** matrix beneath it is the prior canonical (it confirmed the 2026-07-02
+> post-investigation matrix and filled the FC/QEMU coverage gaps); the 2026-07-02 section is below
+> that, then the 2026-07-01 profile-matrix baseline plus the `docs/45` experiment pass (EXP-A…E,
+> incl. the Firecracker warm-restore unlock). The historical pass sections further down record how
+> the system got here (CH cold 642→330 ms, CH restore 166→84→60 ms); the detailed sub-analyses
+> (kernel sweep, eager/lazy) were measured **pre-pass**: their *relative* conclusions still hold,
+> but their absolute cold/restore ms are superseded by the tables below.
 
-## Full backend×mode matrix (2026-07-04, HEAD `c6eeefc`) — CANONICAL
+## Full backend×mode matrix (2026-07-15, HEAD `7497b26`) — CANONICAL
+
+Re-run of the whole `scripts/perf-matrix.sh` after the development rounds since the 2026-07-04
+matrix (`c6eeefc..HEAD`, 15 commits): **session persistence**, **CoW cloning**, the **mandatory
+VMM seccomp + jailer** (`vmm/seccomp.rs`, `vmm/jail.rs` — new; every spawn now
+`fork → apply_jail → execve`, and QEMU gained `-sandbox`), daemon security, dep bumps, and — the
+headline — **QEMU suspend/resume** (in-kernel `vhost-vsock` transport + `migrate`/`-incoming`).
+Same substrate/method as the 2026-07-04 matrix: freq-pinned at the 2.2 GHz base via the blessed
+runner under a delegated cgroup scope, warm-cache, mem=256 MiB, `default` profile. N=20 (latency) /
+N=12 (phase-budget) / N=200 (vsock-rtt) / 8 concurrent (footprint). Suspect deltas were
+re-measured, and the no-regression call was cross-checked against the `c6eeefc..HEAD` diff.
+
+**Verdict: no latency regression in any measured area.** Every CH (primary) and FC headline p50
+lands within run-to-run noise of 2026-07-04. The new spawn-path security layer is **negligible by
+construction, not just by measurement**: `JailConfig::default()` is `hardened` with
+`seccomp_deny_list=false`, so `apply_jail` compiles no BPF and adds only three async-signal-safe
+child syscalls (`setrlimit(RLIMIT_CORE=0)` + `prctl(DUMPABLE=0)` + `prctl(NO_NEW_PRIVS=1)`) in the
+already-existing pre-`exec` fork window. CH's `--seccomp true` and FC's built-in filter were
+**already the 2026-07-04 default** (`vmm_seccomp_args("firecracker", …)` returns an empty vec), so
+the seccomp *centralization* adds nothing to CH/FC; the only genuinely-new VMM confinement is
+QEMU's `-sandbox` (off→on), a few-ms one-time filter compile that is below the benchmark's
+resolution and left QEMU cold p50 within its documented cross-session band. What is genuinely new
+is all-QEMU: warm restore, suspend-size, and better cold-boot robustness.
+
+**Time-to-ready (latency mode), p50 / p95 ms** (Δ vs 2026-07-04):
+
+| Backend | cold | restore |
+| --- | --- | --- |
+| **Cloud Hypervisor** | 317 / 335 (≈) | **49 / 64** (−8, ≈noise) |
+| **Firecracker** | 761 / 789 (≈) | **26 / 33** (=) |
+| **QEMU** (`q35`) | **1002** / 1078 (p50 ≈; **20/20 iters, 0 dropped** vs 18/20) | **462 / 476** (NEW — was `snapshot_restore=false`) |
+
+- **QEMU warm restore ≈462 ms** is the new capability. It is slower than CH (49) / FC (26) because
+  QEMU restore streams the **full memory image** through `migrate-incoming` (`file:`) — no
+  demand-paged/UFFD lazy backend (`lazy_restore=false`, §17). The restore rotates the host-global
+  guest CID, so concurrent QEMU zygote fan-out is sound (`restore_rotates_host_paths=true`).
+- **QEMU cold-boot is now flake-free by count**: 20/20 iterations completed (baseline dropped 2/20).
+  The new `verify_control_plane` health-gate + re-spawn loop (`CONTROL_PLANE_PROBE_BUDGET=4 s`,
+  `MAX_CONTROL_PLANE_RESPAWNS=4`) *recovers* the ~11 % external-`vhost-device-vsock` bring-up flake
+  instead of dropping the iteration; the cost is a rare (~1/20) ~5 s p99 tail on the recovered boot
+  (4 s probe budget + ~1.3 s re-spawn). p50 is unchanged (~1002 ms, re-measured 1004) — the
+  health-gate pays the guest-boot wait once, then `agent()` re-connects cheaply.
+
+**Phase-budget, p50 ms (`default` profile: create + connect + graceful `shutdown()` teardown):**
+
+| Backend | path | create | connect | exec | teardown | TOTAL |
+| --- | --- | --- | --- | --- | --- | --- |
+| **CH** | COLD | 39 | 267 | 3 | 264 | **~579** |
+| **CH** | RESTORE | 52 | 3 | 5 | 257 | **~321** |
+| **FC** | COLD | 41 | 725 | 5 | 278 | **~1057** |
+| **FC** | RESTORE | 15 | 13 | 9 | 43 | **~78** |
+| **QEMU** | COLD † | 118 | 870 | 5 | 303 | **~1303** |
+| **QEMU** | RESTORE | **448** | 8 | 9 | 328 | **~798** (NEW) |
+
+- **QEMU RESTORE phase-budget is `create`-bound (448 ms / 56 %)** — the `migrate-incoming`
+  full-memory load, consistent with the 462 ms restore-latency figure. `connect` collapses to 8 ms
+  (the guest is already booted in the stream), the mirror of the cold path's boot-bound 870 ms.
+- † **QEMU COLD phase-budget is not a like-for-like comparison** with 2026-07-04. Snapshot-taking
+  modes (phase-budget, suspend, restore) select the in-kernel `vhost-vsock` transport, whereas the
+  2026-07-04 QEMU cold row used the external daemon. So the +33 ms TOTAL is a transport change, not
+  a regression, and the n=12 completing on the **1st attempt** (baseline needed 3) reflects the
+  deterministic in-kernel device removing the external-daemon race — *not* the re-spawn recovery
+  (which is a no-op on the in-kernel endpoint). QEMU cold *latency* above (1002 ms) is the
+  like-for-like external-daemon comparison and is within band. CH/FC phase-budget are like-for-like
+  and flat-or-improved.
+
+**Datapath — vsock exec round-trip (`/bin/true`), µs** (re-measured; central tendency):
+
+| Backend | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| **Cloud Hypervisor** | 697–723 | 832 | 936 |
+| **Firecracker** | 728 | 823 | 965 |
+| **QEMU** | **723** | 837 | 901 |
+
+Sub-millisecond floor on all three, unchanged. A single QEMU matrix sample read p50 915 µs; two
+re-measurements returned 820 then **723 µs** with CH/FC controls at 728 µs the same session —
+**shared-host load, not a regression**; QEMU remains the fastest backend, as at baseline. exec RTT
+is in-guest fork/exec/reap-dominated and the transport/`-sandbox` do not touch it.
+
+**Suspend-state size on disk (256 MiB guest):**
+
+| Backend | total | memory-file share | note |
+| --- | --- | --- | --- |
+| **CH** | 268.5 MB | 100 % | dense: full memory-file (`memory-ranges`) |
+| **FC** | 268.4 MB | 100 % | dense: full `mem_file` |
+| **QEMU** | **52.2 MB** | 100 % | **sparse**: `migrate file:` streams only populated/non-zero pages |
+
+- **QEMU snapshots are sparse for free** (~52 MB vs CH/FC's dense 256 MB): QEMU migration skips zero
+  pages, so a snapshot tracks the guest's touched working set (~52–59 MB here, matching footprint),
+  not the full RAM allotment. For CH/FC, sparse-snapshot (`SEEK_HOLE`) remains the warm-pool-density
+  lever; QEMU gets it inherently from the migration stream. The small size is an optimization, not a
+  truncation — the restore connects + execs every iteration.
+
+**Guest-RAM footprint & density (8 concurrent, 256 MiB), per-guest resident** — unchanged vs
+2026-07-04: CH ≈57 MiB `RssShmem` (memfd), FC ≈57 MiB `RssAnon` (private), QEMU ≈59 MiB `RssShmem`
++ ≈21 MiB `RssAnon` VMM overhead (heaviest resident VMM). CH `--ksm-mergeable` still dedups the bulk
+of identical-guest RAM. Dead-linear per added guest on every backend.
+
+**Coverage caveat — what this matrix does *not* reach.** The core modes are scoped to **single-VM,
+no-network (`NetConfig::None`), library-direct (no `vmcelld`/broker), one-shot `AgentClient`**
+lifecycle. They *do* bound the changed spawn path (seccomp/jailer land on the measured `create` phase
+for all three backends) and the rewritten connect/handshake law (measured by the `connect` phase +
+vsock-rtt on both the Unix and Vsock arms). The **three follow-up probes below** (added 2026-07-15,
+collected every run) now cover the surfaces this pass first flagged as unreached: unprivileged
+smoltcp NAT egress (`net-egress`), CoW / zygote fan-out (`zygote`), and the daemon HTTP + broker
+bridge (`perf-daemon.sh`). What remains structurally unmeasured — changed but not exercised, so
+neither confirmed nor cleared per AGENTS.md rule 4: **privileged** networked start (netns + tap + 3×
+`nft` spawns per VM, `net/tap.rs` — the probes use unprivileged smoltcp, a directly-invoked bench
+lacks `CAP_NET_ADMIN`); the daemon `restore_cow` reflink tree-copy (the daemon probe times cold
+create, not restore); interactive session create/resume (`SessionMux` second handshake + per-session
+PTY, `agent/session.rs`); and the TLS-MITM egress proxy per-connection cert minting (`proxy/tls.rs` —
+`net-egress` uses `Egress::Open`, no filtered proxy). Carrying those is the next follow-up.
+
+### Follow-up probes — egress, zygote fan-out, daemon API (2026-07-15)
+
+Three probes for the changed-but-unmeasured paths above, shipped in `scripts/perf-matrix.sh` so
+they run every matrix: `bench-vm --mode net-egress` and `--mode zygote` (per backend, self-skipping
+where unsupported) and the standalone `scripts/perf-daemon.sh`. Same freq-pinned substrate as the
+matrix above, **except the daemon probe** (a plain backgrounded process — read its `list` bridge
+floor and deltas, not its absolute create).
+
+**Networked egress (`net-egress`; CH + QEMU — Firecracker has no unprivileged vhost-user-net, skips).**
+Unprivileged smoltcp NAT + `Egress::Open` to an in-process host endpoint; the guest curls it through
+the NAT and a real returned byte is asserted (data-plane, not a proxy signal).
+
+| Backend | NET-START p50 / p95 (boot WITH NAT) | egress RTT p50 / p95 (in-guest curl→NAT→host) |
+| --- | --- | --- |
+| **CH** | 309 / 331 ms | **36.8 / 41.7 ms** |
+| **QEMU** | 1062 / 1079 ms | **36.6 / 37.7 ms** |
+
+- NET-START vs the network-disabled cold boot (CH 317 ms, QEMU 1002 ms) is the **smoltcp NAT setup
+  cost on the boot path** — small on both (the NAT threads start concurrently with the guest boot).
+  The egress RTT (~37 ms on both) is ~50× a vsock exec (~0.7 ms): a full in-guest `curl` process +
+  TCP through the **userspace** smoltcp NAT + host round-trip — the realistic cost a guest workload
+  pays to reach a host service, which the vsock control-plane floor does not capture. It is backend-
+  independent (the datapath is the shared smoltcp NAT, not the VMM).
+- **Discovered: smoltcp bring-up flake.** ~10 % of networked boots the smoltcp `vhost-user-net`
+  daemon never binds its socket in time (the daemon thread intermittently errors on start — sibling
+  to the recorded ~11 % external-`vhost-device-vsock` flake). Latent because the egress *tests* boot
+  one VM; this volume probe (13+ networked boots/run) exposes it. The probe retries a transient boot
+  on a fresh VM (bounded, and prints `recovered N …` so it is surfaced, not hidden). Two fixes landed
+  with it: (1) `spawn_qemu` now waits for the smoltcp socket before launch — QEMU's `-chardev socket`
+  is a no-retry client that otherwise raced the lazy bind and crashed (`wait_for_socket` gained an
+  `Option<&mut Child>` for the process-less thread producer; the same gate the vsock daemon already
+  had). The root-cause fix (synchronous bind in `SmoltcpProcess::start`) is recorded open in
+  `implementation-notes.md`.
+
+**Zygote CoW fan-out (`zygote`; CH + QEMU concurrent, Firecracker single-clone control).**
+Snapshot a base once, then time `Zygote::spawn_clones` restoring + resuming N=8 CoW clones
+concurrently, plus time-to-agent-ready across all.
+
+| Backend | fan-out to N total p50 / p95 | per-clone p50 | agent-ready-all p50 | CoW |
+| --- | --- | --- | --- | --- |
+| **CH** (N=8) | 440 / 467 ms | ~55 ms | 4 ms | FullCopy |
+| **QEMU** (N=8) | 522 / 526 ms | ~65 ms | 9 ms | FullCopy |
+| **FC** (N=1 control) | 125 / 132 ms | ~125 ms | 9 ms | FullCopy |
+
+- **CoW is `FullCopy` on this host**: `restore_cow` reflinks the master snapshot dir, but the copy
+  lands under `$TMPDIR` (tmpfs) with the master under `target/` (ext4) — neither is a reflink-capable
+  fs (XFS/Btrfs/bcachefs), so `FICLONE` falls back to a full byte copy. The per-clone figure is
+  therefore the **non-reflink ceiling** (the whole snapshot is byte-copied); on a reflink fs it would
+  collapse to the restore+resume alone. The probe prints `cow=Reflink`/`FullCopy` so it is never
+  misread. **Fan-out is sub-linear**: CH's 8-clone total (440 ms) is only ~1.3× its 3-clone total
+  (~348 ms) — the concurrent CoW copies + restores overlap, so per-clone drops from ~116 ms (n=3) to
+  ~55 ms (n=8). QEMU's per-clone (~65 ms) beats its single-boot restore (~462 ms) because the sparse
+  52 MB migrate stream copies far less than CH's dense 256 MB. agent-ready across all clones is a few
+  ms — they are already resumed by `spawn_clones`; the fan-out cost is the CoW copy + restore + resume.
+
+**Daemon API (`perf-daemon.sh`; CH).** vmcelld HTTP + broker-bridge overhead over the raw VMM op,
+via `curl -w %{time_total}` (daemon-side request latency, excluding curl startup). NOT freq-pinned.
+
+| Op | p50 / p95 | what it isolates |
+| --- | --- | --- |
+| **list** | **0.6 / 0.9 ms** | pure HTTP + broker bridge, NO VMM work — the **bridge floor** |
+| **exec** | **2.9 / 3.8 ms** | bridge + in-guest vsock exec (~2 ms over the raw vsock-rtt ~0.7 ms) |
+| **create** | 199 / 207 ms | full cold-boot-to-agent-ready THROUGH the HTTP + broker (defaults vcpus=2/mem=512) |
+| **destroy** | 262 / 273 ms | teardown THROUGH the daemon (graceful grace, like the ~260 ms `shutdown()` path) |
+
+- **`list` (~0.6 ms) is the clean bridge floor**: every daemon op forwards parent→broker over a
+  length-prefixed JSON frame on top of HTTP routing/auth; with no VMM work behind it, that ~0.6 ms is
+  the per-op tax the daemon adds. `exec` shows it on top of the vsock datapath (~2 ms over the
+  library-direct vsock-rtt); `create`/`destroy` are dominated by the VM lifecycle they wrap, so their
+  absolute figures are boot/teardown-bound (and not freq-pinned) — read the bridge delta, not the
+  total. Percentiles are nearest-rank (matching `bench-vm`'s `pcts`).
+
+## Full backend×mode matrix (2026-07-04, HEAD `c6eeefc`) — PRIOR CANONICAL
 
 Every applicable metric on every backend, run via `scripts/perf-matrix.sh` (a superset of
 `perf-baseline.sh`; backends self-skip modes they cannot serve). Same substrate/method as the

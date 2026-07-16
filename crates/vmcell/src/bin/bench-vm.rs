@@ -1,11 +1,15 @@
 use clap::Parser;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::time::Instant;
 
 use vmcell::HostEnv;
 use vmcell::agent::protocol::ExecRequest;
-use vmcell::config::{RestoreMode, RootfsSource, VmConfig};
+use vmcell::config::{Egress, NetConfig, RestoreMode, RootfsSource, VmConfig};
 use vmcell::orchestrator::{MicroVm, VmidAllocator};
 use vmcell::vmm::{VmInstance, Vmm};
 
@@ -487,6 +491,8 @@ const VALID_MODES: &[&str] = &[
     "suspend-size",
     "phase-budget",
     "vsock-rtt",
+    "net-egress",
+    "zygote",
 ];
 
 /// Validates `--mode` against [`VALID_MODES`].
@@ -569,6 +575,8 @@ async fn run_mode<V: Vmm>(
         "suspend-size" => run_suspend_size(vmm, backend, args, allocator).await,
         "phase-budget" => run_phase_budget(vmm, backend, args, allocator).await,
         "vsock-rtt" => run_vsock_rtt(vmm, backend, args, allocator).await,
+        "net-egress" => run_net_egress(vmm, backend, args, allocator).await,
+        "zygote" => run_zygote(vmm, backend, args, allocator).await,
         other => anyhow::bail!(
             "unknown --mode '{other}' (valid: {})",
             VALID_MODES.join(", ")
@@ -1521,6 +1529,448 @@ async fn run_vsock_rtt<V: Vmm>(
             anyhow::bail!("vsock-rtt: no successful exec round-trips");
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// net-egress: boot-with-networking latency + in-guest egress round-trip (§13, the
+// L-invariant data plane). Fills the coverage gap where every other mode uses
+// `network_disabled()` and never exercises the smoltcp NAT.
+// ----------------------------------------------------------------------------
+
+/// A minimal host-side HTTP/1.1 responder for the `net-egress` benchmark: binds
+/// `127.0.0.1:0`, answers every connection with a fixed 200 body, and is reaped on
+/// `Drop` (ownership owns cleanup — it survives a panic mid-run). The guest reaches
+/// it through the smoltcp NAT at `http://<gateway_ip>:<port>/`. In-process `std::net`
+/// (no `python3 -m http.server` dependency, unlike the integration tests).
+struct HostResponder {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HostResponder {
+    fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        // Non-blocking accept + a poll loop so `Drop` can stop the thread promptly
+        // without a self-connect wakeup hack.
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || {
+            const BODY: &[u8] = b"vmcell-egress-ok\n";
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        // Drain one request chunk (a GET fits in 1 KiB) before replying,
+                        // so curl doesn't take an RST on unread data; then a fixed 200.
+                        let mut buf = [0u8; 1024];
+                        let _ = conn.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                        let _ = conn.read(&mut buf);
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            BODY.len()
+                        );
+                        let _ = conn.write_all(head.as_bytes());
+                        let _ = conn.write_all(BODY);
+                        let _ = conn.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    // A real accept error (fd exhaustion, etc.) ends the responder; the
+                    // bench's per-request checks then surface it as dropped samples.
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            port,
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for HostResponder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// The in-guest egress client: `curl -s --max-time 5 <url>`. `curl` is on the guest
+/// PATH (rootfs `--include=curl` + the guest-tools multicall).
+fn egress_curl(url: &str) -> Vec<String> {
+    vec![
+        "curl".to_string(),
+        "-s".to_string(),
+        "--max-time".to_string(),
+        "5".to_string(),
+        url.to_string(),
+    ]
+}
+
+/// §16 (Performance) — net-egress: (A) VM start latency WITH the smoltcp NAT on the
+/// boot path, and (B) the in-guest egress round-trip through the NAT to a host
+/// endpoint (asserting a real egress byte, not a proxy signal — §15/AGENTS.md).
+async fn run_net_egress<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
+    // Self-skip: the unprivileged smoltcp NAT needs the vhost-user-net device (CH +
+    // QEMU; Firecracker has none). A capability skip is success (Ok), not a failure
+    // (M-BIN-1). `Privileged` tap is deliberately NOT used — a directly-invoked
+    // bench-vm lacks CAP_NET_ADMIN and would leave netns residue.
+    if !vmm.capabilities().unprivileged_vhost_user_net {
+        println!("net-egress: backend {backend} has no unprivileged vhost-user-net; skipping");
+        return Ok(());
+    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
+    if !kernel.exists() || !rootfs.exists() {
+        println!("net-egress: No successful runs (missing artifacts in {dir})");
+        anyhow::bail!("net-egress: missing artifacts in {dir}");
+    }
+
+    // Host endpoint the guest NATs to, owned in a Drop guard (reaped even on panic).
+    let responder = HostResponder::start()
+        .map_err(|e| anyhow::anyhow!("net-egress: failed to start host responder: {e}"))?;
+    let host_port = responder.port;
+
+    // Networked config (NOT `network_disabled()`); same tunable knobs as `build_cfg`.
+    let cfg = VmConfig::builder(kernel, RootfsSource::Erofs { image: rootfs })
+        .vcpus(1)
+        .mem_mib(args.mem_mib)
+        .net(NetConfig::Unprivileged {
+            egress: Egress::Open,
+            host_services_port: Some(host_port),
+        })
+        .restore_mode(args.restore_mode)
+        .timeouts(timeouts_for(&args.profile))
+        .kernel_verbosity(args.kernel_verbosity)
+        .console_mode(args.console)
+        .build()
+        .map_err(|e| anyhow::anyhow!("net-egress: invalid config: {e}"))?;
+
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator;
+    let iters = args.iters();
+
+    // The smoltcp vhost-user-net daemon intermittently fails to bind its UDS (~10% of
+    // boots the daemon thread errors and the socket never appears within the readiness
+    // ceiling — a latent smoltcp bring-up flake this volume probe surfaced; the existing
+    // egress tests boot a single VM and never hit it. See docs/benchmark-results.md).
+    // Retry a transient boot failure on a FRESH VM (fresh smoltcp) a bounded number of
+    // times, counting the retries so they are visible, not hidden (mirrors the QEMU vsock
+    // re-spawn recovery). An agent-connect failure is separate `dropped` accounting.
+    const NET_BOOT_RETRIES: usize = 5;
+
+    // --- Phase A: start latency WITH the smoltcp NAT set up on the boot path ---
+    let mut starts = Vec::new();
+    let mut start_dropped = 0usize;
+    let mut boot_retries = 0usize;
+    for i in 0..(iters + args.warmup) {
+        let mut attempt = 0usize;
+        loop {
+            let t = Instant::now();
+            match MicroVm::start(vmm, cfg.clone(), &env).await {
+                Ok(mut vm) => {
+                    match vm.agent(None).await {
+                        Ok(_) => {
+                            let dt = t.elapsed().as_millis();
+                            if i >= args.warmup {
+                                starts.push(dt);
+                            }
+                        }
+                        Err(e) => {
+                            println!("net-egress: net-start iter {i} agent-connect failed: {e}");
+                            if i >= args.warmup {
+                                start_dropped += 1;
+                            }
+                        }
+                    }
+                    let _ = vm.shutdown().await;
+                    break;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > NET_BOOT_RETRIES {
+                        anyhow::bail!(
+                            "net-egress: net-start iter {i} start failed after {attempt} attempts: {e}"
+                        );
+                    }
+                    boot_retries += 1;
+                    println!(
+                        "net-egress: net-start iter {i} transient boot failure (attempt {attempt}, retrying): {e}"
+                    );
+                }
+            }
+        }
+    }
+    if boot_retries > 0 {
+        println!(
+            "net-egress: NET-START recovered {boot_retries} transient smoltcp-bringup boot failure(s) via retry"
+        );
+    }
+    report(
+        "NET-START (boot with smoltcp NAT)",
+        &mut starts,
+        start_dropped,
+        0,
+    );
+
+    // --- Phase B: steady egress round-trip (one warm VM, N in-guest curls) ---
+    // Same bounded retry over the smoltcp bring-up flake as Phase A.
+    let mut vm = {
+        let mut attempt = 0usize;
+        loop {
+            match MicroVm::start(vmm, cfg.clone(), &env).await {
+                Ok(v) => break v,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > NET_BOOT_RETRIES {
+                        anyhow::bail!(
+                            "net-egress: egress VM boot failed after {attempt} attempts: {e}"
+                        );
+                    }
+                    println!(
+                        "net-egress: egress VM transient boot failure (attempt {attempt}, retrying): {e}"
+                    );
+                }
+            }
+        }
+    };
+    if let Err(e) = vm.agent(None).await {
+        let _ = vm.shutdown().await;
+        anyhow::bail!("net-egress: egress VM agent connect failed: {e}");
+    }
+    let (gateway_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid())
+        .map_err(|e| anyhow::anyhow!("net-egress: ip_math({}): {e}", vm.vmid()))?;
+    let url = format!("http://{gateway_ip}:{host_port}/");
+
+    // Warm-up: the guest configures eth0 from the kernel `ip=` line (IP-PNP) after
+    // boot, so the first curl races the interface/NAT coming up. Retry until the first
+    // success (bounded) before measuring the steady RTT — and require a real egress
+    // byte (`code==0 && !stdout.is_empty()`), a data-plane assertion.
+    let mut warmed = false;
+    for _ in 0..40 {
+        if let Ok(agent) = vm.agent(None).await
+            && let Ok(o) = agent.exec(ExecRequest::new(egress_curl(&url))).await
+            && o.code == 0
+            && !o.stdout.is_empty()
+        {
+            warmed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    if !warmed {
+        let _ = vm.shutdown().await;
+        anyhow::bail!("net-egress: no successful egress request within the warm-up budget");
+    }
+
+    let mut rtts = Vec::with_capacity(iters);
+    let mut dropped = 0usize;
+    for i in 0..iters {
+        let agent = match vm.agent(None).await {
+            Ok(a) => a,
+            Err(e) => {
+                println!("net-egress: egress iter {i} agent-connect failed: {e}");
+                break;
+            }
+        };
+        let t = Instant::now();
+        let r = agent.exec(ExecRequest::new(egress_curl(&url))).await;
+        let dt = t.elapsed().as_micros();
+        match r {
+            Ok(o) if o.code == 0 && !o.stdout.is_empty() => rtts.push(dt),
+            Ok(o) => {
+                println!(
+                    "net-egress: egress iter {i} curl code={} stdout={}B (no egress byte)",
+                    o.code,
+                    o.stdout.len()
+                );
+                dropped += 1;
+            }
+            Err(e) => {
+                println!("net-egress: egress iter {i} exec failed: {e}");
+                dropped += 1;
+            }
+        }
+    }
+    let _ = vm.shutdown().await;
+    // `responder` stays alive until here; its Drop reaps the host thread.
+
+    let acct = accounting_suffix(dropped, 0);
+    println!(
+        "=== NET-EGRESS (backend={backend} n={}{acct} url={url}) ===",
+        rtts.len()
+    );
+    match pcts(&mut rtts) {
+        Some((p50, p95, p99, max)) => {
+            println!(
+                "  in-guest curl round-trip (guest→NAT→host→guest): p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs"
+            );
+            Ok(())
+        }
+        None => {
+            println!("  No successful egress round-trips");
+            anyhow::bail!("net-egress: no egress samples");
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// zygote: CoW-clone fan-out latency. Snapshot a base once, then time restoring +
+// resuming N CoW clones concurrently (the zygote/lineage fan-out the library-direct
+// single-VM restore metric structurally cannot reach).
+// ----------------------------------------------------------------------------
+
+/// §16 (Performance) — zygote fan-out: snapshot a base VM once, then time
+/// `Zygote::spawn_clones` to `--count` resumed CoW clones (plus the time to reach
+/// agent-ready across all of them). `restore_rotates_host_paths` gates concurrent
+/// fan-out (CH + QEMU); Firecracker degrades to the single-clone control.
+async fn run_zygote<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
+    let caps = vmm.capabilities();
+    if !caps.snapshot_restore {
+        println!("zygote: backend {backend} has no snapshot support; skipping");
+        return Ok(());
+    }
+    // FC rotates no host paths → only a single clone is representable (`spawn_clones`
+    // would return `Unsupported` for n>1); CH/QEMU fan out to `--count`. Announce the
+    // clamp loudly rather than silently measuring a different n (N-BIN-2 spirit).
+    let requested = args.count;
+    let clone_count = if caps.restore_rotates_host_paths {
+        requested
+    } else {
+        if requested > 1 {
+            println!(
+                "zygote: backend {backend} does not rotate host paths; measuring the \
+                 single-clone control (n=1), not {requested}"
+            );
+        }
+        1
+    };
+
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
+    if !kernel.exists() || !rootfs.exists() {
+        println!("zygote: No successful runs (missing artifacts in {dir})");
+        anyhow::bail!("zygote: missing artifacts in {dir}");
+    }
+    // snapshotting=true: QEMU needs the in-kernel vhost-vsock transport to restore.
+    let cfg = build_cfg(args, kernel, rootfs, false, true);
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator;
+
+    // --- Snapshot the base ONCE into the master zygote image ---
+    let master =
+        resolve_snap_dir(&args.snap_dir).join(format!("zygote-{backend}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&master);
+    std::fs::create_dir_all(&master).map_err(|e| {
+        anyhow::anyhow!("zygote: cannot create master dir {}: {e}", master.display())
+    })?;
+
+    let mut base = match MicroVm::start(vmm, cfg.clone(), &env).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&master);
+            anyhow::bail!("zygote: base VM start failed: {e}");
+        }
+    };
+    if let Err(e) = base.agent(None).await {
+        let _ = base.shutdown().await;
+        let _ = std::fs::remove_dir_all(&master);
+        anyhow::bail!("zygote: base VM agent connect failed: {e}");
+    }
+    let zygote = match vmcell::Zygote::suspend(&mut base, cfg.clone(), &master).await {
+        Ok(z) => z,
+        Err(e) => {
+            let _ = base.shutdown().await;
+            let _ = std::fs::remove_dir_all(&master);
+            anyhow::bail!("zygote: suspend failed: {e}");
+        }
+    };
+    let _ = base.shutdown().await;
+    let cow = zygote.probe_cow_support();
+    println!(
+        "zygote master ready (fan-out={clone_count}); CoW support: {cow:?} \
+         (reflink needs $TMPDIR + master on one reflink-capable fs; else a full copy)"
+    );
+
+    // --- Timed fan-out: N clones restored + resumed concurrently per iteration ---
+    let mut fanout = Vec::new(); // wall-clock to `clone_count` live+resumed clones
+    let mut ready = Vec::new(); // + time to agent-ready across all clones
+    let mut dropped = 0usize;
+    for i in 0..(args.iters() + args.warmup) {
+        let t_fan = Instant::now();
+        let mut clones = match zygote.spawn_clones(vmm, clone_count, &env).await {
+            Ok(c) => c,
+            Err(e) => {
+                println!("zygote: iteration {i} fan-out failed: {e}");
+                dropped += 1;
+                continue;
+            }
+        };
+        let fan_ms = t_fan.elapsed().as_millis();
+
+        // Time to agent-ready across all clones (concurrent; the first agent() runs the
+        // post-restore resync). Disjoint `&mut` borrows via `iter_mut`, so this is sound.
+        let t_ready = Instant::now();
+        let ready_res =
+            futures::future::try_join_all(clones.iter_mut().map(|c| c.agent(None))).await;
+        let ready_ms = t_ready.elapsed().as_millis();
+
+        match ready_res {
+            Ok(_) => {
+                if i >= args.warmup {
+                    fanout.push(fan_ms);
+                    ready.push(ready_ms);
+                }
+            }
+            Err(e) => {
+                println!("zygote: iteration {i} clone agent-ready failed: {e}");
+                dropped += 1;
+            }
+        }
+        for c in clones {
+            let _ = c.shutdown().await;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&master);
+
+    let acct = accounting_suffix(dropped, 0);
+    println!(
+        "=== ZYGOTE (backend={backend} fan-out={clone_count} n={}{acct} cow={cow:?}) ===",
+        fanout.len()
+    );
+    let per_clone = |p: u128| p / clone_count.max(1) as u128;
+    match pcts(&mut fanout) {
+        Some((p50, p95, p99, max)) => {
+            println!(
+                "  fan-out to {clone_count} resumed clones: p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms  (per-clone p50≈{}ms)",
+                per_clone(p50)
+            );
+        }
+        None => {
+            println!("  No successful fan-outs");
+            anyhow::bail!("zygote: no successful fan-outs");
+        }
+    }
+    if let Some((p50, p95, p99, max)) = pcts(&mut ready) {
+        println!(
+            "  + time to agent-ready across all clones: p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
