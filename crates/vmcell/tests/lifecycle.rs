@@ -69,7 +69,7 @@ async fn test_lifecycle_force_kill_ch() {
 #[tokio::test]
 #[ignore = "needs KVM"]
 async fn test_lifecycle_force_kill_fc() {
-    let vmm = vmcell::vmm::firecracker::Firecracker::new(common::fc_bin());
+    let vmm = vmcell_firecracker::Firecracker::new(common::fc_bin());
     test_lifecycle_force_kill_impl(&vmm).await;
 }
 
@@ -77,7 +77,7 @@ async fn test_lifecycle_force_kill_fc() {
 #[tokio::test]
 #[ignore = "needs KVM"]
 async fn test_lifecycle_force_kill_qemu() {
-    let vmm = vmcell::vmm::qemu::Qemu::new(common::qemu_bin());
+    let vmm = vmcell_qemu::Qemu::new(common::qemu_bin());
     test_lifecycle_force_kill_impl(&vmm).await;
 }
 
@@ -228,7 +228,7 @@ async fn test_lifecycle_panic_residue_ch() {
 #[tokio::test]
 #[ignore = "needs KVM + CAP_NET_ADMIN (privileged tap networking)"]
 async fn test_lifecycle_panic_residue_fc() {
-    let vmm = vmcell::vmm::firecracker::Firecracker::new(common::fc_bin());
+    let vmm = vmcell_firecracker::Firecracker::new(common::fc_bin());
     test_lifecycle_panic_residue_impl(&vmm).await;
 }
 
@@ -236,7 +236,7 @@ async fn test_lifecycle_panic_residue_fc() {
 #[tokio::test]
 #[ignore = "needs KVM + CAP_NET_ADMIN (privileged tap networking)"]
 async fn test_lifecycle_panic_residue_qemu() {
-    let vmm = vmcell::vmm::qemu::Qemu::new(common::qemu_bin());
+    let vmm = vmcell_qemu::Qemu::new(common::qemu_bin());
     test_lifecycle_panic_residue_impl(&vmm).await;
 }
 

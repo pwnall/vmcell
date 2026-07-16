@@ -117,7 +117,7 @@ macro_rules! vmm_matrix_test {
             #[tokio::test]
             #[ignore = "needs KVM"]
             async fn firecracker() {
-                let $vmm = vmcell::vmm::firecracker::Firecracker::new(super::common::fc_bin());
+                let $vmm = vmcell_firecracker::Firecracker::new(super::common::fc_bin());
                 $body
             }
 
@@ -125,7 +125,7 @@ macro_rules! vmm_matrix_test {
             #[tokio::test]
             #[ignore = "needs KVM"]
             async fn qemu() {
-                let $vmm = vmcell::vmm::qemu::Qemu::new(super::common::qemu_bin());
+                let $vmm = vmcell_qemu::Qemu::new(super::common::qemu_bin());
                 $body
             }
         }

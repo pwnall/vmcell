@@ -252,7 +252,7 @@ impl AgentClient {
     ///
     /// # Errors
     /// As [`AgentClient::connect`].
-    pub(crate) async fn connect_endpoint(
+    pub async fn connect_endpoint(
         endpoint: &VsockEndpoint,
         timeout: std::time::Duration,
         timeouts: &crate::config::Timeouts,

@@ -1,9 +1,46 @@
-use crate::config::VmConfig;
-use crate::error::{Error, Result};
-use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
+//! Firecracker VMM backend for `vmcell`.
+//!
+//! Provides the [`Firecracker`] implementation of the [`vmcell::vmm::Vmm`] trait and its
+//! running-instance type [`FcInstance`]. Extracted from the `vmcell` crate (design §2.1, The
+//! trait and the capability descriptor) so the core library carries only the primary Cloud
+//! Hypervisor backend; this crate depends on `vmcell` for the shared `Vmm`/`VmInstance` traits,
+//! the jail/seccomp predicates, and the spawn/reap/console/snapshot-eligibility helpers — every
+//! "one law, one predicate" invariant stays single-sourced in `vmcell`.
+
+#![deny(missing_docs)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block, // one obligation per SAFETY comment
+    unsafe_op_in_unsafe_fn,
+    rustdoc::broken_intra_doc_links
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
+    )
+)]
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use vmcell::config::VmConfig;
+use vmcell::error::{Error, Result};
+use vmcell::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities};
 
 use tokio::process::Child;
 
@@ -213,7 +250,7 @@ impl FcInstance {
         path: &str,
         body: Option<&impl Serialize>,
     ) -> Result<()> {
-        crate::vmm::unix_api_request(&self.api_socket, method, path, body).await
+        vmcell::vmm::unix_api_request(&self.api_socket, method, path, body).await
     }
 }
 
@@ -222,7 +259,7 @@ impl Firecracker {
         &self,
         cfg: &VmConfig,
         res: &PerVmResources,
-        cgroups: &dyn crate::metrics::CgroupFs,
+        cgroups: &dyn vmcell::metrics::CgroupFs,
     ) -> Result<(
         std::path::PathBuf,
         std::path::PathBuf,
@@ -241,10 +278,10 @@ impl Firecracker {
 
         // §12.2 (Layer 1 — the VMM's own seccomp filter)/§12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): FC's built-in seccomp filter is on unless `--no-seccomp` (Disabled);
         // the jailer-equivalent hardening is applied in build_vmm_cmd's forked-child window.
-        let seccomp_args = crate::vmm::seccomp::vmm_seccomp_args("firecracker", cfg.vmm_seccomp)?;
-        let jail = crate::vmm::jail::jail_spec_from_config(&cfg.jail)?;
+        let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("firecracker", cfg.vmm_seccomp)?;
+        let jail = vmcell::vmm::jail::jail_spec_from_config(&cfg.jail)?;
         let mut cmd =
-            crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
+            vmcell::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
         cmd.args(&seccomp_args);
 
         let log_file = std::fs::File::create(&serial_path)?;
@@ -259,7 +296,7 @@ impl Firecracker {
         // Shared spawn+register+await-ready sequence (VMM-2): capture the pgid, add
         // the VMM to its cgroup, and block on the API socket — reaping the process
         // group on any failure. Identical error handling across CH/FC/QEMU.
-        let pgid = crate::vmm::register_and_await_ready(
+        let pgid = vmcell::vmm::register_and_await_ready(
             &mut process,
             cgroups,
             &res.cgroup_name,
@@ -346,7 +383,7 @@ fn noxsave_fallback(has_cpu_template: bool) -> &'static str {
 /// `vmcell-fc-probe-*.socket` in the temp dir. Reap first (VMM process group before
 /// sockets), then unlink, mirroring `FcInstance::drop`.
 fn reap_and_unlink_probe(process: &mut tokio::process::Child, pgid: Option<u32>, socket: &Path) {
-    crate::vmm::reap_process_group(process, pgid);
+    vmcell::vmm::reap_process_group(process, pgid);
     let _ = std::fs::remove_file(socket);
 }
 
@@ -387,7 +424,7 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     // fails fast on an early exit) instead of a hand-rolled `try_exists`-only loop,
     // and reap the process *group* via `reap_process_group` on failure instead of the
     // leader-only, non-blocking `process.kill()` (which orphans the group).
-    if crate::vmm::wait_for_socket(
+    if vmcell::vmm::wait_for_socket(
         &api_socket,
         Some(&mut process),
         1000,
@@ -483,19 +520,19 @@ impl Vmm for Firecracker {
         &self,
         cfg: &VmConfig,
         res: &PerVmResources,
-        cgroups: &dyn crate::metrics::CgroupFs,
+        cgroups: &dyn vmcell::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         // FC has no virtio-console device, so a VirtioConsole config must be rejected
         // BEFORE build_kernel_cmdline — otherwise the boot args would carry
         // `console=hvc0` with no `hvc0` device and `serial.log` would stay empty.
-        crate::vmm::reject_unsupported_console(
+        vmcell::vmm::reject_unsupported_console(
             "firecracker",
             &self.capabilities(),
             cfg.console_mode,
         )?;
 
         let caps = self.capabilities();
-        if let crate::config::NetConfig::Unprivileged { .. } = cfg.net
+        if let vmcell::config::NetConfig::Unprivileged { .. } = cfg.net
             && !caps.unprivileged_vhost_user_net
         {
             return Err(Error::Unsupported {
@@ -571,7 +608,7 @@ impl Vmm for Firecracker {
             boot_args: String,
         }
 
-        let cmdline = crate::config::build_kernel_cmdline(cfg, res.vmid, fpu_guard)?;
+        let cmdline = vmcell::config::build_kernel_cmdline(cfg, res.vmid, fpu_guard)?;
 
         instance
             .api_request(
@@ -611,10 +648,10 @@ impl Vmm for Firecracker {
             size: u64,
             refill_time: u64,
         }
-        let fc_rate_limiter = |limit: &crate::config::DiskIoLimit| {
+        let fc_rate_limiter = |limit: &vmcell::config::DiskIoLimit| {
             let bucket = |rate: u64| FcTokenBucket {
                 size: rate,
-                refill_time: crate::config::IO_LIMIT_REFILL_TIME_MS,
+                refill_time: vmcell::config::IO_LIMIT_REFILL_TIME_MS,
             };
             FcRateLimiter {
                 bandwidth: limit.bandwidth_bytes_per_sec.map(bucket),
@@ -623,13 +660,13 @@ impl Vmm for Firecracker {
         };
 
         let rootfs_path = match &cfg.rootfs {
-            crate::config::RootfsSource::Erofs { image } => image.clone(),
-            crate::config::RootfsSource::Block { image, overlay } => {
+            vmcell::config::RootfsSource::Erofs { image } => image.clone(),
+            vmcell::config::RootfsSource::Block { image, overlay } => {
                 overlay.as_ref().unwrap_or(image).clone()
             }
         };
 
-        let is_ro = matches!(&cfg.rootfs, crate::config::RootfsSource::Erofs { .. });
+        let is_ro = matches!(&cfg.rootfs, vmcell::config::RootfsSource::Erofs { .. });
 
         instance
             .api_request(
@@ -675,7 +712,7 @@ impl Vmm for Firecracker {
                 host_dev_name: String,
                 guest_mac: String,
             }
-            let mac = crate::net::mac_math(res.vmid)?;
+            let mac = vmcell::net::mac_math(res.vmid)?;
             instance
                 .api_request(
                     "PUT",
@@ -728,12 +765,12 @@ impl Vmm for Firecracker {
         snapshot_dir: &Path,
         cfg: &VmConfig,
         res: &PerVmResources,
-        cgroups: &dyn crate::metrics::CgroupFs,
+        cgroups: &dyn vmcell::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         // FC has no virtio-console device; reject a VirtioConsole config before any
         // spawn/build_kernel_cmdline so it can never emit `console=hvc0` with no
         // `hvc0` device.
-        crate::vmm::reject_unsupported_console(
+        vmcell::vmm::reject_unsupported_console(
             "firecracker",
             &self.capabilities(),
             cfg.console_mode,
@@ -752,7 +789,7 @@ impl Vmm for Firecracker {
         // share/rootfs, unprivileged net, or external vhost-user-net handed to us via
         // the config, before spawning a VMM. FC never attaches these, so this is
         // defense in depth.
-        if crate::vmm::config_has_vhost_user_device(cfg, res) {
+        if vmcell::vmm::config_has_vhost_user_device(cfg, res) {
             return Err(Error::Unsupported {
                 vmm: "firecracker".to_string(),
                 feature: "snapshot/restore with a vhost-user device".to_string(),
@@ -956,7 +993,7 @@ impl VmInstance for FcInstance {
                 feature: "snapshot_restore".to_string(),
             });
         }
-        if crate::vmm::has_vhost_user_device(false, false, self.vhost_user_net) {
+        if vmcell::vmm::has_vhost_user_device(false, false, self.vhost_user_net) {
             return Err(Error::Unsupported {
                 vmm: "firecracker".to_string(),
                 feature: "snapshot with a vhost-user device".to_string(),
@@ -1056,6 +1093,39 @@ impl Drop for FcInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A no-op [`vmcell::metrics::CgroupFs`] for the reject-before-spawn tests below, which
+    /// exercise `create`/`restore` capability guards that return **before** any cgroup
+    /// interaction — so the fake's methods are never called. Replaces the former
+    /// `vmcell::metrics::FakeCgroupFs` (a `#[cfg(test)]`-only fixture that is not visible to a
+    /// downstream crate's test build).
+    #[derive(Debug)]
+    struct TestCgroupFs;
+
+    impl TestCgroupFs {
+        fn new() -> Self {
+            Self
+        }
+    }
+
+    impl vmcell::metrics::CgroupFs for TestCgroupFs {
+        fn create_slice(
+            &self,
+            _name: &str,
+            _limits: &vmcell::config::ResourceLimits,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn delete_slice(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn read_stats(&self, _name: &str) -> Result<vmcell::metrics::ResourceUsage> {
+            Ok(vmcell::metrics::ResourceUsage::default())
+        }
+        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+    }
 
     // Guards VMM-4: the probe must distinguish a firm "T2 unsupported" (a 400 template
     // error) from a transient probe failure (a 500, a non-template 400, a timeout, a
@@ -1255,7 +1325,7 @@ mod tests {
         // VM's scratch dir (§8.2, Restore correctness: a restored VM is not a fresh VM) — the rotation semantics the integration test's
         // `assert_ne` branch encodes.
         assert!(
-            crate::vmm::cloud_hypervisor::CloudHypervisor::new("/usr/bin/cloud-hypervisor")
+            vmcell::vmm::cloud_hypervisor::CloudHypervisor::new("/usr/bin/cloud-hypervisor")
                 .capabilities()
                 .restore_rotates_host_paths,
             "CH restore_rotates_host_paths must be true: the restore config rewrite \
@@ -1279,7 +1349,7 @@ mod tests {
     // this typed vhost-user Unsupported — reddening the assert.
     #[tokio::test]
     async fn restore_rejects_virtio_fs_share() {
-        use crate::config::{Access, CachePolicy, RootfsSource, Share};
+        use vmcell::config::{Access, CachePolicy, RootfsSource, Share};
         let fc = Firecracker::new("/usr/bin/firecracker");
         let cfg = VmConfig::builder(
             "/k",
@@ -1304,7 +1374,7 @@ mod tests {
             guest_cid: 3,
             tmp_dir: std::env::temp_dir().join("vmcell-fc-restore-vfs-test"),
         };
-        let cgroups = crate::metrics::FakeCgroupFs::new();
+        let cgroups = TestCgroupFs::new();
         let err = fc
             .restore(Path::new("/nonexistent-snapshot"), &cfg, &res, &cgroups)
             .await
@@ -1322,7 +1392,7 @@ mod tests {
     // is needed. Inverse (the old "unprivileged_net" literal) reddens the assert.
     #[tokio::test]
     async fn create_rejects_unprivileged_net_with_capability_field_name() {
-        use crate::config::{Egress, NetConfig, RootfsSource};
+        use vmcell::config::{Egress, NetConfig, RootfsSource};
         let fc = Firecracker::new("/usr/bin/firecracker");
         let cfg = VmConfig::builder(
             "/k",
@@ -1345,7 +1415,7 @@ mod tests {
             guest_cid: 3,
             tmp_dir: std::env::temp_dir().join("vmcell-fc-unpriv-test"),
         };
-        let cgroups = crate::metrics::FakeCgroupFs::new();
+        let cgroups = TestCgroupFs::new();
         let err = fc
             .create(&cfg, &res, &cgroups)
             .await

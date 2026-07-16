@@ -1,0 +1,24 @@
+[package]
+name = "vmcell-qemu"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "QEMU VMM backend for vmcell (the secondary micro-VM backend, extracted out of the vmcell core so it carries only Cloud Hypervisor)"
+publish = false
+
+# Depends on `vmcell` for the shared `Vmm`/`VmInstance` traits, the jail/seccomp predicates (QEMU
+# must pass `-sandbox …` via `vmm_seccomp_args`), and the spawn/reap/console/snapshot-eligibility
+# helpers — every "one law, one predicate" invariant stays single-sourced there. `vmcell` has NO
+# edge back to this crate (only a dev-dep, for the matrix tests). QEMU speaks QMP as JSON, so it
+# needs `serde_json` but no serde derive. `host-common` compiles the vmm/config/metrics/net/agent/fs
+# modules this backend consumes.
+[dependencies]
+vmcell = { path = "../vmcell", version = "0.11.0", default-features = false, features = ["host-common"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
+nix = { version = "0.31", features = ["signal", "process"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

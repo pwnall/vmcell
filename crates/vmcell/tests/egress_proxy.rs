@@ -34,15 +34,13 @@ fn capability_honesty_unprivileged_vhost_user_net() {
     );
     #[cfg(feature = "firecracker")]
     assert!(
-        !vmcell::vmm::Vmm::capabilities(&vmcell::vmm::firecracker::Firecracker::new(
-            common::fc_bin()
-        ))
-        .unprivileged_vhost_user_net,
+        !vmcell::vmm::Vmm::capabilities(&vmcell_firecracker::Firecracker::new(common::fc_bin()))
+            .unprivileged_vhost_user_net,
         "FC must NOT advertise unprivileged_vhost_user_net; a true here hides a real gap"
     );
     #[cfg(feature = "qemu")]
     assert!(
-        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::qemu::Qemu::new(common::qemu_bin()))
+        vmcell::vmm::Vmm::capabilities(&vmcell_qemu::Qemu::new(common::qemu_bin()))
             .unprivileged_vhost_user_net,
         "QEMU must support unprivileged_vhost_user_net; a false silently skips egress_proxy::qemu"
     );

@@ -2,6 +2,14 @@
 resolver = "2"
 members = [
     "crates/vmcell",
+    # The two secondary VMM backends, extracted out of `vmcell` so the core library carries only the
+    # primary Cloud Hypervisor backend. Each depends on `vmcell` (shared `Vmm` trait + helpers);
+    # `vmcell` has no production edge back (only a dev-dep, for the matrix tests).
+    "crates/vmcell-firecracker",
+    "crates/vmcell-qemu",
+    # The cross-backend benchmark harness (the `bench-vm` binary); wires all three backends, so like
+    # `vmcell-cli` it lives outside the `vmcell` package to keep the dependency graph acyclic.
+    "crates/vmcell-bench",
     "crates/vmcell-protocol",
     "crates/vmcell-guest-agent",
     "crates/vmcell-test-runner",

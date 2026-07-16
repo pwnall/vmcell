@@ -1007,7 +1007,8 @@ required-features bump; `just ci` green. Baseline in `docs/benchmark-results.md`
 The bash probe scripts had accumulated non-trivial logic; moved it into the `vmcell` bench crate so
 the one-law rules apply and it is testable. `just ci` green.
 
-- **`scripts/perf-daemon.sh` (207 lines) → `bench-vm --mode daemon-api`** (`crates/vmcell/src/bin/bench-vm.rs`).
+- **`scripts/perf-daemon.sh` (207 lines) → `bench-vm --mode daemon-api`** (`crates/vmcell/src/bin/bench-vm.rs`;
+  the `bench-vm` binary later moved to the `vmcell-bench` crate — see the 2026-07-16 backend-extraction note below).
   The script carried an ephemeral-port picker, artifact-store seeding, a daemon spawn/health-poll/
   SIGTERM-teardown lifecycle, `curl -w %{time_total}` timing of five ops, python JSON id-parsing, and
   **a python percentile heredoc reimplementing the Rust `pcts`** (a confirmed second copy of the
@@ -1036,3 +1037,49 @@ the one-law rules apply and it is testable. `just ci` green.
   and the `perf-matrix.sh` backend×mode loop (pure argv orchestration). A `bench-vm --mode all` was
   rejected: per-mode process isolation — fresh address space / tokio runtime / delegated cgroup scope /
   freq-pin, and a contained blast radius per mode — is a feature the shell loop provides for free.
+
+## Secondary VMM backends extracted into their own crates (`vmcell` → `vmcell-firecracker` / `vmcell-qemu` / `vmcell-bench`, 2026-07-16)
+
+`vmcell` now carries only the **primary** Cloud Hypervisor backend. Firecracker and QEMU moved out of
+`crates/vmcell/src/vmm/{firecracker,qemu}.rs` into standalone `vmcell-firecracker` and `vmcell-qemu`
+crates, and the `bench-vm` binary (which drives all three backends) moved into a new `vmcell-bench`
+crate. `vmcell` bumped `0.10.0 → 0.11.0` (the `Firecracker`/`Qemu` re-exports left its public API).
+
+- **No new "helper crate"; the shared plumbing stays in `vmcell`.** The backends depend on `vmcell`
+  (the same acyclic pattern as `vmcell-rootfs-builder`/`vmcell-kernel-builder`) and reuse the existing
+  `Vmm`/`VmInstance` traits, `jail`/`seccomp` predicates (`vmm_seccomp_args` still keys off the backend
+  **string id**, so "one law, one predicate" is untouched), and the spawn/reap/console/eligibility
+  helpers. Nine already-shared items were promoted `pub(crate) → pub`: `register_and_await_ready`,
+  `reap_process_group`, `reject_unsupported_console`, `has_vhost_user_device`,
+  `config_has_vhost_user_device`, `AGENT_VSOCK_PORT` (vmm), `build_kernel_cmdline`,
+  `IO_LIMIT_REFILL_TIME_MS` (config), and `AgentClient::connect_endpoint` (agent). No logic was
+  duplicated into the new crates.
+- **Five shared VMM-contract types made exhaustive (dropped `#[non_exhaustive]`):** `VmmCapabilities`
+  and `PerVmResources` (vmm), `RootfsSource`, `ConsoleMode`, `VsockTransport` (config). The extracted
+  backends must construct/exhaustively-match each of these; `#[non_exhaustive]` would let a new
+  field/variant slip through a backend as an unhandled default. Making them exhaustive turns a new
+  field/variant into a **compile error in every backend crate** (fail-loud) — the desired discipline
+  for a tightly-coupled backend set. Justified because `vmcell` is `publish = false` (no external
+  consumer relied on the non-exhaustiveness). This is the load-bearing reversal of the extraction.
+- **`FakeCgroupFs` was NOT exposed.** It is `#[cfg(test)]` and its deliberate `.lock().unwrap()`s would
+  trip `vmcell`'s `#![cfg_attr(not(test), deny(clippy::unwrap_used, …))]` if exposed behind a feature.
+  All four moved backend tests only pass the fake to a **reject-before-spawn** path (cgroups untouched),
+  so each backend crate's test module defines a local no-op `TestCgroupFs: vmcell::metrics::CgroupFs`
+  instead. No `test-util` feature, no new `vmcell` public surface.
+- **The `firecracker`/`qemu` cargo features were kept as `host-common` aliases.** They no longer gate
+  any in-tree module (dropping them would be a semver feature removal, cf. `jip-nftables`); they now
+  only gate the FC/QEMU **integration-test legs**, so `just ci`'s `--features firecracker,qemu`
+  invocation and the `#[cfg(feature = …)]` `vmm_matrix_test!` arms still compile and run. The matrix
+  tests and the three `qemu_*` tests stay in `crates/vmcell/tests/` via a **dev-dependency cycle**
+  (`vmcell(dev) → vmcell-firecracker/vmcell-qemu → vmcell`, the same permitted cycle as the validator);
+  cargo forbids optional dev-deps, so the backend dev-deps are unconditional but the test arms remain
+  feature-gated. `benchmark.rs` moved to `vmcell-bench/tests/` (its `assert_cmd::cargo_bin("bench-vm")`
+  resolves a bin only in the same package). `clap`/`anyhow` left `vmcell` with the `bench-vm` binary
+  (`cargo machete` verified); the `cli` feature is retained but now only ensures the host JSON stack.
+- **Gates.** `just ci`'s `--workspace --all-features` clippy/doc/nextest and the reduced-host-feature
+  loop cover the new crates; an explicit `clippy -p vmcell-firecracker -p vmcell-qemu -p vmcell-bench
+  --all-targets -- -D warnings` (added to the justfile and `ci.yml`) asserts each backend compiles
+  standalone against `vmcell`'s shared surface. The moved unit tests run KVM-free
+  (`cargo test -p vmcell-firecracker` = 13, `-p vmcell-qemu` = 15). No backend leg silently dropped to
+  a green no-op — the FC/QEMU matrix arms and the `qemu_*` tests still select under
+  `--features firecracker,qemu`.

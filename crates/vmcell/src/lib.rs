@@ -139,10 +139,8 @@ pub use overlay::{OverlayStore, ReflinkOverlayStore};
 pub use proxy::EgressProxy;
 #[cfg(feature = "host-common")]
 pub use reflink::CowSupport;
-#[cfg(feature = "firecracker")]
-pub use vmm::Firecracker;
-#[cfg(feature = "qemu")]
-pub use vmm::Qemu;
+// `Firecracker` / `Qemu` now live in the `vmcell-firecracker` / `vmcell-qemu` crates; `vmcell`
+// re-exports only the primary Cloud Hypervisor backend and the shared traits.
 #[cfg(feature = "host-common")]
 pub use vmm::{CloudHypervisor, VmInstance, Vmm};
 #[cfg(feature = "host-common")]

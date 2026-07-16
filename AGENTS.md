@@ -6,12 +6,16 @@ Deploy at the repository root as `AGENTS.md`. Terse by design; the reasoning liv
 
 ## What this is
 
-vmcell runs each integration test in an isolated micro-VM. Cloud Hypervisor is the primary backend;
-Firecracker and QEMU are secondary, behind one `Vmm` trait with a `VmmCapabilities` descriptor.
-Crates (under `crates/`): `vmcell` (host lib), `vmcell-cli`, `vmcell-protocol`,
-`vmcell-guest-agent` (PID 1 in-guest), `vmcell-test-runner` (privileged capability runner),
-`vmcell-guest-tools`, the rootfs/kernel builders, `vmcell-privilege` (shared cap/blessing
-predicates), and the control-plane tier: `vmcell-daemon` (lib), `vmcelld` (binary),
+vmcell runs each integration test in an isolated micro-VM. Cloud Hypervisor is the primary backend
+and the **only** one in the `vmcell` lib; Firecracker and QEMU are secondary and live in their own
+crates (`vmcell-firecracker`, `vmcell-qemu`), each depending on `vmcell` for the one `Vmm` trait,
+the `VmmCapabilities` descriptor, and the shared jail/seccomp/spawn/console/eligibility helpers —
+`vmcell` has no production edge back (only a dev-dep, for the matrix tests). Crates (under
+`crates/`): `vmcell` (host lib), `vmcell-firecracker` / `vmcell-qemu` (the secondary backends),
+`vmcell-bench` (the cross-backend `bench-vm` harness, wiring all three backends), `vmcell-cli`,
+`vmcell-protocol`, `vmcell-guest-agent` (PID 1 in-guest), `vmcell-test-runner` (privileged
+capability runner), `vmcell-guest-tools`, the rootfs/kernel builders, `vmcell-privilege` (shared
+cap/blessing predicates), and the control-plane tier: `vmcell-daemon` (lib), `vmcelld` (binary),
 `vmcell-daemon-client`, `vmcelld-ctl`, and `vmcell-broker` (the privileged spawn helper). Two
 operating modes: **unprivileged** (KVM group only, smoltcp NAT) and **privileged** (three caps,
 netns/tap/nft, the only snapshot-eligible mode).

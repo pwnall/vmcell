@@ -453,13 +453,13 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "firecracker")]
         "firecracker" => {
-            let vmm = vmcell::vmm::firecracker::Firecracker::new("firecracker");
+            let vmm = vmcell_firecracker::Firecracker::new("firecracker");
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "firecracker", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "qemu")]
         "qemu" => {
-            let vmm = vmcell::vmm::qemu::Qemu::new("qemu-system-x86_64");
+            let vmm = vmcell_qemu::Qemu::new("qemu-system-x86_64");
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "qemu", &args, allocator.clone()).await?;
         }

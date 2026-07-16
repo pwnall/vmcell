@@ -25,16 +25,13 @@ fn capability_honesty_nested_virt() {
     );
     #[cfg(feature = "firecracker")]
     assert!(
-        !vmcell::vmm::Vmm::capabilities(&vmcell::vmm::firecracker::Firecracker::new(
-            common::fc_bin()
-        ))
-        .nested_virt,
+        !vmcell::vmm::Vmm::capabilities(&vmcell_firecracker::Firecracker::new(common::fc_bin()))
+            .nested_virt,
         "FC must NOT advertise nested_virt; a true here hides a real gap"
     );
     #[cfg(feature = "qemu")]
     assert!(
-        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::qemu::Qemu::new(common::qemu_bin()))
-            .nested_virt,
+        vmcell::vmm::Vmm::capabilities(&vmcell_qemu::Qemu::new(common::qemu_bin())).nested_virt,
         "QEMU must support nested_virt; a false silently skips nested_virt::qemu"
     );
 }
@@ -58,16 +55,13 @@ fn capability_honesty_virtio_console() {
     );
     #[cfg(feature = "firecracker")]
     assert!(
-        !vmcell::vmm::Vmm::capabilities(&vmcell::vmm::firecracker::Firecracker::new(
-            common::fc_bin()
-        ))
-        .virtio_console,
+        !vmcell::vmm::Vmm::capabilities(&vmcell_firecracker::Firecracker::new(common::fc_bin()))
+            .virtio_console,
         "FC must NOT advertise virtio_console (no hvc0 device); a true would silence the serial log on a VirtioConsole config"
     );
     #[cfg(feature = "qemu")]
     assert!(
-        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::qemu::Qemu::new(common::qemu_bin()))
-            .virtio_console,
+        vmcell::vmm::Vmm::capabilities(&vmcell_qemu::Qemu::new(common::qemu_bin())).virtio_console,
         "QEMU must advertise virtio_console (it attaches hvc0)"
     );
 }

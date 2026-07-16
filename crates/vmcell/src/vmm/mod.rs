@@ -16,19 +16,11 @@ pub mod jail;
 /// The VMM subprocess's own seccomp-BPF confinement — one predicate, three backends (§12.2, Layer 1 — the VMM's own seccomp filter).
 pub mod seccomp;
 
-#[cfg(feature = "firecracker")]
-/// Firecracker VMM backend implementation.
-pub mod firecracker;
-
-#[cfg(feature = "firecracker")]
-pub use firecracker::{FcInstance, Firecracker};
-
-#[cfg(feature = "qemu")]
-/// QEMU VMM backend implementation.
-pub mod qemu;
-
-#[cfg(feature = "qemu")]
-pub use qemu::{Qemu, QemuInstance};
+// The Firecracker and QEMU backends were extracted into the standalone `vmcell-firecracker` and
+// `vmcell-qemu` crates (they depend on `vmcell`; `vmcell` has no production edge back). Only Cloud
+// Hypervisor — the primary backend — stays in-tree. The shared `Vmm`/`VmInstance` traits, the
+// jail/seccomp predicates, and the spawn/reap/console/snapshot-eligibility helpers below remain the
+// single source of truth those crates depend on.
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -347,7 +339,7 @@ pub async fn wait_for_socket(
 /// owning instance (whose `Drop` would otherwise do this): a failure there — e.g. a
 /// cgroup `add_task` or a readiness timeout — must not leak a running VMM, because
 /// `tokio::process::Child` does not kill on drop. No-op when `pgid` is `None`.
-pub(crate) fn reap_process_group(process: &mut tokio::process::Child, pgid: Option<u32>) {
+pub fn reap_process_group(process: &mut tokio::process::Child, pgid: Option<u32>) {
     let Some(pgid) = pgid else {
         return;
     };
@@ -377,10 +369,10 @@ pub(crate) fn reap_process_group(process: &mut tokio::process::Child, pgid: Opti
 ///
 /// # Errors
 /// Returns — after reaping the process group — the raw underlying error: the cgroup
-/// `add_task` failure, or the readiness [`Error::Timeout`]/process-exited-early
+/// `add_task` failure, or the readiness [`Error::Timeout`](crate::error::Error::Timeout)/process-exited-early
 /// `Error` from [`wait_for_socket`]. The error is returned verbatim and identically
 /// across backends, so no backend can silently diverge on how it wraps it.
-pub(crate) async fn register_and_await_ready(
+pub async fn register_and_await_ready(
     process: &mut tokio::process::Child,
     cgroups: &dyn crate::metrics::CgroupFs,
     cgroup_name: &str,
@@ -425,7 +417,7 @@ pub(crate) async fn register_and_await_ready(
 /// Returns [`Error::Unsupported`](crate::error::Error::Unsupported)
 /// `{ vmm, feature: "virtio_console" }` when `mode` is `VirtioConsole` and
 /// `caps.virtio_console` is `false`; `Ok(())` otherwise.
-pub(crate) fn reject_unsupported_console(
+pub fn reject_unsupported_console(
     vmm: &str,
     caps: &VmmCapabilities,
     mode: crate::config::ConsoleMode,
@@ -451,7 +443,7 @@ pub(crate) fn reject_unsupported_console(
 /// Centralizing it makes that class of divergence impossible. (Design §18 delta 5, Delta register: changes from the validated v27 build
 /// later removed the virtio-fs-rootfs variant entirely, making that boundary case
 /// unrepresentable rather than a runtime check.)
-pub(crate) fn has_vhost_user_device(
+pub fn has_vhost_user_device(
     virtio_fs_share: bool,
     unprivileged_net: bool,
     vhost_user_net: bool,
@@ -463,7 +455,7 @@ pub(crate) fn has_vhost_user_device(
 /// is therefore **not** snapshot-eligible (§8.1, The warm-snapshot path and the eligibility law). Covers the boundary cases at
 /// `restore()`/`snapshot()`: a virtio-fs data share (backed by virtiofsd), the
 /// unprivileged `vhost-user-net` NAT, and an external `vhost-user-net` socket.
-pub(crate) fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
+pub fn config_has_vhost_user_device(cfg: &VmConfig, res: &PerVmResources) -> bool {
     let virtio_fs = !cfg.shares.is_empty();
     has_vhost_user_device(
         virtio_fs,
@@ -555,8 +547,13 @@ impl CidAllocator {
 }
 
 /// Per-VM resources allocated by the orchestrator before VM creation.
+///
+/// Constructed by the orchestrator and, in their tests, by the out-of-tree backend crates
+/// (`vmcell-firecracker`/`vmcell-qemu`). It is deliberately **not** `#[non_exhaustive]`: every
+/// backend must be handed a fully-specified resource set, so a new field should be a compile error
+/// in each backend crate (fail-loud) rather than a silently-defaulted one. (`vmcell` is
+/// `publish = false`; there is no external consumer relying on non-exhaustiveness.)
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct PerVmResources {
     /// Name of the cgroup v2 slice for the VM.
     pub cgroup_name: String,
@@ -578,8 +575,13 @@ pub struct PerVmResources {
 }
 
 /// Virtual Machine Monitor (VMM) capabilities.
+///
+/// Every backend — including the out-of-tree `vmcell-firecracker`/`vmcell-qemu` crates and the
+/// `FakeVmm` — constructs its own descriptor by naming all fields. It is deliberately **not**
+/// `#[non_exhaustive]`: a new capability must force every backend to declare its stance on it (a
+/// compile error until it does), not default silently to `false`. (`vmcell` is `publish = false`;
+/// there is no external consumer relying on non-exhaustiveness.)
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct VmmCapabilities {
     /// True if the VMM supports snapshot and restore.
     pub snapshot_restore: bool,
@@ -680,7 +682,7 @@ pub trait Vmm: Send + Sync {
 /// definition shared by the orchestrator's agent connect and the QEMU
 /// control-plane health-gate probe (AGENTS.md "one law, one predicate") — the
 /// guest agent's own `VSOCK_PORT` is its mirror on the other side of the boundary.
-pub(crate) const AGENT_VSOCK_PORT: u32 = 5000;
+pub const AGENT_VSOCK_PORT: u32 = 5000;
 
 /// How the host reaches a VM's guest-agent vsock control plane.
 ///

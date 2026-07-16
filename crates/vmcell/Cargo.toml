@@ -22,7 +22,10 @@ name = "vmcell"
 # `LineageAllocator`) modules; `MicroVm::restore_cow` gained a final
 # `Arc<dyn OverlayStore>` seam param (the one breaking change, a minor pre-1.0 bump);
 # `Zygote` gained `with_overlay_store`.
-version = "0.10.0"
+# 0.11.0: the Firecracker and QEMU backends were extracted into the `vmcell-firecracker` and
+# `vmcell-qemu` crates, so the `Firecracker`/`Qemu` re-exports left the public API (a breaking
+# change under the pre-1.0 minor-bump convention).
+version = "0.11.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -35,17 +38,10 @@ publish = false
 name = "vmcell"
 path = "src/lib.rs"
 
-# The `vmcell` CLI binary moved to the `vmcell-cli` crate (design §10.1): it is the
-# composition root that wires the in-VM builder crates, which depend on `vmcell` — keeping it
-# here would form a dependency cycle. `bench-vm` stays: it only *consumes* built artifacts.
-[[bin]]
-name = "bench-vm"
-path = "src/bin/bench-vm.rs"
-# `proxy` is required by the `net-egress --net-mode tls|privileged` MITM probes (they
-# construct a `proxy::doubles::TestDouble`); the default feature set already enables it,
-# so every real build (default + `firecracker,qemu`, and `--all-features`) satisfies this.
-required-features = ["cloud-hypervisor", "metrics", "cli", "proxy"]
-
+# The `vmcell` CLI binary moved to the `vmcell-cli` crate and the `bench-vm` binary to the
+# `vmcell-bench` crate (design §10.1): both are composition roots that wire crates depending on
+# `vmcell` (bench-vm drives all three backends, including `vmcell-firecracker`/`vmcell-qemu`), so
+# keeping them here would form a dependency cycle. `vmcell` itself declares no binary.
 [[bench]]
 name = "micro"
 harness = false
@@ -64,11 +60,8 @@ required-features = ["pipeline"]
 # compiling them under configs where the host modules are absent, AND avoids the
 # dead-code that a backend-less-but-host-common config would leave (the matrix would
 # emit no backend fn, so the shared `test_*_impl` helpers would be unused).
-[[test]]
-name = "benchmark"
-path = "tests/benchmark.rs"
-required-features = ["cloud-hypervisor"]
-
+# (The `benchmark` integration test moved to the `vmcell-bench` crate alongside the `bench-vm`
+# binary it drives via `assert_cmd::cargo_bin`.)
 [[test]]
 name = "boot"
 path = "tests/boot.rs"
@@ -203,9 +196,8 @@ reflink-copy = { version = "0.1", optional = true }
 walkdir = { version = "2", optional = true }
 tempfile = { version = "3", optional = true }
 
-# CLI
-clap = { version = "4", optional = true, features = ["derive"] }
-anyhow = { version = "1", optional = true }
+# (The `clap`/`anyhow` deps left with the `bench-vm` binary when it moved to the `vmcell-bench`
+# crate; nothing in the `vmcell` library used them. `vmcell-cli` and `vmcell-bench` carry their own.)
 
 # OCI
 oci-client = { version = "0.17", optional = true }
@@ -237,6 +229,13 @@ http = { version = "1", optional = true }
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
 vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.1.0" }
+# The `vmm_matrix_test!` harness and the FC/QEMU capability/lifecycle/`qemu_*` tests construct the
+# concrete backends, which now live in these crates. Same permitted dev-dependency cycle as the
+# validator above (`vmcell(dev) → vmcell-firecracker/vmcell-qemu → vmcell`), so `vmcell` gains no
+# production edge to them. The FC/QEMU test arms stay `#[cfg(feature = …)]`-gated, but the dev-deps
+# themselves are unconditional (cargo forbids optional dev-deps).
+vmcell-firecracker = { path = "../vmcell-firecracker", version = "0.1.0" }
+vmcell-qemu = { path = "../vmcell-qemu", version = "0.1.0" }
 criterion = { version = "0.8", features = ["html_reports"] }
 # `test-util` enables `#[tokio::test(start_paused = true)]` for the deterministic
 # EXP-D shutdown-timing tests (L-ORCH-5). Test-only: dev-deps do not affect the
@@ -283,8 +282,13 @@ host-common = [
 ]
 
 cloud-hypervisor = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:serde_json"]
-firecracker = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:serde_json"]
-qemu = ["host-common", "dep:serde_json"]
+# `firecracker` and `qemu` no longer gate any in-tree module — those backends moved to the
+# `vmcell-firecracker` / `vmcell-qemu` crates (which `vmcell` dev-depends on). The features are kept
+# (dropping them would be a semver feature removal, cf. `jip-nftables`) as aliases of `host-common`
+# so the integration-test legs `#[cfg(feature = "firecracker"/"qemu")]` still compile the FC/QEMU
+# matrix arms and CI's `--features firecracker,qemu` invocation keeps selecting them.
+firecracker = ["host-common"]
+qemu = ["host-common"]
 
 net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:tun-tap", "dep:netlink-packet-route"]
 experiment-nftables = ["net-privileged", "jip-nftables"]
@@ -310,7 +314,10 @@ pipeline = [
     "am-fs-erofs", "dep:oci-client",
 ]
 
-cli = ["host-common", "dep:clap", "dep:anyhow", "dep:serde_json"]
+# Retained (dependents `vmcell-cli`/`vmcell-daemon`/`vmcell-bench` still name `vmcell/cli`, and
+# dropping a feature is a semver break, cf. `jip-nftables`) but now only ensures the shared host
+# JSON stack — the `bench-vm` binary that needed clap/anyhow moved to the `vmcell-bench` crate.
+cli = ["host-common", "dep:serde_json"]
 
 fuse-backend-rs = ["dep:fuse-backend-rs"]
 vhost = ["dep:vhost"]

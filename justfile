@@ -170,6 +170,11 @@ ci:
       echo "== reduced-host-feature clippy: --no-default-features --features $feat =="; \
       cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets; \
     done
+    # The Firecracker and QEMU backends now live in their own crates (they depend on `vmcell`;
+    # `vmcell` keeps only Cloud Hypervisor). Clippy each standalone so a backend crate that stops
+    # compiling against `vmcell`'s shared surface fails here, not only inside the workspace build.
+    # `vmcell-bench` is the composition root that wires all three backends (the `bench-vm` binary).
+    cargo clippy --locked -p vmcell-firecracker -p vmcell-qemu -p vmcell-bench --all-targets
     # rustdoc gate (docs/51): RUSTDOCFLAGS=-D warnings turns EVERY rustdoc lint into a hard error —
     # broken/private intra-doc links, unresolved links — for the whole public surface. clippy does
     # NOT run rustdoc lints, and `cargo doc` runs nowhere else, so without this a broken doc link is

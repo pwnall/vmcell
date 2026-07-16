@@ -31,15 +31,13 @@ fn capability_honesty_virtio_fs_shares() {
     );
     #[cfg(feature = "firecracker")]
     assert!(
-        !vmcell::vmm::Vmm::capabilities(&vmcell::vmm::firecracker::Firecracker::new(
-            common::fc_bin()
-        ))
-        .virtio_fs_shares,
+        !vmcell::vmm::Vmm::capabilities(&vmcell_firecracker::Firecracker::new(common::fc_bin()))
+            .virtio_fs_shares,
         "FC has no virtio-fs, so it must NOT advertise virtio_fs_shares; a true here hides a real gap"
     );
     #[cfg(feature = "qemu")]
     assert!(
-        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::qemu::Qemu::new(common::qemu_bin()))
+        vmcell::vmm::Vmm::capabilities(&vmcell_qemu::Qemu::new(common::qemu_bin()))
             .virtio_fs_shares,
         "QEMU must support virtio_fs_shares; a false here silently skips shares_ro_rw::qemu"
     );

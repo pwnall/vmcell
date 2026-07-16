@@ -119,6 +119,13 @@ jobs:
             cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets -- -D warnings
             echo "::endgroup::"
           done
+          # The Firecracker/QEMU backends now live in their own crates (depending on `vmcell`, which
+          # keeps only Cloud Hypervisor); `vmcell-bench` wires all three (the `bench-vm` binary).
+          # Clippy each standalone so a backend that stops compiling against vmcell's shared surface
+          # fails here, not only inside the workspace build.
+          echo "::group::clippy extracted backend + bench crates"
+          cargo clippy --locked -p vmcell-firecracker -p vmcell-qemu -p vmcell-bench --all-targets -- -D warnings
+          echo "::endgroup::"
 
       - name: rustdoc (deny warnings)   # broken/private intra-doc links; clippy does NOT run rustdoc lints
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked

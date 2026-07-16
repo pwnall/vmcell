@@ -7,7 +7,8 @@
 #
 # Usage: scripts/perf-matrix.sh [logfile]
 # Assumes: `just bless` installed the runner at .vmcell-bin/release/ and
-#          target/release/bench-vm was built with `--features firecracker,qemu`.
+#          target/release/bench-vm was built via `cargo build --release -p vmcell-bench`
+#          (its default features enable all three backends, including firecracker + qemu).
 set -uo pipefail
 WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="${1:-/tmp/perf-matrix.log}"

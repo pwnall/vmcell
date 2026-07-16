@@ -347,7 +347,7 @@ pub(crate) fn push_guest_timeout_args(cmdline: &mut String, timeouts: &Timeouts)
 ///
 /// # Errors
 /// Propagates the `/30` host-IP math error when networking is enabled.
-pub(crate) fn build_kernel_cmdline(
+pub fn build_kernel_cmdline(
     cfg: &VmConfig,
     vmid: u32,
     backend_extra: &str,
@@ -515,8 +515,12 @@ fn validate_extra_kernel_arg(arg: &str) -> Result<(), String> {
 }
 
 /// Options for the root filesystem backing the VM.
+///
+/// Every VMM backend — including the out-of-tree `vmcell-firecracker`/`vmcell-qemu` crates — must
+/// exhaustively map each rootfs source to its own device wiring, so this enum is deliberately
+/// **not** `#[non_exhaustive]`: a new variant should be a compile error in every backend (fail-loud)
+/// rather than an unhandled `_` arm. (`vmcell` is `publish = false`; there is no external consumer.)
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub enum RootfsSource {
     /// Read-only EROFS image. Shared across multiple VMs.
     Erofs {
@@ -640,7 +644,7 @@ impl DiskIoLimit {
 /// shared by the CH and Firecracker rate-limiter builders (one law, one predicate), so
 /// they can never express the same `DiskIoLimit` as different rates. QEMU takes the
 /// per-second rate directly (`throttling.bps-total`/`iops-total`).
-pub(crate) const IO_LIMIT_REFILL_TIME_MS: u64 = 1000;
+pub const IO_LIMIT_REFILL_TIME_MS: u64 = 1000;
 
 /// Guest kernel console log verbosity, mapped to the `loglevel=` boot parameter.
 ///
@@ -687,8 +691,10 @@ impl KernelVerbosity {
 /// The cmdline `console=` token and the device wiring must move in lockstep, or the
 /// guest writes its console to a device that sinks nowhere and `serial.log` goes
 /// silent. Both are derived from this one knob so they cannot desync.
+// Not `#[non_exhaustive]`: each VMM backend (including the out-of-tree `vmcell-qemu` crate)
+// exhaustively maps every console mode to its device wiring, so a new mode should be a compile
+// error in every backend (fail-loud) rather than an unhandled `_`. (`vmcell` is `publish = false`.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ConsoleMode {
     /// Legacy 8250 `ttyS0`: alive from the first instruction (early-boot + panic
     /// capture, §5.3, The kernel command line) but per-byte PIO VM-exits. The safe default.
@@ -748,8 +754,11 @@ pub enum RestoreMode {
 /// resolves to it, and [`VmConfigBuilder::build`] rejects `snapshotting` combined with
 /// an explicit `ExternalDaemon` (the invalid combination is fail-loud, not silently
 /// overridden). The one predicate `uses_in_kernel_vsock` reads this field.
+// Not `#[non_exhaustive]`: the QEMU backend (now the out-of-tree `vmcell-qemu` crate) exhaustively
+// matches this in `uses_in_kernel_vsock`, and a new transport must force that decision to be
+// re-made (a compile error) rather than slip through an unhandled `_` arm. (`vmcell` is
+// `publish = false`; there is no external consumer relying on non-exhaustiveness.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum VsockTransport {
     /// `InKernel` when `snapshotting`, else `ExternalDaemon` — the unprivileged
     /// default that preserves the historical behavior.

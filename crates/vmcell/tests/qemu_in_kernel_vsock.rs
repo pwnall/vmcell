@@ -16,7 +16,8 @@
 use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig, VsockTransport};
 use vmcell::orchestrator::MicroVm;
-use vmcell::vmm::{Qemu, VmInstance, VsockEndpoint};
+use vmcell::vmm::{VmInstance, VsockEndpoint};
+use vmcell_qemu::Qemu;
 
 mod common;
 

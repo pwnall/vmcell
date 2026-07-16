@@ -66,7 +66,7 @@ async fn probe_connect(uds: &std::path::Path) -> String {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "investigation harness; boots QEMU in a loop"]
 async fn qemu_vsock_flake_repro() {
-    let vmm = vmcell::vmm::qemu::Qemu::new(common::qemu_bin());
+    let vmm = vmcell_qemu::Qemu::new(common::qemu_bin());
 
     let mut ok = 0usize;
     let mut fail = 0usize;

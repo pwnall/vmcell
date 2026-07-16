@@ -1,12 +1,46 @@
-//! QEMU VMM backend.
+//! QEMU VMM backend for `vmcell`.
 //!
-//! Provides the [`Qemu`] implementation of the `Vmm` trait.
+//! Provides the [`Qemu`] implementation of the [`vmcell::vmm::Vmm`] trait and its running-instance
+//! type [`QemuInstance`]. Extracted from the `vmcell` crate (design §2.4, QEMU q35 — the fallback
+//! and most-proven nester) so the core library carries only the primary Cloud Hypervisor backend;
+//! this crate depends on `vmcell` for the shared `Vmm`/`VmInstance` traits, the jail/seccomp
+//! predicates (QEMU **must** pass `-sandbox …` via `vmm_seccomp_args` or it runs unconfined), and
+//! the spawn/reap/console/snapshot-eligibility helpers — every "one law, one predicate" invariant
+//! stays single-sourced in `vmcell`.
 
-use crate::config::VmConfig;
-use crate::error::{Error, Result};
-use crate::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities, VsockEndpoint};
+#![deny(missing_docs)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block, // one obligation per SAFETY comment
+    unsafe_op_in_unsafe_fn,
+    rustdoc::broken_intra_doc_links
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
+    )
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use vmcell::config::VmConfig;
+use vmcell::error::{Error, Result};
+use vmcell::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities, VsockEndpoint};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -38,7 +72,7 @@ pub struct QemuInstance {
     qmp_socket: PathBuf,
     vsock_path: PathBuf,
     serial_path: PathBuf,
-    _fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
+    _fs_daemons: Vec<vmcell::fs::VirtioFsDaemon>,
     _vsock_daemon: Option<Child>,
     cid: u32,
     /// How the host reaches this VM's guest agent (returned by
@@ -366,7 +400,7 @@ impl VsockDaemonGuard {
 impl Drop for VsockDaemonGuard {
     fn drop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
-            crate::vmm::reap_process_group(&mut daemon, self.pgid);
+            vmcell::vmm::reap_process_group(&mut daemon, self.pgid);
         }
     }
 }
@@ -380,7 +414,7 @@ struct SpawnedQemu {
     serial_path: PathBuf,
     process: Child,
     vsock_daemon: Option<Child>,
-    fs_daemons: Vec<crate::fs::VirtioFsDaemon>,
+    fs_daemons: Vec<vmcell::fs::VirtioFsDaemon>,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
     /// The effective guest CID the vsock device was bound to (the baked CID on a
@@ -425,7 +459,7 @@ fn push_fixed_qemu_flags(cmd: &mut tokio::process::Command) {
 ///   must carry no vhost-user device (the eligibility law S1, §8.1), and the external
 ///   daemon *is* one, so the only migratable transport is the in-kernel
 ///   `vhost-vsock-pci` device (§2.4). `snapshotting` is privileged-gated at
-///   [`VmConfig::build`](crate::config) (no unprivileged net / virtio-fs share / custom
+///   [`VmConfig::build`](vmcell::config) (no unprivileged net / virtio-fs share / custom
 ///   init) and cannot pair with an explicit `ExternalDaemon`, so a snapshotting VM is
 ///   always in-kernel here.
 ///
@@ -435,9 +469,9 @@ fn push_fixed_qemu_flags(cmd: &mut tokio::process::Command) {
 /// downgrade to the daemon.
 fn uses_in_kernel_vsock(cfg: &VmConfig) -> bool {
     match cfg.vsock_transport {
-        crate::config::VsockTransport::InKernel => true,
-        crate::config::VsockTransport::ExternalDaemon => false,
-        crate::config::VsockTransport::Auto => cfg.snapshotting,
+        vmcell::config::VsockTransport::InKernel => true,
+        vmcell::config::VsockTransport::ExternalDaemon => false,
+        vmcell::config::VsockTransport::Auto => cfg.snapshotting,
     }
 }
 
@@ -501,7 +535,7 @@ impl Qemu {
         &self,
         cfg: &VmConfig,
         res: &PerVmResources,
-        cgroups: &dyn crate::metrics::CgroupFs,
+        cgroups: &dyn vmcell::metrics::CgroupFs,
         params: &SpawnParams,
     ) -> Result<SpawnedQemu> {
         // The orchestrator owns the per-VM scratch dir; derive our socket and
@@ -558,7 +592,7 @@ impl Qemu {
             // Wait for the vhost-vsock socket to appear; on failure reap the daemon's
             // group before the RAII guard takes ownership, so a half-started daemon
             // never leaks.
-            if let Err(e) = crate::vmm::wait_for_socket(
+            if let Err(e) = vmcell::vmm::wait_for_socket(
                 &vhost_vsock,
                 Some(&mut vsock_daemon),
                 1000,
@@ -566,7 +600,7 @@ impl Qemu {
             )
             .await
             {
-                crate::vmm::reap_process_group(&mut vsock_daemon, vsock_pgid);
+                vmcell::vmm::reap_process_group(&mut vsock_daemon, vsock_pgid);
                 return Err(Error::Vmm(format!(
                     "vhost-device-vsock failed to start: {e}"
                 )));
@@ -582,17 +616,17 @@ impl Qemu {
 
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
-            let daemon = crate::fs::VirtioFsDaemon::start(share, &res.tmp_dir).await?;
+            let daemon = vmcell::fs::VirtioFsDaemon::start(share, &res.tmp_dir).await?;
             fs_daemons.push(daemon);
         }
 
         // §12.2 (Layer 1 — the VMM's own seccomp filter)/§12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): QEMU had NO `-sandbox` — it ran unconfined. Enforcing now emits the
         // libseccomp sandbox (a QEMU built without libseccomp errors fail-loud on it, the
         // desired behavior); the jailer-equivalent hardening is applied in build_vmm_cmd.
-        let seccomp_args = crate::vmm::seccomp::vmm_seccomp_args("qemu", cfg.vmm_seccomp)?;
-        let jail = crate::vmm::jail::jail_spec_from_config(&cfg.jail)?;
+        let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("qemu", cfg.vmm_seccomp)?;
+        let jail = vmcell::vmm::jail::jail_spec_from_config(&cfg.jail)?;
         let mut cmd =
-            crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
+            vmcell::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
         cmd.args(&seccomp_args);
 
         cmd.arg("-M")
@@ -630,13 +664,13 @@ impl Qemu {
         // `reject_unsupported_console` already gated an unsupported mode in create().
         match cfg.console_mode {
             // Uart: the 8250 `ttyS0` bytes go straight to serial.log.
-            crate::config::ConsoleMode::Uart => {
+            vmcell::config::ConsoleMode::Uart => {
                 cmd.arg("-serial")
                     .arg(format!("file:{}", serial_path.display()));
             }
             // VirtioConsole: no `-serial`; `hvc0` is a virtconsole on a virtio-serial
             // bus (q35 already provides PCI) whose chardev writes serial.log.
-            crate::config::ConsoleMode::VirtioConsole => {
+            vmcell::config::ConsoleMode::VirtioConsole => {
                 cmd.arg("-device")
                     .arg("virtio-serial-pci,id=virtio-serial0")
                     .arg("-chardev")
@@ -667,7 +701,7 @@ impl Qemu {
         }
 
         match &cfg.rootfs {
-            crate::config::RootfsSource::Erofs { image } => {
+            vmcell::config::RootfsSource::Erofs { image } => {
                 cmd.arg("-drive")
                     .arg(format!(
                         "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
@@ -676,7 +710,7 @@ impl Qemu {
                     .arg("-device")
                     .arg("virtio-blk-pci,drive=rfs");
             }
-            crate::config::RootfsSource::Block { image, overlay } => {
+            vmcell::config::RootfsSource::Block { image, overlay } => {
                 cmd.arg("-drive")
                     .arg(format!(
                         "file={},format=raw,id=rfs,if=none,file.locking=off",
@@ -750,7 +784,7 @@ impl Qemu {
             // smoltcp bring-up promptly (the ~10% flake the net-egress probe surfaced) so
             // the caller's bounded retry recovers on a fresh VM. Fails loud on timeout; the
             // mid-`start` teardown releases smoltcp.
-            crate::vmm::wait_for_socket(
+            vmcell::vmm::wait_for_socket(
                 socket,
                 None,
                 2000,
@@ -764,11 +798,11 @@ impl Qemu {
                 .arg("-device")
                 .arg(format!(
                     "virtio-net-pci,netdev=vnet0,mac={}",
-                    crate::net::mac_math(res.vmid)?
+                    vmcell::net::mac_math(res.vmid)?
                 ));
         }
 
-        let cmdline = crate::config::build_kernel_cmdline(cfg, res.vmid, "")?;
+        let cmdline = vmcell::config::build_kernel_cmdline(cfg, res.vmid, "")?;
         cmd.arg("-kernel")
             .arg(&cfg.kernel)
             .arg("-append")
@@ -801,7 +835,7 @@ impl Qemu {
         // `Error::Vmm("QMP socket failed to appear")` wrapping so the readiness error is
         // now propagated raw, identically to CH/FC. On an error here the still-armed
         // `vsock_guard` (and `fs_daemons`) reap the vhost-user daemons via `?`/`Drop`.
-        let pgid = crate::vmm::register_and_await_ready(
+        let pgid = vmcell::vmm::register_and_await_ready(
             &mut process,
             cgroups,
             &res.cgroup_name,
@@ -824,12 +858,12 @@ impl Qemu {
         let endpoint = if params.in_kernel_vsock {
             VsockEndpoint::Vsock {
                 cid: params.guest_cid,
-                port: crate::vmm::AGENT_VSOCK_PORT,
+                port: vmcell::vmm::AGENT_VSOCK_PORT,
             }
         } else {
             VsockEndpoint::Unix {
                 path: vsock_path.clone(),
-                port: crate::vmm::AGENT_VSOCK_PORT,
+                port: vmcell::vmm::AGENT_VSOCK_PORT,
             }
         };
 
@@ -847,7 +881,7 @@ impl Qemu {
             // Record the S1 predicate now (spawn_qemu has cfg+res); `snapshot()` reads
             // it to reject a vhost-user-carrying VM even when Task B gave a non-snapshot
             // in-kernel VM a Vsock endpoint.
-            has_vhost_user_device: crate::vmm::config_has_vhost_user_device(cfg, res),
+            has_vhost_user_device: vmcell::vmm::config_has_vhost_user_device(cfg, res),
         })
     }
 }
@@ -859,12 +893,12 @@ impl Vmm for Qemu {
         &self,
         cfg: &VmConfig,
         res: &PerVmResources,
-        cgroups: &dyn crate::metrics::CgroupFs,
+        cgroups: &dyn vmcell::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
         // The cmdline `console=` token and the serial/virtconsole device wiring in
         // `spawn_qemu` are both driven by `cfg.console_mode`; gate an unsupported
         // mode up front so they can never desync into a silent `serial.log`.
-        crate::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
+        vmcell::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
 
         // Cold create: fresh CID, no `-incoming`. A `snapshotting` config selects the
         // in-kernel vhost-vsock transport (§2.4, QEMU q35 — the fallback and most-proven nester) so the VM is snapshot-eligible.
@@ -883,16 +917,16 @@ impl Vmm for Qemu {
         snapshot_dir: &Path,
         cfg: &VmConfig,
         res: &PerVmResources,
-        cgroups: &dyn crate::metrics::CgroupFs,
+        cgroups: &dyn vmcell::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
-        crate::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
+        vmcell::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
 
         // Eligibility (S1, §8.1, The warm-snapshot path and the eligibility law), defense in depth alongside `config::build()` and the
         // orchestrator re-check. The shared predicate catches a virtio-fs share or
         // unprivileged net; the in-kernel-vsock requirement catches the case it can't
         // see — a QEMU restore over the external `vhost-device-vsock` daemon, which is
         // itself a non-migratable vhost-user device.
-        if crate::vmm::config_has_vhost_user_device(cfg, res) {
+        if vmcell::vmm::config_has_vhost_user_device(cfg, res) {
             return Err(Error::Unsupported {
                 vmm: "qemu".to_string(),
                 feature: "snapshot restore with a vhost-user device (virtio-fs share or unprivileged net)"
@@ -1110,15 +1144,15 @@ impl VmInstance for QemuInstance {
     async fn verify_control_plane(
         &self,
         budget: std::time::Duration,
-        timeouts: &crate::config::Timeouts,
+        timeouts: &vmcell::config::Timeouts,
     ) -> Result<()> {
         if let VsockEndpoint::Vsock { .. } = self.endpoint {
             return Ok(());
         }
-        let serial = crate::vmm::RealSerialLog {
+        let serial = vmcell::vmm::RealSerialLog {
             path: self.serial_path.clone(),
         };
-        crate::agent::AgentClient::connect_endpoint(&self.endpoint, budget, timeouts, &serial)
+        vmcell::agent::AgentClient::connect_endpoint(&self.endpoint, budget, timeouts, &serial)
             .await
             .map(|_client| ())
     }
@@ -1171,6 +1205,38 @@ impl Drop for QemuInstance {
 mod tests {
     use super::*;
 
+    /// A no-op [`vmcell::metrics::CgroupFs`] for the reject-before-spawn tests below, which
+    /// exercise `restore` capability guards that return **before** any cgroup interaction — so the
+    /// fake's methods are never called. Replaces the former `vmcell::metrics::FakeCgroupFs` (a
+    /// `#[cfg(test)]`-only fixture that is not visible to a downstream crate's test build).
+    #[derive(Debug)]
+    struct TestCgroupFs;
+
+    impl TestCgroupFs {
+        fn new() -> Self {
+            Self
+        }
+    }
+
+    impl vmcell::metrics::CgroupFs for TestCgroupFs {
+        fn create_slice(
+            &self,
+            _name: &str,
+            _limits: &vmcell::config::ResourceLimits,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn delete_slice(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn read_stats(&self, _name: &str) -> Result<vmcell::metrics::ResourceUsage> {
+            Ok(vmcell::metrics::ResourceUsage::default())
+        }
+        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
     // Guards H-VMM-2: every QEMU launch must carry `-S` so the guest stays frozen until
     // boot() issues `cont`. Without it create() spawns an already-running guest and
     // boot() is a no-op cont that trivially succeeds on either impl — nothing else can
@@ -1209,7 +1275,7 @@ mod tests {
     // restore that spawned regardless would need KVM and not return this typed error.
     #[tokio::test]
     async fn restore_rejects_non_snapshotting_config_before_spawning() {
-        use crate::config::{RootfsSource, VmConfig};
+        use vmcell::config::{RootfsSource, VmConfig};
 
         let qemu = Qemu::new("/usr/bin/qemu-system-x86_64");
         let cfg = VmConfig::builder(
@@ -1220,7 +1286,7 @@ mod tests {
         )
         .build()
         .expect("build config");
-        let cgroups = crate::metrics::FakeCgroupFs::new();
+        let cgroups = TestCgroupFs::new();
 
         let err = qemu
             .restore(
@@ -1245,7 +1311,7 @@ mod tests {
     // and lose this clean pre-spawn error.
     #[tokio::test]
     async fn restore_checks_state_file_before_spawning() {
-        use crate::config::{RootfsSource, VmConfig};
+        use vmcell::config::{RootfsSource, VmConfig};
 
         let qemu = Qemu::new("/usr/bin/qemu-system-x86_64");
         let cfg = VmConfig::builder(
@@ -1257,7 +1323,7 @@ mod tests {
         .snapshotting(true)
         .build()
         .expect("build snapshotting config");
-        let cgroups = crate::metrics::FakeCgroupFs::new();
+        let cgroups = TestCgroupFs::new();
 
         let err = qemu
             .restore(
@@ -1305,7 +1371,7 @@ mod tests {
     // a non-snapshot `InKernel` VM, silently sending it down the external daemon).
     #[test]
     fn uses_in_kernel_vsock_reads_transport() {
-        use crate::config::{RootfsSource, VmConfig, VsockTransport};
+        use vmcell::config::{RootfsSource, VmConfig, VsockTransport};
 
         let cfg = |transport: VsockTransport, snapshotting: bool| {
             VmConfig::builder(

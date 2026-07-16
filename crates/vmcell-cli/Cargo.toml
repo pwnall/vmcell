@@ -17,7 +17,7 @@ name = "vmcell"
 path = "src/main.rs"
 
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.10.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"] }
+vmcell = { path = "../vmcell", version = "0.11.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"] }
 vmcell-rootfs-builder = { path = "../vmcell-rootfs-builder", version = "0.1.0" }
 vmcell-kernel-builder = { path = "../vmcell-kernel-builder", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
