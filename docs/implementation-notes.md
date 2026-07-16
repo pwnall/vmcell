@@ -961,3 +961,41 @@ backend, self-skipping where unsupported) and the standalone `scripts/perf-daemo
   failure(s)` so it is surfaced, not hidden. Follow-up owner: make `SmoltcpProcess::start` block until the
   UDS is bound (signal readiness from the daemon thread) instead of deferring the bind — that would retire
   both the connect race and this flake at the source.
+
+## Coverage-gap perf probes, round 2 — privileged net, TLS-MITM, sessions, daemon restore (2026-07-15)
+
+Closes the four surfaces round 1 left unmeasured (the `docs/benchmark-results.md` coverage caveat). No
+shipped lib change — only `bench-vm` modes, a `perf-daemon.sh` addition, and one `Cargo.toml`
+required-features bump; `just ci` green. Baseline in `docs/benchmark-results.md` ("round 2").
+
+- **`net-egress` gained `--net-mode {plain|tls|privileged}`.** `plain` is the round-1 smoltcp+`Open`
+  datapath (unchanged, kept as its own function for zero regression risk). `tls`/`privileged` route the
+  guest's HTTPS through an `Egress::Filtered` MITM proxy: `tls` over the unprivileged smoltcp NAT
+  (CH+QEMU), `privileged` over tap + netns + nft (all backends via the blessed runner's `CAP_NET_ADMIN`;
+  self-skips via `HostCapabilities::probe().privileged_net_available()`, and sweeps orphan
+  `vmcell-net-*` netns at entry/exit). The MITM double (`proxy::doubles::TestDouble`) answers
+  `*.probe.local` so no real upstream origin is needed; a **fresh unique host per iteration** forces a
+  moka cache-miss → a fresh per-connection cert mint each time (the dominant cost). Key facts learned:
+  `Egress::Open` privileged fires **zero** nft and has no reachable endpoint (the host responder is in a
+  different netns) — only `Filtered` exercises the nft spawn + gives an in-netns proxy the guest reaches
+  via `http_proxy=<gateway>:<vm.proxy().port>`. The **upstream** (proxy→origin) handshake is out of
+  scope: hudsucker pins `with_webpki_roots()`, rejecting a self-signed local origin (recorded in the doc).
+- **`--mode session`** measures the `SessionMux` layer vsock-rtt never touches: (A) `connect_sessions`
+  (a **second** vsock connection + `Ready` handshake, separate from the cached one-shot client) and (B)
+  per-session `open`→guest-spawn→exit. **There is no resume-by-id API** — "session persistence" (b7c5db6)
+  means *long-lived* sessions, not reattach-across-reconnect (grep for `resume|reattach` on sessions =
+  zero); the connect handshake is the closest analogue, so that is what is measured. `open` has no ack, so
+  it is timed to `wait()`'s terminal exit, not the fire-and-return `open()` alone. No capability gate;
+  all three backends (CH/FC Unix, in-kernel QEMU Vsock).
+- **`perf-daemon.sh` gained a `restore` metric**: snapshot one source VM once (`POST
+  /v1/vms/{id}/snapshot` → `<artifacts-dir>/<prefix>/`), then time N restores (`POST /v1/vms` with
+  `restore_from` → `Registry::create` → `MicroVm::restore_cow`, synchronous to agent-ready). The source
+  must be snapshot-eligible (`snapshotting:true` in-kernel vsock, NOT the unprivileged-net path), and
+  `kernel`+`rootfs` are required on the restore body too. Restore is **FullCopy** here (the store dir is
+  not on a reflink fs), so daemon-restore lands *slower* than daemon-create — the `restore_cow`
+  memory-image copy is the tax; it would invert on a reflink fs.
+- **`bench-vm` `required-features` gained `proxy`** — the `tls`/`privileged` MITM code constructs a
+  `proxy::doubles::TestDouble`, and `cloud-hypervisor` pulls `hyper` but not `hudsucker`/the `proxy`
+  module. The default feature set (and the `--features firecracker,qemu` perf build) already enable
+  `proxy`, so every real build satisfies it; a proxy-less `cargo hack` combo now skips the bin instead of
+  failing to compile.

@@ -162,7 +162,45 @@ for _ in $(seq 1 "$ITERS"); do
 done
 destroy_vm "$sid" >/dev/null
 
+# --- Restore loop: snapshot ONE source VM once, then time N restores (the restore_cow
+# reflink tree-copy path). Restore = POST /v1/vms with restore_from -> Registry::create ->
+# MicroVm::restore_cow; it blocks until agent-ready, so %{time_total} is the full
+# restore-to-ready latency INCLUDING the CoW copy of the memory image (FullCopy here — the
+# store dir is not on a reflink fs, same as the bench-vm zygote finding). The source must be
+# snapshot-eligible (in-kernel vsock via snapshotting:true; NOT the unprivileged smoltcp/
+# vhost-user net path), and kernel+rootfs are required on the restore body too.
+SNAP_PREFIX="snap0"
+SRC_BODY='{"kernel":"vmlinux","rootfs":"rootfs.erofs","snapshotting":true}'
+RESTORE_BODY="{\"kernel\":\"vmlinux\",\"rootfs\":\"rootfs.erofs\",\"snapshotting\":true,\"restore_from\":\"$SNAP_PREFIX\"}"
+restore_ms=""
+src_out="$(curl -s -w '\n%{time_total}' -X POST "$BASE/v1/vms" \
+          -H 'content-type: application/json' -d "$SRC_BODY" 2>/dev/null)"
+src_id="$(printf '%s\n' "$src_out" | sed '$d' \
+         | python3 -c 'import sys,json;print(json.load(sys.stdin)["vm"]["id"])' 2>/dev/null)"
+if [ -z "$src_id" ] || [ "$src_id" = "None" ]; then echo "  snapshot-source create failed"; exit 1; fi
+if ! curl -sf -X POST "$BASE/v1/vms/$src_id/snapshot" \
+     -H 'content-type: application/json' -d "{\"artifact_prefix\":\"$SNAP_PREFIX\"}" >/dev/null; then
+  echo "  snapshot failed"; exit 1
+fi
+restore_one() {
+  local out ms id
+  out="$(curl -s -w '\n%{time_total}' -X POST "$BASE/v1/vms" \
+        -H 'content-type: application/json' -d "$RESTORE_BODY" 2>/dev/null)"
+  ms="$(printf '%s\n' "$out" | tail -n1)"
+  id="$(printf '%s\n' "$out" | sed '$d' \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["vm"]["id"])' 2>/dev/null)"
+  printf '%s %s\n' "$ms" "$id"
+}
+for i in $(seq 1 "$total"); do
+  read -r rms rid < <(restore_one)
+  if [ -z "$rid" ] || [ "$rid" = "None" ]; then echo "  restore iter $i failed (no id)"; exit 1; fi
+  destroy_vm "$rid" >/dev/null
+  if [ "$i" -gt "$WARMUP" ]; then restore_ms+="$rms "; fi
+done
+destroy_vm "$src_id" >/dev/null
+
 printf '%s' "$create_ms"  | pctl create
+printf '%s' "$restore_ms" | pctl restore
 printf '%s' "$exec_ms"    | pctl exec
 printf '%s' "$list_ms"    | pctl list
 printf '%s' "$destroy_ms" | pctl destroy

@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use vmcell::HostEnv;
 use vmcell::agent::protocol::ExecRequest;
+use vmcell::agent::session::SessionSpecBuilder;
 use vmcell::config::{Egress, NetConfig, RestoreMode, RootfsSource, VmConfig};
 use vmcell::orchestrator::{MicroVm, VmidAllocator};
 use vmcell::vmm::{VmInstance, Vmm};
@@ -83,6 +84,16 @@ struct Args {
     /// An unknown value is rejected at parse time.
     #[arg(long, default_value = "uart", value_parser = parse_console)]
     console: vmcell::config::ConsoleMode,
+
+    /// `net-egress` variant: `plain` (unprivileged smoltcp NAT + `Egress::Open` to a
+    /// host responder — the datapath cost), `tls` (unprivileged smoltcp + `Egress::Filtered`
+    /// MITM proxy, HTTPS-through-proxy — the per-connection cert-mint + guest↔proxy TLS
+    /// handshake cost), or `privileged` (tap + netns + nft + `Egress::Filtered` — the
+    /// privileged networked-start cost + the same MITM egress). `tls`/`privileged` need the
+    /// `proxy` feature; `privileged` needs CAP_NET_ADMIN (self-skips otherwise). Ignored by
+    /// other modes. An unknown value is rejected at parse time.
+    #[arg(long, default_value = "plain", value_parser = parse_net_mode)]
+    net_mode: String,
 }
 
 /// Validates the `--profile` flag, rejecting any value other than `default`,
@@ -134,6 +145,17 @@ fn parse_console(s: &str) -> Result<vmcell::config::ConsoleMode, String> {
         "virtio-console" => Ok(C::VirtioConsole),
         other => Err(format!(
             "invalid console '{other}' (expected: uart, virtio-console)"
+        )),
+    }
+}
+
+/// Validates `--net-mode` (the `net-egress` variant selector), rejecting unknown values
+/// at parse time (H-BIN-1) instead of silently defaulting.
+fn parse_net_mode(s: &str) -> Result<String, String> {
+    match s {
+        "plain" | "tls" | "privileged" => Ok(s.to_string()),
+        other => Err(format!(
+            "invalid net-mode '{other}' (expected: plain, tls, privileged)"
         )),
     }
 }
@@ -493,6 +515,7 @@ const VALID_MODES: &[&str] = &[
     "vsock-rtt",
     "net-egress",
     "zygote",
+    "session",
 ];
 
 /// Validates `--mode` against [`VALID_MODES`].
@@ -577,6 +600,7 @@ async fn run_mode<V: Vmm>(
         "vsock-rtt" => run_vsock_rtt(vmm, backend, args, allocator).await,
         "net-egress" => run_net_egress(vmm, backend, args, allocator).await,
         "zygote" => run_zygote(vmm, backend, args, allocator).await,
+        "session" => run_session(vmm, backend, args, allocator).await,
         other => anyhow::bail!(
             "unknown --mode '{other}' (valid: {})",
             VALID_MODES.join(", ")
@@ -1613,10 +1637,29 @@ fn egress_curl(url: &str) -> Vec<String> {
     ]
 }
 
-/// §16 (Performance) — net-egress: (A) VM start latency WITH the smoltcp NAT on the
-/// boot path, and (B) the in-guest egress round-trip through the NAT to a host
-/// endpoint (asserting a real egress byte, not a proxy signal — §15/AGENTS.md).
+/// §16 (Performance) — net-egress dispatcher: `--net-mode plain` (unprivileged smoltcp
+/// NAT datapath), `tls` (unprivileged smoltcp + MITM proxy), or `privileged` (tap +
+/// netns + nft + MITM proxy). Each self-skips where its facility is absent.
 async fn run_net_egress<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
+    match args.net_mode.as_str() {
+        "plain" => run_net_egress_plain(vmm, backend, args, allocator).await,
+        "tls" => run_net_egress_filtered(vmm, backend, args, allocator, false).await,
+        "privileged" => run_net_egress_filtered(vmm, backend, args, allocator, true).await,
+        // Pre-validated by `parse_net_mode`; fail loud rather than silently succeed if the
+        // two ever drift.
+        other => anyhow::bail!("net-egress: unknown --net-mode '{other}'"),
+    }
+}
+
+/// §16 (Performance) — net-egress `plain`: (A) VM start latency WITH the smoltcp NAT on
+/// the boot path, and (B) the in-guest egress round-trip through the NAT to a host
+/// endpoint (asserting a real egress byte, not a proxy signal — §15/AGENTS.md).
+async fn run_net_egress_plain<V: Vmm>(
     vmm: &V,
     backend: &str,
     args: &Args,
@@ -1624,8 +1667,7 @@ async fn run_net_egress<V: Vmm>(
 ) -> anyhow::Result<()> {
     // Self-skip: the unprivileged smoltcp NAT needs the vhost-user-net device (CH +
     // QEMU; Firecracker has none). A capability skip is success (Ok), not a failure
-    // (M-BIN-1). `Privileged` tap is deliberately NOT used — a directly-invoked
-    // bench-vm lacks CAP_NET_ADMIN and would leave netns residue.
+    // (M-BIN-1).
     if !vmm.capabilities().unprivileged_vhost_user_net {
         println!("net-egress: backend {backend} has no unprivileged vhost-user-net; skipping");
         return Ok(());
@@ -1824,6 +1866,302 @@ async fn run_net_egress<V: Vmm>(
     }
 }
 
+/// Builds a `Filtered` proxy config whose MITM test-double answers any `*.probe.local`
+/// host with a fixed body. The guest↔proxy TLS handshake + per-connection cert mint happen
+/// at `CONNECT`, *before* the double is matched, so they are exercised with NO real upstream
+/// origin (hudsucker's upstream leg pins webpki roots and can't reach a self-signed local
+/// origin — so the upstream handshake is deliberately out of scope; §16). The proxy
+/// self-generates its CA (baked into the rootfs trust store, so the guest verifies).
+fn mitm_proxy_config() -> vmcell::config::ProxyConfig {
+    // `ProxyConfig` is `#[non_exhaustive]`, so build via `default()` + field-set (the exact
+    // pattern the `egress_proxy` test uses; clippy does not fire `field_reassign_with_default`
+    // for a `#[non_exhaustive]` struct from another crate).
+    let mut cfg = vmcell::config::ProxyConfig::default();
+    cfg.doubles = std::sync::Arc::new(std::sync::RwLock::new(vec![
+        vmcell::proxy::doubles::TestDouble {
+            matcher: Box::new(|req| {
+                req.method() != hyper::Method::CONNECT
+                    && req
+                        .uri()
+                        .host()
+                        .is_some_and(|h| h.ends_with(".probe.local"))
+            }),
+            responder: Box::new(|_req| {
+                hyper::Response::builder()
+                    .status(200)
+                    .body(hudsucker::Body::from("vmcell-mitm-ok\n"))
+                    .expect("static MITM response builds")
+            }),
+        },
+    ]));
+    cfg
+}
+
+// ----------------------------------------------------------------------------
+// net-egress `tls` / `privileged`: the MITM egress proxy (per-connection cert mint +
+// guest↔proxy TLS handshake) over either the unprivileged smoltcp NAT (`tls`) or the
+// privileged tap + netns + nft path (`privileged`). Covers the two egress surfaces the
+// `plain` NAT datapath probe leaves unmeasured (docs/benchmark-results.md coverage caveat).
+// ----------------------------------------------------------------------------
+
+/// §16 (Performance) — net-egress `tls`/`privileged`: (A) start latency WITH the filtered
+/// egress set up (smoltcp+proxy, or netns+tap+nft+proxy), and (B) the in-guest
+/// HTTPS-through-MITM-proxy round-trip (fresh unique host per iter → fresh cert mint),
+/// asserting a real MITM'd body byte. `privileged=true` uses `NetConfig::Privileged` (tap)
+/// and self-skips without CAP_NET_ADMIN; `false` uses unprivileged smoltcp and self-skips
+/// without the vhost-user-net device.
+async fn run_net_egress_filtered<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+    privileged: bool,
+) -> anyhow::Result<()> {
+    let label = if privileged { "privileged" } else { "tls" };
+    let sweep_prefix = vmcell::naming::netns_sweep_prefix(vmcell::naming::DEFAULT_RESOURCE_PREFIX);
+
+    // Self-skip per variant (a capability skip is success, M-BIN-1).
+    if privileged {
+        if !vmcell::HostCapabilities::probe().privileged_net_available() {
+            println!("net-egress[{label}]: no CAP_NET_ADMIN / netns dir; skipping");
+            return Ok(());
+        }
+        // Reap orphan `vmcell-net-*` netns from prior aborted/hard-killed runs before we start.
+        let _ = vmcell::net::cleanup_orphan_netns(&sweep_prefix);
+    } else if !vmm.capabilities().unprivileged_vhost_user_net {
+        println!(
+            "net-egress[{label}]: backend {backend} has no unprivileged vhost-user-net; skipping"
+        );
+        return Ok(());
+    }
+
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
+    if !kernel.exists() || !rootfs.exists() {
+        println!("net-egress[{label}]: No successful runs (missing artifacts in {dir})");
+        anyhow::bail!("net-egress[{label}]: missing artifacts in {dir}");
+    }
+
+    let egress = Egress::Filtered(mitm_proxy_config());
+    let net = if privileged {
+        NetConfig::Privileged { egress }
+    } else {
+        NetConfig::Unprivileged {
+            egress,
+            host_services_port: None,
+        }
+    };
+    let cfg = VmConfig::builder(kernel, RootfsSource::Erofs { image: rootfs })
+        .vcpus(1)
+        .mem_mib(args.mem_mib)
+        .net(net)
+        .restore_mode(args.restore_mode)
+        .timeouts(timeouts_for(&args.profile))
+        .kernel_verbosity(args.kernel_verbosity)
+        .console_mode(args.console)
+        .build()
+        .map_err(|e| anyhow::anyhow!("net-egress[{label}]: invalid config: {e}"))?;
+
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator;
+    let iters = args.iters();
+    // Bounded retry over transient net bring-up (the smoltcp flake for `tls`; a
+    // netns/tap/nft hiccup for `privileged`), same recovery pattern as `plain`.
+    const NET_BOOT_RETRIES: usize = 5;
+
+    // --- Phase A: start latency WITH the filtered-egress net setup on the boot path ---
+    let mut starts = Vec::new();
+    let mut start_dropped = 0usize;
+    let mut boot_retries = 0usize;
+    for i in 0..(iters + args.warmup) {
+        let mut attempt = 0usize;
+        loop {
+            let t = Instant::now();
+            match MicroVm::start(vmm, cfg.clone(), &env).await {
+                Ok(mut vm) => {
+                    match vm.agent(None).await {
+                        Ok(_) => {
+                            let dt = t.elapsed().as_millis();
+                            if i >= args.warmup {
+                                starts.push(dt);
+                            }
+                        }
+                        Err(e) => {
+                            println!(
+                                "net-egress[{label}]: net-start iter {i} agent-connect failed: {e}"
+                            );
+                            if i >= args.warmup {
+                                start_dropped += 1;
+                            }
+                        }
+                    }
+                    let _ = vm.shutdown().await;
+                    break;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > NET_BOOT_RETRIES {
+                        anyhow::bail!(
+                            "net-egress[{label}]: net-start iter {i} start failed after {attempt} attempts: {e}"
+                        );
+                    }
+                    boot_retries += 1;
+                    println!(
+                        "net-egress[{label}]: net-start iter {i} transient boot failure (attempt {attempt}, retrying): {e}"
+                    );
+                }
+            }
+        }
+    }
+    if boot_retries > 0 {
+        println!(
+            "net-egress[{label}]: NET-START recovered {boot_retries} transient boot failure(s) via retry"
+        );
+    }
+    let start_label = if privileged {
+        "NET-START (boot with tap+netns+nft+proxy)"
+    } else {
+        "NET-START (boot with smoltcp NAT + MITM proxy)"
+    };
+    report(start_label, &mut starts, start_dropped, 0);
+
+    // --- Phase B: steady MITM egress round-trip (one warm VM, N HTTPS-through-proxy curls) ---
+    let mut vm = {
+        let mut attempt = 0usize;
+        loop {
+            match MicroVm::start(vmm, cfg.clone(), &env).await {
+                Ok(v) => break v,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > NET_BOOT_RETRIES {
+                        anyhow::bail!(
+                            "net-egress[{label}]: egress VM boot failed after {attempt} attempts: {e}"
+                        );
+                    }
+                    println!(
+                        "net-egress[{label}]: egress VM transient boot failure (attempt {attempt}, retrying): {e}"
+                    );
+                }
+            }
+        }
+    };
+    if let Err(e) = vm.agent(None).await {
+        let _ = vm.shutdown().await;
+        anyhow::bail!("net-egress[{label}]: egress VM agent connect failed: {e}");
+    }
+    let (gateway_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid())
+        .map_err(|e| anyhow::anyhow!("net-egress[{label}]: ip_math({}): {e}", vm.vmid()))?;
+    let proxy_port = match vm.proxy() {
+        Some(p) => p.port,
+        None => {
+            let _ = vm.shutdown().await;
+            anyhow::bail!("net-egress[{label}]: filtered egress did not start a proxy");
+        }
+    };
+    let proxy_url = format!("http://{gateway_ip}:{proxy_port}");
+    // A fresh unique `*.probe.local` host per request → cache miss → fresh per-connection
+    // cert mint each time (the moka authority cache is keyed by host). `--resolve …:1.2.3.4`
+    // is a black-hole placeholder never contacted (the double answers post-handshake).
+    let mitm_curl = |host: &str| -> (Vec<String>, Vec<(String, String)>) {
+        (
+            vec![
+                "curl".to_string(),
+                "-4".to_string(),
+                "-k".to_string(),
+                "-s".to_string(),
+                "--max-time".to_string(),
+                "5".to_string(),
+                "--resolve".to_string(),
+                format!("{host}:443:1.2.3.4"),
+                format!("https://{host}/"),
+            ],
+            vec![
+                ("http_proxy".to_string(), proxy_url.clone()),
+                ("https_proxy".to_string(), proxy_url.clone()),
+            ],
+        )
+    };
+
+    // Warm-up: bring eth0 / NAT / proxy up + prime the CA; retry until the first successful
+    // MITM'd byte before measuring the steady round-trip (data-plane assertion).
+    let mut warmed = false;
+    for w in 0..40 {
+        let (argv, cenv) = mitm_curl(&format!("warm{w}.probe.local"));
+        if let Ok(agent) = vm.agent(None).await
+            && let Ok(o) = agent.exec(ExecRequest::new(argv).with_env(cenv)).await
+            && o.code == 0
+            && o.stdout.starts_with(b"vmcell-mitm-ok")
+        {
+            warmed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    if !warmed {
+        let _ = vm.shutdown().await;
+        if privileged {
+            let _ = vmcell::net::cleanup_orphan_netns(&sweep_prefix);
+        }
+        anyhow::bail!("net-egress[{label}]: no successful MITM egress within the warm-up budget");
+    }
+
+    let mut rtts = Vec::with_capacity(iters);
+    let mut dropped = 0usize;
+    for i in 0..iters {
+        let (argv, cenv) = mitm_curl(&format!("h{i}.probe.local"));
+        let agent = match vm.agent(None).await {
+            Ok(a) => a,
+            Err(e) => {
+                println!("net-egress[{label}]: egress iter {i} agent-connect failed: {e}");
+                break;
+            }
+        };
+        let t = Instant::now();
+        let r = agent.exec(ExecRequest::new(argv).with_env(cenv)).await;
+        let dt = t.elapsed().as_micros();
+        match r {
+            Ok(o) if o.code == 0 && o.stdout.starts_with(b"vmcell-mitm-ok") => rtts.push(dt),
+            Ok(o) => {
+                println!(
+                    "net-egress[{label}]: egress iter {i} MITM curl code={} stdout={}B (no MITM byte)",
+                    o.code,
+                    o.stdout.len()
+                );
+                dropped += 1;
+            }
+            Err(e) => {
+                println!("net-egress[{label}]: egress iter {i} exec failed: {e}");
+                dropped += 1;
+            }
+        }
+    }
+    let _ = vm.shutdown().await;
+    // Belt-and-suspenders netns sweep for any panic residue (privileged only; a clean
+    // `shutdown()` already removes this VM's netns).
+    if privileged {
+        let _ = vmcell::net::cleanup_orphan_netns(&sweep_prefix);
+    }
+
+    let acct = accounting_suffix(dropped, 0);
+    let tag = if privileged {
+        "NET-EGRESS-PRIV (MITM via tap+nft+proxy)"
+    } else {
+        "NET-EGRESS-TLS (MITM via smoltcp+proxy)"
+    };
+    println!("=== {tag} (backend={backend} n={}{acct}) ===", rtts.len());
+    match pcts(&mut rtts) {
+        Some((p50, p95, p99, max)) => {
+            println!(
+                "  in-guest HTTPS-through-MITM-proxy round-trip (cert mint + TLS handshake): p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs"
+            );
+            Ok(())
+        }
+        None => {
+            println!("  No successful MITM egress round-trips");
+            anyhow::bail!("net-egress[{label}]: no MITM egress samples");
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // zygote: CoW-clone fan-out latency. Snapshot a base once, then time restoring +
 // resuming N CoW clones concurrently (the zygote/lineage fan-out the library-direct
@@ -1971,6 +2309,146 @@ async fn run_zygote<V: Vmm>(
         );
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// session: the interactive-session layer (`SessionMux`) the one-shot AgentClient
+// path (measured by vsock-rtt) never exercises — the SECOND vsock handshake +
+// per-session open/spawn. (There is no resume-by-id API: "session persistence" =
+// long-lived sessions, not reattach-across-reconnect, so the connect handshake is
+// the closest analogue to a resume.)
+// ----------------------------------------------------------------------------
+
+/// §16 (Performance) — session: (A) `connect_sessions` latency (the mux's own second
+/// vsock connection + `Ready` handshake, separate from the cached `agent()` client),
+/// and (B) per-session `open`→guest-spawn→`exit` on one persistent mux. Both assert a
+/// real `code==0` exit before counting (data-plane liveness, not a connect-only signal).
+/// Works on all three backends (sessions ride the same vsock; no capability gate).
+async fn run_session<V: Vmm>(
+    vmm: &V,
+    backend: &str,
+    args: &Args,
+    allocator: VmidAllocator,
+) -> anyhow::Result<()> {
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
+    if !kernel.exists() || !rootfs.exists() {
+        println!("session: No successful runs (missing artifacts in {dir})");
+        anyhow::bail!("session: missing artifacts in {dir}");
+    }
+    let cfg = build_cfg(args, kernel, rootfs, false, false);
+    let mut env = HostEnv::hermetic();
+    env.vmids = allocator;
+    let iters = args.iters();
+
+    let mut vm = match MicroVm::start(vmm, cfg, &env).await {
+        Ok(v) => v,
+        Err(e) => anyhow::bail!("session: boot failed: {e}"),
+    };
+    if let Err(e) = vm.agent(None).await {
+        let _ = vm.shutdown().await;
+        anyhow::bail!("session: agent connect failed: {e}");
+    }
+    let argv = pick_exec_cmd(&mut vm).await;
+
+    // --- Metric A: session-connect latency (the 2nd vsock handshake) ---
+    // Each `connect_sessions` dials a fresh mux connection + `Ready` handshake, distinct
+    // from the cached one-shot `agent()` client vsock-rtt reuses. Prove liveness (run one
+    // command to `code==0`) before counting the sample, then drop the mux.
+    let mut connect_rtts = Vec::with_capacity(iters);
+    let mut conn_dropped = 0usize;
+    for _ in 0..args.warmup {
+        if let Ok(mux) = vm.connect_sessions(None).await
+            && let Ok(mut s) = mux.open_spec(SessionSpecBuilder::new(argv.clone())).await
+        {
+            let _ = s.wait().await;
+        }
+    }
+    for i in 0..iters {
+        let t = Instant::now();
+        let mux = match vm.connect_sessions(None).await {
+            Ok(m) => m,
+            Err(e) => {
+                println!("session: connect iter {i} failed: {e}");
+                conn_dropped += 1;
+                continue;
+            }
+        };
+        let dt = t.elapsed().as_micros();
+        let live = match mux.open_spec(SessionSpecBuilder::new(argv.clone())).await {
+            Ok(mut s) => s.wait().await.code == 0,
+            Err(_) => false,
+        };
+        drop(mux);
+        if live {
+            connect_rtts.push(dt);
+        } else {
+            conn_dropped += 1;
+        }
+    }
+
+    // --- Metric B: session-open latency on ONE persistent mux (open→spawn→exit) ---
+    // `open` has no ack round-trip (it fires OpenSession and returns), so the real cost is
+    // open→guest-spawn→Exit: time to `wait()`'s terminal exit, not `open()` alone.
+    let mux = match vm.connect_sessions(None).await {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = vm.shutdown().await;
+            anyhow::bail!("session: mux connect failed: {e}");
+        }
+    };
+    for _ in 0..args.warmup {
+        if let Ok(mut s) = mux.open_spec(SessionSpecBuilder::new(argv.clone())).await {
+            let _ = s.wait().await;
+        }
+    }
+    let mut open_rtts = Vec::with_capacity(iters);
+    let mut open_dropped = 0usize;
+    for i in 0..iters {
+        let t = Instant::now();
+        let outcome = match mux.open_spec(SessionSpecBuilder::new(argv.clone())).await {
+            Ok(mut s) => s.wait().await,
+            Err(e) => {
+                println!("session: open iter {i} failed: {e}");
+                open_dropped += 1;
+                continue;
+            }
+        };
+        let dt = t.elapsed().as_micros();
+        if outcome.code == 0 {
+            open_rtts.push(dt);
+        } else {
+            open_dropped += 1;
+        }
+    }
+    drop(mux);
+    let _ = vm.shutdown().await;
+
+    println!("=== SESSION (backend={backend} cmd={argv:?}) ===");
+    let acct_c = accounting_suffix(conn_dropped, 0);
+    match pcts(&mut connect_rtts) {
+        Some((p50, p95, p99, max)) => println!(
+            "  session-connect (2nd vsock handshake) n={}{acct_c}: p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs",
+            connect_rtts.len()
+        ),
+        None => {
+            println!("  session-connect: No successful runs{acct_c}");
+            anyhow::bail!("session: no successful mux connects");
+        }
+    }
+    let acct_o = accounting_suffix(open_dropped, 0);
+    match pcts(&mut open_rtts) {
+        Some((p50, p95, p99, max)) => {
+            println!(
+                "  session-open (open→spawn→exit) n={}{acct_o}: p50={p50}µs p95={p95}µs p99={p99}µs max={max}µs",
+                open_rtts.len()
+            );
+            Ok(())
+        }
+        None => {
+            println!("  session-open: No successful runs{acct_o}");
+            anyhow::bail!("session: no successful session opens");
+        }
+    }
 }
 
 #[cfg(test)]

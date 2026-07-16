@@ -117,16 +117,18 @@ of identical-guest RAM. Dead-linear per added guest on every backend.
 no-network (`NetConfig::None`), library-direct (no `vmcelld`/broker), one-shot `AgentClient`**
 lifecycle. They *do* bound the changed spawn path (seccomp/jailer land on the measured `create` phase
 for all three backends) and the rewritten connect/handshake law (measured by the `connect` phase +
-vsock-rtt on both the Unix and Vsock arms). The **three follow-up probes below** (added 2026-07-15,
-collected every run) now cover the surfaces this pass first flagged as unreached: unprivileged
-smoltcp NAT egress (`net-egress`), CoW / zygote fan-out (`zygote`), and the daemon HTTP + broker
-bridge (`perf-daemon.sh`). What remains structurally unmeasured — changed but not exercised, so
-neither confirmed nor cleared per AGENTS.md rule 4: **privileged** networked start (netns + tap + 3×
-`nft` spawns per VM, `net/tap.rs` — the probes use unprivileged smoltcp, a directly-invoked bench
-lacks `CAP_NET_ADMIN`); the daemon `restore_cow` reflink tree-copy (the daemon probe times cold
-create, not restore); interactive session create/resume (`SessionMux` second handshake + per-session
-PTY, `agent/session.rs`); and the TLS-MITM egress proxy per-connection cert minting (`proxy/tls.rs` —
-`net-egress` uses `Egress::Open`, no filtered proxy). Carrying those is the next follow-up.
+vsock-rtt on both the Unix and Vsock arms). The **follow-up probes below** (added 2026-07-15,
+collected every run) cover the surfaces this pass flagged as unreached — round 1: unprivileged
+smoltcp NAT egress (`net-egress`), CoW / zygote fan-out (`zygote`), the daemon HTTP + broker bridge
+(`perf-daemon.sh`); round 2: **privileged** networked start (netns + tap + 1 `nft` spawn + tproxy,
+via `net-egress --net-mode privileged` under the blessed runner's `CAP_NET_ADMIN`), the **TLS-MITM
+egress proxy** per-connection cert mint + handshake (`--net-mode tls`/`privileged`), interactive
+**sessions** (`--mode session`: the `SessionMux` second handshake + per-session open), and the daemon
+**`restore_cow`** tree-copy (`perf-daemon.sh` `restore`). The **only** surface left deliberately
+unmeasured is the MITM proxy→origin (upstream) TLS handshake: hudsucker pins `with_webpki_roots()` on
+the upstream leg, so a hermetic self-signed local origin is rejected and measuring it would require a
+webpki-trusted public origin over the host's internet (WAN latency + external dependency) — out of
+scope for a controlled probe. Every other changed latency surface is now bounded.
 
 ### Follow-up probes — egress, zygote fan-out, daemon API (2026-07-15)
 
@@ -199,6 +201,75 @@ via `curl -w %{time_total}` (daemon-side request latency, excluding curl startup
   library-direct vsock-rtt); `create`/`destroy` are dominated by the VM lifecycle they wrap, so their
   absolute figures are boot/teardown-bound (and not freq-pinned) — read the bridge delta, not the
   total. Percentiles are nearest-rank (matching `bench-vm`'s `pcts`).
+
+### Follow-up probes, round 2 — privileged net, TLS-MITM, sessions, daemon restore (2026-07-15)
+
+The four surfaces round 1 left unmeasured, now collected every run: `bench-vm --mode net-egress
+--net-mode {tls,privileged}`, `--mode session`, and a snapshot+restore loop in `scripts/perf-daemon.sh`.
+
+**Filtered / TLS-MITM egress (`net-egress --net-mode tls` and `--net-mode privileged`).** The guest
+makes an HTTPS request through the `Egress::Filtered` proxy, which mints a per-connection leaf cert
+(rcgen) and completes the guest↔proxy TLS handshake; a `TestDouble` short-circuits the origin (no real
+upstream). A fresh unique `*.probe.local` host per iteration forces a cache-miss → **fresh cert mint
+every request**. `tls` rides the unprivileged smoltcp NAT (CH+QEMU; FC has no vhost-user-net, skips);
+`privileged` rides tap + netns + nft (all backends, via the runner's `CAP_NET_ADMIN`).
+
+| Variant | NET-START p50 / p95 | MITM egress RTT p50 / p95 (cert mint + guest↔proxy TLS handshake) |
+| --- | --- | --- |
+| **CH `tls`** (smoltcp + proxy) | 318 / 343 ms | **166 / 169 ms** |
+| **CH `privileged`** (tap+nft + proxy) | 334 / 349 ms | **79 / 79 ms** |
+| **QEMU `tls`** | 1042 / 1077 ms | 168 / 171 ms |
+| **QEMU `privileged`** | 1040 ms (5.3 s p95 tail †) | 79 / 80 ms |
+| **FC `privileged`** | 798 / 812 ms | 80 / 82 ms |
+
+- **The MITM RTT is dominated by per-connection cert minting** (RSA keygen + sign in rcgen): the smoltcp
+  `tls` path is ~**166 ms** vs the plain-NAT HTTP egress (~37 ms) — a large tax paid once per *new*
+  upstream host (a repeated host hits the moka authority cache and skips the mint; this probe measures
+  the worst-case fresh-mint path by design).
+- **`privileged` MITM (~79 ms) is ~2× faster than `tls` MITM (~166 ms)** — backend-independent on both
+  (the cert mint is fixed; the datapath differs). The multi-round-trip TLS handshake pays the userspace
+  smoltcp NAT's per-packet cost on `tls` but rides the in-kernel tap on `privileged`. The ~87 ms delta
+  is the smoltcp-NAT overhead compounded over the handshake — a concrete argument for the kernel tap
+  path where egress latency matters.
+- **NET-START** for `privileged` (netns-create + tap-setup + 1 `nft` spawn + tproxy routing + in-netns
+  proxy) and `tls` (smoltcp + proxy) both sit within ~30 ms of the plain cold boot — the net setup runs
+  concurrently with the guest boot. † QEMU `privileged` shows the same rare ~5 s external-vsock
+  bring-up tail seen in the cold-latency table; p50 is unaffected.
+- **Out of scope: the proxy→origin (upstream) TLS handshake.** hudsucker pins `with_webpki_roots()` on
+  the upstream leg, so a hermetic self-signed local origin is rejected; the real second handshake needs
+  a webpki-trusted public origin over the host's internet (WAN latency + external dependency). The probe
+  measures the mint + client-handshake path.
+
+**Interactive sessions (`session`; all three backends, no capability gate).** The `SessionMux` layer the
+one-shot `AgentClient` (measured by vsock-rtt) never exercises — a **second** vsock connection + its own
+`Ready` handshake, plus per-session open→guest-spawn→exit. (No resume-by-id API: "persistence" means
+long-lived sessions, not reattach; the connect handshake is the closest analogue.)
+
+| Backend | session-connect p50 / p95 (2nd vsock handshake) | session-open p50 / p95 (open→spawn→exit) |
+| --- | --- | --- |
+| **CH** | 142 / 215 µs | 621 / 681 µs |
+| **FC** | 161 / 247 µs | 632 / 683 µs |
+| **QEMU** | 201 / 475 µs | 788 / 1334 µs |
+
+- **session-connect (~140–200 µs)** is the mux's own second vsock connect + `Ready` handshake — the
+  interactive layer's setup cost, distinct from the cached one-shot client vsock-rtt reuses.
+  **session-open (~620–790 µs)** is the per-command open (no ack; timed to the terminal exit) —
+  right on the vsock exec RTT floor (~0.7 ms), since it is the same in-guest fork/exec/reap round-trip
+  plus session-registry bookkeeping. Sub-millisecond on all three; QEMU is marginally higher (its
+  vsock/agent path).
+
+**Daemon restore (`perf-daemon.sh` `restore`; CH; not freq-pinned).** Snapshot one VM once, then time N
+restores via `POST /v1/vms` with `restore_from` — the `restore_cow` reflink tree-copy path.
+
+| Op | p50 / p95 | vs |
+| --- | --- | --- |
+| **restore** | **269 / 282 ms** | daemon `create` 180 ms; library-direct CH restore ~49 ms |
+
+- Daemon `restore` (269 ms) is **slower than the daemon `create`** (180 ms) here because `restore_cow`
+  byte-copies the whole memory image (**FullCopy** — the store dir is not on a reflink fs, same as the
+  zygote/CoW finding) before restoring, whereas cold create boots fresh. On a reflink fs the copy is
+  near-instant and restore would beat create. The gap over the library-direct restore (~49 ms) is the
+  FullCopy + the larger default geometry (512 MiB / 2 vCPU) + the HTTP/broker hop.
 
 ## Full backend×mode matrix (2026-07-04, HEAD `c6eeefc`) — PRIOR CANONICAL
 

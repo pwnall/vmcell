@@ -14,7 +14,7 @@ LOG="${1:-/tmp/perf-matrix.log}"
 : > "$LOG"
 
 # Summary lines worth keeping (drops CH serial-log + VMM deprecation noise).
-KEEP='Cold Boot|Warm Restore|PHASE-BUDGET|^  (create|connect|exec|teardown|destroy|list)|TOTAL|VSOCK-RTT|round-trip|SUSPEND-SIZE|snapshot bytes|memory file =|memory-file share|host RssShmem total|host RssAnon total|marginal host|KSM pages_sharing|guest MemTotal|guest pid1|density|no snapshot support|cpufreq:|Capabilities:|=== |^Running benchmarks|^kernel:|No successful runs|NET-START|NET-EGRESS|fan-out|agent-ready across|CoW support|master ready|DAEMON-API|NOT freq-pinned|does not rotate|no unprivileged|single-clone|skipping'
+KEEP='Cold Boot|Warm Restore|PHASE-BUDGET|^  (create|connect|exec|teardown|destroy|list|restore)|TOTAL|VSOCK-RTT|round-trip|SUSPEND-SIZE|snapshot bytes|memory file =|memory-file share|host RssShmem total|host RssAnon total|marginal host|KSM pages_sharing|guest MemTotal|guest pid1|density|no snapshot support|cpufreq:|Capabilities:|=== |^Running benchmarks|^kernel:|No successful runs|NET-START|NET-EGRESS|fan-out|agent-ready across|CoW support|master ready|DAEMON-API|NOT freq-pinned|does not rotate|no unprivileged|single-clone|skipping|session-|CAP_NET_ADMIN'
 
 FAILED=0
 run() {
@@ -38,10 +38,15 @@ for BE in cloud-hypervisor firecracker qemu; do
   run --backend "$BE" --mode footprint    --count 8
   # Follow-up probes for the paths the single-VM/no-network/library-direct modes above
   # structurally cannot reach (docs/benchmark-results.md coverage caveat). net-egress
-  # self-skips on FC (no unprivileged vhost-user-net); zygote degrades to the single-clone
-  # control on FC (no host-path rotation).
+  # `plain`/`tls` self-skip on FC (no unprivileged vhost-user-net); zygote degrades to the
+  # single-clone control on FC (no host-path rotation); net-egress `privileged` and session
+  # run on all three (session needs no cap; privileged self-skips without CAP_NET_ADMIN,
+  # which the blessed runner provides here).
   run --backend "$BE" --mode net-egress   --iterations 10 --warmup 3
+  run --backend "$BE" --mode net-egress   --net-mode tls        --iterations 10 --warmup 3
+  run --backend "$BE" --mode net-egress   --net-mode privileged --iterations 10 --warmup 3
   run --backend "$BE" --mode zygote       --count 8 --iterations 5 --warmup 2
+  run --backend "$BE" --mode session      --iterations 30 --warmup 3
 done
 # KSM-dedup density lever is CH-only (needs mergeable=on + shared=off).
 echo "==================== CH KSM-mergeable footprint ====================" | tee -a "$LOG"

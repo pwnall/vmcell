@@ -41,7 +41,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "bench-vm"
 path = "src/bin/bench-vm.rs"
-required-features = ["cloud-hypervisor", "metrics", "cli"]
+# `proxy` is required by the `net-egress --net-mode tls|privileged` MITM probes (they
+# construct a `proxy::doubles::TestDouble`); the default feature set already enables it,
+# so every real build (default + `firecracker,qemu`, and `--all-features`) satisfies this.
+required-features = ["cloud-hypervisor", "metrics", "cli", "proxy"]
 
 [[bench]]
 name = "micro"
