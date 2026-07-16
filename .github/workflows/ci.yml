@@ -114,17 +114,17 @@ jobs:
           # `metrics` is part of that stack, so CFG-1's "host without metrics" config is no longer
           # constructible (its code fix remains as defense-in-depth). The powerset below is the
           # comprehensive guard; this loop is fast per-backend feedback.
-          for feat in cloud-hypervisor firecracker qemu; do
+          for feat in cloud-hypervisor firecracker qemu crosvm; do
             echo "::group::clippy --no-default-features --features $feat"
             cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets -- -D warnings
             echo "::endgroup::"
           done
-          # The Firecracker/QEMU backends now live in their own crates (depending on `vmcell`, which
-          # keeps only Cloud Hypervisor); `vmcell-bench` wires all three (the `bench-vm` binary).
+          # The Firecracker/QEMU/crosvm backends live in their own crates (depending on `vmcell`, which
+          # keeps only Cloud Hypervisor); `vmcell-bench` wires all of them (the `bench-vm` binary).
           # Clippy each standalone so a backend that stops compiling against vmcell's shared surface
           # fails here, not only inside the workspace build.
           echo "::group::clippy extracted backend + bench crates"
-          cargo clippy --locked -p vmcell-firecracker -p vmcell-qemu -p vmcell-bench --all-targets -- -D warnings
+          cargo clippy --locked -p vmcell-firecracker -p vmcell-qemu -p vmcell-crosvm -p vmcell-bench --all-targets -- -D warnings
           echo "::endgroup::"
 
       - name: rustdoc (deny warnings)   # broken/private intra-doc links; clippy does NOT run rustdoc lints

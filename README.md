@@ -30,7 +30,8 @@ out. Build it with `cargo build` (the default feature set) and run subcommands w
 
 The suite targets a Linux **x86_64** host with KVM enabled (`/dev/kvm` present). External tooling
 falls into four groups: system packages, Cargo-installed subprocess binaries, the externally
-distributed VMM binaries (Firecracker, QEMU), and the developer command runner (`just`).
+distributed VMM binaries (Firecracker, QEMU, and — optional — crosvm), and the developer command
+runner (`just`).
 
 ### 1. System Packages (Debian / Ubuntu)
 
@@ -51,7 +52,7 @@ What these are for:
   bootstrap tooling (and no `/bin/sh` → `bash` workaround) is required.
 - `pkg-config libseccomp-dev libcap-ng-dev` — build dependencies for the Cargo-installed
   `cloud-hypervisor` and `virtiofsd` binaries (§2).
-- `libcap2-bin` — provides `setcap`, used to bless the privileged test runner (§5).
+- `libcap2-bin` — provides `setcap`, used to bless the privileged test runner (§6).
 - `nftables` — provides `nft`; the transparent egress proxy installs an `nft` TPROXY ruleset.
   (Host networking otherwise uses `rtnetlink` directly, so the `ip` CLI / `iproute2` is not needed.)
 
@@ -94,7 +95,46 @@ Install the `qemu-system-x86` package which provides the `qemu-system-x86_64` bi
 sudo apt install -y qemu-system-x86
 ```
 
-### 5. Privileged Test Runner
+### 5. crosvm Binary (optional, secondary backend)
+
+crosvm (the ChromeOS Rust VMM) is a fourth, secondary backend. Unlike Firecracker there is **no
+official prebuilt binary release** and no Debian/Ubuntu package, so it is built from source. crosvm is
+only *spawned* as an external binary (never linked as a crate), so — exactly like the QEMU binary — it
+does **not** enter the workspace `Cargo.lock`, the `cargo deny` license scan, or the dependency tree.
+
+crosvm is **boot-first**: its boot/lifecycle path (boot, agent-exec, sessions, tap networking, cgroup
+limits) is validated live via the opt-in `just test-crosvm` matrix (21/21 on a KVM host with a
+source-built crosvm), while snapshot/virtio-fs/unprivileged-net stay honest-`false`. Its KVM-free gates
+(unit tests, capability-honesty pins, seccomp mapping, clippy) run in `just ci`; the live matrix needs
+KVM **and** a crosvm binary and is deliberately **not** part of `just test-privileged`, so a host without
+crosvm is unaffected — install this only to run the crosvm backend.
+
+Build from source (Debian / Ubuntu):
+
+```sh
+sudo apt install -y build-essential clang libclang-dev libcap-dev libwayland-dev pkg-config protobuf-compiler
+git clone https://chromium.googlesource.com/crosvm/crosvm && cd crosvm
+git submodule update --init          # pulls minijail — REQUIRED
+cargo build --release                # → ./target/release/crosvm
+sudo install -m 0755 target/release/crosvm /usr/local/bin/crosvm
+```
+
+crosvm pins its own Rust toolchain via its `rust-toolchain` file and should be built `--locked` against
+its committed `Cargo.lock`.
+
+The `apt` line above covers the **default** feature build, whose gpu/wayland/audio/video features pull
+extra system libraries — `libwayland-dev` is the first (and other default features, e.g. gpu, may pull
+further `-dev` packages depending on your target crosvm version). vmcell drives crosvm **headless**
+(serial + virtio-block + virtio-net + vsock) and needs none of those features, so the cleaner route is a
+slimmed build that skips the whole gpu/wayland/audio dependency chain:
+
+```sh
+cargo build --release --no-default-features
+```
+
+The test suite discovers the binary via `$VMCELL_CROSVM_BIN` (default: `crosvm` on `$PATH`).
+
+### 6. Privileged Test Runner
 
 To run privileged networking tests (like those requiring TAP interfaces or transparent proxying)
 without running the entire `cargo test` suite as `root`, we use a lightweight capability-granting
@@ -126,9 +166,9 @@ it wraps, whose identity is deliberately out of scope (the security boundary is 
 runner* plus path-confinement, not test-binary content).
 
 The privileged suite points the cargo/nextest target-runner at this stable path; `just
-test-privileged` (§6) wires it up for you.
+test-privileged` (§7) wires it up for you.
 
-### 6. Developer command runner (`just`) and CI tooling
+### 7. Developer command runner (`just`) and CI tooling
 
 The lint, test, and dependency gates are driven by [`just`](https://github.com/casey/just) recipes
 (`just ci`, `just test-unit`, `just test-unprivileged`, `just test-privileged`, `just bless`). Install `just`
@@ -157,7 +197,7 @@ Common recipes:
 Built VM artifacts (kernel, rootfs, proxy CA) default to `target/vmcell-artifacts`, overridable via
 `VMCELL_ARTIFACTS_DIR` (with `VMCELL_KERNEL` / `VMCELL_ROOTFS` overriding the individual kernel/rootfs paths).
 
-### 7. Building the VM artifacts
+### 8. Building the VM artifacts
 
 The KVM integration suites need built artifacts (guest kernel, erofs rootfs, proxy CA) in the
 artifacts dir. Build them once with the CLI:
@@ -186,7 +226,7 @@ build — no `sudo` / root step is involved either way.**
   `vmcell build-kernels` and point `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for the
   privileged run.
 
-### 8. Packages supporting experiments
+### 9. Packages supporting experiments
 
 The groups above are everything the product needs to build and run. The packages below are **only**
 for the *optional* performance experiments and contested-fact benchmarks in the design doc §13 (the

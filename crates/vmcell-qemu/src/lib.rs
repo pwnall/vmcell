@@ -1007,6 +1007,8 @@ impl Vmm for Qemu {
             // verbatim baked-path rebind. A deliberate re-gate must flip this AND its
             // capability-honesty test together (docs/45).
             restore_rotates_host_paths: true,
+            // QEMU has native per-drive throttling (`throttling.bps-total`/`iops-total`), §4.6.
+            disk_io_throttle: true,
         }
     }
 

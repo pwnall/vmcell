@@ -712,6 +712,8 @@ impl Vmm for CloudHypervisor {
             // restored VM's OWN fresh scratch dir before launch (§8.2, Restore correctness: a restored VM is not a fresh VM), so every
             // restore gets rotated host-side socket paths.
             restore_rotates_host_paths: true,
+            // CH has a native per-drive rate limiter (`rate_limiter_config`), §4.6.
+            disk_io_throttle: true,
         }
     }
 

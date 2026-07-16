@@ -102,6 +102,8 @@ fn fc_capabilities() -> VmmCapabilities {
         // lineage share the one baked path: restore-while-alive is rejected and
         // concurrent restores from one lineage are unsupported.
         restore_rotates_host_paths: false,
+        // FC has a native per-drive rate limiter (`rate_limiter`), §4.6.
+        disk_io_throttle: true,
     }
 }
 

@@ -1083,3 +1083,94 @@ crate. `vmcell` bumped `0.10.0 → 0.11.0` (the `Firecracker`/`Qemu` re-exports 
   (`cargo test -p vmcell-firecracker` = 13, `-p vmcell-qemu` = 15). No backend leg silently dropped to
   a green no-op — the FC/QEMU matrix arms and the `qemu_*` tests still select under
   `--features firecracker,qemu`.
+
+## crosvm — a fourth secondary backend (`vmcell-crosvm`, design v29 §2.5, 2026-07-16)
+
+Added crosvm (the ChromeOS Rust VMM) as a fourth **secondary** backend crate, mirroring the
+`vmcell-firecracker`/`vmcell-qemu` extraction pattern (depends on `vmcell`; no production edge back;
+`vmcell` dev-depends on it for the matrix). It is **not** a §18 delta-register item (additive, not a
+breaking pass). Its boot/lifecycle path was **validated live** against a source-built crosvm on a KVM host
+(the maintainer installed it per the README); the validation loop found three real runtime bugs and one
+capability divergence — all fixed and re-validated below.
+
+**Live-validation findings (the whole point — these were UNVERIFIED at first draft):** the full
+`just test-crosvm` matrix runs **21/21 passing** (boot + agent-exec + put_file, sessions, concurrency,
+extra-block, privileged egress/host-endpoint, metrics/cgroup limits) with 5 `require_cap!` skips recorded
+to the manifest. Three flag/device fixes were forced by crosvm panics at first boot, each now a KVM-free
+arg-builder assertion:
+
+1. **`--disable-sandbox` (not the built-in sandbox).** crosvm's own sandbox is a *multiprocess* minijail
+   that `pivot_root`s into `/var/empty`; first boot died `"/var/empty" is not a directory, cannot create
+   jail`, and its per-device child forking fights the single-process supervision model. This **reverses**
+   the first-draft seccomp posture (see below).
+2. **`--no-usb`.** crosvm attaches a legacy xhci USB controller by default which does not implement
+   `Suspendable`; the `--suspended`→resume device-wake cycle panicked
+   `Suspendable::wake not implemented for XhciController`. Dropping USB (the guest needs none) fixes it.
+3. **`crosvm resume --full` for `boot()`.** `--suspended` is a FULL suspend (devices + vCPUs); a plain
+   `resume` wakes only vCPUs and crosvm errors `"Trying to wake Vcpus while Devices are asleep"`. `pause()`
+   /`resume()` stay vCPU-only `suspend`/`resume`.
+
+**Seccomp posture — REVERSED by live validation (`--disable-sandbox` + Layer-2 deny-list, not the FC
+analogue).** The first draft kept crosvm's built-in sandbox on for `Enforcing` (FC-shaped, `Enforcing →
+[]`), reasoning it kept the backend confined-by-default. Live validation refuted it (finding 1 above): the
+multiprocess minijail can't run under the harness's supervision model. So the `"crosvm"` arm of
+`vmm_seccomp_args` is now `Enforcing | Disabled → ["--disable-sandbox"]`, `Log → Unsupported`. To keep the
+`seccomp.rs` "never unconfined by default" invariant (the jailer's own deny-list is opt-in/default-off, so
+`--disable-sandbox` alone would leave crosvm unconfined), **`Crosvm::create` turns the Layer-2 jailer
+deny-list ON for `Enforcing`** (`jail_cfg.seccomp_deny_list = true`) and leaves `cfg.jail` untouched for
+`Disabled`. crosvm is thus the one backend whose confinement is Layer-2 rather than its own filter — the
+per-backend deny-list enablement the deny-list was designed for. **Validated:** crosvm boots, execs, and
+does tap/netns networking under the deny-list (the netns `setns` runs in `build_vmm_cmd`'s pre_exec BEFORE
+`apply_jail` loads the filter, so the deny-list's `setns`/`unshare` bans don't break it). The golden test
+and the `Log`-unsupported test were extended to crosvm.
+
+**Capability descriptor — `disk_io_throttle` added; `vmcell` 0.11 → 0.12.** crosvm's `--block` has no
+bandwidth/iops key (verified against `crosvm run --help`), so it cannot rate-limit disk I/O like CH/FC/QEMU.
+`extra_block_io_throttle` had no capability gate and hard-failed on crosvm's fail-loud rejection. The
+in-pattern fix is a new `VmmCapabilities.disk_io_throttle` bool (CH/FC/QEMU/Fake `true`, crosvm `false`) +
+`require_cap!` on the test + a KVM-free honesty pin. Adding a field to the deliberately-exhaustive
+`VmmCapabilities` is a breaking change (cargo-semver-checks `constructible_struct_adds_field` → **requires a
+major version**), so `vmcell` bumped **0.11.0 → 0.12.0** and all ten in-workspace `version = "0.11.0"` pins
+followed. This is the one place the crosvm addition was *not* purely additive — it revised the first draft's
+"no version bump" expectation. `crosvm_capabilities()` (one source of truth for `capabilities()` + the
+`snapshot()`/`restore()` self-guards) reports `snapshot_restore`/`virtio_fs_shares`/
+`unprivileged_vhost_user_net`/`restore_rotates_host_paths`/`lazy_restore`/`nested_virt`/`disk_io_throttle`
+all **false**, only `virtio_console` **true**. `create()` rejects a share / unprivileged net / vhost-user
+socket / throttled disk fail-loud (feature strings match the capability field names, N-VMM-1).
+
+**QEMU-shaped structure; a third control transport.** crosvm is CLI-configured (`crosvm run`) like QEMU,
+but its control plane is driven by **re-invoking the crosvm binary as a client** (`crosvm
+resume|suspend|powerbtn|stop <VM_SOCKET> [--full]`, socket positional before flags) — neither QMP-JSON nor
+HTTP-over-Unix. The socket wire protocol is unstable binary and is **never hand-rolled**, so the crate
+carries no serde/JSON (zero new `cargo deny` surface). vsock is in-kernel vhost-vsock so `vsock_endpoint()`
+overrides to `VsockEndpoint::Vsock{cid, AGENT_VSOCK_PORT}` (host AF_VSOCK; validated in privileged mode).
+All flag spellings (`-s`/`--suspended`/`--no-usb`/`-c`/`-m`/`--vsock cid=`/`--net tap-name=,mac=`/`--block
+path=,ro=`/`--serial type=file,hardware=`/`-p`/the control subcommands) were confirmed against
+`crosvm run --help` and pinned in one testable arg-builder
+(`build_crosvm_run_args`/`crosvm_control_args`/`serial_arg`).
+
+**deny.toml / cargo-deny: no change, by design.** crosvm is *spawned as an external binary*, not linked as
+a crate, so its BSD-3-Clause license and its minijail/C-libseccomp static linkage never enter the workspace
+`Cargo.lock` or the license scan — identical to the external QEMU-binary carve-out. The `[bans]` on the
+libseccomp-wrapper crates still bind the `vmcell-crosvm` **Rust** crate; it reaches for none (VMM-child
+seccomp goes through `vmcell`'s `seccompiler`). Do **not** add crosvm as a crate dependency.
+
+**Staging: crosvm is OUT of the default privileged/bench sets (the binary is absent on CI).** Adding crosvm
+to `just test-privileged` / the CI privileged suite would hard-fail every KVM host lacking a `crosvm` binary
+(a missing backend binary is a spawn error, not a skip). So the live matrix is the **opt-in
+`just test-crosvm`** recipe (needs KVM + `$VMCELL_CROSVM_BIN`), and `crosvm` is out of `vmcell-bench`'s
+`default` feature set (mirrors how `qemu` was staged). The preflight was NOT extended: it probes no backend
+binaries (not ch/fc/qemu either), so a crosvm-only probe would be inconsistent.
+
+**README:** the crosvm build-from-source section needs `libwayland-dev` (the maintainer hit it building the
+default feature set), and points at `cargo build --release --no-default-features` for a headless build that
+skips the whole gpu/wayland/audio dependency chain vmcell doesn't use.
+
+**Gates.** KVM-free and always-on: the in-crate unit tests (arg builders incl. `--no-usb`/`--suspended`/
+root-ordering, control args incl. `resume --full`, serial-mode mapping, capability honesty,
+unprivileged-net reject, restore-Unsupported) run under `just test-unit` (`--all-features`);
+`--workspace --all-features` clippy/doc, the reduced-host-feature loop (`+ crosvm`), and the standalone
+`clippy -p vmcell-crosvm` gate the crate; the seccomp golden + the `crosvm`/`disk_io_throttle` honesty pins
+run under the `crosvm` feature; `cargo semver-checks -p vmcell` gates the 0.12.0 bump. Live (opt-in):
+`just test-crosvm` (21/21 on this KVM host) + `vmcell-bench`'s `test_benchmark_crosvm`. `cargo machete`
+clean (the template's `tempfile` dev-dep was dropped — crosvm tests need no tempdir).

@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "am-fs-erofs",
  "assert_cmd",
@@ -4532,6 +4532,7 @@ dependencies = [
  "virtio-queue",
  "vm-memory",
  "vmcell-artifact-validator",
+ "vmcell-crosvm",
  "vmcell-firecracker",
  "vmcell-protocol",
  "vmcell-qemu",
@@ -4569,6 +4570,7 @@ dependencies = [
  "tokio 1.52.3",
  "vmcell",
  "vmcell-artifact-validator",
+ "vmcell-crosvm",
  "vmcell-firecracker",
  "vmcell-qemu",
 ]
@@ -4595,6 +4597,16 @@ dependencies = [
  "vmcell",
  "vmcell-kernel-builder",
  "vmcell-rootfs-builder",
+]
+
+[[package]]
+name = "vmcell-crosvm"
+version = "0.1.0"
+dependencies = [
+ "nix 0.31.3",
+ "tokio 1.52.3",
+ "tracing",
+ "vmcell",
 ]
 
 [[package]]

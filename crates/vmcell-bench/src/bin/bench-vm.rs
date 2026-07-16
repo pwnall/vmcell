@@ -463,6 +463,12 @@ async fn main() -> anyhow::Result<()> {
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "qemu", &args, allocator.clone()).await?;
         }
+        #[cfg(feature = "crosvm")]
+        "crosvm" => {
+            let vmm = vmcell_crosvm::Crosvm::new("crosvm");
+            println!("Capabilities: {:?}", vmm.capabilities());
+            run_mode(&vmm, "crosvm", &args, allocator.clone()).await?;
+        }
         // Unreachable after `validate_backend`, but fail loud rather than
         // silently succeed if the two ever drift.
         _ => anyhow::bail!(
@@ -489,6 +495,8 @@ fn supported_backends() -> Vec<&'static str> {
         "firecracker",
         #[cfg(feature = "qemu")]
         "qemu",
+        #[cfg(feature = "crosvm")]
+        "crosvm",
     ]
     .to_vec()
 }
@@ -912,6 +920,13 @@ fn footprint_mem_notes(backend: &str) -> (&'static str, &'static str) {
         "firecracker" => (
             "VMM overhead + private-anon guest RAM on Firecracker (the real density figure)",
             "shared shmem (minimal on FC; guest RAM is the anon line above)",
+        ),
+        // crosvm's guest-RAM accounting under `--disable-sandbox` (single process) is not yet
+        // measured on this host; keep the generic backend-dependent labels until an RssShmem vs
+        // RssAnon probe confirms which line is the real density figure (bench-only follow-up).
+        "crosvm" => (
+            "RssAnon: VMM overhead / anon guest RAM (crosvm; model unverified — probe before labeling)",
+            "RssShmem: shared guest RAM if crosvm uses a memfd (unverified — probe before labeling)",
         ),
         _ => (
             "RssAnon: VMM overhead / anon guest RAM (backend-dependent)",

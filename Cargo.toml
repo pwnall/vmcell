@@ -7,7 +7,12 @@ members = [
     # `vmcell` has no production edge back (only a dev-dep, for the matrix tests).
     "crates/vmcell-firecracker",
     "crates/vmcell-qemu",
-    # The cross-backend benchmark harness (the `bench-vm` binary); wires all three backends, so like
+    # vmcell-crosvm: a third secondary backend (crosvm, the ChromeOS Rust VMM). Like the FC/QEMU
+    # crates it depends on `vmcell` (shared `Vmm` trait + jail/seccomp/spawn helpers); `vmcell` has
+    # no production edge back (only a dev-dep, for the matrix tests). crosvm is driven purely as an
+    # external binary, so this crate carries no serde/JSON.
+    "crates/vmcell-crosvm",
+    # The cross-backend benchmark harness (the `bench-vm` binary); wires all backends, so like
     # `vmcell-cli` it lives outside the `vmcell` package to keep the dependency graph acyclic.
     "crates/vmcell-bench",
     "crates/vmcell-protocol",

@@ -109,6 +109,17 @@ test-unprivileged:
     # both CH and QEMU rather than the CH leg alone.
     cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
+# Opt-in crosvm live matrix. crosvm is a NEW secondary backend whose binary is NOT installed on the
+# build/CI hosts, so it is deliberately kept OUT of `test-privileged` (adding it there would hard-fail
+# every KVM host lacking a `crosvm` binary). Its KVM-FREE gates (unit tests, capability-honesty pins,
+# seccomp golden, clippy) run in `just ci`/`just test-unit` already. This recipe validates the crosvm
+# RUNTIME claims — all currently UNVERIFIED — once a `crosvm` binary is present ($VMCELL_CROSVM_BIN or
+# on PATH) on a KVM host. `--no-tests=fail` catches a mis-scoped filter that selects nothing.
+test-crosvm:
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
+        cargo nextest run --locked --profile integration -p vmcell --features crosvm --run-ignored all \
+        --no-tests=fail -E 'kind(test) & test(crosvm) & !(test(unprivileged) | test(smoltcp))'
+
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide
 # (matching CI's workflow-level env, which — unlike a clippy `-- -D warnings` arg — also denies
@@ -166,15 +177,15 @@ ci:
     # which previously did not (the shared hyper HTTP-over-Unix client + serde_json are now host-common
     # deps). `metrics` is part of that stack, so CFG-1's "host without metrics" config is no longer
     # constructible — the CFG-1 class is closed by construction (its code fix remains as defense-in-depth).
-    for feat in cloud-hypervisor firecracker qemu; do \
+    for feat in cloud-hypervisor firecracker qemu crosvm; do \
       echo "== reduced-host-feature clippy: --no-default-features --features $feat =="; \
       cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets; \
     done
     # The Firecracker and QEMU backends now live in their own crates (they depend on `vmcell`;
     # `vmcell` keeps only Cloud Hypervisor). Clippy each standalone so a backend crate that stops
     # compiling against `vmcell`'s shared surface fails here, not only inside the workspace build.
-    # `vmcell-bench` is the composition root that wires all three backends (the `bench-vm` binary).
-    cargo clippy --locked -p vmcell-firecracker -p vmcell-qemu -p vmcell-bench --all-targets
+    # `vmcell-bench` is the composition root that wires all backends (the `bench-vm` binary).
+    cargo clippy --locked -p vmcell-firecracker -p vmcell-qemu -p vmcell-crosvm -p vmcell-bench --all-targets
     # rustdoc gate (docs/51): RUSTDOCFLAGS=-D warnings turns EVERY rustdoc lint into a hard error —
     # broken/private intra-doc links, unresolved links — for the whole public surface. clippy does
     # NOT run rustdoc lints, and `cargo doc` runs nowhere else, so without this a broken doc link is

@@ -85,8 +85,47 @@ async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 // depending on the host's raw disk speed. Every backend has a native rate limiter (CH
 // `rate_limiter_config`, FC `rate_limiter`, QEMU `throttling.*`).
 vmm_matrix_test!(extra_block_io_throttle, |vmm| {
+    // crosvm has no per-drive rate limiter (`--block` exposes no bandwidth/iops key), so it
+    // self-skips this data-plane test rather than failing it; CH/FC/QEMU all have one. The
+    // descriptor value is pinned KVM-free in `capability_honesty_disk_io_throttle` below.
+    require_cap!(vmcell::vmm::Vmm::capabilities(&vmm), disk_io_throttle, vmm);
     test_io_throttle_impl(&vmm).await;
 });
+
+// H-TEST-3: capability-honesty pin for `disk_io_throttle`. A `require_cap!` skip is an invisible
+// nextest PASS, so if crosvm's flag silently flipped `true` the throttle leg would run and hard-fail
+// (crosvm rejects a throttled disk at create); if a throttling backend flipped `false` its leg would
+// go dark. This non-KVM pin fixes the documented per-backend values. Inverse: flip any asserted value.
+#[test]
+fn capability_honesty_disk_io_throttle() {
+    #[cfg(feature = "cloud-hypervisor")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(
+            common::ch_bin()
+        ))
+        .disk_io_throttle,
+        "CH has a native rate limiter; a false silently skips extra_block_io_throttle::cloud_hypervisor"
+    );
+    #[cfg(feature = "firecracker")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell_firecracker::Firecracker::new(common::fc_bin()))
+            .disk_io_throttle,
+        "FC has a native rate limiter; a false silently skips extra_block_io_throttle::firecracker"
+    );
+    #[cfg(feature = "qemu")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell_qemu::Qemu::new(common::qemu_bin()))
+            .disk_io_throttle,
+        "QEMU has native throttling; a false silently skips extra_block_io_throttle::qemu"
+    );
+    #[cfg(feature = "crosvm")]
+    assert!(
+        !vmcell::vmm::Vmm::capabilities(&vmcell_crosvm::Crosvm::new(common::crosvm_bin()))
+            .disk_io_throttle,
+        "crosvm must NOT advertise disk_io_throttle (--block has no bandwidth/iops key); a true would \
+         hard-fail extra_block_io_throttle::crosvm at create"
+    );
+}
 
 async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     const MIB: usize = 1 << 20;

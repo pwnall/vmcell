@@ -1,0 +1,23 @@
+[package]
+name = "vmcell-crosvm"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "crosvm VMM backend for vmcell (a secondary micro-VM backend, extracted like Firecracker/QEMU so the vmcell core carries only Cloud Hypervisor)"
+publish = false
+
+# Depends on `vmcell` for the shared `Vmm`/`VmInstance` traits, the jail/seccomp predicates (crosvm
+# must route its sandbox posture through `vmm_seccomp_args`), and the spawn/reap/console/
+# snapshot-eligibility helpers — every "one law, one predicate" invariant stays single-sourced in
+# `vmcell`. `vmcell` has NO production edge back to this crate (only a dev-dep, for the matrix
+# tests), so the production graph stays acyclic. `host-common` is the minimal feature that compiles
+# the `vmm`/`config`/`metrics`/`net`/`agent`/`fs` modules this backend consumes. crosvm is driven
+# entirely as an external binary (`crosvm run` + short-lived `crosvm <ctl>` control clients over a
+# side socket), so — like QEMU — this crate needs NO serde/JSON: the crosvm control-socket protocol
+# is unstable binary and must never be hand-rolled.
+[dependencies]
+vmcell = { path = "../vmcell", version = "0.12.0", default-features = false, features = ["host-common"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
+nix = { version = "0.31", features = ["signal", "process"] }
+tracing = "0.1"

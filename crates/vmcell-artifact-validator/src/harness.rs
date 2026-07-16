@@ -73,6 +73,12 @@ pub fn qemu_bin() -> String {
     std::env::var("VMCELL_QEMU_BIN").unwrap_or_else(|_| "qemu-system-x86_64".to_string())
 }
 
+/// The crosvm binary (`VMCELL_CROSVM_BIN` or `crosvm`).
+#[must_use]
+pub fn crosvm_bin() -> String {
+    std::env::var("VMCELL_CROSVM_BIN").unwrap_or_else(|_| "crosvm".to_string())
+}
+
 /// Probes the process's **effective** capability set for capability `bit` via `/proc/self/status`
 /// `CapEff:` — the §13 (Cross-cutting invariants)-consistent gate: the capability runner grants caps ambiently without a
 /// full-root uid, so a `geteuid()==0` gate checks the wrong thing.

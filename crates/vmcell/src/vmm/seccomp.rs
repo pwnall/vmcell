@@ -1,4 +1,4 @@
-//! The VMM subprocess's own seccomp-BPF confinement — one predicate, three backends
+//! The VMM subprocess's own seccomp-BPF confinement — one predicate, four backends
 //! (design §12.2, Layer 1 — the VMM's own seccomp filter / invariant §13, Cross-cutting invariants).
 //!
 //! Every backend ships an audited seccomp-BPF filter; the job here is to enable the
@@ -17,6 +17,8 @@
 //! - **QEMU** `-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`
 //!   (default **off** — the hole this closes; a QEMU built without libseccomp errors out on
 //!   `-sandbox on`, the desired fail-loud rather than running unconfined).
+//! - **crosvm** sandboxes itself by default (per-device minijail + compiled-in seccomp), so — like
+//!   Firecracker — Enforcing keeps it (no flag) and only `--disable-sandbox` opts out.
 
 use crate::config::VmmSeccomp;
 use crate::error::{Error, Result};
@@ -61,6 +63,23 @@ pub fn vmm_seccomp_args(backend: &str, policy: VmmSeccomp) -> Result<Vec<String>
                 Ok(vec!["-sandbox".to_string(), QEMU_SANDBOX_SPEC.to_string()])
             }
             VmmSeccomp::Disabled => Ok(Vec::new()),
+            VmmSeccomp::Log => Err(unsupported("seccomp_log")),
+        },
+        "crosvm" => match policy {
+            // crosvm's OWN sandbox is a MULTIPROCESS minijail — per-device jailed subprocesses that
+            // `pivot_root` into `/var/empty` and load policy-dir seccomp. Empirically (validated live)
+            // that is incompatible with the harness's single-process supervision model: it fails
+            // `"/var/empty" is not a directory, cannot create jail` unless that dir is pre-created, and
+            // then forks device children that fight the cgroup `add_task`/pgid-reap/`find_host_pid`
+            // assumptions. So crosvm ALWAYS runs `--disable-sandbox` (a single externally-jailed
+            // process). Its seccomp confinement is instead the Layer-2 jailer deny-list, which
+            // `Crosvm::create` turns ON for `Enforcing` (so the backend is NOT unconfined by default)
+            // and leaves OFF for `Disabled` (the loud opt-out). Both emit the same flag; the
+            // Enforcing/Disabled distinction lives in the jail spec, not the argv. Log has no
+            // observe-only mode → Unsupported (as on FC/QEMU).
+            VmmSeccomp::Enforcing | VmmSeccomp::Disabled => {
+                Ok(vec!["--disable-sandbox".to_string()])
+            }
             VmmSeccomp::Log => Err(unsupported("seccomp_log")),
         },
         _ => Err(unsupported("vmm_seccomp")),
@@ -113,6 +132,21 @@ mod tests {
                 .is_empty(),
             "QEMU Disabled must emit no -sandbox"
         );
+
+        // crosvm: its own multiprocess minijail is incompatible with the single-process supervision
+        // model (needs /var/empty, forks device children), so BOTH Enforcing and Disabled emit
+        // --disable-sandbox; the Enforcing-vs-Disabled distinction is the Layer-2 jailer deny-list
+        // (`Crosvm::create` enables it only for Enforcing), not the argv. A regression that stopped
+        // emitting --disable-sandbox would reintroduce the `/var/empty ... cannot create jail` boot
+        // failure.
+        assert_eq!(
+            vmm_seccomp_args("crosvm", VmmSeccomp::Enforcing).expect("crosvm enforcing"),
+            vec!["--disable-sandbox".to_string()]
+        );
+        assert_eq!(
+            vmm_seccomp_args("crosvm", VmmSeccomp::Disabled).expect("crosvm disabled"),
+            vec!["--disable-sandbox".to_string()]
+        );
         // The sandbox spec must actually deny the four dangerous classes (a regression to a
         // bare `-sandbox on` that dropped spawn/elevateprivileges reddens).
         assert!(QEMU_SANDBOX_SPEC.contains("spawn=deny"));
@@ -127,7 +161,7 @@ mod tests {
     // DEBUG a filter running under a killing filter, unaware.
     #[test]
     fn vmm_seccomp_args_log_unsupported_on_fc_and_qemu() {
-        for backend in ["firecracker", "qemu"] {
+        for backend in ["firecracker", "qemu", "crosvm"] {
             let err = vmm_seccomp_args(backend, VmmSeccomp::Log)
                 .expect_err("Log must be Unsupported on a backend with no audit mode");
             assert!(

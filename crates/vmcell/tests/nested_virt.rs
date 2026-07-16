@@ -34,6 +34,12 @@ fn capability_honesty_nested_virt() {
         vmcell::vmm::Vmm::capabilities(&vmcell_qemu::Qemu::new(common::qemu_bin())).nested_virt,
         "QEMU must support nested_virt; a false silently skips nested_virt::qemu"
     );
+    #[cfg(feature = "crosvm")]
+    assert!(
+        !vmcell::vmm::Vmm::capabilities(&vmcell_crosvm::Crosvm::new(common::crosvm_bin()))
+            .nested_virt,
+        "crosvm must NOT advertise nested_virt (documented-unsupported); a true here hides a real gap"
+    );
 }
 
 // H-TEST-3: capability-honesty pin for `virtio_console`. This flag has no dedicated
@@ -63,6 +69,12 @@ fn capability_honesty_virtio_console() {
     assert!(
         vmcell::vmm::Vmm::capabilities(&vmcell_qemu::Qemu::new(common::qemu_bin())).virtio_console,
         "QEMU must advertise virtio_console (it attaches hvc0)"
+    );
+    #[cfg(feature = "crosvm")]
+    assert!(
+        vmcell::vmm::Vmm::capabilities(&vmcell_crosvm::Crosvm::new(common::crosvm_bin()))
+            .virtio_console,
+        "crosvm must advertise virtio_console (--serial hardware=virtio-console exposes hvc0)"
     );
 }
 

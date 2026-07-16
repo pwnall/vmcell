@@ -71,3 +71,24 @@ fn test_benchmark_qemu() {
         .success()
         .stdout(predicates::str::contains("p50="));
 }
+
+// See `test_benchmark_fc`. The `p50=` assertion comes from the snapshot-independent Cold Boot
+// sub-bench, so this passes regardless of crosvm's (honest-false in v1) snapshot support. Needs a
+// `crosvm` binary on PATH in addition to KVM.
+#[cfg(feature = "crosvm")]
+#[test]
+#[ignore = "needs KVM"]
+fn test_benchmark_crosvm() {
+    let _kernel = common::get_vmlinux();
+    let _rootfs = common::get_rootfs();
+    let mut cmd = Command::cargo_bin("bench-vm").unwrap();
+    cmd.arg("--backend")
+        .arg("crosvm")
+        .arg("--iterations")
+        .arg("1")
+        .arg("--warmup")
+        .arg("0");
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("p50="));
+}

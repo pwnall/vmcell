@@ -379,6 +379,7 @@ mod tests {
                 nested_virt: true,
                 virtio_console: true,
                 restore_rotates_host_paths: self.rotates,
+                disk_io_throttle: true,
             }
         }
 

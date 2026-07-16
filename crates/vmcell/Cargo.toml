@@ -25,7 +25,11 @@ name = "vmcell"
 # 0.11.0: the Firecracker and QEMU backends were extracted into the `vmcell-firecracker` and
 # `vmcell-qemu` crates, so the `Firecracker`/`Qemu` re-exports left the public API (a breaking
 # change under the pre-1.0 minor-bump convention).
-version = "0.11.0"
+# 0.11.0 → 0.12.0: adding the crosvm backend (`vmcell-crosvm`) surfaced a per-backend divergence —
+# crosvm has no disk I/O rate limiter — so `VmmCapabilities` gained a `disk_io_throttle` field. That
+# is a breaking change to an externally-constructible (exhaustive) struct (cargo-semver-checks
+# `constructible_struct_adds_field`), hence the pre-1.0 minor bump.
+version = "0.12.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -236,6 +240,7 @@ vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "
 # themselves are unconditional (cargo forbids optional dev-deps).
 vmcell-firecracker = { path = "../vmcell-firecracker", version = "0.1.0" }
 vmcell-qemu = { path = "../vmcell-qemu", version = "0.1.0" }
+vmcell-crosvm = { path = "../vmcell-crosvm", version = "0.1.0" }
 criterion = { version = "0.8", features = ["html_reports"] }
 # `test-util` enables `#[tokio::test(start_paused = true)]` for the deterministic
 # EXP-D shutdown-timing tests (L-ORCH-5). Test-only: dev-deps do not affect the
@@ -289,6 +294,11 @@ cloud-hypervisor = ["host-common", "dep:hyper", "dep:hyper-util", "dep:http-body
 # matrix arms and CI's `--features firecracker,qemu` invocation keeps selecting them.
 firecracker = ["host-common"]
 qemu = ["host-common"]
+# Same alias as firecracker/qemu: the `crosvm` backend lives in the `vmcell-crosvm` crate (which
+# `vmcell` dev-depends on), so this feature gates no in-tree module — it only compiles the
+# `#[cfg(feature = "crosvm")]` matrix/honesty test arms and lets CI's `--features …,crosvm`
+# invocation select them.
+crosvm = ["host-common"]
 
 net-privileged = ["host-common", "dep:rtnetlink", "dep:netns-rs", "dep:tun-tap", "dep:netlink-packet-route"]
 experiment-nftables = ["net-privileged", "jip-nftables"]

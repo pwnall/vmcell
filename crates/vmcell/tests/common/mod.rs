@@ -10,7 +10,7 @@
 // different subset, so allow the re-export to be partially unused per binary.
 #[allow(unused_imports)]
 pub use vmcell_artifact_validator::harness::{
-    ch_bin, fc_bin, get_rootfs, get_vmlinux, has_cap_net_admin, qemu_bin, start_vm,
+    ch_bin, crosvm_bin, fc_bin, get_rootfs, get_vmlinux, has_cap_net_admin, qemu_bin, start_vm,
 };
 
 /// Recomputes the cgroup-v2 slice name the orchestrator assigns to a VM, so a residue check can
@@ -126,6 +126,14 @@ macro_rules! vmm_matrix_test {
             #[ignore = "needs KVM"]
             async fn qemu() {
                 let $vmm = vmcell_qemu::Qemu::new(super::common::qemu_bin());
+                $body
+            }
+
+            #[cfg(feature = "crosvm")]
+            #[tokio::test]
+            #[ignore = "needs KVM"]
+            async fn crosvm() {
+                let $vmm = vmcell_crosvm::Crosvm::new(super::common::crosvm_bin());
                 $body
             }
         }

@@ -610,6 +610,15 @@ pub struct VmmCapabilities {
     /// restores from one snapshot lineage are unsupported (the design §17, Open gaps and future capabilities
     /// single-snapshot-CoW gap covers both backends anyway).
     pub restore_rotates_host_paths: bool,
+    /// True if the VMM can rate-limit an extra virtio-blk device's I/O
+    /// ([`DiskIoLimit`](crate::config::DiskIoLimit), §4.6). Cloud Hypervisor
+    /// (`rate_limiter_config`), Firecracker (`rate_limiter`), and QEMU
+    /// (`throttling.*`) all have a native per-drive limiter; **crosvm has none**
+    /// (its `--block` exposes no bandwidth/iops key), so it advertises `false`
+    /// and rejects a throttled disk fail-loud at `create()`. A backend that
+    /// reports `false` self-skips the `extra_block_io_throttle` data-plane test
+    /// via `require_cap!` rather than failing it.
+    pub disk_io_throttle: bool,
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
@@ -946,6 +955,7 @@ impl Vmm for FakeVmm {
             // FC-style verbatim-rebind semantics should build its own fake with
             // this set `false`.
             restore_rotates_host_paths: true,
+            disk_io_throttle: true,
         }
     }
 
@@ -1432,6 +1442,7 @@ mod tests {
             nested_virt: true,
             virtio_console,
             restore_rotates_host_paths: true,
+            disk_io_throttle: true,
         };
 
         // FC-like (virtio_console:false) + VirtioConsole => Unsupported.
