@@ -185,7 +185,7 @@ tun-tap = { version = "0.1", optional = true }
 rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rcgen = { version = "0.14", optional = true, features = ["x509-parser"] }
-hudsucker = { version = "0.24", optional = true }
+hudsucker = { version = "0.25", optional = true }
 
 
 # Pipeline
