@@ -73,8 +73,8 @@ fn test_benchmark_qemu() {
 }
 
 // See `test_benchmark_fc`. The `p50=` assertion comes from the snapshot-independent Cold Boot
-// sub-bench, so this passes regardless of crosvm's (honest-false in v1) snapshot support. Needs a
-// `crosvm` binary on PATH in addition to KVM.
+// sub-bench, so this passes independent of crosvm's snapshot path (which is live-validated true,
+// §2.5 — the baked-CID Firecracker pattern). Needs a `crosvm` binary on PATH in addition to KVM.
 #[cfg(feature = "crosvm")]
 #[test]
 #[ignore = "needs KVM"]

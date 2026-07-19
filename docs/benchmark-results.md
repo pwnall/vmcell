@@ -4,18 +4,245 @@ Performance results for the `vmcell` framework: hot-path overheads (micro-benchm
 KVM lifecycle/density/size metrics (macro-benchmarks). Per design §16 (Performance) these are **tracked metrics,
 not pass/fail gates** — absolute numbers are hardware-bound and only meaningful with their substrate.
 
-> **Canonical numbers: the 2026-07-15 full backend×mode matrix** (directly below) — the re-run
-> after the QEMU suspend/resume + session-persistence + security-hardening rounds, which adds the
-> first QEMU restore/suspend numbers and confirms no latency regression on CH/FC. The
-> **2026-07-04** matrix beneath it is the prior canonical (it confirmed the 2026-07-02
-> post-investigation matrix and filled the FC/QEMU coverage gaps); the 2026-07-02 section is below
-> that, then the 2026-07-01 profile-matrix baseline plus the `docs/45` experiment pass (EXP-A…E,
-> incl. the Firecracker warm-restore unlock). The historical pass sections further down record how
-> the system got here (CH cold 642→330 ms, CH restore 166→84→60 ms); the detailed sub-analyses
-> (kernel sweep, eager/lazy) were measured **pre-pass**: their *relative* conclusions still hold,
-> but their absolute cold/restore ms are superseded by the tables below.
+> **Canonical numbers: the 2026-07-17 full backend×mode matrix** (directly below) — the re-run that
+> adds **crosvm** as the fourth backend (`vmcell-crosvm`, design §2.5), alongside fresh same-session
+> CH/FC/QEMU controls confirming no regression. The **2026-07-15** matrix beneath it is the prior
+> canonical (it added the first QEMU restore/suspend numbers after the suspend/resume + session-
+> persistence + security-hardening rounds); the **2026-07-04** matrix below that filled the FC/QEMU
+> coverage gaps; the 2026-07-02 section is below that, then the 2026-07-01 profile-matrix baseline
+> plus the `docs/45` experiment pass (EXP-A…E, incl. the Firecracker warm-restore unlock). The
+> historical pass sections further down record how the system got here (CH cold 642→330 ms, CH
+> restore 166→84→60 ms); the detailed sub-analyses (kernel sweep, eager/lazy) were measured
+> **pre-pass**: their *relative* conclusions still hold, but their absolute cold/restore ms are
+> superseded by the tables below.
 
-## Full backend×mode matrix (2026-07-15, HEAD `7497b26`) — CANONICAL
+## Full backend×mode matrix (2026-07-17, HEAD `05fe674`) — CANONICAL
+
+Re-run of the whole `scripts/perf-matrix.sh` — now a **four-backend** matrix — after the crosvm
+rounds since 2026-07-15 (`7497b26..HEAD`, 6 commits): the new **`vmcell-crosvm`** backend (design
+§2.5) plus its **suspend/resume**, the FC/QEMU crate extraction, the Rust bench-harness move, and the
+`vmcell` 0.11→0.12 bump (`VmmCapabilities` gained `disk_io_throttle`). The headline is **crosvm as
+the fourth backend**, on the same substrate/method as the 2026-07-15 matrix (freq-pinned at the
+2.2 GHz base via the blessed runner under a delegated cgroup scope, warm-cache, mem=256 MiB,
+`default` profile; N=20 latency / N=12 phase-budget / N=200 vsock-rtt / 8 concurrent footprint).
+CH/FC/QEMU are re-run **in the same session** as interleaved controls — the only regression evidence
+that counts. `bench-vm` now wires all four backends by default (`vmcell-bench`'s `crosvm` feature
+graduated into the default set once it was live-validated); `perf-matrix.sh` loops crosvm too.
+
+**Verdict: no regression on CH/FC/QEMU; crosvm lands as a coherent fourth backend.** Every CH/FC/QEMU
+headline p50 sits within run-to-run noise of 2026-07-15 (nothing since `7497b26` touches their
+measured lifecycle path — the delta is a new crate, one capability field, a crate move, and the
+harness move). The run had **zero dropped iterations and zero warmup failures on all four backends**
+(one transient smoltcp-NAT boot on a `tls` probe was recovered by retry, as designed). This is the
+**idle-host re-run**: the µs-scale datapath (vsock-rtt, session, daemon `list`/`exec`) sits on its
+sub-millisecond floor across all four backends, superseding an earlier same-day run whose µs figures
+were inflated ~1.5× by unrelated host activity (the ms-scale cold/restore/phase numbers were
+unaffected either way). Quote central tendency, per the substrate caveats.
+
+**crosvm in one line:** a **hybrid** — a CH-like memory model (memfd/shmem guest RAM, VMM overhead at
+the CH floor), a Firecracker-like restore identity (baked vsock CID, no host-path rotation →
+single-lineage, no concurrent fan-out), and QEMU-like **sparse** snapshots (~58 MiB, tracking the
+touched working set, not the 256 MiB allotment). Slowest cold boot but the most consistent (in-kernel
+vsock → no external-daemon flake); fast sub-100 ms restore.
+
+**Time-to-ready (latency mode), p50 / p95 ms** (CH/FC/QEMU Δ vs 2026-07-15):
+
+| Backend | cold | restore |
+| --- | --- | --- |
+| **Cloud Hypervisor** | 305 / 322 (≈) | **53 / 62** (≈) |
+| **Firecracker** | 775 / 785 (≈) | **27 / 29** (≈) |
+| **QEMU** (`q35`) | 991 / 1132 (≈; 20/20, one ~5 s p99 recovered tail) | 475 / 487 (≈) |
+| **crosvm** | **1413 / 1420** (NEW) | **76 / 86** (NEW) |
+
+- **crosvm cold (~1413 ms) is the slowest of the four but the most consistent** — p50/p95/p99 span
+  ~9 ms with no flake tail. crosvm terminates vsock **in-kernel** (`vhost-vsock`, like CH/FC), so it
+  has none of QEMU's external-`vhost-device-vsock` bring-up race (QEMU's lone ~5 s p99 tail above is
+  that flake, recovered by the health-gate — 20/20 completed). The cold cost is entirely guest bring-
+  up: the phase-budget below puts crosvm's `connect` (guest-boot-to-vsock-ready) at 1361 ms / 79 %,
+  the highest boot share of any backend, while its VMM launch (`create` 51 ms) is on par with CH/FC.
+  The gap is in-guest / device-probe time, not VMM spawn.
+- **crosvm restore (~76 ms) is fast** — 3rd of four (FC 27 < CH 53 < crosvm 76 < QEMU 475). Unlike
+  QEMU's full-memory `migrate-incoming` stream (475 ms), crosvm restores its small **sparse** ~58 MiB
+  snapshot directly via `run --restore`, reusing the **baked** vsock CID (crosvm rejects a rotated
+  one — the Firecracker pattern), landing near CH's restore band.
+
+**Phase-budget, p50 ms (`default` profile: create + connect + graceful `shutdown()` teardown):**
+
+| Backend | path | create | connect | exec | teardown | TOTAL |
+| --- | --- | --- | --- | --- | --- | --- |
+| **CH** | COLD | 42 | 266 | 4 | 263 | **~578** |
+| **CH** | RESTORE | 51 | 3 | 5 | 259 | **~321** |
+| **FC** | COLD | 46 | 732 | 5 | 278 | **~1063** |
+| **FC** | RESTORE | 16 | 9 | 8 | 43 | **~78** |
+| **QEMU** | COLD | 121 | 874 | 5 | 302 | **~1320** |
+| **QEMU** | RESTORE | 461 | 11 | 10 | 339 | **~825** |
+| **crosvm** | COLD | 51 | 1361 | 4 | 296 | **~1715** |
+| **crosvm** | RESTORE | 72 | 5 | 5 | 300 | **~380** |
+
+- **crosvm COLD is the most guest-boot-bound** (`connect` 1361 ms / 79 %, the highest boot share
+  of the four) — the mirror of its slow cold latency; `create` (51 ms) is on par with CH/FC.
+- **crosvm RESTORE is teardown-bound** (300 ms / 79 %, the CH profile): the restored guest does not
+  power off within the 250 ms default grace, so it pins at the ceiling (a profile artifact, not a
+  leak — the `throughput` 50 ms grace would collapse it, as for CH). `create` (72 ms) is the
+  sparse-snapshot restore + resume; `connect` collapses to ~5 ms (the guest is already booted in the
+  snapshot), the mirror of the cold path's 1361 ms.
+
+**Datapath — vsock exec round-trip (`/bin/true`), µs:**
+
+| Backend | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| **Cloud Hypervisor** | 708 | 826 | 902 |
+| **Firecracker** | 821 | 1109 | 1380 |
+| **QEMU** | 715 | 834 | 866 |
+| **crosvm** | **847** | 1054 | 1181 |
+
+- **Sub-millisecond control-plane floor on all four backends** (CH 708 / QEMU 715 / FC 821 / crosvm
+  847 µs p50), incl. in-guest fork/exec/reap — the four sit within ~140 µs of each other. exec RTT is
+  in-guest fork/exec/reap-dominated, so the transport does not separate the backends; crosvm (847 µs)
+  is marginally the highest p50 but well under 1 ms. (This idle-host run restores the ~0.7 ms floor an
+  earlier same-day run had inflated ~1.5× under host activity — the ms-scale numbers were unaffected.)
+
+**Suspend-state size on disk (256 MiB guest):**
+
+| Backend | total (MiB) | memory-file share | note |
+| --- | --- | --- | --- |
+| **CH** | 256.0 | 100 % | dense: full memory-file (`memory-ranges`) |
+| **FC** | 256.0 | 100 % | dense: full `mem_file` |
+| **QEMU** | 52.2 | 100 % | **sparse**: `migrate file:` streams only populated pages |
+| **crosvm** | **57.8** | 100 % | **sparse**: `mem` file ≈ touched working set (~58 MiB, matches footprint) |
+
+- **crosvm snapshots are sparse like QEMU** (~58 MiB vs CH/FC's dense 256 MiB): the snapshot `mem`
+  file tracks the guest's touched working set (~57 MiB, matching the footprint below), not the RAM
+  allotment. So **both** QEMU and crosvm get warm-pool-density-friendly small snapshots inherently;
+  CH/FC still need `SEEK_HOLE` sparse-snapshot for the equivalent. The small size is not a
+  truncation — the restore connects + execs every iteration (76 ms restore latency above).
+
+**Guest-RAM footprint & density (8 concurrent, 256 MiB), per-guest resident:**
+
+| Backend | guest RAM (per guest) | VMM overhead (per guest) | KSM dedup over run |
+| --- | --- | --- | --- |
+| **CH** (shared memfd) | ≈57 MiB `RssShmem` | ≈0–1 MiB `RssAnon` | **0** (shared pages can't merge) |
+| **CH `--ksm-mergeable`** | ≈58 MiB `RssAnon` (private) | — | **≈384 MiB** (`pages_sharing` +98,390) |
+| **FC** (private anon) | ≈57 MiB `RssAnon` | (in the anon line) | 0 (not mergeable) |
+| **QEMU** (memfd + heavier VMM) | ≈59 MiB `RssShmem` | **≈21 MiB `RssAnon`** | ~6 MiB (small) |
+| **crosvm** (memfd, light VMM) | ≈57 MiB `RssShmem` | **≈1 MiB `RssAnon`** | 0 (shared pages can't merge) |
+
+- **crosvm's memory model is now probed** (was "unverified — probe before labeling"): guest RAM is a
+  **memfd/shmem** mapping (57 MiB/guest `RssShmem` — the CH model, *not* FC's private anon), with a
+  **VMM anon overhead at the CH floor** (~1 MiB/guest — effectively tied with CH's ≈0–1, and far
+  below QEMU's ≈21). Dead-linear per added guest; the implied density ceiling is CH-equivalent (~230 idle guests /
+  ~13 GiB). KSM dedup is 0 — the shared memfd pages can't merge, exactly as for the CH baseline; a
+  crosvm mergeable lever (if any) is unmeasured. So crosvm's runtime footprint reads like CH's, at a
+  VMM overhead tied with CH for the matrix floor (far below QEMU's ≈21 MiB).
+
+### Follow-up probes — round 1: egress, zygote fan-out, daemon API (2026-07-17)
+
+Same three probes as 2026-07-15 (mechanisms unchanged — see that section for the cert-mint,
+smoltcp-flake, and CoW-FullCopy analysis); here with crosvm added.
+
+**Networked egress (`net-egress` plain; CH + QEMU only — Firecracker *and* crosvm have no
+unprivileged vhost-user-net, both self-skip).** Unprivileged smoltcp NAT + `Egress::Open`, real
+returned byte asserted.
+
+| Backend | NET-START p50 / p95 (boot WITH NAT) | egress RTT p50 / p95 (in-guest curl→NAT→host) |
+| --- | --- | --- |
+| **CH** | 323 / 349 ms | **37.2 / 38.9 ms** |
+| **QEMU** | 1040 / 1104 ms | **36.8 / 41.2 ms** |
+| **FC, crosvm** | — | skip (`unprivileged_vhost_user_net=false`) |
+
+**Zygote CoW fan-out (`zygote`; CH + QEMU concurrent N=8; FC + crosvm single-clone control N=1).**
+
+| Backend | fan-out to N total p50 / p95 | per-clone p50 | agent-ready-all p50 | CoW |
+| --- | --- | --- | --- | --- |
+| **CH** (N=8) | 440 / 468 ms | ~55 ms | 4 ms | FullCopy |
+| **QEMU** (N=8) | 504 / 522 ms | ~63 ms | 8 ms | FullCopy |
+| **FC** (N=1 control) | 129 / 136 ms | ~129 ms | 13 ms | FullCopy |
+| **crosvm** (N=1 control) | **101 / 109 ms** | ~101 ms | 3 ms | FullCopy |
+
+- **crosvm degrades to the single-clone control, like FC** (`restore_rotates_host_paths=false`):
+  crosvm bakes the vsock CID into the snapshot and requires it on restore, so concurrent fan-out from
+  one lineage is unrepresentable (`spawn_clones` returns `Unsupported` for n>1 — the §17 single-
+  snapshot-CoW gap). Its single-clone (~101 ms) is the fastest of the two controls (< FC's 129 ms) —
+  the small sparse ~58 MiB snapshot byte-copies quickly (FullCopy on this non-reflink host) and
+  restores near its own 76 ms restore.
+
+**Daemon API (`bench-vm --mode daemon-api`; CH — the daemon backend is CH; freq-pinned).**
+
+| Op | p50 / p95 | what it isolates |
+| --- | --- | --- |
+| **list** | 0.7 / 0.7 ms | pure HTTP + broker bridge, NO VMM work, connection reused — the bridge floor |
+| **exec** | 1.4 / 1.5 ms | bridge + in-guest vsock exec (~0.7 ms over `list`) |
+| **create** | 329.2 / 345.2 ms | full cold-boot-to-agent-ready THROUGH HTTP + broker (defaults vcpus=2/mem=512) |
+| **destroy** | 262.6 / 268.2 ms | teardown THROUGH the daemon (graceful grace, like the ~260 ms `shutdown()` path) |
+| **restore** | 517.5 / 549.6 ms | `restore_from` via `restore_cow` FullCopy tree-copy (round-2 note below) |
+
+- The `list` bridge floor (~0.7 ms) is the per-op HTTP + broker tax with no VMM work behind it and the
+  connection pooled; `exec` adds the in-guest vsock datapath (~0.7 ms over `list`). The ms-scale
+  `create`/`destroy`/`restore` are dominated by the VM lifecycle they wrap. Read the bridge delta,
+  not the total.
+
+### Follow-up probes — round 2: privileged net, TLS-MITM, sessions, daemon restore (2026-07-17)
+
+Same four surfaces as 2026-07-15 (mechanism unchanged), with crosvm added.
+
+**Filtered / TLS-MITM egress (`net-egress --net-mode tls` and `--net-mode privileged`).** Fresh
+`*.probe.local` host per iteration → fresh cert mint every request. `tls` rides the unprivileged
+smoltcp NAT (CH + QEMU; FC + crosvm skip); `privileged` rides tap + netns + nft (all four, via the
+runner's `CAP_NET_ADMIN`).
+
+| Variant | NET-START p50 / p95 | MITM egress RTT p50 / p95 (cert mint + guest↔proxy TLS handshake) |
+| --- | --- | --- |
+| **CH `tls`** | 324 / 341 ms | **165.6 / 172.1 ms** |
+| **CH `privileged`** | 319 / 344 ms | **80.1 / 81.5 ms** |
+| **QEMU `tls`** | 1054 / 1208 ms | 169.7 / 175.7 ms |
+| **QEMU `privileged`** | 1051 ms (5.3 s p95 tail †) | 81.5 / 83.2 ms |
+| **FC `privileged`** | 802 / 817 ms | 79.9 / 80.1 ms |
+| **crosvm `privileged`** | **1414 / 1427 ms** | **79.2 / 80.8 ms** |
+| **FC, crosvm `tls`** | — | skip (no unprivileged vhost-user-net) |
+
+- **crosvm privileged MITM (~79 ms) matches CH/FC/QEMU privileged (~80 ms)** — backend-independent, as
+  round 1 found: the per-connection cert mint (RSA keygen + sign in rcgen) dominates and is fixed, so
+  the four converge on the same privileged-tap figure. crosvm's NET-START (1414 ms) is the net setup
+  running concurrently with its slow cold boot (~1413 ms). crosvm skips `tls` (no unprivileged
+  vhost-user-net, like FC). The `tls`↔`privileged` gap (~170 vs ~80 ms) is the smoltcp-NAT overhead
+  compounded over the TLS handshake, identical to 2026-07-15. † QEMU `privileged` shows the same rare
+  ~5 s external-vsock bring-up tail seen in the cold-latency table (p95 5.3 s; p50 unaffected).
+
+**Interactive sessions (`session`; all four backends, no capability gate).** The `SessionMux` second
+vsock connect + `Ready` handshake, plus per-session open→spawn→exit.
+
+| Backend | session-connect p50 / p95 (2nd vsock handshake) | session-open p50 / p95 (open→spawn→exit) |
+| --- | --- | --- |
+| **CH** | 169 / 242 µs | 613 / 687 µs |
+| **FC** | 206 / 235 µs | 648 / 740 µs |
+| **QEMU** | 202 / 317 µs | 749 / 1202 µs |
+| **crosvm** | **112 / 135 µs** | **570 / 614 µs** |
+
+- **crosvm sessions are sub-millisecond on both legs** — this idle run crosvm has the **fastest**
+  session-connect (~112 µs, the mux's second vsock connect + `Ready` handshake) and per-command open
+  (~570 µs, right on the vsock exec floor). All four backends are sub-millisecond on both legs on the
+  idle host; QEMU's session-open p95 (1202 µs) is its heaviest tail.
+
+**Daemon restore (`bench-vm --mode daemon-api` `restore`; CH; freq-pinned).**
+
+| Op | p50 / p95 | vs |
+| --- | --- | --- |
+| **restore** | **517.5 / 549.6 ms** | daemon `create` 329.2 ms; library-direct CH restore ~53 ms |
+
+- Daemon `restore` (518 ms) is slower than daemon `create` (329 ms) because `restore_cow` byte-copies
+  the whole memory image (**FullCopy** — the store dir is not on a reflink fs) before restoring; on a
+  reflink fs it would beat create. Consistent with 2026-07-15 (567 ms); the gap over library-direct
+  restore is the FullCopy + the larger default geometry (512 MiB / 2 vCPU) + the HTTP/broker hop.
+
+**Coverage caveat.** The matrix is scoped exactly as the 2026-07-15 section documents (single-VM
+core modes + the two follow-up probe rounds); crosvm is now included on every surface it can serve.
+crosvm-specific skips are honest-capability, not gaps: `net-egress` plain/tls (no unprivileged
+vhost-user-net, `unprivileged_vhost_user_net=false`) and concurrent zygote fan-out (baked-CID
+restore, `restore_rotates_host_paths=false` → single-clone control). The one deliberately-unmeasured
+surface is unchanged: the MITM proxy→origin (upstream) TLS handshake (hudsucker pins webpki roots, so
+a hermetic local origin is rejected).
+
+## Full backend×mode matrix (2026-07-15, HEAD `7497b26`) — PRIOR CANONICAL
 
 Re-run of the whole `scripts/perf-matrix.sh` after the development rounds since the 2026-07-04
 matrix (`c6eeefc..HEAD`, 15 commits): **session persistence**, **CoW cloning**, the **mandatory

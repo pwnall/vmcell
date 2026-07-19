@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "The vmcell cross-backend micro-VM benchmark harness (the bench-vm binary). Composition root that wires all three backends, kept out of the vmcell package so the dependency graph stays acyclic."
+description = "The vmcell cross-backend micro-VM benchmark harness (the bench-vm binary). Composition root that wires all four backends, kept out of the vmcell package so the dependency graph stays acyclic."
 publish = false
 
-# The `bench-vm` binary drives all three backends, so — like `vmcell-cli` — it lives OUTSIDE the
-# `vmcell` package and depends on `vmcell` plus the two extracted backend crates. This is the one
+# The `bench-vm` binary drives all four backends, so — like `vmcell-cli` — it lives OUTSIDE the
+# `vmcell` package and depends on `vmcell` plus the three extracted backend crates. This is the one
 # place with an edge to every backend; `vmcell` itself keeps only Cloud Hypervisor. The optional
-# `firecracker`/`qemu` features gate the two secondary backends the same way the in-tree bin used to.
+# `firecracker`/`qemu`/`crosvm` features gate the three secondary backends the same way the in-tree
+# bin used to.
 [dependencies]
 vmcell = { path = "../vmcell", version = "0.12.0", default-features = false, features = ["cloud-hypervisor", "metrics", "cli", "proxy"] }
 vmcell-firecracker = { path = "../vmcell-firecracker", version = "0.1.0", optional = true }
@@ -28,10 +29,14 @@ libc = "0.2"
 tempfile = "3"
 
 [features]
-# `crosvm` is deliberately OUT of the default set until it is validated on a KVM host with a crosvm
-# binary present (mirrors how `qemu` was staged): an unvalidated backend must not redden the default
-# `bench-vm` build/CI. Enable it explicitly with `--features crosvm`.
-default = ["cloud-hypervisor", "firecracker", "qemu"]
+# `crosvm` graduated INTO the default set once it was validated live on a KVM host with a `crosvm`
+# binary present (21/21 via `just test-crosvm`, incl. snapshot/restore — the exit condition the
+# staging comment named, mirroring how `qemu` graduated). CI compiles the crosvm arm regardless via
+# `--all-features` (see `just ci`), so default-on adds no build risk; it only lets the standard
+# `cargo build --release -p vmcell-bench` cover crosvm, which the perf matrix relies on. The crosvm
+# *runtime* matrix still needs a `crosvm` binary present (absent on CI), so its LIVE validation stays
+# the opt-in `just test-crosvm` recipe, not `test-privileged`.
+default = ["cloud-hypervisor", "firecracker", "qemu", "crosvm"]
 # `cloud-hypervisor` is the binary's `required-features` equivalent; the `vmcell` dep pins it
 # unconditionally above, so this feature only exists to satisfy the bin's `#[cfg(feature=…)]` arm.
 cloud-hypervisor = ["vmcell/cloud-hypervisor"]

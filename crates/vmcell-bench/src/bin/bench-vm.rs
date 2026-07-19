@@ -921,12 +921,12 @@ fn footprint_mem_notes(backend: &str) -> (&'static str, &'static str) {
             "VMM overhead + private-anon guest RAM on Firecracker (the real density figure)",
             "shared shmem (minimal on FC; guest RAM is the anon line above)",
         ),
-        // crosvm's guest-RAM accounting under `--disable-sandbox` (single process) is not yet
-        // measured on this host; keep the generic backend-dependent labels until an RssShmem vs
-        // RssAnon probe confirms which line is the real density figure (bench-only follow-up).
+        // Probed 2026-07-17 (docs/benchmark-results.md): crosvm backs guest RAM with a memfd
+        // accounted as `RssShmem` (the CH model — ~57 MiB/guest is the real density figure), with a
+        // very light ~1 MiB/guest `RssAnon` VMM overhead (at the CH floor, far below QEMU's ~21).
         "crosvm" => (
-            "RssAnon: VMM overhead / anon guest RAM (crosvm; model unverified — probe before labeling)",
-            "RssShmem: shared guest RAM if crosvm uses a memfd (unverified — probe before labeling)",
+            "VMM overhead; guest RAM is a shmem/memfd on crosvm (~1 MiB/guest — at the CH floor)",
+            "crosvm guest-RAM memfd; the real density figure",
         ),
         _ => (
             "RssAnon: VMM overhead / anon guest RAM (backend-dependent)",
@@ -2346,7 +2346,7 @@ async fn run_zygote<V: Vmm>(
 /// vsock connection + `Ready` handshake, separate from the cached `agent()` client),
 /// and (B) per-session `open`→guest-spawn→`exit` on one persistent mux. Both assert a
 /// real `code==0` exit before counting (data-plane liveness, not a connect-only signal).
-/// Works on all three backends (sessions ride the same vsock; no capability gate).
+/// Works on all four backends (sessions ride the same vsock; no capability gate).
 async fn run_session<V: Vmm>(
     vmm: &V,
     backend: &str,

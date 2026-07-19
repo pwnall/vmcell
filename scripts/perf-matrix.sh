@@ -8,7 +8,8 @@
 # Usage: scripts/perf-matrix.sh [logfile]
 # Assumes: `just bless` installed the runner at .vmcell-bin/release/ and
 #          target/release/bench-vm was built via `cargo build --release -p vmcell-bench`
-#          (its default features enable all three backends, including firecracker + qemu).
+#          (its default features enable all FOUR backends: cloud-hypervisor + firecracker + qemu +
+#          crosvm). crosvm needs a `crosvm` binary on PATH ($VMCELL_CROSVM_BIN or /usr/local/bin).
 set -uo pipefail
 WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="${1:-/tmp/perf-matrix.log}"
@@ -30,7 +31,11 @@ run() {
 }
 
 echo "== PERF MATRIX @ $(date -Is) ==" | tee -a "$LOG"
-for BE in cloud-hypervisor firecracker qemu; do
+# crosvm capabilities (§2.5): snapshot_restore=true (latency-restore/suspend-size/phase-restore run),
+# restore_rotates_host_paths=false (zygote degrades to the single-clone control, like FC),
+# unprivileged_vhost_user_net=false (net-egress plain/tls self-skip, like FC). net-egress privileged
+# rides tap+netns+nft under the runner's CAP_NET_ADMIN.
+for BE in cloud-hypervisor firecracker qemu crosvm; do
   echo "==================== BACKEND: $BE ====================" | tee -a "$LOG"
   run --backend "$BE" --mode latency      --iterations 20 --warmup 3
   run --backend "$BE" --mode phase-budget --iterations 12 --warmup 3
