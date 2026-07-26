@@ -27,7 +27,7 @@ jobs:
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
       - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae  # nightly branch
         with: { toolchain: nightly }
-      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2
         with: { tool: "cargo-fuzz" }
 
       - name: run all fuzz targets (5 min each)
