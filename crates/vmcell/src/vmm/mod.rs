@@ -431,6 +431,35 @@ pub fn reject_unsupported_console(
     Ok(())
 }
 
+/// Rejects [`VmConfig::usb_host_devices`](crate::config::VmConfig::usb_host_devices) on a
+/// backend that cannot attach a host USB device (§2.4, QEMU q35 — the fallback and most-proven nester), so the request is never
+/// silently dropped.
+///
+/// The **one** predicate every backend's `create()` calls (AGENTS.md "one law, one
+/// predicate"): QEMU passes it (its `usb_host_passthrough` is `true`), CH / Firecracker /
+/// crosvm refuse. Routing all four through here means a future capability flip — in
+/// either direction — changes the refusal at exactly one site, and the feature string can
+/// never drift from the [`VmmCapabilities`] field name (N-VMM-1).
+///
+/// # Errors
+/// Returns [`Error::Unsupported`](crate::error::Error::Unsupported)
+/// `{ vmm, feature: "usb_host_passthrough" }` when `devices` is non-empty and
+/// `caps.usb_host_passthrough` is `false`; `Ok(())` otherwise.
+pub fn reject_usb_host_devices(
+    vmm: &str,
+    caps: &VmmCapabilities,
+    devices: &[crate::config::UsbHostDevice],
+) -> Result<()> {
+    if !devices.is_empty() && !caps.usb_host_passthrough {
+        return Err(crate::error::Error::Unsupported {
+            vmm: vmm.into(),
+            // N-VMM-1: the feature string IS the VmmCapabilities field name.
+            feature: "usb_host_passthrough".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Returns `true` when a VM carrying any of these is **not** snapshot-eligible,
 /// because it has a vhost-user device attached (a virtio-fs data share served by
 /// virtiofsd, the unprivileged `vhost-user-net` NAT, or an external `vhost-user-net`
@@ -559,8 +588,19 @@ pub struct PerVmResources {
     pub cgroup_name: String,
     /// Optional TAP interface name for privileged networking.
     pub tap_name: Option<String>,
-    /// Optional network namespace name for privileged networking.
+    /// Optional network namespace name for privileged networking. On a **segment** member this is
+    /// the *segment's* namespace (`<prefix>-seg-<segid>`), not a per-VM one — the VMM enters it
+    /// through the same `build_vmm_cmd` pre-exec `setns`, so no backend needs new spawn logic.
     pub netns_name: Option<String>,
+    /// This VM's place in a VM-to-VM segment, when it is a member (§6.5, VM-to-VM segments;
+    /// v30 §18 delta 8). `None` for every non-segment VM.
+    ///
+    /// This is the exhaustive-struct channel §6.2 names: a backend cannot compile without
+    /// acknowledging segments, and [`crate::config::build_kernel_cmdline`] reads the member's
+    /// address from here. The **device** wiring still keys on `tap_name` (a member's tap is an
+    /// ordinary tap — it simply lives in the segment's namespace), so no backend re-derives the
+    /// mode from `cfg.net`.
+    pub segment: Option<crate::net::SegmentMembership>,
     /// Optional vhost-user socket path for unprivileged networking.
     pub vhost_user_socket: Option<PathBuf>,
     /// Unique internal VM ID.
@@ -619,6 +659,19 @@ pub struct VmmCapabilities {
     /// reports `false` self-skips the `extra_block_io_throttle` data-plane test
     /// via `require_cap!` rather than failing it.
     pub disk_io_throttle: bool,
+    /// True if the VMM can attach a **host USB device** to the guest
+    /// ([`VmConfig::usb_host_devices`](crate::config::VmConfig::usb_host_devices), §2.4, QEMU q35 — the fallback and most-proven nester).
+    /// QEMU is the only backend whose upstream binary does (`qemu-xhci` + `usb-host`);
+    /// Cloud Hypervisor has no upstream USB, Firecracker has none, and crosvm's default
+    /// xhci controller is not `Suspendable` (vmcell always passes `--no-usb`, §2.5, crosvm — the fourth backend (v29, boot-first)), so
+    /// all three are honest-`false` and reject a USB device fail-loud at `create()` via
+    /// [`reject_usb_host_devices`].
+    ///
+    /// Deliberately **narrow** (USB, not a generic `host_device` flag): the flag claims
+    /// exactly what is live-validated; the flag + config + typed-refusal *pattern* is the
+    /// part that generalizes to other device classes (§7.1, the `mem_limit_enforced`
+    /// naming lesson — narrow names for narrow claims).
+    pub usb_host_passthrough: bool,
 }
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
@@ -956,6 +1009,11 @@ impl Vmm for FakeVmm {
             // this set `false`.
             restore_rotates_host_paths: true,
             disk_io_throttle: true,
+            // Mirrors CH (the primary backend the fake stands in for): no USB
+            // passthrough. A fake-driven test of the QEMU-only USB path must build its
+            // own fake with this set `true` — and note the fakes are argv- and
+            // device-node-blind either way (the live leg is the only evidence there).
+            usb_host_passthrough: false,
         }
     }
 
@@ -1324,6 +1382,7 @@ mod tests {
             cgroup_name: "vmcell-test".to_string(),
             tap_name: Some("tap0".to_string()),
             netns_name: Some("ns0".to_string()),
+            segment: None,
             vhost_user_socket,
             vmid: 1,
             guest_cid: 3,
@@ -1443,6 +1502,7 @@ mod tests {
             virtio_console,
             restore_rotates_host_paths: true,
             disk_io_throttle: true,
+            usb_host_passthrough: false,
         };
 
         // FC-like (virtio_console:false) + VirtioConsole => Unsupported.
@@ -1467,6 +1527,53 @@ mod tests {
             .expect("Uart must always be accepted");
         reject_unsupported_console("cloud-hypervisor", &caps(true), ConsoleMode::Uart)
             .expect("Uart must always be accepted");
+    }
+
+    // v30 §18 delta 9: the ONE host-USB refusal predicate. Guards three things at once —
+    // (a) an incapable backend refuses a non-empty list, (b) the typed feature string IS
+    // the `VmmCapabilities` field name (N-VMM-1; a caller matching feature strings sees
+    // one spelling across CH/FC/crosvm), and (c) an EMPTY list is accepted everywhere, so
+    // adding the predicate to four `create()` paths cannot reject the 99% config.
+    // Red on the inverse: a refusal keyed on `caps.usb_host_passthrough` alone (ignoring
+    // emptiness) fails the empty-list legs; a hand-spelled "usb-host"/"usb_passthrough"
+    // feature string fails the equality assert.
+    #[test]
+    fn reject_usb_host_devices_refuses_only_incapable_backends_with_devices() {
+        use crate::config::UsbHostDevice;
+
+        let caps = |usb_host_passthrough: bool| VmmCapabilities {
+            snapshot_restore: true,
+            lazy_restore: false,
+            virtio_fs_shares: true,
+            unprivileged_vhost_user_net: true,
+            nested_virt: true,
+            virtio_console: true,
+            restore_rotates_host_paths: true,
+            disk_io_throttle: true,
+            usb_host_passthrough,
+        };
+        let devices = [UsbHostDevice::new(0x1d6b, 0x0002)];
+
+        // Incapable backend + a device => typed Unsupported naming the field.
+        for vmm in ["cloud-hypervisor", "firecracker", "crosvm"] {
+            let err = reject_usb_host_devices(vmm, &caps(false), &devices)
+                .expect_err("an incapable backend must reject a host USB device");
+            assert!(
+                matches!(&err, crate::error::Error::Unsupported { vmm: got, feature }
+                    if got == vmm && feature == "usb_host_passthrough"),
+                "expected usb_host_passthrough Unsupported from {vmm}, got {err:?}"
+            );
+        }
+
+        // QEMU-like (capable) + a device => Ok.
+        reject_usb_host_devices("qemu", &caps(true), &devices)
+            .expect("a capable backend must accept a host USB device");
+
+        // The empty list is accepted on BOTH sides — the over-rejection inverse.
+        reject_usb_host_devices("cloud-hypervisor", &caps(false), &[])
+            .expect("no USB device requested must never be refused");
+        reject_usb_host_devices("qemu", &caps(true), &[])
+            .expect("no USB device requested must never be refused");
     }
 
     #[test]

@@ -1,0 +1,72 @@
+# The out-of-tree downstream-consumer example (design v30 §5.6, The downstream kernel toolkit;
+# §10.4, The downstream toolkit contract; §18 delta 5).
+#
+# This is its OWN cargo workspace — the bare `[workspace]` table below makes this directory a
+# workspace root holding exactly one package. vmcell's root `Cargo.toml` `exclude`s it (beside
+# `fuzz`), so `cargo build --workspace` / nextest / `cargo hack` in vmcell never compile it and
+# this workspace resolves, locks, and builds the way a git-dep consumer's does.
+#
+# CONSUMER SHAPE, with ONE stated exception: the two vmcell deps below are PATH deps, not
+# `git = "…", rev = "…"`. A git dep would pin a commit and therefore stop reddening on the
+# same-commit contract drift this example exists to catch — and could not be exercised on a PR at
+# all, since the rev would not exist yet. Everything else is consumer-shaped: its own Cargo.lock,
+# its own pins overlay (`pins-overlay.json`), its own artifacts dir, and no reach from the crate
+# into the vmcell workspace (the documented CLI legs in `ci-check.sh` do invoke the CLI from the
+# vmcell checkout — which is what §5.6 documents: `vmcell build-kernels --pins <file>`, *from a
+# vmcell checkout*).
+#
+# The path deps carry no `version = "…"` requirement on purpose: a consumer pins by `rev`, and a
+# duplicated version requirement here would be a second place the 0.12 → 0.13 ledger bump has to
+# be remembered — the sort of drift the contract exists to remove.
+[workspace]
+
+[package]
+name = "downstream-kernel"
+version = "0.1.0"
+edition = "2024"
+# Git-dep guidance item (1) — a consumer's toolchain is at least vmcell's single-source MSRV. The
+# repo's `rust-toolchain.toml` governs this directory too (rustup ascends), so CI builds it on the
+# same pinned 1.96.1 without a second toolchain fact.
+rust-version = "1.96.1"
+license = "MIT OR Apache-2.0"
+description = "Out-of-tree consumer of the vmcell downstream toolkit: builds a labelled kernel from its own pins overlay, asserts the fragment survived, and validates the result"
+publish = false
+
+[lib]
+name = "downstream_kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "downstream-kernel"
+path = "src/main.rs"
+
+[dependencies]
+# The two contract crates (§10.4). The feature set mirrors `vmcell-artifact-validator`'s
+# (`cloud-hypervisor`, `metrics`, `pipeline`) — without `pipeline` the whole `vmcell::artifact`
+# toolkit is not even compiled — plus `net-unprivileged`, which is what pulls `vhost` /
+# `vhost-user-backend` into the graph and therefore makes the `[patch.crates-io]` stanza below
+# load-bearing: this workspace is the vendored-patch assertion's POSITIVE CONTROL (§18 delta 2), and
+# a feature set that never resolved vhost would make `check-vendored-vhost.sh` report
+# "not applicable" and control nothing.
+vmcell = { path = "../../crates/vmcell", features = [
+    "cloud-hypervisor",
+    "metrics",
+    "pipeline",
+    "net-unprivileged",
+] }
+vmcell-artifact-validator = { path = "../../crates/vmcell-artifact-validator" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+
+[dev-dependencies]
+# The overlay-typo leg writes a throwaway overlay; a consumer would reach for the same crate.
+tempfile = "3"
+
+# Git-dep guidance item (2) — the replicated vendored-vhost stanza (design §10.4). Cargo honors
+# `[patch.crates-io]` only from the CONSUMING workspace root, so without these two lines this
+# workspace would resolve `vhost` from the registry and silently lose the carried
+# SET_VRING_ENABLE quirk fix. The path form is used here because the vendor trees are two
+# directories up in the same checkout; a real git-dep consumer uses the git form (both shapes are
+# accepted by `scripts/check-vendored-vhost.sh`, which `ci-check.sh` runs against this workspace).
+[patch.crates-io]
+vhost-user-backend = { path = "../../vendor/vhost-user-backend" }
+vhost = { path = "../../vendor/vhost" }

@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use vmcell::artifact::rootfs::{
-    fold_rootfs_injection_identity, pack_erofs_with_injection, resolve_builder_base,
+    ExtraFile, fold_rootfs_injection_identity, pack_erofs_with_injection, resolve_builder_base,
 };
 use vmcell::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use vmcell::config::{Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig};
@@ -67,7 +67,22 @@ pub struct MmdebstrapRootfsStage {
     pub release: String,
     /// CID allocator for the builder VM this stage boots.
     pub cid_alloc: Arc<CidAllocator>,
+    /// Downstream files composed into the produced rootfs at pack time (§4.2, FR-V4). Empty
+    /// for the default `vmcell build --rootfs-source mmdebstrap`.
+    pub extra: Vec<ExtraFile>,
 }
+
+/// The mmdebstrap rootfs stage's cache-key version. Bump when this stage's build logic or its
+/// folded identity changes so stale outputs are not served — the rootfs is a warm-cache
+/// artifact, and an identity-fold change without the bump serves a stale image while every
+/// test stays green (the recorded v20 precedent).
+///
+/// v30 (§18 delta 6): bumped to 2 — [`fold_rootfs_injection_identity`] gained the sorted
+/// downstream extra-file triples.
+///
+/// Module-level (rather than a `fn`-local `const`) so the bump itself is assertable KVM-free:
+/// `mmdebstrap_stage_version_pins_the_delta6_bump`.
+const MMDEBSTRAP_STAGE_VERSION: u32 = 2;
 
 /// The `deb` source line pointing at the pinned `snapshot.debian.org` archive. Kept a **pure**
 /// function so the pin-driven mirror string is unit-testable. `[check-valid-until=no]` disables
@@ -106,14 +121,13 @@ impl Stage for MmdebstrapRootfsStage {
     }
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
-        // Bump when this stage's build logic changes so stale outputs are not served.
-        const STAGE_VERSION: u32 = 1;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&STAGE_VERSION.to_le_bytes());
-        // The shared injected-content identity (agent + CA + guest-agent source), ONE
-        // implementation reused from `vmcell` (§4.3, The rootfs-construction contract). mmdebstrap always uses the default
-        // glibc agent (its Debian rootfs ships libc6), so no musl override.
-        fold_rootfs_injection_identity(&mut hasher, inputs, None);
+        hasher.update(&MMDEBSTRAP_STAGE_VERSION.to_le_bytes());
+        // The shared injected-content identity (agent + CA + guest-agent source + the
+        // downstream extra files), ONE implementation reused from `vmcell` (§4.3, The
+        // rootfs-construction contract). mmdebstrap always uses the default glibc agent (its
+        // Debian rootfs ships libc6), so no musl override.
+        fold_rootfs_injection_identity(&mut hasher, inputs, None, &self.extra);
         hasher.update(b"mmdebstrap");
         hasher.update(self.release.as_bytes());
         hasher.update(
@@ -166,6 +180,11 @@ impl Stage for MmdebstrapRootfsStage {
             &builder_rootfs,
             // The builder VM uses the default glibc agent (its OCI base ships libc6).
             None,
+            // No downstream extra files: this is the BUILDER VM's own rootfs, not the rootfs
+            // being produced. Baking a consumer's daemon into vmcell's build infrastructure
+            // (and into its cache key) is exactly what §13 invariant G1 forbids; `self.extra`
+            // belongs on the final pack below.
+            &[],
         )
         .await?;
 
@@ -259,7 +278,7 @@ impl Stage for MmdebstrapRootfsStage {
         }
         let tar_file = std::fs::File::open(&tar_path).map_err(Error::Io)?;
         let tar_stream: Box<dyn std::io::Read + Send> = Box::new(tar_file);
-        pack_erofs_with_injection(vec![tar_stream], inputs, out, None).await
+        pack_erofs_with_injection(vec![tar_stream], inputs, out, None, &self.extra).await
     }
 }
 
@@ -271,7 +290,22 @@ mod tests {
         MmdebstrapRootfsStage {
             release: "trixie".into(),
             cid_alloc: Arc::new(CidAllocator::new()),
+            extra: Vec::new(),
         }
+    }
+
+    // Quality-gates v4 row 6: the mmdebstrap stage's cache-key version must carry the v30
+    // delta-6 bump. `fold_rootfs_injection_identity` grew the extra-file triples, so an
+    // un-bumped version serves the previously-packed rootfs — which has no injected extra
+    // files — while every KVM-free test stays green (the recorded v20 precedent). RED on the
+    // inverse: reverting the const to 1.
+    #[test]
+    fn mmdebstrap_stage_version_pins_the_delta6_bump() {
+        assert_eq!(
+            MMDEBSTRAP_STAGE_VERSION, 2,
+            "the v30 delta-6 identity-fold change requires this stage-version bump; \
+             without it a stale rootfs (no extra files) is served from the warm cache"
+        );
     }
 
     // The mirror line is built from the pinned timestamp + release, with `[check-valid-until=no]`

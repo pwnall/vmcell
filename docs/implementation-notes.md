@@ -1217,3 +1217,1425 @@ capability *values* changed, not the struct), so no further version bump beyond 
   restore variant, cold create carries no `--restore`); the restore-Unsupported unit test became
   `restore_checks_snapshot_file_before_spawning` (KVM-free missing-artifact reject); the capability-honesty
   test flipped `snapshot_restore` true / `restore_rotates_host_paths` false with the baked-CID rationale.
+
+# v30 — the downstream-platform delta register (design v30 §18), as built
+
+The nine-item register of design v30 (`docs/74-claude-fable-design-v30.md` §18) landed as
+`vmcell` 0.12 → 0.13. Each delta below records the as-built shape, every deviation from the §18
+sketch and why, every design premise this pass found **empirically false** (with the evidence that
+disproved it), and the gate that now pins each claim. Deltas were implemented in the §18 order —
+1 → 3 → 4 → 5, then 2; 6 and 7; 8 after 7 (its live gate consumes 7's `echo-server` applet); 9 last.
+
+Every delta went through an adversarial review pass that re-injected the bug each new test claims to
+guard and confirmed it goes red; the fixes from those reviews are folded into the sections below
+rather than recorded separately, so each section is the as-shipped state, not a history.
+
+## v30 delta 1 — the pins overlay (design §18 delta 1 / §10.2), as built
+
+`ResolvePinsStage` no longer reads a caller-supplied pins path. Its baseline is the repo-root
+`pins.json` **embedded at compile time** (`COMMITTED_PINS = include_str!`), and an optional
+`overlay_file: Option<PathBuf>` merges over it leaf-wise. `VMCELL_PINS` (via the one
+`pins_overlay_path()` resolver) and `--pins` (on `build`, `build-kernels`, `oci2-erofs`; flag beats
+env) set it. `run()` publishes the document it actually resolved as `resolved_pins.json`, flattens
+that same document into the propagated pin map, and both `ResolvePinsStage::cache_key` and
+`fast_artifacts_fingerprint` fold the pins identity through one shared `fold_pins_identity()`
+(`STAGE_VERSION` 1→2, fingerprint domain tag `v1`→`v2`, so no pre-overlay output or `.build.stamp`
+is served). New public surface (§10.4 contract): `pins_overlay_path`, `resolve_pins`,
+`resolve_kernel_labels`.
+
+### Deviations from the §18 sketch
+
+- **`pins_file` was removed, not supplemented.** §18 says the stage "gains `overlay_file`"; §10.2
+  makes the baseline the compile-time-embedded `pins.json`. Keeping both a caller path and the
+  embedded copy is two sources of truth with no stated precedence, so the field is gone. Cost: two
+  `semver-checks` breaking edges (`constructible_struct_adds_field`, `struct_pub_field_missing`)
+  instead of one — both inside §18's budgeted "ResolvePinsStage changes shape". Benefit: with no
+  baseline path left to compute, `vmcell-cli`'s private `pins_path()` (a near-duplicate
+  `workspace_root()` ascent) had nothing to do and was retired, which is what §18 asked for, without
+  exporting `workspace_root()`.
+- **The merge is a recursive leaf-wise *document* merge, then one flatten** — not flatten-both-then-
+  merge-the-flat-maps. Identical for this schema (every pin key is a leaf) and it leaves an honest
+  document to publish as `resolved_pins.json`; flatten-then-merge leaves none. Where the schema
+  aliases (top-level vs `rootfs`-nested `debian_snapshot_timestamp`), flatten-once gives one rule:
+  top-level wins.
+- **Three public items beyond the sketch.** `pins_overlay_path()` (the one `$VMCELL_PINS` reader),
+  `resolve_pins()` (the flat merged map, minus the workspace-only `guest_agent_src_hash`), and
+  `resolve_kernel_labels()`. The last is load-bearing: `vmcell build-kernels` enumerates labels
+  *outside* the stage, so without it a downstream-added `kernels.<label>` would be resolvable but
+  unbuildable by the exact command the toolkit contract advertises.
+- **New `builder_base` namespace** (`builder_base_image` / `_digest`). See the false-premise record
+  below.
+- **Overlay strictness covers the value's *shape*, not only the key** — a strengthening of the §18
+  sketch, forced by the false premise recorded below.
+- **Sub-key strictness stays out of scope** (§10.2's own scoping): `kernel.source_ur1` and
+  `kernels.<label>.source_sh256` are still ignored at flatten and caught by the existing
+  referenced-but-absent hard errors. Stated at the `flatten_pins_namespace` site so it is not
+  re-opened.
+- **`parse_pins_json` retired from production.** With the baseline embedded, the overlay is the only
+  runtime string parse; the schema unit tests now go through a 3-line test fixture that delegates to
+  `flatten_pins_document` (a fixture, not a second copy of the law), and the A8 malformed-JSON guard
+  moved to `parse_pins_overlay`, where the message additionally names the offending file.
+- **`fast_artifacts_fingerprint` split** into an env-reading wrapper plus
+  `fast_artifacts_fingerprint_with(overlay)` (the `resolve_artifacts_dir` precedent), so the
+  `.build.stamp` short-circuit is unit-testable with no `std::env` mutation and therefore no
+  cross-test env race.
+- **`vmcell bundle`'s `pins` entry re-pointed** from the repo `pins.json` to
+  `<artifacts_dir>/resolved_pins.json`: with an overlay the repo file is not what the artifacts were
+  built from, and the baseline is embedded in the binary anyway. `bundle.rs`'s module doc was
+  corrected to match (it still scoped the manifest as "`pins.json`" — one fact, two places, already
+  disagreeing).
+- **`vmcell-cli` lost its `serde_json` dependency.** Its only consumer was `build-kernels`'
+  overlay-blind pins re-parse. Landed as part of this delta because `cargo machete` (a `just ci`
+  step) was red without it.
+
+### Empirically-false premises found
+
+- **"Top-level *key* strictness closes the accept-then-ignore hole" is false** (design §10.2 / §18
+  delta 1 word the guard as key-matching only). Evidence, through the public `resolve_pins`: the
+  overlay `{"cloud_hypervisor": {"version": "46.0"}}` was **accepted** and resolved with
+  `cloud_hypervisor` absent from the pin map. The object form is the shape a downstream will guess —
+  every namespace the committed `pins.json` actually carries is an object — and unlike `kernel.*`
+  this pin has no referenced-but-absent backstop: `artifact/snapshot.rs` folds it with
+  `.unwrap_or_default()`, so the CH build identity silently drops out of the snapshot cache key.
+  That is the M-ART-7 stale-snapshot hazard the pin exists to prevent, reached through the surface
+  whose whole purpose is overriding. `virtiofsd` and `debian_snapshot_timestamp` are the same shape.
+  **Fix:** the schema dispatch now declares each namespace's shape (`PinsNamespaceShape::Object` /
+  `Scalar`), returned by `flatten_pins_namespace` itself so the accept-list, the shape table and the
+  flattening remain one law; `parse_pins_overlay` rejects a shape mismatch naming the key and the
+  expected shape.
+- **"The leaf-wise merge prevents a whole-namespace replacement" was false as written** — the claim
+  lived in `merge_pins_documents`' own doc comment while its fallback arm (`_ => *baseline =
+  overlay.clone()`) performed exactly that replacement. Evidence: the overlay
+  `{"kernel": "https://x/y.tar.xz"}` was accepted and wiped `kernel_source_url`,
+  `kernel_source_sha256` **and** `kernel_microvm_config` out of the resolved map (it surfaced much
+  later as `Missing kernel_microvm_config pin`, so it was loud but misattributed). The replacement is
+  now unreachable from an overlay file because the shape check rejects it at the parse boundary; the
+  doc comment says that, instead of claiming an immunity the function does not have. Below the top
+  level shapes stay unpoliced by design, and that is now stated rather than implied.
+- **"No overlay ⇒ published artifact byte-identical to 0.12" shipped unguarded.** The delta's own
+  integration test asserted only parsed-`Value` field equality while its comment claimed it pinned
+  byte-identity; re-rendering both arms through `to_string_pretty` (reflowed whitespace, re-ordered
+  keys) left all 383 tests green. The assert now compares the published bytes against
+  `include_str!("../../../pins.json")`.
+- **`builder_base_image` / `_digest` were consumed but had no producer.** `artifact::rootfs::
+  resolve_builder_base` prefers them over the `rootfs_*` pair, yet no namespace emitted them — so the
+  strict overlay would have *rejected* a legitimate override of a pin production code already reads.
+  Added as a namespace; the committed `pins.json` does not carry it, so baseline behavior is
+  unchanged.
+- **The roster/dispatch pinning was one-directional.** `KNOWN_PINS_NAMESPACES` (the rejection
+  message's human-readable list) was tested as roster ⊆ dispatch, never dispatch ⊆ roster, so a new
+  arm without a roster entry would have made the error advertise an incomplete list — telling a
+  downstream its valid key is unknown — with nothing red.
+
+### Gates
+
+| What it pins | Gate | Proven red by |
+| --- | --- | --- |
+| Overlay wins per key, baseline siblings survive | `pins_overlay_wins_per_key_and_keeps_baseline_siblings` | baseline-wins merge; namespace-replacement merge |
+| Fallback to baseline; a new label is resolvable **and** buildable | `pins_overlay_falls_back_to_baseline_and_admits_new_registry_entries` | overlay-blind `resolve_kernel_labels` |
+| Misspelled top-level key rejected, naming it | `pins_overlay_rejects_misspelled_top_level_key_naming_it` | disabling the namespace check |
+| Referenced-but-absent overlay fails loud naming the path | `pins_overlay_referenced_but_absent_fails_loud_naming_the_path` | `read_to_string(..).unwrap_or_default()` |
+| Non-object overlay rejected | `pins_overlay_rejects_non_object_document` | dropping the `as_object()` guard |
+| **Wrong-shaped scalar namespace rejected** (`{"cloud_hypervisor": {…}}`), with the right shape as the positive control reaching the pin map | `pins_overlay_rejects_wrong_shaped_scalar_namespace` | neutralizing `shape.matches(value)` → **RED** (the object form accepted, `cloud_hypervisor` resolving to `None`) |
+| **Scalar on an object namespace rejected**, so the whole-namespace wipe is unreachable | `pins_overlay_rejects_scalar_on_an_object_namespace` | neutralizing `shape.matches(value)` → **RED** (the resolved map came back missing `kernel_source_url`/`_sha256`/`_microvm_config`) |
+| **Dispatch ⊆ roster** (source-text scan of the `match` arms; the scan's own arm count is asserted so it cannot pass vacuously) | `flatten_dispatch_arms_are_all_advertised_in_the_roster` | adding a `"gremlin"` arm without a roster entry → **RED** naming `gremlin`, while the pre-existing roster test stayed green |
+| Roster ⊆ dispatch, and the committed baseline satisfies the shapes the overlay is held to | `known_pins_namespace_roster_matches_the_flatten_dispatch` | a roster name the dispatch does not know |
+| Baseline keeps ignore-unknown semantics (the deliberate asymmetry) | `pins_baseline_keeps_ignore_unknown_semantics` | making the baseline parse strict |
+| `builder_base` reaches `resolve_builder_base` | `pins_builder_base_namespace_feeds_resolve_builder_base` | removing the arm |
+| The one fold separates absent / content / unreadable | `fold_pins_identity_separates_absent_content_and_unreadable` | `unwrap_or_default()` aliasing |
+| The `.build.stamp` short-circuit moves with the overlay | `fast_artifacts_fingerprint_moves_with_the_pins_overlay` | dropping the fold call |
+| An overlay edit invalidates the stage key (4 distinct states) | `resolve_pins_stage_key_folds_the_overlay` | folding only the baseline |
+| The published artifact is the **merged** document, and **byte-identical to `pins.json` with no overlay** | `tests/pipeline.rs::resolve_pins_publishes_the_merged_document` | publishing either input verbatim; **re-rendering the no-overlay arm through `to_string_pretty` → RED** on the byte compare (was green before this fix) |
+| `vmcell-cli` carries no dead dependency | `cargo machete` (a `just ci` step) | re-adding `serde_json = "1"` → **rc=1**; removed → rc=0 |
+
+Live legs (`just test-privileged` / `-unprivileged` / `-daemon`) are the orchestrator's. Note for the
+first live run after this lands: the `.build.stamp` domain tag moved `v1`→`v2`, so every existing
+workspace re-packs the rootfs once. That is the intended cache-key discipline, not a regression.
+
+## v30 delta 3 — the labelled-kernel build path (design §18 delta 3; §5.5–§5.6, §10.1), as built + the review-fix pass
+
+`kernels.<label>` entries now accept `fragments: [<NAME>, …]`, read by one library resolver
+(`resolve_kernel_registry`) that both `vmcell build-kernels` and the new library entry point
+`build_labelled_kernel` drive. Sorted label order is explicit (`sort_kernel_registry`) and pinned.
+Prebuilt + label/fragments is a typed refusal through one predicate (`reject_labelled_prebuilt`),
+made reachable by replacing `build-kernels --in-vm` with `--kernel-source
+<prebuilt|host-make|in-vm>`. A missing fragment folds a distinct cache-key marker in **both**
+compiling producers. Both compiling producers publish `vmlinux[-<label>].config` as a registered
+sibling artifact through one law, and `Pipeline::build` now treats a cache hit whose *registered*
+artifact vanished as a miss — which is what actually content-addresses the sidecar with its kernel.
+A labelled build logs its producer (stage `tracing` + a CLI line).
+
+The adversarial review found five defects in the first landing; each is listed below with the gate
+that now pins it. Two were blocking-class: the toolkit entry point could not run from the consumer
+position the contract advertises, and the sidecar could become a lying artifact.
+
+### As-built shape
+
+- **One-law extractions in `vmcell::artifact::kernel`** (all additive public surface, all called by
+  both compiling producers rather than mirrored): `fragment_pin_key`, `sorted_fragments`,
+  `fold_fragment_identity` (with the `FRAGMENT_RESOLVED` / `FRAGMENT_MISSING` markers replacing
+  `unwrap_or_default()`), `kconfig_append`, `resolved_config_path`, `config_artifact_key`,
+  `reject_labelled_prebuilt`, plus — from the review-fix pass — `kernel_filename_suffix`,
+  `kernel_filename`, `kernel_label_from_filename`, `publish_resolved_config` and
+  `clear_resolved_config`.
+- **The label-filename law and its inverse now live together.** `kernel_filename_suffix` is the
+  single `.`→`-` sanitization; `kernel_label_from_filename` is its inverse and the rule `vmcell
+  bundle` reads the artifacts dir with. `KernelStage::suffix`, `vmcell-kernel-builder::suffix`,
+  `bench-vm::kernel_filename` and the CLI's former private reader all delegate; a round-trip gate
+  over the shipped `kernels` roster keeps the two halves from moving apart.
+- **The sidecar has one publisher and one clearer.** `publish_resolved_config(config, vmlinux,
+  kernel)` copies the post-`olddefconfig` `.config` to `resolved_config_path(vmlinux)` and hard-errors
+  naming the kernel; `clear_resolved_config(vmlinux)` removes a stale one. Both compiling producers
+  publish through the first; `PrebuiltKernelStage` — which republishes the same `vmlinux` path and
+  compiles nothing — calls the second.
+- **`ResolvePinsStage` resolves the guest-agent pin only when a vmcell checkout is present.**
+  `find_vmcell_source_root` is the one source-tree predicate; `workspace_root` (which must always
+  produce a path) and `vmcell_source_root` (which is legitimately `None` downstream) both go
+  through it. `resolve_guest_agent_pin` is the one pin law used by `cache_key` and `run`; outside a
+  checkout the key folds the distinct `NO_VMCELL_SOURCE_TREE` marker and the pin is absent rather
+  than fabricated.
+- **`build_labelled_kernel(label, target_dir, overlay_file) -> Result<PathBuf>`** assembles
+  `ResolvePinsStage`(+overlay) → `KernelStage` and returns the `vmlinux` path; the sidecar is derived
+  via the public `kernel::resolved_config_path`.
+- **STAGE_VERSION bumps**: host-`make` `KernelStage` 2→3, `InVmKernelStage` 1→2. Both are correct
+  (a v2 output has no `.config` beside it and was keyed by the old fold) and both **invalidate every
+  cached `vmlinux*` on every box and CI runner** — a cold host-`make` rebuild (minutes) or in-VM
+  rebuild (up to the 7200 s bound) on first use after this lands.
+
+### Deviations from the §18 sketch
+
+- **`build_labelled_kernel(label, &env)` shipped as `(label, target_dir, overlay_file)`.** `vmcell`
+  has no dep (not even a dev-dep) on `vmcell-kernel-builder` and §9.1 forbids adding one, so the
+  entry point offers the host-`make` producer only; its rustdoc says so and points at the CLI for
+  in-VM. With no in-VM producer there is no `CidAllocator` to inject, so `&HostEnv` would have
+  carried nothing the function uses.
+- **Host-`make`-only producer scope** (the sketch names `InVmKernelStage` too) — same §9.1 reason.
+- **`build-kernels --in-vm` (bool) → `--kernel-source <prebuilt|host-make|in-vm>` (enum, default
+  `host-make`)**, matching the vocabulary `build` and §9.1 already use. This is what makes the
+  prebuilt refusal reachable, and it is a **user-visible breaking CLI change**. No in-repo
+  automation used `--in-vm` (justfile / CI / README / bench all clean at the time of the change).
+- **`kernels.<label>.fragments` is read at the DOCUMENT layer** (`resolve_kernel_registry`), not
+  flattened into a `kernel_<label>_fragments` pin: the fragment set is consumed when the STAGE is
+  constructed, not by a stage reading `inputs.pins`, so a flat pin would be a second representation
+  nothing reads. It also leaves delta 1's single pin-schema authority untouched. The reader is
+  strict (fail-loud) even though sibling sub-keys stay permissive by §10.2 design — a silently
+  ignored `fragments` builds an uninstrumented kernel and reports success.
+- **`Pipeline::build` gained a registered-artifact existence re-check** (a general cache behavior
+  change, not kernel-specific). Without it the sidecar is not content-addressed with its kernel in
+  any meaningful sense: the pipeline hash-verifies only `out_path` and never calls `run()` on a hit,
+  so a deleted `.config` would be republished as a dangling path forever. Every in-tree stage
+  registers only paths under `target_dir`, so the check is safe; the effect elsewhere is that a
+  deleted published artifact now forces a rebuild, which is the correct semantics.
+- **`kernel_label_from_filename` changed meaning and fixed a pre-existing `bundle` bug in passing.**
+  It previously matched `vmlinux-6-12-94.cache_key` and made `bundle` record a cache sidecar as the
+  kernel artifact `kernel-6-12-94.cache_key`; the resolved-config sidecar would have joined it.
+- **The sorted-label-order pin is honest about its blind spot.** Through the public resolver the
+  order is *also* what `serde_json`'s default `BTreeMap` backing yields, so an end-to-end test
+  cannot distinguish "sorted on purpose" from "sorted by accident" (verified empirically: dropping
+  the sort does not redden it). The order law therefore lives in `sort_kernel_registry` and is
+  tested there on a deliberately reversed input; the integration test pins the observable
+  COLLATION (byte, not version: `6.12.94` before `6.6.143`) and the roster/registry agreement, and
+  says so rather than claiming a red-on-inverse it does not have.
+- **`crates/vmcell/examples/blake3_cache_key.rs`** — the documented hand-mint-a-sidecar escape
+  hatch — was not updated by this delta. It constructs a `KernelStage` and re-derives the key from
+  the shipped code, so it still mints a correct v3 key, but it is worth a look before anyone relies
+  on it.
+
+### Review-fix pass: five defects, and the empirically-false premises behind them
+
+- **F1 (blocking). The toolkit entry point could not run from the consumer position it
+  advertises.** `ResolvePinsStage::run` called `guest_agent_closure_hash(&workspace_root())?`
+  unconditionally. `workspace_root()` ascends for the marker `crates/vmcell-protocol/Cargo.toml`
+  and, finding none downstream, returns the *start* dir — so the hash hard-errored on a vmcell
+  source file the consumer never had, at **stage 0**, before any kernel work. Every git-dep call of
+  `build_labelled_kernel` / `vmcell build-kernels --pins` died there. Evidence (an out-of-tree crate
+  path-depending on `vmcell`, run outside the checkout with `CARGO_MANIFEST_DIR` unset):
+  `Artifact("guest-agent binary source missing at /tmp/<tmpdir>/crates/vmcell-guest-agent/src/main.rs")`.
+  The stage's own rustdoc claimed it had avoided exactly this ("does not ride `ensure_test_artifacts`,
+  whose fingerprint hashes the guest-agent source closure out of the vmcell tree and so cannot run
+  downstream") while inheriting the identical defect one stage earlier — a comment contradicting
+  shipped behavior. **Fix:** the pin is a *rootfs-lineage* pin (`KernelStage` reads only `kernel_*`;
+  its only consumer is the rootfs cache key), so it is resolved only when a checkout is present, and
+  is absent — never fabricated — otherwise. A rootfs build downstream still fails loud, at
+  `GuestAgentStage`, which builds the agent with `cargo build -p vmcell-guest-agent` in that same
+  absent tree. H-CACHE-1 is untouched: inside a checkout the full closure is still folded and a
+  broken closure is still a hard error. The doc now states the mechanism instead of the aspiration.
+- **F2. The resolved-config sidecar became a lying artifact when the prebuilt seed republished the
+  same path.** `PrebuiltKernelStage` and the unlabelled `KernelStage` share `out_path` (`vmlinux`)
+  and `name()` (`"kernel"`), and `vmcell bundle` picks the sidecar up by **filesystem existence**,
+  not from the stage's registered artifacts. Reachable with documented commands: `vmcell build
+  --kernel-source host-make` writes `vmlinux` + `vmlinux.config`; a later `vmcell build
+  --kernel-source prebuilt` — or `build-kernels --kernel-source in-vm`, which prepends the prebuilt
+  seed at that same path — replaces `vmlinux` and left the old `vmlinux.config`, so `bundle`
+  digest-pinned a config describing a *different* kernel as this kernel's `kernel-config`. That is
+  precisely the "assert against the result, not the fragment" property the sidecar exists for,
+  passing silently. **Fix:** `clear_resolved_config` on the non-compiling producer, and the CLI
+  comment that asserted the old (false) invariant now describes the clearing.
+- **F3. The sanitization law had four copies, one of them the inverse, with nothing cross-checking
+  them.** `KernelStage::suffix`, `vmcell-kernel-builder::suffix` and `bench-vm::kernel_filename`
+  each re-encoded `.`→`-`, and the CLI's new dotted-remainder rule encoded the *inverse* of that
+  law justified only by a comment. Nothing tied them: the CLI test asserted on hardcoded strings, so
+  a producer that stopped sanitizing would have made `bundle` **silently drop that kernel** from a
+  manifest that reads as "covered everything". **Fix:** one law + one inverse in
+  `vmcell::artifact::kernel`, every producer and the CLI delegating, and a round-trip gate composed
+  through the producers' own composer over the shipped registry's labels (asserted to still contain
+  a dotted one) — so the CLI test can no longer pass while a producer's naming drifts.
+- **F4.** This section (the delta had no reconciliation at all).
+- **F5. The delta's own named gate was absent.** §18 delta 3 opens its gate list with "a fragment
+  build asserts the sidecar exists and contains a fragment symbol"; nothing asserted it, and the
+  actual copies (`tokio::fs::copy` in the host producer, `cp /build/.config /vmcell-out/config` in
+  the guest) had **zero** test coverage. **Fix:** the copy is now one law with content assertions
+  (below), and the compiling half was validated live — see the live leg.
+
+Two further premises are recorded because they were false as worded in §18:
+
+- **"A missing fragment folds empty bytes … so two unresolvable names collide" is false as
+  worded.** The count and each NAME were already folded, so two different unresolvable names always
+  hashed apart. The genuine `unwrap_or_default()` alias is fragment-**absent-from-pins** ≡
+  fragment-**present-with-empty-text** — different builds (the first a hard-error request, the
+  second a legal no-op) sharing a key. The marker targets exactly that. §18 also omits that the
+  identical hole lived in `vmcell-kernel-builder`; it is fixed there too, and both producers now
+  share one fold.
+- **`build-kernels --in-vm` was already broken before this delta.** The in-VM producer needs a
+  working `vmlinux` published under the `kernel` artifact key, and `build-kernels` publishes only
+  `kernel-<label>` keys, so the path died on "needs a seed `kernel` artifact" regardless of what the
+  operator had already built. Fixed rather than deferred: the CLI prepends `PrebuiltKernelStage`
+  when the in-VM producer is selected. Note the seed writes `<artifacts>/vmlinux`, so on a tree
+  whose default kernel was built with host-`make` this replaces it with the pinned prebuilt seed
+  (both are valid bootable kernels; prebuilt is `vmcell build`'s default) — and, since F2, also
+  clears that kernel's now-stale `.config`.
+
+### Gates
+
+| What it pins | Gate | Proven red by |
+| --- | --- | --- |
+| **The toolkit runs from the consumer position** — `ResolvePinsStage::run` succeeds with no vmcell checkout, publishes `resolved_pins.json`, and propagates the `kernel_*` pins | `tests/kernel_toolkit.rs::resolve_pins_runs_outside_the_vmcell_source_tree` (re-execs this test binary with `CARGO_MANIFEST_DIR` cleared and its CWD outside the checkout) + its in-child half `resolve_pins_in_the_consumer_position` | restoring `guest_agent_closure_hash(&workspace_root())?` → **RED**, the child failing with the exact production error: `Artifact("guest-agent binary source missing at /tmp/.tmpAuPvVH/crates/vmcell-guest-agent/src/main.rs")` |
+| The same, in-process, on the real `run()` body | `artifact::tests::resolve_pins_into_omits_the_agent_pin_without_a_checkout` | the same mutation → **RED** (`the rootfs-lineage agent pin must be ABSENT outside a checkout, got Some("c1df19…")`) |
+| Inside a checkout the closure IS still folded (positive control for the negative above) | the `else` arm of `resolve_pins_in_the_consumer_position` (a direct nextest run) | — |
+| The source-tree predicate answers **no** outside a checkout and finds the marker-owning root inside one | `artifact::tests::find_vmcell_source_root_answers_no_outside_a_checkout` | an ascent that falls back to the start dir |
+| H-CACHE-1 stays fixed: a checkout with a broken agent closure is still a hard error | `artifact::tests::guest_agent_pin_is_absent_without_a_checkout_and_hard_errors_with_a_broken_one` | making the `Some(root)` arm lenient |
+| **A non-compiling producer leaves no stale sidecar**, registers no config artifact, and is idempotent | `artifact::kernel::tests::test_prebuilt_kernel_clears_a_stale_resolved_config` | dropping `clear_resolved_config(out).await?` → **RED** (`the stale resolved config at /tmp/.tmpZcHnzG/vmlinux.config must be gone`) |
+| **The sidecar's CONTENT**: a fragment's symbol composed through the real `kconfig_append` law reaches the published sidecar verbatim, registered under its own artifact key | `artifact::kernel::tests::test_publish_resolved_config_carries_the_fragment_symbol` | short-circuiting the copy in `publish_resolved_config` → **RED** |
+| A compiling producer with no `.config` is a hard error naming the kernel, and invents no sidecar | `artifact::kernel::tests::test_publish_resolved_config_hard_errors_when_absent` | the same mutation → **RED** (`expected a hard error …, got Ok("…/vmlinux-ikconfig.config")`) |
+| **The filename law and its inverse round-trip** over the shipped registry's labels (asserted to still include a dotted one) plus synthetic dotted labels; sidecars are not kernels | `artifact::kernel::tests::test_kernel_filename_round_trips_through_the_label_law` | dropping `.`→`-` in `kernel_filename_suffix` → **RED** (`the on-disk name of 6.12.94 must carry no '.' … got vmlinux-6.12.94`) |
+| `bundle` reads labels **through** that law rather than a local copy | `vmcell-cli tests::bundle_reads_kernel_labels_through_the_library_law` | the same producer-side mutation → **RED** (`left: None, right: Some("6-12-94")`) — the cross-check that did not exist before |
+| The missing-fragment marker (absent ≠ present-with-empty) in **both** producers | `artifact::kernel::tests::test_kernel_cache_key_missing_fragment_marker`; `vmcell-kernel-builder tests::test_cache_key_missing_fragment_marker` | restoring `.unwrap_or_default()` in `fold_fragment_identity` → both **RED** with identical keys |
+| Prebuilt + label/fragments is a typed refusal, reachable from the CLI | `artifact::kernel::tests::test_reject_labelled_prebuilt`; `vmcell-cli tests::kernel_stage_rejects_labelled_prebuilt` | returning `Ok(())` (the pre-v30 silent drop) → both **RED** |
+| A vanished registered sibling forces a rebuild and is republished under its own key | `tests/kernel_toolkit.rs::a_vanished_registered_artifact_forces_a_rebuild` | removing the existence re-check in `Pipeline::build` → **RED** (runs stayed 1, expected 2) |
+| `fragments` is honored or rejected naming `kernels.<label>.fragments` | `kernel_registry_entry_declares_its_fragments`; `malformed_fragments_are_rejected_naming_the_label` | a reader that returns `Ok(Vec::new())` → both **RED** |
+| Sorted label order is a decision, not an accident | `artifact::tests::kernel_registry_is_sorted_byte_lexicographically` | making `sort_kernel_registry` a no-op → **RED** |
+| The guest ships its resolved config back | `vmcell-kernel-builder tests::test_build_commands_ordered` | commenting out the `copy resolved config out` step → **RED** |
+| Only the in-VM producer needs a seed stage | `vmcell-cli tests::only_the_in_vm_producer_needs_a_seed` | — |
+
+### The live leg (§18 delta 3's named gate)
+
+The compiling half was **run live** on a KVM/dev host, from an out-of-tree consumer crate that
+path-depends on `vmcell` (replicating the `[patch.crates-io]` vendored-vhost stanza, §10.4) and
+calls `build_labelled_kernel("ikconfig", …)` with a pins overlay adding
+`kernel_fragments.IKCONFIG = CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y` and a `kernels.ikconfig`
+entry declaring it. It proves F1 and delta 3's named gate together, and it passed
+(2026-08-11, 20-core host, cold: source download → extract → `defconfig kvm_guest.config` →
+fragment append → `olddefconfig` → `make -j20 vmlinux` → sidecar publish in **346.9 s**):
+
+```
+built  …/dsk-target/vmlinux-ikconfig in 346.869618608s
+sidecar …/dsk-target/vmlinux-ikconfig.config exists=true
+sidecar contains CONFIG_IKCONFIG=y: true
+sidecar contains CONFIG_IKCONFIG_PROC=y: true
+exit=0
+```
+
+The published `vmlinux-ikconfig.cache_key` registers both artifacts (`kernel-ikconfig` and
+`kernel-ikconfig-config`), which is what content-addresses the sidecar with its kernel across a warm
+build. Note the wall time: a **small, dependency-clean** fragment through the host-`make` producer is
+minutes, not the 45–90 min a KASAN build costs — so the example workspace's job can afford this one.
+
+What the in-tree suite still cannot see, and who owns it:
+
+- `make olddefconfig`'s own drops **as a standing gate** — the sidecar exists precisely because
+  `olddefconfig` may silently discard a symbol whose dependencies are unmet. The KVM-free gates
+  assert the copy and its content; the live run above asserts what `olddefconfig` kept *once*, by
+  hand, and nothing in CI re-asserts it. **Owner: delta 5's example workspace**, whose
+  CI job builds `vmlinux-ikconfig` through deltas 1+3, asserts the sidecar via delta 4's
+  `KconfigValues`, and proves `/proc/config.gz` in-guest.
+- The **in-VM** producer end to end (seed stage → builder VM → config on the output share) is
+  unvalidated: it needs KVM plus apt egress. Worth one manual `vmcell build-kernels --kernel-source
+  in-vm` before the 0.13 tag.
+- **Do not** land the live fragment build as a plain `#[ignore]`d test in `-p vmcell`'s integration
+  tests: `just test-privileged` runs `--run-ignored all` over `kind(test)` with only
+  unprivileged/smoltcp excluded, so it would pull a 45–90 min networked kernel compile into the
+  privileged suite. It belongs in the example workspace's own CI job (or its own justfile recipe +
+  filter, the `test-crosvm` shape).
+
+### Version ledger
+
+Delta 3 contributes **no** `cargo semver-checks` breaking edge of its own to `vmcell`'s type surface
+— every library item it adds is additive (`build_labelled_kernel`, `resolve_kernel_registry`,
+`KernelRegistryEntry`, `sort_kernel_registry`, `pins_overlay_or_env`, and the
+`artifact::kernel` one-law exports). Its breaking edges are behavioral and belong in the 0.12 → 0.13
+changelog entry all the same:
+
+- `vmcell build-kernels --in-vm` **removed**, replaced by `--kernel-source
+  <prebuilt|host-make|in-vm>`.
+- `ResolvePinsStage` no longer emits the `guest_agent_src_hash` pin when it runs outside a vmcell
+  source checkout (in-checkout behavior byte-identical).
+- `KernelStage` STAGE_VERSION 2→3 and `InVmKernelStage` 1→2 invalidate every cached `vmlinux*`.
+
+## v30 delta 4 — the serial classifier, as built + the review-fix pass (design §18 delta 4; §5.4, §5.6)
+
+`vmcell-artifact-validator` gained two pure modules — `classify` (serial log → the §5.4 clause it
+broke) and `kconfig` (a resolved `.config` parser) — and `checks` now renders every boot failure
+through them. What follows is the as-built shape after the adversarial review, which found eight
+defects in the first landing; each is listed with the gate that now pins it.
+
+**As built.** `classify::ContractViolation` (`#[non_exhaustive]`, contract surface §10.4) has four
+variants — `RootDeviceMissing`, `RootFsMount`, `VsockTransport`, `NoDirectBootKernel` — each with
+`clause()` (the §5.4 prose) and `symbols()` (the unconditionally-required `CONFIG_*` set).
+`classify_serial(&str) -> Option<ContractViolation>` keys on the emitters' real text. Rendering is
+**two** functions, chosen by whether console evidence exists:
+
+- `explain_boot_failure(log, base)` — the console *was* captured (an empty capture is evidence: the
+  VM ran and printed nothing);
+- `explain_without_serial(base, why)` — there is *no* console evidence (the VMM never started, the
+  log could not be read). It names **candidate causes** and keeps the §5.4 pointer instead of
+  asserting a clause.
+
+`checks` routes every arm that reports a failed `MicroVm::start` or a failed agent handshake — Core,
+Extended and Full — through one of the two, via four helpers: `explain_boot_failure_at(path, base)`
+(the fs read + classification, and the one place an unreadable log is turned into "no evidence"),
+`explain_boot_failure_for(vm, base)` (the only place a serial-log path is derived from a `MicroVm`),
+`failed_start(e)`, and `agent_handshake_base(e)`. `kernel_banner` delegates to
+`await_kernel_banner(path, budget)`, whose budget is injected so the failure path is unit-drivable.
+
+### Empirically-false premises found (design §18 delta 4 / §5.6 wording)
+
+1. **`EAFNOSUPPORT` is not a serial signature.** §18 delta 4 names "a vsock `EAFNOSUPPORT` →
+   `CONFIG_VSOCKETS`". That mnemonic appears in no serial log: what reaches the console is the guest
+   agent's own PID-1 output, `vmcell-guest-agent: boot self-check: AF_VSOCK unavailable (Address
+   family not supported by protocol (os error 97))` (`vmcell-guest-agent/src/main.rs:387-391`) and
+   later `failed to bind vsock: …` (`main.rs:561`). The classifier keys on those two vmcell-owned
+   prefixes. The *rendered* errno prose is deliberately **not** a signature either — the agent prints
+   it verbatim for an unrelated `AF_INET` loopback failure (`main.rs:361-366`), which would
+   misattribute a non-vsock clause. **Gates:** `classify_vsock_unavailable` (reddens a classifier
+   keyed on `EAFNOSUPPORT`, and asserts the fixture does not contain that mnemonic) and
+   `classify_unrelated_eafnosupport_is_not_the_vsock_clause`.
+
+2. **`VFS: Unable to mount root fs` is not the erofs signature — it is the shared panic of two
+   different failures.** §18 delta 4 maps it to "the erofs/root symbol set". The kernel prints that
+   same panic when the root *block device* never appeared (no virtio transport / no virtio-blk), and
+   in that case it *also* prints `VFS: Cannot open root device` first; the missing-filesystem case
+   prints `No filesystem could mount root, tried:` instead. The first landing folded all three
+   strings into one clause, so a kernel built without `CONFIG_VIRTIO_BLK` was told to fix its erofs
+   decompressor. As built, `ROOT_DEVICE_SIGNATURES` is checked **before** `ROOT_FS_MOUNT_SIGNATURES`
+   and gets its own variant + symbol set (`CONFIG_VIRTIO_BLK`, `CONFIG_VIRTIO_PCI`,
+   `CONFIG_VIRTIO_MMIO`). **Gate:** `classify_root_device_missing_outranks_the_mount_panic`, whose
+   fixture carries the shared panic line so it proves precedence, not just matching.
+
+3. **"A bogus kernel fails by raw timeout" describes one of three shapes.** (1) A garbage kernel file
+   → CH loads the kernel at `vm.boot`, so `MicroVm::start` returns `Error::VmmApi` with no timeout and
+   no serial log; (2) boots-but-silent → `kernel_banner`'s genuine budget expiry; (3)
+   boots-then-panics-at-root-mount (the design's headline case) → `contains_panic` matches `panic -
+   not syncing`, so it surfaces fast as `Error::Agent("Panic detected in serial log")` on the
+   agent-handshake arm. A classifier wired only to the timeout branch would never fire on the
+   design's own headline signature — hence three wiring points, not one.
+
+4. **§5.6's "every check carries an `Instant` deadline … so 'fails loudly, not by hanging' holds by
+   construction" was false in the tree, and is only half-closed.** `grep -rn Instant
+   crates/vmcell-artifact-validator/` returned nothing before this pass. `await_kernel_banner` now
+   computes a real `tokio::time::Instant` deadline once and bounds its whole loop (which is also what
+   makes the failure path unit-testable with a 50 ms budget); the agent budgets remain `Duration`s
+   that `AgentClient::connect_framed` turns into an `Instant` one layer down, and there is still **no
+   overall wall-clock budget on `validate()`** (a Full run boots ~7 VMs sequentially). Plumbing one
+   would touch the exhaustive `ValidationOptions` and every `checks::*` signature — out of scope, and
+   recorded here rather than silently left as an unqualified design claim.
+
+5. **`make olddefconfig` semantics: `=m` is not a satisfied clause.** §5.4 requires `=y` (the guest
+   has no early userspace to load a module from), so `missing_symbols` filters on
+   `KconfigValues::is_builtin`, not `is_enabled`. The first landing used `is_enabled` (y|m), under
+   which the exact case the cross-check exists to name — the console says the root mount failed and
+   the resolved `.config` says `CONFIG_EROFS_FS=m` — reported "no missing symbols", which the
+   function's own doc tells the caller to read as "the config disagrees with the console".
+   **Gate:** `missing_symbols_counts_a_module_as_missing`.
+
+6. **The §5.4 symbol roster existed in three uncross-checked copies** — the design prose,
+   `pins.json`'s `kernel.microvm_config`, and `classify::symbols()` — which is how (2) went unnoticed.
+   **Gate:** `every_named_symbol_is_pinned_builtin` parses the committed `microvm_config` with this
+   crate's own kconfig parser and asserts every symbol the classifier names is `=y` there.
+
+### Deviations from the §18 sketch
+
+- **`Tristate` → `KconfigValue`.** The design names `KconfigValues::parse` "→ tristate lookup". A
+  real `.config` is full of `CONFIG_CC_VERSION_TEXT="…"`, so the shipped enum is `{Yes, Module, No,
+  Other(String)}` with two predicates (`is_enabled` = y|m, `is_builtin` = y). Gate:
+  `enabled_and_builtin_differ_on_modules`.
+- **Fail-loud parser.** `parse` returns `Result` and rejects any line that is not blank / a comment /
+  `CONFIG_<SYM>=<value>` — including a missing `CONFIG_` prefix and a bare `CONFIG_X=`. A silently
+  empty parse of the wrong file would make every downstream assertion fail as "symbol absent",
+  naming the wrong cause. Duplicate symbols are last-wins (kconfig's own append-a-fragment
+  semantics), documented rather than rejected.
+- **Report roster widened.** `run_core`'s start-failure arm previously recorded only
+  `boot.agent_ready`, so `boot.kernel_banner` vanished from the report on exactly the failure the
+  smoke test exercises. It now records both. Gate:
+  `run_core_records_both_boot_checks_when_the_vm_never_starts`.
+- **Two renderers, not one.** The delta was written as "the ONE renderer every boot-failure arm
+  routes through", and the arm for a VM that never started fed it an empty log — so a missing
+  `cloud-hypervisor` binary, a netns/cgroup setup error, and a VMM API error all printed "the image
+  is not a direct-boot PVH-ELF vmlinux … CONFIG_PVH". Absence of evidence is not evidence, so that
+  path became `explain_without_serial`. Gates:
+  `explain_without_serial_names_candidates_rather_than_asserting_a_violation`,
+  `await_kernel_banner_without_a_console_reports_absence`,
+  `explain_boot_failure_at_reports_absence_when_the_console_is_unreadable`.
+- **`BANNER_SIGNATURE` is `pub`.** `checks::kernel_banner` polls for the same literal and names it in
+  its rustdoc; a `pub(crate)` const cannot be linked from public docs, and re-inlining the string was
+  the second-copy defect being fixed. Additive — `cargo semver-checks` reports no update required.
+
+### Gates (all KVM-free; the live leg is `--ignored`)
+
+`cargo nextest run -p vmcell-artifact-validator`: **34 tests, 34 passed, 2 skipped** (the two
+`#[ignore]`d smoke tests). 4 were pre-existing before delta 4 (3 in `lib.rs` + `checks::tests::
+test_parse_oom_kill`); the delta as landed added 17 (`classify.rs` carried 10 `#[test]`s, not 11 —
+both counts in the hand-off report were off by one); this review-fix pass adds 13 more (9 in
+`checks.rs`, 4 in `classify.rs`).
+
+The defect class the review exposed was that **none of the delta's tests touched the wiring**: every
+one called `classify_serial`/`explain_boot_failure` directly, so mutating `serial_text` to read the
+log and discard it (`Ok(_) => String::new()`) left 21/21 green while every classified boot failure
+named the wrong clause. The new `checks::tests` drive the real filesystem read and the real
+`run_core`/`run_extended`/`run_full` arms over a `FakeVmm`, which needs no KVM. Mutations re-injected
+and observed red in this pass:
+
+| mutation | result |
+| --- | --- |
+| `serial_text`'s success arm discards the text (the reviewer's own mutation) | RED — `explain_boot_failure_at_classifies_the_console_it_read` |
+| the banner poll drops the text it read (`last = Some(String::new())`) | RED — `await_kernel_banner_classifies_the_console_it_polled` |
+| the start-failure arm stops recording `boot.kernel_banner` | RED — `run_core_records_both_boot_checks_when_the_vm_never_starts` |
+| `missing_symbols` back to `is_enabled` (=m counts as satisfied) | RED — `missing_symbols_counts_a_module_as_missing` |
+| the root-device signature folded back into the erofs clause | RED — `classify_root_device_missing_outranks_the_mount_panic` |
+| a symbol the pinned kernel config does not build in | RED — `every_named_symbol_is_pinned_builtin` |
+| a second, diverged copy of the banner literal in the poll | RED — `await_kernel_banner_accepts_the_shared_banner_literal` |
+| an inline `Duration::from_secs(60)` agent budget re-introduced | RED — `every_agent_budget_is_a_named_const` |
+| an Extended arm back to a bare `Err(format!("boot: {e}"))` | RED — `every_extended_and_full_boot_failure_names_the_missing_evidence` |
+| an empty log fed to `explain_boot_failure` on the failed-start path | RED — two tests |
+| a 5th `ContractViolation` variant with `clause() => ""`, `symbols() => &[]`, walk untouched | **COMPILE ERROR** in the test module's exhaustive `next_in_walk` |
+| the same variant spliced into the walk (the honest growth) | RED — `every_violation_names_a_clause_and_symbols` |
+
+Also green: `RUSTFLAGS="-D warnings" cargo clippy -p vmcell-artifact-validator --all-targets`;
+`cargo clippy -p vmcell --tests` (no public check signature changed); `cargo test --doc`;
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`;
+`cargo semver-checks -p vmcell-artifact-validator` (196 pass, "no semver update required" — the new
+enum variant is minor because the enum is `#[non_exhaustive]`); `cargo machete`; `typos`.
+
+### Residual, deliberately recorded
+
+- **The `#[non_exhaustive]` growth gate is compiler-forced but not airtight.** A new variant cannot
+  compile without an arm in `clause()`, `symbols()`, and the test module's `next_in_walk`; the walk
+  is a *cycle*, so the honest splice puts the variant under test. An author who instead writes a
+  self-terminating arm nothing points at would still evade the per-variant assertions. Rust has no
+  stable variant enumeration (`std::mem::variant_count` is nightly) and the crate takes no derive
+  dependency, so this is the strongest available shape; the arm's doc says "splice, do not append".
+- **One uncovered line:** `explain_boot_failure_for`'s `vm.instance().serial_log()`. Everything
+  either side of it is unit-driven (the fs read + classification below it, the FakeVmm-started VM
+  above it — `explain_boot_failure_for_reads_the_vms_own_console` asserts the message names *that
+  VM's* console path), but a `FakeVmm` cannot be given a serial log with content, so the
+  content-through-a-real-VM path is proven only by the live smoke leg.
+- **The live smoke leg is still not run by any CI recipe.** `validate_broken_kernel_reports_failure`
+  now asserts the *message* (`no serial evidence:` / `contract violation:` plus `CONFIG_PVH`), not
+  just the check id — but both smoke tests are `#[ignore]`d and nothing in `justfile`/
+  `.github/workflows` invokes `--test smoke -- --ignored`. Delta 4's live half stays unguarded until
+  such a recipe exists (it needs built artifacts).
+- **Pre-existing, untouched:** `checks.rs` carries 11 bare `let _ = …await` on best-effort
+  teardown/shutdown `Result`s, which "fail loud" forbids; fixing them is a class-wide cleanup that
+  must land with a `scripts/`-level ban script. Same for `guest_core_checks`' roster shrinkage when
+  the agent is unreachable (the four `rootfs.*` + `agent.put_file_roundtrip` ids vanish rather than
+  failing) — the equivalent shrinkage on the arm delta 4 touches *was* fixed.
+- **`vmcell-artifact-validator/Cargo.toml` has no comment-changelog block** unlike
+  `crates/vmcell/Cargo.toml`, though §10.4 now makes this crate contract surface. semver-checks says
+  no bump is required for this change; this is a convention item for the ledger pass.
+
+## v30 delta 5 — `examples/downstream-kernel/`, the living consumer gate (as built)
+
+**What landed.** A second cargo workspace at `examples/downstream-kernel/`, excluded from the vmcell
+members (root `Cargo.toml`: `exclude = ["fuzz", "examples/downstream-kernel"]`, the `fuzz`
+precedent), consuming `vmcell` + `vmcell-artifact-validator` the way a git-dep consumer does. It
+carries its own `Cargo.lock`, its own `[patch.crates-io]`, its own `pins-overlay.json` (the neutral
+`IKCONFIG`/`IKCONFIG_PROC` fragment plus a `kernels.ikconfig` label declaring it), a lib+bin crate,
+a KVM-free contract test binary, and `ci-check.sh` — the whole KVM-free gate. Two CI jobs:
+`example-downstream` (ubuntu-latest, KVM-free) and a live step appended to `test-integration` after
+`just test-daemon`.
+
+**Deviations and their reasons, recorded rather than silent.**
+
+1. **Path deps, not `git`+`rev`.** §5.6 says "the way a git-dep consumer does"; a `rev` pin would
+   stop the example reddening on *same-commit* contract drift — the entire point — and could not be
+   exercised on a PR at all. Everything else is consumer-shaped. Stated in the example's README.
+2. **The harness getters' two-step route needed a code change, not just a test.** §10.4 specifies
+   that `harness::get_vmlinux`/`get_rootfs` "fail loud with a message naming the two-step route",
+   and `crates/vmcell/src/lib.rs`'s crate doc already *claimed* it — but no such message existed:
+   the observable refusals were `ensure_test_artifacts`'s "guest kernel missing at …. Build it once:
+   `cargo run -p vmcell-cli …`" and (outside a checkout) "guest-agent binary source missing at …",
+   both vmcell-checkout-only fixes and a dead end downstream. Landed as one const
+   (`TWO_STEP_ROUTE`) + one composer (`fail_loud`) in `crates/vmcell-artifact-validator/src/
+   harness.rs`, appended to all three refusal paths (bootstrap failure and the two existence
+   checks). It rides *every* failure rather than only downstream-looking ones because there is no
+   honest local "am I downstream?" predicate: the example workspace lives **inside** the vmcell
+   checkout, so `workspace_root()`'s ascent finds vmcell's tree and any presence test answers
+   "in-workspace" for a genuinely downstream-shaped consumer. In the vmcell workspace this only adds
+   a sentence to an already-failing path. (This is the delta-5 change the premise report flagged as
+   "load-bearing, and it is NOT free".)
+3. **The documented CLI verb was wrong in the docs, and the gate found it.** §10.4, §5.6 and
+   `README.md` (two places, incl. the CLI table) all documented `vmcell oci2erofs …`; the shipped
+   clap verb is **`oci2-erofs`** (kebab-cased from `Oci2Erofs`), and has been since v15 — every
+   historical design doc repeats the wrong spelling. The example's documented-CLI leg failed with
+   clap's "unrecognized subcommand 'oci2erofs'". Fixed in `README.md` and in the new harness
+   message; **design §5.6/§10.4 still carry the wrong spelling and need the same one-word
+   correction** (or, if the documented spelling is preferred, a `#[command(alias = "oci2erofs")]`
+   on the subcommand — a CLI change, not taken here).
+4. **The documented-CLI legs run on their fail-fast boundaries.** §10.4 asks the job to invoke the
+   exact documented commands; a real `build-kernels --pins` compiles kernels for minutes and
+   `oci2-erofs` pulls an OCI image, neither of which belongs on the ubuntu job. The legs invoke the
+   real binary with the real flags and assert the contract boundary each one owns: `--pins` rejects
+   a typo'd overlay key **naming it**; `--kernel-source prebuilt` + a label is the §5.6 typed error;
+   a well-formed `--inject` triple parses (the command then stops on the un-pinned image digest, so
+   the leg needs no network); an unknown `--inject` key is named. The *real* labelled build is the
+   live leg. `--inject`'s reserved-dest rejection lives past the image pull and stays covered by
+   delta 6's own in-tree tests.
+5. **The vendor-assertion red leg mutates the tree, not the manifest.** Deleting `[patch.crates-io]`
+   invalidates the example's `Cargo.lock`, so `check-vendored-vhost.sh` — `--locked` on purpose, so
+   a "check" can never rewrite a consumer's lockfile — would fail with cargo's stale-lock message
+   instead of the dropped-patch verdict under test. The leg strips the `(…/vendor/vhost…)` source
+   annotations from **this workspace's real `cargo tree`** and feeds it back through a stub `cargo`,
+   which is exactly what a consumer who forgot the stanza sees, anchored on the real resolution.
+   A non-vacuity guard reddens if the tree carries no vendored annotation to strip (i.e. if the
+   feature set ever stops resolving vhost and the green leg becomes meaningless).
+6. **The example resolves its own artifacts dir.** `vmcell::artifact::artifacts_dir()` would resolve
+   into the vmcell checkout's `target/vmcell-artifacts` from here (the source-root ascent finds the
+   vmcell tree), so `downstream_kernel::artifacts_dir()` defaults under the example's own `target/`
+   and the CI live step sets `VMCELL_ARTIFACTS_DIR` explicitly. A downstream build must never write
+   into the host project's artifact cache.
+7. **`shellcheck`'s glob widened** from `scripts/*.sh` to `scripts/*.sh
+   examples/downstream-kernel/*.sh` in **both** the justfile and `ci.yml`'s `lint` job (local ≡ CI).
+   docs/76 specifies the script's path, so the gate moved to the script rather than the script to
+   `scripts/`.
+
+**Gate meta-rule 2 — the deliberate reds.** Two, both KVM-free and both restored afterwards:
+renaming the overlay's `kernels.ikconfig` key to `ikconfg`, and deleting its `fragments` array. Both
+reddened `the_overlay_adds_this_consumers_label_and_fragment` and took `ci-check.sh` to exit 101,
+naming the cause ("the resolved `kernels` registry has no `ikconfig` label — the overlay … was not
+merged; resolved labels: [6.12.94, 6.6.143, ikconfg, usbhost]" / "`kernels.ikconfig.fragments`
+resolved to [], expected [\"IKCONFIG\"]"). The sidecar-drop inverse is additionally pinned KVM-free
+by `a_missing_resolved_config_sidecar_is_named_not_silently_skipped`.
+
+**Not executed here.** The live leg (`downstream-kernel live`: labelled kernel build → sidecar →
+battery → in-guest `/proc/config.gz`) was written but not run — a sibling agent held the serial KVM
+host. Its data-plane assertion is a **subset**, not an equality: every symbol/value the sidecar
+records must appear identically in the guest's `/proc/config.gz`, because kbuild regenerates the
+stored copy and it may carry symbols the copied file did not.
+
+## v30 delta 6 — downstream rootfs extra files (design §18 delta 6 / §4.2, FR-V4, invariant F5), as built + the review-fix pass
+
+`pub struct ExtraFile { dest: String, src: PathBuf, mode: u32 }` ships exactly as §18 writes it (plus
+an `ExtraFile::new` ctor), threaded through the **one** inject+pack tail —
+`pack_erofs_with_injection(…, extra: &[ExtraFile])` — so both rootfs sources and any third-party
+`Stage` get it identically (§4.3 obligation 3). The CLI reaches it as a new `RootfsStage` field:
+`vmcell oci2erofs … --inject dest=…,src=…,mode=0755` (repeatable). Insertion order in the packer is
+layer merge → extra files → vmcell's manifest injections → vmcell's symlinks, so extras win base-image
+content and `.wh.` whiteouts (deliberate composition) and vmcell's own injections stay unconditional
+and authoritative. Modes are **explicit**: an extra file does not inherit `injected_file_mode`'s
+`bin`/`sbin` heuristic. Cache identity folds `(dest, mode, content-hash)` sorted by dest through the
+shared `fold_rootfs_injection_identity`, and **both** source stages bumped
+(`OCI_ROOTFS_STAGE_VERSION` 3→4, `MMDEBSTRAP_STAGE_VERSION` 1→2), both hoisted from `fn`-local consts
+to module-level consts so the bumps are assertable KVM-free.
+
+**The F5 predicate is derived, not restated.** `is_reserved_injection_path(dest)` is computed *from*
+`rootfs_injection_manifest` (called with probe paths that are never read) plus a `vmcell-tools/`
+prefix rule, so the reserved list cannot drift from what the packer actually bakes and delta 7's
+`echo-server` applet was covered the moment it was added. It compares **normalized** paths through the
+packer's own `normalize_path` (promoted `pub(crate)` rather than re-implemented), so the caller's
+absolute form, the manifest's relative form, and the `/usr/sbin/./vmcell-guest-agent` and
+`//usr/sbin/…` evasion shapes all collapse to one key. Gate:
+`is_reserved_injection_path_covers_every_vmcell_dest` (manifest-derived, both forms, the evasion
+shapes, the whole-dir rule, and a positive control of legitimate downstream dests) — verified RED on a
+raw-string comparison.
+
+**Validation happens at the pack tail, before any I/O.** An `ExtraFile` never passes through
+`VmConfig`, so the tail is its only accepted-input boundary. `validate_extra_files` rejects: a relative
+dest, a `..` component, a dest that names a **directory**, a reserved dest, a duplicate normalized
+dest, and a mode carrying bits outside `0o7777` (validated *then* `u16::try_from` — a full `st_mode`
+like `0o100755` is refused, never `as`-narrowed). Gate:
+`validate_extra_files_rejects_the_silent_corruption_classes` (two positive controls plus 17 rejection
+arms) and `test_pack_erofs_rejects_reserved_extra_dest_before_any_io`, which asserts the reserved-dest
+error beats the missing-agent error and that neither `ca.pem` nor the image was written.
+
+### The review-fix pass
+
+**`/opt/.` — a dest naming a *directory* passed the "must name a file" guard and would have replaced a
+base-image directory with a regular file.** As first shipped that guard was a raw
+`dest.len() > 1 && dest.ends_with('/')` on the **un-normalized** string, while every other rule in the
+same loop (reserved, duplicate) keyed on `normalize_path`. `/opt/.` normalizes to `opt` and does not
+end in `/`, so it was accepted end-to-end: fed through `build_node_map` over a base shipping an empty
+`opt/` directory, the resulting node was `Node::File`. Debian ships `/opt`, `/srv`, `/mnt` and
+`/media` **empty**, and an empty directory clears the pre-existing "child under a non-directory
+parent" check, so the corruption was silent for exactly the shapes that occur in practice; a *non-*
+empty directory happened to trip that other check. A component scan does not catch it either —
+`Path::components` folds a trailing `.` away just as it folds a trailing `/`. This was the same
+raw-vs-normalized asymmetry that had already been closed one guard below, for the reserved check.
+
+Fixed by deriving the rule from the normalized form: the dest's raw final segment (the text after the
+last `/`) must equal the normalized path's final component. That one comparison subsumes the trailing
+slash, the trailing `.`, `/.`, `/./` and the bare `/`, and it keeps an *interior* `.` accepted. The
+`..` check must stay ahead of it, since `/usr/local/../sbin/acme` has agreeing raw and normalized
+leaves. Gate: four new arms in `validate_extra_files_rejects_the_silent_corruption_classes` —
+`/opt/.`, `/usr/local/bin/.`, `/opt/./`, `/.` — verified RED on re-injecting the original raw guard
+(`trailing '.' on a top-level dir must be a hard Error::Artifact, got Ok([("/opt/.", "/src", 493)])`).
+
+**The contract-surface rustdoc contradicted the shipped accepted-input rule.**
+`pack_erofs_with_injection`'s `# Errors` claimed it rejects a dest with "no `.`/`..` component"; `.`
+components are deliberately accepted and normalized away, which `ExtraFile`'s own rustdoc stated
+correctly — two docs on the same rule disagreeing, with the wrong one on the surface §10.4 names as
+downstream contract. Both rustdocs (and `validate_extra_files`') now say the same true thing: a `..`
+component is rejected, an *interior* `.` is accepted and folded, and a trailing `/` or `.` names the
+parent directory and is refused. A second positive control in the rejection battery pins the accepted
+half, so the directory-naming arms cannot later be "satisfied" by rejecting every `.`.
+
+**The live gate was run.** `extra_file_is_present_in_guest_with_its_explicit_mode` boots a real Cloud
+Hypervisor VM on a freshly packed rootfs and, as its first execs, `cat`s the injected marker and
+`stat -c %a`s it: PASS, non-vacuous on 755-vs-644 (`injected_file_mode` would give 644 for
+`/opt/acme/acme-daemon`, which has no `bin`/`sbin` component). Re-run green after the validation-path
+fix above. It is selected by `just test-privileged`'s existing filter.
+
+### Deviations from the §18 sketch (behavior and gate bind; a shift is recorded, never silent)
+
+- **The widened injected-file shape is ONE alias, not two.** The sketch implies extras arrive as
+  widened `InjectFile`s; as built there is a single
+  `pub type vmcell::artifact::tar2erofs::InjectedFile<'a> = (&'a str, &'a Path, Option<u16>)`, aliased
+  by `rootfs::InjectFile`, with the mode in the tuple: `None` = vmcell's `injected_file_mode`
+  heuristic, `Some` = a caller's explicit mode. Two spellings of one shape is the duplication the
+  house rule forbids. Both file loops go through one new `insert_injected_file` helper carrying the
+  uid/gid/mtime/type-bit rules and the explicit-mode-else-heuristic rule; `injected_file_mode` and its
+  pin test are untouched.
+- **`ExtraFile` ships exhaustive with three public fields**, not `#[non_exhaustive]`. The design text
+  is explicit and this is a breaking release anyway. Ledger consequence: a later `uid`/`gid` field, or
+  `mode` becoming `Option`, is another breaking bump.
+- **`MmdebstrapRootfsStage` also gained `pub extra: Vec<ExtraFile>`.** The delta named only the pack
+  tail and `RootfsStage`, but §4.3 obligation 3 says the parameter applies to every rootfs source for
+  free — an mmdebstrap-produced rootfs that could not carry extras would be a source-dependent
+  contract.
+- **`--inject` is on `oci2erofs` only, not `build`** (§10.4's documented consumer invocation).
+  `vmcell build` produces vmcell's own canonical rootfs and takes no consumer content (G1). Both
+  builder-base `build_rootfs` call sites (`vmcell-rootfs-builder`, `vmcell-kernel-builder`) pass `&[]`
+  with an at-site G1 rationale.
+- **Dest semantics beyond the sketch's "absolute, UTF-8, no trailing slash":** a `..` component is
+  rejected outright (because `normalize_path` *pops* it, so the dest would mean something other than
+  it reads as), an interior `.` is normalized away rather than rejected (so `/a/./b` and `/a/b` are
+  the same dest and therefore the same duplicate — and `/usr/sbin/./vmcell-guest-agent` is caught by
+  the reserved check, which is what proves the normalize-before-compare ordering), and a trailing `.`
+  is rejected as directory-naming (the review-fix above).
+- **`parse_inject` is the parser, not the policy.** It rejects unknown/repeated/missing keys, empty
+  values, non-octal modes and comma-bearing paths *by name*, but reserved/duplicate/dest-shape
+  rejection stays at the pack tail so every non-CLI caller gets it. Gate:
+  `parse_inject_honors_or_rejects_every_field`, RED on each of an ignored unknown key, a decimal mode,
+  and a last-wins repeated key.
+
+### Empirically-false premises found in this pass (each now pinned by a gate)
+
+1. *AGENTS.md's one-law roster listed `is_reserved_injection_path` as shipped* (line 112, F5). It did
+   **not exist**: `git show HEAD:crates/vmcell/src/artifact/rootfs/mod.rs | grep -c
+   is_reserved_injection_path` → `0`. Treated as the stop-and-check §18 requires; the predicate ships
+   with this delta and the roster is now true. Pinned by
+   `is_reserved_injection_path_covers_every_vmcell_dest`.
+2. *The delta's premise pass counted two `build_rootfs` callers.* There are three —
+   `vmcell-kernel-builder` also builds a builder-base rootfs. Pinned by the compile: the parameter is
+   required, so a missed caller cannot build.
+3. *The trailing-slash guard was "the" names-a-file law.* False, per the review-fix above; the raw
+   string and the normalized form disagree on `/opt/.`. Pinned by the four directory-naming arms.
+
+### Still open — deliberately not fixed here
+
+The **vmcell-internal** file-vs-symlink clobber in `tar2erofs` is untouched: the injected symlinks are
+inserted last into the same `entries` map with plain last-wins `insert`, so a vmcell symlink dest that
+collided with a vmcell file dest would silently win. Delta 6 as specified rejects *extra-file*
+collisions only, and `is_reserved_injection_path` covers both the file and the symlink manifest
+entries, so no downstream dest can reach the clobber. F5's wording could be read as implying the
+internal case was fixed — it was not. It is a one-manifest-edit-away hazard with no gate; a future
+delta should make `insert_injected_file` and the symlink loop refuse an occupied key outright.
+
+## v30 delta 7 — the raw vsock dial (design §18 delta 7, §3.1/§3.2 — FR-V3), as built + the review-fix pass
+
+`MicroVm::dial_vsock(port, timeout) -> VsockDial` ships: a plain byte stream to an arbitrary guest
+AF_VSOCK port, no framing, no `Ready`, no agent. The fragile hybrid `CONNECT <port>`/`OK` prologue was
+extracted out of `AgentClient::connect_framed` into the one `hybrid_connect_prologue`, shared by the
+framed connect and the raw dial. The in-guest listener is a new `echo-server` guest-tools applet
+(`--vsock <port>` / `--tcp <addr>:<port>`), baked into the erofs like the other applets.
+
+**The load-bearing correction: design §3.2's "EOF propagates in both directions (half-close forwards)"
+is empirically FALSE on half the backends.** It was written as a property of the dial; it is a property
+of each backend's vsock bridge. Measured 2026-08-11 on the full live matrix (cloud-hypervisor 54.0.0,
+Firecracker 1.16.0, QEMU 10.2.1, crosvm), writing a request, calling `shutdown()`, then draining the
+guest's echo — five connections per backend:
+
+| backend | host-side transport | reply after the host's `shutdown()` |
+| --- | --- | --- |
+| Cloud Hypervisor | in-VMM hybrid muxer over AF_UNIX | arrives — 5/5 |
+| crosvm | in-kernel AF_VSOCK, no bridge | arrives — 5/5 |
+| Firecracker | in-VMM hybrid muxer over AF_UNIX | **discarded — 0/5** |
+| QEMU | external `vhost-device-vsock` daemon over AF_UNIX | **races the teardown — 2/5** |
+
+On FC and QEMU the host's `SHUT_WR` on the bridge socket becomes a teardown of the whole vsock
+connection, dropping whatever the guest had not yet flushed. The loss is **silent**: the host's next
+read returns `Ok(0)`, an ordinary clean EOF, never an error — a caller cannot distinguish a complete
+reply from a truncated one after the fact. The *guest→host* direction is portable: the host sees EOF
+when the guest half-closes or exits, on all four.
+
+Consequences, all landed:
+
+- **The `VsockDial` rustdoc now carries that table verbatim**, dated and version-anchored, plus the
+  portable rule it implies: treat `shutdown()` as end-of-conversation, never as an in-band "your turn"
+  signal; frame the guest protocol so a reply's end is knowable without an EOF (length prefix,
+  delimiter, fixed size), drain it, and only then half-close. The pre-fix rustdoc told a downstream to
+  `shutdown()` and drain — which silently loses the reply on FC and QEMU. `MicroVm::dial_vsock` states
+  the caveat once and links there (the fact lives in one place).
+- **The live gate was red as shipped, and was not run before it was declared complete.** The reviewer
+  ran it: `dial_vsock_echo` failed on Firecracker (4/4 tries) and flaked on QEMU. Reproduced here
+  before touching anything. The matrix leg now asserts the **portable** contract — write, `read_exact`
+  the reply, then half-close and require a prompt clean end — and is green on all four backends with
+  `--retries 0` (a retry-masked flake is not a pass), five consecutive runs of the CH/FC/QEMU set.
+- **The non-portable direction is not dropped, it is pinned where it holds**:
+  `dial_vsock_host_half_close_forwards_on_cloud_hypervisor` and `…_on_crosvm` assert the
+  half-close-then-drain idiom positively, so the rustdoc's per-backend claim is a gate rather than
+  prose. Non-vacuous by construction: the identical assertion aimed at Firecracker fails
+  (`left: []`), which is exactly why it is not a matrix leg.
+
+**Capability honesty (§7.2) — decided: documentation + gates, NOT a `VmmCapabilities` field.** The
+difference is real and now live-validated on all four backends, so a `vsock_half_close_forwards` flag
+would be honest. It is deliberately not shipped: (a) no operation refuses on it — vmcell cannot detect
+or typed-refuse a half-close at dial time, and §7.2's contract is about facilities the library either
+provides or refuses with the field's own name; (b) the drain-first order works identically on all four,
+so no caller is *forced* to branch — unlike `restore_rotates_host_paths`, where the two behaviors are
+mutually exclusive and a test must pick one; (c) the field would be a breaking addition to the
+exhaustive `VmmCapabilities`, touching all four backend crates + bench + validator, which §18 assigns
+to delta 9's separable bump. **What would change the decision:** a caller that must branch
+programmatically (a protocol that cannot self-delimit). The flag's name, values, and evidence are all
+in the table above, ready to ship as its own delta.
+
+**Design-text follow-up for v31:** §3.2's sentence "EOF propagates in both directions (half-close
+forwards)" should be replaced by the table above. It is not errata against an implementation
+deviation — the implementation matches the design; the design's premise was wrong.
+
+### Deviations from the §18 sketch (behavior and gate bind; a shift is recorded, never silent)
+
+- **The applet is hand-rolled on `libc`, not on the sync `vsock` crate the delta text names.** The
+  crate already links `libc` for its `ifreq` ioctls, and `socket`/`bind`/`listen`/`accept4` are exactly
+  what a wrapper would issue; adding a dep would also mutate a `Cargo.lock` three concurrent agents
+  were writing. `libc::sockaddr_vm` is the ABI struct (defined once, by libc). Recorded here rather
+  than left implicit, and cited at `vsock_listener`'s own rustdoc.
+- **`libc::VMADDR_CID_ANY` is used directly.** The first cut defined a local
+  `const VMADDR_CID_ANY = 0xFFFF_FFFF` whose comment claimed "not exported by `libc`" — false against
+  the pinned libc 0.2.186 (`VMADDR_CID_ANY` at `linux_like/linux/mod.rs:3034`). Both the second
+  spelling of the kernel ABI value and the false comment are gone.
+- **The retry-cadence fix covers four sites, not the one the design records.** `connect_framed` had
+  four no-sleep `continue`s (CONNECT write, non-decodable first frame, postcard error, non-`Ready`
+  message), the last three being the accept-then-EOF shape a dead/half-open bridge produces. The loop
+  body became `connect_framed_once` returning a typed `ConnectAttemptError`, so the cadence exists in
+  one place. EXP-HOST-BACKOFF-RESET is preserved exactly: only the socket-connect arm grows the
+  backoff, every other arm resets to the floor.
+- **`VsockDial::connect_endpoint` is public, beyond the sketch** (mirroring `AgentClient::connect_endpoint`):
+  it is what lets the KVM-free mock-bridge gates — which live in an integration test, i.e. an external
+  crate — drive the dial without a VM, and it is the single place the port override is applied.
+- **`dial_vsock` takes a required `Duration`**, not its neighbours' `Option<Duration>` (§9.3): a dial
+  has no boot to outwait, so there is no defensible 10 s default to imply.
+- **The prologue gained `MAX_PROLOGUE_LINE_BYTES` (256)** on the acknowledgement line, which the pre-v30
+  code lacked (unbounded `String` growth from a peer). Validate-before-allocate per §13; an overlong
+  unterminated line is a typed `Refused`.
+- **`RootfsStage::STAGE_VERSION` was not bumped.** The cache key folds the `guest_tools` artifact by
+  on-disk content, and the new applet changes that binary, so the manifest edit cannot produce a stale
+  warm hit in this commit. Confirmed live: `vmcell build` re-baked the rootfs and the new `guest_tools`
+  contains `echo-server` where the pre-change one did not.
+- **The guest-tools multicall roster was collapsed into one `APPLETS` table** (`is_known` + the dispatch
+  `match` were two lists). Not requested; a one-sided edit means a custom-`init=` boot exits 2 and
+  panics the guest kernel.
+
+### Empirically-false premises found in this pass (each now pinned by a gate)
+
+1. *"EOF propagates in both directions."* False on FC/QEMU — the table above. Pinned by the matrix leg
+   (portable order, all four) and the two `…_half_close_forwards_…` legs (the two backends where it
+   holds), plus the rustdoc table they check.
+2. *"`libc` does not export `VMADDR_CID_ANY`."* False against the pinned libc. Pinned by the constant
+   simply being `libc`'s — a re-introduced local copy is a visible second spelling.
+3. *"`read_to_end` returning at all IS the server's half-close: without the shutdown it would block
+   until the connection dropped."* (A comment on the applet's own unit test.) False: `echo_connection`
+   returning drops the only handle, so a full close delivers the same EOF. Measured — deleting
+   `shutdown_write` left that unit test **and all four live backends green**. Fixed by adding
+   `echo_connection_half_closes_while_the_connection_stays_open`, which holds the connection open with
+   a second handle so half-closed and closed differ, and bounds the read with `set_read_timeout` so the
+   inverse fails by name instead of hanging. Verified RED on the deletion (`WouldBlock` after 5 s).
+4. *"The live matrix leg's EOF assertion goes red if the guest stops half-closing."* My own first
+   comment; false for the same reason as (3), and additionally masked on FC/QEMU where the host's own
+   teardown supplies the EOF. Corrected to what was actually measured: the assertion catches a guest
+   that **never ends the connection** (applet's `Ok(0) => return` replaced by a sleep loop → RED on CH
+   and crosvm, GREEN on FC and QEMU), and the comment now states that blind spot explicitly.
+
+### Other review-fix items in this pass
+
+- **The accept loops cannot busy-spin or flood the serial log.** A permanently bad listener fd — the
+  §3.2 shape where a restore re-creates the vhost-vsock device and a *user* listener gets no re-bind —
+  previously `continue`d with no pause and an unconditional `eprintln!` per iteration; that stdout is
+  the serial console, which vmcell persists as a per-VM artifact. Both listeners now route through one
+  `accept_error_pacing(consecutive) -> (Duration, bool)` law: the pause grows 50 ms → 1.6 s and caps,
+  and only the first three failures plus every fiftieth are logged. Exiting is not an option (PID 1
+  returning panics the guest kernel). Gate: `accept_error_pacing_bounds_both_the_retry_rate_and_the_log`,
+  verified RED on the pre-fix `(ZERO, true)` shape.
+- **`SOCK_CLOEXEC` from birth** on both the listener (`socket`) and each connection (`accept4`, not
+  `accept`), so no `exec` in another thread can race an inheritable window.
+- **Connect-loop diagnostics are capped, not frame-sized.** `ConnectAttemptError::Ready` eagerly
+  `{:?}`-rendered a whole frame (bounded only by `MAX_FRAME_BYTES` = 16 MiB) on **every** failed
+  boot-wait attempt. `capped_debug(value, READY_DIAGNOSTIC_BYTES = 256)` writes into a sink that
+  returns `Err` at the cap, so `std::fmt` **aborts** — the tail is never rendered, not merely never
+  kept. Gate: `ready_diagnostics_are_capped_not_frame_sized`, which bounds the output for a 1 MiB frame
+  and proves the abort with a `Debug` impl that counts its own writes (<100 of 10 000 chunks run).
+- **`prologue_non_ok_line_is_refused` now drives both refusal shapes its comment claimed.** Only `ERR`
+  was exercised; `OKAY …` — the prefix trap that only the trailing space in `"OK "` rejects — is now
+  driven too, so the narrower `starts_with("OK")` mutation goes red.
+- **The KVM-free mock-bridge test was renamed** `dial_vsock_round_trips_bytes_and_eof_both_directions`
+  → `…_round_trips_bytes_over_the_hybrid_bridge`, switched to the portable order, and carries an
+  explicit "what this fake cannot see": a socketpair's half-close is real, so no mock can show the
+  bridge teardown that FC and QEMU perform.
+- **Rosters re-checked against the tree** (four applets in `APPLETS`, four symlinks in
+  `rootfs_injection_manifest`): the guest-tools module doc and the `test-privileged` justfile comment
+  said `ip/curl/kvm-ok`. The `test-crosvm` comment's "21/21" is now the measured **23/23**, with the
+  note that `metrics_limits::crosvm` needs a systemd-delegated scope (it fails without one and passes
+  with — mechanism identified, not filed as "environmental").
+
+### Gates
+
+`RUSTFLAGS="-D warnings" cargo clippy --locked -p vmcell -p vmcell-guest-tools --all-targets`, the five
+reduced-feature `-p vmcell` configs, `RUSTDOCFLAGS="-D warnings" cargo doc -p vmcell --all-features`,
+`cargo nextest run --locked -p vmcell -p vmcell-guest-tools` (406 passed), and live:
+`cargo nextest run --profile integration -p vmcell --features firecracker,qemu --run-ignored all
+-E 'kind(test) & test(dial)' --retries 0` → 8/8 (CH, FC, QEMU, the two mock-bridge legs, the CH
+half-close leg, the custom-init guard-bypass leg), plus `just test-crosvm` → 23/23 under a delegated
+scope. `dial_vsock_echo` was additionally run five consecutive times with `--retries 0` (15/15) to show
+the QEMU flake is gone rather than masked.
+
+## v30 delta 8 — VM-to-VM segments (design §18 delta 8 / §6.2, §6.5 — FR-V2 + FR-V3's privileged host→guest shape), as built
+
+`NetConfig::Segment { segment: NetSegmentRef }` ships. A **segment** is one network namespace
+(`<prefix>-seg-<segid>`) holding one Linux bridge (`<prefix>-br-<segid>`) on `10.201.<s>.0/24`, with
+each member's tap (still `<prefix>-tap-<vmid>`, still `TUNSETPERSIST`'d, still opened only by the
+VMM) created *inside that namespace* and enslaved to the bridge. A member has **no per-VM netns**:
+`res.netns_name` names the segment, so `build_vmm_cmd`'s pre-exec `setns` needed no change and every
+backend's device wiring took the existing tap arm unmodified. The guest still learns its address from
+the kernel `ip=` token — zero netlink and zero new guest code in PID 1 (law C6 untouched).
+
+Live-validated on this KVM host under the blessed runner, `--retries 0` (a retry-masked flake is not
+a pass): **19/19** across cloud-hypervisor, Firecracker and QEMU (102 s), plus **5/5 on crosvm**
+(41 s, `just test-crosvm`'s filter — the fourth backend's first segment validation; CI lacks the
+binary, so that recipe stays opt-in). The battery covers the full §6.5 set — two-VM bidirectional
+TCP, the off-segment negative against **both** members with the on-segment positive control re-run
+afterwards *and* the dialer's own loopback positive control, host `dial_tcp` plus its dead-port
+typed refusal, `netem` delay and `netem loss 100%` as separate legs, last-holder residue (namespace
+**and** the cross-process segid lock file), the orphan-`seg` sweep, the duplicate-vmid ownership
+refusal, and the `setup_tap_on_bridge` cleanup contract.
+
+*(The 2026-08-11 first pass reported "16/16"; the battery was 17 tests then and is 19 now. Counts
+are checked against the tree — that first figure was wrong, not the suite.)*
+
+Whole-suite re-validation after the review pass, same host: `just test-privileged` **144/144** (279 s,
+no retries consumed — no `TRY`/`FAIL` line in the run), `just test-unprivileged` **4/4**, KVM-free
+`cargo nextest run --all-features` **691/691**, `clippy --workspace --all-targets --all-features`
+with `-D warnings` clean, `fmt --check` clean. Skip manifest reviewed: 5 capability skips, all
+Firecracker's honest absences (`nested_virt`, `unprivileged_vhost_user_net`, `virtio_fs_shares`)
+plus QEMU's env-gated `usb_host_passthrough_no_designated_device` — none in the segment battery.
+Host after: zero namespaces, zero `vmcell-*` links, no `.lock` files under `/tmp/vmcell-segid` (only
+the never-removed `.coord` files, the same pattern `/tmp/vmcell-vmid` leaves) — and those coord
+files now span 54 distinct segids where every run used to leave exactly `1.coord`, which is the
+seeding fix visible on the host.
+
+### Three premises §6.5/§18 assert as shipped facts that were empirically FALSE
+
+**1. "Guest MACs stay `mac_math(vmid)`, so member MACs are bridge-unique" — false on two of four
+backends, including the primary.** `mac_math` was applied only on the *vhost-user* arm.
+`build_ch_net`'s tap arm emitted `mac: None` (the guest MAC came from CH's own undocumented
+generation), and QEMU's tap arm emitted `-device virtio-net-pci,netdev=net0` with **no `mac=` at
+all**, so every QEMU guest carried QEMU's fixed default `52:54:00:12:34:56`. Only Firecracker
+(`guest_mac`) and crosvm (`tap-name=…,mac=…`) set it. This was invisible for as long as each
+privileged VM owned an isolated `/30` L2 domain; two QEMU members on one bridge is a deterministic L2
+collision, and the CH leg would have passed by luck. **Fixed in both backends before the live legs**
+(two lines each), each with its own gate over the shape the process actually gets: CH's serialized
+`ChNet` and QEMU's *composed* argv. Proven red by reverting each fix — and, decisively, by the live
+inverse: with QEMU's `,mac=` dropped, `segment_two_vm_tcp_both_directions::qemu` is red on this host
+while the identical code with the fix is green.
+
+**2. "The privileged suite's liveness-blind test-start sweeper already removes every
+`<prefix>-`-prefixed netns, segments included" (§6.5, verbatim) — false; nothing reaped a leaked
+segment.** Evidence: `clean_vmcell_netns` passed `netns_sweep_prefix(prefix)` == `"vmcell-net-"`
+into `cleanup_orphan_netns`, which filters on a literal `starts_with`, and
+`"vmcell-seg-1".starts_with("vmcell-net-")` is false; `HostOrphanScanner::scan_netns` used the same
+filter. A `vmcell-seg-*` namespace was therefore reaped by **nothing** — not the test-start
+sweeper, not the daemon start-up sweep — so an aborted segment test would have poisoned the next
+run's segid forever. The sentence is stale in the design and should be corrected there; both code
+holes are closed here: the test helper now sweeps the segment class too (its own one-law filter),
+and the sweeper grew the class properly (below).
+
+**3. `net_uses_tap` does not exist, and no backend asks the question AGENTS.md says it asks.** All
+four backends key tap-vs-NAT on `res.tap_name.is_some()`, never on `cfg.net`. That is *good* news —
+a `Segment` variant that populates `res.tap_name`/`res.netns_name` already takes the identical tap arm
+with zero backend edits — but it means the rubric's "the device wiring routes through the one
+`net_uses_tap(cfg)` predicate" cannot be satisfied literally without giving `build_ch_net(res)` a
+`cfg` parameter it does not need, i.e. moving the decision from the exhaustive-struct channel onto a
+weaker signal. **Decided deliberately, recorded here:** `net_uses_tap(&NetConfig)` ships in `config`
+as the **orchestrator/config-side** predicate (`Privileged | Segment`, exhaustive in-crate so a new
+variant is a compile error there), and the backends keep the stronger `res.tap_name` channel. The two
+are held in lockstep by a new fail-loud post-condition, `assert_tap_wiring_matches(net, tap_present)`,
+run once in `setup_env`: a datapath that claims a tap and was handed none — or the reverse — is an
+`Error::Network` at construction, not a guest with an unconfigurable `eth0`.
+
+A fourth, smaller one: AGENTS.md/L1 lists "the registry's `destroy`/`shutdown_all`/`Drop`" — the
+daemon `Registry` has **no** `Drop` impl. Not delta 8's to fix; recorded so it is not cited as an
+existing teardown path.
+
+### Deviations from the §18/§6.5 sketch (behavior and gate bind; a shift is recorded, never silent)
+
+- **`build_kernel_cmdline(cfg, vmid, backend_extra)` → `(cfg, res, backend_extra)`.** §6.5 says "the
+  cmdline builder reads it from the new `res.segment`", but the builder took no `res` at all. It now
+  takes the whole `PerVmResources` (reading `res.vmid` and `res.segment`), which ripples to all four
+  backend call sites — a breaking change, fine for the 0.12 → 0.13 pass, and itself a useful
+  fail-loud: a backend cannot compile while ignoring membership.
+- **`segment_ip_math(segid, slot)`, not `(seg_octet, slot)`.** Taking the segid keeps the
+  `s = (segid % 254) + 1` derivation written **once** (the same shape `ip_math` uses) instead of
+  making every caller compute the octet. `MAX_SEGMENT_ID` / `MAX_SEGMENT_SLOT` are public consts, so
+  the 254-segments / 253-members-per-segment limits are named rather than inlined.
+- **`NetSegment::dial_tcp` does not re-enter the root netns.** §6.5 cites the §6.4 proxy's
+  capture-root → `setns` → socket → re-enter-root pattern. The proxy re-enters because its thread goes
+  on to originate *upstream* sockets; `dial_tcp`'s dedicated thread exists only for this one connect
+  and terminates immediately after handing the socket back, so there is no later socket that could be
+  trapped. Re-entering would only add a failure mode (a good socket discarded because a dying thread
+  could not move back). The connected socket keeps its segment binding — a socket's netns is fixed at
+  `socket()` time — so `set_nonblocking(true)` + `tokio::net::TcpStream::from_std` on the caller's
+  runtime is sound. It is a **dedicated `std::thread`**, never `spawn_blocking`: `setns` moves the
+  calling thread, and a pooled worker would keep the segment namespace for every later blocking task.
+- **The two `setns` calls live in `crate::net_sys`, not in `net::segment`.** `vmcell::net` is
+  `#![forbid(unsafe_code)]`; `net_sys` exists for exactly this. `setns_net(fd)` joins
+  `set_tun_persist` there, one operation per `unsafe` block with its own `SAFETY:`.
+- **`NetSegment` implements `PartialEq`/`Eq` by `Arc::ptr_eq`.** Forced, not chosen: `NetConfig`
+  derives `PartialEq, Eq`, and dropping those derives would be a `cargo semver-checks` break. The
+  semantics are handle **identity** — two handles to one segment are equal; two distinct segments
+  holding equal ids from independent allocators are not (the same discipline `Lineage`'s
+  cross-allocator ancestry check uses for S5). Pinned by
+  `distinct_segments_with_equal_ids_are_not_equal`.
+- **`setup_tap_on_bridge` owns its own failure cleanup** (review pass, R1). The trait states it: on
+  error it leaves behind exactly what it found — it deletes the tap it created, and deletes nothing
+  when the create itself failed. The caller cannot make that call, because the namespace is shared
+  and an interface of that name may be a live sibling's.
+- **`SegmentInner::slots` is a `BTreeMap<slot, vmid>`, not a `BTreeSet<slot>`** (review pass, R1):
+  the occupant's vmid is what lets `claim_member` refuse a duplicate before touching host state.
+  `active_slots()` keeps its `BTreeSet<u32>` signature (it returns the keys).
+- **The `Netlink` trait grew three methods, not two.** `create_bridge` and `setup_tap_on_bridge` were
+  foreseen; `delete_link(netns, link)` was not. It is load-bearing: a member's tap is persistent in a
+  namespace that **outlives the member**, so without deleting it on teardown a reused vmid collides
+  with a leftover tap. `setup_tap_on_bridge` deliberately assigns **no** address (the sketch's
+  "distinct trait method is mandatory, not cosmetic" — reusing `setup_tap` would have put a stray
+  `10.200.<n>.1/30` on a bridge port, a silent second subnet on the segment). Four impls updated
+  (`RtNetlink`, the `net::tap` fake, the broker's fake, and the segment module's recording fake) plus
+  the orchestrator's three test fakes; all in-workspace, all compile-time fail-loud.
+- **`sweep_orphans` grew `live_segids` and `OrphanScanner` grew `scan_segment_netns`; `trailing_vmid`
+  was renamed `trailing_id`.** The rename is the point: the helper parses `vmcell-seg-7` as `7` just
+  as happily as `vmcell-net-7`, so an id-space-neutral name is what stops a future reader from
+  checking one class against the other's live set. `SweepReport` gained `segment_netns` (it is
+  `#[non_exhaustive]`, so that half is additive). The signature change ripples to the broker's
+  `BrokerRequest::Sweep` / `BrokerReply::SweepDone` (postcard-safe — plain `Vec<u32>`/`Vec<String>`
+  with no presence attributes, so the Appendix A reversal-10 trap does not apply; parent and broker
+  child still ship together) and to the daemon's `startup_sweep`, which passes **both** sets empty.
+- **`SegmentMember` is public.** The sketch names only `NetSegment`. The RAII guard that owns a
+  member's slot + tap is held by `MicroVm` and by `EnvSetup`, and `MicroVm::segment()` /
+  `segment_membership()` are the accessors the netem legs need (`MicroVm::netns()` is `None` on this
+  path — worth knowing before reaching for it).
+- **`NetSegment` exposes `prefix()`, `segid()`, `netns_name()` and `active_slots()`** beyond the
+  sketch's four methods: `prefix()` is what `build()`'s prefix-equality refusal compares against, and
+  the other three are what the live residue/impairment legs assert on.
+
+### As-built shape, in one place
+
+- **Ownership.** `NetSegment(Arc<SegmentInner>)`; `SegmentInner::Drop` deletes the namespace, and its
+  `segid_guard` field is declared last so the id is released *after* the namespace is gone. Every
+  member `MicroVm` holds a clone, so "never delete a netns under a live VMM" is **structural**: a
+  member's teardown necessarily precedes the segment's.
+- **Teardown (law L1).** The segment member is released through the **one** ordered helper —
+  `release_net_before_netns` grew a `segment` parameter and drops it after the netns take, so the
+  success path (`teardown_post_instance`), the mid-`start()` error path (`EnvSetup::drop`), and
+  `Drop` cannot diverge. A member releases its **slot and tap only**; it never touches the namespace.
+  The segment path leaves `netns == None`, so the ordering gate learned a new recorded event
+  (`segment_slot_release:<tap>`) rather than reusing `netns_delete`.
+- **Ids.** Two laws, each written once and shared by both allocators: the H1 **claim** core
+  (`flock` coordination file + liveness check + `hard_link` atomic claim) and the **search order**
+  (`seeded_id_order`, clock-seeded so two processes do not both start at 1 — added by the review
+  pass, R3). The claim core was extracted verbatim into a private, id-space-agnostic `FsIdClaim`
+  parameterized by lock directory. `VmidAllocator` and the new `SegmentIdAllocator`
+  (`/tmp/vmcell-segid`, the same recorded bare-`/tmp` cross-process-rendezvous exception) both route
+  through it, and the exactly-one-winner race gate now drives the shared core, so it covers both.
+  `env.segids` is an additive `HostEnv` field.
+- **Refusals, typed, at `build()`.** `snapshotting` + `Segment`; and a member whose `resource_prefix`
+  differs from its segment's (one prefix must name and sweep every resource in the domain, law F2).
+  `Egress`/`host_services_port` are unrepresentable on the variant. Two further boundaries:
+  `restore_inner` refuses a segment member with `Error::Unsupported` (the resources-in-hand re-check),
+  and `zygote::check_clone_eligible` refuses it at the config-only gate so a fan-out fails before
+  minting N copies rather than after.
+
+### The adversarial-review pass: five verified defects, each fixed with its gate
+
+Three reviewers took independent lenses (correctness / teardown-residue / gate-honesty) against the
+landed delta and verified their findings live. All five are fixed here, and every fix's gate was
+re-run with the bug **re-injected** and observed red.
+
+**R1 (L1 ownership, the severe one) — a failed `claim_member` deleted a LIVE SIBLING member's
+tap.** The cleanup on the enslave-failure path deleted the tap **by name**, and unlike every other
+cleanup-on-failure in the tree it ran inside a namespace that **pre-exists and is shared**: a
+member's tap is not provably its own. `claim_member` accepted any vmid without checking the segment
+already held one, and the tap name is `<prefix>-tap-<vmid>`, so two members with equal vmids name
+**one** interface in **one** namespace. Reproduced live: B's tap create fails `EBUSY` (correctly
+fail-loud, because A's VMM holds that interface open) and the cleanup then deleted A's running tap,
+severing A's datapath with nothing logged — the `tracing::debug!` fired only when the cleanup
+*failed*. The rationale comment ("delete whatever half of the tap came up") was false on that arm:
+on `EBUSY` no half came up.
+
+Fixed on both axes the reviewer offered, because either alone leaves a sharp edge:
+
+1. **Fail loud on the accepted input, before any host state.** `SegmentInner::slots` is now
+   `BTreeMap<slot, vmid>`, and `claim_member` refuses a vmid the segment already holds with a typed
+   `Error::Config` naming the conflict — no netlink call at all. (`active_slots()` keeps its
+   `BTreeSet<u32>` signature; it returns the keys.)
+2. **Cleanup belongs to the creator.** `claim_member` no longer deletes anything; the half-created
+   tap is reclaimed inside `Netlink::setup_tap_on_bridge`, the only party that knows whether it
+   created one, and the trait now states that contract: on error it leaves behind exactly what it
+   found — it removes the tap it created, and removes **nothing** when the create itself failed.
+   The caller cannot make that distinction in a shared namespace.
+
+The old recording fake could not see any of this (it never touched the kernel, so a pre-existing tap
+was unrepresentable and the gate could only assert that `delete_link` *was called*). It now carries
+a **live-link set** per namespace and models the two kernel behaviors that matter — a create whose
+name is taken fails, a delete of an absent link fails — which is what makes the axis testable
+KVM-free at all.
+
+**R2 (gate honesty) — the off-segment negative control was vacuous on the dialer axis.** An
+off-segment `Privileged` VM holds only its `/30` tap (no veth, no uplink), so it can reach *nothing*
+by construction: "the probe reached nothing" and "isolation held" were the same observation. Proven
+by the reviewer with a probe mutated to `sh -c "exit 1"` — a dialer that never opens a socket — which
+left the leg green. The rubric wants a positive control **the same dialer** passes, so the outsider
+now runs `echo-server --tcp` itself and must echo through `127.0.0.1:<port>` via the identical
+`echo_probe_until_ok` before its refusals count. Re-verified both ways on this host.
+
+**R3 (cross-process hazard) — segment ids were deterministic per process.** `SegmentIdAllocator::allocate`
+scanned `1..=MAX` with no seed, while its sibling `VmidAllocator` carries an injected clock
+explicitly to spread the first-tried id; every process therefore chose segid 1, named its namespace
+`vmcell-seg-1`, and another run's liveness-blind start-up sweep reaped it (reproduced, including the
+resulting mid-test `netns get failed: Can not open netns /var/run/netns/vmcell-seg-1` — the real
+mechanism behind the one flake seen under retries; **not** "environmental"). Both offered fixes
+taken:
+
+- The search-order seeding is now **one law** — `seeded_id_order(clock, max)` — used by both
+  allocators; `SegmentIdAllocator` grew the same injected-`Clock` seam (and a manual `Debug`, since
+  `Clock` is not `Debug`). Three existing unit tests silently depended on "allocators are
+  deterministic"; each now asks for a fixed `FakeClock` explicitly, which is the honest form.
+- The **live battery** now builds its `HostEnv` with `SegmentIdAllocator::shared()`, so the
+  `/tmp/vmcell-segid` claim law this delta extracted actually arbitrates on a real host (it was
+  exercised only against unit-test temp dirs), and the residue leg asserts that lock file's whole
+  lifecycle — present while the segment lives, gone when the last holder drops.
+
+Residual, recorded and deliberately out of scope: `clean_vmcell_netns` is still liveness-blind by
+design for **both** id classes (it reaped a live `vmcell-net-207` too). That is the pre-existing
+posture for vmids, and the fixes above restore segments to parity with it rather than fixing a
+hazard the suite has always carried; concurrent `test-privileged` runs remain unsupported.
+
+**R4 (gate gap) — Firecracker had no KVM-free MAC gate.** Replacing `mac_math(res.vmid)` with a
+constant MAC left the whole KVM-free suite green; the other three backends each pin theirs through a
+composed-argv/serialized-config test, but FC built its `NetworkInterface` inline inside `spawn_fc`,
+so nothing pure was testable and only the live matrix caught it (73 s in). Since "member MACs are
+bridge-unique" is this delta's load-bearing premise, the request is now a pure
+`build_fc_network_interface(tap, vmid)` with its own gate over the identity, the per-vmid
+distinctness, the serialized body FC actually receives, and the out-of-range refusal.
+
+**R5 (records)** — the fake-blind-axis pointer in `orchestrator.rs` named a test that does not
+exist (`segment_teardown_leaves_no_residue`); it now names the real
+`segment_last_holder_teardown_leaves_no_residue` plus the new ownership leg. The "16/16" count is
+corrected above. crosvm's segment legs are recorded above. The fourth false premise is recorded
+with its evidence above.
+
+**R6 (found while gating R1) — every live residue check was blind to a DOWN interface.**
+The presence helper read `tc qdisc show`, which lists only interfaces that are **UP** — and a leaked
+tap is typically down (nothing brought it up, or its VMM is gone). Verified on this host: a tap left
+behind by a failed enslave is absent from `tc qdisc show` and plainly present in `ip -o link show`.
+So the `!present` half of the residue leg — the half that exists to catch exactly that residue —
+passed vacuously, and the new cleanup-contract leg passed even with the cleanup disabled. All
+presence assertions now go through one `links_in_segment` + `link_listed` helper over `ip -o link
+show`, matching the whole name **token** (the prefix-confusion property the old helper had, plus a
+new one: a name appearing only as another link's `master` is not a link of that name). `tc` remains
+for what it is good at — adding and removing the `netem` qdiscs.
+
+### Gates
+
+| What it pins | Gate | Proven red by |
+| --- | --- | --- |
+| The tap-arm MAC is `mac_math(vmid)` on **CH** (was `None`) | `vmcell vmm::cloud_hypervisor::tests::build_ch_net_shapes_tap_and_vhost_user_branches` | restoring `mac: None` → **RED** |
+| …and on **QEMU** (was absent entirely), over the *composed* argv | `vmcell-qemu tests::qemu_tap_argv_carries_the_vmid_derived_mac` | dropping the `,mac=` splice → **RED** |
+| …and that it matters: two QEMU members on one bridge | live `vmcell::segment segment_two_vm_tcp_both_directions::qemu` | dropping the same splice → **RED on this host** |
+| The `-seg-` class is swept against **segids**, not vmids (fails *open* if miswired) | `vmcell orchestrator::tests::test_sweep_orphans_reclaims_only_dead_ids_in_order` (plants `vmcell-seg-7` with vmid 7 live + `vmcell-seg-9` with segid 9 live) | checking the class against `live_vmids` → **RED** (`left: ["vmcell-seg-9"]`) |
+| …end to end over the broker's postcard wire | `vmcell-broker tests::dispatch_sweep_reaps_segments_against_live_segids` + the `Sweep`/`SweepDone` round-trip | swapping the two live sets |
+| A member's `ip=` is the segment `/24` with the bridge gateway, and F3 still holds on that path | `vmcell config::tests::build_kernel_cmdline_emits_the_segment_subnet_for_a_member` | falling back to the `/30` branch → **RED** |
+| A member releases its tap + slot and **never** the namespace | `vmcell net::segment::tests::member_teardown_releases_its_tap_and_slot_but_never_the_namespace` | adding a `delete_netns` to `SegmentMember::Drop` → **RED** |
+| …in the L1 order: instance → slot release → cgroup | `vmcell orchestrator::tests::segment_member_teardown_releases_its_slot_between_instance_and_cgroup` | the same edit → **RED**; reordering the helper |
+| The namespace dies with the **last** handle, and frees the segid | `vmcell net::segment::tests::namespace_dies_with_the_last_handle_and_frees_the_segid` | deleting on every clone's drop |
+| `segment_ip_math` range, injectivity, disjointness from `ip_math` | `vmcell net::tests::segment_ip_math_range_injectivity_and_disjointness` | reusing `10.200`; allowing slot 0 (aliases the gateway) or 254 |
+| The `-seg-` naming joins the F2 lockstep, pairwise-distinct from `-net-`/`-vm-` | `vmcell naming::tests::prefix_matches_its_names`, `default_prefix_reproduces_the_historical_names` | a `-net-`-stemmed segment name |
+| Slot claim / free / exhaustion at 253, and the address each slot maps to | `vmcell net::segment::tests::slots_are_claimed_freed_and_exhaust_at_the_documented_limit` | a free-list that never returns a released slot |
+| Both allocators claim through the one extracted core, in their own dirs; exactly-one-winner under 8×200 concurrent reclaimers | `vmcell orchestrator::tests::both_allocators_claim_through_the_one_cross_process_core`, `segment_id_allocator_exhausts_typed_at_the_limit`, `shared_at_concurrent_reclaimers_have_exactly_one_winner` (now over `FsIdClaim`) | an in-process-only segid allocator |
+| The prefix goes through the **one** validator | `vmcell net::segment::tests::segment_rejects_an_invalid_prefix_through_the_one_validator` | skipping `validate_resource_prefix` |
+| A failed bridge creation does not leak the namespace | `vmcell net::segment::tests::failed_bridge_creation_cleans_up_the_namespace` | returning the error without the cleanup |
+| A failed member enslave leaks neither the half-created tap nor the slot (asserted on the resulting STATE — no tap in the namespace — not on who called what) | `vmcell net::segment::tests::failed_member_enslave_releases_the_slot_and_the_tap` | dropping the creator-side cleanup → **RED** |
+| **R1** — a duplicate vmid is refused *before* any netlink call, and the live sibling's tap and slot survive; a different vmid still joins (positive control) | `vmcell net::segment::tests::a_duplicate_vmid_is_refused_and_the_live_siblings_tap_survives` (over the now-stateful `RecordingNetlink`) | restoring the shipped code (accept the duplicate + delete by name) → **RED**, on the typed refusal *and*, with that assertion relaxed, on "the live sibling's tap must survive" |
+| **R1, live** — the same, against a real running VMM: the refusal is typed, member A's tap is still there, and A's datapath still echoes through `dial_tcp` | live `vmcell::segment segment_duplicate_vmid_is_refused_without_touching_the_live_member` (CH; the mechanism is host-side) | the same re-injection → **RED**: `got Network("tap create fail: Device or resource busy")`, and with that relaxed, `the refused claim must not delete the live member's tap vmcell-tap-77` — with cloud-hypervisor logging `failed reading from tap: File descriptor in bad state` / `NEEDS_RESET` as its datapath was pulled out from under it |
+| **R1** — `setup_tap_on_bridge` reclaims the tap **it** created when the enslave fails, and leaves an existing one alone (positive control: the same call against the real bridge keeps the tap) | live `vmcell::segment segment_setup_tap_on_bridge_reclaims_the_tap_it_created_when_enslaving_fails` (no VM at all) | disabling the internal cleanup → **RED** |
+| The residue helper matches whole interface names (`vmcell-tap-1` ≠ `vmcell-tap-11`), over `ip -o link show` so a **DOWN** leaked tap is visible at all, and a `master <bridge>` mention is not a link | `vmcell::segment link_listed_matches_whole_interface_names_only` (KVM-free) | reverting it to a bare `contains` → **RED** |
+| **R3** — the segid search start is clock-seeded through the ONE `seeded_id_order` law the vmid search uses, and the seeded order is still a permutation of the whole space | `vmcell orchestrator::tests::segment_id_search_start_is_clock_seeded_like_the_vmid_search` | restoring the unseeded `1..=MAX` scan → **RED** (`left: 1, right: 1`) |
+| **R3, live** — the shared `/tmp/vmcell-segid` claim arbitrates on a real host: the lock file exists while the segment lives and is gone after the last holder drops | live `vmcell::segment segment_last_holder_teardown_leaves_no_residue::{…}` | reverting the battery to the hermetic allocator → **RED** (`a shared segid claim must leave its cross-process lock file: /tmp/vmcell-segid/8.lock`) |
+| **R4** — FC's network-interface request carries `mac_math(vmid)`, distinct per vmid, in the JSON FC is actually PUT, and refuses an out-of-range vmid | `vmcell-firecracker tests::fc_network_interface_carries_the_vmid_derived_mac` (the pure builder extracted for it) | a constant `52:54:00:12:34:56` → **RED** (this is the mutation that previously left the ENTIRE KVM-free suite green) |
+| `net_uses_tap` covers exactly the tap datapaths, and config↔resources stay in lockstep | `vmcell config::tests::net_uses_tap_covers_exactly_the_tap_datapaths`, `assert_tap_wiring_matches_rejects_both_mismatches` | a `Segment` arm answering `false` |
+| Both `build()` refusals, each with a positive control | `vmcell config::tests::build_rejects_snapshotting_with_a_segment`, `build_rejects_a_member_whose_prefix_differs_from_its_segment` | disabling either arm |
+| A `Zygote` over a segment config fails at the config-only gate | `vmcell zygote::tests::segment_config_rejected_at_zygote_construction` | dropping the `Segment` arm from `check_clone_eligible` |
+| **Live** — two members exchange bytes both ways; a third off-segment VM reaches neither — after **that same dialer** echoes off its own loopback (**R2**: without it the leg passed with a dialer that never opened a socket), with the on-segment control re-run afterwards | `vmcell::segment segment_two_vm_tcp_both_directions::{cloud_hypervisor,firecracker,qemu,crosvm}` | the QEMU MAC inverse above; and the dead-dialer mutation (`sh -c "exit 1"` for the outsider's payloads) → **RED**: `the in-guest echo probe to 127.0.0.1:7100 never succeeded` |
+| **Live** — host `dial_tcp` echoes through a member, and a dead port is a bounded typed error | `vmcell::segment segment_host_dial_tcp_reaches_a_member::{…}` | — |
+| **Live** — `netem delay 50ms` on both member taps measurably shifts the guest↔guest round trip | `vmcell::segment segment_netem_delay_shifts_the_round_trip::{…}` | — |
+| **Live** — `netem loss 100%` partitions the link, and it heals when the qdisc goes (its own leg: a bridge that silently healed would pass a delay-only gate) | `vmcell::segment segment_netem_loss_partitions_and_heals::{…}` | — |
+| **Live** — the namespace exists before the last holder drops and is gone after; a departing member's tap goes while its sibling's survives | `vmcell::segment segment_last_holder_teardown_leaves_no_residue::{…}` | — |
+| **Live** — a planted `vmcell-seg-*` is reclaimed and a foreign-prefix segment is left alone | `vmcell::segment segment_orphan_sweep_reclaims_leaked_namespaces` | — |
+
+### One defect the full suite found in this battery (in the test, not the product)
+
+The residue leg first ran green under an isolated `-E test(segment)` invocation and then went red once
+inside `just test-privileged`. The cause is a mechanism, not "environmental": the leg asserted tap
+presence with a bare `contains(&tap_name)`, and `tc qdisc show` prints `dev vmcell-tap-11 root …`.
+When the clock-seeded vmid allocator handed the two members **1** and **11** — an ordinary pair, and
+exactly the one the isolated run had not drawn — `"…dev vmcell-tap-11 …".contains("vmcell-tap-1")` is
+`true`, so the departed member's tap was reported as still present. The mirror assertion is worse: it
+would have passed **vacuously** in the other ordering. Recorded because it is the recurring shape — a
+residue assertion satisfied by a *different* resource's name — not because the fix is interesting.
+
+The first fix (one `tap_listed(out, tap)` helper matching the `dev <tap> ` token) was itself
+insufficient, which the review pass then caught: `tc qdisc show` lists only interfaces that are
+**UP**, and a leaked tap is typically DOWN. Presence now goes through `links_in_segment` +
+`link_listed` over `ip -o link show` — same token discipline, on a view that can actually see
+residue (see R6 above).
+
+**What the fakes cannot see, and what covers it.** `FakeNetlink`/the segment module's
+`RecordingNetlink` never touch the kernel: the real bridge creation, the tap enslavement, the
+*absence* of an address on a bridge port, the namespace removal under a live VMM, the `netem`
+qdiscs, and `/var/run/netns` residue are all invisible to them. Every one of those is covered by a
+named live leg in `crates/vmcell/tests/segment.rs`; §18 marks that battery non-optional, and it was
+run. The review pass moved one axis from that list into the fake: `RecordingNetlink` is no longer a
+pure call recorder but keeps a **live-link set** per namespace, because "the cleanup deleted a link
+it did not create" is unrepresentable when no link can pre-exist — a call recorder can only assert
+that `delete_link` *was called*, which is precisely what made the shipped L1 defect invisible. It
+still models nothing about addressing, carrier, or enslavement; those stay live-only.
+
+**The in-guest data plane needs no new guest code.** The listener is delta 7's `echo-server --tcp`
+applet; the client is bash's `/dev/tcp` net-redirection, which the Debian rootfs's bash has compiled
+in (verified in-guest before the battery was written). Law C6 is untouched, and no rootfs rebuild was
+required.
+
+### Residual, deliberately recorded
+
+- **Segments are not exposed over the daemon REST** (§17). The daemon's own `NetMode` enum maps
+  exhaustively to `NetConfig`, so the new variant needed no DTO change; when segments *are* exposed,
+  the presence-attribute round-trip rule bites there.
+- **`tc netem` is names, not a typed API.** rtnetlink 0.21 / netlink-packet-route 0.30 type only
+  fq_codel and ingress, and `QDiscNewRequest` has no generic kind/options seam (its `TcMessage` is
+  private with no `message_mut()`), so a typed `SegmentImpairment` means hand-assembled messages —
+  §17 forward work. Tests shell out through `nsenter`; production code does not.
+- **Per-segment filtered egress** is unrepresentable by design in v30 (§17).
+- **`clean_vmcell_netns` stays liveness-blind, for both id classes.** The review pass fixed segment
+  ids being *deterministic*; it did not make the test-start sweeper liveness-aware. Two concurrent
+  privileged runs still reap each other's namespaces — the pre-existing posture for `-net-`
+  (a live `vmcell-net-207` was observed reaped), now shared symmetrically by `-seg-`. The suite is
+  `serial-host` within a run; concurrent runs remain unsupported. The `/tmp/vmcell-segid` lock files
+  would make a liveness-aware sweep possible and are the obvious future fix.
+- **Version ledger.** `PerVmResources` gains `segment` (`constructible_struct_adds_field`),
+  `NetConfig` gains a variant, `build_kernel_cmdline` and `sweep_orphans` change signature, `Netlink`
+  gains three methods, `HostEnv` gains `segids` (additive, `#[non_exhaustive]`). The review pass adds
+  no public surface: `SegmentIdAllocator`'s new clock is a private field (its derived `Debug` became
+  a manual one, since `Clock` is not `Debug`), `claim_member` is `pub(crate)`, and FC's
+  `build_fc_network_interface` is private. All belong to the pass's single 0.12 → 0.13 bump; this
+  change deliberately did not touch the version or the ledger comment.
+
+## v30 delta 9 — host-USB passthrough (design §18 delta 9 / §2.4 — FR-V5), as built + the review-fix pass
+
+The ninth `VmmCapabilities` field (`usb_host_passthrough`: QEMU `true`, CH / Firecracker / crosvm
+`false`, feature string == field name), `VmConfig::usb_host_devices: Vec<UsbHostDevice>` with both
+`build()` rejections, one shared refusal predicate (`vmcell::vmm::reject_usb_host_devices`) wired
+into all four `create()` paths, QEMU's `qemu-xhci` + `usb-host` argv, the committed `usbhost` kernel
+label its live leg boots, and the opt-in `just test-usb-passthrough` recipe.
+
+The adversarial review of the first landing found five defects; what follows is the as-shipped state
+after that fix pass, not a history. Three of them were structural and are the reason this section is
+long: the argv splice had **no gate at all**, the live leg's guest kernel **did not exist**, and the
+`true` was **presumed rather than measured**.
+
+### As built
+
+- **`vmcell` core.** `UsbHostDevice { vendor_id, product_id }` (`#[non_exhaustive]`, `Copy`),
+  `VmConfig::usb_host_devices` + `VmConfigBuilder::with_usb_host_device`, `build()` rejecting
+  `snapshotting`+USB (a passed-through device is not in the migration stream) and zero/duplicate ids,
+  and `vmm::reject_usb_host_devices(vmm, caps, devices)` — the one refusal law, beside
+  `reject_unsupported_console`. `restore()` is deliberately **not** wired: `build()` rejects
+  `snapshotting`+USB and every backend's `restore()` rejects a non-snapshotting config, so USB cannot
+  reach it.
+- **QEMU argv, two layers.** `build_qemu_usb_args` (pure, per-fragment: one
+  `-device qemu-xhci,id=vmcell-xhci` regardless of device count, one
+  `-device usb-host,vendorid=0x%04x,productid=0x%04x` per device, empty-in/empty-out) **and**
+  `build_qemu_command` — a new I/O-free composer holding the **whole** QEMU argv, which
+  `Qemu::spawn_qemu` now calls. `spawn_qemu` keeps the I/O (stale-socket cleanup, the
+  `vhost-device-vsock`/`virtiofsd` starts, and the smoltcp vhost-user-net readiness wait, hoisted out
+  of the `-chardev` branch it gates); `finish_qemu_spawn` keeps the launch tail (spawn → cgroup
+  register → QMP readiness → `SpawnedQemu`). Two small carriers make the split honest:
+  `QemuSpawnPaths` (the per-VM socket/log paths; virtio-fs daemons enter as *socket paths*, never as
+  live `Child` handles) and `SpawnedDaemons` (the helper daemons `finish_qemu_spawn` must reap).
+  A `fs_daemon_sockets`/`shares` length mismatch is a typed error rather than a `zip` truncation.
+- **A fail-loud host-device precheck.** `Qemu::create()` now calls `require_usb_host_devices`, which
+  resolves every requested `(vendor_id, product_id)` through `/sys/bus/usb/devices` to its
+  `/dev/bus/usb/BBB/DDD` node and proves that node opens **read-write**. Absent, ambiguous (two host
+  devices carrying the ids — every host's root hubs do) and unopenable are three named errors. Both
+  roots are parameters, so the resolution is unit-testable against a fixture tree.
+- **The `usbhost` guest kernel.** Committed `pins.json` gained `kernels.usbhost` (the 6.12.94 source,
+  `fragments: ["USBHOST"]`) and `kernel_fragments.USBHOST` — `CONFIG_USB_SUPPORT/USB/USB_PCI/
+  USB_XHCI_HCD/USB_XHCI_PCI/USB_ANNOUNCE_NEW_DEVICES` plus `HID`/`HID_GENERIC`/`USB_HID` as the one
+  class-smoke driver, and nothing else. It is built by the delta-3 toolkit path
+  (`vmcell build-kernels`, or `build_labelled_kernel("usbhost", …)`) to `vmlinux-usbhost`, which is
+  what the recipe tells the operator to point `VMCELL_KERNEL` at. Per G1 this is vmcell's **own**
+  capability-gate infrastructure (the IKCONFIG example-fragment shape) and carries **none** of the
+  consumer usbip/`vhci_hcd`/gadget/`dummy_hcd` closure FR-V5 withdrew — asserted, not just intended.
+- **Tests.** `crates/vmcell/tests/usb_passthrough.rs` (four-backend honesty pin; the KVM-free
+  `create()` refusal battery with the QEMU positive control; the pins/label gate; the absent-device
+  refusal; the `#[ignore]`d live leg) plus the in-crate QEMU gates listed below.
+
+### Deviations from the §18 sketch (behavior and gate bind; a shift is recorded, never silent)
+
+- **The sketch's "pure extracted args helper" was necessary but not sufficient, so the extraction
+  went one level up.** §18 asks for the fragment helper (the `build_crosvm_run_args` precedent). That
+  precedent works only because crosvm's helper **is** the whole argv; QEMU's fragment helper leaves a
+  `cmd.args(...)` seam, and that seam is where the defect lived (see the false premise below). The
+  full-argv `build_qemu_command` is the shipped shape; the fragment helper stays as the token-level
+  golden.
+- **A host-device precheck the design does not name.** §2.4 expects QEMU's own open error to surface;
+  it does not exist (below). The precheck is the honor-or-reject rule applied to an accepted input.
+- **The live leg is a plain QEMU-only `#[ignore]`d test, not a `vmm_matrix_test!`.**
+  `require_cap!` **panics** ("SKIP == PASS ERROR") when the *primary* backend lacks the capability,
+  and cloud-hypervisor is honest-`false` here — `usb_host_passthrough` is the first flag whose
+  primary-backend stance is `false`, so a matrix leg would hard-fail `usb_passthrough::
+  cloud_hypervisor` on every KVM host. **This is a recorded deviation from AGENTS.md's "skips go
+  through `require_cap!` only".**
+- **…and from it, an env-gated recorded skip.** `test-privileged` selects
+  `kind(test) & !(test(unprivileged) | test(smoltcp))` with `--run-ignored all`, so the live leg is
+  compiled and selected there. With `VMCELL_TEST_USB_DEVICE` unset it records
+  `SKIP qemu usb_host_passthrough_no_designated_device` through the same `record_capability_skip`
+  recorder `require_cap!` uses (so it lands in `$VMCELL_SKIP_MANIFEST` for the mandatory review); a
+  **set but malformed** value is a hard panic naming the variable. The airtight alternative — adding
+  `| test(usb_passthrough)` to `test-privileged`'s filter — is left to the orchestrator, since the
+  recipe text is quoted verbatim from the gates doc.
+- **A zero-id rejection the design does not name.** QEMU's `usb-host` treats a `0` `vendorid`/
+  `productid` as *unset* (match-any), so `vendorid=0x0000` would attach an **arbitrary** host device.
+  Rejected at construction, documented at both the type and the check.
+- **Argv slot: the LATE edge of §2.4's window.** The design says "after the extra-disk block, before
+  `-kernel`"; the virtio-fs and net blocks sit inside that window. USB goes immediately before
+  `-kernel` so the PCI enumeration order of every pre-existing device is untouched (`/dev/vd*` and
+  the NIC cannot shift). Migration congruence does not constrain the slot — `build()` rejects
+  `snapshotting`+USB.
+- **Naming.** The pins fragment is `USBHOST` (the registry's uppercase convention, beside
+  `KASAN`/`KCOV`/`LOCKDEP`/`SLUB_DEBUG`); the `kernels` label is `usbhost`, which is what produces the
+  design's `vmlinux-usbhost`.
+- **`vmcell build-kernels` now builds a third kernel.** The `usbhost` label lives in the committed
+  registry, so the roster command that builds "every kernel in the registry" includes it. That is the
+  price of "the label alone determines the build" (§5.5) and of the gate being runnable at all.
+- **Cross-delta touch (flagged for merge).** `crates/vmcell/tests/kernel_toolkit.rs` (delta 3) pinned
+  the committed roster as exactly `["6.12.94", "6.6.143"]` and asserted *every* committed entry
+  declares no fragments. Both are stale the moment delta 9's entry lands; they were updated minimally
+  — the roster gained `"usbhost"`, and the no-`fragments`-key promise is now asserted over the two
+  entries that carry no `fragments` key, which keeps the migration promise it was written for.
+- **`UsbHostDevice` is `vmcell::config::UsbHostDevice`, not root-re-exported** (unlike `BlockDevice`).
+  A one-line follow-up left to the orchestrator's public-surface pass.
+
+### Empirically-false premises found in this pass (each now pinned by a gate)
+
+- **"A pure fragment helper makes the QEMU device argv goldenable" (§18 delta 9) is false as a
+  *gate*.** Evidence: replacing `cmd.args(build_qemu_usb_args(&cfg.usb_host_devices))` with
+  `let _unused = build_qemu_usb_args(&cfg.usb_host_devices);` left `cargo test -p vmcell-qemu`
+  (17 passed, including the token golden **and** the capability-vs-argv test) and
+  `-p vmcell --test usb_passthrough` fully green: QEMU advertised host-USB passthrough while emitting
+  **no USB argv at all**. Nothing in the suite could distinguish "advertises and attaches" from
+  "advertises and silently drops", because QEMU's argv was observable only by spawning. **Fix:**
+  `build_qemu_command` composes the entire argv without I/O, and the gates assert over
+  `cmd.as_std().get_args()`. Re-injecting the same deletion after the fix reddens
+  `qemu_full_argv_splices_the_usb_fragment` *and* `qemu_usb_capability_matches_the_emitted_argv`
+  (observed, then reverted).
+- **"An absent/unopenable host device surfaces QEMU's own fail-loud open error" (§2.4) is false.**
+  Measured on QEMU 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2), 2026-08-11: launching
+  `qemu-system-x86_64 -M q35 -m 128 -nodefaults -display none -S -sandbox on,obsolete=deny,
+  elevateprivileges=deny,spawn=deny,resourcecontrol=deny -device qemu-xhci,id=vmcell-xhci -device
+  usb-host,vendorid=0xdead,productid=0xbeef -qmp stdio` reaches QMP `prelaunch`, prints **nothing**,
+  and exits 0 on `quit`. The same is true for a device that is present but whose node this user
+  cannot open (`27c6:609c`, node `0664 root:root`). So the capability degrades **silently** into an
+  empty xhci bus — the exact failure mode a capability flag exists to prevent. **Fix:**
+  `require_usb_host_devices` in `create()`; gates `usb_device_node_resolution_is_fail_loud` (unit,
+  fixture tree) and `qemu_refuses_a_usb_device_absent_from_the_host` (integration, real `create()`).
+- **"The `-sandbox …` Enforcing filter may not tolerate usbfs" (§2.4, stated as an open question) —
+  answered NO conflict.** The launch above carries vmcell's own `QEMU_SANDBOX_SPEC` verbatim and
+  realizes both USB devices, so **no sandbox downgrade is owed**. Recorded so the question is not
+  re-opened as speculation.
+- **"A QEMU built without libusb would report `true` and drop the device" — the failure is loud, not
+  silent.** `-device usb-host-nonexistent,…` exits 1 with
+  `'usb-host-nonexistent' is not a valid device model name`; a libusb-less build has no `usb-host`
+  model and dies the same way at spawn. Measured the same session. This is why the flag stays a
+  static `true` rather than a per-binary probe.
+- **"The empirical questions are answered *before* the flag ships `true`" (§18) is unsatisfiable as
+  written.** With the flag `false`, `create()` refuses every USB config through the shared predicate,
+  so the live leg cannot run — the ordering is circular. Resolved by validating out-of-band against
+  the real binary (the three runs above) and by making the one remaining unknown loud rather than
+  presumed. What the `true` now rests on is written at the flag itself, evidence and date included.
+- **The live gate was un-runnable, not merely un-run.** `just test-usb-passthrough` pointed
+  `VMCELL_KERNEL` at a `vmlinux-usbhost` build that no pins entry could produce (`kernel_fragments`
+  held only KASAN/KCOV/LOCKDEP/SLUB_DEBUG; `kernels` only the two versions), so the live leg would
+  have died at its own `NOBUS` guard on every host. That is why the argv defect above had no
+  backstop. **Fix:** the committed label + fragment, gated by
+  `usbhost_kernel_label_and_fragment_are_pinned`.
+- **usbfs permissions, measured:** `/dev/bus/usb/*/*` on this host are `0664 root:root`; as the
+  unprivileged test user a read-only open succeeds and a read-write open fails `EACCES`. QEMU needs
+  read-write to claim a device, so an unprivileged run genuinely cannot pass one through — which the
+  precheck now says out loud, naming the node, instead of booting a guest with an empty bus.
+
+### Gates
+
+| What it pins | Gate | Proven red by |
+| --- | --- | --- |
+| The USB fragment actually **reaches the `Command`**, contiguously, inside §2.4's window, and adds nothing else | `vmcell-qemu tests::qemu_full_argv_splices_the_usb_fragment` | deleting the `cmd.args(build_qemu_usb_args(...))` splice → **RED** (was green before this pass) |
+| The advertised capability matches the **composed** argv | `vmcell-qemu tests::qemu_usb_capability_matches_the_emitted_argv` | the same deletion → **RED**; flipping the flag → RED |
+| Token-level argv rendering (one controller, `0x%04x` ids, call order, empty-in/empty-out) | `vmcell-qemu tests::qemu_usb_args_golden` | per-device controller; `{:x}`/decimal ids |
+| An absent / ambiguous / unopenable host device is refused, with the present-unique device as the positive control | `vmcell-qemu tests::usb_device_node_resolution_is_fail_loud` | returning `Ok` on no match; taking the first of several matches; skipping the read-write open |
+| …and that the refusal is **wired into `create()`** | `vmcell::usb_passthrough qemu_refuses_a_usb_device_absent_from_the_host` | neutralizing the `require_usb_host_devices` call in `Qemu::create()` → **RED** |
+| The live leg's guest kernel is buildable from the committed pins, produces `vmlinux-usbhost`, carries xhci/USB-core/one class driver, and carries **no** consumer usbip/gadget closure (G1) | `vmcell::usb_passthrough usbhost_kernel_label_and_fragment_are_pinned` | dropping the entry's `fragments` key → **RED** (`left: []`) |
+| The ninth capability flag across all four backends | `vmcell::usb_passthrough capability_honesty_usb_host_passthrough` | flipping any backend's literal |
+| Non-QEMU `create()` refuses typed, feature string == field name, with QEMU as the positive control | `vmcell::usb_passthrough incapable_backends_refuse_a_usb_config_at_create` | dropping a backend's `reject_usb_host_devices` call; renaming the feature string |
+| The refusal predicate refuses only incapable backends **with** devices | `vmcell vmm::tests::reject_usb_host_devices_refuses_only_incapable_backends_with_devices` | keying on the flag alone |
+| Both `build()` rejections (`snapshotting`+USB; zero/duplicate ids) with the accept-valid control | `vmcell config::tests::reject_usb_host_device_with_snapshot`, `reject_bad_usb_host_device`, `accept_valid_usb_host_devices` | disabling either arm |
+| The `spawn_qemu` split changed no launch behavior | live: `boot::qemu`, `shares_ro_rw::qemu`, `extra_block::qemu`, `qemu_in_kernel_vsock_boot_and_exec`, `lifecycle_unprivileged_smoltcp::qemu` (the hoisted readiness wait), `snapshot_restore::qemu`, `zygote_fan_out::qemu`, `session_multiplexed_exec::qemu` — all green on this KVM host | — |
+| In-guest enumeration of a designated device | `just test-usb-passthrough` (opt-in; `VMCELL_TEST_USB_DEVICE=<vid>:<pid>` + `VMCELL_KERNEL=<…>/vmlinux-usbhost`) | **not run: this host has no designated, disposable USB device** |
+
+### Residual, deliberately recorded
+
+- **In-guest enumeration is still unproven.** The flag's `true` covers a validated host-side
+  mechanism plus a fail-loud precheck; the guest half waits for a host with a disposable device. The
+  live leg is written and selected — it records a capability skip rather than passing quietly.
+- **The precheck runs in the vmcell process, not in the jailed child.** They share uid and, with
+  `clear_ambient_caps: false` (the default, Appendix A reversal 9), ambient capabilities. A jail that
+  cleared them could still leave the child unable to open a node this process opened, and QEMU's
+  silence would again be the only signal. Stated at the function; it is the standing argument against
+  flipping that default without fd-passing.
+- **Version ledger.** `VmmCapabilities` gains a field → `constructible_struct_adds_field`, a breaking
+  change to an externally-constructible exhaustive struct; it belongs in the pass's single
+  0.12 → 0.13 bump. `VmConfig`/`VmConfigBuilder` are `#[non_exhaustive]`, so the config half is
+  purely additive — do not conflate them.

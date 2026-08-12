@@ -187,13 +187,19 @@ pub enum BrokerRequest {
         /// The resource prefix.
         prefix: String,
     },
-    /// Reclaim leaked netns/cgroup/scratch for `prefix`, sparing every id in `live_vmids` (the
-    /// start-up orphan sweep, §11.4, The VM registry and the start-up sweep).
+    /// Reclaim leaked netns/segment-netns/cgroup/scratch for `prefix`, sparing every id in
+    /// `live_vmids` / `live_segids` (the start-up orphan sweep, §11.4, The VM registry and the
+    /// start-up sweep).
     Sweep {
         /// The resource prefix whose leaks to reclaim.
         prefix: String,
-        /// The live ids to spare (never swept).
+        /// The live **vmids** to spare (never swept): the `-net-`/`-vm-` classes.
         live_vmids: Vec<u32>,
+        /// The live **segids** to spare (never swept): the `-seg-` class (§6.5). Its own id
+        /// space — checking it against `live_vmids` fails open. A plain `Vec<u32>` with no serde
+        /// presence attribute, so the postcard channel round-trips it faithfully (Appendix A
+        /// reversal 10 does not apply); parent and broker child still ship together.
+        live_segids: Vec<u32>,
     },
     /// Graceful shutdown of the broker serve loop.
     Shutdown,
@@ -220,8 +226,10 @@ pub enum BrokerReply {
     },
     /// A sweep completed; the reclaimed resource names/paths.
     SweepDone {
-        /// Reclaimed netns names.
+        /// Reclaimed per-VM netns names.
         netns: Vec<String>,
+        /// Reclaimed segment netns names (§6.5).
+        segment_netns: Vec<String>,
         /// Reclaimed cgroup slice names.
         cgroup_slices: Vec<String>,
         /// Reclaimed scratch-dir paths (as strings).
@@ -438,18 +446,25 @@ impl<B: BrokerBackend> BrokerServer<B> {
                     BrokerReply::Error(errs.join("; "))
                 }
             }
-            BrokerRequest::Sweep { prefix, live_vmids } => {
+            BrokerRequest::Sweep {
+                prefix,
+                live_vmids,
+                live_segids,
+            } => {
                 let scanner = self.backend.new_scanner(&prefix);
                 let netlink = self.backend.new_netlink();
                 let live: BTreeSet<u32> = live_vmids.into_iter().collect();
+                let live_segs: BTreeSet<u32> = live_segids.into_iter().collect();
                 let report = sweep_orphans(
                     scanner.as_ref(),
                     netlink.as_ref(),
                     self.backend.cgroups(),
                     &live,
+                    &live_segs,
                 );
                 BrokerReply::SweepDone {
                     netns: report.netns,
+                    segment_netns: report.segment_netns,
                     cgroup_slices: report.cgroup_slices,
                     scratch_dirs: report
                         .scratch_dirs

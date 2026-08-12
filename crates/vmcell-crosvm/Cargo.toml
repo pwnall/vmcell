@@ -17,7 +17,7 @@ publish = false
 # side socket), so — like QEMU — this crate needs NO serde/JSON: the crosvm control-socket protocol
 # is unstable binary and must never be hand-rolled.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.12.0", default-features = false, features = ["host-common"] }
+vmcell = { path = "../vmcell", version = "0.13.0", default-features = false, features = ["host-common"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
 nix = { version = "0.31", features = ["signal", "process"] }
 tracing = "0.1"

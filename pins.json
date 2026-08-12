@@ -12,6 +12,11 @@
     "6.12.94": {
       "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.94.tar.xz",
       "source_sha256": "e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2"
+    },
+    "usbhost": {
+      "source_url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.94.tar.xz",
+      "source_sha256": "e998a232b9418db3301cb58468e291a4f41d6ab8306029b30d991f56251dc8d2",
+      "fragments": ["USBHOST"]
     }
   },
   "kernel_prebuilt": {
@@ -28,6 +33,7 @@
     "KASAN": "CONFIG_KASAN=y\nCONFIG_KASAN_GENERIC=y\nCONFIG_KASAN_INLINE=y\nCONFIG_KASAN_VMALLOC=y\n",
     "KCOV": "CONFIG_KCOV=y\nCONFIG_KCOV_INSTRUMENT_ALL=y\n",
     "LOCKDEP": "CONFIG_PROVE_LOCKING=y\nCONFIG_LOCKDEP=y\nCONFIG_DEBUG_LOCK_ALLOC=y\n",
-    "SLUB_DEBUG": "CONFIG_SLUB_DEBUG=y\nCONFIG_SLUB_DEBUG_ON=y\n"
+    "SLUB_DEBUG": "CONFIG_SLUB_DEBUG=y\nCONFIG_SLUB_DEBUG_ON=y\n",
+    "USBHOST": "CONFIG_USB_SUPPORT=y\nCONFIG_USB=y\nCONFIG_USB_PCI=y\nCONFIG_USB_XHCI_HCD=y\nCONFIG_USB_XHCI_PCI=y\nCONFIG_USB_ANNOUNCE_NEW_DEVICES=y\nCONFIG_HID=y\nCONFIG_HID_GENERIC=y\nCONFIG_USB_HID=y\n"
   }
 }

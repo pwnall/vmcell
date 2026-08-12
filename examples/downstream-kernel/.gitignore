@@ -1,0 +1,4 @@
+# This is its own cargo workspace, so it has its own build directory — the repository root's
+# `/target` rule is anchored and does not reach it. `Cargo.lock` IS committed: every leg builds
+# `--locked`, the way a git-dep consumer's CI does.
+/target

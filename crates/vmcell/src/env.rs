@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use crate::metrics::{CgroupFs, DefaultCgroupFs};
-use crate::orchestrator::{Clock, RealClock, VmidAllocator};
+use crate::orchestrator::{Clock, RealClock, SegmentIdAllocator, VmidAllocator};
 use crate::overlay::{OverlayStore, ReflinkOverlayStore};
 use crate::vmm::CidAllocator;
 
@@ -47,6 +47,10 @@ pub struct HostEnv {
     pub cids: Arc<CidAllocator>,
     /// The VMID allocator (`1..=254`; `shared()` for cross-process uniqueness, `new()` hermetic).
     pub vmids: VmidAllocator,
+    /// The segment-id allocator (`1..=254`, §6.5 VM-to-VM segments) — its **own** id space, over
+    /// the same cross-process claim law as `vmids` (an additive field: this bundle grows by field,
+    /// never by a new positional argument).
+    pub segids: SegmentIdAllocator,
     /// The cgroup-v2 backend every VM's slice is created/limited/read through.
     pub cgroups: Arc<dyn CgroupFs>,
     /// The clock that drives the mandatory first post-restore resync (§8.2, Restore correctness: a
@@ -66,6 +70,7 @@ impl std::fmt::Debug for HostEnv {
         f.debug_struct("HostEnv")
             .field("cids", &self.cids)
             .field("vmids", &self.vmids)
+            .field("segids", &self.segids)
             .field("cgroups", &self.cgroups)
             .field("overlay", &self.overlay)
             .finish_non_exhaustive()
@@ -86,6 +91,7 @@ impl HostEnv {
         Ok(Self {
             cids: Arc::new(CidAllocator::new()),
             vmids: VmidAllocator::shared(),
+            segids: SegmentIdAllocator::shared(),
             cgroups: Arc::new(DefaultCgroupFs),
             clock: Arc::new(RealClock),
             overlay: Arc::new(ReflinkOverlayStore),
@@ -101,6 +107,7 @@ impl HostEnv {
         Self {
             cids: Arc::new(CidAllocator::new()),
             vmids: VmidAllocator::new(),
+            segids: SegmentIdAllocator::new(),
             cgroups: Arc::new(DefaultCgroupFs),
             clock: Arc::new(RealClock),
             overlay: Arc::new(ReflinkOverlayStore),

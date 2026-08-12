@@ -174,15 +174,31 @@ fn artifacts_stamp_fresh(stamp: Option<&str>, fingerprint: &str, rootfs_exists: 
 /// here re-packs the rootfs. Reuses the pipeline's own closure/file hashers ("use our hashing").
 #[cfg(feature = "pipeline")]
 fn fast_artifacts_fingerprint(_dir: &Path) -> crate::error::Result<String> {
+    fast_artifacts_fingerprint_with(pins_overlay_path().as_deref())
+}
+
+/// The body of [`fast_artifacts_fingerprint`] with the pins overlay passed in rather than read from
+/// the process environment — the [`resolve_artifacts_dir`] precedent, so the "an overlay edit must
+/// move this fingerprint" contract is unit-testable with no `std::env` mutation and therefore no
+/// cross-test env-var race.
+#[cfg(feature = "pipeline")]
+fn fast_artifacts_fingerprint_with(overlay_file: Option<&Path>) -> crate::error::Result<String> {
     let ws = workspace_root();
     let mut h = blake3::Hasher::new();
-    h.update(b"vmcell-test-artifacts-fingerprint-v1\0");
+    // v1 → v2 with the pins overlay (§18 delta 1): the pins half of this fold changed shape, so
+    // every existing `.build.stamp` must invalidate rather than read as fresh under the new rules.
+    h.update(b"vmcell-test-artifacts-fingerprint-v2\0");
     h.update(guest_agent_closure_hash(&ws)?.as_bytes());
     h.update(b"\0");
     h.update(guest_tools_closure_hash(&ws)?.as_bytes());
     h.update(b"\0");
-    let pins = std::fs::read(ws.join("pins.json")).map_err(crate::error::Error::Io)?;
-    h.update(&pins);
+    // The one pins fold (embedded baseline + the `$VMCELL_PINS` overlay), shared with
+    // `ResolvePinsStage::cache_key` (§10.2, The stage model and the five cache-key rules). Without
+    // the overlay here an overlay edit leaves this stamp matching, `ensure_test_artifacts`
+    // short-circuits the whole pipeline, and `$VMCELL_PINS` is silently ignored in a warm workspace
+    // — the accept-then-ignore class the overlay exists to kill. Unlike the cache key, this fold
+    // may fail: a referenced-but-unreadable overlay is a hard error naming the path.
+    fold_pins_identity(&mut h, overlay_file)?;
     h.update(b"\0");
     #[cfg(feature = "proxy")]
     {
@@ -214,7 +230,9 @@ fn fast_artifacts_fingerprint(_dir: &Path) -> crate::error::Result<String> {
 #[cfg(feature = "pipeline")]
 fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
     let dir = dir.to_path_buf();
-    let ws = workspace_root();
+    // The pins baseline is embedded (`COMMITTED_PINS`), so this bootstrap no longer hunts the
+    // workspace for `pins.json`; only the optional `$VMCELL_PINS` overlay is a path (§10.2).
+    let overlay_file = pins_overlay_path();
     let joined = std::thread::scope(|s| {
         s.spawn(move || -> crate::error::Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -223,14 +241,13 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
                 .map_err(crate::error::Error::Io)?;
             rt.block_on(async move {
                 Pipeline::new(dir.clone())
-                    .add_stage(Box::new(ResolvePinsStage {
-                        pins_file: ws.join("pins.json"),
-                    }))
+                    .add_stage(Box::new(ResolvePinsStage { overlay_file }))
                     .add_stage(Box::new(crate::artifact::guest_agent::GuestAgentStage {}))
                     .add_stage(Box::new(crate::artifact::guest_tools::GuestToolsStage {}))
                     .add_stage(Box::new(crate::artifact::rootfs::RootfsStage {
                         image_override: None,
                         agent_musl: None,
+                        extra: Vec::new(),
                     }))
                     .build(&Cache::default())
                     .await
@@ -532,110 +549,611 @@ pub fn hash_artifacts_sorted(
     }
 }
 
-/// Parses the resolved-pins JSON document into a flat map of pin keys.
+/// vmcell's own committed `pins.json`, embedded at compile time — the **baseline** every pins
+/// resolution starts from (§10.2, The stage model and the five cache-key rules).
 ///
-/// Extracted as a pure helper so the pin extraction (including the
-/// `debian_snapshot_timestamp` the mmdebstrap source depends on) is unit-testable.
+/// Embedded rather than read from disk so a git-dep consumer workspace needs no fragile filesystem
+/// hunt for the vmcell checkout; inside the vmcell workspace the embedded copy and the on-disk file
+/// are the same committed bytes by construction, and `include_str!` registers a rebuild dependency
+/// so editing `pins.json` recompiles this crate and moves every derived cache key with it. This is
+/// the **one** baseline source: keeping a caller-supplied `pins_file` path alongside it would be two
+/// sources of truth with no stated precedence (§18 delta 1 retired that field).
+///
+/// Reaching outside the crate directory is safe here because `vmcell` is `publish = false` and a
+/// git-dep consumer checks out the whole repository; it would break `cargo package`/`cargo vendor`
+/// of this crate directory alone.
+const COMMITTED_PINS: &str = include_str!("../../../../pins.json");
+
+/// Unambiguous field separator for the pins folds, so distinct (baseline, overlay, …) splits
+/// cannot concatenate to the same byte stream (non-injective-hash defense).
+const PINS_FOLD_SEP: &[u8] = b"\x1f";
+
+/// Folds the **pins identity** — the embedded baseline plus the optional overlay — into `h`.
+///
+/// The one fold law for pins (AGENTS.md "one law, one predicate"): [`ResolvePinsStage::cache_key`]
+/// and [`fast_artifacts_fingerprint`] both route through it, so an overlay edit cannot move one and
+/// leave the other stale. Without it in the *fingerprint*, `ensure_test_artifacts` short-circuits on
+/// a matching `.build.stamp` and `$VMCELL_PINS` is silently ignored in a warm workspace.
+///
+/// The three overlay states fold under mutually exclusive prefixes — absent, content, unreadable —
+/// so an empty overlay file can never alias "no overlay" and a read error can never alias either
+/// (`unwrap_or_default()` collapses all three, ART-11). The read happens before any content prefix
+/// is folded, so an error leaves a well-defined prefix for the caller to complete.
 ///
 /// # Errors
-/// Returns [`crate::error::Error::Artifact`] if `content` is not valid JSON. A
-/// tampered/garbled `pins.json` must fail loud here — the old code swallowed the
-/// parse error and degraded to an empty map, which only surfaced later as a
-/// misleading "Missing X pin" far from the real cause (A8 — verify what you ingest).
-fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, String>> {
-    let json = serde_json::from_str::<serde_json::Value>(content)
-        .map_err(|e| crate::error::Error::Artifact(format!("malformed pins JSON: {e}")))?;
+/// Returns [`crate::error::Error::Artifact`] naming the overlay path when it cannot be read.
+fn fold_pins_identity(h: &mut blake3::Hasher, overlay_file: Option<&Path>) -> Result<()> {
+    // The baseline is a compile-time constant, so folding it is not a no-op: editing `pins.json`
+    // recompiles this crate (the `include_str!` rebuild dependency) and these bytes move with it.
+    h.update(COMMITTED_PINS.as_bytes());
+    h.update(PINS_FOLD_SEP);
+    match overlay_file {
+        None => {
+            h.update(b"pins-overlay-absent");
+        }
+        Some(path) => {
+            let content = read_pins_overlay(path)?;
+            h.update(b"pins-overlay-content");
+            h.update(PINS_FOLD_SEP);
+            h.update(content.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// The pins **overlay** path from the environment: `$VMCELL_PINS`, else `None`.
+///
+/// The single resolver for the `VMCELL_PINS` half of the `VMCELL_*` env contract (§10.4, The
+/// downstream toolkit contract), so the CLI, the workspace test bootstrap, and the toolkit build
+/// entry points all read the same variable. An empty value is *not* treated as unset: it is passed
+/// through as a path and fails loud on read, because silently ignoring `VMCELL_PINS=$UNSET_VAR`
+/// would be exactly the accept-then-ignore class the overlay exists to kill.
+#[must_use]
+pub fn pins_overlay_path() -> Option<PathBuf> {
+    std::env::var_os("VMCELL_PINS").map(PathBuf::from)
+}
+
+/// The known top-level pins namespaces, for the overlay rejection message only.
+///
+/// **Not** the accept-list: [`flatten_pins_namespace`] is the single authority on what a namespace
+/// is (one law, one predicate — an accept-list beside a flatten-list is the duplicate that always
+/// diverges). A unit test pins every entry here against that authority.
+const KNOWN_PINS_NAMESPACES: [&str; 9] = [
+    "kernel",
+    "kernel_prebuilt",
+    "kernels",
+    "kernel_fragments",
+    "rootfs",
+    "builder_base",
+    "cloud_hypervisor",
+    "virtiofsd",
+    "debian_snapshot_timestamp",
+];
+
+/// The JSON shape a top-level pins namespace's value must have.
+///
+/// Declared by the [`flatten_pins_namespace`] arm that consumes it — never a second table beside the
+/// dispatch — so the overlay's shape check and the flattening read the same law. A namespace whose
+/// value has the wrong shape flattens to *nothing*, which is why the overlay parser rejects the
+/// mismatch instead of accepting a document that resolves to the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinsNamespaceShape {
+    /// A JSON object of sub-keys (`kernel`, `kernels`, `kernel_fragments`, `rootfs`, …).
+    Object,
+    /// A bare JSON string (`cloud_hypervisor`, `virtiofsd`, `debian_snapshot_timestamp`).
+    Scalar,
+}
+
+impl PinsNamespaceShape {
+    /// Whether `value` has this shape.
+    fn matches(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::Object => value.is_object(),
+            Self::Scalar => value.is_string(),
+        }
+    }
+
+    /// How the shape reads in a rejection message.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Object => "a JSON object of sub-keys",
+            Self::Scalar => "a JSON string",
+        }
+    }
+}
+
+/// Flattens one top-level pins namespace into `out`, returning that namespace's declared **shape**
+/// — or `None` when `name` is not a pins namespace at all.
+///
+/// This one `match` is the pin schema: [`flatten_pins_document`] drives the baseline flattening
+/// from it and [`pins_namespace_shape`] answers the overlay parser's two strictness questions (is
+/// this a namespace? does its value have that namespace's shape?) with the very same dispatch, so
+/// the three can never drift.
+///
+/// Sub-keys stay permissive by design (§10.2): a typo'd `kernel.source_ur1` is ignored here and is
+/// caught downstream by the referenced-but-absent hard errors (`Missing kernel_source_url pin`,
+/// `missing kernel fragment ...`). The strictness the overlay adds is scoped to the **top level**,
+/// where a typo — in the key *or* in the value's shape — would otherwise silently resolve the whole
+/// namespace from the baseline.
+fn flatten_pins_namespace(
+    name: &str,
+    value: &serde_json::Value,
+    out: &mut std::collections::HashMap<String, String>,
+) -> Option<PinsNamespaceShape> {
+    match name {
+        "kernel" => {
+            if let Some(sha) = value.get("source_sha256").and_then(|v| v.as_str()) {
+                out.insert("kernel_source_sha256".to_string(), sha.to_string());
+            }
+            if let Some(url) = value.get("source_url").and_then(|v| v.as_str()) {
+                out.insert("kernel_source_url".to_string(), url.to_string());
+            }
+            if let Some(cfg) = value.get("microvm_config").and_then(|v| v.as_str()) {
+                out.insert("kernel_microvm_config".to_string(), cfg.to_string());
+            }
+            Some(PinsNamespaceShape::Object)
+        }
+        // The prebuilt-kernel bootstrap pin (§5.4, The guest-kernel contract and the bootstrap
+        // seed): a digest-pinned `vmlinux` the in-`vmcell` `PrebuiltKernelBuilder` downloads and
+        // SHA-verifies as the bootstrap seed (the seed the in-VM `vmcell-kernel-builder` boots its
+        // builder VM on). Emitted only when present; absent → the prebuilt bootstrap fails loud and
+        // host-make is the guaranteed fallback seed.
+        "kernel_prebuilt" => {
+            if let Some(url) = value.get("url").and_then(|v| v.as_str()) {
+                out.insert("kernel_prebuilt_url".to_string(), url.to_string());
+            }
+            if let Some(sha) = value.get("sha256").and_then(|v| v.as_str()) {
+                out.insert("kernel_prebuilt_sha256".to_string(), sha.to_string());
+            }
+            // Optional archive extraction: many prebuilt `vmlinux` binaries (e.g. the validated
+            // Kata Containers kernel, §5.4, The guest-kernel contract and the bootstrap seed) ship
+            // *inside* a compressed tar. When `archive_member` is set, the download is a
+            // `.tar.zst`/`.tar` archive verified against `archive_sha256`; the named member is
+            // extracted and re-verified against `sha256`. Both digests fold into the cache key so
+            // re-pointing either invalidates the artifact.
+            if let Some(m) = value.get("archive_member").and_then(|v| v.as_str()) {
+                out.insert("kernel_prebuilt_archive_member".to_string(), m.to_string());
+            }
+            if let Some(s) = value.get("archive_sha256").and_then(|v| v.as_str()) {
+                out.insert("kernel_prebuilt_archive_sha256".to_string(), s.to_string());
+            }
+            Some(PinsNamespaceShape::Object)
+        }
+        // The multi-kernel registry: each `kernels.<label>` → keyed pins
+        // (`kernel_<label>_source_url` / `_source_sha256`), so a labelled `KernelStage` can build
+        // `vmlinux-<label>` — the kernel-version benchmark dimension. They share the default
+        // `kernel`'s `microvm_config`. New labels within the namespace are legal in an overlay.
+        "kernels" => {
+            if let Some(kernels) = value.as_object() {
+                for (label, spec) in kernels {
+                    if let Some(url) = spec.get("source_url").and_then(|v| v.as_str()) {
+                        out.insert(format!("kernel_{label}_source_url"), url.to_string());
+                    }
+                    if let Some(sha) = spec.get("source_sha256").and_then(|v| v.as_str()) {
+                        out.insert(format!("kernel_{label}_source_sha256"), sha.to_string());
+                    }
+                }
+            }
+            Some(PinsNamespaceShape::Object)
+        }
+        // The kernel config-fragment registry (§5.2, The config fragment): each
+        // `kernel_fragments.<NAME>` → a `kernel_fragments_<NAME>` pin holding that fragment's
+        // KConfig text, which a `KernelStage` with `fragments = [NAME, ...]` layers onto the base
+        // config (content-addressed, so editing a fragment's text invalidates the cache).
+        "kernel_fragments" => {
+            if let Some(fragments) = value.as_object() {
+                for (fragment, cfg) in fragments {
+                    if let Some(text) = cfg.as_str() {
+                        out.insert(format!("kernel_fragments_{fragment}"), text.to_string());
+                    }
+                }
+            }
+            Some(PinsNamespaceShape::Object)
+        }
+        "rootfs" => {
+            if let Some(img) = value.get("image").and_then(|v| v.as_str()) {
+                out.insert("rootfs_image".to_string(), img.to_string());
+            }
+            if let Some(dig) = value.get("digest").and_then(|v| v.as_str()) {
+                out.insert("rootfs_digest".to_string(), dig.to_string());
+            }
+            Some(PinsNamespaceShape::Object)
+        }
+        // The builder-base override pair `resolve_builder_base` prefers over `rootfs_*`
+        // (`artifact::rootfs::resolve_builder_base`). It was consumed but had no producer, so a
+        // legitimate downstream override of the in-VM builder base had no way in and — worse — the
+        // overlay's strict parser would have rejected the key. Both halves or neither: the
+        // half-specified case is `resolve_builder_base`'s existing hard error.
+        "builder_base" => {
+            if let Some(img) = value.get("image").and_then(|v| v.as_str()) {
+                out.insert("builder_base_image".to_string(), img.to_string());
+            }
+            if let Some(dig) = value.get("digest").and_then(|v| v.as_str()) {
+                out.insert("builder_base_digest".to_string(), dig.to_string());
+            }
+            Some(PinsNamespaceShape::Object)
+        }
+        // The CH/virtiofsd build identity for the snapshot pool (§10.2, The stage model and the
+        // five cache-key rules / M-ART-7): a snapshot is only valid for the exact CH build that
+        // produced it, so the snapshot stage folds the `cloud_hypervisor` pin into its cache key.
+        "cloud_hypervisor" | "virtiofsd" => {
+            if let Some(v) = value.as_str() {
+                out.insert(name.to_string(), v.to_string());
+            }
+            Some(PinsNamespaceShape::Scalar)
+        }
+        // The snapshot.debian.org timestamp the mmdebstrap source requires.
+        "debian_snapshot_timestamp" => {
+            if let Some(ts) = value.as_str() {
+                out.insert("debian_snapshot_timestamp".to_string(), ts.to_string());
+            }
+            Some(PinsNamespaceShape::Scalar)
+        }
+        _ => None,
+    }
+}
+
+/// The declared shape of the pins namespace `name`, or `None` when it is not a namespace.
+///
+/// Answered by running [`flatten_pins_namespace`]'s own dispatch against a JSON `null` (which
+/// matches no leaf probe, so nothing is emitted and the discard map stays empty): the overlay's
+/// accept-list and its shape table **are** the flatten dispatch, never a second copy of it.
+fn pins_namespace_shape(name: &str) -> Option<PinsNamespaceShape> {
+    let mut discard = std::collections::HashMap::new();
+    flatten_pins_namespace(name, &serde_json::Value::Null, &mut discard)
+}
+
+/// Flattens a whole pins document into the flat map every stage reads.
+///
+/// The **baseline** keeps its ignore-unknown semantics on purpose (§10.2): `pins.json` is
+/// vmcell-committed, not caller input. Only the overlay is strict — see [`parse_pins_overlay`].
+fn flatten_pins_document(json: &serde_json::Value) -> std::collections::HashMap<String, String> {
     let mut pins_map = std::collections::HashMap::new();
-    if let Some(k) = json.get("kernel") {
-        if let Some(sha) = k.get("source_sha256").and_then(|v| v.as_str()) {
-            pins_map.insert("kernel_source_sha256".to_string(), sha.to_string());
-        }
-        if let Some(url) = k.get("source_url").and_then(|v| v.as_str()) {
-            pins_map.insert("kernel_source_url".to_string(), url.to_string());
-        }
-        if let Some(cfg) = k.get("microvm_config").and_then(|v| v.as_str()) {
-            pins_map.insert("kernel_microvm_config".to_string(), cfg.to_string());
+    if let Some(obj) = json.as_object() {
+        for (name, value) in obj {
+            // The shape answer is deliberately discarded here: an unrecognized top-level key in
+            // the committed baseline is ignored, exactly as before the overlay landed.
+            let _shape = flatten_pins_namespace(name, value, &mut pins_map);
         }
     }
-    // Flatten the prebuilt-kernel bootstrap pin (§5.4, The guest-kernel contract and the bootstrap seed): a digest-pinned `vmlinux` the
-    // in-`vmcell` `PrebuiltKernelBuilder` downloads and SHA-verifies as the bootstrap
-    // seed (the seed the in-VM `vmcell-kernel-builder` boots its builder VM on). Emitted
-    // only when present; absent → the prebuilt bootstrap fails loud and host-make is the
-    // guaranteed fallback seed.
-    if let Some(p) = json.get("kernel_prebuilt") {
-        if let Some(url) = p.get("url").and_then(|v| v.as_str()) {
-            pins_map.insert("kernel_prebuilt_url".to_string(), url.to_string());
-        }
-        if let Some(sha) = p.get("sha256").and_then(|v| v.as_str()) {
-            pins_map.insert("kernel_prebuilt_sha256".to_string(), sha.to_string());
-        }
-        // Optional archive extraction: many prebuilt `vmlinux` binaries (e.g. the validated
-        // Kata Containers kernel, §5.4, The guest-kernel contract and the bootstrap seed) ship *inside* a compressed tar. When `archive_member`
-        // is set, the download is a `.tar.zst`/`.tar` archive verified against `archive_sha256`;
-        // the named member is extracted and re-verified against `sha256`. Both digests fold
-        // into the cache key so re-pointing either invalidates the artifact.
-        if let Some(m) = p.get("archive_member").and_then(|v| v.as_str()) {
-            pins_map.insert("kernel_prebuilt_archive_member".to_string(), m.to_string());
-        }
-        if let Some(s) = p.get("archive_sha256").and_then(|v| v.as_str()) {
-            pins_map.insert("kernel_prebuilt_archive_sha256".to_string(), s.to_string());
-        }
-    }
-    // Flatten the multi-kernel registry: each `kernels.<label>` → keyed pins
-    // (`kernel_<label>_source_url` / `_source_sha256`), so a labelled `KernelStage`
-    // can build `vmlinux-<label>` — the kernel-version benchmark dimension. They
-    // share the default `kernel`'s `microvm_config`.
-    if let Some(kernels) = json.get("kernels").and_then(|v| v.as_object()) {
-        for (label, spec) in kernels {
-            if let Some(url) = spec.get("source_url").and_then(|v| v.as_str()) {
-                pins_map.insert(format!("kernel_{label}_source_url"), url.to_string());
-            }
-            if let Some(sha) = spec.get("source_sha256").and_then(|v| v.as_str()) {
-                pins_map.insert(format!("kernel_{label}_source_sha256"), sha.to_string());
-            }
-        }
-    }
-    // Flatten the kernel config-fragment registry (§5.2, The config fragment): each `kernel_fragments.<NAME>` →
-    // a `kernel_fragments_<NAME>` pin holding that fragment's KConfig text, which a
-    // `KernelStage` with `fragments = [NAME, ...]` layers onto the base config (content-
-    // addressed, so editing a fragment's text invalidates the cache).
-    if let Some(fragments) = json.get("kernel_fragments").and_then(|v| v.as_object()) {
-        for (name, cfg) in fragments {
-            if let Some(text) = cfg.as_str() {
-                pins_map.insert(format!("kernel_fragments_{name}"), text.to_string());
-            }
-        }
-    }
-    if let Some(r) = json.get("rootfs") {
-        if let Some(img) = r.get("image").and_then(|v| v.as_str()) {
-            pins_map.insert("rootfs_image".to_string(), img.to_string());
-        }
-        if let Some(dig) = r.get("digest").and_then(|v| v.as_str()) {
-            pins_map.insert("rootfs_digest".to_string(), dig.to_string());
-        }
-    }
-    // Emit the CH/virtiofsd build identity for the snapshot pool (§10.2, The stage model and the five cache-key rules / M-ART-7): a snapshot
-    // is only valid for the exact CH build that produced it, so the snapshot stage folds the
-    // `cloud_hypervisor` pin into its cache key. Emitted only when present in pins.json.
-    for key in ["cloud_hypervisor", "virtiofsd"] {
-        if let Some(v) = json.get(key).and_then(|v| v.as_str()) {
-            pins_map.insert(key.to_string(), v.to_string());
-        }
-    }
-    // Emit the Debian snapshot.debian.org timestamp pin if present (top-level or under
-    // `rootfs`) so the mmdebstrap source has its required source timestamp.
-    let ts = json
-        .get("debian_snapshot_timestamp")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            json.get("rootfs")
-                .and_then(|r| r.get("debian_snapshot_timestamp"))
-                .and_then(|v| v.as_str())
-        });
-    if let Some(ts) = ts {
+    // `rootfs.debian_snapshot_timestamp` is the historical nesting; the top-level pin (emitted by
+    // the namespace dispatch above) wins when both are present.
+    if !pins_map.contains_key("debian_snapshot_timestamp")
+        && let Some(ts) = json
+            .get("rootfs")
+            .and_then(|r| r.get("debian_snapshot_timestamp"))
+            .and_then(|v| v.as_str())
+    {
         pins_map.insert("debian_snapshot_timestamp".to_string(), ts.to_string());
     }
-    Ok(pins_map)
+    pins_map
+}
+
+/// Reads a pins overlay file, failing loud with the path on any I/O error.
+///
+/// A referenced-but-absent overlay is never a skipped fold: `$VMCELL_PINS` pointing at nothing is
+/// a configuration error, not "no overlay".
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] naming `path` when it cannot be read.
+fn read_pins_overlay(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| {
+        crate::error::Error::Artifact(format!(
+            "failed to read pins overlay {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Parses a pins **overlay** document — strictly (§10.2, The stage model and the five cache-key
+/// rules).
+///
+/// Stricter than the baseline's [`flatten_pins_document`] at exactly one level — the top one, where
+/// both the key **and** the value's shape must match the pin schema ([`pins_namespace_shape`]).
+/// Reference-time errors cannot catch a typo'd *override*: `{"kerne1": …}` would simply resolve the
+/// whole `kernel` namespace from the baseline and build the wrong kernel with a green log, and
+/// `{"cloud_hypervisor": {"version": "46.0"}}` — the natural shape to guess, since most namespaces
+/// *are* objects — would flatten to nothing and drop the CH build identity out of the snapshot cache
+/// key (the M-ART-7 stale-snapshot hazard the pin exists to prevent; unlike `kernel.*`, that pin has
+/// no referenced-but-absent backstop, `artifact/snapshot.rs` folds it with `unwrap_or_default`). Both
+/// are rejected here, naming the key.
+///
+/// Sub-key strictness stays out of scope (§10.2): those typos are caught by the referenced-but-absent
+/// hard errors.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] for malformed JSON, a non-object document, a top-level
+/// key matching no known pins namespace, or a top-level value whose shape is not the one that
+/// namespace declares.
+fn parse_pins_overlay(content: &str, source: &Path) -> Result<serde_json::Value> {
+    let json = serde_json::from_str::<serde_json::Value>(content).map_err(|e| {
+        crate::error::Error::Artifact(format!(
+            "malformed pins overlay JSON at {}: {e}",
+            source.display()
+        ))
+    })?;
+    let obj = json.as_object().ok_or_else(|| {
+        crate::error::Error::Artifact(format!(
+            "pins overlay {} must be a JSON object of pin namespaces",
+            source.display()
+        ))
+    })?;
+    for (name, value) in obj {
+        let Some(shape) = pins_namespace_shape(name) else {
+            return Err(crate::error::Error::Artifact(format!(
+                "unknown pins overlay key `{name}` in {} (known namespaces: {}); \
+                 a misspelled override would otherwise silently resolve from the committed \
+                 baseline (§10.2)",
+                source.display(),
+                KNOWN_PINS_NAMESPACES.join(", ")
+            )));
+        };
+        if !shape.matches(value) {
+            return Err(crate::error::Error::Artifact(format!(
+                "pins overlay key `{name}` in {} must be {}; a wrong-shaped override contributes \
+                 no pins and would silently resolve from the committed baseline (§10.2)",
+                source.display(),
+                shape.describe()
+            )));
+        }
+    }
+    Ok(json)
+}
+
+/// Merges `overlay` over `baseline` **leaf-wise**, in place.
+///
+/// An overlay object merges into a baseline object key by key; any other overlay value replaces the
+/// baseline value outright — which is what makes a leaf override work. This is exactly §10.2's "a
+/// flattened key present in the overlay wins": every pin key is a leaf of the namespace tree, so
+/// merging leaf-wise and flattening once is identical to flattening both documents and merging the
+/// flat maps. An overlay setting only `kernel.source_url` therefore keeps the baseline's
+/// `kernel.microvm_config`, which a document-level namespace replacement would drop.
+///
+/// What this function does **not** do is police shapes: the replace-outright arm applied to a
+/// *namespace* (an overlay handing the scalar `"https://…"` to the object namespace `kernel`) is a
+/// whole-namespace replacement that would wipe the baseline's siblings. That is unreachable from an
+/// overlay file because [`parse_pins_overlay`]'s shape check rejects it before the merge runs — one
+/// law, at the parse boundary, not a second copy here. Below the top level shapes stay unpoliced by
+/// design (§10.2): a `kernel.microvm_config` given an object replaces the baseline's string, the
+/// flatten then emits no pin, and the referenced-but-absent hard error names it.
+fn merge_pins_documents(baseline: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (baseline.as_object_mut(), overlay.as_object()) {
+        (Some(base_obj), Some(overlay_obj)) => {
+            for (key, value) in overlay_obj {
+                match base_obj.get_mut(key) {
+                    Some(existing) => merge_pins_documents(existing, value),
+                    None => {
+                        base_obj.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        _ => *baseline = overlay.clone(),
+    }
+}
+
+/// Resolves the pins **document**: the committed baseline with `overlay_file` merged over it.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if the embedded baseline is malformed (a build-time
+/// impossibility, checked anyway rather than swallowed), or if the overlay cannot be read or fails
+/// the strict parse.
+fn resolve_pins_document(overlay_file: Option<&Path>) -> Result<serde_json::Value> {
+    let mut doc = serde_json::from_str::<serde_json::Value>(COMMITTED_PINS).map_err(|e| {
+        crate::error::Error::Artifact(format!("malformed committed pins.json: {e}"))
+    })?;
+    if let Some(path) = overlay_file {
+        let overlay = parse_pins_overlay(&read_pins_overlay(path)?, path)?;
+        merge_pins_documents(&mut doc, &overlay);
+    }
+    Ok(doc)
+}
+
+/// Resolves the flat pin map a downstream consumer builds against: vmcell's committed baseline with
+/// the optional overlay merged over it (§10.2 / §10.4 — contract surface).
+///
+/// This is the pipeline's own resolution, minus the `guest_agent_src_hash` entry that
+/// [`ResolvePinsStage`] adds from the workspace source closure (which no consumer workspace has).
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if the overlay cannot be read, is not JSON, is not a
+/// JSON object, carries a top-level key matching no known pins namespace, or gives a known
+/// namespace a value of the wrong shape.
+pub fn resolve_pins(
+    overlay_file: Option<&Path>,
+) -> Result<std::collections::HashMap<String, String>> {
+    Ok(flatten_pins_document(&resolve_pins_document(overlay_file)?))
+}
+
+/// One entry of the merged `kernels` registry: a build label and the KConfig fragment set that
+/// label declares (§5.5, Kernel as a benchmark dimension).
+///
+/// The label alone fully determines the build — that is the point of the `fragments` key: before
+/// v30 a fragment set was reachable only by constructing a [`kernel::KernelStage`] programmatically,
+/// so `vmcell build-kernels` could never build one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KernelRegistryEntry {
+    /// The registry label, e.g. `"6.12.94"` — the `kernels.<label>` key and the `vmlinux-<label>`
+    /// artifact name.
+    pub label: String,
+    /// The KConfig fragment names this label declares, in the order written. Empty when the entry
+    /// carries no `fragments` key (today's committed entries), which is exactly today's behavior.
+    /// Each name resolves to `kernel_fragments_<NAME>` in the pins registry.
+    pub fragments: Vec<String>,
+}
+
+/// The merged `kernels` registry in **sorted label order** — the set, and the per-label fragment
+/// sets, that `vmcell build-kernels` builds.
+///
+/// Resolved through the same baseline+overlay merge as the pipeline stage, so a downstream-added
+/// `kernels.<label>` is buildable by the exact CLI command the toolkit contract advertises. A
+/// second, overlay-blind enumeration beside the stage would leave that label resolvable but
+/// unbuildable.
+///
+/// The order is **byte-lexicographic on the label** and pinned by a unit test rather than inherited
+/// from `serde_json`'s `BTreeMap` backing (§5.5): a transitive dependency enabling `preserve_order`
+/// would otherwise silently switch the build order to document order. Byte order is not version
+/// order — `6.12.94` builds before `6.6.143` — which is deliberate: the labels are opaque strings,
+/// and inventing a version collation would be a second, guessing law.
+///
+/// # Errors
+/// As [`resolve_pins`], plus [`crate::error::Error::Artifact`] when a `kernels.<label>` entry's
+/// `fragments` key is not an array of non-empty strings (a malformed override is named, never
+/// silently ignored).
+pub fn resolve_kernel_registry(overlay_file: Option<&Path>) -> Result<Vec<KernelRegistryEntry>> {
+    let doc = resolve_pins_document(overlay_file)?;
+    let Some(kernels) = doc.get("kernels").and_then(|k| k.as_object()) else {
+        return Ok(Vec::new());
+    };
+    let entries: Vec<KernelRegistryEntry> = kernels
+        .iter()
+        .map(|(label, spec)| {
+            Ok(KernelRegistryEntry {
+                label: label.clone(),
+                fragments: kernel_entry_fragments(label, spec)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(sort_kernel_registry(entries))
+}
+
+/// Puts a kernel registry into the pinned **build order**: byte-lexicographic on the label (§5.5).
+///
+/// Its own function so the ordering law can be exercised on a deliberately unsorted input. Through
+/// the public resolver the order is currently *also* what `serde_json`'s default `BTreeMap` map
+/// backing produces, so an end-to-end test cannot tell "sorted on purpose" from "sorted by
+/// accident" — which is exactly the unpinned-order hazard §5.5 names: a transitive dep enabling
+/// `preserve_order` swaps the backing to document order, and then this call is the only thing
+/// keeping the promise.
+fn sort_kernel_registry(mut entries: Vec<KernelRegistryEntry>) -> Vec<KernelRegistryEntry> {
+    entries.sort_by(|a, b| a.label.cmp(&b.label));
+    entries
+}
+
+/// The fragment names declared by one `kernels.<label>` entry (§5.5).
+///
+/// The whole strictness of this reader is the point: `fragments` is an *accepted input*, so a
+/// wrong-shaped one is rejected naming the label rather than dropped. The surrounding pins schema
+/// stays permissive below the top level by design (§10.2), but a silently-ignored `fragments` key
+/// would build an *uninstrumented* kernel and report success — the accept-then-ignore class, on the
+/// exact key a downstream fragment author writes.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] when `fragments` is present but is not an array, holds a
+/// non-string element, or holds an empty name.
+fn kernel_entry_fragments(label: &str, spec: &serde_json::Value) -> Result<Vec<String>> {
+    let Some(value) = spec.get("fragments") else {
+        return Ok(Vec::new());
+    };
+    let array = value.as_array().ok_or_else(|| {
+        crate::error::Error::Artifact(format!(
+            "pins `kernels.{label}.fragments` must be an array of fragment names \
+             (e.g. [\"KASAN\", \"LOCKDEP\"]), each resolving to a `kernel_fragments.<NAME>` entry"
+        ))
+    })?;
+    array
+        .iter()
+        .map(|item| match item.as_str() {
+            Some(name) if !name.is_empty() => Ok(name.to_string()),
+            _ => Err(crate::error::Error::Artifact(format!(
+                "pins `kernels.{label}.fragments` must hold non-empty fragment NAMES, got {item}"
+            ))),
+        })
+        .collect()
+}
+
+/// The labels of the merged `kernels` registry, sorted — the set `vmcell build-kernels` builds.
+///
+/// The label half of [`resolve_kernel_registry`], which it delegates to so the roster and the
+/// per-label fragment sets can never come from two different readers.
+///
+/// # Errors
+/// As [`resolve_kernel_registry`].
+pub fn resolve_kernel_labels(overlay_file: Option<&Path>) -> Result<Vec<String>> {
+    Ok(resolve_kernel_registry(overlay_file)?
+        .into_iter()
+        .map(|e| e.label)
+        .collect())
+}
+
+/// The pins overlay a build entry point uses: an explicit `flag` wins, else `$VMCELL_PINS`
+/// ([`pins_overlay_path`]), else none — the committed baseline alone.
+///
+/// The one flag-beats-env law (§10.4, The downstream toolkit contract), shared by the CLI's
+/// pipeline subcommands and the library build entry points, so `VMCELL_PINS` cannot reach one and
+/// be ignored by the other.
+#[must_use]
+pub fn pins_overlay_or_env(flag: Option<&Path>) -> Option<PathBuf> {
+    flag.map(Path::to_path_buf).or_else(pins_overlay_path)
+}
+
+/// Builds the labelled kernel `label` from the pins `kernels` registry into `target_dir`, returning
+/// the path of the built `vmlinux-<label>` (§5.6, The downstream kernel toolkit; §18 delta 3).
+///
+/// This is the **library** build entry point a git-dep consumer calls from its own harness, the
+/// counterpart of `vmcell build-kernels --pins <file>`: it assembles
+/// [`ResolvePinsStage`] (baseline + overlay) → [`kernel::KernelStage`] with the label's declared
+/// fragments and runs that pipeline. The resolved-config sidecar lands beside the kernel at
+/// [`kernel::resolved_config_path`], which is what a fragment author asserts against.
+///
+/// `overlay_file` follows [`pins_overlay_or_env`] (explicit path, else `$VMCELL_PINS`), so a
+/// consumer's `kernel_fragments.<NAME>` + `kernels.<label>` additions need no vmcell-source edit.
+///
+/// **Producer scope (a recorded deviation from the §18 sketch's `build_labelled_kernel(label,
+/// &env)`).** It offers the host-`make` producer only — the one compiling producer `vmcell` can
+/// name. The in-VM builder lives in `vmcell-kernel-builder`, which depends on `vmcell`; naming it
+/// here would invert that edge and break §9.1's acyclicity, so the in-VM producer stays reachable
+/// through the composition root (`vmcell build-kernels --kernel-source in-vm`). With no in-VM
+/// producer there is no `CidAllocator` to inject either, so the sketch's `&HostEnv` parameter would
+/// carry nothing this function uses and is replaced by the explicit `target_dir` + `overlay_file`.
+///
+/// **It runs with no vmcell source checkout present**, which is the whole point: it does not ride
+/// [`ensure_test_artifacts`] (the vmcell-workspace test bootstrap, whose fingerprint hashes the
+/// guest-agent source closure out of the vmcell tree), and the two stages it does assemble read
+/// nothing from that tree — [`ResolvePinsStage`] resolves the `guest_agent_src_hash` pin only when
+/// a checkout is actually there (`vmcell_source_root`), and [`kernel::KernelStage`] reads only
+/// `kernel_*` pins. Landing the entry point without that second half made every downstream call
+/// die at stage 0 on a missing `crates/vmcell-guest-agent/src/main.rs`; the
+/// `resolve_pins_runs_outside_the_vmcell_source_tree` gate re-execs this crate's test binary from
+/// outside the checkout so that cannot return.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] when the overlay cannot be resolved, when `label` is
+/// not in the merged `kernels` registry (naming the labels that are), or when the build fails.
+#[cfg(feature = "pipeline")]
+pub async fn build_labelled_kernel(
+    label: &str,
+    target_dir: &Path,
+    overlay_file: Option<&Path>,
+) -> Result<PathBuf> {
+    let overlay = pins_overlay_or_env(overlay_file);
+    let registry = resolve_kernel_registry(overlay.as_deref())?;
+    let entry = registry.iter().find(|e| e.label == label).ok_or_else(|| {
+        crate::error::Error::Artifact(format!(
+            "unknown kernel label `{label}`: the resolved pins `kernels` registry holds [{}] \
+                 (add yours through a pins overlay, §10.2)",
+            registry
+                .iter()
+                .map(|e| e.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    let stage = kernel::KernelStage {
+        http_client: std::sync::Arc::new(kernel::ReqwestClient),
+        label: Some(entry.label.clone()),
+        fragments: Some(entry.fragments.clone()),
+    };
+    let out_path = Stage::out_path(&stage, target_dir);
+    Pipeline::new(target_dir.to_path_buf())
+        .add_stage(Box::new(ResolvePinsStage {
+            overlay_file: overlay,
+        }))
+        .add_stage(Box::new(stage))
+        .build(&Cache::default())
+        .await?;
+    Ok(out_path)
 }
 
 /// Computes the blake3 hash of the guest-agent source file at `path`.
@@ -669,18 +1187,46 @@ fn guest_agent_src_hash(path: &Path) -> Result<String> {
 /// ancestors to ascend, so the artifacts under the workspace `target/` would not be
 /// found. The marker is `crates/vmcell-protocol/Cargo.toml`, a stable landmark.
 pub(crate) fn workspace_root() -> PathBuf {
-    let start = std::env::var_os("CARGO_MANIFEST_DIR")
+    let start = source_search_start();
+    // No marker found (e.g. a bare binary run outside the workspace, or a downstream consumer's
+    // own workspace) — fall back to the starting dir so callers still get a usable,
+    // absolute-when-possible anchor.
+    find_vmcell_source_root(&start).unwrap_or(start)
+}
+
+/// The directory the vmcell-source-root ascent starts from: `CARGO_MANIFEST_DIR` when set (the
+/// crate dir under the workspace), else the **absolute** process CWD. Named once so
+/// [`workspace_root`] and [`vmcell_source_root`] cannot start from different places.
+fn source_search_start() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    for dir in start.ancestors() {
-        if dir.join("crates/vmcell-protocol/Cargo.toml").is_file() {
-            return dir.to_path_buf();
-        }
-    }
-    // No marker found (e.g. a bare binary run outside the workspace) — fall back to the
-    // starting dir so callers still get a usable, absolute-when-possible anchor.
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The **one** vmcell-source-tree predicate: the ancestor of `start` that owns the member crates
+/// (marker `crates/vmcell-protocol/Cargo.toml`), or `None` when there is none.
+///
+/// Pure (takes its start dir) so the "not in a vmcell checkout" answer is testable without
+/// mutating process-global state.
+fn find_vmcell_source_root(start: &Path) -> Option<PathBuf> {
     start
+        .ancestors()
+        .find(|dir| dir.join("crates/vmcell-protocol/Cargo.toml").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// The vmcell **source** checkout this process is running inside, or `None` when it is not running
+/// inside one — a git-dep consumer's own workspace, or an installed `vmcell` binary (§10.4, the
+/// downstream toolkit contract).
+///
+/// [`workspace_root`] answers "where do artifacts and source closures anchor", and must always
+/// produce a path; this answers "is vmcell's own source here at all", which downstream is legitimately
+/// **no**. Anything that reads vmcell's own sources (the guest-agent / guest-tools closures) asks
+/// this one and honors the `None`, instead of asking `workspace_root` and hard-erroring on a
+/// fallback directory that never had those sources.
+pub(crate) fn vmcell_source_root() -> Option<PathBuf> {
+    find_vmcell_source_root(&source_search_start())
 }
 
 /// Recursively collects every `*.rs` file under `dir` into `out`.
@@ -890,9 +1436,26 @@ impl Pipeline {
                         // (L-ART-4).
                         let actual_hash = hash_output(&out_path)?;
                         if actual_hash == metadata.hash {
-                            cached = true;
-                            cached_pins = metadata.pins;
-                            cached_artifacts = metadata.artifacts;
+                            // A stage may publish SIBLING artifacts beside its payload (the
+                            // kernel's resolved-config sidecar, §5.6). Only the payload is
+                            // hash-verified above, so a hit that re-publishes a path which no
+                            // longer exists would hand downstream a dangling artifact and never
+                            // regenerate it — `run()` is not called on a hit. Treat a vanished
+                            // registered artifact as a MISS: the rebuild is the only thing that can
+                            // put it back.
+                            let missing =
+                                metadata.artifacts.values().find(|p| !p.exists()).cloned();
+                            if let Some(gone) = missing {
+                                tracing::info!(
+                                    "Rebuilding stage {}: registered artifact {} is missing",
+                                    stage.name(),
+                                    gone.display()
+                                );
+                            } else {
+                                cached = true;
+                                cached_pins = metadata.pins;
+                                cached_artifacts = metadata.artifacts;
+                            }
                         } else {
                             return Err(crate::error::Error::Artifact(format!(
                                 "Tampered artifact for stage {}: payload hash mismatch",
@@ -1009,17 +1572,25 @@ impl Pipeline {
     }
 }
 
-/// Pipeline Stage 0: publishes the committed `pins.json` lock into the pipeline.
+/// Pipeline Stage 0: publishes the resolved pins lock into the pipeline.
 ///
 /// Despite the "resolve" name, this stage does **not** perform live version→digest
-/// resolution (that is the deferred `ARTIFACT-PIPELINE-5`); it reads the *already
-/// committed* `pins.json` (the lock), copies it to `resolved_pins.json`, flattens its
-/// entries into the propagated `pins` map, and folds in the guest-agent source-closure
-/// hash so downstream stages consume pins purely from memory (ART-6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// resolution (that is the deferred `ARTIFACT-PIPELINE-5`); it takes the *already
+/// committed* `pins.json` (embedded at compile time) as its baseline, merges the optional
+/// overlay over it, writes the resolved document to `resolved_pins.json`, flattens its entries into
+/// the propagated `pins` map, and folds in the guest-agent source-closure hash so downstream stages
+/// consume pins purely from memory (ART-6).
+///
+/// The pre-overlay `pins_file: PathBuf` field is gone (§18 delta 1): the baseline is embedded, so a
+/// consumer workspace needs no path, and carrying both a path and the embedded copy would be two
+/// sources of truth with no stated precedence.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvePinsStage {
-    /// Path to the pins.json file.
-    pub pins_file: PathBuf,
+    /// The pins **overlay** (§10.2, The stage model and the five cache-key rules): a JSON document
+    /// whose top-level pin namespaces override the committed baseline key by key, letting a
+    /// downstream extend the registry without forking `pins.json`. `None` resolves the baseline
+    /// alone. Set from `--pins`, from `$VMCELL_PINS` via [`pins_overlay_path`], or directly.
+    pub overlay_file: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -1030,23 +1601,22 @@ impl Stage for ResolvePinsStage {
 
     fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
         // Bump when this stage's resolution logic changes so stale outputs are not served.
-        const STAGE_VERSION: u32 = 1;
-        // Unambiguous field separator so distinct (pins, agent-hash) splits cannot
+        // 1 → 2 (§18 delta 1, cache-key rule 4): the fold gained the pins OVERLAY and moved the
+        // baseline to the compile-time-embedded `pins.json`, so no v1 output may be served.
+        const STAGE_VERSION: u32 = 2;
+        // The shared pins-fold separator, so distinct (pins, overlay, agent-hash) splits cannot
         // concatenate to the same byte stream (non-injective-hash defense).
-        const SEP: &[u8] = b"\x1f";
+        const SEP: &[u8] = PINS_FOLD_SEP;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
         hasher.update(SEP);
-        // Fold the pins content — or, on a read failure, a DISTINCT error marker rather
-        // than `unwrap_or_default()`'s empty string (ART-11). Collapsing every read error
-        // (missing file, permission denied, …) to `""` made all of them share one key, and
-        // aliased with a genuinely-empty pins file. Folding the error keeps the key
-        // distinct; the resulting cache miss drives `run()`, which fails hard with the real
-        // cause. Mirrors `GuestToolsStage::cache_key`.
-        match std::fs::read_to_string(&self.pins_file) {
-            Ok(content) => hasher.update(content.as_bytes()),
-            Err(e) => hasher.update(format!("resolve-pins-read-error:{e}").as_bytes()),
-        };
+        // The one pins fold (baseline + overlay), shared with `fast_artifacts_fingerprint`. A read
+        // failure folds a DISTINCT error marker rather than `unwrap_or_default()`'s empty string
+        // (ART-11) — the resulting cache miss drives `run()`, which fails hard with the real cause.
+        // Mirrors `GuestToolsStage::cache_key`.
+        if let Err(e) = fold_pins_identity(&mut hasher, self.overlay_file.as_deref()) {
+            hasher.update(format!("resolve-pins-overlay-read-error:{e}").as_bytes());
+        }
         hasher.update(SEP);
         // Fold the FULL guest-agent source closure (bin wrapper + src/agent/** +
         // Cargo.lock), not just the thin wrapper, so a change to `src/agent/mod.rs`
@@ -1055,8 +1625,12 @@ impl Stage for ResolvePinsStage {
         // stale-agent-baked-into-rootfs bug (H-CACHE-1). A closure-hash failure folds a
         // distinct error marker (not `unwrap_or_default()`'s `""`) for the same ART-11
         // reason.
-        match guest_agent_closure_hash(&workspace_root()) {
-            Ok(h) => hasher.update(h.as_bytes()),
+        // Outside a vmcell checkout there is no closure to fold; the DISTINCT
+        // `NO_VMCELL_SOURCE_TREE` marker keeps that case from colliding with any hex hash (and
+        // with the error marker above), so a consumer's key and an in-tree key never alias.
+        match resolve_guest_agent_pin(vmcell_source_root().as_deref()) {
+            Ok(Some(h)) => hasher.update(h.as_bytes()),
+            Ok(None) => hasher.update(NO_VMCELL_SOURCE_TREE),
             Err(e) => hasher.update(format!("resolve-pins-agent-closure-error:{e}").as_bytes()),
         };
         CacheKey(format!("resolve-pins-{}", hasher.finalize().to_hex()))
@@ -1067,36 +1641,105 @@ impl Stage for ResolvePinsStage {
     }
 
     async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
-        let content = tokio::fs::read_to_string(&self.pins_file)
-            .await
-            .map_err(crate::error::Error::Io)?;
-        tokio::fs::write(out, &content)
-            .await
-            .map_err(crate::error::Error::Io)?;
-
-        let mut pins_map = parse_pins_json(&content)?;
-
-        // Resolve the guest-agent source hash over the FULL source closure (the bin
-        // wrapper PLUS every `src/agent/**/*.rs` it links PLUS `Cargo.lock`), anchored
-        // at the crate root, and FAIL HARD if any of it is missing. Hashing only the
-        // thin wrapper left a `src/agent/mod.rs` change invisible to every downstream
-        // cache key, baking a stale agent into the rootfs (H-CACHE-1). A silent
-        // `"unknown"` fallback would do the same without invalidating any key.
-        let agent_hash = guest_agent_closure_hash(&workspace_root())?;
-        pins_map.insert("guest_agent_src_hash".to_string(), agent_hash);
-
-        let mut outputs = StageOutputs::default();
-        outputs
-            .artifacts
-            .insert("resolved_pins".to_string(), out.to_path_buf());
-        outputs.pins = pins_map;
-        Ok(outputs)
+        resolve_pins_into(
+            self.overlay_file.as_deref(),
+            vmcell_source_root().as_deref(),
+            out,
+        )
+        .await
     }
+}
+
+/// The cache-key marker folded by [`ResolvePinsStage`] when this process is not running inside a
+/// vmcell source checkout, so there is no guest-agent closure to fold (§10.4).
+const NO_VMCELL_SOURCE_TREE: &[u8] = b"resolve-pins-no-vmcell-source-tree";
+
+/// The **one** `guest_agent_src_hash` pin law, shared by [`ResolvePinsStage`]'s `cache_key` and
+/// `run` so the key and the published pin map can never disagree about it.
+///
+/// * Inside a vmcell checkout (`Some(root)`): hash the FULL agent source closure and **fail hard**
+///   if any of it is missing. Hashing only the thin `main.rs` wrapper left a `src/agent/mod.rs`
+///   change invisible to every downstream cache key, baking a stale agent into the rootfs
+///   (H-CACHE-1); a silent `"unknown"` fallback would do the same without invalidating any key.
+/// * Outside one (`None`): there is **no** agent source to hash, so the pin is absent rather than
+///   fabricated. It is a rootfs-lineage pin — `KernelStage` reads only `kernel_*` — so requiring it
+///   unconditionally made the downstream kernel toolkit (§5.6) die at stage 0 in exactly the
+///   consumer position §10.4 advertises, with an error about a vmcell source file the consumer
+///   never had. The producer of a rootfs still fails loud downstream: `GuestAgentStage` builds the
+///   agent by `cargo build -p vmcell-guest-agent` in that same absent tree.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] when a vmcell checkout IS present but its guest-agent
+/// source closure cannot be read.
+fn resolve_guest_agent_pin(source_root: Option<&Path>) -> Result<Option<String>> {
+    match source_root {
+        Some(root) => guest_agent_closure_hash(root).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The body of [`ResolvePinsStage::run`], with the vmcell-source-tree seam explicit so the
+/// **consumer position** (`source_root = None`) is drivable in-process rather than only by
+/// re-execing outside the checkout.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] when the overlay cannot be resolved or rendered, and
+/// [`crate::error::Error::Io`] when the artifact cannot be written.
+async fn resolve_pins_into(
+    overlay_file: Option<&Path>,
+    source_root: Option<&Path>,
+    out: &Path,
+) -> Result<StageOutputs> {
+    // Resolve ONCE, then both publish and flatten that same document — so the artifact and the
+    // propagated pin map can never disagree.
+    let doc = resolve_pins_document(overlay_file)?;
+    // `resolved_pins.json` is a published artifact (and a `vmcell bundle` entry), so it must be
+    // the document the pins were actually resolved from. With no overlay that is the committed
+    // baseline VERBATIM — byte-identical to the pre-overlay artifact, the §18 delta-1 migration
+    // promise. With an overlay it is the MERGED document: copying either input verbatim there
+    // would ship a lying artifact.
+    let rendered = match overlay_file {
+        None => COMMITTED_PINS.to_string(),
+        Some(_) => {
+            serde_json::to_string_pretty(&doc).map_err(|e| {
+                crate::error::Error::Artifact(format!("failed to render resolved pins: {e}"))
+            })? + "\n"
+        }
+    };
+    tokio::fs::write(out, rendered.as_bytes())
+        .await
+        .map_err(crate::error::Error::Io)?;
+
+    let mut pins_map = flatten_pins_document(&doc);
+
+    // The guest-agent source identity, through the one `resolve_guest_agent_pin` law: folded from
+    // the full closure in a vmcell checkout, absent (never fabricated) outside one.
+    if let Some(agent_hash) = resolve_guest_agent_pin(source_root)? {
+        pins_map.insert("guest_agent_src_hash".to_string(), agent_hash);
+    }
+
+    let mut outputs = StageOutputs::default();
+    outputs
+        .artifacts
+        .insert("resolved_pins".to_string(), out.to_path_buf());
+    outputs.pins = pins_map;
+    Ok(outputs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test fixture for the schema tests below: the production string → flat-map path
+    /// (`serde_json` + [`flatten_pins_document`]). It delegates — it is NOT a second copy of the
+    /// flatten law. The former production `parse_pins_json` retired when the stage's baseline
+    /// became the embedded `COMMITTED_PINS` constant (§18 delta 1); the only runtime string it
+    /// still parses is the overlay, which goes through the strict [`parse_pins_overlay`].
+    fn parse_pins_json(content: &str) -> Result<std::collections::HashMap<String, String>> {
+        let json = serde_json::from_str::<serde_json::Value>(content)
+            .map_err(|e| crate::error::Error::Artifact(format!("malformed pins JSON: {e}")))?;
+        Ok(flatten_pins_document(&json))
+    }
 
     // The at-most-once auto-build skip decision (`ensure_test_artifacts`). Fresh iff the rootfs
     // output exists AND the stamp matches the current input fingerprint — so a source/dep/packer
@@ -1175,6 +1818,45 @@ mod tests {
             .expect("valid pins JSON");
         assert!(!empty.contains_key("kernel_prebuilt_url"));
         assert!(!empty.contains_key("kernel_prebuilt_sha256"));
+    }
+
+    // §5.5 GATE (delta 3) — the BUILD ORDER law, on an input the map backing cannot pre-sort for
+    // it. Through `resolve_kernel_registry` the order today also happens to be what serde_json's
+    // `BTreeMap` yields, so only this direct call can tell "sorted on purpose" from "sorted by
+    // accident" (and it is the call that keeps the promise if a transitive dep ever enables
+    // `preserve_order`). RED on the inverse (a no-op `sort_kernel_registry`): the reversed input
+    // below comes back reversed. Byte-lexicographic, NOT version order — a "fix" to semver
+    // collation reddens the dotted pair too.
+    #[test]
+    fn kernel_registry_is_sorted_byte_lexicographically() {
+        let entry = |label: &str| KernelRegistryEntry {
+            label: label.to_string(),
+            fragments: Vec::new(),
+        };
+        let sorted = sort_kernel_registry(vec![
+            entry("zz"),
+            entry("6.6.143"),
+            entry("6.12.94"),
+            entry("aa"),
+        ]);
+        assert_eq!(
+            sorted.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
+            vec!["6.12.94", "6.6.143", "aa", "zz"],
+            "labels build in byte-lexicographic order (6.12.94 before 6.6.143)"
+        );
+        // The fragment sets ride along with their labels rather than being re-paired by index.
+        let carried = sort_kernel_registry(vec![
+            KernelRegistryEntry {
+                label: "b".into(),
+                fragments: vec!["B_FRAG".into()],
+            },
+            KernelRegistryEntry {
+                label: "a".into(),
+                fragments: vec!["A_FRAG".into()],
+            },
+        ]);
+        assert_eq!(carried[0].label, "a");
+        assert_eq!(carried[0].fragments, vec!["A_FRAG".to_string()]);
     }
 
     // Guards the multi-kernel dimension: each `kernels.<label>` must flatten to
@@ -1264,15 +1946,19 @@ mod tests {
         assert_ne!(h1, h2, "changed source content must change the hash");
     }
 
-    // Guards M-PIPE-3: malformed pins JSON must fail loud here, not degrade to an
-    // empty pin map that later surfaces as a misleading "Missing X pin". The buggy
-    // `if let Ok(json)` swallow returned an empty map (Ok) → this `Err` match goes red.
+    // Guards M-PIPE-3 on the one pins document that is still parsed from a string at runtime, the
+    // OVERLAY: malformed JSON must fail loud, not degrade to an empty map that later surfaces as a
+    // misleading "Missing X pin". The buggy `if let Ok(json)` swallow returns an empty overlay (Ok)
+    // → this `Err` match goes red. The message names the offending file.
     #[test]
-    fn test_parse_pins_rejects_malformed_json() {
-        let res = parse_pins_json("{ this is : not json ]");
+    fn test_parse_pins_overlay_rejects_malformed_json() {
+        let res = parse_pins_overlay("{ this is : not json ]", Path::new("/tmp/over.json"));
+        let Err(crate::error::Error::Artifact(msg)) = res else {
+            panic!("malformed pins overlay JSON must be a hard error, got {res:?}");
+        };
         assert!(
-            matches!(res, Err(crate::error::Error::Artifact(_))),
-            "malformed pins JSON must be a hard error, got {res:?}"
+            msg.contains("/tmp/over.json"),
+            "the rejection must name the overlay file, got {msg}"
         );
     }
 
@@ -1311,6 +1997,7 @@ mod tests {
         let rootfs = RootfsStage {
             image_override: None,
             agent_musl: None,
+            extra: Vec::new(),
         };
         let mut inputs1 = StageInputs::default();
         inputs1
@@ -1346,6 +2033,100 @@ mod tests {
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "missing guest-agent bin wrapper must be a hard error, got {res:?}"
+        );
+    }
+
+    // §10.4 GATE (delta 3, F1): the vmcell-source-tree predicate must answer NO outside a vmcell
+    // checkout. `workspace_root` cannot answer it — it falls back to the start dir — so an
+    // "is vmcell's own source here" question asked through it always says yes and then explodes on
+    // a file that dir never had. RED on the inverse (an ascent that returns the start dir when the
+    // marker is absent): the temp dir comes back as `Some`.
+    #[test]
+    fn find_vmcell_source_root_answers_no_outside_a_checkout() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let nested = outside.path().join("consumer/crates/acme");
+        std::fs::create_dir_all(&nested).expect("mkdir consumer tree");
+        assert_eq!(
+            find_vmcell_source_root(&nested),
+            None,
+            "a consumer workspace is NOT a vmcell source checkout"
+        );
+        // Positive control: the same ascent finds the marker when it IS there, and returns the
+        // MARKER-owning dir (not the start dir) — so the None above is a real answer, not a
+        // predicate that never matches.
+        let checkout = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(checkout.path().join("crates/vmcell-protocol"))
+            .expect("mkdir marker dir");
+        std::fs::write(
+            checkout.path().join("crates/vmcell-protocol/Cargo.toml"),
+            b"[package]\n",
+        )
+        .expect("write marker");
+        let deep = checkout.path().join("crates/vmcell/src");
+        std::fs::create_dir_all(&deep).expect("mkdir deep");
+        assert_eq!(
+            find_vmcell_source_root(&deep).as_deref(),
+            Some(checkout.path()),
+            "the ascent must find the marker-owning root from a member crate dir"
+        );
+    }
+
+    // §10.4 GATE (delta 3, F1): the `guest_agent_src_hash` pin is a ROOTFS-lineage pin, and
+    // requiring it outside a vmcell checkout is what made the §5.6 toolkit unusable from the
+    // consumer position it advertises. Absent checkout => no pin, no error; present-but-broken
+    // checkout => still a hard error (H-CACHE-1 stays fixed).
+    // RED on the inverse (`guest_agent_closure_hash(&workspace_root())?` unconditionally): the
+    // `None` arm errors instead of yielding `Ok(None)`.
+    #[test]
+    fn guest_agent_pin_is_absent_without_a_checkout_and_hard_errors_with_a_broken_one() {
+        assert_eq!(
+            resolve_guest_agent_pin(None).expect("no checkout is not an error"),
+            None,
+            "outside a vmcell checkout there is no agent source to hash — the pin must be \
+             ABSENT, never fabricated"
+        );
+        let broken = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(broken.path().join("crates/vmcell-protocol"))
+            .expect("mkdir marker dir");
+        std::fs::write(
+            broken.path().join("crates/vmcell-protocol/Cargo.toml"),
+            b"[package]\n",
+        )
+        .expect("write marker");
+        let res = resolve_guest_agent_pin(Some(broken.path()));
+        assert!(
+            matches!(res, Err(crate::error::Error::Artifact(_))),
+            "a checkout whose guest-agent source is missing must still hard-error \
+             (H-CACHE-1), got {res:?}"
+        );
+    }
+
+    // §10.4 GATE (delta 3, F1): the CONSUMER POSITION, driven through the real
+    // `ResolvePinsStage::run` body. It must publish `resolved_pins.json`, propagate the `kernel_*`
+    // pins the labelled-kernel build reads, and simply omit `guest_agent_src_hash`.
+    // RED on the inverse: restoring the unconditional agent-closure hash makes this assert fail
+    // in-tree (the pin comes back) and makes the real downstream call fail outright — which is the
+    // bug the re-exec gate in `tests/kernel_toolkit.rs` reproduces end to end.
+    #[cfg(feature = "pipeline")]
+    #[tokio::test]
+    async fn resolve_pins_into_omits_the_agent_pin_without_a_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("resolved_pins.json");
+        let outputs = resolve_pins_into(None, None, &out)
+            .await
+            .expect("resolving pins must not need a vmcell source checkout");
+        assert!(
+            out.is_file(),
+            "the resolved-pins artifact must be published"
+        );
+        assert!(
+            outputs.pins.contains_key("kernel_source_url"),
+            "the kernel pins the §5.6 toolkit reads must still travel"
+        );
+        assert!(
+            !outputs.pins.contains_key("guest_agent_src_hash"),
+            "the rootfs-lineage agent pin must be ABSENT outside a checkout, got {:?}",
+            outputs.pins.get("guest_agent_src_hash")
         );
     }
 
@@ -1702,6 +2483,494 @@ mod tests {
             runs.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "B must stay cached on the warm build; a dropped restoration loop re-runs it (M-ART-12)"
+        );
+    }
+
+    // ---- The pins overlay (§18 delta 1 / §10.2, The stage model and the five cache-key rules) ----
+
+    /// Writes an overlay document into `dir` and returns its path.
+    fn write_overlay(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("overlay.json");
+        std::fs::write(&path, body).expect("write overlay");
+        path
+    }
+
+    // GATE (delta 1) — OVERLAY WINS, and wins at the FLATTENED KEY level. An overlay that sets only
+    // `kernel.source_url` must replace that one pin and leave the baseline's siblings standing.
+    // Red-on-inverse: (a) a merge that lets the baseline win leaves `source_url` at the cdn.kernel.org
+    // pin; (b) a whole-namespace REPLACEMENT merge (`*baseline = overlay` on `kernel`) drops
+    // `kernel_microvm_config` and `kernel_source_sha256` — the exact trap that would build a kernel
+    // with no microvm config. Both assertions below go red on their respective bug.
+    #[test]
+    fn pins_overlay_wins_per_key_and_keeps_baseline_siblings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = write_overlay(
+            tmp.path(),
+            r#"{ "kernel": { "source_url": "https://downstream.example/linux-9.9.9.tar.xz" } }"#,
+        );
+        let baseline = resolve_pins(None).expect("baseline resolves");
+        let merged = resolve_pins(Some(&overlay)).expect("overlay resolves");
+
+        assert_eq!(
+            merged.get("kernel_source_url").map(String::as_str),
+            Some("https://downstream.example/linux-9.9.9.tar.xz"),
+            "the overridden key must take the overlay's value"
+        );
+        // The siblings inside the same namespace survive — key-level, not document-level, merge.
+        assert_eq!(
+            merged.get("kernel_microvm_config"),
+            baseline.get("kernel_microvm_config"),
+            "a namespace-replacement merge would drop the baseline's microvm_config"
+        );
+        assert_eq!(
+            merged.get("kernel_source_sha256"),
+            baseline.get("kernel_source_sha256"),
+            "a namespace-replacement merge would drop the baseline's source_sha256"
+        );
+    }
+
+    // GATE (delta 1) — FALLS BACK TO THE BASELINE. Every key the overlay does not mention resolves
+    // from the committed baseline, and a NEW entry inside a known namespace is legal (that is the
+    // whole point: extend the registry without forking pins.json). Red-on-inverse: a resolver that
+    // returns only the overlay's own keys drops `rootfs_image`/the baseline labels.
+    #[test]
+    fn pins_overlay_falls_back_to_baseline_and_admits_new_registry_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = write_overlay(
+            tmp.path(),
+            r#"{ "kernels": { "9.9.9": { "source_url": "https://d.example/l.tar.xz",
+                 "source_sha256": "beef" } } }"#,
+        );
+        let baseline = resolve_pins(None).expect("baseline resolves");
+        let merged = resolve_pins(Some(&overlay)).expect("overlay resolves");
+
+        // Untouched namespaces fall back verbatim.
+        assert_eq!(
+            merged.get("rootfs_image"),
+            baseline.get("rootfs_image"),
+            "an unmentioned namespace must resolve from the baseline"
+        );
+        // The baseline's own labels survive alongside the added one.
+        assert!(
+            baseline.contains_key("kernel_6.12.94_source_url"),
+            "fixture premise: the committed baseline carries the 6.12.94 label"
+        );
+        assert_eq!(
+            merged.get("kernel_6.12.94_source_url"),
+            baseline.get("kernel_6.12.94_source_url"),
+            "an added registry entry must not evict the baseline's entries"
+        );
+        assert_eq!(
+            merged.get("kernel_9.9.9_source_url").map(String::as_str),
+            Some("https://d.example/l.tar.xz")
+        );
+        // …and the added label is enumerable by the roster `vmcell build-kernels` builds, so a
+        // downstream label is not merely resolvable but buildable (the gate-blindness this closes).
+        let labels = resolve_kernel_labels(Some(&overlay)).expect("labels resolve");
+        assert!(
+            labels.contains(&"9.9.9".to_string()) && labels.contains(&"6.12.94".to_string()),
+            "the label roster must be the MERGED registry, got {labels:?}"
+        );
+        assert_eq!(
+            labels,
+            {
+                let mut sorted = labels.clone();
+                sorted.sort();
+                sorted
+            },
+            "the roster must be sorted so the build order is deterministic"
+        );
+    }
+
+    // GATE (delta 1) — a MISSPELLED top-level override is REJECTED, naming the key. This is the
+    // whole reason the overlay parser is stricter than the baseline's: `kerne1` (the `1`-for-`l`
+    // slip, the same shape as the `source_ur1` example in the schema doc) would otherwise
+    // parse fine, contribute nothing, and let the entire `kernel` namespace resolve from the
+    // baseline — a green build of the wrong kernel. Red-on-inverse: drop the `pins_namespace_shape`
+    // key check (i.e. reuse the baseline's ignore-unknown parse) and this returns Ok.
+    #[test]
+    fn pins_overlay_rejects_misspelled_top_level_key_naming_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = write_overlay(
+            tmp.path(),
+            r#"{ "kerne1": { "source_url": "https://d.example/l.tar.xz" } }"#,
+        );
+        let res = resolve_pins(Some(&overlay));
+        let Err(crate::error::Error::Artifact(msg)) = res else {
+            panic!("a misspelled overlay namespace must be a hard error, got {res:?}");
+        };
+        assert!(
+            msg.contains("kerne1"),
+            "the rejection must NAME the offending key, got {msg}"
+        );
+        // A correctly-spelled key is the positive control: the same shape must be accepted.
+        let ok = write_overlay(
+            tmp.path(),
+            r#"{ "kernel": { "source_url": "https://d.example/l.tar.xz" } }"#,
+        );
+        resolve_pins(Some(&ok)).expect("the correctly-spelled namespace must be accepted");
+    }
+
+    // GATE (delta 1) — a REFERENCED-BUT-ABSENT overlay fails loud NAMING THE PATH. `$VMCELL_PINS`
+    // (or `--pins`) pointing at nothing is a configuration error, never "no overlay".
+    // Red-on-inverse: `read_to_string(...).unwrap_or_default()` (or `.ok()`) silently resolves the
+    // baseline and this `Err` match goes red.
+    #[test]
+    fn pins_overlay_referenced_but_absent_fails_loud_naming_the_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("no-such-overlay.json");
+        let res = resolve_pins(Some(&missing));
+        let Err(crate::error::Error::Artifact(msg)) = res else {
+            panic!("an absent overlay must be a hard error, got {res:?}");
+        };
+        assert!(
+            msg.contains("no-such-overlay.json"),
+            "the failure must name the missing overlay, got {msg}"
+        );
+    }
+
+    // A non-object overlay (`[...]`, `"str"`, `null`) has no top-level namespaces to check, so the
+    // key check alone would wave it through and every override would silently vanish.
+    // Red-on-inverse: drop the `as_object()` guard and this returns Ok.
+    #[test]
+    fn pins_overlay_rejects_non_object_document() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = write_overlay(tmp.path(), r#"["kernel"]"#);
+        let res = resolve_pins(Some(&overlay));
+        assert!(
+            matches!(res, Err(crate::error::Error::Artifact(_))),
+            "a non-object overlay must be a hard error, got {res:?}"
+        );
+    }
+
+    // The BASELINE keeps its ignore-unknown semantics — it is vmcell-committed, not caller input
+    // (§10.2). This pins the asymmetry so a later "tidy-up" that makes one strict parser for both
+    // cannot land silently. Red-on-inverse: route the baseline through `parse_pins_overlay` and the
+    // unknown key becomes an error here.
+    #[test]
+    fn pins_baseline_keeps_ignore_unknown_semantics() {
+        let map =
+            parse_pins_json(r#"{ "kerne1": { "source_url": "x" }, "rootfs": { "image": "i" } }"#)
+                .expect("the baseline parser must ignore an unknown top-level key");
+        assert_eq!(map.get("rootfs_image").map(String::as_str), Some("i"));
+        assert!(!map.contains_key("kernel_source_url"));
+    }
+
+    // One law, one predicate: the human-readable roster in the rejection message must agree with
+    // the authority (`flatten_pins_namespace`'s dispatch), and the authority must cover every
+    // namespace vmcell's own committed pins.json uses plus the `builder_base` pair
+    // `resolve_builder_base` consumes. Red-on-inverse: drop an arm from the dispatch (or add a name
+    // to the roster that the dispatch does not know) and this goes red.
+    #[test]
+    fn known_pins_namespace_roster_matches_the_flatten_dispatch() {
+        for name in KNOWN_PINS_NAMESPACES {
+            assert!(
+                pins_namespace_shape(name).is_some(),
+                "`{name}` is advertised in the rejection message but the flatten dispatch rejects it"
+            );
+        }
+        let committed: serde_json::Value =
+            serde_json::from_str(COMMITTED_PINS).expect("committed pins.json is valid JSON");
+        for (name, value) in committed.as_object().expect("pins.json is an object") {
+            let shape = pins_namespace_shape(name).unwrap_or_else(|| {
+                panic!("the committed pins.json uses `{name}`, which an overlay could not override")
+            });
+            // The committed baseline must itself satisfy the shape the overlay is held to —
+            // otherwise the strict parser would reject an overlay that merely restates a baseline
+            // namespace, and the two documents would answer to different schemas.
+            assert!(
+                shape.matches(value),
+                "the committed pins.json gives `{name}` a value the overlay parser would reject \
+                 (expected {})",
+                shape.describe()
+            );
+        }
+        assert!(pins_namespace_shape("kerne1").is_none());
+    }
+
+    // GATE (delta 1 fix) — DISPATCH ⊆ ROSTER, the direction the roster test above cannot see. The
+    // roster is only the rejection message's human-readable list, so an arm added to
+    // `flatten_pins_namespace` without a roster entry leaves the error advertising an INCOMPLETE
+    // "known namespaces" list — a downstream is then told its perfectly valid key is unknown. There
+    // is no way to enumerate a `match`'s arms at runtime, so this scans the dispatch's own source
+    // text (the fn is in this file). Red-on-inverse: add an arm (`"gremlin" => …`) to the dispatch
+    // without adding it to `KNOWN_PINS_NAMESPACES` and this goes red naming `gremlin`.
+    #[test]
+    fn flatten_dispatch_arms_are_all_advertised_in_the_roster() {
+        const SOURCE: &str = include_str!("mod.rs");
+        let body = SOURCE
+            .split_once("fn flatten_pins_namespace(")
+            .expect("the dispatch is defined in this file")
+            .1
+            .split_once("match name {")
+            .expect("the dispatch matches on `name`")
+            .1;
+        let mut arms: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // The catch-all closes the dispatch; everything after it is other code.
+            if line.starts_with("_ =>") {
+                break;
+            }
+            // An arm line is `"name" => {` or `"a" | "b" => {`; bodies and comments never start
+            // with a quote.
+            if !line.starts_with('"') {
+                continue;
+            }
+            let Some((patterns, _)) = line.split_once("=>") else {
+                continue;
+            };
+            for pat in patterns.split('|') {
+                arms.push(pat.trim().trim_matches('"').to_string());
+            }
+        }
+        // The scan itself must be able to fail: if it silently matched nothing, every assert below
+        // would be vacuous.
+        assert_eq!(
+            arms.len(),
+            KNOWN_PINS_NAMESPACES.len(),
+            "the source scan found dispatch arms {arms:?} against roster {KNOWN_PINS_NAMESPACES:?}"
+        );
+        for name in &arms {
+            assert!(
+                KNOWN_PINS_NAMESPACES.contains(&name.as_str()),
+                "the dispatch handles `{name}` but the rejection message does not advertise it, so \
+                 a downstream using it would be told the roster is {KNOWN_PINS_NAMESPACES:?}"
+            );
+        }
+    }
+
+    // GATE (delta 1 fix) — ACCEPT-THEN-IGNORE ON A SCALAR NAMESPACE. `cloud_hypervisor` and
+    // `virtiofsd` are bare strings, while every namespace the committed pins.json actually carries
+    // (`kernel`, `kernels`, `kernel_prebuilt`, `rootfs`, `kernel_fragments`) is an object — so
+    // `{"cloud_hypervisor": {"version": "46.0"}}` is the shape a downstream will guess. Before the
+    // shape check that document was ACCEPTED and flattened to nothing: the CH build identity
+    // silently vanished from the snapshot cache key (M-ART-7 stale-snapshot), with no
+    // referenced-but-absent backstop because `snapshot.rs` folds the pin with `unwrap_or_default`.
+    // Red-on-inverse: drop the `shape.matches(value)` check in `parse_pins_overlay` and the object
+    // form is accepted again with `cloud_hypervisor` resolving to None.
+    #[test]
+    fn pins_overlay_rejects_wrong_shaped_scalar_namespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for ns in ["cloud_hypervisor", "virtiofsd"] {
+            let overlay = write_overlay(
+                tmp.path(),
+                &format!(r#"{{ "{ns}": {{ "version": "46.0" }} }}"#),
+            );
+            let res = resolve_pins(Some(&overlay));
+            let Err(crate::error::Error::Artifact(msg)) = res else {
+                panic!(
+                    "an object on the scalar namespace `{ns}` must be a hard error, got {res:?}"
+                );
+            };
+            assert!(
+                msg.contains(ns) && msg.contains("JSON string"),
+                "the rejection must name the key and the expected shape, got {msg}"
+            );
+        }
+        // Positive control: the RIGHT shape is accepted and actually resolves the pin, so the check
+        // rejects the shape and not the namespace.
+        let ok = write_overlay(tmp.path(), r#"{ "cloud_hypervisor": "46.0" }"#);
+        let merged = resolve_pins(Some(&ok)).expect("a scalar override must be accepted");
+        assert_eq!(
+            merged.get("cloud_hypervisor").map(String::as_str),
+            Some("46.0"),
+            "the accepted shape must reach the pin map — otherwise the check moved the silence"
+        );
+    }
+
+    // GATE (delta 1 fix) — THE WHOLE-NAMESPACE WIPE. `merge_pins_documents`' replace-outright arm
+    // makes a scalar on an object namespace replace the namespace, dropping every baseline sibling
+    // (`{"kernel": "https://…"}` wipes microvm_config AND source_sha256). It is unreachable only
+    // because the shape check runs first — this pins that, plus the invariant it protects.
+    // Red-on-inverse: drop the shape check and the document is accepted, `Missing
+    // kernel_microvm_config pin` surfacing much later instead of here.
+    #[test]
+    fn pins_overlay_rejects_scalar_on_an_object_namespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = write_overlay(tmp.path(), r#"{ "kernel": "https://d.example/l.tar.xz" }"#);
+        let res = resolve_pins(Some(&overlay));
+        let Err(crate::error::Error::Artifact(msg)) = res else {
+            panic!("a scalar on the object namespace `kernel` must be a hard error, got {res:?}");
+        };
+        assert!(
+            msg.contains("kernel") && msg.contains("JSON object"),
+            "the rejection must name the key and the expected shape, got {msg}"
+        );
+        // The baseline siblings the wipe would have dropped are still resolvable — the positive
+        // control that the rejection protected something real.
+        let baseline = resolve_pins(None).expect("baseline resolves");
+        assert!(baseline.contains_key("kernel_microvm_config"));
+        assert!(baseline.contains_key("kernel_source_sha256"));
+    }
+
+    // The `builder_base` namespace closes a consumed-but-unproducible hole: `resolve_builder_base`
+    // prefers `builder_base_image`/`_digest` over the `rootfs_*` pair, but nothing emitted them.
+    // Red-on-inverse: remove the `builder_base` arm and both the flatten and the
+    // `resolve_builder_base` preference go red.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn pins_builder_base_namespace_feeds_resolve_builder_base() {
+        let map = parse_pins_json(
+            r#"{ "rootfs": { "image": "docker.io/library/debian", "digest": "sha256:aa" },
+                 "builder_base": { "image": "docker.io/library/ubuntu", "digest": "sha256:bb" } }"#,
+        )
+        .expect("valid pins JSON");
+        assert_eq!(
+            map.get("builder_base_image").map(String::as_str),
+            Some("docker.io/library/ubuntu")
+        );
+        let (img, dig) = crate::artifact::rootfs::resolve_builder_base(&map).expect("resolves");
+        assert_eq!(
+            (img.as_str(), dig.as_str()),
+            ("docker.io/library/ubuntu", "sha256:bb")
+        );
+    }
+
+    // GATE (delta 1) — the ONE pins fold, which `ResolvePinsStage::cache_key` AND
+    // `fast_artifacts_fingerprint` (the `.build.stamp` short-circuit) both route through. Testing it
+    // directly is how the fingerprint half gets coverage at all: that fn needs the whole workspace
+    // source closure and the proxy CA, and reads `$VMCELL_PINS` from the process env.
+    // Red-on-inverse: (a) drop the overlay branch and v1/v2/absent collapse onto one digest — an
+    // overlay edit would leave a warm `.build.stamp` fresh and the pipeline skipped; (b) swap the
+    // absent marker for `unwrap_or_default()`'s empty string and the empty-file case aliases it;
+    // (c) make the unreadable case fold a marker instead of erroring and the `Err` assert goes red.
+    #[test]
+    fn fold_pins_identity_separates_absent_content_and_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay.json");
+        let fold = |path: Option<&Path>| -> Result<blake3::Hash> {
+            let mut h = blake3::Hasher::new();
+            fold_pins_identity(&mut h, path)?;
+            Ok(h.finalize())
+        };
+
+        // A referenced-but-absent overlay is a hard error naming the path — never a silent fold.
+        let err = fold(Some(&overlay)).expect_err("an absent overlay must fail loud");
+        assert!(
+            format!("{err}").contains("overlay.json"),
+            "the fold error must name the overlay, got {err}"
+        );
+
+        let absent = fold(None).expect("no overlay folds");
+        std::fs::write(&overlay, "").expect("write empty");
+        let empty = fold(Some(&overlay)).expect("empty overlay folds");
+        assert_ne!(
+            absent, empty,
+            "an empty overlay file must not alias the no-overlay marker"
+        );
+
+        std::fs::write(&overlay, r#"{ "rootfs": { "image": "v1" } }"#).expect("write v1");
+        let v1 = fold(Some(&overlay)).expect("v1 folds");
+        std::fs::write(&overlay, r#"{ "rootfs": { "image": "v2" } }"#).expect("write v2");
+        let v2 = fold(Some(&overlay)).expect("v2 folds");
+        assert_ne!(v1, v2, "editing the overlay must move the fold");
+        assert_ne!(absent, v1, "an overlay must move the fold off the baseline");
+        assert_eq!(v1, {
+            std::fs::write(&overlay, r#"{ "rootfs": { "image": "v1" } }"#).expect("rewrite v1");
+            fold(Some(&overlay)).expect("v1 folds")
+        });
+    }
+
+    // GATE (delta 1) — GATE BLINDNESS #1: the `.build.stamp` short-circuit. `ensure_test_artifacts`
+    // skips the ENTIRE fast pipeline when the stamp matches this fingerprint, so an overlay that
+    // does not move the fingerprint is silently ignored in any warm workspace — accept-then-ignore
+    // on the very surface the overlay exists to provide. Red-on-inverse: drop the
+    // `fold_pins_identity` call from `fast_artifacts_fingerprint_with` and the two fingerprints
+    // below become equal.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn fast_artifacts_fingerprint_moves_with_the_pins_overlay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay.json");
+        std::fs::write(&overlay, r#"{ "rootfs": { "image": "downstream/base" } }"#).expect("write");
+
+        let without = fast_artifacts_fingerprint_with(None).expect("fingerprint");
+        let with = fast_artifacts_fingerprint_with(Some(&overlay)).expect("fingerprint");
+        assert_ne!(
+            without, with,
+            "an overlay must move the fingerprint, or `.build.stamp` stays fresh and the pipeline \
+             is skipped"
+        );
+        assert_eq!(
+            with,
+            fast_artifacts_fingerprint_with(Some(&overlay)).expect("fingerprint"),
+            "the fingerprint must be stable for identical inputs"
+        );
+        // A referenced-but-absent overlay is a hard error here too, never a skipped fold.
+        assert!(fast_artifacts_fingerprint_with(Some(&tmp.path().join("nope.json"))).is_err());
+    }
+
+    // GATE (delta 1) — AN OVERLAY EDIT INVALIDATES THE STAGE KEY. Four distinct states must yield
+    // four distinct keys: no overlay, overlay v1, overlay v2 (edited), and a referenced-but-absent
+    // overlay. Red-on-inverse: (a) drop the overlay fold from `cache_key` and v1/v2/absent all
+    // collapse onto the no-overlay key — a warm workspace would serve pre-overlay artifacts;
+    // (b) fold `unwrap_or_default()` instead of the distinct markers and the empty-overlay case
+    // aliases the no-overlay case (asserted last).
+    #[test]
+    fn resolve_pins_stage_key_folds_the_overlay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay.json");
+        let inputs = StageInputs::default();
+
+        let none_key = ResolvePinsStage { overlay_file: None }.cache_key(&inputs);
+
+        // A referenced-but-absent overlay is its own state, never the no-overlay state.
+        let absent_key = ResolvePinsStage {
+            overlay_file: Some(overlay.clone()),
+        }
+        .cache_key(&inputs);
+        assert_ne!(
+            none_key, absent_key,
+            "an unreadable overlay must not hash as `no overlay`"
+        );
+
+        std::fs::write(
+            &overlay,
+            r#"{ "kernel": { "source_url": "https://d.example/v1" } }"#,
+        )
+        .expect("write v1");
+        let v1 = ResolvePinsStage {
+            overlay_file: Some(overlay.clone()),
+        }
+        .cache_key(&inputs);
+        assert_ne!(none_key, v1, "an overlay must change the stage key");
+        assert_ne!(absent_key, v1, "content must not hash as a read error");
+
+        std::fs::write(
+            &overlay,
+            r#"{ "kernel": { "source_url": "https://d.example/v2" } }"#,
+        )
+        .expect("write v2");
+        let v2 = ResolvePinsStage {
+            overlay_file: Some(overlay.clone()),
+        }
+        .cache_key(&inputs);
+        assert_ne!(v1, v2, "EDITING the overlay must re-resolve the stage");
+
+        // Same bytes → same key (the fold is pure, cache-key rule 1/4).
+        std::fs::write(
+            &overlay,
+            r#"{ "kernel": { "source_url": "https://d.example/v1" } }"#,
+        )
+        .expect("rewrite v1");
+        assert_eq!(
+            v1,
+            ResolvePinsStage {
+                overlay_file: Some(overlay.clone())
+            }
+            .cache_key(&inputs)
+        );
+
+        // An EMPTY overlay file is a fourth distinct state, not an alias of "no overlay".
+        std::fs::write(&overlay, "").expect("write empty");
+        let empty = ResolvePinsStage {
+            overlay_file: Some(overlay),
+        }
+        .cache_key(&inputs);
+        assert_ne!(
+            none_key, empty,
+            "an empty overlay file must not alias the no-overlay marker"
         );
     }
 }

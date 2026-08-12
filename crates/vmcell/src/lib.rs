@@ -3,6 +3,31 @@
 //! This crate provides tools to configure, launch, and interact with microVMs.
 //! It includes abstractions for networking, virtual machine monitors (like Cloud Hypervisor),
 //! and an agent protocol for executing commands inside the guest.
+//!
+//! # Consuming `vmcell` as a git dependency
+//!
+//! Out-of-repo consumers stand on one **named contract surface** (design §10.4, The downstream
+//! toolkit contract): the pins schema + overlay ([`artifact::ResolvePinsStage`],
+//! [`artifact::resolve_pins`], [`artifact::pins_overlay_path`]), the stage model
+//! ([`artifact::Stage`], [`artifact::Pipeline`], [`artifact::CacheKey`]), the kernel build entry
+//! points and their resolved-config sidecar, [`artifact::rootfs::pack_erofs_with_injection`] and the
+//! rootfs-construction contract, the `VMCELL_*` environment contract, and the
+//! `vmcell-artifact-validator` battery. A breaking change to any of it is a deliberate entry in the
+//! comment-changelog at the top of this crate's `Cargo.toml`, gated by `cargo semver-checks` over
+//! both contract crates and by the out-of-tree `examples/downstream-kernel/` consumer workspace.
+//!
+//! Two things bite consumers that the compiler cannot catch, both covered in the repository README's
+//! "Consuming vmcell as a dependency" section:
+//!
+//! - **The vendored `vhost` patch does not travel with a git dep.** Cargo honors `[patch.crates-io]`
+//!   only from the *consuming* workspace root, so a QEMU + [`config::NetConfig::Unprivileged`]
+//!   consumer silently loses the carried `SET_VRING_ENABLE` fix and gets a cryptic vhost-handshake
+//!   boot failure. Replicate the stanza, and run `scripts/check-vendored-vhost.sh` (path-independent,
+//!   the same predicate this repo's CI runs) in your own CI.
+//! - **The artifact bootstrap cannot build downstream.** Build artifacts with a vmcell checkout, or
+//!   build kernels through the toolkit with `VMCELL_PINS`, then point `VMCELL_KERNEL` /
+//!   `VMCELL_ROOTFS` at the outputs. The harness getters fail loud naming that route rather than
+//!   attempting the workspace bootstrap against your checkout.
 
 #![deny(missing_docs)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
@@ -114,6 +139,10 @@ pub mod vmm;
 
 #[cfg(feature = "host-common")]
 pub use agent::AgentClient;
+/// The raw vsock dial's stream handle (§3.2, The host side: AgentClient and SessionMux), re-exported beside
+/// [`AgentClient`] because `MicroVm::dial_vsock` returns it.
+#[cfg(feature = "host-common")]
+pub use agent::VsockDial;
 pub use agent::{ExecOutcome, ExecRequest};
 #[cfg(feature = "host-common")]
 pub use config::{

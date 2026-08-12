@@ -1,3 +1,33 @@
+//! `bench-vm`: the cross-backend macro-benchmark harness (design §16, Performance). The composition
+//! root that wires all four backends — Cloud Hypervisor, Firecracker, QEMU, crosvm — behind one
+//! `--backend` flag, so a lever is measured the same way everywhere.
+//!
+//! `print_stdout`/`print_stderr` are intentionally NOT denied here — emitting the measured tables
+//! and the per-run report on stdout/stderr is the whole point of a benchmark harness.
+#![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
+#![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
+#![deny(
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::multiple_unsafe_ops_per_block // one obligation per SAFETY comment
+)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::dbg_macro,
+        clippy::allow_attributes,               // B11: prefer #[expect] over #[allow] in prod code
+        clippy::allow_attributes_without_reason  // B11: every suppression states why
+    )
+)]
+
 use clap::Parser;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -629,14 +659,11 @@ async fn run_mode<V: Vmm>(
 // ----------------------------------------------------------------------------
 
 /// The kernel artifact filename for an optional version label (`vmlinux` or
-/// `vmlinux-<sanitized-label>`). `.`→`-` matches the build-side filename
-/// sanitization in `KernelStage::suffix` (the pipeline's cache sidecar uses
-/// `with_extension`, which mangles dotted names).
+/// `vmlinux-<sanitized-label>`) — `vmcell`'s shared
+/// [`kernel_filename`](vmcell::artifact::kernel::kernel_filename) law, so this harness resolves
+/// exactly the names the producers write rather than re-encoding the `.`→`-` sanitization.
 fn kernel_filename(label: Option<&str>) -> String {
-    match label {
-        Some(l) => format!("vmlinux-{}", l.replace('.', "-")),
-        None => "vmlinux".to_string(),
-    }
+    vmcell::artifact::kernel::kernel_filename(label)
 }
 
 /// The workspace root, so `--snap-dir` anchors independent of the process CWD
@@ -809,11 +836,13 @@ fn pcts(latencies: &mut [u128]) -> Option<(u128, u128, u128, u128)> {
     let n = latencies.len();
     let last = n - 1;
     let idx = |q: f64| ((n as f64 * q).ceil() as usize).saturating_sub(1).min(last);
+    // `.get()` rather than `[]`: the clamp above already proves every index in-bounds, so this is
+    // the same values with no panic path to argue about — and no suppression to outlive its proof.
     Some((
-        latencies[idx(0.5)],
-        latencies[idx(0.95)],
-        latencies[idx(0.99)],
-        latencies[last],
+        *latencies.get(idx(0.5))?,
+        *latencies.get(idx(0.95))?,
+        *latencies.get(idx(0.99))?,
+        *latencies.get(last)?,
     ))
 }
 
@@ -1128,16 +1157,19 @@ async fn run_footprint<V: Vmm>(
         }
     }
 
+    // Marginal cost of each additional resident guest: step N minus step N-1, with the first step
+    // its own marginal. Carrying `prev` (seeded 0, so the first subtraction is a no-op) keeps this
+    // index-free — the arithmetic that would panic on an empty/short slice cannot be written.
     let marginal_of = |steps: &[u64]| -> Vec<u64> {
-        let mut m = Vec::new();
-        for i in 0..steps.len() {
-            m.push(if i == 0 {
-                steps[0]
-            } else {
-                steps[i].saturating_sub(steps[i - 1])
-            });
-        }
-        m
+        let mut prev = 0u64;
+        steps
+            .iter()
+            .map(|&s| {
+                let marginal = s.saturating_sub(prev);
+                prev = s;
+                marginal
+            })
+            .collect()
     };
     let marginals = marginal_of(&step_anon);
     let marg_mean = mean_u64(&marginals);
@@ -2543,8 +2575,12 @@ async fn daemon_create(
             .body(body.to_string()),
     )
     .await?;
-    let id = v["vm"]["id"]
-        .as_str()
+    // `.get()` rather than `v["vm"]["id"]`: serde_json's Index panics on a non-object, and a daemon
+    // that answered with an error body is exactly the case this must report, not crash on.
+    let id = v
+        .get("vm")
+        .and_then(|vm| vm.get("id"))
+        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("daemon-api: create response carried no vm.id"))?
         .to_string();
     Ok((us, id))

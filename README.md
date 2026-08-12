@@ -2,10 +2,16 @@
 
 An end-to-end integration-testing and evaluation platform for a hypothetical agentic harness.
 Each test runs in a fresh micro-VM for structural isolation, hermetic state, and production fidelity.
-Driven entirely from a single Rust library, organized as a cargo **workspace**: the `vmcell` library
-(plus its CLI) and four lean member crates — `vmcell-protocol` (the shared wire enum),
-`vmcell-guest-agent` (guest PID 1), `vmcell-test-runner` (the privileged-test capability runner), and
-`vmcell-guest-tools` (the in-rootfs `ip`/`curl`/`kvm-ok` helper).
+Driven entirely from a single Rust library, organized as a cargo **workspace**. `vmcell` is the host
+library and carries the primary Cloud Hypervisor backend; the three secondary backends live in their
+own crates (`vmcell-firecracker`, `vmcell-qemu`, `vmcell-crosvm`), each depending on `vmcell` for the
+one `Vmm` trait and the shared jail/seccomp/spawn helpers. Around them sit the lean members —
+`vmcell-protocol` (the shared wire enum), `vmcell-guest-agent` (guest PID 1), `vmcell-test-runner`
+(the privileged-test capability runner), `vmcell-guest-tools` (the in-rootfs multicall helper:
+`ip`/`curl`/`kvm-ok`/`echo-server`), `vmcell-privilege`, the two in-VM artifact builders, the
+`vmcell-artifact-validator` conformance kit, the `vmcell-bench` harness, the CLI, and the
+control-plane tier (`vmcell-daemon`, `vmcelld`, `vmcell-daemon-client`, `vmcelld-ctl`,
+`vmcell-broker`).
 
 ## CLI (`vmcell`)
 
@@ -17,7 +23,7 @@ out. Build it with `cargo build` (the default feature set) and run subcommands w
 |---|---|
 | `build` | Build all VM artifacts (kernel, erofs rootfs, proxy CA) from `pins.json`. |
 | `build-kernels` | Build every kernel in the `pins.kernels` registry to `vmlinux-<label>`. |
-| `oci2erofs IMAGE@sha256:DIGEST -o out.erofs` | Convert any **digest-pinned** OCI base image into an erofs rootfs (verify blobs → whiteouts → inject agent/CA/tools → pack). Tags are rejected; a libc6-less base fails loud unless `--agent-musl <path>` supplies a static-musl agent. |
+| `oci2-erofs IMAGE@sha256:DIGEST -o out.erofs` | Convert any **digest-pinned** OCI base image into an erofs rootfs (verify blobs → whiteouts → inject agent/CA/tools → pack). Tags are rejected; a libc6-less base fails loud unless `--agent-musl <path>` supplies a static-musl agent. |
 | `run --kernel K --rootfs R [-- CMD…]` | Boot a fresh micro-VM, run `CMD` (default `/bin/true`) over vsock, tear down, and exit with the guest's exit code. |
 | `create --kernel K --rootfs R` | Boot a micro-VM and confirm the agent is ready, then tear down (a boot smoke test). |
 | `snapshot --kernel K --rootfs R --out DIR` | Boot a micro-VM and write a warm snapshot into `DIR` (snapshot-eligible config only). |
@@ -25,6 +31,70 @@ out. Build it with `cargo build` (the default feature set) and run subcommands w
 | `bundle [-o manifest.json]` | Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel/rootfs/CA/pins.json). |
 | `verify-bundle [-m manifest.json]` | Re-hash every artifact in a manifest and fail loud on any mismatch. |
 | `exec` / `ls` / `rm` / `destroy` | Deferred to the `vmcelld` daemon (§18) (need a cross-process VM registry); these fail loud with a typed error. |
+
+## Consuming vmcell as a dependency (the downstream contract)
+
+vmcell has out-of-repo consumers, so the surface they stand on is named here and held still by gates
+(design §10.4) — no more "public in the Rust-visibility sense, semi-public in practice".
+
+**The contract surface.** The pins schema + overlay semantics; `Stage`, `Pipeline`,
+`ResolvePinsStage`, `StageInputs`/`StageOutputs`, `CacheKey` and the hash helpers; the kernel build
+entry points and the resolved-config sidecar; `pack_erofs_with_injection` + `ExtraFile` and the
+rootfs-construction contract; the `VMCELL_*` env contract below; and the `vmcell-artifact-validator`
+battery + `KconfigValues`. A breaking change to any of it is a **deliberate ledger entry** in the
+comment-changelog at the top of `crates/vmcell/Cargo.toml` (pre-1.0 convention: breaking changes are
+minor bumps), never something a consumer discovers when their build breaks. `cargo semver-checks`
+gates both contract crates (`vmcell` and `vmcell-artifact-validator`), and the out-of-tree
+`examples/downstream-kernel/` workspace builds on every push as the living consumer — **reddening
+that job is the intended failure mode of contract drift**, so fix the contract or bump it, never the
+example.
+
+**The `VMCELL_*` environment contract.**
+
+| Variable | Contract |
+|---|---|
+| `VMCELL_ARTIFACTS_DIR` | Relocates the artifact cache; all freshness/fingerprint logic runs there unchanged. |
+| `VMCELL_KERNEL` | Path redirect only: the kernel is used verbatim and must exist (fail-loud). It does **not** disable any build. |
+| `VMCELL_ROOTFS` | The externally-managed-artifacts switch: its presence makes `ensure_test_artifacts` a **full no-op** — not a rootfs-only skip, so the kernel-presence check and the agent/tools rebuilds are skipped too. This is the switch a downstream harness sets. |
+| `VMCELL_PINS` | The pins overlay: a JSON file whose top-level keys override the committed baseline key-by-key. An unknown or wrong-shaped top-level key is a hard error naming it, so a typo'd override can never silently resolve from the baseline. |
+| `VMCELL_CH_BIN` / `_FC_BIN` / `_QEMU_BIN` / `_CROSVM_BIN` | Backend binary resolvers. |
+| `VMCELL_SKIP_MANIFEST` | Where capability-driven test skips are recorded (`SKIP <vmm> <capability>`). |
+
+**The harness getters, downstream.** In a consumer workspace `harness::get_vmlinux()`/`get_rootfs()`
+have exactly two behaviors: with `VMCELL_KERNEL` + `VMCELL_ROOTFS` set (the documented downstream
+configuration) they return those paths after an existence check; **without** them — including with
+`VMCELL_PINS` alone — they **fail loud**, naming the two-step route (build the kernel through the
+toolkit, then point `VMCELL_KERNEL`/`VMCELL_ROOTFS` at the outputs). They never quietly try to run
+the workspace bootstrap against your cargo checkout, because that bootstrap structurally cannot build
+downstream. Build with the overlay; consume through the env contract.
+
+**Git-dep guidance**, each item load-bearing:
+
+1. Pin by `rev`, build `--locked`, and use a toolchain at least the single-source MSRV
+   (`rust-toolchain.toml` ≡ `[workspace.package] rust-version`). Understating the MSRV lets
+   MSRV-aware resolvers hand you older, vulnerable dependency versions.
+2. **If you use QEMU with `NetConfig::Unprivileged`, replicate the `[patch.crates-io]` vendored-vhost
+   stanza in your own workspace root.** Cargo honors patch sections only from the *consuming*
+   workspace root, so a plain git dep silently drops vmcell's carried `SET_VRING_ENABLE` fix and
+   regresses that one path to a cryptic vhost-handshake boot failure:
+
+   ```toml
+   [patch.crates-io]
+   vhost = { git = "https://github.com/<your-fork-or-vmcell-remote>", rev = "<the rev you pinned>" }
+   vhost-user-backend = { git = "https://github.com/<your-fork-or-vmcell-remote>", rev = "<the rev you pinned>" }
+   ```
+
+   (The path form works too, but then copy the `vendor/vhost*` trees as well. Every other
+   backend/mode needs none of this.)
+3. Run `scripts/check-vendored-vhost.sh` in your CI when (2) applies. It is path-independent — it
+   greps *your* workspace's `cargo tree` for the patched resolution — and is the same predicate
+   vmcell's own CI runs, so the check cannot drift between here and downstream. A workspace that
+   never links vhost gets a "not applicable" pass rather than a failure it is told to ignore.
+4. Artifacts: build the rootfs with a vmcell checkout (`vmcell build`, or `vmcell oci2-erofs …
+   --inject …` for your own files), then point your harness at it with `VMCELL_ROOTFS` +
+   `VMCELL_ARTIFACTS_DIR`. Kernels build downstream through the toolkit with `VMCELL_PINS`.
+5. Privileged runs use **your own** workspace's blessed `vmcell-test-runner` copy (`just bless`) —
+   the blessing is per-workspace by design.
 
 ## Development
 

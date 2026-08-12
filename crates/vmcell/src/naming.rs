@@ -72,10 +72,41 @@ pub fn scratch_dir_name(prefix: &str, pid: u32, vmid: u32) -> String {
     format!("{prefix}-vm-{pid}-{vmid}")
 }
 
+/// The **segment** network-namespace name for `segid`: `<prefix>-seg-<segid>` (§6.5, VM-to-VM
+/// segments). One netns per segment, holding the bridge and every member's tap; a segment member
+/// therefore has **no** per-VM netns.
+#[must_use]
+pub fn segment_netns_name(prefix: &str, segid: u32) -> String {
+    format!("{prefix}-seg-{segid}")
+}
+
+/// The segment **bridge** interface name for `segid`: `<prefix>-br-<segid>` (§6.5, VM-to-VM
+/// segments). The short `-br-` stem keeps the name inside `IFNAMSIZ` (≤ 6 + 4 + 3 = 13 < 15) for
+/// the longest legal prefix and segid.
+#[must_use]
+pub fn segment_bridge_name(prefix: &str, segid: u32) -> String {
+    format!("{prefix}-br-{segid}")
+}
+
 /// The prefix the orphan sweep matches **netns** names by: `<prefix>-net-`.
+///
+/// Per-VM namespaces only — a segment namespace is matched by
+/// [`segment_netns_sweep_prefix`] and liveness-checked against **segids**, not vmids (law F2,
+/// §6.5). The two stems are asserted distinct by `prefix_matches_its_names`.
 #[must_use]
 pub fn netns_sweep_prefix(prefix: &str) -> String {
     format!("{prefix}-net-")
+}
+
+/// The prefix the orphan sweep matches **segment** namespaces by: `<prefix>-seg-` (§6.5).
+///
+/// Deliberately distinct from [`netns_sweep_prefix`]: the two classes live in different id
+/// spaces (vmids vs segids), and sweeping a `-seg-` name against live *vmids* fails **open** —
+/// a dead segid colliding with a live vmid would never be reclaimed. There is no bridge sweep
+/// filter on purpose: the bridge lives inside the segment netns and dies with it.
+#[must_use]
+pub fn segment_netns_sweep_prefix(prefix: &str) -> String {
+    format!("{prefix}-seg-")
 }
 
 /// The prefix the orphan sweep matches **cgroup slices and scratch dirs** by: `<prefix>-vm-` (both use
@@ -109,8 +140,40 @@ mod tests {
                 scratch_dir_name(prefix, pid, vmid).starts_with(&vm_resource_sweep_prefix(prefix)),
                 "scratch dir name must match its sweep filter for prefix {prefix:?}"
             );
-            // The netns and vm stems are DISTINCT so a netns is never swept as a cgroup/scratch.
+            // v30 §6.5: the segment class joins the same lockstep — its netns name must match its
+            // OWN sweep filter (never the per-VM `-net-` one, which is checked against vmids).
+            let segid = 5;
+            assert!(
+                segment_netns_name(prefix, segid).starts_with(&segment_netns_sweep_prefix(prefix)),
+                "segment netns name must match its sweep filter for prefix {prefix:?}"
+            );
+            // The three stems are PAIRWISE distinct so no class is ever swept against another
+            // class's id space (the wrong-id-space bug §6.5 calls out: `trailing_id` parses
+            // `<prefix>-seg-7` as 7 just as happily as `<prefix>-net-7`).
             assert_ne!(netns_sweep_prefix(prefix), vm_resource_sweep_prefix(prefix));
+            assert_ne!(
+                netns_sweep_prefix(prefix),
+                segment_netns_sweep_prefix(prefix)
+            );
+            assert_ne!(
+                vm_resource_sweep_prefix(prefix),
+                segment_netns_sweep_prefix(prefix)
+            );
+            // A segment netns must NOT be caught by the per-VM netns filter, and vice versa.
+            assert!(
+                !segment_netns_name(prefix, segid).starts_with(&netns_sweep_prefix(prefix)),
+                "a segment netns must not be swept against live vmids for prefix {prefix:?}"
+            );
+            assert!(
+                !netns_name(prefix, vmid).starts_with(&segment_netns_sweep_prefix(prefix)),
+                "a per-VM netns must not be swept against live segids for prefix {prefix:?}"
+            );
+            // The bridge lives inside the segment netns and dies with it, so it has no sweep
+            // filter — but its name must still stay inside IFNAMSIZ (15) for the longest prefix.
+            assert!(
+                segment_bridge_name(prefix, 254).len() < 15,
+                "segment bridge name must stay under IFNAMSIZ for prefix {prefix:?}"
+            );
         }
     }
 
@@ -123,6 +186,10 @@ mod tests {
         assert_eq!(scratch_dir_name(p, 3, 7), "vmcell-vm-3-7");
         assert_eq!(netns_sweep_prefix(p), "vmcell-net-");
         assert_eq!(vm_resource_sweep_prefix(p), "vmcell-vm-");
+        // v30 §6.5 — the segment class's golden names.
+        assert_eq!(segment_netns_name(p, 7), "vmcell-seg-7");
+        assert_eq!(segment_bridge_name(p, 7), "vmcell-br-7");
+        assert_eq!(segment_netns_sweep_prefix(p), "vmcell-seg-");
     }
 
     #[test]

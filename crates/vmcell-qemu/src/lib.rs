@@ -444,6 +444,192 @@ fn push_fixed_qemu_flags(cmd: &mut tokio::process::Command) {
         .arg("-S");
 }
 
+/// The id of the single xhci controller vmcell attaches when a config requests host-USB
+/// passthrough. One controller carries every requested device (§2.4, QEMU q35 — the fallback and most-proven nester).
+const USB_CONTROLLER_ID: &str = "vmcell-xhci";
+
+/// Builds the host-USB passthrough argv fragment for `devices` (§2.4, QEMU q35 — the fallback and most-proven nester), v30 §18 (Delta register)
+/// delta 9): one `-device qemu-xhci,id=vmcell-xhci` controller followed by one
+/// `-device usb-host,vendorid=0x…,productid=0x…` per device, in call order.
+///
+/// Empty in, empty out — QEMU runs under `-nodefaults`, so a config with no USB device
+/// gets **no** USB controller at all (the state crosvm has to force with `--no-usb`).
+///
+/// **Pure and unit-testable** (no I/O, no spawn, no `Command`), following
+/// `vmcell_crosvm::build_crosvm_run_args`: QEMU's argv is otherwise assembled inline into
+/// a `tokio::process::Command`, which is why its device flags were never goldenable. The
+/// caller splices the result in with `cmd.args(...)`.
+///
+/// Both ids are rendered zero-padded lowercase hex (`0x1d6b`). `VmConfigBuilder::build`
+/// has already rejected a zero id (QEMU reads zero as *unset* — match-any) and a
+/// duplicate `(vendor_id, product_id)` pair, so this helper does no validation of its
+/// own — it is the emitter, not a second copy of that law.
+fn build_qemu_usb_args(devices: &[vmcell::config::UsbHostDevice]) -> Vec<String> {
+    let mut args = Vec::new();
+    if devices.is_empty() {
+        return args;
+    }
+    args.push("-device".to_string());
+    args.push(format!("qemu-xhci,id={USB_CONTROLLER_ID}"));
+    for dev in devices {
+        args.push("-device".to_string());
+        args.push(format!(
+            "usb-host,vendorid=0x{:04x},productid=0x{:04x}",
+            dev.vendor_id, dev.product_id
+        ));
+    }
+    args
+}
+
+/// The sysfs directory naming every USB device attached to the host — one subdirectory
+/// per device (plus per-interface ones, which carry no `idVendor` and are skipped).
+const SYSFS_USB_DEVICES: &str = "/sys/bus/usb/devices";
+
+/// The usbfs mount whose `<bus>/<dev>` character devices QEMU's `usb-host` opens (and
+/// must be able to open **read-write** to claim the device).
+const USBFS_ROOT: &str = "/dev/bus/usb";
+
+/// Reads a hex sysfs attribute (`idVendor`, `idProduct` — e.g. `1d6b`).
+fn read_usb_hex_attr(dir: &Path, name: &str) -> Option<u16> {
+    let raw = std::fs::read_to_string(dir.join(name)).ok()?;
+    u16::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// Reads a decimal sysfs attribute (`busnum`, `devnum` — usbfs path components).
+fn read_usb_dec_attr(dir: &Path, name: &str) -> Option<u32> {
+    let raw = std::fs::read_to_string(dir.join(name)).ok()?;
+    raw.trim().parse().ok()
+}
+
+/// Resolves the usbfs node of the one host device matching `device`, and proves it is
+/// **openable read-write** — the access QEMU's `usb-host` needs to claim it.
+///
+/// Why this exists (measured, not assumed — QEMU 10.2.1, 2026-08-11): QEMU accepts
+/// `-device usb-host,vendorid=…,productid=…` for a device that is **absent, ambiguous or
+/// unopenable and says nothing at all** — it reaches QMP `prelaunch` normally and the
+/// guest simply gets an empty xhci bus. A capability that advertises host-USB
+/// passthrough must not degrade into "attached nothing" in silence, so vmcell answers
+/// the question QEMU declines to: the device exists, exactly one host device carries
+/// those ids, and this process can open its node read-write.
+///
+/// Both roots are parameters so the resolution is unit-testable against a fixture tree;
+/// production passes [`SYSFS_USB_DEVICES`] and [`USBFS_ROOT`].
+///
+/// **Residual (recorded, not hidden):** the check runs in the vmcell host process, which
+/// shares the QEMU child's uid and — with `clear_ambient_caps: false`, the default — its
+/// ambient capabilities. A jail configured to clear them could still leave the child
+/// unable to open a node this process opened; QEMU's own (silent) failure is then the
+/// only signal, which is why `clear_ambient_caps` stays default-`false` here.
+///
+/// # Errors
+/// [`Error::Vmm`] naming the ids when no host device matches, naming both nodes when the
+/// ids are ambiguous (two identical devices — every host's *root hubs* collide this way:
+/// `1d6b:0002` is typically several), and naming the node plus the OS error when it
+/// cannot be opened read-write (`/dev/bus/usb` nodes are commonly `0664 root:root`, so an
+/// unprivileged run needs a udev rule; the blessed runner's ambient `CAP_DAC_OVERRIDE`
+/// covers it).
+fn resolve_usb_device_node(
+    sysfs_root: &Path,
+    usbfs_root: &Path,
+    device: vmcell::config::UsbHostDevice,
+) -> Result<PathBuf> {
+    let (vid, pid) = (device.vendor_id, device.product_id);
+    let entries = std::fs::read_dir(sysfs_root).map_err(|e| {
+        Error::Vmm(format!(
+            "host USB passthrough: cannot enumerate {} ({e}) — the host kernel exposes no \
+             USB devices, so {vid:04x}:{pid:04x} cannot be passed through",
+            sysfs_root.display()
+        ))
+    })?;
+
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let dir = entry
+            .map_err(|e| Error::Vmm(format!("host USB passthrough: reading {sysfs_root:?}: {e}")))?
+            .path();
+        // Interface directories (`3-7:1.0`) carry no `idVendor`; only devices do.
+        let (Some(found_vid), Some(found_pid)) = (
+            read_usb_hex_attr(&dir, "idVendor"),
+            read_usb_hex_attr(&dir, "idProduct"),
+        ) else {
+            continue;
+        };
+        if (found_vid, found_pid) != (vid, pid) {
+            continue;
+        }
+        let (Some(bus), Some(dev)) = (
+            read_usb_dec_attr(&dir, "busnum"),
+            read_usb_dec_attr(&dir, "devnum"),
+        ) else {
+            return Err(Error::Vmm(format!(
+                "host USB passthrough: {} matches {vid:04x}:{pid:04x} but has no readable \
+                 busnum/devnum, so its {} node cannot be named",
+                dir.display(),
+                usbfs_root.display()
+            )));
+        };
+        matches.push(
+            usbfs_root
+                .join(format!("{bus:03}"))
+                .join(format!("{dev:03}")),
+        );
+    }
+    matches.sort();
+
+    let [node] = matches.as_slice() else {
+        if matches.is_empty() {
+            return Err(Error::Vmm(format!(
+                "host USB passthrough: no host device matches {vid:04x}:{pid:04x} under {} — \
+                 QEMU would start with an empty xhci bus and never report it",
+                sysfs_root.display()
+            )));
+        }
+        return Err(Error::Vmm(format!(
+            "host USB passthrough: {vid:04x}:{pid:04x} is ambiguous — {} host devices carry \
+             those ids ({matches:?}); QEMU would attach an arbitrary one",
+            matches.len()
+        )));
+    };
+
+    // Prove the access QEMU needs, here, where the error can name the node.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .map_err(|e| {
+            Error::Vmm(format!(
+                "host USB passthrough: cannot open {} read-write for {vid:04x}:{pid:04x} ({e}) \
+                 — usbfs nodes are typically 0664 root:root, so this needs a udev rule or the \
+                 blessed runner's ambient CAP_DAC_OVERRIDE",
+                node.display()
+            ))
+        })?;
+    Ok(node.clone())
+}
+
+/// Fails loud unless every requested host USB device is present, unambiguous and openable
+/// (see [`resolve_usb_device_node`]). Runs before the spawn, so a misnamed or absent
+/// device never boots a guest that silently lacks it.
+///
+/// # Errors
+/// As [`resolve_usb_device_node`], for the first device that fails.
+fn require_usb_host_devices(
+    sysfs_root: &Path,
+    usbfs_root: &Path,
+    devices: &[vmcell::config::UsbHostDevice],
+) -> Result<()> {
+    for device in devices {
+        let node = resolve_usb_device_node(sysfs_root, usbfs_root, *device)?;
+        tracing::debug!(
+            "host USB passthrough: {:04x}:{:04x} -> {}",
+            device.vendor_id,
+            device.product_id,
+            node.display()
+        );
+    }
+    Ok(())
+}
+
 /// Selects the **in-kernel `vhost-vsock`** transport for a QEMU config, versus the
 /// default external `vhost-device-vsock` daemon. The **one** predicate every call site
 /// (create, restore, endpoint wiring) reads — never a second copy (AGENTS.md "one law,
@@ -510,9 +696,10 @@ fn qemu_snapshot_eligibility(endpoint: &VsockEndpoint, has_vhost_user_device: bo
 }
 
 /// Per-spawn transport/lifecycle knobs shared by `create` and `restore`, so both
-/// drive the one [`Qemu::spawn_qemu`] builder instead of forking the argv
-/// construction (the source/destination topology must stay congruent for migration,
-/// so a second builder would be a divergence hazard).
+/// drive the one [`Qemu::spawn_qemu`] path — and through it the one
+/// [`build_qemu_command`] composer — instead of forking the argv construction (the
+/// source/destination topology must stay congruent for migration, so a second builder
+/// would be a divergence hazard).
 struct SpawnParams {
     /// Attach the in-kernel `vhost-vsock-pci` device (the snapshot transport) instead
     /// of the external `vhost-device-vsock` daemon.
@@ -528,6 +715,38 @@ struct SpawnParams {
     /// `true` on the restore path: launch with `-incoming defer` so the caller drives
     /// `migrate-incoming` over QMP, then `resume`. `false` on cold create.
     incoming: bool,
+}
+
+/// The per-VM host paths the QEMU argv references, computed by [`Qemu::spawn_qemu`] and
+/// consumed by the I/O-free composer [`build_qemu_command`].
+///
+/// Passing the virtio-fs daemons' *socket paths* (not the live `VirtioFsDaemon` handles)
+/// is what keeps the composer free of process ownership: it reads paths, spawns nothing,
+/// and can therefore be driven from a unit test that asserts the exact argv the launch
+/// would exec.
+struct QemuSpawnPaths<'a> {
+    /// The QMP control socket QEMU serves (`-qmp unix:…`).
+    qmp_socket: &'a Path,
+    /// The AF_UNIX path the *host* dials for the guest agent on the external-daemon
+    /// transport. Not in the argv — `vhost-device-vsock`'s `--uds-path` — but carried
+    /// here so the spawn tail can name it once.
+    vsock_path: &'a Path,
+    /// The socket QEMU connects to as the `vhost-user-vsock` frontend.
+    vhost_vsock: &'a Path,
+    /// The file the guest console/serial bytes land in.
+    serial_path: &'a Path,
+    /// One socket path per [`VmConfig::shares`] entry, in the same order.
+    fs_daemon_sockets: &'a [PathBuf],
+}
+
+/// The helper daemons a spawn has already started and still owns when the QEMU child is
+/// launched — handed to [`finish_qemu_spawn`], which must reap them on every error path
+/// until the long-lived `QemuInstance` takes over (H-QEMU-1).
+struct SpawnedDaemons {
+    /// The external `vhost-device-vsock` daemon (absent on the in-kernel transport).
+    vsock: Option<VsockDaemonGuard>,
+    /// One `virtiofsd` per configured share.
+    fs: Vec<vmcell::fs::VirtioFsDaemon>,
 }
 
 impl Qemu {
@@ -619,171 +838,30 @@ impl Qemu {
             let daemon = vmcell::fs::VirtioFsDaemon::start(share, &res.tmp_dir).await?;
             fs_daemons.push(daemon);
         }
+        // The argv names each virtio-fs daemon by socket path only, so the composer gets
+        // the paths — never the live `Child` handles this function still owns.
+        let fs_daemon_sockets: Vec<PathBuf> =
+            fs_daemons.iter().map(|d| d.socket_path.clone()).collect();
 
-        // §12.2 (Layer 1 — the VMM's own seccomp filter)/§12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): QEMU had NO `-sandbox` — it ran unconfined. Enforcing now emits the
-        // libseccomp sandbox (a QEMU built without libseccomp errors fail-loud on it, the
-        // desired behavior); the jailer-equivalent hardening is applied in build_vmm_cmd.
-        let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("qemu", cfg.vmm_seccomp)?;
-        let jail = vmcell::vmm::jail::jail_spec_from_config(&cfg.jail)?;
-        let mut cmd =
-            vmcell::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
-        cmd.args(&seccomp_args);
-
-        cmd.arg("-M")
-            .arg("q35,memory-backend=mem")
-            .arg("-m")
-            .arg(cfg.mem_mib.to_string())
-            .arg("-smp")
-            .arg(cfg.vcpus.to_string());
-        // Fixed, config-independent flags — including `-S` to freeze the guest vCPUs at
-        // launch so `boot()`'s `cont` is the real start point (H-VMM-2). The former
-        // `-trace vhost_user_*` debug residue is dropped (L-VMM-4).
-        push_fixed_qemu_flags(&mut cmd);
-        cmd.arg("-object")
-            .arg(format!(
-                "memory-backend-file,id=mem,size={}M,mem-path=/dev/shm,share=on",
-                cfg.mem_mib
-            ))
-            .arg("-qmp")
-            .arg(format!("unix:{},server,nowait", qmp_socket.display()));
-
-        // virtio-rng gives the guest `/dev/hwrng`. The post-restore CSPRNG reseed copies
-        // 32 bytes `/dev/hwrng` → `/dev/urandom` in-guest (§8.2, Restore correctness: a restored VM is not a fresh VM); without an entropy
-        // device that reseed reports `reseed_applied: false` and restored clones replay
-        // frozen CSPRNG state — the same reason Firecracker's create() attaches
-        // virtio-rng (§2.3, Firecracker — the density tier and the fastest restore). Present on every launch so the source and
-        // restore topologies stay congruent for migration.
-        cmd.arg("-object")
-            .arg("rng-random,filename=/dev/urandom,id=rng0")
-            .arg("-device")
-            .arg("virtio-rng-pci,rng=rng0");
-
-        // Console wiring, driven by the SAME `cfg.console_mode` as the cmdline
-        // `console=` token (`build_kernel_cmdline`) so the two move in lockstep — a
-        // desync sinks the guest console nowhere and `serial.log` goes silent.
-        // `reject_unsupported_console` already gated an unsupported mode in create().
-        match cfg.console_mode {
-            // Uart: the 8250 `ttyS0` bytes go straight to serial.log.
-            vmcell::config::ConsoleMode::Uart => {
-                cmd.arg("-serial")
-                    .arg(format!("file:{}", serial_path.display()));
-            }
-            // VirtioConsole: no `-serial`; `hvc0` is a virtconsole on a virtio-serial
-            // bus (q35 already provides PCI) whose chardev writes serial.log.
-            vmcell::config::ConsoleMode::VirtioConsole => {
-                cmd.arg("-device")
-                    .arg("virtio-serial-pci,id=virtio-serial0")
-                    .arg("-chardev")
-                    .arg(format!(
-                        "file,id=charconsole0,path={}",
-                        serial_path.display()
-                    ))
-                    .arg("-device")
-                    .arg("virtconsole,chardev=charconsole0,id=console0");
-            }
-        }
-
-        // Attach the vsock device selected above. The in-kernel `vhost-vsock-pci`
-        // (snapshot-eligible, §2.4, QEMU q35 — the fallback and most-proven nester) is realized by QEMU against `/dev/vhost-vsock` — a
-        // root:kvm device, so a jailed QEMU needs the runner's `CAP_DAC_OVERRIDE` to
-        // open it; a permission failure surfaces loud at device realize, never a silent
-        // downgrade (M-VMM-2). Its `guest-cid` is a device *property* (not migrated),
-        // so restore reuses the baked CID here (§8.2). The default external daemon path
-        // stays the `vhost-user-vsock-pci` chardev pair.
-        if params.in_kernel_vsock {
-            cmd.arg("-device")
-                .arg(format!("vhost-vsock-pci,guest-cid={}", params.guest_cid));
-        } else {
-            cmd.arg("-chardev")
-                .arg(format!("socket,id=vvsock,path={}", vhost_vsock.display()))
-                .arg("-device")
-                .arg("vhost-user-vsock-pci,chardev=vvsock");
-        }
-
-        match &cfg.rootfs {
-            vmcell::config::RootfsSource::Erofs { image } => {
-                cmd.arg("-drive")
-                    .arg(format!(
-                        "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
-                        image.display()
-                    ))
-                    .arg("-device")
-                    .arg("virtio-blk-pci,drive=rfs");
-            }
-            vmcell::config::RootfsSource::Block { image, overlay } => {
-                cmd.arg("-drive")
-                    .arg(format!(
-                        "file={},format=raw,id=rfs,if=none,file.locking=off",
-                        overlay.as_ref().unwrap_or(image).display()
-                    ))
-                    .arg("-device")
-                    .arg("virtio-blk-pci,drive=rfs");
-            }
-        }
-
-        // Extra virtio-blk devices (§4.6, Extra virtio-blk devices and disk-I/O throttling), attached AFTER the root `virtio-blk-pci` so
-        // they enumerate `/dev/vdb`, `/dev/vdc`, … in order and never shift the root
-        // off `/dev/vda`. Each is a split-form drive/device pair with its own id.
-        // `readonly=on` only for read-only disks; `file.locking=off` matches the root.
-        for (i, disk) in cfg.extra_disks.iter().enumerate() {
-            let ro = if disk.readonly { ",readonly=on" } else { "" };
-            // Disk-I/O fault injection (§4.6, Extra virtio-blk devices and disk-I/O throttling): QEMU's per-drive throttling takes the rate
-            // directly (bytes/s, ops/s) — no token-bucket conversion, unset caps omitted.
-            let mut throttle = String::new();
-            if let Some(limit) = &disk.io_limit {
-                if let Some(bps) = limit.bandwidth_bytes_per_sec {
-                    throttle.push_str(&format!(",throttling.bps-total={bps}"));
-                }
-                if let Some(iops) = limit.iops {
-                    throttle.push_str(&format!(",throttling.iops-total={iops}"));
-                }
-            }
-            cmd.arg("-drive")
-                .arg(format!(
-                    "file={},format=raw,id=extra{},if=none{},file.locking=off{}",
-                    disk.image.display(),
-                    i,
-                    ro,
-                    throttle,
-                ))
-                .arg("-device")
-                .arg(format!("virtio-blk-pci,drive=extra{i}"));
-        }
-
-        for (i, (share, daemon)) in cfg.shares.iter().zip(fs_daemons.iter()).enumerate() {
-            cmd.arg("-chardev")
-                .arg(format!(
-                    "socket,id=vfs{},path={}",
-                    i,
-                    daemon.socket_path.display()
-                ))
-                .arg("-device")
-                .arg(format!(
-                    "vhost-user-fs-pci,chardev=vfs{},tag={}",
-                    i, share.tag
-                ));
-        }
-
-        if let Some(tap) = &res.tap_name {
-            cmd.arg("-netdev")
-                .arg(format!("tap,id=net0,ifname={tap},script=no,downscript=no"))
-                .arg("-device")
-                .arg("virtio-net-pci,netdev=net0");
-        } else if let Some(socket) = &res.vhost_user_socket {
-            // The smoltcp NAT (orchestrator) binds this UDS lazily from a background
-            // thread (`VhostUserDaemon::start` inside the thread, not `Listener::new`);
-            // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so
-            // it must not race the bind — otherwise boots die with
-            // "-chardev socket ...: Failed to connect ...: No such file or directory".
-            // Wait for the socket first: the same readiness gate the external vsock
-            // daemon gets above, but process-less (smoltcp is a thread, not a `Child`).
-            // CH's vhost-user-net frontend tolerates a not-yet-bound socket via its own
-            // client-side reconnect over its multi-second startup; QEMU does not. Normally
-            // the socket appears in <10 ms; the 2 s ceiling covers a bind thread scheduled
-            // late under a freq-pinned, many-thread load while abandoning a truly-failed
-            // smoltcp bring-up promptly (the ~10% flake the net-egress probe surfaced) so
-            // the caller's bounded retry recovers on a fresh VM. Fails loud on timeout; the
-            // mid-`start` teardown releases smoltcp.
+        // The smoltcp NAT (orchestrator) binds this UDS lazily from a background
+        // thread (`VhostUserDaemon::start` inside the thread, not `Listener::new`);
+        // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so
+        // it must not race the bind — otherwise boots die with
+        // "-chardev socket ...: Failed to connect ...: No such file or directory".
+        // Wait for the socket first: the same readiness gate the external vsock
+        // daemon gets above, but process-less (smoltcp is a thread, not a `Child`).
+        // CH's vhost-user-net frontend tolerates a not-yet-bound socket via its own
+        // client-side reconnect over its multi-second startup; QEMU does not. Normally
+        // the socket appears in <10 ms; the 2 s ceiling covers a bind thread scheduled
+        // late under a freq-pinned, many-thread load while abandoning a truly-failed
+        // smoltcp bring-up promptly (the ~10% flake the net-egress probe surfaced) so
+        // the caller's bounded retry recovers on a fresh VM. Fails loud on timeout; the
+        // mid-`start` teardown releases smoltcp. It runs HERE rather than beside the
+        // `-chardev` it gates so that `build_qemu_command` performs no I/O at all and
+        // the composed argv is assertable from a unit test.
+        if res.tap_name.is_none()
+            && let Some(socket) = &res.vhost_user_socket
+        {
             vmcell::vmm::wait_for_socket(
                 socket,
                 None,
@@ -791,99 +869,348 @@ impl Qemu {
                 cfg.timeouts.api_socket_poll.as_millis() as u64,
             )
             .await?;
-            cmd.arg("-chardev")
-                .arg(format!("socket,id=net0,path={}", socket.display()))
-                .arg("-netdev")
-                .arg("vhost-user,id=vnet0,chardev=net0,vhostforce=on")
-                .arg("-device")
-                .arg(format!(
-                    "virtio-net-pci,netdev=vnet0,mac={}",
-                    vmcell::net::mac_math(res.vmid)?
-                ));
         }
 
-        let cmdline = vmcell::config::build_kernel_cmdline(cfg, res.vmid, "")?;
-        cmd.arg("-kernel")
-            .arg(&cfg.kernel)
-            .arg("-append")
-            .arg(&cmdline);
-
-        // Restore launches with `-incoming defer`: the guest state is not loaded at
-        // spawn — `restore()` drives `migrate-incoming` over QMP once QMP is ready and
-        // waits for `query-migrate` to complete before returning the paused instance
-        // (§8.1, The warm-snapshot path and the eligibility law). `-S` (always emitted) keeps the vCPUs stopped alongside it. On
-        // cold `create` this is absent.
-        if params.incoming {
-            cmd.arg("-incoming").arg("defer");
-        }
-
-        let cmd_str = format!("{cmd:?}");
-        // Debug level (not info): the full command line is diagnostic noise on every
-        // create, and with stderr inherited it should not clutter harness output
-        // (L-VMM-4).
-        tracing::debug!("QEMU CMD: {}", cmd_str);
-
-        let mut process = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-
-        // Shared spawn+register+await-ready sequence (VMM-2): capture the pgid, add the
-        // VMM to its cgroup, and block on the QMP socket — reaping the process group on
-        // any failure. Routing through the shared helper drops QEMU's former
-        // `Error::Vmm("QMP socket failed to appear")` wrapping so the readiness error is
-        // now propagated raw, identically to CH/FC. On an error here the still-armed
-        // `vsock_guard` (and `fs_daemons`) reap the vhost-user daemons via `?`/`Drop`.
-        let pgid = vmcell::vmm::register_and_await_ready(
-            &mut process,
-            cgroups,
-            &res.cgroup_name,
-            &qmp_socket,
-            1000,
-            cfg.timeouts.api_socket_poll.as_millis() as u64,
-        )
-        .await?;
-
-        // All post-spawn fallible steps succeeded; disarm the guard (if any) and hand
-        // the daemon to the caller, which constructs the long-lived QemuInstance whose
-        // Drop now owns the daemon's teardown. In-kernel vsock has no daemon.
-        let (vsock_daemon, vsock_pgid) = match vsock_guard {
-            Some(g) => g.into_inner(),
-            None => (None, None),
+        let paths = QemuSpawnPaths {
+            qmp_socket: &qmp_socket,
+            vsock_path: &vsock_path,
+            vhost_vsock: &vhost_vsock,
+            serial_path: &serial_path,
+            fs_daemon_sockets: &fs_daemon_sockets,
         };
-
-        // How the host reaches this VM's guest agent: in-kernel vsock is dialed by CID
-        // over AF_VSOCK; the external daemon bridges to the AF_UNIX `vsock.sock`.
-        let endpoint = if params.in_kernel_vsock {
-            VsockEndpoint::Vsock {
-                cid: params.guest_cid,
-                port: vmcell::vmm::AGENT_VSOCK_PORT,
-            }
-        } else {
-            VsockEndpoint::Unix {
-                path: vsock_path.clone(),
-                port: vmcell::vmm::AGENT_VSOCK_PORT,
-            }
+        let cmd = build_qemu_command(&self.binary_path, cfg, res, params, &paths)?;
+        let daemons = SpawnedDaemons {
+            vsock: vsock_guard,
+            fs: fs_daemons,
         };
-
-        Ok(SpawnedQemu {
-            qmp_socket,
-            vsock_path,
-            serial_path,
-            process,
-            vsock_daemon,
-            fs_daemons,
-            pgid,
-            vsock_pgid,
-            cid: params.guest_cid,
-            endpoint,
-            // Record the S1 predicate now (spawn_qemu has cfg+res); `snapshot()` reads
-            // it to reject a vhost-user-carrying VM even when Task B gave a non-snapshot
-            // in-kernel VM a Vsock endpoint.
-            has_vhost_user_device: vmcell::vmm::config_has_vhost_user_device(cfg, res),
-        })
+        finish_qemu_spawn(cmd, cfg, res, cgroups, params, daemons, &paths).await
     }
+}
+
+/// Composes the **complete** QEMU argv for one launch (§2.4) — every flag the process is
+/// exec'd with, and nothing else.
+///
+/// Split out of [`Qemu::spawn_qemu`] so the argv is **observable without spawning**: it
+/// performs no I/O (the daemon starts and the vhost-user-net readiness wait stay in the
+/// caller), so a unit test can build a `VmConfig`, call this, and assert over
+/// `cmd.as_std().get_args()`. That is what a pure per-*fragment* helper cannot do:
+/// `build_qemu_usb_args` can be perfect while its result never reaches the `Command`,
+/// and only a test over the *composed* argv sees the difference — the deleted-splice
+/// defect its gate (`qemu_full_argv_splices_the_usb_fragment`) now catches.
+///
+/// # Errors
+/// Propagates the seccomp-spec, jail-spec, MAC-math and kernel-cmdline builders, and
+/// fails loud when `paths.fs_daemon_sockets` does not carry one entry per configured
+/// share (a length mismatch would otherwise `zip`-truncate a share's device out of the
+/// argv silently).
+fn build_qemu_command(
+    binary_path: &Path,
+    cfg: &VmConfig,
+    res: &PerVmResources,
+    params: &SpawnParams,
+    paths: &QemuSpawnPaths<'_>,
+) -> Result<tokio::process::Command> {
+    if paths.fs_daemon_sockets.len() != cfg.shares.len() {
+        return Err(Error::Vmm(format!(
+            "virtio-fs daemon sockets ({}) do not match the configured shares ({})",
+            paths.fs_daemon_sockets.len(),
+            cfg.shares.len()
+        )));
+    }
+
+    // §12.2 (Layer 1 — the VMM's own seccomp filter)/§12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): QEMU had NO `-sandbox` — it ran unconfined. Enforcing now emits the
+    // libseccomp sandbox (a QEMU built without libseccomp errors fail-loud on it, the
+    // desired behavior); the jailer-equivalent hardening is applied in build_vmm_cmd.
+    let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("qemu", cfg.vmm_seccomp)?;
+    let jail = vmcell::vmm::jail::jail_spec_from_config(&cfg.jail)?;
+    let mut cmd = vmcell::vmm::build_vmm_cmd(binary_path, res.netns_name.as_deref(), &jail);
+    cmd.args(&seccomp_args);
+
+    cmd.arg("-M")
+        .arg("q35,memory-backend=mem")
+        .arg("-m")
+        .arg(cfg.mem_mib.to_string())
+        .arg("-smp")
+        .arg(cfg.vcpus.to_string());
+    // Fixed, config-independent flags — including `-S` to freeze the guest vCPUs at
+    // launch so `boot()`'s `cont` is the real start point (H-VMM-2). The former
+    // `-trace vhost_user_*` debug residue is dropped (L-VMM-4).
+    push_fixed_qemu_flags(&mut cmd);
+    cmd.arg("-object")
+        .arg(format!(
+            "memory-backend-file,id=mem,size={}M,mem-path=/dev/shm,share=on",
+            cfg.mem_mib
+        ))
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", paths.qmp_socket.display()));
+
+    // virtio-rng gives the guest `/dev/hwrng`. The post-restore CSPRNG reseed copies
+    // 32 bytes `/dev/hwrng` → `/dev/urandom` in-guest (§8.2, Restore correctness: a restored VM is not a fresh VM); without an entropy
+    // device that reseed reports `reseed_applied: false` and restored clones replay
+    // frozen CSPRNG state — the same reason Firecracker's create() attaches
+    // virtio-rng (§2.3, Firecracker — the density tier and the fastest restore). Present on every launch so the source and
+    // restore topologies stay congruent for migration.
+    cmd.arg("-object")
+        .arg("rng-random,filename=/dev/urandom,id=rng0")
+        .arg("-device")
+        .arg("virtio-rng-pci,rng=rng0");
+
+    // Console wiring, driven by the SAME `cfg.console_mode` as the cmdline
+    // `console=` token (`build_kernel_cmdline`) so the two move in lockstep — a
+    // desync sinks the guest console nowhere and `serial.log` goes silent.
+    // `reject_unsupported_console` already gated an unsupported mode in create().
+    match cfg.console_mode {
+        // Uart: the 8250 `ttyS0` bytes go straight to serial.log.
+        vmcell::config::ConsoleMode::Uart => {
+            cmd.arg("-serial")
+                .arg(format!("file:{}", paths.serial_path.display()));
+        }
+        // VirtioConsole: no `-serial`; `hvc0` is a virtconsole on a virtio-serial
+        // bus (q35 already provides PCI) whose chardev writes serial.log.
+        vmcell::config::ConsoleMode::VirtioConsole => {
+            cmd.arg("-device")
+                .arg("virtio-serial-pci,id=virtio-serial0")
+                .arg("-chardev")
+                .arg(format!(
+                    "file,id=charconsole0,path={}",
+                    paths.serial_path.display()
+                ))
+                .arg("-device")
+                .arg("virtconsole,chardev=charconsole0,id=console0");
+        }
+    }
+
+    // Attach the vsock device selected above. The in-kernel `vhost-vsock-pci`
+    // (snapshot-eligible, §2.4, QEMU q35 — the fallback and most-proven nester) is realized by QEMU against `/dev/vhost-vsock` — a
+    // root:kvm device, so a jailed QEMU needs the runner's `CAP_DAC_OVERRIDE` to
+    // open it; a permission failure surfaces loud at device realize, never a silent
+    // downgrade (M-VMM-2). Its `guest-cid` is a device *property* (not migrated),
+    // so restore reuses the baked CID here (§8.2). The default external daemon path
+    // stays the `vhost-user-vsock-pci` chardev pair.
+    if params.in_kernel_vsock {
+        cmd.arg("-device")
+            .arg(format!("vhost-vsock-pci,guest-cid={}", params.guest_cid));
+    } else {
+        cmd.arg("-chardev")
+            .arg(format!(
+                "socket,id=vvsock,path={}",
+                paths.vhost_vsock.display()
+            ))
+            .arg("-device")
+            .arg("vhost-user-vsock-pci,chardev=vvsock");
+    }
+
+    match &cfg.rootfs {
+        vmcell::config::RootfsSource::Erofs { image } => {
+            cmd.arg("-drive")
+                .arg(format!(
+                    "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
+                    image.display()
+                ))
+                .arg("-device")
+                .arg("virtio-blk-pci,drive=rfs");
+        }
+        vmcell::config::RootfsSource::Block { image, overlay } => {
+            cmd.arg("-drive")
+                .arg(format!(
+                    "file={},format=raw,id=rfs,if=none,file.locking=off",
+                    overlay.as_ref().unwrap_or(image).display()
+                ))
+                .arg("-device")
+                .arg("virtio-blk-pci,drive=rfs");
+        }
+    }
+
+    // Extra virtio-blk devices (§4.6, Extra virtio-blk devices and disk-I/O throttling), attached AFTER the root `virtio-blk-pci` so
+    // they enumerate `/dev/vdb`, `/dev/vdc`, … in order and never shift the root
+    // off `/dev/vda`. Each is a split-form drive/device pair with its own id.
+    // `readonly=on` only for read-only disks; `file.locking=off` matches the root.
+    for (i, disk) in cfg.extra_disks.iter().enumerate() {
+        let ro = if disk.readonly { ",readonly=on" } else { "" };
+        // Disk-I/O fault injection (§4.6, Extra virtio-blk devices and disk-I/O throttling): QEMU's per-drive throttling takes the rate
+        // directly (bytes/s, ops/s) — no token-bucket conversion, unset caps omitted.
+        let mut throttle = String::new();
+        if let Some(limit) = &disk.io_limit {
+            if let Some(bps) = limit.bandwidth_bytes_per_sec {
+                throttle.push_str(&format!(",throttling.bps-total={bps}"));
+            }
+            if let Some(iops) = limit.iops {
+                throttle.push_str(&format!(",throttling.iops-total={iops}"));
+            }
+        }
+        cmd.arg("-drive")
+            .arg(format!(
+                "file={},format=raw,id=extra{},if=none{},file.locking=off{}",
+                disk.image.display(),
+                i,
+                ro,
+                throttle,
+            ))
+            .arg("-device")
+            .arg(format!("virtio-blk-pci,drive=extra{i}"));
+    }
+
+    for (i, (share, socket)) in cfg
+        .shares
+        .iter()
+        .zip(paths.fs_daemon_sockets.iter())
+        .enumerate()
+    {
+        cmd.arg("-chardev")
+            .arg(format!("socket,id=vfs{},path={}", i, socket.display()))
+            .arg("-device")
+            .arg(format!(
+                "vhost-user-fs-pci,chardev=vfs{},tag={}",
+                i, share.tag
+            ));
+    }
+
+    if let Some(tap) = &res.tap_name {
+        // The guest MAC is the shared `mac_math(vmid)` (v30 §18 delta 8). QEMU previously emitted
+        // NO `mac=` on the tap arm, so every guest carried QEMU's fixed default 52:54:00:12:34:56.
+        // That was invisible while each privileged VM owned an isolated /30 L2 domain, but two
+        // members of one segment bridge is a deterministic L2 collision — and the §6.5 claim that
+        // "member MACs are bridge-unique by the existing collision-freedom law" was only true once
+        // this line existed.
+        cmd.arg("-netdev")
+            .arg(format!("tap,id=net0,ifname={tap},script=no,downscript=no"))
+            .arg("-device")
+            .arg(format!(
+                "virtio-net-pci,netdev=net0,mac={}",
+                vmcell::net::mac_math(res.vmid)?
+            ));
+    } else if let Some(socket) = &res.vhost_user_socket {
+        // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so
+        // it must not race smoltcp's lazy bind. `spawn_qemu` has already waited for
+        // this exact socket to appear (the readiness gate lives there so that this
+        // composer stays I/O-free); by the time the argv is exec'd it is bound.
+        cmd.arg("-chardev")
+            .arg(format!("socket,id=net0,path={}", socket.display()))
+            .arg("-netdev")
+            .arg("vhost-user,id=vnet0,chardev=net0,vhostforce=on")
+            .arg("-device")
+            .arg(format!(
+                "virtio-net-pci,netdev=vnet0,mac={}",
+                vmcell::net::mac_math(res.vmid)?
+            ));
+    }
+
+    // Host-USB passthrough (§2.4, QEMU q35 — the fallback and most-proven nester)): the xhci controller + one `usb-host` per
+    // requested device, from the pure `build_qemu_usb_args` helper. Placed after the
+    // extra-disk block and immediately before `-kernel` — the design's window — at
+    // its LATE edge deliberately: appending here leaves the PCI enumeration order of
+    // every pre-existing device (root/extra virtio-blk, virtio-fs, virtio-net)
+    // untouched, so adding USB cannot shift `/dev/vd*` or the NIC. Migration
+    // congruence does not constrain the slot: `config::build()` rejects
+    // snapshotting + USB.
+    cmd.args(build_qemu_usb_args(&cfg.usb_host_devices));
+
+    let cmdline = vmcell::config::build_kernel_cmdline(cfg, res, "")?;
+    cmd.arg("-kernel")
+        .arg(&cfg.kernel)
+        .arg("-append")
+        .arg(&cmdline);
+
+    // Restore launches with `-incoming defer`: the guest state is not loaded at
+    // spawn — `restore()` drives `migrate-incoming` over QMP once QMP is ready and
+    // waits for `query-migrate` to complete before returning the paused instance
+    // (§8.1, The warm-snapshot path and the eligibility law). `-S` (always emitted) keeps the vCPUs stopped alongside it. On
+    // cold `create` this is absent.
+    if params.incoming {
+        cmd.arg("-incoming").arg("defer");
+    }
+
+    Ok(cmd)
+}
+
+/// Launches the composed `cmd`, registers it in its cgroup, waits for QMP, and hands the
+/// caller the [`SpawnedQemu`] record — the I/O half of [`Qemu::spawn_qemu`], split from
+/// the argv composition so that half can stay pure.
+///
+/// Takes ownership of the still-armed helper `daemons`: every fallible step below must
+/// reap them, and `?` here does exactly that.
+///
+/// # Errors
+/// Propagates the spawn, cgroup-registration and QMP-readiness failures.
+async fn finish_qemu_spawn(
+    mut cmd: tokio::process::Command,
+    cfg: &VmConfig,
+    res: &PerVmResources,
+    cgroups: &dyn vmcell::metrics::CgroupFs,
+    params: &SpawnParams,
+    daemons: SpawnedDaemons,
+    paths: &QemuSpawnPaths<'_>,
+) -> Result<SpawnedQemu> {
+    let SpawnedDaemons {
+        vsock: vsock_guard,
+        fs: fs_daemons,
+    } = daemons;
+    let cmd_str = format!("{cmd:?}");
+    // Debug level (not info): the full command line is diagnostic noise on every
+    // create, and with stderr inherited it should not clutter harness output
+    // (L-VMM-4).
+    tracing::debug!("QEMU CMD: {}", cmd_str);
+
+    let mut process = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    // Shared spawn+register+await-ready sequence (VMM-2): capture the pgid, add the
+    // VMM to its cgroup, and block on the QMP socket — reaping the process group on
+    // any failure. Routing through the shared helper drops QEMU's former
+    // `Error::Vmm("QMP socket failed to appear")` wrapping so the readiness error is
+    // now propagated raw, identically to CH/FC. On an error here the still-armed
+    // `vsock_guard` (and `fs_daemons`) reap the vhost-user daemons via `?`/`Drop`.
+    let pgid = vmcell::vmm::register_and_await_ready(
+        &mut process,
+        cgroups,
+        &res.cgroup_name,
+        paths.qmp_socket,
+        1000,
+        cfg.timeouts.api_socket_poll.as_millis() as u64,
+    )
+    .await?;
+
+    // All post-spawn fallible steps succeeded; disarm the guard (if any) and hand
+    // the daemon to the caller, which constructs the long-lived QemuInstance whose
+    // Drop now owns the daemon's teardown. In-kernel vsock has no daemon.
+    let (vsock_daemon, vsock_pgid) = match vsock_guard {
+        Some(g) => g.into_inner(),
+        None => (None, None),
+    };
+
+    // How the host reaches this VM's guest agent: in-kernel vsock is dialed by CID
+    // over AF_VSOCK; the external daemon bridges to the AF_UNIX `vsock.sock`.
+    let endpoint = if params.in_kernel_vsock {
+        VsockEndpoint::Vsock {
+            cid: params.guest_cid,
+            port: vmcell::vmm::AGENT_VSOCK_PORT,
+        }
+    } else {
+        VsockEndpoint::Unix {
+            path: paths.vsock_path.to_path_buf(),
+            port: vmcell::vmm::AGENT_VSOCK_PORT,
+        }
+    };
+
+    Ok(SpawnedQemu {
+        qmp_socket: paths.qmp_socket.to_path_buf(),
+        vsock_path: paths.vsock_path.to_path_buf(),
+        serial_path: paths.serial_path.to_path_buf(),
+        process,
+        vsock_daemon,
+        fs_daemons,
+        pgid,
+        vsock_pgid,
+        cid: params.guest_cid,
+        endpoint,
+        // Record the S1 predicate now (the spawn path has cfg+res); `snapshot()` reads
+        // it to reject a vhost-user-carrying VM even when Task B gave a non-snapshot
+        // in-kernel VM a Vsock endpoint.
+        has_vhost_user_device: vmcell::vmm::config_has_vhost_user_device(cfg, res),
+    })
 }
 
 impl Vmm for Qemu {
@@ -899,6 +1226,21 @@ impl Vmm for Qemu {
         // `spawn_qemu` are both driven by `cfg.console_mode`; gate an unsupported
         // mode up front so they can never desync into a silent `serial.log`.
         vmcell::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
+        // Self-check against our OWN descriptor rather than assuming QEMU semantics
+        // (the §2.1 trait contract, and the same shape as CH's `snapshot_restore`
+        // self-check): today `usb_host_passthrough` is `true`, so this passes — but a
+        // re-gate of the flag turns every USB config into the typed refusal here,
+        // through the ONE shared predicate, with no second copy to update.
+        vmcell::vmm::reject_usb_host_devices("qemu", &self.capabilities(), &cfg.usb_host_devices)?;
+        // …and the half the descriptor cannot answer: QEMU accepts a `usb-host` device
+        // that matches nothing on this host **without a word** (measured, §2.4 notes on
+        // `resolve_usb_device_node`), so the requested devices are resolved to their
+        // usbfs nodes and proven openable here, before the spawn.
+        require_usb_host_devices(
+            Path::new(SYSFS_USB_DEVICES),
+            Path::new(USBFS_ROOT),
+            &cfg.usb_host_devices,
+        )?;
 
         // Cold create: fresh CID, no `-incoming`. A `snapshotting` config selects the
         // in-kernel vhost-vsock transport (§2.4, QEMU q35 — the fallback and most-proven nester) so the VM is snapshot-eligible.
@@ -1009,6 +1351,29 @@ impl Vmm for Qemu {
             restore_rotates_host_paths: true,
             // QEMU has native per-drive throttling (`throttling.bps-total`/`iops-total`), §4.6.
             disk_io_throttle: true,
+            // The ONE backend whose upstream binary attaches a host USB device: one
+            // `qemu-xhci` controller plus a `usb-host` device per requested
+            // `(vendorid, productid)` (§2.4, QEMU q35 — the fallback and most-proven nester), emitted by `build_qemu_usb_args`.
+            //
+            // What this `true` rests on — EXECUTED against QEMU 10.2.1 (Debian
+            // 1:10.2.1+ds-1ubuntu3.2) on 2026-08-11, recorded under
+            // "v30 delta 9 — host-USB passthrough" in docs/implementation-notes.md:
+            //   * `qemu-system-x86_64 -device help` lists BOTH `qemu-xhci` and
+            //     `usb-host`, and an absent device MODEL is fail-loud (a bogus name exits
+            //     1 naming it) — so a libusb-less build cannot silently drop the device.
+            //   * launching with vmcell's own Enforcing `-sandbox
+            //     on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny`
+            //     PLUS `-device qemu-xhci,id=vmcell-xhci -device usb-host,…` reaches QMP
+            //     `prelaunch` — the libseccomp filter tolerates the usb-host/usbfs path,
+            //     so no sandbox downgrade is owed (§2.4's second empirical question).
+            //   * the third (device-node access) is answered per launch, not assumed:
+            //     `require_usb_host_devices` resolves each requested id pair to its
+            //     `/dev/bus/usb/BBB/DDD` node and proves it opens read-write — because
+            //     the same run showed QEMU accepts an ABSENT device in total silence.
+            // Still open, and only the opt-in `just test-usb-passthrough` leg can close
+            // it (this host has no designated, disposable device): in-GUEST enumeration
+            // of a passed-through device. A re-gate must flip this AND its honesty pin.
+            usb_host_passthrough: true,
         }
     }
 
@@ -1257,11 +1622,318 @@ mod tests {
         );
     }
 
+    // v30 §18 (Delta register) delta 9 / §2.4 (QEMU q35 — the fallback and most-proven nester): the host-USB argv GOLDEN. QEMU's argv is
+    // otherwise assembled inline into a `Command`, so this is the reason the fragment was
+    // extracted as a pure helper (the `build_crosvm_run_args` precedent). It pins, on
+    // exact tokens: (a) no devices => NO USB argv at all (QEMU runs `-nodefaults`, so a
+    // stray controller would appear in every VM); (b) exactly ONE `qemu-xhci` controller
+    // regardless of device count; (c) one `usb-host` per device, in call order; (d) the
+    // zero-padded lowercase `0x%04x` id rendering QEMU's property parser expects.
+    // Red on the inverse: emitting the controller per device, `{:x}` (unpadded) or
+    // `{}` (decimal) ids, or a controller with an empty device list.
+    #[test]
+    fn qemu_usb_args_golden() {
+        use vmcell::config::UsbHostDevice;
+
+        assert!(
+            build_qemu_usb_args(&[]).is_empty(),
+            "no USB device requested must emit no USB argv (QEMU is -nodefaults)"
+        );
+
+        assert_eq!(
+            build_qemu_usb_args(&[UsbHostDevice::new(0x1d6b, 0x0002)]),
+            vec![
+                "-device".to_string(),
+                "qemu-xhci,id=vmcell-xhci".to_string(),
+                "-device".to_string(),
+                "usb-host,vendorid=0x1d6b,productid=0x0002".to_string(),
+            ]
+        );
+
+        // Two devices: still ONE controller, then both `usb-host` devices in order. The
+        // second id (0x0a5c:0x0021) is padded on neither half by accident — `{:04x}`
+        // renders `0x0a5c`/`0x0021`, which is what a `%i` QEMU property expects.
+        assert_eq!(
+            build_qemu_usb_args(&[
+                UsbHostDevice::new(0x1d6b, 0x0002),
+                UsbHostDevice::new(0x0a5c, 0x0021),
+            ]),
+            vec![
+                "-device".to_string(),
+                "qemu-xhci,id=vmcell-xhci".to_string(),
+                "-device".to_string(),
+                "usb-host,vendorid=0x1d6b,productid=0x0002".to_string(),
+                "-device".to_string(),
+                "usb-host,vendorid=0x0a5c,productid=0x0021".to_string(),
+            ]
+        );
+    }
+
+    /// A `VmConfig` carrying `devices` and nothing else unusual.
+    fn usb_cfg(devices: &[vmcell::config::UsbHostDevice]) -> VmConfig {
+        use vmcell::config::RootfsSource;
+        let mut builder = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        );
+        for device in devices {
+            builder = builder.with_usb_host_device(*device);
+        }
+        builder.build().expect("build config")
+    }
+
+    /// The **composed** argv `spawn_qemu` would exec for `cfg` — the real `Command`, read
+    /// back through `as_std().get_args()` without spawning anything.
+    ///
+    /// This is the observation point a per-fragment helper test cannot reach: it sees the
+    /// `cmd.args(...)` splices themselves, so deleting one reddens.
+    fn composed_argv(cfg: &VmConfig) -> Vec<String> {
+        let params = SpawnParams {
+            in_kernel_vsock: false,
+            guest_cid: 3,
+            incoming: false,
+        };
+        let paths = QemuSpawnPaths {
+            qmp_socket: Path::new("/tmp/vmcell-argv-test/qmp.sock"),
+            vsock_path: Path::new("/tmp/vmcell-argv-test/vsock.sock"),
+            vhost_vsock: Path::new("/tmp/vmcell-argv-test/vhost-vsock.sock"),
+            serial_path: Path::new("/tmp/vmcell-argv-test/serial.log"),
+            fs_daemon_sockets: &[],
+        };
+        let cmd = build_qemu_command(
+            Path::new("/usr/bin/qemu-system-x86_64"),
+            cfg,
+            &restore_test_res(),
+            &params,
+            &paths,
+        )
+        .expect("the argv composes");
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // v30 §18 delta 9 GATE, over the COMPOSED argv (the fragment→`Command` seam). The
+    // per-fragment golden above proves `build_qemu_usb_args` renders the right tokens; it
+    // says nothing about whether they ever reach the process, and deleting the
+    // `cmd.args(build_qemu_usb_args(...))` splice left every other gate green. This test
+    // is the one that reddens on that deletion. It pins, on the real `Command`:
+    // (a) the fragment appears CONTIGUOUSLY and in order in the argv the launch execs;
+    // (b) it sits in the design's window — after the last virtio-blk device, before
+    //     `-kernel` — so PCI enumeration of the existing devices is unshifted;
+    // (c) USB is purely ADDITIVE: strip the fragment's window and the argv is identical
+    //     to the same config with no USB device (a splice that also reordered or dropped
+    //     another device would redden here);
+    // (d) negative control: with no USB device requested, no USB token is emitted at all
+    //     (QEMU is `-nodefaults`, so a stray controller would ride in every VM).
+    #[test]
+    fn qemu_full_argv_splices_the_usb_fragment() {
+        use vmcell::config::UsbHostDevice;
+
+        let devices = [
+            UsbHostDevice::new(0x1d6b, 0x0002),
+            UsbHostDevice::new(0x0a5c, 0x0021),
+        ];
+        let argv = composed_argv(&usb_cfg(&devices));
+        let fragment = build_qemu_usb_args(&devices);
+
+        let at = argv
+            .windows(fragment.len())
+            .position(|w| w == fragment)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the composed QEMU argv never carries the USB fragment {fragment:?} — \
+                     `usb_host_passthrough` is advertised but the device is silently dropped; \
+                     argv was {argv:?}"
+                )
+            });
+
+        let kernel_at = argv
+            .iter()
+            .position(|a| a == "-kernel")
+            .expect("every launch carries -kernel");
+        let last_blk = argv
+            .iter()
+            .rposition(|a| a.starts_with("virtio-blk-pci"))
+            .expect("every launch carries the root virtio-blk device");
+        assert!(
+            last_blk < at,
+            "the USB fragment must follow the block devices so /dev/vd* cannot shift: {argv:?}"
+        );
+        assert!(
+            at + fragment.len() <= kernel_at,
+            "the USB fragment must precede -kernel (§2.4's window): {argv:?}"
+        );
+
+        let mut stripped = argv.clone();
+        stripped.drain(at..at + fragment.len());
+        assert_eq!(
+            stripped,
+            composed_argv(&usb_cfg(&[])),
+            "attaching USB must add ONLY the USB fragment to the argv"
+        );
+
+        assert!(
+            !composed_argv(&usb_cfg(&[]))
+                .iter()
+                .any(|a| a.contains("usb-host") || a.contains("xhci")),
+            "a config with no USB device must get no USB argv at all (QEMU is -nodefaults)"
+        );
+    }
+
+    /// Writes one sysfs USB *device* directory (`idVendor`/`idProduct`/`busnum`/`devnum`)
+    /// plus its usbfs node, mirroring the real `/sys/bus/usb/devices` layout.
+    fn fake_usb_device(sysfs: &Path, usbfs: &Path, name: &str, ids: (u16, u16), at: (u32, u32)) {
+        let dir = sysfs.join(name);
+        std::fs::create_dir_all(&dir).expect("sysfs dir");
+        std::fs::write(dir.join("idVendor"), format!("{:04x}\n", ids.0)).expect("idVendor");
+        std::fs::write(dir.join("idProduct"), format!("{:04x}\n", ids.1)).expect("idProduct");
+        std::fs::write(dir.join("busnum"), format!("{}\n", at.0)).expect("busnum");
+        std::fs::write(dir.join("devnum"), format!("{}\n", at.1)).expect("devnum");
+        let bus = usbfs.join(format!("{:03}", at.0));
+        std::fs::create_dir_all(&bus).expect("usbfs bus dir");
+        std::fs::write(bus.join(format!("{:03}", at.1)), b"node").expect("usbfs node");
+    }
+
+    // v30 §18 delta 9 / AGENTS.md rule 5 GATE — the fail-loud host-device precheck.
+    // MEASURED premise (QEMU 10.2.1, 2026-08-11): `-device usb-host,vendorid=…` for a
+    // device that is absent or ambiguous starts QEMU normally and prints NOTHING, so an
+    // advertised `usb_host_passthrough` would silently deliver an empty xhci bus. The
+    // four arms below are the four ways that happens, each of which must be an error
+    // instead. RED on the inverse: a precheck that returns Ok() when nothing matches
+    // (or that takes the first of several matches) fails the second/third arms; one that
+    // skips the read-write open fails the fourth; one that also rejects a legitimate
+    // device fails the first (the positive control).
+    #[test]
+    fn usb_device_node_resolution_is_fail_loud() {
+        use vmcell::config::UsbHostDevice;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sysfs = tmp.path().join("sys");
+        let usbfs = tmp.path().join("dev");
+        std::fs::create_dir_all(&sysfs).expect("sysfs root");
+        fake_usb_device(&sysfs, &usbfs, "3-7", (0x0bda, 0x5634), (3, 2));
+        // A per-interface directory: no idVendor, must be skipped, not tripped over.
+        std::fs::create_dir_all(sysfs.join("3-7:1.0")).expect("interface dir");
+        // The root hubs every host has — two devices sharing 1d6b:0002.
+        fake_usb_device(&sysfs, &usbfs, "usb1", (0x1d6b, 0x0002), (1, 1));
+        fake_usb_device(&sysfs, &usbfs, "usb3", (0x1d6b, 0x0002), (3, 1));
+
+        // Positive control: the unique device resolves to its usbfs node.
+        let node = resolve_usb_device_node(&sysfs, &usbfs, UsbHostDevice::new(0x0bda, 0x5634))
+            .expect("a present, unique, openable device must resolve");
+        assert_eq!(node, usbfs.join("003").join("002"));
+
+        // Absent: QEMU's silence becomes vmcell's loud error.
+        let err = resolve_usb_device_node(&sysfs, &usbfs, UsbHostDevice::new(0xdead, 0xbeef))
+            .expect_err("an absent device must be refused, not silently dropped");
+        assert!(
+            matches!(&err, Error::Vmm(m) if m.contains("no host device matches dead:beef")),
+            "expected a no-match error naming the ids, got {err:?}"
+        );
+
+        // Ambiguous: two host devices carry the ids, QEMU would pick one arbitrarily.
+        let err = resolve_usb_device_node(&sysfs, &usbfs, UsbHostDevice::new(0x1d6b, 0x0002))
+            .expect_err("ambiguous ids must be refused");
+        assert!(
+            matches!(&err, Error::Vmm(m) if m.contains("ambiguous")),
+            "expected an ambiguity error, got {err:?}"
+        );
+
+        // Present in sysfs, but the usbfs node QEMU opens is not there.
+        std::fs::remove_file(usbfs.join("003").join("002")).expect("remove node");
+        let err = resolve_usb_device_node(&sysfs, &usbfs, UsbHostDevice::new(0x0bda, 0x5634))
+            .expect_err("an unopenable node must be refused");
+        assert!(
+            matches!(&err, Error::Vmm(m) if m.contains("cannot open") && m.contains("003/002")),
+            "expected an open error naming the node, got {err:?}"
+        );
+
+        // Over-rejection inverse: no devices requested is never an error, even though
+        // this host's sysfs root is a fixture that carries neither of the ids above.
+        require_usb_host_devices(&sysfs, &usbfs, &[]).expect("no USB device requested, no check");
+    }
+
+    // Capability honesty (AGENTS.md rule 5 / §7.2): QEMU is the ONE backend advertising
+    // `usb_host_passthrough`, and the flag must move together with what the launch
+    // actually execs — a `true` with no `qemu-xhci` in the COMPOSED argv is the
+    // silent-drop failure the capability exists to prevent. Red on the inverse: flip the
+    // flag, make `build_qemu_usb_args` return empty for a non-empty list, or delete the
+    // splice in `build_qemu_command`.
+    #[test]
+    fn qemu_usb_capability_matches_the_emitted_argv() {
+        let caps = Qemu::new("/usr/bin/qemu-system-x86_64").capabilities();
+        assert!(
+            caps.usb_host_passthrough,
+            "QEMU advertises usb_host_passthrough (qemu-xhci + usb-host, §2.4)"
+        );
+        let argv = composed_argv(&usb_cfg(&[vmcell::config::UsbHostDevice::new(
+            0x1d6b, 0x0002,
+        )]));
+        assert!(
+            argv.iter().any(|a| a == "qemu-xhci,id=vmcell-xhci"),
+            "a true usb_host_passthrough must put the xhci controller on the real command \
+             line; got {argv:?}"
+        );
+        assert!(
+            argv.iter()
+                .any(|a| a == "usb-host,vendorid=0x1d6b,productid=0x0002"),
+            "a true usb_host_passthrough must put the requested device on the real command \
+             line; got {argv:?}"
+        );
+    }
+
+    // v30 §18 delta 8 GATE, over the COMPOSED argv. QEMU's tap arm emitted NO `mac=`, so every
+    // guest carried QEMU's fixed default 52:54:00:12:34:56 — two members of one segment bridge
+    // were a deterministic L2 collision, and §6.5's "member MACs are bridge-unique by the existing
+    // collision-freedom law" was simply false here. Buggy impl guarded: dropping the `,mac=`
+    // splice reddens on the identity assertion; hardcoding one MAC reddens on the distinctness
+    // assertion. Recomputed through `vmcell::net::mac_math`, never a test-local format!.
+    #[test]
+    fn qemu_tap_argv_carries_the_vmid_derived_mac() {
+        use vmcell::config::{RootfsSource, VmConfig};
+        let cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .build()
+        .expect("build config");
+
+        let argv = composed_argv(&cfg);
+        let res = restore_test_res();
+        let mac = vmcell::net::mac_math(res.vmid).expect("mac_math");
+        assert!(
+            argv.iter()
+                .any(|a| a == &format!("virtio-net-pci,netdev=net0,mac={mac}")),
+            "the tap arm must set the vmid-derived guest MAC; got {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "virtio-net-pci,netdev=net0"),
+            "the bare, MAC-less net device must be gone (it took QEMU's fixed default MAC): {argv:?}"
+        );
+        // Distinct vmids give distinct MACs — the bridge-uniqueness property itself.
+        let other_res = PerVmResources {
+            vmid: res.vmid + 1,
+            ..restore_test_res()
+        };
+        assert_ne!(
+            mac,
+            vmcell::net::mac_math(other_res.vmid).expect("mac_math"),
+            "two members of one bridge must not share a MAC"
+        );
+    }
+
     fn restore_test_res() -> PerVmResources {
         PerVmResources {
             cgroup_name: "vmcell-test".to_string(),
             tap_name: Some("tap0".to_string()),
             netns_name: None,
+            segment: None,
             vhost_user_socket: None,
             vmid: 1,
             guest_cid: 3,

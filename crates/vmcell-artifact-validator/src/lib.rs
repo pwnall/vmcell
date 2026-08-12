@@ -17,6 +17,25 @@
 //! a green all-skipped report). `Extended`/`Full` checks that need a host capability the run
 //! lacks (CAP_NET_ADMIN, cgroup delegation, a backend feature) record a
 //! [`CheckStatus::Skip`] with a reason — never a silent pass.
+//!
+//! ## Naming what a bad kernel is missing
+//! A boot failure never reports a bare timeout. Every arm of [`checks`] that **reports** a VM
+//! which failed to start (`MicroVm::start`) or failed its agent handshake — Core, Extended and
+//! Full alike — renders through one of the two [`classify`] renderers, chosen by whether console
+//! evidence exists:
+//!
+//! - [`classify::explain_boot_failure`] — the console *was* captured. It maps the known serial
+//!   signatures onto the §5.4 guest-kernel contract clause they break (root device, root-fs mount,
+//!   the vsock transport, no direct-boot kernel at all) and, for the residual class, still emits
+//!   the named check, the budget that expired, the serial tail, and a pointer to the §5.4
+//!   checklist.
+//! - [`classify::explain_without_serial`] — there is *no* console evidence (the VMM never started,
+//!   or the log could not be read). It names candidate causes instead of asserting a clause,
+//!   because a missing `cloud-hypervisor` binary is not a bad kernel.
+//!
+//! [`kconfig::KconfigValues`] is the matching mechanism for the other half of §5.6: asserting
+//! against a *resolved* `.config`, since `make olddefconfig` silently drops symbols whose
+//! dependencies are unmet.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
@@ -44,7 +63,9 @@
 )]
 
 pub mod checks;
+pub mod classify;
 pub mod harness;
+pub mod kconfig;
 
 use std::path::PathBuf;
 use vmcell::vmm::cloud_hypervisor::CloudHypervisor;

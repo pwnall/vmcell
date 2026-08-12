@@ -681,21 +681,36 @@ async fn privileged_net_gives_host_netns_and_guest_default_route() {
     );
 
     // Guest side: the agent brought eth0 up with a /30 in the privileged subnet.
-    let addr = c
-        .exec(
-            &vm.id,
-            ExecRequestDto::new(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "ip -4 addr show".into(),
-            ]),
-        )
-        .await
-        .expect("ip addr in guest");
-    let a = String::from_utf8_lossy(&addr.stdout().expect("decode")).into_owned();
+    //
+    // POLL, for the same reason `vmcell/tests/lifecycle.rs` polls: the `ip` applet prints
+    // `/sys/class/net/eth0/operstate`, and virtio-net briefly reports "down" AFTER the agent is
+    // already reachable, while the link settles. The agent becoming reachable is what unblocks
+    // `create_vm`, so a single read here races that transition — reading "state down" beside a
+    // correctly configured `inet 10.200.11.2/30`. Polling keeps the assertion able to fail: an
+    // eth0 that never comes up still reddens after the window.
+    let mut a = String::new();
+    for _ in 0..15 {
+        let addr = c
+            .exec(
+                &vm.id,
+                ExecRequestDto::new(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "ip -4 addr show".into(),
+                ]),
+            )
+            .await
+            .expect("ip addr in guest");
+        a = String::from_utf8_lossy(&addr.stdout().expect("decode")).into_owned();
+        if a.contains("state up") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     assert!(
         a.contains("eth0") && a.contains("state up") && a.contains("inet 10.200."),
-        "guest eth0 should be up with a 10.200.x/30 under privileged net; `ip -4 addr show`: {a:?}"
+        "guest eth0 should be up with a 10.200.x/30 under privileged net within the poll window; \
+         `ip -4 addr show`: {a:?}"
     );
 
     // ...and a default route. The guest-tools `ip route` prints the raw `/proc/net/route` table (hex,

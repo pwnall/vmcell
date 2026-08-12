@@ -50,7 +50,13 @@ members = [
 # The cargo-fuzz crate is NOT a workspace member: libfuzzer-sys only builds under `cargo fuzz` on
 # nightly, so keeping it out means `cargo build --workspace` / nextest / doc / hack (all stable, all
 # --locked) never try to compile it. The nightly `fuzz.yml` job drives it via `cargo fuzz` directly.
-exclude = ["fuzz"]
+#
+# `examples/downstream-kernel` is excluded for the same structural reason, not a toolchain one
+# (v30 §18 delta 5): it is the out-of-tree CONSUMER workspace — its own `[workspace]` root, its own
+# Cargo.lock, its own `[patch.crates-io]` — and the whole point is that it resolves and builds the
+# way a git-dep consumer's workspace does. Pulling it in as a member would unify its features and
+# lockfile with vmcell's and silently repair exactly the drift it exists to detect.
+exclude = ["fuzz", "examples/downstream-kernel"]
 
 [workspace.package]
 # The single MSRV fact: the tested floor, tracking the latest stable (1.96.1). Understating it is a

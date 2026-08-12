@@ -9,6 +9,7 @@
 //! multi-VM checks (concurrency). The [`run_core`]/[`run_extended`]/[`run_full`] orchestrators
 //! boot capability-appropriate VMs and collect outcomes.
 
+use std::path::Path;
 use std::time::Duration;
 
 use vmcell::ExecRequest;
@@ -19,8 +20,70 @@ use vmcell::config::{
 use vmcell::orchestrator::MicroVm;
 use vmcell::vmm::{VmInstance, Vmm};
 
+use crate::classify::{BANNER_SIGNATURE, explain_boot_failure, explain_without_serial};
 use crate::harness::{cgroup_memory_delegated, try_start_vm};
 use crate::{ArtifactSet, CheckOutcome, Level};
+
+/// The agent-handshake budget every check allows before it calls the boot failed (§9.4: deadlines
+/// are outer-bounds-inner — this is the outer bound `AgentClient` turns into its `Instant`).
+/// **One** statement of the number: an inline per-call 60-second literal anywhere in this module is
+/// a second copy of the same law, and `every_agent_budget_is_a_named_const` reddens on it.
+const AGENT_READY_BUDGET: Duration = Duration::from_secs(60);
+
+/// The agent-handshake budget for a VM booted **concurrently with others**
+/// (`concurrency_distinct_ids`): three guests contending for the same host take longer than one.
+const CONCURRENT_AGENT_READY_BUDGET: Duration = Duration::from_secs(180);
+
+/// How long [`kernel_banner`] waits for the kernel's banner before calling the boot failed.
+const KERNEL_BANNER_BUDGET: Duration = Duration::from_secs(15);
+
+/// How often [`await_kernel_banner`] re-reads the console while waiting.
+const BANNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Reads `serial_log` and renders the classified boot failure — the one composition every arm with
+/// a **live VM** uses (`fs` + [`explain_boot_failure`]).
+///
+/// The unreadable case is not silently rendered as an empty console: an empty captured log means
+/// "the VM ran and printed nothing" (a real §5.4 signature), while an unreadable log is *absence of
+/// evidence*, so it routes through [`explain_without_serial`] instead. Either way the message names
+/// the console it consulted, so the reader can go look at it.
+async fn explain_boot_failure_at(serial_log: &Path, base: &str) -> String {
+    let base = format!("{base} (serial log {})", serial_log.display());
+    match tokio::fs::read_to_string(serial_log).await {
+        Ok(text) => explain_boot_failure(&text, &base),
+        Err(e) => {
+            tracing::warn!(
+                path = %serial_log.display(),
+                error = %e,
+                "serial log unreadable; reporting the boot failure without console evidence"
+            );
+            explain_without_serial(&base, &format!("it could not be read: {e}"))
+        }
+    }
+}
+
+/// [`explain_boot_failure_at`] against a VM's own console — the single place a serial-log path is
+/// derived from a [`MicroVm`].
+async fn explain_boot_failure_for<V: Vmm>(vm: &MicroVm<V>, base: &str) -> String {
+    explain_boot_failure_at(vm.instance().serial_log(), base).await
+}
+
+/// The message every `MicroVm::start` failure records — one shape for all of them, since they all
+/// lose the console the same way (the per-VM scratch dir dies with the failed start).
+fn failed_start(e: &impl std::fmt::Display) -> String {
+    explain_without_serial(
+        &format!("VM failed to start: {e}"),
+        "MicroVm::start failed and took its per-VM scratch dir (with the console) with it",
+    )
+}
+
+/// The base sentence every agent-handshake failure records, naming the budget that expired.
+fn agent_handshake_base(e: &impl std::fmt::Display) -> String {
+    format!(
+        "agent handshake failed within the {}s budget: {e}",
+        AGENT_READY_BUDGET.as_secs()
+    )
+}
 
 /// A base builder for `artifacts` (the caller-supplied kernel + erofs rootfs pair).
 fn base_cfg(a: &ArtifactSet) -> VmConfigBuilder {
@@ -45,25 +108,55 @@ async fn exec(agent: &mut AgentClient, argv: &[&str]) -> Result<vmcell::ExecOutc
 // Core checks (need only KVM; run on one net-disabled VM)
 // ---------------------------------------------------------------------------
 
-/// The kernel reaches userspace: the serial console shows the "Linux version" banner within a
+/// The kernel reaches userspace: the serial console shows the [`BANNER_SIGNATURE`] banner within a
 /// bounded window (← `boot.rs`). A kernel that never boots (bad config, wrong format) reddens.
+///
+/// On failure the message names the §5.4 contract clause the serial log proves was broken
+/// ([`explain_boot_failure`]) — never a bare timeout (§5.6).
 ///
 /// # Errors
 /// Returns `Err` if the kernel never reaches userspace within the boot window (bad config / wrong format) or the console cannot be read.
 pub async fn kernel_banner<V: Vmm>(vm: &MicroVm<V>) -> Result<(), String> {
-    let log = vm.instance().serial_log().to_path_buf();
-    for _ in 0..150 {
-        if let Ok(content) = tokio::fs::read_to_string(&log).await
-            && content.contains("Linux version")
-        {
-            return Ok(());
+    await_kernel_banner(vm.instance().serial_log(), KERNEL_BANNER_BUDGET).await
+}
+
+/// The bounded banner poll, with the budget injected so it is drivable in a unit test (§9.4: the
+/// deadline is an [`tokio::time::Instant`], computed once and bounding the whole loop).
+///
+/// Both failure shapes are distinguished, because they have different causes: a console that was
+/// *read* and lacks the banner is evidence for [`explain_boot_failure`] to classify, while a
+/// console file the VMM never created is *no* evidence and routes through
+/// [`explain_without_serial`].
+async fn await_kernel_banner(serial_log: &Path, budget: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    // `None` until the file is first read: an unwritten console is the normal early-boot case, so
+    // it is retried rather than reported. The newest text that *was* read is what the classifier
+    // sees when the budget expires.
+    let mut last: Option<String> = None;
+    loop {
+        if let Ok(content) = tokio::fs::read_to_string(serial_log).await {
+            if content.contains(BANNER_SIGNATURE) {
+                return Ok(());
+            }
+            last = Some(content);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(BANNER_POLL_INTERVAL).await;
     }
-    Err(format!(
-        "kernel did not print the 'Linux version' banner within 15s (serial log {})",
-        log.display()
-    ))
+    let base = format!(
+        "kernel did not print the '{BANNER_SIGNATURE}' banner within {}s (serial log {})",
+        budget.as_secs(),
+        serial_log.display()
+    );
+    Err(match last {
+        Some(text) => explain_boot_failure(&text, &base),
+        None => explain_without_serial(
+            &base,
+            "the VMM never created the serial log, so no console was captured",
+        ),
+    })
 }
 
 /// An exec round-trips: `echo` returns exit 0 with the expected stdout (← `boot.rs`). Proves the
@@ -220,10 +313,14 @@ pub async fn rootfs_overlay_writable(agent: &mut AgentClient) -> Result<(), Stri
 pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
     let (_, guest_ip, _) = vmcell::net::ip_math(vm.vmid())
         .map_err(|e| format!("ip_math({}) failed: {e}", vm.vmid()))?;
-    let agent = vm
-        .agent(Some(Duration::from_secs(60)))
-        .await
-        .map_err(|e| format!("agent connect failed: {e}"))?;
+    // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+    let serial_log = vm.instance().serial_log().to_path_buf();
+    let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
+        Ok(a) => a,
+        Err(e) => {
+            return Err(explain_boot_failure_at(&serial_log, &agent_handshake_base(&e)).await);
+        }
+    };
     let addr = exec(agent, &["ip", "a"]).await?;
     if addr.code != 0 {
         return Err(format!(
@@ -359,7 +456,7 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
     let starts = (0..3).map(|_| MicroVm::start(vmm, cfg.clone(), &env));
     let mut vms = Vec::new();
     for res in futures::future::join_all(starts).await {
-        vms.push(res.map_err(|e| format!("concurrent VM start failed: {e}"))?);
+        vms.push(res.map_err(|e| failed_start(&e))?);
     }
 
     let mut vmids = std::collections::HashSet::new();
@@ -380,10 +477,23 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
         }
     }
     for mut vm in vms {
-        let agent = vm
-            .agent(Some(Duration::from_secs(180)))
-            .await
-            .map_err(|e| format!("concurrent VM agent connect failed: {e}"))?;
+        // Captured before the `&mut` agent borrow (see `guest_core_checks`). The budget is
+        // deliberately not `AGENT_READY_BUDGET`: three guests boot concurrently here.
+        let serial_log = vm.instance().serial_log().to_path_buf();
+        let agent = match vm.agent(Some(CONCURRENT_AGENT_READY_BUDGET)).await {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(explain_boot_failure_at(
+                    &serial_log,
+                    &format!(
+                        "a concurrently-started VM's agent handshake failed within the {}s \
+                         budget: {e}",
+                        CONCURRENT_AGENT_READY_BUDGET.as_secs()
+                    ),
+                )
+                .await);
+            }
+        };
         let out = exec(agent, &["true"]).await?;
         if out.code != 0 {
             return Err(format!("concurrent VM exec `true` exited {}", out.code));
@@ -410,11 +520,12 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
     let env = vmcell::HostEnv::hermetic();
     let mut vm = MicroVm::start(vmm, cfg.clone(), &env)
         .await
-        .map_err(|e| format!("snapshot-source VM start failed: {e}"))?;
+        .map_err(|e| format!("snapshot-source: {}", failed_start(&e)))?;
     // Boot to agent-ready before snapshotting.
-    vm.agent(Some(Duration::from_secs(60)))
-        .await
-        .map_err(|e| format!("snapshot-source agent connect failed: {e}"))?;
+    if let Err(e) = vm.agent(Some(AGENT_READY_BUDGET)).await {
+        let base = format!("snapshot-source: {}", agent_handshake_base(&e));
+        return Err(explain_boot_failure_for(&vm, &base).await);
+    }
 
     let snap_dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     vm.snapshot(snap_dir.path())
@@ -425,10 +536,15 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
     let mut restored = MicroVm::restore(vmm, snap_dir.path(), cfg, &env)
         .await
         .map_err(|e| format!("restore() failed: {e}"))?;
-    let agent = restored
-        .agent(Some(Duration::from_secs(60)))
-        .await
-        .map_err(|e| format!("restored VM did not reach agent-ready: {e}"))?;
+    // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+    let restored_serial = restored.instance().serial_log().to_path_buf();
+    let agent = match restored.agent(Some(AGENT_READY_BUDGET)).await {
+        Ok(a) => a,
+        Err(e) => {
+            let base = format!("restored VM: {}", agent_handshake_base(&e));
+            return Err(explain_boot_failure_at(&restored_serial, &base).await);
+        }
+    };
     let out = exec(agent, &["true"]).await?;
     if out.code != 0 {
         return Err(format!("restored VM exec `true` exited {}", out.code));
@@ -448,10 +564,14 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), S
     // Fire a runaway allocation; the VMM may itself be OOM-killed, so ignore the exec result —
     // the binding signal is the host counter.
     {
-        let agent = vm
-            .agent(Some(Duration::from_secs(60)))
-            .await
-            .map_err(|e| format!("agent connect failed: {e}"))?;
+        // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+        let serial_log = vm.instance().serial_log().to_path_buf();
+        let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(explain_boot_failure_at(&serial_log, &agent_handshake_base(&e)).await);
+            }
+        };
         let _ = exec(agent, &["tail", "/dev/zero"]).await;
     }
     for _ in 0..50 {
@@ -526,12 +646,19 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
     let mut vm = match try_start_vm(vmm, cfg).await {
         Ok(vm) => vm,
         Err(e) => {
+            // `MicroVm::start` owns the per-VM temp dir, so on this arm the serial log is already
+            // deleted — there is no console evidence at all, and `start` also fails for reasons
+            // that are not the artifact pair (missing VMM binary, denied host resource), so this
+            // must NOT assert the "not a direct-boot vmlinux" clause. Both Core boot checks are
+            // recorded so a failed start never *shrinks* the report's roster.
+            let msg = failed_start(&e);
             record(
                 outcomes,
-                "boot.agent_ready",
+                "boot.kernel_banner",
                 Level::Core,
-                Err(format!("VM failed to start: {e}")),
+                Err(msg.clone()),
             );
+            record(outcomes, "boot.agent_ready", Level::Core, Err(msg));
             return;
         }
     };
@@ -543,15 +670,14 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
     );
 
     // agent-ready gates every guest probe; if it fails, record it and stop the guest checks.
-    match vm.agent(Some(Duration::from_secs(60))).await {
+    match vm.agent(Some(AGENT_READY_BUDGET)).await {
         Ok(_) => record(outcomes, "boot.agent_ready", Level::Core, Ok(())),
         Err(e) => {
-            record(
-                outcomes,
-                "boot.agent_ready",
-                Level::Core,
-                Err(format!("agent handshake failed: {e}")),
-            );
+            // The VM is still alive here, so its serial log is readable — this is the arm that
+            // catches both the erofs root-mount panic (which surfaces only as "Panic detected in
+            // serial log") and the missing-`CONFIG_VSOCKETS` guest.
+            let msg = explain_boot_failure_for(&vm, &agent_handshake_base(&e)).await;
+            record(outcomes, "boot.agent_ready", Level::Core, Err(msg));
             let _ = vm.shutdown().await;
             return;
         }
@@ -570,13 +696,15 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
 
 /// Runs the guest-facing Core checks against `vm`'s cached agent, returning (id, result) pairs.
 async fn guest_core_checks<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<(&'static str, Result<(), String>)> {
-    let agent = match vm.agent(Some(Duration::from_secs(60))).await {
+    // Captured before the `&mut` agent borrow so the failure arm can still read the console (the
+    // borrow checker keeps the mutable borrow alive across the whole `match` here).
+    let serial_log = vm.instance().serial_log().to_path_buf();
+    let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
-            return vec![(
-                "agent.exec_roundtrip",
-                Err(format!("agent unavailable: {e}")),
-            )];
+            let msg =
+                explain_boot_failure_at(&serial_log, &format!("agent unavailable: {e}")).await;
+            return vec![("agent.exec_roundtrip", Err(msg))];
         }
     };
     vec![
@@ -620,7 +748,7 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                     outcomes,
                     "net.ip_pnp",
                     Level::Extended,
-                    Err(format!("boot: {e}")),
+                    Err(failed_start(&e)),
                 ),
                 Ok(mut vm) => {
                     record(
@@ -683,12 +811,18 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                         outcomes,
                         "nested.kvm_ok",
                         Level::Extended,
-                        Err(format!("boot: {e}")),
+                        Err(failed_start(&e)),
                     ),
                     Ok(mut vm) => {
-                        let res = match vm.agent(Some(Duration::from_secs(60))).await {
+                        // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+                        let serial_log = vm.instance().serial_log().to_path_buf();
+                        let res = match vm.agent(Some(AGENT_READY_BUDGET)).await {
                             Ok(agent) => nested_kvm_ok(agent).await,
-                            Err(e) => Err(format!("agent connect: {e}")),
+                            Err(e) => Err(explain_boot_failure_at(
+                                &serial_log,
+                                &agent_handshake_base(&e),
+                            )
+                            .await),
                         };
                         record(outcomes, "nested.kvm_ok", Level::Extended, res);
                         let _ = vm.shutdown().await;
@@ -725,11 +859,11 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                         outcomes,
                         "metrics.usage_readable",
                         Level::Extended,
-                        Err(format!("boot: {e}")),
+                        Err(failed_start(&e)),
                     ),
                     Ok(mut vm) => {
                         // Let it consume some memory first.
-                        let _ = vm.agent(Some(Duration::from_secs(60))).await;
+                        let _ = vm.agent(Some(AGENT_READY_BUDGET)).await;
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         record(
                             outcomes,
@@ -820,12 +954,16 @@ async fn run_shares_check<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
             outcomes,
             "virtiofs.shares",
             Level::Extended,
-            Err(format!("boot: {e}")),
+            Err(failed_start(&e)),
         ),
         Ok(mut vm) => {
-            let res = match vm.agent(Some(Duration::from_secs(60))).await {
+            // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+            let serial_log = vm.instance().serial_log().to_path_buf();
+            let res = match vm.agent(Some(AGENT_READY_BUDGET)).await {
                 Ok(agent) => virtiofs_shares(agent, &out_dir).await,
-                Err(e) => Err(format!("agent connect: {e}")),
+                Err(e) => {
+                    Err(explain_boot_failure_at(&serial_log, &agent_handshake_base(&e)).await)
+                }
             };
             record(outcomes, "virtiofs.shares", Level::Extended, res);
             let _ = vm.shutdown().await;
@@ -883,7 +1021,7 @@ pub async fn run_full<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
                         outcomes,
                         "metrics.mem_limit_ooms",
                         Level::Full,
-                        Err(format!("boot: {e}")),
+                        Err(failed_start(&e)),
                     ),
                     Ok(mut vm) => {
                         record(
@@ -910,10 +1048,244 @@ pub async fn run_full<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vmcell::vmm::{FakeVmm, FaultMenu};
 
     #[test]
     fn test_parse_oom_kill() {
         assert_eq!(parse_oom_kill("low 0\noom_kill 3\n"), Some(3));
         assert_eq!(parse_oom_kill("low 0\nhigh 1\n"), None);
+    }
+
+    /// A guest that panicked mounting the erofs root, as the console really records it. Written to
+    /// a real file by the tests below, because the bug class these tests exist to catch lives in
+    /// the *reading* — `classify.rs`'s canned-log tests never touch the filesystem.
+    const PANICKED_CONSOLE: &str = "\
+[    0.000000] Linux version 6.12.94 (build@vmcell) #1 SMP PREEMPT_DYNAMIC
+[    0.402244] No filesystem could mount root, tried:
+[    0.402901] Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(254,0)
+";
+
+    /// The same guest, before it ever printed the banner (the console the banner poll would see).
+    const PANICKED_CONSOLE_NO_BANNER: &str = "\
+[    0.402244] No filesystem could mount root, tried:
+[    0.402901] Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(254,0)
+";
+
+    // THE wiring gate. `classify.rs`'s tests all call the classifier directly, so a `serial_text`
+    // that read the log and threw it away (`Ok(_) => String::new()`) left 21/21 green while every
+    // classified boot failure reported the wrong clause. This drives the real fs read: the bytes on
+    // disk must reach the classifier and the tail.
+    #[tokio::test]
+    async fn explain_boot_failure_at_classifies_the_console_it_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("serial.log");
+        std::fs::write(&log, PANICKED_CONSOLE).expect("write console");
+
+        let msg = explain_boot_failure_at(&log, "agent handshake failed").await;
+        assert!(msg.starts_with("agent handshake failed"), "{msg}");
+        assert!(
+            msg.contains("contract violation:") && msg.contains("CONFIG_EROFS_FS"),
+            "the message must name the clause the console proves: {msg}"
+        );
+        assert!(
+            msg.contains("VFS: Unable to mount root fs on unknown-block(254,0)"),
+            "the tail must quote the console that was read: {msg}"
+        );
+        assert!(msg.contains(&log.display().to_string()), "{msg}");
+    }
+
+    // An unreadable console is absence of evidence, not proof of a silent console: it must not be
+    // rendered as the "not a direct-boot PVH vmlinux" contract violation.
+    #[tokio::test]
+    async fn explain_boot_failure_at_reports_absence_when_the_console_is_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("never-created.log");
+
+        let msg = explain_boot_failure_at(&missing, "agent handshake failed").await;
+        assert!(msg.contains("no serial evidence:"), "{msg}");
+        assert!(msg.contains("it could not be read"), "{msg}");
+        assert!(
+            !msg.contains("contract violation:"),
+            "an unreadable log proves no clause: {msg}"
+        );
+    }
+
+    // The banner poll feeds the classifier the newest text it actually read. Guards dropping
+    // `last` (the poll's only evidence) and a poll wired to a second copy of the banner literal.
+    #[tokio::test]
+    async fn await_kernel_banner_classifies_the_console_it_polled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("serial.log");
+        std::fs::write(&log, PANICKED_CONSOLE_NO_BANNER).expect("write console");
+
+        let err = await_kernel_banner(&log, Duration::from_millis(50))
+            .await
+            .expect_err("a console without the banner must fail the check");
+        assert!(
+            err.contains("contract violation:") && err.contains("CONFIG_EROFS_FS"),
+            "the banner arm must classify the console it polled: {err}"
+        );
+    }
+
+    // The positive control for the shared banner literal: a real banner line satisfies the poll.
+    // Guards the poll and `classify_serial` drifting onto two different literals.
+    #[tokio::test]
+    async fn await_kernel_banner_accepts_the_shared_banner_literal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("serial.log");
+        std::fs::write(&log, PANICKED_CONSOLE).expect("write console");
+        assert!(
+            PANICKED_CONSOLE.contains(BANNER_SIGNATURE),
+            "the fixture must carry the banner the kernel really prints"
+        );
+
+        await_kernel_banner(&log, Duration::from_millis(50))
+            .await
+            .expect("a console carrying the banner passes the check");
+    }
+
+    // A console file the VMM never created is no evidence at all — not "the VM ran and printed
+    // nothing". Guards the arm that used to classify an empty string as NoDirectBootKernel.
+    #[tokio::test]
+    async fn await_kernel_banner_without_a_console_reports_absence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("never-created.log");
+
+        let err = await_kernel_banner(&missing, Duration::from_millis(50))
+            .await
+            .expect_err("no console means the check fails");
+        assert!(err.contains("no serial evidence:"), "{err}");
+        assert!(
+            !err.contains("contract violation:"),
+            "a console that never existed proves no clause: {err}"
+        );
+        assert!(
+            err.contains("CONFIG_PVH"),
+            "the candidate cause survives: {err}"
+        );
+    }
+
+    // `run_core`'s start-failure arm, driven end to end without KVM: both Core boot ids stay in the
+    // report (a failed start must not shrink the roster) and both carry the no-evidence rendering
+    // rather than an asserted contract violation — `MicroVm::start` also fails for reasons that are
+    // not the artifact pair, which is exactly what a missing `cloud-hypervisor` binary looks like.
+    #[tokio::test]
+    async fn run_core_records_both_boot_checks_when_the_vm_never_starts() {
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            fail_create: true,
+            ..FaultMenu::default()
+        });
+        let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
+        let mut outcomes = Vec::new();
+        run_core(&vmm, &artifacts, &mut outcomes).await;
+
+        let ids: Vec<&str> = outcomes.iter().map(|o| o.id).collect();
+        assert_eq!(
+            ids,
+            vec!["boot.kernel_banner", "boot.agent_ready"],
+            "{ids:?}"
+        );
+        for o in &outcomes {
+            let crate::CheckStatus::Fail(msg) = &o.status else {
+                panic!(
+                    "{} must fail when the VM never starts: {:?}",
+                    o.id, o.status
+                );
+            };
+            assert!(msg.contains("VM failed to start:"), "{msg}");
+            assert!(msg.contains("no serial evidence:"), "{msg}");
+            assert!(
+                !msg.contains("contract violation:"),
+                "a VMM that never started proves no §5.4 clause: {msg}"
+            );
+            assert!(
+                msg.contains("CONFIG_PVH"),
+                "the candidate cause survives: {msg}"
+            );
+        }
+    }
+
+    // Every Extended/Full arm reports its boot failures through the same renderer as Core — the
+    // crate doc's "every arm that reports a VM which failed to start" claim, driven. Guards the
+    // bare `Err(format!("boot: {e}"))` these arms used to record, which named no clause, no
+    // console, and no candidate cause.
+    #[tokio::test]
+    async fn every_extended_and_full_boot_failure_names_the_missing_evidence() {
+        let vmm = FakeVmm::with_faults(FaultMenu {
+            fail_create: true,
+            ..FaultMenu::default()
+        });
+        let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
+        let mut outcomes = Vec::new();
+        run_extended(&vmm, &artifacts, &mut outcomes).await;
+        run_full(&vmm, &artifacts, &mut outcomes).await;
+
+        let failures: Vec<(&str, &String)> = outcomes
+            .iter()
+            .filter_map(|o| match &o.status {
+                crate::CheckStatus::Fail(m) => Some((o.id, m)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            failures.len() >= 3,
+            "a backend that cannot create a VM must fail several Extended/Full checks; got \
+             {failures:?} (skips: {:?})",
+            outcomes
+                .iter()
+                .map(|o| (o.id, &o.status))
+                .collect::<Vec<_>>()
+        );
+        for (id, msg) in failures {
+            assert!(
+                msg.contains("no serial evidence:"),
+                "{id} reports a boot failure without routing through the renderers: {msg}"
+            );
+        }
+    }
+
+    // The agent budget is one law in one place. Guards re-inlining a per-call literal — the state
+    // the module was in with the const declared and seven copies of the number still in the calls.
+    #[test]
+    fn every_agent_budget_is_a_named_const() {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs"));
+        // Built at runtime so this test's own needles are not the thing it counts.
+        let literal = format!("Duration::from_secs({})", AGENT_READY_BUDGET.as_secs());
+        assert_eq!(
+            SRC.matches(&literal).count(),
+            1,
+            "{literal} must appear exactly once (the AGENT_READY_BUDGET const)"
+        );
+        let inline_call = format!("agent(Some(Duration::{}", "from_secs");
+        assert_eq!(
+            SRC.matches(&inline_call).count(),
+            0,
+            "every `agent(Some(..))` budget must be a named const, not an inline literal"
+        );
+    }
+
+    // The one line that turns a VM into a console path. Guards `explain_boot_failure_for` reading
+    // some other file than the VM's own serial log.
+    #[tokio::test]
+    async fn explain_boot_failure_for_reads_the_vms_own_console() {
+        let vmm = FakeVmm::default();
+        let cfg = base_cfg(&ArtifactSet::new(
+            "/nonexistent/vmlinux",
+            "/nonexistent/rootfs.erofs",
+        ))
+        .network_disabled()
+        .build()
+        .expect("config builds");
+        let mut vm = try_start_vm(&vmm, cfg)
+            .await
+            .expect("the fake backend starts");
+        let expected = vm.instance().serial_log().display().to_string();
+
+        let msg = explain_boot_failure_for(&vm, "agent handshake failed").await;
+        assert!(
+            msg.contains(&expected),
+            "the message must name the VM's own serial log ({expected}): {msg}"
+        );
+        vm.kill().await.expect("the fake backend stops");
     }
 }

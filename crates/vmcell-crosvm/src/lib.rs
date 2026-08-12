@@ -158,6 +158,12 @@ fn crosvm_capabilities() -> VmmCapabilities {
         // crosvm's `--block` has NO bandwidth/iops key (verified against `crosvm run --help`), so it
         // cannot rate-limit disk I/O like CH/FC/QEMU — `create()` rejects a throttled disk fail-loud.
         disk_io_throttle: false,
+        // crosvm's default xhci USB controller is NOT `Suspendable` (validated live: `resume` panics
+        // "Suspendable::wake not implemented for XhciController"), so vmcell always launches with
+        // `--no-usb` (§2.5) — there is no controller to attach a host device to. Honest-false;
+        // `create()` rejects a USB device fail-loud via the shared `reject_usb_host_devices`
+        // predicate. Flipping this would require dropping `--no-usb`, which re-breaks snapshot.
+        usb_host_passthrough: false,
     }
 }
 
@@ -214,9 +220,11 @@ fn build_crosvm_run_args(
     args.push("--suspended".to_string());
 
     // Restore path: load the snapshot's device + guest-RAM state on startup. The device topology is
-    // reconstructed from the run args below (kernel/disks/net/vsock) with a FRESH `res` — notably a
-    // rotated `--vsock cid=` — so the CID is programmed anew on the destination while guest RAM is
-    // loaded verbatim (`restore_rotates_host_paths: true`; the guest binds VMADDR_CID_ANY).
+    // reconstructed from the run args below (kernel/disks/net) against a FRESH `res` — but NOT the
+    // vsock CID: crosvm bakes it into the snapshot and rejects a rotated `--vsock cid=` ("Virtio
+    // vsock incorrect cid for restore", validated live), so the caller passes the sidecar-carried
+    // BAKED `guest_cid` here while guest RAM is loaded verbatim (`restore_rotates_host_paths:
+    // false` — the Firecracker pattern; see the capability descriptor above and `restore()` below).
     if let Some(snapshot) = restore_from {
         args.push("--restore".to_string());
         args.push(snapshot.display().to_string());
@@ -328,7 +336,7 @@ impl Crosvm {
         // (a no-op, and thus harmless, on the first spawn when nothing exists yet).
         let _ = tokio::fs::remove_file(&control_socket).await;
 
-        let cmdline = vmcell::config::build_kernel_cmdline(cfg, res.vmid, "")?;
+        let cmdline = vmcell::config::build_kernel_cmdline(cfg, res, "")?;
 
         // Sandbox posture (§12.2, validated live): crosvm ALWAYS runs `--disable-sandbox` (from
         // `vmm_seccomp_args`) because its own multiprocess minijail (`pivot_root` into `/var/empty`
@@ -447,6 +455,10 @@ impl Vmm for Crosvm {
                 feature: "disk_io_throttle".to_string(),
             });
         }
+        // vmcell always launches crosvm with `--no-usb` (the xhci controller is not `Suspendable`,
+        // §2.5), so there is no bus to attach a host device to. Refuse through the ONE shared
+        // predicate rather than silently ignoring the accepted input.
+        vmcell::vmm::reject_usb_host_devices("crosvm", &caps, &cfg.usb_host_devices)?;
 
         self.spawn(cfg, res, cgroups, None, res.guest_cid).await
     }
@@ -744,6 +756,7 @@ mod tests {
             cgroup_name: "vmcell-test".to_string(),
             tap_name: Some("tap0".to_string()),
             netns_name: None,
+            segment: None,
             vhost_user_socket: None,
             vmid: 1,
             guest_cid: 3,
@@ -962,6 +975,12 @@ mod tests {
         assert!(
             !caps.disk_io_throttle,
             "crosvm --block has no bandwidth/iops key — honest-false"
+        );
+        assert!(
+            !caps.usb_host_passthrough,
+            "vmcell always launches crosvm with --no-usb (its xhci is not Suspendable, §2.5), so \
+             there is no bus to attach a host device to — honest-false; a true would silently \
+             drop the requested device"
         );
     }
 

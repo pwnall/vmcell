@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use vmcell::artifact::kernel::HttpClient;
+use vmcell::artifact::kernel::{self, HttpClient};
 use vmcell::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use vmcell::config::{Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig};
 use vmcell::error::{Error, Result};
@@ -78,20 +78,6 @@ pub struct InVmKernelStage {
     pub cid_alloc: Arc<CidAllocator>,
 }
 
-/// The fragment names, **sorted** and de-duplicated (§5.2, The config fragment): the on-disk `.config` append order
-/// and the cache key are independent of the request order.
-fn sorted_fragments(fragments: &Option<Vec<String>>) -> Vec<String> {
-    let mut names = fragments.clone().unwrap_or_default();
-    names.sort();
-    names.dedup();
-    names
-}
-
-/// The pins key holding the KConfig text for the named fragment (mirrors `KernelStage`).
-fn fragment_pin_key(name: &str) -> String {
-    format!("kernel_fragments_{name}")
-}
-
 /// The pins keys holding this kernel's source URL / SHA256 (label-aware, mirrors `KernelStage`).
 fn url_pin_key(label: &Option<String>) -> String {
     match label {
@@ -106,13 +92,11 @@ fn sha_pin_key(label: &Option<String>) -> String {
     }
 }
 
-/// The filename suffix (`""` or `-<sanitized-label>`), sanitizing `.`→`-` so a dotted version
-/// does not collide the `.cache_key` sidecar via `Path::with_extension` (mirrors `KernelStage`).
+/// The filename suffix (`""` or `-<sanitized-label>`) — `vmcell`'s shared
+/// [`kernel::kernel_filename_suffix`] law, never a second copy of the `.`→`-` sanitization the
+/// CLI's `bundle` reader depends on to tell a kernel from its sidecars.
 fn suffix(label: &Option<String>) -> String {
-    label
-        .as_ref()
-        .map(|l| format!("-{}", l.replace('.', "-")))
-        .unwrap_or_default()
+    kernel::kernel_filename_suffix(label.as_deref())
 }
 
 /// The artifact-map key this stage registers its `vmlinux` under (`"kernel"` for the default,
@@ -125,30 +109,28 @@ fn artifact_key(label: &Option<String>) -> String {
 }
 
 /// The full concatenated KConfig text appended after `make defconfig kvm_guest.config`: the
-/// base `kernel_microvm_config` plus each requested fragment's text, in **sorted** order. A
-/// requested fragment missing from the pins registry is a hard error — never a silent skip
-/// that builds a kernel without the requested instrumentation (§5.2, The config fragment).
+/// base `kernel_microvm_config` plus each requested fragment's text, in **sorted** order.
+///
+/// Resolves the base pin, then delegates the fragment layering to `vmcell`'s shared
+/// [`kernel::kconfig_append`] law, so the in-VM guest appends the very bytes the host-`make`
+/// producer would (§5.2, The config fragment). A requested fragment missing from the pins registry
+/// is a hard error there — never a silent skip that builds a kernel without the requested
+/// instrumentation.
 ///
 /// # Errors
-/// [`Error::Artifact`] if a requested fragment name is absent from the pins.
+/// [`Error::Artifact`] if the base pin or a requested fragment name is absent from the pins.
 fn kconfig_append(inputs: &StageInputs, fragments: &[String]) -> Result<String> {
-    let mut out = inputs
+    let base = inputs
         .pins
         .get("kernel_microvm_config")
-        .ok_or_else(|| Error::Artifact("Missing kernel_microvm_config pin".into()))?
-        .clone();
-    for name in fragments {
-        let frag = inputs.pins.get(&fragment_pin_key(name)).ok_or_else(|| {
-            Error::Artifact(format!(
-                "missing kernel fragment `{name}` in pins (expected key `{}`)",
-                fragment_pin_key(name)
-            ))
-        })?;
-        out.push('\n');
-        out.push_str(frag);
-    }
-    Ok(out)
+        .ok_or_else(|| Error::Artifact("Missing kernel_microvm_config pin".into()))?;
+    kernel::kconfig_append(base, &inputs.pins, fragments)
 }
+
+/// The file name the guest writes the resolved config to on the output share. Named once so the
+/// guest build step and the host copy-out in `run()` cannot drift; the host then renames it to the
+/// published sidecar ([`kernel::resolved_config_path`]).
+const OUT_SHARE_CONFIG: &str = "config";
 
 /// The ordered guest command sequence that extracts the shared source, installs a toolchain,
 /// and compiles `vmlinux` (§5.4, The guest-kernel contract and the bootstrap seed). Kept a **pure** function so the sequence is unit-testable
@@ -156,6 +138,10 @@ fn kconfig_append(inputs: &StageInputs, fragments: &[String]) -> Result<String> 
 ///
 /// The shared read-only source tarball is at `/vmcell-src/linux.tar.xz`, the KConfig append at
 /// `/vmcell-src/kconfig-append`, and the output share is `/vmcell-out`.
+///
+/// Two files cross the output share: the compiled `vmlinux` and the post-`olddefconfig` **resolved
+/// config** (§5.6, The downstream kernel toolkit) — without the second, the only record of what
+/// `olddefconfig` actually kept dies with the builder VM.
 fn build_commands() -> Vec<(&'static str, Vec<String>, Duration)> {
     let sh = |s: &str| vec!["sh".to_string(), "-c".to_string(), s.to_string()];
     vec![
@@ -215,6 +201,14 @@ fn build_commands() -> Vec<(&'static str, Vec<String>, Duration)> {
             sh("cp /build/vmlinux /vmcell-out/vmlinux"),
             Duration::from_secs(60),
         ),
+        (
+            // The RESOLVED config, after `olddefconfig` has dropped every symbol whose
+            // dependencies were unmet — the artifact a fragment author asserts against (§5.6).
+            // Its own step so a non-zero `cp` is a named hard failure, not a silent omission.
+            "copy resolved config out",
+            sh(&format!("cp /build/.config /vmcell-out/{OUT_SHARE_CONFIG}")),
+            Duration::from_secs(30),
+        ),
     ]
 }
 
@@ -247,7 +241,10 @@ impl Stage for InVmKernelStage {
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         // Bump when this stage's build logic changes so stale kernels are not served.
-        const STAGE_VERSION: u32 = 1;
+        // v30 (§18 delta 3, cache-key rule 4): 1 → 2 — the fragment fold gained the distinct
+        // missing-fragment marker AND the guest now ships the resolved config back, so no v1
+        // output (which has no `.config` beside it) may be served.
+        const STAGE_VERSION: u32 = 2;
         const SEP: &[u8] = b"\x1f";
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
@@ -279,23 +276,14 @@ impl Stage for InVmKernelStage {
                 .map(String::as_bytes)
                 .unwrap_or_default(),
         );
-        // Fold the fragment set (name + KConfig content) in SORTED order (§5.2, The config fragment): the same set
-        // in any order hashes identically, and editing a fragment's text invalidates the key.
-        let fragments = sorted_fragments(&self.fragments);
-        hasher.update(SEP);
-        hasher.update(&(fragments.len() as u32).to_le_bytes());
-        for name in &fragments {
-            hasher.update(SEP);
-            hasher.update(name.as_bytes());
-            hasher.update(SEP);
-            hasher.update(
-                inputs
-                    .pins
-                    .get(&fragment_pin_key(name))
-                    .map(String::as_bytes)
-                    .unwrap_or_default(),
-            );
-        }
+        // Fold the fragment set through `vmcell`'s shared fold (§5.2, The config fragment): sorted,
+        // name + KConfig content, and a DISTINCT marker for a fragment absent from the registry —
+        // the same law the host-`make` producer folds, never a second copy.
+        kernel::fold_fragment_identity(
+            &mut hasher,
+            &inputs.pins,
+            &kernel::sorted_fragments(self.fragments.as_deref()),
+        );
         // The compiled bytes depend on the in-guest toolchain, which comes from the builder
         // base image; fold its resolved image@digest so a builder-base bump invalidates the
         // kernel (mirrors the mmdebstrap rootfs builder). A resolution failure folds empty
@@ -310,6 +298,15 @@ impl Stage for InVmKernelStage {
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        // Which producer ran (§5.6, The downstream kernel toolkit): both compiling producers share
+        // `name()` (the label), so only this line distinguishes an in-VM build from a host-`make`
+        // one in the log.
+        tracing::info!(
+            producer = "in-vm",
+            kernel = self.label.as_deref().unwrap_or("default"),
+            fragments = ?kernel::sorted_fragments(self.fragments.as_deref()),
+            "building kernel"
+        );
         // The seed kernel that boots the builder VM (the chicken-and-egg, §5.4, The guest-kernel contract and the bootstrap seed). Missing is a
         // hard error — never a boot from a fallback path.
         let seed_kernel = inputs.artifacts.get("kernel").cloned().ok_or_else(|| {
@@ -331,7 +328,7 @@ impl Stage for InVmKernelStage {
             .get(&sha_pin_key(&self.label))
             .ok_or_else(|| Error::Artifact(format!("Missing {} pin", sha_pin_key(&self.label))))?;
 
-        let fragments = sorted_fragments(&self.fragments);
+        let fragments = kernel::sorted_fragments(self.fragments.as_deref());
         let kconfig_append = kconfig_append(inputs, &fragments)?;
 
         let src_dir = tempfile::TempDir::new().map_err(Error::Io)?;
@@ -361,6 +358,9 @@ impl Stage for InVmKernelStage {
             inputs,
             &builder_rootfs,
             None,
+            // No downstream extra files: this is vmcell's own build infrastructure, and the
+            // core ships mechanisms, never consumer content (§13 invariant G1).
+            &[],
         )
         .await?;
 
@@ -435,10 +435,39 @@ impl Stage for InVmKernelStage {
         }
         tokio::fs::copy(&produced, out).await?;
 
+        // The post-`olddefconfig` RESOLVED config, shipped back on the output share and published
+        // beside the kernel (§5.6, The downstream kernel toolkit). Inside the builder VM it lives in
+        // the guest overlay and dies with the VM, so this copy is the only record of which symbols
+        // `olddefconfig` actually kept. Absent = hard error: a kernel with no evidence of its own
+        // config is exactly the silent-drop this artifact exists to catch.
+        let produced_config = out_dir.path().join(OUT_SHARE_CONFIG);
+        if !produced_config.exists() {
+            return Err(Error::Artifact(format!(
+                "in-VM kernel build reported success but produced no resolved config on the \
+                 output share (expected `{OUT_SHARE_CONFIG}`, §5.6)"
+            )));
+        }
+        // Publish through `vmcell`'s shared law, so this producer's sidecar lands at exactly the
+        // path (and fails with exactly the message) the host-`make` producer's does.
+        let sidecar = kernel::publish_resolved_config(
+            &produced_config,
+            out,
+            self.label.as_deref().unwrap_or("default"),
+        )
+        .await?;
+        tracing::info!(
+            producer = "in-vm",
+            kernel = self.label.as_deref().unwrap_or("default"),
+            config = %sidecar.display(),
+            "kernel built; resolved config written"
+        );
+
+        let key = artifact_key(&self.label);
         let mut outputs = StageOutputs::default();
+        outputs.artifacts.insert(key.clone(), out.to_path_buf());
         outputs
             .artifacts
-            .insert(artifact_key(&self.label), out.to_path_buf());
+            .insert(kernel::config_artifact_key(&key), sidecar);
         Ok(outputs)
     }
 }
@@ -488,6 +517,45 @@ mod tests {
         assert!(idx("make vmlinux") < idx("copy vmlinux out"));
         // The toolchain must be installed before the compile.
         assert!(idx("apt-get install toolchain") < idx("make vmlinux"));
+        // §5.6 GATE (delta 3): the RESOLVED config crosses the output share, and only after
+        // `olddefconfig` has resolved it — copying it earlier would ship the pre-resolution file,
+        // which is the very thing the sidecar exists to distinguish. RED on the inverse (no
+        // copy-out step at all): `idx` panics on the missing step.
+        assert!(idx("make olddefconfig") < idx("copy resolved config out"));
+        let cmd = build_commands()
+            .into_iter()
+            .find(|(n, _, _)| *n == "copy resolved config out")
+            .expect("the resolved-config copy-out step")
+            .1
+            .join(" ");
+        assert!(
+            cmd.contains("/build/.config") && cmd.contains("/vmcell-out/config"),
+            "the step must copy the guest's resolved .config onto the output share, got: {cmd}"
+        );
+    }
+
+    // §5.5 GATE (delta 3) — the missing-fragment marker, in the in-VM producer's key too (the
+    // design's premise names only the host producer; the identical `unwrap_or_default()` hole
+    // lived here). A fragment ABSENT from the registry must not hash like the same fragment
+    // PRESENT with empty text. RED on the inverse (fold `.unwrap_or_default()` instead of the
+    // shared `fold_fragment_identity`): the two keys become equal.
+    #[test]
+    fn test_cache_key_missing_fragment_marker() {
+        let s = stage(Some(vec!["NOSUCH"]));
+        let absent = inputs();
+        assert!(
+            !absent.pins.contains_key("kernel_fragments_NOSUCH"),
+            "fixture premise: the fragment is unresolvable"
+        );
+        let mut empty = inputs();
+        empty
+            .pins
+            .insert("kernel_fragments_NOSUCH".into(), String::new());
+        assert_ne!(
+            s.cache_key(&absent),
+            s.cache_key(&empty),
+            "an unresolvable fragment must not hash like a resolvable-but-empty one"
+        );
     }
 
     // A non-zero exit at any guest step is a HARD error (never swallowed). The inverse — an

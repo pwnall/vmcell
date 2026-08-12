@@ -5,6 +5,13 @@ set shell := ["bash", "-uc"]
 runner := ".vmcell-bin/debug/vmcell-test-runner"
 runner-release := ".vmcell-bin/release/vmcell-test-runner"
 
+# H-TEST-3: `require_cap!` records every capability-driven skip as `SKIP <vmm> <capability>` to
+# $VMCELL_SKIP_MANIFEST. Without a set path it defaults to a per-PID temp file nobody ever reads —
+# i.e. the "skip manifest is reviewed" rule was unenforced, gate theater by our own meta-rules. The
+# suite recipes below export this run-scoped path and `skip-manifest-show` surfaces it (the CI kvm
+# job calls both, so local ≡ CI). An externally-set VMCELL_SKIP_MANIFEST always wins.
+skip-manifest := justfile_directory() + "/target/vmcell-skip-manifest.txt"
+
 # §18.2: `vmcelld` is NOT blessed on the dev hot path. It gets its caps by being LAUNCHED THROUGH the
 # blessed runner (`just daemon`, and integration tests), which raises the three caps into the ambient
 # set and execs `vmcelld` — so the ever-changing daemon rebuilds with no `setcap` churn. Only the runner
@@ -75,8 +82,10 @@ test-unit:
 # Privileged integration suite via the capability runner. `just bless` installs it 0700 (owner-only)
 # — that mode is the security boundary (PRIV-1); on a shared host use a dedicated group + 0750.
 # Wraps every test binary with vmcell-test-runner via the cargo target-runner hook.
-# The in-guest test-helper (ip/curl/kvm-ok) is baked into the rootfs by `vmcell build`, not
-# built here. `--features` is scoped to the `vmcell` member that owns the integration tests.
+# The in-guest test-helper (the four applets ip/curl/kvm-ok/echo-server, one multicall binary) is
+# baked into the rootfs by `vmcell build`, not built here — so a suite whose guest side needs a NEW
+# applet (the raw dial's and the segment gates' `echo-server`) must re-run that build first; a warm
+# rootfs fails it with a missing /vmcell-tools path. `--features` is scoped to the `vmcell` member that owns the integration tests.
 # The `kind(test)` predicate scopes to the integration-test BINARIES only (all in the
 # `serial-host` nextest group), excluding the ~172 `kind(lib)` unit tests that `-p vmcell`
 # would otherwise pull in. Those lib tests are NOT in serial-host, so under the old filter they
@@ -85,6 +94,7 @@ test-unit:
 # root cause of the intermittent "Agent … timed out" flake. They still run in `just test-unit` /
 # `just ci`, so no coverage is lost by excluding them here.
 test-privileged:
+    VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --locked --profile integration -p vmcell --features firecracker,qemu --run-ignored all \
         -E 'kind(test) & !(test(unprivileged) | test(smoltcp))'
@@ -99,7 +109,8 @@ test-privileged:
 test-daemon:
     cargo build --locked -p vmcelld -p vmcelld-ctl
     systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh \
-        env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
+        env VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --locked --profile integration -p vmcelld --run-ignored all
 
 # Unprivileged integration suite under no elevation (keeps the unprivileged path honest).
@@ -107,18 +118,68 @@ test-unprivileged:
     # `--features qemu` (additive over the default set) builds QEMU's unprivileged
     # NAT leg too, so the M-TEST-8 `vmm_matrix_test!` exercises the smoltcp NAT on
     # both CH and QEMU rather than the CH leg alone.
-    cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
+    VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
+        cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
-# Opt-in crosvm live matrix. crosvm is a NEW secondary backend whose binary is NOT installed on the
+# Opt-in crosvm live matrix. crosvm is a secondary backend whose binary is NOT installed on the
 # build/CI hosts, so it is deliberately kept OUT of `test-privileged` (adding it there would hard-fail
 # every KVM host lacking a `crosvm` binary). Its KVM-FREE gates (unit tests, capability-honesty pins,
-# seccomp golden, clippy) run in `just ci`/`just test-unit` already. This recipe validates the crosvm
-# RUNTIME claims — all currently UNVERIFIED — once a `crosvm` binary is present ($VMCELL_CROSVM_BIN or
-# on PATH) on a KVM host. `--no-tests=fail` catches a mis-scoped filter that selects nothing.
+# seccomp golden, clippy) run in `just ci`/`just test-unit` already. This recipe is where the crosvm
+# RUNTIME claims are validated — and they HAVE been, live on a KVM host with a `crosvm` binary
+# present (2026-08-12: 28/28, including snapshot/restore, the raw dial's two legs — the echo round
+# trip and the half-close-forwards leg the in-kernel AF_VSOCK arm passes — and the five §6.5 segment
+# legs delta 8 added, which is crosvm's first segment validation; run it under
+# `systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh`, since
+# `metrics_limits::crosvm` asserts REAL cgroup enforcement and fails without a delegated scope);
+# it stays opt-in because CI has no `crosvm` binary, not
+# because the claims are unverified. Re-run it ($VMCELL_CROSVM_BIN or `crosvm` on PATH, on a KVM
+# host) whenever the backend changes. `--no-tests=fail` catches a mis-scoped filter that selects nothing.
 test-crosvm:
+    VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --locked --profile integration -p vmcell --features crosvm --run-ignored all \
         --no-tests=fail -E 'kind(test) & test(crosvm) & !(test(unprivileged) | test(smoltcp))'
+
+# v30 delta 9 (FR-V5): host-USB passthrough live validation — QEMU only, opt-in.
+# Needs KVM, a blessed runner, and a designated test device: VMCELL_TEST_USB_DEVICE=<vid>:<pid>.
+# The guest kernel is the `usbhost` label built through the §5.6 toolkit (a vmcell-owned GENERIC
+# xhci/USB-core fragment — never the consumer usbip/gadget closure; design §2.4 defends this):
+# the stock vmcell kernel has no USB driver at all, so build it first with
+#   cargo run -p vmcell-cli -- build-kernels          # builds every `kernels` label
+# and point VMCELL_KERNEL at the resulting `<artifacts>/vmlinux-usbhost`. `usbhost` and its
+# `kernel_fragments.USBHOST` text live in the committed pins.json (gated by
+# `usbhost_kernel_label_and_fragment_are_pinned`). `test-privileged` also compiles and selects
+# this test (its filter excludes only unprivileged/smoltcp), so with no designated device it records a
+# capability skip to $VMCELL_SKIP_MANIFEST instead of hard-failing every KVM host — this recipe is
+# the only place it actually exercises a device.
+test-usb-passthrough:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${VMCELL_TEST_USB_DEVICE:?set VMCELL_TEST_USB_DEVICE=<vid>:<pid> (a designated, disposable test device)}"
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
+        cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all \
+        --no-tests=fail -E 'kind(test) & test(usb_passthrough)'
+
+# Reset the run-scoped capability-skip manifest. Run BEFORE a suite sequence (the CI kvm job does)
+# so the surfaced skips belong to this run and not to an accumulated history.
+skip-manifest-reset:
+    mkdir -p "$(dirname "${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}")"
+    : > "${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}"
+
+# Surface the capability-skip manifest (count + contents). A skip is only auditable if someone reads
+# it: this is the "skip manifest reviewed" rubric row's enforcement point, called as the CI kvm job's
+# final step. Never fails the build — a skip is a recorded fact to review, not a gate.
+skip-manifest-show:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    manifest="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}"
+    if [ ! -f "$manifest" ]; then
+      echo "skip manifest: $manifest does not exist — no suite ran, or none recorded a skip"
+      exit 0
+    fi
+    n=$(grep -c '^SKIP ' "$manifest" || true)
+    echo "skip manifest: $n capability skip(s) recorded in $manifest"
+    if [ "$n" -gt 0 ]; then sort "$manifest" | uniq -c | sort -rn; fi
 
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide
@@ -142,10 +203,13 @@ ci:
     # M-VEND-3: assert the carried vhost patch is actually applied. A caret version
     # bump would silently drop the `[patch.crates-io]` (only a "Patch was not used"
     # warning), regressing the QEMU-unprivileged SET_VRING_ENABLE quirk with a green
-    # build. `cargo tree` prints a path dep with its path in parens, so require both
-    # to resolve from vendor/.
-    if ! cargo tree --locked -e normal --all-features 2>/dev/null | grep -qE 'vhost v0\.16\.0 \(.*vendor/vhost\)'; then echo "M-VEND-3: vhost 0.16.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
-    if ! cargo tree --locked -e normal --all-features 2>/dev/null | grep -qE 'vhost-user-backend v0\.22\.0 \(.*vendor/vhost-user-backend\)'; then echo "M-VEND-3: vhost-user-backend 0.22.0 is not resolved from vendor/ — carried patch dropped (version bump?)"; exit 1; fi
+    # build. ONE predicate, here and downstream (v30 delta 2): this call REPLACES the two
+    # inline cargo-tree greps that used to live here — they had already diverged from the
+    # downstream copy on pattern strictness, the duplication-hides-divergence trap. The
+    # script is path-independent so a git-dep consumer runs the SAME check in its own
+    # workspace (design §10.4).
+    ./scripts/check-vendored-vhost.sh
+    ./scripts/test-check-vendored-vhost.sh
     # lean-agent invariant: the guest PID-1 member must omit the host stack AND compile standalone.
     # v15: the lean boundary is now a per-MEMBER structural property (§12.8 #4), so the check
     # targets the crate directly (`-p`) rather than a feature slice of the old single package.
@@ -221,7 +285,9 @@ ci:
     [ -n "$rv" ] && [ "$rv" = "$ch" ] || { echo "MSRV drift: [workspace.package] rust-version=$rv vs rust-toolchain channel=$ch" >&2; exit 1; }
     # The ban scripts, preflight, bless path, and delegated-scope helper are load-bearing,
     # security-adjacent bash — lint them all.
-    shellcheck scripts/*.sh
+    # ...including the downstream example's contract check (v30 delta 5): it must live beside the
+    # workspace it checks, so the lint glob comes to it rather than the script moving to scripts/.
+    shellcheck scripts/*.sh examples/downstream-kernel/*.sh
     # Workflow files: correctness (actionlint also shellchecks `run:` blocks) + security (zizmor:
     # script injection, over-broad permissions, unpinned actions — the suites run on a SELF-HOSTED
     # KVM runner, where a compromised action is lateral movement onto the host).
@@ -235,8 +301,12 @@ ci:
     cargo nextest run --locked --all-features
     # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main
     # merge-base). Runs on the pinned toolchain — 1.96.1 satisfies cargo-semver-checks' rustc floor.
+    # v30 delta 2: `vmcell-artifact-validator` is downstream CONTRACT surface (§10.4), so it is
+    # semver-gated exactly like `vmcell` — a silent breaking change to the validator battery is the
+    # same defect as one to the library, and "discovered by a consumer's build breaking" is the
+    # failure mode the ledgered bump exists to prevent.
     baseline="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse main 2>/dev/null || true)"
-    if [ -n "$baseline" ]; then cargo semver-checks --baseline-rev "$baseline" -p vmcell; else echo "semver-checks: no main baseline available locally, skipping (CI enforces it on PRs)"; fi
+    if [ -n "$baseline" ]; then cargo semver-checks --baseline-rev "$baseline" -p vmcell -p vmcell-artifact-validator; else echo "semver-checks: no main baseline available locally, skipping (CI enforces it on PRs)"; fi
     # Feature-powerset LAST and BLOCKING (former C-GATE-1 debt, closed by the §10.5 host-stack collapse):
     # every ≤2-feature config must compile+clippy clean under -D warnings. This is the comprehensive
     # guard that the collapse holds; a newly mis-gated module regresses it back to RED and fails here.

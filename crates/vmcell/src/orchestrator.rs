@@ -61,126 +61,76 @@ impl Drop for CidGuard {
     }
 }
 
-/// Allocates unique VM IDs for the orchestrator.
+/// The **one** search-order law both id allocators use: the ids `1..=max`, rotated so the search
+/// **starts** at a clock-seeded offset.
 ///
-/// `new()` is hermetic: it tracks reservations only in-process, so two
-/// independent allocators in the same process never interfere (this is what
-/// unit tests rely on). The design injects a single shared `Arc<VmidAllocator>`
-/// per process, so in-process uniqueness is sufficient there. Use
-/// [`VmidAllocator::shared`] for cross-process uniqueness on a real host, where
-/// several runner processes may share host-global resources keyed by VMID
-/// (netns, tap, cgroup, socket paths, CID, MAC, IP).
-#[derive(Clone)]
-pub struct VmidAllocator {
-    /// Set of allocated VMIDs. Mutex-poison recovery via `into_inner()` is sound
-    /// throughout: every critical section is a single `BTreeSet` insert/remove/
-    /// contains with no intermediate invariant, so the set is always valid after
-    /// any panic point (N-ORCH-3).
-    active: Arc<Mutex<std::collections::BTreeSet<u32>>>,
-    /// When set, cross-process reservations are recorded as lock files in this
-    /// directory. `None` (the default) means in-process-only (hermetic).
-    lock_dir: Option<std::path::PathBuf>,
-    /// Injected clock used **only** to seed the search start (a hermetic,
-    /// non-critical randomization that spreads the first-tried vmid across
-    /// processes). Injected rather than reading `SystemTime::now()` directly so
-    /// this seam is consistent with the rest of the file (ORCH-8) and the seed
-    /// is deterministic under a `FakeClock` in tests.
-    ///
-    /// The `+ RefUnwindSafe` bound keeps `VmidAllocator` (and any public type that
-    /// embeds it, e.g. `artifact::SnapshotStage`) `UnwindSafe`/`RefUnwindSafe`: a
-    /// bare `dyn Clock` trait object is not unwind-safe, so storing one silently
-    /// drops those auto-traits from the public surface. Both `Clock` impls
-    /// (`RealClock`, `FakeClock`) satisfy it, so the bound is free here.
-    clock: Arc<dyn Clock + std::panic::RefUnwindSafe>,
+/// Non-critical to correctness — every allocator scans the whole space and takes the first free id
+/// regardless of where it starts — but load-bearing on a shared host: an unseeded scan makes every
+/// process try id 1 first, so every process picks the *same* first id, names the same host
+/// resources after it, and a liveness-blind sweep in one run reaps another's live namespace. The
+/// segment-id allocator shipped without this and every vmcell process on the host therefore chose
+/// `vmcell-seg-1` (verified live: one process's start-up sweep reaped another's running segment).
+/// Written once so the two allocators cannot drift.
+///
+/// The clock is the injected [`Clock`] seam rather than `SystemTime::now()` (ORCH-8), so the seed
+/// is deterministic under a `FakeClock`.
+fn seeded_id_order(clock: &dyn Clock, max: u32) -> impl Iterator<Item = u32> {
+    let seed = clock
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let start = seed % max;
+    (0..max).map(move |i| (start + i) % max + 1)
 }
 
-impl std::fmt::Debug for VmidAllocator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The injected `Clock` is not `Debug`; omit it (it is a non-critical seed
-        // source, never part of the allocator's identity).
-        f.debug_struct("VmidAllocator")
-            .field("active", &self.active)
-            .field("lock_dir", &self.lock_dir)
-            .finish_non_exhaustive()
-    }
+/// The **one** cross-process id-claim law, shared by [`VmidAllocator`] and
+/// [`SegmentIdAllocator`] (§6.5, VM-to-VM segments; the H1 fix, extracted and parameterized by
+/// lock directory).
+///
+/// It is deliberately id-space-**agnostic**: nothing here knows whether the `u32` it claims is a
+/// vmid or a segid — the id space's range and lock directory belong to the owning allocator.
+/// Extracting it means the exactly-one-winner race gate covers both allocators instead of one,
+/// and a second copy (the historical failure mode) cannot diverge.
+#[derive(Clone, Debug)]
+struct FsIdClaim {
+    /// When set, cross-process reservations are recorded as lock files in this directory. `None`
+    /// (the hermetic default) means in-process-only.
+    dir: Option<std::path::PathBuf>,
 }
 
-impl Default for VmidAllocator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl VmidAllocator {
-    /// Creates a new, hermetic VMID allocator (in-process reservations only).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_clock(Arc::new(RealClock))
-    }
-
-    /// Creates a hermetic allocator seeded from an injected [`Clock`] (ORCH-8).
-    /// Used by the unit tests to make the search-start seed deterministic; the
-    /// public constructors seed from [`RealClock`].
-    fn with_clock(clock: Arc<dyn Clock + std::panic::RefUnwindSafe>) -> Self {
-        Self {
-            active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            lock_dir: None,
-            clock,
-        }
-    }
-
-    /// Creates a VMID allocator that additionally enforces cross-process
-    /// uniqueness via lock files under `/tmp/vmcell-vmid`. Crashed-owner
-    /// reservations are reclaimed by an owner-liveness check (`/proc/<pid>`), so
-    /// a crash does not erode capacity permanently.
-    #[must_use]
-    pub fn shared() -> Self {
-        Self::shared_at("/tmp/vmcell-vmid")
-    }
-
-    /// Like [`VmidAllocator::shared`] but with an injectable lock directory, so the
-    /// cross-process claim/reclaim path is unit-testable (H-ORCH-4). `shared()`
-    /// delegates here with the production `/tmp/vmcell-vmid` path.
-    #[must_use]
-    pub fn shared_at(dir: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            lock_dir: Some(dir.into()),
-            clock: Arc::new(RealClock),
-        }
-    }
-
-    /// Attempts to claim `vmid` in the cross-process lock directory.
+impl FsIdClaim {
+    /// Attempts to claim `id` in the cross-process lock directory.
     ///
     /// Returns `true` when there is no cross-process locking configured (hermetic
     /// mode) or the claim succeeded; `false` when another **live** process already
     /// holds it.
     ///
     /// Correctness under contention (H-ORCH-4): the whole read→decide→(re)claim runs
-    /// while holding an **exclusive advisory lock** (`flock`) on a per-vmid
-    /// coordination file, so at most one claimer of a given vmid executes it at a
+    /// while holding an **exclusive advisory lock** (`flock`) on a per-id
+    /// coordination file, so at most one claimer of a given id executes it at a
     /// time — the liveness check and the claim are atomic against every other
     /// claimer, closing the reclaim TOCTOU (an unconditional rename-by-path after a
     /// snapshot read could dual-claim; so could a rename-back that clobbers a third
     /// racer's fresh claim). The kernel releases the `flock` when its holder dies, so
-    /// a crashed *coordinator* cannot wedge the vmid; a lock file left by a crashed
+    /// a crashed *coordinator* cannot wedge the id; a lock file left by a crashed
     /// *owner* still carries its pid, so the next claimer (under the coordination
     /// lock) sees `/proc/<pid>` is absent and reclaims it. The lock file is created
     /// *already carrying* the owner pid (never the old create-then-write two-step
     /// that could leave an empty, unreclaimable lock).
-    fn try_claim_fs(&self, vmid: u32) -> bool {
+    fn try_claim(&self, id: u32) -> bool {
         use std::os::unix::io::AsRawFd;
-        let Some(dir) = &self.lock_dir else {
+        let Some(dir) = &self.dir else {
             return true;
         };
         let _ = std::fs::create_dir_all(dir);
-        let lock_path = dir.join(format!("{vmid}.lock"));
+        let lock_path = dir.join(format!("{id}.lock"));
 
-        // Serialize every cross-process claim/reclaim of THIS vmid on an exclusive
-        // advisory lock over a per-vmid coordination file. `flock` on two distinct
+        // Serialize every cross-process claim/reclaim of THIS id on an exclusive
+        // advisory lock over a per-id coordination file. `flock` on two distinct
         // open file descriptions is mutually exclusive even within one process, so
         // this serializes threads (the blessed-runner suite) *and* processes.
-        let coord_path = dir.join(format!("{vmid}.coord"));
+        let coord_path = dir.join(format!("{id}.coord"));
         let Ok(coord) = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -210,14 +160,14 @@ impl VmidAllocator {
             let _ = std::fs::remove_file(&lock_path);
         }
         // The path is free and we exclusively hold the coordination lock: claim it.
-        Self::atomic_claim(dir, &lock_path, vmid)
+        Self::atomic_claim(dir, &lock_path, id)
     }
 
     /// Creates `lock_path` as a fresh hard link to a temp file already containing
     /// our pid. `hard_link` fails if `lock_path` exists, giving mutual exclusion,
     /// and the winning lock is never observably empty. The temp is always removed.
-    fn atomic_claim(dir: &std::path::Path, lock_path: &std::path::Path, vmid: u32) -> bool {
-        let tmp = dir.join(format!("{vmid}.lock.{}.tmp", std::process::id()));
+    fn atomic_claim(dir: &std::path::Path, lock_path: &std::path::Path, id: u32) -> bool {
+        let tmp = dir.join(format!("{id}.lock.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, std::process::id().to_string()).is_err() {
             let _ = std::fs::remove_file(&tmp);
             return false;
@@ -227,11 +177,103 @@ impl VmidAllocator {
         linked
     }
 
-    /// Releases the cross-process lock for `vmid`, if any.
-    fn release_fs(&self, vmid: u32) {
-        if let Some(dir) = &self.lock_dir {
-            let lock_path = dir.join(format!("{vmid}.lock"));
+    /// Releases the cross-process lock for `id`, if any.
+    fn release(&self, id: u32) {
+        if let Some(dir) = &self.dir {
+            let lock_path = dir.join(format!("{id}.lock"));
             let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+}
+
+/// Allocates unique VM IDs for the orchestrator.
+///
+/// `new()` is hermetic: it tracks reservations only in-process, so two
+/// independent allocators in the same process never interfere (this is what
+/// unit tests rely on). The design injects a single shared `Arc<VmidAllocator>`
+/// per process, so in-process uniqueness is sufficient there. Use
+/// [`VmidAllocator::shared`] for cross-process uniqueness on a real host, where
+/// several runner processes may share host-global resources keyed by VMID
+/// (netns, tap, cgroup, socket paths, CID, MAC, IP).
+#[derive(Clone)]
+pub struct VmidAllocator {
+    /// Set of allocated VMIDs. Mutex-poison recovery via `into_inner()` is sound
+    /// throughout: every critical section is a single `BTreeSet` insert/remove/
+    /// contains with no intermediate invariant, so the set is always valid after
+    /// any panic point (N-ORCH-3).
+    active: Arc<Mutex<std::collections::BTreeSet<u32>>>,
+    /// The shared cross-process claim law ([`FsIdClaim`]), parameterized with this allocator's
+    /// lock directory (`/tmp/vmcell-vmid` for [`VmidAllocator::shared`]; `None` = hermetic).
+    claim: FsIdClaim,
+    /// Injected clock used **only** to seed the search start (a hermetic,
+    /// non-critical randomization that spreads the first-tried vmid across
+    /// processes). Injected rather than reading `SystemTime::now()` directly so
+    /// this seam is consistent with the rest of the file (ORCH-8) and the seed
+    /// is deterministic under a `FakeClock` in tests.
+    ///
+    /// The `+ RefUnwindSafe` bound keeps `VmidAllocator` (and any public type that
+    /// embeds it, e.g. `artifact::SnapshotStage`) `UnwindSafe`/`RefUnwindSafe`: a
+    /// bare `dyn Clock` trait object is not unwind-safe, so storing one silently
+    /// drops those auto-traits from the public surface. Both `Clock` impls
+    /// (`RealClock`, `FakeClock`) satisfy it, so the bound is free here.
+    clock: Arc<dyn Clock + std::panic::RefUnwindSafe>,
+}
+
+impl std::fmt::Debug for VmidAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The injected `Clock` is not `Debug`; omit it (it is a non-critical seed
+        // source, never part of the allocator's identity).
+        f.debug_struct("VmidAllocator")
+            .field("active", &self.active)
+            .field("lock_dir", &self.claim.dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for VmidAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VmidAllocator {
+    /// Creates a new, hermetic VMID allocator (in-process reservations only).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_clock(Arc::new(RealClock))
+    }
+
+    /// Creates a hermetic allocator seeded from an injected [`Clock`] (ORCH-8).
+    /// Used by the unit tests to make the search-start seed deterministic; the
+    /// public constructors seed from [`RealClock`].
+    fn with_clock(clock: Arc<dyn Clock + std::panic::RefUnwindSafe>) -> Self {
+        Self {
+            active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            claim: FsIdClaim { dir: None },
+            clock,
+        }
+    }
+
+    /// Creates a VMID allocator that additionally enforces cross-process
+    /// uniqueness via lock files under `/tmp/vmcell-vmid`. Crashed-owner
+    /// reservations are reclaimed by an owner-liveness check (`/proc/<pid>`), so
+    /// a crash does not erode capacity permanently.
+    #[must_use]
+    pub fn shared() -> Self {
+        Self::shared_at("/tmp/vmcell-vmid")
+    }
+
+    /// Like [`VmidAllocator::shared`] but with an injectable lock directory, so the
+    /// cross-process claim/reclaim path is unit-testable (H-ORCH-4). `shared()`
+    /// delegates here with the production `/tmp/vmcell-vmid` path.
+    #[must_use]
+    pub fn shared_at(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            claim: FsIdClaim {
+                dir: Some(dir.into()),
+            },
+            clock: Arc::new(RealClock),
         }
     }
 
@@ -241,19 +283,9 @@ impl VmidAllocator {
     /// Returns an error if all 254 VMIDs are currently in use.
     pub fn allocate(&self) -> Result<u32> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        // ORCH-8: seed from the injected clock (consistent with the rest of the
-        // file), not `SystemTime::now()` directly. Non-critical: `allocate()`
-        // scans all 254 vmids and returns the first free one regardless of seed.
-        let seed = self
-            .clock
-            .now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let start = (seed % 254) + 1;
-        for i in 0..254 {
-            let vmid = (start + i - 1) % 254 + 1;
-            if !active.contains(&vmid) && self.try_claim_fs(vmid) {
+        // The one seeded search order (ORCH-8), shared with `SegmentIdAllocator`.
+        for vmid in seeded_id_order(&*self.clock, 254) {
+            if !active.contains(&vmid) && self.claim.try_claim(vmid) {
                 active.insert(vmid);
                 return Ok(vmid);
             }
@@ -281,7 +313,7 @@ impl VmidAllocator {
                 "VMID {vmid} already reserved"
             )));
         }
-        if !self.try_claim_fs(vmid) {
+        if !self.claim.try_claim(vmid) {
             return Err(crate::error::Error::Exhaustion(format!(
                 "VMID {vmid} already in use by another process"
             )));
@@ -294,7 +326,7 @@ impl VmidAllocator {
     pub fn release(&self, vmid: u32) {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         active.remove(&vmid);
-        self.release_fs(vmid);
+        self.claim.release(vmid);
     }
 }
 
@@ -312,6 +344,157 @@ impl Drop for VmidGuard {
     }
 }
 
+/// Allocates unique **segment** ids (§6.5, VM-to-VM segments), `1..=`[`crate::net::MAX_SEGMENT_ID`].
+///
+/// A sibling of [`VmidAllocator`] over the **same** (private) `FsIdClaim` law — it does not re-implement
+/// cross-process claiming, only parameterizes it with its own lock directory
+/// (`/tmp/vmcell-segid`, the deliberate un-prefixed bare-`/tmp` cross-process rendezvous the vmid
+/// allocator already uses). Segment ids live in their **own** id space: a leaked `-seg-` netns is
+/// liveness-checked against segids, never vmids ([`sweep_orphans`]).
+///
+/// `new()` is hermetic (in-process only); [`SegmentIdAllocator::shared`] adds the cross-process
+/// lock files.
+#[derive(Clone)]
+pub struct SegmentIdAllocator {
+    /// Set of allocated segment ids. Mutex-poison recovery via `into_inner()` is sound: every
+    /// critical section is a single `BTreeSet` insert/remove/contains with no intermediate
+    /// invariant.
+    active: Arc<Mutex<std::collections::BTreeSet<u32>>>,
+    /// The shared cross-process claim law, parameterized with this allocator's lock directory.
+    claim: FsIdClaim,
+    /// The injected clock that seeds the search start, through the one [`seeded_id_order`] law
+    /// [`VmidAllocator`] uses. Same `+ RefUnwindSafe` bound and same reason: a bare `dyn Clock`
+    /// silently strips `UnwindSafe`/`RefUnwindSafe` from every public type embedding this one
+    /// (here, [`crate::env::HostEnv`]).
+    clock: Arc<dyn Clock + std::panic::RefUnwindSafe>,
+}
+
+impl std::fmt::Debug for SegmentIdAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The injected `Clock` is not `Debug`; it is a non-critical seed source, never part of the
+        // allocator's identity.
+        f.debug_struct("SegmentIdAllocator")
+            .field("active", &self.active)
+            .field("lock_dir", &self.claim.dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for SegmentIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SegmentIdAllocator {
+    /// Creates a hermetic segment-id allocator (in-process reservations only).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_clock(Arc::new(RealClock))
+    }
+
+    /// A hermetic allocator seeded from an injected [`Clock`]. The public constructors seed from
+    /// [`RealClock`].
+    fn with_clock(clock: Arc<dyn Clock + std::panic::RefUnwindSafe>) -> Self {
+        Self {
+            active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            claim: FsIdClaim { dir: None },
+            clock,
+        }
+    }
+
+    /// Test-only: replaces the search-start seed clock (keeping the lock directory), so a unit
+    /// test can make two allocators start their search at the same place — the determinism the
+    /// production seed deliberately removes.
+    #[cfg(test)]
+    pub(crate) fn with_seed_clock(
+        mut self,
+        clock: Arc<dyn Clock + std::panic::RefUnwindSafe>,
+    ) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Creates a segment-id allocator that additionally enforces cross-process uniqueness via lock
+    /// files under `/tmp/vmcell-segid` — the same recorded cross-process-rendezvous exception as
+    /// `/tmp/vmcell-vmid` (deliberate, not swept).
+    #[must_use]
+    pub fn shared() -> Self {
+        Self::shared_at("/tmp/vmcell-segid")
+    }
+
+    /// Like [`SegmentIdAllocator::shared`] but with an injectable lock directory, so the
+    /// cross-process claim/reclaim path is unit-testable without touching `/tmp/vmcell-segid`.
+    #[must_use]
+    pub fn shared_at(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            active: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            claim: FsIdClaim {
+                dir: Some(dir.into()),
+            },
+            clock: Arc::new(RealClock),
+        }
+    }
+
+    /// Allocates the next available segment id.
+    ///
+    /// The search **starts** at a clock-seeded offset, through the one `seeded_id_order` law the
+    /// vmid allocator uses (private, so it is named rather than linked): an unseeded scan hands
+    /// every process on the host segid 1, so every process names its namespace `<prefix>-seg-1`
+    /// and a liveness-blind sweep reaps a live one.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::Error::Exhaustion`] when all
+    /// [`crate::net::MAX_SEGMENT_ID`] ids are in use.
+    pub fn allocate(&self) -> Result<u32> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        for segid in seeded_id_order(&*self.clock, crate::net::MAX_SEGMENT_ID) {
+            if !active.contains(&segid) && self.claim.try_claim(segid) {
+                active.insert(segid);
+                return Ok(segid);
+            }
+        }
+        Err(crate::error::Error::Exhaustion(format!(
+            "No available segment ids (limit {})",
+            crate::net::MAX_SEGMENT_ID
+        )))
+    }
+
+    /// Releases a previously allocated segment id.
+    pub fn release(&self, segid: u32) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.remove(&segid);
+        self.claim.release(segid);
+    }
+}
+
+/// A guard that releases the segment id when dropped.
+#[derive(Debug)]
+pub struct SegmentIdGuard {
+    /// The allocated segment id.
+    pub segid: u32,
+    allocator: SegmentIdAllocator,
+}
+
+impl SegmentIdGuard {
+    /// Claims one segment id from `allocator`, returning the guard that releases it on drop.
+    ///
+    /// # Errors
+    /// Propagates [`SegmentIdAllocator::allocate`]'s exhaustion error.
+    pub fn claim(allocator: &SegmentIdAllocator) -> Result<Self> {
+        Ok(Self {
+            segid: allocator.allocate()?,
+            allocator: allocator.clone(),
+        })
+    }
+}
+
+impl Drop for SegmentIdGuard {
+    fn drop(&mut self) {
+        self.allocator.release(self.segid);
+    }
+}
+
 /// Represents a fully managed test VM, including its associated resources and VMM instance.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -320,8 +503,14 @@ pub struct MicroVm<V: Vmm> {
     vmid: Option<VmidGuard>,
     /// The underlying VMM instance running the VM.
     instance: Option<V::Instance>,
-    /// The network namespace associated with this VM, if any.
+    /// The network namespace associated with this VM, if any. Always `None` for a **segment**
+    /// member: it has no per-VM namespace (§6.5) — reach the segment's through
+    /// [`MicroVm::segment`].
     netns: Option<NetNamespace>,
+    /// This VM's segment membership guard, if it joined one (§6.5). Holds an `Arc` clone of the
+    /// [`NetSegment`](crate::net::NetSegment), which is what makes "never delete a netns under a
+    /// live VMM" structural.
+    segment: Option<crate::net::SegmentMember>,
     #[cfg(feature = "net-unprivileged")]
     /// The smoltcp userspace networking process associated with this VM, if any.
     smoltcp: Option<SmoltcpProcess>,
@@ -411,6 +600,9 @@ struct EnvSetup {
     #[cfg(feature = "net-unprivileged")]
     smoltcp: Option<SmoltcpProcess>,
     netns: Option<NetNamespace>,
+    /// This VM's segment slot + tap, when it is a member (§6.5). Released through the same shared
+    /// [`release_net_before_netns`] helper as every other net resource.
+    segment: Option<crate::net::SegmentMember>,
     cgroup_guard: CgroupGuard,
     cid_guard: Option<CidGuard>,
     res: PerVmResources,
@@ -426,6 +618,7 @@ fn release_net_before_netns(
     proxy: &mut Option<EgressProxy>,
     #[cfg(feature = "net-unprivileged")] smoltcp: &mut Option<SmoltcpProcess>,
     netns: &mut Option<NetNamespace>,
+    segment: &mut Option<crate::net::SegmentMember>,
 ) {
     #[cfg(feature = "net-unprivileged")]
     drop(smoltcp.take());
@@ -433,6 +626,11 @@ fn release_net_before_netns(
     // `NetNamespace::Drop` performs the single idempotent teardown, surfacing a genuine failure via
     // the NET-8 warning; dropping the taken value tears it down exactly once.
     drop(netns.take());
+    // §6.5 (VM-to-VM segments): a member releases its SLOT and its TAP here — never the segment
+    // namespace, which dies with the last `NetSegment` Arc holder (this guard holds one, so the
+    // namespace necessarily outlives the VMM this teardown already reaped). The segment path
+    // leaves `netns == None`, so the take above is a no-op for it; the order is still one law.
+    drop(segment.take());
 }
 
 impl Drop for EnvSetup {
@@ -447,6 +645,7 @@ impl Drop for EnvSetup {
             #[cfg(feature = "net-unprivileged")]
             &mut self.smoltcp,
             &mut self.netns,
+            &mut self.segment,
         );
     }
 }
@@ -670,8 +869,29 @@ impl<V: Vmm> MicroVm<V> {
     }
 
     /// Gets the network namespace associated with this VM, if any.
+    ///
+    /// Always `None` for a **segment** member — a member has no per-VM namespace; its tap lives in
+    /// the segment's (§6.5). Use [`MicroVm::segment`] to reach that one (e.g. for
+    /// `nsenter --net=<path> tc qdisc … netem`).
     pub fn netns(&self) -> Option<&NetNamespace> {
         self.netns.as_ref()
+    }
+
+    /// Gets the VM-to-VM segment this VM is a member of, if any (§6.5, VM-to-VM segments).
+    ///
+    /// The only route to a member's namespace path, bridge name, and gateway — [`MicroVm::netns`]
+    /// returns `None` on this path.
+    pub fn segment(&self) -> Option<&crate::net::NetSegment> {
+        self.segment
+            .as_ref()
+            .map(crate::net::SegmentMember::segment)
+    }
+
+    /// Gets this VM's place in its segment (namespace, tap, segid, slot), if it is a member.
+    pub fn segment_membership(&self) -> Option<&crate::net::SegmentMembership> {
+        self.segment
+            .as_ref()
+            .map(crate::net::SegmentMember::membership)
     }
 
     #[cfg(feature = "net-unprivileged")]
@@ -697,6 +917,8 @@ impl<V: Vmm> MicroVm<V> {
         let mut proxy = None;
         let mut tap_name = None;
         let mut netns_name = None;
+        let mut segment_member: Option<crate::net::SegmentMember> = None;
+        let mut res_segment: Option<crate::net::SegmentMembership> = None;
         // `mut`: reassigned on the `net-unprivileged` leg below, which `host-common` always enables
         // (and this fn only compiles under `host-common`), so the binding is unconditionally mutated.
         let mut vhost_user_socket = None;
@@ -795,8 +1017,25 @@ impl<V: Vmm> MicroVm<V> {
                     smoltcp = Some(p);
                 }
             }
+            crate::config::NetConfig::Segment { segment } => {
+                // §6.5 (VM-to-VM segments): a member has NO per-VM netns. Its tap is created in
+                // the *segment's* namespace and enslaved to the bridge; `netns_name` therefore
+                // names the segment, and `build_vmm_cmd`'s pre-exec `setns` needs no change.
+                // The member holds an `Arc` clone of the segment, so the namespace cannot be
+                // removed while this VM lives.
+                let member = segment.claim_member(vmid)?;
+                tap_name = Some(member.membership().tap_name.clone());
+                netns_name = Some(member.membership().netns.clone());
+                res_segment = Some(member.membership().clone());
+                segment_member = Some(member);
+            }
             crate::config::NetConfig::None => {}
         }
+
+        // Fail-loud post-condition, one law (`net_uses_tap`): the tap-datapath question the config
+        // answers and the resources actually allocated must agree, so every backend can keep
+        // keying its device wiring on `res.tap_name` alone.
+        crate::config::assert_tap_wiring_matches(&cfg.net, tap_name.is_some())?;
 
         // §13 (Cross-cutting invariants) sibling placement: create the per-VM slice as a sibling of the
         // supervisor's own leaf, using the shared, unit-tested line-based parser
@@ -832,6 +1071,7 @@ impl<V: Vmm> MicroVm<V> {
             cgroup_name,
             tap_name,
             netns_name,
+            segment: res_segment,
             vhost_user_socket,
             vmid,
             guest_cid,
@@ -843,6 +1083,7 @@ impl<V: Vmm> MicroVm<V> {
             cid_guard: Some(cid_guard),
             cgroup_guard,
             netns,
+            segment: segment_member,
             #[cfg(feature = "net-unprivileged")]
             smoltcp,
             proxy,
@@ -937,6 +1178,7 @@ impl<V: Vmm> MicroVm<V> {
             vmid: Some(vmid),
             instance: Some(instance),
             netns: staged.netns.take(),
+            segment: staged.segment.take(),
             #[cfg(feature = "net-unprivileged")]
             smoltcp: staged.smoltcp.take(),
             proxy: staged.proxy.take(),
@@ -1063,6 +1305,17 @@ impl<V: Vmm> MicroVm<V> {
             });
         }
 
+        // §6.5 (VM-to-VM segments), boundary 2: restore-time slot/addressing semantics for a
+        // segment member are unspecified in v30, so a restore onto a segment is a typed capability
+        // refusal, not a silently mis-addressed member. `build()` already refuses the pair; this is
+        // the resources-in-hand re-check that a hand-built config cannot slip past.
+        if matches!(cfg.net, crate::config::NetConfig::Segment { .. }) {
+            return Err(crate::error::Error::Unsupported {
+                vmm: vmm.id().to_string(),
+                feature: "snapshot restore of a vm-to-vm segment member (§6.5)".into(),
+            });
+        }
+
         // Snapshot-eligibility law: a virtio-fs data share is served by
         // virtiofsd (a vhost-user device), which a snapshot-eligible VM must
         // not attach. Reject it here (enforced in code, not just docs).
@@ -1136,6 +1389,7 @@ impl<V: Vmm> MicroVm<V> {
             vmid: Some(vmid),
             instance: Some(instance),
             netns: staged.netns.take(),
+            segment: staged.segment.take(),
             #[cfg(feature = "net-unprivileged")]
             smoltcp: staged.smoltcp.take(),
             proxy: staged.proxy.take(),
@@ -1297,6 +1551,70 @@ impl<V: Vmm> MicroVm<V> {
         .await
     }
 
+    /// Dials a **raw byte stream** to a guest AF_VSOCK listener on `port`
+    /// (§3.2, The host side: AgentClient and SessionMux — the raw vsock dial), returning a
+    /// [`VsockDial`](crate::agent::VsockDial). The guest process on the other end
+    /// owns its own protocol: no framing, no `Ready` handshake, no guest agent.
+    ///
+    /// **Independent of the control plane, by design.** Unlike [`agent`](Self::agent)
+    /// and [`connect_sessions`](Self::connect_sessions), this does *not* refuse when
+    /// a custom `init=` replaced the guest agent (§5.3, The kernel command line): the vsock
+    /// **device** is attached unconditionally on every backend — CH's `vsock` create
+    /// payload field, Firecracker's `PUT /vsock`, QEMU's device/daemon block, and
+    /// crosvm's `--vsock cid=` are all straight-line, none reads `cfg.init` — so a
+    /// custom-init guest that binds a vsock port is reachable even though the agent
+    /// is absent. That is precisely FR-V3's cheapest shape: an in-guest listener
+    /// reachable from the host with no IP stack, on every backend and both operating
+    /// modes.
+    ///
+    /// The endpoint is re-derived from the instance on every call (its port
+    /// overridden with `port`), never cached: Firecracker's restore replaces the
+    /// instance's vsock path with the snapshot's baked one, so a cached endpoint
+    /// would go stale across a restore.
+    ///
+    /// Three caveats (§3.2, The host side: AgentClient and SessionMux):
+    /// - **A host half-close is not portable.** `VsockDial::shutdown()` forwards to
+    ///   the guest on Cloud Hypervisor and crosvm, but on Firecracker and QEMU it
+    ///   tears the connection down and silently discards a reply the guest had not
+    ///   yet flushed. Drain the reply before half-closing; the per-backend
+    ///   measurements and the portable protocol rule are on
+    ///   [`VsockDial`](crate::agent::VsockDial), stated once there.
+    /// - A *user* listener gets no post-restore re-bind service. Only the guest
+    ///   agent re-binds after a restore re-creates the vhost-vsock device
+    ///   (§3.4, The guest: vmcell-guest-agent as PID 1), so dial afresh after a restore.
+    /// - On the non-rotating backends (Firecracker, crosvm — `restore_rotates_host_paths`
+    ///   false, §2.6, The capability matrix) the endpoint after a restore is the **baked**
+    ///   path/CID, exactly as the agent connect already handles.
+    ///
+    /// # Panics
+    /// Panics if the VM instance is missing (e.g. after shutdown).
+    ///
+    /// # Errors
+    /// Fails **fast and typed** rather than retrying — the caller already brought
+    /// this VM up, so "nobody listens on that port" is an answer, not a reason to
+    /// wait: [`Error::Agent`](crate::error::Error::Agent) naming the port when the
+    /// vsock bridge closes the connection without an `OK` line (the CH/FC in-VMM
+    /// muxer's dead-port signal), [`Error::Timeout`](crate::error::Error::Timeout)
+    /// naming the port when a bridge accepts the `CONNECT` and never answers
+    /// (bounded by `Timeouts::connect_ok_read`) or when the whole dial exceeds
+    /// `timeout`, and [`Error::Io`](crate::error::Error::Io) — errno intact — when
+    /// the transport socket cannot be opened, which on the AF_VSOCK transport is the
+    /// kernel's own connect error for a port with no guest listener.
+    pub async fn dial_vsock(
+        &self,
+        port: u32,
+        timeout: std::time::Duration,
+    ) -> Result<crate::agent::VsockDial> {
+        let instance = self.instance.as_ref().expect("instance missing");
+        crate::agent::VsockDial::connect_endpoint(
+            &instance.vsock_endpoint(),
+            port,
+            timeout,
+            &self.timeouts,
+        )
+        .await
+    }
+
     /// Whether the one-shot post-restore CSPRNG reseed actually applied (the
     /// `ResyncAck.reseed_applied` ack field) on the first post-restore
     /// [`MicroVm::agent`] call.
@@ -1409,6 +1727,7 @@ impl<V: Vmm> MicroVm<V> {
             #[cfg(feature = "net-unprivileged")]
             &mut self.smoltcp,
             &mut self.netns,
+            &mut self.segment,
         );
         // The cgroup backend lives on the captured `HostEnv` (no longer a standalone
         // `cgroup_fs` field); `cgroup_name.take()` is the once-only guard so a second
@@ -1520,12 +1839,17 @@ fn shutdown_poll_step(grace: std::time::Duration) -> std::time::Duration {
     }
 }
 
-/// Parses the trailing vmid from a per-VM resource identifier — the last
-/// `-`-separated numeric token. Works for every vmcell resource name:
-/// `vmcell-net-<vmid>`, a `vmcell-vm-<vmid>` cgroup slice (even nested under a
-/// `<base>/…` prefix), and a `vmcell-vm-<pid>-<vmid>` scratch dir. Returns
-/// `None` when the tail is not a `u32`, so a foreign entry is never swept.
-fn trailing_vmid(name: &str) -> Option<u32> {
+/// Parses the trailing id from a vmcell resource identifier — the last `-`-separated numeric
+/// token. Works for every vmcell resource name: `vmcell-net-<vmid>`, a `vmcell-vm-<vmid>` cgroup
+/// slice (even nested under a `<base>/…` prefix), a `vmcell-vm-<pid>-<vmid>` scratch dir, and a
+/// `vmcell-seg-<segid>` segment namespace. Returns `None` when the tail is not a `u32`, so a
+/// foreign entry is never swept.
+///
+/// Deliberately **id-space-neutral** in name (it was `trailing_vmid`): it parses
+/// `vmcell-seg-7` as `7` exactly as happily as `vmcell-net-7`, so the *caller* must check each
+/// class against its own live set. Checking a segid against live vmids fails **open** — a dead
+/// segid colliding with a live vmid would never be reclaimed (§6.5, law F2).
+fn trailing_id(name: &str) -> Option<u32> {
     name.rsplit('-').next()?.parse().ok()
 }
 
@@ -1542,6 +1866,11 @@ fn trailing_vmid(name: &str) -> Option<u32> {
 pub trait OrphanScanner: Send + Sync {
     /// Names of every network namespace matching the `vmcell-net-*` prefix.
     fn scan_netns(&self) -> Vec<String>;
+    /// Names of every **segment** namespace matching the `vmcell-seg-*` prefix (§6.5).
+    ///
+    /// A separate method, not a merge into [`OrphanScanner::scan_netns`], because the two classes
+    /// are liveness-checked against **different id spaces** — segids here, vmids there.
+    fn scan_segment_netns(&self) -> Vec<String>;
     /// Names (paths relative to the cgroup-v2 root, as [`CgroupFs`](crate::metrics::CgroupFs)
     /// expects) of every per-VM cgroup slice matching `vmcell-vm-*`.
     fn scan_cgroup_slices(&self) -> Vec<String>;
@@ -1631,6 +1960,17 @@ impl OrphanScanner for HostOrphanScanner {
             .collect()
     }
 
+    fn scan_segment_netns(&self) -> Vec<String> {
+        let seg_prefix = crate::naming::segment_netns_sweep_prefix(&self.prefix);
+        let Ok(dir) = std::fs::read_dir("/var/run/netns") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&seg_prefix))
+            .collect()
+    }
+
     fn scan_cgroup_slices(&self) -> Vec<String> {
         let vm_prefix = crate::naming::vm_resource_sweep_prefix(&self.prefix);
         let mut out = Vec::new();
@@ -1666,8 +2006,11 @@ impl OrphanScanner for HostOrphanScanner {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SweepReport {
-    /// Network namespaces removed (in sweep order).
+    /// Per-VM network namespaces removed (in sweep order).
     pub netns: Vec<String>,
+    /// **Segment** namespaces removed (in sweep order, §6.5) — reclaimed against live *segids*,
+    /// never live vmids.
+    pub segment_netns: Vec<String>,
     /// Cgroup slices removed (in sweep order).
     pub cgroup_slices: Vec<String>,
     /// Per-VM scratch directories removed (in sweep order).
@@ -1677,8 +2020,10 @@ pub struct SweepReport {
 /// Reclaims orphaned per-VM host resources left by a crashed run (ORCH-6).
 ///
 /// Enumerates candidates through the injected [`OrphanScanner`] and removes each
-/// one whose trailing vmid is **not** in `live_vmids` — so a resource still owned
-/// by a running VM is never swept — through the injected
+/// one whose trailing id is **not** live in **its own id space** — per-VM namespaces, cgroup
+/// slices, and scratch dirs against `live_vmids`; segment namespaces (§6.5) against
+/// `live_segids` — so a resource still owned by a running VM or segment is never swept, through
+/// the injected
 /// [`Netlink`](crate::net::tap::Netlink) (netns) and
 /// [`CgroupFs`](crate::metrics::CgroupFs) (cgroup slice) seams, plus a direct
 /// scratch-dir `remove_dir_all`. Removal follows the canonical teardown order —
@@ -1695,11 +2040,12 @@ pub fn sweep_orphans(
     netlink: &dyn crate::net::tap::Netlink,
     cgroup_fs: &dyn crate::metrics::CgroupFs,
     live_vmids: &std::collections::BTreeSet<u32>,
+    live_segids: &std::collections::BTreeSet<u32>,
 ) -> SweepReport {
     let mut report = SweepReport::default();
 
     for name in scanner.scan_netns() {
-        let Some(vmid) = trailing_vmid(&name) else {
+        let Some(vmid) = trailing_id(&name) else {
             continue;
         };
         if live_vmids.contains(&vmid) {
@@ -1711,8 +2057,29 @@ pub fn sweep_orphans(
         }
     }
 
+    // §6.5 (VM-to-VM segments): the `-seg-` class against its OWN id space. Checking it against
+    // `live_vmids` would fail open — a leaked segid that happens to equal a live vmid would be
+    // spared forever, and a live segment whose id equals no live vmid would be destroyed under
+    // its members.
+    for name in scanner.scan_segment_netns() {
+        let Some(segid) = trailing_id(&name) else {
+            continue;
+        };
+        if live_segids.contains(&segid) {
+            continue;
+        }
+        match netlink.delete_netns(&name) {
+            Ok(()) => report.segment_netns.push(name),
+            Err(e) => tracing::warn!(
+                "sweep_orphans: failed to delete segment netns {}: {}",
+                name,
+                e
+            ),
+        }
+    }
+
     for name in scanner.scan_cgroup_slices() {
-        let Some(vmid) = trailing_vmid(&name) else {
+        let Some(vmid) = trailing_id(&name) else {
             continue;
         };
         if live_vmids.contains(&vmid) {
@@ -1734,7 +2101,7 @@ pub fn sweep_orphans(
         let Some(vmid) = dir
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(trailing_vmid)
+            .and_then(trailing_id)
         else {
             continue;
         };
@@ -1837,9 +2204,13 @@ mod tests {
         let path = dir.path();
 
         std::fs::write(path.join("5.lock"), b"").expect("seed empty lock");
-        let a = VmidAllocator::shared_at(path);
+        // Drives the EXTRACTED claim core directly (v30 §18 delta 8): `VmidAllocator` and
+        // `SegmentIdAllocator` both route through it, so this one gate covers both id spaces.
+        let a = FsIdClaim {
+            dir: Some(path.to_path_buf()),
+        };
         assert!(
-            a.try_claim_fs(5),
+            a.try_claim(5),
             "an empty (crashed-mid-claim) lock must reclaim"
         );
         let content = std::fs::read_to_string(path.join("5.lock")).unwrap();
@@ -1851,8 +2222,143 @@ mod tests {
 
         // `/proc/4294967295` can never exist, so this owner is definitively dead.
         std::fs::write(path.join("6.lock"), u32::MAX.to_string()).unwrap();
-        let b = VmidAllocator::shared_at(path);
-        assert!(b.try_claim_fs(6), "a dead owner's lock must be reclaimable");
+        let b = FsIdClaim {
+            dir: Some(path.to_path_buf()),
+        };
+        assert!(b.try_claim(6), "a dead owner's lock must be reclaimable");
+    }
+
+    // v30 §18 delta 8: BOTH allocators claim through the one extracted core, in their OWN lock
+    // directories. Buggy impl guarded: a `SegmentIdAllocator` that skipped the cross-process claim
+    // (an in-process-only set) hands out an id another process already holds — the assertion that
+    // a live-owner lock blocks it reddens. The positive control is the neighbouring id.
+    #[test]
+    fn both_allocators_claim_through_the_one_cross_process_core() {
+        let vmid_dir = tempfile::tempdir().expect("tempdir");
+        let segid_dir = tempfile::tempdir().expect("tempdir");
+
+        // Seed a lock owned by a LIVE process (ourselves) in each id space.
+        std::fs::write(
+            vmid_dir.path().join("1.lock"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            segid_dir.path().join("1.lock"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let vmids = VmidAllocator::shared_at(vmid_dir.path());
+        assert!(
+            vmids.reserve(1).is_err(),
+            "a live owner's vmid lock must block the claim"
+        );
+        assert!(
+            vmids.reserve(2).is_ok(),
+            "positive control: a free vmid claims"
+        );
+
+        // A fixed seed clock, so the two allocators below start their search at the same place and
+        // the reclaim assertion is about the lock file, not about where the scan began.
+        let seed = || -> Arc<dyn Clock + std::panic::RefUnwindSafe> {
+            Arc::new(FakeClock {
+                time: std::time::UNIX_EPOCH + std::time::Duration::new(11, 123_456_789),
+            })
+        };
+        let segids = SegmentIdAllocator::shared_at(segid_dir.path()).with_seed_clock(seed());
+        let first = segids.allocate().expect("a free segid must allocate");
+        assert_ne!(
+            first, 1,
+            "segid 1 is held by a live owner and must be skipped"
+        );
+        assert!(
+            segid_dir.path().join(format!("{first}.lock")).exists(),
+            "a claimed segid must leave its cross-process lock file"
+        );
+        segids.release(first);
+        assert!(
+            !segid_dir.path().join(format!("{first}.lock")).exists(),
+            "releasing a segid must remove its lock file"
+        );
+        // The two id spaces are independent: the same numeric id is free in the other dir.
+        assert_eq!(
+            SegmentIdAllocator::shared_at(segid_dir.path())
+                .with_seed_clock(seed())
+                .allocate()
+                .unwrap(),
+            first
+        );
+    }
+
+    // v30 §18 delta 8, review fix: the SEGID search start is clock-seeded, through the same one
+    // `seeded_id_order` law the vmid search uses.
+    //
+    // Buggy impl guarded — the shipped delta-8 code: an unseeded `1..=MAX` scan hands **every**
+    // vmcell process on the host segid 1, so every process names its namespace `vmcell-seg-1`;
+    // another run's liveness-blind start-up sweep then reaps a live segment (reproduced live: a
+    // member's `netns get failed: Can not open netns /var/run/netns/vmcell-seg-1` mid-test). With
+    // the bug restored both allocators below return 1 and the first assertion reddens.
+    #[test]
+    fn segment_id_search_start_is_clock_seeded_like_the_vmid_search() {
+        let at = |nanos: u32| -> Arc<dyn Clock + std::panic::RefUnwindSafe> {
+            Arc::new(FakeClock {
+                time: std::time::UNIX_EPOCH + std::time::Duration::new(7, nanos),
+            })
+        };
+
+        let a = SegmentIdAllocator::new()
+            .with_seed_clock(at(5_000_000))
+            .allocate()
+            .expect("a fresh allocator allocates");
+        let b = SegmentIdAllocator::new()
+            .with_seed_clock(at(9_000_000))
+            .allocate()
+            .expect("a fresh allocator allocates");
+        assert_ne!(
+            a, b,
+            "two processes' fresh segid allocators must not deterministically pick the same id"
+        );
+
+        // One law, not a second copy: the vmid allocator on the same seed starts in the same
+        // place (both id spaces are 254 wide).
+        assert_eq!(
+            VmidAllocator::with_clock(at(5_000_000))
+                .allocate()
+                .expect("vmid allocates"),
+            a,
+            "both allocators must order their search through the ONE seeded law"
+        );
+
+        // Seeding rotates the search; it never shrinks it. Every id stays reachable, so the
+        // exhaustion limit is unchanged.
+        let order: Vec<u32> =
+            seeded_id_order(&*at(9_000_000), crate::net::MAX_SEGMENT_ID).collect();
+        assert_eq!(order.len(), crate::net::MAX_SEGMENT_ID as usize);
+        let unique: std::collections::BTreeSet<u32> = order.into_iter().collect();
+        assert_eq!(
+            unique,
+            (1..=crate::net::MAX_SEGMENT_ID).collect::<std::collections::BTreeSet<u32>>(),
+            "the seeded order must be a permutation of the whole id space"
+        );
+    }
+
+    // v30 §18 delta 8: exhaustion is typed, at exactly the documented limit.
+    #[test]
+    fn segment_id_allocator_exhausts_typed_at_the_limit() {
+        let alloc = SegmentIdAllocator::new();
+        let mut held = Vec::new();
+        for _ in 0..crate::net::MAX_SEGMENT_ID {
+            held.push(alloc.allocate().expect("within the limit"));
+        }
+        held.sort_unstable();
+        assert_eq!(held.first(), Some(&1));
+        assert_eq!(held.last(), Some(&crate::net::MAX_SEGMENT_ID));
+        assert!(
+            matches!(alloc.allocate(), Err(crate::error::Error::Exhaustion(_))),
+            "the {}th segment id must be a typed Exhaustion",
+            crate::net::MAX_SEGMENT_ID + 1
+        );
     }
 
     // H-ORCH-4 (H1): the read→decide→claim must be atomic against other claimers of
@@ -1880,9 +2386,11 @@ mod tests {
                     s.spawn(|| {
                         // Each thread has its OWN allocator (distinct in-process set)
                         // sharing only the lock dir — the cross-process shape.
-                        let alloc = VmidAllocator::shared_at(dir.path());
+                        let alloc = FsIdClaim {
+                            dir: Some(dir.path().to_path_buf()),
+                        };
                         barrier.wait();
-                        if alloc.try_claim_fs(VMID) {
+                        if alloc.try_claim(VMID) {
                             wins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     });
@@ -1977,6 +2485,27 @@ mod tests {
         ) -> Result<Option<tun_tap::Iface>> {
             Ok(None)
         }
+        fn create_bridge(
+            &self,
+            _netns: &str,
+            _bridge: &str,
+            _gateway: std::net::Ipv4Addr,
+            _prefix_len: u8,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn setup_tap_on_bridge(&self, _netns: &str, _tap: &str, _bridge: &str) -> Result<()> {
+            Ok(())
+        }
+        fn delete_link(&self, _netns: &str, link: &str) -> Result<()> {
+            // The segment member's slot release: the event the segment teardown path orders
+            // against (it has no `netns_delete` — a member never removes the segment namespace).
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("segment_slot_release:{link}"));
+            Ok(())
+        }
         fn delete_netns(&self, _name: &str) -> Result<()> {
             self.log
                 .lock()
@@ -2040,6 +2569,7 @@ mod tests {
             vmid: None,
             instance: Some(instance),
             netns: Some(netns),
+            segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
@@ -2122,6 +2652,7 @@ mod tests {
                 #[cfg(feature = "net-unprivileged")]
                 smoltcp: None,
                 netns: Some(netns),
+                segment: None,
                 cgroup_guard: CgroupGuard {
                     name: "vmcell-vm-8".to_string(),
                     fs: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
@@ -2135,6 +2666,7 @@ mod tests {
                     cgroup_name: "vmcell-vm-8".to_string(),
                     tap_name: None,
                     netns_name: None,
+                    segment: None,
                     vhost_user_socket: None,
                     vmid: 8,
                     guest_cid: 3,
@@ -2154,6 +2686,101 @@ mod tests {
             idx("netns_delete") < idx("cgroup_delete"),
             "the error-path EnvSetup::drop must release the netns before the cgroup slice — the same \
              order as the success path (delta 7): {calls:?}"
+        );
+    }
+
+    // v30 §18 delta 8 (L1): a SEGMENT MEMBER's teardown goes through the same one ordered helper.
+    // The segment path has no per-VM netns, so `netns_delete` is absent from the timeline
+    // entirely — the orderable event is the member's slot release (its tap delete). Asserts:
+    // instance drop -> segment slot release -> cgroup delete, and that the member never deletes
+    // the segment namespace (which would kill every sibling VM's datapath).
+    //
+    // Buggy impl guarded: a `teardown_post_instance` that dropped `self.segment` before the
+    // instance (or after the cgroup) reorders the timeline; a member `Drop` that deleted the
+    // namespace records `delete_netns` while the segment handle is still alive.
+    //
+    // FAKE-BLIND AXIS: `TimelineNetlink` never touches the kernel, so the real bridge creation,
+    // enslavement, and namespace removal are invisible here — `tests/segment.rs`'s live
+    // `segment_last_holder_teardown_leaves_no_residue` leg is what covers those, and its
+    // `segment_duplicate_vmid_is_refused_without_touching_the_live_member` sibling covers the
+    // ownership question a name-only recorder cannot pose (whose tap is `<prefix>-tap-<vmid>` in a
+    // SHARED namespace).
+    #[cfg(feature = "net-privileged")]
+    #[test]
+    fn segment_member_teardown_releases_its_slot_between_instance_and_cgroup() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
+            ..HostEnv::hermetic()
+        };
+        let segment = crate::net::NetSegment::with_netlink_for_test(
+            "vmcell",
+            &env,
+            Box::new(TimelineNetlink { log: log.clone() }),
+        )
+        .expect("hermetic segment creates");
+        let member = segment.claim_member(7).expect("member slot");
+        let tap = member.membership().tap_name.clone();
+
+        {
+            let instance = crate::vmm::FakeVmInstance {
+                vsock_path: std::path::PathBuf::from("/tmp/vmcell-seg-order-vsock.sock"),
+                serial: std::path::PathBuf::from("/tmp/vmcell-seg-order-serial.log"),
+                calls: log.clone(),
+                faults: Default::default(),
+                control_plane_probes: Default::default(),
+            };
+            let _vm = MicroVm::<crate::vmm::FakeVmm> {
+                vmid: None,
+                instance: Some(instance),
+                netns: None,
+                segment: Some(member),
+                #[cfg(feature = "net-unprivileged")]
+                smoltcp: None,
+                proxy: None,
+                cgroup_name: Some("vmcell-vm-7".to_string()),
+                env: env.clone(),
+                agent_client: None,
+                restored: false,
+                restore_reseed_applied: None,
+                cid: None,
+                tmp_dir: None,
+                timeouts: crate::config::Timeouts::default(),
+                control_plane_disabled: false,
+            };
+        }
+
+        let calls = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let idx = |needle: &str| {
+            calls
+                .iter()
+                .position(|c| c == needle)
+                .unwrap_or_else(|| panic!("{needle} not recorded; timeline: {calls:?}"))
+        };
+        assert!(
+            idx("drop") < idx(&format!("segment_slot_release:{tap}")),
+            "the VMM instance must be reaped before its segment slot is released: {calls:?}"
+        );
+        assert!(
+            idx(&format!("segment_slot_release:{tap}")) < idx("cgroup_delete"),
+            "the segment slot must be released before the cgroup slice: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("netns_delete")),
+            "a member must NEVER delete the segment namespace while the segment lives: {calls:?}"
+        );
+        // The slot is back on the free list, and the namespace only goes when the LAST handle does.
+        assert!(
+            segment.active_slots().is_empty(),
+            "the member's slot must return to the segment's free list"
+        );
+        drop(segment);
+        assert!(
+            log.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|c| c == "netns_delete"),
+            "the last segment handle must delete the namespace"
         );
     }
 
@@ -2225,6 +2852,7 @@ mod tests {
                 virtio_console: true,
                 restore_rotates_host_paths: true,
                 disk_io_throttle: true,
+                usb_host_passthrough: false,
             }
         }
 
@@ -2855,6 +3483,7 @@ mod tests {
             vmid: None,
             instance: None,
             netns: None,
+            segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
@@ -2915,6 +3544,7 @@ mod tests {
             vmid: None,
             instance: Some(instance),
             netns: None,
+            segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
@@ -3077,6 +3707,7 @@ mod tests {
             }),
             instance: None,
             netns: None,
+            segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
@@ -3110,12 +3741,16 @@ mod tests {
 
     struct FakeOrphanScanner {
         netns: Vec<String>,
+        segment_netns: Vec<String>,
         cgroups: Vec<String>,
         scratch: Vec<std::path::PathBuf>,
     }
     impl OrphanScanner for FakeOrphanScanner {
         fn scan_netns(&self) -> Vec<String> {
             self.netns.clone()
+        }
+        fn scan_segment_netns(&self) -> Vec<String> {
+            self.segment_netns.clone()
         }
         fn scan_cgroup_slices(&self) -> Vec<String> {
             self.cgroups.clone()
@@ -3141,6 +3776,21 @@ mod tests {
             _vmid: u32,
         ) -> Result<Option<tun_tap::Iface>> {
             Ok(None)
+        }
+        fn create_bridge(
+            &self,
+            _netns: &str,
+            _bridge: &str,
+            _gateway: std::net::Ipv4Addr,
+            _prefix_len: u8,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn setup_tap_on_bridge(&self, _netns: &str, _tap: &str, _bridge: &str) -> Result<()> {
+            Ok(())
+        }
+        fn delete_link(&self, _netns: &str, _link: &str) -> Result<()> {
+            Ok(())
         }
         fn delete_netns(&self, name: &str) -> Result<()> {
             self.log
@@ -3182,11 +3832,18 @@ mod tests {
         }
     }
 
-    // ORCH-6. `sweep_orphans` must reclaim ONLY resources whose trailing vmid is
-    // not live, in the canonical teardown order (netns -> cgroup -> scratch dir),
-    // through the injected Netlink/CgroupFs seams. Seeds the scanner with an
-    // orphan (vmid 3) and a live (vmid 7) entry of each kind. Reddens on: sweeping
+    // ORCH-6. `sweep_orphans` must reclaim ONLY resources whose trailing id is
+    // not live IN ITS OWN ID SPACE, in the canonical teardown order (netns -> segment netns ->
+    // cgroup -> scratch dir), through the injected Netlink/CgroupFs seams. Seeds the scanner with
+    // an orphan (vmid 3) and a live (vmid 7) entry of each kind. Reddens on: sweeping
     // a live id (no-skip), skipping an orphan, or reordering netns-vs-cgroup.
+    //
+    // v30 §18 delta 8 leg (the WRONG-ID-SPACE inverse): `vmcell-seg-7` is planted while vmid 7 is
+    // live and segid 7 is NOT. `trailing_id` parses it as 7 just as happily as `vmcell-net-7`, so
+    // a sweep that checked the `-seg-` class against `live_vmids` would spare it forever (failing
+    // OPEN) — the assertion that it IS reclaimed reddens on exactly that bug. Its mirror
+    // (`vmcell-seg-9`, live segid 9, no live vmid 9) reddens on the opposite miswiring, which
+    // would destroy a live segment under its members.
     #[cfg(feature = "net-privileged")]
     #[test]
     fn test_sweep_orphans_reclaims_only_dead_ids_in_order() {
@@ -3194,6 +3851,7 @@ mod tests {
         let nl = RecordingSweepNetlink { log: log.clone() };
         let cg = RecordingSweepCgroupFs { log: log.clone() };
         let live: std::collections::BTreeSet<u32> = [7].into_iter().collect();
+        let live_segids: std::collections::BTreeSet<u32> = [9].into_iter().collect();
 
         // Real scratch dirs so removal is observable on disk (unique per process).
         let base = std::env::temp_dir();
@@ -3205,11 +3863,12 @@ mod tests {
 
         let scanner = FakeOrphanScanner {
             netns: vec!["vmcell-net-3".into(), "vmcell-net-7".into()],
+            segment_netns: vec!["vmcell-seg-7".into(), "vmcell-seg-9".into()],
             cgroups: vec!["base/vmcell-vm-3".into(), "base/vmcell-vm-7".into()],
             scratch: vec![orphan_dir.clone(), live_dir.clone()],
         };
 
-        let report = sweep_orphans(&scanner, &nl, &cg, &live);
+        let report = sweep_orphans(&scanner, &nl, &cg, &live, &live_segids);
 
         // Only the dead (vmid 3) resources were swept; the live (vmid 7) kept.
         assert_eq!(report.netns, vec!["vmcell-net-3".to_string()]);
@@ -3221,6 +3880,14 @@ mod tests {
         );
         assert!(live_dir.exists(), "the live scratch dir must be kept");
 
+        // The segment class against SEGIDS: segid 7 is dead (vmid 7 being live is irrelevant),
+        // segid 9 is live.
+        assert_eq!(
+            report.segment_netns,
+            vec!["vmcell-seg-7".to_string()],
+            "a leaked segment must be reclaimed against live SEGIDS, not live vmids"
+        );
+
         // Every netns delete precedes every cgroup delete, and only orphans were
         // deleted through the injected seams.
         let calls = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -3228,9 +3895,10 @@ mod tests {
             calls,
             vec![
                 "netns:vmcell-net-3".to_string(),
+                "netns:vmcell-seg-7".to_string(),
                 "cgroup:base/vmcell-vm-3".to_string(),
             ],
-            "sweep must delete only the orphan, netns before cgroup: {calls:?}"
+            "sweep must delete only the orphans, netns before cgroup: {calls:?}"
         );
 
         let _ = std::fs::remove_dir_all(&live_dir);
@@ -3279,6 +3947,21 @@ mod tests {
             });
             Ok(())
         }
+        fn create_bridge(
+            &self,
+            _netns: &str,
+            _bridge: &str,
+            _gateway: std::net::Ipv4Addr,
+            _prefix_len: u8,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn setup_tap_on_bridge(&self, _netns: &str, _tap: &str, _bridge: &str) -> Result<()> {
+            Ok(())
+        }
+        fn delete_link(&self, _netns: &str, _link: &str) -> Result<()> {
+            Ok(())
+        }
         fn setup_tproxy_routing(&self, _netns: &str) -> Result<()> {
             Ok(())
         }
@@ -3315,6 +3998,7 @@ mod tests {
             vmid: None,
             instance: Some(instance),
             netns: Some(netns),
+            segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: Some(proxy),
@@ -3469,6 +4153,7 @@ mod tests {
                 serial: std::path::PathBuf::from("/tmp/vmcell-grace-serial.log"),
             }),
             netns: None,
+            segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
@@ -3505,6 +4190,7 @@ mod tests {
                 control_plane_probes: Default::default(),
             }),
             netns: None,
+            segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
@@ -3530,6 +4216,92 @@ mod tests {
             err.to_string().contains("custom init"),
             "the error must name the custom-init cause: {err}"
         );
+    }
+
+    // §3.2 (The host side: AgentClient and SessionMux) / §18 delta 7: `dial_vsock` must NOT copy
+    // `agent()`'s custom-init guard. The vsock DEVICE is attached unconditionally by
+    // every backend (none reads `cfg.init`), so a custom-init guest that binds a vsock
+    // port is reachable even with no agent anywhere — that is the whole point of the
+    // raw dial. This drives the real transport (a mock bridge on a UDS) through a VM
+    // whose `control_plane_disabled` is TRUE and asserts the dial reached the wire:
+    // the bridge saw a `CONNECT` for the DIALED port, and the handle came back.
+    // Red-on-inverse: adding the `control_plane_disabled` early-return to
+    // `dial_vsock` makes this fail with the custom-init Agent error instead.
+    #[tokio::test]
+    async fn dial_vsock_bypasses_the_custom_init_guard() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let sock = std::env::temp_dir().join(format!(
+            "vmcell-dialguard-{}-{:?}.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind mock vsock bridge");
+
+        // The mock bridge: read the CONNECT line byte-by-byte, answer OK, and hold the
+        // connection open (returned, not dropped) so the dialed handle stays valid.
+        let bridge = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut line = String::new();
+            loop {
+                let mut byte = [0u8; 1];
+                match stream.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        line.push(byte[0] as char);
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                }
+            }
+            stream.write_all(b"OK 7000\n").await.expect("write OK");
+            (line, stream)
+        });
+
+        let vm = MicroVm::<crate::vmm::FakeVmm> {
+            vmid: None,
+            instance: Some(crate::vmm::FakeVmInstance {
+                vsock_path: sock.clone(),
+                serial: std::path::PathBuf::from("/dev/null"),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                faults: Default::default(),
+                control_plane_probes: Default::default(),
+            }),
+            netns: None,
+            segment: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: None,
+            cgroup_name: None,
+            env: HostEnv::hermetic(),
+            agent_client: None,
+            restored: false,
+            restore_reseed_applied: None,
+            cid: None,
+            tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
+            // The VM boots a custom init=: no agent, no control plane — and the dial
+            // must work anyway.
+            control_plane_disabled: true,
+        };
+
+        let dialed = vm.dial_vsock(7000, std::time::Duration::from_secs(5)).await;
+        // Asserted BEFORE joining the bridge: a `dial_vsock` that short-circuits on
+        // `control_plane_disabled` never connects, so joining first would hang the
+        // inverse instead of failing it.
+        assert!(
+            dialed.is_ok(),
+            "dial_vsock must reach the transport on a custom-init VM (the vsock device \
+             is attached unconditionally); got {dialed:?}"
+        );
+        let (line, _held) = bridge.await.expect("mock bridge task");
+        assert_eq!(
+            line, "CONNECT 7000\n",
+            "the dial must CONNECT to the port the caller asked for, not the agent's"
+        );
+        let _ = std::fs::remove_file(&sock);
     }
 
     // EXP-D (c): the adaptive step's exact thresholds — <= 50 ms -> 5 ms,

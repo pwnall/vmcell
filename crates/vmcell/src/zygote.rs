@@ -247,6 +247,11 @@ impl Zygote {
 fn check_clone_eligible(cfg: &VmConfig) -> Result<()> {
     let feature = if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
         Some("unprivileged (vhost-user-net) networking")
+    } else if matches!(cfg.net, crate::config::NetConfig::Segment { .. }) {
+        // §6.5 (VM-to-VM segments): segments are snapshot-forbidden at `build()`, but a `Zygote`
+        // over a segment config must fail at THIS config-only gate rather than after minting the
+        // copy-on-write copies — and a fan-out would dual-claim one member slot besides.
+        Some("vm-to-vm segment membership (§6.5)")
     } else if !cfg.shares.is_empty() {
         Some("a virtio-fs data share (vhost-user device)")
     } else {
@@ -380,6 +385,7 @@ mod tests {
                 virtio_console: true,
                 restore_rotates_host_paths: self.rotates,
                 disk_io_throttle: true,
+                usb_host_passthrough: false,
             }
         }
 
@@ -571,6 +577,41 @@ mod tests {
         assert!(
             matches!(res, Err(Error::Unsupported { .. })),
             "a vhost-user device must be rejected at construction, got {res:?}"
+        );
+    }
+
+    // v30 §18 delta 8: a `Zygote` over a SEGMENT config must be refused at the config-only gate,
+    // not after minting the copy-on-write copies (and never at the per-clone restore, where the
+    // fan-out would already have dual-claimed one member slot). Buggy impl guarded: without the
+    // `Segment` arm in `check_clone_eligible`, this returns `Ok` and the failure surfaces N copies
+    // later. Positive control: the same config with no segment is accepted.
+    #[tokio::test]
+    async fn segment_config_rejected_at_zygote_construction() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let master = root.path().join("zygote");
+        write_master(&master);
+        let (_seg, _env, _calls) = crate::net::segment::testing::fake_segment("vmcell");
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(crate::config::NetConfig::Segment {
+            segment: _seg.clone(),
+        })
+        .build()
+        .expect("a non-snapshotting segment config builds");
+        let res = Zygote::from_snapshot_dir(master.clone(), cfg).await;
+        assert!(
+            matches!(&res, Err(Error::Unsupported { feature, .. }) if feature.contains("segment")),
+            "a segment member must be rejected at zygote construction, got {res:?}"
+        );
+
+        // Positive control: the identical master with a non-segment config is accepted.
+        assert!(
+            Zygote::from_snapshot_dir(master, erofs_cfg()).await.is_ok(),
+            "the same master must still accept an eligible config"
         );
     }
 

@@ -1,23 +1,32 @@
 //! Multicall guest **test-helper** binary: a small Rust stand-in for the distro
 //! `ip`, `curl`, and `kvm-ok` tools the integration tests invoke inside the
-//! guest.
+//! guest, plus the `echo-server` listener the host's raw vsock dial and the
+//! VM-to-VM segment gates connect to (§3.2, §6.5).
 //!
 //! It is baked into the rootfs erofs at `/vmcell-tools/vmcell-guest-tools` (with
-//! `ip`/`curl`/`kvm-ok` symlinks), which the guest agent places on the exec
-//! `PATH`. Baking — rather than a virtio-fs share — is what lets the *unprivileged*
-//! egress test use the tools: virtiofsd cannot enter its sandbox unprivileged, so
-//! a share fails there, whereas the erofs rootfs is served over virtio-blk in both
-//! modes. This keeps the base image otherwise minimal (no
+//! `ip`/`curl`/`kvm-ok`/`echo-server` symlinks), which the guest agent places on
+//! the exec `PATH`. Baking — rather than a virtio-fs share — is what lets the
+//! *unprivileged* egress test use the tools: virtiofsd cannot enter its sandbox
+//! unprivileged, so a share fails there, whereas the erofs rootfs is served over
+//! virtio-blk in both modes. This keeps the base image otherwise minimal (no
 //! `iproute2`/`curl`/`cpu-checker` packages) while still exercising the real
 //! operations the tests assert on: genuine HTTP(S) requests (honoring the proxy
-//! env + the `-k` flag), real `/dev/kvm` access, and real interface/route state.
+//! env + the `-k` flag), real `/dev/kvm` access, real interface/route state, and a
+//! real AF_VSOCK/TCP listener.
 //!
-//! Dispatch is busy-box style: when invoked through an `ip`/`curl`/`kvm-ok`
-//! symlink the command is taken from `argv[0]`; otherwise the first argument
-//! selects it (`vmcell-guest-tools <cmd> …`).
+//! Dispatch is busy-box style: when invoked through an
+//! `ip`/`curl`/`kvm-ok`/`echo-server` symlink the command is taken from `argv[0]`;
+//! otherwise the first argument selects it (`vmcell-guest-tools <cmd> …`). The
+//! `echo-server` applet is additionally usable as a custom `init=` target (its
+//! symlink is an absolute path and it needs no writable root), which is how the
+//! raw dial's guard-bypass claim is validated live with no agent in the guest.
 //!
-//! `print_stdout`/`print_stderr` are intentionally NOT denied here — reproducing `ip`/`curl`/`kvm-ok`
-//! output on stdout/stderr is the whole point of the tool.
+//! `print_stdout`/`print_stderr` are intentionally NOT denied here — reproducing
+//! `ip`/`curl`/`kvm-ok` output on stdout/stderr, and announcing/diagnosing the
+//! `echo-server` listener on the serial console (a custom-`init=` guest's only
+//! observable), is the whole point of the tool. Because that stdout **is** a
+//! persisted host artifact, the accept loops pace their failures through
+//! `accept_error_pacing` rather than logging per iteration.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
@@ -57,7 +66,7 @@ fn main() {
         match args.get(1) {
             Some(c) => (c.clone(), args.get(2..).unwrap_or(&[])),
             None => {
-                eprintln!("usage: vmcell-guest-tools <ip|curl|kvm-ok> [args…]");
+                eprintln!("usage: vmcell-guest-tools <ip|curl|kvm-ok|echo-server> [args…]");
                 // expect(disallowed_methods): a busy-box multicall helper relays its status as the
                 // process exit code; nothing is owned to unwind here (usage error before any work).
                 #[expect(
@@ -69,12 +78,10 @@ fn main() {
         }
     };
 
-    let code = match cmd.as_str() {
-        "ip" => run_ip(rest),
-        "curl" => run_curl(rest),
-        "kvm-ok" => run_kvm_ok(),
-        other => {
-            eprintln!("vmcell-guest-tools: unknown command {other}");
+    let code = match applet(&cmd) {
+        Some(run) => run(rest),
+        None => {
+            eprintln!("vmcell-guest-tools: unknown command {cmd}");
             2
         }
     };
@@ -91,8 +98,31 @@ fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// One applet: takes the sub-command's own arguments, returns its exit code (never
+/// exits itself, so `main`'s single `std::process::exit` suppression covers the
+/// whole class).
+type Applet = fn(&[String]) -> i32;
+
+/// The **one** applet roster: the `argv[0]` symlink-name test and the dispatch read
+/// the same table, so a new applet cannot be added to one and forgotten in the other
+/// (that split is how a symlinked applet silently degrades to the usage error). The
+/// injected symlinks in `vmcell::artifact::rootfs`'s manifest are this list.
+const APPLETS: &[(&str, Applet)] = &[
+    ("ip", run_ip),
+    ("curl", run_curl),
+    ("kvm-ok", |_args| run_kvm_ok()),
+    ("echo-server", run_echo_server),
+];
+
+fn applet(name: &str) -> Option<Applet> {
+    APPLETS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, run)| *run)
+}
+
 fn is_known(name: &str) -> bool {
-    matches!(name, "ip" | "curl" | "kvm-ok")
+    applet(name).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +145,353 @@ fn run_kvm_ok() -> i32 {
             println!("KVM acceleration can NOT be used");
             1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `echo-server` — a real in-guest listener (§3.2 raw vsock dial, §6.5 segments).
+// ---------------------------------------------------------------------------
+
+/// Where an `echo-server` listens. Exactly one endpoint per invocation — the two
+/// gates it serves want different transports, never both at once.
+#[derive(Debug, PartialEq, Eq)]
+enum EchoBind {
+    /// AF_VSOCK on `VMADDR_CID_ANY:<port>` — what the host's `MicroVm::dial_vsock`
+    /// reaches, with no IP stack in the guest at all.
+    Vsock(u32),
+    /// A guest TCP endpoint — the VM-to-VM segment gates' listener.
+    Tcp(std::net::SocketAddr),
+}
+
+/// Parses `echo-server`'s arguments. Pure, so the accept/reject law is unit-tested
+/// without a socket.
+///
+/// Every accepted input is honored or rejected here: an unknown flag, a missing
+/// value, a malformed endpoint, port 0, or both endpoints at once are hard errors
+/// naming the offender — never a silently ignored argument that leaves the server
+/// listening somewhere the caller did not ask for.
+fn parse_echo_args(args: &[String]) -> Result<EchoBind, String> {
+    let mut bind: Option<EchoBind> = None;
+    let set = |chosen: EchoBind, slot: &mut Option<EchoBind>| -> Result<(), String> {
+        if let Some(prev) = slot.as_ref() {
+            return Err(format!(
+                "echo-server takes exactly one endpoint; {prev:?} was already given"
+            ));
+        }
+        *slot = Some(chosen);
+        Ok(())
+    };
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--vsock" => {
+                let raw = it
+                    .next()
+                    .ok_or_else(|| "--vsock needs a <port>".to_string())?;
+                let port: u32 = raw
+                    .parse()
+                    .map_err(|e| format!("invalid --vsock port {raw:?}: {e}"))?;
+                if port == 0 {
+                    return Err("--vsock port 0 is VMADDR_PORT_ANY, not a listener".to_string());
+                }
+                set(EchoBind::Vsock(port), &mut bind)?;
+            }
+            "--tcp" => {
+                let raw = it
+                    .next()
+                    .ok_or_else(|| "--tcp needs an <addr>:<port>".to_string())?;
+                let addr: std::net::SocketAddr = raw
+                    .parse()
+                    .map_err(|e| format!("invalid --tcp endpoint {raw:?}: {e}"))?;
+                if addr.port() == 0 {
+                    return Err("--tcp port 0 asks the kernel to pick, not a listener".to_string());
+                }
+                set(EchoBind::Tcp(addr), &mut bind)?;
+            }
+            other => return Err(format!("unknown echo-server argument {other:?}")),
+        }
+    }
+
+    bind.ok_or_else(|| "echo-server needs one of --vsock <port> / --tcp <addr>:<port>".to_string())
+}
+
+/// Serves an echo listener forever.
+///
+/// Returns only on a fatal error (a bad usage or a listener that cannot be bound).
+/// This matters beyond exit codes: the applet is also usable as a custom `init=`
+/// target, where PID 1 returning panics the guest kernel — so a *per-connection*
+/// failure is logged and the loop continues, and only "there is no listener at all"
+/// gives up.
+fn run_echo_server(args: &[String]) -> i32 {
+    let bind = match parse_echo_args(args) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("echo-server: {e}");
+            eprintln!("usage: echo-server --vsock <port> | --tcp <addr>:<port>");
+            return 2;
+        }
+    };
+    match bind {
+        EchoBind::Vsock(port) => serve_vsock(port),
+        EchoBind::Tcp(addr) => serve_tcp(addr),
+    }
+}
+
+/// Binds and listens on [`libc::VMADDR_CID_ANY`]`:<port>` over AF_VSOCK — bind on
+/// whatever context id the VMM gave this guest, so the listener need not know its
+/// own CID (the guest agent binds the same way). The constant is `libc`'s, never a
+/// second local spelling of the same kernel ABI value.
+///
+/// Hand-rolled on `libc` rather than on the sync `vsock` crate the guest agent uses
+/// (which is what design §18 delta 7 sketches): this crate already links `libc` for
+/// its `ifreq` ioctls, and the three calls below (`socket`/`bind`/`listen`) are
+/// exactly what a wrapper would make — recorded as a deviation in
+/// `docs/implementation-notes.md` rather than taken silently.
+fn vsock_listener(port: u32) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::fd::FromRawFd as _;
+
+    // SAFETY: `socket` takes three integers and returns a fresh fd or -1; it reads
+    // and writes no memory through pointers. `SOCK_CLOEXEC` is set in the type
+    // argument (not a later `fcntl`) so no `exec` in another thread can race the
+    // window where the fd would otherwise be inheritable.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(format!(
+            "socket(AF_VSOCK): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` was just returned by `socket`, is >= 0, and is not owned or
+    // closed anywhere else — this is its single owner from here on.
+    let listener = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    // SAFETY: `sockaddr_vm` is a plain `#[repr(C)]` POD of integers and a padding
+    // array, so the all-zero bit pattern is a valid, fully initialized value.
+    let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+    addr.svm_port = port;
+    addr.svm_cid = libc::VMADDR_CID_ANY;
+
+    let addr_len = std::mem::size_of::<libc::sockaddr_vm>();
+    let addr_len = libc::socklen_t::try_from(addr_len)
+        .map_err(|e| format!("sockaddr_vm size does not fit socklen_t: {e}"))?;
+    // SAFETY: `addr` is a live, fully initialized `sockaddr_vm` for the duration of
+    // this call, and `addr_len` is that same struct's own size — the pointer/length
+    // pair the kernel reads.
+    let rc = unsafe {
+        libc::bind(
+            std::os::fd::AsRawFd::as_raw_fd(&listener),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            addr_len,
+        )
+    };
+    if rc < 0 {
+        return Err(format!(
+            "bind(AF_VSOCK, port {port}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // SAFETY: `listener` is a bound stream socket we own; `backlog` is a plain int.
+    let rc = unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&listener), 16) };
+    if rc < 0 {
+        return Err(format!(
+            "listen(AF_VSOCK, port {port}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(listener)
+}
+
+/// How an accept loop paces itself after `consecutive` **consecutive** failed
+/// `accept`s: how long to pause, and whether to log this one.
+///
+/// The **one** pacing law both echo listeners use. A listener fd that has gone
+/// permanently bad — the shape §3.2 warns about, where a restore re-creates the
+/// vhost-vsock device and a *user* listener gets no re-bind — otherwise turns the
+/// accept loop into an unbounded busy loop whose every iteration writes a line to
+/// the guest's stdout. That stdout is the **serial console**, which vmcell persists
+/// as a per-VM log artifact, so the busy loop does not merely spin: it fills the
+/// host's disk with the same message. Exiting instead is not an option — the applet
+/// is also a custom `init=` target, where PID 1 returning panics the guest kernel.
+///
+/// So: the pause grows 50 ms → 1.6 s and stops there (bounded, and a listener that
+/// recovers is picked up within 1.6 s), and only the first three failures plus every
+/// fiftieth after them are logged, which bounds the artifact at a few lines per
+/// minute while still recording that the listener is broken.
+fn accept_error_pacing(consecutive: u32) -> (Duration, bool) {
+    let doublings = consecutive.saturating_sub(1).min(5);
+    let pause = Duration::from_millis(50u64 << doublings);
+    let log = consecutive <= 3 || consecutive.is_multiple_of(50);
+    (pause, log)
+}
+
+fn serve_vsock(port: u32) -> i32 {
+    use std::os::fd::FromRawFd as _;
+
+    let listener = match vsock_listener(port) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("echo-server: {e}");
+            return 1;
+        }
+    };
+    // The host's dial races the listener coming up, so announce readiness on the
+    // serial console — the one observable a custom-init guest still has.
+    println!("echo-server: listening on vsock port {port}");
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("echo-server: stdout flush: {e}");
+    }
+
+    let mut consecutive_errors: u32 = 0;
+    loop {
+        // SAFETY: the first argument is a listening socket we own; the null
+        // address/length pair is the documented way to tell `accept4` not to write a
+        // peer address, so no memory is written through either pointer; the flags
+        // argument is a plain int. `accept4` + `SOCK_CLOEXEC` rather than `accept`:
+        // the accepted fd is close-on-exec from birth, with no window an `exec` in
+        // another thread could inherit it through.
+        let fd = unsafe {
+            libc::accept4(
+                std::os::fd::AsRawFd::as_raw_fd(&listener),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            // EINTR is not a failure — the syscall was interrupted, so retry it at
+            // once and do not count it against the pacing.
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            consecutive_errors = consecutive_errors.saturating_add(1);
+            let (pause, log) = accept_error_pacing(consecutive_errors);
+            if log {
+                eprintln!(
+                    "echo-server: accept on vsock port {port} failed \
+                     ({consecutive_errors} consecutive): {err}"
+                );
+            }
+            std::thread::sleep(pause);
+            continue;
+        }
+        consecutive_errors = 0;
+        // SAFETY: `fd` was just returned by `accept`, is >= 0, and is owned by
+        // nothing else — the connection's single owner.
+        let conn = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        // A stream socket fd: `UnixStream` is an address-family-agnostic wrapper
+        // over one, and only its `read`/`write`/`shutdown` (plain syscalls on the
+        // fd) are used here — never anything that would parse a `sockaddr_un`.
+        let stream = std::os::unix::net::UnixStream::from(conn);
+        // Detached on purpose: connections are independent and this loop never
+        // joins — it runs until the VM goes away.
+        drop(std::thread::spawn(move || {
+            if let Err(e) = echo_connection(stream) {
+                eprintln!("echo-server: vsock connection: {e}");
+            }
+        }));
+    }
+}
+
+fn serve_tcp(addr: std::net::SocketAddr) -> i32 {
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("echo-server: bind {addr}: {e}");
+            return 1;
+        }
+    };
+    println!("echo-server: listening on tcp {addr}");
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("echo-server: stdout flush: {e}");
+    }
+
+    let mut consecutive_errors: u32 = 0;
+    for conn in listener.incoming() {
+        match conn {
+            Ok(stream) => {
+                consecutive_errors = 0;
+                drop(std::thread::spawn(move || {
+                    if let Err(e) = echo_connection(stream) {
+                        eprintln!("echo-server: tcp connection: {e}");
+                    }
+                }));
+            }
+            // Never give up the listener: as PID 1 a return panics the kernel, and
+            // as a test helper a single failed accept must not end the service. But
+            // never spin on it either — the same `accept_error_pacing` law the vsock
+            // loop uses bounds both the retry rate and the serial-log artifact.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                let (pause, log) = accept_error_pacing(consecutive_errors);
+                if log {
+                    eprintln!(
+                        "echo-server: accept on tcp {addr} failed \
+                         ({consecutive_errors} consecutive): {e}"
+                    );
+                }
+                std::thread::sleep(pause);
+            }
+        }
+    }
+    // `incoming()` is infinite; reaching here means the listener died.
+    eprintln!("echo-server: listener ended unexpectedly");
+    1
+}
+
+/// One connection: echo every byte back until the peer half-closes, then half-close
+/// this side so the peer observes EOF too.
+///
+/// The second half is load-bearing for the gates: a host asserting "EOF propagates
+/// in both directions" only proves anything if the server actually shuts its write
+/// side down instead of letting the socket close carry it.
+fn echo_connection<S: EchoStream>(mut stream: S) -> std::io::Result<()> {
+    echo_until_eof(&mut stream)?;
+    stream.shutdown_write()
+}
+
+/// The stream operations the echo loop needs, so AF_VSOCK and TCP connections share
+/// **one** echo implementation instead of two copies that could drift.
+trait EchoStream: std::io::Read + std::io::Write + Send + 'static {
+    /// Half-closes the write side, sending the peer an EOF.
+    fn shutdown_write(&self) -> std::io::Result<()>;
+}
+
+impl EchoStream for std::os::unix::net::UnixStream {
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+impl EchoStream for std::net::TcpStream {
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+fn echo_until_eof<S: std::io::Read + std::io::Write>(stream: &mut S) -> std::io::Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let chunk = buf.get(..n).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "read reported {n} bytes into a {}-byte buffer",
+                buf.len()
+            ))
+        })?;
+        // `write_all` loops partial writes (a bare `write` would silently drop the
+        // tail of a large echo).
+        stream.write_all(chunk)?;
+        stream.flush()?;
     }
 }
 
@@ -729,6 +1106,202 @@ mod tests {
     //! the duplicated `ifreq` layout unguarded. Each test below reddens on a
     //! specific inverse (see comments).
     use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // §3.2 / §6.5: the echo-server's two endpoint arms, parsed. Both are shipped
+    // now, not just the vsock one the raw-dial gate exercises — the segment gates
+    // consume `--tcp`, and an arm that exists only in the usage string is a trap.
+    // RED on a parser that ignores the value, or that accepts one flag's spelling
+    // for the other.
+    #[test]
+    fn parse_echo_args_accepts_both_endpoint_arms() {
+        assert_eq!(
+            parse_echo_args(&argv(&["--vsock", "7000"])),
+            Ok(EchoBind::Vsock(7000))
+        );
+        assert_eq!(
+            parse_echo_args(&argv(&["--tcp", "0.0.0.0:7100"])),
+            Ok(EchoBind::Tcp("0.0.0.0:7100".parse().expect("addr")))
+        );
+    }
+
+    // Fail loud: every accepted input is honored or REJECTED naming the offender.
+    // RED on the accept-then-ignore shapes — an unknown flag skipped silently, a
+    // missing value defaulted, a malformed endpoint deferred to bind() time, or a
+    // second endpoint quietly overwriting the first.
+    #[test]
+    fn parse_echo_args_rejects_every_malformed_invocation() {
+        for (args, needle) in [
+            (vec!["--vsock"], "needs a <port>"),
+            (vec!["--tcp"], "needs an <addr>"),
+            (vec!["--vsock", "not-a-port"], "invalid --vsock port"),
+            (vec!["--tcp", "7100"], "invalid --tcp endpoint"),
+            (vec!["--vsock", "0"], "VMADDR_PORT_ANY"),
+            (vec!["--udp", "7000"], "unknown echo-server argument"),
+            (vec![], "needs one of"),
+            (
+                vec!["--vsock", "7000", "--tcp", "0.0.0.0:7100"],
+                "exactly one endpoint",
+            ),
+        ] {
+            let err = parse_echo_args(&argv(&args))
+                .expect_err(&format!("{args:?} must be rejected, not accepted"));
+            assert!(
+                err.contains(needle),
+                "{args:?} must be rejected naming the cause ({needle:?}), got {err:?}"
+            );
+        }
+    }
+
+    // The multicall roster is ONE table: `argv[0]` symlink dispatch and the
+    // sub-command dispatch read it, so the `/vmcell-tools/echo-server` symlink the
+    // rootfs manifest injects actually resolves. RED on the pre-v30 shape (a
+    // `matches!` name list beside an independent dispatch `match`), where adding the
+    // applet to only one degrades the symlink to exit 2 — which, as a custom `init=`,
+    // is an immediate kernel panic.
+    #[test]
+    fn applet_roster_is_one_list_and_carries_echo_server() {
+        for name in ["ip", "curl", "kvm-ok", "echo-server"] {
+            assert!(is_known(name), "{name} must be dispatchable by argv[0]");
+            assert!(
+                applet(name).is_some(),
+                "{name} must resolve to a run function"
+            );
+        }
+        assert!(!is_known("vmcell-guest-tools"));
+        assert!(applet("nope").is_none());
+    }
+
+    // The echo data plane, over a real socket pair: every byte comes back, including
+    // a payload larger than the 8 KiB read buffer (so a single-read echo that drops
+    // the tail goes red), and the server half-closes so the peer sees EOF.
+    #[test]
+    fn echo_connection_returns_every_byte_then_half_closes() {
+        use std::io::{Read as _, Write as _};
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let worker = std::thread::spawn(move || echo_connection(server));
+
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let mut writer = client.try_clone().expect("clone");
+        let sent = payload.clone();
+        let feeder = std::thread::spawn(move || {
+            writer.write_all(&sent).expect("write payload");
+            // Half-close so the echo loop sees EOF and stops.
+            writer
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown");
+        });
+
+        let mut back = Vec::new();
+        let mut reader = client;
+        reader.read_to_end(&mut back).expect("read echo");
+
+        feeder.join().expect("feeder");
+        worker.join().expect("worker").expect("echo_connection");
+        assert_eq!(
+            back, payload,
+            "every byte must be echoed back, including past the read buffer"
+        );
+        assert_eq!(back.len(), 40_000);
+    }
+
+    // The half-close itself, pinned where it is actually observable.
+    //
+    // It is NOT observable in the test above, and was measured not to be: dropping
+    // `echo_connection`'s `shutdown_write` leaves that test green, because returning
+    // drops the only handle and the full close delivers the same EOF. (The live
+    // matrix leg cannot see it either, for the same reason — that mutation stayed
+    // green on all four backends.) So here the connection is deliberately kept open
+    // by a second handle, which is the only arrangement where "half-closed" and
+    // "closed" differ.
+    //
+    // RED on a `echo_connection` that drops the `shutdown_write`: the follow-up read
+    // then blocks on a peer that is still open, and the read timeout below turns
+    // that hang into a named failure instead of a stuck test.
+    #[test]
+    fn echo_connection_half_closes_while_the_connection_stays_open() {
+        use std::io::{Read as _, Write as _};
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // The worker gets a clone; `keepalive` holds the server end of the
+        // connection open after `echo_connection` returns, so the only thing that
+        // can end the client's read is the explicit half-close.
+        let keepalive = server.try_clone().expect("clone server");
+        let worker = std::thread::spawn(move || echo_connection(server));
+
+        let mut stream = client;
+        stream.write_all(b"ping").expect("write");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("client half-close");
+
+        let mut echo = [0u8; 4];
+        stream.read_exact(&mut echo).expect("read echo");
+        assert_eq!(&echo, b"ping");
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut tail = [0u8; 1];
+        let n = stream.read(&mut tail).expect(
+            "the server's half-close must end the read; a blocked read here \
+                     means echo_connection never shut its write side down",
+        );
+        assert_eq!(n, 0, "EOF, not data: {tail:?}");
+
+        drop(keepalive);
+        worker.join().expect("worker").expect("echo_connection");
+    }
+
+    // A permanently-bad listener fd must not become a busy loop that floods the
+    // persisted serial-log artifact. Both properties of the ONE pacing law both
+    // accept loops use are pinned here, because neither is observable from a test
+    // that only drives a *healthy* listener.
+    // RED on the pre-fix shape (`continue` with no sleep and an unconditional
+    // `eprintln!`), which is `(ZERO, true)` for every `consecutive`: the first
+    // assert catches the missing pause, the third the unbounded logging.
+    #[test]
+    fn accept_error_pacing_bounds_both_the_retry_rate_and_the_log() {
+        // Every failure pauses — no arm returns a zero pause, which is the busy loop.
+        for n in 1..500u32 {
+            let (pause, _) = accept_error_pacing(n);
+            assert!(
+                pause >= Duration::from_millis(50),
+                "failure #{n} must pause at least the floor, got {pause:?}"
+            );
+            assert!(
+                pause <= Duration::from_millis(1600),
+                "the pause must stay bounded so a recovered listener is picked up \
+                 promptly; failure #{n} asked for {pause:?}"
+            );
+        }
+        // It grows, then caps: the whole point of counting consecutive failures.
+        assert_eq!(accept_error_pacing(1).0, Duration::from_millis(50));
+        assert_eq!(accept_error_pacing(2).0, Duration::from_millis(100));
+        assert_eq!(accept_error_pacing(6).0, Duration::from_millis(1600));
+        assert_eq!(
+            accept_error_pacing(1_000_000).0,
+            Duration::from_millis(1600)
+        );
+
+        // The log is bounded: a broken listener writes a few lines a minute, not one
+        // per iteration. At the 1.6 s cap, 500 failures span >13 minutes.
+        let logged = (1..=500u32).filter(|n| accept_error_pacing(*n).1).count();
+        assert!(
+            (5..=15).contains(&logged),
+            "500 consecutive failures must log a handful of lines, not flood the \
+             serial-log artifact — logged {logged}"
+        );
+        // …but the first failures ARE logged: silence would hide a broken listener.
+        assert!(
+            accept_error_pacing(1).1 && accept_error_pacing(2).1,
+            "the first failures must be reported"
+        );
+    }
 
     #[test]
     fn parse_mac_accepts_six_hex_octets() {

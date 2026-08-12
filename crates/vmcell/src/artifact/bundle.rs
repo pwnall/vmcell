@@ -1,8 +1,11 @@
 //! Reproducible fetch-and-verify manifest for the vmcell-owned artifacts (v15 §10, The artifact build pipeline).
 //!
 //! Scope (deliberately narrow): a digest-pinned manifest of the artifacts vmcell *controls*
-//! — the guest kernel, the erofs rootfs, the proxy CA, and `pins.json` — so a consumer can
-//! re-hash them on use and reject a tampered or swapped file. The VMM binaries
+//! — the guest kernel, the erofs rootfs, the proxy CA, and the resolved pins lock
+//! (`<artifacts_dir>/resolved_pins.json`, the `pins` entry) — so a consumer can re-hash them on use
+//! and reject a tampered or swapped file. The manifested pins are the RESOLVED document, not the
+//! committed `pins.json`: since §18 delta 1 the baseline is embedded in the binary and an overlay
+//! may have overridden it, so the repo file is not what the artifacts were built from. The VMM binaries
 //! (Cloud Hypervisor / Firecracker / QEMU) are **not** vendored or manifested here: QEMU is
 //! GPL (redistribution is a legal question the "external binary" carve-out does not cover),
 //! CH/FC are 100+ MB per release, and they already arrive digest-verified by their own pins —

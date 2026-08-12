@@ -153,6 +153,316 @@ async fn connect_control_stream(endpoint: &VsockEndpoint) -> std::io::Result<Con
     }
 }
 
+/// The upper bound on the hybrid prologue's acknowledgement line, in bytes.
+///
+/// The `OK <port>\n` line a bridge sends is a dozen bytes; the cap exists so a
+/// broken or hostile bridge that streams bytes without ever sending a newline
+/// cannot grow the accumulator without bound (the same validate-before-allocate
+/// discipline `MAX_FRAME_BYTES` applies to the framed plane, §13, Cross-cutting invariants).
+#[cfg(feature = "host-common")]
+const MAX_PROLOGUE_LINE_BYTES: usize = 256;
+
+/// How the hybrid `CONNECT <port>`/`OK` prologue failed, at the granularity its two
+/// callers interpret differently (§3.2, The host side: AgentClient and SessionMux).
+///
+/// [`AgentClient::connect_framed`] folds every arm into "retry after a backoff" —
+/// it exists to outwait a *booting* agent. [`VsockDial`] maps each arm to its own
+/// typed, fail-fast error ([`dial_prologue_error`]): a raw dial is issued against a
+/// VM the caller already brought up, so "nobody listens on that port" must surface
+/// immediately instead of spinning to the deadline.
+#[cfg(feature = "host-common")]
+#[derive(Debug)]
+enum PrologueError {
+    /// The `CONNECT <port>` line could not be written to the bridge.
+    Write(std::io::Error),
+    /// Reading the acknowledgement line failed at the transport level.
+    Read(std::io::Error),
+    /// The bridge closed the connection before a complete line arrived — the
+    /// in-VMM muxer's "no guest listener on that port" signal (CH/FC).
+    Eof {
+        /// The partial line received before the close (often empty).
+        partial: String,
+    },
+    /// The per-byte read budget (`Timeouts::connect_ok_read`) elapsed with the line
+    /// still incomplete — an accepted-and-hung bridge (QEMU's external
+    /// `vhost-device-vsock` daemon on a dead port).
+    ReadTimeout {
+        /// The partial line received before the budget elapsed (often empty).
+        partial: String,
+    },
+    /// A complete line arrived that was not an `OK …` acknowledgement, or a line
+    /// that ran past [`MAX_PROLOGUE_LINE_BYTES`] without a newline.
+    Refused {
+        /// The line the bridge sent (newline included when it sent one).
+        line: String,
+    },
+}
+
+#[cfg(feature = "host-common")]
+impl std::fmt::Display for PrologueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write(e) => write!(f, "CONNECT line write failed: {e}"),
+            Self::Read(e) => write!(f, "OK line read failed: {e}"),
+            Self::Eof { partial } => {
+                write!(f, "stream closed before an OK line (partial {partial:?})")
+            }
+            Self::ReadTimeout { partial } => write!(
+                f,
+                "no OK line within the per-byte read budget (partial {partial:?})"
+            ),
+            Self::Refused { line } => write!(f, "bridge answered {line:?} instead of an OK line"),
+        }
+    }
+}
+
+/// Speaks the Firecracker-style hybrid `CONNECT <port>`/`OK` prologue on `stream`.
+///
+/// The **one** implementation of the handshake (§13, Cross-cutting invariants — one law, one
+/// predicate): the framed control-plane connect ([`AgentClient::connect_framed`],
+/// shared by [`session::SessionMux`]) and the raw dial ([`VsockDial`]) both go
+/// through it, so the fragile part of the wire can never exist in two versions.
+///
+/// The acknowledgement line is read **byte by byte** — never through a buffered
+/// reader, which would swallow the first framed payload that follows the newline —
+/// and every single-byte read is bounded by `ok_read`, so a bridge that accepts and
+/// then hangs is a bounded failure rather than a wedge.
+#[cfg(feature = "host-common")]
+async fn hybrid_connect_prologue(
+    stream: &mut ControlStream,
+    port: u32,
+    ok_read: std::time::Duration,
+) -> std::result::Result<(), PrologueError> {
+    let connect_msg = format!("CONNECT {port}\n");
+    stream
+        .write_all(connect_msg.as_bytes())
+        .await
+        .map_err(PrologueError::Write)?;
+
+    let mut resp = String::new();
+    loop {
+        let mut byte = [0; 1];
+        use tokio::io::AsyncReadExt;
+        match tokio::time::timeout(ok_read, stream.read(&mut byte)).await {
+            Err(_elapsed) => return Err(PrologueError::ReadTimeout { partial: resp }),
+            Ok(Err(e)) => return Err(PrologueError::Read(e)),
+            Ok(Ok(0)) => return Err(PrologueError::Eof { partial: resp }),
+            Ok(Ok(_)) => {
+                resp.push(byte[0] as char);
+                if byte[0] == b'\n' {
+                    return if resp.starts_with("OK ") {
+                        Ok(())
+                    } else {
+                        Err(PrologueError::Refused { line: resp })
+                    };
+                }
+                if resp.len() >= MAX_PROLOGUE_LINE_BYTES {
+                    return Err(PrologueError::Refused { line: resp });
+                }
+            }
+        }
+    }
+}
+
+/// The typed, fail-fast interpretation of a failed prologue for the **raw dial**
+/// (§3.2, The host side: AgentClient and SessionMux) — the one place the refusal signals are given
+/// meaning, so `dial_vsock`'s error contract lives beside the handshake that
+/// produces it and is unit-testable without a VM.
+///
+/// `EOF` before an `OK` line is the in-VMM muxer's dead-port signal (a typed
+/// [`Error::Agent`] naming the port); an accepted-and-hung bridge runs out the
+/// per-byte budget into a typed [`Error::Timeout`] naming the port; a transport
+/// error surfaces as [`Error::Io`], errno intact.
+#[cfg(feature = "host-common")]
+fn dial_prologue_error(port: u32, ok_read: std::time::Duration, err: PrologueError) -> Error {
+    match err {
+        PrologueError::Write(e) | PrologueError::Read(e) => Error::Io(e),
+        PrologueError::Eof { partial } => Error::Agent(format!(
+            "no guest vsock listener on port {port}: the vsock bridge closed the connection \
+             without an OK line (received {partial:?})"
+        )),
+        PrologueError::ReadTimeout { partial } => Error::Timeout(format!(
+            "no guest vsock listener answered on port {port}: the vsock bridge accepted the \
+             CONNECT and sent no OK line within {ok_read:?} (received {partial:?})"
+        )),
+        PrologueError::Refused { line } => Error::Agent(format!(
+            "guest vsock port {port} refused: the vsock bridge answered {line:?} instead of an \
+             OK line"
+        )),
+    }
+}
+
+/// The same [`VsockEndpoint`] with its port replaced by `port`.
+///
+/// The one place a caller-chosen guest port is spliced into an instance's endpoint
+/// (§3.2, The host side: AgentClient and SessionMux), so the raw dial's transport dispatch is exactly
+/// [`hybrid_prologue_port`]'s and the AF_VSOCK arm dials the requested port rather
+/// than the agent's. Exhaustive on both arms — [`VsockEndpoint`] is deliberately not
+/// `#[non_exhaustive]`, so a future transport breaks this at compile time instead of
+/// silently keeping the agent port.
+#[cfg(feature = "host-common")]
+fn endpoint_on_port(endpoint: &VsockEndpoint, port: u32) -> VsockEndpoint {
+    match endpoint {
+        VsockEndpoint::Unix { path, .. } => VsockEndpoint::Unix {
+            path: path.clone(),
+            port,
+        },
+        VsockEndpoint::Vsock { cid, .. } => VsockEndpoint::Vsock { cid: *cid, port },
+    }
+}
+
+/// A raw byte stream to a guest AF_VSOCK listener (§3.2, The host side: AgentClient and SessionMux — the raw vsock
+/// dial): the guest process on the other end owns its own protocol, so there is no
+/// framing, no `Ready` handshake, and no guest-agent involvement.
+///
+/// Obtained from [`MicroVm::dial_vsock`](crate::MicroVm::dial_vsock), or from
+/// [`VsockDial::connect_endpoint`] by a caller that already holds the endpoint.
+/// Read and write it through [`tokio::io::AsyncReadExt`] /
+/// [`tokio::io::AsyncWriteExt`].
+///
+/// # Half-close is not portable — drain the reply *before* `shutdown()`
+///
+/// The **guest→host** direction is portable: when the guest half-closes its write
+/// side or exits, the host's read returns `0`, on every backend.
+///
+/// The **host→guest** direction is not. Calling [`shutdown()`](tokio::io::AsyncWriteExt::shutdown)
+/// half-closes the host's write side, and whether the guest sees a clean EOF *and
+/// can still answer* is a property of the backend's vsock bridge, not of this API.
+/// Measured on the live matrix on 2026-08-11 (Cloud Hypervisor 54.0.0, Firecracker
+/// 1.16.0, QEMU 10.2.1, crosvm), writing a request, calling `shutdown()`, then
+/// draining the guest's echo:
+///
+/// | backend | host-side transport | reply after the host's `shutdown()` |
+/// | --- | --- | --- |
+/// | Cloud Hypervisor | in-VMM hybrid muxer over AF_UNIX | arrives — 5/5 |
+/// | crosvm | in-kernel AF_VSOCK (no bridge) | arrives — 5/5 |
+/// | Firecracker | in-VMM hybrid muxer over AF_UNIX | **discarded** — 0/5 |
+/// | QEMU | external `vhost-device-vsock` daemon over AF_UNIX | **races** the teardown — 2/5 |
+///
+/// On Firecracker and QEMU the host's `SHUT_WR` on the bridge socket is translated
+/// into a teardown of the whole vsock connection, so anything the guest had not
+/// already put on the wire is lost. **The loss is silent**: the host's next read
+/// returns `Ok(0)` — an ordinary clean EOF — not an error, so a caller cannot tell
+/// a complete reply from a truncated one after the fact.
+///
+/// The portable rule, therefore: **treat `shutdown()` as end-of-conversation, never
+/// as an in-band "your turn" signal.** Frame the guest protocol so the host knows
+/// when a reply is complete without needing the EOF — a length prefix, a delimiter,
+/// or a fixed size — read the reply to completion, and only then half-close or drop
+/// the handle. That order works identically on all four backends. A caller that
+/// truly needs half-close-as-signal is choosing Cloud Hypervisor or crosvm, and
+/// should say so; vmcell does not advertise the difference as a capability flag
+/// (see `docs/implementation-notes.md`, the delta-7 record) precisely because the
+/// drain-first order removes the need to branch on it.
+///
+/// A public newtype over the crate's transport enum rather than a public enum: the
+/// two-arm `ControlStream` stays `pub(crate)` and non-generic, so adding a transport
+/// is not a breaking change for a downstream holding this handle. It is
+/// [`std::panic::UnwindSafe`] and [`std::panic::RefUnwindSafe`] for the same reason
+/// the inner stream is — a transport socket carries no panic-observable invariant —
+/// which a plain newtype (no interior mutability) inherits automatically.
+#[cfg(feature = "host-common")]
+#[derive(Debug)]
+pub struct VsockDial(ControlStream);
+
+#[cfg(feature = "host-common")]
+impl VsockDial {
+    /// Dials a raw byte stream to `port` over `endpoint`'s transport.
+    ///
+    /// `endpoint` is the VM instance's own endpoint (its AF_UNIX bridge path or its
+    /// AF_VSOCK CID); `port` replaces the endpoint's own port, so the same call
+    /// reaches an arbitrary guest listener on either transport. On an AF_UNIX
+    /// bridge the hybrid `CONNECT <port>`/`OK` prologue runs first — the very same
+    /// handshake implementation the framed control-plane connect uses; on the
+    /// in-kernel AF_VSOCK transport there is no bridge and thus no prologue.
+    ///
+    /// Unlike [`AgentClient::connect_endpoint`] this does **not** retry: that retry
+    /// loop exists to outwait a booting agent and folds "nobody listens" into a
+    /// terminal timeout, whereas a dial is issued against a VM the caller already
+    /// brought up. Refusal signals are interpreted and returned fast and typed.
+    ///
+    /// # Errors
+    /// - [`Error::Agent`] naming the port when the vsock bridge closes the
+    ///   connection without an `OK` line (the CH/FC in-VMM muxer's dead-port
+    ///   signal) or answers something other than `OK`.
+    /// - [`Error::Timeout`] naming the port when the bridge accepts the `CONNECT`
+    ///   and never answers (QEMU's external daemon on a dead port), bounded by
+    ///   `timeouts.connect_ok_read`, or when the whole dial exceeds `timeout`.
+    /// - [`Error::Io`] when the transport socket cannot be opened — including the
+    ///   kernel's own AF_VSOCK connect error (`ECONNRESET` for a port with no guest
+    ///   listener), errno intact.
+    pub async fn connect_endpoint(
+        endpoint: &VsockEndpoint,
+        port: u32,
+        timeout: std::time::Duration,
+        timeouts: &crate::config::Timeouts,
+    ) -> Result<Self> {
+        let endpoint = endpoint_on_port(endpoint, port);
+        let dial = async {
+            let mut stream = connect_control_stream(&endpoint).await.map_err(|e| {
+                tracing::trace!("vsock dial to port {port} could not open the transport: {e}");
+                Error::Io(e)
+            })?;
+            if let Some(prologue_port) = hybrid_prologue_port(&endpoint) {
+                hybrid_connect_prologue(&mut stream, prologue_port, timeouts.connect_ok_read)
+                    .await
+                    .map_err(|e| {
+                        tracing::trace!("vsock dial prologue on port {prologue_port} failed: {e}");
+                        dial_prologue_error(prologue_port, timeouts.connect_ok_read, e)
+                    })?;
+            }
+            Ok(Self(stream))
+        };
+        match tokio::time::timeout(timeout, dial).await {
+            Ok(res) => res,
+            Err(_elapsed) => Err(Error::Timeout(format!(
+                "raw vsock dial to guest port {port} did not complete within {timeout:?}"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "host-common")]
+impl AsyncRead for VsockDial {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "host-common")]
+impl AsyncWrite for VsockDial {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    /// Half-closes the host's write side.
+    ///
+    /// What the *guest* observes is backend-dependent, and on two of the four
+    /// backends this discards a reply the guest had not yet flushed — see the
+    /// half-close table on [`VsockDial`] before using it as an in-band signal.
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
 /// The per-step outcome of a native post-restore [`AgentClient::resync`]
 /// (§8.2, Restore correctness: a restored VM is not a fresh VM).
 ///
@@ -187,6 +497,89 @@ pub struct AgentClient {
     /// return a wrong result. Further requests fail loud until
     /// [`AgentClient::reconnect`] re-establishes the stream.
     desynced: bool,
+}
+
+/// Why one [`AgentClient::connect_framed_once`] attempt failed, and therefore how
+/// the retry loop paces the next one.
+///
+/// Only [`ConnectAttemptError::Socket`] — the VMM's host-side socket still absent —
+/// grows the backoff; every other arm means the socket was up, so the loop resets to
+/// the tight poll floor (EXP-HOST-BACKOFF-RESET).
+#[cfg(feature = "host-common")]
+enum ConnectAttemptError {
+    /// The transport socket itself could not be opened.
+    Socket(std::io::Error),
+    /// The socket was up but the hybrid `CONNECT`/`OK` prologue did not complete.
+    Prologue(PrologueError),
+    /// Socket and prologue completed, but the guest's first frame was not a
+    /// decodable `Ready` (the agent is still booting).
+    Ready(String),
+}
+
+/// How much of a rejected first frame a [`ConnectAttemptError::Ready`] diagnostic
+/// carries. Enough to identify the payload, far below `MAX_FRAME_BYTES`.
+#[cfg(feature = "host-common")]
+const READY_DIAGNOSTIC_BYTES: usize = 256;
+
+/// `{value:?}`, but never longer than `cap` — the formatter is stopped at the cap
+/// instead of the whole value being rendered and then trimmed.
+///
+/// The connect loop's `Ready` diagnostics describe *frames*, which are bounded only
+/// by `MAX_FRAME_BYTES` (16 MiB), and it builds one on **every** failed attempt
+/// while the guest boots. Rendering the frame in full there allocates megabytes per
+/// attempt for a string almost always thrown away, so the sink refuses further
+/// writes past the cap: `std::fmt::Write` returning `Err` aborts the formatting, so
+/// the tail is never rendered at all, not merely never kept.
+#[cfg(feature = "host-common")]
+fn capped_debug(value: &dyn std::fmt::Debug, cap: usize) -> String {
+    use std::fmt::Write as _;
+
+    struct CappedSink {
+        out: String,
+        cap: usize,
+    }
+    impl std::fmt::Write for CappedSink {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let room = self.cap.saturating_sub(self.out.len());
+            if room == 0 {
+                return Err(std::fmt::Error);
+            }
+            if s.len() <= room {
+                self.out.push_str(s);
+                Ok(())
+            } else {
+                // Truncate on a char boundary, then stop the whole format.
+                let mut end = room;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.out.push_str(s.get(..end).unwrap_or_default());
+                Err(std::fmt::Error)
+            }
+        }
+    }
+
+    let mut sink = CappedSink {
+        out: String::new(),
+        cap,
+    };
+    // The cap stopping the formatter is the expected outcome, not a failure: it is
+    // reported to the reader as the ellipsis rather than swallowed.
+    if write!(sink, "{value:?}").is_err() {
+        sink.out.push('…');
+    }
+    sink.out
+}
+
+#[cfg(feature = "host-common")]
+impl std::fmt::Display for ConnectAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socket(e) => write!(f, "control-stream connect failed: {e}"),
+            Self::Prologue(e) => write!(f, "hybrid prologue failed: {e}"),
+            Self::Ready(m) => write!(f, "no Ready handshake: {m}"),
+        }
+    }
 }
 
 /// How a request closure failed, with respect to whether the framed stream is
@@ -306,93 +699,93 @@ impl AgentClient {
                 return Err(Error::Agent("Panic detected in serial log".into()));
             }
 
-            let mut stream = match connect_control_stream(endpoint).await {
-                Ok(s) => {
-                    // The transport socket is up, so we are now in the "guest still
-                    // booting / not yet listening" regime, where the right cadence
-                    // is a tight fixed poll — not the exponential backoff that only
-                    // makes sense while the socket was absent. Reset to the floor so
-                    // a few socket-absent iterations can't inflate the guest-ready
-                    // detection gap (EXP-HOST-BACKOFF-RESET).
-                    backoff = timeouts.connect_backoff_floor;
-                    s
-                }
-                Err(e) => {
+            match Self::connect_framed_once(endpoint, timeouts).await {
+                Ok(framed) => return Ok(framed),
+                // ONE retry cadence for every failure arm. Before v30 only two of the
+                // five arms slept at all — a failed `CONNECT` write, a non-decodable
+                // first frame, a postcard error, and a non-`Ready` message each
+                // `continue`d with no pause, busy-spinning to the deadline on exactly
+                // the shapes a dead or half-open bridge produces (§18 delta 7).
+                Err(ConnectAttemptError::Socket(e)) => {
                     tracing::trace!("Agent connect control-stream connect failed: {}", e);
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, timeouts.connect_backoff_cap);
-                    continue;
                 }
-            };
-
-            // AF_UNIX bridges (CH/FC/QEMU's external `vhost-device-vsock` daemon)
-            // speak the Firecracker-style hybrid `CONNECT <port>`/`OK` prologue; the
-            // in-kernel AF_VSOCK transport has no bridge, so there is no prologue and
-            // the guest's first framed message is already `Ready`.
-            if let Some(port) = hybrid_prologue_port(endpoint) {
-                let connect_msg = format!("CONNECT {port}\n");
-                if let Err(e) = stream.write_all(connect_msg.as_bytes()).await {
-                    tracing::trace!("Agent connect write_all failed: {}", e);
-                    continue;
-                }
-
-                let mut resp = String::new();
-                let mut ok = false;
-                loop {
-                    let mut byte = [0; 1];
-                    use tokio::io::AsyncReadExt;
-                    if let Ok(Ok(1)) =
-                        tokio::time::timeout(timeouts.connect_ok_read, stream.read(&mut byte)).await
-                    {
-                        resp.push(byte[0] as char);
-                        if byte[0] == b'\n' {
-                            ok = resp.starts_with("OK ");
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if !ok {
-                    tracing::trace!("Agent connect failed! resp was: {:?}", resp);
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-            }
-
-            let mut codec = LengthDelimitedCodec::new();
-            // Align the host frame cap with the guest's (the codec default is
-            // only 8 MiB), so neither side silently drops a frame the other sent.
-            codec.set_max_frame_length(MAX_FRAME_BYTES);
-            let mut framed = Framed::new(stream, codec);
-
-            let ready_result =
-                tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await;
-            let ready = match ready_result {
-                Ok(Some(Ok(bytes))) => bytes,
-                other => {
-                    tracing::trace!("Agent connect framed.next() returned: {:?}", other);
-                    continue;
-                }
-            };
-
-            let msg: Message = match postcard::from_bytes(&ready) {
-                Ok(m) => m,
                 Err(e) => {
-                    tracing::trace!("Agent connect postcard error: {:?}, bytes: {:?}", e, ready);
-                    continue;
-                }
-            };
-
-            match msg {
-                Message::Ready => {
-                    return Ok(framed);
-                }
-                other => {
-                    tracing::trace!("Agent connect received unexpected message: {:?}", other);
-                    continue;
+                    tracing::trace!("Agent connect attempt failed: {}", e);
+                    // The transport socket was up, so we are in the "guest still
+                    // booting / not yet listening" regime, where the right cadence is
+                    // a tight fixed poll — not the exponential backoff that only makes
+                    // sense while the socket was absent. Reset to the floor so a few
+                    // socket-absent iterations can't inflate the guest-ready detection
+                    // gap (EXP-HOST-BACKOFF-RESET).
+                    backoff = timeouts.connect_backoff_floor;
+                    tokio::time::sleep(backoff).await;
                 }
             }
+        }
+    }
+
+    /// One attempt of the [`AgentClient::connect_framed`] loop: open the transport,
+    /// speak the prologue the transport needs, and read the guest's first frame.
+    ///
+    /// Split out so the retry *cadence* lives in exactly one place (the caller) and
+    /// every failure shape is a typed value rather than a bare `continue` — the
+    /// pre-v30 shape, where four of the five failure arms silently skipped the
+    /// backoff.
+    async fn connect_framed_once(
+        endpoint: &VsockEndpoint,
+        timeouts: &crate::config::Timeouts,
+    ) -> std::result::Result<Framed<ControlStream, LengthDelimitedCodec>, ConnectAttemptError> {
+        let mut stream = connect_control_stream(endpoint)
+            .await
+            .map_err(ConnectAttemptError::Socket)?;
+
+        // AF_UNIX bridges (CH/FC/QEMU's external `vhost-device-vsock` daemon)
+        // speak the Firecracker-style hybrid `CONNECT <port>`/`OK` prologue; the
+        // in-kernel AF_VSOCK transport has no bridge, so there is no prologue and
+        // the guest's first framed message is already `Ready`.
+        if let Some(port) = hybrid_prologue_port(endpoint) {
+            hybrid_connect_prologue(&mut stream, port, timeouts.connect_ok_read)
+                .await
+                .map_err(ConnectAttemptError::Prologue)?;
+        }
+
+        let mut codec = LengthDelimitedCodec::new();
+        // Align the host frame cap with the guest's (the codec default is
+        // only 8 MiB), so neither side silently drops a frame the other sent.
+        codec.set_max_frame_length(MAX_FRAME_BYTES);
+        let mut framed = Framed::new(stream, codec);
+
+        let ready_result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await;
+        let ready = match ready_result {
+            Ok(Some(Ok(bytes))) => bytes,
+            other => {
+                return Err(ConnectAttemptError::Ready(format!(
+                    "framed.next() returned: {}",
+                    capped_debug(&other, READY_DIAGNOSTIC_BYTES)
+                )));
+            }
+        };
+
+        // Both diagnostics below quote *frame-sized* values (a raw frame, a decoded
+        // `Message` that may carry one), and this runs once per retry while the
+        // guest boots — so they are capped, never rendered in full.
+        let msg: Message = postcard::from_bytes(&ready).map_err(|e| {
+            ConnectAttemptError::Ready(format!(
+                "postcard error: {e:?}, {} bytes, starting {}",
+                ready.len(),
+                capped_debug(&&ready[..], READY_DIAGNOSTIC_BYTES)
+            ))
+        })?;
+
+        match msg {
+            Message::Ready => Ok(framed),
+            other => Err(ConnectAttemptError::Ready(format!(
+                "received unexpected message: {}",
+                capped_debug(&other, READY_DIAGNOSTIC_BYTES)
+            ))),
         }
     }
 
@@ -684,7 +1077,344 @@ impl AgentClient {
 
 #[cfg(all(test, feature = "host-common"))]
 mod tests {
-    use super::{AgentClient, Error, RequestFailure, VsockEndpoint, hybrid_prologue_port};
+    use super::{
+        AgentClient, ControlStream, Error, MAX_PROLOGUE_LINE_BYTES, PrologueError,
+        READY_DIAGNOSTIC_BYTES, RequestFailure, VsockDial, VsockEndpoint, capped_debug,
+        dial_prologue_error, endpoint_on_port, hybrid_connect_prologue, hybrid_prologue_port,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Reads one `\n`-terminated line from a mock bridge's end of a socket pair,
+    /// byte by byte (the client under test writes exactly one line, so a buffered
+    /// read would be free to consume more than the test intends to observe).
+    async fn read_line(stream: &mut tokio::net::UnixStream) -> String {
+        let mut line = String::new();
+        loop {
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte).await {
+                Ok(0) | Err(_) => return line,
+                Ok(_) => {
+                    line.push(byte[0] as char);
+                    if byte[0] == b'\n' {
+                        return line;
+                    }
+                }
+            }
+        }
+    }
+
+    // §3.2 (The host side: AgentClient and SessionMux): the extracted prologue is the ONE
+    // implementation of the fragile hybrid handshake, shared by the framed connect and
+    // the raw dial. This drives the accept-and-answer path end to end over a real
+    // socket pair and asserts BOTH halves of the wire: the exact `CONNECT <port>` line
+    // the bridge receives (the dialed port, not the agent's), and that an `OK` line is
+    // accepted. RED on a prologue that writes the wrong port, omits the line, or
+    // accepts a non-`OK` answer.
+    #[tokio::test]
+    async fn prologue_writes_connect_line_and_accepts_ok() {
+        let (client, mut server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let task = tokio::spawn(async move {
+            let line = read_line(&mut server).await;
+            server.write_all(b"OK 7000\n").await.expect("write OK");
+            (line, server)
+        });
+
+        let mut stream = ControlStream::Unix(client);
+        let res =
+            hybrid_connect_prologue(&mut stream, 7000, std::time::Duration::from_millis(500)).await;
+        let (line, _server) = task.await.expect("mock bridge task");
+
+        assert_eq!(
+            line, "CONNECT 7000\n",
+            "the prologue must CONNECT to the dialed port"
+        );
+        assert!(res.is_ok(), "an OK line must be accepted, got {res:?}");
+    }
+
+    // The dead-port signal CH's and Firecracker's in-VMM muxers actually send: accept
+    // the CONNECT, then close without an `OK` line. It must be a DISTINCT, typed
+    // outcome from "the bridge is hanging" — that distinction is what lets the raw
+    // dial fail fast instead of folding into a timeout. RED on a prologue that
+    // collapses EOF into the same arm as an elapsed read budget.
+    #[tokio::test]
+    async fn prologue_eof_without_ok_is_typed_eof() {
+        let (client, mut server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let task = tokio::spawn(async move {
+            let line = read_line(&mut server).await;
+            drop(server); // the muxer's "no listener on that port" answer
+            line
+        });
+
+        let mut stream = ControlStream::Unix(client);
+        let res =
+            hybrid_connect_prologue(&mut stream, 7000, std::time::Duration::from_secs(5)).await;
+        assert_eq!(task.await.expect("mock bridge task"), "CONNECT 7000\n");
+        assert!(
+            matches!(res, Err(PrologueError::Eof { .. })),
+            "a close before any OK line must be a typed Eof, got {res:?}"
+        );
+    }
+
+    // QEMU's external `vhost-device-vsock` daemon on a dead port: it accepts the
+    // CONNECT and simply never answers. The per-byte `connect_ok_read` budget is what
+    // bounds that, and it must surface as its own arm (a timeout), not as an EOF. RED
+    // on a prologue with an unbounded read: this test would hang instead of failing.
+    #[tokio::test]
+    async fn prologue_accept_and_hang_is_typed_read_timeout() {
+        let (client, mut server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let task = tokio::spawn(async move {
+            let line = read_line(&mut server).await;
+            (line, server) // held open, never answered
+        });
+
+        let mut stream = ControlStream::Unix(client);
+        let started = std::time::Instant::now();
+        let res =
+            hybrid_connect_prologue(&mut stream, 7000, std::time::Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        let (line, _server) = task.await.expect("mock bridge task");
+
+        assert_eq!(line, "CONNECT 7000\n");
+        assert!(
+            matches!(res, Err(PrologueError::ReadTimeout { .. })),
+            "an accepted-and-hung bridge must be a typed ReadTimeout, got {res:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the read budget must bound the hang (took {elapsed:?})"
+        );
+    }
+
+    // A complete line that is not an acknowledgement is a refusal, not a success:
+    // the pre-extraction code's `resp.starts_with("OK ")` check is the property, and
+    // it stays exact. BOTH refusal shapes the comment claims are driven here —
+    // `ERR …` (a bridge saying no) and `OKAY …` (the prefix trap: a line that starts
+    // with the letters `OK` but is a different word, which only the trailing SPACE
+    // in `"OK "` rejects).
+    // RED on a prologue that treats any complete line as success, and RED on the
+    // narrower `resp.starts_with("OK")` — which passes `ERR` correctly but lets
+    // `OKAY` through as an acknowledgement.
+    #[tokio::test]
+    async fn prologue_non_ok_line_is_refused() {
+        for answer in ["ERR connection refused\n", "OKAY but not an ack\n"] {
+            let (client, mut server) = tokio::net::UnixStream::pair().expect("socketpair");
+            let task = tokio::spawn(async move {
+                let line = read_line(&mut server).await;
+                server
+                    .write_all(answer.as_bytes())
+                    .await
+                    .expect("write the refusal line");
+                (line, server)
+            });
+
+            let mut stream = ControlStream::Unix(client);
+            let res =
+                hybrid_connect_prologue(&mut stream, 7000, std::time::Duration::from_millis(500))
+                    .await;
+            let (_line, _server) = task.await.expect("mock bridge task");
+            assert!(
+                matches!(&res, Err(PrologueError::Refused { line }) if line == answer),
+                "{answer:?} must be refused, carrying verbatim what was received: {res:?}"
+            );
+        }
+    }
+
+    // The connect loop builds a `Ready` diagnostic on EVERY failed attempt while the
+    // guest boots, and the values it quotes are frame-sized (`MAX_FRAME_BYTES` = 16
+    // MiB). Rendering one in full is megabytes of allocation per retry for a string
+    // that is normally discarded — the shape the pre-fix `format!("… {ready:?}")`
+    // had.
+    // RED on that shape: the produced string grew with the frame (a 1 MiB frame
+    // renders to several MiB of `[1, 2, 3, …]` decimal), so the length bound below
+    // fails. Also RED on a cap applied by rendering-then-truncating: the
+    // `chars().count()` bound would pass, but `render_calls` proves the tail was
+    // never handed to the sink at all.
+    #[test]
+    fn ready_diagnostics_are_capped_not_frame_sized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let frame = vec![7u8; 1024 * 1024];
+        let rendered = capped_debug(&&frame[..], READY_DIAGNOSTIC_BYTES);
+        assert!(
+            rendered.len() <= READY_DIAGNOSTIC_BYTES + 4,
+            "a 1 MiB frame must render to a capped diagnostic, got {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.starts_with("[7, 7, 7,"),
+            "the cap must keep the identifying prefix, got {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with('…'),
+            "a truncated diagnostic must say so, got {rendered:?}"
+        );
+
+        // The formatter is STOPPED, not just trimmed: a value whose Debug counts its
+        // own writes proves the tail is never rendered.
+        // The counter is a LOCAL borrowed by the value (not a `static`): a module-global would
+        // trip the B6 global-state ban, and nothing here needs to outlive the test.
+        struct Counted<'a>(&'a AtomicUsize);
+        let calls = AtomicUsize::new(0);
+        impl std::fmt::Debug for Counted<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..10_000 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    write!(f, "0123456789")?;
+                }
+                Ok(())
+            }
+        }
+        let counted = capped_debug(&Counted(&calls), READY_DIAGNOSTIC_BYTES);
+        let render_calls = calls.load(Ordering::Relaxed);
+        assert!(
+            counted.chars().count() <= READY_DIAGNOSTIC_BYTES + 1,
+            "capped output, got {} chars",
+            counted.chars().count()
+        );
+        assert!(
+            render_calls < 100,
+            "formatting must ABORT at the cap, not render all 10 000 chunks — {render_calls} ran"
+        );
+
+        // A value that fits is untouched: no ellipsis, no truncation.
+        assert_eq!(capped_debug(&"fits", READY_DIAGNOSTIC_BYTES), "\"fits\"");
+    }
+
+    // Validate-before-allocate (§13, Cross-cutting invariants): a bridge that streams bytes and never
+    // sends a newline must hit `MAX_PROLOGUE_LINE_BYTES` and refuse, not grow the
+    // accumulator without bound. RED on an uncapped loop: this test would run until
+    // the read budget elapsed and report ReadTimeout instead of Refused.
+    #[tokio::test]
+    async fn prologue_caps_the_acknowledgement_line() {
+        let flood = vec![b'x'; MAX_PROLOGUE_LINE_BYTES * 2];
+        let (client, mut server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let task = tokio::spawn(async move {
+            let line = read_line(&mut server).await;
+            // Best-effort: the client stops reading at the cap, so a large write can
+            // legitimately fail on a closed peer once the test completes.
+            let _sent = server.write_all(&flood).await;
+            (line, server)
+        });
+
+        let mut stream = ControlStream::Unix(client);
+        let res =
+            hybrid_connect_prologue(&mut stream, 7000, std::time::Duration::from_secs(5)).await;
+        let (_line, _server) = task.await.expect("mock bridge task");
+        assert!(
+            matches!(&res, Err(PrologueError::Refused { line }) if line.len() >= MAX_PROLOGUE_LINE_BYTES),
+            "an unterminated line must be capped and refused, got {res:?}"
+        );
+    }
+
+    // §3.2 (The host side: AgentClient and SessionMux): the raw dial's typed interpretation of each
+    // refusal signal — the property that makes a dead port an immediate, matchable
+    // answer instead of a retry-until-Timeout. Every arm must NAME THE PORT (the
+    // error enum has no dedicated no-listener variant, so the message is the only
+    // thing that distinguishes it from any other Agent error). RED on a mapping that
+    // folds EOF into Timeout (or vice versa), or that drops the port.
+    #[test]
+    fn dial_prologue_error_interprets_each_refusal_typed() {
+        let budget = std::time::Duration::from_millis(150);
+
+        let eof = dial_prologue_error(
+            7000,
+            budget,
+            PrologueError::Eof {
+                partial: String::new(),
+            },
+        );
+        assert!(
+            matches!(&eof, Error::Agent(m) if m.contains("no guest vsock listener") && m.contains("7000")),
+            "EOF before an OK line must be a typed no-listener Agent error naming the port: {eof:?}"
+        );
+
+        let hung = dial_prologue_error(
+            7001,
+            budget,
+            PrologueError::ReadTimeout {
+                partial: String::new(),
+            },
+        );
+        assert!(
+            matches!(&hung, Error::Timeout(m) if m.contains("7001")),
+            "an accepted-and-hung bridge must be a typed Timeout naming the port: {hung:?}"
+        );
+
+        let refused = dial_prologue_error(
+            7002,
+            budget,
+            PrologueError::Refused {
+                line: "ERR nope\n".into(),
+            },
+        );
+        assert!(
+            matches!(&refused, Error::Agent(m) if m.contains("7002") && m.contains("ERR nope")),
+            "a non-OK answer must name the port and what was received: {refused:?}"
+        );
+
+        let io = dial_prologue_error(
+            7003,
+            budget,
+            PrologueError::Write(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        );
+        assert!(
+            matches!(&io, Error::Io(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
+            "a transport failure must surface as Io with its errno intact: {io:?}"
+        );
+    }
+
+    // §3.2 (The host side: AgentClient and SessionMux): the caller-chosen guest port is spliced into
+    // the instance's endpoint in ONE place, and it must reach the transport that
+    // actually carries it — the CONNECT line on AF_UNIX, the connect address on
+    // AF_VSOCK — while everything else (bridge path, guest CID) is preserved. RED on
+    // an override that keeps the agent's port, which would silently dial the control
+    // plane instead of the requested listener.
+    #[test]
+    fn endpoint_on_port_overrides_only_the_port() {
+        let unix = endpoint_on_port(
+            &VsockEndpoint::Unix {
+                path: std::path::PathBuf::from("/run/vmcell/vsock.sock"),
+                port: 5000,
+            },
+            7000,
+        );
+        assert_eq!(
+            unix,
+            VsockEndpoint::Unix {
+                path: std::path::PathBuf::from("/run/vmcell/vsock.sock"),
+                port: 7000,
+            }
+        );
+        // The dispatch law still sees an AF_UNIX endpoint, so the dial speaks the
+        // prologue for the OVERRIDDEN port.
+        assert_eq!(hybrid_prologue_port(&unix), Some(7000));
+
+        let vsock = endpoint_on_port(
+            &VsockEndpoint::Vsock {
+                cid: 42,
+                port: 5000,
+            },
+            7000,
+        );
+        assert_eq!(
+            vsock,
+            VsockEndpoint::Vsock {
+                cid: 42,
+                port: 7000
+            }
+        );
+        assert_eq!(hybrid_prologue_port(&vsock), None);
+    }
+
+    // The `VsockDial` newtype must stay exactly as unwind-safe as the `ControlStream`
+    // it wraps (the manual assertions above it), so a downstream holding one across a
+    // `catch_unwind` boundary keeps compiling. A plain newtype inherits both; adding
+    // an interior-mutability field would silently take them away. RED on such a field.
+    #[test]
+    fn vsock_dial_preserves_unwind_safety() {
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe + Send>() {}
+        assert_unwind_safe::<VsockDial>();
+    }
 
     // The transport-dispatch law: an AF_UNIX endpoint speaks the hybrid
     // `CONNECT <port>`/`OK` prologue (so `Some(port)`), while the in-kernel AF_VSOCK

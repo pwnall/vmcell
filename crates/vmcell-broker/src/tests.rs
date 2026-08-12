@@ -40,6 +40,32 @@ impl Netlink for FakeNetlink {
         self.log.push(format!("delete_netns:{name}"));
         Ok(())
     }
+    fn create_bridge(
+        &self,
+        netns: &str,
+        bridge: &str,
+        gateway: std::net::Ipv4Addr,
+        prefix_len: u8,
+    ) -> vmcell::error::Result<()> {
+        self.log.push(format!(
+            "create_bridge:{netns}:{bridge}:{gateway}/{prefix_len}"
+        ));
+        Ok(())
+    }
+    fn setup_tap_on_bridge(
+        &self,
+        netns: &str,
+        tap_name: &str,
+        bridge: &str,
+    ) -> vmcell::error::Result<()> {
+        self.log
+            .push(format!("setup_tap_on_bridge:{netns}:{tap_name}:{bridge}"));
+        Ok(())
+    }
+    fn delete_link(&self, netns: &str, link: &str) -> vmcell::error::Result<()> {
+        self.log.push(format!("delete_link:{netns}:{link}"));
+        Ok(())
+    }
     fn setup_tproxy_routing(&self, netns: &str) -> vmcell::error::Result<()> {
         self.log.push(format!("setup_tproxy_routing:{netns}"));
         Ok(())
@@ -101,10 +127,14 @@ impl CgroupFs for FakeCgroups {
 
 struct FakeScanner {
     netns: Vec<String>,
+    segment_netns: Vec<String>,
 }
 impl OrphanScanner for FakeScanner {
     fn scan_netns(&self) -> Vec<String> {
         self.netns.clone()
+    }
+    fn scan_segment_netns(&self) -> Vec<String> {
+        self.segment_netns.clone()
     }
     fn scan_cgroup_slices(&self) -> Vec<String> {
         Vec::new()
@@ -121,6 +151,7 @@ struct FakeBackend {
     nft: FakeNft,
     cgroups: FakeCgroups,
     scanner_netns: Vec<String>,
+    scanner_segment_netns: Vec<String>,
 }
 impl FakeBackend {
     fn new() -> Self {
@@ -129,10 +160,15 @@ impl FakeBackend {
             nft: FakeNft::default(),
             cgroups: FakeCgroups::default(),
             scanner_netns: Vec::new(),
+            scanner_segment_netns: Vec::new(),
         }
     }
     fn with_scanner_netns(mut self, names: Vec<String>) -> Self {
         self.scanner_netns = names;
+        self
+    }
+    fn with_scanner_segment_netns(mut self, names: Vec<String>) -> Self {
+        self.scanner_segment_netns = names;
         self
     }
     fn with_nft_fail(mut self) -> Self {
@@ -159,6 +195,7 @@ impl BrokerBackend for FakeBackend {
     fn new_scanner(&self, _prefix: &str) -> Box<dyn OrphanScanner> {
         Box::new(FakeScanner {
             netns: self.scanner_netns.clone(),
+            segment_netns: self.scanner_segment_netns.clone(),
         })
     }
 }
@@ -205,6 +242,7 @@ fn codec_round_trips_requests_and_replies() {
         BrokerRequest::Sweep {
             prefix: "acme".into(),
             live_vmids: vec![1, 2, 3],
+            live_segids: vec![4, 5],
         },
         BrokerRequest::Shutdown,
     ];
@@ -227,6 +265,7 @@ fn codec_round_trips_requests_and_replies() {
         },
         BrokerReply::SweepDone {
             netns: vec!["vmcell-net-1".into()],
+            segment_netns: vec!["vmcell-seg-4".into()],
             cgroup_slices: vec![],
             scratch_dirs: vec!["/tmp/x".into()],
         },
@@ -381,6 +420,7 @@ fn dispatch_sweep_reaps_only_dead_ids() {
     let reply = srv.dispatch(BrokerRequest::Sweep {
         prefix: "vmcell".into(),
         live_vmids: vec![2],
+        live_segids: vec![],
     });
     match reply {
         BrokerReply::SweepDone { netns, .. } => {
@@ -395,6 +435,46 @@ fn dispatch_sweep_reaps_only_dead_ids() {
             assert!(
                 !netns.contains(&vmcell::naming::netns_name("vmcell", 2)),
                 "the LIVE vmid 2 must NOT be reaped: {netns:?}"
+            );
+        }
+        other => panic!("expected SweepDone, got {other:?}"),
+    }
+}
+
+// v30 §18 delta 8: the `-seg-` class is swept against LIVE SEGIDS, its own id space. Planted:
+// segment 1 (dead) and segment 2 (live), while vmid 2 is live and vmid 1 is not. A broker that
+// forwarded `live_vmids` for both classes would spare segment 2 for the wrong reason and reap
+// segment 1 for the wrong reason — swap the two live sets and this reddens both ways.
+#[test]
+fn dispatch_sweep_reaps_segments_against_live_segids() {
+    let backend = FakeBackend::new()
+        .with_scanner_netns(vec![vmcell::naming::netns_name("vmcell", 1)])
+        .with_scanner_segment_netns(vec![
+            vmcell::naming::segment_netns_name("vmcell", 1),
+            vmcell::naming::segment_netns_name("vmcell", 2),
+        ]);
+    let mut srv = BrokerServer::new(backend);
+
+    let reply = srv.dispatch(BrokerRequest::Sweep {
+        prefix: "vmcell".into(),
+        // vmid 1 is live (so its netns is spared) while SEGID 1 is dead (so its netns goes).
+        live_vmids: vec![1],
+        live_segids: vec![2],
+    });
+    match reply {
+        BrokerReply::SweepDone {
+            netns,
+            segment_netns,
+            ..
+        } => {
+            assert!(
+                netns.is_empty(),
+                "the live vmid's netns must not be reaped: {netns:?}"
+            );
+            assert_eq!(
+                segment_netns,
+                vec![vmcell::naming::segment_netns_name("vmcell", 1)],
+                "only the dead SEGID's namespace may be reaped: {segment_netns:?}"
             );
         }
         other => panic!("expected SweepDone, got {other:?}"),

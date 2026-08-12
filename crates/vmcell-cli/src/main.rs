@@ -72,13 +72,22 @@ enum Commands {
         /// Debian release suite for the `mmdebstrap` rootfs source (ignored for `oci`).
         #[arg(long, default_value = "trixie")]
         release: String,
+        /// Pins overlay layered over vmcell's committed baseline (§10.2). Overrides `$VMCELL_PINS`.
+        #[arg(long)]
+        pins: Option<PathBuf>,
     },
     /// Build every kernel in the pins `kernels` registry to `vmlinux-<label>`.
     BuildKernels {
-        /// Compile each kernel inside a builder micro-VM (`vmcell-kernel-builder`) instead of
-        /// on the host — the in-VM path needs a seed kernel already present (§5.4, The guest-kernel contract and the bootstrap seed).
+        /// Which producer compiles each labelled kernel (§5.4, The guest-kernel contract and the bootstrap seed).
+        /// `host-make` compiles on this host; `in-vm` compiles inside a builder micro-VM
+        /// (`vmcell-kernel-builder`, which needs a bootstrap seed — prepended automatically).
+        /// `prebuilt` compiles nothing and is therefore a typed error here (§5.6).
+        #[arg(long, value_enum, default_value_t = KernelSource::HostMake)]
+        kernel_source: KernelSource,
+        /// Pins overlay layered over vmcell's committed baseline (§10.2); its `kernels` entries are
+        /// built too. Overrides `$VMCELL_PINS`.
         #[arg(long)]
-        in_vm: bool,
+        pins: Option<PathBuf>,
     },
     /// Convert any digest-pinned OCI image into an erofs rootfs (build-time; v15 §4.2, Rootfs sources and the one packer).
     /// The base MUST be pinned by digest (`IMAGE@sha256:...`), never a tag.
@@ -92,9 +101,19 @@ enum Commands {
         /// (required for a libc6-less base). Without it, a libc6-less base fails loud.
         #[arg(long)]
         agent_musl: Option<PathBuf>,
+        /// Compose a downstream file into the image at pack time (repeatable, §4.2 FR-V4):
+        /// `dest=/usr/local/bin/acme,src=./acme,mode=0755`. `dest` is absolute, `mode` is
+        /// octal permission bits, and neither key may be omitted. A dest vmcell itself owns
+        /// (the guest agent, the CA trust store, `/vmcell-tools`) or a duplicated dest is a
+        /// hard error, never a silent overwrite. A `,` cannot appear in a path.
+        #[arg(long = "inject", value_parser = parse_inject)]
+        inject: Vec<vmcell::artifact::rootfs::ExtraFile>,
+        /// Pins overlay layered over vmcell's committed baseline (§10.2). Overrides `$VMCELL_PINS`.
+        #[arg(long)]
+        pins: Option<PathBuf>,
     },
     /// Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel,
-    /// rootfs, proxy CA, pins.json) for reproducibility (v15 §10, The artifact build pipeline).
+    /// rootfs, proxy CA, resolved_pins.json) for reproducibility (v15 §10, The artifact build pipeline).
     Bundle {
         /// Output path for the manifest JSON (default `<artifacts_dir>/manifest.json`).
         #[arg(short, long)]
@@ -275,15 +294,26 @@ fn moved_to_vmcelld_ctl(subcommand: &str) -> vmcell::Error {
 /// bootstrap producer (prebuilt download or host-`make`) or the in-VM `vmcell-kernel-builder`.
 /// This is the composition-root wiring that keeps the dependency graph acyclic (§9.1, Workspace layout): only
 /// `vmcell-cli` names the builder crates.
+///
+/// # Errors
+/// Returns [`vmcell::Error::Artifact`] when a `label` or `fragments` are routed at the **prebuilt**
+/// seed, which compiles nothing and can honor neither (§5.6, The downstream kernel toolkit). The
+/// condition is the library's one `reject_labelled_prebuilt` predicate, not a local re-test.
 fn kernel_stage(
     source: KernelSource,
     label: Option<String>,
     fragments: Option<Vec<String>>,
     cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
-) -> Box<dyn vmcell::artifact::Stage> {
+) -> vmcell::Result<Box<dyn vmcell::artifact::Stage>> {
     let http_client = std::sync::Arc::new(vmcell::artifact::kernel::ReqwestClient);
-    match source {
+    Ok(match source {
         KernelSource::Prebuilt => {
+            // Pre-v30 this arm silently DROPPED label+fragments and handed back the default seed:
+            // a labelled build that never happened, reported as success.
+            vmcell::artifact::kernel::reject_labelled_prebuilt(
+                label.as_deref(),
+                fragments.as_deref(),
+            )?;
             Box::new(vmcell::artifact::kernel::PrebuiltKernelStage { http_client })
         }
         KernelSource::HostMake => Box::new(vmcell::artifact::kernel::KernelStage {
@@ -297,7 +327,30 @@ fn kernel_stage(
             fragments,
             cid_alloc,
         }),
+    })
+}
+
+/// The producer name reported for a labelled build (§5.6, The downstream kernel toolkit).
+///
+/// Both compiling stages answer `name()` with the label, so neither the pipeline's stage log nor
+/// the CLI's own line can say *how* a kernel was built without this mapping.
+fn kernel_source_name(source: KernelSource) -> &'static str {
+    match source {
+        KernelSource::Prebuilt => "prebuilt",
+        KernelSource::HostMake => "host-make",
+        KernelSource::InVm => "in-vm",
     }
+}
+
+/// Whether `source` needs a **bootstrap seed kernel** staged ahead of it in the same pipeline
+/// (§5.4, The guest-kernel contract and the bootstrap seed).
+///
+/// Only the in-VM producer does: it boots a builder micro-VM, which needs an already-working
+/// `vmlinux` published under the `kernel` artifact key. `build-kernels` publishes only
+/// `kernel-<label>` keys, so without a seed stage in front the in-VM path died on
+/// "needs a seed `kernel` artifact" no matter what the operator had already built.
+fn kernel_source_needs_seed(source: KernelSource) -> bool {
+    matches!(source, KernelSource::InVm)
 }
 
 /// Builds the rootfs [`Stage`](vmcell::artifact::Stage) selected by `source` — the `vmcell`
@@ -308,13 +361,19 @@ fn rootfs_stage(
     cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
 ) -> Box<dyn vmcell::artifact::Stage> {
     match source {
+        // `vmcell build` produces vmcell's own canonical rootfs and takes no `--inject`; the
+        // downstream extra-file surface is `oci2erofs` (§10.4's documented consumer
+        // invocation), so both arms compose nothing.
         RootfsSourceKind::Oci => Box::new(vmcell::artifact::rootfs::RootfsStage {
             image_override: None,
             agent_musl: None,
+            extra: Vec::new(),
         }),
-        RootfsSourceKind::Mmdebstrap => {
-            Box::new(vmcell_rootfs_builder::MmdebstrapRootfsStage { release, cid_alloc })
-        }
+        RootfsSourceKind::Mmdebstrap => Box::new(vmcell_rootfs_builder::MmdebstrapRootfsStage {
+            release,
+            cid_alloc,
+            extra: Vec::new(),
+        }),
     }
 }
 
@@ -324,15 +383,16 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             kernel_source,
             rootfs_source,
             release,
+            pins,
         } => {
             println!("Building artifacts...");
             // One CID allocator shared by any in-VM builder stage this pipeline runs.
             let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
             let pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
                 .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
-                    pins_file: pins_path(),
+                    overlay_file: pins_overlay(pins.as_deref()),
                 }))
-                .add_stage(kernel_stage(*kernel_source, None, None, cid_alloc.clone()))
+                .add_stage(kernel_stage(*kernel_source, None, None, cid_alloc.clone())?)
                 .add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}))
                 .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
                 .add_stage(rootfs_stage(*rootfs_source, release.clone(), cid_alloc));
@@ -344,23 +404,57 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             image,
             output,
             agent_musl,
-        } => oci2erofs(image, output, agent_musl.as_deref()).await,
+            inject,
+            pins,
+        } => {
+            oci2erofs(
+                image,
+                output,
+                agent_musl.as_deref(),
+                inject,
+                pins.as_deref(),
+            )
+            .await
+        }
         Commands::Bundle { out } => {
             let dir = vmcell::artifact::artifacts_dir();
             let mut candidates: Vec<(String, PathBuf)> = vec![
                 ("kernel".to_string(), dir.join("vmlinux")),
                 ("rootfs".to_string(), dir.join("rootfs.erofs")),
                 ("ca".to_string(), dir.join("ca.pem")),
-                ("pins".to_string(), pins_path()),
+                // The RESOLVED pins (baseline + any overlay), not the committed baseline: with an
+                // overlay in play the repo file is not what the artifacts were built from, and the
+                // baseline is embedded in the binary now anyway (§10.2). Absent until a pipeline
+                // has run, which the skipped-artifact notice below reports.
+                ("pins".to_string(), dir.join("resolved_pins.json")),
             ];
+            // The default kernel's resolved-config sidecar (§5.6): present for a compiling
+            // producer, absent for the prebuilt seed — which clears any config an earlier
+            // compiling build of the same `vmlinux` path left behind (`clear_resolved_config`), so
+            // this candidate is either THIS kernel's config or absent, never a stale one
+            // describing different bytes. The skip notice below reports the absence honestly
+            // rather than hiding it.
+            candidates.push((
+                "kernel-config".to_string(),
+                vmcell::artifact::kernel::resolved_config_path(&dir.join("vmlinux")),
+            ));
             // Cover every labelled kernel built by `build-kernels` (`vmlinux-<label>`),
             // not just the default `vmlinux` — otherwise the manifest silently omits
-            // the cross-kernel sweep's artifacts (N-BIN-4).
+            // the cross-kernel sweep's artifacts (N-BIN-4) — and each one's resolved-config
+            // sidecar alongside it, so the manifest pins what the kernel actually contains.
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let fname = e.file_name();
                     let name = fname.to_string_lossy();
-                    if let Some(label) = kernel_label_from_filename(&name) {
+                    // The library's one label law (the inverse of the producers' filename
+                    // composer), so a producer that changed its sanitization could not silently
+                    // drop its kernels from this manifest.
+                    if let Some(label) = vmcell::artifact::kernel::kernel_label_from_filename(&name)
+                    {
+                        candidates.push((
+                            format!("kernel-{label}-config"),
+                            vmcell::artifact::kernel::resolved_config_path(&e.path()),
+                        ));
                         candidates.push((format!("kernel-{label}"), e.path()));
                     }
                 }
@@ -406,47 +500,66 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             println!("vmcell: artifact manifest {} verified OK", mp.display());
             Ok(())
         }
-        Commands::BuildKernels { in_vm } => {
+        Commands::BuildKernels {
+            kernel_source,
+            pins,
+        } => {
             // Build each kernel in the `kernels` registry to its own `vmlinux-<label>`
             // (the kernel-version dimension), so multiple versions coexist for the
             // cross-kernel benchmark sweep. Each labelled stage has its own cache sidecar
-            // and build dir. `--in-vm` compiles inside a builder micro-VM instead.
+            // and build dir, and each carries the fragment set its registry entry declares.
             let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-            let pins_file = pins_path();
-            let content = std::fs::read_to_string(&pins_file).map_err(vmcell::Error::Io)?;
-            let json: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| vmcell::Error::Artifact(format!("pins.json parse: {e}")))?;
-            let labels: Vec<String> = json
-                .get("kernels")
-                .and_then(|k| k.as_object())
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
-            if labels.is_empty() {
+            let overlay_file = pins_overlay(pins.as_deref());
+            // The roster comes from the library's merged resolution — the same one the stage
+            // uses (§10.2), in the pinned sorted label order. A private re-parse here would be
+            // overlay-blind, leaving a downstream-added `kernels.<label>` resolvable but
+            // unbuildable by this very command, and would need its own fragment reader.
+            let registry = vmcell::artifact::resolve_kernel_registry(overlay_file.as_deref())?;
+            if registry.is_empty() {
                 return Err(vmcell::Error::Artifact(
-                    "no `kernels` registry in pins.json".to_string(),
+                    "no `kernels` registry in the resolved pins".to_string(),
                 ));
             }
-            println!("Building kernels: {}", labels.join(", "));
+            let labels: Vec<&str> = registry.iter().map(|e| e.label.as_str()).collect();
+            let producer = kernel_source_name(*kernel_source);
+            println!("Building kernels ({producer}): {}", labels.join(", "));
             let mut pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
                 .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
-                    pins_file: pins_file.clone(),
+                    overlay_file,
                 }));
-            let ksrc = if *in_vm {
-                KernelSource::InVm
-            } else {
-                KernelSource::HostMake
-            };
-            for label in &labels {
-                println!("  - kernel {label} -> vmlinux-{label}");
+            // The in-VM producer boots a builder micro-VM, which needs a working `vmlinux`
+            // published under the `kernel` artifact key — a key no labelled stage ever registers
+            // (they register `kernel-<label>`). Stage the pinned prebuilt bootstrap seed ahead of
+            // them (§5.4); it is content-addressed like any stage, so a warm artifacts dir hits
+            // cache and nothing is re-downloaded.
+            if kernel_source_needs_seed(*kernel_source) {
+                println!("  - bootstrap seed (prebuilt) -> vmlinux (boots the builder VM)");
                 pipeline = pipeline.add_stage(kernel_stage(
-                    ksrc,
-                    Some(label.clone()),
+                    KernelSource::Prebuilt,
+                    None,
                     None,
                     cid_alloc.clone(),
-                ));
+                )?);
+            }
+            for entry in &registry {
+                let label = &entry.label;
+                println!(
+                    "  - kernel {label} -> vmlinux-{label} (producer: {producer}, fragments: {})",
+                    if entry.fragments.is_empty() {
+                        "none".to_string()
+                    } else {
+                        entry.fragments.join("+")
+                    }
+                );
+                pipeline = pipeline.add_stage(kernel_stage(
+                    *kernel_source,
+                    Some(label.clone()),
+                    Some(entry.fragments.clone()),
+                    cid_alloc.clone(),
+                )?);
             }
             pipeline.build(&vmcell::artifact::Cache::default()).await?;
-            println!("Kernels built: {}", labels.join(", "));
+            println!("Kernels built ({producer}): {}", labels.join(", "));
             Ok(())
         }
         Commands::Run {
@@ -555,37 +668,71 @@ fn ch_bin() -> String {
     std::env::var("VMCELL_CH_BIN").unwrap_or_else(|_| "cloud-hypervisor".to_string())
 }
 
-/// Resolves the committed `pins.json` at the workspace root, independent of the
-/// process CWD (L-BIN-10). Artifacts anchor on the workspace root (design §10, The artifact build pipeline), so a
-/// bare `PathBuf::from("pins.json")` would read pins from a *different* location than
-/// the artifacts when the tool is run from `crates/vmcell/`. Mirrors the library's
-/// `workspace_root` ascent (the `vmcell-protocol` marker); falls back to a
-/// CWD-relative `pins.json` for an installed binary run outside the tree.
+/// Resolves the pins overlay for a pipeline-building subcommand: the `--pins` flag wins, else
+/// `$VMCELL_PINS` (§10.2, The stage model and the five cache-key rules; §10.4's env contract), else
+/// none — the committed baseline alone.
 ///
-/// The library's `workspace_root` is `pub(crate)`, so it cannot be reused here — see
-/// the integrator note to expose it publicly and collapse this duplicate.
-fn pins_path() -> PathBuf {
-    let start = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    for dir in start.ancestors() {
-        if dir.join("crates/vmcell-protocol/Cargo.toml").is_file() {
-            return dir.join("pins.json");
-        }
-    }
-    PathBuf::from("pins.json")
+/// This retired the CLI's private `pins_path()` workspace-root ascent (L-BIN-10, a near-duplicate
+/// of the library's `workspace_root`): the pins **baseline** is embedded in the library now, so the
+/// CLI no longer hunts the filesystem for `pins.json` and there is nothing left to duplicate. Only
+/// the overlay is a path, and it is caller-supplied rather than discovered.
+///
+/// Delegates to the library's [`pins_overlay_or_env`](vmcell::artifact::pins_overlay_or_env), the
+/// one flag-beats-env law the toolkit build entry points use as well, so `$VMCELL_PINS` cannot
+/// reach one and be ignored by the other.
+fn pins_overlay(flag: Option<&std::path::Path>) -> Option<PathBuf> {
+    vmcell::artifact::pins_overlay_or_env(flag)
 }
 
-/// Extracts the version label of a labelled kernel artifact filename
-/// (`vmlinux-<label>` → `Some("<label>")`), used by `bundle` to cover every
-/// `vmlinux-*` built by `build-kernels`, not just the default `vmlinux` (N-BIN-4).
-/// The bare `vmlinux` (no `-`) and an empty label return `None`.
-fn kernel_label_from_filename(name: &str) -> Option<&str> {
-    match name.strip_prefix("vmlinux-") {
-        Some(label) if !label.is_empty() => Some(label),
-        _ => None,
+/// Parses one `--inject dest=<abs path>,src=<path>,mode=<octal>` value into an
+/// [`ExtraFile`](vmcell::artifact::rootfs::ExtraFile) (design §4.2, FR-V4).
+///
+/// Syntax only — this is the parser, not the policy. The reserved-dest and duplicate-dest
+/// rejections (invariant F5) live at the one pack tail, so every rootfs source and every
+/// non-CLI caller gets them; re-checking them here would be a second copy of the list.
+///
+/// Every accepted key is honored and every unaccepted one is refused by name: an unknown key,
+/// a repeated key, a missing key, an empty value, or a fragment without `=` (which is what a
+/// `,` inside a path looks like) is an error. Errors are `String` because clap's
+/// `value_parser` renders them alongside the flag name.
+fn parse_inject(spec: &str) -> std::result::Result<vmcell::artifact::rootfs::ExtraFile, String> {
+    let mut dest: Option<&str> = None;
+    let mut src: Option<&str> = None;
+    let mut mode: Option<u32> = None;
+    for field in spec.split(',') {
+        let (key, value) = field.split_once('=').ok_or_else(|| {
+            format!(
+                "`{field}` is not a `key=value` field (a `,` in a path is not expressible; \
+                 expected dest=<abs path>,src=<path>,mode=<octal>)"
+            )
+        })?;
+        if value.is_empty() {
+            return Err(format!("`{key}` has an empty value"));
+        }
+        let already = match key {
+            "dest" => dest.replace(value).is_some(),
+            "src" => src.replace(value).is_some(),
+            "mode" => {
+                let parsed = u32::from_str_radix(value, 8).map_err(|e| {
+                    format!("`mode={value}` is not an octal permission set (e.g. 0755): {e}")
+                })?;
+                mode.replace(parsed).is_some()
+            }
+            other => {
+                return Err(format!(
+                    "unknown key `{other}` (expected `dest`, `src`, or `mode`)"
+                ));
+            }
+        };
+        if already {
+            return Err(format!("`{key}` is given more than once"));
+        }
     }
+    Ok(vmcell::artifact::rootfs::ExtraFile::new(
+        dest.ok_or("missing `dest=<absolute in-guest path>`")?,
+        src.ok_or("missing `src=<host path>`")?,
+        mode.ok_or("missing `mode=<octal permission set, e.g. 0755>`")?,
+    ))
 }
 
 /// Validates an OCI digest string (`sha256:<64 lowercase/upper hex>`), rejecting an
@@ -756,6 +903,8 @@ async fn oci2erofs(
     image_ref: &str,
     output: &std::path::Path,
     agent_musl: Option<&std::path::Path>,
+    inject: &[vmcell::artifact::rootfs::ExtraFile],
+    pins: Option<&std::path::Path>,
 ) -> vmcell::Result<()> {
     // Reject a tag: require `IMAGE@sha256:DIGEST`. The digest is whatever follows the last `@`.
     let (image, digest) = image_ref.rsplit_once('@').ok_or_else(|| {
@@ -781,7 +930,7 @@ async fn oci2erofs(
     let _ = std::fs::remove_dir_all(&stage_dir);
     let mut pipeline = vmcell::artifact::Pipeline::new(stage_dir.clone()).add_stage(Box::new(
         vmcell::artifact::ResolvePinsStage {
-            pins_file: pins_path(),
+            overlay_file: pins_overlay(pins),
         },
     ));
     // The default glibc agent is built by the pipeline; `--agent-musl` supplies its own
@@ -794,6 +943,9 @@ async fn oci2erofs(
         .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
             image_override: Some((image.to_string(), digest.to_string())),
             agent_musl: agent_musl.map(std::path::Path::to_path_buf),
+            // The `--inject` files; the pack tail validates them (absolute dest, explicit
+            // mode, no vmcell-owned or duplicated dest — §4.2, invariant F5).
+            extra: inject.to_vec(),
         }));
 
     pipeline.build(&vmcell::artifact::Cache::default()).await?;
@@ -895,18 +1047,148 @@ mod tests {
         assert!(validate_oci_digest(&format!("sha256:{}", "a".repeat(64))).is_ok());
     }
 
-    // N-BIN-4: `bundle` must recognize `vmlinux-<label>` kernels but not the bare
-    // `vmlinux` (already covered) or an empty label. RED on the inverse (matching
-    // bare `vmlinux` or accepting an empty label).
+    // §18 delta 6 gate: the `--inject` parser. Every accepted key is honored and everything
+    // else is refused BY NAME — the accept-then-ignore class AGENTS.md bans. RED on the
+    // inverse: a lenient parser (a `_ => {}` arm for unknown keys, a last-wins duplicate, a
+    // decimal `mode`, or defaulted-away missing keys) turns each rejection below into an Ok
+    // that silently packs the wrong file, at the wrong path, with the wrong permissions.
     #[test]
-    fn kernel_label_from_filename_matches_labelled_only() {
+    fn parse_inject_honors_or_rejects_every_field() {
+        // The positive control: a well-formed spec parses, mode is OCTAL, and the fields
+        // land where they belong (a `mode=0755` read as decimal would be 755 == 0o1373).
+        let f = parse_inject("dest=/usr/local/bin/acme,src=./build/acme,mode=0755")
+            .expect("a well-formed spec must parse");
+        assert_eq!(f.dest, "/usr/local/bin/acme");
+        assert_eq!(f.src, std::path::PathBuf::from("./build/acme"));
+        assert_eq!(f.mode, 0o755);
+        // Key order is free.
         assert_eq!(
-            kernel_label_from_filename("vmlinux-6.12.94"),
-            Some("6.12.94")
+            parse_inject("mode=0644,src=./x,dest=/etc/x").expect("any key order"),
+            vmcell::artifact::rootfs::ExtraFile::new("/etc/x", "./x", 0o644)
         );
-        assert_eq!(kernel_label_from_filename("vmlinux-6.6"), Some("6.6"));
-        assert_eq!(kernel_label_from_filename("vmlinux"), None);
-        assert_eq!(kernel_label_from_filename("vmlinux-"), None);
+
+        for (label, spec) in [
+            ("unknown key", "dest=/a,src=./a,mode=0755,owner=root"),
+            ("misspelled key", "destination=/a,src=./a,mode=0755"),
+            ("missing dest", "src=./a,mode=0755"),
+            ("missing src", "dest=/a,mode=0755"),
+            ("missing mode", "dest=/a,src=./a"),
+            ("repeated key", "dest=/a,src=./a,mode=0755,dest=/b"),
+            ("empty value", "dest=,src=./a,mode=0755"),
+            ("non-octal mode", "dest=/a,src=./a,mode=0o755"),
+            ("out-of-range mode digit", "dest=/a,src=./a,mode=0778"),
+            ("bare mode word", "dest=/a,src=./a,mode=rwx"),
+            ("a `,` inside a path", "dest=/a,b,src=./a,mode=0755"),
+            ("not key=value at all", "/usr/local/bin/acme"),
+            ("empty spec", ""),
+        ] {
+            let err = parse_inject(spec)
+                .map(|f| format!("{f:?}"))
+                .expect_err(&format!("{label} must be rejected: `{spec}`"));
+            assert!(!err.is_empty(), "{label} must explain itself");
+        }
+        // The refusal NAMES the offending key, so the user can fix it without guessing.
+        assert!(
+            parse_inject("dest=/a,src=./a,mode=0755,owner=root")
+                .expect_err("unknown key")
+                .contains("owner"),
+            "an unknown key must be named in the error"
+        );
+    }
+
+    // N-BIN-4 / §5.6: `bundle`'s directory walk must recognize the names the PRODUCERS write
+    // (`vmlinux-<sanitized-label>`) and neither the bare `vmlinux` nor a kernel's sidecars. The
+    // rule itself and its round-trip against the producers' filename composer live in
+    // `vmcell::artifact::kernel` (one law); this pins that `bundle` reads through it — RED on the
+    // inverse (a CLI-local re-implementation, which is what let the rule and the producers drift).
+    #[test]
+    fn bundle_reads_kernel_labels_through_the_library_law() {
+        use vmcell::artifact::kernel::{kernel_filename, kernel_label_from_filename};
+        // Composed by the producers' own filename law, not a test-local `format!`.
+        assert_eq!(
+            kernel_label_from_filename(&kernel_filename(Some("6.12.94"))),
+            Some("6-12-94")
+        );
+        assert_eq!(
+            kernel_label_from_filename(&kernel_filename(Some("ikconfig"))),
+            Some("ikconfig")
+        );
+        assert_eq!(kernel_label_from_filename(&kernel_filename(None)), None);
         assert_eq!(kernel_label_from_filename("rootfs.erofs"), None);
+        // A kernel's SIDECARS are not kernels: `bundle` used to record the cache sidecar as the
+        // artifact `kernel-6-12-94.cache_key`, and the resolved config would have joined it.
+        assert_eq!(
+            kernel_label_from_filename("vmlinux-6-12-94.cache_key"),
+            None
+        );
+        assert_eq!(kernel_label_from_filename("vmlinux-6-12-94.config"), None);
+    }
+
+    // §5.6 GATE (delta 3): a labelled or fragment-carrying build routed at the PREBUILT seed is a
+    // typed refusal from the producer selector — reachable from the CLI now that `build-kernels`
+    // takes `--kernel-source`. RED on the inverse (the pre-v30 arm that ignored both arguments and
+    // handed back `PrebuiltKernelStage`): every case below returns Ok.
+    #[test]
+    fn kernel_stage_rejects_labelled_prebuilt() {
+        let alloc = || std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+        let labelled = kernel_stage(
+            KernelSource::Prebuilt,
+            Some("6.12.94".to_string()),
+            None,
+            alloc(),
+        );
+        match labelled {
+            Err(vmcell::Error::Artifact(m)) => assert!(
+                m.contains("6.12.94"),
+                "the refusal must name the label, got: {m}"
+            ),
+            _ => panic!("prebuilt + label must be refused"),
+        }
+        assert!(
+            kernel_stage(
+                KernelSource::Prebuilt,
+                None,
+                Some(vec!["KASAN".to_string()]),
+                alloc()
+            )
+            .is_err(),
+            "prebuilt + fragments must be refused"
+        );
+        // Positive control: the seed request the prebuilt producer exists for still works, and
+        // both compiling producers accept a labelled fragment build.
+        assert!(kernel_stage(KernelSource::Prebuilt, None, None, alloc()).is_ok());
+        assert!(
+            kernel_stage(
+                KernelSource::HostMake,
+                Some("6.12.94".to_string()),
+                Some(vec!["KASAN".to_string()]),
+                alloc()
+            )
+            .is_ok()
+        );
+        assert!(
+            kernel_stage(
+                KernelSource::InVm,
+                Some("6.12.94".to_string()),
+                Some(vec!["KASAN".to_string()]),
+                alloc()
+            )
+            .is_ok()
+        );
+    }
+
+    // §5.4/§5.6 (delta 3): only the in-VM producer needs a bootstrap seed staged ahead of it —
+    // it boots a builder VM off the `kernel` artifact key, which no labelled stage registers.
+    // RED on the inverse (returning false for `InVm`, i.e. the pre-v30 pipeline):
+    // `vmcell build-kernels --kernel-source in-vm` dies on "needs a seed `kernel` artifact".
+    #[test]
+    fn only_the_in_vm_producer_needs_a_seed() {
+        assert!(kernel_source_needs_seed(KernelSource::InVm));
+        assert!(!kernel_source_needs_seed(KernelSource::HostMake));
+        assert!(!kernel_source_needs_seed(KernelSource::Prebuilt));
+        // The producer names the CLI reports (§5.6: a labelled build says which producer ran).
+        assert_eq!(kernel_source_name(KernelSource::InVm), "in-vm");
+        assert_eq!(kernel_source_name(KernelSource::HostMake), "host-make");
+        assert_eq!(kernel_source_name(KernelSource::Prebuilt), "prebuilt");
     }
 }

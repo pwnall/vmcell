@@ -127,6 +127,9 @@ impl OciPuller for RealOciPuller {
 
 /// Builds a root filesystem by pulling from an OCI registry (the real network puller).
 ///
+/// `extra` are the downstream files composed into the image at pack time (§4.2, FR-V4); pass
+/// `&[]` for a rootfs that carries no consumer content.
+///
 /// # Errors
 /// Returns an error if the registry pull or unpacking fails.
 pub async fn build_rootfs(
@@ -135,6 +138,7 @@ pub async fn build_rootfs(
     inputs: &crate::artifact::StageInputs,
     out: &Path,
     agent_musl: Option<&Path>,
+    extra: &[super::ExtraFile],
 ) -> Result<StageOutputs> {
     build_rootfs_with(
         &RealOciPuller::new(),
@@ -143,6 +147,7 @@ pub async fn build_rootfs(
         inputs,
         out,
         agent_musl,
+        extra,
     )
     .await
 }
@@ -156,6 +161,7 @@ async fn build_rootfs_with(
     inputs: &crate::artifact::StageInputs,
     out: &Path,
     agent_musl: Option<&Path>,
+    extra: &[super::ExtraFile],
 ) -> Result<StageOutputs> {
     // Digest-pinned pulls only: a tag (or any non-`sha256:` reference) is the §10.2 (The
     // stage model and the five cache-key rules) provenance hard stop and is rejected BEFORE
@@ -217,7 +223,7 @@ async fn build_rootfs_with(
         }
     }
 
-    super::pack_erofs_with_injection(streams, inputs, out, agent_musl).await
+    super::pack_erofs_with_injection(streams, inputs, out, agent_musl, extra).await
 }
 
 /// The OCI/Docker layer media types this builder can decode (gzip and zstd
@@ -462,7 +468,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("rootfs.erofs");
         let inputs = crate::artifact::StageInputs::default();
-        let res = build_rootfs_with(&fake, "example.com/img", "latest", &inputs, &out, None).await;
+        let res =
+            build_rootfs_with(&fake, "example.com/img", "latest", &inputs, &out, None, &[]).await;
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a tag-fallback (non-digest) pull must be rejected, got {res:?}"
@@ -522,7 +529,7 @@ mod tests {
         let digest = sha256_hex(b"manifest-bytes");
 
         // (1) Cold build: every layer pulled, erofs produced (gzip + zstd both decode).
-        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None)
+        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None, &[])
             .await
             .expect("cold build");
         assert_eq!(
@@ -536,7 +543,7 @@ mod tests {
         );
 
         // (2) Warm build: cached blobs are re-verified but NOT re-pulled.
-        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None)
+        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None, &[])
             .await
             .expect("warm build");
         assert_eq!(
@@ -558,7 +565,8 @@ mod tests {
             .join("oci-cache")
             .join(gz_dig.replace(':', "-"));
         std::fs::write(&cache_file, b"tampered-cache-bytes").unwrap();
-        let res = build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None).await;
+        let res =
+            build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None, &[]).await;
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a tampered cached blob must be rejected on the hit path, got {res:?}"

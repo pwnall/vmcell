@@ -473,3 +473,93 @@ async fn test_pipeline_dir_output_tamper_rejected() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// §18 delta 1 / §10.2 (The stage model and the five cache-key rules) — ARTIFACT HONESTY.
+// `resolved_pins.json` is a published artifact (`outputs.artifacts["resolved_pins"]`, and the
+// `pins` entry of `vmcell bundle`), so with an overlay in play it must be the MERGED document —
+// a verbatim copy of either input would ship a lying artifact naming pins the build did not use.
+// Buggy impls this guards: (a) `run()` writing the committed baseline verbatim (the pre-overlay
+// code) — the `downstream.example` assert goes red; (b) `run()` writing the OVERLAY verbatim — the
+// `microvm_config` assert goes red, since the overlay never carried one; (c) a document-level
+// namespace replacement — same assert. The no-overlay leg pins §18 delta 1's migration promise —
+// "no overlay ⇒ baseline behavior byte-identical" — by comparing the published BYTES against the
+// committed `pins.json`, not the parsed document: a re-render through `to_string_pretty` reflows
+// whitespace and re-orders keys, which every field-equality assert in this test happily accepts
+// while silently changing a published, content-addressed artifact. Buggy impl this catches:
+// dropping `run()`'s verbatim `None` arm so both arms render the parsed document.
+#[tokio::test]
+async fn resolve_pins_publishes_the_merged_document() {
+    use vmcell::artifact::Stage as _;
+
+    /// The same bytes `ResolvePinsStage` embeds as its baseline. Read here from the repo root, so
+    /// this is an independent copy of the promise, not the constant under test.
+    const COMMITTED_PINS: &str = include_str!("../../../pins.json");
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("vmcell-test-pins-overlay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let overlay_path = tmp_dir.join("overlay.json");
+    std::fs::write(
+        &overlay_path,
+        r#"{ "kernel": { "source_url": "https://downstream.example/linux.tar.xz" } }"#,
+    )
+    .unwrap();
+
+    let inputs = vmcell::artifact::StageInputs::default();
+
+    // No overlay: the published document is the committed baseline, verbatim.
+    let baseline_out = tmp_dir.join("resolved_pins_baseline.json");
+    let stage = vmcell::artifact::ResolvePinsStage { overlay_file: None };
+    let baseline_outputs = stage.run(&inputs, &baseline_out).await.unwrap();
+    let baseline_bytes = std::fs::read_to_string(&baseline_out).unwrap();
+    assert_eq!(
+        baseline_bytes, COMMITTED_PINS,
+        "with no overlay the published artifact must be the committed pins.json BYTE-FOR-BYTE \
+         (§18 delta 1's migration promise); a re-render moves this content-addressed artifact"
+    );
+    let baseline_doc: serde_json::Value = serde_json::from_str(&baseline_bytes).unwrap();
+
+    // With an overlay: the published document carries the override AND the baseline's siblings.
+    let merged_out = tmp_dir.join("resolved_pins_merged.json");
+    let stage = vmcell::artifact::ResolvePinsStage {
+        overlay_file: Some(overlay_path.clone()),
+    };
+    let merged_outputs = stage.run(&inputs, &merged_out).await.unwrap();
+    let merged_doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&merged_out).unwrap()).unwrap();
+
+    assert_eq!(
+        merged_doc["kernel"]["source_url"].as_str(),
+        Some("https://downstream.example/linux.tar.xz"),
+        "the published artifact must carry the overlay's override, not the baseline's URL"
+    );
+    assert_eq!(
+        merged_doc["kernel"]["microvm_config"], baseline_doc["kernel"]["microvm_config"],
+        "the published artifact must keep the baseline siblings the merge preserved"
+    );
+    assert_eq!(
+        merged_doc["kernels"], baseline_doc["kernels"],
+        "an untouched namespace must be published unchanged"
+    );
+
+    // The propagated pin map and the published document agree — one resolution, not two.
+    assert_eq!(
+        merged_outputs
+            .pins
+            .get("kernel_source_url")
+            .map(String::as_str),
+        Some("https://downstream.example/linux.tar.xz")
+    );
+    assert_eq!(
+        merged_outputs.pins.get("kernel_microvm_config"),
+        baseline_outputs.pins.get("kernel_microvm_config")
+    );
+    assert_eq!(
+        merged_outputs.artifacts.get("resolved_pins"),
+        Some(&merged_out)
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

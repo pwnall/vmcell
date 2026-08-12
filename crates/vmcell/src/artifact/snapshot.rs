@@ -83,6 +83,9 @@ impl Stage for SnapshotStage {
         let env = crate::env::HostEnv {
             cids: self.cid_alloc.clone(),
             vmids: self.vmid_alloc.clone(),
+            // The snapshot stage never joins a segment (segments are snapshot-forbidden, §6.5), so
+            // a hermetic allocator here is correct: nothing claims a segid on this path.
+            segids: crate::orchestrator::SegmentIdAllocator::new(),
             cgroups: std::sync::Arc::new(crate::metrics::DefaultCgroupFs),
             clock: std::sync::Arc::new(crate::orchestrator::RealClock),
             overlay: std::sync::Arc::new(crate::overlay::ReflinkOverlayStore),

@@ -8,6 +8,54 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// A `(dest_path, source_path, mode)` file inserted into the merged tree after every layer.
+///
+/// `mode` is `None` for vmcell's own manifest entries — they take the
+/// `injected_file_mode` bin/sbin heuristic — and `Some(perm)` for a downstream
+/// [`ExtraFile`](crate::artifact::rootfs::ExtraFile), whose permission bits the caller stated
+/// explicitly (design §4.2: "extra files do not inherit the `injected_file_mode` heuristic —
+/// the caller said what they meant"). `perm` carries permission bits only; the `S_IFREG` type
+/// bit is added here.
+#[cfg(feature = "am-fs-erofs")]
+pub type InjectedFile<'a> = (&'a str, &'a Path, Option<u16>);
+
+/// Reads `src_path` and inserts it into `entries` at the normalized `dest_path` as a regular
+/// file owned by `uid`/`gid` 0 with `mtime` 0 (the deterministic-emission discipline, §10.3).
+///
+/// The ONE injection insert: both the downstream extra files and vmcell's own manifest entries
+/// go through it, so the ownership/mtime/type-bit rules and the explicit-mode-else-heuristic
+/// rule exist in exactly one place.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if `src_path` cannot be read.
+#[cfg(feature = "am-fs-erofs")]
+fn insert_injected_file(
+    entries: &mut HashMap<PathBuf, Node>,
+    (dest_path, src_path, mode): InjectedFile<'_>,
+) -> crate::error::Result<()> {
+    let content = std::fs::read(src_path).map_err(|e| {
+        crate::error::Error::Artifact(format!("Failed to read injected file {src_path:?}: {e}"))
+    })?;
+    let meta = NodeMeta {
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    };
+    // An explicit caller mode wins; otherwise only injected binaries (guest-agent -> usr/sbin,
+    // guest-tools -> vmcell-tools) are executable and injected DATA files (the CA cert under
+    // ca-certificates/) are 0o644.
+    let mode = mode.unwrap_or_else(|| injected_file_mode(dest_path)) | fs_erofs::inode::S_IFREG;
+    let node = Node::File {
+        mode,
+        data: content,
+        meta,
+        xattrs: vec![],
+    };
+    entries.insert(normalize_path(Path::new(dest_path)), node);
+    Ok(())
+}
+
 /// Builds the flat `path -> Node` map from the injected files/symlinks and the given tar
 /// archives, applying OCI whiteout semantics (`.wh.<name>` deletions and `.wh..wh..opq`
 /// opaque-dir markers) as layers are merged in order.
@@ -17,13 +65,21 @@ use std::path::{Path, PathBuf};
 /// whiteout deletions — are unit-testable (ART-4) by inspecting the resulting nodes
 /// directly, rather than only through the opaque packed EROFS bytes.
 ///
+/// `extra_files` are the downstream [`ExtraFile`](crate::artifact::rootfs::ExtraFile)s: they
+/// are inserted AFTER the layer merge (so they win base-image collisions and whiteouts —
+/// deliberate composition) and BEFORE `injected_files`, which keeps vmcell's own injections
+/// unconditional and authoritative (design §4.2, invariant F5). The pack tail rejects an extra
+/// dest that collides with vmcell's own list, so the two sets are disjoint by construction; the
+/// insert order is the structural backstop.
+///
 /// # Errors
 /// Returns [`crate::error::Error::Artifact`] if an injected file or an archive entry
 /// cannot be read.
 #[cfg(feature = "am-fs-erofs")]
 fn build_node_map<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
-    injected_files: Vec<(&str, &Path)>,
+    extra_files: Vec<InjectedFile<'_>>,
+    injected_files: Vec<InjectedFile<'_>>,
     injected_symlinks: Vec<(&str, &str)>,
 ) -> crate::error::Result<HashMap<PathBuf, Node>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
@@ -214,31 +270,20 @@ fn build_node_map<'a, R: Read + 'a>(
         }
     }
 
+    // The downstream extra files (design §4.2, delta 6) land FIRST in the tail: after the
+    // layer merge (so they win base-image content and `.wh.` whiteouts — deliberate
+    // composition) but before vmcell's own injections below, which stay authoritative.
+    for extra in extra_files {
+        insert_injected_file(&mut entries, extra)?;
+    }
+
     // Inject the agent/CA/guest-tools AFTER every layer is merged (H-ART-3 / design §4.2,
     // Rootfs sources and the one packer: "inject ... then stream the tree"). Injecting last
     // makes the injected files
     // authoritative: an upper layer's content or a `.wh.` whiteout can no longer clobber the
     // baked guest-agent or the CA under `usr/local/share/ca-certificates/`.
-    for (dest_path, src_path) in injected_files {
-        let content = std::fs::read(src_path).map_err(|e| {
-            crate::error::Error::Artifact(format!("Failed to read injected file {src_path:?}: {e}"))
-        })?;
-        let meta = NodeMeta {
-            uid: 0,
-            gid: 0,
-            mtime: 0,
-            mtime_nsec: 0,
-        };
-        // Only injected binaries (guest-agent -> usr/sbin, guest-tools -> vmcell-tools) are
-        // executable; injected DATA files (the CA cert under ca-certificates/) are 0o644.
-        let mode = injected_file_mode(dest_path) | fs_erofs::inode::S_IFREG;
-        let node = Node::File {
-            mode,
-            data: content,
-            meta,
-            xattrs: vec![],
-        };
-        entries.insert(normalize_path(Path::new(dest_path)), node);
+    for injected in injected_files {
+        insert_injected_file(&mut entries, injected)?;
     }
     for (dest_path, target) in injected_symlinks {
         let node = Node::Symlink {
@@ -260,16 +305,23 @@ fn build_node_map<'a, R: Read + 'a>(
 
 /// Converts a tar archive to an EROFS filesystem image.
 ///
+/// `extra_files` are the downstream [`ExtraFile`](crate::artifact::rootfs::ExtraFile)s and are
+/// inserted after the layer merge but before `injected_files` (design §4.2, invariant F5), so
+/// they win base-image collisions and whiteouts while vmcell's own injections stay
+/// authoritative. Missing parent directories of any entry — including an extra file placed
+/// under a directory the base image does not ship — are synthesized `0o755 root:root` below.
+///
 /// # Errors
 /// Returns an error if reading the archive or generating the EROFS image fails.
 #[cfg(feature = "am-fs-erofs")]
 pub fn tar_to_erofs<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
-    injected_files: Vec<(&str, &Path)>,
+    extra_files: Vec<InjectedFile<'_>>,
+    injected_files: Vec<InjectedFile<'_>>,
     injected_symlinks: Vec<(&str, &str)>,
     require_libc6: bool,
 ) -> crate::error::Result<Vec<u8>> {
-    let mut entries = build_node_map(archives, injected_files, injected_symlinks)?;
+    let mut entries = build_node_map(archives, extra_files, injected_files, injected_symlinks)?;
 
     // Fail loud on a base image without glibc (§4.2, Rootfs sources and the one packer / oci2erofs §8.2). One pass over the
     // merged path set for a file named `libc.so.6` at ANY path in the tree (the scan keys
@@ -408,8 +460,14 @@ fn injected_file_mode(dest_path: &str) -> u16 {
     if is_bin { 0o755 } else { 0o644 }
 }
 
+/// Folds a tar/injection path into the flat merged-tree key: root and `.` components are
+/// dropped, `..` pops. `pub(crate)` so the pack tail's reserved-dest check
+/// ([`is_reserved_injection_path`](crate::artifact::rootfs::is_reserved_injection_path))
+/// compares against the SAME normal form the packer keys on — a second normalizer there would
+/// let `/usr/sbin/./vmcell-guest-agent` sail past the check and then silently lose to the
+/// vmcell injection (one law, one predicate).
 #[cfg(feature = "am-fs-erofs")]
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -439,7 +497,7 @@ mod tests {
         let archive = tar::Archive::new(reader);
         // require_libc6=false: this packs an empty tar (no agent injected), so the
         // glibc-presence requirement does not apply.
-        let image = tar_to_erofs(vec![archive], vec![], vec![], false);
+        let image = tar_to_erofs(vec![archive], vec![], vec![], vec![], false);
         assert!(
             image.is_ok(),
             "Failed to convert empty tar to EROFS: {:?}",
@@ -463,7 +521,7 @@ mod tests {
             builder.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar_data));
-        tar_to_erofs(vec![archive], vec![], vec![], require_libc6)
+        tar_to_erofs(vec![archive], vec![], vec![], vec![], require_libc6)
     }
 
     // oci2erofs §8.2 fail-loud guard. With `require_libc6=true`, a base that contains a
@@ -558,7 +616,7 @@ mod tests {
             b.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let map = build_node_map(vec![archive], vec![], vec![]).expect("node map");
+        let map = build_node_map(vec![archive], vec![], vec![], vec![]).expect("node map");
 
         match map.get(Path::new("dev/mychar")) {
             Some(Node::Device { rdev, mode, .. }) => {
@@ -626,7 +684,7 @@ mod tests {
         }
         let a1 = tar::Archive::new(std::io::Cursor::new(lower));
         let a2 = tar::Archive::new(std::io::Cursor::new(upper));
-        let map = build_node_map(vec![a1, a2], vec![], vec![]).expect("node map");
+        let map = build_node_map(vec![a1, a2], vec![], vec![], vec![]).expect("node map");
 
         assert!(
             map.contains_key(Path::new("etc/keep")),
@@ -677,10 +735,11 @@ mod tests {
             (
                 "usr/local/share/ca-certificates/vmcell-ca.crt",
                 ca.as_path(),
+                None,
             ),
-            ("usr/sbin/vmcell-guest-agent", agent.as_path()),
+            ("usr/sbin/vmcell-guest-agent", agent.as_path(), None),
         ];
-        let map = build_node_map(vec![empty], injected, vec![]).expect("node map");
+        let map = build_node_map(vec![empty], vec![], injected, vec![]).expect("node map");
         match map.get(&normalize_path(Path::new(
             "usr/local/share/ca-certificates/vmcell-ca.crt",
         ))) {
@@ -725,7 +784,7 @@ mod tests {
             b.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let map = build_node_map(vec![archive], vec![], vec![]).expect("node map");
+        let map = build_node_map(vec![archive], vec![], vec![], vec![]).expect("node map");
         match map.get(&normalize_path(Path::new("usr/bin/ping"))) {
             Some(Node::File { xattrs, .. }) => assert!(
                 xattrs.is_empty(),
@@ -762,6 +821,7 @@ mod tests {
             vec![tar::Archive::new(std::io::Cursor::new(a))],
             vec![],
             vec![],
+            vec![],
         )
         .expect("node map");
         assert!(
@@ -786,6 +846,7 @@ mod tests {
         }
         let map = build_node_map(
             vec![tar::Archive::new(std::io::Cursor::new(c))],
+            vec![],
             vec![],
             vec![],
         )
@@ -818,7 +879,7 @@ mod tests {
             b.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let entries = build_node_map(vec![archive], vec![], vec![]).expect("build");
+        let entries = build_node_map(vec![archive], vec![], vec![], vec![]).expect("build");
         let link = entries
             .get(&normalize_path(Path::new("usr/bin/perl5.40.1")))
             .expect("the hardlink must be materialized, not dropped");
@@ -847,7 +908,7 @@ mod tests {
         let archive = tar::Archive::new(std::io::Cursor::new(orphan));
         assert!(
             matches!(
-                build_node_map(vec![archive], vec![], vec![]),
+                build_node_map(vec![archive], vec![], vec![], vec![]),
                 Err(crate::error::Error::Artifact(_))
             ),
             "a hardlink to a missing target must still fail loud"
@@ -893,10 +954,11 @@ mod tests {
             (
                 "usr/local/share/ca-certificates/vmcell-ca.crt",
                 ca.as_path(),
+                None,
             ),
-            ("usr/sbin/vmcell-guest-agent", agent.as_path()),
+            ("usr/sbin/vmcell-guest-agent", agent.as_path(), None),
         ];
-        let map = build_node_map(vec![a1, a2], injected_files, vec![]).expect("node map");
+        let map = build_node_map(vec![a1, a2], vec![], injected_files, vec![]).expect("node map");
 
         // (1) The injected CA survives the whiteout that deleted the CA dir.
         match map.get(Path::new("usr/local/share/ca-certificates/vmcell-ca.crt")) {
@@ -917,6 +979,142 @@ mod tests {
         }
     }
 
+    // §18 delta 6 image-level gate: a downstream extra file must be PRESENT with the caller's
+    // exact CONTENT and its EXPLICIT MODE, and must beat both the base layer's content and an
+    // upper layer's `.wh.` whiteout (it is inserted after the merge). Three buggy impls redden
+    // here: (a) inserting extras before the layer merge — the stale layer content or the
+    // whiteout wins; (b) running extras through `injected_file_mode` instead of the explicit
+    // mode — `/opt/acme/acme-daemon` has no bin/sbin component, so it packs 0o644 instead of
+    // 0o755; (c) applying the heuristic to a dest that DOES have a `bin` component — the
+    // 0o600 config below would pack 0o755.
+    #[test]
+    fn extra_files_are_present_with_their_explicit_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon = dir.path().join("acme");
+        std::fs::write(&daemon, b"ACME-DAEMON").unwrap();
+        let conf = dir.path().join("acme.conf");
+        std::fs::write(&conf, b"secret=1").unwrap();
+
+        // Lower layer: stale content at BOTH extra dests.
+        let mut lower = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut lower);
+            append_file(&mut b, "opt/acme/acme-daemon", b"STALE-LAYER-DAEMON");
+            append_file(&mut b, "usr/local/bin/acme.conf", b"STALE-LAYER-CONF");
+            b.finish().unwrap();
+        }
+        // Upper layer: whiteout the whole `opt/acme` directory.
+        let mut upper = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut upper);
+            append_file(&mut b, "opt/.wh.acme", &[]);
+            b.finish().unwrap();
+        }
+        let extra = vec![
+            // No `bin`/`sbin` component: the heuristic would say 0o644, the caller says 0o755.
+            ("/opt/acme/acme-daemon", daemon.as_path(), Some(0o755u16)),
+            // A `bin` component: the heuristic would say 0o755, the caller says 0o600.
+            ("/usr/local/bin/acme.conf", conf.as_path(), Some(0o600u16)),
+        ];
+        let map = build_node_map(
+            vec![
+                tar::Archive::new(std::io::Cursor::new(lower)),
+                tar::Archive::new(std::io::Cursor::new(upper)),
+            ],
+            extra,
+            vec![],
+            vec![],
+        )
+        .expect("node map");
+
+        for (dest, want_data, want_mode) in [
+            ("opt/acme/acme-daemon", &b"ACME-DAEMON"[..], 0o755),
+            ("usr/local/bin/acme.conf", &b"secret=1"[..], 0o600),
+        ] {
+            match map.get(&normalize_path(Path::new(dest))) {
+                Some(Node::File {
+                    mode, data, meta, ..
+                }) => {
+                    assert_eq!(data, want_data, "{dest} must carry the caller's content");
+                    assert_eq!(
+                        mode & 0o777,
+                        want_mode,
+                        "{dest} must carry the caller's EXPLICIT mode, not the \
+                         injected_file_mode heuristic"
+                    );
+                    assert_eq!(mode & fs_erofs::inode::S_IFMT, fs_erofs::inode::S_IFREG);
+                    // Deterministic emission (§10.3): uid/gid 0, mtime 0.
+                    assert_eq!((meta.uid, meta.gid, meta.mtime), (0, 0, 0));
+                }
+                other => panic!("expected the injected extra file at {dest}, got {other:?}"),
+            }
+        }
+    }
+
+    // Invariant F5's structural backstop: vmcell's own injections are inserted AFTER the
+    // extras, so even if a reserved dest ever reached the packer (the pack tail rejects it
+    // first), vmcell's content wins rather than being silently clobbered. RED on the inverse
+    // (swapping the two loops): the extra's bytes would land at the guest-agent path.
+    #[test]
+    fn vmcell_injections_win_over_a_colliding_extra_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = dir.path().join("agent");
+        std::fs::write(&agent, b"INJECTED-AGENT").unwrap();
+        let impostor = dir.path().join("impostor");
+        std::fs::write(&impostor, b"IMPOSTOR").unwrap();
+        let empty = tar::Archive::new(std::io::Cursor::new({
+            let mut v = Vec::new();
+            tar::Builder::new(&mut v).finish().unwrap();
+            v
+        }));
+        let map = build_node_map(
+            vec![empty],
+            vec![(
+                "/usr/sbin/vmcell-guest-agent",
+                impostor.as_path(),
+                Some(0o755),
+            )],
+            vec![("usr/sbin/vmcell-guest-agent", agent.as_path(), None)],
+            vec![],
+        )
+        .expect("node map");
+        match map.get(&normalize_path(Path::new("usr/sbin/vmcell-guest-agent"))) {
+            Some(Node::File { data, .. }) => assert_eq!(
+                data, b"INJECTED-AGENT",
+                "vmcell's own injection is authoritative and is inserted last"
+            ),
+            other => panic!("expected the injected agent file node, got {other:?}"),
+        }
+    }
+
+    // The parent-synthesis path: `build_node_map` does NOT create parent directories — only
+    // `tar_to_erofs` does — so an extra file under a directory the base image does not ship
+    // (`/opt/acme/bin/x`) is only proven complete at THIS level. RED on the inverse (dropping
+    // the parent-synthesis loop): the pack fails with "cannot add child … under non-directory"
+    // / "Missing node" instead of producing an image.
+    #[test]
+    fn extra_file_under_a_new_directory_packs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon = dir.path().join("acme");
+        std::fs::write(&daemon, b"ACME").unwrap();
+        // A base with libc6 so `require_libc6` stays exercised on the real path.
+        let mut base = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut base);
+            append_file(&mut b, "lib/x86_64-linux-gnu/libc.so.6", b"libc");
+            b.finish().unwrap();
+        }
+        let image = tar_to_erofs(
+            vec![tar::Archive::new(std::io::Cursor::new(base))],
+            vec![("/opt/acme/bin/acme-daemon", daemon.as_path(), Some(0o755))],
+            vec![],
+            vec![],
+            true,
+        )
+        .expect("an extra file under a directory absent from the base must pack");
+        assert!(!image.is_empty(), "EROFS image bytes should not be empty");
+    }
+
     // L-ART-6: a child whose parent path is occupied by a NON-directory node must fail loud,
     // never be silently dropped. Here `a/b` is a regular file and `a/b/c` is a child under
     // it. The buggy version (no `else` arm) packs Ok with `a/b/c` missing.
@@ -930,7 +1128,7 @@ mod tests {
             b.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let res = tar_to_erofs(vec![archive], vec![], vec![], false);
+        let res = tar_to_erofs(vec![archive], vec![], vec![], vec![], false);
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a child under a non-directory parent must fail loud (L-ART-6), got {res:?}"

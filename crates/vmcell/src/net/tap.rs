@@ -101,6 +101,65 @@ pub fn cleanup_orphan_netns(prefix: &str) -> Vec<String> {
     removed
 }
 
+/// Resolves an interface index by name inside the current namespace.
+///
+/// One helper for every `link().get().match_name(..)` lookup in this module — the tap path, the
+/// `lo` bring-ups, and the segment bridge/enslave path — so a future lookup cannot drift.
+async fn link_index(handle: &rtnetlink::Handle, name: &str) -> std::result::Result<u32, String> {
+    Ok(handle
+        .link()
+        .get()
+        .match_name(name.to_string())
+        .execute()
+        .try_next()
+        .await
+        .map_err(|e| format!("get link {name} err: {e}"))?
+        .ok_or_else(|| format!("link {name} not found"))?
+        .header
+        .index)
+}
+
+/// Brings the interface at `index` up (`IFF_UP`).
+///
+/// rtnetlink 0.21: `link().set(..)` takes a fully-built `LinkMessage` (the fluent `.set(idx).up()`
+/// builder was removed), so the message is built here — once, for every caller.
+async fn link_up(handle: &rtnetlink::Handle, index: u32) -> std::result::Result<(), String> {
+    handle
+        .link()
+        .set(
+            rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
+                .index(index)
+                .up()
+                .build(),
+        )
+        .execute()
+        .await
+        .map_err(|e| format!("link {index} up err: {e}"))
+}
+
+/// Creates `tap_name` inside the already-entered namespace, makes it persistent
+/// (`TUNSETPERSIST`), and drops our fd.
+///
+/// A non-multi-queue tap allows a single opener and the VMM must be it (otherwise CH fails with
+/// "Open tap device failed: Device or resource busy"), so the interface is persisted and the
+/// creating fd released. One helper for both the per-VM tap ([`Netlink::setup_tap`]) and the
+/// segment member tap ([`Netlink::setup_tap_on_bridge`]) — the two differ only in addressing.
+/// (The ioctl lives in `crate::net_sys` because this module is `#![forbid(unsafe_code)]`.)
+fn create_persistent_tap_in_ns(ns: &netns_rs::NetNs, tap_name: &str) -> Result<()> {
+    let tn = tap_name.to_string();
+    let tap = ns
+        .run(move |_| tun_tap::Iface::without_packet_info(&tn, tun_tap::Mode::Tap))
+        .map_err(|e| Error::Network(format!("ns run tap fail: {e:?}")))?
+        .map_err(|e| Error::Network(format!("tap create fail: {e}")))?;
+    {
+        use std::os::fd::AsRawFd;
+        crate::net_sys::set_tun_persist(tap.as_raw_fd())
+            .map_err(|e| Error::Network(format!("TUNSETPERSIST on tap failed: {e}")))?;
+    }
+    drop(tap);
+    Ok(())
+}
+
 /// Interface for executing netlink operations.
 pub trait Netlink: Send + Sync {
     /// Creates a network namespace.
@@ -113,6 +172,42 @@ pub trait Netlink: Send + Sync {
     /// # Errors
     /// Returns an error if setting up the TAP interface or assigning the IP fails.
     fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<Option<tun_tap::Iface>>;
+    /// Creates a Linux **bridge** inside `netns`, gives it `gateway`/`prefix_len`, and brings it
+    /// (and `lo`) up — the segment's shared L2 domain (§6.5, VM-to-VM segments).
+    ///
+    /// # Errors
+    /// Returns an error if the namespace or any `rtnetlink` operation fails.
+    fn create_bridge(
+        &self,
+        netns: &str,
+        bridge: &str,
+        gateway: std::net::Ipv4Addr,
+        prefix_len: u8,
+    ) -> Result<()>;
+    /// Creates a **member** tap inside `netns`, enslaves it to `bridge`, and brings it up —
+    /// deliberately assigning it **no** address (§6.5: the bridge holds the gateway; an address on
+    /// a bridge port would put a second subnet on the segment).
+    ///
+    /// The tap is `TUNSETPERSIST`'d and our fd dropped, exactly as [`Netlink::setup_tap`] does, so
+    /// the VMM is the single opener.
+    ///
+    /// **Cleanup contract:** on error this leaves behind exactly what it found — if it created the
+    /// tap and a later step failed it removes that tap, and if the tap creation itself failed
+    /// (typically because an interface of that name is already there) it removes **nothing**. The
+    /// caller must not clean up by name: a segment namespace is shared and pre-existing, so the
+    /// interface of that name may be a live sibling member's (§6.5).
+    ///
+    /// # Errors
+    /// Returns an error if the namespace, the tap creation, or any `rtnetlink` operation fails.
+    fn setup_tap_on_bridge(&self, netns: &str, tap_name: &str, bridge: &str) -> Result<()>;
+    /// Deletes a link (e.g. a member tap) inside `netns`.
+    ///
+    /// A segment member releases its tap this way on teardown — the segment netns outlives the
+    /// member, so a left-behind persistent tap would collide when its vmid is reused (§6.5).
+    ///
+    /// # Errors
+    /// Returns an error if the namespace or the `rtnetlink` delete fails.
+    fn delete_link(&self, netns: &str, link: &str) -> Result<()>;
     /// Deletes a network namespace.
     ///
     /// # Errors
@@ -146,42 +241,15 @@ impl Netlink for RtNetlink {
     fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<Option<tun_tap::Iface>> {
         let ns = netns_rs::NetNs::get(netns)
             .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
-        let tn = tap_name.to_string();
 
-        let tap = ns
-            .run(move |_| tun_tap::Iface::without_packet_info(&tn, tun_tap::Mode::Tap))
-            .map_err(|e| Error::Network(format!("ns run tap fail: {e:?}")))?
-            .map_err(|e| Error::Network(format!("tap create fail: {e}")))?;
-
-        // Make the tap persistent, then release our fd: a non-multi-queue tap can be
-        // opened by only one process, and the VMM must be the opener (otherwise CH
-        // fails with "Open tap device failed: Device or resource busy"). The
-        // persistent interface lives in the netns until it is torn down. (The
-        // ioctl lives in `crate::net_sys` because this module is
-        // `#![forbid(unsafe_code)]` via `net`.)
-        {
-            use std::os::fd::AsRawFd;
-            crate::net_sys::set_tun_persist(tap.as_raw_fd())
-                .map_err(|e| Error::Network(format!("TUNSETPERSIST on tap failed: {e}")))?;
-        }
-        drop(tap);
+        create_persistent_tap_in_ns(&ns, tap_name)?;
 
         let tap_name = tap_name.to_string();
         let (ip, _, _) = crate::net::ip_math(vmid)?;
 
         let res = ns.run(move |_| {
             run_with_rtnetlink(|handle| async move {
-                let link_idx = handle
-                    .link()
-                    .get()
-                    .match_name(tap_name.clone())
-                    .execute()
-                    .try_next()
-                    .await
-                    .map_err(|e| format!("get link err: {e}"))?
-                    .ok_or_else(|| format!("link {tap_name} not found"))?
-                    .header
-                    .index;
+                let link_idx = link_index(&handle, &tap_name).await?;
 
                 handle
                     .address()
@@ -190,43 +258,10 @@ impl Netlink for RtNetlink {
                     .await
                     .map_err(|e| format!("addr add err: {e}"))?;
 
-                // rtnetlink 0.21: `link().set(..)` now takes a fully-built `LinkMessage`
-                // (the fluent `.set(idx).up()` builder was removed); build one with IFF_UP set.
-                handle
-                    .link()
-                    .set(
-                        rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
-                            .index(link_idx)
-                            .up()
-                            .build(),
-                    )
-                    .execute()
-                    .await
-                    .map_err(|e| format!("link up err: {e}"))?;
+                link_up(&handle, link_idx).await?;
 
-                let lo_idx = handle
-                    .link()
-                    .get()
-                    .match_name("lo".to_string())
-                    .execute()
-                    .try_next()
-                    .await
-                    .map_err(|e| format!("get lo err: {e}"))?
-                    .ok_or_else(|| "lo not found".to_string())?
-                    .header
-                    .index;
-
-                handle
-                    .link()
-                    .set(
-                        rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
-                            .index(lo_idx)
-                            .up()
-                            .build(),
-                    )
-                    .execute()
-                    .await
-                    .map_err(|e| format!("lo up err: {e}"))?;
+                let lo_idx = link_index(&handle, "lo").await?;
+                link_up(&handle, lo_idx).await?;
 
                 Ok(())
             })
@@ -236,6 +271,138 @@ impl Netlink for RtNetlink {
             // The tap is persistent in the netns and our fd is already dropped, so
             // there is no handle to return — the VMM opens the interface by name.
             Ok(Ok(())) => Ok(None),
+            Ok(Err(e)) => Err(Error::Network(e)),
+            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
+        }
+    }
+
+    fn create_bridge(
+        &self,
+        netns: &str,
+        bridge: &str,
+        gateway: std::net::Ipv4Addr,
+        prefix_len: u8,
+    ) -> Result<()> {
+        let ns = netns_rs::NetNs::get(netns)
+            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
+        let bridge_name = bridge.to_string();
+
+        let res = ns.run(move |_| {
+            run_with_rtnetlink(|handle| async move {
+                // rtnetlink 0.21's typed bridge builder — the first bridge in the tree.
+                handle
+                    .link()
+                    .add(rtnetlink::LinkBridge::new(&bridge_name).build())
+                    .execute()
+                    .await
+                    .map_err(|e| format!("bridge add err: {e}"))?;
+
+                let br_idx = link_index(&handle, &bridge_name).await?;
+                handle
+                    .address()
+                    .add(br_idx, std::net::IpAddr::V4(gateway), prefix_len)
+                    .execute()
+                    .await
+                    .map_err(|e| format!("bridge addr add err: {e}"))?;
+                link_up(&handle, br_idx).await?;
+
+                let lo_idx = link_index(&handle, "lo").await?;
+                link_up(&handle, lo_idx).await?;
+
+                Ok(())
+            })
+        });
+
+        match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Error::Network(e)),
+            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
+        }
+    }
+
+    fn setup_tap_on_bridge(&self, netns: &str, tap_name: &str, bridge: &str) -> Result<()> {
+        let ns = netns_rs::NetNs::get(netns)
+            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
+
+        // Nothing exists yet if this fails (in particular, an `EBUSY`/`EEXIST` means the
+        // interface of that name is someone else's) — so it returns without any cleanup.
+        create_persistent_tap_in_ns(&ns, tap_name)?;
+
+        let name_for_cleanup = tap_name.to_string();
+        let tap_name = tap_name.to_string();
+        let bridge_name = bridge.to_string();
+
+        let res = ns.run(move |_| {
+            run_with_rtnetlink(|handle| async move {
+                let tap_idx = link_index(&handle, &tap_name).await?;
+                let br_idx = link_index(&handle, &bridge_name).await?;
+
+                // Enslave, and bring up — but assign NO address: the bridge holds
+                // `10.201.<s>.1`, and an address on a bridge port would silently put a
+                // second subnet on the segment (§6.5). This is the one deliberate
+                // difference from `setup_tap`.
+                handle
+                    .link()
+                    .set(
+                        rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
+                            .index(tap_idx)
+                            .controller(br_idx)
+                            .up()
+                            .build(),
+                    )
+                    .execute()
+                    .await
+                    .map_err(|e| format!("tap enslave err: {e}"))?;
+
+                Ok(())
+            })
+        });
+
+        let enslaved = match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Error::Network(e)),
+            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
+        };
+        if let Err(e) = enslaved {
+            // We created this tap moments ago, so deleting it removes only what we made — the
+            // cleanup contract on `Netlink::setup_tap_on_bridge`. The caller cannot do this:
+            // it cannot tell our half-created tap from a live sibling's interface of the same
+            // name in this shared namespace.
+            if let Err(cleanup_err) = self.delete_link(netns, name_for_cleanup.as_str()) {
+                tracing::warn!(
+                    "setup_tap_on_bridge: failed to remove the tap {} we created in {} after an \
+                     enslave error ({}): {}",
+                    name_for_cleanup,
+                    netns,
+                    e,
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn delete_link(&self, netns: &str, link: &str) -> Result<()> {
+        let ns = netns_rs::NetNs::get(netns)
+            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
+        let link_name = link.to_string();
+
+        let res = ns.run(move |_| {
+            run_with_rtnetlink(|handle| async move {
+                let idx = link_index(&handle, &link_name).await?;
+                handle
+                    .link()
+                    .del(idx)
+                    .execute()
+                    .await
+                    .map_err(|e| format!("link {link_name} del err: {e}"))?;
+                Ok(())
+            })
+        });
+
+        match res {
+            Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(Error::Network(e)),
             Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
         }
@@ -588,6 +755,31 @@ mod tests {
                 return Err(Error::Network("injected setup_tap failure".to_string()));
             }
             Ok(None)
+        }
+        fn create_bridge(
+            &self,
+            netns: &str,
+            bridge: &str,
+            gateway: std::net::Ipv4Addr,
+            prefix_len: u8,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "create_bridge({netns}, {bridge}, {gateway}/{prefix_len})"
+            ));
+            Ok(())
+        }
+        fn setup_tap_on_bridge(&self, netns: &str, tap_name: &str, bridge: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "setup_tap_on_bridge({netns}, {tap_name}, {bridge})"
+            ));
+            Ok(())
+        }
+        fn delete_link(&self, netns: &str, link: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("delete_link({netns}, {link})"));
+            Ok(())
         }
         fn delete_netns(&self, name: &str) -> Result<()> {
             self.calls

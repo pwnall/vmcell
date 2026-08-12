@@ -104,6 +104,10 @@ fn fc_capabilities() -> VmmCapabilities {
         restore_rotates_host_paths: false,
         // FC has a native per-drive rate limiter (`rate_limiter`), §4.6.
         disk_io_throttle: true,
+        // Firecracker's minimal device model has no USB controller of any kind (§2.4, QEMU q35 — the fallback and most-proven nester),
+        // so host-USB passthrough is a hard, documented false; `create()` rejects a USB
+        // device fail-loud via the shared `reject_usb_host_devices` predicate.
+        usb_host_passthrough: false,
     }
 }
 
@@ -378,6 +382,32 @@ fn noxsave_fallback(has_cpu_template: bool) -> &'static str {
     if has_cpu_template { "" } else { "noxsave " }
 }
 
+/// Firecracker's `PUT /network-interfaces/eth0` body.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct NetworkInterface {
+    iface_id: String,
+    host_dev_name: String,
+    guest_mac: String,
+}
+
+/// Builds that request, with the guest MAC from the **one** [`vmcell::net::mac_math`] law.
+///
+/// Pure so the identity is gate-able without KVM — the other three backends pin their MAC through
+/// a composed-argv/serialized-config test, and FC built this inline, so a constant MAC here left
+/// the whole KVM-free suite green. It is load-bearing for §6.5: on a per-VM `/30` a duplicate MAC
+/// is invisible, but two segment members share one L2 domain, where a backend-chosen or constant
+/// MAC is a silent collision.
+///
+/// # Errors
+/// Propagates [`vmcell::net::mac_math`]'s range error for an out-of-range vmid.
+fn build_fc_network_interface(tap: &str, vmid: u32) -> Result<NetworkInterface> {
+    Ok(NetworkInterface {
+        iface_id: "eth0".to_string(),
+        host_dev_name: tap.to_string(),
+        guest_mac: vmcell::net::mac_math(vmid)?,
+    })
+}
+
 /// Reaps a failed T2-probe child's process group and unlinks its API socket. On the
 /// `wait_for_socket`-failure branch no `FcInstance` owns the socket yet (the instance
 /// is built only after a successful wait), so its `Drop` never runs — without this,
@@ -550,6 +580,9 @@ impl Vmm for Firecracker {
                 feature: "vhost_user_socket".to_string(),
             });
         }
+        // FC has no USB controller (§2.4, QEMU q35 — the fallback and most-proven nester); refuse a passthrough request through the
+        // ONE shared predicate rather than silently ignoring the accepted input.
+        vmcell::vmm::reject_usb_host_devices("firecracker", &caps, &cfg.usb_host_devices)?;
 
         if !cfg.shares.is_empty() {
             return Err(Error::Unsupported {
@@ -610,7 +643,7 @@ impl Vmm for Firecracker {
             boot_args: String,
         }
 
-        let cmdline = vmcell::config::build_kernel_cmdline(cfg, res.vmid, fpu_guard)?;
+        let cmdline = vmcell::config::build_kernel_cmdline(cfg, res, fpu_guard)?;
 
         instance
             .api_request(
@@ -708,22 +741,11 @@ impl Vmm for Firecracker {
 
         // Configure Network
         if let Some(tap) = &res.tap_name {
-            #[derive(Serialize)]
-            struct NetworkInterface {
-                iface_id: String,
-                host_dev_name: String,
-                guest_mac: String,
-            }
-            let mac = vmcell::net::mac_math(res.vmid)?;
             instance
                 .api_request(
                     "PUT",
                     "/network-interfaces/eth0",
-                    Some(&NetworkInterface {
-                        iface_id: "eth0".to_string(),
-                        host_dev_name: tap.clone(),
-                        guest_mac: mac,
-                    }),
+                    Some(&build_fc_network_interface(tap, res.vmid)?),
                 )
                 .await?;
         }
@@ -1129,6 +1151,46 @@ mod tests {
         }
     }
 
+    // v30 §18 delta 8, review fix: FC's guest MAC comes from the ONE `mac_math(vmid)` law, and the
+    // JSON firecracker actually receives carries it.
+    //
+    // Buggy impl guarded: replacing `mac_math(res.vmid)` with a constant (say the QEMU default
+    // `52:54:00:12:34:56`) left the ENTIRE KVM-free suite green — FC built its `NetworkInterface`
+    // inline inside `spawn_fc`, so nothing pure was testable and only the live segment matrix
+    // caught it, 73 s in. Both assertions below redden on that mutation: the identity, and the
+    // per-vmid distinctness two members of one segment depend on.
+    #[test]
+    fn fc_network_interface_carries_the_vmid_derived_mac() {
+        let a = build_fc_network_interface("vmcell-tap-7", 7).expect("a valid vmid builds");
+        assert_eq!(a.iface_id, "eth0");
+        assert_eq!(a.host_dev_name, "vmcell-tap-7");
+        assert_eq!(
+            a.guest_mac,
+            vmcell::net::mac_math(7).expect("mac_math(7)"),
+            "the guest MAC must be the one mac_math law, not a backend default"
+        );
+
+        // Bridge-uniqueness, the §6.5 premise: two members' MACs differ.
+        let b = build_fc_network_interface("vmcell-tap-9", 9).expect("a valid vmid builds");
+        assert_ne!(
+            a.guest_mac, b.guest_mac,
+            "two segment members on one bridge must not share a MAC"
+        );
+
+        // …and it survives serialization: this body is what FC is actually PUT.
+        let json = serde_json::to_string(&a).expect("the request serializes");
+        assert!(
+            json.contains(&format!("\"guest_mac\":\"{}\"", a.guest_mac)),
+            "the PUT body must carry the derived MAC: {json}"
+        );
+
+        // An out-of-range vmid is a typed error, not a silently truncated MAC.
+        assert!(
+            build_fc_network_interface("vmcell-tap-0", 0).is_err(),
+            "vmid 0 has no valid MAC and must fail loud"
+        );
+    }
+
     // Guards VMM-4: the probe must distinguish a firm "T2 unsupported" (a 400 template
     // error) from a transient probe failure (a 500, a non-template 400, a timeout, a
     // transport error). The buggy inverse — the old code collapsed every `Err(_)` to
@@ -1335,8 +1397,18 @@ mod tests {
         );
         // The instance-facing free function and the `Vmm` trait method must agree, so
         // `FcInstance::snapshot`'s self-check sees the same gate the orchestrator does.
+        // FC's device model has no USB controller at all (§2.4), so a USB config is
+        // rejected at create() rather than silently dropped (v30 §18 delta 9).
+        assert!(
+            !caps.usb_host_passthrough,
+            "FC has no USB device model; a true would silently drop the requested device"
+        );
         assert_eq!(caps.snapshot_restore, fc_capabilities().snapshot_restore);
         assert_eq!(caps.lazy_restore, fc_capabilities().lazy_restore);
+        assert_eq!(
+            caps.usb_host_passthrough,
+            fc_capabilities().usb_host_passthrough
+        );
         assert_eq!(
             caps.restore_rotates_host_paths,
             fc_capabilities().restore_rotates_host_paths
@@ -1371,6 +1443,7 @@ mod tests {
             cgroup_name: "vmcell-test".to_string(),
             tap_name: Some("tap0".to_string()),
             netns_name: None,
+            segment: None,
             vhost_user_socket: None,
             vmid: 1,
             guest_cid: 3,
@@ -1412,6 +1485,7 @@ mod tests {
             cgroup_name: "vmcell-test".to_string(),
             tap_name: None,
             netns_name: None,
+            segment: None,
             vhost_user_socket: None,
             vmid: 1,
             guest_cid: 3,

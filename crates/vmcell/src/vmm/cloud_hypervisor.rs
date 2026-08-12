@@ -224,7 +224,12 @@ fn build_ch_net(res: &PerVmResources) -> Result<Vec<ChNet>> {
     if let Some(tap) = &res.tap_name {
         Ok(vec![ChNet {
             tap: Some(tap.clone()),
-            mac: None,
+            // The guest MAC is the shared `mac_math(vmid)` on BOTH arms (v30 §18 delta 8). The tap
+            // arm previously emitted `mac: None`, leaving the guest MAC to CH's own undocumented
+            // generation — harmless while each privileged VM owned an isolated /30 L2 domain, but a
+            // shared segment bridge needs the vmid-derived, host-unique MAC the §6.5
+            // collision-freedom argument assumes.
+            mac: Some(crate::net::mac_math(res.vmid)?),
             vhost_user: None,
             vhost_mode: None,
             vhost_socket: None,
@@ -536,6 +541,15 @@ impl Vmm for CloudHypervisor {
             cfg.console_mode,
         )?;
 
+        // CH's upstream device model has no USB controller (§2.4, v30 §18 delta 9), so a
+        // passthrough request is refused through the ONE shared predicate rather than
+        // silently ignored.
+        crate::vmm::reject_usb_host_devices(
+            "cloud-hypervisor",
+            &self.capabilities(),
+            &cfg.usb_host_devices,
+        )?;
+
         let SpawnedCh {
             api_socket,
             vsock_path,
@@ -601,7 +615,7 @@ impl Vmm for CloudHypervisor {
             },
             payload: ChPayload {
                 kernel: cfg.kernel.clone(),
-                cmdline: crate::config::build_kernel_cmdline(cfg, res.vmid, "")?,
+                cmdline: crate::config::build_kernel_cmdline(cfg, res, "")?,
             },
             disks: vec![],
             fs: ch_fs,
@@ -714,6 +728,11 @@ impl Vmm for CloudHypervisor {
             restore_rotates_host_paths: true,
             // CH has a native per-drive rate limiter (`rate_limiter_config`), §4.6.
             disk_io_throttle: true,
+            // Cloud Hypervisor's upstream device model has no USB controller at all
+            // (§2.4, v30 §18 delta 9), so host-USB passthrough is a hard, documented
+            // false; `create()` rejects a USB device fail-loud via the shared
+            // `reject_usb_host_devices` predicate.
+            usb_host_passthrough: false,
         }
     }
 
@@ -1184,6 +1203,12 @@ mod tests {
     // Shape-gate build_ch_net for BOTH net branches (like its four extracted siblings).
     // Inverse (branch swap, dropped mac, or a local format! MAC diverging from mac_math)
     // reddens the branch-specific / positive-identity asserts.
+    //
+    // v30 §18 delta 8: the tap arm carries `mac_math(vmid)` too. It used to emit `mac: None`,
+    // leaving the guest MAC to CH's own generation — invisible while each privileged VM owned an
+    // isolated /30, but two members of one segment bridge must not collide. Buggy impl guarded:
+    // reverting to `mac: None` reddens the positive-identity assert; a constant MAC reddens the
+    // distinctness assert.
     #[test]
     fn build_ch_net_shapes_tap_and_vhost_user_branches() {
         use crate::vmm::PerVmResources;
@@ -1191,14 +1216,16 @@ mod tests {
             cgroup_name: String::new(),
             tap_name: tap,
             netns_name: None,
+            segment: None,
             vhost_user_socket: sock,
             vmid,
             guest_cid: 3,
             tmp_dir: PathBuf::new(),
         };
 
-        // Privileged (tap) branch: a single tap device, no mac / vhost fields.
-        let tap_net = build_ch_net(&base(Some("vmcell-tap0".into()), None, 7)).unwrap();
+        // Privileged (tap) branch: a single tap device, no vhost fields, and the vmid-derived MAC.
+        let tap_vmid = 7;
+        let tap_net = build_ch_net(&base(Some("vmcell-tap0".into()), None, tap_vmid)).unwrap();
         assert_eq!(tap_net.len(), 1);
         let j = serde_json::to_string(&tap_net[0]).unwrap();
         assert!(
@@ -1209,7 +1236,18 @@ mod tests {
             !j.contains("vhost_user"),
             "tap device must not set vhost_user: {j}"
         );
-        assert!(!j.contains("mac"), "tap device must not set a mac: {j}");
+        // Positive identity, recomputed through the one law (never a test-local format!).
+        assert_eq!(
+            tap_net[0].mac.as_deref(),
+            Some(crate::net::mac_math(tap_vmid).unwrap().as_str()),
+            "the tap arm must carry mac_math(vmid): {j}"
+        );
+        // …and two vmids get DISTINCT MACs, which is what makes a shared segment bridge sound.
+        let other = build_ch_net(&base(Some("vmcell-tap1".into()), None, 8)).unwrap();
+        assert_ne!(
+            tap_net[0].mac, other[0].mac,
+            "two vmids must not share a guest MAC on a segment bridge"
+        );
 
         // Unprivileged (vhost-user) branch: client mode + the vmid-derived MAC.
         let vmid = 9;

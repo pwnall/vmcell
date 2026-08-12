@@ -29,7 +29,32 @@ name = "vmcell"
 # crosvm has no disk I/O rate limiter — so `VmmCapabilities` gained a `disk_io_throttle` field. That
 # is a breaking change to an externally-constructible (exhaustive) struct (cargo-semver-checks
 # `constructible_struct_adds_field`), hence the pre-1.0 minor bump.
-version = "0.12.0"
+# 0.12.0 → 0.13.0: the design v30 §18 downstream-platform pass (deltas 1–9), one breaking release.
+# Every edge below is deliberate and named here so a consumer reads it in the ledger instead of
+# discovering it when their build breaks (§10.4, the downstream toolkit contract):
+#   * `constructible_struct_adds_field` (exhaustive structs, the intended compile-time fail-loud):
+#     `ResolvePinsStage.overlay_file` (delta 1), `RootfsStage.extra` (delta 6),
+#     `PerVmResources.segment` (delta 8), `VmmCapabilities.usb_host_passthrough` (delta 9).
+#   * `struct_pub_field_missing`: `ResolvePinsStage.pins_file` is GONE (delta 1) — the pins baseline
+#     is now the compile-time-embedded `pins.json`, so a caller-supplied baseline path would be a
+#     second source of truth with no stated precedence. `overlay_file` is what a caller sets now.
+#   * `function_parameter_count_changed`: `pack_erofs_with_injection`, `tar2erofs::tar_to_erofs`,
+#     `oci::build_rootfs` and `fold_rootfs_injection_identity` each gained the `extra: &[ExtraFile]`
+#     downstream-injection slot (delta 6; existing callers pass `&[]`); `sweep_orphans` gained
+#     `live_segids` (delta 8 — a segment netns must be liveness-checked against its OWN id space,
+#     never against live vmids). `build_kernel_cmdline` keeps its arity but now takes `&PerVmResources`
+#     instead of a bare `vmid`, because the segment `ip=` token is derived from the membership.
+#   * `enum_no_repr_variant_discriminant_changed`: `NetConfig::None` moved 2 → 3 as `Segment` was
+#     inserted (delta 8). `NetConfig` is `#[non_exhaustive]`, so this only bites code that relies on
+#     discriminant VALUES (a transmute or an `as` cast), never a match.
+#   * `trait_method_added`: `Netlink` gained `create_bridge` / `setup_tap_on_bridge` / `delete_link`
+#     (delta 8). Out-of-tree implementors of that seam must add the three methods.
+#   * `auto_trait_impl_removed`: `VmConfig`, `Zygote` and `Lineage` are no longer `UnwindSafe` /
+#     `RefUnwindSafe`, because `NetConfig::Segment` carries the `Arc<Mutex<…>>`-backed segment
+#     handle. Only `catch_unwind` callers holding those types across the boundary are affected.
+# The `vmcell-artifact-validator` half of the contract surface is additive in this pass
+# (`cargo semver-checks -p vmcell-artifact-validator`: no update required).
+version = "0.13.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -119,6 +144,14 @@ required-features = ["cloud-hypervisor"]
 [[test]]
 name = "shares_ro_rw"
 path = "tests/shares_ro_rw.rs"
+required-features = ["cloud-hypervisor"]
+
+# v30 §18 delta 8: the VM-to-VM segment live battery (§6.5). Auto-joins `serial-host` via the
+# workspace-glob nextest override, and `test-privileged`'s filter selects it (it is neither
+# `unprivileged` nor `smoltcp`).
+[[test]]
+name = "segment"
+path = "tests/segment.rs"
 required-features = ["cloud-hypervisor"]
 
 [[test]]
@@ -222,7 +255,7 @@ virtio-bindings = { version = "0.2.7", optional = true }
 smoltcp = { version = "0.13.1", optional = true, features = ["std", "log", "medium-ethernet", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "phy-tuntap_interface"] }
 am-fs-erofs = { version = "0.1.1", optional = true }
 async-trait = { version = "0.1.89", optional = true }
-# Used only by the privileged tap path (`net/tap.rs`, alongside rtnetlink 0.14) and the proxy CA
+# Used only by the privileged tap path (`net/tap.rs`, alongside rtnetlink 0.21) and the proxy CA
 # authority type (`proxy/tls.rs`); both are optional so they stay out of feature-trimmed builds.
 netlink-packet-route = { version = "0.30", optional = true }
 http = { version = "1", optional = true }

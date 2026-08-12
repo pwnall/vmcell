@@ -70,6 +70,15 @@ pub struct VmConfig {
     /// [`image`](BlockDevice::image) must live at a **stable path** to survive a
     /// restore. Default empty.
     pub extra_disks: Vec<BlockDevice>,
+    /// Host USB devices passed through to the guest ([`UsbHostDevice`], §2.4, QEMU q35 — the fallback and most-proven nester).
+    /// **QEMU only**: it is the one backend whose upstream binary attaches a host USB
+    /// device, so it alone reports
+    /// [`usb_host_passthrough`](crate::vmm::VmmCapabilities::usb_host_passthrough); every
+    /// other backend's `create()` refuses a non-empty list with a typed
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported) rather than silently
+    /// dropping it. A passed-through device is **not** migratable, so
+    /// [`VmConfigBuilder::build`] rejects this combined with `snapshotting`. Default empty.
+    pub usb_host_devices: Vec<UsbHostDevice>,
     /// Append-only extra kernel command-line arguments, appended **after** every
     /// token vmcell owns (§5.3, The kernel command line). An extra arg can add a boot parameter but can never
     /// override one vmcell controls; [`VmConfigBuilder::build`] rejects any arg whose
@@ -345,13 +354,21 @@ pub(crate) fn push_guest_timeout_args(cmdline: &mut String, timeouts: &Timeouts)
 /// `backend_extra` carries the one genuine per-backend fragment (Firecracker's
 /// `noxsave ` FPU guard), inserted before `init=` exactly where it was.
 ///
+/// It takes the whole [`PerVmResources`](crate::vmm::PerVmResources) rather than a bare `vmid`
+/// (v30 §18 delta 8, a recorded signature shift): the `ip=` token now depends on `res.segment` —
+/// a segment member gets `10.201.<s>.<k+1>` with gateway `.1` and mask `/24` instead of the per-VM
+/// `/30` — and `PerVmResources` is the exhaustive struct that makes that dependency a compile
+/// error for any backend that ignores it.
+///
 /// # Errors
-/// Propagates the `/30` host-IP math error when networking is enabled.
+/// Propagates the `/30` host-IP math error (or the segment `/24` math error) when networking is
+/// enabled.
 pub fn build_kernel_cmdline(
     cfg: &VmConfig,
-    vmid: u32,
+    res: &crate::vmm::PerVmResources,
     backend_extra: &str,
 ) -> Result<String, crate::error::Error> {
+    let vmid = res.vmid;
     let rootfstype = match &cfg.rootfs {
         RootfsSource::Erofs { .. } => "erofs",
         _ => "ext4",
@@ -388,7 +405,16 @@ pub fn build_kernel_cmdline(
         init,
         vmid,
     );
-    if !matches!(cfg.net, NetConfig::None) {
+    // The guest configures `eth0` from this token and nothing else — zero netlink in PID 1
+    // (law C6), on the per-VM /30 and on a segment alike. A segment member's address is read from
+    // `res.segment`, the exhaustive-struct channel; the /24 mask and the `.1` gateway are the
+    // segment's, not the /30's.
+    if let Some(membership) = &res.segment {
+        let (gateway, guest_ip, _) = membership.addresses()?;
+        s.push_str(&format!(
+            " ip={guest_ip}::{gateway}:255.255.255.0::eth0:off"
+        ));
+    } else if !matches!(cfg.net, NetConfig::None) {
         let (host_ip, guest_ip, _) = crate::net::ip_math(vmid)?;
         s.push_str(&format!(
             " ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"
@@ -587,6 +613,43 @@ impl BlockDevice {
     pub fn with_io_limit(mut self, limit: DiskIoLimit) -> Self {
         self.io_limit = Some(limit);
         self
+    }
+}
+
+/// A host USB device passed through to the guest, identified by its USB vendor and
+/// product ID (§2.4, QEMU q35 — the fallback and most-proven nester).
+///
+/// Attached on QEMU as one `-device qemu-xhci` controller plus a
+/// `-device usb-host,vendorid=0x…,productid=0x…` per device — the
+/// [`usb_host_passthrough`](crate::vmm::VmmCapabilities::usb_host_passthrough)
+/// capability, which only QEMU advertises. The pair identifies the device *by type*,
+/// not by bus/port, so the host must expose exactly one matching device; both IDs are
+/// required and validated at [`VmConfigBuilder::build`].
+///
+/// A passed-through device is host state living outside guest RAM, so it cannot be
+/// migrated: `build()` rejects a USB device combined with `snapshotting`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct UsbHostDevice {
+    /// The USB vendor ID (the `idVendor` sysfs value), e.g. `0x1d6b`.
+    pub vendor_id: u16,
+    /// The USB product ID (the `idProduct` sysfs value), e.g. `0x0002`.
+    pub product_id: u16,
+}
+
+impl UsbHostDevice {
+    /// A host USB device selected by its `(vendor_id, product_id)` pair.
+    ///
+    /// Both IDs must be non-zero — QEMU's `usb-host` treats a `0` `vendorid`/`productid`
+    /// as *unset* (match-any) rather than as a literal match, so a zero would silently
+    /// widen the selection to an arbitrary host device. [`VmConfigBuilder::build`]
+    /// rejects that fail-loud.
+    #[must_use]
+    pub fn new(vendor_id: u16, product_id: u16) -> Self {
+        Self {
+            vendor_id,
+            product_id,
+        }
     }
 }
 
@@ -902,9 +965,65 @@ pub enum NetConfig {
         /// Optional port for host services accessible from the guest.
         host_services_port: Option<u16>,
     },
+    /// Shared L2 **segment** membership: the VM's tap lives in the segment's namespace, enslaved to
+    /// the segment bridge, so two members reach each other over a real kernel-bridged L2 domain
+    /// (§6.5, VM-to-VM segments; v30 §18 delta 8).
+    ///
+    /// Deliberately carries **no `egress` and no `host_services_port`**: a segment VM's
+    /// connectivity is segment-internal by definition in v30, so a MITM proxy or a NAT forward on a
+    /// member is *unrepresentable* rather than validated (the same move delta 4 made for
+    /// `host_services_port`). Per-segment filtered egress is recorded forward work (§17).
+    Segment {
+        /// The segment to join. Every member holds a clone of this handle, and the namespace and
+        /// bridge are reclaimed when the last holder drops.
+        segment: crate::net::NetSegmentRef,
+    },
     /// No networking configuration.
     #[default]
     None,
+}
+
+/// Whether `net` selects the **kernel tap in a netns** datapath — `Privileged` or `Segment`
+/// (§6.2, NetConfig and the two datapaths).
+///
+/// The one predicate for that question, so no caller re-derives the mode from an ad-hoc match. Note
+/// what it is *not*: the backends' device wiring keys on `res.tap_name.is_some()`, the stronger
+/// exhaustive-struct channel (a `PerVmResources` field every backend must acknowledge to compile),
+/// and `assert_tap_wiring_matches` below is the law that keeps the two in lockstep.
+#[must_use]
+pub fn net_uses_tap(net: &NetConfig) -> bool {
+    match net {
+        NetConfig::Privileged { .. } | NetConfig::Segment { .. } => true,
+        NetConfig::Unprivileged { .. } | NetConfig::None => false,
+        // No wildcard arm on purpose: `NetConfig` is `#[non_exhaustive]` to *consumers*, but
+        // in-crate this match is exhaustive, so a new variant is a compile error here — the
+        // fail-loud channel that stops a new datapath from silently defaulting to "no tap".
+    }
+}
+
+/// Fail-loud post-condition: the resources the orchestrator allocated must agree with what
+/// [`net_uses_tap`] says the config's datapath is.
+///
+/// A `Privileged`/`Segment` config with no tap would boot a guest with an unconfigurable `eth0`
+/// (and, on a segment, no bridge port at all); a `Unprivileged`/`None` config carrying one would
+/// take the backends' tap arm and silently ignore the NAT. Checked once, in the orchestrator, so
+/// every backend can keep keying on `res.tap_name`.
+///
+/// # Errors
+/// [`crate::error::Error::Network`] naming the mismatch.
+pub(crate) fn assert_tap_wiring_matches(
+    net: &NetConfig,
+    tap_present: bool,
+) -> Result<(), crate::error::Error> {
+    if net_uses_tap(net) != tap_present {
+        return Err(crate::error::Error::Network(format!(
+            "network wiring mismatch: net_uses_tap = {}, but a tap interface is {} — a \
+             tap-datapath config must be handed a tap, and a NAT/no-net config must not",
+            net_uses_tap(net),
+            if tap_present { "present" } else { "absent" },
+        )));
+    }
+    Ok(())
 }
 
 /// Egress filtering strategy for outbound network traffic.
@@ -1015,6 +1134,7 @@ impl VmConfig {
             console_mode: ConsoleMode::Uart,
             resource_prefix: crate::naming::DEFAULT_RESOURCE_PREFIX.to_string(),
             extra_disks: vec![],
+            usb_host_devices: vec![],
             extra_kernel_args: vec![],
             init: None,
             vmm_seccomp: VmmSeccomp::default(),
@@ -1045,6 +1165,7 @@ pub struct VmConfigBuilder {
     console_mode: ConsoleMode,
     resource_prefix: String,
     extra_disks: Vec<BlockDevice>,
+    usb_host_devices: Vec<UsbHostDevice>,
     extra_kernel_args: Vec<String>,
     init: Option<PathBuf>,
     vmm_seccomp: VmmSeccomp,
@@ -1081,6 +1202,17 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn with_extra_disk(mut self, disk: BlockDevice) -> Self {
         self.extra_disks.push(disk);
+        self
+    }
+
+    /// Passes a host USB device through to the guest ([`UsbHostDevice`], §2.4, QEMU q35 — the fallback and most-proven nester).
+    /// **QEMU only** — every other backend's `create()` refuses a non-empty list with a
+    /// typed [`Error::Unsupported`](crate::error::Error::Unsupported). Validated at
+    /// [`build`](Self::build), which rejects a zero ID, a duplicate device, and the
+    /// combination with `snapshotting`.
+    #[must_use]
+    pub fn with_usb_host_device(mut self, device: UsbHostDevice) -> Self {
+        self.usb_host_devices.push(device);
         self
     }
 
@@ -1236,7 +1368,11 @@ impl VmConfigBuilder {
     ///   rootfs, any virtio-fs data share, or unprivileged (vhost-user-net)
     ///   networking — which violates the §8.1 (The warm-snapshot path and the eligibility law) snapshot-eligibility law;
     /// - `ksm_mergeable` combined with any vhost-user device (it sets CH
-    ///   `shared=off`, mutually exclusive with the vhost-user paths — §8.3, Density levers).
+    ///   `shared=off`, mutually exclusive with the vhost-user paths — §8.3, Density levers);
+    /// - a [`UsbHostDevice`] with a zero vendor or product ID (QEMU reads a zero as
+    ///   *unset* — match-any — not as a literal ID), two USB devices naming the same
+    ///   `(vendor_id, product_id)` pair, or any USB device combined with
+    ///   `snapshotting` (a passed-through host device is not migratable, §2.4, QEMU q35 — the fallback and most-proven nester).
     ///
     /// This validates internal consistency only; it does **not** check that the
     /// kernel, rootfs, or share paths exist on disk.
@@ -1342,6 +1478,30 @@ impl VmConfigBuilder {
             if matches!(self.net, NetConfig::Unprivileged { .. }) {
                 return Err(crate::error::Error::Config(
                     "unprivileged (vhost-user-net) networking cannot be combined with snapshotting"
+                        .into(),
+                ));
+            }
+            // §6.5 (VM-to-VM segments), v30 §18 delta 8: restore-time slot and addressing
+            // semantics for a segment are deliberately unspecified in v30 (§17) — a restored
+            // member would resume holding a frozen slot address whose tap no longer exists, and
+            // the fan-out would silently dual-claim it. Reject fail-loud at the boundary.
+            if matches!(self.net, NetConfig::Segment { .. }) {
+                return Err(crate::error::Error::Config(
+                    "vm-to-vm segment membership cannot be combined with snapshotting (restore-time \
+                     slot and addressing semantics are unspecified in v30)"
+                        .into(),
+                ));
+            }
+            // §2.4 (QEMU q35 — the fallback and most-proven nester), v30 §18 (Delta register) delta 9: a passed-through host USB device is
+            // host state living OUTSIDE guest RAM — the migration stream carries the
+            // guest's view of the xhci controller but not the host device behind it, so
+            // a restore would resume a guest holding a handle to a device the
+            // destination never attached. Reject fail-loud at the boundary rather than
+            // silently dropping the device on restore.
+            if !self.usb_host_devices.is_empty() {
+                return Err(crate::error::Error::Config(
+                    "host USB passthrough cannot be combined with snapshotting (a \
+                     passed-through host device is not part of the migration stream)"
                         .into(),
                 ));
             }
@@ -1489,6 +1649,31 @@ impl VmConfigBuilder {
             }
         }
 
+        // Host USB passthrough (§2.4, QEMU q35 — the fallback and most-proven nester), v30 §18 (Delta register) delta 9. QEMU's `usb-host`
+        // selects by `(vendorid, productid)` and treats a **zero** id as *unset* — i.e.
+        // "match any device on this axis" — so `vendorid=0x0000` would attach an
+        // arbitrary host device instead of failing to find the requested one. Reject a
+        // zero id at the boundary (honor-or-reject accepted input). A duplicate pair is
+        // equally ambiguous: both `usb-host` devices would race for the ONE matching host
+        // device, so the second silently gets nothing.
+        let mut usb_ids = std::collections::HashSet::new();
+        for dev in &self.usb_host_devices {
+            if dev.vendor_id == 0 || dev.product_id == 0 {
+                return Err(crate::error::Error::Config(format!(
+                    "usb host device vendor_id/product_id must be non-zero (got \
+                     {:#06x}:{:#06x}); QEMU reads a zero id as unset (match-any), not as a \
+                     literal id",
+                    dev.vendor_id, dev.product_id
+                )));
+            }
+            if !usb_ids.insert((dev.vendor_id, dev.product_id)) {
+                return Err(crate::error::Error::Config(format!(
+                    "duplicate usb host device: {:#06x}:{:#06x}",
+                    dev.vendor_id, dev.product_id
+                )));
+            }
+        }
+
         // A custom `init=` override is a single load-bearing cmdline token selecting
         // PID 1, so it is validated at the boundary (§5.3, The kernel command line): absolute, UTF-8, no
         // whitespace/control chars that could forge a second boot token.
@@ -1506,6 +1691,20 @@ impl VmConfigBuilder {
         // invalid one is rejected fail-loud at construction (never silently sanitized).
         crate::naming::validate_resource_prefix(&self.resource_prefix)
             .map_err(crate::error::Error::Config)?;
+
+        // §6.5 (VM-to-VM segments): one prefix must name every resource in the domain, or the F2
+        // name/sweep lockstep splits across two prefixes — this member's tap would be created in a
+        // namespace swept under a different filter, so a leak would never be reclaimed.
+        if let NetConfig::Segment { segment } = &self.net
+            && segment.prefix() != self.resource_prefix
+        {
+            return Err(crate::error::Error::Config(format!(
+                "a segment member's resource_prefix ({:?}) must equal the prefix its segment was \
+                 created with ({:?}): one prefix names and sweeps every resource in the domain",
+                self.resource_prefix,
+                segment.prefix()
+            )));
+        }
 
         Ok(VmConfig {
             kernel: self.kernel,
@@ -1530,6 +1729,7 @@ impl VmConfigBuilder {
             console_mode: self.console_mode,
             resource_prefix: self.resource_prefix,
             extra_disks: self.extra_disks,
+            usb_host_devices: self.usb_host_devices,
             extra_kernel_args: self.extra_kernel_args,
             init: self.init,
             vmm_seccomp: self.vmm_seccomp,
@@ -1542,6 +1742,35 @@ impl VmConfigBuilder {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The `PerVmResources` a non-segment VM with `vmid` is handed, for the cmdline tests.
+    fn test_res(vmid: u32) -> crate::vmm::PerVmResources {
+        crate::vmm::PerVmResources {
+            cgroup_name: format!("vmcell-vm-{vmid}"),
+            tap_name: None,
+            netns_name: None,
+            segment: None,
+            vhost_user_socket: None,
+            vmid,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from(format!("/tmp/vmcell-vm-test-{vmid}")),
+        }
+    }
+
+    /// The same, for a VM that is member `slot` of segment `segid`.
+    fn test_res_in_segment(vmid: u32, segid: u32, slot: u32) -> crate::vmm::PerVmResources {
+        crate::vmm::PerVmResources {
+            segment: Some(crate::net::SegmentMembership {
+                netns: crate::naming::segment_netns_name("vmcell", segid),
+                tap_name: crate::naming::tap_name("vmcell", vmid),
+                segid,
+                slot,
+            }),
+            tap_name: Some(crate::naming::tap_name("vmcell", vmid)),
+            netns_name: Some(crate::naming::segment_netns_name("vmcell", segid)),
+            ..test_res(vmid)
+        }
+    }
 
     #[test]
     fn test_builder_defaults() {
@@ -1728,7 +1957,7 @@ mod tests {
         )
         .build()
         .unwrap();
-        let c = build_kernel_cmdline(&ok, 1, "").unwrap();
+        let c = build_kernel_cmdline(&ok, &test_res(1), "").unwrap();
         assert!(c.contains("rootfstype=erofs"), "{c}");
         // An Erofs root is read-only with no journal to replay, so `rootflags=noload`
         // (a Block-rootfs token) must be ABSENT. A refactor emitting it
@@ -2354,8 +2583,8 @@ mod tests {
         .build()
         .unwrap();
 
-        let plain = build_kernel_cmdline(&cfg, 1, "").unwrap();
-        let fpu = build_kernel_cmdline(&cfg, 1, "noxsave ").unwrap();
+        let plain = build_kernel_cmdline(&cfg, &test_res(1), "").unwrap();
+        let fpu = build_kernel_cmdline(&cfg, &test_res(1), "noxsave ").unwrap();
         for c in [&plain, &fpu] {
             // The default (Uart) console token is `ttyS0`, emitted as the FIRST
             // cmdline token. A hardcoded `console=hvc0` (or a dropped token) reddens.
@@ -2414,7 +2643,7 @@ mod tests {
         .network_disabled()
         .build()
         .unwrap();
-        let vc = build_kernel_cmdline(&verbose, 1, "").unwrap();
+        let vc = build_kernel_cmdline(&verbose, &test_res(1), "").unwrap();
         assert!(
             vc.contains("loglevel=7"),
             "verbose loglevel not honored: {vc}"
@@ -2432,7 +2661,7 @@ mod tests {
         .network_disabled()
         .build()
         .unwrap();
-        let hvc = build_kernel_cmdline(&virtio, 1, "").unwrap();
+        let hvc = build_kernel_cmdline(&virtio, &test_res(1), "").unwrap();
         assert!(
             hvc.starts_with("console=hvc0"),
             "VirtioConsole must emit console=hvc0 first: {hvc}"
@@ -2577,6 +2806,95 @@ mod tests {
         .with_extra_disk(BlockDevice::read_only("/img/data.raw"))
         .build()
         .expect("a valid absolute extra-disk image must build");
+    }
+
+    // §2.4 (QEMU q35 — the fallback and most-proven nester), v30 §18 (Delta register) delta 9, rejection 1: a passed-through host USB
+    // device is host state outside guest RAM, so it cannot ride the migration stream —
+    // `snapshotting` + USB must be refused at the boundary. Buggy impl this guards: the
+    // snapshotting block omits the USB arm, so the config builds and the VM snapshots
+    // into an image that silently loses the device on restore.
+    #[test]
+    fn reject_usb_host_device_with_snapshot() {
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_usb_host_device(UsbHostDevice::new(0x1d6b, 0x0002))
+        .snapshotting(true)
+        .build()
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config(_)));
+        assert!(
+            err.to_string()
+                .contains("host USB passthrough cannot be combined with snapshotting"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // §2.4 (QEMU q35 — the fallback and most-proven nester), v30 §18 (Delta register) delta 9, rejection 2: a zero id is QEMU's *unset*
+    // sentinel (match-any), not a literal id, so it would attach an ARBITRARY host
+    // device; a duplicate `(vendor_id, product_id)` pair is equally ambiguous (two
+    // `usb-host` devices racing for the one match). Buggy impl this guards: the id loop
+    // is absent, so `0x0000:0x0000` builds and QEMU grabs whatever it finds first.
+    #[test]
+    fn reject_bad_usb_host_device() {
+        let mk = |devs: &[UsbHostDevice]| {
+            let mut b = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            );
+            for d in devs {
+                b = b.with_usb_host_device(*d);
+            }
+            b.build()
+        };
+        for (devs, needle) in [
+            (vec![UsbHostDevice::new(0, 0x0002)], "must be non-zero"),
+            (vec![UsbHostDevice::new(0x1d6b, 0)], "must be non-zero"),
+            (
+                vec![
+                    UsbHostDevice::new(0x1d6b, 0x0002),
+                    UsbHostDevice::new(0x1d6b, 0x0002),
+                ],
+                "duplicate usb host device",
+            ),
+        ] {
+            let err = mk(&devs).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)) && err.to_string().contains(needle),
+                "expected {needle:?}, got {err}"
+            );
+        }
+    }
+
+    // §2.4 (QEMU q35 — the fallback and most-proven nester) positive control for both rejections above: two DISTINCT non-zero devices
+    // on a non-snapshotting config build, and land on `VmConfig` in call order. The
+    // over-rejection inverse (refusing every USB device, or keying the duplicate check on
+    // the vendor id alone) reddens here.
+    #[test]
+    fn accept_valid_usb_host_devices() {
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_usb_host_device(UsbHostDevice::new(0x1d6b, 0x0002))
+        .with_usb_host_device(UsbHostDevice::new(0x1d6b, 0x0003))
+        .build()
+        .expect("two distinct non-zero USB devices must build");
+        assert_eq!(
+            cfg.usb_host_devices,
+            vec![
+                UsbHostDevice::new(0x1d6b, 0x0002),
+                UsbHostDevice::new(0x1d6b, 0x0003)
+            ],
+            "the builder must carry the devices through in call order"
+        );
     }
 
     // §4.6 (Extra virtio-blk devices and disk-I/O throttling): DiskIoLimit constructors set the intended cap and leave the other unset; a
@@ -2832,7 +3150,7 @@ mod tests {
         .network_disabled()
         .build()
         .unwrap();
-        let c = build_kernel_cmdline(&cfg, 7, "").unwrap();
+        let c = build_kernel_cmdline(&cfg, &test_res(7), "").unwrap();
         assert!(c.contains("init=/bin/sh"), "override missing: {c}");
         assert!(
             !c.contains("init=/usr/sbin/vmcell-guest-agent"),
@@ -2857,7 +3175,7 @@ mod tests {
         .build()
         .unwrap();
         assert!(
-            build_kernel_cmdline(&default_cfg, 1, "")
+            build_kernel_cmdline(&default_cfg, &test_res(1), "")
                 .unwrap()
                 .contains(&format!("init={DEFAULT_INIT}")),
             "default init token must be the guest agent"
@@ -2879,7 +3197,7 @@ mod tests {
         .network_disabled()
         .build()
         .unwrap();
-        let c = build_kernel_cmdline(&cfg, 1, "").unwrap();
+        let c = build_kernel_cmdline(&cfg, &test_res(1), "").unwrap();
         assert!(
             c.ends_with(" mitigations=off nokaslr"),
             "extra args not last: {c}"
@@ -2897,6 +3215,205 @@ mod tests {
     // key (or the vmcell_ prefix), so `is_reserved_cmdline_arg` — and hence the
     // append-only guard — can never fall out of sync with the builder. Add a new
     // builder token without reserving its key ⇒ this reddens.
+    // ---- v30 §18 delta 8 (VM-to-VM segments) ----
+
+    /// A `NetConfig::Segment` over a hermetic, kernel-free segment.
+    fn fake_segment_config(prefix: &str) -> (crate::net::NetSegment, NetConfig) {
+        let (seg, _env, _calls) = crate::net::segment::testing::fake_segment(prefix);
+        let net = NetConfig::Segment {
+            segment: seg.clone(),
+        };
+        (seg, net)
+    }
+
+    // `net_uses_tap` is the ONE predicate for "this datapath is a kernel tap in a netns", and it
+    // is exhaustive in-crate. Buggy impl guarded: a `Segment` arm that answered `false` would let
+    // `assert_tap_wiring_matches` accept a member with no tap (a guest with an unconfigurable
+    // eth0 and no bridge port).
+    #[test]
+    fn net_uses_tap_covers_exactly_the_tap_datapaths() {
+        let (_seg, segment_net) = fake_segment_config("vmcell");
+        assert!(net_uses_tap(&NetConfig::Privileged {
+            egress: Egress::Open
+        }));
+        assert!(net_uses_tap(&segment_net));
+        assert!(!net_uses_tap(&NetConfig::Unprivileged {
+            egress: Egress::Open,
+            host_services_port: None
+        }));
+        assert!(!net_uses_tap(&NetConfig::None));
+    }
+
+    // The fail-loud post-condition the orchestrator runs after allocating resources. Buggy impl
+    // guarded: a `Segment` arm in `setup_env` that forgot to set `tap_name` (or a NAT config that
+    // set one) passes every other test and boots a silently-broken guest; this reddens.
+    #[test]
+    fn assert_tap_wiring_matches_rejects_both_mismatches() {
+        let (_seg, segment_net) = fake_segment_config("vmcell");
+        // Positive controls.
+        assert!(assert_tap_wiring_matches(&segment_net, true).is_ok());
+        assert!(
+            assert_tap_wiring_matches(
+                &NetConfig::Privileged {
+                    egress: Egress::Open
+                },
+                true
+            )
+            .is_ok()
+        );
+        assert!(assert_tap_wiring_matches(&NetConfig::None, false).is_ok());
+        // Both inverses are typed refusals, not silent acceptances.
+        assert!(matches!(
+            assert_tap_wiring_matches(&segment_net, false),
+            Err(crate::error::Error::Network(_))
+        ));
+        assert!(matches!(
+            assert_tap_wiring_matches(&NetConfig::None, true),
+            Err(crate::error::Error::Network(_))
+        ));
+    }
+
+    // §6.5: a member's `ip=` token is the SEGMENT /24 (gateway `.1`), not the per-VM /30 — read
+    // from `res.segment`, the exhaustive-struct channel. Buggy impl guarded: a builder that kept
+    // the `/30` branch for members hands the guest 10.200.x.2 with a 255.255.255.252 mask on a
+    // bridge whose gateway is 10.201.<s>.1 — no route to any peer. Recomputed through
+    // `segment_ip_math`, never a test-local literal.
+    #[test]
+    fn build_kernel_cmdline_emits_the_segment_subnet_for_a_member() {
+        let (seg, segment_net) = fake_segment_config("vmcell");
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(segment_net)
+        .build()
+        .expect("a segment config builds");
+
+        let segid = seg.segid();
+        let res = test_res_in_segment(5, segid, 2);
+        let c = build_kernel_cmdline(&cfg, &res, "").unwrap();
+
+        let (gateway, guest_ip, _) = crate::net::segment_ip_math(segid, 2).unwrap();
+        assert!(
+            c.contains(&format!(
+                " ip={guest_ip}::{gateway}:255.255.255.0::eth0:off"
+            )),
+            "a segment member's ip= must carry the /24 and the bridge gateway: {c}"
+        );
+        // The per-VM /30 must NOT appear.
+        let (host30, guest30, _) = crate::net::ip_math(5).unwrap();
+        assert!(
+            !c.contains(&format!(" ip={guest30}::{host30}")),
+            "a member must not get the per-VM /30 token: {c}"
+        );
+        assert!(
+            !c.contains("255.255.255.252"),
+            "a member must not get the /30 netmask: {c}"
+        );
+        // Every emitted token is still reserved (law F3 holds on the segment path too).
+        for token in c.split_ascii_whitespace() {
+            assert!(
+                is_reserved_cmdline_arg(token),
+                "builder token {token:?} on the segment path is not reserved: {c}"
+            );
+        }
+        // Positive control: the SAME config with no membership falls back to the /30.
+        let plain = build_kernel_cmdline(&cfg, &test_res(5), "").unwrap();
+        assert!(
+            plain.contains(&format!(
+                " ip={guest30}::{host30}:255.255.255.252::eth0:off"
+            )),
+            "a non-member must still get the per-VM /30: {plain}"
+        );
+    }
+
+    // §6.5 typed refusal 1: snapshotting + Segment. Buggy impl guarded: without the arm, the pair
+    // builds and the restore path mis-addresses a member from a frozen slot.
+    #[test]
+    fn build_rejects_snapshotting_with_a_segment() {
+        let (_seg, segment_net) = fake_segment_config("vmcell");
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(segment_net.clone())
+        .snapshotting(true)
+        .build()
+        .expect_err("snapshotting + Segment must be refused");
+        assert!(
+            matches!(&err, crate::error::Error::Config(m) if m.contains("segment")),
+            "expected a Config error naming segments, got {err:?}"
+        );
+        // Positive control: the same config without snapshotting builds.
+        assert!(
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .net(segment_net)
+            .build()
+            .is_ok()
+        );
+    }
+
+    // §6.5 typed refusal 2: one prefix must name every resource in the domain (law F2). Buggy
+    // impl guarded: without the check, an `acme`-prefixed member joins a `vmcell`-prefixed
+    // segment, so its tap is created in a namespace the `acme` sweep filter never matches and a
+    // leak is never reclaimed.
+    #[test]
+    fn build_rejects_a_member_whose_prefix_differs_from_its_segment() {
+        let (_seg, segment_net) = fake_segment_config("vmcell");
+        let err = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(segment_net.clone())
+        .resource_prefix("acme")
+        .build()
+        .expect_err("a prefix mismatch must be refused");
+        assert!(
+            matches!(&err, crate::error::Error::Config(m)
+                if m.contains("resource_prefix") && m.contains("acme")),
+            "expected a Config error naming both prefixes, got {err:?}"
+        );
+
+        // Positive control: a matching prefix on both sides builds.
+        let (_seg2, segment_net2) = fake_segment_config("acme");
+        assert!(
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .net(segment_net2)
+            .resource_prefix("acme")
+            .build()
+            .is_ok(),
+            "a member whose prefix matches its segment must build"
+        );
+        // And the default-prefix member of the default-prefix segment still builds.
+        assert!(
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .net(segment_net)
+            .build()
+            .is_ok()
+        );
+    }
+
     #[test]
     fn extra_kernel_args_cannot_clobber_reserved_tokens() {
         // A config that exercises every conditional token: block rootfs (rootflags),
@@ -2922,7 +3439,7 @@ mod tests {
         .unwrap();
         // `noxsave ` is the FC backend_extra fragment — include it so its key is
         // covered too.
-        let c = build_kernel_cmdline(&cfg, 5, "noxsave ").unwrap();
+        let c = build_kernel_cmdline(&cfg, &test_res(5), "noxsave ").unwrap();
         for token in c.split_ascii_whitespace() {
             assert!(
                 is_reserved_cmdline_arg(token),

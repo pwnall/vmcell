@@ -58,33 +58,291 @@ pub struct KernelStage {
     pub fragments: Option<Vec<String>>,
 }
 
+/// The pins key holding the KConfig text for the named fragment (§5.2, The config fragment).
+///
+/// The **one** composer for the fragment→pin-key law: both compiling producers (this crate's
+/// host-`make` [`KernelStage`] and the out-of-crate in-VM builder) resolve a fragment through it,
+/// so the key shape cannot drift between them.
+#[must_use]
+pub fn fragment_pin_key(name: &str) -> String {
+    format!("kernel_fragments_{name}")
+}
+
+/// The requested fragment names, **sorted** and de-duplicated (§5.2, The config fragment), so both
+/// the cache key and the on-disk config-append order are independent of the request order.
+///
+/// Public for the same one-law reason as [`fragment_pin_key`]: the in-VM producer canonicalizes
+/// its fragment set with this exact function, never a second copy of the sort+dedup.
+#[must_use]
+pub fn sorted_fragments(fragments: Option<&[String]>) -> Vec<String> {
+    let mut names: Vec<String> = fragments.map(<[String]>::to_vec).unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The cache-key marker for a fragment whose KConfig text **resolved** from the pins registry,
+/// prefixing the text itself.
+const FRAGMENT_RESOLVED: &[u8] = b"c:";
+
+/// The cache-key marker for a fragment name that resolved to **nothing** — no
+/// `kernel_fragments_<NAME>` pin exists (§5.5, Kernel as a benchmark dimension).
+///
+/// Distinct from [`FRAGMENT_RESOLVED`] + empty text on purpose: the old fold used
+/// `unwrap_or_default()`, so a fragment *absent* from the registry hashed identically to the same
+/// fragment *present with empty KConfig text*. Those are different builds — the first is a
+/// hard-error request, the second a legal no-op — and a shared key let the second's cached kernel
+/// be served for the first until `run()` failed.
+const FRAGMENT_MISSING: &[u8] = b"m:<missing-fragment>";
+
+/// Folds a canonicalized (sorted, de-duplicated) fragment set into `hasher`: the set's size, then
+/// each fragment's NAME and its resolved KConfig CONTENT — or the
+/// distinct `FRAGMENT_MISSING` marker when the pins registry has no such fragment.
+///
+/// The **one** fragment fold both compiling producers call (§5.2, The config fragment; §10.2, The
+/// stage model and the five cache-key rules): the name travels so two sets never collide, the
+/// content travels so editing a fragment's text invalidates the key, and the missing marker travels
+/// so an unresolvable fragment is not confused with an empty one.
+pub fn fold_fragment_identity(
+    hasher: &mut blake3::Hasher,
+    pins: &std::collections::HashMap<String, String>,
+    fragments: &[String],
+) {
+    /// Unambiguous field separator (matches each producer's own key fold).
+    const SEP: &[u8] = b"\x1f";
+    hasher.update(SEP);
+    hasher.update(&(fragments.len() as u32).to_le_bytes());
+    for name in fragments {
+        hasher.update(SEP);
+        hasher.update(name.as_bytes());
+        hasher.update(SEP);
+        match pins.get(&fragment_pin_key(name)) {
+            Some(text) => {
+                hasher.update(FRAGMENT_RESOLVED);
+                hasher.update(text.as_bytes());
+            }
+            None => {
+                hasher.update(FRAGMENT_MISSING);
+            }
+        }
+    }
+}
+
+/// The KConfig text appended after `make defconfig kvm_guest.config`: the `base` micro-VM config
+/// plus each requested fragment's registry text, in the given (already sorted) order.
+///
+/// The **one** append law both compiling producers use, so the host-`make` and in-VM builds layer
+/// identical bytes for the same request. A requested fragment absent from the pins registry is a
+/// HARD ERROR — never a silent skip that builds a kernel without the requested instrumentation
+/// (§5.2, The config fragment).
+///
+/// # Errors
+/// Returns [`Error::Artifact`] naming the fragment and the pin key it expected.
+pub fn kconfig_append(
+    base: &str,
+    pins: &std::collections::HashMap<String, String>,
+    fragments: &[String],
+) -> Result<String> {
+    let mut out = base.to_string();
+    for name in fragments {
+        let frag = pins.get(&fragment_pin_key(name)).ok_or_else(|| {
+            Error::Artifact(format!(
+                "missing kernel fragment `{name}` in pins (expected key `{}`)",
+                fragment_pin_key(name)
+            ))
+        })?;
+        out.push('\n');
+        out.push_str(frag);
+    }
+    Ok(out)
+}
+
+/// The on-disk filename **suffix** for a kernel label (`""` for the default kernel, `-<label>`
+/// with `.` sanitized to `-` otherwise) — the **one** label-sanitization law (§5.6, The downstream
+/// kernel toolkit).
+///
+/// The `.`→`-` sanitization is load-bearing: the pipeline derives a stage's cache sidecar with
+/// `Path::with_extension`, which would treat the trailing `.NNN` of a dotted version as an
+/// extension and collide same-minor labels (`vmlinux-6.6.143` → `vmlinux-6.6.cache_key`). The pins
+/// key and the cache-key *hash* keep the dotted label; only the on-disk filename is sanitized.
+///
+/// Every producer composes its filename through this function and
+/// [`kernel_label_from_filename`] is its inverse, so the rule cannot drift between the two: a
+/// producer that stopped sanitizing would make `bundle`'s reader silently drop that kernel from
+/// the manifest, which is what the round-trip gate pins.
+#[must_use]
+pub fn kernel_filename_suffix(label: Option<&str>) -> String {
+    label
+        .map(|l| format!("-{}", l.replace('.', "-")))
+        .unwrap_or_default()
+}
+
+/// The on-disk artifact **filename** of a kernel image: `vmlinux` for the default kernel,
+/// `vmlinux-<sanitized-label>` for a labelled one ([`kernel_filename_suffix`]).
+///
+/// The one composer every producer and every consumer of the artifacts dir uses — the host-`make`
+/// [`KernelStage`], the out-of-crate in-VM builder, and the benchmark harness that resolves
+/// `--kernel` to a path.
+#[must_use]
+pub fn kernel_filename(label: Option<&str>) -> String {
+    format!("vmlinux{}", kernel_filename_suffix(label))
+}
+
+/// The inverse of [`kernel_filename`]: the on-disk label carried by a kernel artifact filename,
+/// or `None` when `name` is not a labelled kernel image.
+///
+/// `vmcell bundle` walks the artifacts dir with this so the manifest covers every
+/// `vmlinux-<label>` built by `build-kernels`, not just the default `vmlinux` (N-BIN-4).
+///
+/// The bare `vmlinux` (no suffix) and an empty label return `None`, and so does a remainder
+/// containing `.`: [`kernel_filename_suffix`] sanitizes `.`→`-`, so every dotted `vmlinux-…` name
+/// in the artifacts dir is one of a kernel's SIDECARS — `vmlinux-6-12-94.cache_key`, and now
+/// `vmlinux-6-12-94.config` (§5.6). Without that rule `bundle` recorded the cache sidecar as a
+/// kernel artifact named `kernel-6-12-94.cache_key`, and would have added the config the same way.
+///
+/// This is the *inverse* of the sanitization law and therefore lives beside it: the two are pinned
+/// together by a round-trip gate over the real `kernels` registry, so neither half can move alone.
+#[must_use]
+pub fn kernel_label_from_filename(name: &str) -> Option<&str> {
+    match name.strip_prefix("vmlinux-") {
+        Some(label) if !label.is_empty() && !label.contains('.') => Some(label),
+        _ => None,
+    }
+}
+
+/// The **resolved-config sidecar** path for a built kernel image: `<vmlinux>.config` (§5.6, The
+/// downstream kernel toolkit; §10.1, Artifacts produced).
+///
+/// The one composer for the sidecar name, so the producers that write it, the CLI that bundles it
+/// and a downstream consumer that asserts against it all name the same file. It APPENDS the
+/// extension instead of using `Path::with_extension`, which would eat the trailing `.NNN` of a
+/// dotted filename (the same hazard the labelled kernel's filename suffix sanitizes for the `.cache_key`
+/// sidecar) and silently point two labels at one config.
+#[must_use]
+pub fn resolved_config_path(vmlinux: &Path) -> std::path::PathBuf {
+    let mut name = vmlinux.as_os_str().to_os_string();
+    name.push(".config");
+    std::path::PathBuf::from(name)
+}
+
+/// The [`StageOutputs`] artifact key of the resolved-config sidecar produced beside the kernel
+/// registered under `kernel_key` (`"kernel"` → `"kernel-config"`, `"kernel-<label>"` →
+/// `"kernel-<label>-config"`).
+///
+/// Registering the sidecar under its own key is what content-addresses it *with* the kernel: the
+/// pipeline records the stage's whole artifact map in the cache sidecar, so a warm build republishes
+/// the config path exactly like the `vmlinux` it belongs to.
+#[must_use]
+pub fn config_artifact_key(kernel_key: &str) -> String {
+    format!("{kernel_key}-config")
+}
+
+/// Publishes a compiling producer's post-`olddefconfig` resolved config from `config_path` to the
+/// [`resolved_config_path`] sidecar beside the built `vmlinux`, returning the sidecar path (§5.6,
+/// The downstream kernel toolkit).
+///
+/// The **one** publish law both compiling producers call — the host-`make` [`KernelStage`] (whose
+/// `.config` is left in the persistent build dir, overwritten by the next build of the same label)
+/// and the out-of-crate in-VM builder (whose `.config` dies with the builder VM unless it is
+/// shipped back on the output share). Neither may keep a second copy: the sidecar is the artifact a
+/// fragment author asserts against, because `olddefconfig` silently drops any symbol whose
+/// dependencies are unmet.
+///
+/// A missing or unreadable source config is a HARD ERROR naming `kernel` — never a skip that ships
+/// a kernel with no evidence of what it contains.
+///
+/// # Errors
+/// Returns [`Error::Artifact`] when `config_path` is absent or cannot be copied to the sidecar.
+pub async fn publish_resolved_config(
+    config_path: &Path,
+    vmlinux: &Path,
+    kernel: &str,
+) -> Result<std::path::PathBuf> {
+    let sidecar = resolved_config_path(vmlinux);
+    tokio::fs::copy(config_path, &sidecar).await.map_err(|e| {
+        Error::Artifact(format!(
+            "kernel `{kernel}` compiled but its resolved config could not be published from {} \
+             to {}: {e} (§5.6 — a kernel with no record of its own config is exactly the silent \
+             fragment drop this artifact exists to catch)",
+            config_path.display(),
+            sidecar.display()
+        ))
+    })?;
+    Ok(sidecar)
+}
+
+/// Removes a **stale** resolved-config sidecar left beside `vmlinux` by an earlier, *compiling*
+/// producer (§5.6, The downstream kernel toolkit).
+///
+/// The counterpart of [`publish_resolved_config`], for the producer that emits no config at all:
+/// [`PrebuiltKernelStage`] republishes the same `vmlinux` path with different bytes, and the
+/// sidecar is picked up from the filesystem by `vmcell bundle`. Left in place, `bundle` would
+/// digest-pin a config describing a *different* kernel as this kernel's `kernel-config` — a lying
+/// artifact that silently passes the "assert against the result, not the fragment" check the
+/// sidecar exists for.
+///
+/// An already-absent sidecar is success (the common case: nothing compiled here before).
+///
+/// # Errors
+/// Returns [`Error::Artifact`] when an existing sidecar cannot be removed — never a swallowed
+/// failure that leaves the stale file behind.
+pub async fn clear_resolved_config(vmlinux: &Path) -> Result<()> {
+    let sidecar = resolved_config_path(vmlinux);
+    match tokio::fs::remove_file(&sidecar).await {
+        Ok(()) => {
+            tracing::info!(
+                config = %sidecar.display(),
+                "removed a stale resolved-config sidecar (this producer compiles nothing)"
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Artifact(format!(
+            "failed to remove the stale resolved config at {}: {e} — leaving it would let \
+             `vmcell bundle` pin a config describing a different kernel (§5.6)",
+            sidecar.display()
+        ))),
+    }
+}
+
+/// Rejects a **labelled** or **fragment-carrying** kernel request routed at the prebuilt bootstrap
+/// seed (§5.4, The guest-kernel contract and the bootstrap seed; §5.6, The downstream kernel toolkit).
+///
+/// [`PrebuiltKernelStage`] downloads one digest-pinned `vmlinux`; it compiles nothing, so it can
+/// honor neither a `kernels.<label>` selection nor a KConfig fragment set. Silently dropping both
+/// (the pre-v30 behavior of the CLI's producer selector) handed back the default seed and reported
+/// success — a labelled build that never happened. Every producer selector routes through this one
+/// predicate rather than repeating the condition.
+///
+/// # Errors
+/// Returns [`Error::Artifact`] naming the label and/or fragments that cannot be honored, and the
+/// producers that can.
+pub fn reject_labelled_prebuilt(label: Option<&str>, fragments: Option<&[String]>) -> Result<()> {
+    let has_fragments = fragments.is_some_and(|f| !f.is_empty());
+    if label.is_none() && !has_fragments {
+        return Ok(());
+    }
+    Err(Error::Artifact(format!(
+        "the prebuilt kernel seed cannot build label {:?} with fragments {:?}: it downloads one \
+         digest-pinned vmlinux and compiles nothing — build a labelled or fragment-carrying kernel \
+         with the host-make or in-VM producer instead (§5.4)",
+        label.unwrap_or("<none>"),
+        fragments.unwrap_or_default()
+    )))
+}
+
 impl KernelStage {
-    /// The fragment names for this stage, **sorted** and de-duplicated, so the cache
-    /// key and the config-append order are independent of the request order (§5.2, The config fragment).
+    /// The fragment names for this stage, **sorted** and de-duplicated (the shared
+    /// [`sorted_fragments`] law).
     fn sorted_fragments(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.fragments.clone().unwrap_or_default();
-        names.sort();
-        names.dedup();
-        names
+        sorted_fragments(self.fragments.as_deref())
     }
 
-    /// The pins key holding the KConfig text for the named fragment.
-    fn fragment_pin_key(name: &str) -> String {
-        format!("kernel_fragments_{name}")
-    }
-
-    /// The artifact filename suffix for this kernel (`""` or `-<sanitized-label>`).
-    ///
-    /// Sanitizes `.`→`-`: the pipeline derives the cache sidecar via
-    /// `Path::with_extension`, which would treat the trailing `.NNN` of a dotted
-    /// version as an extension and collide same-minor labels' sidecars
-    /// (`vmlinux-6.6.143` → `vmlinux-6.6.cache_key`). The pins key and the cache-key
-    /// *hash* keep the dotted label; only the on-disk filename is sanitized.
+    /// The artifact filename suffix for this kernel — the shared
+    /// [`kernel_filename_suffix`] law (`""` or `-<sanitized-label>`), never a second copy of the
+    /// `.`→`-` rule.
     fn suffix(&self) -> String {
-        self.label
-            .as_ref()
-            .map(|l| format!("-{}", l.replace('.', "-")))
-            .unwrap_or_default()
+        kernel_filename_suffix(self.label.as_deref())
     }
 
     /// The pins key holding this kernel's source URL.
@@ -137,7 +395,10 @@ impl Stage for KernelStage {
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         // Bump when this stage's build logic changes so stale kernels are not served.
         // v15: bumped to 2 with the config-fragment matrix (§5.2, The config fragment).
-        const STAGE_VERSION: u32 = 2;
+        // v30 (§18 delta 3, cache-key rule 4): bumped to 3 — the fragment fold gained the distinct
+        // missing-fragment marker AND the stage now emits the resolved-config sidecar, so no v2
+        // output (which has no `.config` beside it) may be served.
+        const STAGE_VERSION: u32 = 3;
         // Unambiguous field separator: without it, label||url||sha||config are a flat
         // byte stream where e.g. (label="x", url="A") and (label="", url="xA") collide
         // to the same key (non-injective hash).
@@ -171,29 +432,22 @@ impl Stage for KernelStage {
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
-        // Fold the config fragments in SORTED order (§5.2, The config fragment): the same set requested in any
-        // order must hash identically, and BOTH the fragment NAME and its KConfig CONTENT
-        // (from the pins registry) must travel, so editing a fragment's text invalidates the
-        // key. The per-fragment SEP plus the count keep distinct sets from colliding.
-        let fragments = self.sorted_fragments();
-        hasher.update(SEP);
-        hasher.update(&(fragments.len() as u32).to_le_bytes());
-        for name in &fragments {
-            hasher.update(SEP);
-            hasher.update(name.as_bytes());
-            hasher.update(SEP);
-            hasher.update(
-                inputs
-                    .pins
-                    .get(&Self::fragment_pin_key(name))
-                    .map(|s| s.as_bytes())
-                    .unwrap_or_default(),
-            );
-        }
+        // Fold the config fragments in SORTED order through the shared fold (§5.2, The config
+        // fragment): the same set requested in any order hashes identically, name + content both
+        // travel, and an unresolvable fragment folds its own marker rather than empty bytes.
+        fold_fragment_identity(&mut hasher, &inputs.pins, &self.sorted_fragments());
         CacheKey(format!("kernel-{}", hasher.finalize().to_hex()))
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        // Which producer ran (§5.6, The downstream kernel toolkit): both compiling producers share
+        // `name()` (the label), so the stage name cannot answer it — the log line must.
+        tracing::info!(
+            producer = "host-make",
+            kernel = self.label.as_deref().unwrap_or("default"),
+            fragments = ?self.sorted_fragments(),
+            "building kernel"
+        );
         let url_key = self.url_pin_key();
         let sha_key = self.sha_pin_key();
         let kernel_source_url = inputs
@@ -337,28 +591,15 @@ impl Stage for KernelStage {
         }
 
         let config_path = workdir.join(".config");
-        // Append our specific config on top
+        // Append our specific config on top, then layer the requested KConfig fragments (§5.2, The
+        // config fragment) in SORTED order through the shared `kconfig_append` law, so the on-disk
+        // `.config` is deterministic regardless of request order and identical to what the in-VM
+        // producer would append. A missing fragment is a HARD ERROR there — never a silent skip
+        // that builds a kernel without the requested instrumentation.
         let mut current_config = tokio::fs::read_to_string(&config_path).await?;
-        current_config.push('\n');
-        current_config.push_str(microvm_config);
-        // Layer the requested KConfig fragments (§5.2, The config fragment) in SORTED order, so the on-disk
-        // `.config` is deterministic regardless of request order. Each fragment's text comes
-        // from the pins `kernel_fragments` registry; a missing fragment is a HARD ERROR —
-        // never a silent skip that builds a kernel without the requested instrumentation.
         let fragments = self.sorted_fragments();
-        for name in &fragments {
-            let frag = inputs
-                .pins
-                .get(&Self::fragment_pin_key(name))
-                .ok_or_else(|| {
-                    Error::Artifact(format!(
-                        "missing kernel fragment `{name}` in pins (expected key `{}`)",
-                        Self::fragment_pin_key(name)
-                    ))
-                })?;
-            current_config.push('\n');
-            current_config.push_str(frag);
-        }
+        current_config.push('\n');
+        current_config.push_str(&kconfig_append(microvm_config, &inputs.pins, &fragments)?);
         tokio::fs::write(&config_path, current_config).await?;
 
         let status = Command::new("make")
@@ -396,7 +637,28 @@ impl Stage for KernelStage {
 
         tokio::fs::copy(workdir.join("vmlinux"), out).await?;
 
-        Ok(kernel_outputs(out, &self.artifact_key()))
+        // The post-`olddefconfig` RESOLVED config, copied out beside the kernel (§5.6, The
+        // downstream kernel toolkit): `olddefconfig` silently drops any symbol whose dependencies
+        // are unmet, so a fragment author asserts against this artifact, not against the fragment
+        // they asked for. Left in the persistent build dir it is overwritten by the next build of
+        // the same label and purged by a pin bump — never content-addressed with its kernel.
+        // A missing `.config` after a successful `olddefconfig` is a hard error, never a skip that
+        // ships a kernel with no evidence of what it contains — the shared `publish_resolved_config`
+        // law, the same one the in-VM producer publishes its share copy through.
+        let sidecar = publish_resolved_config(
+            &config_path,
+            out,
+            self.label.as_deref().unwrap_or("default"),
+        )
+        .await?;
+        tracing::info!(
+            producer = "host-make",
+            kernel = self.label.as_deref().unwrap_or("default"),
+            config = %sidecar.display(),
+            "kernel built; resolved config written"
+        );
+
+        Ok(kernel_outputs(out, &self.artifact_key(), Some(&sidecar)))
     }
 }
 
@@ -581,7 +843,17 @@ impl Stage for PrebuiltKernelStage {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(out, &vmlinux_bytes).await?;
-        Ok(kernel_outputs(out, "kernel"))
+        // No resolved-config sidecar: this producer downloads an opaque prebuilt kernel and
+        // compiles nothing, so it has no post-`olddefconfig` `.config` to emit (§5.6, recorded
+        // honestly rather than faked).
+        //
+        // It shares `out_path` (`vmlinux`) with the host-`make` producer, so a config left by an
+        // EARLIER compiling build of that path would now describe different bytes. `vmcell bundle`
+        // picks the sidecar up by filesystem existence, so leaving it there digest-pins a config
+        // describing a different kernel as this kernel's `kernel-config` — the exact lying
+        // artifact the sidecar exists to prevent. Clear it as part of publishing.
+        clear_resolved_config(out).await?;
+        Ok(kernel_outputs(out, "kernel", None))
     }
 }
 
@@ -637,9 +909,18 @@ fn extract_tar_member(archive: &[u8], member: &str) -> Result<Vec<u8>> {
 /// only on a warm-cache hit. Omitting this on the cold path lets the snapshot stage fall
 /// through to a `/tmp/vmlinux` fallback; collapsing every labelled kernel onto `"kernel"`
 /// loses all but one entry in a multi-kernel `Artifacts` map (M-PIPE-4).
-fn kernel_outputs(out: &Path, key: &str) -> StageOutputs {
+///
+/// `resolved_config` registers the sidecar under [`config_artifact_key`] when the producer
+/// **compiled** the kernel (§5.6, The downstream kernel toolkit). The prebuilt seed passes `None`:
+/// it has no config to emit, and inventing an empty one would be a lying artifact.
+fn kernel_outputs(out: &Path, key: &str, resolved_config: Option<&Path>) -> StageOutputs {
     let mut outputs = StageOutputs::default();
     outputs.artifacts.insert(key.to_string(), out.to_path_buf());
+    if let Some(cfg) = resolved_config {
+        outputs
+            .artifacts
+            .insert(config_artifact_key(key), cfg.to_path_buf());
+    }
     outputs
 }
 
@@ -688,12 +969,278 @@ mod tests {
     #[test]
     fn test_kernel_outputs_registers_kernel_artifact() {
         let out = Path::new("/some/target/vmlinux");
-        let outputs = kernel_outputs(out, "kernel");
+        let outputs = kernel_outputs(out, "kernel", None);
         assert_eq!(
             outputs.artifacts.get("kernel").map(|p| p.as_path()),
             Some(out),
             "cold-build outputs must register the kernel artifact"
         );
+        // The prebuilt seed emits no resolved config, so none is registered (§5.6).
+        assert!(
+            !outputs.artifacts.contains_key("kernel-config"),
+            "a producer with no resolved config must not register one"
+        );
+    }
+
+    // §5.6 (The downstream kernel toolkit): a COMPILING producer registers its resolved-config
+    // sidecar under its own artifact key, which is what carries it through the pipeline's cache
+    // sidecar onto the warm path. RED on the inverse (writing the `.config` to disk but registering
+    // only the kernel): the `kernel-6.12.94-config` lookup returns None.
+    #[test]
+    fn test_kernel_outputs_registers_resolved_config_sidecar() {
+        let out = Path::new("/some/target/vmlinux-6-12-94");
+        let cfg = resolved_config_path(out);
+        let outputs = kernel_outputs(out, "kernel-6.12.94", Some(&cfg));
+        assert_eq!(
+            outputs
+                .artifacts
+                .get("kernel-6.12.94-config")
+                .map(|p| p.as_path()),
+            Some(cfg.as_path()),
+            "a compiling producer must register its resolved-config sidecar"
+        );
+        assert_eq!(
+            outputs.artifacts.get("kernel-6.12.94").map(|p| p.as_path()),
+            Some(out),
+            "the kernel itself stays registered under its own key"
+        );
+    }
+
+    // §5.6: the sidecar composer APPENDS `.config` — `Path::with_extension` would eat the trailing
+    // component of a dotted name and alias two labels onto one config. RED on the inverse
+    // (`with_extension("config")`): the dotted case below yields `vmlinux-6.12.config`.
+    #[test]
+    fn test_resolved_config_path_appends_extension() {
+        assert_eq!(
+            resolved_config_path(Path::new("/a/vmlinux-6-12-94")),
+            Path::new("/a/vmlinux-6-12-94.config")
+        );
+        assert_eq!(
+            resolved_config_path(Path::new("/a/vmlinux")),
+            Path::new("/a/vmlinux.config")
+        );
+        assert_eq!(
+            resolved_config_path(Path::new("/a/vmlinux-6.12.94")),
+            Path::new("/a/vmlinux-6.12.94.config"),
+            "a dotted filename keeps its whole name"
+        );
+        assert_eq!(config_artifact_key("kernel"), "kernel-config");
+        assert_eq!(
+            config_artifact_key("kernel-6.6.143"),
+            "kernel-6.6.143-config"
+        );
+    }
+
+    // §5.6 GATE (delta 3, F3): the ONE label-sanitization law and its inverse must round-trip, on
+    // the labels the shipped registry actually carries plus the dotted/undotted shapes a consumer
+    // overlay can add. `vmcell bundle` walks the artifacts dir with `kernel_label_from_filename`,
+    // so a producer emitting a name this reader rejects would SILENTLY drop that kernel from a
+    // manifest that reads as "covered everything".
+    // RED on the inverse (drop the `.`→`-` sanitization in `kernel_filename_suffix`, the shape the
+    // producers had four separate copies of): `vmlinux-6.12.94` comes back `None`.
+    #[test]
+    fn test_kernel_filename_round_trips_through_the_label_law() {
+        // The shipped registry's own labels, read through the resolver rather than retyped.
+        let shipped: Vec<String> = crate::artifact::resolve_kernel_registry(None)
+            .expect("the baseline registry resolves")
+            .into_iter()
+            .map(|e| e.label)
+            .collect();
+        assert!(
+            shipped.iter().any(|l| l.contains('.')),
+            "the baseline registry must still exercise a DOTTED label; got {shipped:?}"
+        );
+        let synthetic = ["ikconfig", "usbhost", "6.12.94", "a.b.c"].map(str::to_string);
+        for label in shipped.iter().chain(synthetic.iter()) {
+            let name = kernel_filename(Some(label));
+            assert!(
+                !name.trim_start_matches("vmlinux").contains('.'),
+                "the on-disk name of `{label}` must carry no `.` (it would be read as a \
+                 sidecar, and `Path::with_extension` would collide same-minor labels), got {name}"
+            );
+            assert_eq!(
+                kernel_label_from_filename(&name).map(str::to_string),
+                Some(label.replace('.', "-")),
+                "`{label}`'s on-disk name must round-trip back through the reader"
+            );
+        }
+        // The default kernel and the sidecars beside a labelled one are not labelled kernels.
+        assert_eq!(kernel_label_from_filename(&kernel_filename(None)), None);
+        assert_eq!(kernel_label_from_filename("vmlinux-"), None);
+        assert_eq!(kernel_label_from_filename("rootfs.erofs"), None);
+        let labelled = kernel_filename(Some("6.12.94"));
+        for sidecar in [
+            resolved_config_path(Path::new(&labelled)),
+            Path::new(&labelled).with_extension("cache_key"),
+        ] {
+            assert_eq!(
+                kernel_label_from_filename(&sidecar.to_string_lossy()),
+                None,
+                "a kernel's sidecar ({}) is not a kernel",
+                sidecar.display()
+            );
+        }
+    }
+
+    // §5.6 GATE (delta 3, F5): the sidecar's CONTENT. `publish_resolved_config` is the one law
+    // both compiling producers ship their post-`olddefconfig` `.config` through, and until now the
+    // copy itself had zero tests. The config here is composed by the REAL `kconfig_append` law
+    // with a fragment in the pins registry, so what is asserted is "the fragment's symbol reaches
+    // the published sidecar", not "some bytes were copied".
+    // RED on the inverse (drop the copy and return the path, the shape `run()` had before the
+    // sidecar existed): the sidecar is absent.
+    // What this canNOT see: `make olddefconfig` between the append and the copy — it may legally
+    // drop a symbol whose dependencies are unmet, which is exactly why the sidecar exists. That
+    // half is the live fragment build (§18 delta 3's live leg / delta 5's example workspace).
+    #[tokio::test]
+    async fn test_publish_resolved_config_carries_the_fragment_symbol() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            fragment_pin_key("IKCONFIG"),
+            "CONFIG_IKCONFIG=y\nCONFIG_IKCONFIG_PROC=y\n".to_string(),
+        );
+        let text = kconfig_append(
+            "CONFIG_VIRTIO=y\n",
+            &pins,
+            &sorted_fragments(Some(&["IKCONFIG".to_string()])),
+        )
+        .expect("the fragment resolves");
+        let workdir_config = dir.path().join(".config");
+        std::fs::write(&workdir_config, &text).expect("write the producer's .config");
+
+        let out = dir.path().join(kernel_filename(Some("ikconfig")));
+        std::fs::write(&out, b"vmlinux-bytes").expect("write the kernel");
+        let sidecar = publish_resolved_config(&workdir_config, &out, "ikconfig")
+            .await
+            .expect("publishing the resolved config");
+
+        assert_eq!(sidecar, resolved_config_path(&out));
+        let published = std::fs::read_to_string(&sidecar).expect("read the published sidecar");
+        assert!(
+            published.contains("CONFIG_IKCONFIG=y"),
+            "the published sidecar must carry the fragment's symbol, got:\n{published}"
+        );
+        assert_eq!(
+            published, text,
+            "the sidecar is the resolved config VERBATIM, not a summary of it"
+        );
+        // And it is registered under its own artifact key beside the kernel, which is what
+        // content-addresses it with the kernel across a warm build.
+        let outputs = kernel_outputs(&out, "kernel-ikconfig", Some(&sidecar));
+        assert_eq!(
+            outputs.artifacts.get("kernel-ikconfig-config"),
+            Some(&sidecar)
+        );
+    }
+
+    // §5.6 GATE (delta 3, F5): a compiling producer that reports success but has no `.config` is a
+    // HARD ERROR naming the kernel — never a skip that ships a kernel with no evidence of what it
+    // contains. RED on the inverse (a best-effort `let _ = tokio::fs::copy(...)`): the call
+    // returns Ok and the build silently ships no sidecar.
+    #[tokio::test]
+    async fn test_publish_resolved_config_hard_errors_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux-ikconfig");
+        std::fs::write(&out, b"vmlinux-bytes").expect("write the kernel");
+        let res = publish_resolved_config(&dir.path().join("nope/.config"), &out, "ikconfig").await;
+        match res {
+            Err(Error::Artifact(m)) => assert!(
+                m.contains("ikconfig") && m.contains(".config"),
+                "the refusal must name the kernel and the config it wanted, got: {m}"
+            ),
+            other => panic!("expected a hard error for a missing resolved config, got {other:?}"),
+        }
+        assert!(
+            !resolved_config_path(&out).exists(),
+            "no sidecar may be invented when the producer emitted none"
+        );
+    }
+
+    // §5.6 GATE (delta 3, F2): a producer that emits NO config must not leave an earlier
+    // producer's config behind at the same `vmlinux` path. RED on the inverse (drop the
+    // `clear_resolved_config` call): the stale sidecar survives, and `vmcell bundle` — which picks
+    // it up by filesystem existence, not from the stage's artifact map — digest-pins a config
+    // describing a DIFFERENT kernel as this kernel's `kernel-config`.
+    #[tokio::test]
+    async fn test_prebuilt_kernel_clears_a_stale_resolved_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("vmlinux");
+        // The state a `vmcell build --kernel-source host-make` leaves behind.
+        std::fs::write(&out, b"host-make-vmlinux").expect("write the old kernel");
+        let stale = resolved_config_path(&out);
+        std::fs::write(&stale, b"CONFIG_IKCONFIG=y\n").expect("write the old config");
+
+        let body = b"prebuilt-vmlinux".to_vec();
+        let stage = PrebuiltKernelStage {
+            http_client: std::sync::Arc::new(FakeHttpClient {
+                body: body.clone(),
+                calls: AtomicUsize::new(0),
+            }),
+        };
+        let mut inputs = StageInputs::default();
+        inputs.pins.insert(
+            "kernel_prebuilt_url".into(),
+            "http://example/vmlinux".into(),
+        );
+        inputs
+            .pins
+            .insert("kernel_prebuilt_sha256".into(), sha256_hex(&body));
+        let outputs = stage.run(&inputs, &out).await.expect("prebuilt seed runs");
+
+        assert_eq!(
+            std::fs::read(&out).expect("read the republished kernel"),
+            body,
+            "the prebuilt bytes replaced the compiled kernel at this path"
+        );
+        assert!(
+            !stale.exists(),
+            "the stale resolved config at {} must be gone — it describes the kernel that USED \
+             to be at this path",
+            stale.display()
+        );
+        assert!(
+            !outputs.artifacts.contains_key("kernel-config"),
+            "this producer compiles nothing, so it registers no config artifact"
+        );
+        // Idempotent: a second run with no sidecar present is not an error.
+        stage
+            .run(&inputs, &out)
+            .await
+            .expect("an absent sidecar is not a failure");
+    }
+
+    // §5.4/§5.6 GATE (delta 3): the prebuilt seed compiles nothing, so a label or a fragment set
+    // routed at it is a TYPED refusal naming what cannot be honored — never the pre-v30 silent
+    // drop that handed back the default seed and reported success. RED on the inverse (a producer
+    // selector that ignores label/fragments on the prebuilt arm): both rejects below return Ok.
+    #[test]
+    fn test_reject_labelled_prebuilt() {
+        // The positive control: an unlabelled, fragment-free seed request is exactly what this
+        // producer is for.
+        assert!(reject_labelled_prebuilt(None, None).is_ok());
+        assert!(
+            reject_labelled_prebuilt(None, Some(&[])).is_ok(),
+            "an empty fragment list is not a fragment request"
+        );
+
+        let label = reject_labelled_prebuilt(Some("6.12.94"), None);
+        match label {
+            Err(Error::Artifact(m)) => assert!(
+                m.contains("6.12.94") && m.contains("prebuilt"),
+                "the refusal must name the label it cannot honor, got: {m}"
+            ),
+            other => panic!("expected a typed refusal for a labelled prebuilt, got {other:?}"),
+        }
+
+        let frags = reject_labelled_prebuilt(None, Some(&["KASAN".to_string()]));
+        match frags {
+            Err(Error::Artifact(m)) => assert!(
+                m.contains("KASAN"),
+                "the refusal must name the fragments it cannot honor, got: {m}"
+            ),
+            other => panic!("expected a typed refusal for prebuilt+fragments, got {other:?}"),
+        }
     }
 
     // Guards M-PIPE-4: labelled kernel stages must have DISTINCT names (so `reset_to`
@@ -827,6 +1374,46 @@ mod tests {
             stage.cache_key(&i2),
             "editing a fragment's KConfig content must change the cache key"
         );
+    }
+
+    // §5.5 GATE (delta 3) — the MISSING-FRAGMENT MARKER. The honest inverse is *not* "two
+    // different unresolvable names collide" (the count + each name were already folded, so that
+    // case has always hashed apart — a test written that way passes on the unfixed code). The real
+    // alias `unwrap_or_default()` created is between a fragment ABSENT from the pins registry and
+    // the same fragment PRESENT with empty KConfig text: both folded zero bytes. They are different
+    // builds — the first is a `run()` hard error, the second a legal no-op — so the second's cached
+    // kernel could be served for the first. RED on the inverse (restore `.unwrap_or_default()` and
+    // the two keys below become equal).
+    #[test]
+    fn test_kernel_cache_key_missing_fragment_marker() {
+        let stage = frag_stage(Some(vec!["NOSUCH"]));
+
+        // (a) `NOSUCH` is absent from the registry entirely.
+        let absent = frag_inputs();
+        assert!(
+            !absent.pins.contains_key("kernel_fragments_NOSUCH"),
+            "fixture premise: the fragment is unresolvable"
+        );
+        // (b) `NOSUCH` is present but its KConfig text is empty.
+        let mut empty = frag_inputs();
+        empty
+            .pins
+            .insert("kernel_fragments_NOSUCH".into(), String::new());
+
+        assert_ne!(
+            stage.cache_key(&absent),
+            stage.cache_key(&empty),
+            "an unresolvable fragment must not hash like a resolvable-but-empty one"
+        );
+
+        // And the same stage against the same pins is still stable (the marker is deterministic).
+        assert_eq!(stage.cache_key(&absent), stage.cache_key(&absent));
+        // Adding the empty fragment's text later must invalidate the key for the same reason.
+        let mut nonempty = frag_inputs();
+        nonempty
+            .pins
+            .insert("kernel_fragments_NOSUCH".into(), "CONFIG_X=y\n".into());
+        assert_ne!(stage.cache_key(&empty), stage.cache_key(&nonempty));
     }
 
     // Guards the LOW tar-slip finding: extraction must reject entries that escape the

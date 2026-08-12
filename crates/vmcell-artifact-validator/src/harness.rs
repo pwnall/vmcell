@@ -6,6 +6,39 @@ use std::path::PathBuf;
 
 use vmcell::{MicroVm, VmConfig, Vmm};
 
+/// The **two-step route** every getter failure names (design §10.4, The downstream toolkit
+/// contract) — stated once, appended by [`fail_loud`] to all three failure messages.
+///
+/// [`vmcell::artifact::ensure_test_artifacts`] is the *vmcell workspace's* test bootstrap: its
+/// fingerprint hashes the guest-agent source closure out of the vmcell tree, so it structurally
+/// cannot build in a consumer workspace. Its own messages therefore name vmcell-checkout-only
+/// fixes (`cargo run -p vmcell-cli …`, "guest-agent binary source missing at …"), which is a dead
+/// end for a downstream caller. §10.4 specifies the substitution instead: overlay-driven *build*
+/// through the toolkit, getter-driven *consumption* through the env contract — so the route out is
+/// part of the refusal, not something a consumer has to already know.
+///
+/// It rides every failure rather than only the ones that look downstream, because "am I
+/// downstream?" has no honest local predicate: this example workspace lives *inside* the vmcell
+/// checkout, so the source-root ascent finds vmcell's tree and any presence test would answer
+/// "in-workspace" for a genuinely downstream-shaped consumer. In the vmcell workspace itself this
+/// only adds a sentence to an already-failing path.
+const TWO_STEP_ROUTE: &str = "\n  Consuming vmcell as a dependency? The workspace artifact \
+     bootstrap cannot run against your checkout. Two steps instead: (1) BUILD — kernels through \
+     the toolkit (`vmcell::artifact::build_labelled_kernel`, or `vmcell build-kernels --pins \
+     <overlay>` from a vmcell checkout), the rootfs with that checkout's `vmcell build` / \
+     `vmcell oci2-erofs`; (2) CONSUME — point `VMCELL_KERNEL` and `VMCELL_ROOTFS` at those outputs \
+     (`VMCELL_ROOTFS` makes the bootstrap a full no-op). See design §10.4 / the README's \
+     \"Consuming vmcell as a dependency\" section.";
+
+/// The one refusal composer for the getters: the concrete problem, then [`TWO_STEP_ROUTE`].
+///
+/// One law, one predicate — three call sites (the bootstrap failure and the two existence checks)
+/// that each formatted their own message would drift, and §10.4's promise is about *every* way the
+/// getters can refuse, not just the one a reader happens to hit.
+fn fail_loud(problem: &str) -> String {
+    format!("{problem}{TWO_STEP_ROUTE}")
+}
+
 /// The built `vmlinux` artifact path (`VMCELL_KERNEL` or `target/vmcell-artifacts/vmlinux`),
 /// asserting it exists — the tests' known-good kernel.
 ///
@@ -14,44 +47,62 @@ use vmcell::{MicroVm, VmConfig, Vmm};
 /// fix if the kernel is not pre-built — so a source edit to the agent, tools, or packer no longer
 /// silently runs against a stale rootfs.
 ///
+/// Downstream (§10.4) it has exactly two behaviors: with `VMCELL_KERNEL` + `VMCELL_ROOTFS` set —
+/// the documented downstream configuration, in which `VMCELL_ROOTFS` no-ops the bootstrap — it
+/// returns the named path after an existence check; without them it fails loud naming
+/// the two-step route (build through the toolkit, then point the two variables at the outputs),
+/// never a silent bootstrap attempt against a consumer's cargo checkout.
+///
 /// # Panics
-/// Panics if the kernel is missing (with the one-command build instruction) or the auto-build fails.
+/// Panics if the kernel is missing or the auto-build fails, naming the two-step route.
 #[must_use]
 pub fn get_vmlinux() -> PathBuf {
     ensure_artifacts_or_panic();
     let p = vmcell::artifact::kernel_path();
-    assert!(p.exists(), "vmlinux artifact missing at {p:?}");
+    assert!(
+        p.exists(),
+        "{}",
+        fail_loud(&format!("vmlinux artifact missing at {p:?}"))
+    );
     p
 }
 
 /// The built erofs rootfs artifact path (`VMCELL_ROOTFS` or the default), asserting it exists.
 ///
-/// Auto-builds via [`vmcell::artifact::ensure_test_artifacts`] first (see [`get_vmlinux`]).
+/// Auto-builds via [`vmcell::artifact::ensure_test_artifacts`] first, and has the same two
+/// downstream behaviors (see [`get_vmlinux`]).
 ///
 /// # Panics
-/// Panics if the kernel is missing (with the one-command build instruction) or the auto-build fails.
+/// Panics if the rootfs is missing or the auto-build fails, naming the two-step route.
 #[must_use]
 pub fn get_rootfs() -> PathBuf {
     ensure_artifacts_or_panic();
     let p = vmcell::artifact::rootfs_path();
-    assert!(p.exists(), "rootfs artifact missing at {p:?}");
+    assert!(
+        p.exists(),
+        "{}",
+        fail_loud(&format!("rootfs artifact missing at {p:?}"))
+    );
     p
 }
 
 /// Runs the at-most-once, hash-gated artifact build; a failure (missing kernel, or a build error)
-/// aborts the test with the underlying message — the fail-loud contract these getters have always
-/// had, now with an actionable instruction instead of a bare "artifact missing". Rendered via
-/// `assert!` (not a bare `panic!`) to match the getters' existing pattern and the crate's lints.
+/// aborts the test with the underlying message plus the downstream route — the fail-loud contract
+/// these getters have always had, now with an actionable instruction instead of a bare "artifact
+/// missing". Rendered via `assert!` (not a bare `panic!`) to match the getters' existing pattern
+/// and the crate's lints.
 fn ensure_artifacts_or_panic() {
     let outcome = vmcell::artifact::ensure_test_artifacts();
     assert!(
         outcome.is_ok(),
         "{}",
-        outcome
-            .as_ref()
-            .err()
-            .map(ToString::to_string)
-            .unwrap_or_default()
+        fail_loud(
+            &outcome
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        )
     );
 }
 

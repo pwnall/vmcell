@@ -54,13 +54,24 @@ pub fn record_capability_skip(vmm: &str, capability: &str) {
     }
 }
 
-/// Reaps orphaned `vmcell-net-*` network namespaces before a privileged/netns test. Test-only.
+/// Reaps orphaned `vmcell-net-*` **and** `vmcell-seg-*` network namespaces before a
+/// privileged/netns test. Test-only.
+///
+/// v30 §18 delta 8: the segment class needs its **own** sweep call. `cleanup_orphan_netns` filters
+/// by a literal starts-with prefix, and `netns_sweep_prefix` is `vmcell-net-` — so before this,
+/// a leaked `vmcell-seg-*` was reaped by nothing at all (not this helper, not
+/// `HostOrphanScanner::scan_netns`), and an aborted segment test poisoned the next run's segid.
 pub fn clean_vmcell_netns() {
-    // Match by the same one-law filter the VM naming produces (default prefix), not a hard-coded string.
-    let netns_prefix = vmcell::naming::netns_sweep_prefix(vmcell::naming::DEFAULT_RESOURCE_PREFIX);
-    let removed = vmcell::net::cleanup_orphan_netns(&netns_prefix);
-    if !removed.is_empty() {
-        println!("clean_vmcell_netns: reaped orphaned namespaces: {removed:?}");
+    // Match by the same one-law filters the naming produces (default prefix), not hard-coded
+    // strings. Both classes, because the two stems are deliberately distinct.
+    for prefix in [
+        vmcell::naming::netns_sweep_prefix(vmcell::naming::DEFAULT_RESOURCE_PREFIX),
+        vmcell::naming::segment_netns_sweep_prefix(vmcell::naming::DEFAULT_RESOURCE_PREFIX),
+    ] {
+        let removed = vmcell::net::cleanup_orphan_netns(&prefix);
+        if !removed.is_empty() {
+            println!("clean_vmcell_netns: reaped orphaned namespaces: {removed:?}");
+        }
     }
 }
 
