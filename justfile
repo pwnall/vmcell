@@ -143,10 +143,13 @@ test-crosvm:
 # v30 delta 9 (FR-V5): host-USB passthrough live validation — QEMU only, opt-in.
 # Needs KVM, a blessed runner, and a designated test device: VMCELL_TEST_USB_DEVICE=<vid>:<pid>.
 # The guest kernel is the `usbhost` label built through the §5.6 toolkit (a vmcell-owned GENERIC
-# xhci/USB-core fragment — never the consumer usbip/gadget closure; design §2.4 defends this):
-# the stock vmcell kernel has no USB driver at all, so build it first with
+# xhci/USB-core fragment — never the consumer usbip/gadget closure; design §2.4 defends this).
+# Build it first with
 #   cargo run -p vmcell-cli -- build-kernels          # builds every `kernels` label
-# and point VMCELL_KERNEL at the resulting `<artifacts>/vmlinux-usbhost`. `usbhost` and its
+# and point VMCELL_KERNEL at the resulting `<artifacts>/vmlinux-usbhost`. (The fragment PINS the
+# xhci/USB-core symbols; it does not conjure them — measured 2026-08-12, `make olddefconfig`
+# inherits CONFIG_USB_XHCI_PCI=y from the x86_64 defconfig, so the fragment-less labels carry it
+# too. Pinning is the point: an upstream defconfig change must not silently drop USB.) `usbhost` and its
 # `kernel_fragments.USBHOST` text live in the committed pins.json (gated by
 # `usbhost_kernel_label_and_fragment_are_pinned`). `test-privileged` also compiles and selects
 # this test (its filter excludes only unprivileged/smoltcp), so with no designated device it records a

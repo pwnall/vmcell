@@ -38,6 +38,16 @@ mod common;
 #[cfg(feature = "qemu")]
 const USB_DEVICE_ENV: &str = "VMCELL_TEST_USB_DEVICE";
 
+/// How long the live leg waits for the guest to enumerate the passed-through device, and how
+/// often it re-scans. Bounded so a device that never appears fails by name (with the guest's own
+/// sysfs output) instead of hanging: the enumeration is asynchronous to agent readiness, and a
+/// host driver that QEMU must unbind first pushes it past the first scan (§2.4).
+#[cfg(feature = "qemu")]
+const USB_ENUMERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// The re-scan interval inside [`USB_ENUMERATION_BUDGET`].
+#[cfg(feature = "qemu")]
+const USB_ENUMERATION_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 // H-TEST-3 capability-honesty pin, the ninth flag. A backend that silently flipped this
 // `true` would emit (or silently drop) USB argv with nothing asserting on it, and one
 // flipped `false` on QEMU would turn every USB config into a typed refusal with the live
@@ -245,14 +255,22 @@ fn usbhost_kernel_label_and_fragment_are_pinned() {
              consumer content (G1, §2.4)"
         );
     }
-    // Premise the live leg's NOBUS diagnostic rests on: the DEFAULT kernel has no USB at
-    // all, which is why the fragment (and this label) exist.
+    // The baseline `microvm_config` names no USB symbol, so the `usbhost` label is the only
+    // place vmcell states them — that is what this pins.
+    //
+    // It does NOT mean a stock-config kernel boots without USB. MEASURED (2026-08-12, host
+    // `make` on linux 6.12.94): `make olddefconfig` inherits `CONFIG_USB_XHCI_PCI=y` from the
+    // x86_64 defconfig, so `vmlinux-6-12-94` and `vmlinux-6-6-143` — which declare no fragments
+    // — carry xhci too. The fragment therefore **pins** the symbols rather than adding them,
+    // which is exactly what a capability gate owes: an upstream defconfig change must not be
+    // able to silently drop USB out from under a passthrough that advertises it.
     let base = pins
         .get("kernel_microvm_config")
         .expect("the baseline carries kernel_microvm_config");
     assert!(
         !base.contains("CONFIG_USB"),
-        "the stock vmcell kernel config must stay USB-free (the fragment is what adds it)"
+        "the baseline microvm_config must not name USB symbols — the `usbhost` fragment is \
+         where vmcell states them, so the label is the one thing a USB gate depends on"
     );
 }
 
@@ -393,19 +411,43 @@ async fn usb_passthrough_qemu() {
         vid = device.vendor_id,
         pid = device.product_id
     );
-    let out = agent
-        .exec(vmcell::ExecRequest::new(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            script,
-        ]))
-        .await
-        .expect("sysfs scan exec");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // POLL the scan: guest USB enumeration is ASYNCHRONOUS to the agent becoming reachable,
+    // and the agent is what unblocks `start_vm`. Measured on this host (QEMU 10.2.1, 2026-08-12):
+    // a device with NO host driver bound (Goodix 27c6:609c, `Driver=[none]`) is already
+    // enumerated by the first scan, but one whose interface holds a LIVE kernel driver
+    // (Realtek 0bda:8156, `r8152`) is not — QEMU must unbind the host driver and reset the
+    // device first, and a single immediate scan failed 3/3 at `--retries 0` on exactly that
+    // device while passing once the previous run had left it unbound. Polling makes the leg
+    // honest for both shapes; it does NOT weaken it — a device that never enumerates still
+    // reddens after the window, which is the state a dropped `-device usb-host` produces
+    // (verified: deleting the argv splice reddens this leg).
+    //
+    // `NOBUS` (code 3) is a kernel-CONFIG fact, not a timing one, so it breaks out at once
+    // rather than burning the window.
+    let mut out;
+    let mut stdout;
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        out = agent
+            .exec(vmcell::ExecRequest::new(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                script.clone(),
+            ]))
+            .await
+            .expect("sysfs scan exec");
+        stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let found_it = out.code == 0 && stdout.lines().any(|l| l.starts_with("FOUND "));
+        if found_it || out.code == 3 || waited >= USB_ENUMERATION_BUDGET {
+            break;
+        }
+        tokio::time::sleep(USB_ENUMERATION_POLL).await;
+        waited += USB_ENUMERATION_POLL;
+    }
     assert_ne!(
         out.code, 3,
         "guest has no /sys/bus/usb — the kernel lacks xhci/USB-core support; point \
-         VMCELL_KERNEL at the `vmlinux-usbhost` build (§2.4)"
+         VMCELL_KERNEL at a kernel carrying the `usbhost` fragment's symbols (§2.4)"
     );
     assert_eq!(
         out.code,
@@ -419,8 +461,8 @@ async fn usb_passthrough_qemu() {
         .find_map(|l| l.strip_prefix("FOUND "))
         .unwrap_or_else(|| {
             panic!(
-                "guest did not enumerate {:04x}:{:04x}; sysfs scan said: {stdout:?}",
-                device.vendor_id, device.product_id
+                "guest did not enumerate {:04x}:{:04x} within {:?}; sysfs scan said: {stdout:?}",
+                device.vendor_id, device.product_id, USB_ENUMERATION_BUDGET
             )
         });
     let mut fields = found.split_whitespace();

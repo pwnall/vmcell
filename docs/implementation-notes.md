@@ -2627,9 +2627,9 @@ long: the argv splice had **no gate at all**, the live leg's guest kernel **did 
 
 ### Residual, deliberately recorded
 
-- **In-guest enumeration is still unproven.** The flag's `true` covers a validated host-side
-  mechanism plus a fail-loud precheck; the guest half waits for a host with a disposable device. The
-  live leg is written and selected — it records a capability skip rather than passing quietly.
+- ~~**In-guest enumeration is still unproven.**~~ **CLOSED 2026-08-12 — see the live-validation
+  record below.** The live leg has now run against two real devices; the flag's `true` is validated
+  end to end.
 - **The precheck runs in the vmcell process, not in the jailed child.** They share uid and, with
   `clear_ambient_caps: false` (the default, Appendix A reversal 9), ambient capabilities. A jail that
   cleared them could still leave the child unable to open a node this process opened, and QEMU's
@@ -2639,3 +2639,45 @@ long: the argv splice had **no gate at all**, the live leg's guest kernel **did 
   change to an externally-constructible exhaustive struct; it belongs in the pass's single
   0.12 → 0.13 bump. `VmConfig`/`VmConfigBuilder` are `#[non_exhaustive]`, so the config half is
   purely additive — do not conflate them.
+
+### Live validation of the flag (2026-08-12) — the last open question, closed
+
+`just test-usb-passthrough` ran on a KVM host (QEMU 10.2.1, guest `vmlinux-usbhost` built through
+the delta-3 toolkit) against **two** designated devices, deliberately chosen to be different shapes:
+
+| Device | Host driver at start | Result |
+|---|---|---|
+| Goodix fingerprint reader `27c6:609c` | none (`Driver=[none]`) | enumerated in-guest, 2/2 at `--retries 0` |
+| Realtek 2.5G NIC `0bda:8156` | **`r8152` bound** | enumerated in-guest, 3/3 at `--retries 0` |
+
+The second is the case that matters: QEMU must unbind a *live* kernel driver to claim the device.
+It does. So `usb_host_passthrough: true` is now measured, not presumed.
+
+**Passthrough is not transparent to the host driver — measured, and the reason the recipe demands a
+*disposable* device.** After the guest exits the device reappears on the host bus, but in the USB
+configuration the guest left it in: `0bda:8156` came back at `bConfigurationValue=2` (of 3) with
+**no driver bound to either interface**, so `r8152` did not re-bind and the host lost that netdev
+until the configuration is reset (write `1` to the device's `bConfigurationValue`, or replug). The
+no-driver device (`27c6:609c`) has nothing to lose and is unaffected. A first reading of this run
+mistook the *other* Realtek NIC's netdev (`0bda:8153`, on a different hub, never passed through) for
+the test device's return — the check that settles it is which USB interface backs the netdev
+(`readlink -f /sys/class/net/<dev>/device`), not the netdev's presence.
+
+**The defect this run found.** The leg scanned guest sysfs **once**, immediately after the agent
+became reachable. Guest USB enumeration is asynchronous to agent readiness, and the driver-bound
+device needs the extra unbind+reset — so the single scan failed **3/3** on the NIC at `--retries 0`,
+while passing on a retry only because the *previous* run had left the device unbound. (That is the
+retry-masked pass AGENTS.md rules out.) The scan is now a bounded poll —
+`USB_ENUMERATION_BUDGET` 10 s at `USB_ENUMERATION_POLL` 250 ms — the same shape
+`lifecycle.rs` already uses for virtio-net `operstate`. Non-vacuity re-proven WITH the poll in
+place: deleting the `cmd.args(build_qemu_usb_args(…))` splice reddens the leg in 10.98 s with
+`guest did not enumerate 0bda:8156 within 10s`, so patience did not buy silence.
+
+**A false premise this run also corrected.** Two comments (the pins test's rationale and the
+justfile recipe) said the stock vmcell kernel "has no USB driver at all" and that the fragment "is
+what adds it". Measured: `make olddefconfig` inherits `CONFIG_USB_XHCI_PCI=y` from the x86_64
+defconfig, so `vmlinux-6-12-94` and `vmlinux-6-6-143` — which declare **no** fragments — carry xhci
+too. The assertion (the baseline `microvm_config` names no USB symbol) stands and is worth keeping,
+but its reason changed: the fragment **pins** the symbols rather than adding them, so an upstream
+defconfig change cannot silently drop USB out from under a capability that advertises it. Both
+comments now say that.

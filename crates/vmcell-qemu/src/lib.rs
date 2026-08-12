@@ -1370,9 +1370,21 @@ impl Vmm for Qemu {
             //     `require_usb_host_devices` resolves each requested id pair to its
             //     `/dev/bus/usb/BBB/DDD` node and proves it opens read-write — because
             //     the same run showed QEMU accepts an ABSENT device in total silence.
-            // Still open, and only the opt-in `just test-usb-passthrough` leg can close
-            // it (this host has no designated, disposable device): in-GUEST enumeration
-            // of a passed-through device. A re-gate must flip this AND its honesty pin.
+            //   * in-GUEST enumeration — the last question, CLOSED on 2026-08-12 by the
+            //     opt-in `just test-usb-passthrough` leg against two real devices on this
+            //     host: a Goodix fingerprint reader (27c6:609c, no host driver bound) and a
+            //     Realtek 2.5G NIC (0bda:8156, whose interface held a live `r8152`). Both
+            //     enumerate in-guest with the ids the config asked for, and the leg reddens
+            //     when the argv splice is dropped.
+            //     MEASURED CAVEAT, and the reason the recipe demands a *disposable* device:
+            //     the device comes back on the host bus after the guest exits, but in the
+            //     CONFIGURATION the guest left it in — the NIC returned at
+            //     `bConfigurationValue=2` (of 3) with NO driver bound, so `r8152` did not
+            //     re-bind and the host lost that netdev until the config is reset (write 1 to
+            //     the device's `bConfigurationValue`, or replug). Passthrough is not
+            //     transparent to the host driver.
+            // So this `true` is now validated end to end, not presumed (AGENTS.md rule 5).
+            // A re-gate must flip this AND its honesty pin.
             usb_host_passthrough: true,
         }
     }
