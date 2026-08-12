@@ -257,7 +257,7 @@ am-fs-erofs = { version = "0.1.1", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 # Used only by the privileged tap path (`net/tap.rs`, alongside rtnetlink 0.21) and the proxy CA
 # authority type (`proxy/tls.rs`); both are optional so they stay out of feature-trimmed builds.
-netlink-packet-route = { version = "0.30", optional = true }
+netlink-packet-route = { version = "0.31", optional = true }
 http = { version = "1", optional = true }
 
 [dev-dependencies]
