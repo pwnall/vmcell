@@ -91,6 +91,11 @@ pub struct QemuInstance {
     snapshot_restore_capable: bool,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
+    /// The host USB interface→driver bindings this VM's passthrough displaced, captured
+    /// before the spawn by `require_usb_host_devices`. Teardown re-binds exactly these
+    /// (see [`restore_usb_host_drivers_at`]); empty for every VM without passthrough, so
+    /// the teardown step costs nothing on the ordinary path.
+    usb_host_bindings: Vec<UsbInterfaceBinding>,
     // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
     // leader is reaped the kernel can recycle its pgid, so `kill`/`Drop` must NOT
     // re-`SIGKILL` the process group or they could hit an unrelated group (M-VMM-1).
@@ -202,7 +207,11 @@ impl QemuInstance {
     /// `snapshot_restore_capable` is the backend descriptor's `snapshot_restore` flag,
     /// captured here because `snapshot()` runs on the instance and has no handle back to
     /// the [`Qemu`] backend (the same capture CH's `ChInstance` does, M-RESTORE-3).
-    fn from_spawned(spawned: SpawnedQemu, snapshot_restore_capable: bool) -> Self {
+    fn from_spawned(
+        spawned: SpawnedQemu,
+        snapshot_restore_capable: bool,
+        usb_host_bindings: Vec<UsbInterfaceBinding>,
+    ) -> Self {
         let SpawnedQemu {
             qmp_socket,
             vsock_path,
@@ -230,6 +239,39 @@ impl QemuInstance {
             pgid,
             vsock_pgid,
             reaped: false,
+            usb_host_bindings,
+        }
+    }
+
+    /// Puts back the host USB drivers this VM's passthrough displaced — the ONE step both
+    /// teardown paths (`kill()` and `Drop`) call, so the graceful and panic paths can
+    /// never disagree about whether the host gets its device back.
+    ///
+    /// Best-effort by design: teardown must complete. A failure is WARNED with the exact
+    /// interfaces and the command to fix them by hand — never swallowed, and never
+    /// promoted to an error that would abort the rest of the ordered teardown. The live
+    /// gate (`usb_passthrough_qemu`) is what makes a regression here loud.
+    fn restore_usb_host_drivers(&self) {
+        if self.usb_host_bindings.is_empty() {
+            return;
+        }
+        let failed = restore_usb_host_drivers_at(
+            Path::new(SYSFS_USB_DEVICES),
+            Path::new(USB_DRIVERS_ROOT),
+            &self.usb_host_bindings,
+            USB_REBIND_BUDGET,
+        );
+        for b in &failed {
+            tracing::warn!(
+                interface = %b.interface,
+                driver = %b.driver,
+                "host USB passthrough: could not re-bind the host driver this VM displaced; \
+                 the device is left driverless on the host. Re-bind with: \
+                 echo -n {} | sudo tee {}/{}/bind",
+                b.interface,
+                USB_DRIVERS_ROOT,
+                b.driver
+            );
         }
     }
 
@@ -504,6 +546,20 @@ fn build_qemu_usb_args(devices: &[vmcell::config::UsbHostDevice]) -> Vec<String>
 /// per device (plus per-interface ones, which carry no `idVendor` and are skipped).
 const SYSFS_USB_DEVICES: &str = "/sys/bus/usb/devices";
 
+/// The sysfs USB driver root whose `<driver>/bind` files re-attach an interface.
+///
+/// Writing there is `0200 root:root`, so it needs `CAP_DAC_OVERRIDE` — which every context
+/// that can spawn a passthrough VM already holds; see [`restore_usb_host_drivers_at`].
+const USB_DRIVERS_ROOT: &str = "/sys/bus/usb/drivers";
+
+/// How long teardown will keep retrying the host-driver re-bind, and how often.
+///
+/// Bounded so a device that never comes back cannot hang teardown: the restore is
+/// best-effort and reports what it could not do. Only ever entered for a VM that actually
+/// used passthrough, and only while an interface is still missing its driver.
+const USB_REBIND_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const USB_REBIND_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The usbfs mount whose `<bus>/<dev>` character devices QEMU's `usb-host` opens (and
 /// must be able to open **read-write** to claim the device).
 const USBFS_ROOT: &str = "/dev/bus/usb";
@@ -547,11 +603,148 @@ fn read_usb_dec_attr(dir: &Path, name: &str) -> Option<u32> {
 /// cannot be opened read-write (`/dev/bus/usb` nodes are commonly `0664 root:root`, so an
 /// unprivileged run needs a udev rule; the blessed runner's ambient `CAP_DAC_OVERRIDE`
 /// covers it).
+/// A host USB device resolved from `vid:pid`: the usbfs node QEMU opens, plus the sysfs
+/// device directory its interface→driver map is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedUsbDevice {
+    /// `/dev/bus/usb/<bus>/<dev>` — what `-device usb-host` opens read-write.
+    node: PathBuf,
+    /// `/sys/bus/usb/devices/<name>` — the device dir whose `<name>:<cfg>.<if>` siblings
+    /// carry the bound-driver symlinks.
+    sysfs_dir: PathBuf,
+}
+
+/// One host USB interface and the kernel driver bound to it **before** passthrough.
+///
+/// Recorded at spawn so teardown can put back exactly what passthrough displaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsbInterfaceBinding {
+    /// The sysfs interface name, e.g. `3-7:1.0` — the token written to a driver's `bind`.
+    interface: String,
+    /// The driver bound at capture time, e.g. `uvcvideo`.
+    driver: String,
+}
+
+/// Reads the interface→driver map of `device_dir` — every `<dev>:<cfg>.<if>` sibling that
+/// currently has a driver bound.
+///
+/// MUST run before the spawn: QEMU's `usb-host` detaches each interface's kernel driver
+/// (libusb `detach_kernel_driver`) to claim the device, and once detached the sysfs
+/// `driver` symlink is gone, so there is nothing left to read at teardown. Interfaces with
+/// no driver are deliberately **not** recorded: an operator who blacklisted a driver, wrote
+/// a udev rule, or keeps a device permanently unbound for passthrough must get that state
+/// back, not a driver vmcell decided to attach. The rule is "restore what we displaced",
+/// never "make the device work".
+fn capture_usb_host_bindings(sysfs_root: &Path, device_dir: &Path) -> Vec<UsbInterfaceBinding> {
+    let Some(dev_name) = device_dir.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{dev_name}:");
+    let Ok(entries) = std::fs::read_dir(sysfs_root) else {
+        return Vec::new();
+    };
+    let mut bindings: Vec<UsbInterfaceBinding> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            // `3-7:1.0` is an interface of `3-7`; `3-7.1` is a device behind a hub at
+            // that port, whose drivers are ITS business and must not be touched.
+            if !name.starts_with(&prefix) {
+                return None;
+            }
+            let driver = bound_driver(&e.path())?;
+            Some(UsbInterfaceBinding {
+                interface: name,
+                driver,
+            })
+        })
+        .collect();
+    // Stable order so the recorded set (and the tests that pin it) do not depend on
+    // readdir order.
+    bindings.sort_by(|a, b| a.interface.cmp(&b.interface));
+    bindings
+}
+
+/// The driver currently bound to a sysfs interface dir, via its `driver` symlink.
+fn bound_driver(iface_dir: &Path) -> Option<String> {
+    std::fs::read_link(iface_dir.join("driver"))
+        .ok()?
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
+}
+
+/// Re-binds every interface in `bindings` that is no longer bound to the driver it had at
+/// capture time, by writing the interface name to `<drivers_root>/<driver>/bind`.
+///
+/// Returns the interfaces it could NOT restore within `budget`, so the caller can warn with
+/// them named.
+///
+/// `budget` exists because the bind does NOT succeed the instant the VMM is reaped:
+/// measured (2026-08-14, laptop camera), a write issued immediately after `wait()` on the
+/// QEMU leader fails and the interface is still driverless ten seconds later, while the
+/// same write from the slightly-later `Drop` path succeeds. Closing the usbfs fd starts an
+/// asynchronous release/reset of the device, and until that settles the interface cannot be
+/// bound. So this retries on a bounded deadline — bounded because teardown must never hang,
+/// and only entered at all when a binding is still missing.
+///
+/// **Why vmcell does this at all.** QEMU detaches the host driver to claim the device and
+/// does not restore it on the paths vmcell uses: teardown ends in a process-group SIGKILL
+/// (a killed QEMU never runs libusb's re-attach), and even the graceful QMP `quit` that
+/// precedes it is bounded by 500 ms. Ownership owns cleanup (AGENTS.md): vmcell caused the
+/// detach, so vmcell puts it back — measured, otherwise a passed-through webcam stays
+/// driverless with no `/dev/video*` until someone re-binds it by hand.
+///
+/// **Why no new privileged binary.** The only permission needed is write access to a
+/// driver's `bind` file (`0200 root:root`), i.e. `CAP_DAC_OVERRIDE` — which every context
+/// that can spawn a passthrough VM already holds (the blessed runner; the daemon's broker
+/// child, which owns VM teardown). A second privileged helper would re-acquire a
+/// capability the caller has in hand, for a strictly wider attack surface. It is also a far
+/// narrower operation than `modprobe`: the module never unloaded, so nothing needs loading
+/// — only one named interface is re-attached to one named driver.
+///
+/// Re-reads the live binding before each write, so an interface that came back on its own
+/// (binding one interface can re-attach its siblings — a driver claiming a multi-interface
+/// device binds them together) is skipped rather than written and spuriously reported.
+fn restore_usb_host_drivers_at(
+    sysfs_root: &Path,
+    drivers_root: &Path,
+    bindings: &[UsbInterfaceBinding],
+    budget: std::time::Duration,
+) -> Vec<UsbInterfaceBinding> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut pending: Vec<&UsbInterfaceBinding> = bindings.iter().collect();
+    loop {
+        pending.retain(|b| {
+            let iface_dir = sysfs_root.join(&b.interface);
+            // Already back — QEMU released it, a sibling bind pulled it in (a driver
+            // claiming a multi-interface device binds them together), or our own earlier
+            // pass took effect. Nothing to do, and nothing to report.
+            if bound_driver(&iface_dir).as_deref() == Some(b.driver.as_str()) {
+                return false;
+            }
+            let bind_path = drivers_root.join(&b.driver).join("bind");
+            let wrote = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&bind_path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, b.interface.as_bytes()));
+            // A write can also fail *because* the interface got bound between the check
+            // and the write; re-read before believing the error.
+            wrote.is_err() && bound_driver(&iface_dir).as_deref() != Some(b.driver.as_str())
+        });
+        if pending.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(USB_REBIND_POLL);
+    }
+    pending.into_iter().cloned().collect()
+}
+
 fn resolve_usb_device_node(
     sysfs_root: &Path,
     usbfs_root: &Path,
     device: vmcell::config::UsbHostDevice,
-) -> Result<PathBuf> {
+) -> Result<ResolvedUsbDevice> {
     let (vid, pid) = (device.vendor_id, device.product_id);
     let entries = std::fs::read_dir(sysfs_root).map_err(|e| {
         Error::Vmm(format!(
@@ -561,7 +754,7 @@ fn resolve_usb_device_node(
         ))
     })?;
 
-    let mut matches: Vec<PathBuf> = Vec::new();
+    let mut matches: Vec<ResolvedUsbDevice> = Vec::new();
     for entry in entries {
         let dir = entry
             .map_err(|e| Error::Vmm(format!("host USB passthrough: reading {sysfs_root:?}: {e}")))?
@@ -587,15 +780,19 @@ fn resolve_usb_device_node(
                 usbfs_root.display()
             )));
         };
-        matches.push(
-            usbfs_root
+        matches.push(ResolvedUsbDevice {
+            node: usbfs_root
                 .join(format!("{bus:03}"))
                 .join(format!("{dev:03}")),
-        );
+            // The sysfs device dir (`…/devices/3-7`) is kept because it is the ONLY
+            // place the interface→driver map can be read, and it must be read BEFORE
+            // QEMU detaches those drivers — afterwards the information is simply gone.
+            sysfs_dir: dir.clone(),
+        });
     }
-    matches.sort();
+    matches.sort_by(|a, b| a.node.cmp(&b.node));
 
-    let [node] = matches.as_slice() else {
+    let [resolved] = matches.as_slice() else {
         if matches.is_empty() {
             return Err(Error::Vmm(format!(
                 "host USB passthrough: no host device matches {vid:04x}:{pid:04x} under {} — \
@@ -603,14 +800,16 @@ fn resolve_usb_device_node(
                 sysfs_root.display()
             )));
         }
+        let nodes: Vec<&PathBuf> = matches.iter().map(|m| &m.node).collect();
         return Err(Error::Vmm(format!(
             "host USB passthrough: {vid:04x}:{pid:04x} is ambiguous — {} host devices carry \
-             those ids ({matches:?}); QEMU would attach an arbitrary one",
+             those ids ({nodes:?}); QEMU would attach an arbitrary one",
             matches.len()
         )));
     };
 
     // Prove the access QEMU needs, here, where the error can name the node.
+    let node = &resolved.node;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -623,12 +822,16 @@ fn resolve_usb_device_node(
                 node.display()
             ))
         })?;
-    Ok(node.clone())
+    Ok(resolved.clone())
 }
 
 /// Fails loud unless every requested host USB device is present, unambiguous and openable
 /// (see [`resolve_usb_device_node`]). Runs before the spawn, so a misnamed or absent
 /// device never boots a guest that silently lacks it.
+///
+/// Returns the host driver bindings it observed, for teardown to restore
+/// ([`restore_usb_host_drivers_at`]). Capturing here is not incidental: this is the last
+/// point at which those drivers are still attached.
 ///
 /// # Errors
 /// As [`resolve_usb_device_node`], for the first device that fails.
@@ -636,17 +839,21 @@ fn require_usb_host_devices(
     sysfs_root: &Path,
     usbfs_root: &Path,
     devices: &[vmcell::config::UsbHostDevice],
-) -> Result<()> {
+) -> Result<Vec<UsbInterfaceBinding>> {
+    let mut bindings = Vec::new();
     for device in devices {
-        let node = resolve_usb_device_node(sysfs_root, usbfs_root, *device)?;
+        let resolved = resolve_usb_device_node(sysfs_root, usbfs_root, *device)?;
         tracing::debug!(
             "host USB passthrough: {:04x}:{:04x} -> {}",
             device.vendor_id,
             device.product_id,
-            node.display()
+            resolved.node.display()
         );
+        // Capture the host driver bindings HERE — the last moment they still exist. The
+        // spawn below detaches them, and teardown restores exactly this set.
+        bindings.extend(capture_usb_host_bindings(sysfs_root, &resolved.sysfs_dir));
     }
-    Ok(())
+    Ok(bindings)
 }
 
 /// Selects the **in-kernel `vhost-vsock`** transport for a QEMU config, versus the
@@ -1296,7 +1503,7 @@ impl Vmm for Qemu {
         // that matches nothing on this host **without a word** (measured, §2.4 notes on
         // `resolve_usb_device_node`), so the requested devices are resolved to their
         // usbfs nodes and proven openable here, before the spawn.
-        require_usb_host_devices(
+        let usb_host_bindings = require_usb_host_devices(
             Path::new(SYSFS_USB_DEVICES),
             Path::new(USBFS_ROOT),
             &cfg.usb_host_devices,
@@ -1312,6 +1519,7 @@ impl Vmm for Qemu {
         Ok(QemuInstance::from_spawned(
             self.spawn_qemu(cfg, res, cgroups, &params).await?,
             self.capabilities().snapshot_restore,
+            usb_host_bindings,
         ))
     }
 
@@ -1377,6 +1585,11 @@ impl Vmm for Qemu {
         let instance = QemuInstance::from_spawned(
             self.spawn_qemu(cfg, res, cgroups, &params).await?,
             self.capabilities().snapshot_restore,
+            // No USB bindings on the restore path: a non-empty `usb_host_devices` is
+            // refused at the one orchestrator boundary before any backend is reached
+            // (docs/78 M4), so a restored VM never displaces a host driver and has
+            // nothing to put back.
+            Vec::new(),
         );
 
         // Drive the incoming migration on the now-ready QMP socket and wait for it to
@@ -1500,6 +1713,11 @@ impl VmInstance for QemuInstance {
         let _ = self.process.wait().await;
         // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
         self.reaped = true;
+
+        // QEMU is gone, so the usbfs fds it held are closed and the interfaces are free:
+        // put back the host drivers passthrough displaced. Ordered AFTER the reap on
+        // purpose — re-binding while QEMU still holds the device would race it.
+        self.restore_usb_host_drivers();
 
         if let Some(mut d) = self._vsock_daemon.take() {
             if let Some(v_pgid) = self.vsock_pgid {
@@ -1628,6 +1846,9 @@ impl Drop for QemuInstance {
                 }
             }
         }
+        // With the VMM reaped, the host USB drivers it displaced can go back (same step,
+        // same order, as the graceful `kill()` path — one helper, never a second copy).
+        self.restore_usb_host_drivers();
         // vhost-user daemons next: the external vhost-device-vsock and each virtiofsd
         // own sockets that live inside `tmp_dir`, so they must be reaped before that
         // directory is removed.
@@ -1950,6 +2171,132 @@ mod tests {
         std::fs::write(bus.join(format!("{:03}", at.1)), b"node").expect("usbfs node");
     }
 
+    /// Adds interface `<name>:<iface>` under `sysfs`, bound to `driver` when given, and
+    /// creates that driver's writable `bind` file under `drivers`.
+    fn fake_usb_interface(
+        sysfs: &Path,
+        drivers: &Path,
+        name: &str,
+        iface: &str,
+        driver: Option<&str>,
+    ) {
+        let idir = sysfs.join(format!("{name}:{iface}"));
+        std::fs::create_dir_all(&idir).expect("iface dir");
+        if let Some(d) = driver {
+            let ddir = drivers.join(d);
+            std::fs::create_dir_all(&ddir).expect("driver dir");
+            std::fs::write(ddir.join("bind"), b"").expect("bind file");
+            std::os::unix::fs::symlink(&ddir, idir.join("driver")).expect("driver symlink");
+        }
+    }
+
+    // The capture half of the host-driver restore. QEMU's `usb-host` detaches each
+    // interface's kernel driver to claim the device, and the sysfs `driver` symlink is
+    // gone once it has — so if this is not read BEFORE the spawn there is nothing left to
+    // put back, which is exactly how a passed-through webcam was left driverless.
+    //
+    // Pins the three rules that make the restore safe rather than merely effective:
+    // interfaces of THIS device only (a `3-7.1` device behind a hub at that port is not
+    // ours to touch), driverless interfaces are NOT recorded (an operator's blacklist or
+    // dedicated-passthrough device must stay unbound — we restore what we displaced, we
+    // do not make devices work), and the order is stable.
+    //
+    // RED on the inverse: match on `starts_with(dev_name)` instead of `"{dev_name}:"` and
+    // the hub-child leaks in; record driverless interfaces and the blacklisted one appears.
+    #[test]
+    fn capture_records_only_this_devices_bound_interfaces() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (sysfs, drivers) = (tmp.path().join("devices"), tmp.path().join("drivers"));
+        std::fs::create_dir_all(&sysfs).expect("sysfs");
+        std::fs::create_dir_all(&drivers).expect("drivers");
+        std::fs::create_dir_all(sysfs.join("3-7")).expect("device dir");
+
+        fake_usb_interface(&sysfs, &drivers, "3-7", "1.0", Some("uvcvideo"));
+        fake_usb_interface(&sysfs, &drivers, "3-7", "1.1", Some("uvcvideo"));
+        // Deliberately unbound (blacklisted / reserved for passthrough): not ours to bind.
+        fake_usb_interface(&sysfs, &drivers, "3-7", "1.2", None);
+        // A DIFFERENT device sitting behind a hub on the same port — not an interface of
+        // 3-7, and its drivers are its own business.
+        fake_usb_interface(&sysfs, &drivers, "3-7.1", "1.0", Some("usbhid"));
+
+        let got = capture_usb_host_bindings(&sysfs, &sysfs.join("3-7"));
+        assert_eq!(
+            got,
+            vec![
+                UsbInterfaceBinding {
+                    interface: "3-7:1.0".into(),
+                    driver: "uvcvideo".into()
+                },
+                UsbInterfaceBinding {
+                    interface: "3-7:1.1".into(),
+                    driver: "uvcvideo".into()
+                },
+            ]
+        );
+    }
+
+    // The restore half, against a real (temp) sysfs tree. Covers the three states teardown
+    // actually meets: still detached (must be re-bound), already back on its own (QEMU
+    // released it, or binding a sibling interface re-attached this one — a driver claiming
+    // a multi-interface device binds them together, measured on the laptop camera, where
+    // binding 3-7:1.0 brought 3-7:1.1 with it), and unrestorable (the driver's `bind` is
+    // missing) which must be REPORTED, never silently swallowed.
+    //
+    // RED on the inverse: drop the write and the detached interface stays unbound; drop
+    // the already-bound short-circuit and the second arm writes a spurious bind; return
+    // an empty failure list and the third arm's warning disappears.
+    #[test]
+    fn restore_rebinds_only_what_is_still_detached_and_reports_what_it_cannot() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (sysfs, drivers) = (tmp.path().join("devices"), tmp.path().join("drivers"));
+        std::fs::create_dir_all(&sysfs).expect("sysfs");
+        std::fs::create_dir_all(&drivers).expect("drivers");
+
+        // (a) detached: interface dir exists, no `driver` symlink; its driver has a bind.
+        fake_usb_interface(&sysfs, &drivers, "3-7", "1.0", None);
+        std::fs::create_dir_all(drivers.join("uvcvideo")).expect("driver dir");
+        std::fs::write(drivers.join("uvcvideo").join("bind"), b"").expect("bind");
+        // (b) already back on its own.
+        fake_usb_interface(&sysfs, &drivers, "3-7", "1.1", Some("uvcvideo"));
+        // (c) driver gone entirely (module unloaded under us) — unrestorable.
+        fake_usb_interface(&sysfs, &drivers, "3-8", "1.0", None);
+
+        let recorded = vec![
+            UsbInterfaceBinding {
+                interface: "3-7:1.0".into(),
+                driver: "uvcvideo".into(),
+            },
+            UsbInterfaceBinding {
+                interface: "3-7:1.1".into(),
+                driver: "uvcvideo".into(),
+            },
+            UsbInterfaceBinding {
+                interface: "3-8:1.0".into(),
+                driver: "vanished".into(),
+            },
+        ];
+        // ZERO budget = exactly one pass, so the unit gate stays instant and still pins
+        // the decision logic; the retry itself is the live gate's business.
+        let failed =
+            restore_usb_host_drivers_at(&sysfs, &drivers, &recorded, std::time::Duration::ZERO);
+
+        // (a) was written to the driver's bind file…
+        assert_eq!(
+            std::fs::read_to_string(drivers.join("uvcvideo").join("bind")).expect("read bind"),
+            "3-7:1.0",
+            "the still-detached interface must be re-bound, and ONLY it"
+        );
+        // …(b) was not (it was already bound), and (c) is reported.
+        assert_eq!(
+            failed,
+            vec![UsbInterfaceBinding {
+                interface: "3-8:1.0".into(),
+                driver: "vanished".into()
+            }],
+            "an unrestorable interface must be surfaced so teardown can warn with it named"
+        );
+    }
+
     // v30 §18 delta 9 / AGENTS.md rule 5 GATE — the fail-loud host-device precheck.
     // MEASURED premise (QEMU 10.2.1, 2026-08-11): `-device usb-host,vendorid=…` for a
     // device that is absent or ambiguous starts QEMU normally and prints NOTHING, so an
@@ -1975,9 +2322,12 @@ mod tests {
         fake_usb_device(&sysfs, &usbfs, "usb3", (0x1d6b, 0x0002), (3, 1));
 
         // Positive control: the unique device resolves to its usbfs node.
-        let node = resolve_usb_device_node(&sysfs, &usbfs, UsbHostDevice::new(0x0bda, 0x5634))
+        let resolved = resolve_usb_device_node(&sysfs, &usbfs, UsbHostDevice::new(0x0bda, 0x5634))
             .expect("a present, unique, openable device must resolve");
-        assert_eq!(node, usbfs.join("003").join("002"));
+        assert_eq!(resolved.node, usbfs.join("003").join("002"));
+        // The sysfs dir travels with the node: it is where the interface→driver map the
+        // teardown restore replays is read from, and it is unreadable after the spawn.
+        assert_eq!(resolved.sysfs_dir, sysfs.join("3-7"));
 
         // Absent: QEMU's silence becomes vmcell's loud error.
         let err = resolve_usb_device_node(&sysfs, &usbfs, UsbHostDevice::new(0xdead, 0xbeef))
@@ -2484,6 +2834,7 @@ mod tests {
             cid: 3,
             endpoint: VsockEndpoint::Vsock { cid: 3, port: 5000 },
             has_vhost_user_device: false,
+            usb_host_bindings: Vec::new(),
             snapshot_restore_capable: true,
             pgid,
             vsock_pgid: None,

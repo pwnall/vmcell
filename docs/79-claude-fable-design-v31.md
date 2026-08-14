@@ -450,7 +450,21 @@ QEMU's own fail-loud open error), the `-sandbox …,spawn=deny` Enforcing filter
 ioctls, and the jailer defaults must not strip the access — any conflict is resolved and recorded,
 never met with a silent sandbox downgrade. `build()` rejects `snapshotting` + a USB device (a
 passed-through device is not migratable), and every non-QEMU backend's `create()` refuses with a typed
-`Error::Unsupported { vmm, feature: "usb_host_passthrough" }`. The opt-in gate's guest kernel is a
+`Error::Unsupported { vmm, feature: "usb_host_passthrough" }`.
+
+**The host gets its device back.** Claiming a device detaches its kernel driver, and QEMU re-attaches
+on none of the paths vmcell drives (teardown ends in a process-group SIGKILL; a killed QEMU runs no
+release path), so passthrough used to leave the host device driverless — measured. Ownership owns
+cleanup: the interface→driver map is captured **before** the spawn (once QEMU has claimed the device
+the sysfs `driver` symlink is gone) and re-bound after the VMM is reaped by the one helper both
+`kill()` and `Drop` call. The rule is *restore what we displaced*, never *make the device work*: an
+interface with no driver at capture time is not recorded, so a blacklisted driver or a device the
+operator keeps unbound for passthrough stays that way. Re-binding needs only write access to
+`/sys/bus/usb/drivers/<driver>/bind`, i.e. `CAP_DAC_OVERRIDE`, which every context that can spawn a
+passthrough VM already holds — no second privileged binary, and a far narrower operation than a
+module reload, since the module never unloaded. The re-bind retries on a bounded deadline because the
+usbfs release is asynchronous (a write issued the instant the leader is reaped fails); a restore that
+still fails is warned with the interface and the manual command, never fatal to teardown. The opt-in gate's guest kernel is a
 `vmlinux-usbhost` label built through the §5.6 toolkit from a **vmcell-owned generic host-controller
 fragment** (xhci + USB core + the one class-smoke driver, and nothing else). Against the requester's
 generality directive this is defended, not assumed: a capability flag must be live-validated (AGENTS.md

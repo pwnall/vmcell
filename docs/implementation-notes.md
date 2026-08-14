@@ -3206,3 +3206,60 @@ processes, and running `vmcelld` through the runner with its stderr attached.
 three-cap runner reads as NOT BLESSED and `just bless` re-blesses it (one sudo). That is the
 `M-BIN-2` caps-check path doing its job: the stamp matches but the caps do not, so it falls through
 rather than reporting a false no-op.
+
+### Host USB drivers are restored at teardown (2026-08-14)
+
+Validating delta 9 live surfaced a real leak that the passing test could not see: after
+`just test-usb-passthrough`, the designated device was left **driverless on the host**. Passing the
+laptop camera removed `/dev/video*` and left `Driver=[none]` on both of its interfaces, and it
+stayed that way — the kernel does not re-attach on its own. QEMU's `usb-host` detaches each
+interface's driver (libusb `detach_kernel_driver`) to claim the device, and it never re-attaches on
+the paths vmcell drives: teardown ends in a process-group SIGKILL, and a killed QEMU runs no
+release path at all. The graceful QMP `quit` that precedes it is bounded at 500 ms and did not
+change the outcome.
+
+**Ownership owns cleanup.** vmcell caused the detach, so vmcell puts it back.
+`require_usb_host_devices` now also captures the interface→driver map — at the last moment it
+exists, since the sysfs `driver` symlink is gone once QEMU has claimed the device — and one helper,
+called by BOTH `QemuInstance::kill()` and `Drop`, re-binds exactly that set after the VMM is reaped.
+Ordering is load-bearing at both ends: capture before the spawn, restore after the reap (re-binding
+while QEMU still holds the device would race it).
+
+**Restore what we displaced, never "make the device work".** Only interfaces that *had* a driver at
+capture time are recorded. An operator who blacklisted a driver, wrote a udev rule, or keeps a
+device permanently unbound for passthrough gets that state back — vmcell never attaches a driver it
+did not itself displace. Interfaces of the device only: `3-7:1.0` is ours, `3-7.1` is a different
+device behind a hub at the same port and is not.
+
+**No new privileged binary, and `modprobe` is the wrong lever.** The only permission needed is write
+access to `/sys/bus/usb/drivers/<driver>/bind` (`0200 root:root`), i.e. `CAP_DAC_OVERRIDE` — which
+every context that can spawn a passthrough VM already holds (the blessed runner; the daemon's broker
+child, which owns VM teardown). Measured: the same write is `EACCES` unprivileged and `OK` through
+the blessed runner. A second privileged helper would re-acquire, from a new attack surface, a
+capability the caller already has. `modprobe` would also be the wrong operation and a much wider
+one: the module never unloaded — only the interface binding was removed — so nothing needs loading,
+and re-binding one named interface to one named driver is as narrow as this gets.
+
+**The retry is not defensive padding.** Measured: a bind issued immediately after `wait()` on the
+QEMU leader FAILS, and the interface is still driverless ten seconds later; a write from the
+slightly-later `Drop` path succeeds. Closing the usbfs fd starts an asynchronous release/reset, and
+until it settles the interface cannot be bound — a single write at t=0 is not enough, while a retry
+100 ms later is. Hence a bounded deadline (5 s, 100 ms poll), bounded because teardown must never
+hang, entered only for a VM that used passthrough and only while a binding is still missing. A
+restore that still fails is WARNED with the interface, the driver, and the exact manual command —
+never swallowed, and never promoted to an error that would abort the rest of the ordered teardown.
+
+**Gates.** KVM-free: `capture_records_only_this_devices_bound_interfaces` (this device's interfaces
+only; driverless ones not recorded; stable order) and
+`restore_rebinds_only_what_is_still_detached_and_reports_what_it_cannot` (re-binds the detached one,
+skips the one already back, reports the unrestorable one), the latter driven with a zero budget so
+it pins the decision logic instantly. Live: `usb_passthrough_qemu` now captures the host bindings
+before the VM starts — asserting they are non-empty first, so the check cannot pass vacuously on a
+device the host never drove — asserts passthrough actually detached them, and asserts teardown gives
+them back, with a bounded retry because the driver probe and udev's node/ACL work are asynchronous.
+Red on the inverse, verified: with the restore stubbed out the live gate fails with
+`before [("3-7:1.0", "uvcvideo"), ("3-7:1.1", "uvcvideo")], after []`.
+
+The restore lives in `vmcell-qemu` because QEMU is the only backend advertising
+`usb_host_passthrough`. If another backend ever gains it, the law moves to `vmcell` beside the other
+shared teardown helpers rather than being copied.

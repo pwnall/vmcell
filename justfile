@@ -181,13 +181,14 @@ test-crosvm:
 # capability skip to $VMCELL_SKIP_MANIFEST instead of hard-failing every KVM host — this recipe is
 # the only place it actually exercises a device.
 #
-# AFTER-EFFECT, measured 2026-08-14: QEMU's `usb-host` detaches the device's kernel driver on the
-# host for the duration and does NOT re-bind it on release, so the device stays driverless
-# afterwards (passing the laptop camera left `Driver=[none]` on both interfaces and removed
-# `/dev/video*`). That is WHY the device must be DISPOSABLE, and it is not residue the suite can
-# sweep — the host driver is not vmcell's to restore. Re-bind with
-#   echo -n <iface> | sudo tee /sys/bus/usb/drivers/<driver>/bind   # e.g. 3-7:1.0 -> uvcvideo
-# or re-plug it (a module reload also works: `sudo modprobe -r uvcvideo && sudo modprobe uvcvideo`).
+# HOST DRIVER, measured 2026-08-14: QEMU's `usb-host` detaches the device's kernel driver to claim
+# it and does NOT re-bind on the paths vmcell uses (teardown ends in a process-group SIGKILL, and a
+# killed QEMU never runs libusb's re-attach), so passing the laptop camera used to leave
+# `Driver=[none]` on both interfaces with no `/dev/video*`. vmcell now restores it: the
+# interface->driver map is captured before the spawn and re-bound by the ONE teardown helper both
+# `kill()` and `Drop` call, asserted end to end by this test. The device should still be one you can
+# afford to lose for the duration of a run — it belongs to the guest while the VM is up, and a
+# restore that fails is warned, not fatal.
 test-usb-passthrough:
     #!/usr/bin/env bash
     set -euo pipefail

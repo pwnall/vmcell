@@ -321,6 +321,48 @@ async fn qemu_refuses_a_usb_device_absent_from_the_host() {
     );
 }
 
+/// The HOST sysfs interface→driver map of the device matching `device`, read independently
+/// of `vmcell-qemu`'s own capture (whose helper is `pub(crate)` and, more importantly,
+/// is the thing under test — a gate that reuses the implementation's reading of the world
+/// cannot catch the implementation misreading it).
+#[cfg(feature = "qemu")]
+fn host_usb_bindings(device: UsbHostDevice) -> Vec<(String, String)> {
+    let root = std::path::Path::new("/sys/bus/usb/devices");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    // Find the device dir by ids, then collect its `<dev>:<cfg>.<if>` interfaces.
+    let Some(dev_name) = std::fs::read_dir(root).ok().and_then(|es| {
+        es.flatten().find_map(|e| {
+            let p = e.path();
+            let hex = |a: &str| {
+                std::fs::read_to_string(p.join(a))
+                    .ok()
+                    .and_then(|v| u16::from_str_radix(v.trim(), 16).ok())
+            };
+            (hex("idVendor") == Some(device.vendor_id)
+                && hex("idProduct") == Some(device.product_id))
+            .then(|| e.file_name().to_string_lossy().to_string())
+        })
+    }) else {
+        return Vec::new();
+    };
+    let prefix = format!("{dev_name}:");
+    let mut out: Vec<(String, String)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with(&prefix) {
+                return None;
+            }
+            let drv = std::fs::read_link(e.path().join("driver")).ok()?;
+            Some((name, drv.file_name()?.to_string_lossy().to_string()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Parses `VMCELL_TEST_USB_DEVICE` (`<vid>:<pid>`, hex, `lsusb` form).
 ///
 /// Returns `None` when the variable is **unset** — the designated-device facility is
@@ -389,6 +431,19 @@ async fn usb_passthrough_qemu() {
     .network_disabled()
     .build()
     .expect("a single non-zero USB device on a non-snapshotting config must build");
+
+    // The host driver bindings BEFORE passthrough. Captured here because QEMU's
+    // `usb-host` detaches them to claim the device, and this is the last moment they can
+    // be observed — the same reason the product captures them at the same point.
+    let before = host_usb_bindings(device);
+    assert!(
+        !before.is_empty(),
+        "the designated device {:04x}:{:04x} has no host driver bound, so the \
+         restore-after-teardown assertion below would pass vacuously; designate a device \
+         the host actually drives",
+        device.vendor_id,
+        device.product_id
+    );
 
     let vmm = vmcell_qemu::Qemu::new(common::qemu_bin());
     let mut vm = common::start_vm(&vmm, cfg).await;
@@ -491,5 +546,37 @@ async fn usb_passthrough_qemu() {
          configuration descriptors were never read ({found:?})"
     );
 
+    // Passthrough DETACHED the host drivers — prove it, so the restore assertion that
+    // follows is about a real transition and not a device that was never taken.
+    let during = host_usb_bindings(device);
+    assert!(
+        during.is_empty() || during != before,
+        "QEMU was supposed to detach the host driver(s) to claim {:04x}:{:04x}, but the \
+         host binding is unchanged ({during:?}) — the guest may be seeing a device the \
+         host never released",
+        device.vendor_id,
+        device.product_id
+    );
+
     vm.kill().await.unwrap();
+
+    // …and TEARDOWN must give them back. QEMU does not: teardown ends in a process-group
+    // SIGKILL, and a killed QEMU never runs libusb's re-attach, so vmcell re-binds exactly
+    // what it displaced. Without that, a passed-through webcam is left driverless with no
+    // `/dev/video*` until someone re-binds it by hand (measured, 2026-08-14).
+    //
+    // Bounded retry: the driver's probe (and udev's node/ACL work) is asynchronous to the
+    // write, so a single immediate read is a flake, not a check.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut after = host_usb_bindings(device);
+    while after != before && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        after = host_usb_bindings(device);
+    }
+    assert_eq!(
+        after, before,
+        "teardown must return the host driver bindings passthrough displaced: before \
+         {before:?}, after {after:?}. Re-bind by hand with \
+         `echo -n <iface> | sudo tee /sys/bus/usb/drivers/<driver>/bind`"
+    );
 }
