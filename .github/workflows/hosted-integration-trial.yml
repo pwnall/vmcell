@@ -13,8 +13,11 @@ name: hosted-integration-trial
 #   systemd user scope  `systemd-run --user --scope -p Delegate=yes` runs             OK
 #   own cgroup          system.slice/hosted-compute-agent.service, NOT delegated      -> use the scope
 #   unshare -Urn        BLOCKED by apparmor_restrict_unprivileged_userns=1            same as the dev box
-#   filesystem          ext4 — NO reflink; the CoW/zygote path is the open question
-#   backends            only qemu present; CH/FC/virtiofsd must be installed
+#   filesystem          ext4 — no reflink, but `reflink_or_copy` treats a full copy as success,
+#                       so the zygote/lineage batteries run; it is a time cost, not a blocker
+#   backends            only qemu present; CH, FC, virtiofsd AND vhost-device-vsock must be
+#                       installed — the last is spawned by bare name and is the DEFAULT QEMU vsock
+#                       transport, so it is not the optional extra the README implies
 
 on:
   workflow_dispatch:
@@ -44,13 +47,22 @@ jobs:
       # The hosted image ships /dev/kvm as root:kvm 0660 and the runner user is not in `kvm`.
       # The udev rule is the standard, documented fix; the assertion after it is the gate — without
       # it a silent failure here would surface 40 minutes later as an unexplained boot failure.
-      - name: make /dev/kvm openable by this user
+      - name: make /dev/kvm and /dev/vhost-vsock openable by this user
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          # /dev/kvm is root:kvm 0660 on the hosted image and the runner user is not in `kvm`.
+          # /dev/vhost-vsock is the same shape and is opened by the QEMU in-kernel-vsock legs
+          # (`uses_in_kernel_vsock`). The blessed runner's CAP_DAC_OVERRIDE would cover the second
+          # one, but `just test-unprivileged` runs WITHOUT the runner — so widen both here rather
+          # than rely on a capability the unprivileged path deliberately does not hold.
+          sudo tee /etc/udev/rules.d/99-vmcell-ci.rules >/dev/null <<'RULES'
+          KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"
+          KERNEL=="vhost-vsock", MODE="0666"
+          KERNEL=="vhost-net", MODE="0666"
+          RULES
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
+          sudo udevadm trigger --name-match=vhost-vsock || true
+          ls -l /dev/kvm /dev/vhost-vsock /dev/vhost-net 2>&1 || true
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             echo "::error::/dev/kvm is still not openable by this user after the udev rule"
             exit 1
@@ -93,16 +105,29 @@ jobs:
           sudo install -m 0755 "release-${FC_VERSION}-x86_64/firecracker-${FC_VERSION}-x86_64" /usr/local/bin/firecracker
           firecracker --version
 
-          # virtiofsd has no GitHub release; it is a small crate build (~2 min) and is version-pinned
-          # by --locked, unlike the README's unpinned `cargo install`.
+          # virtiofsd has no GitHub release; it is a small crate build and is version-pinned by
+          # --locked, unlike the README's unpinned `cargo install`.
           cargo install virtiofsd --locked
           virtiofsd --version
 
+          # `vhost-device-vsock` is NOT optional here, despite the README filing it under "only
+          # needed for the QEMU unprivileged-vsock path". It is spawned by BARE NAME
+          # (crates/vmcell-qemu/src/lib.rs) and is the default QEMU vsock transport —
+          # `uses_in_kernel_vsock` returns `cfg.snapshotting` on `Auto`, so every non-snapshotting
+          # QEMU leg goes through the external daemon. Its absence is a deliberately loud spawn
+          # failure, not a skip. It is present on the maintainer's box, which is exactly how a
+          # self-hosted runner hides a dependency.
+          cargo install vhost-device-vsock --locked
+          vhost-device-vsock --version || true
+
       - name: record the CoW/reflink verdict for this filesystem
         run: |
-          # The zygote + lineage batteries clone through reflink. / is ext4 here, which has none.
-          # Report it rather than discover it inside a test: this decides whether those batteries
-          # run, skip, or fall back to a full copy.
+          # The zygote + lineage batteries clone through reflink; / is ext4 here, which has none.
+          # This is a COST, not a blocker: `clone_tree_cow_blocking` calls `reflink_or_copy`, where a
+          # full byte copy is a success, and `probe_reflink` collapses every uncertainty to
+          # `CowSupport::FullCopy`. No test asserts `Reflink` against the real filesystem. Recorded
+          # here so the per-clone guest-RAM-sized copy is a known line item rather than a mystery in
+          # the wall-clock.
           stat -f -c 'artifacts fs: %T' "${{ github.workspace }}" || true
           truncate -s 1M /tmp/reflink-src
           if cp --reflink=always /tmp/reflink-src /tmp/reflink-dst 2>/tmp/reflink.err; then
@@ -114,8 +139,10 @@ jobs:
       - name: reset the run-scoped skip manifest
         run: just skip-manifest-reset
 
-      # The long pole: compiles the pinned guest kernel with host `make` and builds the rootfs in a
-      # builder micro-VM. `--kernel-source host-make` is mandatory — the bare default silently
+      # The long pole: compiles the pinned guest kernel with host `make`. The rootfs comes from a
+      # digest-pinned OCI base (the CLI's default `RootfsSourceKind::Oci`), which is host-native — the
+      # mmdebstrap-in-a-builder-VM source is opt-in, so this step needs no KVM at all.
+      # `--kernel-source host-make` is mandatory — the bare default silently
       # substitutes a prebuilt vmlinux lacking CONFIG_KVM_INTEL/CONFIG_HW_RANDOM_VIRTIO and reddens
       # nested_virt and snapshot_restore.
       - name: build VM artifacts (host-make kernel + rootfs)
