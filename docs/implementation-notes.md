@@ -746,6 +746,10 @@ Delta 9/11 notes above were corrected in the same pass. Justified deviations rec
 - **(fs-reap) the three open-coded `kill(-pgid)`+`waitpid` teardowns in `fs.rs`** (try_wait error,
   socket-wait timeout, `Drop`) now route through the single-source `crate::vmm::reap_process_group`
   (already gated by the existing `Drop`/readiness-failure reap tests).
+  **[DISPROVEN 2026-08-13 — the docs/78 review: the routing never landed.** All three open-coded
+  copies still ship (`fs.rs:166`, `:181`, `:270`); `git log -S reap_process_group -- crates/vmcell/src/fs.rs`
+  is empty. The consolidation is a docs/78 §6 fix item; this entry stands only as the record of
+  what was *intended*.]
 
 - **(M2) Daemon `Registry::snapshot` checks the VM/state before any filesystem mutation.** The
   `NotFound`/`Conflict` (slot + `require_state(Ready)`) checks now precede `create_dir_all(out_dir)`,
@@ -1161,6 +1165,11 @@ to `just test-privileged` / the CI privileged suite would hard-fail every KVM ho
 `just test-crosvm`** recipe (needs KVM + `$VMCELL_CROSVM_BIN`), and `crosvm` is out of `vmcell-bench`'s
 `default` feature set (mirrors how `qemu` was staged). The preflight was NOT extended: it probes no backend
 binaries (not ch/fc/qemu either), so a crosvm-only probe would be inconsistent.
+**[Bench-default half SUPERSEDED 2026-07-17 (annotated 2026-08-13, the docs/78 review):** crosvm
+graduated into `vmcell-bench`'s `default` feature set once it was live-validated
+(`vmcell-bench/Cargo.toml` `default = [.., "crosvm"]`; the benchmark doc's 2026-07-17 canonical
+matrix). The privileged-suite staging — `just test-crosvm` stays opt-in because CI lacks the
+binary — still stands.]
 
 **README:** the crosvm build-from-source section needs `libwayland-dev` (the maintainer hit it building the
 default feature set), and points at `cargo build --release --no-default-features` for a headless build that
@@ -1745,7 +1754,12 @@ enum variant is minor because the enum is `#[non_exhaustive]`); `cargo machete`;
   such a recipe exists (it needs built artifacts).
 - **Pre-existing, untouched:** `checks.rs` carries 11 bare `let _ = …await` on best-effort
   teardown/shutdown `Result`s, which "fail loud" forbids; fixing them is a class-wide cleanup that
-  must land with a `scripts/`-level ban script. Same for `guest_core_checks`' roster shrinkage when
+  must land with a `scripts/`-level ban script. **[CORRECTED 2026-08-13 — the docs/78 review: the
+  "best-effort teardown/shutdown" characterization is inaccurate for one of the 11.** The cluster is
+  10 teardown/shutdown sites plus the deliberately-commented OOM-probe exec discard — and
+  `checks.rs:866`'s `let _ = vm.agent(..)` is a **load-bearing** swallow: the `metrics.usage_readable`
+  arm passes on a guest that never booted, with the handshake failure reported nowhere (docs/78 §6
+  fix item).] Same for `guest_core_checks`' roster shrinkage when
   the agent is unreachable (the four `rootfs.*` + `agent.put_file_roundtrip` ids vanish rather than
   failing) — the equivalent shrinkage on the arm delta 4 touches *was* fixed.
 - **`vmcell-artifact-validator/Cargo.toml` has no comment-changelog block** unlike
@@ -2485,7 +2499,13 @@ long: the argv splice had **no gate at all**, the live leg's guest kernel **did 
   and `vmm::reject_usb_host_devices(vmm, caps, devices)` — the one refusal law, beside
   `reject_unsupported_console`. `restore()` is deliberately **not** wired: `build()` rejects
   `snapshotting`+USB and every backend's `restore()` rejects a non-snapshotting config, so USB cannot
-  reach it.
+  reach it. **[CORRECTED 2026-08-13 — the docs/78 review (M4): the second half of that rationale is
+  empirically false.** No backend's `restore()` reads `cfg.snapshotting`; QEMU's only restore gate is
+  `uses_in_kernel_vsock`, which a `{VsockTransport::InKernel, snapshotting: false}` config passes —
+  so a non-snapshotting USB config reaches `Qemu::restore()` and is spawned with the USB argv but
+  without the `require_usb_host_devices` precheck, while CH/FC/crosvm restores silently drop the
+  accepted devices. The fix (docs/78 M4) is a `usb_host_devices` rejection at the `restore_inner`
+  boundary; until it lands, this entry must not be cited as settling the restore question.]
 - **QEMU argv, two layers.** `build_qemu_usb_args` (pure, per-fragment: one
   `-device qemu-xhci,id=vmcell-xhci` regardless of device count, one
   `-device usb-host,vendorid=0x%04x,productid=0x%04x` per device, empty-in/empty-out) **and**
@@ -2681,3 +2701,58 @@ too. The assertion (the baseline `microvm_config` names no USB symbol) stands an
 but its reason changed: the fragment **pins** the symbols rather than adding them, so an upstream
 defconfig change cannot silently drop USB out from under a capability that advertises it. Both
 comments now say that.
+
+# The docs/78 code-review pass (2026-08-13)
+
+A comprehensive post-landing review of the 0.13 tree (`docs/78-claude-fable-code-review.md`; live
+gates re-run green on this host: ci, privileged 144/144, unprivileged 4/4, daemon 12/12, crosvm
+28/28). Its findings are reported there, not here; this section carries only the **ledger actions**
+the review is obligated to make in this file — three entry corrections applied in place above
+(the v28 (fs-reap) routing that never landed; the v30 delta-9 restore-premise; the delta-4
+`let _` cluster mis-characterization), the crosvm bench-staging supersession annotation, and the
+three new records below.
+
+## Recorded (justified): post-snapshot resume is warn-and-Ok on all four backends
+
+`snapshot()` on CH, FC, QEMU, and crosvm resumes the source **best-effort, warn-only** after the
+snapshot completes: a successful snapshot with a failed resume returns `Ok`. *Reason it is Ok, not
+Err:* a completed snapshot is a valid, restorable artifact — failing the call would misreport the
+artifact's state — and design §2.2's "or stay paused if the VM is about to be killed" flow depends
+on a snapshot's success being determined by the snapshot alone. Previously recorded only for crosvm
+(and stated at-site on FC/QEMU); this generalizes it to the policy it already was. CH's
+implementation site is the one missing the at-site rationale comment (docs/78 fix item). The
+consequence stays visible: a wedged post-snapshot source surfaces on the next agent op's timeout,
+not from `snapshot()`.
+
+## v30 delta 2 — the downstream contract (§18 delta 2 / §10.4), as built (retroactive record)
+
+Recorded retroactively by the docs/78 review — the register convention (each delta reconciled here)
+was met for deltas 1 and 3–9, but delta 2's pieces landed without a record. Where each landed:
+
+- **The §10.4 contract section + the `VMCELL_*` env table + git-dep guidance** → `README.md`
+  ("Consuming vmcell as a dependency", the env table with the specified `VMCELL_ROOTFS` full-no-op /
+  `VMCELL_KERNEL` path-redirect / `VMCELL_PINS` overlay semantics) and design §10.4.
+- **`scripts/check-vendored-vhost.sh`** — the path-independent, consumer-runnable vendored-patch
+  assertion; the `ci` recipe's two inline M-VEND-3 greps were replaced by one call to it (one law).
+  Its gate legs (green positive control, red stanza-dropped inverse, not-applicable exit-0, and the
+  non-vacuity guard) landed with delta 5's example workspace and are recorded in that section.
+- **`cargo semver-checks` over both contract crates** → `justfile` (the baseline-rev invocation,
+  `-p vmcell -p vmcell-artifact-validator`) and `ci.yml`'s PR job.
+- **Deviation:** the README's git-dep patch guidance documents the **git-form** stanza (a
+  `[patch.crates-io]` entry pointing at the vmcell repo) as the primary route rather than a literal
+  copy of the `=`-pinned path stanza — both sanctioned shapes the script accepts; the path form
+  additionally requires copying the `vendor/` trees, which the README states.
+
+## v30 delta 8 addendum — naming the live coverage of the hostcaps probe
+
+Rule-4 enumeration the delta-8 record omitted: the `HostCapabilities` **probe body** (CapEff parse,
+`/dev/kvm` open, netns reachability) has no injection seam and no unit tests — the recorded gate
+("a fake-host descriptor drives every decision") covers only the decision methods. The live test
+that covers what the units cannot: the privileged **segment suite** — `require_privileged_net`'s
+independent CapEff parser plus `NetSegment::new(..).expect(..)` (which gates on
+`HostCapabilities::probe()`) — reddens on a blessed host if the CapEff/netns probe half regresses;
+the independent parser is what makes it non-vacuous. The **cgroup half**
+(`probe_delegated_controllers`/`probe_domain_leaf`) remains genuinely uncovered; its as-built blast
+radius is the daemon's boot-log line only (`controller_enforceable` is consulted nowhere
+load-bearing today). An injectable probe root (the `SysfsCpuFreq::with_root` pattern) is the fix if
+that ever changes.
