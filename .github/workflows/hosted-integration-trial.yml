@@ -148,8 +148,14 @@ jobs:
       - name: build VM artifacts (host-make kernel + rootfs)
         run: cargo run --locked -p vmcell-cli --bin vmcell -- build --kernel-source host-make
 
-      - name: unprivileged suite
-        run: just test-unprivileged
+      # EVERY live suite runs inside the delegated scope, not just the privileged ones. A hosted
+      # runner's own cgroup (system.slice/hosted-compute-agent.service) is not delegated, and
+      # `MicroVm::start` needs a writable cgroup even when no limit is requested — so the FIRST trial
+      # died here with `Cgroup("create cgroup …: Permission denied (os error 13)")` on the
+      # unprivileged suite, before reaching anything privileged. That is not an unprivileged-mode
+      # property; it is the same host fact that reddened the KVM-free unit suite.
+      - name: unprivileged suite (inside a delegated scope)
+        run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-unprivileged
 
       - name: bless the capability runner
         run: just bless
@@ -167,7 +173,7 @@ jobs:
         env:
           VMCELL_ARTIFACTS_DIR: ${{ github.workspace }}/examples/downstream-kernel/target/vmcell-artifacts
           VMCELL_ROOTFS: ${{ github.workspace }}/target/vmcell-artifacts/rootfs.erofs
-        run: cargo run --locked --bin downstream-kernel -- live
+        run: systemd-run --user --scope -p Delegate=yes ../../scripts/with-delegated-scope.sh cargo run --locked --bin downstream-kernel -- live
         working-directory: examples/downstream-kernel
 
       - name: surface the capability-skip manifest (count + contents)
