@@ -375,35 +375,44 @@ fn read_stats_at(base_path: &str) -> ResourceUsage {
     usage
 }
 
-/// Creates the per-VM cgroup directory under `cgroup_root` and applies every
-/// requested functional limit. The limit-application block is deliberately **not**
-/// gated on the `metrics` feature (CFG-1): it writes cgroup sysfs directly via
-/// `std::fs` and pulls in no `metrics`-only dependency, so gating it silently dropped
-/// every requested limit — returning `Ok(())` on an unbounded VM — in a
-/// `--no-default-features --features cloud-hypervisor` build whose `create_slice`
-/// caller (`orchestrator::setup_env`) is *not* gated on `metrics`. `cgroup_root` is
-/// injected (default `/sys/fs/cgroup`) so the real write path is unit-testable against
-/// a temp directory without touching the host cgroup tree.
+/// Best-effort reclaim of the per-VM cgroup leaf directory at `path`, used by the
+/// `create_slice_at` error path so a mid-sequence limit failure leaves **no**
+/// partially-configured cgroup behind (`failed-create-slice-leaves-partial-cgroup-dir`).
 ///
-/// # Errors
-/// Returns [`crate::error::Error::Cgroup`] if the directory cannot be created, or
-/// [`crate::error::Error::CapabilityUnavailable`] if a requested limit's controller is
-/// not delegated or its control-file write fails.
-fn create_slice_at(
+/// On real cgroupfs a slice's control files are kernfs attributes, not directory
+/// entries, so the plain `rmdir` below already reclaims a slice carrying `memory.max`
+/// and friends. A plain-filesystem cgroup tree (the injected `cgroup_root` the unit
+/// tests use) holds them as regular files and answers `ENOTEMPTY` instead, so that one
+/// errno falls back to sweeping the depth-1 *files* and retrying. The fallback never
+/// recurses: a real slice that grew a **child** cgroup must keep its child and surface
+/// the failure, never be silently flattened (and on cgroupfs the sweep's `remove_file`
+/// is refused by kernfs anyway, so the caller warns rather than damaging anything).
+fn remove_cgroup_leaf(path: &str) -> std::io::Result<()> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+            std::fs::remove_dir(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Applies every *requested functional* limit in `limits` to the (already created) slice
+/// `name` under `cgroup_root`, in the fixed memory → cpu → pids → io order. Split out of
+/// [`create_slice_at`] so the error path has a single place to reclaim the leaf directory
+/// it created (`failed-create-slice-leaves-partial-cgroup-dir`); every arm keeps the
+/// fail-loud §7.2 (The fail-loud capability contract and HostCapabilities) contract.
+fn apply_requested_limits(
     cgroup_root: &str,
     name: &str,
     limits: &crate::config::ResourceLimits,
 ) -> Result<()> {
-    // Create the per-VM cgroup directly with `mkdir`. The previous implementation used
-    // `cgroups-rs` `CgroupBuilder`, whose V2 path manipulates the parent's
-    // `subtree_control` and leaves the new cgroup in a state that rejects
-    // `cgroup.procs` writes (EOPNOTSUPP) under common systemd cgroup layouts; a plain
-    // directory + direct limit writes is robust across layouts. (The cgroup must still
-    // live in a non-threaded `domain` subtree — a threaded scope rejects `cgroup.procs`
-    // regardless; see implementation-notes.)
-    std::fs::create_dir_all(format!("{cgroup_root}/{name}"))
-        .map_err(|e| crate::error::Error::Cgroup(format!("create cgroup {name}: {e}")))?;
-
     if let Some(mem) = limits.mem_max_mib {
         try_apply_limit_at(
             cgroup_root,
@@ -447,6 +456,63 @@ fn create_slice_at(
         try_apply_limit_at(cgroup_root, name, "io", "io.max", io_str.trim_end())?;
     }
     Ok(())
+}
+
+/// Creates the per-VM cgroup directory under `cgroup_root` and applies every
+/// requested functional limit. The limit-application block is deliberately **not**
+/// gated on the `metrics` feature (CFG-1): it writes cgroup sysfs directly via
+/// `std::fs` and pulls in no `metrics`-only dependency, so gating it silently dropped
+/// every requested limit — returning `Ok(())` on an unbounded VM — in a
+/// `--no-default-features --features cloud-hypervisor` build whose `create_slice`
+/// caller (`orchestrator::setup_env`) is *not* gated on `metrics`. `cgroup_root` is
+/// injected (default `/sys/fs/cgroup`) so the real write path is unit-testable against
+/// a temp directory without touching the host cgroup tree.
+///
+/// A failed limit leaves **no residue**
+/// (`failed-create-slice-leaves-partial-cgroup-dir`): the caller sees `Err` and drops
+/// the slice name on the floor, so a leaf this call created and then half-configured
+/// (say `memory.max` applied, `cpu.max` refused) would linger forever — the effect class
+/// `FakeCgroupFs` is structurally blind to (AGENTS rule 4: the fakes never touch the
+/// filesystem). Only a leaf *we* created is reclaimed; a pre-existing slice may already
+/// hold a live VMM's members and is left alone.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Cgroup`] if the directory cannot be created, or
+/// [`crate::error::Error::CapabilityUnavailable`] if a requested limit's controller is
+/// not delegated or its control-file write fails.
+fn create_slice_at(
+    cgroup_root: &str,
+    name: &str,
+    limits: &crate::config::ResourceLimits,
+) -> Result<()> {
+    // Create the per-VM cgroup directly with `mkdir`. The previous implementation used
+    // `cgroups-rs` `CgroupBuilder`, whose V2 path manipulates the parent's
+    // `subtree_control` and leaves the new cgroup in a state that rejects
+    // `cgroup.procs` writes (EOPNOTSUPP) under common systemd cgroup layouts; a plain
+    // directory + direct limit writes is robust across layouts. (The cgroup must still
+    // live in a non-threaded `domain` subtree — a threaded scope rejects `cgroup.procs`
+    // regardless; see implementation-notes.)
+    let slice_path = format!("{cgroup_root}/{name}");
+    // Whether the leaf existed BEFORE this call decides whether the error path may
+    // reclaim it: only a leaf we created is ours to remove.
+    let preexisting = std::path::Path::new(&slice_path).is_dir();
+    std::fs::create_dir_all(&slice_path)
+        .map_err(|e| crate::error::Error::Cgroup(format!("create cgroup {name}: {e}")))?;
+
+    let applied = apply_requested_limits(cgroup_root, name, limits);
+    if applied.is_err() && !preexisting {
+        // Best-effort, like `delete_slice`: a failure to reclaim is a leak, so it is a
+        // visible `warn!` rather than a swallowed discard (L-HOST-2), and it never
+        // masks the limit error the caller must see.
+        if let Err(e) = remove_cgroup_leaf(&slice_path) {
+            tracing::warn!(
+                "failed to remove partially-configured cgroup {}: {}",
+                name,
+                e
+            );
+        }
+    }
+    applied
 }
 
 /// The default CgroupFs implementation.
@@ -991,6 +1057,94 @@ mod tests {
         assert_eq!(read("cpu.max"), "50000 100000");
         assert_eq!(read("pids.max"), "64");
         assert_eq!(read("io.max"), "8:0 rbps=1000 wbps=2000");
+    }
+
+    // `failed-create-slice-leaves-partial-cgroup-dir` (docs/78 §6): a mid-sequence limit
+    // failure must leave NO cgroup leaf behind. This runs against a REAL (temp-dir) cgroup
+    // tree on purpose — `FakeCgroupFs` never touches the filesystem, so the residue is an
+    // effect class it is structurally blind to (AGENTS rule 4). Residue shape: assert the
+    // artifact exists on the success control first, then that it is gone after the failure.
+    // Goes RED without the error-path reclaim (the half-configured `vmcell-vm-2` directory,
+    // carrying `memory.max`, survives).
+    #[test]
+    fn test_create_slice_at_leaves_no_partial_cgroup_dir_on_limit_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let limits = ResourceLimits {
+            mem_max_mib: Some(256),
+            cpu_max_pct: Some(50),
+            pids_max: None,
+            io_max: None,
+        };
+
+        // Positive control: on a fully delegated host the slice IS created and configured,
+        // so the absence asserted below is the cleanup — not a create that never ran.
+        std::fs::write(
+            dir.path().join("cgroup.subtree_control"),
+            "cpu io memory pids",
+        )
+        .expect("seed delegated subtree_control");
+        create_slice_at(&root, "vmcell-vm-ok", &limits)
+            .expect("a delegated host applies both limits");
+        assert!(
+            dir.path().join("vmcell-vm-ok/memory.max").exists(),
+            "the control leg must exist before the residue assertion means anything"
+        );
+        assert!(dir.path().join("vmcell-vm-ok").is_dir());
+
+        // The failing run: `memory` IS delegated (its three writes land in the leaf) but
+        // `cpu` is NOT, so the sequence fails half-applied — the partially-configured
+        // directory this finding is about.
+        std::fs::write(dir.path().join("cgroup.subtree_control"), "memory pids")
+            .expect("re-seed subtree_control without cpu");
+        let err = create_slice_at(&root, "vmcell-vm-2", &limits)
+            .expect_err("an undelegated cpu controller must fail loud");
+        assert!(
+            matches!(err, crate::error::Error::CapabilityUnavailable { .. }),
+            "expected CapabilityUnavailable, got {err:?}"
+        );
+        assert!(
+            !dir.path().join("vmcell-vm-2").exists(),
+            "a mid-sequence limit failure must leave no partially-configured cgroup leaf"
+        );
+
+        // A slice we did NOT create is never reclaimed — it may already hold a live VMM's
+        // members. (`try_apply_limit_at` clobbered subtree_control with `+cpu`; re-seed.)
+        std::fs::write(dir.path().join("cgroup.subtree_control"), "memory pids")
+            .expect("re-seed subtree_control without cpu");
+        let pre = dir.path().join("vmcell-vm-3");
+        std::fs::create_dir_all(&pre).expect("pre-create a foreign slice");
+        create_slice_at(&root, "vmcell-vm-3", &limits)
+            .expect_err("an undelegated cpu controller must fail loud");
+        assert!(
+            pre.is_dir(),
+            "a pre-existing slice must survive a failed create — it is not ours to remove"
+        );
+    }
+
+    // The reclaim is deliberately NON-recursive: a leaf that grew a child cgroup keeps its
+    // child and surfaces the failure instead of being flattened. Goes RED on a
+    // `remove_dir_all` implementation (the child would vanish and the call would succeed).
+    #[test]
+    fn test_remove_cgroup_leaf_sweeps_control_files_but_never_recurses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaf = dir.path().join("vmcell-vm-1");
+        std::fs::create_dir_all(leaf.join("child")).expect("mkdir child cgroup");
+        std::fs::write(leaf.join("memory.max"), "1").expect("write control file");
+
+        remove_cgroup_leaf(&leaf.to_string_lossy())
+            .expect_err("a leaf holding a child cgroup must not be reclaimed");
+        assert!(
+            leaf.join("child").is_dir(),
+            "the child cgroup must survive — the sweep never recurses"
+        );
+
+        // Inverse: with the child gone, the same call reclaims the leaf AND the control
+        // files a plain filesystem holds as real directory entries.
+        std::fs::remove_dir(leaf.join("child")).expect("rmdir child");
+        std::fs::write(leaf.join("cpu.max"), "50000 100000").expect("write control file");
+        remove_cgroup_leaf(&leaf.to_string_lossy()).expect("a control-file-only leaf is reclaimed");
+        assert!(!leaf.exists(), "the leaf and its control files are gone");
     }
 
     // CFG-2: a parent-less slice name must still have its controller delegation

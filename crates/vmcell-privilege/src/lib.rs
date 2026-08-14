@@ -219,6 +219,83 @@ pub struct UidDrop {
     pub uid: libc::uid_t,
 }
 
+/// The operator-facing warning for a partially-failed bounding-set shrink, or `None` when every
+/// drop succeeded — PURE, so the wording and the count are unit-testable without `CAP_SETPCAP`
+/// (design §12.4, Layer 3 — the setup broker (network surface never holds caps); implementation-notes (j)).
+///
+/// A wider-than-intended bounding set is a hardening regression the operator must see, and both
+/// privileged edges ([`apply_privilege_transition`] and [`apply_broker_parent_drop`]) hit the same
+/// `CAP_SETPCAP`-absent limitation, so the message lives here ONCE (AGENTS.md "one law, one
+/// predicate") instead of being counted at one site and silently discarded at the other.
+#[must_use]
+fn bounding_drop_warning(failures: usize) -> Option<String> {
+    if failures == 0 {
+        return None;
+    }
+    Some(format!(
+        "vmcell-privilege: warning: could not drop {failures} bounding-set \
+         capabilities (PR_CAPBSET_DROP needs CAP_SETPCAP in the effective set); the bounding \
+         set is wider than intended"
+    ))
+}
+
+/// Attempts every cap in `caps` and emits [`bounding_drop_warning`] ONCE if any drop failed.
+///
+/// `drop_one` returns `true` on a successful drop and `warn` receives the single summary line;
+/// both are injected so the counting AND the emission are unit-testable on a host that holds (or
+/// lacks) `CAP_SETPCAP` — a test that only passes because this box happens to lack the cap would
+/// prove nothing. Every cap is attempted regardless of earlier failures: the shrink is
+/// best-effort, and stopping at the first failure would leave droppable caps in the bounding set.
+fn shrink_bounding_set(
+    caps: &[Cap],
+    mut drop_one: impl FnMut(Cap) -> bool,
+    warn: impl FnOnce(&str),
+) {
+    let mut failures = 0usize;
+    for &c in caps {
+        if !drop_one(c) {
+            failures += 1;
+        }
+    }
+    if let Some(msg) = bounding_drop_warning(failures) {
+        warn(&msg);
+    }
+}
+
+/// The live edge shared by both drop paths: raise `CAP_SETPCAP` into effective (from permitted, if
+/// held — `PR_CAPBSET_DROP` requires it there), then shrink the bounding set and warn on failure.
+///
+/// The warning goes straight to stderr rather than through a logger: both callers run on a
+/// pre-`main` / pre-runtime cap-drop path where the caller may not have wired one up.
+fn shrink_bounding_set_live(caps: &[Cap]) {
+    if let Ok(mut st) = CapState::get_current()
+        && st.permitted.has(Cap::SETPCAP)
+        && !st.effective.has(Cap::SETPCAP)
+    {
+        st.effective.add(Cap::SETPCAP);
+        // Deliberately unchecked: raising SETPCAP is an optimization of the best-effort shrink, and
+        // a failure here is already reported by the drop-failure warning below (it is exactly the
+        // no-SETPCAP case) — surfacing it twice would be noise on a path that must not abort.
+        let _ = st.set_current();
+    }
+    shrink_bounding_set(
+        caps,
+        |c| capctl::bounding::drop(c).is_ok(),
+        |msg| {
+            // The #[expect] wraps a block, not the macro directly — an attribute on a bare
+            // macro-call statement is silently ignored by rustc (unused_attributes), which would
+            // leave print_stderr firing.
+            #[expect(
+                clippy::print_stderr,
+                reason = "best-effort cap-drop-failure warning on the privilege boundary; must reach the operator without depending on a logger"
+            )]
+            {
+                eprintln!("{msg}");
+            }
+        },
+    );
+}
+
 /// A PURE description of the privilege transition, computed off the live process so every
 /// step is unit-testable against its buggy inverse (design §13, Cross-cutting invariants, churn-fix #3). Only
 /// the thin [`apply_privilege_transition`] performs syscalls.
@@ -320,40 +397,10 @@ pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
     caps.set_current()
         .map_err(|e| format!("failed to set inheritable capabilities: {e}"))?;
 
-    // 3. Shrink the bounding set. PR_CAPBSET_DROP needs CAP_SETPCAP in EFFECTIVE; raise it
-    //    from permitted first if we hold it (setuid-root form). Best-effort — but surface,
-    //    never swallow, a failed drop.
-    if let Ok(mut st) = CapState::get_current()
-        && st.permitted.has(Cap::SETPCAP)
-        && !st.effective.has(Cap::SETPCAP)
-    {
-        st.effective.add(Cap::SETPCAP);
-        let _ = st.set_current();
-    }
-    let mut bounding_drop_failures = 0usize;
-    for &c in &plan.bounding_drop {
-        if capctl::bounding::drop(c).is_err() {
-            bounding_drop_failures += 1;
-        }
-    }
-    if bounding_drop_failures > 0 {
-        // Best-effort security-boundary warning: a wider-than-intended bounding set is a hardening
-        // regression the operator must see, so it goes straight to stderr rather than depending on a
-        // logger the caller may not have wired up on this pre-`main` cap-drop path. The #[expect]
-        // wraps a block, not the macro directly — an attribute on a bare macro-call statement is
-        // silently ignored by rustc (unused_attributes), which would leave print_stderr firing.
-        #[expect(
-            clippy::print_stderr,
-            reason = "best-effort cap-drop-failure warning on the privilege boundary; must reach the operator without depending on a logger"
-        )]
-        {
-            eprintln!(
-                "vmcell-privilege: warning: could not drop {bounding_drop_failures} bounding-set \
-                 capabilities (PR_CAPBSET_DROP needs CAP_SETPCAP in the effective set); the bounding \
-                 set is wider than intended"
-            );
-        }
-    }
+    // 3. Shrink the bounding set (setuid-root form holds CAP_SETPCAP; the file-cap form does not,
+    //    so this is a warned no-op there — design §15, `just bless`). Best-effort — but surface,
+    //    never swallow, a failed drop; the one shared edge does both.
+    shrink_bounding_set_live(&plan.bounding_drop);
 
     // 4. Raise ambient last, after the bounding set is shrunk and uid is dropped.
     for &c in &plan.ambient_raise {
@@ -429,20 +476,13 @@ pub fn apply_broker_parent_drop(plan: &BrokerParentDropPlan) -> Result<(), Strin
         capctl::ambient::clear().map_err(|e| format!("failed to clear ambient caps: {e}"))?;
     }
 
-    // 2. Shrink the bounding set. PR_CAPBSET_DROP needs CAP_SETPCAP in EFFECTIVE — raise it
-    //    from permitted first while we still hold it.
-    if let Ok(mut st) = CapState::get_current()
-        && st.permitted.has(Cap::SETPCAP)
-        && !st.effective.has(Cap::SETPCAP)
-    {
-        st.effective.add(Cap::SETPCAP);
-        let _ = st.set_current();
-    }
-    for &c in &plan.bounding_drop {
-        // Best-effort: without CAP_SETPCAP some drops fail, but the permitted/effective clear
-        // below is the load-bearing removal; surface a wider-than-intended bounding set loudly.
-        let _ = capctl::bounding::drop(c);
-    }
+    // 2. Shrink the bounding set through the SAME edge the runner uses. Best-effort: the broker
+    //    parent inherits the runner's file-cap limitation (no CAP_SETPCAP), so some drops fail and
+    //    the shrink is a *warned* no-op — the permitted/effective clear below is the load-bearing
+    //    removal and the wide bounding set is inert under `no_new_privs` (implementation-notes (j)).
+    //    Discarding those failures silently is the defect this shared edge fixes
+    //    (`broker-parent-bounding-drop-failure-is-silent`).
+    shrink_bounding_set_live(&plan.bounding_drop);
 
     // 3. no_new_privs: no setuid exec can regain a capability after this.
     if plan.no_new_privs {
@@ -664,6 +704,117 @@ mod tests {
         );
         assert_eq!(merge_preserved_groups(108, Some(108), &[108]), vec![108]);
         assert_eq!(merge_preserved_groups(1000, None, &[4]), vec![1000]);
+    }
+
+    // ---- the shared bounding-set shrink: the failure must be WARNED, never swallowed ----
+
+    // Guards `broker-parent-bounding-drop-failure-is-silent`. Buggy impl this guards: the broker
+    // parent's shrink was `let _ = capctl::bounding::drop(c);` — every failure discarded, so the
+    // wider-than-intended bounding set §12.4 / implementation-notes (j) promise to WARN about was
+    // invisible. Both the dropper and the emitter are injected, so this reddens on any host: a box
+    // that happens to hold CAP_SETPCAP cannot make it vacuously green.
+    #[test]
+    fn bounding_shrink_warns_once_with_the_failure_count() {
+        let caps = [
+            Cap::NET_ADMIN,
+            Cap::SYS_ADMIN,
+            Cap::DAC_OVERRIDE,
+            Cap::CHOWN,
+        ];
+        let mut attempted = Vec::new();
+        let mut warnings = Vec::new();
+        shrink_bounding_set(
+            &caps,
+            |c| {
+                attempted.push(c);
+                // The no-CAP_SETPCAP shape: two of the four drops are refused by the kernel.
+                !matches!(c, Cap::SYS_ADMIN | Cap::CHOWN)
+            },
+            |msg| warnings.push(msg.to_string()),
+        );
+
+        assert_eq!(
+            attempted, caps,
+            "every cap must be attempted; stopping at the first failure leaves droppable caps in \
+             the bounding set"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the failed shrink must warn exactly once, not per cap and not never: {warnings:?}"
+        );
+        let msg = &warnings[0];
+        assert!(
+            msg.contains("could not drop 2 bounding-set"),
+            "the warning must carry the FAILURE count (2 of 4), not the attempt count: {msg}"
+        );
+        assert!(
+            msg.contains("CAP_SETPCAP") && msg.contains("wider than intended"),
+            "the warning must name the cause and the consequence: {msg}"
+        );
+    }
+
+    // The inverse: a fully successful shrink is silent, so the warning stays a real signal rather
+    // than noise every privileged start-up prints.
+    #[test]
+    fn bounding_shrink_is_silent_when_every_drop_succeeds() {
+        let mut warnings: Vec<String> = Vec::new();
+        shrink_bounding_set(
+            &[Cap::NET_ADMIN, Cap::CHOWN],
+            |_| true,
+            |msg| warnings.push(msg.to_string()),
+        );
+        assert!(
+            warnings.is_empty(),
+            "a fully successful shrink must not warn: {warnings:?}"
+        );
+        assert_eq!(bounding_drop_warning(0), None, "zero failures = no warning");
+    }
+
+    // GATE, the direction the injected-closure tests above structurally cannot see: they prove the
+    // shared edge warns, not that both live paths GO THROUGH it. `apply_broker_parent_drop` and
+    // `apply_privilege_transition` are syscall edges (integration-only, and unobservable without
+    // CAP_SETPCAP), so this scans this file's own source the way `artifact::mod.rs` scans its
+    // dispatch: the raw bounding-drop call may appear exactly ONCE, inside `shrink_bounding_set_live`.
+    // Red-on-inverse: re-inline the pre-fix `let _ = capctl::bounding::drop(c);` loop at either
+    // caller and the count goes to 2.
+    #[test]
+    fn the_raw_bounding_drop_call_exists_only_in_the_shared_warned_edge() {
+        const SOURCE: &str = include_str!("lib.rs");
+        // Only the production half is scanned — the first `#[cfg(test)]` in the file is this
+        // module's own attribute, and the prose below quotes the pre-fix call verbatim.
+        let prod = SOURCE
+            .split_once("#[cfg(test)]")
+            .expect("the test module is gated in this file")
+            .0;
+        let needle = "capctl::bounding::drop(";
+        assert_eq!(
+            prod.matches(needle).count(),
+            1,
+            "the bounding-set drop must have exactly one call site ({needle} in \
+             shrink_bounding_set_live); a second copy is a silently-discarded failure waiting to \
+             happen (broker-parent-bounding-drop-failure-is-silent)"
+        );
+        let live = prod
+            .split_once("fn shrink_bounding_set_live(")
+            .expect("the shared live edge is defined in this file")
+            .1;
+        assert!(
+            live.contains(needle),
+            "the one call site must be inside the shared warned edge"
+        );
+    }
+
+    // The two privileged edges (runner transition, broker-parent drop) share ONE message, so the
+    // wording cannot drift between them (AGENTS.md "one law, one predicate").
+    #[test]
+    fn bounding_drop_warning_names_count_cause_and_consequence() {
+        let msg = bounding_drop_warning(38).expect("a non-zero failure count must warn");
+        assert!(
+            msg.starts_with("vmcell-privilege: warning: could not drop 38 bounding-set"),
+            "warning must be prefixed and count-carrying: {msg}"
+        );
+        assert!(msg.contains("PR_CAPBSET_DROP needs CAP_SETPCAP"), "{msg}");
     }
 
     // Guards §12.4, Layer 3 — the setup broker (network surface never holds caps): the broker parent keeps NOTHING. `final_caps` must be empty (the whole

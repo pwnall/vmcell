@@ -39,6 +39,13 @@ use std::path::{Path, PathBuf};
 /// CLI (CWD = workspace root) or an integration-test binary that cargo/nextest run with the
 /// CWD set to `crates/vmcell/` — the workspace split changed the latter, which otherwise made
 /// the suites fail-loud with "vmlinux artifact missing".
+///
+/// **Downstream (§10.4, the toolkit contract):** a consumer workspace has no vmcell checkout, so
+/// the workspace-root ascent's `crates/vmcell-protocol/Cargo.toml` marker is never found and the
+/// default falls back to `<CARGO_MANIFEST_DIR>/target/vmcell-artifacts` — or, when that env var is unset
+/// (a plain binary, not a cargo-run one), `<CWD>/target/vmcell-artifacts`. That fallback is a
+/// per-consumer-crate directory, not a per-workspace one, so a consumer wanting one shared
+/// artifacts dir across its members sets `$VMCELL_ARTIFACTS_DIR` explicitly.
 #[must_use]
 pub fn artifacts_dir() -> PathBuf {
     resolve_artifacts_dir(std::env::var_os("VMCELL_ARTIFACTS_DIR"), &workspace_root())
@@ -379,6 +386,28 @@ struct CacheMetadata {
     pins: std::collections::HashMap<String, String>,
     #[serde(default)]
     artifacts: std::collections::HashMap<String, PathBuf>,
+}
+
+/// Serializes `metadata` and writes the stage's `.cache_key` sidecar at `key_path`.
+///
+/// Returns the failure **reason** rather than logging it, so [`Pipeline::build`] owns the single
+/// warn and the classification stays unit-testable. Both failure modes have the identical
+/// consequence and so share one arm: with no sidecar the next `build()` misses the cache and
+/// re-runs the stage — every time, forever.
+///
+/// The serialization arm is not hypothetical: `serde_json` refuses a [`PathBuf`] that is not valid
+/// UTF-8, and `artifacts` holds one per registered artifact. Before docs/78
+/// (`cache-sidecar-serialize-silently-dropped`) that arm was an `if let Ok(json)` with no `else`,
+/// so a stage on a non-UTF-8 output path re-ran the whole (multi-minute) kernel or rootfs build on
+/// every invocation with nothing anywhere saying why.
+fn write_cache_sidecar(
+    key_path: &Path,
+    metadata: &CacheMetadata,
+) -> std::result::Result<(), String> {
+    let json = serde_json::to_string(metadata)
+        .map_err(|e| format!("cache metadata does not serialize: {e}"))?;
+    std::fs::write(key_path, json)
+        .map_err(|e| format!("cannot write the sidecar at {}: {e}", key_path.display()))
 }
 
 /// Streams `path` through blake3 and returns its lowercase-hex content hash.
@@ -1000,7 +1029,7 @@ pub struct KernelRegistryEntry {
 /// # Errors
 /// As [`resolve_pins`], plus [`crate::error::Error::Artifact`] when a `kernels.<label>` entry's
 /// `fragments` key is not an array of non-empty strings (a malformed override is named, never
-/// silently ignored).
+/// silently ignored), or when two labels sanitize to one on-disk artifact filename (naming both).
 pub fn resolve_kernel_registry(overlay_file: Option<&Path>) -> Result<Vec<KernelRegistryEntry>> {
     let doc = resolve_pins_document(overlay_file)?;
     let Some(kernels) = doc.get("kernels").and_then(|k| k.as_object()) else {
@@ -1015,7 +1044,44 @@ pub fn resolve_kernel_registry(overlay_file: Option<&Path>) -> Result<Vec<Kernel
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(sort_kernel_registry(entries))
+    let entries = sort_kernel_registry(entries);
+    // Reject here, at the ONE reader every producer and every roster goes through, so a colliding
+    // pair cannot reach `build-kernels`, `build_labelled_kernel`, or `bundle` by any route.
+    reject_sanitized_label_collision(&entries)?;
+    Ok(entries)
+}
+
+/// Rejects two registry labels that sanitize to the **same** on-disk kernel filename, naming both
+/// (§5.6, The downstream kernel toolkit; docs/78 `sanitized-label-collision-unrejected`).
+///
+/// The filename law sanitizes `.`→`-` ([`kernel::kernel_filename`]) so a dotted label cannot make
+/// `Path::with_extension` eat its trailing component — which means `6.12.94` and `6-12-94` are two
+/// distinct pins keys, two distinct cache-key hashes, and **one** `vmlinux-6-12-94`. Nothing else
+/// notices: `build-kernels` builds both in label order, the second silently overwrites the first's
+/// image *and* both sidecars (`.cache_key`, `.config`), and because each build's cache key still
+/// says "this is mine" the two labels evict each other on every warm run, forever. The labels are
+/// opaque strings, so vmcell cannot pick a winner; the operator renames one.
+///
+/// Checked on the SORTED registry so the pair is named in a stable order.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] naming both colliding labels and the filename they share.
+fn reject_sanitized_label_collision(entries: &[KernelRegistryEntry]) -> Result<()> {
+    let mut by_filename: std::collections::HashMap<String, &str> =
+        std::collections::HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let filename = kernel::kernel_filename(Some(&entry.label));
+        if let Some(previous) = by_filename.insert(filename.clone(), entry.label.as_str()) {
+            return Err(crate::error::Error::Artifact(format!(
+                "pins `kernels` labels `{previous}` and `{}` both sanitize to the one artifact \
+                 filename `{filename}` (the `.`→`-` law, §5.6): building both would overwrite one \
+                 kernel with the other plus its `.cache_key` and `.config` sidecars, and leave the \
+                 two labels evicting each other's cache entry on every build — rename one label",
+                entry.label
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Puts a kernel registry into the pinned **build order**: byte-lexicographic on the label (§5.5).
@@ -1506,13 +1572,12 @@ impl Pipeline {
                                 pins: outputs.pins.clone(),
                                 artifacts: outputs.artifacts.clone(),
                             };
-                            if let Ok(json) = serde_json::to_string(&metadata)
-                                && let Err(e) = std::fs::write(&key_path, json)
-                            {
+                            if let Err(reason) = write_cache_sidecar(&key_path, &metadata) {
                                 tracing::warn!(
-                                    "Failed to write cache key for stage {}: {}",
+                                    "No cache sidecar written for stage {} — it will re-run on \
+                                     every build until this is fixed: {}",
                                     stage.name(),
-                                    e
+                                    reason
                                 );
                             }
                         }
@@ -1857,6 +1922,63 @@ mod tests {
         ]);
         assert_eq!(carried[0].label, "a");
         assert_eq!(carried[0].fragments, vec!["A_FRAG".to_string()]);
+    }
+
+    // docs/78 GATE (`sanitized-label-collision-unrejected`): two labels that differ only where the
+    // §5.6 filename law sanitizes (`.`→`-`) are two pins entries and two cache keys but ONE
+    // `vmlinux-…`, so building both silently overwrites one kernel (and both its sidecars) with the
+    // other and leaves the pair evicting each other's cache entry on every warm build. The refusal
+    // must name BOTH labels — naming only the second leaves the operator hunting for the peer.
+    // RED on the inverse (drop the `reject_sanitized_label_collision` call in
+    // `resolve_kernel_registry`): the collision resolves Ok and both labels appear in the roster.
+    #[test]
+    fn kernel_registry_rejects_labels_colliding_on_one_filename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Premise: the committed baseline carries the dotted `6.12.94`, so the overlay only has to
+        // add its already-sanitized twin to collide (the shape a downstream author actually hits).
+        assert!(
+            resolve_pins(None)
+                .expect("baseline resolves")
+                .contains_key("kernel_6.12.94_source_url"),
+            "fixture premise: the committed baseline carries the 6.12.94 label"
+        );
+        let overlay = write_overlay(
+            tmp.path(),
+            r#"{ "kernels": { "6-12-94": { "source_url": "https://d.example/l.tar.xz",
+                 "source_sha256": "beef" } } }"#,
+        );
+        let res = resolve_kernel_registry(Some(&overlay));
+        let Err(crate::error::Error::Artifact(msg)) = res else {
+            panic!("colliding labels must be a hard error, got {res:?}");
+        };
+        assert!(
+            msg.contains("6.12.94") && msg.contains("6-12-94"),
+            "the refusal must name BOTH colliding labels, got: {msg}"
+        );
+        assert!(
+            msg.contains(&kernel::kernel_filename(Some("6.12.94"))),
+            "the refusal must name the one filename they share, got: {msg}"
+        );
+        // The label roster is the same reader, so it refuses too — no route around the check.
+        assert!(
+            resolve_kernel_labels(Some(&overlay)).is_err(),
+            "the roster `build-kernels` builds must refuse the collision as well"
+        );
+
+        // Positive control: a label that does NOT collide after sanitization still resolves, so the
+        // check rejects collisions rather than dotted labels. Its own dir — `write_overlay` uses
+        // one fixed filename per dir.
+        let tmp_ok = tempfile::tempdir().expect("tempdir");
+        let fine = write_overlay(
+            tmp_ok.path(),
+            r#"{ "kernels": { "6.12.95": { "source_url": "https://d.example/l.tar.xz",
+                 "source_sha256": "beef" } } }"#,
+        );
+        assert!(
+            resolve_kernel_labels(Some(&fine))
+                .expect("a non-colliding label resolves")
+                .contains(&"6.12.95".to_string())
+        );
     }
 
     // Guards the multi-kernel dimension: each `kernels.<label>` must flatten to
@@ -2483,6 +2605,63 @@ mod tests {
             runs.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "B must stay cached on the warm build; a dropped restoration loop re-runs it (M-ART-12)"
+        );
+    }
+
+    // docs/78 GATE (`cache-sidecar-serialize-silently-dropped`): a sidecar that cannot be written
+    // must report WHY, because both failure modes have the same invisible consequence — the stage
+    // misses the cache and re-runs (minutes, per build) forever. `serde_json` refuses a non-UTF-8
+    // `PathBuf`, which is the reachable serialize failure: `artifacts` holds one per registered
+    // artifact. RED on the inverse (`if let Ok(json) = to_string(..)` with no else, i.e. returning
+    // `Ok(())` when serialization fails): the serialize leg's `expect_err` panics.
+    #[test]
+    fn cache_sidecar_write_reports_why_no_sidecar_was_written() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mk = |artifacts: std::collections::HashMap<String, PathBuf>| CacheMetadata {
+            key: "kernel-abc".into(),
+            hash: "deadbeef".into(),
+            pins: std::collections::HashMap::new(),
+            artifacts,
+        };
+
+        // Positive control: well-formed metadata writes a sidecar that reads back.
+        let ok_path = dir.path().join("ok.cache_key");
+        let mut good = std::collections::HashMap::new();
+        good.insert("kernel".to_string(), dir.path().join("vmlinux"));
+        write_cache_sidecar(&ok_path, &mk(good)).expect("well-formed metadata writes a sidecar");
+        let round: CacheMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&ok_path).expect("read sidecar"))
+                .expect("the sidecar round-trips");
+        assert_eq!(round.key, "kernel-abc");
+
+        // Serialize leg: a non-UTF-8 artifact path. No sidecar, and the reason names it.
+        let bad_path = dir.path().join("bad.cache_key");
+        let mut bad = std::collections::HashMap::new();
+        bad.insert(
+            "kernel".to_string(),
+            PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe])),
+        );
+        let reason = write_cache_sidecar(&bad_path, &mk(bad))
+            .expect_err("a non-UTF-8 artifact path cannot serialize");
+        assert!(
+            reason.contains("does not serialize"),
+            "the reason must name the serialization failure, got: {reason}"
+        );
+        assert!(
+            !bad_path.exists(),
+            "a failed serialization must not leave a partial sidecar"
+        );
+
+        // I/O leg: an unwritable location is reported with the path, not swallowed.
+        let io_reason = write_cache_sidecar(
+            &dir.path().join("nope").join("x.cache_key"),
+            &mk(std::collections::HashMap::new()),
+        )
+        .expect_err("a missing parent dir cannot be written");
+        assert!(
+            io_reason.contains("cannot write the sidecar"),
+            "the reason must name the write failure, got: {io_reason}"
         );
     }
 

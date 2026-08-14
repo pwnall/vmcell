@@ -36,12 +36,31 @@ pub struct VirtioFsDaemon {
 }
 
 impl VirtioFsDaemon {
-    /// Starts a virtiofs daemon (using the standalone `virtiofsd` binary) for the given share.
+    /// Starts a virtiofs daemon (using the standalone `virtiofsd` binary) for the given share,
+    /// paced by the default [`Timeouts`](crate::config::Timeouts) profile.
+    ///
+    /// Prefer [`start_paced`](Self::start_paced) from a call site that has the VM's own
+    /// `Timeouts`: §9.4 makes `api_socket_poll` pace **every** daemon readiness wait, and this
+    /// entry point can only supply the default cadence.
     ///
     /// # Errors
     /// Returns an error if the daemon fails to spawn or create the socket.
     #[cfg(not(feature = "experiment-fuse"))]
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
+        Self::start_paced(share, vm_tmp, &crate::config::Timeouts::default()).await
+    }
+
+    /// Starts a virtiofs daemon (using the standalone `virtiofsd` binary) for the given share,
+    /// pacing its socket-readiness wait with `timeouts.api_socket_poll` (§9.4).
+    ///
+    /// # Errors
+    /// Returns an error if the daemon fails to spawn or create the socket.
+    #[cfg(not(feature = "experiment-fuse"))]
+    pub async fn start_paced(
+        share: &Share,
+        vm_tmp: &Path,
+        timeouts: &crate::config::Timeouts,
+    ) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
 
         let cache_arg = match share.cache {
@@ -99,20 +118,14 @@ impl VirtioFsDaemon {
                 }
                 VirtiofsdUid::InheritUnprivileged => {}
             }
-            // SAFETY: the `pre_exec` closure runs in the forked child before `execve`,
-            // so it must touch only async-signal-safe operations. `setpgid` is
-            // async-signal-safe, and the error branch builds the `io::Error` with
-            // `from_raw_os_error` (a non-allocating wrapper around the errno) rather
-            // than `io::Error::other`, which would heap-allocate after the fork.
+            // Captured before the fork so the child can tell whether we are still its parent by
+            // the time it arms `PR_SET_PDEATHSIG` (see `helper_daemon_pre_exec`).
+            let spawning_parent = libc::pid_t::try_from(std::process::id()).unwrap_or(-1);
+            // SAFETY: `pre_exec` runs the closure in the forked child before `execve`, so its body
+            // must be async-signal-safe and non-allocating; it only calls
+            // `helper_daemon_pre_exec`, which proves both at its definition, on a captured scalar.
             unsafe {
-                cmd.pre_exec(|| {
-                    nix::unistd::setpgid(
-                        nix::unistd::Pid::from_raw(0),
-                        nix::unistd::Pid::from_raw(0),
-                    )
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                    Ok(())
-                });
+                cmd.pre_exec(move || helper_daemon_pre_exec(spawning_parent));
             }
         }
 
@@ -137,73 +150,73 @@ impl VirtioFsDaemon {
         let mut process = cmd.spawn().map_err(|e| {
             crate::error::Error::Subprocess(format!("failed to spawn virtiofsd: {e}"))
         })?;
-        let pgid = process.id();
 
-        // Wait for socket to be created
-        let mut ready = false;
-        for _ in 0..50 {
-            if socket_path.exists() {
-                ready = true;
-                break;
-            }
-            match process.try_wait() {
-                Ok(Some(status)) => {
-                    let stderr = std::fs::read_to_string(&stderr_log_path).unwrap_or_default();
-                    return Err(crate::error::Error::Subprocess(format!(
-                        "virtiofsd exited prematurely with {}: {}",
-                        status,
-                        stderr.trim()
-                    )));
-                }
-                Ok(None) => {}
-                // Surface, rather than swallow, an error from polling the child:
-                // a failed `try_wait` means we no longer know the daemon's state.
-                // L-HOST-3: a dropped tokio `Child` is NOT killed (kill_on_drop is
-                // false), so force-kill and reap the group before returning — the
-                // same cleanup as the timeout path below — to avoid leaking a
-                // possibly-live virtiofsd on this acquire-then-fail path.
-                Err(e) => {
-                    if let Some(p) = pgid {
-                        let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(-(p as i32)),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
-                        let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(p as i32), None);
-                    }
-                    return Err(crate::error::Error::Subprocess(format!(
-                        "failed to poll virtiofsd status: {e}"
-                    )));
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        if !ready {
-            if let Some(p) = pgid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(p as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(p as i32), None);
-            }
-            // N-HOST-1: no redundant `process.start_kill()` here — the pgid leader
-            // (the virtiofsd process, which `setpgid`'d itself) was just SIGKILL'd
-            // and reaped above, so `start_kill` on the reaped leader is a guaranteed
-            // no-op error and is exactly the leader-only API the teardown contract
-            // warns against.
+        // §9.4: `api_socket_poll` paces EVERY VMM-control-socket / daemon readiness wait, and the
+        // readiness loop itself is the single-source `vmm::wait_for_socket` — this site used to
+        // hand-copy that loop on a hard-coded 50×20 ms grid, which both fixed the cadence and
+        // forked the "socket appeared / process exited early / deadline" logic (finding
+        // `virtiofsd-socket-wait-hardcoded-cadence`). Only the ceiling stays a constant (§9.4:
+        // the failure ceilings are correctness constants, not knobs). The stderr-log read-back
+        // and the kill/reap wrapper below are what `wait_for_socket` does NOT provide, so they
+        // stay here around it.
+        //
+        // One diagnostic narrows deliberately: the shared helper folds a failing `try_wait` into
+        // the deadline (`unwrap_or(None)`), so a poll error now surfaces as the readiness failure
+        // *with the daemon's stderr* instead of a separate "failed to poll virtiofsd status"
+        // message. Nothing is swallowed — the reap and the loud typed error still run — and the
+        // alternative was keeping a second copy of the readiness loop alive to phrase one message.
+        let (timeout_ms, interval_ms) = socket_wait_budget(timeouts);
+        if let Err(e) =
+            crate::vmm::wait_for_socket(&socket_path, Some(&mut process), timeout_ms, interval_ms)
+                .await
+        {
+            // L-HOST-3: a dropped tokio `Child` is NOT killed (kill_on_drop is false), so
+            // force-kill and reap the group before returning — otherwise this acquire-then-fail
+            // path leaks a live virtiofsd holding the shared dir.
+            //
+            // The pgid is re-read from the LIVE handle rather than captured before the wait
+            // (H-HOST-1 pid reuse): `wait_for_socket`'s `try_wait` reaps the child on the
+            // exited-early arm, after which `process.id()` is `None` and `reap_process_group` is
+            // a no-op — signalling the captured id there could hit a recycled process group.
+            //
+            // N-HOST-1: `reap_process_group` deliberately does NOT call `process.start_kill()` —
+            // it SIGKILLs the group (`-pgid`) and `waitpid`s the leader, so a `start_kill` on the
+            // just-reaped leader would be a guaranteed no-op error and is exactly the
+            // leader-only API the teardown contract warns against.
+            let live_pgid = process.id();
+            crate::vmm::reap_process_group(&mut process, live_pgid);
             let stderr = std::fs::read_to_string(&stderr_log_path).unwrap_or_default();
-            return Err(crate::error::Error::Subprocess(format!(
-                "virtiofsd failed to create socket: {}",
-                stderr.trim()
+            return Err(crate::error::Error::Subprocess(readiness_failure_message(
+                &e,
+                stderr.trim(),
             )));
         }
 
         Ok(Self {
             socket_path,
             // Hold the live `Child` (H-HOST-1) so its pid cannot be recycled before
-            // `Drop` reaps the group; `Drop` reads the pgid from it, not `pgid`.
+            // `Drop` reaps the group; `Drop` reads the pgid from it, never a stored id.
             #[cfg(not(feature = "experiment-fuse"))]
             process: Some(process),
         })
+    }
+
+    /// Starts an in-process virtiofs daemon for the given share, for API parity with the
+    /// `virtiofsd`-subprocess build.
+    ///
+    /// The in-process backend signals readiness directly from its worker thread, so there is no
+    /// readiness poll for `timeouts.api_socket_poll` (§9.4) to pace and the profile is unused
+    /// here; callers can nonetheless pass their VM's `Timeouts` under either feature.
+    ///
+    /// # Errors
+    /// Returns an error if the virtiofs daemon fails to start or bind to the socket.
+    #[cfg(feature = "experiment-fuse")]
+    pub async fn start_paced(
+        share: &Share,
+        vm_tmp: &Path,
+        _timeouts: &crate::config::Timeouts,
+    ) -> crate::error::Result<Self> {
+        Self::start(share, vm_tmp).await
     }
 
     #[cfg(feature = "experiment-fuse")]
@@ -264,17 +277,15 @@ impl Drop for VirtioFsDaemon {
         {
             // H-HOST-1: read the pgid from the LIVE, still-held child handle so we
             // never signal a recycled pid. `process.id()` is `None` only once the
-            // child has been reaped, in which case there is nothing to kill. Holding
-            // the `Child` until here pins the pid across the kill+reap; the `Child`
-            // is dropped after this block, after the group has already been reaped.
-            if let Some(process) = self.process.take()
-                && let Some(pgid) = process.id()
-            {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pgid as i32), None);
+            // child has been reaped, in which case `reap_process_group` is a no-op.
+            // Holding the `Child` until here pins the pid across the kill+reap; the
+            // `Child` is dropped after this block, after the group has been reaped.
+            // The kill+reap itself is the single-source `vmm::reap_process_group`
+            // (finding `fs-reap-note-claims-consolidation-that-never-landed`: the
+            // recorded v28 consolidation had never actually landed here).
+            if let Some(mut process) = self.process.take() {
+                let pgid = process.id();
+                crate::vmm::reap_process_group(&mut process, pgid);
             }
         }
         #[cfg(feature = "experiment-fuse")]
@@ -288,6 +299,88 @@ impl Drop for VirtioFsDaemon {
         }
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+/// The ceiling on the `virtiofsd` socket-readiness wait, in milliseconds.
+///
+/// A failure ceiling, not a knob: §9.4 keeps the correctness ceilings as constants and puts only
+/// the *cadence* in `Timeouts` (`api_socket_poll`). Same 1 s ceiling `spawn_ch` passes to
+/// `register_and_await_ready` for the VMM control socket.
+#[cfg(not(feature = "experiment-fuse"))]
+const SOCKET_READY_TIMEOUT_MS: u64 = 1000;
+
+/// The `(timeout_ms, interval_ms)` pair the `virtiofsd` readiness wait passes to
+/// [`crate::vmm::wait_for_socket`].
+///
+/// Extracted so the §9.4 pacing rule ("`api_socket_poll` paces **every** … daemon readiness
+/// wait") is unit-testable without spawning a daemon: the cadence must come from the caller's
+/// profile, never from a hard-coded grid. `wait_for_socket` clamps the interval to ≥1 ms itself,
+/// so a zero-valued profile cannot busy-spin here either.
+#[cfg(not(feature = "experiment-fuse"))]
+fn socket_wait_budget(timeouts: &crate::config::Timeouts) -> (u64, u64) {
+    (
+        SOCKET_READY_TIMEOUT_MS,
+        u64::try_from(timeouts.api_socket_poll.as_millis()).unwrap_or(u64::MAX),
+    )
+}
+
+/// Renders a [`crate::vmm::wait_for_socket`] failure as the `virtiofsd`-specific message, with the
+/// daemon's captured stderr appended.
+///
+/// The shared readiness helper reports a generic `Timeout` / "process exited early"; the daemon's
+/// own stderr log (METRICS-FS-5) is what actually diagnoses the failure, and it is only readable
+/// here. Kept pure so both arms are unit-testable.
+#[cfg(not(feature = "experiment-fuse"))]
+fn readiness_failure_message(err: &crate::error::Error, stderr: &str) -> String {
+    match err {
+        crate::error::Error::Timeout(_) => format!("virtiofsd failed to create socket: {stderr}"),
+        // `wait_for_socket`'s fail-fast arm: the daemon exited before the socket appeared, and the
+        // error carries the real exit status — far more informative than the later timeout.
+        other => format!("virtiofsd exited prematurely ({other}): {stderr}"),
+    }
+}
+
+/// The `pre_exec` body for the spawned `virtiofsd`: own process group + parent-death signal.
+///
+/// Runs in the forked child between `fork` and `execve`, so it may touch only async-signal-safe
+/// operations and must not allocate — the error branches build the `io::Error` with
+/// `from_raw_os_error` / `last_os_error` (non-allocating errno wrappers) rather than
+/// `io::Error::other`, which would heap-allocate after the fork.
+///
+/// - `setpgid(0, 0)`: the daemon leads its own group, so teardown can SIGKILL `-pgid` and sweep
+///   virtiofsd's sandbox children with it.
+/// - `PR_SET_PDEATHSIG(SIGKILL)`: helper-daemon discipline (AGENTS.md, "Writing code"). Without
+///   it, an orchestrator that is itself SIGKILLed (no `Drop`, no teardown) leaks a live daemon
+///   holding the shared directory — the daemon's start-up sweep reclaims *directories*, never
+///   processes, so nothing else would ever collect it (finding `virtiofsd-missing-pdeathsig`).
+///
+/// `spawning_parent` is our pid, captured *before* the fork: the parent-death signal is armed
+/// after the fork, so a parent that dies inside that window is already gone when `prctl` runs and
+/// the signal would never fire. Comparing it against `getppid()` closes the window.
+///
+/// The signal fires when the spawning *thread* exits (`pdeath_signal` is per-task, and `clone`
+/// zeroes it in the new task), so the daemon dies with the tokio worker that spawned it — i.e. at
+/// runtime shutdown, which is orchestrator teardown. That is the intent; `Drop`/`shutdown()`
+/// normally get there first, and this is the backstop for the paths that never run (`SIGKILL`).
+#[cfg(all(unix, not(feature = "experiment-fuse")))]
+fn helper_daemon_pre_exec(spawning_parent: libc::pid_t) -> std::io::Result<()> {
+    nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL)` takes scalar arguments only — no pointers, no
+    // buffers — and is a single async-signal-safe syscall acting on the calling process itself,
+    // which is this forked child. It survives the following `execve` (only a credential-changing
+    // exec clears it; `Command::uid` drops privilege via `setuid` before exec, not by exec'ing a
+    // setuid binary).
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `getppid()` takes no arguments, cannot fail, and is async-signal-safe. If our parent
+    // died between the fork and the `prctl` above, we were already reparented and the armed signal
+    // will never be delivered — refuse to exec rather than leak a daemon nothing will collect.
+    if unsafe { libc::getppid() } != spawning_parent {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    Ok(())
 }
 
 /// Which uid the spawned `virtiofsd` should run as.
@@ -368,6 +461,218 @@ mod uid_tests {
     }
 }
 
+#[cfg(all(test, not(feature = "experiment-fuse")))]
+mod readiness_pacing_tests {
+    use super::{SOCKET_READY_TIMEOUT_MS, readiness_failure_message, socket_wait_budget};
+    use crate::config::Timeouts;
+    use std::time::Duration;
+
+    // §9.4: `api_socket_poll` paces EVERY daemon readiness wait. This goes RED on the pre-fix
+    // implementation, whose hard-coded 50×20 ms grid ignored the profile entirely (the interval
+    // would stay 20 for both profiles below).
+    #[test]
+    fn socket_wait_interval_comes_from_the_profile_not_a_hard_coded_grid() {
+        let fast = Timeouts {
+            api_socket_poll: Duration::from_millis(2),
+            ..Timeouts::default()
+        };
+        assert_eq!(
+            socket_wait_budget(&fast),
+            (SOCKET_READY_TIMEOUT_MS, 2),
+            "the readiness cadence must be the caller's api_socket_poll"
+        );
+
+        let slow = Timeouts {
+            api_socket_poll: Duration::from_millis(37),
+            ..Timeouts::default()
+        };
+        assert_eq!(socket_wait_budget(&slow), (SOCKET_READY_TIMEOUT_MS, 37));
+    }
+
+    // The ceiling is a correctness constant (§9.4), and it must match what the pre-fix loop
+    // budgeted (50 × 20 ms) so this fix does not silently shorten or lengthen the wait.
+    #[test]
+    fn socket_wait_ceiling_matches_the_previous_total_budget() {
+        assert_eq!(socket_wait_budget(&Timeouts::default()).0, 1000);
+    }
+
+    // The shared `wait_for_socket` reports a generic Timeout / "process exited early"; the two
+    // virtiofsd-specific diagnoses (with the daemon's own stderr, which only this site can read)
+    // must survive the consolidation. Goes RED if either arm loses its stderr or collapses into
+    // the other's wording.
+    #[test]
+    fn readiness_failure_messages_keep_both_diagnoses_with_stderr() {
+        let timeout = readiness_failure_message(
+            &crate::error::Error::Timeout("socket failed to appear in time".into()),
+            "vhost_user_fs: bad --shared-dir",
+        );
+        assert_eq!(
+            timeout,
+            "virtiofsd failed to create socket: vhost_user_fs: bad --shared-dir"
+        );
+
+        let exited = readiness_failure_message(
+            &crate::error::Error::Vmm("process exited early: exit status: 1".into()),
+            "unknown option --nope",
+        );
+        assert!(
+            exited.contains("exited prematurely")
+                && exited.contains("exit status: 1")
+                && exited.contains("unknown option --nope"),
+            "the early-exit arm must keep the status and the daemon stderr, got {exited}"
+        );
+    }
+}
+
+#[cfg(all(test, unix, not(feature = "experiment-fuse")))]
+mod pre_exec_tests {
+    use std::io::BufRead as _;
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+
+    /// Set on the re-exec'd middle process so it takes the "spawn a daemon and park" branch.
+    const MIDDLE_ENV: &str = "VMCELL_FS_PRE_EXEC_MIDDLE";
+    /// The libtest name of the test below; the middle process is re-exec'd with `--exact` on it.
+    const MIDDLE_TEST: &str =
+        "fs::pre_exec_tests::helper_daemon_dies_with_its_parent_and_leads_its_own_group";
+    /// Line the middle process prints so the driver learns the daemon stand-in's pid.
+    const PID_MARKER: &str = "VMCELL_DAEMON_PID=";
+
+    /// The `/proc/<pid>/stat` state character, or `None` once the pid is gone.
+    ///
+    /// A killed-but-unreaped process is still signalable (`kill(pid, 0)` succeeds on a zombie), so
+    /// "dead" here means *gone or `Z`* — the reap is init's job, not ours, and racing it would
+    /// make this test flaky.
+    fn process_state(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `comm` is parenthesized and may itself contain ')' — split on the LAST one.
+        let after_comm = stat.rsplit_once(')')?.1;
+        after_comm.split_whitespace().next()?.chars().next()
+    }
+
+    fn is_dead(pid: i32) -> bool {
+        matches!(process_state(pid), None | Some('Z'))
+    }
+
+    // Helper-daemon discipline (AGENTS.md "Writing code"; finding `virtiofsd-missing-pdeathsig`):
+    // a daemon spawned through `helper_daemon_pre_exec` must (a) lead its own process group, so
+    // teardown can `kill(-pgid)` virtiofsd's sandbox children with it, and (b) carry
+    // `PR_SET_PDEATHSIG(SIGKILL)`, so an orchestrator that is itself SIGKILLed — no `Drop`, no
+    // `shutdown()`, no teardown at all — cannot leak a live daemon holding the shared dir.
+    //
+    // (b) is asserted as BEHAVIOR, not as the flag: `PR_GET_PDEATHSIG` is per-task and `clone`
+    // zeroes it, so a readback from a libtest worker thread would report 0 however the exec'd
+    // image was armed. So the test builds the real three-level shape — driver → middle process
+    // (a re-exec of this test binary) → daemon stand-in spawned with the production `pre_exec` —
+    // SIGKILLs the middle process, and requires the stand-in to die on its own.
+    //
+    // RED on the inverse: drop the `prctl` from `helper_daemon_pre_exec` and the orphaned stand-in
+    // outlives its killed parent; drop the `setpgid` and it reports its parent's group.
+    #[test]
+    fn helper_daemon_dies_with_its_parent_and_leads_its_own_group() {
+        let spawning_parent = libc::pid_t::try_from(std::process::id()).unwrap_or(-1);
+
+        if std::env::var_os(MIDDLE_ENV).is_some() {
+            // Middle role: spawn a long-lived daemon stand-in exactly the way `start` spawns
+            // virtiofsd, report its pid, and park until the driver SIGKILLs us. `sleep` outlives
+            // the whole test unless something kills it, which is the point.
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("60");
+            // SAFETY: `pre_exec` runs the closure in the forked child before `execve`; it only
+            // calls the production `helper_daemon_pre_exec`, which is async-signal-safe and
+            // non-allocating (proven at its definition), on a captured scalar.
+            unsafe {
+                cmd.pre_exec(move || super::helper_daemon_pre_exec(spawning_parent));
+            }
+            // Held (not dropped early) for the same reason `start` holds virtiofsd's `Child`: the
+            // pid must not be recycled while the driver is watching it. std does not kill on drop.
+            #[expect(
+                clippy::zombie_processes,
+                reason = "this middle process is SIGKILLed by the driver on purpose, so it can \
+                          never wait() — the stand-in's death is exactly what is under test, and \
+                          init reaps it"
+            )]
+            let child = cmd.spawn().expect("spawn the daemon stand-in");
+            let pid = child.id();
+            let mut out = std::io::stdout();
+            writeln!(out, "{PID_MARKER}{pid}").expect("report the stand-in pid");
+            // The driver reads this over a pipe, so line-buffering does not apply — flush.
+            out.flush().expect("flush the stand-in pid");
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            return;
+        }
+
+        // Driver role.
+        let exe = std::env::current_exe().expect("current test binary");
+        let mut middle = std::process::Command::new(exe)
+            .args(["--exact", MIDDLE_TEST, "--nocapture"])
+            .env(MIDDLE_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("re-exec the middle process");
+
+        // Read the stand-in's pid. EOF without the marker means the filter selected no test (CI
+        // rule 3: a filter that matches nothing must not pass) or the middle role panicked.
+        let mut reader = std::io::BufReader::new(middle.stdout.take().expect("piped stdout"));
+        let mut daemon_pid = None;
+        let mut line = String::new();
+        while reader.read_line(&mut line).expect("read middle stdout") > 0 {
+            if let Some(rest) = line.trim().strip_prefix(PID_MARKER) {
+                daemon_pid = Some(rest.parse::<i32>().expect("stand-in pid"));
+                break;
+            }
+            line.clear();
+        }
+        let daemon_pid = match daemon_pid {
+            Some(pid) => pid,
+            None => {
+                let _ = middle.kill();
+                let _ = middle.wait();
+                panic!(
+                    "the middle process never reported a stand-in pid (is {MIDDLE_TEST} still the test name?)"
+                );
+            }
+        };
+
+        // (a) Own process group, observable from here (`getpgid`), so `kill(-pgid)` in teardown
+        // sweeps the daemon's own children rather than the orchestrator's group.
+        let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(daemon_pid)))
+            .expect("stand-in process group");
+        assert_eq!(
+            pgid.as_raw(),
+            daemon_pid,
+            "the helper daemon must lead its own process group"
+        );
+        assert!(
+            !is_dead(daemon_pid),
+            "the stand-in must be alive before the parent is killed"
+        );
+
+        // (b) SIGKILL the middle process — the "orchestrator was hard-killed, no teardown ran"
+        // case — and require the stand-in to die on its own.
+        middle.kill().expect("SIGKILL the middle process");
+        middle.wait().expect("reap the middle process");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !is_dead(daemon_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let dead = is_dead(daemon_pid);
+        if !dead {
+            // Never leave a 60 s `sleep` behind on the failure path.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(daemon_pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            dead,
+            "the helper daemon outlived its SIGKILLed parent — PR_SET_PDEATHSIG(SIGKILL) is not armed"
+        );
+    }
+}
+
 #[cfg(all(test, unix, not(feature = "experiment-fuse")))]
 mod drop_reaps_tests {
     use super::VirtioFsDaemon;
@@ -386,13 +691,15 @@ mod drop_reaps_tests {
         // (mirrors virtiofsd's `setpgid(0,0)`), so the group-kill path is exercised.
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("10");
-        // SAFETY: async-signal-safe `setpgid` runs in the forked child before exec.
+        let spawning_parent = libc::pid_t::try_from(std::process::id()).unwrap_or(-1);
+        // Routed through the production `pre_exec` body rather than a hand-copied `setpgid` so the
+        // fixture cannot drift from what `start` actually spawns (it is a test fixture, not a
+        // helper daemon; inheriting PR_SET_PDEATHSIG is harmless — `Drop` kills it first).
+        // SAFETY: `pre_exec` runs the closure in the forked child before `execve`; it only calls
+        // `helper_daemon_pre_exec`, which is async-signal-safe and non-allocating (proven at its
+        // definition), on a captured scalar.
         unsafe {
-            cmd.pre_exec(|| {
-                nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                Ok(())
-            });
+            cmd.pre_exec(move || super::helper_daemon_pre_exec(spawning_parent));
         }
         let child = cmd.spawn().expect("spawn sleep");
         let pid = child.id().expect("child has a pid") as i32;

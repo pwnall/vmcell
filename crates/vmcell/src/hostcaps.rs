@@ -4,15 +4,23 @@
 //! caller asks for a 256 MiB cap, the controller isn't delegated, the write fails, and the VM runs
 //! *unlimited* while the call returns `Ok`. The rule is reversed: a missing capability fails loud
 //! unless the op is explicitly best-effort (law F1). To make "what does this host support?" have
-//! **one** answer and **one** probe, [`HostCapabilities`] records — probed once at start-up (by mode
-//! selection, the daemon's `main`, and the test harness) — the effective capability set, KVM-group
-//! access, `/var/run/netns` reachability, which cgroup controllers the current scope delegates, and
-//! whether the scope is a non-threaded `domain` leaf. As built (§18 delta 8, Delta register: changes
-//! from the validated v27 build), the descriptor is **probed once at start-up and logged** as a
-//! visible boot-time capability signal (the daemon's `MicroVmLauncher::new`); per-op enforcement
-//! keeps its own authoritative fail-loud per-write check (`metrics::try_apply_limit_at` /
-//! `classify_limit_write_err`), so the descriptor is the queryable single source, not a replacement
-//! for that per-write typed error (see docs/implementation-notes.md, Delta 8).
+//! **one** answer and **one** probe, [`HostCapabilities`] records the effective capability set,
+//! KVM-group access, `/var/run/netns` reachability, which cgroup controllers the current scope
+//! delegates, and whether the scope is a non-threaded `domain` leaf. As built (§18 delta 8, Delta
+//! register: changes from the validated v27 build), the descriptor is **probed once at start-up and
+//! logged** as a visible boot-time capability signal; per-op enforcement keeps its own authoritative
+//! fail-loud per-write check (`metrics::try_apply_limit_at` / `classify_limit_write_err`), so the
+//! descriptor is the queryable single source, not a replacement for that per-write typed error (see
+//! docs/implementation-notes.md, Delta 8).
+//!
+//! The as-built production consumers are exactly three (`hostcaps-consumer-roster-overstated`; the
+//! §7.2 sentence "mode selection, the daemon's main, and the test harness" overstates them — there
+//! is no mode-selection and no test-harness caller):
+//!
+//! 1. [`crate::net::segment::NetSegment::new`] — the fail-loud
+//!    [`HostCapabilities::privileged_net_available`] gate for vm-to-vm segments (§6.5).
+//! 2. `vmcell_daemon::launcher::MicroVmLauncher::new` — the boot-time capability log (§11.2).
+//! 3. `vmcell-bench`'s `bench-vm` net-egress leg — the privileged-variant self-skip (M-BIN-1).
 
 use std::collections::BTreeSet;
 
@@ -57,13 +65,14 @@ impl HostCapabilities {
     /// so an unknown host is treated as *un*-provisioned rather than optimistically capable.
     #[must_use]
     pub fn probe() -> Self {
+        let cgroups = CgroupSysfs::system();
         Self {
             cap_net_admin: has_effective_cap(CAP_NET_ADMIN),
             cap_sys_admin: has_effective_cap(CAP_SYS_ADMIN),
             kvm_accessible: kvm_accessible(),
             netns_reachable: netns_reachable(),
-            delegated_controllers: probe_delegated_controllers(),
-            domain_leaf: probe_domain_leaf(),
+            delegated_controllers: cgroups.delegated_controllers(),
+            domain_leaf: cgroups.domain_leaf(),
         }
     }
 
@@ -144,32 +153,76 @@ fn netns_reachable() -> bool {
     std::path::Path::new("/run").is_dir() || std::path::Path::new("/var/run").is_dir()
 }
 
-/// The cgroup-v2 controllers delegated into the current scope's subtree, read from the current
-/// scope's `cgroup.subtree_control` (via the canonical `/proc/self/cgroup` base parser).
-fn probe_delegated_controllers() -> BTreeSet<String> {
-    let base = current_cgroup_base();
-    let path = match &base {
-        Some(b) => format!("/sys/fs/cgroup/{b}/cgroup.subtree_control"),
-        None => "/sys/fs/cgroup/cgroup.subtree_control".to_string(),
-    };
-    std::fs::read_to_string(path)
-        .map(|s| s.split_whitespace().map(str::to_owned).collect())
-        .unwrap_or_default()
+/// The cgroup-v2 sysfs tree the cgroup half of the probe reads, with an **injectable root** so
+/// `delegated_controllers` / `domain_leaf` are unit-testable against a synthetic tree
+/// (`hostcaps-probe-body-untested`). This is the crate's existing seam idiom —
+/// [`crate::cpufreq::SysfsCpuFreq::with_root`] — not a second one; the cgroup read needs a second
+/// coordinate (the scope base under the root), so [`CgroupSysfs::with_root`] carries it explicitly
+/// rather than growing a builder.
+///
+/// The other half of the probe (`CapEff` / `/dev/kvm` / netns) has no seam and does not need one:
+/// it is live-covered by `tests/segment.rs`, whose `require_privileged_net` guard parses `CapEff`
+/// **independently** and must agree with `NetSegment::new`'s `privileged_net_available()` gate —
+/// a disagreement either way (skip-then-run, or run-then-refuse) reddens the suite.
+#[derive(Debug, Clone)]
+struct CgroupSysfs {
+    root: std::path::PathBuf,
+    /// The current scope's path relative to `root`, `None` when `/proc/self/cgroup` has no usable
+    /// unified entry (the reads then fall back to the root's own control files).
+    base: Option<String>,
 }
 
-/// Whether the current cgroup scope is a non-threaded `domain` leaf (a threaded scope rejects
-/// `cgroup.procs`). Reads the scope's `cgroup.type`; absent/unreadable is treated as `domain` (the
-/// unified-hierarchy default) so a host that simply does not expose the file is not falsely degraded.
-fn probe_domain_leaf() -> bool {
-    let base = current_cgroup_base();
-    let path = match &base {
-        Some(b) => format!("/sys/fs/cgroup/{b}/cgroup.type"),
-        None => "/sys/fs/cgroup/cgroup.type".to_string(),
-    };
-    match std::fs::read_to_string(path) {
-        Ok(t) => t.trim() == "domain",
-        // No `cgroup.type` (e.g. the root, or a v1/hybrid host) → assume the default `domain`.
-        Err(_) => true,
+impl CgroupSysfs {
+    /// The live tree: the real `/sys/fs/cgroup` at the scope the canonical `/proc/self/cgroup`
+    /// parser reports.
+    fn system() -> Self {
+        Self {
+            root: std::path::PathBuf::from("/sys/fs/cgroup"),
+            base: current_cgroup_base(),
+        }
+    }
+
+    /// A tree rooted at `root` with scope `base`, for testing the reads against a synthetic sysfs
+    /// tree. `#[cfg(test)]` so the seam constructor ships in no build but the test one (the
+    /// `AgentClient::from_stream_for_tests` precedent) — production has exactly one tree,
+    /// [`CgroupSysfs::system`].
+    #[cfg(test)]
+    fn with_root(root: impl Into<std::path::PathBuf>, base: Option<String>) -> Self {
+        Self {
+            root: root.into(),
+            base,
+        }
+    }
+
+    /// The path of control file `file` in the current scope.
+    fn scope_file(&self, file: &str) -> std::path::PathBuf {
+        match &self.base {
+            Some(b) => self.root.join(b).join(file),
+            None => self.root.join(file),
+        }
+    }
+
+    /// The cgroup-v2 controllers delegated into this scope's subtree, read from the scope's
+    /// `cgroup.subtree_control`. Whole tokens only: the `+memory` *write* form is not the effective
+    /// form, so a tree holding it reports no `memory` delegation (matching the whole-token
+    /// `metrics::controller_listed` law the per-write check enforces). An absent/unreadable file is
+    /// the conservative empty set.
+    fn delegated_controllers(&self) -> BTreeSet<String> {
+        std::fs::read_to_string(self.scope_file("cgroup.subtree_control"))
+            .map(|s| s.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether this scope is a non-threaded `domain` leaf (a threaded scope rejects
+    /// `cgroup.procs`). Reads the scope's `cgroup.type`; absent/unreadable is treated as `domain`
+    /// (the unified-hierarchy default) so a host that simply does not expose the file is not
+    /// falsely degraded.
+    fn domain_leaf(&self) -> bool {
+        match std::fs::read_to_string(self.scope_file("cgroup.type")) {
+            Ok(t) => t.trim() == "domain",
+            // No `cgroup.type` (e.g. the root, or a v1/hybrid host) → assume the default `domain`.
+            Err(_) => true,
+        }
     }
 }
 
@@ -258,5 +311,108 @@ mod tests {
             ..full
         };
         assert!(!no_kvm.can_boot_vm(), "no /dev/kvm → static-only");
+    }
+
+    /// Writes `contents` to `dir/name`, creating the parent scope directory.
+    fn seed(dir: &std::path::Path, name: &str, contents: &str) {
+        if let Some(parent) = dir.join(name).parent() {
+            std::fs::create_dir_all(parent).expect("create synthetic scope dir");
+        }
+        std::fs::write(dir.join(name), contents).expect("seed synthetic control file");
+    }
+
+    // `hostcaps-probe-body-untested` (docs/78 §7): the cgroup half of the probe body — the half the
+    // segment suite's live coverage does NOT reach — read against a synthetic sysfs tree through
+    // the injected root. Covers the present arm (including the scope base join, so a probe that
+    // ignored `base` and read the tree root would go red) and the absent-facility arm.
+    #[test]
+    fn cgroup_probe_reads_scope_control_files_under_injected_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The scope's OWN files (delegated: cpu+memory, non-threaded) …
+        seed(
+            dir.path(),
+            "user.slice/scope/cgroup.subtree_control",
+            "cpu memory\n",
+        );
+        seed(dir.path(), "user.slice/scope/cgroup.type", "domain\n");
+        // … and decoy root files that must NOT be read when a base is set.
+        seed(dir.path(), "cgroup.subtree_control", "io pids");
+        seed(dir.path(), "cgroup.type", "threaded");
+
+        let probe = CgroupSysfs::with_root(dir.path(), Some("user.slice/scope".to_string()));
+        assert_eq!(
+            probe.delegated_controllers(),
+            controllers(&["cpu", "memory"]),
+            "the SCOPE's subtree_control is the delegation source, not the tree root's"
+        );
+        assert!(
+            probe.domain_leaf(),
+            "a `domain` scope is a usable non-threaded leaf"
+        );
+
+        // Absent facility: a scope with no control files at all (a v1/hybrid host, or a root that
+        // exposes neither) delegates nothing and keeps the `domain` default rather than being
+        // falsely degraded to "threaded".
+        let bare = CgroupSysfs::with_root(dir.path(), Some("no/such/scope".to_string()));
+        assert!(
+            bare.delegated_controllers().is_empty(),
+            "an unreadable subtree_control is the conservative empty set"
+        );
+        assert!(
+            bare.domain_leaf(),
+            "an absent cgroup.type is the unified-hierarchy `domain` default"
+        );
+
+        // No base (`/proc/self/cgroup` had no usable unified entry) reads the tree root's files —
+        // the fallback the `None` arm exists for.
+        let rooted = CgroupSysfs::with_root(dir.path(), None);
+        assert_eq!(rooted.delegated_controllers(), controllers(&["io", "pids"]));
+        assert!(
+            !rooted.domain_leaf(),
+            "a `threaded` scope cannot hold the VMM's cgroup.procs write"
+        );
+    }
+
+    // The malformed/edge content arms of the same two reads. Each goes red on the sloppy
+    // implementation it names.
+    #[test]
+    fn cgroup_probe_rejects_malformed_control_file_contents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // `+memory` is the WRITE form, not the effective delegation. Reporting it as a delegated
+        // `memory` controller is the silent-unlimited no-op §7.2 exists to prevent, so the
+        // whole-token set must not contain `memory` (red on a `contains("memory")` impl).
+        seed(dir.path(), "cgroup.subtree_control", "+memory");
+        let probe = CgroupSysfs::with_root(dir.path(), None);
+        assert!(
+            !probe.delegated_controllers().contains("memory"),
+            "the `+memory` write form is not an effective delegation"
+        );
+        assert_eq!(probe.delegated_controllers(), controllers(&["+memory"]));
+
+        // An empty file is empty delegation, not a parse that yields an empty-string controller.
+        seed(dir.path(), "cgroup.subtree_control", "\n  \n");
+        assert!(probe.delegated_controllers().is_empty());
+
+        // `cgroup.type` is compared on the TRIMMED whole value: `domain threaded` and
+        // `domain invalid` are not the plain `domain` leaf (red on a `starts_with`/`contains` impl),
+        // while the real kernel's trailing newline still reads as `domain` (red on an untrimmed
+        // equality).
+        for (contents, expected) in [
+            ("domain\n", true),
+            ("domain", true),
+            ("  domain \n", true),
+            ("threaded\n", false),
+            ("domain threaded\n", false),
+            ("domain invalid\n", false),
+            ("", false),
+        ] {
+            seed(dir.path(), "cgroup.type", contents);
+            assert_eq!(
+                probe.domain_leaf(),
+                expected,
+                "cgroup.type {contents:?} → domain_leaf {expected}"
+            );
+        }
     }
 }

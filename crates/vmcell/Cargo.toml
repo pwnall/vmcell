@@ -52,6 +52,11 @@ name = "vmcell"
 #   * `auto_trait_impl_removed`: `VmConfig`, `Zygote` and `Lineage` are no longer `UnwindSafe` /
 #     `RefUnwindSafe`, because `NetConfig::Segment` carries the `Arc<Mutex<…>>`-backed segment
 #     handle. Only `catch_unwind` callers holding those types across the boundary are affected.
+#   * ADDITIVE (no breakage, ledgered so a consumer reads it here): the crate-root re-export set
+#     gained `RootfsSource`, `Egress` and `UsbHostDevice` (docs/78 §9.4). They were reachable only
+#     as `vmcell::config::…` while the leaf types they are passed alongside were root-re-exported,
+#     so `use vmcell::{VmConfig, NetConfig}` could not actually call the builder. A re-export
+#     addition is minor-compatible; `lib.rs`'s `root_reexport_tests` is the gate.
 # The `vmcell-artifact-validator` half of the contract surface is additive in this pass
 # (`cargo semver-checks -p vmcell-artifact-validator`: no update required).
 version = "0.13.0"
@@ -69,7 +74,8 @@ path = "src/lib.rs"
 
 # The `vmcell` CLI binary moved to the `vmcell-cli` crate and the `bench-vm` binary to the
 # `vmcell-bench` crate (design §10.1): both are composition roots that wire crates depending on
-# `vmcell` (bench-vm drives all three backends, including `vmcell-firecracker`/`vmcell-qemu`), so
+# `vmcell` (bench-vm drives all four backends, wiring `vmcell-firecracker`/`vmcell-qemu`/
+# `vmcell-crosvm` alongside the in-tree Cloud Hypervisor), so
 # keeping them here would form a dependency cycle. `vmcell` itself declares no binary.
 [[bench]]
 name = "micro"

@@ -34,6 +34,7 @@ use crate::error::{Error, Result};
 use crate::vmm::VsockEndpoint;
 use vmcell_protocol::{
     ExecOutcome, ExecRequest, MAX_FRAME_BYTES, Message, PtyConfig, SessionId, SessionSpec,
+    capped_debug,
 };
 
 /// Encodes a host→guest frame and enforces the shared `MAX_FRAME_BYTES` cap at
@@ -480,8 +481,16 @@ async fn reader_task(mut stream: SplitStream<FramedStream>, registry: Registry) 
             // A late `Ready` (shouldn't occur — the handshake consumed the first)
             // is ignored; any other frame is a host→guest control frame the guest
             // should never send, so log it (a protocol desync) and keep going.
+            // docs/78 §6: the frame is guest-chosen and `MAX_FRAME_BYTES` (16 MiB)
+            // big, so the render goes through the shared `capped_debug`; the wire
+            // length beside it is the number a desync report actually needs, and it
+            // is free here (the frame is still in hand).
             Message::Ready => {}
-            other => tracing::warn!("session reader: unexpected guest frame {:?}", other),
+            other => tracing::warn!(
+                "session reader: unexpected guest frame ({} byte frame): {}",
+                bytes.len(),
+                capped_debug(&other)
+            ),
         }
     }
     // The connection ended: CLOSE the registry (M5) — one critical section that
@@ -609,6 +618,63 @@ mod tests {
         assert_eq!(s1.recv().await, Some(SessionEvent::Stdout(b"b2".to_vec())));
         assert_eq!(s1.recv().await, Some(SessionEvent::Exit(0)));
         assert_eq!(s1.recv().await, None);
+    }
+
+    // docs/78 §6 (`uncapped-frame-debug-renders`), the session-reader half. The
+    // renderer is pinned where the law lives (`vmcell_protocol::capped_debug`, beside
+    // `MAX_FRAME_BYTES`); what this pins is that THIS SITE routes through it — the
+    // pre-fix line was a bare `{:?}` on a guest-chosen frame.
+    //
+    // The reader runs ON THIS THREAD (not through `from_framed`'s `tokio::spawn`), so
+    // its warn is emitted inside the test's tracing span and `logs_assert` sees it;
+    // the peer's write + close is queued first, so the task runs to EOF and returns.
+    // RED on the inverse (restore `"… unexpected guest frame {:?}", other`): the line
+    // grows to ~100 KB of `[7, 7, …]` decimal and the length bound fails; RED too on
+    // a site that drops the frame length or the truncation marker.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn unexpected_guest_frame_is_logged_capped_not_frame_sized() {
+        let (client_io, server_io) = UnixStream::pair().expect("unix pair");
+        let mut guest = Framed::new(server_io, codec());
+
+        // `Stdin` is host→guest only: a guest that sends one is the desync this arm
+        // reports. 32 KiB of payload renders to ~100 KB of decimal `Debug`.
+        let stray = Message::Stdin {
+            session: SessionId(0),
+            data: vec![7u8; 32 * 1024],
+        };
+        let stray_bytes = postcard::to_stdvec(&stray).expect("encode the stray frame");
+        let stray_len = stray_bytes.len();
+        guest
+            .send(::bytes::Bytes::from(stray_bytes))
+            .await
+            .expect("guest send");
+        drop(guest);
+
+        let (_sink, stream) = Framed::new(ControlStream::Unix(client_io), codec()).split();
+        let registry: Registry = Arc::new(Mutex::new(Some(HashMap::new())));
+        reader_task(stream, registry).await;
+
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("unexpected guest frame"))
+                .ok_or_else(|| "the desync warn is missing entirely".to_string())?;
+            if line.len() > 1024 {
+                return Err(format!(
+                    "the desync log line is frame-sized ({} bytes): {}",
+                    line.len(),
+                    line.chars().take(200).collect::<String>()
+                ));
+            }
+            if !line.contains(vmcell_protocol::DEBUG_TRUNCATED_MARKER) {
+                return Err(format!("a truncated render must say so: {line}"));
+            }
+            if !line.contains(&format!("{stray_len} byte frame")) {
+                return Err(format!("the line must quote the frame's wire size: {line}"));
+            }
+            Ok(())
+        });
     }
 
     // The `wait()` convenience drains to Exit, collecting output. RED if wait

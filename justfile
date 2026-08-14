@@ -43,10 +43,16 @@ bless:
       # its 0700 owner-only mode; if any check fails, fall through and RE-bless rather than reporting
       # a no-op "already blessed" that leaves the runner effectively un-capped (review-preflight-priv
       # then reads that as skip==pass).
+      # L-BIN-2: the effective bit is matched as getcap's own FIELD (`=ep` / `+ep`), never a bare
+      # `ep` substring — the getcap line also prints the file PATH, so a path component containing
+      # `ep` (…/deps/…, a username with `ep`) satisfies `*ep*` even on a `+p`-only runner and this
+      # skip would report "already blessed" for a runner whose caps are not raised. Same predicate
+      # shape as scripts/review-preflight-priv.sh's check_runner, which hardened it first.
       local caps_now; caps_now="$(getcap "$stable" 2>/dev/null || true)"
       if [[ -f "$stamp" && -f "$stable" && "$(cat "$stamp")" == "$h" ]] \
          && [[ "$caps_now" == *cap_net_admin* && "$caps_now" == *cap_sys_admin* \
-               && "$caps_now" == *cap_dac_override* && "$caps_now" == *ep* ]] \
+               && "$caps_now" == *cap_dac_override* ]] \
+         && [[ "$caps_now" == *"=ep"* || "$caps_now" == *"+ep"* ]] \
          && [[ "$(stat -c %a "$stable" 2>/dev/null)" == "700" ]]; then
         echo "bless: $stable already blessed (runner sha256 unchanged, caps +ep, mode 0700); skipping setcap"
         return 0
@@ -159,6 +165,10 @@ test-usb-passthrough:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${VMCELL_TEST_USB_DEVICE:?set VMCELL_TEST_USB_DEVICE=<vid>:<pid> (a designated, disposable test device)}"
+    # H-TEST-3, like every sibling suite recipe: without the run-scoped export the test's capability
+    # skips (a missing `usbip`/device-class prerequisite the test records rather than hard-fails)
+    # land in the per-PID temp file nobody reads, i.e. a skip nobody can review.
+    VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all \
         --no-tests=fail -E 'kind(test) & test(usb_passthrough)'
@@ -290,7 +300,9 @@ ci:
     # security-adjacent bash — lint them all.
     # ...including the downstream example's contract check (v30 delta 5): it must live beside the
     # workspace it checks, so the lint glob comes to it rather than the script moving to scripts/.
-    shellcheck scripts/*.sh examples/downstream-kernel/*.sh
+    # `scripts/git-pre-commit` is listed EXPLICITLY: a git hook carries no `.sh` extension, so the
+    # glob silently skipped the one hook that runs on every commit.
+    shellcheck scripts/*.sh scripts/git-pre-commit examples/downstream-kernel/*.sh
     # Workflow files: correctness (actionlint also shellchecks `run:` blocks) + security (zizmor:
     # script injection, over-broad permissions, unpinned actions — the suites run on a SELF-HOSTED
     # KVM runner, where a compromised action is lateral movement onto the host).

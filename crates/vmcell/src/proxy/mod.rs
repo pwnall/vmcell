@@ -99,6 +99,21 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Moves the **calling** (proxy worker) thread into the network namespace `ns`
+/// refers to, through the one `setns(CLONE_NEWNET)` home
+/// ([`crate::net_sys::setns_net`], delta 8's designated site — S2). `what`
+/// names which of the worker's two moves failed (into the VM netns before
+/// binding the listener, or back into the host netns before dialing upstream),
+/// producing the readiness-channel string the caller reports so startup aborts
+/// instead of silently binding — or re-originating — in the wrong namespace.
+///
+/// `CLONE_NEWNET` scopes the move to this thread alone; the worker's
+/// current-thread tokio runtime therefore decides the namespace of every socket
+/// it creates afterwards, and no other thread in the process is affected.
+fn enter_netns(ns: &std::fs::File, what: &str) -> std::result::Result<(), String> {
+    crate::net_sys::setns_net(ns.as_raw_fd()).map_err(|e| format!("{what}: {e}"))
+}
+
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         tracing::info!("EgressProxy dropping!");
@@ -195,20 +210,12 @@ impl EgressProxy {
             if let Some(ref netns) = cfg.netns {
                 match std::fs::File::open(format!("/var/run/netns/{netns}")) {
                     Ok(file) => {
-                        // SAFETY: `setns(2)` with a live fd opened just above from
-                        // `/var/run/netns/<name>`, valid for the duration of the
-                        // call. `CLONE_NEWNET` scopes the move to *this* worker
-                        // thread only (other threads keep their netns); the
-                        // current-thread tokio runtime built below runs solely on
-                        // this thread, so its listener socket inherits this netns.
-                        // The return value is checked against 0 — a failure aborts
-                        // startup rather than silently binding in the wrong netns.
-                        let ret = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
-                        if ret != 0 {
-                            let _ = tx.send(Err(format!(
-                                "Failed to setns: {}",
-                                std::io::Error::last_os_error()
-                            )));
+                        // The current-thread tokio runtime built below runs solely
+                        // on this worker thread, so the listener it binds inherits
+                        // the namespace entered here. A failure aborts startup
+                        // rather than silently binding in the wrong netns.
+                        if let Err(e) = enter_netns(&file, "Failed to setns") {
+                            let _ = tx.send(Err(e));
                             return;
                         }
                     }
@@ -294,17 +301,17 @@ impl EgressProxy {
                 // still receives TPROXY-redirected guest connections; only newly
                 // created upstream sockets pick up the host netns.
                 if let Some(ref host_ns) = host_netns {
-                    // SAFETY: `host_ns` is a live fd opened from
-                    // `/proc/thread-self/ns/net` before this thread entered the VM
-                    // netns, valid for this call. `CLONE_NEWNET` scopes the move
-                    // back to this current-thread-runtime worker only; the return
-                    // is checked and a failure aborts startup.
-                    let ret = unsafe { libc::setns(host_ns.as_raw_fd(), libc::CLONE_NEWNET) };
-                    if ret != 0 {
-                        let _ = tx.send(Err(format!(
-                            "Failed to re-enter host netns for upstream re-origination: {}",
-                            std::io::Error::last_os_error()
-                        )));
+                    // `host_ns` was opened from `/proc/thread-self/ns/net` *before*
+                    // this thread entered the VM netns, so it still refers to the
+                    // host root namespace. A failure aborts startup rather than
+                    // leaving the worker trapped in the VM netns, where it could
+                    // serve doubles/403 but never re-originate real upstream
+                    // traffic.
+                    if let Err(e) = enter_netns(
+                        host_ns,
+                        "Failed to re-enter host netns for upstream re-origination",
+                    ) {
+                        let _ = tx.send(Err(e));
                         return;
                     }
                 }
@@ -733,6 +740,65 @@ mod tests {
         );
         // Let the detached worker exit cleanly.
         release.store(true, Ordering::Relaxed);
+    }
+
+    // S2: the worker's two namespace moves route through `net_sys::setns_net`
+    // (delta 8's one home), and a failed move must be REPORTED, labelled with the
+    // move that failed — never swallowed, which would leave the listener bound in
+    // the host netns (no TPROXY delivery) or the upstream leg trapped in the VM
+    // netns (no real egress). KVM-free and privilege-independent: `setns(2)` on a
+    // non-namespace fd is `EINVAL` for root and unprivileged alike (verified on
+    // this host), so the wrong-fd arm below is deterministic.
+    //
+    // Buggy impls guarded: dropping the syscall's return (the pre-refactor
+    // `let ret = ...` with an unchecked `ret`, or a `let _ =`) makes the `is_err`
+    // assert red; dropping the `what` label collapses the two call sites into one
+    // indistinguishable message and makes the prefix asserts red.
+    //
+    // The live coverage this cannot replace: `egress_privileged_filtered`
+    // (tests/egress_proxy.rs) boots `NetConfig::Privileged` + `Egress::Filtered`,
+    // which is the only path that drives both moves for real — a unit test cannot
+    // create a netns or observe which namespace a socket landed in.
+    #[test]
+    fn enter_netns_reports_a_failed_move_with_its_label() {
+        // Wrong-fd arm: a live, readable, NON-namespace fd. The move cannot
+        // succeed, so the error must reach the caller carrying its label.
+        let not_a_netns = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let err = enter_netns(&not_a_netns, "Failed to setns")
+            .expect_err("setns on a non-namespace fd must fail, not be swallowed");
+        assert!(
+            err.starts_with("Failed to setns: "),
+            "the failed move must be labelled with which move it was, got: {err}"
+        );
+        // The errno is carried through verbatim (`EINVAL` = os error 22 — the
+        // locale-independent half of `io::Error`'s Display), proving the message
+        // is the syscall's own diagnosis and not a fixed string.
+        assert!(
+            err.contains("(os error 22)"),
+            "the move's errno must survive into the report, got: {err}"
+        );
+        // The other call site's label, so a single hard-coded message is red.
+        let err2 = enter_netns(&not_a_netns, "Failed to re-enter host netns")
+            .expect_err("setns on a non-namespace fd must fail");
+        assert!(
+            err2.starts_with("Failed to re-enter host netns: "),
+            "each call site must keep its own label, got: {err2}"
+        );
+
+        // POSITIVE CONTROL: a REAL namespace fd (the calling thread's own netns —
+        // re-entering it is a no-op) does not hit the `EINVAL` above. Unprivileged
+        // it is `EPERM` (setns needs CAP_SYS_ADMIN); under the blessed runner it
+        // succeeds. Either outcome proves the helper reaches the syscall with a
+        // usable fd, so the wrong-fd failures above are fd-specific rather than a
+        // helper that unconditionally errors.
+        let own_netns = std::fs::File::open("/proc/thread-self/ns/net").expect("open own netns fd");
+        match enter_netns(&own_netns, "control") {
+            Ok(()) => {}
+            Err(e) => assert!(
+                !e.contains("(os error 22)"),
+                "a real namespace fd must not be rejected as a non-namespace fd: {e}"
+            ),
+        }
     }
 
     // L-NET-7: a worker panic before readiness must surface its real payload, not

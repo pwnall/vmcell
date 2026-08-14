@@ -32,11 +32,18 @@ jobs:
 
       - name: run all fuzz targets (5 min each)
         run: |
+          # Every target gets its full window even when an earlier one crashes: under `bash -e` a
+          # single failing `cargo fuzz run` aborts the loop, so the FIRST crashing target starves
+          # every later one of its nightly budget until someone fixes it — the second decode surface
+          # then silently stops being fuzzed at all. Record the failure per target and fail at the
+          # end instead, so the run still reports (and uploads reproducers for) all of them.
+          rc=0
           for t in $(cargo fuzz list); do
             echo "::group::cargo fuzz run $t"
-            cargo fuzz run "$t" -- -max_total_time=300
+            cargo fuzz run "$t" -- -max_total_time=300 || rc=1
             echo "::endgroup::"
           done
+          exit $rc
 
       - name: upload crash reproducers
         if: ${{ failure() }}

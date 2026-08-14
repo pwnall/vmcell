@@ -9,14 +9,22 @@
 # Assumes: `just bless` installed the runner at .vmcell-bin/release/ and
 #          target/release/bench-vm was built via `cargo build --release -p vmcell-bench`
 #          (its default features enable all FOUR backends: cloud-hypervisor + firecracker + qemu +
-#          crosvm). crosvm needs a `crosvm` binary on PATH ($VMCELL_CROSVM_BIN or /usr/local/bin).
+#          crosvm). Each backend's binary is resolved through the design §10.4 contract vars —
+#          $VMCELL_CH_BIN / $VMCELL_FC_BIN / $VMCELL_QEMU_BIN / $VMCELL_CROSVM_BIN, else the
+#          bare name on PATH — and every run echoes the one it resolved ("vmm binary: …"). The
+#          vars only became load-bearing here when bench-vm stopped hardcoding the four names
+#          (`bench-ignores-contract-bin-resolvers`); this header used to document them as working
+#          while only PATH was consulted. crosvm needs a crosvm binary via either route. Export
+#          them: run-bench.sh's `systemd-run --user --scope` and the file-capability runner both
+#          exec through without sanitizing the environment (verified), so an exported var reaches
+#          bench-vm; the echoed line is the proof for a given run.
 set -uo pipefail
 WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="${1:-/tmp/perf-matrix.log}"
 : > "$LOG"
 
 # Summary lines worth keeping (drops CH serial-log + VMM deprecation noise).
-KEEP='Cold Boot|Warm Restore|PHASE-BUDGET|^  (create|connect|exec|teardown|destroy|list|restore)|TOTAL|VSOCK-RTT|round-trip|SUSPEND-SIZE|snapshot bytes|memory file =|memory-file share|host RssShmem total|host RssAnon total|marginal host|KSM pages_sharing|guest MemTotal|guest pid1|density|no snapshot support|cpufreq:|Capabilities:|=== |^Running benchmarks|^kernel:|No successful runs|NET-START|NET-EGRESS|fan-out|agent-ready across|CoW support|master ready|DAEMON-API|NOT freq-pinned|does not rotate|no unprivileged|single-clone|skipping|session-|CAP_NET_ADMIN'
+KEEP='Cold Boot|Warm Restore|PHASE-BUDGET|^  (create|connect|exec|teardown|destroy|list|restore)|TOTAL|VSOCK-RTT|round-trip|SUSPEND-SIZE|snapshot bytes|memory file =|memory-file share|host RssShmem total|host RssAnon total|marginal host|KSM pages_sharing|guest MemTotal|guest pid1|density|no snapshot support|cpufreq:|Capabilities:|=== |^Running benchmarks|^kernel:|No successful runs|NET-START|NET-EGRESS|fan-out|agent-ready across|CoW support|master ready|DAEMON-API|^vmm binary:|daemon-api: NOT applied|NOT freq-pinned|does not rotate|no unprivileged|single-clone|skipping|session-|CAP_NET_ADMIN'
 
 FAILED=0
 run() {

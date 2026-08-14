@@ -37,6 +37,10 @@ const CONCURRENT_AGENT_READY_BUDGET: Duration = Duration::from_secs(180);
 /// How long [`kernel_banner`] waits for the kernel's banner before calling the boot failed.
 const KERNEL_BANNER_BUDGET: Duration = Duration::from_secs(15);
 
+/// How long `metrics.usage_readable` lets the booted guest run before reading its cgroup counters
+/// back — `memory.peak` is only non-zero once the guest has actually touched memory.
+const USAGE_SETTLE: Duration = Duration::from_secs(2);
+
 /// How often [`await_kernel_banner`] re-reads the console while waiting.
 const BANNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -78,10 +82,14 @@ fn failed_start(e: &impl std::fmt::Display) -> String {
 }
 
 /// The base sentence every agent-handshake failure records, naming the budget that expired.
-fn agent_handshake_base(e: &impl std::fmt::Display) -> String {
+///
+/// `budget` is passed rather than read off [`AGENT_READY_BUDGET`] so the sentence names the budget
+/// the call **actually** used: the arms that inject a different one (a unit test's millisecond
+/// budget, a concurrent boot's longer one) must not report the default's number.
+fn agent_handshake_base(e: &impl std::fmt::Display, budget: Duration) -> String {
     format!(
         "agent handshake failed within the {}s budget: {e}",
-        AGENT_READY_BUDGET.as_secs()
+        budget.as_secs()
     )
 }
 
@@ -318,7 +326,11 @@ pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
     let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
-            return Err(explain_boot_failure_at(&serial_log, &agent_handshake_base(&e)).await);
+            return Err(explain_boot_failure_at(
+                &serial_log,
+                &agent_handshake_base(&e, AGENT_READY_BUDGET),
+            )
+            .await);
         }
     };
     let addr = exec(agent, &["ip", "a"]).await?;
@@ -434,6 +446,31 @@ pub async fn metrics_usage_readable<V: Vmm>(vm: &MicroVm<V>) -> Result<(), Strin
     Ok(())
 }
 
+/// The whole `metrics.usage_readable` arm: the agent handshake that proves the guest actually
+/// booted, the settle window that lets it touch memory, then [`metrics_usage_readable`].
+///
+/// Extracted with both durations injected so the **handshake decision** is drivable KVM-free
+/// (`usage-readable-swallows-agent-handshake`): the handshake used to be a bare `let _`, so a guest
+/// that never came up still reached the cgroup readout and the check could report anything but the
+/// boot failure that caused it. Every sibling arm renders a failed handshake through
+/// [`explain_boot_failure_at`]; this one now does too.
+async fn usage_readable_after_agent_ready<V: Vmm>(
+    vm: &mut MicroVm<V>,
+    ready_budget: Duration,
+    settle: Duration,
+) -> Result<(), String> {
+    // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+    let serial_log = vm.instance().serial_log().to_path_buf();
+    if let Err(e) = vm.agent(Some(ready_budget)).await {
+        return Err(
+            explain_boot_failure_at(&serial_log, &agent_handshake_base(&e, ready_budget)).await,
+        );
+    }
+    // Agent-ready: let the guest consume some memory before the counters are read back.
+    tokio::time::sleep(settle).await;
+    metrics_usage_readable(vm).await
+}
+
 // ---------------------------------------------------------------------------
 // Full checks
 // ---------------------------------------------------------------------------
@@ -483,12 +520,14 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
         let agent = match vm.agent(Some(CONCURRENT_AGENT_READY_BUDGET)).await {
             Ok(a) => a,
             Err(e) => {
+                // The sentence is composed by the one `agent_handshake_base` (now that it takes the
+                // budget it must name), not a second copy of the phrasing that only differed in
+                // which const it read.
                 return Err(explain_boot_failure_at(
                     &serial_log,
                     &format!(
-                        "a concurrently-started VM's agent handshake failed within the {}s \
-                         budget: {e}",
-                        CONCURRENT_AGENT_READY_BUDGET.as_secs()
+                        "a concurrently-started VM: {}",
+                        agent_handshake_base(&e, CONCURRENT_AGENT_READY_BUDGET)
                     ),
                 )
                 .await);
@@ -523,7 +562,10 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
         .map_err(|e| format!("snapshot-source: {}", failed_start(&e)))?;
     // Boot to agent-ready before snapshotting.
     if let Err(e) = vm.agent(Some(AGENT_READY_BUDGET)).await {
-        let base = format!("snapshot-source: {}", agent_handshake_base(&e));
+        let base = format!(
+            "snapshot-source: {}",
+            agent_handshake_base(&e, AGENT_READY_BUDGET)
+        );
         return Err(explain_boot_failure_for(&vm, &base).await);
     }
 
@@ -541,7 +583,10 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
     let agent = match restored.agent(Some(AGENT_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
-            let base = format!("restored VM: {}", agent_handshake_base(&e));
+            let base = format!(
+                "restored VM: {}",
+                agent_handshake_base(&e, AGENT_READY_BUDGET)
+            );
             return Err(explain_boot_failure_at(&restored_serial, &base).await);
         }
     };
@@ -569,7 +614,11 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), S
         let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
             Ok(a) => a,
             Err(e) => {
-                return Err(explain_boot_failure_at(&serial_log, &agent_handshake_base(&e)).await);
+                return Err(explain_boot_failure_at(
+                    &serial_log,
+                    &agent_handshake_base(&e, AGENT_READY_BUDGET),
+                )
+                .await);
             }
         };
         let _ = exec(agent, &["tail", "/dev/zero"]).await;
@@ -676,7 +725,8 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
             // The VM is still alive here, so its serial log is readable — this is the arm that
             // catches both the erofs root-mount panic (which surfaces only as "Panic detected in
             // serial log") and the missing-`CONFIG_VSOCKETS` guest.
-            let msg = explain_boot_failure_for(&vm, &agent_handshake_base(&e)).await;
+            let msg =
+                explain_boot_failure_for(&vm, &agent_handshake_base(&e, AGENT_READY_BUDGET)).await;
             record(outcomes, "boot.agent_ready", Level::Core, Err(msg));
             let _ = vm.shutdown().await;
             return;
@@ -820,7 +870,7 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                             Ok(agent) => nested_kvm_ok(agent).await,
                             Err(e) => Err(explain_boot_failure_at(
                                 &serial_log,
-                                &agent_handshake_base(&e),
+                                &agent_handshake_base(&e, AGENT_READY_BUDGET),
                             )
                             .await),
                         };
@@ -862,14 +912,16 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                         Err(failed_start(&e)),
                     ),
                     Ok(mut vm) => {
-                        // Let it consume some memory first.
-                        let _ = vm.agent(Some(AGENT_READY_BUDGET)).await;
-                        tokio::time::sleep(Duration::from_secs(2)).await;
                         record(
                             outcomes,
                             "metrics.usage_readable",
                             Level::Extended,
-                            metrics_usage_readable(&vm).await,
+                            usage_readable_after_agent_ready(
+                                &mut vm,
+                                AGENT_READY_BUDGET,
+                                USAGE_SETTLE,
+                            )
+                            .await,
                         );
                         let _ = vm.shutdown().await;
                     }
@@ -961,9 +1013,11 @@ async fn run_shares_check<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
             let serial_log = vm.instance().serial_log().to_path_buf();
             let res = match vm.agent(Some(AGENT_READY_BUDGET)).await {
                 Ok(agent) => virtiofs_shares(agent, &out_dir).await,
-                Err(e) => {
-                    Err(explain_boot_failure_at(&serial_log, &agent_handshake_base(&e)).await)
-                }
+                Err(e) => Err(explain_boot_failure_at(
+                    &serial_log,
+                    &agent_handshake_base(&e, AGENT_READY_BUDGET),
+                )
+                .await),
             };
             record(outcomes, "virtiofs.shares", Level::Extended, res);
             let _ = vm.shutdown().await;
@@ -1262,6 +1316,49 @@ mod tests {
             0,
             "every `agent(Some(..))` budget must be a named const, not an inline literal"
         );
+    }
+
+    // `metrics.usage_readable` must FAIL, naming the boot failure, when the guest never hands
+    // shakes. The handshake was a bare `let _` (`usage-readable-swallows-agent-handshake`), so the
+    // arm walked into the cgroup readout on a guest that never booted and reported anything but the
+    // reason — on a host where the counters happen to read back, a green PASS.
+    //
+    // KVM-free: the fake backend's vsock path has no listener, so the handshake genuinely fails;
+    // the budget is injected (1s, not `AGENT_READY_BUDGET`) so it fails in a second rather than a
+    // minute, and the message must name *that* budget. What this fake cannot see is the pass side —
+    // a real delegated cgroup readout — which is the live `metrics.usage_readable` leg of a
+    // `Level::Extended` validation run on a KVM host.
+    #[tokio::test]
+    async fn usage_readable_fails_naming_the_boot_failure_when_the_agent_never_handshakes() {
+        let vmm = FakeVmm::default();
+        let cfg = base_cfg(&ArtifactSet::new(
+            "/nonexistent/vmlinux",
+            "/nonexistent/rootfs.erofs",
+        ))
+        .network_disabled()
+        .build()
+        .expect("config builds");
+        let mut vm = try_start_vm(&vmm, cfg)
+            .await
+            .expect("the fake backend starts");
+        let serial = vm.instance().serial_log().display().to_string();
+
+        let err = usage_readable_after_agent_ready(&mut vm, Duration::from_secs(1), Duration::ZERO)
+            .await
+            .expect_err("a guest that never hands shakes has no readable usage to report");
+        assert!(
+            err.starts_with("agent handshake failed within the 1s budget"),
+            "the arm must report the handshake failure, with the budget it really used: {err}"
+        );
+        assert!(
+            err.contains(&serial),
+            "the message must name the VM's own console ({serial}): {err}"
+        );
+        assert!(
+            !err.contains("memory controller delegated"),
+            "a guest that never booted must not be reported as a cgroup readout problem: {err}"
+        );
+        vm.kill().await.expect("the fake backend stops");
     }
 
     // The one line that turns a VM into a console path. Guards `explain_boot_failure_for` reading

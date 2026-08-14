@@ -1,7 +1,9 @@
 //! Virtual Machine Monitor (VMM) abstraction and management.
 //!
-//! This module provides a generic abstraction for different VMM backends
-//! (like Cloud Hypervisor), as well as fake implementations for testing.
+//! This module provides a generic abstraction for the four shipping VMM backends — Cloud
+//! Hypervisor (primary, in-tree), Firecracker, QEMU, and crosvm (the out-of-tree
+//! `vmcell-firecracker`/`vmcell-qemu`/`vmcell-crosvm` crates) — as well as fake implementations
+//! for testing.
 
 use crate::config::VmConfig;
 use crate::error::Result;
@@ -13,12 +15,13 @@ pub use cloud_hypervisor::{ChInstance, CloudHypervisor};
 /// Jailer-equivalent pre-exec hardening of the VMM child (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
 pub mod jail;
 
-/// The VMM subprocess's own seccomp-BPF confinement — one predicate, three backends (§12.2, Layer 1 — the VMM's own seccomp filter).
+/// The VMM subprocess's own seccomp-BPF confinement — one predicate, four backends (§12.2, Layer 1 — the VMM's own seccomp filter).
 pub mod seccomp;
 
 // The Firecracker and QEMU backends were extracted into the standalone `vmcell-firecracker` and
-// `vmcell-qemu` crates (they depend on `vmcell`; `vmcell` has no production edge back). Only Cloud
-// Hypervisor — the primary backend — stays in-tree. The shared `Vmm`/`VmInstance` traits, the
+// `vmcell-qemu` crates, and crosvm shipped as `vmcell-crosvm` (they depend on `vmcell`; `vmcell`
+// has no production edge back). Only Cloud Hypervisor — the primary backend — stays in-tree, so
+// the roster is one in-tree plus three out-of-tree. The shared `Vmm`/`VmInstance` traits, the
 // jail/seccomp predicates, and the spawn/reap/console/snapshot-eligibility helpers below remain the
 // single source of truth those crates depend on.
 
@@ -366,9 +369,9 @@ pub fn reap_process_group(process: &mut tokio::process::Child, pgid: Option<u32>
 /// control socket appears, reaping the process **group** on any failure.
 ///
 /// This is the one shared "capture pgid → `add_task` (reap-on-err) → `wait_for_socket`
-/// (reap-on-err)" sequence for all three backends (VMM-2). It was copy-pasted into
-/// `spawn_ch`/`spawn_fc`/`spawn_qemu` and had already diverged (QEMU wrapped the
-/// readiness error in `Error::Vmm` while CH/FC propagated the raw error); routing
+/// (reap-on-err)" sequence for **every** backend — CH, Firecracker, QEMU, and crosvm (VMM-2). It
+/// was copy-pasted into `spawn_ch`/`spawn_fc`/`spawn_qemu` and had already diverged (QEMU
+/// wrapped the readiness error in `Error::Vmm` while CH/FC propagated the raw error); routing
 /// every backend through this helper makes the error handling **identical** — the
 /// place per-backend divergence bugs hide (AGENTS.md "don't triplicate; extract").
 ///
@@ -588,10 +591,11 @@ impl CidAllocator {
 /// Per-VM resources allocated by the orchestrator before VM creation.
 ///
 /// Constructed by the orchestrator and, in their tests, by the out-of-tree backend crates
-/// (`vmcell-firecracker`/`vmcell-qemu`). It is deliberately **not** `#[non_exhaustive]`: every
-/// backend must be handed a fully-specified resource set, so a new field should be a compile error
-/// in each backend crate (fail-loud) rather than a silently-defaulted one. (`vmcell` is
-/// `publish = false`; there is no external consumer relying on non-exhaustiveness.)
+/// (`vmcell-firecracker`/`vmcell-qemu`/`vmcell-crosvm`). It is deliberately **not**
+/// `#[non_exhaustive]`: every backend must be handed a fully-specified resource set, so a new
+/// field should be a compile error in each backend crate (fail-loud) rather than a
+/// silently-defaulted one. (`vmcell` is `publish = false`; there is no external consumer relying
+/// on non-exhaustiveness.)
 #[derive(Debug, Clone)]
 pub struct PerVmResources {
     /// Name of the cgroup v2 slice for the VM.
@@ -626,11 +630,11 @@ pub struct PerVmResources {
 
 /// Virtual Machine Monitor (VMM) capabilities.
 ///
-/// Every backend — including the out-of-tree `vmcell-firecracker`/`vmcell-qemu` crates and the
-/// `FakeVmm` — constructs its own descriptor by naming all fields. It is deliberately **not**
-/// `#[non_exhaustive]`: a new capability must force every backend to declare its stance on it (a
-/// compile error until it does), not default silently to `false`. (`vmcell` is `publish = false`;
-/// there is no external consumer relying on non-exhaustiveness.)
+/// Every backend — including the out-of-tree `vmcell-firecracker`/`vmcell-qemu`/`vmcell-crosvm`
+/// crates and the `FakeVmm` — constructs its own descriptor by naming all fields. It is
+/// deliberately **not** `#[non_exhaustive]`: a new capability must force every backend to declare
+/// its stance on it (a compile error until it does), not default silently to `false`. (`vmcell`
+/// is `publish = false`; there is no external consumer relying on non-exhaustiveness.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmmCapabilities {
     /// True if the VMM supports snapshot and restore.
@@ -644,21 +648,26 @@ pub struct VmmCapabilities {
     /// True if the VMM supports nested virtualization (exposing KVM to guest).
     pub nested_virt: bool,
     /// True if the VMM can attach a virtio-console (`hvc0`) device (Cloud
-    /// Hypervisor and QEMU). Firecracker has no virtio-console, so a
+    /// Hypervisor, QEMU, and crosvm — the latter via `--serial
+    /// hardware=virtio-console`). Firecracker has no virtio-console, so a
     /// [`ConsoleMode::VirtioConsole`](crate::config::ConsoleMode::VirtioConsole)
     /// config is rejected there (`console=hvc0` with no device silences the log).
     pub virtio_console: bool,
     /// True if `restore()` gives the restored VM **fresh host-side socket paths**
     /// inside its own scratch dir. Cloud Hypervisor does: its restore config
     /// rewrite moves the vsock/serial paths into the new VM's tmp dir before
-    /// launch (§8.2, Restore correctness: a restored VM is not a fresh VM). Firecracker does not: `PUT /snapshot/load` re-binds the
+    /// launch (§8.2, Restore correctness: a restored VM is not a fresh VM), and so does QEMU (its
+    /// restore programs a fresh guest CID). Firecracker does not: `PUT /snapshot/load` re-binds the
     /// snapshot's recorded host vsock UDS path **verbatim** — no load-time
-    /// override exists in FC v1.16. Consequences when `false`: every restore of
-    /// a snapshot lineage shares the ONE baked host vsock path, so (a) restoring
+    /// override exists in FC v1.16. Neither does crosvm: it bakes the vsock CID
+    /// into the snapshot and rejects a rotated `--vsock cid=` on restore, so
+    /// `restore()` reuses the baked CID — the Firecracker pattern (§2.5, crosvm — the fourth backend (v29, boot-first)).
+    /// Consequences when `false`: every restore of a snapshot lineage shares the
+    /// ONE baked host vsock path, so (a) restoring
     /// while the snapshotted VM (or a prior restore of it) is still alive is
     /// rejected by the backend's pre-restore liveness guard, and (b) concurrent
     /// restores from one snapshot lineage are unsupported (the design §17, Open gaps and future capabilities
-    /// single-snapshot-CoW gap covers both backends anyway).
+    /// single-snapshot-CoW gap covers every non-rotating backend anyway).
     pub restore_rotates_host_paths: bool,
     /// True if the VMM can rate-limit an extra virtio-blk device's I/O
     /// ([`DiskIoLimit`](crate::config::DiskIoLimit), §4.6). Cloud Hypervisor
@@ -686,8 +695,8 @@ pub struct VmmCapabilities {
 
 /// Abstract Virtual Machine Monitor (VMM) trait.
 ///
-/// A backend abstracts the differences between QEMU, Cloud Hypervisor, and
-/// Firecracker. Every implementation **self-checks** unsupported operations against
+/// A backend abstracts the differences between Cloud Hypervisor, Firecracker, QEMU, and
+/// crosvm. Every implementation **self-checks** unsupported operations against
 /// its [`capabilities`](Vmm::capabilities) and returns
 /// [`Error::Unsupported`](crate::error::Error::Unsupported) with a typed feature name
 /// rather than assuming the caller validated first (design §2.1, The trait and the capability descriptor).
@@ -764,8 +773,10 @@ pub const AGENT_VSOCK_PORT: u32 = 5000;
 /// [`VsockEndpoint::Unix`]. A snapshot-eligible QEMU instead attaches the in-kernel
 /// `vhost-vsock-pci` device (§2.4, QEMU q35 — the fallback and most-proven nester), which exposes the guest directly on the host's
 /// **AF_VSOCK** namespace at `(guest_cid, port)` — no AF_UNIX path and no hybrid
-/// handshake — [`VsockEndpoint::Vsock`]. The agent transport ([`crate::agent`])
-/// branches only its connect *prologue* on this; the framed protocol after the
+/// handshake — [`VsockEndpoint::Vsock`]. crosvm is the one backend that is **always**
+/// on that AF_VSOCK arm: its vsock is the in-kernel device on every path, and its
+/// AF_UNIX `vsock_path` is vestigial API parity (§2.5, crosvm — the fourth backend (v29, boot-first)).
+/// The agent transport ([`crate::agent`]) branches only its connect *prologue* on this; the framed protocol after the
 /// guest's first `Ready` frame is byte-identical on both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VsockEndpoint {
@@ -845,11 +856,12 @@ pub trait VmInstance: Send {
     /// vsock control plane.
     ///
     /// Defaults to [`VsockEndpoint::Unix`] over [`vsock_path`](VmInstance::vsock_path)
-    /// with the shared internal agent vsock port — the AF_UNIX hybrid-vsock transport
-    /// every backend uses today. A backend whose control plane rides an AF_VSOCK transport
-    /// (a snapshot-eligible QEMU on the in-kernel `vhost-vsock-pci` device, §2.4, QEMU q35 — the fallback and most-proven nester)
-    /// overrides this to return [`VsockEndpoint::Vsock`] carrying its
-    /// [`guest_cid`](VmInstance::guest_cid).
+    /// with the shared internal agent vsock port — the AF_UNIX hybrid-vsock transport Cloud
+    /// Hypervisor, Firecracker, and an external-daemon QEMU use. A backend whose control plane
+    /// rides an AF_VSOCK transport overrides this to return [`VsockEndpoint::Vsock`] carrying its
+    /// [`guest_cid`](VmInstance::guest_cid): a snapshot-eligible QEMU on the in-kernel
+    /// `vhost-vsock-pci` device (§2.4, QEMU q35 — the fallback and most-proven nester), and crosvm
+    /// on **every** path (its vsock is in-kernel unconditionally, §2.5, crosvm — the fourth backend (v29, boot-first)).
     fn vsock_endpoint(&self) -> VsockEndpoint {
         VsockEndpoint::Unix {
             path: self.vsock_path().to_path_buf(),
@@ -865,9 +877,9 @@ pub trait VmInstance: Send {
     /// actually carrying traffic, so [`MicroVm::start`](crate::MicroVm::start) can
     /// re-spawn a VM whose transport came up half-wired instead of returning it.
     ///
-    /// Default: `Ok(())`. Cloud Hypervisor and Firecracker terminate vsock *inside*
-    /// the VMM process, so the device cannot half-initialize — there is nothing to
-    /// probe. QEMU overrides this: its vsock rides an **external**
+    /// Default: `Ok(())`. Cloud Hypervisor, Firecracker, and crosvm terminate vsock *inside*
+    /// the VMM process (crosvm on the in-kernel vhost-vsock device), so the device cannot
+    /// half-initialize — there is nothing to probe. QEMU overrides this: its vsock rides an **external**
     /// `vhost-device-vsock` daemon over a `vhost-user-vsock` virtqueue whose
     /// bring-up races. On the measured host ~11% of QEMU boots leave that data path
     /// wedged for the VM's entire life — the daemon accepts the host `CONNECT` but
@@ -1162,9 +1174,9 @@ mod tests {
 
     // Pins the trait default: every backend that does NOT override `vsock_endpoint`
     // keeps the AF_UNIX hybrid-vsock transport, derived from `vsock_path()` + the
-    // shared `AGENT_VSOCK_PORT`. A backend flipping to the AF_VSOCK transport (QEMU
-    // in-kernel vhost-vsock) must override this method; the buggy inverse (a QEMU
-    // that forgets to override, so the host dials a nonexistent AF_UNIX path) is
+    // shared `AGENT_VSOCK_PORT`. A backend on the AF_VSOCK transport (an in-kernel-vsock QEMU,
+    // and crosvm always) must override this method; the buggy inverse (a QEMU or crosvm
+    // that forgets to override, so the host dials a vestigial AF_UNIX path) is
     // exactly what an endpoint-mismatch would surface.
     #[test]
     fn fake_instance_vsock_endpoint_defaults_to_unix_path() {
@@ -1494,7 +1506,7 @@ mod tests {
 
     // Guards the shared console self-guard: VirtioConsole on a backend that does not
     // advertise `virtio_console` (Firecracker) must return a typed
-    // `Unsupported { feature: "virtio_console" }`; a capable backend (CH/QEMU) must
+    // `Unsupported { feature: "virtio_console" }`; a capable backend (CH/QEMU/crosvm) must
     // accept it; and Uart is always accepted regardless of the capability. The buggy
     // inverse (no guard, or gating the wrong mode) lets a VirtioConsole config reach a
     // backend with no hvc0 device — `console=hvc0` then sinks nowhere and serial.log
@@ -1525,11 +1537,13 @@ mod tests {
             "expected virtio_console Unsupported, got {err:?}"
         );
 
-        // CH/QEMU-like (virtio_console:true) + VirtioConsole => Ok.
-        reject_unsupported_console("cloud-hypervisor", &caps(true), ConsoleMode::VirtioConsole)
-            .expect("a capable backend must accept VirtioConsole");
-        reject_unsupported_console("qemu", &caps(true), ConsoleMode::VirtioConsole)
-            .expect("a capable backend must accept VirtioConsole");
+        // CH/QEMU/crosvm-like (virtio_console:true) + VirtioConsole => Ok. crosvm advertises
+        // `virtio_console: true` too (`--serial hardware=virtio-console`), so it belongs on this
+        // side of the guard.
+        for vmm in ["cloud-hypervisor", "qemu", "crosvm"] {
+            reject_unsupported_console(vmm, &caps(true), ConsoleMode::VirtioConsole)
+                .expect("a capable backend must accept VirtioConsole");
+        }
 
         // Uart is always accepted, on capable and incapable backends alike (the
         // over-rejection inverse — gating Uart too — reddens here).
@@ -1584,6 +1598,176 @@ mod tests {
             .expect("no USB device requested must never be refused");
         reject_usb_host_devices("qemu", &caps(true), &[])
             .expect("no USB device requested must never be refused");
+    }
+
+    /// The rustdoc block immediately above `anchor` (skipping any attributes between them), with
+    /// the `///` markers stripped and whitespace normalized so a name split across a line break
+    /// still matches. Panics if the anchor is missing or carries no doc — an extraction that
+    /// silently returned nothing would make every roster assert below vacuous.
+    fn doc_block_before(source: &str, anchor: &str) -> String {
+        let before = source
+            .split_once(anchor)
+            .unwrap_or_else(|| panic!("`{anchor}` must exist in this file"))
+            .0;
+        let mut doc: Vec<&str> = Vec::new();
+        for line in before.lines().rev() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("///") {
+                doc.push(rest);
+                continue;
+            }
+            // Attributes and blank lines sit between the doc and its item; anything else ends the
+            // block.
+            if doc.is_empty() && (trimmed.is_empty() || trimmed.starts_with("#[")) {
+                continue;
+            }
+            break;
+        }
+        assert!(!doc.is_empty(), "`{anchor}` must carry a rustdoc block");
+        doc.reverse();
+        crate::vmm::seccomp::roster::normalize_ws(&doc.join("\n"))
+    }
+
+    // GATE (docs/78 §9.4 `vmm-rustdoc-stale-backend-rosters`) — five rustdoc rosters in this module
+    // had gone stale on crosvm (the `Vmm` trait, `PerVmResources`, `VmmCapabilities`,
+    // `virtio_console`, and the two vsock-endpoint docs), each still describing three backends
+    // while four ship. A roster is checkable, so it gets a gate: every doc block below must name
+    // every backend `vmm_seccomp_args` dispatches — the authoritative roster, since a backend
+    // cannot ship without an arm there (`crate::vmm::seccomp::roster`, which both doc gates share
+    // rather than keeping a second copy). Two of the blocks enumerate the out-of-tree backend
+    // *crates* instead of prose names, so they are checked against `vmcell-<id>` for every
+    // non-primary backend.
+    //
+    // Red-on-inverse: delete `crosvm` from any one block (e.g. revert the `Vmm` trait doc to
+    // "QEMU, Cloud Hypervisor, and Firecracker") and this reddens naming that block; add a fifth
+    // `vmm_seccomp_args` arm and every block reddens until it is documented.
+    #[test]
+    fn backend_rosters_in_this_modules_rustdoc_name_every_shipping_backend() {
+        use crate::vmm::seccomp::roster;
+
+        const SOURCE: &str = include_str!("mod.rs");
+
+        let ids = roster::dispatched_backend_ids();
+        // The scan is self-checking: a silently-empty roster would make everything below vacuous.
+        assert_eq!(
+            ids.len(),
+            roster::BACKEND_DISPLAY_NAMES.len(),
+            "the seccomp dispatch scan found {ids:?} against roster {:?}",
+            roster::BACKEND_DISPLAY_NAMES
+        );
+
+        // Rosters written as prose backend names.
+        // The `//!` markers come off before normalizing, or a name the comment wrapped would read
+        // as "Cloud //! Hypervisor" and never match.
+        let module_doc = roster::normalize_ws(
+            &SOURCE
+                .lines()
+                .map_while(|l| l.strip_prefix("//!"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let prose_blocks: [(&str, String); 9] = [
+            ("the module doc", module_doc),
+            (
+                "the `Vmm` trait",
+                doc_block_before(SOURCE, "pub trait Vmm: Send + Sync {"),
+            ),
+            (
+                "`VmmCapabilities::virtio_console`",
+                doc_block_before(SOURCE, "    pub virtio_console: bool,"),
+            ),
+            (
+                "`VmmCapabilities::restore_rotates_host_paths`",
+                doc_block_before(SOURCE, "    pub restore_rotates_host_paths: bool,"),
+            ),
+            (
+                "`VmmCapabilities::disk_io_throttle`",
+                doc_block_before(SOURCE, "    pub disk_io_throttle: bool,"),
+            ),
+            (
+                "`VmmCapabilities::usb_host_passthrough`",
+                doc_block_before(SOURCE, "    pub usb_host_passthrough: bool,"),
+            ),
+            (
+                "the `VsockEndpoint` enum",
+                doc_block_before(SOURCE, "pub enum VsockEndpoint {"),
+            ),
+            (
+                "`VmInstance::vsock_endpoint`",
+                doc_block_before(SOURCE, "    fn vsock_endpoint(&self) -> VsockEndpoint {"),
+            ),
+            (
+                "`VmInstance::verify_control_plane`",
+                doc_block_before(SOURCE, "    async fn verify_control_plane("),
+            ),
+        ];
+        for (what, doc) in &prose_blocks {
+            for id in &ids {
+                let display = roster::display_name(id);
+                assert!(
+                    doc.contains(display),
+                    "{what} enumerates backends but never names {display} — a stale roster is how \
+                     a reader learns the wrong shipping set"
+                );
+            }
+        }
+
+        // Rosters written as the out-of-tree backend crate names. Cloud Hypervisor is the primary,
+        // in-tree backend and has no such crate, so it is derived out of this list rather than
+        // hand-maintained.
+        let crate_blocks: [(&str, String); 2] = [
+            (
+                "`PerVmResources`",
+                doc_block_before(SOURCE, "pub struct PerVmResources {"),
+            ),
+            (
+                "`VmmCapabilities`",
+                doc_block_before(SOURCE, "pub struct VmmCapabilities {"),
+            ),
+        ];
+        for (what, doc) in &crate_blocks {
+            for id in ids.iter().filter(|id| *id != "cloud-hypervisor") {
+                let krate = format!("vmcell-{id}");
+                assert!(
+                    doc.contains(&krate),
+                    "{what} lists the out-of-tree backend crates but omits `{krate}`"
+                );
+            }
+        }
+
+        // The manifest's composition-root comment is a roster too (docs/78 §9.4
+        // `cargo-toml-three-backends-comment`: it claimed bench-vm "drives all three backends"
+        // while `VMM_BIN_RESOLVERS` wires four). No other test can reach a `Cargo.toml` comment, so
+        // it rides here. Red-on-inverse: put "three" back and this reddens.
+        const MANIFEST: &str = include_str!("../../Cargo.toml");
+        let count_word = roster::COUNT_WORDS
+            .get(ids.len())
+            .expect("the backend roster is small enough to spell out");
+        assert!(
+            MANIFEST.contains(&format!("bench-vm drives all {count_word} backends")),
+            "crates/vmcell/Cargo.toml must say bench-vm drives all {count_word} backends \
+             ({} dispatch arms: {ids:?})",
+            ids.len()
+        );
+        // …and names the crates it wires. Scoped to that comment's own lines — the manifest's
+        // dev-dependencies name every backend crate anyway, so a whole-file `contains` would pass
+        // vacuously.
+        let comment: String = roster::normalize_ws(
+            &MANIFEST
+                .lines()
+                .skip_while(|l| !l.contains("bench-vm drives all"))
+                .take(3)
+                .map(|l| l.trim_start_matches('#'))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for id in ids.iter().filter(|id| *id != "cloud-hypervisor") {
+            let krate = format!("vmcell-{id}");
+            assert!(
+                comment.contains(&krate),
+                "the manifest's composition-root comment omits `{krate}`: {comment}"
+            );
+        }
     }
 
     #[test]

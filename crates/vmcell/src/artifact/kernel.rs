@@ -331,6 +331,36 @@ pub fn reject_labelled_prebuilt(label: Option<&str>, fragments: Option<&[String]
     )))
 }
 
+/// Classifies the removal of a stale kernel-build input at `path`: `NotFound` is "nothing to
+/// purge" (`Ok`), every other failure is a hard stop (docs/78 `kernel-workdir-purge-swallowed`).
+///
+/// The **one** law both purge sites in [`KernelStage::run`] use — the whole build dir before a
+/// re-fetch, and the intermediate `linux.tar` after an extraction. Both were `let _ =`, and both
+/// have the same silent consequence, because each purge's *consumer* is an existence check that a
+/// survivor satisfies: extraction is skipped when `Makefile` exists, decompression is skipped when
+/// `linux.tar` exists. So a failed purge does not degrade to "a slower rebuild" — it makes `make`
+/// compile the PREVIOUS pin's source tree and publish it under the NEW pin's cache identity, a
+/// wrong kernel with a green build and a warm cache.
+///
+/// Takes the already-attempted removal so the two sites can pass their own (async/sync,
+/// tree/file) call and still share one classification and one message.
+///
+/// # Errors
+/// [`Error::Artifact`] naming `path` and what a survivor would cause.
+fn purged_or_hard_stop(removal: std::io::Result<()>, path: &Path) -> Result<()> {
+    match removal {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Artifact(format!(
+            "failed to purge the stale kernel build input {}: {e} — the re-fetch does not \
+             re-create what survived, and the extraction/decompression steps are gated on the \
+             survivor's existence, so `make` would compile the OLD source tree under the NEW \
+             pin's cache identity (§5.6)",
+            path.display()
+        ))),
+    }
+}
+
 impl KernelStage {
     /// The fragment names for this stage, **sorted** and de-duplicated (the shared
     /// [`sorted_fragments`] law).
@@ -358,6 +388,33 @@ impl KernelStage {
         match &self.label {
             Some(l) => format!("kernel_{l}_source_sha256"),
             None => "kernel_source_sha256".to_string(),
+        }
+    }
+
+    /// The refusal for a source pin this stage needs but the resolved pins do not carry, naming
+    /// the **overlay** key an operator adds — not only the flattened internal key
+    /// (docs/78 `labelled-kernel-missing-source-pins-guidance`).
+    ///
+    /// `kernel_<label>_source_url` is a key that appears in no pins DOCUMENT: it is what the
+    /// flattener derives from `kernels.<label>.source_url`. §5.6 shows a `kernels.<label>` entry
+    /// carrying only `fragments`, which is a complete, valid registry entry for enumeration and
+    /// the exact way to land here — so the pre-fix message pointed the reader at a route they
+    /// cannot take. Both source keys are named because a labelled kernel needs both and the second
+    /// refusal only arrives after fixing the first.
+    ///
+    /// `sub_key` is the sub-key under the namespace (`source_url` / `source_sha256`), which is the
+    /// same spelling in both the labelled (`kernels.<label>.…`) and default (`kernel.…`) routes.
+    fn missing_source_pin(&self, pin_key: &str, sub_key: &str) -> Error {
+        match &self.label {
+            Some(label) => Error::Artifact(format!(
+                "Missing {pin_key} pin for kernel label `{label}`: add \
+                 `kernels.{label}.{sub_key}` to your pins overlay (§10.2) — a `kernels.{label}` \
+                 entry needs BOTH `source_url` and `source_sha256` to be buildable; one carrying \
+                 only `fragments` declares the label without a source to build it from"
+            )),
+            None => Error::Artifact(format!(
+                "Missing {pin_key} pin: the resolved pins carry no `kernel.{sub_key}` (§10.2)"
+            )),
         }
     }
 
@@ -453,11 +510,11 @@ impl Stage for KernelStage {
         let kernel_source_url = inputs
             .pins
             .get(&url_key)
-            .ok_or_else(|| Error::Artifact(format!("Missing {url_key} pin")))?;
+            .ok_or_else(|| self.missing_source_pin(&url_key, "source_url"))?;
         let kernel_source_sha256 = inputs
             .pins
             .get(&sha_key)
-            .ok_or_else(|| Error::Artifact(format!("Missing {sha_key} pin")))?;
+            .ok_or_else(|| self.missing_source_pin(&sha_key, "source_sha256"))?;
         let microvm_config = inputs
             .pins
             .get("kernel_microvm_config")
@@ -491,8 +548,11 @@ impl Stage for KernelStage {
             Err(_) => true,
         };
         if needs_fetch {
-            // Best-effort purge of any stale tarball + extracted tree (ignore "not found").
-            let _ = tokio::fs::remove_dir_all(&workdir).await;
+            // Purge any stale tarball + extracted tree. Only "not found" is ignorable — see
+            // `purged_or_hard_stop`: the re-fetch below does NOT re-create what survived, and
+            // extraction is gated on `Makefile` existing, so a swallowed purge failure compiles
+            // the OLD source tree under the NEW pin's cache identity.
+            purged_or_hard_stop(tokio::fs::remove_dir_all(&workdir).await, &workdir)?;
             tokio::fs::create_dir_all(&workdir).await?;
             let bytes = self.http_client.get(kernel_source_url).await?;
             tokio::fs::write(&tarball, &bytes).await?;
@@ -569,7 +629,13 @@ impl Stage for KernelStage {
                     }
                 }
 
-                let _ = std::fs::remove_file(&tar_uncompressed_path);
+                // Same law as the workdir purge above (`purged_or_hard_stop`): the decompress
+                // step is SKIPPED when `linux.tar` already exists, so a survivor of the previous
+                // pin is what the next extraction unpacks.
+                purged_or_hard_stop(
+                    std::fs::remove_file(&tar_uncompressed_path),
+                    &tar_uncompressed_path,
+                )?;
 
                 Ok(())
             })
@@ -1560,6 +1626,125 @@ mod tests {
         assert!(
             !workdir.join("stale_marker").exists(),
             "a bumped pin must purge the stale extracted tree"
+        );
+    }
+
+    // docs/78 GATE (`kernel-workdir-purge-swallowed`): the one law both purge sites in
+    // `KernelStage::run` route through. `NotFound` means there was nothing to purge (the cold
+    // build) and is the ONLY ignorable outcome; every other failure must be surfaced, because the
+    // survivor is never re-created by the re-fetch and both consumers (extraction gated on
+    // `Makefile`, decompression gated on `linux.tar`) skip on its existence — a swallowed failure
+    // compiles the previous pin's source under the new pin's cache identity.
+    // RED on the inverse (`Err(_) => Ok(())`, i.e. the pre-fix `let _ =`): both hard-stop legs
+    // panic on the `Ok`. The real-fs leg additionally proves the classifier is fed a genuine
+    // kernel-level failure, not just a synthesized one.
+    #[test]
+    fn purged_or_hard_stop_ignores_only_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kernel-build");
+
+        purged_or_hard_stop(Ok(()), &path).expect("a successful purge is Ok");
+        purged_or_hard_stop(
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            &path,
+        )
+        .expect("nothing to purge is Ok");
+
+        let Err(Error::Artifact(msg)) = purged_or_hard_stop(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &path,
+        ) else {
+            panic!("a non-NotFound purge failure must be an Artifact hard stop");
+        };
+        assert!(
+            msg.contains("kernel-build") && msg.contains("cache identity"),
+            "the refusal must name the surviving path and the consequence, got: {msg}"
+        );
+
+        // Real-fs leg: `remove_dir_all` on a REGULAR file is ENOTDIR on every filesystem and
+        // every uid — a genuine failure this classifier must not treat as "nothing to purge".
+        let a_file = dir.path().join("linux.tar");
+        std::fs::write(&a_file, b"not a dir").expect("write");
+        let res = purged_or_hard_stop(std::fs::remove_dir_all(&a_file), &a_file);
+        assert!(
+            matches!(res, Err(Error::Artifact(ref m)) if m.contains("linux.tar")),
+            "a real removal failure must hard-stop naming the path, got {res:?}"
+        );
+        assert!(
+            a_file.exists(),
+            "fixture premise: the removal really failed"
+        );
+    }
+
+    // docs/78 GATE (`labelled-kernel-missing-source-pins-guidance`): a `kernels.<label>` entry
+    // carrying only `fragments` — exactly the shape §5.6 shows — is a valid registry entry with no
+    // source to build from. The refusal must name the OVERLAY key the operator adds
+    // (`kernels.<label>.source_url`), because `kernel_<label>_source_url` is a flattener-derived
+    // key that appears in no pins document: adding it verbatim to an overlay is rejected by the
+    // top-level namespace check. RED on the inverse (the pre-fix `Missing {url_key} pin`): the
+    // overlay-route assertion goes red while the flattened key is still named.
+    #[tokio::test]
+    async fn labelled_kernel_missing_source_pin_names_the_overlay_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = std::sync::Arc::new(FakeHttpClient {
+            body: Vec::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let stage = KernelStage {
+            http_client: fake.clone(),
+            label: Some("6.12.94".into()),
+            fragments: Some(vec!["KASAN".into()]),
+        };
+        // A fragments-only registry entry: the shared `kernel_microvm_config` and the fragment
+        // text resolve, the label's own source pins do not.
+        let mut inputs = StageInputs::default();
+        inputs
+            .pins
+            .insert("kernel_microvm_config".into(), "CONFIG_X=y\n".into());
+        inputs
+            .pins
+            .insert("kernel_fragments_KASAN".into(), "CONFIG_KASAN=y\n".into());
+
+        let res = stage
+            .run(&inputs, &dir.path().join("vmlinux-6-12-94"))
+            .await;
+        let Err(Error::Artifact(msg)) = res else {
+            panic!("a labelled kernel with no source pins must fail loud, got {res:?}");
+        };
+        assert!(
+            msg.contains("kernels.6.12.94.source_url"),
+            "the refusal must name the OVERLAY key to add, got: {msg}"
+        );
+        assert!(
+            msg.contains("source_sha256"),
+            "the refusal must name the second required key too, got: {msg}"
+        );
+        assert!(
+            msg.contains("kernel_6.12.94_source_url"),
+            "the flattened key stays named so a log grep still matches, got: {msg}"
+        );
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            0,
+            "the refusal precedes any fetch"
+        );
+
+        // Positive control (the DEFAULT kernel): no label, so no `kernels.<label>` route exists
+        // and the message must not invent one.
+        let default_stage = KernelStage {
+            http_client: fake.clone(),
+            label: None,
+            fragments: None,
+        };
+        let res = default_stage
+            .run(&inputs, &dir.path().join("vmlinux"))
+            .await;
+        let Err(Error::Artifact(msg)) = res else {
+            panic!("the default kernel with no source pins must fail loud, got {res:?}");
+        };
+        assert!(
+            msg.contains("Missing kernel_source_url pin") && !msg.contains("kernels."),
+            "the unlabelled refusal names the default `kernel.source_url` route, got: {msg}"
         );
     }
 

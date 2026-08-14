@@ -29,9 +29,14 @@ async fn validate_known_good_full_is_ok() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs KVM + built artifacts"]
 async fn validate_broken_kernel_reports_failure() {
-    let bogus = std::env::temp_dir().join("vmcell-validate-bogus-kernel");
-    std::fs::write(&bogus, b"this is not a kernel").expect("write bogus kernel");
-    let artifacts = ArtifactSet::new(bogus, vmcell::artifact::rootfs_path());
+    // A private, per-run fixture that dies with the test, not a fixed name in shared `/tmp`
+    // (`smoke-fixed-tmp-fixture`): the old file was never removed, so on a shared host another
+    // user's leftover turns this leg red with EACCES instead of the contract failure it exists to
+    // prove. The guard binding outlives the `validate` call below — the file must still be there
+    // when the VM tries to boot it.
+    let bogus = tempfile::NamedTempFile::new().expect("bogus kernel fixture");
+    std::fs::write(bogus.path(), b"this is not a kernel").expect("write bogus kernel");
+    let artifacts = ArtifactSet::new(bogus.path(), vmcell::artifact::rootfs_path());
     let report = validate(&artifacts, &ValidationOptions::default())
         .await
         .expect("validation should run (the bogus kernel file exists)");

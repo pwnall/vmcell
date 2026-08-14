@@ -7,7 +7,7 @@
 //! ordered `Drop`; a hard kill relies on the next boot's start-up orphan sweep.
 
 use crate::artifact_store::ArtifactStore;
-use crate::auth::{AuthPolicy, authorize};
+use crate::auth::{AuthDecision, AuthPolicy, authorize};
 use crate::bridge::VmEngine;
 use crate::dto::{
     ArtifactInfo, CreateVmRequest, CreateVmResponse, ExecOutcomeDto, ExecRequestDto,
@@ -76,6 +76,12 @@ pub fn build_router(state: AppState) -> Router {
 
 /// The bearer-auth middleware: reads the `Authorization` header and enforces the policy, returning a
 /// typed 401/403 before the handler runs. Applied to every protected route (invariant §13, Cross-cutting invariants).
+///
+/// It is also the site of the `--allow-unauthenticated` **per-request** warn design §11.6
+/// (Authentication — a bearer API key) promises: `vmcelld`'s one-time start-up warn scrolls out of a
+/// long-running daemon's log, leaving an unprotected control plane with nothing in the record that
+/// says so (finding `allow-unauthenticated-not-logged-per-request`). The decision itself stays in
+/// the pure [`authorize`]; the layer only reacts to the returned [`AuthDecision`].
 async fn auth_layer(
     State(state): State<AppState>,
     req: Request,
@@ -85,7 +91,19 @@ async fn auth_layer(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    authorize(&state.auth, header)?;
+    match authorize(&state.auth, header)? {
+        AuthDecision::Authenticated => {}
+        AuthDecision::UnauthenticatedBypass => {
+            // WARN, with the request's identity, on EVERY request — not once at start-up. The
+            // `unauthenticated_bypass` field is what the gate matches on.
+            tracing::warn!(
+                unauthenticated_bypass = true,
+                method = %req.method(),
+                path = %req.uri().path(),
+                "request served with --allow-unauthenticated: the API is UNPROTECTED (design §11.6)"
+            );
+        }
+    }
     Ok(next.run(req).await)
 }
 
@@ -207,6 +225,7 @@ mod tests {
     use crate::launcher::{LaunchSpec, VmHandle, VmLauncher};
     use crate::registry::Registry;
     use axum::body::Body;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt as _;
 
     // These wiring tests exercise routing + auth only (no VM is ever launched), so the launcher just
@@ -222,6 +241,10 @@ mod tests {
     }
 
     fn app() -> Router {
+        app_with(AuthPolicy::Key(ApiKey::from_secret(b"secret")))
+    }
+
+    fn app_with(auth: AuthPolicy) -> Router {
         let dir = Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
         let art_dir = dir.path().join("artifacts");
         // The engine (registry) and the parent's artifact store are separate seams over the same
@@ -234,7 +257,7 @@ mod tests {
         let state = AppState {
             engine: Arc::new(registry),
             artifacts: Arc::new(ArtifactStore::open(&art_dir, 1 << 20).expect("parent store")),
-            auth: AuthPolicy::Key(ApiKey::from_secret(b"secret")),
+            auth,
             max_artifact_bytes: 1 << 20,
         };
         build_router(state)
@@ -266,6 +289,103 @@ mod tests {
         assert_eq!(
             status_of("/v1/vms", Some("Bearer secret")).await,
             StatusCode::OK
+        );
+    }
+
+    /// A minimal `tracing::Subscriber` that counts WARN events carrying the
+    /// `unauthenticated_bypass` field. Hand-rolled because the crate has no `tracing-subscriber`
+    /// dev-dependency, and counting the events the layer actually emits is the only way to gate a
+    /// claim about logging (a test that only asserts the [`AuthDecision`] value would still pass on
+    /// a layer that ignores it).
+    #[derive(Clone)]
+    struct BypassWarnCounter(Arc<AtomicUsize>);
+
+    /// Matches the field name rather than the message text, so a reworded warn does not go red.
+    struct HasBypassField(bool);
+
+    impl tracing::field::Visit for HasBypassField {
+        fn record_debug(&mut self, field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+            // `record_bool` (and every other typed recorder) defaults to `record_debug`, so this
+            // one arm sees the `unauthenticated_bypass = true` field.
+            if field.name() == "unauthenticated_bypass" {
+                self.0 = true;
+            }
+        }
+    }
+
+    impl tracing::Subscriber for BypassWarnCounter {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = HasBypassField(false);
+            event.record(&mut visitor);
+            if visitor.0 {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    async fn get_status(app: &Router, uri: &str, auth: Option<&str>) -> StatusCode {
+        let mut b = Request::builder().uri(uri);
+        if let Some(a) = auth {
+            b = b.header(header::AUTHORIZATION, a);
+        }
+        let req = b.body(Body::empty()).expect("request");
+        app.clone().oneshot(req).await.expect("response").status()
+    }
+
+    // §11.6 (Authentication — a bearer API key): the `--allow-unauthenticated` dev bypass is warned
+    // about loudly on EVERY request, not once at start-up — a start-up warn scrolls out of a
+    // long-running daemon's log (finding `allow-unauthenticated-not-logged-per-request`). Two
+    // requests ⇒ two warns. RED on both buggy implementations: a layer that drops the warn (0), and
+    // a start-up-only or `Once`-guarded warn (1).
+    #[tokio::test]
+    async fn unauthenticated_bypass_warns_on_every_request() {
+        let warns = Arc::new(AtomicUsize::new(0));
+        let app = app_with(AuthPolicy::Unauthenticated);
+        let guard = tracing::subscriber::set_default(BypassWarnCounter(warns.clone()));
+        for _ in 0..2 {
+            assert_eq!(
+                get_status(&app, "/v1/vms", None).await,
+                StatusCode::OK,
+                "the dev bypass still serves the request"
+            );
+        }
+        drop(guard);
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            2,
+            "one loud warn PER request under --allow-unauthenticated"
+        );
+    }
+
+    // The positive control for the warn: a properly authenticated request must NOT emit the
+    // unprotected-API warn (a layer that warns unconditionally would make the signal worthless).
+    #[tokio::test]
+    async fn authenticated_request_does_not_warn() {
+        let warns = Arc::new(AtomicUsize::new(0));
+        let app = app_with(AuthPolicy::Key(ApiKey::from_secret(b"secret")));
+        let guard = tracing::subscriber::set_default(BypassWarnCounter(warns.clone()));
+        assert_eq!(
+            get_status(&app, "/v1/vms", Some("Bearer secret")).await,
+            StatusCode::OK
+        );
+        drop(guard);
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            0,
+            "no bypass warn when a key authenticated"
         );
     }
 

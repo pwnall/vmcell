@@ -100,8 +100,20 @@ pub enum Level {
     /// `Core` plus capability-gated probes: IP-PNP networking, virtio-fs RO/RW shares, nested
     /// `/dev/kvm`, cgroup usage readout.
     Extended,
-    /// `Extended` plus the expensive/privileged contract: egress proxy, snapshot/restore state
-    /// rotation, memory-limit OOM, concurrent-boot identity distinctness.
+    /// `Extended` plus the expensive checks, each on VMs of its own — the shipped roster, named by
+    /// check id: `concurrency.distinct_ids` (three concurrently-started VMs get distinct
+    /// vmid/CID/vsock and each execs), `snapshot.restore_roundtrip` (a snapshotted VM restores back
+    /// to agent-ready and execs), `metrics.mem_limit_ooms` (a host cgroup cap below guest RAM trips
+    /// the host OOM killer).
+    ///
+    /// Two things this level does **not** do, despite an earlier roster here promising them
+    /// (`level-full-rustdoc-claims-absent-checks`): there is no egress-proxy check, and the
+    /// restore leg asserts a working guest, **not** the §8.2 state rotation (post-restore MAC /
+    /// vsock path / in-guest default route). Both live in vmcell's own privileged suite
+    /// (`tests/egress_proxy.rs`, `tests/snapshot_restore.rs`), which validates the *system*; this
+    /// crate validates an *artifact pair* against the contract. The roster above is exactly what
+    /// `checks::run_full` records — `level_full_rustdoc_names_exactly_the_shipped_checks` reddens
+    /// if the two drift apart.
     Full,
 }
 
@@ -341,6 +353,59 @@ mod tests {
         let err = report.into_result().unwrap_err();
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].id, "b");
+    }
+
+    /// The check ids the [`Level::Full`] rustdoc names, read out of this file: every backticked
+    /// dotted token in the doc block that precedes the `Full` variant.
+    fn documented_full_ids() -> std::collections::BTreeSet<String> {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        let head = SRC
+            .split_once("\n    Full,")
+            .expect("the Full variant is declared in this file")
+            .0;
+        // Walk back over the variant's own doc lines only (the loop stops at `Extended,`).
+        let doc: Vec<&str> = head
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect();
+        doc.iter()
+            // Odd segments of a backtick split are the code spans; a dotted, space-free one is a
+            // check id (`/dev/kvm`, `Extended` and prose are not).
+            .flat_map(|l| l.split('`').skip(1).step_by(2))
+            .filter(|t| t.contains('.') && !t.contains(char::is_whitespace) && !t.contains('/'))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    // The contract-surface roster gate (`level-full-rustdoc-claims-absent-checks`): this rustdoc is
+    // part of the downstream toolkit contract (design §10.4), and it promised two checks —
+    // an egress-proxy leg and restore state-rotation assertions — that `run_full` has never run.
+    // Prose cannot be diffed against behavior, so the doc names ids and this drives `run_full` to
+    // learn the shipped set. `fail_create` makes every arm fail at start, which is what keeps this
+    // KVM-free *and* complete: each Full arm records (or skips) its id on every path, so the fake
+    // run enumerates the whole roster. Core/Extended are deliberately not gated this way — their
+    // guest-facing ids only exist after a real handshake, so a fake run under-reports them.
+    #[tokio::test]
+    async fn level_full_rustdoc_names_exactly_the_shipped_checks() {
+        let vmm = vmcell::vmm::FakeVmm::with_faults(vmcell::vmm::FaultMenu {
+            fail_create: true,
+            ..vmcell::vmm::FaultMenu::default()
+        });
+        let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
+        let mut outcomes = Vec::new();
+        checks::run_full(&vmm, &artifacts, &mut outcomes).await;
+
+        let shipped: std::collections::BTreeSet<String> =
+            outcomes.iter().map(|o| o.id.to_string()).collect();
+        assert!(!shipped.is_empty(), "run_full records at least one check");
+        assert_eq!(
+            documented_full_ids(),
+            shipped,
+            "the Level::Full rustdoc must name exactly the checks run_full runs — this doc is \
+             downstream contract surface (§10.4), so a promised-but-absent check is a lie to a \
+             consumer, and a shipped-but-undocumented one is invisible coverage"
+        );
     }
 
     // Level ordering gates which groups run: Core < Extended < Full.

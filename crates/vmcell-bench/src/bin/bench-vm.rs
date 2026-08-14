@@ -426,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
     // `.expect()` site with a misleading "benchmark invariant" message (P22).
     validate_backend(&args.backend)?;
     validate_mode(&args.mode)?;
+    validate_daemon_api_knobs(&args)?;
     validate_vm_params(&args)?;
 
     println!("Running benchmarks with backend: {}", args.backend);
@@ -467,35 +468,48 @@ async fn main() -> anyhow::Result<()> {
 
     // `daemon-api` drives an already-spawned `vmcelld` over HTTP — it needs no local `Vmm`,
     // so branch here (after the freq-pin engages, so the daemon's VM boots are freq-pinned)
-    // before the per-backend VMM construction. It ignores `--backend` (the daemon is CH).
+    // before the per-backend VMM construction. The knobs it cannot honor are already rejected
+    // (`validate_daemon_api_knobs`); the ones it merely does not apply are disclosed here, next
+    // to the header, so the results table cannot be read as a `--mem-mib 4096` run.
     if args.mode == "daemon-api" {
+        println!("{}", daemon_api_ignored_knobs_line());
         return run_daemon_api(&args).await;
     }
 
     let allocator = VmidAllocator::new();
 
+    // `bench-ignores-contract-bin-resolvers`: the binary comes from the §10.4 contract
+    // `VMCELL_*_BIN` resolver, not a hardcoded name — resolved ONCE here and echoed (H-BIN-1's
+    // rule: a run states the knobs it actually used), so a results table can be attributed to the
+    // VMM build it measured instead of "whatever `crosvm` was first on PATH".
+    let vmm_bin = vmm_binary(&args.backend)?;
+    println!(
+        "vmm binary: {vmm_bin} (via ${})",
+        vmm_bin_resolver(&args.backend).map_or("?", |(var, _)| var)
+    );
+
     match args.backend.as_str() {
         #[cfg(feature = "cloud-hypervisor")]
         "cloud-hypervisor" => {
-            let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new("cloud-hypervisor");
+            let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(vmm_bin);
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "cloud-hypervisor", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "firecracker")]
         "firecracker" => {
-            let vmm = vmcell_firecracker::Firecracker::new("firecracker");
+            let vmm = vmcell_firecracker::Firecracker::new(vmm_bin);
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "firecracker", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "qemu")]
         "qemu" => {
-            let vmm = vmcell_qemu::Qemu::new("qemu-system-x86_64");
+            let vmm = vmcell_qemu::Qemu::new(vmm_bin);
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "qemu", &args, allocator.clone()).await?;
         }
         #[cfg(feature = "crosvm")]
         "crosvm" => {
-            let vmm = vmcell_crosvm::Crosvm::new("crosvm");
+            let vmm = vmcell_crosvm::Crosvm::new(vmm_bin);
             println!("Capabilities: {:?}", vmm.capabilities());
             run_mode(&vmm, "crosvm", &args, allocator.clone()).await?;
         }
@@ -508,6 +522,58 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The design §10.4 contract binary resolvers, as `(backend, env var, default binary)`.
+/// ONE table, so `--backend X` boots exactly the binary `$VMCELL_*_BIN` names — the same law
+/// `vmcell_artifact_validator::harness::{ch,fc,qemu,crosvm}_bin` applies to the conformance
+/// battery and `vmcell::artifact::ch_binary_path()` applies to the artifact pipeline
+/// (`bench-ignores-contract-bin-resolvers`: this harness used to hardcode the four names, so a
+/// documented `$VMCELL_CROSVM_BIN` override silently measured whatever `crosvm` PATH resolved to
+/// — or failed to spawn at all on a host where the binary is only reachable via the var).
+/// Parity with the validator getters is asserted in the tests below; the table is the whole
+/// list, so a backend added to [`supported_backends`] without an entry fails there too.
+const VMM_BIN_RESOLVERS: [(&str, &str, &str); 4] = [
+    ("cloud-hypervisor", "VMCELL_CH_BIN", "cloud-hypervisor"),
+    ("firecracker", "VMCELL_FC_BIN", "firecracker"),
+    ("qemu", "VMCELL_QEMU_BIN", "qemu-system-x86_64"),
+    ("crosvm", "VMCELL_CROSVM_BIN", "crosvm"),
+];
+
+/// The `(env var, default binary)` §10.4 contract resolver for `backend`, or `None` when the
+/// backend has no entry (a drift between [`VMM_BIN_RESOLVERS`] and the `--backend` dispatch —
+/// surfaced as a loud error by [`vmm_binary`], never as a silently-hardcoded name).
+fn vmm_bin_resolver(backend: &str) -> Option<(&'static str, &'static str)> {
+    VMM_BIN_RESOLVERS
+        .iter()
+        .find(|(b, _, _)| *b == backend)
+        .map(|(_, var, default)| (*var, *default))
+}
+
+/// Resolves `backend`'s VMM binary through `lookup` — the env reader, injected so the contract
+/// behavior (override wins, else the documented default) is unit-testable **without** mutating
+/// the process environment (this repo has no `set_var` anywhere: it is `unsafe` in edition 2024
+/// and races sibling tests in a shared test process).
+fn resolve_vmm_binary(backend: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    // No emptiness/validity filtering: the validator's getters do `env::var(..).unwrap_or(default)`
+    // verbatim, and a *different* interpretation of the same var here would be a second law.
+    vmm_bin_resolver(backend)
+        .map(|(var, default)| lookup(var).unwrap_or_else(|| default.to_string()))
+}
+
+/// The VMM binary this run should execute for `backend`, read from the process environment
+/// through the §10.4 contract var.
+///
+/// # Errors
+/// Returns an error when `backend` has no [`VMM_BIN_RESOLVERS`] entry — i.e. the table and the
+/// `--backend` dispatch drifted. Failing loud beats falling back to the bare backend name, which
+/// is exactly the hardcoding this resolver replaced.
+fn vmm_binary(backend: &str) -> anyhow::Result<String> {
+    resolve_vmm_binary(backend, |var| std::env::var(var).ok()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no VMCELL_*_BIN resolver for --backend '{backend}' (design §10.4 contract)"
+        )
+    })
 }
 
 /// The benchmark backends compiled into this binary, honoring the per-backend
@@ -580,6 +646,71 @@ fn validate_mode(mode: &str) -> anyhow::Result<()> {
     }
 }
 
+/// The VM-shaping knobs `--mode daemon-api` structurally cannot apply: it drives an
+/// already-running `vmcelld`, which builds every VM from its OWN request DTO defaults, so these
+/// flags never reach a guest. Disclosed in the run header rather than rejected — unlike
+/// `--backend`/`--kernel` they do not *misname* the run, and rejecting them would break the
+/// perf-matrix's uniform per-mode invocation.
+const DAEMON_API_IGNORED_KNOBS: &[&str] = &[
+    "--mem-mib",
+    "--profile",
+    "--kernel-verbosity",
+    "--console",
+    "--restore-mode",
+    "--ksm-mergeable",
+    "--count",
+    "--net-mode",
+    "--snap-dir",
+];
+
+/// The `daemon-api` ignored-knob disclosure line (`daemon-api-header-misnames-backend`): the run
+/// header echoes `--profile`/`--console`/… for every mode (H-BIN-1), and on this mode those
+/// echoes describe knobs the daemon never sees. Naming them beside the header is what keeps a
+/// reader of the results table from attributing the numbers to them.
+fn daemon_api_ignored_knobs_line() -> String {
+    format!(
+        "daemon-api: NOT applied (the daemon builds each VM from its own request defaults): {}",
+        DAEMON_API_IGNORED_KNOBS.join(" ")
+    )
+}
+
+/// Rejects the `--mode daemon-api` invocations whose knobs would **misname the results table**
+/// (`daemon-api-header-misnames-backend`).
+///
+/// Two accepted inputs are structurally unhonorable on this mode, and both are printed in the run
+/// header, so silently ignoring them mislabels the run: `--backend` (the header printed
+/// "backend: firecracker" while the CH-backed daemon was measured) and `--kernel <label>` (the
+/// header printed `vmlinux-<label>` while the daemon's create DTO names the plain `vmlinux` this
+/// mode symlinks into its store). Rejecting is the choice that cannot mislead — a disclosure line
+/// still leaves a wrong-but-plausible header on the page — and matches the AGENTS rule that every
+/// accepted input is honored or rejected. The knobs that are merely inapplicable are disclosed by
+/// [`daemon_api_ignored_knobs_line`] instead.
+///
+/// # Errors
+/// Returns an error for `--mode daemon-api` with a non-`cloud-hypervisor` `--backend` or with a
+/// `--kernel` label. Every other mode is untouched.
+fn validate_daemon_api_knobs(args: &Args) -> anyhow::Result<()> {
+    if args.mode != "daemon-api" {
+        return Ok(());
+    }
+    if args.backend != "cloud-hypervisor" {
+        anyhow::bail!(
+            "--mode daemon-api benchmarks the CH-backed vmcelld, so --backend must be \
+             cloud-hypervisor (got '{}'); drop the flag rather than have the header name a \
+             backend that was never run",
+            args.backend
+        );
+    }
+    if let Some(label) = args.kernel.as_deref() {
+        anyhow::bail!(
+            "--mode daemon-api boots the daemon store's plain `vmlinux`, so it cannot honor \
+             --kernel '{label}'; drop the flag (or run the labeled kernel through a non-daemon \
+             mode)"
+        );
+    }
+    Ok(())
+}
+
 /// Validates the VM parameters shared by every benchmark mode by running them
 /// through [`VmConfig`]'s own builder, surfacing its typed validation error
 /// (chiefly a `--mem-mib` below the documented 64 MiB floor) instead of
@@ -595,10 +726,15 @@ fn validate_vm_params(args: &Args) -> anyhow::Result<()> {
     if args.count == 0 {
         anyhow::bail!("--count must be >= 1 (0 guests measures nothing)");
     }
+    // Absolute placeholder paths: this probe validates the *numeric* knobs (mem floor) before any
+    // side effect, and `VmConfig` now applies the same absolute/non-empty boundary checks to the
+    // rootfs image that every other path input gets (`rootfs-image-escapes-boundary-validation`),
+    // so relative literals here would fail the probe on EVERY invocation. Nothing opens them —
+    // the real paths come from `artifact_paths` in each mode.
     VmConfig::builder(
-        PathBuf::from("vmlinux"),
+        PathBuf::from("/vmcell-bench/validate/vmlinux"),
         RootfsSource::Erofs {
-            image: PathBuf::from("rootfs.erofs"),
+            image: PathBuf::from("/vmcell-bench/validate/rootfs.erofs"),
         },
     )
     .vcpus(1)
@@ -668,8 +804,11 @@ fn kernel_filename(label: Option<&str>) -> String {
 
 /// The workspace root, so `--snap-dir` anchors independent of the process CWD
 /// (N-BIN-5). Mirrors the library's `workspace_root` ascent (the `vmcell-protocol`
-/// marker); the library's is `pub(crate)` so it cannot be reused here — see the
-/// integrator note to expose it publicly and collapse this duplicate.
+/// marker); the library's is `pub(crate)`, so collapsing this copy needs a `vmcell`-side
+/// export and cannot be done from this crate (`bench-workspace-root-third-copy`). Listed on
+/// the design §17 consolidation register beside `harness::ch_bin()` — the register, not this
+/// comment, is what keeps the duplicate from being forgotten; the marker string is the
+/// coupling to watch.
 fn workspace_root() -> PathBuf {
     let start = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
@@ -1680,8 +1819,12 @@ impl Drop for HostResponder {
     }
 }
 
-/// The in-guest egress client: `curl -s --max-time 5 <url>`. `curl` is on the guest
-/// PATH (rootfs `--include=curl` + the guest-tools multicall).
+/// The in-guest egress client: `curl -s --max-time 5 <url>`. The `curl` this resolves to is the
+/// **guest-tools multicall shim** at `/vmcell-tools/curl`, which the agent puts FIRST on the
+/// child PATH (`child_path`): the OCI rootfs this repo builds carries no GNU curl at all, so the
+/// shim is the only `curl` in the guest — the measured round-trip is that applet's HTTP GET, not
+/// upstream curl's (the old comment claimed a rootfs `--include=curl`, which no shipped rootfs
+/// recipe does).
 fn egress_curl(url: &str) -> Vec<String> {
     vec![
         "curl".to_string(),
@@ -2820,6 +2963,165 @@ mod tests {
         // Every compiled-in backend round-trips through the validator.
         for b in supported_backends() {
             assert!(validate_backend(b).is_ok(), "backend {b} should be valid");
+        }
+    }
+
+    // `bench-ignores-contract-bin-resolvers`: every backend arm hardcoded its binary name, so the
+    // §10.4-contract `VMCELL_*_BIN` overrides (documented in README and perf-matrix.sh) did
+    // nothing here. RED on that inverse (a hardcoded `"crosvm"`/`"firecracker"`/…): the override
+    // asserts below fail. The lookup is injected, so this pins the behavior without touching the
+    // process environment.
+    #[test]
+    fn vmm_binary_honors_contract_env_overrides() {
+        let overridden = |var: &str| match var {
+            "VMCELL_CH_BIN" => Some("/opt/vmm/ch-dev".to_string()),
+            "VMCELL_FC_BIN" => Some("/opt/vmm/fc-dev".to_string()),
+            "VMCELL_QEMU_BIN" => Some("/opt/vmm/qemu-dev".to_string()),
+            "VMCELL_CROSVM_BIN" => Some("/opt/vmm/crosvm-dev".to_string()),
+            _ => None,
+        };
+        for (backend, want) in [
+            ("cloud-hypervisor", "/opt/vmm/ch-dev"),
+            ("firecracker", "/opt/vmm/fc-dev"),
+            ("qemu", "/opt/vmm/qemu-dev"),
+            ("crosvm", "/opt/vmm/crosvm-dev"),
+        ] {
+            assert_eq!(
+                resolve_vmm_binary(backend, overridden).as_deref(),
+                Some(want),
+                "{backend} must resolve through its VMCELL_*_BIN override"
+            );
+        }
+
+        // Unset → the documented default binary name (PATH resolution), per backend.
+        let unset = |_: &str| None;
+        assert_eq!(
+            resolve_vmm_binary("qemu", unset).as_deref(),
+            Some("qemu-system-x86_64")
+        );
+        assert_eq!(
+            resolve_vmm_binary("cloud-hypervisor", unset).as_deref(),
+            Some("cloud-hypervisor")
+        );
+
+        // A backend with no table entry resolves to nothing (and `vmm_binary` then fails loud)
+        // rather than falling back to the bare name — the hardcoding this replaced.
+        assert_eq!(resolve_vmm_binary("totally-not-a-vmm", unset), None);
+        assert!(vmm_binary("totally-not-a-vmm").is_err());
+
+        // Table/dispatch drift guard: every compiled-in backend has a resolver.
+        for b in supported_backends() {
+            assert!(
+                vmm_bin_resolver(b).is_some(),
+                "backend {b} has no VMCELL_*_BIN resolver entry"
+            );
+        }
+    }
+
+    // One-law parity with the §10.4 contract getters the artifact-validator ships (a dev-dep here,
+    // linked only for the test cfg — the bin cannot depend on the validator in production without
+    // a new edge). This pins the DEFAULT half of each resolver against the contract surface under
+    // whatever the ambient env is; the var-name half is pinned by the injected-lookup test above.
+    // RED on the inverse (a bench-local default like `"qemu"` for QEMU, the drift this guards):
+    // the qemu assert fails.
+    #[test]
+    fn vmm_binary_matches_validator_contract_getters() {
+        use vmcell_artifact_validator::harness;
+        for (backend, contract) in [
+            ("cloud-hypervisor", harness::ch_bin()),
+            ("firecracker", harness::fc_bin()),
+            ("qemu", harness::qemu_bin()),
+            ("crosvm", harness::crosvm_bin()),
+        ] {
+            assert_eq!(
+                vmm_binary(backend).expect("every backend has a resolver"),
+                contract,
+                "{backend}: bench-vm and the validator harness must resolve one binary"
+            );
+        }
+        // The CH leg is also the library's own pipeline law — same var, same default.
+        assert_eq!(
+            vmm_binary("cloud-hypervisor").expect("CH resolver"),
+            vmcell::artifact::ch_binary_path()
+        );
+    }
+
+    // `daemon-api-header-misnames-backend`: `--backend firecracker --mode daemon-api` printed a
+    // FIRECRACKER header (and `--kernel <label>` a `vmlinux-<label>` header) while the CH-backed
+    // daemon booted plain `vmlinux` — an unhonorable input that mislabels the results table. RED
+    // on the inverse (no validation / accept-all): the two `unwrap_err`/`is_err` asserts fail.
+    #[test]
+    fn daemon_api_rejects_knobs_it_cannot_honor() {
+        let parse = |argv: &[&str]| <Args as clap::Parser>::parse_from(argv.to_vec());
+
+        let err = validate_daemon_api_knobs(&parse(&[
+            "bench-vm",
+            "--mode",
+            "daemon-api",
+            "--backend",
+            "firecracker",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cloud-hypervisor"),
+            "the refusal must name the backend that IS measured, got: {err}"
+        );
+
+        assert!(
+            validate_daemon_api_knobs(&parse(&[
+                "bench-vm",
+                "--mode",
+                "daemon-api",
+                "--kernel",
+                "6.12.94"
+            ]))
+            .is_err(),
+            "a --kernel label the daemon store never boots must be rejected"
+        );
+
+        // The honored invocation, and every other mode, are untouched.
+        assert!(validate_daemon_api_knobs(&parse(&["bench-vm", "--mode", "daemon-api"])).is_ok());
+        assert!(
+            validate_daemon_api_knobs(&parse(&[
+                "bench-vm",
+                "--mode",
+                "daemon-api",
+                "--backend",
+                "cloud-hypervisor"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            validate_daemon_api_knobs(&parse(&[
+                "bench-vm",
+                "--mode",
+                "latency",
+                "--backend",
+                "firecracker",
+                "--kernel",
+                "6.12.94"
+            ]))
+            .is_ok(),
+            "non-daemon modes honor both flags and must not be rejected"
+        );
+    }
+
+    // `daemon-api-header-misnames-backend` (disclosure half): the header echoes VM knobs the
+    // daemon never applies, so the mode names them. RED on the inverse (an empty/omitted line):
+    // the `--mem-mib`/`--console` asserts fail.
+    #[test]
+    fn daemon_api_discloses_inapplicable_knobs() {
+        let line = daemon_api_ignored_knobs_line();
+        assert!(line.contains("--mem-mib"), "{line}");
+        assert!(line.contains("--console"), "{line}");
+        assert!(line.contains("--profile"), "{line}");
+        // The echoed knobs from `resolved_knobs_line` are exactly what this must cover.
+        for knob in ["--profile", "--kernel-verbosity", "--console"] {
+            assert!(
+                DAEMON_API_IGNORED_KNOBS.contains(&knob),
+                "header-echoed knob {knob} must be disclosed as not-applied"
+            );
         }
     }
 

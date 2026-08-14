@@ -144,10 +144,19 @@ pub use agent::AgentClient;
 #[cfg(feature = "host-common")]
 pub use agent::VsockDial;
 pub use agent::{ExecOutcome, ExecRequest};
+// The root re-export set is what `use vmcell::{…}` gives a consumer, and it must be *callable*:
+// every type a caller cannot avoid naming to build a `VmConfig` is here, not only the leaf
+// value types. `RootfsSource` is a required `VmConfig::builder` argument, `Egress` is carried by
+// the `NetConfig::Privileged`/`Unprivileged` variants, and `UsbHostDevice` is the
+// `with_usb_host_device` argument — a consumer holding only the leaf re-exports could not call the
+// builder at all and had to reach into `vmcell::config` for the missing halves (docs/78 §9.4,
+// `crate-root-reexport-roster-inconsistent`; this also retires the recorded `UsbHostDevice`
+// residual). `root_reexport_tests` below is the gate: it builds a full config importing from the
+// crate root only, so a re-export dropped from this list stops compiling.
 #[cfg(feature = "host-common")]
 pub use config::{
-    BlockDevice, ConsoleMode, DiskIoLimit, KernelVerbosity, NetConfig, ResourceLimits, Share,
-    Timeouts, VmConfig,
+    BlockDevice, ConsoleMode, DiskIoLimit, Egress, KernelVerbosity, NetConfig, ResourceLimits,
+    RootfsSource, Share, Timeouts, UsbHostDevice, VmConfig,
 };
 #[cfg(feature = "host-common")]
 pub use env::HostEnv;
@@ -174,3 +183,48 @@ pub use reflink::CowSupport;
 pub use vmm::{CloudHypervisor, VmInstance, Vmm};
 #[cfg(feature = "host-common")]
 pub use zygote::Zygote;
+
+#[cfg(all(test, feature = "host-common"))]
+mod root_reexport_tests {
+    // GATE (docs/78 §9.4 `crate-root-reexport-roster-inconsistent`). Every path below names a type
+    // through the crate ROOT — exactly what an out-of-repo consumer writes after
+    // `use vmcell::{…}` — and never through `crate::config::…`. A re-export dropped from the
+    // roster above therefore stops this module COMPILING, which is the failure mode: the defect
+    // this guards (`RootfsSource`/`Egress`/`UsbHostDevice` reachable only via `vmcell::config`)
+    // is invisible to any test that imports from the private-facing module path. Red-on-inverse:
+    // remove `RootfsSource` from the root `pub use config::{…}` and `cargo test -p vmcell` fails
+    // to build here.
+    use crate::{Egress, NetConfig, RootfsSource, UsbHostDevice, VmConfig};
+
+    #[test]
+    fn a_full_vm_config_builds_from_the_root_reexports_alone() {
+        let cfg = VmConfig::builder(
+            "/nonexistent/vmlinux",
+            RootfsSource::Erofs {
+                image: "/nonexistent/rootfs.erofs".into(),
+            },
+        )
+        .net(NetConfig::Unprivileged {
+            egress: Egress::Blocked,
+            host_services_port: None,
+        })
+        .with_usb_host_device(UsbHostDevice::new(0x1d6b, 0x0002))
+        .build()
+        .expect("a config naming only root-re-exported types must build");
+
+        // Not a compile-only test: assert the values actually landed, so the builder chain cannot
+        // be reduced to a type-check that silently drops what it was handed.
+        assert!(matches!(cfg.rootfs, RootfsSource::Erofs { .. }));
+        assert!(matches!(
+            cfg.net,
+            NetConfig::Unprivileged {
+                egress: Egress::Blocked,
+                host_services_port: None
+            }
+        ));
+        assert_eq!(
+            cfg.usb_host_devices,
+            vec![UsbHostDevice::new(0x1d6b, 0x0002)]
+        );
+    }
+}

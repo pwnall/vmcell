@@ -139,31 +139,102 @@ pub(crate) fn clone_tree_cow_blocking(src: &Path, dst: &Path) -> Result<CowSuppo
 }
 
 /// Probes whether `dir`'s filesystem supports reflink, by reflinking a tiny
-/// sentinel file into `dir` and observing the outcome.
+/// sentinel file inside a private **sibling scratch directory** (never inside
+/// `dir` itself) and observing the outcome.
 ///
-/// Best-effort and side-effect-free: both sentinels are removed before return,
-/// and any I/O error is treated as "reflink unconfirmed" ⇒ [`CowSupport::FullCopy`].
+/// Best-effort: the scratch dir and both sentinels are removed before return, and
+/// any I/O error is treated as "reflink unconfirmed" ⇒ [`CowSupport::FullCopy`].
 /// Useful for an up-front signal ("this pool will be cheap / expensive") without
-/// having to mint a clone first. The sentinel name embeds the pid so concurrent
-/// probes from sibling processes do not collide.
+/// having to mint a clone first. The scratch name embeds the pid and a per-process
+/// counter so concurrent probes — from sibling processes or from sibling threads —
+/// do not collide.
+///
+/// **The probed directory is never written to** (docs/78
+/// `overlay-probe-not-side-effect-free`). Its one production caller probes a
+/// zygote *master*, which §13 (Cross-cutting invariants) declares immutable: the
+/// pre-fix probe wrote its sentinels straight into that master, so it reported
+/// `FullCopy` on a read-only master (the write failed, and "uncertain" is
+/// `FullCopy`), and its create/unlink pair raced a concurrent fan-out's
+/// [`clone_tree_cow_blocking`] tree walk. The scratch lives one level up because
+/// the reflink answer is a property of the **filesystem**, not the directory —
+/// and [`same_filesystem`] proves the sibling really is on it, so the answer that
+/// comes back is still `dir`'s.
 #[must_use]
 pub(crate) fn probe_reflink(dir: &Path) -> CowSupport {
-    let stem = format!(".vmcell-cow-probe-{}", std::process::id());
-    let src = dir.join(format!("{stem}.src"));
-    let dst = dir.join(format!("{stem}.dst"));
+    probe_reflink_inner(dir).unwrap_or(CowSupport::FullCopy)
+}
+
+/// The fallible body of [`probe_reflink`], separated so every failure mode funnels
+/// through one "reflink unconfirmed ⇒ `FullCopy`" collapse in the caller instead of
+/// being swallowed arm by arm.
+fn probe_reflink_inner(dir: &Path) -> io::Result<CowSupport> {
+    // No usable sibling location (`dir` is a filesystem root, or a bare relative name whose
+    // parent is `""`) ⇒ unconfirmed. Falling back to probing INSIDE `dir` is exactly the
+    // behavior being removed, so there is no fallback: an unconfirmed probe is `FullCopy`.
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "no sibling scratch location beside {} for the reflink probe",
+                dir.display()
+            ))
+        })?;
+    // A sibling on a DIFFERENT filesystem answers a different question (`dir` is a mount
+    // point). Report unconfirmed rather than a confidently wrong `Reflink`.
+    if !same_filesystem(dir, parent)? {
+        return Err(io::Error::other(format!(
+            "{} is a mount point; its parent is a different filesystem",
+            dir.display()
+        )));
+    }
+
+    // pid disambiguates sibling processes; the counter disambiguates sibling threads in this
+    // one (the seam is `Sync`, and a warm-pool builder may probe from several).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // allow-global-state: fn-local monotonic name disambiguator for the probe scratch dir; holds no borrowed state and is never read back, so there is nothing for a seam to inject (rubric B6's "justify" arm)
+    let scratch = parent.join(format!(
+        ".vmcell-cow-probe-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // A leftover scratch from a crashed prior probe (same pid after a wrap) would make the
+    // `reflink` below fail spuriously; clear it first. Only `NotFound` is "nothing to clear".
+    match std::fs::remove_dir_all(&scratch) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir(&scratch)?;
+
     let outcome = (|| -> io::Result<CowSupport> {
+        let src = scratch.join("src");
+        let dst = scratch.join("dst");
         std::fs::write(&src, b"vmcell-cow-probe")?;
-        // A leftover dst from a crashed prior probe would make `reflink` fail
-        // spuriously; clear it first.
-        let _ = std::fs::remove_file(&dst);
         Ok(match reflink_copy::reflink(&src, &dst) {
             Ok(()) => CowSupport::Reflink,
             Err(_) => CowSupport::FullCopy,
         })
     })();
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&dst);
-    outcome.unwrap_or(CowSupport::FullCopy)
+    // The scratch dir is this probe's alone, so a whole-tree removal is exact, not scope creep.
+    // A failed cleanup does not invalidate the answer — but it does leave residue beside a
+    // zygote master, so it is logged rather than discarded (no bare `let _ =` on a Result).
+    if let Err(e) = std::fs::remove_dir_all(&scratch) {
+        tracing::warn!(
+            scratch = %scratch.display(),
+            error = %e,
+            "failed to remove the reflink-probe scratch dir"
+        );
+    }
+    outcome
+}
+
+/// Whether `a` and `b` live on the same filesystem (same `st_dev`).
+///
+/// The correctness anchor for probing a sibling: reflink support is a filesystem property, so a
+/// scratch dir that is *not* on the probed directory's filesystem would answer about the wrong one.
+fn same_filesystem(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(a)?.dev() == std::fs::metadata(b)?.dev())
 }
 
 #[cfg(test)]
@@ -266,20 +337,95 @@ mod tests {
         assert!(!CowSupport::FullCopy.is_reflink());
     }
 
-    // The probe is side-effect-free: it leaves no sentinel files behind.
+    /// Every `(name, bytes)` pair directly under `dir`, sorted — a byte-exact fingerprint of a
+    /// directory's contents for the probe's "touches nothing" assertions below.
+    fn dir_fingerprint(dir: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut out: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| {
+                let e = e.expect("dir entry");
+                let bytes = std::fs::read(e.path()).unwrap_or_default();
+                (e.file_name(), bytes)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    // The probe is side-effect-free in BOTH directories it can reach: the probed dir (never
+    // written) and the sibling parent that holds the scratch (written, then fully removed).
+    // RED on an inverse that leaks the scratch dir (drop the second `remove_dir_all`).
     #[test]
     fn probe_leaves_no_residue() {
         let root = tempfile::tempdir().expect("tempdir");
-        let before: Vec<_> = std::fs::read_dir(root.path())
-            .expect("read")
-            .filter_map(|e| e.ok().map(|e| e.file_name()))
-            .collect();
-        let _ = probe_reflink(root.path());
-        let after: Vec<_> = std::fs::read_dir(root.path())
-            .expect("read")
-            .filter_map(|e| e.ok().map(|e| e.file_name()))
-            .collect();
-        assert_eq!(before.len(), after.len(), "probe must leave no residue");
+        let probed = root.path().join("probed");
+        std::fs::create_dir_all(&probed).expect("mk probed");
+        let before_probed = dir_fingerprint(&probed);
+        let before_parent = dir_fingerprint(root.path());
+        let _ = probe_reflink(&probed);
+        assert_eq!(
+            before_probed,
+            dir_fingerprint(&probed),
+            "probe must leave no residue in the probed dir"
+        );
+        assert_eq!(
+            before_parent,
+            dir_fingerprint(root.path()),
+            "probe must leave no residue in the sibling parent that holds its scratch"
+        );
+    }
+
+    // docs/78 GATE (`overlay-probe-not-side-effect-free`): the probed directory is the IMMUTABLE
+    // zygote master (§13, Cross-cutting invariants) — the probe may not create, overwrite, or
+    // unlink ANY name in it. A post-hoc listing alone cannot see the pre-fix behavior (it removed
+    // its own sentinels), so the master is pre-seeded with files carrying exactly the sentinel
+    // names the pre-fix probe used, making both halves of its write/unlink pair observable:
+    // unprivileged it fails the write (EACCES on a 0o444 file) and then UNLINKS the seeds (unlink
+    // needs write on the DIR, which it has); as root it overwrites their bytes and then unlinks
+    // them. Either way the byte-exact fingerprint below changes ⇒ RED on the inverse
+    // (`probe_reflink` writing `dir.join(...)`), on any uid and any filesystem.
+    #[test]
+    fn probe_never_touches_the_probed_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let master = root.path().join("zygote");
+        std::fs::create_dir_all(&master).expect("mk master");
+        std::fs::write(master.join("config.json"), b"{\"vsock\":1}").expect("cfg");
+        std::fs::write(master.join("mem_file"), vec![0xABu8; 4096]).expect("mem");
+
+        let stem = format!(".vmcell-cow-probe-{}", std::process::id());
+        for suffix in ["src", "dst"] {
+            let seed = master.join(format!("{stem}.{suffix}"));
+            std::fs::write(&seed, format!("seed-{suffix}").as_bytes()).expect("seed");
+            std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        }
+
+        let before = dir_fingerprint(&master);
+        let _ = probe_reflink(&master);
+        assert_eq!(
+            before,
+            dir_fingerprint(&master),
+            "the probe must not create, overwrite, or unlink any name in the probed \
+             (immutable-master) dir"
+        );
+    }
+
+    // A directory with no usable sibling location (a filesystem root has no parent) is
+    // "reflink unconfirmed" ⇒ `FullCopy`, never a silent fall-back to writing inside it.
+    // RED on the inverse (`unwrap_or(dir)` instead of the `ok_or_else`): probing `/` would then
+    // attempt `/.vmcell-cow-probe-*` — and on a host where that succeeds, report `Reflink`.
+    #[test]
+    fn probe_without_a_sibling_location_is_unconfirmed() {
+        let err = probe_reflink_inner(Path::new("/")).expect_err("a root dir has no sibling");
+        assert!(
+            err.to_string().contains("no sibling scratch location"),
+            "the unconfirmed reason must name the missing sibling location, got: {err}"
+        );
+        assert_eq!(
+            probe_reflink(Path::new("/")),
+            CowSupport::FullCopy,
+            "an unconfirmed probe collapses to FullCopy"
+        );
     }
 
     // The probe must AGREE with what an actual clone does on the same filesystem —
@@ -288,6 +434,11 @@ mod tests {
     // host: on a reflink fs the clone is `Reflink` (catches an unconditional
     // `FullCopy`), on ext4/tmpfs it is `FullCopy` (catches an unconditional
     // `Reflink`). So exactly one inverse goes red on whatever fs the test runs on.
+    //
+    // It also pins the correctness half of the sibling-scratch move (docs/78
+    // `overlay-probe-not-side-effect-free`): the probe answers about `master`'s FILESYSTEM even
+    // though it never writes into `master`, so a scratch location that drifted off that
+    // filesystem would disagree here.
     #[tokio::test]
     async fn probe_agrees_with_actual_clone_outcome() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -296,7 +447,7 @@ mod tests {
         std::fs::write(master.join("f"), vec![0x5Au8; 4096]).expect("f");
         let clone = root.path().join("c");
         let clone_support = clone_tree_cow_blocking(&master, &clone).expect("clone");
-        let probe_support = probe_reflink(root.path());
+        let probe_support = probe_reflink(&master);
         assert_eq!(
             clone_support, probe_support,
             "probe_reflink must report the same CoW support an actual clone gets on this fs"

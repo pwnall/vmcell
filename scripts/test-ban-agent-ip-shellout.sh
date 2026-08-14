@@ -3,6 +3,11 @@
 # Builds a fixture tree and asserts the scanner flags exactly the `ip` shell-out cases and
 # leaves the legitimate cases alone: deleting the `"ip"` / `/ip` patterns from the scanner
 # (its inverse) makes the MUST-flag fixtures go un-flagged and reddens this test.
+# The multi-word shell-string fixtures below cover the OTHER half of the scanner (M-BIN-3's
+# `"ip ` / `"…/ip ` branches) for the same reason PRIV-4 added the bare-Mutex/OnceLock fixtures to
+# test-ban-global-state.sh: until they existed every MUST-flag case was a bare `"ip"` argv literal,
+# so deleting both multi-word branches from the scanner left every expectation intact — half a gate
+# that could not fail.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +20,11 @@ mkdir -p "$work/src"
 printf 'fn boot() { let mut c = std::process::Command::new("ip"); c.arg("link"); }\n' > "$work/src/spawn_ip.rs"
 printf 'fn restore() { cmd.args(["ip", "addr", "flush"]); }\n' > "$work/src/arg_ip.rs"
 printf 'fn boot() { std::process::Command::new("/sbin/ip"); }\n' > "$work/src/path_ip.rs"
+# The multi-word shell-string forms (M-BIN-3). Neither contains `"ip"` nor a quoted path ENDING in
+# `/ip`, so each is flagged only by its own scanner branch — delete `"ip ` and sh_cmd_ip.rs goes
+# un-flagged; delete `"[^"]*\/ip ` and sh_cmd_slash_ip.rs does.
+printf 'fn boot() { Command::new("sh").arg("-c").arg("ip link set eth0 up"); }\n' > "$work/src/sh_cmd_ip.rs"
+printf 'fn boot() { Command::new("sh").arg("-c").arg("/sbin/ip addr add 10.0.0.2/30 dev eth0"); }\n' > "$work/src/sh_cmd_slash_ip.rs"
 
 # --- MUST NOT be flagged: legitimate agent code + false-positive guards -------------------
 # The agent's real, legitimate dynamic exec of a host-supplied argv[0].
@@ -39,6 +49,8 @@ if [[ $rc -ne 1 ]]; then echo "FAIL: scanner exit code = $rc, expected 1 (violat
 expect_flag spawn_ip.rs
 expect_flag arg_ip.rs
 expect_flag path_ip.rs
+expect_flag sh_cmd_ip.rs
+expect_flag sh_cmd_slash_ip.rs
 expect_clean dynamic_argv.rs
 expect_clean comment_ip.rs
 expect_clean substrings.rs

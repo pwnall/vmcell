@@ -452,6 +452,13 @@ pub(crate) const DEFAULT_INIT: &str = "/usr/sbin/vmcell-guest-agent";
 /// `extra_kernel_args_cannot_clobber_reserved_tokens` coverage test: every token the
 /// builder produces has a reserved key here (or the `vmcell_` prefix), so a caller
 /// arg can never silently override a load-bearing boot parameter.
+///
+/// The coverage test structurally **cannot** discover the alias block below: it walks the
+/// emitted tokens and asserts each key is reserved, and an alias shares no key with the token
+/// it overrides (`rw` inverts `ro`; `quiet`/`debug`/`ignore_loglevel` override `loglevel=`).
+/// Aliases are therefore listed by hand and guarded by their own negative test
+/// (`reserved_cmdline_keys_cover_owned_token_aliases`) — adding a boot token whose kernel
+/// semantics have an alias means adding the alias here too (finding `f3-alias-clobber-gap`).
 const RESERVED_CMDLINE_KEYS: &[&str] = &[
     "console",
     "loglevel",
@@ -469,6 +476,20 @@ const RESERVED_CMDLINE_KEYS: &[&str] = &[
     "kvm-intel.nested",
     "kvm-amd.nested",
     "noxsave",
+    // Aliases of tokens vmcell owns — same effect, different key, so the key-equality
+    // check above would let them through.
+    // `rw` inverts the owned `ro`: a `Block` root would then be mounted read-write while
+    // `rootflags=noload` still suppresses ext4 journal replay — a dirty image mounted
+    // writable with its journal ignored is silent filesystem corruption, not a boot failure.
+    "rw",
+    // `quiet` (console loglevel 4), `debug` (10) and `ignore_loglevel` (print everything)
+    // each override the owned `loglevel=` **after** it on the cmdline (the kernel applies
+    // them in order, and caller args go last), so a caller could silently reinstate the
+    // full KERN_INFO UART flood the §16 boot lever exists to remove — or, via `quiet`,
+    // suppress the boot lines a test greps for. `kernel_verbosity` is the dedicated knob.
+    "quiet",
+    "debug",
+    "ignore_loglevel",
 ];
 
 /// Whether `arg` collides with a boot token vmcell owns — its key is in
@@ -560,6 +581,25 @@ pub enum RootfsSource {
         /// Optional writable overlay file.
         overlay: Option<PathBuf>,
     },
+}
+
+impl RootfsSource {
+    /// The host file actually attached as the root disk (`/dev/vda`): the [`Block`](Self::Block)
+    /// overlay when one is set — the base image is then never attached — else the base image.
+    ///
+    /// One law, one predicate (§13, Cross-cutting invariants): the boundary's
+    /// duplicate-backing-file check and every backend's root-disk wiring must agree on *which*
+    /// file backs the root device, or an extra virtio-blk disk naming the same file passes
+    /// validation and the guest gets two writable attachments of one image — the exact
+    /// corruption the extra-disk duplicate guard exists to prevent
+    /// (finding `rootfs-image-escapes-boundary-validation`).
+    #[must_use]
+    pub fn effective_image(&self) -> &std::path::Path {
+        match self {
+            RootfsSource::Erofs { image } => image,
+            RootfsSource::Block { image, overlay } => overlay.as_deref().unwrap_or(image),
+        }
+    }
 }
 
 /// An extra virtio-blk device attached to the VM in addition to the root disk
@@ -715,8 +755,11 @@ pub const IO_LIMIT_REFILL_TIME_MS: u64 = 1000;
 /// exit** (§5.3, The kernel command line), so verbose boot logging is a real cold-boot cost — the single
 /// largest lever in the §16 (Performance) latency pass. This knob lets debugging and specific
 /// tests opt into a verbose log without making every VM pay the exit tax. Panic
-/// capture ([`contains_panic`](crate::vmm::SerialLog::contains_panic), KERN_EMERG)
-/// works at every level.
+/// capture works at every level:
+/// [`contains_panic`](crate::vmm::SerialLog::contains_panic) matches the literal panic
+/// markers (`Kernel panic`, `panicked at`, `panic - not syncing`), not log-level
+/// prefixes (§5.3, The kernel command line — the "KERN_EMERG lines" phrasing earlier
+/// revisions carried was drift).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KernelVerbosity {
@@ -1561,6 +1604,30 @@ impl VmConfigBuilder {
                     share.tag
                 )));
             }
+            // The tag is also a *host filename*: `fs::VirtioFsDaemon::start` names the
+            // vhost-user socket `<vm_tmp>/<tag>.sock`, and the backends join it the same way.
+            // A tag carrying a path separator (`../../etc/x`, `/abs`) escapes the per-VM
+            // scratch dir, so virtiofsd would create-and-truncate a caller-chosen file
+            // outside it — and outside what teardown sweeps. Require the tag to be exactly
+            // one normal path component (no separator, no `.`/`..`, no root, no trailing
+            // slash) so the join can never leave the scratch dir
+            // (finding `share-tag-path-separator-escapes-scratch-dir`).
+            let mut tag_components = std::path::Path::new(share.tag.as_str()).components();
+            let tag_is_one_normal_component = match (tag_components.next(), tag_components.next()) {
+                // Compare against the whole tag, not just "one component": `Path` normalizes
+                // a trailing separator away, so `"a/"` yields a single `Normal("a")`.
+                (Some(std::path::Component::Normal(c)), None) => {
+                    c == std::ffi::OsStr::new(share.tag.as_str())
+                }
+                _ => false,
+            };
+            if !tag_is_one_normal_component {
+                return Err(crate::error::Error::Config(format!(
+                    "share tag {:?} must be a single normal path component (no '/', '.' or '..' — \
+                     it names a host socket file inside the per-VM scratch dir)",
+                    share.tag
+                )));
+            }
             if !tags.insert(share.tag.clone()) {
                 return Err(crate::error::Error::Config(format!(
                     "duplicate share tag: {}",
@@ -1606,12 +1673,47 @@ impl VmConfigBuilder {
             }
         }
 
+        // The root disk's backing file(s) get the same boundary treatment as every other
+        // host path input — non-empty and absolute — instead of failing late as a VMM
+        // "cannot open image" (finding `rootfs-image-escapes-boundary-validation`).
+        // Existence stays unchecked, as for the share/extra-disk paths: the artifact may be
+        // built after the config (the `Block` overlay is materialized by the CoW store).
+        let mut rootfs_paths = vec![match &self.rootfs {
+            RootfsSource::Erofs { image } | RootfsSource::Block { image, .. } => ("image", image),
+        }];
+        if let RootfsSource::Block {
+            overlay: Some(overlay),
+            ..
+        } = &self.rootfs
+        {
+            rootfs_paths.push(("overlay", overlay));
+        }
+        for (what, path) in rootfs_paths {
+            if path.as_os_str().is_empty() {
+                return Err(crate::error::Error::Config(format!(
+                    "rootfs {what} path cannot be empty"
+                )));
+            }
+            if path.is_relative() {
+                return Err(crate::error::Error::Config(format!(
+                    "rootfs {what} {path:?} must be an absolute path"
+                )));
+            }
+        }
+
         // Extra virtio-blk device images: absolute, non-empty, no duplicate backing
         // file (§4.6, Extra virtio-blk devices and disk-I/O throttling). Existence is deliberately NOT checked here (consistent with
         // the rootfs/share paths — the image may be created later); a bad path fails
         // loud at `create()`. A duplicate image is a rw corruption footgun (two
         // attachments of one file), so it is rejected at the boundary.
+        //
+        // The set is SEEDED with the root disk's effective backing file (the one law,
+        // `RootfsSource::effective_image`), because an extra disk naming the Block root's image
+        // is that same two-attachments corruption — and it used to build, since the guard only
+        // compared extra disks against each other (finding
+        // `rootfs-image-escapes-boundary-validation`).
         let mut extra_disk_images = std::collections::HashSet::new();
+        extra_disk_images.insert(self.rootfs.effective_image().to_path_buf());
         for disk in &self.extra_disks {
             if disk.image.as_os_str().is_empty() {
                 return Err(crate::error::Error::Config(
@@ -1626,7 +1728,9 @@ impl VmConfigBuilder {
             }
             if !extra_disk_images.insert(disk.image.clone()) {
                 return Err(crate::error::Error::Config(format!(
-                    "duplicate extra disk image: {}",
+                    "duplicate extra disk image: {} (already attached — as the root disk's \
+                     backing file or as an earlier extra disk; two attachments of one image \
+                     is a read-write corruption footgun)",
                     disk.image.display()
                 )));
             }
@@ -2222,6 +2326,58 @@ mod tests {
         assert_eq!(cfg.shares[0].tag, "my-data.in");
     }
 
+    // Finding `share-tag-path-separator-escapes-scratch-dir`: the tag also names a host file —
+    // `fs::VirtioFsDaemon::start` builds `<vm_tmp>/<tag>.sock` — so a tag carrying a path
+    // separator makes virtiofsd create-and-truncate a caller-chosen file OUTSIDE the per-VM
+    // scratch dir, where teardown never sweeps it. None of these tags contain ':' or
+    // whitespace, so the pre-existing cmdline-encoding check cannot see them; only the
+    // single-normal-component rule can. Buggy impl this guards: dropping that rule (the
+    // ':'/whitespace check alone) — every case below then builds.
+    #[test]
+    fn test_reject_share_tag_with_path_separator() {
+        for bad in ["..", "a/b", "/abs", ".", "../../etc/x", "a/"] {
+            let err = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .with_share(Share::new(
+                bad,
+                "/tmp/a",
+                Access::ReadOnly,
+                CachePolicy::Auto,
+            ))
+            .build()
+            .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)),
+                "tag {bad:?} should be rejected"
+            );
+            assert!(
+                err.to_string().contains("single normal path component"),
+                "tag {bad:?} error should explain the scratch-dir constraint: {err}"
+            );
+        }
+        // Positive control (over-rejection inverse): an ordinary tag — which IS a single
+        // normal component — still builds and still names the socket.
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_share(Share::new(
+            "data",
+            "/tmp/a",
+            Access::ReadOnly,
+            CachePolicy::Auto,
+        ))
+        .build()
+        .expect("an ordinary single-component tag must still build");
+        assert_eq!(cfg.shares[0].tag, "data");
+    }
+
     // The host→guest mount plan encodes each share as a cmdline token with its
     // access mode. Buggy impls this guards: dropping the access mode, emitting
     // nothing for rw shares, or appending tokens when there are no shares.
@@ -2808,6 +2964,116 @@ mod tests {
         .expect("a valid absolute extra-disk image must build");
     }
 
+    // Finding `rootfs-image-escapes-boundary-validation`, half 1: the duplicate-backing-file
+    // guard used to compare extra disks against each other ONLY, so an extra disk naming the
+    // root disk's backing file built — two attachments of one image, the exact rw corruption
+    // the guard's own comment names. The expected path is recomputed through the one law
+    // (`RootfsSource::effective_image`), never a test-local literal. Buggy impl this guards:
+    // dropping the seed insert — every rejection below then builds.
+    #[test]
+    fn extra_disk_cannot_alias_the_root_disk_backing_file() {
+        for rootfs in [
+            RootfsSource::Erofs {
+                image: PathBuf::from("/img/root.erofs"),
+            },
+            RootfsSource::Block {
+                image: PathBuf::from("/img/root.raw"),
+                overlay: None,
+            },
+            // With an overlay set, the OVERLAY is what every backend attaches as /dev/vda —
+            // so that is the path an extra disk may not alias.
+            RootfsSource::Block {
+                image: PathBuf::from("/img/root.raw"),
+                overlay: Some(PathBuf::from("/img/overlay.raw")),
+            },
+        ] {
+            let root = rootfs.effective_image().to_path_buf();
+            let err = VmConfig::builder(PathBuf::from("/vmlinux"), rootfs)
+                .with_extra_disk(BlockDevice::read_write(&root))
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_))
+                    && err.to_string().contains("duplicate extra disk image")
+                    && err.to_string().contains(&root.display().to_string()),
+                "an extra disk aliasing the root backing file {root:?} must be rejected: {err}"
+            );
+        }
+        // Positive control (over-rejection inverse): a distinct extra disk alongside the same
+        // root still builds.
+        VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Block {
+                image: PathBuf::from("/img/root.raw"),
+                overlay: None,
+            },
+        )
+        .with_extra_disk(BlockDevice::read_write("/img/data.raw"))
+        .build()
+        .expect("an extra disk with its own backing file must build");
+    }
+
+    // Finding `rootfs-image-escapes-boundary-validation`, half 2: the rootfs image/overlay are
+    // host path inputs like any other, so they get the same empty/relative boundary checks the
+    // share and extra-disk paths get — instead of failing late as a VMM "cannot open image".
+    // Buggy impl this guards: dropping the rootfs path loop — every case below then builds.
+    #[test]
+    fn rootfs_paths_are_validated_at_the_boundary() {
+        for (rootfs, needle) in [
+            (
+                RootfsSource::Erofs {
+                    image: PathBuf::new(),
+                },
+                "image path cannot be empty",
+            ),
+            (
+                RootfsSource::Erofs {
+                    image: PathBuf::from("rel/rootfs.erofs"),
+                },
+                "must be an absolute path",
+            ),
+            (
+                RootfsSource::Block {
+                    image: PathBuf::from("rel/root.raw"),
+                    overlay: None,
+                },
+                "must be an absolute path",
+            ),
+            (
+                RootfsSource::Block {
+                    image: PathBuf::from("/img/root.raw"),
+                    overlay: Some(PathBuf::new()),
+                },
+                "overlay path cannot be empty",
+            ),
+            (
+                RootfsSource::Block {
+                    image: PathBuf::from("/img/root.raw"),
+                    overlay: Some(PathBuf::from("rel/overlay.raw")),
+                },
+                "must be an absolute path",
+            ),
+        ] {
+            let err = VmConfig::builder(PathBuf::from("/vmlinux"), rootfs)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_)) && err.to_string().contains(needle),
+                "expected {needle:?}, got {err}"
+            );
+        }
+        // Positive control: absolute image + absolute overlay build.
+        VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Block {
+                image: PathBuf::from("/img/root.raw"),
+                overlay: Some(PathBuf::from("/img/overlay.raw")),
+            },
+        )
+        .build()
+        .expect("absolute rootfs image + overlay must build");
+    }
+
     // §2.4 (QEMU q35 — the fallback and most-proven nester), v30 §18 (Delta register) delta 9, rejection 1: a passed-through host USB
     // device is host state outside guest RAM, so it cannot ride the migration stream —
     // `snapshotting` + USB must be refused at the boundary. Buggy impl this guards: the
@@ -3092,6 +3358,56 @@ mod tests {
                 "{allowed:?} must be allowed as an append-only arg"
             );
         }
+    }
+
+    // Finding `f3-alias-clobber-gap`: F3 compares KEYS, so an alias of a token vmcell owns
+    // slips through — it shares no key with what it overrides, which is exactly why the
+    // `extra_kernel_args_cannot_clobber_reserved_tokens` coverage test (which walks emitted
+    // tokens) structurally cannot discover these. `rw` inverts the owned `ro` (a Block root
+    // mounted writable with `rootflags=noload` still suppressing journal replay); `quiet` /
+    // `debug` / `ignore_loglevel` override the owned `loglevel=` because caller args go last.
+    // Buggy impl this guards: the alias block missing from RESERVED_CMDLINE_KEYS.
+    #[test]
+    fn reserved_cmdline_keys_cover_owned_token_aliases() {
+        for alias in ["rw", "quiet", "debug", "ignore_loglevel"] {
+            assert!(
+                is_reserved_cmdline_arg(alias),
+                "{alias:?} aliases a token vmcell owns and must be reserved"
+            );
+            // …and the boundary must actually refuse it, not just the predicate.
+            let err = VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Block {
+                    image: PathBuf::from("/rootfs.img"),
+                    overlay: None,
+                },
+            )
+            .with_kernel_arg(alias)
+            .build()
+            .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Config(_))
+                    && err
+                        .to_string()
+                        .contains("collides with a boot token vmcell owns"),
+                "extra arg {alias:?} must be rejected at the boundary: {err}"
+            );
+        }
+        // Positive control (over-rejection inverse): an unrelated append-only token that only
+        // *resembles* the aliases still passes and is carried onto the cmdline.
+        let cfg = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Block {
+                image: PathBuf::from("/rootfs.img"),
+                overlay: None,
+            },
+        )
+        .with_kernel_arg("quiet_boot=1")
+        .with_kernel_arg("rwsem.debug=0")
+        .build()
+        .expect("an append-only arg that is not an owned-token alias must build");
+        let c = build_kernel_cmdline(&cfg, &test_res(4), "").unwrap();
+        assert!(c.ends_with(" quiet_boot=1 rwsem.debug=0"), "{c}");
     }
 
     // §5.3 (The kernel command line): build() rejects an extra arg that clobbers a reserved token, spoofs a

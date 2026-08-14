@@ -277,10 +277,12 @@ impl Registry {
     }
 
     /// Writes a warm snapshot of a `Ready` VM into the artifact store under `artifact_prefix/`,
-    /// returning the file names written.
+    /// returning the file names written. The prefix is **create-only**, like every other name in
+    /// the store: an existing one is refused, not written into.
     ///
     /// # Errors
-    /// [`DaemonError::InvalidName`] for a bad prefix, [`DaemonError::NotFound`]/[`DaemonError::Conflict`],
+    /// [`DaemonError::InvalidName`] for a bad prefix, [`DaemonError::AlreadyExists`] for a prefix
+    /// the store already holds, [`DaemonError::NotFound`]/[`DaemonError::Conflict`],
     /// or the mapped snapshot error (`Unsupported` for an ineligible config, design §13, Cross-cutting invariants).
     pub async fn snapshot(&self, id: &VmId, artifact_prefix: &str) -> DaemonResult<SnapshotInfo> {
         // The prefix names a subdirectory of the artifact store — validate it as a single safe
@@ -294,8 +296,23 @@ impl Registry {
         let slot = self.slot(id).await?;
         let mut inner = slot.inner.lock().await;
         require_state(&inner, VmState::Ready, id)?;
-        std::fs::create_dir_all(&out_dir).map_err(|e| {
-            DaemonError::Internal(format!("cannot create snapshot dir {out_dir:?}: {e}"))
+        // `create_dir`, NOT `create_dir_all`: the store is create-only (design §11.3, The artifact
+        // store) and a snapshot prefix is part of that namespace, so an existing prefix is a 409,
+        // never a write into a populated directory. The old `create_dir_all` let a second snapshot
+        // overwrite part of an older one file-by-file, and a `restore_from` copy racing that write
+        // read a torn mix of the two lineages (finding `snapshot-prefix-silent-reuse`). The
+        // EEXIST check is the kernel's, so it is atomic against a concurrent snapshot to the same
+        // prefix — no check-then-act window. Free the name with DELETE /v1/artifacts/{prefix},
+        // which removes a snapshot prefix dir (`ArtifactStore::delete`).
+        std::fs::create_dir(&out_dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                DaemonError::AlreadyExists(format!(
+                    "snapshot prefix {artifact_prefix:?} already exists in the artifact store \
+                     (the store has no update; delete it, then snapshot again)"
+                ))
+            } else {
+                DaemonError::Internal(format!("cannot create snapshot dir {out_dir:?}: {e}"))
+            }
         })?;
         inner.state = VmState::Snapshotting;
         let result = handle_mut(&mut inner, id)?.snapshot(&out_dir).await;
@@ -474,7 +491,13 @@ mod tests {
                 io_read_ok: true,
             })
         }
-        async fn snapshot(&mut self, _dir: &std::path::Path) -> DaemonResult<()> {
+        /// Writes one file into the snapshot dir, tagged with this VM's vmid. The fake is
+        /// otherwise fs-blind (AGENTS.md: name what the fake cannot see); this one byte of real
+        /// filesystem effect is what lets the prefix-reuse gate below prove that a refused second
+        /// snapshot did not overwrite the first VM's state.
+        async fn snapshot(&mut self, dir: &std::path::Path) -> DaemonResult<()> {
+            std::fs::write(dir.join("state.json"), format!("vmid={}", self.vmid))
+                .map_err(|e| DaemonError::Internal(format!("fake snapshot write failed: {e}")))?;
             Ok(())
         }
         async fn pause(&mut self) -> DaemonResult<()> {
@@ -639,10 +662,72 @@ mod tests {
             .await
             .expect("snapshot");
         assert_eq!(info.artifact_prefix, "snap1");
+        assert_eq!(
+            info.files,
+            vec!["state.json".to_string()],
+            "the files the backend wrote are enumerated"
+        );
         assert!(matches!(
             reg.snapshot(&created.info.id, "../escape").await,
             Err(DaemonError::InvalidName(_))
         ));
+    }
+
+    // §11.3 (The artifact store) create-only, applied to snapshot prefixes: a second snapshot to an
+    // EXISTING prefix is refused (409 AlreadyExists) and the first snapshot's bytes are untouched —
+    // the old `create_dir_all` wrote a second VM's state into the populated dir file-by-file, which
+    // a racing `restore_from` copy could read as a torn mix of two lineages (finding
+    // `snapshot-prefix-silent-reuse`). Then the positive control: DELETE frees the prefix and the
+    // same name is snapshot-able again, this time carrying the SECOND VM's state. RED on the
+    // inverse (`create_dir_all`): the refusal never happens and `state.json` reads `vmid=2`.
+    #[tokio::test]
+    async fn snapshot_refuses_an_existing_prefix_and_preserves_the_first() {
+        let (reg, _s, _d) = registry();
+        let first = reg.create(create_req()).await.expect("first vm");
+        let second = reg.create(create_req()).await.expect("second vm");
+        let state = reg.artifacts().dir().join("snap1").join("state.json");
+
+        reg.snapshot(&first.info.id, "snap1")
+            .await
+            .expect("first snapshot");
+        let original = std::fs::read_to_string(&state).expect("first snapshot state");
+        assert_eq!(original, format!("vmid={}", first.info.vmid));
+
+        let err = reg
+            .snapshot(&second.info.id, "snap1")
+            .await
+            .expect_err("a populated prefix must be refused");
+        assert!(matches!(err, DaemonError::AlreadyExists(_)), "got {err:?}");
+        assert_eq!(err.kind().status_code(), 409, "a taken prefix is a 409");
+        assert_eq!(
+            std::fs::read_to_string(&state).expect("state survives"),
+            original,
+            "the refused snapshot must not have written into the populated prefix"
+        );
+
+        // A prefix colliding with an uploaded FILE artifact is refused the same way (the prefix and
+        // artifact namespaces are one).
+        assert!(matches!(
+            reg.snapshot(&second.info.id, "vmlinux").await,
+            Err(DaemonError::AlreadyExists(_))
+        ));
+
+        // Positive control: the prefix is freeable, and re-snapshotting then succeeds.
+        reg.delete_artifact_if_unused("snap1")
+            .await
+            .expect("delete frees the snapshot prefix");
+        assert!(
+            !reg.artifacts().dir().join("snap1").exists(),
+            "the prefix dir is gone after delete"
+        );
+        reg.snapshot(&second.info.id, "snap1")
+            .await
+            .expect("the freed prefix is snapshot-able again");
+        assert_eq!(
+            std::fs::read_to_string(&state).expect("second snapshot state"),
+            format!("vmid={}", second.info.vmid),
+            "the re-snapshot carries the second VM's state"
+        );
     }
 
     // A snapshot against a MISSING VM returns NotFound and leaves NO residue dir — a live (real-fs)

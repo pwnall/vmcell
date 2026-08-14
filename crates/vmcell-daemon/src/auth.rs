@@ -58,8 +58,24 @@ pub enum AuthPolicy {
     /// Every non-open route requires the bearer key.
     Key(ApiKey),
     /// Auth disabled — only reachable via the explicit `--allow-unauthenticated` dev flag, logged
-    /// loudly at every request (design §11.6, Authentication — a bearer API key).
+    /// loudly at every request (design §11.6, Authentication — a bearer API key). The per-request
+    /// warn lives in the HTTP auth layer, driven by [`AuthDecision::UnauthenticatedBypass`].
     Unauthenticated,
+}
+
+/// How a request was allowed through — the value the HTTP auth layer logs on.
+///
+/// [`authorize`] stays **pure** (no I/O, no logging, unit-testable against its inverses), so the
+/// "logged loudly at every request" half of the `--allow-unauthenticated` contract (design §11.6,
+/// Authentication — a bearer API key) travels back to the layer as data rather than as a side
+/// effect the predicate performs itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthDecision {
+    /// The request presented the correct bearer key.
+    Authenticated,
+    /// Auth was **bypassed** by the `--allow-unauthenticated` dev flag. The caller must warn, on
+    /// every request — a one-time start-up warn scrolls out of a long-running daemon's log.
+    UnauthenticatedBypass,
 }
 
 /// Extracts the bearer token from an `Authorization` header value, if it is a well-formed
@@ -77,16 +93,22 @@ pub fn extract_bearer(header: Option<&str>) -> Option<&str> {
 
 /// The PURE authorization decision (no I/O), unit-tested against its inverses.
 ///
-/// - `Unauthenticated` policy ⇒ always `Ok` (the dev bypass).
+/// - `Unauthenticated` policy ⇒ `Ok(AuthDecision::UnauthenticatedBypass)` (the dev bypass, which
+///   the layer warns on per request).
 /// - absent / malformed / empty bearer ⇒ `Unauthorized` (401, with a `WWW-Authenticate` challenge).
 /// - present but wrong ⇒ `Forbidden` (403).
-/// - present and correct ⇒ `Ok` (the positive control).
+/// - present and correct ⇒ `Ok(AuthDecision::Authenticated)` (the positive control).
 ///
 /// # Errors
 /// Returns [`DaemonError::Unauthorized`] or [`DaemonError::Forbidden`] as above.
-pub fn authorize(policy: &AuthPolicy, auth_header: Option<&str>) -> Result<(), DaemonError> {
+pub fn authorize(
+    policy: &AuthPolicy,
+    auth_header: Option<&str>,
+) -> Result<AuthDecision, DaemonError> {
     let key = match policy {
-        AuthPolicy::Unauthenticated => return Ok(()),
+        // The bypass is reported, never silently swallowed: the caller owns the loud per-request
+        // warn design §11.6 promises (finding `allow-unauthenticated-not-logged-per-request`).
+        AuthPolicy::Unauthenticated => return Ok(AuthDecision::UnauthenticatedBypass),
         AuthPolicy::Key(k) => k,
     };
     let Some(token) = extract_bearer(auth_header) else {
@@ -95,7 +117,7 @@ pub fn authorize(policy: &AuthPolicy, auth_header: Option<&str>) -> Result<(), D
         ));
     };
     if key.verify(token.as_bytes()) {
-        Ok(())
+        Ok(AuthDecision::Authenticated)
     } else {
         Err(DaemonError::Forbidden("invalid API key".to_string()))
     }
@@ -164,9 +186,10 @@ mod tests {
     #[test]
     fn authorize_accepts_correct_rejects_wrong_and_absent() {
         let policy = AuthPolicy::Key(ApiKey::from_secret(b"s3cret-key"));
-        assert!(
-            authorize(&policy, Some("Bearer s3cret-key")).is_ok(),
-            "positive control"
+        assert_eq!(
+            authorize(&policy, Some("Bearer s3cret-key")).expect("positive control"),
+            AuthDecision::Authenticated,
+            "a real key authenticates — the layer must NOT warn on it"
         );
 
         let wrong = authorize(&policy, Some("Bearer nope")).expect_err("wrong key");
@@ -185,9 +208,19 @@ mod tests {
         );
     }
 
+    // The dev bypass allows everything AND reports itself as a bypass, so the HTTP layer can warn
+    // loudly on every request (design §11.6, Authentication — a bearer API key). RED on the inverse
+    // (an `authorize` that returns a plain `Ok`/`Authenticated` for the bypass): the layer would
+    // have nothing to branch on and the "logged at every request" promise would be undeliverable.
     #[test]
-    fn unauthenticated_policy_allows_everything() {
-        assert!(authorize(&AuthPolicy::Unauthenticated, None).is_ok());
+    fn unauthenticated_policy_allows_everything_and_reports_the_bypass() {
+        for header in [None, Some("Bearer whatever"), Some("garbage")] {
+            assert_eq!(
+                authorize(&AuthPolicy::Unauthenticated, header).expect("bypass allows"),
+                AuthDecision::UnauthenticatedBypass,
+                "every request under the dev flag is a reportable bypass ({header:?})"
+            );
+        }
     }
 
     #[test]

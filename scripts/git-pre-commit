@@ -8,4 +8,7 @@ if ! cargo fmt --all --check; then
 fi
 
 # Fast clippy on default features; the full powerset runs in CI.
-cargo clippy --all-targets -- -D warnings
+# `--locked` like every other resolving cargo command in this repo: without it the hook that runs on
+# EVERY commit is the one place a stale Cargo.lock gets silently regenerated — the drift the --locked
+# policy exists to surface would be repaired underneath the commit that introduced it.
+cargo clippy --locked --all-targets -- -D warnings

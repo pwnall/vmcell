@@ -50,6 +50,84 @@ use serde::{Deserialize, Serialize};
 /// a frame the other accepts.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// How much of a value's `{:?}` render a log line may carry.
+///
+/// Every desync diagnostic on this control plane quotes a **frame**, and a frame is
+/// bounded only by [`MAX_FRAME_BYTES`] (16 MiB) with a payload the peer chooses. The
+/// guest agent's own logs land on the *persisted* serial-console artifact, so an
+/// uncapped `{other:?}` there lets a peer write 16 MiB — rendered as `[1, 2, 3, …]`
+/// decimal, several times that again — into an artifact every later run reads; the
+/// host sites have the same shape at a smaller blast radius. 256 bytes still shows
+/// the variant name, the session id, and the head of the payload — enough to
+/// identify the frame in a desync report — while staying ~65 000× below the frame
+/// cap.
+///
+/// It lives here, beside `MAX_FRAME_BYTES`, because the cap on what a frame may
+/// carry and the cap on what a log may quote from one are a single law: the guest
+/// agent and both host clients share this one const and [`capped_debug`], never a
+/// per-site copy (docs/78 §6, `uncapped-frame-debug-renders`).
+pub const MAX_DEBUG_RENDER_BYTES: usize = 256;
+
+/// What [`capped_debug`] appends when the cap stopped the formatter, so a truncated
+/// render is never mistaken for a whole value — and so a caller's *test* can assert
+/// truncation against the same string the renderer emits, rather than a second copy
+/// of the literal.
+pub const DEBUG_TRUNCATED_MARKER: &str = "…<truncated>";
+
+/// `{value:?}`, truncated at [`MAX_DEBUG_RENDER_BYTES`] and marked as truncated so a
+/// reader never mistakes a capped render for the whole value.
+///
+/// The formatter is **stopped** at the cap rather than the value being rendered in
+/// full and then trimmed: [`core::fmt::Write`] returning `Err` aborts the formatting,
+/// so the tail is never rendered at all, not merely never kept. That bounds the CPU
+/// as well as the allocation a peer-chosen 16 MiB frame can cost a log line — the
+/// guest agent is PID 1, and a diagnostic must not become a work amplifier for
+/// whatever the peer sends.
+///
+/// The trade-off that buys: the *total* render length is unknowable without
+/// rendering it, so the output carries [`DEBUG_TRUNCATED_MARKER`] rather than a
+/// total, and every call site — each of which holds the encoded frame — quotes the
+/// frame's true byte count beside the render. That is the more useful number anyway
+/// (wire bytes, not decimal-`Debug` bytes).
+#[must_use]
+pub fn capped_debug(value: &dyn core::fmt::Debug) -> String {
+    use core::fmt::Write as _;
+
+    struct CappedSink {
+        out: String,
+    }
+    impl core::fmt::Write for CappedSink {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let room = MAX_DEBUG_RENDER_BYTES.saturating_sub(self.out.len());
+            if room == 0 {
+                return Err(core::fmt::Error);
+            }
+            if s.len() <= room {
+                self.out.push_str(s);
+                Ok(())
+            } else {
+                // Truncate on a char boundary, then stop the whole format.
+                let mut end = room;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.out.push_str(s.get(..end).unwrap_or_default());
+                Err(core::fmt::Error)
+            }
+        }
+    }
+
+    let mut sink = CappedSink { out: String::new() };
+    // The cap stopping the formatter is the expected outcome, not a failure: it is
+    // reported to the reader as the marker rather than swallowed. A `Debug` impl of
+    // its own that errors lands here too, and the same marker is the honest answer —
+    // the render is incomplete either way.
+    if write!(sink, "{value:?}").is_err() {
+        sink.out.push_str(DEBUG_TRUNCATED_MARKER);
+    }
+    sink.out
+}
+
 /// Default per-exec timeout applied when an [`ExecRequest`] does not set one.
 ///
 /// The host applies this as its own wait bound and propagates it into the
@@ -388,6 +466,100 @@ impl Default for ExecOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // docs/78 §6 (`uncapped-frame-debug-renders`): the ONE renderer every desync log
+    // site on this plane goes through. A frame is peer-chosen and `MAX_FRAME_BYTES`
+    // (16 MiB) big, and the guest agent's log lines are PERSISTED on the serial
+    // artifact — so this pins both halves of the law: an over-cap value renders to a
+    // bounded, visibly-truncated string, and an under-cap one renders verbatim (a
+    // "cap" that mangled ordinary frames would just be traded for silent log loss).
+    //
+    // RED on the inverse in three distinct ways: a plain `format!("{value:?}")`
+    // fails the length bound and the marker assert; a render-then-truncate
+    // implementation passes the length bound but fails `render_calls` (the tail was
+    // handed to the sink, which is the CPU half of the defect); a cap that also
+    // clipped short values fails the verbatim assert.
+    #[test]
+    fn capped_debug_truncates_over_cap_values_and_leaves_short_ones_verbatim() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The real shape at the sites: a session frame whose payload alone is far
+        // over the cap (each byte renders as up to 5 chars of `[7, 7, …]` decimal).
+        let frame = Message::SessionStdout {
+            session: SessionId(42),
+            data: vec![7u8; 64 * 1024],
+        };
+        let rendered = capped_debug(&frame);
+        assert!(
+            rendered.len() <= MAX_DEBUG_RENDER_BYTES + DEBUG_TRUNCATED_MARKER.len(),
+            "a 64 KiB frame must render to a capped diagnostic, got {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.starts_with("SessionStdout { session: SessionId(42), data: [7, 7,"),
+            "the cap must keep the identifying prefix — variant, id, payload head — got {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with(DEBUG_TRUNCATED_MARKER),
+            "a truncated render must say so, got {rendered:?}"
+        );
+
+        // The formatter is STOPPED, not just trimmed: a value whose `Debug` counts
+        // its own writes proves the tail is never rendered. The counter is a LOCAL
+        // borrowed by the value (not a `static`): a module-global would trip the B6
+        // global-state ban, and nothing here needs to outlive the test.
+        struct Counted<'a>(&'a AtomicUsize);
+        let calls = AtomicUsize::new(0);
+        impl std::fmt::Debug for Counted<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..10_000 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    write!(f, "0123456789")?;
+                }
+                Ok(())
+            }
+        }
+        let counted = capped_debug(&Counted(&calls));
+        let render_calls = calls.load(Ordering::Relaxed);
+        assert!(
+            counted.chars().count()
+                <= MAX_DEBUG_RENDER_BYTES + DEBUG_TRUNCATED_MARKER.chars().count(),
+            "capped output, got {} chars",
+            counted.chars().count()
+        );
+        assert!(
+            render_calls < 100,
+            "formatting must ABORT at the cap, not render all 10 000 chunks — {render_calls} ran"
+        );
+
+        // A value that fits is byte-identical to the uncapped render: no marker, no
+        // truncation, nothing lost from an ordinary desync report.
+        let small = Message::SessionExit {
+            session: SessionId(1),
+            code: 7,
+        };
+        assert_eq!(capped_debug(&small), format!("{small:?}"));
+        assert!(!capped_debug(&small).contains(DEBUG_TRUNCATED_MARKER));
+    }
+
+    // The cap is a *byte* cap applied to a UTF-8 `String`: a multi-byte char
+    // straddling the boundary must be dropped whole, never split into invalid UTF-8
+    // (which is not even representable) or silently rounded UP past the cap. RED on
+    // a `end -= 1` boundary walk removed: the push panics on a non-boundary index.
+    #[test]
+    fn capped_debug_truncates_on_a_char_boundary() {
+        // 4-byte chars, so the cap lands mid-char for at least one of these lengths.
+        for pad in 0..4usize {
+            let value = format!("{}{}", "a".repeat(pad), "🐟".repeat(1024));
+            let rendered = capped_debug(&value);
+            assert!(
+                rendered.len() <= MAX_DEBUG_RENDER_BYTES + DEBUG_TRUNCATED_MARKER.len(),
+                "pad {pad}: {} bytes",
+                rendered.len()
+            );
+            assert!(rendered.ends_with(DEBUG_TRUNCATED_MARKER), "pad {pad}");
+        }
+    }
 
     #[test]
     fn test_serialization() {

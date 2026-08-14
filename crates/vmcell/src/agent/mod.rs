@@ -24,7 +24,7 @@ pub use session::{Session, SessionEvent, SessionMux, SessionSpecBuilder};
 #[cfg(feature = "host-common")]
 use crate::error::{Error, Result};
 #[cfg(feature = "host-common")]
-use vmcell_protocol::Message;
+use vmcell_protocol::{Message, capped_debug};
 
 #[cfg(feature = "host-common")]
 use crate::vmm::VsockEndpoint;
@@ -516,61 +516,6 @@ enum ConnectAttemptError {
     Ready(String),
 }
 
-/// How much of a rejected first frame a [`ConnectAttemptError::Ready`] diagnostic
-/// carries. Enough to identify the payload, far below `MAX_FRAME_BYTES`.
-#[cfg(feature = "host-common")]
-const READY_DIAGNOSTIC_BYTES: usize = 256;
-
-/// `{value:?}`, but never longer than `cap` — the formatter is stopped at the cap
-/// instead of the whole value being rendered and then trimmed.
-///
-/// The connect loop's `Ready` diagnostics describe *frames*, which are bounded only
-/// by `MAX_FRAME_BYTES` (16 MiB), and it builds one on **every** failed attempt
-/// while the guest boots. Rendering the frame in full there allocates megabytes per
-/// attempt for a string almost always thrown away, so the sink refuses further
-/// writes past the cap: `std::fmt::Write` returning `Err` aborts the formatting, so
-/// the tail is never rendered at all, not merely never kept.
-#[cfg(feature = "host-common")]
-fn capped_debug(value: &dyn std::fmt::Debug, cap: usize) -> String {
-    use std::fmt::Write as _;
-
-    struct CappedSink {
-        out: String,
-        cap: usize,
-    }
-    impl std::fmt::Write for CappedSink {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            let room = self.cap.saturating_sub(self.out.len());
-            if room == 0 {
-                return Err(std::fmt::Error);
-            }
-            if s.len() <= room {
-                self.out.push_str(s);
-                Ok(())
-            } else {
-                // Truncate on a char boundary, then stop the whole format.
-                let mut end = room;
-                while end > 0 && !s.is_char_boundary(end) {
-                    end -= 1;
-                }
-                self.out.push_str(s.get(..end).unwrap_or_default());
-                Err(std::fmt::Error)
-            }
-        }
-    }
-
-    let mut sink = CappedSink {
-        out: String::new(),
-        cap,
-    };
-    // The cap stopping the formatter is the expected outcome, not a failure: it is
-    // reported to the reader as the ellipsis rather than swallowed.
-    if write!(sink, "{value:?}").is_err() {
-        sink.out.push('…');
-    }
-    sink.out
-}
-
 #[cfg(feature = "host-common")]
 impl std::fmt::Display for ConnectAttemptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -764,7 +709,7 @@ impl AgentClient {
             other => {
                 return Err(ConnectAttemptError::Ready(format!(
                     "framed.next() returned: {}",
-                    capped_debug(&other, READY_DIAGNOSTIC_BYTES)
+                    capped_debug(&other)
                 )));
             }
         };
@@ -776,7 +721,7 @@ impl AgentClient {
             ConnectAttemptError::Ready(format!(
                 "postcard error: {e:?}, {} bytes, starting {}",
                 ready.len(),
-                capped_debug(&&ready[..], READY_DIAGNOSTIC_BYTES)
+                capped_debug(&&ready[..])
             ))
         })?;
 
@@ -784,7 +729,7 @@ impl AgentClient {
             Message::Ready => Ok(framed),
             other => Err(ConnectAttemptError::Ready(format!(
                 "received unexpected message: {}",
-                capped_debug(&other, READY_DIAGNOSTIC_BYTES)
+                capped_debug(&other)
             ))),
         }
     }
@@ -929,8 +874,16 @@ impl AgentClient {
                     // protocol mismatch or a stray control frame) is surfaced at
                     // `warn`, not silently dropped — a silent `_ => {}` would hide
                     // a desync where the guest and host disagree on the protocol.
+                    // docs/78 §6: the frame is guest-chosen and `MAX_FRAME_BYTES`
+                    // (16 MiB) big, so the render goes through the shared
+                    // `capped_debug`; the wire length beside it is the number a
+                    // desync report actually needs, and it costs nothing here.
                     other => {
-                        tracing::warn!("unexpected message on exec stream (ignored): {:?}", other);
+                        tracing::warn!(
+                            "unexpected message on exec stream (ignored, {} byte frame): {}",
+                            bytes.len(),
+                            capped_debug(&other)
+                        );
                     }
                 }
             }
@@ -1078,9 +1031,10 @@ impl AgentClient {
 #[cfg(all(test, feature = "host-common"))]
 mod tests {
     use super::{
-        AgentClient, ControlStream, Error, MAX_PROLOGUE_LINE_BYTES, PrologueError,
-        READY_DIAGNOSTIC_BYTES, RequestFailure, VsockDial, VsockEndpoint, capped_debug,
-        dial_prologue_error, endpoint_on_port, hybrid_connect_prologue, hybrid_prologue_port,
+        AgentClient, ControlStream, Error, ExecRequest, LengthDelimitedCodec, MAX_FRAME_BYTES,
+        MAX_PROLOGUE_LINE_BYTES, Message, PrologueError, RequestFailure, SessionId, VsockDial,
+        VsockEndpoint, dial_prologue_error, endpoint_on_port, hybrid_connect_prologue,
+        hybrid_prologue_port, protocol,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1219,65 +1173,75 @@ mod tests {
         }
     }
 
-    // The connect loop builds a `Ready` diagnostic on EVERY failed attempt while the
-    // guest boots, and the values it quotes are frame-sized (`MAX_FRAME_BYTES` = 16
-    // MiB). Rendering one in full is megabytes of allocation per retry for a string
-    // that is normally discarded — the shape the pre-fix `format!("… {ready:?}")`
-    // had.
-    // RED on that shape: the produced string grew with the frame (a 1 MiB frame
-    // renders to several MiB of `[1, 2, 3, …]` decimal), so the length bound below
-    // fails. Also RED on a cap applied by rendering-then-truncating: the
-    // `chars().count()` bound would pass, but `render_calls` proves the tail was
-    // never handed to the sink at all.
-    #[test]
-    fn ready_diagnostics_are_capped_not_frame_sized() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    // docs/78 §6 (`uncapped-frame-debug-renders`), the exec-stream half. The renderer
+    // itself is pinned where the law lives (`vmcell_protocol::capped_debug`'s unit
+    // tests, beside `MAX_FRAME_BYTES`); what this pins is that THIS SITE routes
+    // through it — the pre-fix line was a bare `{:?}` on a guest-chosen frame, so a
+    // desync could put megabytes of guest bytes into the host log. The connect-loop
+    // `Ready` diagnostics above share the same one helper.
+    //
+    // The guest peer queues its frames BEFORE `exec` runs: a socketpair buffers
+    // both, so the exchange needs no second task. RED on the inverse (restore
+    // `"… (ignored): {:?}", other`): the warn line grows to ~100 KB of `[7, 7, …]`
+    // decimal and the length bound below fails; RED too on a site that drops the
+    // frame length or the truncation marker.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn unexpected_exec_frame_is_logged_capped_not_frame_sized() {
+        use futures::SinkExt as _;
 
-        let frame = vec![7u8; 1024 * 1024];
-        let rendered = capped_debug(&&frame[..], READY_DIAGNOSTIC_BYTES);
-        assert!(
-            rendered.len() <= READY_DIAGNOSTIC_BYTES + 4,
-            "a 1 MiB frame must render to a capped diagnostic, got {} bytes",
-            rendered.len()
-        );
-        assert!(
-            rendered.starts_with("[7, 7, 7,"),
-            "the cap must keep the identifying prefix, got {rendered:?}"
-        );
-        assert!(
-            rendered.ends_with('…'),
-            "a truncated diagnostic must say so, got {rendered:?}"
-        );
+        let (client_io, server_io) = tokio::net::UnixStream::pair().expect("socketpair");
+        let mut client = AgentClient::from_stream_for_tests(client_io);
 
-        // The formatter is STOPPED, not just trimmed: a value whose Debug counts its
-        // own writes proves the tail is never rendered.
-        // The counter is a LOCAL borrowed by the value (not a `static`): a module-global would
-        // trip the B6 global-state ban, and nothing here needs to outlive the test.
-        struct Counted<'a>(&'a AtomicUsize);
-        let calls = AtomicUsize::new(0);
-        impl std::fmt::Debug for Counted<'_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                for _ in 0..10_000 {
-                    self.0.fetch_add(1, Ordering::Relaxed);
-                    write!(f, "0123456789")?;
-                }
-                Ok(())
+        let mut codec = LengthDelimitedCodec::new();
+        codec.set_max_frame_length(MAX_FRAME_BYTES);
+        let mut guest = tokio_util::codec::Framed::new(server_io, codec);
+
+        // A host→guest-only frame (the guest must never send `Stdin`) whose payload
+        // alone is 32 KiB, then the terminal `Exit` so `exec` returns normally.
+        let stray = Message::Stdin {
+            session: SessionId(0),
+            data: vec![7u8; 32 * 1024],
+        };
+        let stray_bytes = postcard::to_stdvec(&stray).expect("encode the stray frame");
+        let stray_len = stray_bytes.len();
+        guest
+            .send(::bytes::Bytes::from(stray_bytes))
+            .await
+            .expect("queue the stray frame");
+        guest
+            .send(::bytes::Bytes::from(
+                postcard::to_stdvec(&Message::Exit(0)).expect("encode Exit"),
+            ))
+            .await
+            .expect("queue Exit");
+
+        let outcome = client
+            .exec(ExecRequest::new(vec!["true".into()]))
+            .await
+            .expect("a stray frame is logged and ignored, never fatal");
+        assert_eq!(outcome.code, 0, "the terminal Exit still resolves the exec");
+
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("unexpected message on exec stream"))
+                .ok_or_else(|| "the desync warn is missing entirely".to_string())?;
+            if line.len() > 1024 {
+                return Err(format!(
+                    "the desync log line is frame-sized ({} bytes): {}",
+                    line.len(),
+                    line.chars().take(200).collect::<String>()
+                ));
             }
-        }
-        let counted = capped_debug(&Counted(&calls), READY_DIAGNOSTIC_BYTES);
-        let render_calls = calls.load(Ordering::Relaxed);
-        assert!(
-            counted.chars().count() <= READY_DIAGNOSTIC_BYTES + 1,
-            "capped output, got {} chars",
-            counted.chars().count()
-        );
-        assert!(
-            render_calls < 100,
-            "formatting must ABORT at the cap, not render all 10 000 chunks — {render_calls} ran"
-        );
-
-        // A value that fits is untouched: no ellipsis, no truncation.
-        assert_eq!(capped_debug(&"fits", READY_DIAGNOSTIC_BYTES), "\"fits\"");
+            if !line.contains(protocol::DEBUG_TRUNCATED_MARKER) {
+                return Err(format!("a truncated render must say so: {line}"));
+            }
+            if !line.contains(&format!("{stray_len} byte frame")) {
+                return Err(format!("the line must quote the frame's wire size: {line}"));
+            }
+            Ok(())
+        });
     }
 
     // Validate-before-allocate (§13, Cross-cutting invariants): a bridge that streams bytes and never

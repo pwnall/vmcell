@@ -818,6 +818,27 @@ fn serve_connection(
     result
 }
 
+/// The desync warn line for a control-plane frame the host must never send, built
+/// where a test can reach it (docs/78 §6, `uncapped-frame-debug-renders`).
+///
+/// This line lands on the **persisted** serial-console artifact, and `msg` is a
+/// host-chosen frame bounded only by [`MAX_FRAME_BYTES`] (16 MiB) — an uncapped
+/// `{msg:?}` writes that, several times over in decimal, into an artifact every later
+/// run reads. The render therefore goes through the shared
+/// [`protocol::capped_debug`], which also *stops* the formatter at the cap, so PID 1
+/// does no frame-sized work for a log line. The frame's wire size beside it is the
+/// number a desync report actually needs, and it is free at the call site.
+///
+/// It is a function, not an inline `warn!`, because the dispatch loop it is called
+/// from takes a concrete `VsockStream` and cannot be driven from a unit test — this
+/// is the reachable seam its gate asserts on.
+fn unexpected_frame_warning(frame_bytes: usize, msg: &Message) -> String {
+    format!(
+        "vmcell-guest-agent: unexpected control-plane message ({frame_bytes} byte frame): {}; closing connection to resync",
+        protocol::capped_debug(msg)
+    )
+}
+
 /// The per-connection dispatch loop: reads one framed [`Message`] at a time and
 /// routes it. It never blocks on a running child — one-shot `Exec` is still
 /// synchronous (drains to `Exit` before the next read, the one-shot contract),
@@ -863,10 +884,7 @@ fn serve_loop(
             // rather than silently swallowing it and looping on a skewed stream
             // (AGENT-5).
             other => {
-                tracing::warn!(
-                    "vmcell-guest-agent: unexpected control-plane message {:?}; closing connection to resync",
-                    other
-                );
+                tracing::warn!("{}", unexpected_frame_warning(req_bytes.len(), &other));
                 return Ok(());
             }
         }
@@ -2142,6 +2160,55 @@ mod tests {
         let ts_max = resync_timespec(0, u32::MAX);
         assert_eq!(ts_max.tv_sec, 0);
         assert_eq!(ts_max.tv_nsec, u32::MAX as i64);
+    }
+
+    // docs/78 §6 (`uncapped-frame-debug-renders`), the guest half — the one whose
+    // blast radius is the PERSISTED serial artifact. The renderer itself is pinned
+    // where the law lives (`vmcell_protocol::capped_debug`, beside
+    // `MAX_FRAME_BYTES`); this pins the guest's line: a host frame at the FULL
+    // `MAX_FRAME_BYTES` still produces a log line of a few hundred bytes, carrying
+    // the truncation marker and the frame's true wire size.
+    //
+    // RED on the inverse: restore `format!("… message {msg:?}; …")` in
+    // `unexpected_frame_warning` and the length bound below fails by ~50 MB (and the
+    // marker assert with it). The remaining gap — that the dispatch arm calls this
+    // function — is not unit-reachable: `serve_loop` takes a concrete `VsockStream`
+    // and a `VsockStream`-typed `Writer`.
+    #[test]
+    fn unexpected_frame_warning_is_capped_not_frame_sized() {
+        // A host→guest frame at the cap: the largest thing the dispatch loop can
+        // ever hand this line.
+        let msg = Message::Stdin {
+            session: SessionId(0),
+            data: vec![7u8; MAX_FRAME_BYTES - 16],
+        };
+        let frame_bytes = postcard::to_stdvec(&msg).expect("encode").len();
+        let line = unexpected_frame_warning(frame_bytes, &msg);
+
+        assert!(
+            line.len() <= 1024,
+            "a 16 MiB frame must still log as a short line, got {} bytes",
+            line.len()
+        );
+        assert!(
+            line.contains(protocol::DEBUG_TRUNCATED_MARKER),
+            "a truncated render must say so: {line}"
+        );
+        assert!(
+            line.contains(&format!("{frame_bytes} byte frame")),
+            "the line must quote the frame's wire size: {line}"
+        );
+        assert!(
+            line.contains("Stdin { session: SessionId(0)"),
+            "the cap must keep enough to identify the frame: {line}"
+        );
+
+        // A small frame is reported in full — the cap must not cost an ordinary
+        // desync report its detail.
+        let small = Message::Ready;
+        let small_line = unexpected_frame_warning(1, &small);
+        assert!(small_line.contains("Ready"), "{small_line}");
+        assert!(!small_line.contains(protocol::DEBUG_TRUNCATED_MARKER));
     }
 
     // AGENT-3: the guest's hand-rolled framing is the load-bearing interop with

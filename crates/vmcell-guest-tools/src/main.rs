@@ -648,19 +648,63 @@ fn read_trim(path: &str) -> Option<String> {
 }
 
 // --- interface ioctls for `ip link set … address` (restore MAC rotation) ---
+//
+// `ifreq-stack-duplicated-guest-tools` (docs/78 §6): this `IfReq` + link-ioctl
+// stack is a SECOND copy of the one in `vmcell_guest_agent::netif`, against the
+// "kernel ABI structs are `#[repr(C)]`, defined once" rule. The review offered two
+// routes; this is the RECORDED-deviation route (b), with a strengthened divergence
+// guard. Why not route (a), consolidating onto the agent's lib target:
+//
+//   * `netif` deliberately exports only what PID 1 calls — `set_loopback_up`,
+//     `set_mac_bytes`, `set_ipv4`. Guest-tools additionally needs a general
+//     `set_link_up(dev, up)` (for `ip link set … up|down`) and `read_ipv4`
+//     (`SIOCGIFADDR`/`SIOCGIFNETMASK`, for `ip addr`'s `inet` line), neither of
+//     which PID 1 has any use for. Consolidating means GROWING the audited PID-1
+//     surface — and its `unsafe` blocks — with code PID 1 never executes, which is
+//     the opposite of the lean-agent posture (§13 C1).
+//   * guest-tools would link the agent's whole production graph (vsock, postcard,
+//     rustix, signal-hook, tracing, tracing-subscriber, vmcell-protocol) to reuse
+//     ~60 lines of `libc`. (The reverse direction is safe — the lean-agent gate
+//     reads `cargo tree -e no-dev -p vmcell-guest-agent`, i.e. the agent's own
+//     subtree, which a dependent cannot enter — so that is not the objection.)
+//
+// The honest consolidation is a third `libc`-only crate both depend on; that is a
+// workspace-layout change, recorded in `docs/implementation-notes.md` rather than
+// taken silently here. Until it lands, the DIVERGENCE GUARD is field-by-field, not
+// total-size-only: the request numbers below are `libc`'s (never a second local
+// spelling of a kernel ABI value — the same rule this file already applies to
+// `VMADDR_CID_ANY`), the union sub-offsets are named constants mirroring
+// `netif::HWADDR_{FAMILY,MAC}_OFFSET`, and
+// `ifreq_is_pinned_field_by_field_to_the_kernel_abi` pins offsets + sizes against
+// `libc::ifreq`/`sockaddr`/`sockaddr_in`. Both copies are anchored to the same ABI,
+// so a drift in either reddens in its own crate.
+//
+// The error-type divergence the review named IS resolved: this stack now returns
+// `std::io::Result`, exactly as `netif` does, so the remaining difference between
+// the copies is only the functions each consumer needs.
 
-const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
-const SIOCGIFADDR: libc::c_ulong = 0x8915;
-const SIOCGIFNETMASK: libc::c_ulong = 0x891b;
-const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
-const ARPHRD_ETHER: u16 = 1;
-const IFF_UP: i16 = 0x1;
+/// Offset of the `ifr_hwaddr`/`ifr_addr` sockaddr's `sa_family` within the `ifru`
+/// union (mirrors `netif::HWADDR_FAMILY_OFFSET`).
+const SOCKADDR_FAMILY_OFFSET: usize = 0;
+/// Offset of the sockaddr's `sa_data` — the six MAC bytes for `ifr_hwaddr` — within
+/// the `ifru` union: the `u16` family precedes it (mirrors
+/// `netif::HWADDR_MAC_OFFSET`).
+const SOCKADDR_DATA_OFFSET: usize = 2;
+/// Offset of `sockaddr_in::sin_addr` within the `ifru` union: `sin_family` (2) plus
+/// `sin_port` (2) precede it.
+const SIN_ADDR_OFFSET: usize = 4;
+
+/// `libc::IFF_UP` narrowed to the `short` the `ifr_flags` union arm actually carries.
+/// A fixed ABI constant (1), not a wire value, so the narrowing is lossless — but it
+/// is still derived from `libc` rather than re-spelled, and
+/// `ioctl_requests_match_the_kernel_abi_values_netif_hardcodes` pins the round trip.
+const IFF_UP: i16 = libc::IFF_UP as i16;
 
 /// A `struct ifreq` (40 bytes on 64-bit Linux): the 16-byte interface name
-/// followed by the `ifr_ifru` union, which we access as raw bytes for the two
-/// shapes we use — `ifr_flags` (a `short` at offset 0) and `ifr_hwaddr` (a
-/// `sockaddr`: `sa_family` then `sa_data`, at offset 0).
+/// followed by the `ifr_ifru` union, which we access as raw bytes for the three
+/// shapes we use — `ifr_flags` (a `short` at offset 0), `ifr_hwaddr` and
+/// `ifr_addr`/`ifr_netmask` (sockaddrs, hence the `SOCKADDR_*`/`SIN_ADDR_OFFSET`
+/// constants above).
 #[repr(C)]
 struct IfReq {
     name: [libc::c_char; libc::IFNAMSIZ],
@@ -668,20 +712,36 @@ struct IfReq {
 }
 
 impl IfReq {
-    fn new(dev: &str) -> Result<Self, String> {
+    fn new(dev: &str) -> std::io::Result<Self> {
         let bytes = dev.as_bytes();
         if bytes.len() >= libc::IFNAMSIZ {
-            return Err(format!("device name too long: {dev}"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("device name too long: {dev}"),
+            ));
         }
         let mut name = [0 as libc::c_char; libc::IFNAMSIZ];
         for (slot, &b) in name.iter_mut().zip(bytes) {
-            *slot = b as libc::c_char;
+            *slot = b.cast_signed();
         }
         Ok(IfReq {
             name,
             ifru: [0u8; 24],
         })
     }
+}
+
+/// The current `errno` tagged with the syscall/ioctl that produced it, keeping the
+/// [`std::io::ErrorKind`] intact.
+///
+/// `netif` returns the bare `last_os_error()`; guest-tools names the operation
+/// because these strings are printed on the **serial console**, which vmcell
+/// persists as the per-VM log artifact and is a restored guest's only observable
+/// when `ip link set` fails. That naming is the one deliberate behavioral
+/// difference between the two copies.
+fn os_err(op: &str) -> std::io::Error {
+    let err = std::io::Error::last_os_error();
+    std::io::Error::new(err.kind(), format!("{op}: {err}"))
 }
 
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -696,21 +756,21 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     if n == 6 { Some(out) } else { None }
 }
 
-fn open_inet_socket() -> Result<libc::c_int, String> {
+fn open_inet_socket() -> std::io::Result<libc::c_int> {
     // SAFETY: a constant, valid `socket(2)` call; the returned fd is checked.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
-        return Err(format!("socket: {}", std::io::Error::last_os_error()));
+        return Err(os_err("socket(AF_INET)"));
     }
     Ok(fd)
 }
 
-fn set_link_up(fd: libc::c_int, dev: &str, up: bool) -> Result<(), String> {
+fn set_link_up(fd: libc::c_int, dev: &str, up: bool) -> std::io::Result<()> {
     let mut ifr = IfReq::new(dev)?;
     // SAFETY: `ifr` is a correctly sized `struct ifreq`; SIOCGIFFLAGS reads the
     // name and writes `ifr_flags` into the union bytes.
-    if unsafe { libc::ioctl(fd, SIOCGIFFLAGS, &mut ifr) } < 0 {
-        return Err(format!("SIOCGIFFLAGS: {}", std::io::Error::last_os_error()));
+    if unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) } < 0 {
+        return Err(os_err("SIOCGIFFLAGS"));
     }
     let mut flags = i16::from_ne_bytes([ifr.ifru[0], ifr.ifru[1]]);
     if up {
@@ -720,8 +780,8 @@ fn set_link_up(fd: libc::c_int, dev: &str, up: bool) -> Result<(), String> {
     }
     ifr.ifru[0..2].copy_from_slice(&flags.to_ne_bytes());
     // SAFETY: same struct, SIOCSIFFLAGS consumes name + ifr_flags.
-    if unsafe { libc::ioctl(fd, SIOCSIFFLAGS, &mut ifr) } < 0 {
-        return Err(format!("SIOCSIFFLAGS: {}", std::io::Error::last_os_error()));
+    if unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &mut ifr) } < 0 {
+        return Err(os_err("SIOCSIFFLAGS"));
     }
     Ok(())
 }
@@ -730,12 +790,14 @@ fn set_link_up(fd: libc::c_int, dev: &str, up: bool) -> Result<(), String> {
 /// name, `ARPHRD_ETHER` in the sockaddr family, then the six MAC bytes. Split out
 /// so the byte layout is unit-testable without a live interface (M-GUEST-3),
 /// mirroring the guest-agent `netif::hwaddr_ifreq` helper.
-fn hwaddr_ifreq(dev: &str, mac: [u8; 6]) -> Result<IfReq, String> {
+fn hwaddr_ifreq(dev: &str, mac: [u8; 6]) -> std::io::Result<IfReq> {
     let mut ifr = IfReq::new(dev)?;
     // ifr_hwaddr: sa_family (host-order u16) then sa_data; first 6 data bytes are
-    // the MAC.
-    ifr.ifru[0..2].copy_from_slice(&ARPHRD_ETHER.to_ne_bytes());
-    ifr.ifru[2..8].copy_from_slice(&mac);
+    // the MAC. The offsets are the named ABI constants, not literals, so the pin
+    // test can assert them against `libc::sockaddr` rather than restating them.
+    ifr.ifru[SOCKADDR_FAMILY_OFFSET..SOCKADDR_FAMILY_OFFSET + 2]
+        .copy_from_slice(&libc::ARPHRD_ETHER.to_ne_bytes());
+    ifr.ifru[SOCKADDR_DATA_OFFSET..SOCKADDR_DATA_OFFSET + 6].copy_from_slice(&mac);
     Ok(ifr)
 }
 
@@ -744,7 +806,9 @@ fn hwaddr_ifreq(dev: &str, mac: [u8; 6]) -> Result<IfReq, String> {
 /// `sin_addr` @4). Split out so the offset is unit-testable without a live interface (M-GUEST-3,
 /// mirroring `hwaddr_ifreq`).
 fn ipv4_from_ifru(ifru: &[u8; 24]) -> [u8; 4] {
-    [ifru[4], ifru[5], ifru[6], ifru[7]]
+    let mut addr = [0u8; 4];
+    addr.copy_from_slice(&ifru[SIN_ADDR_OFFSET..SIN_ADDR_OFFSET + 4]);
+    addr
 }
 
 /// The CIDR prefix length of a contiguous IPv4 netmask (e.g. `255.255.255.252` → `30`).
@@ -762,13 +826,13 @@ fn read_ipv4(dev: &str) -> Option<([u8; 4], u8)> {
         let mut ifr = IfReq::new(dev).ok()?;
         // SAFETY: `ifr` is a correctly sized `struct ifreq`; SIOCGIFADDR reads the name and
         // writes the `ifr_addr` sockaddr into the union bytes.
-        if unsafe { libc::ioctl(fd, SIOCGIFADDR, &mut ifr) } < 0 {
+        if unsafe { libc::ioctl(fd, libc::SIOCGIFADDR, &mut ifr) } < 0 {
             return None;
         }
         let addr = ipv4_from_ifru(&ifr.ifru);
         let mut mask_ifr = IfReq::new(dev).ok()?;
         // SAFETY: same struct shape; SIOCGIFNETMASK writes `ifr_netmask` (a sockaddr).
-        let prefix = if unsafe { libc::ioctl(fd, SIOCGIFNETMASK, &mut mask_ifr) } < 0 {
+        let prefix = if unsafe { libc::ioctl(fd, libc::SIOCGIFNETMASK, &mut mask_ifr) } < 0 {
             32
         } else {
             netmask_to_prefix(ipv4_from_ifru(&mask_ifr.ifru))
@@ -782,19 +846,27 @@ fn read_ipv4(dev: &str) -> Option<([u8; 4], u8)> {
     res
 }
 
-fn set_mac(dev: &str, mac_str: &str) -> Result<(), String> {
-    let mac = parse_mac(mac_str).ok_or_else(|| format!("invalid MAC: {mac_str}"))?;
+fn set_mac(dev: &str, mac_str: &str) -> std::io::Result<()> {
+    let mac = parse_mac(mac_str).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid MAC: {mac_str}"),
+        )
+    })?;
     let fd = open_inet_socket()?;
-    let res = (|| -> Result<(), String> {
-        // Some drivers require the link down to change its hardware address;
-        // bring it down (best effort) then back up around the set.
+    let res = (|| -> std::io::Result<()> {
+        // Some drivers require the link down to change its hardware address; bring
+        // it down (best effort) then back up around the set. The `Result` is
+        // deliberately discarded: a driver that refuses the down-transition may
+        // still accept the hwaddr change, and the SIOCSIFHWADDR below is the check
+        // that actually decides the outcome.
         let _ = set_link_up(fd, dev, false);
 
         let mut ifr = hwaddr_ifreq(dev, mac)?;
         // SAFETY: `ifr` is a correctly sized `struct ifreq`; SIOCSIFHWADDR reads
         // the name and the `ifr_hwaddr` sockaddr from the union bytes.
-        if unsafe { libc::ioctl(fd, SIOCSIFHWADDR, &mut ifr) } < 0 {
-            let err = format!("SIOCSIFHWADDR: {}", std::io::Error::last_os_error());
+        if unsafe { libc::ioctl(fd, libc::SIOCSIFHWADDR, &mut ifr) } < 0 {
+            let err = os_err("SIOCSIFHWADDR");
             // M-GUEST-2: the link was brought down above; re-raise it even on this
             // failure path so a failed (best-effort) MAC change never strands the
             // restored guest's eth0 administratively DOWN with no one to re-raise
@@ -1742,17 +1814,93 @@ mod tests {
         assert!(!is_write_verb(None), "a read form (no verb) is not a write");
     }
 
-    // M-GUEST-3 / L-GUEST-8 class: pin the guest-tools `IfReq` to the kernel's
-    // `struct ifreq` size. C-GUEST-1 showed an unpinned ifreq is an OOB-copy
-    // vector, and guest-tools duplicated the layout with no guard. Shrinking
-    // `ifru` (e.g. to [u8; 20]) would pass the offset asserts below but reddens
-    // here.
+    // `ifreq-stack-duplicated-guest-tools` (docs/78 §6) — the divergence guard for
+    // the recorded duplication of `vmcell_guest_agent::netif`'s ABI stack.
+    //
+    // Total size alone is NOT enough: it stays green while the union moves, while
+    // the name array shrinks and the union grows to compensate, or while the fields
+    // swap order — every one of which is the C-GUEST-1 shape (an ifreq whose layout
+    // disagrees with what `copy_{from,to}_user` reads/writes). So every field fact
+    // is pinned against `libc`'s own ABI types, which is what BOTH copies are
+    // anchored to; a copy that drifts from the ABI reddens in its own crate.
+    //
+    // RED on: reordering `name`/`ifru` (both offset asserts), shrinking either field
+    // (its size assert plus the total), spelling the name array `[c_char; 14]`
+    // instead of `IFNAMSIZ`, or moving a `SOCKADDR_*`/`SIN_ADDR_OFFSET` constant.
     #[test]
-    fn ifreq_matches_kernel_struct_size() {
+    fn ifreq_is_pinned_field_by_field_to_the_kernel_abi() {
+        use std::mem::{offset_of, size_of, size_of_val};
+
+        let probe = IfReq::new("eth0").expect("ifreq");
         assert_eq!(
-            std::mem::size_of::<IfReq>(),
-            std::mem::size_of::<libc::ifreq>(),
+            size_of::<IfReq>(),
+            size_of::<libc::ifreq>(),
             "IfReq must match the kernel `struct ifreq` size (40 bytes on x86-64)"
+        );
+        assert_eq!(
+            offset_of!(IfReq, name),
+            offset_of!(libc::ifreq, ifr_name),
+            "ifr_name must start where the kernel's does"
+        );
+        assert_eq!(
+            offset_of!(IfReq, ifru),
+            offset_of!(libc::ifreq, ifr_ifru),
+            "the ifr_ifru union must start where the kernel's does"
+        );
+        assert_eq!(
+            size_of_val(&probe.name),
+            offset_of!(libc::ifreq, ifr_ifru),
+            "the name array must exactly fill the space before the union (IFNAMSIZ)"
+        );
+        assert_eq!(
+            size_of_val(&probe.ifru),
+            size_of::<libc::ifreq>() - offset_of!(libc::ifreq, ifr_ifru),
+            "the ifru byte array must exactly cover the kernel's union"
+        );
+        assert!(
+            size_of::<libc::sockaddr>() <= size_of_val(&probe.ifru),
+            "the union must hold a whole sockaddr — the hwaddr/addr arms write one"
+        );
+
+        // The union sub-offsets this file writes/reads through, pinned to the real
+        // sockaddr layouts rather than restated as literals.
+        assert_eq!(
+            SOCKADDR_FAMILY_OFFSET, 0,
+            "sa_family is the first field of a sockaddr"
+        );
+        assert_eq!(
+            SOCKADDR_DATA_OFFSET,
+            offset_of!(libc::sockaddr, sa_data),
+            "the MAC goes at the sockaddr's sa_data offset"
+        );
+        assert_eq!(
+            SIN_ADDR_OFFSET,
+            offset_of!(libc::sockaddr_in, sin_addr),
+            "SIOCGIFADDR's address sits at sockaddr_in::sin_addr"
+        );
+    }
+
+    // The five ioctl request numbers this file issues, plus the two ABI constants,
+    // pinned to their kernel values — which are ALSO the literals the agent's
+    // `netif` copy hardcodes (0x8913/0x8914/0x8924 there). Production code takes
+    // them from `libc` (never a second local spelling of a kernel ABI value, the
+    // rule this file already applies to `VMADDR_CID_ANY`), so this test is what
+    // keeps the two copies' request numbers checkable against one another.
+    // RED on any renumbering, and on an `IFF_UP` that does not survive the narrowing
+    // to the `ifr_flags` `short`.
+    #[test]
+    fn ioctl_requests_match_the_kernel_abi_values_netif_hardcodes() {
+        assert_eq!(libc::SIOCGIFFLAGS, 0x8913);
+        assert_eq!(libc::SIOCSIFFLAGS, 0x8914);
+        assert_eq!(libc::SIOCGIFADDR, 0x8915);
+        assert_eq!(libc::SIOCGIFNETMASK, 0x891b);
+        assert_eq!(libc::SIOCSIFHWADDR, 0x8924);
+        assert_eq!(libc::ARPHRD_ETHER, 1);
+        assert_eq!(IFF_UP, 0x1);
+        assert_eq!(
+            i32::from(IFF_UP),
+            libc::IFF_UP,
+            "IFF_UP must survive the narrowing to the ifr_flags short"
         );
     }
 
@@ -1780,13 +1928,19 @@ mod tests {
         );
         assert_eq!(
             u16::from_ne_bytes([ifr.ifru[0], ifr.ifru[1]]),
-            ARPHRD_ETHER,
+            libc::ARPHRD_ETHER,
             "sa_family must decode to ARPHRD_ETHER"
         );
         assert_eq!(
             &ifr.ifru[2..8],
             &mac,
             "MAC must be at the hwaddr data offset"
+        );
+        // The rest of the union must stay zero: SIOCSIFHWADDR reads a whole
+        // sockaddr, so a stray byte past the MAC is submitted to the kernel.
+        assert!(
+            ifr.ifru[8..].iter().all(|b| *b == 0),
+            "no bytes beyond the MAC may be set"
         );
     }
 
@@ -1812,11 +1966,28 @@ mod tests {
     }
 
     // A device name too long for IFNAMSIZ is rejected (not silently truncated),
-    // matching netif.rs's IfReq::new.
+    // matching netif.rs's IfReq::new — including the `InvalidInput` kind, which is
+    // the error-type half of the divergence the duplication record names: both
+    // copies now return `std::io::Result` with the same kind for the same input.
     #[test]
     fn ifreq_new_rejects_overlong_device() {
         let long = "x".repeat(libc::IFNAMSIZ);
-        assert!(IfReq::new(&long).is_err());
+        // `IfReq` is deliberately not `Debug` (it is a raw ABI buffer), so unwrap
+        // the error arm by hand rather than via `expect_err`.
+        let err = IfReq::new(&long)
+            .err()
+            .unwrap_or_else(|| panic!("an overlong device must be rejected"));
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "the rejection must carry netif's kind, not an opaque one"
+        );
+        assert!(
+            err.to_string().contains(&long),
+            "the rejection must name the offending device, got {err}"
+        );
+        // One under IFNAMSIZ is the longest accepted name (the NUL terminator).
+        assert!(IfReq::new(&"x".repeat(libc::IFNAMSIZ - 1)).is_ok());
         assert!(IfReq::new("eth0").is_ok());
     }
 

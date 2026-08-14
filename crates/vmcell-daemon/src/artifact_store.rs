@@ -66,7 +66,7 @@ impl ArtifactStore {
         // The `.sha256` suffix is reserved for digest sidecars (delta 10); an artifact with that
         // name would shadow a real artifact's sidecar and vanish from `list`. Reject before disk
         // (a 400, not a name-syntax error — the name is well-formed, just reserved).
-        if name.ends_with(SHA256_SIDECAR_SUFFIX) {
+        if is_reserved_sidecar_name(name) {
             return Err(DaemonError::BadRequest(format!(
                 "artifact name {name:?} must not end in `{SHA256_SIDECAR_SUFFIX}` (reserved for digest sidecars)"
             )));
@@ -116,13 +116,18 @@ impl ArtifactStore {
         })
     }
 
-    /// Reads one artifact's metadata.
+    /// Reads one artifact's metadata. A digest sidecar is **not** an artifact: a reserved
+    /// `<name>.sha256` reads back as [`DaemonError::NotFound`], exactly like an absent name.
     ///
     /// # Errors
     /// [`DaemonError::InvalidName`] / [`DaemonError::NotFound`] / [`DaemonError::Internal`].
     pub fn info(&self, name: &str) -> Result<ArtifactInfo, DaemonError> {
         let path = self.path_for(name)?;
-        if !path.is_file() {
+        // The reserved-suffix guard used to live in `create` only, so a client could GET (and, in
+        // `delete` below, remove) a live artifact's internal digest record — store bookkeeping is
+        // not a client-visible surface (finding `sidecar-suffix-guard-is-create-only`). 404, not
+        // the create path's 400: to a client the name simply does not name an artifact.
+        if is_reserved_sidecar_name(name) || !path.is_file() {
             return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
         }
         artifact_info(name, &path)
@@ -148,7 +153,7 @@ impl ArtifactStore {
             };
             // Digest sidecars (delta 10) are internal bookkeeping, never bootable artifacts —
             // exclude them from `list` output (create() forbids a client artifact of that name).
-            if name.ends_with(SHA256_SIDECAR_SUFFIX) {
+            if is_reserved_sidecar_name(&name) {
                 continue;
             }
             // Only names that would pass the predicate (so a NamedTempFile leftover `.tmp…` or an
@@ -164,14 +169,39 @@ impl ArtifactStore {
         Ok(out)
     }
 
-    /// Deletes an artifact. (The "is it pinned by a live VM?" check is the caller's — the handler
-    /// consults the registry before calling this, design §11.3.2, The artifact store.)
+    /// Deletes an artifact **or a snapshot prefix directory**. (The "is it pinned by a live VM?"
+    /// check is the caller's — the handler consults the registry before calling this, design
+    /// §11.3.2, The artifact store.)
+    ///
+    /// A name resolves to either a file (an uploaded artifact) or a directory (`<prefix>/`, written
+    /// by [`crate::registry::Registry::snapshot`], §11.4). Both are deletable: since `snapshot` now
+    /// refuses to reuse a populated prefix (finding `snapshot-prefix-silent-reuse`), a prefix that
+    /// could never be freed would burn its name for the daemon's lifetime.
     ///
     /// # Errors
     /// [`DaemonError::InvalidName`] / [`DaemonError::NotFound`] / [`DaemonError::Internal`].
     pub fn delete(&self, name: &str) -> Result<(), DaemonError> {
         let path = self.path_for(name)?;
-        if !path.is_file() {
+        // Same reserved-suffix law as `info` (finding `sidecar-suffix-guard-is-create-only`): a
+        // client that could DELETE `<artifact>.sha256` would strip a live artifact's digest record
+        // while the artifact itself stayed bootable.
+        if is_reserved_sidecar_name(name) {
+            return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
+        }
+        // `symlink_metadata`, not `is_file`/`is_dir`: those follow symlinks, and the recursive
+        // directory delete below must never walk out of the store through one planted out-of-band.
+        let Ok(meta) = path.symlink_metadata() else {
+            return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
+        };
+        if meta.is_dir() {
+            // A snapshot prefix. `path` came from `resolve_artifact_path`, so it is a validated
+            // single component — the recursive delete is confined to one direct child of the store
+            // dir (invariant §13, Cross-cutting invariants). Snapshot dirs carry no sidecar.
+            return std::fs::remove_dir_all(&path).map_err(|e| {
+                DaemonError::Internal(format!("cannot delete snapshot prefix {name:?}: {e}"))
+            });
+        }
+        if !meta.is_file() {
             return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
         }
         std::fs::remove_file(&path)
@@ -188,6 +218,16 @@ impl ArtifactStore {
 /// whole body on every call. A client cannot create an artifact whose name ends in this suffix (it
 /// would shadow a real artifact's sidecar and vanish from `list`).
 const SHA256_SIDECAR_SUFFIX: &str = ".sha256";
+
+/// The ONE reserved-name predicate (AGENTS.md "one law, one predicate"): true iff `name` names a
+/// digest sidecar rather than a client artifact. Every store op consults this single function —
+/// `create` rejects it (400: well-formed but reserved), `list` skips it, and `info`/`delete` report
+/// it as absent (404). The reaction differs per op; the *law* does not, so a second `ends_with`
+/// copy can never drift from it (the guard used to exist only in `create`, which is exactly how
+/// `info`/`delete` came to accept sidecar names).
+fn is_reserved_sidecar_name(name: &str) -> bool {
+    name.ends_with(SHA256_SIDECAR_SUFFIX)
+}
 
 /// The sidecar path for an artifact, derived by **appending** the suffix to the already-validated,
 /// dir-anchored artifact path. `with_extension` would REPLACE (`rootfs.erofs` -> `rootfs.sha256`)
@@ -408,6 +448,58 @@ mod tests {
             store.create("evil.sha256", b"x"),
             Err(DaemonError::BadRequest(_))
         ));
+    }
+
+    // The reserved-suffix law holds on EVERY op, not just `create` (finding
+    // `sidecar-suffix-guard-is-create-only`): a client can neither read nor delete an artifact's
+    // internal digest record, and the sidecar survives the refused delete. The same test carries
+    // the POSITIVE CONTROL (AGENTS.md) — the real artifact name still reaches `info` and `delete`,
+    // so the guard rejects the reserved name rather than breaking the ops. RED on the inverse (the
+    // pre-fix `info`/`delete`, which happily served and removed `k.sha256`).
+    #[test]
+    fn sidecar_names_are_neither_readable_nor_deletable_but_real_names_are() {
+        let (_d, store) = store();
+        let info = store.create("k", b"kernel").expect("create");
+        let sidecar = store.dir().join("k.sha256");
+        assert!(sidecar.is_file(), "the sidecar exists on disk");
+
+        assert!(
+            matches!(store.info("k.sha256"), Err(DaemonError::NotFound(_))),
+            "a sidecar must not be readable through the artifact API"
+        );
+        assert!(
+            matches!(store.delete("k.sha256"), Err(DaemonError::NotFound(_))),
+            "a sidecar must not be deletable through the artifact API"
+        );
+        assert!(sidecar.is_file(), "the refused delete left the sidecar");
+
+        // Positive control: the artifact's own name still reaches both ops.
+        assert_eq!(store.info("k").expect("info").sha256, info.sha256);
+        store.delete("k").expect("delete");
+        assert!(!store.exists("k"), "the real artifact deleted");
+    }
+
+    // A snapshot prefix directory (`Registry::snapshot` writes `<prefix>/`) is deletable, so a
+    // prefix the create-only snapshot guard now refuses to reuse can be freed (finding
+    // `snapshot-prefix-silent-reuse`). Residue check: the dir existed before, then is gone. RED on
+    // the inverse (the pre-fix `is_file()`-only delete, which 404s the prefix forever).
+    #[test]
+    fn delete_frees_a_snapshot_prefix_directory() {
+        let (_d, store) = store();
+        let prefix = store.dir().join("snap1");
+        std::fs::create_dir(&prefix).expect("mkdir");
+        std::fs::write(prefix.join("state.json"), b"{}").expect("snapshot file");
+        assert!(prefix.is_dir(), "prefix exists before delete");
+
+        store.delete("snap1").expect("delete frees the prefix");
+        assert!(
+            !prefix.exists(),
+            "prefix (and its contents) gone after delete"
+        );
+        assert!(
+            matches!(store.delete("snap1"), Err(DaemonError::NotFound(_))),
+            "a freed prefix is then absent"
+        );
     }
 
     // Delta 10 residue: delete removes the sidecar too — no orphaned digest survives.
