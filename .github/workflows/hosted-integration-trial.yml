@@ -1,0 +1,148 @@
+name: hosted-integration-trial
+
+# TEMPORARY, manual-only. Establishes, step by step and with evidence, how much of the
+# `test-integration` matrix a GitHub-HOSTED ubuntu runner can carry. Folded into ci.yml (or replaced
+# by a README statement of what must be run locally) once the answer is known; delete either way.
+#
+# What the probe run (hosted-kvm-probe, 2026-08-14, image ubuntu-24.04 20260810.271.1) already
+# established on ubuntu-24.04, so this workflow does not re-litigate it:
+#   /dev/kvm            present, root:kvm 0660 -> 0666 after the udev rule below      OK
+#   nested virt         kvm_intel.nested = Y                                          OK
+#   host shape          4 cores, 15 GiB RAM, 87 GiB free on /                         OK
+#   sudo / setcap       passwordless; setcap of the three caps + SETPCAP succeeds     OK
+#   systemd user scope  `systemd-run --user --scope -p Delegate=yes` runs             OK
+#   own cgroup          system.slice/hosted-compute-agent.service, NOT delegated      -> use the scope
+#   unshare -Urn        BLOCKED by apparmor_restrict_unprivileged_userns=1            same as the dev box
+#   filesystem          ext4 — NO reflink; the CoW/zygote path is the open question
+#   backends            only qemu present; CH/FC/virtiofsd must be installed
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  trial:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      VMCELL_SKIP_MANIFEST: ${{ github.workspace }}/target/vmcell-skip-manifest.txt
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with: { persist-credentials: false }
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
+        with: { tool: "cargo-nextest,just", fallback: none }
+
+      # The hosted image ships /dev/kvm as root:kvm 0660 and the runner user is not in `kvm`.
+      # The udev rule is the standard, documented fix; the assertion after it is the gate — without
+      # it a silent failure here would surface 40 minutes later as an unexplained boot failure.
+      - name: make /dev/kvm openable by this user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is still not openable by this user after the udev rule"
+            exit 1
+          fi
+
+      - name: system packages (README §1)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential flex bison bc libelf-dev libssl-dev \
+            pkg-config libseccomp-dev libcap-ng-dev libcap2-bin \
+            nftables qemu-system-x86
+
+      # Pinned + checksum-verified, exactly as the actionlint install in ci.yml: these binaries are
+      # spawned with capabilities on a machine that runs the test suite, so "latest" is not an option.
+      # Cloud Hypervisor and Firecracker both publish static x86_64 builds, which avoids the ~15-minute
+      # source builds the README's `cargo install` route would cost on a 4-core runner.
+      - name: install VMM backends (pinned, checksum-verified)
+        env:
+          CH_VERSION: "v53.0"
+          CH_SHA256: "448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc"
+          FC_VERSION: "v1.16.1"
+        run: |
+          set -euo pipefail
+          sudo curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+            -o /usr/local/bin/cloud-hypervisor \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
+          echo "${CH_SHA256}  /usr/local/bin/cloud-hypervisor" | sha256sum -c -
+          sudo chmod +x /usr/local/bin/cloud-hypervisor
+          cloud-hypervisor --version
+
+          # Firecracker publishes its own .sha256.txt beside the tarball — verify against that
+          # rather than a digest copied into this file, and fail loud if the file is missing.
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -O \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -O \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz.sha256.txt"
+          sha256sum -c "firecracker-${FC_VERSION}-x86_64.tgz.sha256.txt"
+          tar -xzf "firecracker-${FC_VERSION}-x86_64.tgz"
+          sudo install -m 0755 "release-${FC_VERSION}-x86_64/firecracker-${FC_VERSION}-x86_64" /usr/local/bin/firecracker
+          firecracker --version
+
+          # virtiofsd has no GitHub release; it is a small crate build (~2 min) and is version-pinned
+          # by --locked, unlike the README's unpinned `cargo install`.
+          cargo install virtiofsd --locked
+          virtiofsd --version
+
+      - name: record the CoW/reflink verdict for this filesystem
+        run: |
+          # The zygote + lineage batteries clone through reflink. / is ext4 here, which has none.
+          # Report it rather than discover it inside a test: this decides whether those batteries
+          # run, skip, or fall back to a full copy.
+          stat -f -c 'artifacts fs: %T' "${{ github.workspace }}" || true
+          truncate -s 1M /tmp/reflink-src
+          if cp --reflink=always /tmp/reflink-src /tmp/reflink-dst 2>/tmp/reflink.err; then
+            echo "REFLINK: supported"
+          else
+            echo "REFLINK: NOT supported -> $(cat /tmp/reflink.err)"
+          fi
+
+      - name: reset the run-scoped skip manifest
+        run: just skip-manifest-reset
+
+      # The long pole: compiles the pinned guest kernel with host `make` and builds the rootfs in a
+      # builder micro-VM. `--kernel-source host-make` is mandatory — the bare default silently
+      # substitutes a prebuilt vmlinux lacking CONFIG_KVM_INTEL/CONFIG_HW_RANDOM_VIRTIO and reddens
+      # nested_virt and snapshot_restore.
+      - name: build VM artifacts (host-make kernel + rootfs)
+        run: cargo run --locked -p vmcell-cli --bin vmcell -- build --kernel-source host-make
+
+      - name: unprivileged suite
+        run: just test-unprivileged
+
+      - name: bless the capability runner
+        run: just bless
+
+      # The hosted runner's own cgroup is NOT delegated, so the privileged and daemon suites run
+      # inside a transient delegated user scope — the same wrapper the maintainer's box uses, which
+      # the probe confirmed works here.
+      - name: privileged suite (inside a delegated scope)
+        run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-privileged
+
+      - name: daemon end-to-end suite (inside a delegated scope)
+        run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-daemon
+
+      - name: downstream example (live)
+        env:
+          VMCELL_ARTIFACTS_DIR: ${{ github.workspace }}/examples/downstream-kernel/target/vmcell-artifacts
+          VMCELL_ROOTFS: ${{ github.workspace }}/target/vmcell-artifacts/rootfs.erofs
+        run: cargo run --locked --bin downstream-kernel -- live
+        working-directory: examples/downstream-kernel
+
+      - name: surface the capability-skip manifest (count + contents)
+        if: always()
+        run: just skip-manifest-show
