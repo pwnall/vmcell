@@ -46,6 +46,11 @@ pub const DENIED_SYSCALLS: &[(&str, i64)] = &[
     ("finit_module", libc::SYS_finit_module),
     ("delete_module", libc::SYS_delete_module),
     ("ptrace", libc::SYS_ptrace),
+    // Both halves of the attach-to-another-process primitive. `process_vm_readv` was missing
+    // (docs/78 M15) while the design roster has carried it since v28; on the crosvm
+    // `Enforcing` path this list is the ONLY confinement (`--disable-sandbox`), so the read
+    // half was the one exfiltration primitive left open there.
+    ("process_vm_readv", libc::SYS_process_vm_readv),
     ("process_vm_writev", libc::SYS_process_vm_writev),
     ("bpf", libc::SYS_bpf),
     ("perf_event_open", libc::SYS_perf_event_open),
@@ -54,6 +59,12 @@ pub const DENIED_SYSCALLS: &[(&str, i64)] = &[
     ("request_key", libc::SYS_request_key),
     ("setns", libc::SYS_setns),
     ("unshare", libc::SYS_unshare),
+    // Deliberate additions BEYOND the §12.3 roster, kept (docs/78 M15) because they are
+    // dangerous-and-never-needed by a booting VMM in exactly the sense the roster entries are:
+    // `reboot` reboots/halts the HOST (a guest reboot is a VMM-internal transition, not this
+    // syscall), and `swapon`/`swapoff` reconfigure host swap. Recorded as a justified deviation
+    // in docs/implementation-notes.md; the design folds them into the roster at the next
+    // revision. Do not drop them to "match the doc" — widen the doc.
     ("reboot", libc::SYS_reboot),
     ("swapon", libc::SYS_swapon),
     ("swapoff", libc::SYS_swapoff),
@@ -183,6 +194,24 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Resul
     Ok(())
 }
 
+/// Flattens a [`seccompiler::Error`] to a bare errno, the only shape [`apply_jail`] may return
+/// from the forked child (docs/78 `apply-jail-error-path-allocates-post-fork`): rendering the
+/// error — `format!`, `io::Error::other`, `io::Error::new` — heap-allocates, and a child that
+/// grabs the allocator lock its parent held at `fork` deadlocks, so `create()` would HANG
+/// instead of failing. The two variants that carry an errno pass it through; the rest (an empty
+/// filter, a TSYNC pid, a backend compile bug) collapse to `EINVAL` — enough for the caller,
+/// which aborts the child either way, so the VMM never runs under partial hardening.
+///
+/// Async-signal-safe: a pure match, no allocation.
+fn seccomp_apply_errno(e: &seccompiler::Error) -> i32 {
+    match e {
+        seccompiler::Error::Prctl(io) | seccompiler::Error::Seccomp(io) => {
+            io.raw_os_error().unwrap_or(libc::EINVAL)
+        }
+        _ => libc::EINVAL,
+    }
+}
+
 /// Applies `spec` to the calling thread in the forked child, **pre-exec** — the only impure,
 /// async-signal-safe edge (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail) / §13, Cross-cutting invariants).
 ///
@@ -193,7 +222,9 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Resul
 ///
 /// # Errors
 /// Returns the first failed syscall's [`std::io::Error`]; the caller (`pre_exec`) aborts the
-/// child, so the VMM never starts under partial hardening.
+/// child, so the VMM never starts under partial hardening. Every error is a bare errno
+/// (`last_os_error`/`from_raw_os_error`, which store the code inline) — the error path is as
+/// allocation-free as the success path, because both run post-`fork`.
 pub fn apply_jail(spec: &JailSpec) -> std::io::Result<()> {
     if let Some(v) = spec.rlimit_core {
         set_rlimit(libc::RLIMIT_CORE, v)?;
@@ -235,9 +266,11 @@ pub fn apply_jail(spec: &JailSpec) -> std::io::Result<()> {
     if let Some(bpf) = &spec.seccomp {
         // seccompiler::apply_filter builds a stack `sock_fprog` from the already-allocated
         // BpfProgram and issues prctl(NO_NEW_PRIVS)+seccomp(SET_MODE_FILTER) — no allocation,
-        // async-signal-safe. Loaded last so the deny-list is active at execve.
+        // async-signal-safe. Loaded last so the deny-list is active at execve. The failure is
+        // flattened to a bare errno by `seccomp_apply_errno` (never rendered — rendering
+        // allocates, see its doc); `from_raw_os_error` stores the code inline.
         seccompiler::apply_filter(bpf)
-            .map_err(|e| std::io::Error::other(format!("seccomp apply: {e}")))?;
+            .map_err(|e| std::io::Error::from_raw_os_error(seccomp_apply_errno(&e)))?;
     }
     Ok(())
 }
@@ -250,8 +283,12 @@ mod tests {
     // to a non-empty BPF program. Pinned as an exact membership so the filter cannot silently
     // drift from design §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)) in either direction — dropping a syscall (e.g. `kexec_file_load`,
     // the file-based kexec variant that stays reachable if only `kexec_load` is blocked) OR
-    // adding an undocumented one reddens here. The behavioral "mount → EPERM" proof is the
-    // KVM-free stand-in integration test (tests/jail_hardening.rs).
+    // adding an undocumented one reddens here. The expected set is the §12.3 roster VERBATIM
+    // plus the three recorded carry-overs (`reboot`/`swapon`/`swapoff`, see the at-site
+    // rationale on the const and docs/implementation-notes.md) — this test pinned a copy that
+    // had silently DROPPED `process_vm_readv` (docs/78 M15), which is why the expected list is
+    // written out here from the design text rather than derived from the const. The behavioral
+    // "mount → EPERM" proof is the KVM-free stand-in integration test (tests/jail_hardening.rs).
     #[test]
     fn deny_list_is_exactly_the_documented_set_and_compiles() {
         use std::collections::BTreeSet;
@@ -265,6 +302,7 @@ mod tests {
             "finit_module",
             "delete_module",
             "ptrace",
+            "process_vm_readv",
             "process_vm_writev",
             "bpf",
             "perf_event_open",
@@ -321,5 +359,51 @@ mod tests {
 
         let noop = jail_spec_from_config(&JailConfig::disabled()).expect("disabled spec");
         assert!(noop.is_noop(), "the disabled jail must be a no-op");
+    }
+
+    // Guards the post-`fork` no-allocation contract of `apply_jail`'s ERROR path (docs/78
+    // `apply-jail-error-path-allocates-post-fork`, §12.3 Layer 2). `raw_os_error()` is `Some`
+    // exactly for an OS-repr `io::Error` — the only variant that carries no heap payload — so
+    // the inverse (`io::Error::other(format!(…))`, `io::Error::new(…, msg)`, or any rendered
+    // error) yields `None` and reddens both legs here. The seccomp arm is driven through the
+    // real `apply_jail` with an EMPTY filter: seccompiler rejects it BEFORE issuing any syscall
+    // (no `prctl`/`seccomp` side effect on the test process), so the leg is in-process,
+    // root-free and KVM-free.
+    #[test]
+    fn apply_jail_errors_are_bare_errnos_never_allocated_messages() {
+        // Both errno-carrying variants pass their code through unchanged…
+        assert_eq!(
+            seccomp_apply_errno(&seccompiler::Error::Prctl(
+                std::io::Error::from_raw_os_error(libc::EACCES)
+            )),
+            libc::EACCES
+        );
+        assert_eq!(
+            seccomp_apply_errno(&seccompiler::Error::Seccomp(
+                std::io::Error::from_raw_os_error(libc::ENOSYS)
+            )),
+            libc::ENOSYS
+        );
+        // …and the errno-less variants collapse to EINVAL rather than being rendered.
+        assert_eq!(
+            seccomp_apply_errno(&seccompiler::Error::EmptyFilter),
+            libc::EINVAL
+        );
+        assert_eq!(
+            seccomp_apply_errno(&seccompiler::Error::ThreadSync(4242)),
+            libc::EINVAL
+        );
+
+        let empty = JailSpec {
+            seccomp: Some(Arc::new(Vec::new())),
+            ..JailSpec::default()
+        };
+        let err = apply_jail(&empty).expect_err("an empty filter must fail the seccomp arm");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EINVAL),
+            "apply_jail must return a bare errno post-fork; a rendered/boxed error allocates \
+             and can deadlock the forked child against the parent's allocator lock"
+        );
     }
 }

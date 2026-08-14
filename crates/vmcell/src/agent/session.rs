@@ -54,8 +54,13 @@ fn encode_frame(msg: &Message) -> Result<::bytes::Bytes> {
 
 type FramedStream = Framed<ControlStream, LengthDelimitedCodec>;
 type FrameSink = SplitSink<FramedStream, ::bytes::Bytes>;
-/// `SessionId` → the sender feeding that session's [`Session::recv`] channel.
-type Registry = Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<SessionEvent>>>>;
+/// `SessionId` → the sender feeding that session's [`Session::recv`] channel, or
+/// `None` once the reader task's terminal step has **closed** the registry (M5).
+/// Closing is one critical section that both drops every live session sender (so
+/// a pending `recv()` wakes with `None` instead of hanging) and makes the closure
+/// observable to [`SessionMux::open`], which then returns the documented typed
+/// error rather than registering into a map nothing will ever read from.
+type Registry = Arc<Mutex<Option<HashMap<SessionId, mpsc::UnboundedSender<SessionEvent>>>>>;
 
 /// An output or terminal event delivered to a [`Session`] (§3, The control plane: vsock, the host clients, and the guest agent).
 ///
@@ -197,7 +202,7 @@ impl SessionMux {
     /// writer tasks. Shared by [`SessionMux::connect`] and the KVM-free demux test.
     fn from_framed(framed: FramedStream) -> Self {
         let (sink, stream) = framed.split();
-        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let registry: Registry = Arc::new(Mutex::new(Some(HashMap::new())));
         let (write_tx, write_rx) = mpsc::unbounded_channel();
         let reader = tokio::spawn(reader_task(stream, Arc::clone(&registry)));
         let writer = tokio::spawn(writer_task(sink, write_rx));
@@ -226,17 +231,33 @@ impl SessionMux {
         // over-cap spec (huge argv/env) fails loud with zero registry residue.
         let frame = encode_frame(&Message::OpenSession { session: id, spec })?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        self.registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, event_tx);
+        {
+            // M5: check-closed and insert in ONE critical section, against the
+            // same lock the reader's terminal step takes the registry through. A
+            // dead reader (peer close, decode desync) is therefore observable
+            // here and fails loud per the `# Errors` contract above; pre-fix the
+            // insert landed in an abandoned map and — because the writer task
+            // only dies on its NEXT transport failure — the `OpenSession` still
+            // enqueued, leaving `recv()`/`wait()` pending forever with no error.
+            let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(sessions) = reg.as_mut() else {
+                return Err(Error::Agent("session connection is closed".into()));
+            };
+            sessions.insert(id, event_tx);
+        }
         // Insert-before-send keeps the guest's first output routable; on a send
-        // failure remove the entry we just inserted so nothing is orphaned.
+        // failure remove the entry we just inserted so nothing is orphaned. (An
+        // open that races the reader's close instead has its sender dropped by
+        // that close, so its `recv()` yields `None` — never a hang.)
         if self.write_tx.send(frame).is_err() {
-            self.registry
+            if let Some(sessions) = self
+                .registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
+                .as_mut()
+            {
+                sessions.remove(&id);
+            }
             return Err(Error::Agent("session connection is closed".into()));
         }
         Ok(Session {
@@ -264,7 +285,17 @@ impl SessionMux {
         self.registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .len()
+            .as_ref()
+            .map_or(0, HashMap::len)
+    }
+
+    /// Test-only: await the reader task's completion, so the M5 gate can assert
+    /// on the state the reader's *terminal* step leaves behind (registry closed)
+    /// without racing it. Replaces the handle with a finished one so `Drop`'s
+    /// abort still has something to abort.
+    async fn await_reader_for_test(&mut self) {
+        let reader = std::mem::replace(&mut self.reader, tokio::spawn(async {}));
+        reader.await.expect("the reader task must not panic");
     }
 
     /// Test-only: deterministically kill the writer task so its `write_rx` is
@@ -401,7 +432,10 @@ impl Session {
 /// for an unknown/closed session — e.g. a stray frame after `SessionExit` (§13, Cross-cutting invariants).
 fn deliver(registry: &Registry, session: SessionId, ev: SessionEvent) {
     let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = reg.get(&session) {
+    // A closed registry (`None`, M5) routes nowhere — the same debug-drop as an
+    // unknown session, never a panic: only the reader task delivers, and it does
+    // so strictly before its own terminal close, so this arm is belt-and-braces.
+    if let Some(tx) = reg.as_ref().and_then(|sessions| sessions.get(&session)) {
         let _ = tx.send(ev);
     } else {
         tracing::debug!(
@@ -438,10 +472,10 @@ async fn reader_task(mut stream: SplitStream<FramedStream>, registry: Registry) 
             }
             Message::SessionExit { session, code } => {
                 deliver(&registry, session, SessionEvent::Exit(code));
-                registry
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&session);
+                if let Some(sessions) = registry.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+                {
+                    sessions.remove(&session);
+                }
             }
             // A late `Ready` (shouldn't occur — the handshake consumed the first)
             // is ignored; any other frame is a host→guest control frame the guest
@@ -450,9 +484,14 @@ async fn reader_task(mut stream: SplitStream<FramedStream>, registry: Registry) 
             other => tracing::warn!("session reader: unexpected guest frame {:?}", other),
         }
     }
-    // The connection ended: drop every session sender so pending `recv()`s wake
-    // with `None` rather than hanging.
-    registry.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // The connection ended: CLOSE the registry (M5) — one critical section that
+    // takes it to `None`. Dropping the map drops every session sender, so pending
+    // `recv()`s wake with `None` rather than hanging, AND the `None` is what a
+    // later `open()` sees, so it fails loud instead of handing back a session no
+    // frame can ever reach. A `clear()` did only the first half. The senders drop
+    // outside the lock, so a waking `recv()` never contends with the guard.
+    let closed = registry.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(closed);
 }
 
 /// The background writer task: serializes every host→guest frame onto the one
@@ -690,6 +729,90 @@ mod tests {
             0,
             "a failed open must leave no orphaned registry entry"
         );
+    }
+
+    /// M5 shared leg: `open()` on a mux whose reader has ended must fail loud with
+    /// the documented `Error::Agent`, promptly (the timeout turns a regression into
+    /// a RED test rather than a hung one) and with zero registry residue.
+    async fn assert_open_refused(mux: &SessionMux, what: &str) {
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            mux.open(SessionSpec::new(ExecRequest::new(vec!["a".into()]))),
+        )
+        .await
+        .expect("open must return promptly once the connection is closed")
+        .expect_err("open after the reader exited must fail loud, not hand back a hung session");
+        assert!(
+            matches!(err, Error::Agent(_)),
+            "open after {what} must be Error::Agent (the `# Errors` contract); got {err:?}"
+        );
+        assert_eq!(
+            mux.registry_len(),
+            0,
+            "a refused open must leave no registry entry"
+        );
+    }
+
+    // M5 (`sessionmux-open-after-reader-exit-hangs`), reader-exit path 1 — PEER
+    // CLOSE: after transport EOF, `open()` must fail loud, and a session opened
+    // BEFORE the close must wake from `recv()` with `None` instead of pending
+    // forever. RED on the pre-fix pair (reader terminal step `clear()`s instead of
+    // closing the registry; `open` inserts unconditionally): the writer task is
+    // still alive, so the `OpenSession` enqueues, `open` returns Ok, and the
+    // `expect_err` fires. KVM-free (UnixStream::pair).
+    #[tokio::test]
+    async fn open_after_peer_close_fails_loud_and_pending_recv_wakes() {
+        let (client_io, server_io) = UnixStream::pair().expect("unix pair");
+        let mut mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
+        let mut guest = Framed::new(server_io, codec());
+        let mut early = mux
+            .open(SessionSpec::new(ExecRequest::new(vec!["early".into()])))
+            .await
+            .expect("open while live");
+        // Drain the `OpenSession` frame BEFORE closing, so the writer task has
+        // flushed it and is parked on its channel — alive at the moment of the
+        // refused `open` below. That is the state the M5 hang needs (the writer
+        // dies only on its NEXT transport failure); closing with a frame still
+        // in flight would kill the writer too and make this gate pass vacuously
+        // through `open`'s send-failure branch.
+        let _ = guest.next().await.expect("open frame").expect("io");
+        drop(guest);
+        mux.await_reader_for_test().await;
+        assert!(
+            !mux.write_tx.is_closed(),
+            "the writer must still be alive — the M5 hang needs a live writer to enqueue into"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), early.recv())
+                .await
+                .expect("a pending recv must wake when the connection closes"),
+            None,
+            "a session live at connection close ends its stream, it does not hang"
+        );
+        assert_open_refused(&mux, "peer close").await;
+    }
+
+    // M5, reader-exit path 2 — DECODE DESYNC: a garbage frame breaks the reader out
+    // of its loop while the WRITER task is untouched and still alive, which is
+    // exactly why the pre-fix `open` happily enqueued a frame into an abandoned
+    // registry and left `recv()`/`wait()` pending forever. RED on the same inverse
+    // as the peer-close leg. KVM-free.
+    #[tokio::test]
+    async fn open_after_decode_desync_fails_loud() {
+        let (client_io, server_io) = UnixStream::pair().expect("unix pair");
+        let mut mux = SessionMux::from_framed(Framed::new(ControlStream::Unix(client_io), codec()));
+        let mut guest = Framed::new(server_io, codec());
+        // An unterminated postcard varint: never a decodable `Message`.
+        guest
+            .send(::bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]))
+            .await
+            .expect("guest send");
+        mux.await_reader_for_test().await;
+        assert!(
+            !mux.write_tx.is_closed(),
+            "the writer must still be alive — the M5 hang needs a live writer to enqueue into"
+        );
+        assert_open_refused(&mux, "a decode desync").await;
     }
 
     // session-open-orphan (send-failure branch): when the WRITER channel is closed

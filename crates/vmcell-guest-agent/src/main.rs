@@ -40,7 +40,7 @@ use rustix::mount::{
 use rustix::process::{WaitOptions, pivot_root, wait};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -849,7 +849,7 @@ fn serve_loop(
             Message::OpenSession { session, spec } => {
                 run_session(session, spec, writer, sessions, reaper);
             }
-            Message::Stdin { session, data } => route_stdin(sessions, session, &data),
+            Message::Stdin { session, data } => route_stdin(sessions, session, data),
             Message::StdinEof { session } => route_stdin_eof(sessions, session),
             Message::Winsize {
                 session,
@@ -876,14 +876,24 @@ fn serve_loop(
 /// Kills every still-open session's process group and drops its fds (§13, Cross-cutting invariants),
 /// invoked once the connection's dispatch loop has ended for any reason.
 fn teardown_sessions(sessions: &Sessions) {
-    let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
-    for (id, handle) in table.drain() {
+    // Drain under the lock, then kill and join OUTSIDE it: joining a stdin writer
+    // thread while holding the table lock would block every still-running waiter
+    // thread's own removal (M6).
+    let drained: Vec<(SessionId, SessionHandle)> = {
+        let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        table.drain().collect()
+    };
+    for (id, handle) in drained {
         tracing::info!(
             "vmcell-guest-agent: connection ending; killing session {:?} (pid {})",
             id,
             handle.pid
         );
+        // Kill first: the dead child releases the pipe read end / PTY slave, so a
+        // writer thread parked on a full stdin fails immediately (EPIPE/EIO) and
+        // the join below is prompt; `closing` bounds the residual case (M6).
         kill_group(handle.pid);
+        handle.shutdown_stdin();
     }
 }
 
@@ -1257,25 +1267,159 @@ fn handle_exec(
 /// writes to the child's stdin pipe (dropping it on `StdinEof` closes it → the
 /// child reads EOF); a PTY session writes to the pseudo-terminal master (bytes
 /// arrive as terminal input). The PTY master `Arc<OwnedFd>` is shared with
-/// [`SessionHandle::pty_master`] so `Stdin` and `Winsize` use the same fd.
+/// [`SessionHandle::pty_master`] so `Stdin` and `Winsize` use the same fd. Owned
+/// solely by the session's stdin writer thread (M6).
 enum StdinSink {
-    /// A pipe session's child-stdin write end.
-    Pipe(std::process::ChildStdin),
+    /// A pipe session's child-stdin write end (the `ChildStdin` taken as its raw
+    /// [`OwnedFd`], so both arms write through the one fd path below).
+    Pipe(OwnedFd),
     /// A PTY session's pseudo-terminal master.
     Pty(Arc<OwnedFd>),
 }
 
+impl StdinSink {
+    /// The fd this sink writes to. One accessor so `poll`+`write` always agree on
+    /// the target (one law, one predicate).
+    fn fd(&self) -> BorrowedFd<'_> {
+        match self {
+            StdinSink::Pipe(fd) => fd.as_fd(),
+            StdinSink::Pty(fd) => fd.as_fd(),
+        }
+    }
+}
+
+/// A queued host→guest stdin item for one session's writer thread (M6). `Eof`
+/// travels through the SAME queue as the bytes, so it closes the pipe only after
+/// everything queued ahead of it has been written — an out-of-band close would
+/// truncate the child's input.
+enum StdinItem {
+    /// Bytes from a `Stdin` frame.
+    Data(Vec<u8>),
+    /// The host's `StdinEof`.
+    Eof,
+}
+
+/// How long a session's stdin writer thread waits for its sink to accept bytes
+/// before re-checking [`SessionHandle::stdin_closing`] (M6). Long enough that a
+/// healthy stream costs one `poll` per chunk, short enough that connection
+/// teardown's join is bounded even when the child never drains its stdin.
+const STDIN_POLL_SLICE: Duration = Duration::from_millis(100);
+
+/// Per-`write(2)` cap on a session's stdin (M6). `PIPE_BUF`: the kernel reports a
+/// pipe writable only once a whole free page is available, so a chunk this size
+/// cannot block after `poll` said go, and a PTY master's terminal input queue is
+/// the same 4096 bytes.
+const STDIN_CHUNK_BYTES: usize = 4096;
+
 /// The live state of one interactive session, keyed by [`SessionId`] in the
 /// per-connection [`Sessions`] table.
 struct SessionHandle {
-    /// The stdin sink, or `None` once closed (pipe `StdinEof`) or never opened.
-    stdin: Arc<Mutex<Option<StdinSink>>>,
+    /// The queue feeding this session's stdin writer thread (M6). Unbounded and
+    /// fed only by the *trusted host's own* sessions (design §3, recorded trade
+    /// §17); `send` never blocks, so the dispatch loop can no longer be wedged by
+    /// a child that stopped reading its stdin.
+    stdin_tx: std::sync::mpsc::Sender<StdinItem>,
+    /// Set by [`SessionHandle::shutdown_stdin`] so a writer thread parked on a
+    /// full pipe or terminal gives up within one [`STDIN_POLL_SLICE`], making the
+    /// teardown join bounded.
+    stdin_closing: Arc<AtomicBool>,
+    /// The stdin writer thread, joined by teardown so no thread outlives the
+    /// connection that opened the session.
+    stdin_writer: JoinHandle<()>,
     /// The PTY master for `Winsize`, or `None` for a pipe session.
     pty_master: Option<Arc<OwnedFd>>,
     /// The child's process-group id (== its pid: `setsid` for a PTY session,
     /// `process_group(0)` for a pipe session), used by `CloseSession`/timeout/
     /// connection-teardown to `kill(-pgid)` the whole group.
     pid: u32,
+}
+
+impl SessionHandle {
+    /// Builds a session's handle, spawning the stdin writer thread that owns
+    /// `stdin` (M6). The one place a handle is constructed, so both the pipe and
+    /// the PTY path get the same stdin discipline.
+    fn new(
+        session: SessionId,
+        stdin: Option<StdinSink>,
+        pty_master: Option<Arc<OwnedFd>>,
+        pid: u32,
+    ) -> Self {
+        let (stdin_tx, stdin_rx) = std::sync::mpsc::channel();
+        let stdin_closing = Arc::new(AtomicBool::new(false));
+        let stdin_writer = spawn_stdin_writer(session, stdin, stdin_rx, Arc::clone(&stdin_closing));
+        Self {
+            stdin_tx,
+            stdin_closing,
+            stdin_writer,
+            pty_master,
+            pid,
+        }
+    }
+
+    /// Stops this session's stdin writer thread and joins it (M6) — the one place
+    /// that sequence lives. Flag it closing (a writer parked on a full pipe or
+    /// terminal gives up within one [`STDIN_POLL_SLICE`]), drop the queue's last
+    /// sender (so a drained writer's `recv` ends), then join so no thread leaks.
+    /// Callers `kill_group` first, which is what makes the pending write fail
+    /// immediately in the common case.
+    fn shutdown_stdin(self) {
+        self.stdin_closing.store(true, Ordering::Relaxed);
+        drop(self.stdin_tx);
+        if self.stdin_writer.join().is_err() {
+            // Not `unwrap`: a panicked writer thread must not take PID 1 with it.
+            tracing::warn!("vmcell-guest-agent: session stdin writer thread panicked");
+        }
+    }
+}
+
+/// Runs one session's stdin writer thread (M6): drains the queue and performs the
+/// blocking writes **off** the connection's dispatch loop. Pre-fix these writes
+/// were inline, so a child that stopped reading a full 64 KiB pipe blocked the
+/// whole connection — `CloseSession` was never dispatched and, on host
+/// disconnect, `serve_loop` never returned, so [`teardown_sessions`] (the
+/// connection-owns-its-sessions law, §13) never ran and the child outlived its
+/// connection.
+///
+/// Ends on a write failure (the child is gone), on `closing`, or when the last
+/// sender is dropped — never on a decode/lookup path, so it cannot panic PID 1.
+fn spawn_stdin_writer(
+    session: SessionId,
+    mut sink: Option<StdinSink>,
+    rx: std::sync::mpsc::Receiver<StdinItem>,
+    closing: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Ok(item) = rx.recv() {
+            match item {
+                StdinItem::Data(data) => {
+                    let Some(current) = sink.as_ref() else {
+                        // Stdin already closed by an earlier `StdinEof`: drop the
+                        // bytes, exactly as the pre-M6 `guard.as_mut()` no-op did.
+                        continue;
+                    };
+                    if let Err(e) = write_stdin_sink(current, &data, &closing) {
+                        tracing::debug!(
+                            "vmcell-guest-agent: stdin write to session {:?} failed: {}",
+                            session,
+                            e
+                        );
+                        break;
+                    }
+                }
+                // Pipe: drop the write end → the child reads EOF, but only now
+                // that every byte queued ahead of this item has been written. PTY:
+                // a no-op (closing the master would tear down output — a PTY
+                // caller ends input in-band).
+                StdinItem::Eof => {
+                    if matches!(sink, Some(StdinSink::Pipe(_))) {
+                        sink = None;
+                    }
+                }
+            }
+        }
+        // Dropping `sink` closes a pipe session's write end (the child reads EOF)
+        // and releases this thread's PTY-master `Arc` clone.
+    })
 }
 
 /// Maps a `rows`×`cols` window into the kernel [`Winsize`](rustix::termios::Winsize)
@@ -1328,13 +1472,19 @@ fn open_failed(writer: &Writer, session: SessionId, msg: &str) {
 /// host is authoritative and monotonic, so this should not happen) kills the
 /// displaced session rather than leaking it.
 fn register_session(sessions: &Sessions, id: SessionId, handle: SessionHandle) {
-    let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = table.insert(id, handle) {
+    // Insert under the lock; kill + join the displaced session's stdin writer
+    // outside it, the same order teardown uses (M6).
+    let displaced = {
+        let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        table.insert(id, handle)
+    };
+    if let Some(old) = displaced {
         tracing::warn!(
             "vmcell-guest-agent: session id {:?} reused; killing the displaced session",
             id
         );
         kill_group(old.pid);
+        old.shutdown_stdin();
     }
 }
 
@@ -1468,11 +1618,9 @@ fn run_pipe_session(
     register_session(
         sessions,
         session,
-        SessionHandle {
-            stdin: Arc::new(Mutex::new(stdin.map(StdinSink::Pipe))),
-            pty_master: None,
-            pid,
-        },
+        // The `ChildStdin` becomes a bare `OwnedFd` owned by the session's stdin
+        // writer thread (M6) — one fd write path for both sink kinds.
+        SessionHandle::new(session, stdin.map(|s| StdinSink::Pipe(s.into())), None, pid),
     );
 
     let out = spawn_pump(stdout, Arc::clone(writer), move |data| {
@@ -1606,11 +1754,12 @@ fn run_pty_session(
     register_session(
         sessions,
         session,
-        SessionHandle {
-            stdin: Arc::new(Mutex::new(Some(StdinSink::Pty(Arc::clone(&master_arc))))),
-            pty_master: Some(Arc::clone(&master_arc)),
+        SessionHandle::new(
+            session,
+            Some(StdinSink::Pty(Arc::clone(&master_arc))),
+            Some(Arc::clone(&master_arc)),
             pid,
-        },
+        ),
     );
 
     let pump = spawn_pump(master_read, Arc::clone(writer), move |data| {
@@ -1629,73 +1778,121 @@ fn run_pty_session(
     );
 }
 
-/// Writes `data` to a session's stdin sink, looping partial writes (B10: counts
-/// are handled).
-fn write_stdin_sink(sink: &mut StdinSink, data: &[u8]) -> std::io::Result<()> {
-    match sink {
-        StdinSink::Pipe(w) => w.write_all(data),
-        StdinSink::Pty(fd) => write_all_fd(fd, data),
+/// Waits (bounded by [`STDIN_POLL_SLICE`]) for a stdin sink to accept bytes.
+/// `Ok(false)` is "not yet" — the caller loops and re-checks its `closing` flag.
+/// Any `revents` at all is a go-ahead: `POLLOUT` means room, and
+/// `POLLERR`/`POLLHUP` (the reader is gone) means the `write(2)` below fails loud
+/// with the real errno instead of spinning here.
+fn stdin_sink_ready(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
+    use rustix::event::{PollFd, PollFlags};
+
+    let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+    let timeout = poll_timeout(STDIN_POLL_SLICE);
+    match rustix::event::poll(&mut fds, Some(&timeout)) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(true),
+        Err(rustix::io::Errno::INTR) => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
-/// `write(2)`s all of `data` to a fd, looping short writes and retrying `EINTR`.
-fn write_all_fd(fd: &OwnedFd, mut data: &[u8]) -> std::io::Result<()> {
+/// Writes all of `data` to a session's stdin sink from that session's own writer
+/// thread (M6), never blocking indefinitely: each pass re-checks `closing`, waits
+/// for the sink to accept bytes, then writes at most [`STDIN_CHUNK_BYTES`].
+/// Partial writes are looped and `EINTR`/`EAGAIN` retried (B10: counts are
+/// handled). Fails once the sink is gone (`EPIPE` on a pipe whose child died,
+/// `EIO` on a PTY master whose slave closed) or the session is tearing down, so
+/// the writer thread ends instead of pinning a dead fd.
+///
+/// Poll-and-chunk rather than `O_NONBLOCK`: a PTY session's output pump reads a
+/// `try_clone` of the same master, which shares the open file description — so
+/// setting `O_NONBLOCK` here would turn every pump read into `EAGAIN` and
+/// silently kill the session's output. Polling gives the same bounded wait
+/// without touching the fd's status flags.
+fn write_stdin_sink(
+    sink: &StdinSink,
+    mut data: &[u8],
+    closing: &AtomicBool,
+) -> std::io::Result<()> {
+    let fd = sink.fd();
     while !data.is_empty() {
-        match rustix::io::write(fd, data) {
+        if closing.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session stdin closing",
+            ));
+        }
+        if !stdin_sink_ready(fd)? {
+            continue;
+        }
+        let chunk = data
+            .get(..data.len().min(STDIN_CHUNK_BYTES))
+            .unwrap_or_default();
+        match rustix::io::write(fd, chunk) {
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => data = data.get(n..).unwrap_or_default(),
-            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
             Err(e) => return Err(e.into()),
         }
     }
     Ok(())
 }
 
-/// Routes a `Stdin` frame to its session (§3, The control plane: vsock, the host clients, and the guest agent). Clones the session's
-/// stdin `Arc` and releases the table lock before writing, so a blocked write
-/// never stalls the dispatch loop. A frame for an unknown/closed session is
-/// dropped at debug — the session simply already ended.
-fn route_stdin(sessions: &Sessions, session: SessionId, data: &[u8]) {
-    let stdin = {
-        let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
-        match table.get(&session) {
-            Some(h) => Arc::clone(&h.stdin),
-            None => {
-                tracing::debug!(
-                    "vmcell-guest-agent: stdin for unknown/closed session {:?}; dropping {} bytes",
-                    session,
-                    data.len()
-                );
-                return;
-            }
+/// Looks up a session's stdin queue, releasing the table lock before returning it
+/// (M6). A frame for an unknown/closed session is dropped at debug — the session
+/// simply already ended.
+fn session_stdin_queue(
+    sessions: &Sessions,
+    session: SessionId,
+) -> Option<std::sync::mpsc::Sender<StdinItem>> {
+    let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    match table.get(&session) {
+        Some(h) => Some(h.stdin_tx.clone()),
+        None => {
+            tracing::debug!(
+                "vmcell-guest-agent: stdin frame for unknown/closed session {:?}; dropping",
+                session
+            );
+            None
         }
+    }
+}
+
+/// Routes a `Stdin` frame to its session (§3, The control plane: vsock, the host clients, and the guest agent). ENQUEUES the bytes on
+/// the session's stdin queue and returns immediately (M6): the blocking write
+/// happens on that session's writer thread, so a child that stopped reading its
+/// stdin can no longer stall the dispatch loop — and with it `CloseSession` and
+/// the connection-owns-its-sessions teardown (§13).
+fn route_stdin(sessions: &Sessions, session: SessionId, data: Vec<u8>) {
+    let Some(tx) = session_stdin_queue(sessions, session) else {
+        return;
     };
-    let mut guard = stdin.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(sink) = guard.as_mut()
-        && let Err(e) = write_stdin_sink(sink, data)
-    {
+    // Never a silent drop: the only failure is a writer thread that has already
+    // ended (its sink died), which is the same condition the pre-M6 inline write
+    // reported at debug.
+    if tx.send(StdinItem::Data(data)).is_err() {
         tracing::debug!(
-            "vmcell-guest-agent: stdin write to session {:?} failed: {}",
-            session,
-            e
+            "vmcell-guest-agent: stdin queue for session {:?} is closed; dropping",
+            session
         );
     }
 }
 
 /// Routes a `StdinEof` frame (§3, The control plane: vsock, the host clients, and the guest agent): closes a **pipe** session's stdin
-/// (dropping the `ChildStdin` → the child reads EOF); a no-op for a PTY session
+/// (dropping the write end → the child reads EOF); a no-op for a PTY session
 /// (closing the master would tear down output — a PTY caller ends input in-band).
+/// Sequenced through the SAME queue as the bytes (M6), so the pipe closes only
+/// after everything already queued has been written — an out-of-band close would
+/// truncate the child's input.
 fn route_stdin_eof(sessions: &Sessions, session: SessionId) {
-    let stdin = {
-        let table = sessions.lock().unwrap_or_else(|e| e.into_inner());
-        match table.get(&session) {
-            Some(h) => Arc::clone(&h.stdin),
-            None => return,
-        }
+    let Some(tx) = session_stdin_queue(sessions, session) else {
+        return;
     };
-    let mut guard = stdin.lock().unwrap_or_else(|e| e.into_inner());
-    if matches!(guard.as_ref(), Some(StdinSink::Pipe(_))) {
-        *guard = None;
+    if tx.send(StdinItem::Eof).is_err() {
+        tracing::debug!(
+            "vmcell-guest-agent: stdin queue for session {:?} is closed; EOF is already implied",
+            session
+        );
     }
 }
 
@@ -2122,5 +2319,109 @@ mod tests {
             "session frame must round-trip through the codec"
         );
         assert!(src.is_empty(), "codec must consume exactly one guest frame");
+    }
+
+    /// Registers a live session handle over `sink` in a fresh table, for the M6
+    /// stdin-queue gates. `pid` is 0 — these tests never take the kill/teardown
+    /// path, so no signal is ever sent.
+    fn stdin_test_session(sink: StdinSink) -> (Sessions, SessionId) {
+        let id = SessionId(0);
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .unwrap()
+            .insert(id, SessionHandle::new(id, Some(sink), None, 0));
+        (sessions, id)
+    }
+
+    // M6 (`guest-dispatch-blocking-stdin-wedge`), KVM-free half of the gate: the
+    // DISPATCH side of a session's stdin must never block, and `StdinEof` must be
+    // sequenced through the same queue as the bytes.
+    //
+    // (1) 128 KiB — twice a full pipe — is routed at a child that is not reading;
+    //     `route_stdin`/`route_stdin_eof` must still return promptly. RED on the
+    //     pre-fix inline `write_all`: the routing thread parks on the full pipe,
+    //     the 5 s wait elapses and the assert fires (the live legs in
+    //     crates/vmcell/tests/session.rs cover the consequences — an undispatched
+    //     `CloseSession` and the skipped C3 teardown).
+    // (2) Only THEN is the pipe drained: every queued byte must arrive, in order,
+    //     before EOF. RED if `StdinEof` closed the sink out of band (a short read)
+    //     or if a post-EOF write were still delivered (a long read).
+    #[test]
+    fn route_stdin_does_not_block_on_a_full_pipe_and_eof_follows_every_byte() {
+        let (mut reader, writer) = std::io::pipe().expect("pipe");
+        let (sessions, id) = stdin_test_session(StdinSink::Pipe(writer.into()));
+
+        const N: usize = 128 * 1024;
+        let payload: Vec<u8> = (0..N).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let routed = std::thread::spawn(move || {
+            route_stdin(&sessions, id, payload);
+            route_stdin_eof(&sessions, id);
+            // A write after EOF: the writer drops it (stdin is closed) — it must
+            // never reach the child, and must not panic the thread.
+            route_stdin(&sessions, id, b"AFTER-EOF".to_vec());
+            // Drop the table (and with it the handle's queue sender) so the writer
+            // thread ends once drained; the JoinHandle inside it is detached here,
+            // exactly as it is when a session's waiter removes its own entry.
+            done_tx.send(()).expect("signal");
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("routing a full pipe's worth of stdin must NOT block the dispatch loop (M6)");
+        routed.join().expect("routing thread");
+
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("read to EOF");
+        assert_eq!(
+            got.len(),
+            N,
+            "every queued byte must be written before StdinEof closes the pipe, and no post-EOF byte after it"
+        );
+        assert_eq!(got, expected, "the streamed bytes must arrive verbatim");
+    }
+
+    // M6: a stdin writer parked on a full pipe must give up once its session is
+    // flagged closing, so `SessionHandle::shutdown_stdin`'s join — run by
+    // `teardown_sessions` for every still-open session — is BOUNDED. RED on the
+    // inverse (drop the `closing` check in `write_stdin_sink`): the thread stays
+    // parked on the pipe forever and the `is_finished` assert fires (5 s), instead
+    // of hanging teardown. `_reader` stays alive throughout: dropping it would
+    // EPIPE the write and make the gate vacuous.
+    #[test]
+    fn stdin_writer_gives_up_on_closing_so_teardown_join_is_bounded() {
+        let (_reader, writer) = std::io::pipe().expect("pipe");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closing = Arc::new(AtomicBool::new(false));
+        let thread = spawn_stdin_writer(
+            SessionId(3),
+            Some(StdinSink::Pipe(writer.into())),
+            rx,
+            Arc::clone(&closing),
+        );
+
+        // 512 KiB at a reader that never reads: the writer parks on the full pipe.
+        tx.send(StdinItem::Data(vec![7u8; 512 * 1024]))
+            .expect("queue stdin");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !thread.is_finished(),
+            "the writer must actually be parked on the full pipe, or this gate is vacuous"
+        );
+
+        // The teardown sequence, minus the blocking join (so a regression reddens
+        // rather than hangs): flag closing, drop the last queue sender.
+        closing.store(true, Ordering::Relaxed);
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            thread.is_finished(),
+            "a writer parked on a full stdin must give up within one STDIN_POLL_SLICE of `closing`"
+        );
+        thread.join().expect("writer thread");
     }
 }

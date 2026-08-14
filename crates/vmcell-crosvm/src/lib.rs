@@ -107,6 +107,83 @@ pub struct CrosvmInstance {
     // `snapshot()` reads. Always false for a crosvm VM (create() rejects shares/unpriv-net), but kept
     // as defense-in-depth so a future config path can't slip an ineligible VM past `snapshot()`.
     has_vhost_user_device: bool,
+    // Whether the backend advertises snapshot/restore, captured from `capabilities()` at spawn so
+    // `snapshot()` can self-guard without a handle to the backend (M-RESTORE-3, the CH shape).
+    snapshot_restore_capable: bool,
+}
+
+/// Pre-flight self-checks for the [`CrosvmInstance::snapshot`] path.
+///
+/// `snapshot()` runs on the instance, which has no handle to the backend, so the `snapshot_restore`
+/// capability is captured at spawn and re-checked here (M-RESTORE-3) alongside the
+/// snapshot-eligibility law: a VM carrying a vhost-user device cannot be snapshotted. Factored as a
+/// free function — the same shape Cloud Hypervisor ships (`snapshot_precheck`), not a second idiom —
+/// so a KVM-free test can drive the false branch a live matrix can never reach (crosvm's descriptor
+/// is `snapshot_restore: true`).
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] if the backend does not advertise `snapshot_restore`, or if the VM
+/// has a vhost-user device attached.
+fn snapshot_precheck(snapshot_restore_capable: bool, has_vhost_user: bool) -> Result<()> {
+    if !snapshot_restore_capable {
+        return Err(Error::Unsupported {
+            vmm: "crosvm".to_string(),
+            feature: "snapshot_restore".to_string(),
+        });
+    }
+    if has_vhost_user {
+        return Err(Error::Unsupported {
+            vmm: "crosvm".to_string(),
+            feature: "snapshot with a vhost-user device (virtio-fs share or unprivileged net)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a per-disk `io_limit`: crosvm's `--block` has no bandwidth/iops key (capability
+/// `disk_io_throttle` is honest-false), so a throttled disk would otherwise be attached
+/// **unthrottled** — an accepted input silently dropped.
+///
+/// One predicate shared by `create()` **and** `restore()`. M4: `restore()` used to accept exactly
+/// what `create()` rejects (the restore run args are built by the same `build_crosvm_run_args`,
+/// which has nowhere to put the limit), so a snapshot lineage could be restored with the throttle
+/// quietly gone. The feature string matches the `VmmCapabilities` field name (N-VMM-1).
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] if any extra disk carries an `io_limit`.
+fn reject_disk_io_throttle(cfg: &VmConfig) -> Result<()> {
+    if cfg.extra_disks.iter().any(|d| d.io_limit.is_some()) {
+        return Err(Error::Unsupported {
+            vmm: "crosvm".to_string(),
+            feature: "disk_io_throttle".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The [`JailConfig`](vmcell::config::JailConfig) actually handed to
+/// [`apply_jail`](vmcell::vmm::jail::apply_jail) for a crosvm launch — the pure, total mapping from
+/// the requested `(cfg.jail, cfg.vmm_seccomp)` pair to the Layer-2 posture that ships.
+///
+/// Sandbox posture (§12.2, validated live): crosvm ALWAYS runs `--disable-sandbox` (from
+/// `vmm_seccomp_args`) because its own multiprocess minijail (`pivot_root` into `/var/empty` +
+/// per-device child forking) is incompatible with the single-process supervision model. The Layer-2
+/// jailer deny-list is therefore crosvm's **only** seccomp confinement, so `Enforcing` turns it ON
+/// no matter what `cfg.jail` asked for (the backend is NEVER unconfined by default — the seccomp.rs
+/// invariant), and `Disabled` — the loud opt-out — leaves `cfg.jail.seccomp_deny_list` exactly as
+/// configured (it never forces the deny-list *off*, so an operator who asked for Layer 2 keeps it).
+/// `Log` never reaches here: `vmm_seccomp_args` typed-refuses it for crosvm first.
+///
+/// Pure (a `Copy` in, a `Copy` out) so a KVM-free test can pin BOTH directions. M10: this flip lived
+/// inline in `spawn` and deleting it left every KVM-free gate *and* the whole live `test-crosvm`
+/// matrix green while crosvm ran with no seccomp filter at all.
+fn effective_jail_config(cfg: &VmConfig) -> vmcell::config::JailConfig {
+    let mut jail = cfg.jail; // JailConfig is Copy
+    if matches!(cfg.vmm_seccomp, vmcell::config::VmmSeccomp::Enforcing) {
+        jail.seccomp_deny_list = true;
+    }
+    jail
 }
 
 /// The crosvm snapshot artifact inside the caller's snapshot dir (`crosvm snapshot take <path>`).
@@ -120,8 +197,10 @@ const SNAPSHOT_FILE: &str = "crosvm-snapshot";
 /// AF_VSOCK needs only the CID, not a host UDS path). Decimal text; no serde (this crate carries none).
 const HOST_CID_SIDECAR: &str = "crosvm-host-cid.txt";
 
-/// The crosvm capability descriptor, exposed as a free function so both [`Crosvm::capabilities`] and
-/// the instance-level `snapshot()`/`restore()` self-guards consult the **same** source of truth.
+/// The crosvm capability descriptor, exposed as a free function so [`Crosvm::capabilities`], the
+/// `restore()` self-guard (which reads it through `capabilities()`), and the instance-level
+/// `snapshot()` self-guard (which reads the `snapshot_restore` bool captured from it at spawn) all
+/// consult the **same** source of truth.
 ///
 /// Each field is the **empirically validated** value (matrix + arg-builder tests). Flipping any of the
 /// remaining `false`s to `true` re-validates against a pinned crosvm build (AGENTS.md rule 5) and
@@ -283,7 +362,8 @@ fn build_crosvm_run_args(
 
     // Extra virtio-blk devices (§4.6), attached AFTER the root disk so they enumerate `/dev/vdb`,
     // `/dev/vdc`, … in order and never displace `/dev/vda`. Per-disk I/O throttling (`io_limit`)
-    // has no crosvm CLI equivalent and is rejected fail-loud in create(), so it is absent here.
+    // has no crosvm CLI equivalent and is rejected fail-loud by `reject_disk_io_throttle` on BOTH
+    // the create and the restore path (M4), so it is absent here.
     for disk in &cfg.extra_disks {
         args.push("--block".to_string());
         if disk.readonly {
@@ -338,21 +418,14 @@ impl Crosvm {
 
         let cmdline = vmcell::config::build_kernel_cmdline(cfg, res, "")?;
 
-        // Sandbox posture (§12.2, validated live): crosvm ALWAYS runs `--disable-sandbox` (from
-        // `vmm_seccomp_args`) because its own multiprocess minijail (`pivot_root` into `/var/empty`
-        // + per-device child forking) is incompatible with the single-process supervision model.
-        // Its seccomp confinement therefore comes from the Layer-2 jailer deny-list instead: turn it
-        // ON for `Enforcing` (so the backend is NEVER unconfined by default — the seccomp.rs
-        // invariant) and leave `cfg.jail`'s setting untouched for `Disabled` (the loud opt-out). This
-        // is the one backend whose confinement is Layer-2 rather than its own filter, and it is the
+        // Sandbox posture (§12.2, validated live): the argv half is always `--disable-sandbox`, and
+        // the confinement half is the Layer-2 deny-list `effective_jail_config` turns on — crosvm is
+        // the one backend whose confinement is Layer 2 rather than its own filter, and it is the
         // per-backend deny-list enablement the deny-list was designed for (validated: crosvm boots +
-        // execs + does tap/netns networking under the deny-list).
+        // execs + does tap/netns networking under the deny-list). The mapping is pure and pinned
+        // KVM-free in both directions (M10) rather than open-coded here.
         let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("crosvm", cfg.vmm_seccomp)?;
-        let mut jail_cfg = cfg.jail; // JailConfig is Copy
-        if matches!(cfg.vmm_seccomp, vmcell::config::VmmSeccomp::Enforcing) {
-            jail_cfg.seccomp_deny_list = true;
-        }
-        let jail = vmcell::vmm::jail::jail_spec_from_config(&jail_cfg)?;
+        let jail = vmcell::vmm::jail::jail_spec_from_config(&effective_jail_config(cfg))?;
         let run_args = build_crosvm_run_args(
             cfg,
             res,
@@ -403,6 +476,9 @@ impl Crosvm {
             // A restore-spawned instance is returned paused; its first `resume()` must be `--full`.
             restored: restore_from.is_some(),
             has_vhost_user_device: vmcell::vmm::config_has_vhost_user_device(cfg, res),
+            // Captured from the ONE descriptor so `snapshot()` self-guards on the same source of
+            // truth `capabilities()` reports (M-RESTORE-3).
+            snapshot_restore_capable: self.capabilities().snapshot_restore,
         })
     }
 }
@@ -447,14 +523,8 @@ impl Vmm for Crosvm {
         }
         // Per-disk I/O throttling has no crosvm CLI equivalent (capability `disk_io_throttle` is
         // false); reject a throttled disk fail-loud rather than silently drop the limit
-        // (honor-or-reject accepted input). The feature string matches the VmmCapabilities field
-        // name (N-VMM-1) so a caller matching feature strings sees one consistent spelling.
-        if cfg.extra_disks.iter().any(|d| d.io_limit.is_some()) {
-            return Err(Error::Unsupported {
-                vmm: "crosvm".to_string(),
-                feature: "disk_io_throttle".to_string(),
-            });
-        }
+        // (honor-or-reject accepted input). The one predicate `restore()` shares (M4).
+        reject_disk_io_throttle(cfg)?;
         // vmcell always launches crosvm with `--no-usb` (the xhci controller is not `Suspendable`,
         // §2.5), so there is no bus to attach a host device to. Refuse through the ONE shared
         // predicate rather than silently ignoring the accepted input.
@@ -470,7 +540,23 @@ impl Vmm for Crosvm {
         res: &PerVmResources,
         cgroups: &dyn vmcell::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // VMM-5 / M-RESTORE-3: self-check the capability descriptor instead of assuming crosvm
+        // semantics — the same shape CH and FC ship. crosvm's descriptor says `snapshot_restore:
+        // true` today, so this branch is only reachable via a deliberate re-gate; the KVM-free
+        // `snapshot_precheck` test drives the equivalent false branch on the snapshot side.
+        if !self.capabilities().snapshot_restore {
+            return Err(Error::Unsupported {
+                vmm: "crosvm".to_string(),
+                feature: "snapshot_restore".to_string(),
+            });
+        }
         vmcell::vmm::reject_unsupported_console("crosvm", &self.capabilities(), cfg.console_mode)?;
+
+        // M4: `restore()` must refuse exactly what `create()` refuses — the restore run args come
+        // from the same `build_crosvm_run_args`, which has nowhere to put an `io_limit`, so an
+        // unguarded restore would silently attach the throttled disk unthrottled. One predicate,
+        // both paths.
+        reject_disk_io_throttle(cfg)?;
 
         // Eligibility (S1, §8.1), defense in depth alongside `config::build()`, the orchestrator
         // re-check, and `check_clone_eligible`. crosvm has no external vhost-user devices, so a share
@@ -645,16 +731,12 @@ impl VmInstance for CrosvmInstance {
     }
 
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
-        // Eligibility (S1, §8.1) — the authoritative snapshot-time guard. crosvm has no external
-        // vhost-user devices and rejects shares/unprivileged net at create, so this holds by
-        // construction; kept as defense in depth (mirrors the QEMU/FC snapshot guards).
-        if self.has_vhost_user_device {
-            return Err(Error::Unsupported {
-                vmm: "crosvm".to_string(),
-                feature: "snapshot with a vhost-user device (virtio-fs share or unprivileged net)"
-                    .to_string(),
-            });
-        }
+        // M-RESTORE-3: self-check the `snapshot_restore` capability (captured from the backend
+        // descriptor at spawn) before doing any work, and enforce the S1 snapshot-eligibility law —
+        // refuse to snapshot a VM with a vhost-user device attached. crosvm has no external
+        // vhost-user devices and rejects shares/unprivileged net at create, so the second half holds
+        // by construction; both are kept as defense in depth (mirrors CH's `snapshot_precheck`).
+        snapshot_precheck(self.snapshot_restore_capable, self.has_vhost_user_device)?;
         // Full-suspend (crosvm requires all devices asleep to snapshot) → `snapshot take` → persist
         // the baked-CID sidecar → resume the source. Mirrors the QEMU stop→migrate→cont / CH-FC
         // pause→snapshot→resume order; the orchestrator's `MicroVm::snapshot` invalidates the cached
@@ -871,9 +953,14 @@ mod tests {
         );
     }
 
-    // The restore path threads `--restore <snapshot>` into the SAME run args (fresh `res` → rotated
-    // `--vsock cid=`), still ending with the kernel positional. Inverse: dropping `--restore`, or
-    // emitting it after the kernel, reddens.
+    // The restore path threads `--restore <snapshot>` into the SAME run args, still ending with the
+    // kernel positional, and programs `--vsock cid=` from the `guest_cid` PARAMETER — which
+    // `restore()` fills from the snapshot's BAKED CID sidecar, never from `res.guest_cid` (crosvm
+    // rejects a rotated CID: "Virtio vsock incorrect cid for restore"; `restore_rotates_host_paths`
+    // is false — the Firecracker pattern). The `7` below is that baked value, deliberately different
+    // from `test_res().guest_cid` (3) so the assertion pins the parameter flow rather than passing
+    // vacuously off the fresh `res`. Inverse: dropping `--restore`, emitting it after the kernel, or
+    // sourcing the CID from `res` instead of the parameter reddens.
     #[test]
     fn crosvm_run_args_restore_emits_restore_flag() {
         let cfg = erofs_cfg();
@@ -893,10 +980,10 @@ mod tests {
             .position(|a| a == "--restore")
             .expect("restore must pass --restore");
         assert_eq!(args[restore_idx + 1], "/snap/crosvm-snapshot");
-        // The rotated CID rides `--vsock cid=<res.guest_cid>` — restore rotates the host-global CID.
+        // The baked CID rides `--vsock cid=<guest_cid param>`; `res.guest_cid` (3) must NOT leak in.
         assert!(
             args.iter().any(|a| a == "cid=7"),
-            "restore must program the fresh guest CID on --vsock"
+            "restore must program the snapshot's baked guest CID on --vsock, not res.guest_cid"
         );
         assert_eq!(
             args.last().map(String::as_str),
@@ -1040,6 +1127,155 @@ mod tests {
         assert!(
             matches!(&err, Error::Vmm(msg) if msg.contains("snapshot artifact") && msg.contains("missing")),
             "expected a missing-snapshot-artifact Vmm error, got {err:?}"
+        );
+    }
+
+    // Guards M10 — crosvm's ONLY seccomp confinement. crosvm always runs `--disable-sandbox`, so the
+    // Layer-2 deny-list is the whole filter, and the `Enforcing → seccomp_deny_list = true` flip used
+    // to live inline in `spawn` where deleting it left every KVM-free gate AND the entire live
+    // `test-crosvm` matrix green (a silently unconfined VMM). Pins BOTH directions of the pure
+    // mapping. KVM-free. Inverse: dropping the flip reddens the Enforcing assertion; force-clearing
+    // the flag on `Disabled` reddens the operator-opt-in assertion; touching any other jail field
+    // reddens the totality assertion.
+    #[test]
+    fn effective_jail_config_turns_the_deny_list_on_only_for_enforcing() {
+        use vmcell::config::{JailConfig, VmmSeccomp};
+
+        let cfg = |seccomp: VmmSeccomp, jail: JailConfig| {
+            VmConfig::builder(
+                "/boot/vmlinux",
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/img/rootfs.erofs"),
+                },
+            )
+            .vmm_seccomp(seccomp)
+            .jail(jail)
+            .build()
+            .expect("build config")
+        };
+
+        // Enforcing: the deny-list is turned ON even though `hardened()` ships it off — this IS
+        // crosvm's seccomp filter, so `Enforcing` may never leave the VMM unconfined.
+        let hardened = JailConfig::hardened();
+        assert!(
+            !hardened.seccomp_deny_list,
+            "precondition: the hardened default ships the deny-list OFF (the other backends carry \
+             their own native filter)"
+        );
+        let enforcing = effective_jail_config(&cfg(VmmSeccomp::Enforcing, hardened));
+        assert!(
+            enforcing.seccomp_deny_list,
+            "crosvm Enforcing must turn the Layer-2 deny-list ON: --disable-sandbox is always \
+             passed, so without it the VMM runs with NO seccomp filter at all"
+        );
+
+        // Disabled (the loud opt-out): the requested posture is passed through untouched — off stays
+        // off …
+        let disabled = effective_jail_config(&cfg(VmmSeccomp::Disabled, hardened));
+        assert!(
+            !disabled.seccomp_deny_list,
+            "crosvm Disabled must not silently re-enable the deny-list — the opt-out is deliberate"
+        );
+        // … and an operator who explicitly asked for Layer 2 keeps it (the flip is one-way).
+        let mut opted_in = JailConfig::hardened();
+        opted_in.seccomp_deny_list = true;
+        assert!(
+            effective_jail_config(&cfg(VmmSeccomp::Disabled, opted_in)).seccomp_deny_list,
+            "an explicitly requested deny-list must survive VmmSeccomp::Disabled"
+        );
+
+        // Totality: `seccomp_deny_list` is the ONLY field the mapping touches, so the rest of the
+        // operator's jail posture reaches `apply_jail` verbatim.
+        let mut expected = hardened;
+        expected.seccomp_deny_list = true;
+        assert_eq!(
+            enforcing, expected,
+            "effective_jail_config must change seccomp_deny_list and nothing else"
+        );
+    }
+
+    // Guards the B3 capability self-guard crosvm's rustdoc claimed but never had: `snapshot()` must
+    // consult the captured `snapshot_restore` capability *and* the S1 vhost-user law. KVM-free — the
+    // live matrix can never reach the false branch (the descriptor ships `snapshot_restore: true`),
+    // which is exactly why the guard needs a unit gate. Inverse: a `snapshot()` that ignores the
+    // descriptor reddens the first assertion; one that ignores the device law reddens the second.
+    #[test]
+    fn snapshot_precheck_enforces_capability_and_law() {
+        // Backend that does not advertise snapshot_restore, even with a clean VM.
+        let err = snapshot_precheck(false, false).expect_err("incapable backend must error");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "crosvm" && feature == "snapshot_restore"),
+            "expected a snapshot_restore Unsupported naming the VmmCapabilities field, got {err:?}"
+        );
+
+        // Capable backend, but the VM carries a vhost-user device.
+        let err = snapshot_precheck(true, true).expect_err("vhost-user VM must error");
+        assert!(
+            matches!(&err, Error::Unsupported { feature, .. } if feature.contains("vhost-user")),
+            "expected a vhost-user Unsupported, got {err:?}"
+        );
+
+        // Capable backend, snapshot-eligible VM: allowed (the positive control — the guard refuses
+        // for a reason, not always).
+        assert!(snapshot_precheck(true, false).is_ok());
+    }
+
+    // Guards M4's crosvm half: an `io_limit` that `create()` refuses must also be refused by
+    // `restore()`, which otherwise builds the same run args with the limit silently dropped. KVM-free
+    // (the rejection precedes the snapshot-artifact check and any spawn) and non-vacuous: the
+    // snapshot dir does not exist, so an unguarded restore reaches the missing-artifact `Vmm` error
+    // instead — which is precisely what this asserts it does NOT get. Inverse: deleting the
+    // `reject_disk_io_throttle(cfg)?` call in `restore()` reddens here.
+    #[tokio::test]
+    async fn restore_rejects_disk_io_throttle_like_create() {
+        use vmcell::config::{BlockDevice, DiskIoLimit};
+
+        let crosvm = Crosvm::new("/usr/bin/crosvm");
+        let cfg = VmConfig::builder(
+            "/boot/vmlinux",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/img/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(
+            BlockDevice::read_only("/img/data.raw")
+                .with_io_limit(DiskIoLimit::bandwidth(2_000_000)),
+        )
+        .build()
+        .expect("build config");
+
+        let err = crosvm
+            .restore(
+                Path::new("/nonexistent-crosvm-snapshot-dir"),
+                &cfg,
+                &test_res(),
+                &TestCgroupFs,
+            )
+            .await
+            .expect_err("a throttled disk must be refused on restore, exactly as on create");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "crosvm" && feature == "disk_io_throttle"),
+            "expected a disk_io_throttle Unsupported (the VmmCapabilities field name, N-VMM-1), got \
+             {err:?}"
+        );
+
+        // Positive control: the SAME restore without the throttle gets past this guard and fails on
+        // the missing snapshot artifact — so the refusal above is about the io_limit, not about
+        // restore refusing everything.
+        let err = crosvm
+            .restore(
+                Path::new("/nonexistent-crosvm-snapshot-dir"),
+                &erofs_cfg(),
+                &test_res(),
+                &TestCgroupFs,
+            )
+            .await
+            .expect_err("the control path still fails on the missing snapshot artifact");
+        assert!(
+            matches!(&err, Error::Vmm(msg) if msg.contains("snapshot artifact")),
+            "expected the un-throttled control to reach the missing-artifact error, got {err:?}"
         );
     }
 }

@@ -287,14 +287,24 @@ async fn test_lifecycle_panic_residue_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // the absence of a path that was never created. Inverse: remove a resource's
         // creation in the backend and its precheck reddens, proving the residue
         // assertion targets the REAL path.
-        let netns_path = format!("/var/run/netns/vmcell-net-{vmid}");
+        // Recomputed through `vmcell::naming` (law F2), never a test-local `format!`: a
+        // hand-rolled copy of a name the composer owns drifts silently, and the precheck below is
+        // exactly what a drifted spelling turns into a vacuous assertion (docs/78 §6,
+        // `test-local-scratch-name-format`).
+        let netns_path = format!(
+            "/var/run/netns/{}",
+            vmcell::naming::netns_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, vmid)
+        );
         // NOTE: the tap (`vmcell-tap-{vmid}`) lives INSIDE the per-VM netns, so it
         // never appears at `/sys/class/net/` in the root netns — a root-sysfs check
         // would be vacuous both while-live and after-drop. Its cleanup is covered by
         // the netns residue check below ("its tap dies with it").
         let cg_path = format!("/sys/fs/cgroup/{}", common::computed_cgroup_name(vmid));
-        let per_vm_dir =
-            std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
+        let per_vm_dir = std::env::temp_dir().join(vmcell::naming::scratch_dir_name(
+            vmcell::naming::DEFAULT_RESOURCE_PREFIX,
+            std::process::id(),
+            vmid,
+        ));
         assert!(
             std::path::Path::new(&netns_path).exists(),
             "netns {netns_path} must exist while the VM is live (precheck before residue test)"
@@ -526,10 +536,14 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
     let vmid = vm.vmid();
     // The unprivileged NAT's vhost-user socket now lives INSIDE the single owned
     // per-VM scratch dir (`/tmp/vmcell-vm-{pid}-{vmid}/smoltcp.sock`), not a
-    // free-standing `/tmp/vmcell-smoltcp-*.sock`. The pid/vmid naming mirrors
-    // `vmm::VmTempDir::create`.
-    let per_vm_dir =
-        std::env::temp_dir().join(format!("vmcell-vm-{}-{}", std::process::id(), vmid));
+    // free-standing `/tmp/vmcell-smoltcp-*.sock`. Recomputed through the ONE
+    // `vmcell::naming` composer `vmm::VmTempDir::create` uses (law F2), never a test-local
+    // `format!` that drifts from it (docs/78 §6, `test-local-scratch-name-format`).
+    let per_vm_dir = std::env::temp_dir().join(vmcell::naming::scratch_dir_name(
+        vmcell::naming::DEFAULT_RESOURCE_PREFIX,
+        std::process::id(),
+        vmid,
+    ));
     let sock_path = per_vm_dir.join("smoltcp.sock");
 
     let agent = match vm.agent(Some(std::time::Duration::from_secs(120))).await {

@@ -276,6 +276,49 @@ async fn dispatch(engine: &dyn VmEngine, req: EngineRequest) -> EngineReply {
     }
 }
 
+/// Writes one reply frame for request `id`, **degrading a reply that cannot be sent as-is into a
+/// compact typed `Err` frame for the same id** rather than dropping it (M8,
+/// `bridge-reply-drop-wedges-request`). Two failures are reachable: `serde_json` refusing the value,
+/// and a payload over [`MAX_BRIDGE_FRAME_BYTES`] — an `exec` reply carries the guest command's whole
+/// captured output, so a large enough capture overflows the cap in [`write_frame`]. The parent's
+/// `rx.await` has no timeout, so a dropped reply wedges that HTTP request **forever**; the fallback
+/// turns it into a `DaemonError::Internal` (500). (Capping the exec capture host-side is the
+/// separate recorded follow-up; this only makes the failure typed instead of a hang.)
+///
+/// Encoding happens outside the write lock so a large reply does not serialize the multiplex.
+async fn write_reply<W: AsyncWriteExt + Unpin>(wr: &Mutex<W>, id: u64, reply: EngineReply) {
+    let sent = match serde_json::to_vec(&(id, reply)) {
+        Ok(bytes) => {
+            let mut w = wr.lock().await;
+            write_frame(&mut *w, &bytes)
+                .await
+                .map_err(|e| format!("broker reply could not be written: {e}"))
+        }
+        Err(e) => Err(format!("broker reply could not be encoded: {e}")),
+    };
+    let Err(reason) = sent else { return };
+    tracing::warn!(
+        id,
+        "broker: {reason}; replying with a typed internal error instead"
+    );
+    let fallback = EngineReply::Err(WireError {
+        kind: ErrorKind::Internal,
+        message: reason,
+    });
+    match serde_json::to_vec(&(id, fallback)) {
+        Ok(bytes) => {
+            let mut w = wr.lock().await;
+            // The fallback frame is a few hundred bytes, so this write can only fail on a dead
+            // socket — the parent is gone, and its reply reader already fails every in-flight
+            // request on EOF, so there is no request left to wedge. Dropping it here is terminal.
+            let _ = write_frame(&mut *w, &bytes).await;
+        }
+        // Unreachable in practice (an enum around two owned `String`s always encodes), but logged
+        // rather than dropped so it can never become an invisible wedge.
+        Err(e) => tracing::error!(id, "broker: cannot encode the fallback error frame: {e}"),
+    }
+}
+
 /// Serves `engine` over `sock` until the peer closes it or a `ShutdownAll` is handled (after which
 /// the broker returns so its caller can `_exit`). Each request is dispatched on its own task so a
 /// long `exec` does not block other VMs' ops; replies carry the request id and are written behind a
@@ -298,10 +341,7 @@ pub async fn serve_engine(engine: Arc<dyn VmEngine>, sock: tokio::net::UnixStrea
         let wr = wr.clone();
         let job = async move {
             let reply = dispatch(engine.as_ref(), req).await;
-            if let Ok(bytes) = serde_json::to_vec(&(id, reply)) {
-                let mut w = wr.lock().await;
-                let _ = write_frame(&mut *w, &bytes).await;
-            }
+            write_reply(wr.as_ref(), id, reply).await;
         };
         if shutdown {
             // Run inline (so the reply is written) and then stop serving — the broker exits next.
@@ -476,3 +516,5 @@ impl VmEngine for BrokerClientEngine {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_reply_tests;

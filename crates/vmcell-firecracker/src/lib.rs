@@ -95,12 +95,16 @@ fn fc_capabilities() -> VmmCapabilities {
         // rejected up front by `reject_unsupported_console` so it can never emit
         // `console=hvc0` with no `hvc0` device.
         virtio_console: false,
-        // FC's `PUT /snapshot/load` re-binds the snapshot's recorded host vsock
-        // UDS path VERBATIM — no load-time override exists in v1.16 — so a
-        // restored VM never gets fresh host-side socket paths (see
-        // `HOST_PATHS_SIDECAR` and `reject_live_baked_vsock`). All restores of a
-        // lineage share the one baked path: restore-while-alive is rejected and
-        // concurrent restores from one lineage are unsupported.
+        // Scoped to the host **socket/serial** identity (docs/78 M1): FC's
+        // `PUT /snapshot/load` re-binds the snapshot's recorded host vsock UDS path
+        // VERBATIM — no load-time override exists in v1.16 — so a restored VM never
+        // gets a fresh vsock path (see `HOST_PATHS_SIDECAR` and
+        // `reject_live_baked_vsock`). All restores of a lineage share the one baked
+        // path: restore-while-alive is rejected and concurrent restores from one
+        // lineage are unsupported. The **tap** is NOT baked: `restore()` rebinds it
+        // to the fresh `res.tap_name` via `network_overrides`
+        // (`build_fc_snapshot_load`), the FC analogue of CH's `net[].tap` rewrite —
+        // that rotation is real and this flag does not describe it.
         restore_rotates_host_paths: false,
         // FC has a native per-drive rate limiter (`rate_limiter`), §4.6.
         disk_io_throttle: true,
@@ -382,12 +386,55 @@ fn noxsave_fallback(has_cpu_template: bool) -> &'static str {
     if has_cpu_template { "" } else { "noxsave " }
 }
 
+/// The **one** Firecracker interface id vmcell programs, shared by the create path's
+/// `PUT /network-interfaces/<id>` and the restore path's `network_overrides` entry.
+///
+/// One law, one predicate: FC's `network_overrides` matches an override to a snapshotted
+/// device *by this id*, so a create/restore mismatch is a silently ignored override — the
+/// restore would fall back to the snapshot's baked `host_dev_name` with no error at all
+/// (docs/78 M1, `fc-restore-rebinds-baked-tap-name-dead-data-plane`). A second literal is
+/// exactly the divergence this const removes.
+const FC_IFACE_ID: &str = "eth0";
+
 /// Firecracker's `PUT /network-interfaces/eth0` body.
 #[derive(Serialize, Debug, PartialEq, Eq)]
 struct NetworkInterface {
     iface_id: String,
     host_dev_name: String,
     guest_mac: String,
+}
+
+/// One entry of Firecracker 1.8+'s `network_overrides` array on `PUT /snapshot/load`: rebind
+/// the snapshotted interface `iface_id` to a **fresh** host tap instead of the baked one.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct NetworkOverride {
+    iface_id: String,
+    host_dev_name: String,
+}
+
+/// Firecracker's `mem_backend` sub-object on `PUT /snapshot/load`.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct MemBackend {
+    backend_path: PathBuf,
+    backend_type: String,
+}
+
+/// Firecracker's `PUT /snapshot/load` body.
+///
+/// `network_overrides` is a **presence attribute** (`skip_serializing_if`): a VM with no tap has
+/// nothing to override, and a `PUT` body that is byte-identical to the pre-override one is what
+/// keeps a tapless restore working against any FC that predates the field. So the key must vanish
+/// entirely rather than serialize as `[]` or `null`. AGENTS ("any presence-attribute type
+/// round-trips on the codec it actually ships over") — FC's engine channel is JSON
+/// (`unix_api_request` → `serde_json::to_vec`), and `fc_snapshot_load_body_shapes` pins both
+/// shapes on that codec.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct SnapshotLoad {
+    snapshot_path: PathBuf,
+    mem_backend: MemBackend,
+    resume_vm: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    network_overrides: Vec<NetworkOverride>,
 }
 
 /// Builds that request, with the guest MAC from the **one** [`vmcell::net::mac_math`] law.
@@ -402,10 +449,45 @@ struct NetworkInterface {
 /// Propagates [`vmcell::net::mac_math`]'s range error for an out-of-range vmid.
 fn build_fc_network_interface(tap: &str, vmid: u32) -> Result<NetworkInterface> {
     Ok(NetworkInterface {
-        iface_id: "eth0".to_string(),
+        iface_id: FC_IFACE_ID.to_string(),
         host_dev_name: tap.to_string(),
         guest_mac: vmcell::net::mac_math(vmid)?,
     })
+}
+
+/// Builds the `PUT /snapshot/load` body, rebinding the snapshotted interface onto the
+/// restore's **fresh** tap when the orchestrator allocated one.
+///
+/// docs/78 M1 (`fc-restore-rebinds-baked-tap-name-dead-data-plane`): without
+/// `network_overrides`, FC re-opens the `host_dev_name` the snapshot BAKED
+/// (`<prefix>-tap-<old vmid>`) while the orchestrator has allocated a fresh vmid and plumbed
+/// `<prefix>-tap-<new vmid>` in the new netns. Under the runner's ambient `CAP_NET_ADMIN` that
+/// `TUNSETIFF` *succeeds* — it creates a fresh, down, unbridged tap — so the restore reports
+/// success and every post-restore packet drops into an unplumbed orphan. The override is the
+/// FC 1.8+ equivalent of CH's `net[].tap` restore-config rewrite (§8.2); it does **not** make
+/// FC a `restore_rotates_host_paths` backend, which is about the *host socket* identity (the
+/// vsock UDS is still re-bound verbatim).
+///
+/// `tap` is `None` for a VM the orchestrator gave no tap; the list then stays empty and the key
+/// is omitted (see [`SnapshotLoad`]). Pure so both shapes are gate-able without KVM — the
+/// create-path MAC defect (`fc_network_interface_carries_the_vmid_derived_mac`) proved that an
+/// inline body inside `restore()` is testable only by a 70-s live matrix.
+fn build_fc_snapshot_load(snapshot_dir: &Path, tap: Option<&str>) -> SnapshotLoad {
+    SnapshotLoad {
+        snapshot_path: snapshot_dir.join("snapshot_file"),
+        mem_backend: MemBackend {
+            backend_path: snapshot_dir.join("mem_file"),
+            backend_type: "File".to_string(),
+        },
+        resume_vm: false,
+        network_overrides: tap
+            .map(|host_dev_name| NetworkOverride {
+                iface_id: FC_IFACE_ID.to_string(),
+                host_dev_name: host_dev_name.to_string(),
+            })
+            .into_iter()
+            .collect(),
+    }
 }
 
 /// Reaps a failed T2-probe child's process group and unlinks its API socket. On the
@@ -864,31 +946,18 @@ impl Vmm for Firecracker {
             reaped: false,
         };
 
-        // Load snapshot
-        #[derive(Serialize)]
-        struct MemBackend {
-            backend_path: PathBuf,
-            backend_type: String,
-        }
-        #[derive(Serialize)]
-        struct SnapshotLoad {
-            snapshot_path: PathBuf,
-            mem_backend: MemBackend,
-            resume_vm: bool,
-        }
-
+        // Load snapshot, rebinding the snapshotted interface onto THIS restore's freshly
+        // allocated tap (`network_overrides`) — without it FC re-opens the baked
+        // `<prefix>-tap-<old vmid>` and post-restore egress is silently dead (docs/78 M1; see
+        // `build_fc_snapshot_load`).
         instance
             .api_request(
                 "PUT",
                 "/snapshot/load",
-                Some(&SnapshotLoad {
-                    snapshot_path: snapshot_dir.join("snapshot_file"),
-                    mem_backend: MemBackend {
-                        backend_path: snapshot_dir.join("mem_file"),
-                        backend_type: "File".to_string(),
-                    },
-                    resume_vm: false,
-                }),
+                Some(&build_fc_snapshot_load(
+                    snapshot_dir,
+                    res.tap_name.as_deref(),
+                )),
             )
             .await?;
 
@@ -1189,6 +1258,74 @@ mod tests {
             build_fc_network_interface("vmcell-tap-0", 0).is_err(),
             "vmid 0 has no valid MAC and must fail loud"
         );
+    }
+
+    // docs/78 M1 (`fc-restore-rebinds-baked-tap-name-dead-data-plane`): the `/snapshot/load`
+    // body must rebind the snapshotted interface to THIS restore's fresh tap, and
+    // `network_overrides` is a presence attribute — so both shapes are pinned on the codec FC
+    // actually ships over (JSON, `unix_api_request` → `serde_json::to_vec`; AGENTS' postcard-trap
+    // rule). Parsed back into a `Value` rather than substring-matched so "the key is ABSENT" is a
+    // real assertion and not a `!contains` that a renamed field would satisfy.
+    //
+    // Buggy impls guarded: dropping `network_overrides` (today's shipped body) empties the Some
+    // arm's array; `skip_serializing_if` removed serializes `"network_overrides":[]` on the None
+    // arm; a second `"eth0"` literal that drifts from the create path
+    // reddens the `FC_IFACE_ID` identity — the live consequence of all three is a silently dead
+    // post-restore data plane, which only `snapshot_restore.rs`'s egress leg can see.
+    #[test]
+    fn fc_snapshot_load_body_shapes() {
+        let dir = Path::new("/snap/lineage-1");
+
+        let with_tap = build_fc_snapshot_load(dir, Some("vmcell-tap-42"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&with_tap).expect("the body serializes"))
+                .expect("FC receives JSON");
+        assert_eq!(json["snapshot_path"], "/snap/lineage-1/snapshot_file");
+        assert_eq!(
+            json["mem_backend"]["backend_path"],
+            "/snap/lineage-1/mem_file"
+        );
+        assert_eq!(json["mem_backend"]["backend_type"], "File");
+        assert_eq!(json["resume_vm"], false);
+        let overrides = json["network_overrides"]
+            .as_array()
+            .expect("a tap-bearing restore must carry network_overrides");
+        assert_eq!(
+            overrides.len(),
+            1,
+            "exactly one override, for the one interface vmcell programs: {json}"
+        );
+        assert_eq!(
+            overrides[0]["host_dev_name"], "vmcell-tap-42",
+            "the override must name THIS restore's fresh tap, not the snapshot's baked one"
+        );
+        // The override binds by interface id: it must equal the id the CREATE path programmed,
+        // or FC silently ignores the override and re-opens the baked device.
+        assert_eq!(
+            overrides[0]["iface_id"],
+            serde_json::Value::from(FC_IFACE_ID)
+        );
+        assert_eq!(
+            overrides[0]["iface_id"],
+            serde_json::Value::from(
+                build_fc_network_interface("vmcell-tap-42", 42)
+                    .expect("a valid vmid builds")
+                    .iface_id
+            ),
+            "the restore override and the create-path interface must share one iface_id"
+        );
+
+        // No tap → the key must VANISH (the body stays byte-identical to the pre-override one),
+        // not serialize as `[]` or `null`.
+        let no_tap = build_fc_snapshot_load(dir, None);
+        let json: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&no_tap).expect("the body serializes"))
+                .expect("FC receives JSON");
+        assert!(
+            json.get("network_overrides").is_none(),
+            "a tapless restore must omit the presence attribute entirely, got {json}"
+        );
+        assert_eq!(json["resume_vm"], false);
     }
 
     // Guards VMM-4: the probe must distinguish a firm "T2 unsupported" (a 400 template

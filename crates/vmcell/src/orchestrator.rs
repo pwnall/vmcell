@@ -178,10 +178,24 @@ impl FsIdClaim {
     }
 
     /// Releases the cross-process lock for `id`, if any.
+    ///
+    /// A failed removal is warned, not swallowed (docs/78 §6): the lock file carries THIS process's
+    /// pid, so `try_claim`'s liveness check reclaims it only once this process exits — until then
+    /// the id is wedged for every other process on the host, with the log line as the only clue.
+    /// `NotFound` is the benign double-release (in-process `active` already dropped it) and stays
+    /// silent.
     fn release(&self, id: u32) {
         if let Some(dir) = &self.dir {
             let lock_path = dir.join(format!("{id}.lock"));
-            let _ = std::fs::remove_file(&lock_path);
+            if let Err(e) = std::fs::remove_file(&lock_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    "failed to release cross-process id lock {}: {}",
+                    lock_path.display(),
+                    e
+                );
+            }
         }
     }
 }
@@ -1297,32 +1311,15 @@ impl<V: Vmm> MicroVm<V> {
         // snapshot-eligibility law returns `Error::Unsupported { vmm, feature }`
         // (a capability rejection a caller can match on), NOT the generic
         // `Error::Config` — a config a snapshot-eligible VMM cannot honor is an
-        // unsupported capability, not a malformed config.
-        if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
+        // unsupported capability, not a malformed config. The arms themselves live in the ONE
+        // config-only predicate `clone_ineligible_feature` (below), the designated home shared
+        // with the zygote fan-out's fail-fast gate: the two open-coded copies had already needed
+        // lock-step edits and had drifted (docs/78 S1), so only the *wrapping* refusal — the
+        // per-boundary prose and the vmm id — stays here.
+        if let Some(feature) = clone_ineligible_feature(&cfg) {
             return Err(crate::error::Error::Unsupported {
                 vmm: vmm.id().to_string(),
-                feature: "snapshot restore with unprivileged (vhost-user-net) networking".into(),
-            });
-        }
-
-        // §6.5 (VM-to-VM segments), boundary 2: restore-time slot/addressing semantics for a
-        // segment member are unspecified in v30, so a restore onto a segment is a typed capability
-        // refusal, not a silently mis-addressed member. `build()` already refuses the pair; this is
-        // the resources-in-hand re-check that a hand-built config cannot slip past.
-        if matches!(cfg.net, crate::config::NetConfig::Segment { .. }) {
-            return Err(crate::error::Error::Unsupported {
-                vmm: vmm.id().to_string(),
-                feature: "snapshot restore of a vm-to-vm segment member (§6.5)".into(),
-            });
-        }
-
-        // Snapshot-eligibility law: a virtio-fs data share is served by
-        // virtiofsd (a vhost-user device), which a snapshot-eligible VM must
-        // not attach. Reject it here (enforced in code, not just docs).
-        if !cfg.shares.is_empty() {
-            return Err(crate::error::Error::Unsupported {
-                vmm: vmm.id().to_string(),
-                feature: "snapshot restore with a virtio-fs data share (vhost-user device)".into(),
+                feature: format!("snapshot restore with {feature}"),
             });
         }
 
@@ -1687,9 +1684,31 @@ impl<V: Vmm> MicroVm<V> {
     /// reconnect.
     ///
     /// # Errors
-    /// Returns an error if the backend fails to snapshot, or
-    /// [`crate::error::Error::Unsupported`] on a backend without snapshot support.
+    /// Returns an error if the backend fails to snapshot,
+    /// [`crate::error::Error::Unsupported`] on a backend without snapshot support, or
+    /// [`crate::error::Error::Unsupported`] when this VM boots a custom `init=` (its restored
+    /// clones could never run the mandatory post-restore resync).
     pub async fn snapshot(&mut self, dir: &std::path::Path) -> Result<()> {
+        // docs/78 M2: refuse to *write* an image whose restore can never be correct. A custom
+        // `init=` replaces the vmcell guest agent, so the mandatory post-restore resync (clock,
+        // CSPRNG reseed, MAC/IP rotation, §8.2) is structurally unreachable for every clone minted
+        // from this image. `build()` rejects `init` + `snapshotting`, but a VM built WITHOUT
+        // `snapshotting` can still reach this method (and `Zygote::suspend` routes straight
+        // through it), so the eligibility law needs its guard at this boundary too — the earliest
+        // point that refuses the bad artifact instead of the N restores of it.
+        // `control_plane_disabled` is the retained `cfg.init.is_some()`; the config-only arms live
+        // in `clone_ineligible_feature`, which needs a `VmConfig` a live `MicroVm` no longer owns.
+        if self.control_plane_disabled {
+            return Err(crate::error::Error::Unsupported {
+                // Not a backend refusal: this boundary is the orchestrator's own eligibility law
+                // (the `zygote`/`in-process-virtiofsd` precedent — a non-backend boundary names
+                // itself rather than blaming the VMM).
+                vmm: "orchestrator".to_string(),
+                feature: "snapshot of a VM with a custom init (VmConfig::init) that replaces the \
+                          guest agent — the mandatory post-restore resync (§8.2) needs it"
+                    .to_string(),
+            });
+        }
         self.instance_mut().snapshot(dir).await?;
         // Firecracker severs established vsock connections across its internal
         // pause/snapshot/resume cycle (Cloud Hypervisor keeps them alive), so a
@@ -1732,8 +1751,16 @@ impl<V: Vmm> MicroVm<V> {
         // The cgroup backend lives on the captured `HostEnv` (no longer a standalone
         // `cgroup_fs` field); `cgroup_name.take()` is the once-only guard so a second
         // teardown (Drop after shutdown) is a no-op.
-        if let Some(cg_name) = self.cgroup_name.take() {
-            let _ = self.env.cgroups.delete_slice(&cg_name);
+        // A failed delete leaves a live slice keyed by this vmid, which the orphan sweep only
+        // reclaims on the next process start-up — so it is warned like every sibling teardown
+        // site (`CgroupGuard::drop`, `sweep_orphans`), never silently discarded (docs/78 §6,
+        // `teardown-cgroup-delete-silently-discarded`). Teardown is still best-effort: the
+        // failure is not propagated (`Drop` cannot, and `shutdown()` guarantees teardown
+        // regardless, M-ORCH-2).
+        if let Some(cg_name) = self.cgroup_name.take()
+            && let Err(e) = self.env.cgroups.delete_slice(&cg_name)
+        {
+            tracing::warn!("failed to delete cgroup slice {}: {}", cg_name, e);
         }
         drop(self.cid.take());
         drop(self.vmid.take());
@@ -1819,6 +1846,68 @@ impl<V: Vmm> Drop for MicroVm<V> {
         drop(self.instance.take());
         self.teardown_post_instance();
     }
+}
+
+/// The **one** config-only snapshot-eligibility predicate (§13, Cross-cutting invariants).
+///
+/// Returns the offending feature when `cfg` can never take part in a snapshot/restore cycle, and
+/// `None` when it is eligible; the caller wraps the returned fragment in its own typed
+/// [`Error::Unsupported`](crate::error::Error::Unsupported). This is the designated home for the
+/// arms `MicroVm::restore_inner`'s boundary-2 re-check and the zygote fan-out's fail-fast gate
+/// (`zygote::check_clone_eligible`) had open-coded twice — the pair had already needed lock-step
+/// edits and had drifted arm-for-arm (docs/78 S1), and every new arm (custom init, host USB) would
+/// have been a third copy. `restore_inner` calls it; **`check_clone_eligible` is still to be
+/// routed through it** (that file is outside this change's set — docs/78 S1's remaining half), so
+/// until then the zygote's fail-fast gate carries the older, narrower arm list and the new arms
+/// are enforced for clones at the per-clone restore boundary instead.
+///
+/// **Config-only by construction**: it takes nothing but a `&VmConfig`, so it runs before any
+/// per-VM resource — or any copy-on-write clone of a suspend image — is minted. The
+/// resources-in-hand checks stay at their own boundaries.
+///
+/// The fragments name the `VmConfig` field they refuse (§7.2, capability honesty: a typed refusal
+/// names the feature it is about, not a paraphrase), so a caller matching on the message can tell
+/// which input to drop.
+pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<&'static str> {
+    if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
+        // A vhost-user-net device is not migratable, so it is not snapshot-eligible.
+        return Some("unprivileged (vhost-user-net) networking");
+    }
+    // §6.5 (VM-to-VM segments): restore-time slot/addressing semantics for a member are
+    // unspecified in v30, so a restore onto a segment is a typed capability refusal, not a
+    // silently mis-addressed member — and a fan-out would dual-claim one member slot besides.
+    // `build()` already refuses the pair; this is what a hand-built config cannot slip past.
+    if matches!(cfg.net, crate::config::NetConfig::Segment { .. }) {
+        return Some("vm-to-vm segment membership (§6.5)");
+    }
+    // A virtio-fs data share is served by virtiofsd (a vhost-user device), which a
+    // snapshot-eligible VM must not attach (§12.1). Enforced in code, not just docs.
+    if !cfg.shares.is_empty() {
+        return Some("a virtio-fs data share (vhost-user device)");
+    }
+    // docs/78 M2: a custom `init=` REPLACES the vmcell guest agent, and the mandatory
+    // post-restore resync — clock, CSPRNG reseed, MAC/IP rotation (§8.2) — runs *through* that
+    // agent. `build()` rejects `init` + `snapshotting`, but nothing rejected *restoring* (or
+    // fanning out) such a config: the clone would come up on a frozen clock with a correlated
+    // CSPRNG and a stale MAC/IP, and `agent()` fails loud, so the resync is structurally
+    // unreachable. Config-only and identical at both boundaries, hence an arm here.
+    if cfg.init.is_some() {
+        return Some("a custom init (VmConfig::init) that replaces the guest agent");
+    }
+    // docs/78 M4: a passed-through host USB device is host state living OUTSIDE guest RAM — the
+    // migration stream carries the guest's view of the xhci controller but not the device behind
+    // it. `build()` rejects `usb_host_devices` + `snapshotting`, but the delta-9 premise that
+    // "every backend's `restore()` rejects a non-snapshotting config" is empirically FALSE (no
+    // backend's `restore()` reads `cfg.snapshotting`), so a `{InKernel, snapshotting: false}`
+    // config carrying USB devices reached restore with the USB argv and without the backends'
+    // `require_usb_host_devices` precheck (QEMU) or was silently dropped (CH/FC/crosvm). The law
+    // is config-only and boundary-independent — a host USB device is no more restorable than it
+    // is snapshottable, and a zygote over one would fan out N guests fighting over one device —
+    // so it belongs in the shared predicate rather than beside it.
+    if !cfg.usb_host_devices.is_empty() {
+        return Some("host USB passthrough (VmConfig::usb_host_devices)");
+    }
+    None
 }
 
 /// Derives `shutdown()`'s `has_exited` poll cadence from the configured grace
@@ -2815,6 +2904,87 @@ mod tests {
         }
     }
 
+    /// A CgroupFs fake whose `delete_slice` always fails, so the **success-path** teardown's
+    /// error branch is reachable (`RecordingCgroupFs` can never take it).
+    #[derive(Debug, Default, Clone)]
+    struct DeleteFailCgroupFs;
+
+    impl crate::metrics::CgroupFs for DeleteFailCgroupFs {
+        fn create_slice(&self, _name: &str, _limits: &crate::config::ResourceLimits) -> Result<()> {
+            Ok(())
+        }
+        fn delete_slice(&self, name: &str) -> Result<()> {
+            Err(crate::error::Error::Cgroup(format!(
+                "cannot delete {name}: device or resource busy"
+            )))
+        }
+        fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
+            Ok(ResourceUsage::default())
+        }
+        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // docs/78 §6 (`teardown-cgroup-delete-silently-discarded`). The success-path
+    // `delete_slice` was the ONE teardown site with no log, so a slice that survives teardown
+    // (busy cgroup, revoked delegation) leaked with zero operator-visible trace until the next
+    // process start-up's orphan sweep. Assert the warn, and — as the sibling sites do — that the
+    // failure is NOT propagated: teardown stays best-effort.
+    //
+    // Red on the inverse: restore the bare `let _ = self.env.cgroups.delete_slice(&cg_name)` and
+    // `logs_contain` goes false.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn teardown_warns_when_the_cgroup_slice_cannot_be_deleted() {
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(DeleteFailCgroupFs),
+            ..HostEnv::hermetic()
+        };
+        let vm = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("the VM starts");
+        vm.shutdown()
+            .await
+            .expect("a failed slice delete must not fail teardown (best-effort, M-ORCH-2)");
+        assert!(
+            logs_contain("failed to delete cgroup slice"),
+            "the success-path teardown must warn like every sibling teardown site"
+        );
+    }
+
+    // docs/78 §6, the sibling half: `FsIdClaim::release`'s discard. The lock file carries THIS
+    // process's pid, so a failed removal wedges the id for every other process until this one
+    // exits — the log line is the only clue. A directory at the lock path makes `remove_file`
+    // fail (EISDIR) without any privileged setup.
+    //
+    // Red on the inverse: restore the bare `let _ = std::fs::remove_file(&lock_path)` and
+    // `logs_contain` goes false. The benign-`NotFound` half is asserted alongside, so the warn
+    // cannot be "fixed" by logging every release.
+    #[test]
+    #[tracing_test::traced_test]
+    fn id_claim_release_warns_when_the_lock_cannot_be_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claim = FsIdClaim {
+            dir: Some(dir.path().to_path_buf()),
+        };
+
+        // Never-claimed id: the removal fails `NotFound`, which is the benign double-release.
+        claim.release(1);
+        assert!(
+            !logs_contain("failed to release cross-process id lock"),
+            "a NotFound release is the benign double-release and stays silent"
+        );
+
+        std::fs::create_dir(dir.path().join("2.lock")).expect("stand-in for an unremovable lock");
+        claim.release(2);
+        assert!(
+            logs_contain("failed to release cross-process id lock"),
+            "a lock that survives release wedges the id and must be warned"
+        );
+    }
+
     /// A VMM whose `create`/`restore` always fail, to exercise the error path
     /// after the cgroup slice has been created.
     #[derive(Debug)]
@@ -3184,6 +3354,252 @@ mod tests {
         let env = HostEnv::hermetic();
         let res = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env).await;
         assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
+    }
+
+    /// A snapshot-ineligible config differing from the eligible baseline in exactly one field.
+    /// Every arm of the shared predicate is reachable from a config that `build()` accepts — the
+    /// combinations `build()` rejects are the *snapshotting* ones, and the whole point of docs/78
+    /// M2/M4 is that a NON-snapshotting config reaches the restore/clone boundaries.
+    fn ineligible_cfg(
+        mutate: impl FnOnce(crate::config::VmConfigBuilder) -> crate::config::VmConfigBuilder,
+    ) -> VmConfig {
+        mutate(
+            VmConfig::builder(
+                std::path::PathBuf::from("/vmlinux"),
+                crate::config::RootfsSource::Erofs {
+                    image: std::path::PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .network_disabled(),
+        )
+        .build()
+        .expect("a non-snapshotting config with a single create-only input builds")
+    }
+
+    // docs/78 S1 + M2 + M4: the ONE config-only snapshot-eligibility predicate `restore_inner`
+    // calls (and `zygote::check_clone_eligible` is to be routed through). Pins every arm's exact
+    // feature fragment (each boundary composes it into its own typed refusal, so the fragment is
+    // what a caller matches on) and the eligible positive control.
+    //
+    // Red on the inverse: delete any arm and its config returns `None` here — which is exactly
+    // how the custom-init (M2) and host-USB (M4) inputs used to reach `restore()`.
+    //
+    // The `NetConfig::Segment` arm is deliberately absent: `NetSegmentRef` cannot be constructed
+    // without a real segment namespace (privileged, KVM-free but netns-requiring), so it is
+    // covered by the segment suite's restore leg, not here.
+    #[test]
+    fn clone_ineligible_feature_covers_every_config_only_arm() {
+        // Positive control: the eligible baseline every arm is a one-field delta from.
+        assert_eq!(
+            clone_ineligible_feature(&erofs_cfg()),
+            None,
+            "a plain erofs, no-network config is snapshot-eligible"
+        );
+
+        let unprivileged = ineligible_cfg(|b| {
+            b.net(crate::config::NetConfig::Unprivileged {
+                egress: crate::config::Egress::Open,
+                host_services_port: None,
+            })
+        });
+        assert_eq!(
+            clone_ineligible_feature(&unprivileged),
+            Some("unprivileged (vhost-user-net) networking")
+        );
+
+        let share = ineligible_cfg(|b| {
+            b.with_share(crate::config::Share::new(
+                "data",
+                "/tmp/data",
+                crate::config::Access::ReadOnly,
+                crate::config::CachePolicy::Auto,
+            ))
+        });
+        assert_eq!(
+            clone_ineligible_feature(&share),
+            Some("a virtio-fs data share (vhost-user device)")
+        );
+
+        // M2: a custom init replaces the agent the mandatory post-restore resync runs through.
+        let custom_init = ineligible_cfg(|b| b.init("/bin/workload"));
+        assert_eq!(
+            clone_ineligible_feature(&custom_init),
+            Some("a custom init (VmConfig::init) that replaces the guest agent")
+        );
+
+        // M4: a passed-through host device is not in the migration stream.
+        let usb = ineligible_cfg(|b| {
+            b.with_usb_host_device(crate::config::UsbHostDevice::new(0x1d6b, 0x0002))
+        });
+        assert_eq!(
+            clone_ineligible_feature(&usb),
+            Some("host USB passthrough (VmConfig::usb_host_devices)")
+        );
+    }
+
+    // docs/78 M2, restore boundary. `build()` rejects `init` + `snapshotting`, but a custom-init
+    // config with `snapshotting` OFF builds and used to sail through `restore_inner` — producing a
+    // clone whose mandatory S2 resync (clock, CSPRNG reseed, MAC/IP rotation) is structurally
+    // unreachable, because `agent()` fails loud on a VM with no guest agent. It must be a typed
+    // capability refusal naming the field, with the positive control proving the very same restore
+    // succeeds once `init` is dropped.
+    //
+    // Red on the inverse: remove the `cfg.init` arm from `clone_ineligible_feature` and this
+    // restore returns `Ok`.
+    #[tokio::test]
+    async fn restore_rejects_a_custom_init_config() {
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv::hermetic();
+        let err = MicroVm::restore(
+            &vmm,
+            std::path::Path::new("/fake/snap"),
+            ineligible_cfg(|b| b.init("/bin/workload")),
+            &env,
+        )
+        .await
+        .expect_err("restoring a custom-init config must be refused");
+        match err {
+            crate::error::Error::Unsupported { feature, .. } => assert!(
+                feature.contains("custom init (VmConfig::init)"),
+                "the refusal must name the offending field, got {feature:?}"
+            ),
+            other => panic!("expected a typed capability refusal, got {other:?}"),
+        }
+
+        // Positive control (the allowed path reaches the same target): the identical restore
+        // without `init` succeeds, so the test is not passing on an unrelated failure.
+        MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), erofs_cfg(), &env)
+            .await
+            .expect("the same restore without a custom init must succeed");
+    }
+
+    // docs/78 M2, clone boundary. The zygote fan-out must refuse the same config: a custom-init
+    // master would mint N clones that can never resync (frozen clock, correlated CSPRNG, stale
+    // MAC/IP). Accepts the refusal at EITHER zygote boundary — `from_snapshot_dir`'s fail-fast
+    // config gate or the per-clone restore — because the fail-fast gate is the honest home for it
+    // once `zygote::check_clone_eligible` routes through the shared predicate (docs/78 S1; that
+    // rewiring is the one edit outside this change's file set).
+    //
+    // Red on the inverse: with the `cfg.init` arm gone, `spawn_clone` returns `Ok` with a live
+    // agent-less clone.
+    #[tokio::test]
+    async fn zygote_clone_rejects_a_custom_init_config() {
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv::hermetic();
+        let master = tempfile::tempdir().expect("tempdir");
+        std::fs::write(master.path().join("state"), b"snapshot").expect("write master state");
+
+        let err = match crate::Zygote::from_snapshot_dir(
+            master.path(),
+            ineligible_cfg(|b| b.init("/bin/workload")),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(zygote) => zygote
+                .spawn_clone(&vmm, &env)
+                .await
+                .expect_err("a custom-init zygote must not mint a clone"),
+        };
+        match err {
+            crate::error::Error::Unsupported { feature, .. } => assert!(
+                feature.contains("custom init (VmConfig::init)"),
+                "the refusal must name the offending field, got {feature:?}"
+            ),
+            other => panic!("expected a typed capability refusal, got {other:?}"),
+        }
+
+        // Positive control: the same master and the same seams mint a clone for the eligible
+        // config, so the refusal above is about `init` and nothing else.
+        crate::Zygote::from_snapshot_dir(master.path(), erofs_cfg())
+            .await
+            .expect("an eligible zygote constructs")
+            .spawn_clone(&vmm, &env)
+            .await
+            .expect("an eligible config must still fan out");
+    }
+
+    // docs/78 M2, snapshot boundary. The image is refused where it is WRITTEN, not only where it
+    // is restored: `Zygote::suspend` routes straight through `MicroVm::snapshot`, which had no
+    // guard at all, so a custom-init VM could produce a master image that is unusable by
+    // construction. `control_plane_disabled` is the retained `cfg.init.is_some()`.
+    //
+    // Red on the inverse: drop the guard and the snapshot succeeds (the `FakeVmm` instance records
+    // a "snapshot" call and returns `Ok`).
+    #[tokio::test]
+    async fn snapshot_refuses_a_custom_init_vm() {
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv::hermetic();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut custom_init =
+            MicroVm::start(&vmm, ineligible_cfg(|b| b.init("/bin/workload")), &env)
+                .await
+                .expect("a custom-init VM starts (the control-plane probe is skipped for it)");
+        let err = custom_init
+            .snapshot(dir.path())
+            .await
+            .expect_err("snapshotting a custom-init VM must be refused");
+        match err {
+            crate::error::Error::Unsupported { feature, .. } => assert!(
+                feature.contains("custom init (VmConfig::init)"),
+                "the refusal must name the offending field, got {feature:?}"
+            ),
+            other => panic!("expected a typed capability refusal, got {other:?}"),
+        }
+
+        // Positive control: the same call on an agent-carrying VM writes the snapshot.
+        let mut eligible = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("the eligible VM starts");
+        eligible
+            .snapshot(dir.path())
+            .await
+            .expect("an eligible VM must still snapshot");
+    }
+
+    // docs/78 M4. The delta-9 record's premise — "every backend's `restore()` rejects a
+    // non-snapshotting config, so USB cannot reach it" — is empirically FALSE: no backend's
+    // `restore()` reads `cfg.snapshotting`. `{VsockTransport::InKernel, snapshotting: false}` +
+    // USB devices is exactly the config that builds (only snapshotting+USB is rejected), passes
+    // QEMU's `uses_in_kernel_vsock` restore gate, and is spawned with the USB argv WITHOUT the
+    // `require_usb_host_devices` precheck — the measured silent-empty-xhci failure mode. The one
+    // orchestrator boundary refuses it for every backend at once.
+    //
+    // Red on the inverse: remove the `usb_host_devices` arm and this restore returns `Ok`.
+    #[tokio::test]
+    async fn restore_rejects_usb_host_devices_on_a_non_snapshotting_config() {
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv::hermetic();
+        let with_usb = ineligible_cfg(|b| {
+            b.vsock_transport(crate::config::VsockTransport::InKernel)
+                .with_usb_host_device(crate::config::UsbHostDevice::new(0x1d6b, 0x0002))
+        });
+        assert!(
+            !with_usb.snapshotting,
+            "the reachable shape is the NON-snapshotting one (build() rejects snapshotting+USB)"
+        );
+        let err = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), with_usb, &env)
+            .await
+            .expect_err("restoring a config carrying host USB devices must be refused");
+        match err {
+            crate::error::Error::Unsupported { feature, .. } => assert!(
+                feature.contains("usb_host_devices"),
+                "the refusal must name the offending field, got {feature:?}"
+            ),
+            other => panic!("expected a typed capability refusal, got {other:?}"),
+        }
+
+        // Positive control: the same in-kernel-vsock config restores once the USB devices are
+        // dropped — the refusal is about the devices, not the transport.
+        MicroVm::restore(
+            &vmm,
+            std::path::Path::new("/fake/snap"),
+            ineligible_cfg(|b| b.vsock_transport(crate::config::VsockTransport::InKernel)),
+            &env,
+        )
+        .await
+        .expect("the same restore without USB devices must succeed");
     }
 
     /// A recording guest-resync fake for the post-restore resync tests. Fails the

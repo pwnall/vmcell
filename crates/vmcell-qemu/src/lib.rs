@@ -85,6 +85,10 @@ pub struct QemuInstance {
     /// B decoupled the in-kernel Vsock transport from `snapshotting`, so a Vsock
     /// endpoint alone is **no longer** proof of eligibility.
     has_vhost_user_device: bool,
+    /// Whether the backend advertises `snapshot_restore`, captured from
+    /// [`Qemu::capabilities`] at construction so `snapshot()` can self-guard on the
+    /// descriptor without a handle back to the backend (M-RESTORE-3, the CH shape).
+    snapshot_restore_capable: bool,
     pgid: Option<u32>,
     vsock_pgid: Option<u32>,
     // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
@@ -194,7 +198,11 @@ impl QemuInstance {
     /// Builds the long-lived instance from a fresh [`SpawnedQemu`], taking ownership of
     /// the VMM/daemon handles so its `Drop` becomes the single teardown owner. Shared
     /// by `create` and `restore` so both construct the instance identically.
-    fn from_spawned(spawned: SpawnedQemu) -> Self {
+    ///
+    /// `snapshot_restore_capable` is the backend descriptor's `snapshot_restore` flag,
+    /// captured here because `snapshot()` runs on the instance and has no handle back to
+    /// the [`Qemu`] backend (the same capture CH's `ChInstance` does, M-RESTORE-3).
+    fn from_spawned(spawned: SpawnedQemu, snapshot_restore_capable: bool) -> Self {
         let SpawnedQemu {
             qmp_socket,
             vsock_path,
@@ -218,6 +226,7 @@ impl QemuInstance {
             cid,
             endpoint,
             has_vhost_user_device,
+            snapshot_restore_capable,
             pgid,
             vsock_pgid,
             reaped: false,
@@ -289,60 +298,70 @@ impl QemuInstance {
     /// error, never a silent timeout-through.
     async fn drive_migration(&self, execute_cmd: &str, budget: std::time::Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + budget;
-        let mut stream = UnixStream::connect(&self.qmp_socket)
-            .await
-            .map_err(Error::Io)?;
-        let (r, mut w) = stream.split();
-        let mut reader = BufReader::new(r);
-        let mut line = String::new();
-
-        // Greeting, then negotiate capabilities once for the whole migrate+poll session.
-        reader.read_line(&mut line).await.map_err(Error::Io)?;
-        w.write_all(b"{\"execute\": \"qmp_capabilities\"}\n")
-            .await
-            .map_err(Error::Io)?;
-        line.clear();
-        reader.read_line(&mut line).await.map_err(Error::Io)?;
-
-        // Kick off the migration and confirm QEMU accepted the command.
-        w.write_all(execute_cmd.as_bytes())
-            .await
-            .map_err(Error::Io)?;
-        w.write_all(b"\n").await.map_err(Error::Io)?;
-        read_qmp_result(&mut reader, &mut line).await?;
-        check_qmp_reply(&line)?;
-
-        // Poll to a terminal status on the same connection.
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                return Err(Error::Vmm(
-                    "QEMU migration did not reach `completed` within the budget".into(),
-                ));
-            }
-            w.write_all(b"{\"execute\": \"query-migrate\"}\n")
+        // The budget bounds the WHOLE QMP session, not the gaps between polls (M7). A
+        // QEMU whose main loop is wedged (or whose snapshot filesystem has stalled)
+        // answers neither the greeting, nor `migrate`, nor a `query-migrate` — and a
+        // between-iterations clock check never runs if the read before it never
+        // returns, so `snapshot()`/`restore()` hung forever instead of surfacing the
+        // typed error this const's doc promises. One `timeout_at` over the entire body
+        // is the shape `qmp_command` already uses; the deadline is an `Instant` that
+        // bounds every inner step (outer-bounds-inner), which is why no step below
+        // re-checks the clock — a second copy of the law is what diverged here.
+        tokio::time::timeout_at(deadline, async {
+            let mut stream = UnixStream::connect(&self.qmp_socket)
                 .await
                 .map_err(Error::Io)?;
+            let (r, mut w) = stream.split();
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+
+            // Greeting, then negotiate capabilities once for the whole migrate+poll session.
+            reader.read_line(&mut line).await.map_err(Error::Io)?;
+            w.write_all(b"{\"execute\": \"qmp_capabilities\"}\n")
+                .await
+                .map_err(Error::Io)?;
+            line.clear();
+            reader.read_line(&mut line).await.map_err(Error::Io)?;
+
+            // Kick off the migration and confirm QEMU accepted the command.
+            w.write_all(execute_cmd.as_bytes())
+                .await
+                .map_err(Error::Io)?;
+            w.write_all(b"\n").await.map_err(Error::Io)?;
             read_qmp_result(&mut reader, &mut line).await?;
-            let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| {
-                Error::Qmp(format!("query-migrate reply parse ({e}): {}", line.trim()))
-            })?;
-            let status = value
-                .get("return")
-                .and_then(|r| r.get("status"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            match status {
-                "completed" => return Ok(()),
-                "failed" | "cancelled" => {
-                    return Err(Error::Vmm(format!(
-                        "QEMU migration {status}: {}",
-                        line.trim()
-                    )));
+            check_qmp_reply(&line)?;
+
+            // Poll to a terminal status on the same connection.
+            loop {
+                w.write_all(b"{\"execute\": \"query-migrate\"}\n")
+                    .await
+                    .map_err(Error::Io)?;
+                read_qmp_result(&mut reader, &mut line).await?;
+                let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| {
+                    Error::Qmp(format!("query-migrate reply parse ({e}): {}", line.trim()))
+                })?;
+                let status = value
+                    .get("return")
+                    .and_then(|r| r.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                match status {
+                    "completed" => return Ok(()),
+                    "failed" | "cancelled" => {
+                        return Err(Error::Vmm(format!(
+                            "QEMU migration {status}: {}",
+                            line.trim()
+                        )));
+                    }
+                    // "setup" / "active" / "device" / "wait-unplug" / "" — still in flight.
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
                 }
-                // "setup" / "active" / "device" / "wait-unplug" / "" — still in flight.
-                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
             }
-        }
+        })
+        .await
+        .map_err(|_| {
+            Error::Vmm("QEMU migration did not reach `completed` within the budget".into())
+        })?
     }
 }
 
@@ -661,10 +680,35 @@ fn uses_in_kernel_vsock(cfg: &VmConfig) -> bool {
     }
 }
 
+/// The ONE `snapshot_restore` capability self-guard, shared by QEMU's `snapshot()` (via
+/// [`qemu_snapshot_eligibility`], reading the flag the instance captured at construction)
+/// and `restore()` (reading `self.capabilities()` directly) — the shape CH and FC already
+/// carry (rubric B3 / M-RESTORE-3): a backend checks its OWN descriptor rather than
+/// assuming its native semantics, so a deliberate re-gate of the flag turns every
+/// snapshot/restore into this typed refusal instead of a live `migrate` against a QEMU
+/// that no longer supports it. One predicate, so the two entry points cannot diverge.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] when the descriptor does not advertise
+/// `snapshot_restore`; the feature string equals the `VmmCapabilities` field name (§7.2).
+fn require_snapshot_restore_capable(snapshot_restore_capable: bool) -> Result<()> {
+    if !snapshot_restore_capable {
+        return Err(Error::Unsupported {
+            vmm: "qemu".to_string(),
+            feature: "snapshot_restore".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// QEMU's authoritative snapshot-eligibility guard (S1, §8.1), checked at `snapshot()`
-/// time on the instance itself. Two independent requirements, each a fail-loud typed
+/// time on the instance itself. Three independent requirements, each a fail-loud typed
 /// `Unsupported`:
 ///
+/// 0. The backend must advertise `snapshot_restore` — the descriptor self-check
+///    ([`require_snapshot_restore_capable`]) CH runs first in its own `snapshot_precheck`
+///    and QEMU was missing entirely; the flag is captured at construction because the
+///    instance has no handle back to the backend.
 /// 1. The instance must ride the **in-kernel `Vsock` transport**. The external
 ///    `vhost-device-vsock` daemon is itself a non-migratable vhost-user device, and the
 ///    shared `config_has_vhost_user_device` predicate cannot see it — so this endpoint
@@ -676,7 +720,12 @@ fn uses_in_kernel_vsock(cfg: &VmConfig) -> bool {
 ///    *and* a virtio-fs share / unprivileged net, so the endpoint is no longer proof of
 ///    eligibility and this second check is what upholds the law (mirrors the
 ///    `config_has_vhost_user_device` reject on the restore path).
-fn qemu_snapshot_eligibility(endpoint: &VsockEndpoint, has_vhost_user_device: bool) -> Result<()> {
+fn qemu_snapshot_eligibility(
+    snapshot_restore_capable: bool,
+    endpoint: &VsockEndpoint,
+    has_vhost_user_device: bool,
+) -> Result<()> {
+    require_snapshot_restore_capable(snapshot_restore_capable)?;
     if !matches!(endpoint, VsockEndpoint::Vsock { .. }) {
         return Err(Error::Unsupported {
             vmm: "qemu".to_string(),
@@ -1251,6 +1300,7 @@ impl Vmm for Qemu {
         };
         Ok(QemuInstance::from_spawned(
             self.spawn_qemu(cfg, res, cgroups, &params).await?,
+            self.capabilities().snapshot_restore,
         ))
     }
 
@@ -1261,6 +1311,11 @@ impl Vmm for Qemu {
         res: &PerVmResources,
         cgroups: &dyn vmcell::metrics::CgroupFs,
     ) -> Result<Self::Instance> {
+        // Self-check our OWN descriptor before doing any work, exactly as CH's
+        // `restore` does (M-RESTORE-3): a re-gate of `snapshot_restore` must land as
+        // this typed refusal, not as a spawn + `migrate-incoming` against a QEMU the
+        // descriptor says cannot do it. One predicate with `snapshot()`'s self-guard.
+        require_snapshot_restore_capable(self.capabilities().snapshot_restore)?;
         vmcell::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
 
         // Eligibility (S1, §8.1, The warm-snapshot path and the eligibility law), defense in depth alongside `config::build()` and the
@@ -1308,8 +1363,10 @@ impl Vmm for Qemu {
             guest_cid: res.guest_cid,
             incoming: true,
         };
-        let instance =
-            QemuInstance::from_spawned(self.spawn_qemu(cfg, res, cgroups, &params).await?);
+        let instance = QemuInstance::from_spawned(
+            self.spawn_qemu(cfg, res, cgroups, &params).await?,
+            self.capabilities().snapshot_restore,
+        );
 
         // Drive the incoming migration on the now-ready QMP socket and wait for it to
         // complete. The VM stays **paused** afterward (the source was paused during
@@ -1460,10 +1517,15 @@ impl VmInstance for QemuInstance {
     }
 
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
-        // Eligibility (S1, §8.1) — the authoritative snapshot-time guard. Restore
-        // rotates the CID (§2.4), so the source CID is not persisted; the migration
-        // stream is the only artifact.
-        qemu_snapshot_eligibility(&self.endpoint, self.has_vhost_user_device)?;
+        // Eligibility (S1, §8.1) — the authoritative snapshot-time guard, now including
+        // the `snapshot_restore` descriptor self-check (M-RESTORE-3) over the flag this
+        // instance captured at construction. Restore rotates the CID (§2.4), so the
+        // source CID is not persisted; the migration stream is the only artifact.
+        qemu_snapshot_eligibility(
+            self.snapshot_restore_capable,
+            &self.endpoint,
+            self.has_vhost_user_device,
+        )?;
 
         // pause → migrate-to-file → poll `completed` → resume the source. Mirrors the
         // CH/FC snapshot order (§8.1, The warm-snapshot path and the eligibility law); the orchestrator's `MicroVm::snapshot`
@@ -1796,6 +1858,73 @@ mod tests {
         );
     }
 
+    /// A `VmConfig` identical to `usb_cfg(&[])` except for its VMM seccomp policy — the
+    /// one axis the sandbox gate below varies, so the two composed argvs differ by
+    /// exactly the `-sandbox` splice and nothing else.
+    fn seccomp_cfg(policy: vmcell::config::VmmSeccomp) -> VmConfig {
+        use vmcell::config::RootfsSource;
+        VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .vmm_seccomp(policy)
+        .build()
+        .expect("build config")
+    }
+
+    // M11 / §12.2 (Layer 1 — the VMM's own seccomp filter) GATE, over the COMPOSED argv.
+    // `vmm_seccomp_args` has its own golden in `vmcell`, but that says nothing about
+    // whether the tokens ever reach the process: deleting `cmd.args(&seccomp_args)` from
+    // `build_qemu_command` left every gate green while QEMU — which has NO sandbox unless
+    // the flag is passed — ran unconfined. This is the test that reddens on that deletion,
+    // the same fragment-vs-composed seam the delta-9 pass closed for USB. It pins:
+    // (a) `Enforcing` puts `-sandbox` and its spec CONTIGUOUSLY in the launched argv
+    //     (a splice that separated them would leave QEMU parsing a bare `-sandbox`);
+    // (b) the value is the ONE shared `vmm_seccomp_args` predicate's, never a local copy;
+    // (c) `Disabled` emits no sandbox token at all — and the two argvs differ by exactly
+    //     that pair, so the splice cannot smuggle in or drop any other flag.
+    #[test]
+    fn qemu_full_argv_splices_the_sandbox_flag() {
+        use vmcell::config::VmmSeccomp;
+
+        let expected = vmcell::vmm::seccomp::vmm_seccomp_args("qemu", VmmSeccomp::Enforcing)
+            .expect("the one seccomp predicate composes QEMU's Enforcing flag");
+        assert_eq!(
+            expected.len(),
+            2,
+            "QEMU's Enforcing policy is the `-sandbox <spec>` pair: {expected:?}"
+        );
+
+        let argv = composed_argv(&seccomp_cfg(VmmSeccomp::Enforcing));
+        let at = argv
+            .windows(expected.len())
+            .position(|w| w == expected.as_slice())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the composed QEMU argv never carries the sandbox flag {expected:?} — \
+                     QEMU launches UNCONFINED (it has no sandbox unless told); argv was {argv:?}"
+                )
+            });
+
+        // Negative control: the loud opt-out emits no sandbox token whatsoever (a
+        // `-sandbox off` regression would still match `contains("sandbox")`).
+        let disabled = composed_argv(&seccomp_cfg(VmmSeccomp::Disabled));
+        assert!(
+            !disabled.iter().any(|a| a.contains("sandbox")),
+            "VmmSeccomp::Disabled must emit no -sandbox token at all: {disabled:?}"
+        );
+
+        // …and Enforcing adds ONLY that pair: strip it and the two argvs are identical.
+        let mut stripped = argv.clone();
+        stripped.drain(at..at + expected.len());
+        assert_eq!(
+            stripped, disabled,
+            "the sandbox splice must add ONLY the `-sandbox <spec>` pair to the argv"
+        );
+    }
+
     /// Writes one sysfs USB *device* directory (`idVendor`/`idProduct`/`busnum`/`devnum`)
     /// plus its usbfs node, mirroring the real `/sys/bus/usb/devices` layout.
     fn fake_usb_device(sysfs: &Path, usbfs: &Path, name: &str, ids: (u16, u16), at: (u32, u32)) {
@@ -2099,20 +2228,58 @@ mod tests {
             path: PathBuf::from("/tmp/v.sock"),
             port: 5000,
         };
-        // The only eligible combination: in-kernel Vsock transport, no vhost-user device.
-        assert!(qemu_snapshot_eligibility(&vsock, false).is_ok());
+        // The only eligible combination: a capable backend, in-kernel Vsock transport,
+        // no vhost-user device.
+        assert!(qemu_snapshot_eligibility(true, &vsock, false).is_ok());
         // Vsock endpoint but the VM carries a vhost-user device (the Task B hole): reject.
         assert!(matches!(
-            qemu_snapshot_eligibility(&vsock, true),
+            qemu_snapshot_eligibility(true, &vsock, true),
             Err(Error::Unsupported { vmm, feature })
                 if vmm == "qemu" && feature.contains("vhost-user device")
         ));
         // External daemon (Unix endpoint) is a non-migratable vhost-user transport: reject.
         assert!(matches!(
-            qemu_snapshot_eligibility(&unix, false),
+            qemu_snapshot_eligibility(true, &unix, false),
             Err(Error::Unsupported { feature, .. }) if feature.contains("in-kernel vsock")
         ));
-        assert!(qemu_snapshot_eligibility(&unix, true).is_err());
+        assert!(qemu_snapshot_eligibility(true, &unix, true).is_err());
+    }
+
+    // §6 (`qemu-crosvm-snapshot-restore-missing-capability-selfguard`): QEMU's
+    // snapshot/restore boundary must self-check its OWN `snapshot_restore` descriptor —
+    // the check CH and FC carry (M-RESTORE-3 / rubric B3) and QEMU lacked entirely, so a
+    // deliberate re-gate of the flag would have left `snapshot()`/`restore()` happily
+    // driving `migrate` on a backend advertising it cannot. The false branch is the one
+    // the shipped descriptor (`snapshot_restore: true`) can never reach at runtime, so it
+    // is pinned here directly. RED on the inverse: a `require_snapshot_restore_capable`
+    // that ignores its argument, or a `qemu_snapshot_eligibility` that skips it, fails
+    // the first two assertions.
+    #[test]
+    fn snapshot_precheck_self_guards_the_capability() {
+        let vsock = VsockEndpoint::Vsock { cid: 3, port: 5000 };
+
+        let err = require_snapshot_restore_capable(false)
+            .expect_err("an incapable backend must refuse fail-loud");
+        assert!(
+            // §7.2 rule: the typed-refusal feature string equals the descriptor field name.
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "qemu" && feature == "snapshot_restore"),
+            "expected a snapshot_restore Unsupported, got {err:?}"
+        );
+
+        // …and the instance-side guard runs it FIRST: an otherwise perfectly eligible VM
+        // (in-kernel Vsock, no vhost-user device) is still refused on the descriptor.
+        let err = qemu_snapshot_eligibility(false, &vsock, false)
+            .expect_err("an incapable backend must refuse even an eligible VM");
+        assert!(
+            matches!(&err, Error::Unsupported { feature, .. } if feature == "snapshot_restore"),
+            "expected a snapshot_restore Unsupported, got {err:?}"
+        );
+
+        // Positive control: the same VM on a capable backend is allowed, so the refusal
+        // above is the capability check and not the eligibility law.
+        assert!(require_snapshot_restore_capable(true).is_ok());
+        assert!(qemu_snapshot_eligibility(true, &vsock, false).is_ok());
     }
 
     // Guards VMM-3: a QMP reply carrying an `error` object must surface as
@@ -2181,6 +2348,104 @@ mod tests {
         assert_eq!(result, Some("{\"return\": {}}"));
         // The first line alone — what a single read captures — is not a result.
         assert_eq!(classify_qmp_line(stream[0]), QmpLine::Event);
+    }
+
+    /// A fake QMP server on `socket` that goes **silent** — the wedged-QEMU shape (stuck
+    /// main loop, stalled snapshot filesystem): it never closes the connection (an EOF is
+    /// a different, already-typed error) and simply stops answering. With `greet` it
+    /// first completes the greeting + `qmp_capabilities` handshake and reads the
+    /// `migrate` command, then answers nothing; without it, it is silent from the first
+    /// byte, so the handshake read is the one that would block.
+    fn spawn_silent_qmp_server(socket: &Path, greet: bool) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind the fake QMP socket");
+        tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("fake QMP accept").0;
+            if greet {
+                let (r, mut w) = stream.split();
+                let mut reader = BufReader::new(r);
+                w.write_all(b"{\"QMP\": {\"version\": {}}}\n")
+                    .await
+                    .expect("greeting");
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("qmp_capabilities");
+                w.write_all(b"{\"return\": {}}\n")
+                    .await
+                    .expect("capabilities reply");
+                line.clear();
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("the migrate command");
+            }
+            std::future::pending::<()>().await;
+        })
+    }
+
+    /// A [`QemuInstance`] whose only real wiring is `qmp_socket`, so the QMP-driving
+    /// methods can run against a fake server with no VMM. The process is a live child in
+    /// its own group, so `Drop`'s reap stays honest rather than being skipped.
+    fn instance_on_socket(qmp_socket: &Path) -> QemuInstance {
+        let (process, _pid) = spawn_group_standin();
+        let pgid = process.id();
+        QemuInstance {
+            process,
+            qmp_socket: qmp_socket.to_path_buf(),
+            vsock_path: qmp_socket.with_file_name("vsock.sock"),
+            serial_path: qmp_socket.with_file_name("serial.log"),
+            _fs_daemons: Vec::new(),
+            _vsock_daemon: None,
+            cid: 3,
+            endpoint: VsockEndpoint::Vsock { cid: 3, port: 5000 },
+            has_vhost_user_device: false,
+            snapshot_restore_capable: true,
+            pgid,
+            vsock_pgid: None,
+            reaped: false,
+        }
+    }
+
+    // M7 GATE (KVM-free): `MIGRATION_BUDGET` must bound the WHOLE QMP session. It used to
+    // be checked only between poll iterations, so the connect, the handshake reads, every
+    // `write_all` and every `read_qmp_result` were unbounded — a QEMU that stops answering
+    // QMP hung `snapshot()`/`restore()` forever, the exact wedge the const's own doc
+    // claims it converts into a typed error. Both blocking points are driven: silent
+    // after `migrate` (the poll-loop read) and silent from the first byte (the handshake
+    // read, which the old between-iterations check could never reach). RED on the inverse
+    // (delete the `timeout_at` wrapper): the call never returns and the wall-clock guard
+    // below — 10× the budget — fires with a naming panic instead of hanging the suite.
+    #[tokio::test]
+    async fn drive_migration_bounds_a_wedged_qmp_session() {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+        const GUARD: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (leg, greet) in [("silent after migrate", true), ("silent handshake", false)] {
+            let socket = dir.path().join(format!("qmp-{}.sock", u8::from(greet)));
+            let server = spawn_silent_qmp_server(&socket, greet);
+            let instance = instance_on_socket(&socket);
+
+            let result = tokio::time::timeout(
+                GUARD,
+                instance.drive_migration(
+                    "{\"execute\": \"migrate\", \"arguments\": {\"uri\": \"file:/dev/null\"}}",
+                    BUDGET,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "M7: drive_migration hung past its {BUDGET:?} budget against a QEMU \
+                     {leg} — the budget does not bound the QMP I/O"
+                )
+            });
+
+            let err = result.expect_err("a wedged QMP session must surface a typed error");
+            assert!(
+                matches!(&err, Error::Vmm(msg) if msg.contains("within the budget")),
+                "expected the migration-budget Vmm error ({leg}), got {err:?}"
+            );
+            server.abort();
+        }
     }
 
     // M-VMM-2: a spawn failure for the external vhost-device-vsock daemon must surface

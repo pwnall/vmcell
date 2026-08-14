@@ -225,12 +225,13 @@ pub(crate) fn remove_vm_tmp_dir(dir: &Path) {
 /// Builds a Tokio command for the VMM, handling network namespaces, the jailer-equivalent
 /// pre-exec hardening (design §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)), and process groups.
 ///
-/// The single `pre_exec` closure enters the netns (when `netns_name` is `Some`) and then
-/// applies `jail` to the VMM child — the order is load-bearing: `setns` needs the caps the
-/// child still holds pre-exec, and the jail (`no_new_privs` + rlimits + seccomp) is applied
-/// after. Both are async-signal-safe (only `open`/`setns`/`close` on a pre-allocated string,
-/// and [`jail::apply_jail`]'s raw `prctl`/`setrlimit`/`seccomp` on already-allocated inputs).
-/// The closure is installed only when there is netns or non-no-op jail work to do.
+/// The single `pre_exec` closure resets SIGINT/SIGTERM to `SIG_DFL`, enters the netns (when
+/// `netns_name` is `Some`) and then applies `jail` to the VMM child — the order is load-bearing:
+/// `setns` needs the caps the child still holds pre-exec, and the jail (`no_new_privs` + rlimits +
+/// seccomp) is applied after. All three are async-signal-safe (`signal` on a constant, `open`/
+/// `setns`/`close` on a pre-allocated string, and [`jail::apply_jail`]'s raw
+/// `prctl`/`setrlimit`/`seccomp` on already-allocated inputs). The closure is **always** installed:
+/// the signal reset applies even with no netns and a no-op jail (M9).
 pub fn build_vmm_cmd(
     binary_path: &Path,
     netns_name: Option<&str>,
@@ -245,36 +246,45 @@ pub fn build_vmm_cmd(
     let netns_path: Option<String> = netns_name.map(|n| format!("/var/run/netns/{n}\0"));
     let jail = jail.clone();
 
-    if netns_path.is_some() || !jail.is_noop() {
-        let pre_exec = move || -> std::io::Result<()> {
-            if let Some(path) = &netns_path {
-                // SAFETY: `open(2)` on the pre-allocated NUL-terminated `path`; async-signal-safe.
-                let fd = unsafe {
-                    libc::open(
-                        path.as_ptr() as *const libc::c_char,
-                        libc::O_RDONLY | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // SAFETY: `setns(2)` on the fd opened just above; async-signal-safe.
-                if unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0 {
-                    let err = std::io::Error::last_os_error();
-                    // SAFETY: close the fd opened above on the error path; async-signal-safe.
-                    unsafe { libc::close(fd) };
-                    return Err(err);
-                }
-                // SAFETY: close the fd opened above on the success path; async-signal-safe.
-                unsafe { libc::close(fd) };
+    let pre_exec = move || -> std::io::Result<()> {
+        // M9 (`broker-child-dies-to-terminal-signals-orphaning-vms`): a supervisor may ignore
+        // SIGINT/SIGTERM so a terminal Ctrl-C cannot kill it before its ordered teardown runs
+        // (`vmcelld`'s broker child does) — and an IGNORED disposition SURVIVES `execve`, unlike
+        // a caught one. Reset both here so the VMM we exec keeps normal signal behavior (an
+        // operator's `kill` on a VMM, and the teardown's own signals, must still work). First:
+        // it needs no caps and must hold even if a later step fails the spawn.
+        // SAFETY: `signal(2)` with `SIG_DFL` on a valid signal number — async-signal-safe,
+        // touches no memory of ours, and allocates nothing in the post-fork window.
+        unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+        // SAFETY: as above, for SIGTERM.
+        unsafe { libc::signal(libc::SIGTERM, libc::SIG_DFL) };
+        if let Some(path) = &netns_path {
+            // SAFETY: `open(2)` on the pre-allocated NUL-terminated `path`; async-signal-safe.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-            // Jailer-equivalent hardening AFTER the netns join (setns still needs the caps).
-            crate::vmm::jail::apply_jail(&jail)
-        };
-        // SAFETY: `pre_exec` runs `pre_exec` post-fork/pre-exec; it is async-signal-safe (above).
-        unsafe {
-            std_cmd.pre_exec(pre_exec);
+            // SAFETY: `setns(2)` on the fd opened just above; async-signal-safe.
+            if unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0 {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: close the fd opened above on the error path; async-signal-safe.
+                unsafe { libc::close(fd) };
+                return Err(err);
+            }
+            // SAFETY: close the fd opened above on the success path; async-signal-safe.
+            unsafe { libc::close(fd) };
         }
+        // Jailer-equivalent hardening AFTER the netns join (setns still needs the caps).
+        crate::vmm::jail::apply_jail(&jail)
+    };
+    // SAFETY: `pre_exec` runs `pre_exec` post-fork/pre-exec; it is async-signal-safe (above).
+    unsafe {
+        std_cmd.pre_exec(pre_exec);
     }
     tokio::process::Command::from(std_cmd)
 }

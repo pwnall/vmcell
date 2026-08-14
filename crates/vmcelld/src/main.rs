@@ -160,10 +160,43 @@ fn run() -> Result<(), i32> {
 /// sweep, and serves the [`vmcell_daemon::bridge`] RPC over `sock`. Never returns — it `_exit`s so a
 /// forked child does not run the parent's at-exit handlers.
 fn run_broker_child(cli: &Cli, ch_bin: String, sock: std::os::unix::net::UnixStream) -> ! {
+    ignore_terminal_signals();
     let code = run_broker_child_inner(cli, ch_bin, sock);
     // SAFETY: `_exit` is async-signal-safe and skips at-exit handlers — the forked child must not run
     // the parent's teardown. The registry (and its VMs) already dropped inside `block_on` above.
     unsafe { libc::_exit(code) }
+}
+
+/// Sets SIGINT/SIGTERM to `SIG_IGN` in the **broker child** (M9,
+/// `broker-child-dies-to-terminal-signals-orphaning-vms`).
+///
+/// `fork(2)` keeps the child in the parent's process group, so a terminal Ctrl-C (SIGINT to the
+/// whole foreground group) — or a `kill -TERM -<pgid>` — reaches the cap-holding child too. At the
+/// default disposition that kills it outright: its [`Registry`] never drops, and the VMM processes
+/// (each in its own process group, with no `PDEATHSIG`) survive as **orphans** pinning guest RAM and
+/// `/dev/kvm` — which the *next* daemon's start-up sweep then de-resources (netns/cgroup/scratch)
+/// underneath. Ignoring both here lets the graceful path win the race: the child's lifetime is
+/// already governed by `PR_SET_PDEATHSIG` (parent death) and the parent's `ShutdownAll`/EOF on the
+/// bridge, both of which run the ordered teardown. Spawned VMMs are unaffected — an ignored
+/// disposition survives `execve`, so `vmcell::vmm::build_vmm_cmd`'s `pre_exec` resets both to
+/// `SIG_DFL` in the VMM child.
+///
+/// Called right after the fork and **before** the tokio runtime is built (the fork must precede any
+/// thread; fork-with-threads is unsafe), so the window at the default disposition is a few
+/// instructions wide.
+fn ignore_terminal_signals() {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: `signal(2)` with `SIG_IGN` on a valid, catchable signal number; it touches no
+        // memory of ours and this is the single-threaded post-fork child.
+        let prev = unsafe { libc::signal(sig, libc::SIG_IGN) };
+        if prev == libc::SIG_ERR {
+            tracing::warn!(
+                sig,
+                "vmcelld broker: cannot ignore this signal; a terminal Ctrl-C may kill the broker \
+                 before its VMs are torn down"
+            );
+        }
+    }
 }
 
 fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::UnixStream) -> i32 {

@@ -41,6 +41,44 @@ pub mod backend {
         send_capacity.saturating_sub(send_queue).min(buf_len)
     }
 
+    /// Performs one guest→host drain step from inside `TcpSocket::recv`'s closure
+    /// and returns `(bytes to consume from the RX ring, the host write's result)`
+    /// (B1, `nat-guest-to-host-wrap-panic`).
+    ///
+    /// `contiguous` is exactly what `recv` hands its closure: the **largest
+    /// contiguous** run of queued octets, `min(len, capacity - read_at)`.
+    /// `RingBuffer::dequeue_many_with` then `assert!`s — a real assert, not a
+    /// debug one — that the returned count fits that slice. The pre-fix pump
+    /// peeked with `peek_slice`, whose `read_allocated` does a **two-part copy
+    /// across the ring wrap**, and fed the resulting count back to `recv`: on any
+    /// sustained >64 KiB guest→host stream, the first tick whose queued data
+    /// straddles the 65536-byte ring boundary returned a count larger than the
+    /// contiguous span and tripped that assert, killing the `run_network` thread
+    /// while the vhost thread kept the device attached — a silently wedged link,
+    /// on a path NET-1/C2 requires to never panic. Writing from inside the closure
+    /// makes `consumed <= contiguous.len()` true by construction; the wrapped
+    /// remainder drains on the next tick, with no data loss.
+    ///
+    /// A short host write consumes exactly the accepted prefix (the unwritten tail
+    /// stays queued for the next tick); an error — `WouldBlock` or fatal — consumes
+    /// nothing, so nothing is dropped on the floor.
+    fn drain_to_host<W>(contiguous: &[u8], write: W) -> (usize, std::io::Result<usize>)
+    where
+        W: FnOnce(&[u8]) -> std::io::Result<usize>,
+    {
+        if contiguous.is_empty() {
+            return (0, Ok(0));
+        }
+        let res = write(contiguous);
+        let consumed = match &res {
+            // The `min` is belt-and-braces: a writer over-reporting what it took
+            // would re-arm the very `dequeue_many_with` assert this helper defuses.
+            Ok(written) => (*written).min(contiguous.len()),
+            Err(_) => 0,
+        };
+        (consumed, res)
+    }
+
     /// Bit position of `VIRTIO_NET_F_CTRL_VQ` in the virtio-net feature set.
     ///
     /// The backend deliberately does **not** advertise this bit (NET-2): it
@@ -75,13 +113,25 @@ pub mod backend {
     // virtio-net header size is 12 bytes
     const VIRTIO_NET_HDR_SIZE: usize = 12;
 
-    /// Maximum length of a single guest TX frame the NAT will buffer: the
-    /// virtio MTU (1500, the `max_transmission_unit` reported by the device)
-    /// plus the 12-byte virtio-net header. virtio-net here negotiates no
-    /// segmentation offload (no `VIRTIO_NET_F_GUEST_TSO`/`GSO`), so
-    /// a frame never legitimately exceeds this. The bound stops a crafted
-    /// descriptor chain from forcing a multi-gigabyte host allocation off a
-    /// guest-controlled `desc.len()`.
+    /// Maximum length of a single guest TX frame the NAT will buffer: 1500 (the
+    /// `max_transmission_unit` this device reports to smoltcp) plus the 12-byte
+    /// virtio-net header. The bound stops a crafted descriptor chain from forcing
+    /// a multi-gigabyte host allocation off a guest-controlled `desc.len()`.
+    ///
+    /// It is a *cap*, not an equality (`max-frame-len-comment-overstates`): on
+    /// `Medium::Ethernet` smoltcp's `max_transmission_unit` is frame-inclusive
+    /// (it counts the 14-byte Ethernet header), while the guest — never told an
+    /// MTU, since `VIRTIO_NET_F_MTU` is not advertised — uses a 1500-byte *IP*
+    /// MTU. A legitimate full-MTU guest frame is therefore 12 + 14 + 1500 = 1526
+    /// bytes and IS dropped here; the older comment's "a frame never legitimately
+    /// exceeds this" conflated the two MTUs. That is inert today because this NAT
+    /// forwards TCP only and the MSS it offers comes off smoltcp's frame-inclusive
+    /// MTU (`ip_mtu()` = 1500 − 14 = 1486, minus 20 + 20 of IP/TCP headers = 1446),
+    /// so the largest legitimate guest TCP frame is 12 + 14 + 20 + 20 + 1446 = 1512
+    /// — exactly this cap (no segmentation offload either:
+    /// `VIRTIO_NET_F_GUEST_TSO`/`GSO` are not negotiated). Raising the cap is a
+    /// data-plane change, not a comment fix: revisit it when non-TCP forwarding
+    /// lands.
     const MAX_FRAME_LEN: usize = VIRTIO_NET_HDR_SIZE + 1500;
 
     /// Returns how many bytes of a TX descriptor may be read into a frame that
@@ -1045,23 +1095,30 @@ pub mod backend {
                             }
 
                             if socket.can_recv() {
-                                let mut buf = [0; 8192];
-                                if let Ok(n) = socket.peek_slice(&mut buf)
-                                    && n > 0
-                                {
-                                    match stream.try_write(buf.get(..n).unwrap_or(&[])) {
-                                        Ok(written) => {
-                                            // NET-1/C2: guest-driven; never panic.
-                                            if let Err(e) = socket.recv(|_| (written, ())) {
-                                                tracing::error!("smoltcp recv failed: {:?}", e);
-                                                closed = true;
-                                            }
-                                        }
-                                        Err(ref e)
-                                            if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                        Err(_) => {
-                                            closed = true;
-                                        }
+                                // B1 (`nat-guest-to-host-wrap-panic`): the host
+                                // write happens INSIDE the `recv` closure, over
+                                // the contiguous slice smoltcp offers, so the
+                                // consumed count can never exceed
+                                // `dequeue_many_with`'s `max_size` (see
+                                // `drain_to_host`). Peeking with `peek_slice` —
+                                // which copies across the RX ring wrap — and
+                                // feeding its count back to `recv` tripped that
+                                // assert on every sustained >64 KiB upload,
+                                // killing this thread while the device stayed
+                                // attached.
+                                match socket.recv(|contiguous| {
+                                    drain_to_host(contiguous, |bytes| stream.try_write(bytes))
+                                }) {
+                                    // NET-1/C2: guest-driven; never panic.
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(ref e))
+                                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                    Ok(Err(_)) => {
+                                        closed = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("smoltcp recv failed: {:?}", e);
+                                        closed = true;
                                     }
                                 }
                             }
@@ -1103,6 +1160,102 @@ pub mod backend {
             assert_eq!(host_read_budget(65536, 40000, 8192), 8192);
             // Never underflows if the queue somehow exceeds capacity.
             assert_eq!(host_read_budget(1024, 2048, 8192), 0);
+        }
+
+        // B1 (`nat-guest-to-host-wrap-panic`) / M13: the guest→host pump must
+        // consume from the RX ring EXACTLY what the host accepted, and never more
+        // than the contiguous span the closure was offered. Driven against a REAL
+        // `TcpSocketBuffer` (the very `RingBuffer` a `TcpSocket`'s rx_buffer is)
+        // positioned across its wrap, so `dequeue_many_with`'s own
+        // `assert!(size <= max_size)` is the judge, not a restatement of it.
+        //
+        // RED on the inverse — the shipped-until-B1 `peek_slice` + `recv(|_|
+        // (written, ()))` shape, i.e. `let n = ring.read_allocated(0, &mut buf);
+        // ring.dequeue_many_with(|_| (n, ()))`: `read_allocated` copies across the
+        // wrap, `n` (10) exceeds `max_size` (4), and this test panics exactly as
+        // the `run_network` thread did on every sustained >64 KiB upload. The
+        // live half of this gate (a real >1 MiB guest→host stream through the
+        // device, which no fake moves) is `tests/nat_window_fill.rs`'s upload leg.
+        #[test]
+        fn guest_to_host_drain_consumes_only_the_contiguous_span() {
+            // A 16-byte ring holding 10 payload bytes that straddle the wrap:
+            // payload[0..4] at storage[12..16], payload[4..10] at storage[0..6),
+            // `read_at` = 12. The contiguous span is 4; `peek_slice` reports 10.
+            // The filler dance is required because `enqueue_many_with` resets
+            // `read_at` to 0 whenever the ring goes EMPTY — so the ring is walked
+            // to offset 12 while staying non-empty, then the two remaining filler
+            // bytes are drained off the front.
+            let mut storage = [0u8; 16];
+            let mut ring = TcpSocketBuffer::new(&mut storage[..]);
+            assert_eq!(ring.enqueue_slice(&[0xAA; 12]), 12);
+            assert_eq!(ring.dequeue_slice(&mut [0u8; 10]), 10);
+            let payload: Vec<u8> = (0..10u8).collect();
+            assert_eq!(ring.enqueue_slice(&payload), 10);
+            assert_eq!(ring.dequeue_slice(&mut [0u8; 2]), 2);
+            assert_eq!(ring.len(), 10);
+
+            // A host writer that accepts everything offered consumes exactly the
+            // contiguous span, leaving the wrapped remainder queued for next tick.
+            let mut seen: Vec<u8> = Vec::new();
+            let (consumed, res) = ring.dequeue_many_with(|contiguous| {
+                assert_eq!(contiguous.len(), 4, "pre-wrap span");
+                drain_to_host(contiguous, |bytes| {
+                    seen.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                })
+            });
+            assert_eq!(consumed, 4, "consumed past the contiguous span");
+            assert_eq!(res.expect("write ok"), 4);
+            assert_eq!(seen, payload[..4], "wrong bytes handed to the host");
+            assert_eq!(ring.len(), 6, "the wrapped remainder must stay queued");
+
+            // A SHORT host write consumes exactly the accepted prefix — the tail
+            // stays queued (consuming `contiguous.len()` here would lose bytes).
+            let (consumed, res) = ring.dequeue_many_with(|contiguous| {
+                assert_eq!(contiguous.len(), 6, "post-wrap span");
+                drain_to_host(contiguous, |bytes| {
+                    seen.extend_from_slice(&bytes[..2]);
+                    Ok(2)
+                })
+            });
+            assert_eq!(consumed, 2, "a short write must consume only what it took");
+            assert_eq!(res.expect("write ok"), 2);
+            assert_eq!(seen, payload[..6]);
+            assert_eq!(ring.len(), 4);
+
+            // `WouldBlock` (and any other error) consumes nothing: the queue is
+            // intact and the same bytes are re-offered next tick.
+            let (consumed, res) = ring.dequeue_many_with(|contiguous| {
+                drain_to_host(contiguous, |_| {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                })
+            });
+            assert_eq!(consumed, 0, "a blocked write must consume nothing");
+            assert_eq!(
+                res.expect_err("blocked").kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert_eq!(ring.len(), 4);
+
+            // A writer over-reporting what it took is clamped to the offered span
+            // rather than re-arming the `dequeue_many_with` assert.
+            let (consumed, _) =
+                ring.dequeue_many_with(|contiguous| drain_to_host(contiguous, |_| Ok(usize::MAX)));
+            assert_eq!(consumed, 4);
+            assert_eq!(ring.len(), 0);
+
+            // Nothing queued → nothing offered, nothing consumed, no write
+            // attempted (the empty slice must not be mistaken for an EOF write).
+            let attempted = AtomicBool::new(false);
+            let (consumed, res) = ring.dequeue_many_with(|contiguous| {
+                drain_to_host(contiguous, |bytes| {
+                    attempted.store(true, Ordering::SeqCst);
+                    Ok(bytes.len())
+                })
+            });
+            assert_eq!(consumed, 0);
+            assert_eq!(res.expect("no write"), 0);
+            assert!(!attempted.load(Ordering::SeqCst), "wrote on an empty ring");
         }
 
         // Invariant #4 (design §6.2): the per-forward-port socket pool must hold MORE

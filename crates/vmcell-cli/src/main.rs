@@ -64,6 +64,9 @@ enum Commands {
     /// Build the kernel + rootfs + agent + tools artifacts into the artifacts dir.
     Build {
         /// Which kernel builder to use for the `vmlinux` seed (§5.4, The guest-kernel contract and the bootstrap seed).
+        /// `prebuilt` downloads the seed and `host-make` compiles it here; `in-vm` needs a seed of
+        /// its own to boot the builder VM and is therefore a typed error here (M3) — that producer's
+        /// route is `build-kernels --kernel-source in-vm`, which stages the seed.
         #[arg(long, value_enum, default_value_t = KernelSource::Prebuilt)]
         kernel_source: KernelSource,
         /// Which rootfs builder to use for the erofs (§4.3, The rootfs-construction contract).
@@ -353,6 +356,107 @@ fn kernel_source_needs_seed(source: KernelSource) -> bool {
     matches!(source, KernelSource::InVm)
 }
 
+/// Refuses a seed-needing producer on `vmcell build`, naming the route that does work (M3, §5.4,
+/// The guest-kernel contract and the bootstrap seed).
+///
+/// `build` publishes exactly one kernel, under the default `kernel` key, and cannot stage a seed
+/// ahead of it the way `build-kernels` does: the unlabelled `InVmKernelStage` answers `name()` with
+/// `"kernel"` and `out_path()` with `vmlinux` — the exact pair `PrebuiltKernelStage` uses — so the
+/// seed and the in-VM stage would share the one `vmlinux.cache_key` sidecar and overwrite each
+/// other's key on every run, making every `vmcell build` miss cache and re-run the up-to-2-hour
+/// compile. That is why this is a refusal and not a copy of `build-kernels`' seed staging; the
+/// obvious fix is the wrong one. Before M3 the flag was accepted and the pipeline then died on
+/// "needs a seed `kernel` artifact" — remedial advice the operator could not act on from here.
+///
+/// The refusal lives at pipeline assembly rather than at clap-parse time: clap's own rejection is
+/// an exit-2 usage error, not the matchable `vmcell::Error` every other CLI refusal is
+/// (`moved_to_vmcelld_ctl`, `reject_labelled_prebuilt`), and encoding it in the type would mean a
+/// second, `build`-only producer enum — a copy of §5.4's producer set whose clap "possible values"
+/// line could not name the `build-kernels` route. It is the FIRST statement of [`build_stages`], so
+/// nothing is printed, allocated, or downloaded before the flag is honored or rejected.
+///
+/// # Errors
+/// Returns [`vmcell::Error::Unsupported`] when `source` needs a bootstrap seed (the one
+/// [`kernel_source_needs_seed`] law), i.e. for the in-VM producer.
+fn reject_seed_needing_source_for_build(source: KernelSource) -> vmcell::Result<()> {
+    if !kernel_source_needs_seed(source) {
+        return Ok(());
+    }
+    let producer = kernel_source_name(source);
+    Err(vmcell::Error::Unsupported {
+        vmm: "vmcell".to_string(),
+        feature: format!(
+            "`vmcell build --kernel-source {producer}` cannot stage the bootstrap seed kernel the \
+             {producer} producer boots from — run `vmcell build-kernels --kernel-source {producer}` \
+             instead, which stages it (§5.4); `vmcell build` takes `prebuilt` or `host-make`"
+        ),
+    })
+}
+
+/// Assembles the `vmcell build` pipeline's stages in run order: resolved pins, the selected kernel
+/// producer, the guest agent and tools, and the selected rootfs producer (§5.4, The guest-kernel contract and the bootstrap seed; §4.3, The rootfs-construction contract).
+///
+/// Separate from [`dispatch`] so the wiring — including the refusal above — is assertable without
+/// running a build that downloads and compiles for hours.
+///
+/// # Errors
+/// As [`reject_seed_needing_source_for_build`] (a producer `build` cannot seed) and
+/// [`kernel_stage`].
+fn build_stages(
+    kernel_source: KernelSource,
+    rootfs_source: RootfsSourceKind,
+    release: String,
+    pins: Option<&std::path::Path>,
+    cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
+) -> vmcell::Result<Vec<Box<dyn vmcell::artifact::Stage>>> {
+    reject_seed_needing_source_for_build(kernel_source)?;
+    Ok(vec![
+        Box::new(vmcell::artifact::ResolvePinsStage {
+            overlay_file: pins_overlay(pins),
+        }),
+        kernel_stage(kernel_source, None, None, cid_alloc.clone())?,
+        Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}),
+        Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}),
+        rootfs_stage(rootfs_source, release, cid_alloc),
+    ])
+}
+
+/// Assembles the kernel stages `vmcell build-kernels` runs, in run order: the bootstrap seed first
+/// when the producer needs one, then one stage per registry label (§5.4, The guest-kernel contract and the bootstrap seed; §5.6, The downstream kernel toolkit).
+///
+/// The in-VM producer boots a builder micro-VM, which needs a working `vmlinux` published under the
+/// `kernel` artifact key — a key no labelled stage ever registers (they register `kernel-<label>`).
+/// The pinned prebuilt seed is staged ahead of them (§5.4); it is content-addressed like any stage,
+/// so a warm artifacts dir hits cache and nothing is re-downloaded. The caller prepends
+/// [`ResolvePinsStage`](vmcell::artifact::ResolvePinsStage), which is not per-kernel.
+///
+/// # Errors
+/// As [`kernel_stage`] — a labelled build routed at the prebuilt producer, which compiles nothing.
+fn build_kernels_stages(
+    kernel_source: KernelSource,
+    registry: &[vmcell::artifact::KernelRegistryEntry],
+    cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
+) -> vmcell::Result<Vec<Box<dyn vmcell::artifact::Stage>>> {
+    let mut stages: Vec<Box<dyn vmcell::artifact::Stage>> = Vec::new();
+    if kernel_source_needs_seed(kernel_source) {
+        stages.push(kernel_stage(
+            KernelSource::Prebuilt,
+            None,
+            None,
+            cid_alloc.clone(),
+        )?);
+    }
+    for entry in registry {
+        stages.push(kernel_stage(
+            kernel_source,
+            Some(entry.label.clone()),
+            Some(entry.fragments.clone()),
+            cid_alloc.clone(),
+        )?);
+    }
+    Ok(stages)
+}
+
 /// Builds the rootfs [`Stage`](vmcell::artifact::Stage) selected by `source` — the `vmcell`
 /// OCI bootstrap producer or the in-VM `vmcell-rootfs-builder` mmdebstrap source (§4.3, The rootfs-construction contract).
 fn rootfs_stage(
@@ -385,17 +489,22 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             release,
             pins,
         } => {
-            println!("Building artifacts...");
             // One CID allocator shared by any in-VM builder stage this pipeline runs.
             let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
-            let pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir())
-                .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
-                    overlay_file: pins_overlay(pins.as_deref()),
-                }))
-                .add_stage(kernel_stage(*kernel_source, None, None, cid_alloc.clone())?)
-                .add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}))
-                .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
-                .add_stage(rootfs_stage(*rootfs_source, release.clone(), cid_alloc));
+            // Assemble — and so honor or reject every flag — BEFORE announcing the build: a
+            // refused `--kernel-source` (M3) must not first print "Building artifacts...".
+            let stages = build_stages(
+                *kernel_source,
+                *rootfs_source,
+                release.clone(),
+                pins.as_deref(),
+                cid_alloc,
+            )?;
+            println!("Building artifacts...");
+            let mut pipeline = vmcell::artifact::Pipeline::new(vmcell::artifact::artifacts_dir());
+            for stage in stages {
+                pipeline = pipeline.add_stage(stage);
+            }
             pipeline.build(&vmcell::artifact::Cache::default()).await?;
             println!("Artifacts built successfully.");
             Ok(())
@@ -527,19 +636,10 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                 .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
                     overlay_file,
                 }));
-            // The in-VM producer boots a builder micro-VM, which needs a working `vmlinux`
-            // published under the `kernel` artifact key — a key no labelled stage ever registers
-            // (they register `kernel-<label>`). Stage the pinned prebuilt bootstrap seed ahead of
-            // them (§5.4); it is content-addressed like any stage, so a warm artifacts dir hits
-            // cache and nothing is re-downloaded.
+            // The seed-then-labels roster is `build_kernels_stages` (assertable without a build);
+            // this loop is its log. The seed line is the same one predicate the assembly uses.
             if kernel_source_needs_seed(*kernel_source) {
                 println!("  - bootstrap seed (prebuilt) -> vmlinux (boots the builder VM)");
-                pipeline = pipeline.add_stage(kernel_stage(
-                    KernelSource::Prebuilt,
-                    None,
-                    None,
-                    cid_alloc.clone(),
-                )?);
             }
             for entry in &registry {
                 let label = &entry.label;
@@ -551,12 +651,9 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                         entry.fragments.join("+")
                     }
                 );
-                pipeline = pipeline.add_stage(kernel_stage(
-                    *kernel_source,
-                    Some(label.clone()),
-                    Some(entry.fragments.clone()),
-                    cid_alloc.clone(),
-                )?);
+            }
+            for stage in build_kernels_stages(*kernel_source, &registry, cid_alloc)? {
+                pipeline = pipeline.add_stage(stage);
             }
             pipeline.build(&vmcell::artifact::Cache::default()).await?;
             println!("Kernels built ({producer}): {}", labels.join(", "));
@@ -1174,6 +1271,108 @@ mod tests {
                 alloc()
             )
             .is_ok()
+        );
+    }
+
+    // M3 GATE (§5.4, delta 3): `vmcell build --kernel-source in-vm` was accepted and could never be
+    // honored — the in-VM stage reads its seed from the pipeline's ARTIFACT MAP, and `build` staged
+    // no seed, so the run died on "needs a seed `kernel` artifact" no matter what the operator had
+    // already built. `build` cannot stage one either (both stages are named `kernel` and write
+    // `vmlinux`, so they would fight over the one `vmlinux.cache_key` sidecar and re-run the
+    // up-to-2-hour compile every time), so the flag is a typed refusal naming the route that works.
+    // RED on the inverse (the pre-M3 arm that wired `InVmKernelStage` with no seed): the assembly
+    // returns Ok and the operator gets the unhonorable pipeline back.
+    #[test]
+    fn build_refuses_the_in_vm_kernel_source_and_names_the_route() {
+        let alloc = || std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+        let err = build_stages(
+            KernelSource::InVm,
+            RootfsSourceKind::Oci,
+            "trixie".to_string(),
+            None,
+            alloc(),
+        )
+        // Render the roster so a regression reports WHAT it assembled instead of `Box<dyn Stage>`
+        // (which is not `Debug`).
+        .map(|s| {
+            s.iter()
+                .map(|st| st.name().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .expect_err("`vmcell build` + in-vm must be refused, not assembled");
+        assert!(
+            matches!(err, vmcell::Error::Unsupported { .. }),
+            "expected Error::Unsupported, got {err:?}"
+        );
+        // The refusal must name the WORKING route verbatim, so the operator's next command is the
+        // one that succeeds. RED on a message that only says "not supported".
+        let shown = err.to_string();
+        assert!(
+            shown.contains("build-kernels --kernel-source in-vm"),
+            "the refusal must name the `build-kernels` route, got: {shown}"
+        );
+        // Positive control: every producer `build` CAN honor still assembles the whole pipeline, in
+        // run order, for both rootfs sources — the refusal is scoped to the seed-needing producer,
+        // not a blanket break of `vmcell build`.
+        for source in [KernelSource::Prebuilt, KernelSource::HostMake] {
+            for rootfs in [RootfsSourceKind::Oci, RootfsSourceKind::Mmdebstrap] {
+                let stages = build_stages(source, rootfs, "trixie".to_string(), None, alloc())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{} + {rootfs:?} must assemble: {e}",
+                            kernel_source_name(source)
+                        )
+                    });
+                let names: Vec<&str> = stages.iter().map(|s| s.name()).collect();
+                assert_eq!(
+                    names,
+                    [
+                        "resolve_pins",
+                        "kernel",
+                        "guest_agent",
+                        "guest_tools",
+                        "rootfs"
+                    ],
+                    "the `build` pipeline's stage roster ({} + {rootfs:?})",
+                    kernel_source_name(source)
+                );
+            }
+        }
+    }
+
+    // M3's other half, and delta 3's own gate: the in-VM producer's working route STILL works —
+    // `build-kernels` stages the prebuilt seed (the `kernel` key the builder VM boots from) ahead
+    // of the labelled stages, which is exactly what `build` structurally cannot do. RED on the
+    // inverse (dropping the seed from the roster, i.e. the pre-v30 pipeline): the seed `kernel`
+    // stage disappears and `build-kernels --kernel-source in-vm` dies on the missing artifact.
+    #[test]
+    fn build_kernels_still_stages_the_seed_for_in_vm() {
+        let alloc = || std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
+        // The real registry, through the library's merged resolution — the same roster the command
+        // builds, never a test-local list.
+        let registry =
+            vmcell::artifact::resolve_kernel_registry(None).expect("the baseline kernels registry");
+        assert!(
+            !registry.is_empty(),
+            "the baseline registry must not be empty"
+        );
+        let labels: Vec<&str> = registry.iter().map(|e| e.label.as_str()).collect();
+        let in_vm = build_kernels_stages(KernelSource::InVm, &registry, alloc())
+            .expect("`build-kernels` + in-vm must assemble");
+        let names: Vec<&str> = in_vm.iter().map(|s| s.name()).collect();
+        // The seed is the unlabelled `kernel` stage FIRST; the labelled stages follow in registry
+        // order (a seed staged after them would publish `kernel` too late for the builder VM).
+        let mut expected = vec!["kernel"];
+        expected.extend(labels.iter().copied());
+        assert_eq!(names, expected, "seed-first roster for the in-VM producer");
+        // Contrast: a producer that needs no seed gets exactly the labels, no seed stage.
+        let host_make = build_kernels_stages(KernelSource::HostMake, &registry, alloc())
+            .expect("`build-kernels` + host-make must assemble");
+        assert_eq!(
+            host_make.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            labels,
+            "host-make needs no seed"
         );
     }
 

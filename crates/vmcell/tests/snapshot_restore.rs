@@ -5,10 +5,158 @@ use vmcell::vmm::VmInstance;
 
 mod common;
 
+/// The in-guest TCP port the data-plane leg's `echo-server` listens on (delta 7's guest-tools
+/// applet, as in `segment.rs` — no new guest code, law C6 untouched).
+const EGRESS_ECHO_PORT: u16 = 7101;
+
+/// The host-side client of that echo server, run INSIDE the VM's own network namespace.
+///
+/// A privileged VM holds only its `/30` tap — no veth, no uplink — so the only host endpoint on
+/// its data plane is the tap's gateway address inside `vmcell-net-<vmid>`; a socket's netns is
+/// fixed at `socket()` time, so the client has to be created there (`NetSegment::dial_tcp`'s
+/// pattern, which is `pub(crate)`-gated for the per-VM netns, hence the `ip netns exec` shell-out
+/// the rest of this suite already uses for `nft`/`tc`). `python3` is the same host dependency
+/// `host_endpoint.rs` / `egress_proxy.rs` already require.
+///
+/// Bounded, never a hang: an unplumbed tap answers no ARP, so the connect must time out rather
+/// than block the suite — 2 s × the 20 attempts below is ~50 s to a loud red, while a listener
+/// that is merely still starting is refused immediately and gets the full retry budget.
+const HOST_ECHO_CLIENT_PY: &str = "\
+import socket,sys
+s=socket.create_connection((sys.argv[1],int(sys.argv[2])),2)
+s.settimeout(2)
+s.sendall(sys.argv[3].encode())
+buf=b''
+while len(buf)<len(sys.argv[3]):
+    c=s.recv(4096)
+    if not c: break
+    buf+=c
+s.close()
+sys.stdout.buffer.write(buf)
+";
+
 vmm_matrix_test!(snapshot_restore, |vmm| {
     require_cap!(vmcell::vmm::Vmm::capabilities(&vmm), snapshot_restore, vmm);
     test_snapshot_restore_impl(&vmm).await;
 });
+
+/// Leaves `echo-server --tcp` listening on [`EGRESS_ECHO_PORT`] inside `vm`.
+///
+/// Re-runnable: a second copy simply fails to bind and exits, so the post-restore call is a no-op
+/// when the pre-snapshot listener resumed with the guest.
+async fn start_guest_echo_server<V: vmcell::vmm::Vmm>(vm: &mut MicroVm<V>) {
+    let started = vm
+        .agent(None)
+        .await
+        .expect("agent for the echo server")
+        .exec(ExecRequest::new(vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "/vmcell-tools/echo-server --tcp 0.0.0.0:{EGRESS_ECHO_PORT} </dev/null \
+                 >/tmp/echo.log 2>&1 &"
+            ),
+        ]))
+        .await
+        .expect("spawning the echo-server must succeed");
+    assert_eq!(
+        started.code,
+        0,
+        "backgrounding the echo-server failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+}
+
+/// One host→guest→host byte exchange over the VM's tap, from inside netns `netns`. `None` on any
+/// failure (the guest listener is not up yet, or nothing is plumbed).
+fn host_echo_once(netns: &str, guest_ip: std::net::Ipv4Addr, payload: &str) -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["netns", "exec", netns, "python3", "-c", HOST_ECHO_CLIENT_PY])
+        .args([
+            guest_ip.to_string(),
+            EGRESS_ECHO_PORT.to_string(),
+            payload.to_string(),
+        ])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The `ip -o link show` view **inside** the VM's netns — the diagnostic that names the M1 defect
+/// directly (an orphan `<prefix>-tap-<old vmid>`, down and unbridged, beside the plumbed one).
+///
+/// `nsenter --net=<path>` is `segment.rs`'s proven idiom, and **stderr is folded into the result**:
+/// the first cut used `ip netns exec … ip …`, whose exec failure goes to stderr only, so the live
+/// red printed an empty listing — a diagnostic that silently says nothing is worse than none.
+fn links_in_netns(netns: &str) -> String {
+    match std::process::Command::new("nsenter")
+        .arg(format!("--net=/var/run/netns/{netns}"))
+        .args(["ip", "-o", "link", "show"])
+        .output()
+    {
+        Ok(out) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => format!("<listing links in {netns} failed: {e}>"),
+    }
+}
+
+/// Asserts the guest actually MOVES A BYTE over its tap: the payload the guest echoes back is
+/// data that left the guest through `eth0`, not a proxy signal.
+///
+/// docs/78 M1 (`fc-restore-rebinds-baked-tap-name-dead-data-plane`): FC's `/snapshot/load` used to
+/// carry no `network_overrides`, so a restore re-opened the snapshot's BAKED
+/// `<prefix>-tap-<old vmid>` — which, under the runner's ambient `CAP_NET_ADMIN`, `TUNSETIFF`
+/// silently *creates* as a fresh, down, unbridged tap. Restore then "succeeds", the guest's resync
+/// rotates its address onto the new `/30`, and every packet drops into the orphan. Nothing in this
+/// file could see it: the `/proc/net/route` assertion above reads guest-side TEXT and the agent
+/// transport is vsock, not the tap. This leg is the data plane itself, so it reddens on that
+/// backend behavior — and it retro-covers CH's `net[].tap` restore-config rewrite (§8.2) and
+/// crosvm/QEMU's fresh `--net tap-name=`/netdev on the same run.
+///
+/// Backend-independent by construction: the guest address is rotated by the SHARED post-restore
+/// resync on every backend, and the netns/tap names are the one `vmcell::naming` law, so unlike
+/// the host-socket identity above there is no `restore_rotates_host_paths` branch to take — that
+/// flag scopes the vsock/serial paths, not the tap.
+async fn assert_guest_egress_byte<V: vmcell::vmm::Vmm>(vm: &mut MicroVm<V>, phase: &str) {
+    let vmid = vm.vmid();
+    let netns = vm
+        .netns()
+        .expect("a privileged VM owns a per-VM netns")
+        .name
+        .clone();
+    let (_host_ip, guest_ip, _cidr) = vmcell::net::ip_math(vmid).expect("ip_math for the vmid");
+    let payload = format!("EGRESS-BYTE-{phase}-{vmid}");
+
+    start_guest_echo_server(vm).await;
+
+    // Retried while the guest listener comes up — the failure being guarded is a permanently dead
+    // data plane, not a slow start.
+    for _ in 0..20 {
+        if host_echo_once(&netns, guest_ip, &payload).as_deref() == Some(payload.as_str()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let echo_log = vm
+        .agent(None)
+        .await
+        .expect("agent for the echo-server log")
+        .exec(ExecRequest::new(vec!["cat".into(), "/tmp/echo.log".into()]))
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+    panic!(
+        "{phase}: the guest never moved a byte out over its tap (expected {payload:?} echoed back \
+         from {guest_ip}:{EGRESS_ECHO_PORT} inside {netns}). Links in {netns}:\n{}\nguest \
+         /tmp/echo.log:\n{echo_log}",
+        links_in_netns(&netns)
+    );
+}
 
 async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Reap any orphaned vmcell-net-* namespaces from a prior aborted run so this
@@ -104,6 +252,12 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .trim()
             .parse()
             .unwrap();
+
+        // THE POSITIVE CONTROL for the post-restore data-plane leg (docs/78 M1). The same
+        // exchange, on the same VM, over the tap the CREATE path plumbed — so a red after restore
+        // means "the restore lost the tap", never "the echo tool is missing" or "python3/`ip netns
+        // exec` cannot run here". It also leaves the listener running into the snapshot.
+        assert_guest_egress_byte(&mut vm, "pre-snapshot").await;
 
         let original_cid = vm.instance().guest_cid();
 
@@ -300,6 +454,11 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
              (hex {expected_gw_hex}); guest /proc/net/route:\n{route_table}"
         );
 
+        // …and the route table is guest-side TEXT: it is identical whether or not the host end of
+        // the link is plumbed. This is the DATA PLANE (docs/78 M1) — a byte that actually left the
+        // guest through eth0 and came back — with the pre-snapshot exchange as its control.
+        assert_guest_egress_byte(&mut vm, "post-restore").await;
+
         let new_cid = vm.instance().guest_cid();
         assert!(
             (3..=254).contains(&new_cid),
@@ -325,13 +484,19 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
                     // M-TEST-RESTORE: assert the REAL socket path embeds the rotated
                     // vmid, not merely that it differs — proving the path reflects the
                     // new identity rather than a coincidental string difference.
+                    // Recomputed through `vmcell::naming` (law F2), never a test-local
+                    // `format!`: a hand-rolled copy of the scratch-dir spelling drifts
+                    // silently when the composer changes and the assert goes vacuous
+                    // (docs/78 §6, `test-local-scratch-name-format`).
+                    let expected_scratch = vmcell::naming::scratch_dir_name(
+                        vmcell::naming::DEFAULT_RESOURCE_PREFIX,
+                        std::process::id(),
+                        new_vmid,
+                    );
                     assert!(
-                        new_vsock.contains(&format!(
-                            "vmcell-vm-{}-{}",
-                            std::process::id(),
-                            new_vmid
-                        )),
-                        "restored vsock path {new_vsock} must embed the rotated vmid {new_vmid}"
+                        new_vsock.contains(&expected_scratch),
+                        "restored vsock path {new_vsock} must embed the rotated vmid {new_vmid} \
+                         (expected scratch dir {expected_scratch})"
                     );
                 }
                 // QEMU in-kernel vhost-vsock: identity is the guest CID (its

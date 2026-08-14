@@ -817,46 +817,238 @@ fn set_mac(dev: &str, mac_str: &str) -> Result<(), String> {
 // `curl` — real HTTP(S) client (curl-flag subset).
 // ---------------------------------------------------------------------------
 
-fn run_curl(args: &[String]) -> i32 {
-    let mut insecure = false;
-    let mut verbose = false;
-    let mut max_time: Option<u64> = None;
-    let mut resolve: Vec<(String, u16, std::net::IpAddr)> = Vec::new();
-    let mut url: Option<String> = None;
+/// The subset of curl's CLI this shim implements, parsed and **validated** before
+/// any request is made.
+///
+/// Every field here is a flag the shim genuinely acts on. That is the whole point
+/// of the type (`curl-shim-silently-ignores-unknown-flags`): the pre-fix parser
+/// ignored unknown flags, swallowed a garbage `--max-time`, discarded `-o`/`-H`/
+/// `-A`/`-X` values, and dropped an unparseable `--resolve` — so a test that
+/// reached for a real-curl feature silently lost the property it was written to
+/// assert (the `-k`-on-a-TLS-test hazard, one step removed). Rejection *is* the
+/// faithful emulation: a flag this shim cannot honor exits 2 naming the offender,
+/// exactly as a missing real-curl feature would fail loudly.
+struct CurlArgs {
+    insecure: bool,
+    verbose: bool,
+    max_time: Option<u64>,
+    resolve: Vec<(String, u16, std::net::IpAddr)>,
+    /// `-H Name: value` sets a header; `-H Name:` (empty value) *removes* it, the
+    /// curl idiom for suppressing a header curl would otherwise add.
+    headers: Vec<(String, Option<String>)>,
+    method: Option<String>,
+    body: Option<Vec<u8>>,
+    output: Option<String>,
+    write_out: Option<String>,
+    follow: bool,
+    url: String,
+}
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "-k" | "--insecure" => insecure = true,
-            "-v" | "--verbose" => verbose = true,
-            "--max-time" => {
-                if let Some(n) = it.next() {
-                    max_time = n.parse().ok();
+/// The `%{…}` variables `-w`/`--write-out` understands. Validated at *parse* time
+/// so an unsupported variable fails before the request rather than rendering as
+/// silent empty text.
+const WRITE_OUT_VARS: &[&str] = &["http_code", "size_download"];
+
+/// Renders a `-w`/`--write-out` format. `\n`/`\t`/`\\` are the escapes curl
+/// documents; `%{var}` interpolates a [`WRITE_OUT_VARS`] entry; `%%` is a literal
+/// `%`. Returns `Err` naming the offending variable, so the same predicate both
+/// validates (at parse time, with placeholder values) and renders.
+fn render_write_out(fmt: &str, http_code: u16, size_download: usize) -> Result<String, String> {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => return Err(format!("unsupported --write-out escape \\{other}")),
+                None => return Err("trailing \\ in --write-out format".to_string()),
+            },
+            '%' => match chars.peek() {
+                Some('%') => {
+                    chars.next();
+                    out.push('%');
                 }
-            }
-            "--resolve" => {
-                if let Some(spec) = it.next()
-                    && let Some(parsed) = parse_resolve(spec)
-                {
-                    resolve.push(parsed);
+                Some('{') => {
+                    chars.next();
+                    let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                    match name.as_str() {
+                        "http_code" => out.push_str(&http_code.to_string()),
+                        "size_download" => out.push_str(&size_download.to_string()),
+                        _ => {
+                            return Err(format!(
+                                "unsupported --write-out variable %{{{name}}} (supported: {})",
+                                WRITE_OUT_VARS.join(", ")
+                            ));
+                        }
+                    }
                 }
-            }
-            // Flags we accept but don't need to act on for the tested behaviour.
-            "-4" | "-6" | "-s" | "-S" | "--silent" | "-L" | "--location" | "--compressed" => {}
-            // Flags that consume a value we ignore.
-            "-H" | "--header" | "-o" | "--output" | "-A" | "--user-agent" | "-X" | "--request" => {
-                let _ = it.next();
-            }
-            other if other.starts_with('-') => {
-                // Unknown flag: ignore rather than fail the whole command.
-            }
-            other => url = Some(other.to_string()),
+                _ => return Err("bare % in --write-out format (use %% or %{var})".to_string()),
+            },
+            other => out.push(other),
         }
     }
+    Ok(out)
+}
 
-    let Some(url) = url else {
-        eprintln!("curl: no URL specified");
-        return 2;
+/// Parses the shim's curl-flag subset, or returns the message to print before
+/// exiting 2. Pure and filesystem-free except for the `@file` body read, so the
+/// whole accept/reject matrix is unit-testable without a network or a guest.
+fn parse_curl_args(args: &[String]) -> Result<CurlArgs, String> {
+    let mut parsed = CurlArgs {
+        insecure: false,
+        verbose: false,
+        max_time: None,
+        resolve: Vec::new(),
+        headers: Vec::new(),
+        method: None,
+        body: None,
+        output: None,
+        write_out: None,
+        follow: false,
+        url: String::new(),
+    };
+    let mut url: Option<String> = None;
+    let mut it = args.iter();
+    // Every value-consuming arm goes through this so a flag at the end of argv is
+    // a named rejection, never a silently-dropped option.
+    macro_rules! value {
+        ($flag:expr) => {
+            it.next()
+                .ok_or_else(|| format!("option {} needs a value", $flag))?
+        };
+    }
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-k" | "--insecure" => parsed.insecure = true,
+            "-v" | "--verbose" => parsed.verbose = true,
+            "-L" | "--location" => parsed.follow = true,
+            // Honored by construction: this shim prints no progress meter (so
+            // `-s` is always in effect) and always writes errors to stderr (so
+            // `-S` is too).
+            "-s" | "-S" | "-sS" | "--silent" | "--show-error" => {}
+            // Every vmcell guest datapath — the NAT /30, the privileged tap /30,
+            // and the segment /24 — is IPv4-only, so `-4` is what already happens.
+            // `-6` is therefore un-honorable and rejected rather than ignored.
+            "-4" => {}
+            "--max-time" => {
+                let raw = value!("--max-time");
+                parsed.max_time = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--max-time takes whole seconds, got {raw:?}"))?,
+                );
+            }
+            "--resolve" => {
+                let spec = value!("--resolve");
+                parsed.resolve.push(
+                    parse_resolve(spec)
+                        .ok_or_else(|| format!("--resolve wants HOST:PORT:ADDR, got {spec:?}"))?,
+                );
+            }
+            "-H" | "--header" => {
+                let spec = value!("-H");
+                let (name, value) = spec
+                    .split_once(':')
+                    .ok_or_else(|| format!("-H wants 'Name: value', got {spec:?}"))?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(format!("-H has an empty header name: {spec:?}"));
+                }
+                let value = value.trim();
+                parsed.headers.push((
+                    name.to_string(),
+                    (!value.is_empty()).then(|| value.to_string()),
+                ));
+            }
+            "-A" | "--user-agent" => {
+                let ua = value!("-A");
+                parsed
+                    .headers
+                    .push(("user-agent".to_string(), Some(ua.clone())));
+            }
+            "-X" | "--request" => parsed.method = Some(value!("-X").clone()),
+            "-o" | "--output" => parsed.output = Some(value!("-o").clone()),
+            "-w" | "--write-out" => {
+                let fmt = value!("-w");
+                // Validate now, with placeholder values, so an unsupported
+                // variable fails before the request instead of rendering empty.
+                render_write_out(fmt, 0, 0)?;
+                parsed.write_out = Some(fmt.clone());
+            }
+            // `--data-binary` sends the bytes verbatim; `--data-raw` never reads a
+            // file. Plain `-d`/`--data` is deliberately NOT accepted: real curl
+            // strips newlines from an `@file` there, and silently emulating that
+            // difference is the trap this whole fix exists to close.
+            "--data-binary" => {
+                let spec = value!("--data-binary");
+                parsed.body = Some(match spec.strip_prefix('@') {
+                    Some(path) => std::fs::read(path)
+                        .map_err(|e| format!("--data-binary cannot read {path}: {e}"))?,
+                    None => spec.as_bytes().to_vec(),
+                });
+            }
+            "--data-raw" => parsed.body = Some(value!("--data-raw").as_bytes().to_vec()),
+            "-d" | "--data" => {
+                return Err(
+                    "-d/--data is not implemented (its @file newline-stripping differs \
+                     from curl's); use --data-binary or --data-raw"
+                        .to_string(),
+                );
+            }
+            "-6" => {
+                return Err(
+                    "-6 cannot be honored: vmcell guest networking is IPv4-only".to_string()
+                );
+            }
+            "--compressed" => {
+                return Err(
+                    "--compressed cannot be honored: this build links reqwest without \
+                     decompression features"
+                        .to_string(),
+                );
+            }
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "unknown option {other} — this is vmcell's curl shim \
+                     (/vmcell-tools/curl), not GNU curl; implement the flag or drop it"
+                ));
+            }
+            other => {
+                if let Some(first) = &url {
+                    return Err(format!(
+                        "more than one URL given ({first:?} and {other:?}); the shim \
+                         performs exactly one transfer"
+                    ));
+                }
+                url = Some(other.to_string());
+            }
+        }
+    }
+    parsed.url = url.ok_or_else(|| "no URL specified".to_string())?;
+    Ok(parsed)
+}
+
+fn run_curl(args: &[String]) -> i32 {
+    let CurlArgs {
+        insecure,
+        verbose,
+        max_time,
+        resolve,
+        headers,
+        method,
+        body,
+        output,
+        write_out,
+        follow,
+        url,
+    } = match parse_curl_args(args) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("curl: {msg}");
+            return 2;
+        }
     };
 
     let mut builder = reqwest::blocking::Client::builder();
@@ -869,6 +1061,14 @@ fn run_curl(args: &[String]) -> i32 {
     for (host, port, ip) in &resolve {
         builder = builder.resolve(host, std::net::SocketAddr::new(*ip, *port));
     }
+    // reqwest follows up to 10 redirects by DEFAULT, i.e. the opposite of curl,
+    // which follows none without `-L`. Pin curl's semantics explicitly so `-L`
+    // means something and its absence means something too.
+    builder = builder.redirect(if follow {
+        reqwest::redirect::Policy::limited(10)
+    } else {
+        reqwest::redirect::Policy::none()
+    });
 
     // Configure the proxy explicitly from the curl-style env vars, rather than
     // relying on reqwest's auto-detection (which proved unreliable here). The
@@ -907,10 +1107,34 @@ fn run_curl(args: &[String]) -> i32 {
         }
     };
 
-    match client.get(&url).send() {
+    // curl's own default-method rule: GET, or POST once a body is given; `-X`
+    // overrides either way.
+    let default_method = if body.is_some() { "POST" } else { "GET" };
+    let method_name = method.as_deref().unwrap_or(default_method).to_uppercase();
+    let method = match reqwest::Method::from_bytes(method_name.as_bytes()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("curl: -X {method_name}: {e}");
+            return 2;
+        }
+    };
+    let mut request = client.request(method, &url);
+    for (name, value) in &headers {
+        // A `Name:` with no value is curl's "do not send this header". Nothing
+        // here adds headers implicitly, so honoring it is simply not sending one
+        // — never sending an empty-valued header, which is a different request.
+        if let Some(v) = value {
+            request = request.header(name.as_str(), v.as_str());
+        }
+    }
+    if let Some(bytes) = body {
+        request = request.body(bytes);
+    }
+
+    match request.send() {
         Ok(resp) => {
+            let status = resp.status();
             if verbose {
-                let status = resp.status();
                 eprintln!(
                     "< HTTP/1.1 {} {}",
                     status.as_u16(),
@@ -922,7 +1146,29 @@ fn run_curl(args: &[String]) -> i32 {
                 eprintln!("<");
             }
             let body = resp.bytes().unwrap_or_default();
-            let _ = std::io::stdout().write_all(&body);
+            // `-o` is HONORED, not consumed-and-dropped: the body goes to the file
+            // and never to stdout, so a `-w` line is the only thing stdout carries.
+            if let Some(path) = &output {
+                if let Err(e) = std::fs::write(path, &body) {
+                    eprintln!("curl: cannot write {path}: {e}");
+                    return 23; // CURLE_WRITE_ERROR
+                }
+            } else {
+                let _ = std::io::stdout().write_all(&body);
+            }
+            if let Some(fmt) = &write_out {
+                // Validated at parse time, so a render error here is unreachable;
+                // surface it rather than papering over it if that ever changes.
+                match render_write_out(fmt, status.as_u16(), body.len()) {
+                    Ok(rendered) => {
+                        let _ = std::io::stdout().write_all(rendered.as_bytes());
+                    }
+                    Err(msg) => {
+                        eprintln!("curl: {msg}");
+                        return 2;
+                    }
+                }
+            }
             let _ = std::io::stdout().flush();
             // curl exits 0 once a response is received (no `--fail`), regardless
             // of HTTP status — the blocked-egress test asserts on the 403 in the
@@ -1362,6 +1608,125 @@ mod tests {
         assert!(parse_resolve("blocked.com:443").is_none());
         assert!(parse_resolve("blocked.com:notaport:1.2.3.4").is_none());
         assert!(parse_resolve("blocked.com:443:not.an.ip").is_none());
+    }
+
+    // `curl-shim-silently-ignores-unknown-flags` (docs/78 §6): the shim must
+    // HONOR-OR-REJECT every accepted input, never silently drop one. Rejection is
+    // the faithful emulation — a real-curl feature this shim lacks has to fail
+    // loudly, or a test reaching for it quietly loses the property it asserts
+    // (the `-k`-on-a-TLS-test hazard, one step removed). RED on the pre-fix
+    // parser, whose `other if other.starts_with('-') => { /* ignore */ }` arm
+    // swallowed every one of these.
+    #[test]
+    fn parse_curl_args_rejects_every_input_it_cannot_honor() {
+        for (args, needle) in [
+            (vec!["--fail", "http://h/"], "unknown option"),
+            (vec!["--cacert", "/x", "http://h/"], "unknown option"),
+            (vec!["--max-time", "soon", "http://h/"], "--max-time"),
+            (vec!["--max-time"], "needs a value"),
+            (vec!["--resolve", "garbage", "http://h/"], "--resolve"),
+            (vec!["-H", "no-colon", "http://h/"], "-H"),
+            (vec!["-o"], "needs a value"),
+            (vec!["-6", "http://h/"], "IPv4-only"),
+            (vec!["--compressed", "http://h/"], "decompression"),
+            (vec!["-d", "x=1", "http://h/"], "--data-binary"),
+            (vec!["-w", "%{elapsed}", "http://h/"], "%{elapsed}"),
+            (vec!["http://a/", "http://b/"], "more than one URL"),
+            (vec!["-s"], "no URL"),
+        ] {
+            let err = parse_curl_args(&argv(&args))
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} must be rejected, not silently accepted"));
+            assert!(
+                err.contains(needle),
+                "{args:?} must be rejected naming the cause ({needle:?}), got {err:?}"
+            );
+        }
+    }
+
+    // The positive control for the rejection matrix above: every flag the shim
+    // DOES implement parses into the field that makes it act. A blanket "reject
+    // everything" would pass the matrix and fail here.
+    #[test]
+    fn parse_curl_args_honors_the_flags_it_accepts() {
+        let dir = std::env::temp_dir().join(format!("vmcell-curl-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let body_path = dir.join("body.bin");
+        std::fs::write(&body_path, b"0123456789").expect("write body");
+
+        let parsed = parse_curl_args(&argv(&[
+            "-k",
+            "-v",
+            "-4",
+            "-sS",
+            "-L",
+            "--max-time",
+            "20",
+            "--resolve",
+            "example.com:443:1.2.3.4",
+            "-H",
+            "X-Trace: on",
+            "-H",
+            "Expect:",
+            "-A",
+            "vmcell/1",
+            "-X",
+            "PUT",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--data-binary",
+            &format!("@{}", body_path.display()),
+            "http://example.com/upload",
+        ]))
+        .expect("the accepted subset must parse");
+
+        assert!(parsed.insecure && parsed.verbose && parsed.follow);
+        assert_eq!(parsed.max_time, Some(20));
+        assert_eq!(parsed.resolve.len(), 1);
+        assert_eq!(
+            parsed.headers,
+            vec![
+                ("X-Trace".to_string(), Some("on".to_string())),
+                // `Expect:` is the REMOVE form, so it must not become an
+                // empty-valued header (a different request on the wire).
+                ("Expect".to_string(), None),
+                ("user-agent".to_string(), Some("vmcell/1".to_string())),
+            ]
+        );
+        assert_eq!(parsed.method.as_deref(), Some("PUT"));
+        assert_eq!(parsed.output.as_deref(), Some("/dev/null"));
+        assert_eq!(parsed.write_out.as_deref(), Some("%{http_code}"));
+        // `@file` reads the file's exact bytes; `--data-raw` never does.
+        assert_eq!(parsed.body.as_deref(), Some(&b"0123456789"[..]));
+        assert_eq!(parsed.url, "http://example.com/upload");
+        assert_eq!(
+            parse_curl_args(&argv(&["--data-raw", "@literal", "http://h/"]))
+                .expect("raw parses")
+                .body
+                .as_deref(),
+            Some(&b"@literal"[..]),
+            "--data-raw must never open a file"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    // The `-w` renderer is the half the M13 upload gate reads (`%{http_code}`
+    // proves the sink replied). RED on a renderer that emits an unknown variable
+    // as empty text — the silent-loss shape the whole fix targets.
+    #[test]
+    fn render_write_out_interpolates_and_rejects_unknown_variables() {
+        assert_eq!(render_write_out("%{http_code}", 200, 7), Ok("200".into()));
+        assert_eq!(
+            render_write_out("code=%{http_code} n=%{size_download}\\n", 404, 12),
+            Ok("code=404 n=12\n".into())
+        );
+        assert_eq!(render_write_out("100%%", 200, 0), Ok("100%".into()));
+        assert!(render_write_out("%{time_total}", 200, 0).is_err());
+        assert!(render_write_out("50% off", 200, 0).is_err());
+        assert!(render_write_out("trailing\\", 200, 0).is_err());
     }
 
     #[test]

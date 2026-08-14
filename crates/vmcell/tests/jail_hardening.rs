@@ -2,15 +2,28 @@
 //!
 //! These are the **non-theater** gates for Layer 2: they exercise the real pre-exec syscalls
 //! (`build_vmm_cmd`'s `apply_jail`) and go **red on the inverse** — with neither KVM nor root,
-//! so they run in `just test-unit`. `no_new_privs`, lowering `RLIMIT_CORE`, and a default-allow
-//! seccomp deny-list are all unprivileged, so a stand-in child (`cat /proc/self/{status,limits}`
-//! or a forked child issuing one syscall) proves the mechanism without a VMM.
+//! so they run in `just test-unit`. `no_new_privs`, lowering `RLIMIT_CORE`, clearing
+//! `PR_SET_DUMPABLE`, and a default-allow seccomp deny-list are all unprivileged, so a stand-in
+//! child (`cat /proc/self/{status,limits}` or a forked child issuing one syscall) proves the
+//! mechanism without a VMM.
+//!
+//! The one exception is `clear_ambient_caps`: an unprivileged process has an EMPTY ambient set,
+//! so "the child's ambient set is empty" would pass against a `apply_jail` that did nothing.
+//! That leg is therefore `#[ignore]`d and runs in the privileged suite, where the blessed runner
+//! has raised `CAP_NET_ADMIN` into the ambient set (§11.2) and the assertion has teeth
+//! (docs/78 `jail-gate-narrower-than-design-claims`).
 
 use std::process::Stdio;
 use std::sync::Arc;
 use vmcell::config::JailConfig;
 use vmcell::vmm::build_vmm_cmd;
 use vmcell::vmm::jail::{JailSpec, apply_jail, build_vmm_deny_filter, jail_spec_from_config};
+
+/// `CAP_NET_ADMIN` from `<linux/capability.h>`. The `libc` crate exports no `CAP_*` numbers and
+/// `capctl` is not a `vmcell` dependency, so the one cap the blessed runner is guaranteed to
+/// have raised into the ambient set (§11.2: `cap_net_admin,cap_sys_admin,cap_dac_override`) is
+/// named here.
+const CAP_NET_ADMIN: libc::c_int = 12;
 
 /// Spawns `cat /proc/self/status /proc/self/limits` through `build_vmm_cmd` with `jail`
 /// applied (no netns, so no caps are needed) and returns the child's stdout.
@@ -40,6 +53,85 @@ fn core_soft_limit(limits: &str) -> Option<String> {
         .lines()
         .find(|l| l.starts_with("Max core file size"))
         .and_then(|l| l.split_whitespace().nth(4).map(str::to_string))
+}
+
+/// Forks, applies `spec` in the child, runs `probe` there, and `_exit`s with the probe's code;
+/// returns the child's exit code. One helper for every probe-in-a-jailed-child leg (seccomp,
+/// dumpable, ambient) — never a second copy of the fork dance.
+///
+/// Fork is safe here: the child does only async-signal-safe work (`apply_jail` is raw
+/// prctl/setrlimit/seccomp on already-allocated inputs — including its error path, which
+/// returns a bare errno — then the probe's raw syscalls and `_exit`), so there is no allocation
+/// and no non-reentrant libc between `fork` and `_exit`, hence no post-fork lock hazard. Any
+/// seccomp filter is compiled pre-fork. Reserved exit code: **20** = `apply_jail` itself failed.
+fn fork_probe(spec: &JailSpec, probe: fn() -> i32) -> i32 {
+    // SAFETY: fork in a test; the child path below is async-signal-safe (see the doc above).
+    match unsafe { libc::fork() } {
+        -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+        0 => {
+            let code = match apply_jail(spec) {
+                Ok(()) => probe(),
+                Err(_) => 20,
+            };
+            // SAFETY: _exit is async-signal-safe and skips at-exit handlers (correct post-fork).
+            unsafe { libc::_exit(code) };
+        }
+        pid => {
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid on our own child pid with a valid status out-pointer.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(libc::WIFEXITED(status), "child did not exit normally");
+            libc::WEXITSTATUS(status)
+        }
+    }
+}
+
+/// Child probe for the deny-list leg: 10 = `unshare(0)` allowed, 11 = `unshare(0)` EPERM,
+/// 12 = `unshare(0)` failed with another errno, 13 = the ALLOWED `getpid` was wrongly blocked.
+fn probe_unshare_and_getpid() -> i32 {
+    // getpid must still work (an allowed syscall).
+    // SAFETY: getpid takes no args and cannot fail.
+    let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+    if pid <= 0 {
+        return 13;
+    }
+    // SAFETY: unshare(0) is a no-op; the deny-list turns it into EPERM.
+    let r = unsafe { libc::syscall(libc::SYS_unshare, 0) };
+    if r == 0 {
+        return 10;
+    }
+    // SAFETY: read thread-local errno; async-signal-safe.
+    let e = unsafe { *libc::__errno_location() };
+    if e == libc::EPERM { 11 } else { 12 }
+}
+
+/// Child probe for the dumpable leg: the `PR_GET_DUMPABLE` value (0 = not dumpable, 1 = the
+/// ordinary `SUID_DUMP_USER`), or 21 if the prctl itself errored.
+///
+/// `/proc/<pid>/status` has **no** `Dumpable` field (docs/78
+/// `jail-gate-narrower-than-design-claims`), so the `cat` stand-in structurally cannot see this
+/// flag — `prctl(PR_GET_DUMPABLE)` in the jailed child is the only read route.
+fn probe_dumpable() -> i32 {
+    // SAFETY: `prctl(PR_GET_DUMPABLE)` takes no pointer args; async-signal-safe.
+    let d = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    if d < 0 { 21 } else { d }
+}
+
+/// Child probe for the ambient leg: 1 if `CAP_NET_ADMIN` is still in the ambient set, 0 if not,
+/// 22 if the prctl errored.
+fn probe_ambient_net_admin() -> i32 {
+    // SAFETY: `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap, …)` takes no pointer args;
+    // async-signal-safe.
+    let r = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_IS_SET,
+            CAP_NET_ADMIN,
+            0,
+            0,
+        )
+    };
+    if r < 0 { 22 } else { r }
 }
 
 // Guards §13 (Cross-cutting invariants): `apply_jail` sets PR_SET_NO_NEW_PRIVS and installs RLIMIT_CORE on the
@@ -90,57 +182,107 @@ async fn apply_jail_sets_no_new_privs_and_the_core_rlimit() {
     );
 }
 
+// Guards §13 (Cross-cutting invariants) / §12.3 (Layer 2 — the jailer-equivalent): `apply_jail`
+// actually clears PR_SET_DUMPABLE (no core dump of guest RAM, no ptrace-attach by same-uid
+// processes via the /proc ownership change), and the INVERSE (a spec with `non_dumpable` off)
+// leaves the child dumpable — so deleting the prctl in `apply_jail` reddens here. Root-free,
+// KVM-free. This is the leg §12.3's "asserts the post-apply capability/no_new_privs/DUMPABLE
+// state" sentence claimed and the suite did not have (docs/78
+// `jail-gate-narrower-than-design-claims`).
+#[test]
+fn apply_jail_clears_dumpable_and_the_inverse_leaves_it_set() {
+    // Normalize this process's own dumpable flag to 1 first, so the inverse leg is deterministic
+    // even under a launcher that left it cleared (an exec that RAISES privileges — a file-cap or
+    // setuid binary — clears it, and the blessed runner is exactly that shape). 1 is the ordinary
+    // value for an unprivileged process, so this is a no-op on a normal host and only removes an
+    // environmental confound; the flag is inherited across `fork`, which is what the legs read.
+    // SAFETY: `prctl(PR_SET_DUMPABLE, 1)` takes no pointer args and only affects this process.
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) },
+        0,
+        "PR_SET_DUMPABLE=1 must succeed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let non_dumpable = JailSpec {
+        non_dumpable: true,
+        ..JailSpec::default()
+    };
+    assert_eq!(
+        fork_probe(&non_dumpable, probe_dumpable),
+        0,
+        "non_dumpable=true must leave the child with PR_GET_DUMPABLE == 0"
+    );
+
+    // The inverse: non_dumpable off => the child keeps the inherited dumpable=1.
+    assert_eq!(
+        fork_probe(&JailSpec::default(), probe_dumpable),
+        1,
+        "without non_dumpable, apply_jail must NOT clear PR_SET_DUMPABLE (the gate must be able to fail)"
+    );
+
+    // And the shipped hardened config is on the clearing side (JailConfig::hardened() sets it).
+    let hardened = jail_spec_from_config(&JailConfig::hardened()).expect("hardened spec");
+    assert_eq!(
+        fork_probe(&hardened, probe_dumpable),
+        0,
+        "JailConfig::hardened() must produce a non-dumpable VMM child"
+    );
+}
+
+// Guards §13 (Cross-cutting invariants) / §12.3: `apply_jail` really empties the AMBIENT
+// capability set when asked, and the INVERSE (the shipped `clear_ambient_caps = false` default,
+// Appendix A reversal 9 — the VMM needs the inherited CAP_NET_ADMIN for tap ioctls) really
+// leaves it intact. PRIVILEGED-ONLY and therefore `#[ignore]`d: an unprivileged process has an
+// empty ambient set, so both legs would read 0 and a no-op `apply_jail` would pass. Under the
+// blessed runner (`just test-privileged`, whose filter selects this binary) the process holds
+// CAP_NET_ADMIN in ambient (§11.2), which the precondition below asserts rather than assumes —
+// a green run here is real evidence, and a run without the runner fails loud instead of
+// pretending. No KVM is needed, only the caps.
+#[test]
+#[ignore = "needs the blessed runner's ambient capability set (privileged suite)"]
+fn apply_jail_clears_the_ambient_capability_set() {
+    // Precondition (fail loud, never skip): this process must actually hold an ambient cap, or
+    // the legs below are vacuous.
+    assert_eq!(
+        probe_ambient_net_admin(),
+        1,
+        "this leg needs CAP_NET_ADMIN in the AMBIENT set — run it through the blessed runner \
+         (`just bless` + `just test-privileged`); without it the assertions would be vacuous"
+    );
+
+    let clearing = JailSpec {
+        clear_ambient_caps: true,
+        ..JailSpec::default()
+    };
+    assert_eq!(
+        fork_probe(&clearing, probe_ambient_net_admin),
+        0,
+        "clear_ambient_caps=true must empty the child's ambient set"
+    );
+
+    // The inverse — and the SHIPPED default: the ambient cap survives into the VMM child, which
+    // is what the privileged tap path depends on (Appendix A reversal 9).
+    let hardened = jail_spec_from_config(&JailConfig::hardened()).expect("hardened spec");
+    assert!(
+        !hardened.clear_ambient_caps,
+        "the shipped hardened jail must keep clear_ambient_caps off (Appendix A reversal 9)"
+    );
+    assert_eq!(
+        fork_probe(&hardened, probe_ambient_net_admin),
+        1,
+        "with clear_ambient_caps off, apply_jail must NOT clear the ambient set (the gate must \
+         be able to fail)"
+    );
+}
+
 // Guards §13 (Cross-cutting invariants) (the seccomp deny-list, §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): the compiled deny-list, applied to a forked
 // child, turns a normally-succeeding no-op `unshare(0)` into EPERM, while leaving an allowed
 // syscall (`getpid`) working. The INVERSE (no filter) lets `unshare(0)` succeed — proving the
 // gate fails on the inverse. Root-free (unprivileged no-op unshare + a default-allow filter),
-// KVM-free. Fork is safe here: the child does only async-signal-safe work (`apply_jail`, one
-// raw syscall, `_exit`) — no allocation, no libc lock — and the filter is compiled pre-fork.
+// KVM-free.
 #[test]
 fn seccomp_deny_list_turns_unshare_into_eperm_via_fork() {
-    // Child exit codes: 10 = unshare allowed, 11 = unshare EPERM, 12 = unshare other-errno,
-    // 13 = the allowed getpid was (wrongly) blocked, 20 = apply_jail itself failed.
-    fn run_child(spec: &JailSpec) -> i32 {
-        // SAFETY: fork in a test; the child path below is async-signal-safe (apply_jail is
-        // raw prctl/setrlimit/seccomp on already-allocated inputs, then one raw syscall and
-        // _exit) — no allocation, no non-reentrant libc, so no post-fork lock hazard.
-        match unsafe { libc::fork() } {
-            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
-            0 => {
-                let code = match apply_jail(spec) {
-                    Ok(()) => {
-                        // getpid must still work (an allowed syscall).
-                        // SAFETY: getpid takes no args and cannot fail.
-                        let pid = unsafe { libc::syscall(libc::SYS_getpid) };
-                        if pid <= 0 {
-                            13
-                        } else {
-                            // SAFETY: unshare(0) is a no-op; the deny-list turns it into EPERM.
-                            let r = unsafe { libc::syscall(libc::SYS_unshare, 0) };
-                            if r == 0 {
-                                10
-                            } else {
-                                // SAFETY: read thread-local errno; async-signal-safe.
-                                let e = unsafe { *libc::__errno_location() };
-                                if e == libc::EPERM { 11 } else { 12 }
-                            }
-                        }
-                    }
-                    Err(_) => 20,
-                };
-                // SAFETY: _exit is async-signal-safe and skips at-exit handlers (correct post-fork).
-                unsafe { libc::_exit(code) };
-            }
-            pid => {
-                let mut status: libc::c_int = 0;
-                // SAFETY: waitpid on our own child pid with a valid status out-pointer.
-                unsafe { libc::waitpid(pid, &mut status, 0) };
-                assert!(libc::WIFEXITED(status), "child did not exit normally");
-                libc::WEXITSTATUS(status)
-            }
-        }
-    }
-
     // With the deny-list: unshare(0) -> EPERM (11), getpid still fine.
     let filter = build_vmm_deny_filter().expect("deny-list must compile");
     let denied = JailSpec {
@@ -148,7 +290,7 @@ fn seccomp_deny_list_turns_unshare_into_eperm_via_fork() {
         ..JailSpec::default()
     };
     assert_eq!(
-        run_child(&denied),
+        fork_probe(&denied, probe_unshare_and_getpid),
         11,
         "the seccomp deny-list must turn unshare(0) into EPERM (getpid still allowed)"
     );
@@ -156,7 +298,7 @@ fn seccomp_deny_list_turns_unshare_into_eperm_via_fork() {
     // The inverse: no filter -> unshare(0) succeeds (10). Proves the gate can fail.
     let allowed = JailSpec::default();
     assert_eq!(
-        run_child(&allowed),
+        fork_probe(&allowed, probe_unshare_and_getpid),
         10,
         "without the deny-list, unshare(0) must succeed — the gate must be able to fail"
     );

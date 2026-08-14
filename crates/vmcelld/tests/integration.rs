@@ -68,6 +68,68 @@ fn have_privileged_caps() -> bool {
     [1u32, 12, 21].iter().all(|&b| (mask >> b) & 1 == 1)
 }
 
+// ---- /proc inspection (the P2 cap gate and the orphan-VMM gate) ----
+
+/// One `/proc/<pid>/status` field's value (the text after its colon), or `None` when the process is
+/// gone or the field is absent.
+fn proc_status_field(pid: libc::pid_t, field: &str) -> Option<String> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let key = format!("{field}:");
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(&key).map(|v| v.trim().to_string()))
+}
+
+/// A hex bitmask field of `/proc/<pid>/status` (`Cap*`, `Sig*`). Panics if the process or the field
+/// is gone — a silently-zero reader would make every mask assertion below vacuous.
+fn proc_status_mask(pid: libc::pid_t, field: &str) -> u64 {
+    let raw = proc_status_field(pid, field)
+        .unwrap_or_else(|| panic!("no {field} in /proc/{pid}/status (process gone?)"));
+    u64::from_str_radix(&raw, 16).unwrap_or_else(|e| panic!("{field} {raw:?} is not hex: {e}"))
+}
+
+/// Every pid currently in `/proc`.
+fn proc_pids() -> Vec<libc::pid_t> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+        .collect()
+}
+
+/// The pids whose `PPid` is `ppid` and whose `Name` is `name` — how a test finds the **forked broker
+/// child** of the `vmcelld` it spawned (the fork leaves nothing else the test can name it by).
+fn child_pids_named(ppid: libc::pid_t, name: &str) -> Vec<libc::pid_t> {
+    proc_pids()
+        .into_iter()
+        .filter(|&pid| {
+            proc_status_field(pid, "PPid").as_deref() == Some(ppid.to_string().as_str())
+                && proc_status_field(pid, "Name").as_deref() == Some(name)
+        })
+        .collect()
+}
+
+/// The live `cloud-hypervisor` processes serving this vmid's per-VM scratch dir (their argv carries
+/// `--api-socket <temp>/vmcell-vm-<pid>-<vmid>/api.sock`). Re-scanned on every call rather than
+/// cached, so a recycled pid can never be mistaken for a survivor, and a zombie (empty `cmdline`)
+/// does not count as one.
+fn ch_pids_for_vmid(vmid: u32) -> Vec<libc::pid_t> {
+    let marker = format!("-{vmid}/api.sock");
+    proc_pids()
+        .into_iter()
+        .filter(|&pid| {
+            let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                return false;
+            };
+            let argv = String::from_utf8_lossy(&raw).replace('\0', " ");
+            argv.contains("cloud-hypervisor")
+                && argv.contains("vmcell-vm-")
+                && argv.contains(&marker)
+        })
+        .collect()
+}
+
 fn artifacts_dir() -> PathBuf {
     std::env::var_os("VMCELL_ARTIFACTS_DIR")
         .map(PathBuf::from)
@@ -174,6 +236,17 @@ impl Daemon {
     /// Like [`start`](Self::start) but with an explicit `--resource-prefix` (for the custom-prefix
     /// test).
     async fn start_with_prefix(auth: Auth, resource_prefix: &str) -> Daemon {
+        Self::start_inner(auth, resource_prefix, false).await
+    }
+
+    /// Like [`start`](Self::start) but the daemon leads its **own process group**, so a test can
+    /// deliver a signal to that whole group — the terminal-Ctrl-C shape, which reaches the HTTP
+    /// parent *and* the forked broker child — without signalling the test process itself.
+    async fn start_in_own_process_group(auth: Auth) -> Daemon {
+        Self::start_inner(auth, "vmcell", true).await
+    }
+
+    async fn start_inner(auth: Auth, resource_prefix: &str, own_process_group: bool) -> Daemon {
         require_preconditions();
         let store = tempfile::tempdir().expect("tempdir");
         // Symlink the artifacts into the store (no 150 MB copy per test); the store reads through
@@ -202,6 +275,11 @@ impl Daemon {
             .arg(resource_prefix)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
+        if own_process_group {
+            use std::os::unix::process::CommandExt as _;
+            // pgid == the daemon's pid, and it contains the broker child too (fork keeps the group).
+            cmd.process_group(0);
+        }
 
         let mut key_file_guard = None;
         match auth {
@@ -261,10 +339,40 @@ impl Daemon {
     fn client(&self, key: &str) -> DaemonClient {
         DaemonClient::new(Url::parse(&self.base).expect("url"), key).expect("client")
     }
+
+    /// The spawned `vmcelld`'s pid — the **HTTP parent** (the broker child is a fork of it), and,
+    /// for a daemon started with [`start_in_own_process_group`](Self::start_in_own_process_group),
+    /// also its process-group id.
+    fn pid(&self) -> libc::pid_t {
+        self.child.id() as libc::pid_t
+    }
+
+    /// Waits up to `budget` for the daemon to exit on its own (a signal-driven graceful shutdown),
+    /// reaping it. `None` means it was still running when the budget elapsed — `Drop` then kills it.
+    fn wait_exit(&mut self, budget: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => {}
+                Err(e) => panic!("try_wait on vmcelld failed: {e}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // Already exited and reaped (a test that drove the shutdown itself): nothing to signal —
+        // and `kill`ing a reaped pid could hit a recycled one. `try_wait` caches the status, so this
+        // stays true however many times it is asked.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         // GRACEFUL teardown: SIGTERM so `vmcelld`'s signal handler runs `shutdown_all`, which tears
         // down every owned VM (kills its Cloud Hypervisor process group). A bare `child.kill()`
         // (SIGKILL) would skip that and ORPHAN the CH VMs — the exact leak a panicking test (e.g. one
@@ -852,4 +960,149 @@ async fn custom_resource_prefix_names_and_sweeps_in_isolation() {
     c.destroy(&vm.id).await.expect("destroy");
     // Clean up the control orphan we planted under the other prefix.
     let _ = Command::new("ip").args(["netns", "delete", other]).status();
+}
+
+/// P2 / §12.4 (Layer 3 — the setup broker): the process that parses network input — the **HTTP
+/// parent** — holds **no capability at all** and can never regain one, while the **broker child**
+/// keeps the three. Read off the real `/proc/<pid>/status` of both processes, so deleting
+/// `apply_broker_parent_drop` from `vmcelld` reddens instead of leaving the suite green (M12,
+/// `p2-parent-capless-has-no-red-able-gate`).
+///
+/// `CapBnd` is deliberately NOT asserted: the runner raises no `CAP_SETPCAP`, so the bounding-set
+/// shrink is a warned no-op (`docs/implementation-notes.md` deviation (j)) — inert under
+/// `NoNewPrivs=1`, which IS asserted.
+#[tokio::test]
+#[ignore = "spawns a real vmcelld; needs the blessed runner (run via `just test-daemon`)"]
+async fn broker_parent_serves_with_no_capabilities_child_keeps_them() {
+    let d = Daemon::start(Auth::Open).await;
+    // `/healthz` already answered, so the parent finished its cap-drop and is serving.
+    let parent = d.pid();
+    let children = child_pids_named(parent, "vmcelld");
+    assert_eq!(
+        children.len(),
+        1,
+        "expected exactly one forked broker child of vmcelld {parent}, found {children:?}\n\
+         --- daemon log ---\n{}",
+        d.read_log()
+    );
+    let broker = children[0];
+
+    // The serving parent: every usable capability set is EMPTY, and no setuid exec can refill them.
+    for field in ["CapEff", "CapPrm", "CapInh", "CapAmb"] {
+        let mask = proc_status_mask(parent, field);
+        assert_eq!(
+            mask, 0,
+            "the HTTP parent (pid {parent}) must hold no capability, but {field} is {mask:#x} \
+             (§12.4: a bug in the request parser must not reach a cap)"
+        );
+    }
+    assert_eq!(
+        proc_status_field(parent, "NoNewPrivs").as_deref(),
+        Some("1"),
+        "the HTTP parent must set no_new_privs (pid {parent})"
+    );
+
+    // POSITIVE CONTROL — the same reader, the same fields, on the broker child, which MUST still
+    // hold the three caps (it does the netns/tap/nft/cgroup work and the jailed VMM spawn). Without
+    // this, a reader that always returned 0 would pass every assertion above.
+    let child_eff = proc_status_mask(broker, "CapEff");
+    for (bit, name) in [
+        (1u32, "CAP_DAC_OVERRIDE"),
+        (12, "CAP_NET_ADMIN"),
+        (21, "CAP_SYS_ADMIN"),
+    ] {
+        assert_eq!(
+            (child_eff >> bit) & 1,
+            1,
+            "the broker child (pid {broker}) must retain {name}; CapEff is {child_eff:#x}"
+        );
+    }
+}
+
+/// M9 (`broker-child-dies-to-terminal-signals-orphaning-vms`): a terminal **Ctrl-C** — SIGINT to the
+/// daemon's whole process group, which contains the HTTP parent *and* the forked broker child — must
+/// still tear the VMs down. The VMM sits in its own process group with no `PDEATHSIG`, so a broker
+/// killed at `SIG_DFL` never drops its `Registry` and leaves the VMM running as an **orphan** pinning
+/// guest RAM and `/dev/kvm` — which the next daemon's start-up sweep then de-resources underneath.
+///
+/// The mechanism itself is asserted too — the broker child's `SigIgn` must carry INT and TERM —
+/// so removing the `SIG_IGN` install reddens on the disposition, not only on the (slower) orphan.
+#[tokio::test]
+#[ignore = "boots a real VM, then SIGINTs the daemon's process group; run via `just test-daemon`"]
+async fn group_sigint_tears_down_vms_leaving_no_orphan_vmm() {
+    let mut d = Daemon::start_in_own_process_group(Auth::Open).await;
+    let broker = child_pids_named(d.pid(), "vmcelld");
+    assert_eq!(
+        broker.len(),
+        1,
+        "expected one broker child, found {broker:?}"
+    );
+    let ignored = proc_status_mask(broker[0], "SigIgn");
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        assert_eq!(
+            (ignored >> (sig - 1)) & 1,
+            1,
+            "the broker child (pid {}) must IGNORE signal {sig} so a group Ctrl-C cannot kill the \
+             cap-holder before its ordered teardown; SigIgn is {ignored:#x}",
+            broker[0]
+        );
+    }
+
+    let c = d.client("");
+    let vm = c.create("vmlinux", "rootfs.erofs").await.expect("create");
+    let vmms = ch_pids_for_vmid(vm.vmid);
+    assert_eq!(
+        vmms.len(),
+        1,
+        "expected exactly one cloud-hypervisor for vmid {}, found {vmms:?}",
+        vm.vmid
+    );
+    // No assertion on the VMM's own SigIgn: `build_vmm_cmd`'s `pre_exec` resets INT/TERM to SIG_DFL
+    // (an ignored disposition survives `execve`), but cloud-hypervisor re-arms both itself at
+    // start-up — measured `SigIgn: 0x4` under a parent ignoring INT+TERM — so a VMM-side assertion
+    // here would pass with or without the reset. That half needs a `vmcell`-side spawn gate against
+    // a program that keeps its inherited dispositions (see the review note).
+
+    // Ctrl-C: SIGINT to the daemon's process group — the parent AND the broker child. The VMM is in
+    // its own group, so it is NOT signalled here; only the ordered teardown can end it.
+    // SAFETY: `kill(2)` on the process group this test created (pgid == the daemon's pid), with a
+    // valid signal; no memory is touched.
+    let rc = unsafe { libc::kill(-d.pid(), libc::SIGINT) };
+    assert_eq!(
+        rc,
+        0,
+        "kill(-{}, SIGINT) failed: {}",
+        d.pid(),
+        std::io::Error::last_os_error()
+    );
+
+    let exited = d.wait_exit(Duration::from_secs(60));
+    assert!(
+        exited.is_some(),
+        "vmcelld must exit after a group SIGINT\n--- daemon log ---\n{}",
+        d.read_log()
+    );
+
+    // The VMM must be gone. Poll briefly: teardown completes before the parent exits, but reaping a
+    // reparented process is asynchronous. A surviving VMM never disappears, so this still reddens.
+    let mut survivors = Vec::new();
+    for _ in 0..50 {
+        survivors = ch_pids_for_vmid(vm.vmid);
+        if survivors.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Kill whatever survived BEFORE asserting, so a red run does not leave an orphan VM (holding
+    // guest RAM and /dev/kvm) behind on the host.
+    for &pid in &survivors {
+        // SAFETY: `kill(2)` on a pid this test just re-verified is a live VMM of its own VM.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(
+        survivors.is_empty(),
+        "a group SIGINT must not orphan the VMM; still running: {survivors:?}\n\
+         --- daemon log ---\n{}",
+        d.read_log()
+    );
 }
