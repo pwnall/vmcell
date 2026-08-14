@@ -322,9 +322,9 @@ async fn qemu_refuses_a_usb_device_absent_from_the_host() {
 }
 
 /// The HOST sysfs interface→driver map of the device matching `device`, read independently
-/// of `vmcell-qemu`'s own capture (whose helper is `pub(crate)` and, more importantly,
-/// is the thing under test — a gate that reuses the implementation's reading of the world
-/// cannot catch the implementation misreading it).
+/// of `vmcell::vmm::usb`'s own capture — deliberately, because that capture is the thing
+/// under test: a gate that reuses the implementation's reading of the world cannot catch
+/// the implementation misreading it.
 #[cfg(feature = "qemu")]
 fn host_usb_bindings(device: UsbHostDevice) -> Vec<(String, String)> {
     let root = std::path::Path::new("/sys/bus/usb/devices");

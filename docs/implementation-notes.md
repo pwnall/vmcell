@@ -3260,6 +3260,23 @@ them back, with a bounded retry because the driver probe and udev's node/ACL wor
 Red on the inverse, verified: with the restore stubbed out the live gate fails with
 `before [("3-7:1.0", "uvcvideo"), ("3-7:1.1", "uvcvideo")], after []`.
 
-The restore lives in `vmcell-qemu` because QEMU is the only backend advertising
-`usb_host_passthrough`. If another backend ever gains it, the law moves to `vmcell` beside the other
-shared teardown helpers rather than being copied.
+**Where it lives.** `usb_host_passthrough` is a *capability*, so the split follows the crate's usual
+one and the whole unified law sits in `vmcell::vmm::usb`: resolving a `vid:pid` to its usbfs node,
+proving that node openable, capturing the interface→driver map, and re-binding it. The backend owns
+only what is backend-shaped — QEMU's `-device qemu-xhci` + `-device usb-host,…` argv — plus *when* to
+claim (before its spawn) and *when* to restore (after its reap). The public surface is one function
+and one type: `claim_usb_host_devices(vmm, devices) -> UsbHostClaim`, and `UsbHostClaim::restore()`.
+A second backend gaining the capability inherits all of it and writes only its argv; there is no
+second copy to keep in step. It was briefly implemented inside `vmcell-qemu` and moved on review —
+recorded because the moved version is the one to reason from.
+
+`UsbHostClaim` deliberately has **no `Drop` impl**, which is the one place this departs from
+"teardown is ownership". The restore has to run *after* the VMM process is gone (re-binding while it
+still holds the device races it) and *before* a graceful `kill()` returns (the live gate asserts
+immediately after `vm.kill()`), so the ordering belongs at the call site with the rest of the
+backend's ordered teardown — visible, rather than implied by struct field-drop order.
+
+**Explicit detach** has no implementation because no shipping backend needs one: QEMU's libusb
+detaches implicitly as it claims the device. If one ever does, `claim_usb_host_devices` is its
+designated home, so the detach and the restore stay one law instead of drifting apart across two
+crates.

@@ -18,6 +18,12 @@ pub mod jail;
 /// The VMM subprocess's own seccomp-BPF confinement — one predicate, four backends (§12.2, Layer 1 — the VMM's own seccomp filter).
 pub mod seccomp;
 
+/// Host USB passthrough: claiming a host device for a guest, and giving it back (§2.4).
+///
+/// `usb_host_passthrough` is a capability, so the backend owns only its own argv; resolving,
+/// prechecking and restoring the host driver bindings are unified and live here.
+pub mod usb;
+
 // The Firecracker and QEMU backends were extracted into the standalone `vmcell-firecracker` and
 // `vmcell-qemu` crates, and crosvm shipped as `vmcell-crosvm` (they depend on `vmcell`; `vmcell`
 // has no production edge back). Only Cloud Hypervisor — the primary backend — stays in-tree, so

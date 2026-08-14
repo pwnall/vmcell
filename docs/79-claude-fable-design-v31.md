@@ -452,7 +452,10 @@ never met with a silent sandbox downgrade. `build()` rejects `snapshotting` + a 
 passed-through device is not migratable), and every non-QEMU backend's `create()` refuses with a typed
 `Error::Unsupported { vmm, feature: "usb_host_passthrough" }`.
 
-**The host gets its device back.** Claiming a device detaches its kernel driver, and QEMU re-attaches
+**The host gets its device back**, and the unified half of passthrough lives in `vmcell::vmm::usb`
+(resolve, precheck, capture, restore) since `usb_host_passthrough` is a capability — the backend
+contributes only its own argv and the two ordering decisions, claim-before-spawn and
+restore-after-reap. Claiming a device detaches its kernel driver, and QEMU re-attaches
 on none of the paths vmcell drives (teardown ends in a process-group SIGKILL; a killed QEMU runs no
 release path), so passthrough used to leave the host device driverless — measured. Ownership owns
 cleanup: the interface→driver map is captured **before** the spawn (once QEMU has claimed the device

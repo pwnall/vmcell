@@ -57,6 +57,13 @@ name = "vmcell"
 #     as `vmcell::config::…` while the leaf types they are passed alongside were root-re-exported,
 #     so `use vmcell::{VmConfig, NetConfig}` could not actually call the builder. A re-export
 #     addition is minor-compatible; `lib.rs`'s `root_reexport_tests` is the gate.
+#   * ADDITIVE: the `vmcell::vmm::usb` module — `claim_usb_host_devices`, `UsbHostClaim`,
+#     `UsbInterfaceBinding`, `ResolvedUsbDevice`. `usb_host_passthrough` is a capability, so the
+#     backend owns only its own argv and everything unified (resolve the `vid:pid`, prove the usbfs
+#     node openable, record the host interface→driver map before the spawn, re-bind it after the
+#     VMM is reaped) is shared here. A backend crate gaining the capability calls
+#     `claim_usb_host_devices` at create and `UsbHostClaim::restore` after its reap; there is no
+#     second copy to write. Gated by `vmm::usb`'s unit tests plus the live `usb_passthrough_qemu`.
 # The `vmcell-artifact-validator` half of the contract surface is additive in this pass
 # (`cargo semver-checks -p vmcell-artifact-validator`: no update required).
 version = "0.13.0"
