@@ -1056,13 +1056,7 @@ impl<V: Vmm> MicroVm<V> {
         // in `metrics` (M-ORCH-4/H-HOST-3) — not an inline `split("0::")` over the
         // whole file, which folds trailing lines into the path on a hybrid v1/v2
         // hierarchy.
-        let leaf = crate::naming::cgroup_slice_name(&cfg.resource_prefix, vmid);
-        let mut cgroup_name = leaf.clone();
-        if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup")
-            && let Some(base) = crate::metrics::cgroup_base_from_proc(&cgroup_str)
-        {
-            cgroup_name = format!("{base}/{leaf}");
-        }
+        let cgroup_name = crate::metrics::vm_slice_name(&cfg.resource_prefix, vmid);
 
         env.cgroups.create_slice(&cgroup_name, &cfg.limits)?;
         // Armed immediately: any failure below (CID allocation, create/boot/
@@ -2664,7 +2658,7 @@ mod tests {
             cgroup_name: Some("vmcell-vm-7".to_string()),
             env: HostEnv {
                 cgroups: std::sync::Arc::new(TimelineCgroupFs { log }),
-                ..HostEnv::hermetic()
+                ..HostEnv::for_unit_tests()
             },
             agent_client: None,
             restored: false,
@@ -2799,7 +2793,7 @@ mod tests {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let env = HostEnv {
             cgroups: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let segment = crate::net::NetSegment::with_netlink_for_test(
             "vmcell",
@@ -2939,7 +2933,7 @@ mod tests {
         let vmm = crate::vmm::FakeVmm::default();
         let env = HostEnv {
             cgroups: std::sync::Arc::new(DeleteFailCgroupFs),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let vm = MicroVm::start(&vmm, erofs_cfg(), &env)
             .await
@@ -3052,7 +3046,7 @@ mod tests {
         let recorder = RecordingCgroupFs::default();
         let env = HostEnv {
             cgroups: std::sync::Arc::new(recorder.clone()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let res = MicroVm::<CreateFailVmm>::start(&vmm, cfg, &env).await;
         assert!(res.is_err(), "create failure must propagate");
@@ -3090,7 +3084,7 @@ mod tests {
             let recorder = RecordingCgroupFs::default();
             let env = HostEnv {
                 cgroups: std::sync::Arc::new(recorder.clone()),
-                ..HostEnv::hermetic()
+                ..HostEnv::for_unit_tests()
             };
             let res = MicroVm::start(&vmm, erofs_cfg(), &env).await;
             assert!(res.is_err(), "a scripted mid-start fault must propagate");
@@ -3116,7 +3110,7 @@ mod tests {
         let recorder = RecordingCgroupFs::default();
         let env = HostEnv {
             cgroups: std::sync::Arc::new(recorder.clone()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let res = MicroVm::restore(
             &vmm,
@@ -3151,7 +3145,7 @@ mod tests {
         let recorder = RecordingCgroupFs::default();
         let env = HostEnv {
             cgroups: std::sync::Arc::new(recorder.clone()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let res = MicroVm::restore(
             &vmm,
@@ -3184,7 +3178,7 @@ mod tests {
         });
         let env = HostEnv {
             cgroups: std::sync::Arc::new(crate::metrics::FakeCgroupFs::new()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let t0 = std::time::Instant::now();
         MicroVm::start(&vmm, erofs_cfg(), &env)
@@ -3210,7 +3204,7 @@ mod tests {
         });
         let env = HostEnv {
             cgroups: std::sync::Arc::new(crate::metrics::FakeCgroupFs::new()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         MicroVm::start(&vmm, erofs_cfg(), &env)
             .await
@@ -3235,7 +3229,7 @@ mod tests {
         });
         let env = HostEnv {
             cgroups: std::sync::Arc::new(crate::metrics::FakeCgroupFs::new()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let err = MicroVm::start(&vmm, erofs_cfg(), &env)
             .await
@@ -3246,6 +3240,68 @@ mod tests {
         );
     }
 
+    // THE DELEGATION GATE. A KVM-free unit test must not require the host cgroup tree to be
+    // delegated to the test process. `HostEnv::hermetic()` wires the real sysfs `DefaultCgroupFs`,
+    // so every fake-VMM start through it `mkdir`s `/sys/fs/cgroup/<base>/<prefix>-vm-<vmid>`: green
+    // on a developer box (a systemd user session IS delegated) and `EACCES` on a GitHub hosted
+    // runner (`system.slice/hosted-compute-agent.service` is not), where 21 of these tests were red
+    // while all 781 passed locally. `HostEnv::for_unit_tests()` is the fix; this is what pins it.
+    //
+    // The assertion is environment-independent, which is the point — it fails on the un-fixed code
+    // in BOTH environments:
+    //   * on a delegated host, `..DefaultCgroupFs` really creates the slice, so assert 3 fires;
+    //   * on a non-delegated host, `start` returns Cgroup("… Permission denied"), so assert 1 fires
+    //     (reproduce with `just test-unit-undelegated`).
+    // Red-on-inverse is expressible despite `hermetic()` being `#[cfg(not(test))]` here: substitute
+    // `cgroups: Arc::new(crate::metrics::DefaultCgroupFs)` over this env and both halves bite.
+    //
+    // The expected slice name is NOT composed here. It comes from `metrics::vm_slice_name`, the one
+    // law `setup_env` itself calls — a test-local `format!("{base}/{leaf}")` would be a second copy
+    // of the composition inside the very test meant to catch drift in it (AGENTS: "Recompute
+    // expected resource names through `vmcell::naming`, never a test-local `format!`").
+    #[tokio::test]
+    async fn unit_test_env_start_creates_no_slice_in_the_host_cgroup_tree() {
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv::for_unit_tests();
+        // 1. Starts on ANY host, delegated or not.
+        let vm = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("a fake-VMM start must not need host cgroup delegation");
+        let name = crate::metrics::vm_slice_name(crate::naming::DEFAULT_RESOURCE_PREFIX, vm.vmid());
+
+        // 2. POSITIVE CONTROL. Absence proves nothing unless the product really would have created
+        // a slice by exactly this name, so drive the same start over a recorder and check it did.
+        // Without this, assert 3 would still pass if `setup_env` stopped creating cgroups at all.
+        let recorder = RecordingCgroupFs::default();
+        let control = HostEnv {
+            cgroups: std::sync::Arc::new(recorder.clone()),
+            ..HostEnv::for_unit_tests()
+        };
+        let control_vm = MicroVm::start(&vmm, erofs_cfg(), &control)
+            .await
+            .expect("control start");
+        let expected = crate::metrics::vm_slice_name(
+            crate::naming::DEFAULT_RESOURCE_PREFIX,
+            control_vm.vmid(),
+        );
+        let created = recorder
+            .created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            created.contains(&expected),
+            "the control must record a create for {expected}, else the absence below is vacuous: {created:?}"
+        );
+
+        // 3. THE GATE: the `for_unit_tests()` start left nothing behind in the host cgroup tree.
+        let path = format!("/sys/fs/cgroup/{name}");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a unit-test start must create no slice in the host cgroup tree ({path})"
+        );
+    }
+
     // CONFIG-ERROR-ORCH-5. Buggy impl: start() ignores cfg.vmid and always
     // allocates a fresh VMID.
     #[tokio::test]
@@ -3253,7 +3309,7 @@ mod tests {
         let vmm = crate::vmm::FakeVmm::default();
         let mut cfg = erofs_cfg();
         cfg.vmid = Some(7);
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let vm = MicroVm::start(&vmm, cfg, &env)
             .await
             .expect("start should succeed with fakes");
@@ -3267,7 +3323,7 @@ mod tests {
         let vmm = crate::vmm::FakeVmm::default();
         let mut cfg = erofs_cfg();
         cfg.vmid = Some(7);
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         // Someone already holds VMID 7 on this shared allocator.
         env.vmids.reserve(7).expect("pre-reservation");
         let res = MicroVm::start(&vmm, cfg, &env).await;
@@ -3289,7 +3345,7 @@ mod tests {
         cfg.timeouts.connect_backoff_floor = Duration::ZERO;
         cfg.timeouts.guest_accept_poll = Duration::ZERO;
         cfg.timeouts.api_socket_poll = Duration::ZERO;
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let vm = MicroVm::start(&vmm, cfg, &env)
             .await
             .expect("start with fakes");
@@ -3320,7 +3376,7 @@ mod tests {
         ))
         .build()
         .expect("valid config");
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let res = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env).await;
         // ORCH-4 / §2.5 (The capability matrix) boundary 2: a vhost-user device on the restore path is an
         // `Unsupported` capability rejection, not a generic `Config` error.
@@ -3350,7 +3406,7 @@ mod tests {
         })
         .build()
         .expect("valid non-snapshotting unprivileged config");
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let res = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env).await;
         assert!(matches!(res, Err(crate::error::Error::Unsupported { .. })));
     }
@@ -3448,7 +3504,7 @@ mod tests {
     #[tokio::test]
     async fn restore_rejects_a_custom_init_config() {
         let vmm = crate::vmm::FakeVmm::default();
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let err = MicroVm::restore(
             &vmm,
             std::path::Path::new("/fake/snap"),
@@ -3484,7 +3540,7 @@ mod tests {
     #[tokio::test]
     async fn zygote_clone_rejects_a_custom_init_config() {
         let vmm = crate::vmm::FakeVmm::default();
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let master = tempfile::tempdir().expect("tempdir");
         std::fs::write(master.path().join("state"), b"snapshot").expect("write master state");
 
@@ -3528,7 +3584,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_refuses_a_custom_init_vm() {
         let vmm = crate::vmm::FakeVmm::default();
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let dir = tempfile::tempdir().expect("tempdir");
 
         let mut custom_init =
@@ -3569,7 +3625,7 @@ mod tests {
     #[tokio::test]
     async fn restore_rejects_usb_host_devices_on_a_non_snapshotting_config() {
         let vmm = crate::vmm::FakeVmm::default();
-        let env = HostEnv::hermetic();
+        let env = HostEnv::for_unit_tests();
         let with_usb = ineligible_cfg(|b| {
             b.vsock_transport(crate::config::VsockTransport::InKernel)
                 .with_usb_host_device(crate::config::UsbHostDevice::new(0x1d6b, 0x0002))
@@ -3855,7 +3911,7 @@ mod tests {
         let vmm = crate::vmm::FakeVmm::default();
         let env = HostEnv {
             cgroups: std::sync::Arc::new(fs),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         MicroVm::start(&vmm, erofs_cfg(), &env)
             .await
@@ -3903,7 +3959,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            env: HostEnv::hermetic(),
+            env: HostEnv::for_unit_tests(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -3964,7 +4020,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            env: HostEnv::hermetic(),
+            env: HostEnv::for_unit_tests(),
             agent_client: Some(AgentClient::from_stream_for_tests(local)),
             restored: false,
             restore_reseed_applied: None,
@@ -4127,7 +4183,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            env: HostEnv::hermetic(),
+            env: HostEnv::for_unit_tests(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -4420,7 +4476,7 @@ mod tests {
             cgroup_name: Some("vmcell-vm-11".to_string()),
             env: HostEnv {
                 cgroups: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
-                ..HostEnv::hermetic()
+                ..HostEnv::for_unit_tests()
             },
             agent_client: None,
             restored: false,
@@ -4573,7 +4629,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            env: HostEnv::hermetic(),
+            env: HostEnv::for_unit_tests(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -4610,7 +4666,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            env: HostEnv::hermetic(),
+            env: HostEnv::for_unit_tests(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
@@ -4690,7 +4746,7 @@ mod tests {
             smoltcp: None,
             proxy: None,
             cgroup_name: None,
-            env: HostEnv::hermetic(),
+            env: HostEnv::for_unit_tests(),
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,

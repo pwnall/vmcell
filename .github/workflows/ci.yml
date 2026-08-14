@@ -257,9 +257,16 @@ jobs:
         run: rustup toolchain install    # reads rust-toolchain.toml — channel 1.96.1 + clippy/rustfmt
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
-        with: { tool: "cargo-nextest" }
+        # `just` so the step below can invoke the recipe instead of hand-copying it; `fallback: none`
+        # for the reason given at the lint job's install step — an unsupported tool name must fail at
+        # the name, not detour through cargo-binstall and take the job down with it.
+        with: { tool: "cargo-nextest,just", fallback: none }
+      # AGENTS rule 3: a CI step that hand-copies a `just` recipe drifts from it. This one was a
+      # verbatim copy of `test-unit` — harmless so far, and exactly the shape that let the
+      # test-integration job's copy drop `--features qemu` and silently stop compiling a whole
+      # backend's matrix legs. Invoke the recipe so local ≡ CI by construction.
       - name: nextest (unit/codec/prop)
-        run: cargo nextest run --locked --all-features
+        run: just test-unit
 
   # ---- Integration matrix: needs /dev/kvm. Runs the #[ignore]'d suite so it is NOT CI-invisible. ----
   test-integration:
@@ -278,7 +285,10 @@ jobs:
         run: rustup toolchain install    # reads rust-toolchain.toml — channel 1.96.1 + clippy/rustfmt
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
-        with: { tool: "cargo-nextest,just" }
+        # `fallback: none` — see the lint job's install step. Both tools here have manifests; the
+        # point is that a future addition without one fails at the name instead of silently
+        # detouring through cargo-binstall.
+        with: { tool: "cargo-nextest,just", fallback: none }
 
       - name: reset the run-scoped skip manifest
         run: just skip-manifest-reset   # so the surfaced skips belong to THIS run, not an accumulated history

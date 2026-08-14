@@ -388,7 +388,7 @@ mod tests {
         let env = HostEnv {
             vmids: shared_vmids(),
             overlay: Arc::new(store.clone()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let vm = lineage.fork(&vmm, &env).await.expect("fork one child");
         let _ = vm.vmid();
@@ -427,7 +427,7 @@ mod tests {
         let vmm = FakeVmm::default();
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let mut child = root.fork(&vmm, &env).await.expect("fork a child to branch");
 
@@ -467,7 +467,7 @@ mod tests {
         let vmm = FakeVmm::default();
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
 
         let mut c0 = root.fork(&vmm, &env).await.expect("fork c0");
@@ -506,7 +506,7 @@ mod tests {
         let vm_dir = tempfile::tempdir().expect("tempdir");
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let mut vm = MicroVm::start(&vmm, erofs_cfg(), &env)
             .await
@@ -583,7 +583,7 @@ mod tests {
         let vmm = FakeVmm::default();
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let mut child = t2.fork(&vmm, &env).await.expect("fork in tree 2");
         let b1 = t2
@@ -620,7 +620,7 @@ mod tests {
         let env = HostEnv {
             vmids: shared_vmids(),
             overlay: Arc::new(store.clone()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         for _ in 0..2 {
             lineage.fork(&vmm, &env).await.expect("fork");
@@ -662,7 +662,7 @@ mod tests {
         let env = HostEnv {
             vmids: shared_vmids(),
             overlay: Arc::new(store.clone()),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let clones = lineage
             .fork_many(&vmm, 3, &env)
@@ -696,7 +696,7 @@ mod tests {
         let vmm = FakeVmm::default();
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let mut child = root.fork(&vmm, &env).await.expect("fork a child");
         let vmid_before = child.vmid();
@@ -742,7 +742,7 @@ mod tests {
         let vmm = FakeVmm::default();
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let mut child = root.fork(&vmm, &env).await.expect("fork a child");
         // A nested, non-existent destination: branch must create it and its parents.

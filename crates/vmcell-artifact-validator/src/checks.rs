@@ -1104,6 +1104,58 @@ mod tests {
     use super::*;
     use vmcell::vmm::{FakeVmm, FaultMenu};
 
+    /// A no-op [`vmcell::metrics::CgroupFs`] for the two KVM-free tests below, which drive a
+    /// `FakeVmm` through `MicroVm::start` only to obtain a handle and never look at a cgroup.
+    ///
+    /// They cannot use [`try_start_vm`]: it builds `vmcell::HostEnv::hermetic()` internally and
+    /// exposes no cgroup seam, and `hermetic()` wires the REAL sysfs backend — which `mkdir`s
+    /// `/sys/fs/cgroup/<base>/<prefix>-vm-<vmid>` and therefore needs the host cgroup tree
+    /// delegated to the test process. That holds on a systemd user session and does NOT hold on a
+    /// GitHub hosted runner (`system.slice/hosted-compute-agent.service`), where both tests failed
+    /// with `Cgroup("create cgroup …: Permission denied (os error 13)")`. `try_start_vm` itself is
+    /// deliberately left alone: it is the contract-surface harness the LIVE battery uses, and the
+    /// `metrics.usage_readable` check needs the real seam to read real counters.
+    ///
+    /// This is a local copy by the recorded decision, not by oversight: `vmcell::metrics::FakeCgroupFs`
+    /// is `#[cfg(test)]` and invisible to a downstream crate's test build, and exposing it was
+    /// rejected (its deliberate `.lock().unwrap()`s would trip `vmcell`'s
+    /// `deny(clippy::unwrap_used)`) — see docs/implementation-notes.md. The three backend crates
+    /// carry the same copy for the same reason.
+    ///
+    /// FAKE-BLIND AXIS: it touches no filesystem, so the real slice create/limit/readback path is
+    /// covered only by the live `metrics.usage_readable` arm of a `Level::Extended` run on a KVM
+    /// host, never here.
+    #[derive(Debug)]
+    struct TestCgroupFs;
+
+    impl vmcell::metrics::CgroupFs for TestCgroupFs {
+        fn create_slice(
+            &self,
+            _name: &str,
+            _limits: &vmcell::config::ResourceLimits,
+        ) -> vmcell::Result<()> {
+            Ok(())
+        }
+        fn delete_slice(&self, _name: &str) -> vmcell::Result<()> {
+            Ok(())
+        }
+        fn read_stats(&self, _name: &str) -> vmcell::Result<vmcell::metrics::ResourceUsage> {
+            Ok(vmcell::metrics::ResourceUsage::default())
+        }
+        fn add_task(&self, _name: &str, _pid: u32) -> vmcell::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `try_start_vm`'s env with the cgroup seam swapped out. Assignment, not
+    /// `..HostEnv::hermetic()`: `HostEnv` is `#[non_exhaustive]`, so functional-update syntax is
+    /// rejected outside `vmcell`.
+    fn unit_test_env() -> vmcell::HostEnv {
+        let mut env = vmcell::HostEnv::hermetic();
+        env.cgroups = std::sync::Arc::new(TestCgroupFs);
+        env
+    }
+
     #[test]
     fn test_parse_oom_kill() {
         assert_eq!(parse_oom_kill("low 0\noom_kill 3\n"), Some(3));
@@ -1338,7 +1390,9 @@ mod tests {
         .network_disabled()
         .build()
         .expect("config builds");
-        let mut vm = try_start_vm(&vmm, cfg)
+        // `MicroVm::start` over `unit_test_env()` rather than `try_start_vm`, which has no cgroup
+        // seam — see `TestCgroupFs` above.
+        let mut vm = MicroVm::start(&vmm, cfg, &unit_test_env())
             .await
             .expect("the fake backend starts");
         let serial = vm.instance().serial_log().display().to_string();
@@ -1373,7 +1427,9 @@ mod tests {
         .network_disabled()
         .build()
         .expect("config builds");
-        let mut vm = try_start_vm(&vmm, cfg)
+        // `MicroVm::start` over `unit_test_env()` rather than `try_start_vm`, which has no cgroup
+        // seam — see `TestCgroupFs` above.
+        let mut vm = MicroVm::start(&vmm, cfg, &unit_test_env())
             .await
             .expect("the fake backend starts");
         let expected = vm.instance().serial_log().display().to_string();

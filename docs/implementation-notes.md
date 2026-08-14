@@ -3383,3 +3383,70 @@ assigned, sits queued for the 24-hour limit, and reports as cancelled. Nothing i
 that: it is infrastructure, not configuration, and the job is deliberately left exactly as it is
 rather than weakened into a skip. Until a runner exists, the privileged / daemon / unprivileged /
 live-downstream matrix is validated **only** by running the suites on a maintainer's KVM box.
+
+### `HostEnv::hermetic()` is hermetic in its allocators, not in its host effects
+
+The `test-unit` job's 21 failures were all one line: `hermetic()` wires the real sysfs
+`DefaultCgroupFs`, so every fake-VMM `MicroVm::start` through it reaches `setup_env`, which composes
+`<base-from-/proc/self/cgroup>/<prefix>-vm-<vmid>` and `create_dir_all`s it under `/sys/fs/cgroup`.
+A systemd **user** session is delegated, so that succeeds on a developer box; a GitHub hosted runner
+sits under `system.slice/hosted-compute-agent.service`, which is not, so it returns
+`Cgroup("create cgroup …: Permission denied (os error 13)")`. 9 lineage + 6 orchestrator + 4 zygote
++ 2 validator tests were red there and green here, for weeks.
+
+**`hermetic()` is left semantically untouched, and that is the load-bearing decision.** It is not a
+test-only constructor: 15 of its call sites are shipping code — `vmcell run`, both artifact builders,
+`bench-vm` (9 modes), and `vmcell-artifact-validator`'s `try_start_vm`, which is named contract
+surface. Defaulting it to an in-memory cgroup seam would silently un-confine every VM those five
+binaries start, and would turn the validator's `metrics.usage_readable` check into a fabricated PASS
+(`FakeCgroupFs::read_stats` returns modelled counters, `mem_limit_enforced: true` among them). A
+feature that silently changes semantics is exactly what AGENTS.md forbids; this would have changed
+them for out-of-repo consumers too, invisibly to `cargo semver-checks`.
+
+Instead `vmcell` gains a `#[cfg(test)] pub(crate) HostEnv::for_unit_tests()` — `hermetic()`'s
+allocators over the existing `#[cfg(test)] FakeCgroupFs` — and the 48 in-crate unit-test sites use
+it. The other two host seams stay real deliberately: `ReflinkOverlayStore` really writes (the lineage
+`create_dir_all` was invisible to every fake-driven test until it wasn't), and `RealClock` is what
+the post-restore resync reads. Only the cgroup seam is swapped, because it is the only one that
+needs a *privilege* the host may not have granted.
+
+**`hermetic()` is `#[cfg(not(test))]`, which is the gate.** A future lib unit test that names it is a
+compile error pointing at `for_unit_tests()`, rather than a green-here/red-in-CI landmine. Integration
+tests under `crates/vmcell/tests/`, doctests, and every downstream crate link the non-test lib and are
+unaffected, so the public API and `cargo semver-checks` do not move.
+
+The two `vmcell-artifact-validator` failures could not be fixed at the test site: both went through
+`harness::try_start_vm`, which builds `hermetic()` internally and exposes no cgroup seam. `try_start_vm`
+is deliberately unchanged — the live battery needs the real seam — and the two tests call
+`MicroVm::start` over a local no-op `TestCgroupFs`, which is the **recorded** shape: exposing
+`FakeCgroupFs` was rejected earlier in this file (its deliberate `.lock().unwrap()`s would trip
+`deny(clippy::unwrap_used)`), and the three backend crates each carry the same local copy.
+
+**Gates, both proven red-on-inverse before landing.**
+`orchestrator::tests::unit_test_env_start_creates_no_slice_in_the_host_cgroup_tree` starts a VM on
+`for_unit_tests()` and asserts no directory by the composed slice name exists under `/sys/fs/cgroup`,
+with a `RecordingCgroupFs` control proving the product really would have created one (absence of a
+path nobody names proves nothing). It fails in *both* environments on the un-fixed code: on a
+delegated box the slice really appears (verified: it named
+`…/tmux-spawn-….scope/vmcell-vm-232`), and on a non-delegated one `start` fails outright.
+`just test-unit-undelegated` is the local mirror of the runner condition — `bwrap` binds an
+unwritable directory over `/sys/fs/cgroup` while `/proc/self/cgroup` still reports the real base.
+Measured: 782 tests, 21 failures before, 781/781 after, with exactly one test excluded by name
+(`apply_jail_sets_no_new_privs_and_the_core_rlimit`, whose own red-on-inverse control is defeated by
+bwrap's process-wide `no_new_privs` — a harness artifact, green unwrapped and on CI).
+
+**One law, and the coverage that moved.** The `{base}/{leaf}` composition moved out of `setup_env`
+into `metrics::vm_slice_name` so the gate can name the slice without holding a second copy of the
+rule it exists to police. And the effect those 21 tests were *incidentally* covering — a real,
+nested `create_dir_all` of a `{base}/{leaf}` name — is now explicit and delegation-free in
+`metrics::tests::test_create_slice_at_creates_a_nested_sibling_slice` (red on `create_dir`, and red
+if the delegation check stops reading the leaf's parent). Real `/sys/fs/cgroup` enforcement and
+readback remain where they always were: the live `tests/metrics_limits.rs` battery,
+`tests/lifecycle.rs`'s residue check, `just test-daemon`'s `limits_enforced` leg, and the validator's
+`metrics.usage_readable` Extended arm.
+
+Not fixed here, and worth naming: `MicroVm::start` refuses to boot on a non-delegated host even when
+`ResourceLimits::default()` requests no limit at all. That is a real product restriction — `vmcell
+run` cannot work on a hosted runner — but tolerating `EACCES` would make a *requested* limit silently
+unenforced, which is the §7.2 failure the fail-loud contract exists to prevent. The two questions are
+kept separate.

@@ -104,6 +104,34 @@ daemon artifacts_dir="/tmp/vmcell-artifacts" bind="127.0.0.1:8787":
 test-unit:
     cargo nextest run --locked --all-features
 
+# The unit suite under the HOSTED-RUNNER condition: a cgroup tree this process cannot write to.
+#
+# A developer box runs the tests inside a systemd *user* scope, which IS delegated, so
+# `HostEnv::hermetic()`'s real `DefaultCgroupFs` happily creates `/sys/fs/cgroup/<base>/vmcell-vm-N`
+# and every test passes. A GitHub hosted runner sits under `system.slice/hosted-compute-agent.service`,
+# which is not delegated, and 21 KVM-free tests failed there with
+# `Cgroup("create cgroup …: Permission denied (os error 13)")` while `just test-unit` stayed green —
+# for weeks. This recipe is the local mirror of that condition, so the delegation gate can be
+# exercised without pushing.
+#
+# `bwrap` binds a root-owned, unwritable directory over /sys/fs/cgroup while leaving
+# /proc/self/cgroup reporting the real base — the runner's exact shape (real base, EACCES on mkdir),
+# not a mocked one. `unshare -Urm` cannot be used here: kernel.apparmor_restrict_unprivileged_userns
+# blocks it, while bwrap ships an AppArmor profile.
+#
+# THE ONE EXCLUSION (measured: drops exactly 1 of 782 tests). bwrap sets PR_SET_NO_NEW_PRIVS on the
+# whole tree, which defeats `jail_hardening`'s own red-on-inverse control — the test asserts that a
+# DISABLED jail leaves NoNewPrivs=0, and under bwrap it is already 1. That is an artifact of the
+# harness, not a failure of the product: the test passes unwrapped and on CI. It is excluded by exact
+# name rather than by binary so the other three tests in that file still run.
+test-unit-undelegated:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v bwrap >/dev/null || { echo "bwrap (bubblewrap) is required for this recipe" >&2; exit 1; }
+    bwrap --dev-bind / / --bind /srv /sys/fs/cgroup --chdir {{justfile_directory()}} -- \
+        cargo nextest run --locked --all-features \
+            -E 'not test(=apply_jail_sets_no_new_privs_and_the_core_rlimit)'
+
 # Privileged integration suite via the capability runner. `just bless` installs it 0700 (owner-only)
 # — that mode is the security boundary (PRIV-1); on a shared host use a dedicated group + 0750.
 # Wraps every test binary with vmcell-test-runner via the cargo target-runner hook.

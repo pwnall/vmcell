@@ -610,7 +610,7 @@ pub(crate) mod testing {
                     time: std::time::UNIX_EPOCH + Duration::new(3, 271_828_182),
                 },
             )),
-            ..crate::env::HostEnv::hermetic()
+            ..crate::env::HostEnv::for_unit_tests()
         }
     }
 
@@ -618,7 +618,7 @@ pub(crate) mod testing {
     pub(crate) fn fake_segment(
         prefix: &str,
     ) -> (NetSegment, crate::env::HostEnv, Arc<Mutex<Vec<String>>>) {
-        let env = crate::env::HostEnv::hermetic();
+        let env = crate::env::HostEnv::for_unit_tests();
         fake_segment_in(prefix, &env)
     }
 
@@ -669,7 +669,7 @@ mod tests {
     // `has-dash-seg-1` namespace whose sweep filter no longer parses.
     #[test]
     fn segment_rejects_an_invalid_prefix_through_the_one_validator() {
-        let env = crate::env::HostEnv::hermetic();
+        let env = crate::env::HostEnv::for_unit_tests();
         for bad in ["", "has-dash", "toolongprefix", "has space"] {
             let err = NetSegment::create_with_netlink(bad, &env, Box::new(RecordingNetlink::new()))
                 .expect_err("an invalid prefix must be refused");
@@ -838,7 +838,7 @@ mod tests {
     // what.
     #[test]
     fn failed_member_enslave_releases_the_slot_and_the_tap() {
-        let env = crate::env::HostEnv::hermetic();
+        let env = crate::env::HostEnv::for_unit_tests();
         let netlink = RecordingNetlink {
             fail_enslave: true,
             ..RecordingNetlink::new()
@@ -883,7 +883,7 @@ mod tests {
     // all), and it fails a create whose name is taken exactly as the kernel does.
     #[test]
     fn a_duplicate_vmid_is_refused_and_the_live_siblings_tap_survives() {
-        let env = crate::env::HostEnv::hermetic();
+        let env = crate::env::HostEnv::for_unit_tests();
         let netlink = RecordingNetlink::new();
         let calls = netlink.calls.clone();
         let links = netlink.links.clone();
@@ -951,7 +951,7 @@ mod tests {
     // reclaims it on the *next* start-up).
     #[test]
     fn failed_bridge_creation_cleans_up_the_namespace() {
-        let env = crate::env::HostEnv::hermetic();
+        let env = crate::env::HostEnv::for_unit_tests();
         let netlink = RecordingNetlink {
             fail_bridge: true,
             ..RecordingNetlink::new()

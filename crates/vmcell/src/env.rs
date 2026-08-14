@@ -18,8 +18,13 @@
 //! per-test allocators hand concurrent tests identical IDs and collide on temp-dir paths and socket
 //! names. [`HostEnv::shared`] is the productized pair (the daemon is its natural single home, §11.1,
 //! What it adds, and where it sits);
-//! [`HostEnv::hermetic`] gives in-process allocators for tests, which substitute recording fakes
-//! field-by-field (every field is `pub`).
+//! [`HostEnv::hermetic`] gives in-process allocators to a **single-process** caller — `vmcell run`,
+//! both artifact builders, `bench-vm`, the validator harness — while keeping the same real host
+//! seams. It is hermetic in its *allocators*, not in its host effects: a VM started through it gets
+//! a real cgroup slice, so it needs the host cgroup tree delegated to the calling process. A caller
+//! that wants a seam faked assigns the field (every field is `pub`); `vmcell`'s own unit tests use
+//! the `#[cfg(test)]` `for_unit_tests()` bundle instead, which is why `hermetic()` is
+//! `#[cfg(not(test))]` here.
 //!
 //! One law follows (invariant S4): **every** copy-on-write clone materializes through
 //! [`HostEnv::overlay`] — there is no second way to inject a store that could drift from the one the
@@ -34,9 +39,11 @@ use crate::vmm::CidAllocator;
 
 /// The process-wide seam bundle passed by reference to every VM-spawning entry point.
 ///
-/// Build one at start-up ([`shared`](HostEnv::shared) in production, [`hermetic`](HostEnv::hermetic)
-/// in tests) and thread `&env` everywhere. The fields are `pub` so a test can substitute a recording
-/// fake for any single seam over [`hermetic`](HostEnv::hermetic)'s in-process defaults.
+/// Build one at start-up ([`shared`](HostEnv::shared) for a multi-process host,
+/// [`hermetic`](HostEnv::hermetic) for a single-process one) and thread `&env` everywhere. The
+/// fields are `pub` so a caller can substitute a recording fake for any single seam; because the
+/// struct is `#[non_exhaustive]`, a crate outside `vmcell` assigns the field after construction
+/// rather than using functional-update syntax.
 ///
 /// `#[non_exhaustive]`: this bundle is designed to **grow** — a new process-global seam is added as a
 /// field here, not as a new positional argument on every spawn signature.
@@ -98,10 +105,39 @@ impl HostEnv {
         })
     }
 
-    /// The hermetic bundle for tests: **in-process** allocators (no cross-process `/tmp` lock files),
-    /// plus the same real `CgroupFs`/`Clock`/`OverlayStore` defaults. A unit test substitutes a
-    /// recording fake for any field it asserts on (the fields are `pub`), e.g.
-    /// `HostEnv { cgroups: Arc::new(FakeCgroupFs::new()), ..HostEnv::hermetic() }`.
+    /// The **in-process** bundle: [`VmidAllocator::new`] and friends instead of the cross-process
+    /// `/tmp` claim files, so a single-process tool draws its ids without the rendezvous — plus the
+    /// same real [`DefaultCgroupFs`]/[`RealClock`]/[`ReflinkOverlayStore`] host seams `shared()`
+    /// uses. It is hermetic in its **allocators**, not in its host effects: a VM started through it
+    /// gets a real cgroup slice, real reflink clones, and the real clock. That is what the shipping
+    /// single-process callers want — `vmcell run`, both artifact builders, `bench-vm`, and the
+    /// validator harness — and it is why this constructor keeps the real seams.
+    ///
+    /// A caller that wants a *seam* faked substitutes it field-by-field (the fields are `pub`, and
+    /// the struct is `#[non_exhaustive]`, so a downstream crate assigns after construction rather
+    /// than using functional-update syntax):
+    ///
+    /// ```text
+    /// let mut env = HostEnv::hermetic();
+    /// env.cgroups = Arc::new(MyCgroupFs);   // assign, don't `..HostEnv::hermetic()`
+    /// ```
+    ///
+    /// `vmcell`'s own unit tests do not call this — see the `#[cfg(not(test))]` note at the
+    /// definition.
+    //
+    // `#[cfg(not(test))]` is deliberate and is a GATE, not an accident. This constructor wires the
+    // real sysfs `DefaultCgroupFs`, so any lib unit test that reaches `MicroVm::start` through it
+    // needs the host cgroup tree DELEGATED to the test process: `setup_env` composes
+    // `<base-from-/proc/self/cgroup>/<prefix>-vm-<vmid>` and `create_dir_all`s it under
+    // /sys/fs/cgroup. A systemd user session is delegated, so it works on a developer box; a GitHub
+    // hosted runner sits under `system.slice/hosted-compute-agent.service`, which is not, so 21
+    // KVM-free unit tests failed there with `Cgroup("create cgroup …: Permission denied (os error
+    // 13)")` while every one of them passed locally. Hiding the constructor from the crate's own
+    // test build turns that green-here/red-in-CI landmine into a compile error naming
+    // `for_unit_tests()`. Integration tests under crates/vmcell/tests/, doctests, and every
+    // downstream crate link the non-test lib and see it exactly as before, so the public API and
+    // `cargo semver-checks` are unchanged.
+    #[cfg(not(test))]
     #[must_use]
     pub fn hermetic() -> Self {
         Self {
@@ -109,6 +145,32 @@ impl HostEnv {
             vmids: VmidAllocator::new(),
             segids: SegmentIdAllocator::new(),
             cgroups: Arc::new(DefaultCgroupFs),
+            clock: Arc::new(RealClock),
+            overlay: Arc::new(ReflinkOverlayStore),
+        }
+    }
+}
+
+#[cfg(test)]
+impl HostEnv {
+    /// The bundle every `vmcell` lib unit test starts from: `hermetic()`'s in-process allocators,
+    /// with the real sysfs cgroup backend replaced by the in-process [`crate::metrics::FakeCgroupFs`]
+    /// so a KVM-free test creates nothing in the host cgroup tree and needs no delegation.
+    ///
+    /// The other two host seams stay REAL on purpose. `ReflinkOverlayStore` really writes: the
+    /// lineage `create_dir_all` was invisible to every fake-driven test until it did (AGENTS rule
+    /// 4), and `RealClock` is what the post-restore resync reads. Only the cgroup seam is swapped,
+    /// because it is the only one that needs a *privilege* the test host may not have granted.
+    ///
+    /// `usage()` through this env returns `FakeCgroupFs`'s modelled counters, not host truth — a
+    /// test that must assert real enforcement belongs in the live `tests/metrics_limits.rs`
+    /// battery. A test that asserts on the seam itself substitutes its own recorder over this one.
+    pub(crate) fn for_unit_tests() -> Self {
+        Self {
+            cids: Arc::new(CidAllocator::new()),
+            vmids: VmidAllocator::new(),
+            segids: SegmentIdAllocator::new(),
+            cgroups: Arc::new(crate::metrics::FakeCgroupFs::new()),
             clock: Arc::new(RealClock),
             overlay: Arc::new(ReflinkOverlayStore),
         }

@@ -112,6 +112,28 @@ pub fn cgroup_base_from_proc(contents: &str) -> Option<String> {
     }
 }
 
+/// The **full** cgroup slice name the orchestrator creates for `vmid`: the
+/// [`crate::naming::cgroup_slice_name`] leaf, placed as a sibling of this process's own cgroup
+/// (§13 sibling placement) when `/proc/self/cgroup` yields a base, and bare otherwise.
+///
+/// One law (AGENTS.md "one law, one predicate"): the leaf, the base, and the `{base}/{leaf}` join
+/// live here and nowhere else. The join used to be inline in `setup_env` — harmless while it had a
+/// single caller, but the unit-test delegation gate in `orchestrator`'s tests must name the exact
+/// slice a start would have created in order to assert that nothing by that name appears under
+/// /sys/fs/cgroup, and a test-local `format!` would put a second copy of the law inside the very
+/// test whose job is to catch drift in it.
+#[must_use]
+pub(crate) fn vm_slice_name(prefix: &str, vmid: u32) -> String {
+    let leaf = crate::naming::cgroup_slice_name(prefix, vmid);
+    match std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|contents| cgroup_base_from_proc(&contents))
+    {
+        Some(base) => format!("{base}/{leaf}"),
+        None => leaf,
+    }
+}
+
 /// Computes the cgroup-v2 `cpu.max` `(quota, period)` pair for a CPU cap expressed
 /// as a percentage of one core. The period is fixed at 100000us and the quota is the
 /// matching slice of that period (e.g. 50% -> `(50000, 100000)`, 200% -> `(200000, 100000)`).
@@ -1017,6 +1039,53 @@ mod tests {
     // `FakeCgroupFs`, which over-promised relative to the old non-`metrics` impl and so
     // never caught the silent-drop bug — so it reddens if the block is re-gated behind
     // `metrics` (the control files would be absent) or a render formula is inverted.
+    #[test]
+    fn test_create_slice_at_creates_a_nested_sibling_slice() {
+        // The name the orchestrator really passes is NESTED — `{base}/{prefix}-vm-{vmid}`, the §13
+        // sibling placement — not the bare leaf the sibling test below uses. Until now the only
+        // thing exercising that shape was every fake-VMM unit test writing into the developer's own
+        // delegated session cgroup: incidental coverage that was invisible on any host without
+        // delegation, and that is exactly why those 21 tests needed delegation in the first place.
+        // Now that they run on an in-process seam (`HostEnv::for_unit_tests`), the nested mkdir is
+        // pinned here instead — KVM-free, delegation-free, against a tempdir root (AGENTS rule 4:
+        // name what the fakes cannot see, and cover it).
+        //
+        // RED on `create_dir` in place of `create_dir_all` (ENOENT on the missing parents), and RED
+        // if the CFG-2 delegation check stops reading the LEAF'S PARENT's `subtree_control` — the
+        // seeded file below is on the parent, not the root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let parent = "system.slice/hosted-compute-agent.service";
+        let name = format!("{parent}/vmcell-vm-7");
+
+        // No limits requested: the bare nested mkdir must succeed with no delegation modelled at all.
+        create_slice_at(&root, &name, &ResourceLimits::default())
+            .expect("a nested slice name must be created in full");
+        assert!(
+            dir.path().join(&name).is_dir(),
+            "create_slice_at must create every missing ancestor of a nested slice name"
+        );
+
+        // …and a requested limit consults the leaf's PARENT, not the root.
+        std::fs::create_dir_all(dir.path().join(parent)).expect("parent dir");
+        std::fs::write(
+            dir.path().join(parent).join("cgroup.subtree_control"),
+            "cpu io memory pids",
+        )
+        .expect("seed the parent's delegated subtree_control");
+        let limits = ResourceLimits {
+            mem_max_mib: Some(256),
+            ..ResourceLimits::default()
+        };
+        create_slice_at(&root, &name, &limits)
+            .expect("a delegated PARENT must let the limit apply on a nested name");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&name).join("memory.max"))
+                .expect("memory.max must be written"),
+            (256u64 << 20).to_string()
+        );
+    }
+
     #[test]
     fn test_create_slice_at_writes_real_limit_files() {
         let dir = tempfile::tempdir().expect("tempdir");

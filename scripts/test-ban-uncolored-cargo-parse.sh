@@ -49,9 +49,9 @@ EOF
 cat > "$work/v-redirect.sh" <<'EOF'
 cargo tree --locked -e normal --all-features > "$work/real-tree.txt"
 EOF
-# Word-split in a `for` loop (fuzz.yml's shape).
+# Word-split in a `for` loop.
 cat > "$work/v-forloop.sh" <<'EOF'
-for t in $(cargo fuzz list); do echo "$t"; done
+for p in $(cargo metadata --format-version 1 | jq -r '.packages[].name'); do echo "$p"; done
 EOF
 # A YAML `run:` block whose command is continued with a backslash — the ci.yml shape.
 cat > "$work/v-continuation.yml" <<'EOF'
@@ -79,6 +79,13 @@ cargo clippy --all-targets -- -D warnings
 cargo nextest run --locked
 cargo fuzz run "$t" -- -max_total_time=300
 EOF
+# `cargo fuzz list` IS parsed (word-split into a loop in fuzz.yml) and must still NOT be flagged:
+# cargo-fuzz is a third-party subcommand whose `List` accepts only `--fuzz-dir`, so the flag this
+# scanner demands does not exist there and demanding it would break the workflow. A rule that cannot
+# be satisfied is worse than no rule; this leg is what keeps it off the roster.
+cat > "$work/ok-third-party.sh" <<'EOF'
+for t in $(cargo fuzz list); do echo "$t"; done
+EOF
 # Prose and diagnostics that merely SPELL the invocation. All three of these were false positives in
 # the scanner's first draft; they are the regression this leg pins.
 cat > "$work/ok-prose.sh" <<'EOF'
@@ -99,7 +106,7 @@ cargo tree \
   --locked -p foo > "$out"
 EOF
 
-for f in ok-flag.sh ok-equals.sh ok-unparsed.sh ok-prose.sh ok-stub.sh ok-continuation.sh; do
+for f in ok-flag.sh ok-equals.sh ok-unparsed.sh ok-third-party.sh ok-prose.sh ok-stub.sh ok-continuation.sh; do
   expect_leg "silent on: $f" 0 "$work/$f"
 done
 
@@ -113,4 +120,4 @@ if [[ $fail -ne 0 ]]; then
   echo "ban-uncolored-cargo-parse self-test FAILED"
   exit 1
 fi
-echo "ok: ban-uncolored-cargo-parse self-test passed (5 violation shapes flagged, 5 compliant/near-miss shapes silent)"
+echo "ok: ban-uncolored-cargo-parse self-test passed (5 violation shapes flagged, 6 compliant/near-miss shapes silent)"

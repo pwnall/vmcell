@@ -456,7 +456,7 @@ mod tests {
             .expect("build zygote");
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
 
         let clones = zygote
@@ -509,7 +509,7 @@ mod tests {
             .expect("build zygote");
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
 
         // > 1 concurrent clone is rejected, typed.
@@ -539,7 +539,7 @@ mod tests {
             .expect("build zygote");
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let clones = zygote
             .spawn_clones(&vmm, 0, &env)
@@ -566,7 +566,7 @@ mod tests {
             .expect("build zygote");
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let vm = zygote.spawn_clone(&vmm, &env).await.expect("single clone");
         let _ = vm.vmid();
@@ -720,7 +720,7 @@ mod tests {
         let env = HostEnv {
             overlay: Arc::new(store.clone()),
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
 
         let zygote = Zygote::from_snapshot_dir(master.clone(), erofs_cfg())
@@ -796,7 +796,7 @@ mod tests {
 
         let env = HostEnv {
             vmids: shared_vmids(),
-            ..HostEnv::hermetic()
+            ..HostEnv::for_unit_tests()
         };
         let res = zygote.spawn_clones(&vmm, 4, &env).await;
         assert!(

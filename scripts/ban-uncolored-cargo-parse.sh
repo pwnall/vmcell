@@ -19,13 +19,14 @@
 # specifically rather than on any general "colour is handled" heuristic.
 #
 # WHAT IT FLAGS: a `cargo <subcommand>` whose output this repo consumes — `tree`, `metadata`,
-# `pkgid`, `locate-project`, `fuzz list` — appearing in a shell/YAML/justfile line without
-# `--color never` (or `--color=never`). Comments are stripped first (`#` to end of line in all three
-# languages), so the prose above is not itself a hit.
+# `pkgid`, `locate-project` — appearing in a shell/YAML/justfile line without `--color never` (or
+# `--color=never`). Comments are stripped first (`#` to end of line in all three languages), so the
+# prose above is not itself a hit.
 #
 # WHAT IT DOES NOT FLAG: the stub `cargo` shims in the self-tests, which dispatch on `"$1" = "tree"`
-# and never spell `cargo tree`; and subcommands whose output nothing parses (`cargo build`,
-# `cargo clippy`, `cargo nextest`) — their diagnostics are for humans and colour is wanted there.
+# and never spell `cargo tree`; subcommands whose output nothing parses (`cargo build`,
+# `cargo clippy`, `cargo nextest`) — their diagnostics are for humans and colour is wanted there;
+# and third-party subcommands that have no `--color` to pass (see the roster note below).
 #
 # scripts/test-ban-uncolored-cargo-parse.sh is the red-on-inverse self-test.
 #
@@ -41,8 +42,8 @@ if [[ ${#files[@]} -eq 0 ]]; then
   # in this repo where a cargo invocation's output is consumed by a gate.
   #
   # THE ONE EXCLUSION, and why it is not a hole: this scanner's own self-test writes deliberate
-  # violation FIXTURES (`printf 'cargo tree …' > "$work/v-pipe.sh"`) into a temp dir, so scanning it
-  # would report the gate's own test data as violations — the cries-wolf failure mode that gets a
+  # violation FIXTURES (heredocs containing bare `cargo tree …` lines) into a temp dir, so scanning
+  # it would report the gate's own test data as violations — the cries-wolf failure mode that gets a
   # gate suppressed. It is named explicitly rather than matched by a `test-*` glob, because every
   # OTHER self-test in scripts/ is still scanned: `test-check-vendored-vhost.sh` and
   # `test-check-broker-lean.sh` build their fixtures as canned cargo OUTPUT, never as invocations,
@@ -56,8 +57,15 @@ if [[ ${#files[@]} -eq 0 ]]; then
   done
 fi
 
-# The subcommands whose stdout this repo parses. `fuzz list` is two words on purpose: `cargo fuzz
-# run` streams to a human and may colour freely.
+# The subcommands whose stdout this repo parses AND which accept `--color`. Both halves matter: the
+# roster is limited to cargo's own built-ins, because a rule that cannot be satisfied is worse than
+# no rule. `cargo fuzz list` is the case in point — its output IS word-split into a loop in
+# fuzz.yml, but cargo-fuzz is a third-party subcommand whose `List` struct carries only `--fuzz-dir`
+# (checked in rust-fuzz/cargo-fuzz `src/options/list.rs`), so passing `--color never` would abort
+# the loop on an unexpected argument and fuzz nothing. This scanner listed it in its first draft and
+# then reddened `just ci` demanding an edit that would have broken the workflow. It is out, and
+# fuzz.yml carries a target-count assertion instead — the empty-list hazard, gated where it is
+# actually reachable.
 #
 # The match is anchored on COMMAND POSITION — start of line, whitespace, `(`, `|`, `&`, `;`, or a
 # `$(` capture — and the subcommand must follow `cargo` immediately (past an optional `+toolchain`
@@ -66,7 +74,7 @@ fi
 # wraps tree glyphs", and an unanchored `cargo tree` matched `"::error::cargo tree failed…"` and the
 # backticked `` `cargo tree -i axum` `` inside a diagnostic. A gate that cries wolf on its own
 # messages gets suppressed, which is how a class gate stops being one.
-parsed_re='(^|[[:space:]]|[|&;(]|[$]\()cargo([[:space:]]+[+-][^[:space:]]*)*[[:space:]]+(tree|metadata|pkgid|locate-project|fuzz[[:space:]]+list)\b'
+parsed_re='(^|[[:space:]]|[|&;(]|[$]\()cargo([[:space:]]+[+-][^[:space:]]*)*[[:space:]]+(tree|metadata|pkgid|locate-project)\b'
 
 # Normalise one file to `<first-line-number>:<logical line>`:
 #   * comments stripped, so neither prose nor a rationale comment naming the invocation is a hit;
