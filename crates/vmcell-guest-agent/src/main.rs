@@ -2408,8 +2408,9 @@ mod tests {
     // (1) 128 KiB — twice a full pipe — is routed at a child that is not reading;
     //     `route_stdin`/`route_stdin_eof` must still return promptly. RED on the
     //     pre-fix inline `write_all`: the routing thread parks on the full pipe,
-    //     the 5 s wait elapses and the assert fires (the live legs in
-    //     crates/vmcell/tests/session.rs cover the consequences — an undispatched
+    //     the 5 s wait elapses and the assert fires (the live leg
+    //     `session_stdin_flood_does_not_wedge_the_connection` in
+    //     crates/vmcell/tests/session.rs covers the consequences — an undispatched
     //     `CloseSession` and the skipped C3 teardown).
     // (2) Only THEN is the pipe drained: every queued byte must arrive, in order,
     //     before EOF. RED if `StdinEof` closed the sink out of band (a short read)

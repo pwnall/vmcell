@@ -314,7 +314,7 @@ pub(crate) mod backend {
             };
             // The daemon is constructed; signal readiness immediately before the
             // (blocking) serve loop. Waiting for `start` to return would deadlock,
-            // as the frontend only connects after `VirtioFsDaemon::start` returns —
+            // as the frontend only connects after `VirtioFsDaemon::start_paced` returns —
             // this is the same readiness point as the external daemon's listening
             // socket (bound, about to accept).
             let _ = ready_tx.send(Ok(()));

@@ -14,8 +14,12 @@ Editing the consumer to match a silently-changed contract inverts the gate.
 
 1. **Extends the pins registry through the overlay.** `pins-overlay.json` adds
    `kernel_fragments.IKCONFIG` (this repo's own fragment) and a `kernels.ikconfig` entry that
-   declares it. The overlay is layered over vmcell's committed baseline key by key; nothing is
-   forked.
+   declares it. That entry carries **all three** of `source_url`, `source_sha256` and
+   `fragments: ["IKCONFIG"]`: a label is buildable only with its own source pins, and an entry
+   carrying `fragments` alone is refused fail-loud (the refusal names the two `kernels.<label>.…`
+   overlay keys to add — the flattened `kernel_<label>_source_url` spelling is not a key any pins
+   document may carry). The overlay is layered over vmcell's committed baseline key by key; nothing
+   is forked.
 2. **Builds `vmlinux-ikconfig` through the library entry point** —
    `vmcell::artifact::build_labelled_kernel(label, target_dir, overlay)` — the entry a git-dep
    consumer calls from its own harness. (The CLI entry point, `vmcell build-kernels --pins <file>`

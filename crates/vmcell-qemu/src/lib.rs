@@ -884,7 +884,14 @@ impl Qemu {
 
         let mut fs_daemons = Vec::new();
         for share in &cfg.shares {
-            let daemon = vmcell::fs::VirtioFsDaemon::start(share, &res.tmp_dir).await?;
+            // §9.4: `api_socket_poll` paces EVERY daemon readiness wait — the same profile the
+            // `vhost-device-vsock` wait above uses, so the two helper daemons of one VM cannot
+            // poll on different cadences. The unpaced `start` shim would pin virtiofsd to the
+            // default grid under `low_latency()`/`throughput()` (finding
+            // `virtiofsd-socket-wait-hardcoded-cadence`). Gated by
+            // `virtiofs_pacing_gate::every_virtiofs_start_here_is_paced_by_the_vm_config`.
+            let daemon =
+                vmcell::fs::VirtioFsDaemon::start_paced(share, &res.tmp_dir, &cfg.timeouts).await?;
             fs_daemons.push(daemon);
         }
         // The argv names each virtio-fs daemon by socket path only, so the composer gets
@@ -2605,5 +2612,105 @@ mod tests {
             nix::sys::signal::Signal::SIGKILL,
         );
         let _ = daemon.wait().await;
+    }
+}
+
+/// Source-level gate for §9.4's "`api_socket_poll` paces **every** daemon readiness wait" on the
+/// shipped QEMU path — the sibling of `vmcell`'s `cloud_hypervisor::virtiofs_pacing_gate`, whose
+/// module doc carries the full rationale for scanning source instead of behavior.
+///
+/// Deliberately a second copy rather than a shared helper: the scan must read *this crate's* own
+/// source, and `include_str!`-ing a sibling crate's file would compile only from a workspace
+/// checkout (it breaks a packaged build) while a runtime-shared predicate would have to become
+/// public API of a contract crate to cross the crate boundary. The law itself is not duplicated —
+/// it is `VirtioFsDaemon::start_paced`'s signature, which is single-sourced in `vmcell::fs`; these
+/// are two readers of it.
+#[cfg(test)]
+mod virtiofs_pacing_gate {
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The number of virtio-fs daemon starts this backend ships: one, in `create`.
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set.
+    const EXPECTED_CALL_SITES: usize = 1;
+
+    /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
+    /// dropped and whitespace collapsed.
+    fn production_code(source: &str) -> String {
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Every `VirtioFsDaemon::…` call expression in `code`, each truncated at its statement's `;`.
+    fn virtiofs_start_calls(code: &str) -> Vec<&str> {
+        code.match_indices("VirtioFsDaemon::")
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    /// The law: a shipped virtio-fs start names the paced entry point **and** hands it the VM's
+    /// own profile — the same profile this backend's `vhost-device-vsock` wait already uses.
+    fn call_is_paced_by_the_vm_config(call: &str) -> bool {
+        call.starts_with("VirtioFsDaemon::start_paced(") && call.contains("&cfg.timeouts")
+    }
+
+    #[test]
+    fn every_virtiofs_start_here_is_paced_by_the_vm_config() {
+        let code = production_code(SOURCE);
+        let calls = virtiofs_start_calls(&code);
+        assert_eq!(
+            calls.len(),
+            EXPECTED_CALL_SITES,
+            "expected {EXPECTED_CALL_SITES} virtio-fs daemon start in `create`; found {}: \
+             {calls:?}. If a site was legitimately added or removed, update EXPECTED_CALL_SITES — \
+             do not delete the scan.",
+            calls.len()
+        );
+        for call in &calls {
+            assert!(
+                call_is_paced_by_the_vm_config(call),
+                "§9.4: this virtio-fs readiness wait is not paced by the VM's own profile — \
+                 `{call}` must be `VirtioFsDaemon::start_paced(share, …, &cfg.timeouts)`"
+            );
+        }
+    }
+
+    /// The gate's own red-on-inverse: the predicate must reject both regression shapes, so the
+    /// scan above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_pacing_predicate_rejects_both_regression_shapes() {
+        assert!(!call_is_paced_by_the_vm_config(
+            "VirtioFsDaemon::start(share, &res.tmp_dir).await?"
+        ));
+        assert!(!call_is_paced_by_the_vm_config(
+            "VirtioFsDaemon::start_paced(share, &res.tmp_dir, &Timeouts::default()).await?"
+        ));
+        assert!(call_is_paced_by_the_vm_config(
+            "VirtioFsDaemon::start_paced(share, &res.tmp_dir, &cfg.timeouts).await?"
+        ));
+    }
+
+    /// The scanner's own controls: a prose mention of the entry point is not a call site, and a
+    /// call split across two rustfmt lines is still seen whole.
+    #[test]
+    fn the_scanner_ignores_comments_and_survives_line_breaks() {
+        let synthetic = "// a failed VirtioFsDaemon::start reaps the VMM\n\
+             let daemon =\n    VirtioFsDaemon::start_paced(share, &res.tmp_dir,\n    \
+             &cfg.timeouts).await?;\n#[cfg(test)]\nmod tests { VirtioFsDaemon::start(x); }";
+        let code = production_code(synthetic);
+        let calls = virtiofs_start_calls(&code);
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert!(call_is_paced_by_the_vm_config(calls[0]), "got {calls:?}");
     }
 }

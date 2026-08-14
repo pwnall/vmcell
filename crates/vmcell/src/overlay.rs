@@ -51,7 +51,18 @@ pub trait OverlayStore: Send + Sync + std::fmt::Debug {
     /// Best-effort probe of whether `dir`'s filesystem gives cheap block-level
     /// copy-on-write, for an up-front cost signal before minting a pool.
     ///
-    /// Side-effect-free; any uncertainty is reported as [`CowSupport::FullCopy`].
+    /// `dir` itself is never written to; any uncertainty is reported as
+    /// [`CowSupport::FullCopy`].
+    ///
+    /// **This is the one entry point for that cost signal** (§8.4, The zygote fan-out
+    /// and the `OverlayStore` seam: "a caller wanting an up-front CoW cost signal
+    /// probes directly: `env.overlay.probe(zygote.master_dir())`"). The answer is a
+    /// property of the *store*, not only of the host filesystem — a store that
+    /// materializes clones some other way answers for what **it** would do — so
+    /// asking the filesystem behind an injected store's back is a lie by
+    /// construction (docs/78 `overlay-probe-not-side-effect-free`, seam half).
+    /// [`Zygote::probe_cow_support_in`](crate::Zygote::probe_cow_support_in) is the
+    /// packaged call.
     fn probe(&self, dir: &Path) -> CowSupport;
 }
 
@@ -87,6 +98,12 @@ impl OverlayStore for ReflinkOverlayStore {
 pub(crate) struct RecordingOverlayStore {
     /// Every `(src, dst)` pair passed to [`OverlayStore::clone_tree`], in order.
     clones: std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, std::path::PathBuf)>>>,
+    /// Every `dir` passed to [`OverlayStore::probe`], in order. Recorded for the same
+    /// reason `clones` is: an equality assertion on the returned [`CowSupport`] alone
+    /// cannot tell "the seam answered" from "the host filesystem happens to agree",
+    /// and the routing is exactly what docs/78 `overlay-probe-not-side-effect-free`
+    /// (seam half) left unproven.
+    probes: std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
     /// The [`CowSupport`] to report from both methods.
     report: CowSupport,
 }
@@ -95,16 +112,14 @@ pub(crate) struct RecordingOverlayStore {
 impl RecordingOverlayStore {
     /// A recording store that reports [`CowSupport::Reflink`].
     pub(crate) fn new() -> Self {
-        Self {
-            clones: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            report: CowSupport::Reflink,
-        }
+        Self::with_report(CowSupport::Reflink)
     }
 
     /// A recording store that reports the given [`CowSupport`].
     pub(crate) fn with_report(report: CowSupport) -> Self {
         Self {
             clones: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            probes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             report,
         }
     }
@@ -112,6 +127,14 @@ impl RecordingOverlayStore {
     /// The recorded `(src, dst)` clone requests, in order.
     pub(crate) fn calls(&self) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
         self.clones
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The recorded [`OverlayStore::probe`] requests, in order.
+    pub(crate) fn probe_calls(&self) -> Vec<std::path::PathBuf> {
+        self.probes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -132,7 +155,11 @@ impl OverlayStore for RecordingOverlayStore {
         Ok(self.report)
     }
 
-    fn probe(&self, _dir: &Path) -> CowSupport {
+    fn probe(&self, dir: &Path) -> CowSupport {
+        self.probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dir.to_path_buf());
         self.report
     }
 }
@@ -213,5 +240,30 @@ mod tests {
         let calls = store.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (src, dst), "must record the exact (src, dst)");
+    }
+
+    // The double records the exact `dir` each `probe` asked about — the observation a
+    // routing gate needs (docs/78 `overlay-probe-not-side-effect-free`, seam half): the
+    // returned `CowSupport` alone cannot distinguish "the seam answered" from "the host
+    // filesystem happened to agree". A double whose `probe` returns its report without
+    // recording (the pre-fix `fn probe(&self, _dir: &Path)`) reddens here.
+    #[test]
+    fn recording_store_records_probe_dirs() {
+        let store = RecordingOverlayStore::with_report(CowSupport::Reflink);
+        assert!(
+            store.probe_calls().is_empty(),
+            "a fresh double has probed nothing"
+        );
+        let dir = Path::new("/nonexistent/zygote-master");
+        assert_eq!(
+            store.probe(dir),
+            CowSupport::Reflink,
+            "probe must honor the configured report"
+        );
+        assert_eq!(
+            store.probe_calls(),
+            vec![dir.to_path_buf()],
+            "must record the exact probed dir, once"
+        );
     }
 }

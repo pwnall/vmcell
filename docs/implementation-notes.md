@@ -1232,8 +1232,14 @@ capability *values* changed, not the struct), so no further version bump beyond 
   path assert; `Vsock` → `assert_eq!(cid, original_cid)` (baked-CID reuse), symmetric to the rotating
   branch's `assert_ne!`. Re-ran CH/FC/QEMU snapshot legs to confirm no regression.
 
-- **Gates.** crosvm arg-builder unit test extended (`--restore` present + rotated-`--vsock cid=` on the
-  restore variant, cold create carries no `--restore`); the restore-Unsupported unit test became
+- **Gates.** crosvm arg-builder unit test extended
+  (`crosvm_run_args_restore_emits_restore_flag`: `--restore <snapshot>` present, the kernel still the
+  trailing positional, and `--vsock cid=` programmed from the **`guest_cid` parameter** — which
+  `restore()` fills from the snapshot's baked-CID sidecar, never from `res.guest_cid`. The test passes
+  `7` while `test_res().guest_cid` is `3`, so the assertion pins that parameter flow non-vacuously and
+  reddens if the CID is ever sourced from the fresh `res`; a rotated CID is what crosvm rejects, so
+  there is no rotation to assert here. Cold create carries no `--restore`); the restore-Unsupported
+  unit test became
   `restore_checks_snapshot_file_before_spawning` (KVM-free missing-artifact reject); the capability-honesty
   test flipped `snapshot_restore` true / `restore_rotates_host_paths` false with the baked-CID rationale.
 
@@ -3007,8 +3013,18 @@ restore suites. Retire this entry when the shared crate lands.
 - **virtiofsd readiness is paced by the caller's profile, with one narrowing.**
   `VirtioFsDaemon::start_paced(share, vm_tmp, &Timeouts)` drives the shared `vmm::wait_for_socket`
   with `api_socket_poll` as the cadence and a named `SOCKET_READY_TIMEOUT_MS` ceiling (unchanged
-  total budget) instead of a hand-copied 20 ms grid; `start` remains a default-profile shim until the
-  CH and QEMU call sites pass `&cfg.timeouts`. *Deliberate narrowing:* the shared helper folds a
+  total budget) instead of a hand-copied 20 ms grid. **All three shipped sites pass `&cfg.timeouts`**
+  (CH create + restore, QEMU create), so §9.4's "every daemon readiness wait" is true on the shipped
+  path — the extraction alone left it false, because the unit gate exercises only the pure
+  `socket_wait_budget` and is structurally blind to a call site that never reaches it; the call-site
+  property is therefore gated by its own source scan in each backend. The unpaced `start` survives as
+  a `#[deprecated]` shim, not because it is wanted but because removing a `pub fn` is an API break
+  that belongs to a ledgered version bump rather than a defect fix — and, measured rather than
+  assumed, `cargo semver-checks` would *not* have caught the removal (for a `0.x` crate it assumes
+  the minor bump that is allowed to break), so the ledger rule is the only thing holding it. Under
+  `-D warnings` the deprecation makes any new caller fail to build, which is what keeps the shim from
+  becoming the accidental twin. Delete it at the next `vmcell` version bump. *Deliberate narrowing:*
+  the shared helper folds a
   failing `try_wait` into the deadline, so a poll error now surfaces as the readiness failure **with**
   the daemon's stderr rather than as its own message — nothing is swallowed, and the alternative was
   keeping a second copy of the readiness loop alive to phrase one sentence. virtiofsd also now spawns
@@ -3080,7 +3096,38 @@ here so the ledger is not read as a to-do that was never done:
   capabilities); a failed setcap removes the temp, says so, and leaves the previous blessing
   untouched. The failure is handled explicitly rather than by a `RETURN` trap, because under
   `set -e` a bare failing command exits the whole shell and the trap never fires.
-- `vmcell-bench`'s `workspace_root()` is a third copy of the workspace ascent, and its backend-binary
-  table parallels the validator's `harness::*_bin` getters (held to the contract by a parity gate,
-  not by sharing code) — `vmcell`'s own resolvers are `pub(crate)`, so both collapse only via a
-  `vmcell`-side export. Same shape as the recorded `harness::ch_bin()` consolidation item.
+
+### The completeness audit, and the six halves it caught (2026-08-14)
+
+The three fix waves above were followed by an **adversarial completeness audit**: five reviewers took
+disjoint slices of docs/78's 83 findings and were told to *disprove* the claim that each was
+addressed, then a sixth independently re-checked every non-green verdict. Seventy-seven came back
+fully addressed; six came back PARTIAL, all six correctly. Every one had the same shape — the fix
+landed and the *second half* of the finding did not — which is exactly the failure mode a
+self-review misses, and the reason the audit is recorded here rather than treated as ceremony.
+
+- **M6's named live gate did not exist.** The stdin writer thread shipped with two good KVM-free
+  gates, but nothing in `crates/vmcell/tests/` moved more than a couple of KiB of stdin, so the two
+  consequences the fix exists to prevent — an undispatched `CloseSession` and a skipped C3 teardown —
+  were unmeasured on the data plane. Worse, a comment in the guest agent *claimed* that coverage.
+  Closed by `session_stdin_flood_does_not_wedge_the_connection` (four backend arms), which floods
+  512 KiB at a non-reading child and then asserts both consequences, and by making the comment name
+  the real leg. Code that documents coverage it does not have is the one thing rule 4 forbids.
+- **The virtiofsd pacing never reached production.** `start_paced` existed with three passing unit
+  gates and *zero* production callers: all three shipped sites still used the default-profile
+  `start`. The gate could not catch it, because it tested the extracted helper rather than the claim.
+  Closed above.
+- **`OverlayStore::probe` still had no production caller.** The side-effect half of
+  `overlay-probe-not-side-effect-free` was fixed; the seam half was not, leaving dead public trait
+  surface and an S4 bypass. Closed by `Zygote::probe_cow_support_in(&HostEnv)`, gated by an injected
+  store configured with the *opposite* answer to the real filesystem's — the only assertion that can
+  tell "the seam answered" from "the filesystem happened to agree".
+- **Three doc halves** (design §10.4's non-executable downstream bless route contradicting the fixed
+  README, the ledger bullet still describing crosvm's *rotated* restore CID, and §5.6 + the example
+  README omitting `source_url`/`source_sha256`) were text-only and are closed.
+
+The transferable lesson, recorded because it recurs: **a gate that tests the extracted helper is not
+a gate on the claim.** Two of the six were invisible precisely because a green unit test stood next
+to an unchanged call site. When a fix extracts a predicate, the gate has to bind the *call sites*,
+not just the predicate — a source scan is an acceptable last resort and is what both backends carry
+for the virtiofsd pacing.

@@ -149,9 +149,15 @@ pub(crate) fn clone_tree_cow_blocking(src: &Path, dst: &Path) -> Result<CowSuppo
 /// counter so concurrent probes — from sibling processes or from sibling threads —
 /// do not collide.
 ///
+/// Its one caller is [`ReflinkOverlayStore::probe`](crate::overlay::ReflinkOverlayStore):
+/// callers reach the cost signal through the `OverlayStore` seam (§8.4, `Zygote::probe_cow_support_in`),
+/// never by calling this directly — a direct call answers for the host filesystem
+/// even when the caller injected a different store (docs/78
+/// `overlay-probe-not-side-effect-free`, seam half).
+///
 /// **The probed directory is never written to** (docs/78
-/// `overlay-probe-not-side-effect-free`). Its one production caller probes a
-/// zygote *master*, which §13 (Cross-cutting invariants) declares immutable: the
+/// `overlay-probe-not-side-effect-free`). What it probes is a zygote *master*,
+/// which §13 (Cross-cutting invariants) declares immutable: the
 /// pre-fix probe wrote its sentinels straight into that master, so it reported
 /// `FullCopy` on a read-only master (the write failed, and "uncertain" is
 /// `FullCopy`), and its create/unlink pair raced a concurrent fan-out's

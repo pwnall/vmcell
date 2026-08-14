@@ -1397,7 +1397,13 @@ what v30 adds is the four pieces that made the existing path *semi-public in pra
 
 **Build (§18 deltas 1, 3).** A downstream workspace extends the pins registry through the **overlay**
 (`VMCELL_PINS`, §10.2) — adding its own `kernel_fragments.<NAME>` entries (flattened pin key:
-`kernel_fragments_<NAME>`) and a `kernels.<label>` entry declaring `fragments: [<NAME>, …]` — and
+`kernel_fragments_<NAME>`) and a `kernels.<label>` entry carrying **all three** of `source_url`,
+`source_sha256` and `fragments: [<NAME>, …]` (a fragments-only entry is a legal registry entry — it
+declares the label for enumeration — but carries no source to build from, so `KernelStage::run`
+refuses it fail-loud naming the two **overlay** keys to add, `kernels.<label>.source_url` and
+`kernels.<label>.source_sha256`; the flattened `kernel_<label>_source_url` spelling names no key a
+pins document may carry, and pasting it into an overlay is rejected by the top-level namespace check
+§10.2 describes) — and
 builds `vmlinux-<label>` into its own
 `VMCELL_ARTIFACTS_DIR` via either entry point: the CLI (`vmcell build-kernels --pins <file>`, from a
 vmcell checkout) or, from the consumer's own harness, the library
@@ -2901,8 +2907,20 @@ manifest replicates the stanza against a vhost-resolving feature set and runs th
 (`cargo tree` only — no NAT compile), while the red leg drops the stanza in a temp copy and asserts the
 script fails; (4) artifacts: build the rootfs with a vmcell checkout's
 `vmcell build` / `oci2-erofs --inject` and point your harness at it via `VMCELL_ROOTFS` +
-`VMCELL_ARTIFACTS_DIR`; kernels build downstream through §5.6; (5) privileged runs use your own
-workspace's blessed `vmcell-test-runner` copy (`just bless` — per-workspace by design, §15.5). A
+`VMCELL_ARTIFACTS_DIR`; kernels build downstream through §5.6; (5) privileged runs need a capability
+runner **installed under the consumer's own workspace**, and the route is four explicit steps, not
+`just bless` — that recipe belongs to the vmcell checkout (§15.5) and `vmcell-test-runner` is not a
+member of the consumer's workspace, so there is nothing there for it to bless: build
+`-p vmcell-test-runner` from the pinned vmcell checkout, `install -D -m 0700` that binary into the
+consumer's own `.vmcell-bin/<profile>/` (`release/` for the usual `--release` runs),
+`sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep`
+the installed copy, then point `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER` at it — once per
+profile tested under (README § "Consuming vmcell as a dependency (the downstream contract)", step 5,
+carries the runnable form). The copy must live in the
+consumer's workspace because the runner derives its confinement root from its **own** canonicalized
+path (§15.5): one blessed inside the vmcell checkout anchors on *that* `target/` and refuses the
+consumer's test binaries. `0700` before the caps land is the security boundary, and writing a file
+strips its capabilities — so the install+`setcap` pair repeats on every runner rebuild. A
 build-script probe that would auto-detect a missing vhost patch was considered and rejected: the
 failure it prevents is loud (a boot error), just cryptic — a documented stanza + a one-line CI check
 beats autoconf machinery (simplicity is reliability).

@@ -1,8 +1,9 @@
 //! Live (KVM) integration tests for interactive sessions (§3, The control plane: vsock, the host clients, and the guest agent): PTY +
 //! controlling terminal + winsize (§13, Cross-cutting invariants), streaming stdin (§3.3, Interactive-session wire semantics), multiplexed
-//! concurrent exec over one connection (§13, Cross-cutting invariants), and connection-owns-its-sessions
-//! teardown (§13, Cross-cutting invariants). Sessions ride the vsock agent only (no snapshot), so every
-//! case runs on **all three** backends via `vmm_matrix_test!` — no `require_cap!`
+//! concurrent exec over one connection (§13, Cross-cutting invariants), connection-owns-its-sessions
+//! teardown (§13, Cross-cutting invariants), and stdin-pressure liveness (M6). Sessions ride the
+//! vsock agent only (no snapshot), so every
+//! case runs on **all four** backends via `vmm_matrix_test!` — no `require_cap!`
 //! skips. Every assertion is on the **data plane** (guest output / process
 //! residue), not a proxy signal (rubric A10).
 
@@ -223,31 +224,12 @@ async fn session_teardown_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let (mut vm, mux) = boot_and_connect(vmm).await;
 
     let mut persistent = mux
-        .open(SessionSpecBuilder::new(argv(&["/bin/sh", "-c", "echo $$; exec sleep 600"])).build())
+        .open(SessionSpecBuilder::new(argv(&["/bin/sh", "-c", PERSISTENT_SH])).build())
         .await
         .expect("open persistent session");
 
     // Read the session process group leader's pid (existed-before proof).
-    let mut acc: Vec<u8> = Vec::new();
-    loop {
-        match persistent.recv().await {
-            Some(SessionEvent::Stdout(d)) => {
-                acc.extend(d);
-                if acc.contains(&b'\n') {
-                    break;
-                }
-            }
-            Some(SessionEvent::Exit(c)) => panic!("persistent session exited early with {c}"),
-            Some(_) => {}
-            None => panic!("connection closed before the session reported its pid"),
-        }
-    }
-    let text = String::from_utf8_lossy(&acc);
-    let pid: u32 = text
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("could not parse pid from {text:?}"));
+    let pid = session_leader_pid(&mut persistent).await;
 
     // Drop the session AND the mux → the connection closes → the guest kills every
     // still-open session's process group (§13, Cross-cutting invariants).
@@ -256,9 +238,65 @@ async fn session_teardown_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Let the guest observe EOF, kill the group, and reap.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // From a FRESH one-shot exec, the pid's process must be gone: its /proc cmdline
-    // no longer names `sleep` (robust against pid reuse — a reused pid would run our
-    // own check command, never `sleep`).
+    assert_sleep_pgroup_gone(
+        &mut vm,
+        pid,
+        "the persistent session's process group must be killed when its connection drops (§13, Cross-cutting invariants)",
+    )
+    .await;
+
+    vm.shutdown().await.expect("shutdown");
+}
+
+/// A child that never reads its stdin: `sh` consumes its script from `-c`, and
+/// `exec sleep` replaces it with a process that reads nothing at all — so the
+/// guest-side stdin pipe fills and stays full. `echo $$` first, so the leg can
+/// name the session's process-group leader for a residue proof.
+const PERSISTENT_SH: &str = "echo $$; exec sleep 600";
+
+/// Bytes streamed at a non-reading child by [`flood_stdin`]: 512 KiB is eight
+/// times a full 64 KiB guest pipe, so the guest's stdin writer is genuinely
+/// parked (not merely slow) for the rest of the leg.
+const FLOOD_BYTES: usize = 512 * 1024;
+
+/// Reads the pid a persistent session's shell echoes as its first line — the
+/// existed-before half of a process-residue proof. Bounded, so a session that
+/// never reports its pid fails the leg instead of hanging the suite.
+async fn session_leader_pid(session: &mut vmcell::agent::session::Session) -> u32 {
+    let mut acc: Vec<u8> = Vec::new();
+    let read = async {
+        loop {
+            match session.recv().await {
+                Some(SessionEvent::Stdout(d)) => {
+                    acc.extend(d);
+                    if acc.contains(&b'\n') {
+                        return;
+                    }
+                }
+                Some(SessionEvent::Exit(c)) => panic!("persistent session exited early with {c}"),
+                Some(_) => {}
+                None => panic!("connection closed before the session reported its pid"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .expect("the session must report its pid well inside 30s");
+    let text = String::from_utf8_lossy(&acc);
+    text.split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse pid from {text:?}"))
+}
+
+/// The process-residue proof: from a FRESH one-shot exec, `pid`'s /proc cmdline no
+/// longer names `sleep` (robust against pid reuse — a reused pid would run our own
+/// check command, never `sleep`). `why` states the law the residue would break.
+async fn assert_sleep_pgroup_gone<V: vmcell::vmm::Vmm>(
+    vm: &mut vmcell::MicroVm<V>,
+    pid: u32,
+    why: &str,
+) {
     let agent = vm
         .agent(Some(Duration::from_secs(30)))
         .await
@@ -274,9 +312,102 @@ async fn session_teardown_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let text = String::from_utf8_lossy(&outcome.stdout);
     assert!(
         !text.contains("sleep"),
-        "the persistent session's process group must be killed when its connection drops (§13, Cross-cutting invariants); \
-         pid {pid} still runs `sleep`: {text:?}"
+        "{why}; pid {pid} still runs `sleep`: {text:?}"
     );
+}
+
+/// Streams [`FLOOD_BYTES`] at a session whose child never reads, then lets the
+/// bytes land: the host writer task is aborted by `SessionMux`'s `Drop`, so the
+/// settle is what makes the guest-side pressure real rather than racy. 64 KiB per
+/// frame — one full pipe each, far under `MAX_FRAME_BYTES`.
+async fn flood_stdin(session: &vmcell::agent::session::Session) {
+    let chunk = vec![b'X'; 64 * 1024];
+    for _ in 0..(FLOOD_BYTES / chunk.len()) {
+        session
+            .write_stdin(&chunk)
+            .await
+            .expect("streaming stdin at a non-reading child must not fail host-side");
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+// M6 (`guest-dispatch-blocking-stdin-wedge`), the live half of the gate the review
+// named (its KVM-free half is `route_stdin_does_not_block_on_a_full_pipe_and_eof_follows_every_byte`
+// + `stdin_writer_gives_up_on_closing_so_teardown_join_is_bounded` in
+// vmcell-guest-agent). A child that stops reading its stdin must not wedge the
+// connection that owns it: 512 KiB is streamed at a `sleep` that reads nothing, so
+// the guest's 64 KiB stdin pipe is full and its writer parked, and BOTH consequences
+// the pre-fix inline `write_all` produced are asserted on the data plane:
+//   (1) `CloseSession` is still dispatched — `close()` yields the session's terminal
+//       `SessionExit`, and the killed process group is gone from /proc.
+//   (2) The C3 teardown still runs — a second flooded session's process group is
+//       killed when the connection drops (`session_connection_owns_sessions`'s
+//       property, now under stdin pressure).
+// RED pre-fix, by construction: the dispatch thread parks inside the first `Stdin`
+// frame's write, so (1) never sees an Exit (the 30 s bound fails the leg fast rather
+// than hanging the suite) and `serve_loop` never returns, so (2) finds `sleep` alive.
+vmm_matrix_test!(session_stdin_flood_does_not_wedge_the_connection, |vmm| {
+    session_stdin_flood_impl(&vmm).await;
+});
+
+async fn session_stdin_flood_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
+    let (mut vm, mux) = boot_and_connect(vmm).await;
+
+    // (1) Dispatch liveness under a full guest pipe.
+    let mut closed = mux
+        .open(SessionSpecBuilder::new(argv(&["/bin/sh", "-c", PERSISTENT_SH])).build())
+        .await
+        .expect("open the close-under-pressure session");
+    let closed_pid = session_leader_pid(&mut closed).await;
+    flood_stdin(&closed).await;
+    closed
+        .close()
+        .await
+        .expect("CloseSession must still reach the guest");
+    let exit = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match closed.recv().await {
+                Some(SessionEvent::Exit(code)) => return Some(code),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    })
+    .await
+    .expect(
+        "`close()` must yield SessionExit well inside 30s, not park behind a full stdin pipe (M6)",
+    );
+    assert!(
+        exit.is_some(),
+        "close() under stdin pressure must deliver the session's terminal SessionExit, \
+         not end the stream with the connection"
+    );
+    assert_sleep_pgroup_gone(
+        &mut vm,
+        closed_pid,
+        "an explicit close() must kill the session's process group even with its stdin pipe full (M6)",
+    )
+    .await;
+
+    // (2) The C3 (§13, Cross-cutting invariants) teardown under the same pressure.
+    let mut persistent = mux
+        .open(SessionSpecBuilder::new(argv(&["/bin/sh", "-c", PERSISTENT_SH])).build())
+        .await
+        .expect("open the residue session");
+    let pid = session_leader_pid(&mut persistent).await;
+    flood_stdin(&persistent).await;
+    drop(persistent);
+    drop(mux);
+    // Let the guest observe EOF, give up on the parked stdin write (one
+    // `STDIN_POLL_SLICE`), kill the group, and reap.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert_sleep_pgroup_gone(
+        &mut vm,
+        pid,
+        "a flooded session's process group must still be killed when its connection drops (§13, Cross-cutting invariants; M6)",
+    )
+    .await;
 
     vm.shutdown().await.expect("shutdown");
 }

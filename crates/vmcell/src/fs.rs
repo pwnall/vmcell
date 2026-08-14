@@ -36,16 +36,34 @@ pub struct VirtioFsDaemon {
 }
 
 impl VirtioFsDaemon {
-    /// Starts a virtiofs daemon (using the standalone `virtiofsd` binary) for the given share,
-    /// paced by the default [`Timeouts`](crate::config::Timeouts) profile.
+    /// Starts a virtiofs daemon for the given share, paced by the **default**
+    /// [`Timeouts`](crate::config::Timeouts) profile.
     ///
-    /// Prefer [`start_paced`](Self::start_paced) from a call site that has the VM's own
-    /// `Timeouts`: §9.4 makes `api_socket_poll` pace **every** daemon readiness wait, and this
-    /// entry point can only supply the default cadence.
+    /// Deprecated, and with no production caller left: §9.4 makes `api_socket_poll` pace **every**
+    /// daemon readiness wait, so a second entry point that can only supply the default cadence
+    /// *is* the divergence "one law, one predicate" forbids — a future caller reaching for the
+    /// shorter name would silently re-pin virtiofsd's wait to the default under `low_latency()`
+    /// or `throughput()` (finding `virtiofsd-socket-wait-hardcoded-cadence`). Every shipped site
+    /// passes its VM's `&cfg.timeouts` to [`start_paced`](Self::start_paced).
+    ///
+    /// It survives as a shim rather than being deleted only because removing a `pub fn` is a
+    /// `vmcell` API break, and an API break belongs to a deliberate, ledgered version bump
+    /// (AGENTS.md, "The downstream toolkit contract"), not to a defect fix — measured, not
+    /// assumed, that break would slip past `cargo semver-checks` here, which for a `0.x` crate
+    /// assumes the minor bump that is allowed to break, so the ledger rule is the only thing
+    /// holding it. `#[deprecated]` is what keeps the shim from becoming an accidental twin: under
+    /// CI's `RUSTFLAGS=-D warnings` any new caller — in this crate or a downstream one — fails to
+    /// build, while an existing downstream caller gets a warning naming the replacement instead of
+    /// a surprise breakage. Delete it in the next `vmcell` version bump.
     ///
     /// # Errors
     /// Returns an error if the daemon fails to spawn or create the socket.
     #[cfg(not(feature = "experiment-fuse"))]
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `VirtioFsDaemon::start_paced(share, vm_tmp, &cfg.timeouts)`: §9.4 paces every \
+                daemon readiness wait with the caller's profile, not the default one"
+    )]
     pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         Self::start_paced(share, vm_tmp, &crate::config::Timeouts::default()).await
     }
@@ -201,12 +219,32 @@ impl VirtioFsDaemon {
         })
     }
 
+    /// Starts a virtiofs daemon for the given share, paced by the **default**
+    /// [`Timeouts`](crate::config::Timeouts) profile.
+    ///
+    /// Deprecated under this feature for the same reason as under the `virtiofsd`-subprocess
+    /// build, and shaped identically (shim → [`start_paced`](Self::start_paced)) so the two
+    /// builds cannot disagree about which entry point owns the start sequence.
+    ///
+    /// # Errors
+    /// Returns an error if the virtiofs daemon fails to start or bind to the socket.
+    #[cfg(feature = "experiment-fuse")]
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `VirtioFsDaemon::start_paced(share, vm_tmp, &cfg.timeouts)`: §9.4 paces every \
+                daemon readiness wait with the caller's profile, not the default one"
+    )]
+    pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
+        Self::start_paced(share, vm_tmp, &crate::config::Timeouts::default()).await
+    }
+
     /// Starts an in-process virtiofs daemon for the given share, for API parity with the
     /// `virtiofsd`-subprocess build.
     ///
     /// The in-process backend signals readiness directly from its worker thread, so there is no
     /// readiness poll for `timeouts.api_socket_poll` (§9.4) to pace and the profile is unused
-    /// here; callers can nonetheless pass their VM's `Timeouts` under either feature.
+    /// here; call sites pass their VM's `Timeouts` under either feature, so the shipped code does
+    /// not fork on the feature flag.
     ///
     /// # Errors
     /// Returns an error if the virtiofs daemon fails to start or bind to the socket.
@@ -216,15 +254,6 @@ impl VirtioFsDaemon {
         vm_tmp: &Path,
         _timeouts: &crate::config::Timeouts,
     ) -> crate::error::Result<Self> {
-        Self::start(share, vm_tmp).await
-    }
-
-    #[cfg(feature = "experiment-fuse")]
-    /// Starts a virtiofs daemon for the given share and returns its handler.
-    ///
-    /// # Errors
-    /// Returns an error if the virtiofs daemon fails to start or bind to the socket.
-    pub async fn start(share: &Share, vm_tmp: &Path) -> crate::error::Result<Self> {
         let socket_path = vm_tmp.join(format!("{}.sock", share.tag));
         let read_only = matches!(share.access, Access::ReadOnly);
         // CFG-3: the in-process (fuse-backend-rs passthrough) backend cannot enforce a
@@ -739,10 +768,14 @@ mod ro_share_tests {
     use crate::config::{Access, CachePolicy, Share};
 
     // CFG-3: the in-process (fuse-backend-rs passthrough) backend cannot enforce a
-    // read-only share, so `start` must fail loud with a typed, matchable
+    // read-only share, so `start_paced` must fail loud with a typed, matchable
     // `Error::Unsupported` — NOT the stringly `Error::Subprocess` the daemon's
     // `io::Error` was formerly wrapped into. This goes red if the refusal regresses to
     // `Subprocess` (or, worse, silently mounts the share read-write).
+    //
+    // Driven through the paced entry point (not the deprecated `start` shim) for the same reason
+    // the production sites are: `start` is `#[deprecated]`, so under `-D warnings` a caller here
+    // would not compile.
     #[tokio::test]
     async fn ro_share_is_unsupported_not_subprocess() {
         let tmp = std::env::temp_dir().join(format!(
@@ -753,7 +786,7 @@ mod ro_share_tests {
         std::fs::create_dir_all(&tmp).expect("create host share dir");
         let share = Share::new("ro", &tmp, Access::ReadOnly, CachePolicy::Never);
 
-        let err = VirtioFsDaemon::start(&share, &tmp)
+        let err = VirtioFsDaemon::start_paced(&share, &tmp, &crate::config::Timeouts::default())
             .await
             .expect_err("a read-only share must be refused by the in-process backend");
         assert!(

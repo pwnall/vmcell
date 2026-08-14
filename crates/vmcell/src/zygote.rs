@@ -32,6 +32,7 @@ use crate::config::VmConfig;
 use crate::env::HostEnv;
 use crate::error::{Error, Result};
 use crate::orchestrator::MicroVm;
+use crate::overlay::{OverlayStore, ReflinkOverlayStore};
 use crate::reflink::CowSupport;
 use crate::vmm::Vmm;
 use std::path::{Path, PathBuf};
@@ -124,12 +125,41 @@ impl Zygote {
         &self.cfg
     }
 
-    /// Best-effort probe of whether the master's filesystem supports reflink, for
-    /// an up-front cost signal before minting a pool. A `FullCopy` result means
-    /// every clone will pay a full byte copy of the suspend image (§8.4, The zygote fan-out and the OverlayStore seam).
+    /// Best-effort probe, **through the [`HostEnv`]'s [`OverlayStore`] seam**, of
+    /// whether this master's clones will be cheap block-level copies, for an
+    /// up-front cost signal before minting a pool. A `FullCopy` result means every
+    /// clone will pay a full byte copy of the suspend image (§8.4, The zygote fan-out and the OverlayStore seam).
+    ///
+    /// This is the packaged form of the design's `env.overlay.probe(zygote.master_dir())`
+    /// (§8.4) and the form to use: the cost signal is answered by the **same** store
+    /// [`spawn_clone`](Zygote::spawn_clone)/[`spawn_clones`](Zygote::spawn_clones)
+    /// will materialize the clones with (invariant S4), so an injected store can
+    /// never be contradicted by a filesystem probe run behind its back.
+    #[must_use]
+    pub fn probe_cow_support_in(&self, env: &HostEnv) -> CowSupport {
+        // docs/78 `overlay-probe-not-side-effect-free`, seam half: the cost signal used
+        // to call `reflink::probe_reflink(&self.master_dir)` directly, which left
+        // `OverlayStore::probe` with no production caller and answered for the host
+        // filesystem even when the caller had injected a different store. One law: the
+        // store that clones is the store that reports what cloning costs.
+        env.overlay.probe(&self.master_dir)
+    }
+
+    /// Best-effort probe of whether the master's filesystem supports reflink under
+    /// the **default production store** ([`ReflinkOverlayStore`], the one
+    /// [`HostEnv::shared`](crate::HostEnv::shared) carries).
+    ///
+    /// Prefer [`probe_cow_support_in`](Zygote::probe_cow_support_in), which asks the
+    /// store the caller actually clones with. This env-less form is only correct for
+    /// a caller running the default store, and reports for it explicitly rather than
+    /// silently (§8.4, The zygote fan-out and the OverlayStore seam).
     #[must_use]
     pub fn probe_cow_support(&self) -> CowSupport {
-        crate::reflink::probe_reflink(&self.master_dir)
+        // Routed through the trait, not through `reflink::probe_reflink`, so there is
+        // exactly ONE way the cost signal is computed (docs/78
+        // `overlay-probe-not-side-effect-free`): this method names the store it answers
+        // for instead of bypassing the seam.
+        ReflinkOverlayStore.probe(&self.master_dir)
     }
 
     /// Mints **one** clone: copy-on-write-copies the master image and restores +
@@ -661,6 +691,77 @@ mod tests {
         assert!(
             Zygote::from_snapshot_dir(master, erofs_cfg()).await.is_ok(),
             "the same master must still accept an eligible config"
+        );
+    }
+
+    // docs/78 `overlay-probe-not-side-effect-free`, SEAM half: the up-front CoW cost
+    // signal must be answered by the store the caller injected — the same store the
+    // fan-out will materialize clones with (S4) — not by a filesystem probe run behind
+    // that store's back. Host-independent by construction: the fake is configured with
+    // the OPPOSITE of what this filesystem really reports, so the two answers are
+    // always distinguishable, on reflink and non-reflink hosts alike. The pre-fix body
+    // (`crate::reflink::probe_reflink(&self.master_dir)`) reddens on both assertions —
+    // it returns the filesystem's answer and the seam records no probe at all.
+    #[tokio::test]
+    async fn probe_cow_support_routes_through_the_injected_seam() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let master = root.path().join("zygote");
+        write_master(&master);
+
+        // What the real filesystem under this tempdir says, via the production store.
+        let real = ReflinkOverlayStore.probe(&master);
+        // …and a store that disagrees with it, whatever it said.
+        let dissenting = if real.is_reflink() {
+            CowSupport::FullCopy
+        } else {
+            CowSupport::Reflink
+        };
+        let store = crate::overlay::RecordingOverlayStore::with_report(dissenting);
+        let env = HostEnv {
+            overlay: Arc::new(store.clone()),
+            vmids: shared_vmids(),
+            ..HostEnv::hermetic()
+        };
+
+        let zygote = Zygote::from_snapshot_dir(master.clone(), erofs_cfg())
+            .await
+            .expect("build zygote");
+
+        let got = zygote.probe_cow_support_in(&env);
+        assert_eq!(
+            got, dissenting,
+            "the cost signal must be the INJECTED store's answer, not the filesystem's ({real:?})"
+        );
+        assert_eq!(
+            store.probe_calls(),
+            vec![master.clone()],
+            "the seam must have been asked exactly once, about the master dir"
+        );
+
+        // The env-less form is the documented default-store reading, and says so by
+        // agreeing with the production store rather than with the injected one.
+        assert_eq!(
+            zygote.probe_cow_support(),
+            real,
+            "the env-less form answers for the default ReflinkOverlayStore"
+        );
+        assert_eq!(
+            store.probe_calls().len(),
+            1,
+            "the env-less form must NOT reach the injected seam"
+        );
+
+        // The probe leaves the immutable master untouched (docs/78, side-effect half —
+        // asserted here too because this is the caller that probes a *master*).
+        let mut entries: Vec<String> = std::fs::read_dir(&master)
+            .expect("read master")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["config.json".to_string(), "mem_file".to_string()],
+            "probing must not write into the immutable master"
         );
     }
 

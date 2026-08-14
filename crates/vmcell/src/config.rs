@@ -1604,7 +1604,7 @@ impl VmConfigBuilder {
                     share.tag
                 )));
             }
-            // The tag is also a *host filename*: `fs::VirtioFsDaemon::start` names the
+            // The tag is also a *host filename*: `fs::VirtioFsDaemon::start_paced` names the
             // vhost-user socket `<vm_tmp>/<tag>.sock`, and the backends join it the same way.
             // A tag carrying a path separator (`../../etc/x`, `/abs`) escapes the per-VM
             // scratch dir, so virtiofsd would create-and-truncate a caller-chosen file
@@ -2327,7 +2327,7 @@ mod tests {
     }
 
     // Finding `share-tag-path-separator-escapes-scratch-dir`: the tag also names a host file —
-    // `fs::VirtioFsDaemon::start` builds `<vm_tmp>/<tag>.sock` — so a tag carrying a path
+    // `fs::VirtioFsDaemon::start_paced` builds `<vm_tmp>/<tag>.sock` — so a tag carrying a path
     // separator makes virtiofsd create-and-truncate a caller-chosen file OUTSIDE the per-VM
     // scratch dir, where teardown never sweeps it. None of these tags contain ':' or
     // whitespace, so the pre-existing cmdline-encoding check cannot see them; only the
