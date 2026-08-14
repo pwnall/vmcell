@@ -24,13 +24,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
+        # fetch-depth: 0 is load-bearing for the `public-API semver` step below, not tidiness. That
+        # step passes `--baseline-rev ${{ github.event.pull_request.base.sha }}`, and the default
+        # depth-1 fetch never puts that commit in the object store, so cargo-semver-checks exits 101
+        # with `couldn't parse revision "<sha>^{tree}"`. It had never been observed because the step
+        # is PR-only and the job died at the tool install below on every PR.
+        with: { persist-credentials: false, fetch-depth: 0 }   # persist-credentials: do not leave the token in .git/config (zizmor: artipacked)
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install    # reads rust-toolchain.toml — channel 1.96.1 + clippy/rustfmt
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
-        with: { tool: "cargo-hack,cargo-deny,cargo-semver-checks,actionlint,cargo-machete,typos-cli,zizmor" }
+        # `fallback: none`. install-action silently falls through to `cargo-binstall <tool>` for any
+        # name it has no manifest for. That detour is exactly how this step killed the whole job:
+        # `actionlint` was in this list, install-action has NEVER shipped a manifest for it (it is a
+        # Go binary from rhysd/actionlint, not a crates.io crate — verified absent from the
+        # recursive tree of both v2.82.8 and v2.85.13, and from TOOLS.md and the CHANGELOG), so
+        # binstall reported `actionlint is not found` and exited 76. Every one of the 20 lint gates
+        # below was then reported `skipped` — from 2026-07-05 until this fix. Dependabot's pin bump
+        # does not help; run 31583296437 proved v2.85.11 fails identically. With `fallback: none` an
+        # unsupported tool name fails AT THE NAME instead of detouring, and the action stops being
+        # handed `github.token` (it only forwards it for the binstall fallback).
+        with: { tool: "cargo-hack,cargo-deny,cargo-semver-checks,cargo-machete,typos-cli,zizmor", fallback: none }
         # shellcheck is not installed here — it ships preinstalled on ubuntu-latest.
+
+      # actionlint is not an install-action tool at any tag and not a crate, so it is installed from
+      # its own release, PINNED and CHECKSUM-VERIFIED. A moving `latest`, or upstream's
+      # `curl | bash` bootstrap off `main`, would be an unpinned third party on the workflow that
+      # also drives a self-hosted KVM runner — the lateral-movement shape zizmor is configured to
+      # police and the reason every action here carries a full commit SHA. Bump the version and the
+      # digest together; the digest IS the gate, and `--version` at the end is the fail-loud
+      # presence check so a bad extract names itself here rather than 14 steps later.
+      - name: install actionlint (pinned release, checksum-verified)
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o /tmp/actionlint.tar.gz "$url"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/actionlint.tar.gz -C "$HOME/.local/bin" actionlint
+          "$HOME/.local/bin/actionlint" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: toolchain honesty (declared MSRV == pinned channel)
         run: |
@@ -60,43 +95,22 @@ jobs:
       - name: cargo-deny
         run: cargo deny check
 
-      - name: lean-agent invariant         # guest PID-1 member must omit the host stack AND compile standalone
+      - name: lean-member invariants (agent / test-runner / privilege)   # host async stack must not leak into any of the three
         run: |
-          # v15: the lean boundary is now a per-MEMBER structural property (§12.8 #4), so the
-          # check targets the crate directly (`-p vmcell-guest-agent`) instead of a feature slice
-          # of the old single package — no host module can leak in by construction.
-          if cargo tree --locked -e no-dev -p vmcell-guest-agent \
-               | grep -E '── (tokio|hyper|rtnetlink) v'; then
-            echo "::error::lean-agent invariant violated — host stack leaked into the agent build"
-            exit 1
-          fi
-          # Graph inspection is not enough: actually compile the agent member so a broken
-          # agent build (e.g. an un-gated host dep) is caught here, not on a KVM host.
+          # ONE predicate, invoked exactly as `just ci` invokes it (AGENTS rule 3: a CI step that
+          # hand-copies a recipe drifts from it). The three inline `cargo tree | grep` blocks this
+          # replaces were WORSE than drifted — they were DEAD. `CARGO_TERM_COLOR: always` (set at
+          # workflow level above) makes cargo emit `\e[2m├──\e[0m tokio v…`, so `── tokio v` matched
+          # 0 lines here where it matches 28 locally: three security-adjacent bans reporting green
+          # while proving nothing, for the seven weeks between landing and this fix. The predicate
+          # carries `--color never`; its self-test runs the predicate UNDER the colour condition and
+          # asserts it still rejects `vmcell-daemon`, so the hazard itself is what is gated.
+          ./scripts/check-lean-tree.sh vmcell-guest-agent vmcell-test-runner vmcell-privilege
+          ./scripts/test-check-lean-tree.sh
+          # Graph inspection is not enough: actually compile each member so a broken build (e.g. an
+          # un-gated host dep) is caught here, not on a KVM host.
           cargo clippy --locked -p vmcell-guest-agent --all-targets -- -D warnings
-
-      - name: lean-test-runner invariant   # privileged-window member must omit the host async stack AND compile standalone
-        run: |
-          # Mirrors lean-agent: the test-runner runs with elevated caps, so the same async host
-          # stack (tokio/hyper/rtnetlink) must not leak in.
-          if cargo tree --locked -e no-dev -p vmcell-test-runner \
-               | grep -E '── (tokio|hyper|rtnetlink) v'; then
-            echo "::error::lean-test-runner invariant violated — host stack leaked into the test-runner build"
-            exit 1
-          fi
           cargo clippy --locked -p vmcell-test-runner --all-targets -- -D warnings
-
-      - name: lean-privilege invariant     # shared blessing/capability crate, linked by BOTH the runner and the daemon
-        run: |
-          # §18.1: `vmcell-privilege` is linked by the runner AND the daemon, so it must stay as lean
-          # as the runner — no host async stack. Mirrors `just ci`, which has run this since §18.1
-          # landed; CI had only the two member bans above, so a host-stack leak into this crate was
-          # caught here at best transitively (and misattributed to the runner edge), and its
-          # standalone clippy ran nowhere at all.
-          if cargo tree --locked -e no-dev -p vmcell-privilege \
-               | grep -E '── (tokio|hyper|rtnetlink) v'; then
-            echo "::error::lean-privilege invariant violated — host stack leaked into vmcell-privilege"
-            exit 1
-          fi
           cargo clippy --locked -p vmcell-privilege --all-targets -- -D warnings
 
       - name: guest-tools build+clippy     # guest userspace helper; build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes)
@@ -111,14 +125,17 @@ jobs:
           # the cap-holding process (§12.23 / P2). `hyper` is NOT asserted absent — it enters
           # legitimately through vmcell's egress proxy (hudsucker) + HTTP clients (reqwest/oci-client);
           # the *server*-stack marker is axum + vmcell-daemon (corrects the v3 "axum/hyper" phrasing to
-          # the built tree — see implementation-notes.md). if/then form (not `! … | grep`): a leading
-          # `!` is exempt from `set -e`, so a two-liner would mask the first hit behind a clean second.
-          if cargo tree --locked -p vmcell-broker -e no-dev -i vmcell-daemon 2>/dev/null | grep -q .; then
-            echo "::error::vmcell-broker must not link vmcell-daemon (the web/server crate must not share the cap-holder)"; exit 1
-          fi
-          if cargo tree --locked -p vmcell-broker -e no-dev -i axum 2>/dev/null | grep -q .; then
-            echo "::error::vmcell-broker must not link axum (network-input server stack must not share the cap-holder)"; exit 1
-          fi
+          # the built tree — see implementation-notes.md).
+          #
+          # ONE predicate, same call as `just ci` (AGENTS rule 3). The two inline
+          # `2>/dev/null | grep -q .` copies this replaces COULD NOT FAIL: `cargo tree -i <pkg>`
+          # exits 101 with "did not match any packages" on STDERR, which the redirect discarded, so
+          # a rename, an ambiguous spec (`-i tokio` really is ambiguous in this workspace) or a
+          # stale lockfile all read as "absent" exactly like the real thing. The script separates
+          # absent / present / cargo-could-not-answer and carries the positive control AGENTS.md
+          # requires beside a negative security result.
+          ./scripts/check-broker-lean.sh
+          ./scripts/test-check-broker-lean.sh
 
       - name: reduced-host-feature builds (blocking)   # fast per-backend smoke before the full powerset
         run: |
@@ -156,6 +173,14 @@ jobs:
           ./scripts/test-ban-artifact-path-join.sh # the artifact-path gate's own red-on-inverse self-test
           ./scripts/ban-inline-setns.sh            # S2/delta 8: no raw `setns` outside net_sys::setns_net + the one pre_exec site
           ./scripts/test-ban-inline-setns.sh       # the inline-setns gate's own red-on-inverse self-test
+          # The CARGO_TERM_COLOR class (AGENTS rule 1). This workflow exports
+          # `CARGO_TERM_COLOR: always` at top level, so `cargo tree` dims its glyphs and any pattern
+          # anchored on the glyph/name boundary matches nothing. It shipped twice: the three
+          # lean-member bans passed while proving nothing, and the downstream example's absent-tree
+          # fixture filtered nothing. Neither showed up in `just ci`, which does not export the
+          # variable — so this ban is also what makes local ≡ CI on this axis.
+          ./scripts/ban-uncolored-cargo-parse.sh
+          ./scripts/test-ban-uncolored-cargo-parse.sh  # the colour gate's own red-on-inverse self-test
           ./scripts/test-review-preflight-priv.sh  # preflight three-way verdict (bless-only sentinel): classifier red-on-inverse self-test
 
       - name: vendored vhost patch is live (M-VEND-3, here and downstream)

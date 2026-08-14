@@ -41,7 +41,13 @@ pinned_version() {
     printf '%s' "$ver"
 }
 
-tree=$(cargo tree --locked -e normal --all-features)
+# `--color never`: CI sets `CARGO_TERM_COLOR: always` at workflow level, which makes `cargo tree`
+# dim the tree glyphs (`\e[2m├──\e[0m vhost v0.16.0 (…)`). This predicate's anchors happen to land
+# on uncoloured spans, so it survives either way — but "happens to" is how the sibling filter in
+# examples/downstream-kernel/ci-check.sh silently stopped removing anything. The flag makes the
+# input deterministic instead of incidentally-parseable; `scripts/test-check-vendored-vhost.sh`
+# carries a coloured fixture that pins it, and scripts/ban-uncolored-cargo-parse.sh is the class gate.
+tree=$(cargo tree --color never --locked -e normal --all-features)
 fail=0
 for spec in "vhost vendor/vhost" "vhost-user-backend vendor/vhost-user-backend"; do
     crate=${spec%% *}; dirpat=$(cut -d' ' -f2 <<<"$spec")

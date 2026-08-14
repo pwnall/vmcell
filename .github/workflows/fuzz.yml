@@ -22,6 +22,13 @@ concurrency:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    env:
+      # `rust-toolchain.toml` pins channel 1.96.1, and a toolchain FILE outranks `rustup default`,
+      # which is all `dtolnay/rust-toolchain@nightly` sets. So every run of this workflow since it
+      # landed (41/41, from 2026-07-05) invoked `cargo fuzz` on STABLE rustc and died on
+      # `-Zsanitizer=address` before building a single target — the workflow has never fuzzed
+      # anything. `RUSTUP_TOOLCHAIN` is the env-var override, which outranks the file.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
@@ -37,12 +44,35 @@ jobs:
           # every later one of its nightly budget until someone fixes it — the second decode surface
           # then silently stops being fuzzed at all. Record the failure per target and fail at the
           # end instead, so the run still reports (and uploads reproducers for) all of them.
+          # The toolchain override is the thing that has silently failed here for 41 runs, so assert
+          # it before spending five minutes per target discovering it again through a -Zsanitizer
+          # error wall. One second, and it names its own cause.
+          rustc -vV | grep -q '^release: .*-nightly' || {
+            echo "::error::effective rustc is not nightly ($(rustc -vV | sed -n 2p)) — cargo fuzz cannot build; the RUSTUP_TOOLCHAIN override regressed (rust-toolchain.toml outranks \`rustup default\`)"
+            exit 1
+          }
           rc=0
+          # NOT in the CARGO_TERM_COLOR class, checked rather than assumed: this workflow sets no
+          # such env, and `cargo fuzz list` prints target names through cargo-fuzz's own
+          # `list_targets()`, not cargo's renderer. It also has no `--color` flag to add — its only
+          # option is `--fuzz-dir` — so "defensively" passing one would abort the loop on an
+          # unexpected argument and fuzz nothing. Left alone deliberately; the empty-list hazard is
+          # covered by the target-count assertion below instead.
+          targets=0
           for t in $(cargo fuzz list); do
+            targets=$((targets + 1))
             echo "::group::cargo fuzz run $t"
             cargo fuzz run "$t" -- -max_total_time=300 || rc=1
             echo "::endgroup::"
           done
+          # An empty target list is the silent-green failure mode of a discovery loop: `cargo fuzz
+          # list` auto-discovers every `[[bin]]`, so a renamed fuzz dir or a mangled list would run
+          # zero targets and exit 0, reporting a fuzz run that fuzzed nothing. Two surfaces are
+          # documented at the top of this file; fewer than two is a regression, not a config choice.
+          if [ "$targets" -lt 2 ]; then
+            echo "::error::cargo fuzz list produced $targets target(s); this repo documents two decode surfaces (protocol_decode, broker_frame). A discovery loop that runs nothing must not report success."
+            exit 1
+          fi
           exit $rc
 
       - name: upload crash reproducers

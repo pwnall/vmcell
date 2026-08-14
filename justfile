@@ -251,17 +251,18 @@ ci:
     # workspace (design §10.4).
     ./scripts/check-vendored-vhost.sh
     ./scripts/test-check-vendored-vhost.sh
-    # lean-agent invariant: the guest PID-1 member must omit the host stack AND compile standalone.
-    # v15: the lean boundary is now a per-MEMBER structural property (§12.8 #4), so the check
-    # targets the crate directly (`-p`) rather than a feature slice of the old single package.
-    if cargo tree --locked -e no-dev -p vmcell-guest-agent | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-agent invariant violated — host stack leaked into the agent build"; exit 1; fi
+    # lean-member invariants (§12.8 #4 / §18.1): the guest PID-1 agent, the privileged-window
+    # test-runner, and the `vmcell-privilege` crate BOTH the runner and the daemon link must omit
+    # the host async stack — and each must compile standalone. The three inline `cargo tree | grep`
+    # copies that used to live here (and their three twins in ci.yml) are gone: they were the
+    # duplication-hides-divergence trap AND they were DEAD in CI, because `CARGO_TERM_COLOR: always`
+    # makes cargo emit `\e[2m├──\e[0m tokio v…` and the `── tokio v` pattern then matches nothing.
+    # One predicate now, with `--color never` inside it, plus its red-on-inverse self-test — which
+    # runs the predicate under the CI colour condition, the leg whose absence let the bans die.
+    ./scripts/check-lean-tree.sh vmcell-guest-agent vmcell-test-runner vmcell-privilege
+    ./scripts/test-check-lean-tree.sh
     cargo clippy --locked -p vmcell-guest-agent --all-targets
-    # lean-test-runner invariant: same host-stack ban + standalone compile for the privileged-window member.
-    if cargo tree --locked -e no-dev -p vmcell-test-runner | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-test-runner invariant violated — host stack leaked into the test-runner build"; exit 1; fi
     cargo clippy --locked -p vmcell-test-runner --all-targets
-    # lean-privilege invariant (§18.1): the shared blessing/capability crate is linked by BOTH the
-    # runner and the daemon, so it must stay as lean as the runner — no host async stack.
-    if cargo tree --locked -e no-dev -p vmcell-privilege | grep -E '── (tokio|hyper|rtnetlink) v'; then echo "lean-privilege invariant violated — host stack leaked into vmcell-privilege"; exit 1; fi
     cargo clippy --locked -p vmcell-privilege --all-targets
     # B9/design §12.4 (erratum-aware): the broker OWNS the engine — tokio + rtnetlink are LEGITIMATE
     # (it does the netns/tap/nft setup itself), so it is NOT governed by the full lean-tree ban above.
@@ -272,8 +273,12 @@ ci:
     # (hudsucker) and HTTP clients (reqwest/oci-client), which the broker's net subset needs. The
     # meaningful marker of the *server* stack is axum + the vmcell-daemon crate. (Corrects the
     # v3/AGENTS.md "axum/hyper" phrasing to the built tree — see implementation-notes.md.)
-    if cargo tree --locked -p vmcell-broker -e no-dev -i vmcell-daemon 2>/dev/null | grep -q .; then echo "vmcell-broker must not link vmcell-daemon (the web/server crate must not share the cap-holder)"; exit 1; fi
-    if cargo tree --locked -p vmcell-broker -e no-dev -i axum 2>/dev/null | grep -q .; then echo "vmcell-broker must not link axum (network-input server stack must not share the cap-holder)"; exit 1; fi
+    # One predicate + its self-test, for the same reason as the lean-member ban above and one more:
+    # the two inline `2>/dev/null | grep -q .` copies could not fail. `cargo tree -i <absent pkg>`
+    # exits 101 with its message on STDERR, so a rename, an ambiguous spec, or a stale lockfile read
+    # as "absent" exactly like the real thing — a negative security gate with no positive control.
+    ./scripts/check-broker-lean.sh
+    ./scripts/test-check-broker-lean.sh
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).
     cargo clippy --locked -p vmcell-guest-tools --all-targets
     # Reduced-host-feature smoke (fast per-backend feedback before the full powerset below). After the
@@ -318,6 +323,14 @@ ci:
     # file, and the stale-exemption check.
     ./scripts/ban-inline-setns.sh
     ./scripts/test-ban-inline-setns.sh
+    # AGENTS rule 1, the CARGO_TERM_COLOR class: CI exports `CARGO_TERM_COLOR: always` at WORKFLOW
+    # level, so `cargo tree` dims its glyphs and every pattern anchored on the glyph/name boundary
+    # silently stops matching. Two shipped instances — three lean-member bans passing while proving
+    # nothing, and the downstream example's absent-tree fixture filtering nothing (a red job with a
+    # misleading message). `just ci` does not export the variable, so local ≢ CI and neither showed
+    # up here. Ban parsing colourisable cargo output outright; the self-test pins both directions.
+    ./scripts/ban-uncolored-cargo-parse.sh
+    ./scripts/test-ban-uncolored-cargo-parse.sh
     # The privileged-review preflight's three-way verdict (bless-only sentinel) — self-test only.
     # The real preflight probes a KVM host and runs at review time (not here), but its classifier —
     # bless-remediable (exit 2, BLOCKED-ON-BLESS) vs environmental (exit 1, NOT READY) — is

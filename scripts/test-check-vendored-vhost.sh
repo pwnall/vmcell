@@ -102,7 +102,17 @@ run_leg() {
     fi
 }
 
+# The same patched tree as `patched-path.txt`, but with the dimmed tree glyphs `cargo tree` really
+# emits under CI's workflow-level `CARGO_TERM_COLOR: always` (`\e[2m├──\e[0m` before each name, and
+# the coloured `(*)` duplicate marker). The predicate's anchors must land on the crate name and the
+# `(…/vendor/…)` source, both of which cargo leaves uncoloured — but this leg is what PINS that,
+# rather than leaving it to luck. Its sibling in examples/downstream-kernel/ci-check.sh had no such
+# leg and its ANSI-blind `^[^a-z]*vhost` filter silently degraded to a no-op in CI for weeks.
+printf 'vmcell v0.12.0 (/home/dev/vmcell/crates/vmcell)\n\033[2m├──\033[0m vhost v0.16.0 (/home/dev/vmcell/vendor/vhost)\n\033[2m└──\033[0m vhost-user-backend v0.22.0 (/home/dev/vmcell/vendor/vhost-user-backend)\n\033[2m    └──\033[0m vhost v0.16.0 (/home/dev/vmcell/vendor/vhost) \033[33m\033[2m(*)\033[39m\033[22m\n' \
+    > "$work/patched-coloured.txt"
+
 run_leg "patched/path form (positive control)" patched-path.txt 0 "check-vendored-vhost: ok"
+run_leg "patched/path form, ANSI-coloured (the CI env)" patched-coloured.txt 0 "check-vendored-vhost: ok"
 run_leg "patched/git form (git-dep consumer)"  patched-git.txt  0 "check-vendored-vhost: ok"
 run_leg "REGISTRY (the dropped-patch trap)"    registry.txt     1 "resolves from the REGISTRY"
 run_leg "absent (not applicable)"              absent.txt       0 "check not applicable"

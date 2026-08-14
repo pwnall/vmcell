@@ -3280,3 +3280,106 @@ backend's ordered teardown — visible, rather than implied by struct field-drop
 detaches implicitly as it claims the device. If one ever does, `claim_usb_host_devices` is its
 designated home, so the detach and the restore stay one law instead of drifting apart across two
 crates.
+
+## The CI-repair pass (2026-08-14): four red jobs, and the two gates that were quietly not gates
+
+Every job of the `ci` workflow was failing, three of them for causes that had nothing to do with the
+code under test. Recorded here because two of the four are *classes*, and because repairing one of
+them would have converted three security-adjacent gates from visibly-broken into confidently-false.
+
+### `CARGO_TERM_COLOR: always` silently disarms every pattern that parses `cargo tree`
+
+`.github/workflows/ci.yml` sets `CARGO_TERM_COLOR: always` at **workflow** level, so it reaches
+every job and every `run:` block. `cargo tree` then dims the tree glyphs — `\e[2m├──\e[0m tokio
+v1.49.0` — and the reset escape, which ends in a lowercase `m`, sits between the glyph and the crate
+name. Every pattern anchored on that boundary stops matching. Measured against `vmcell-daemon`,
+which genuinely links tokio and hyper: **28 matches uncoloured, 0 coloured, 28 coloured with
+`--color never`.** `NO_COLOR=1` does not help — `CARGO_TERM_COLOR` outranks it (still 0).
+
+Two instances shipped, and the reason neither was noticed is the same: `just ci` does not export the
+variable, cargo auto-detects the non-TTY, and the identical predicate works locally. Local ≢ CI by
+construction, which is the shape AGENTS.md rule 3 exists to prevent.
+
+- **`examples/downstream-kernel/ci-check.sh`** built its "vhost absent from the graph" fixture with
+  `grep -vE '^[^a-z]*vhost(-user-backend)? v'`. Under colour that filter removed **0 of 3** lines, so
+  the fixture was byte-identical to the real tree, the predicate found the patched vhost in it, and
+  the leg failed with `output does not match /check not applicable/` — a message that names the
+  assertion rather than the broken setup. This was the whole of the `example-downstream` failure.
+- **The three lean-member host-stack bans** (guest PID-1 agent, the capability-holding test-runner,
+  and `vmcell-privilege`, which the runner *and* the daemon link) matched nothing in CI. They passed
+  while proving nothing, from 2026-06-25 until this pass. The tree is in fact clean — verified by
+  hand at this commit — but anything that leaked in during that window would have shipped unnoticed.
+
+**Fixed at the producer, not the consumer.** A regex taught to skip ANSI would leave the next derived
+fixture to rediscover the trap, so `--color never` goes on the `cargo tree` invocation instead. The
+six inline copies of the lean-member pipeline (three in `ci.yml`, three in the `justfile`) collapse
+into one `scripts/check-lean-tree.sh`, which both callers now invoke — one law, and `just ci` ≡ CI
+by construction. Its self-test, `scripts/test-check-lean-tree.sh`, **exports
+`CARGO_TERM_COLOR=always`** and asserts the predicate still rejects `vmcell-daemon`: a self-test run
+in a plain dev shell would have passed against the broken predicate, which is exactly how six copies
+stayed green while proving nothing. `scripts/ban-uncolored-cargo-parse.sh` is the class gate.
+
+`.github/workflows/fuzz.yml` was **checked and deliberately left alone**: it sets no such env, and
+`cargo fuzz list` prints through cargo-fuzz's own `list_targets()`, not cargo's renderer. It also has
+no `--color` flag to add — `List` carries only `--fuzz-dir` — so a defensive one would abort the loop
+on an unexpected argument and fuzz nothing. The empty-list hazard is covered by a target-count
+assertion instead.
+
+### The broker's P2 web-stack exclusion could not fail
+
+`cargo tree -i <pkg>` exits **101** with `did not match any packages` on **stderr** when the package
+is absent. Both copies of the exclusion (`ci.yml`, `justfile`) tested only whether stdout was
+non-empty, with `2>/dev/null`. "Absent" and "cargo could not answer" were therefore indistinguishable:
+a rename, a stale lockfile, or an ambiguous spec (`-i tokio` really is ambiguous in this workspace)
+all read as GREEN. A negative security gate guarding P2 — the rule that the network-input server
+stack never shares the cap-holding process — with no way to fail.
+
+`scripts/check-broker-lean.sh` separates absent / present / cargo-could-not-answer, and carries the
+positive control AGENTS.md requires beside a negative security result: the same `-i axum` probe must
+find axum in `vmcell-daemon`, which links it by definition. Its self-test drives all four arms, and
+reddens against the old inline form on two of them.
+
+### `actionlint` is not an install-action tool, at any version
+
+The `lint` job died at `taiki-e/install-action` with exit 76 and **skipped all 20 gates below it**,
+from 2026-07-05 until this pass — so `clippy`, `cargo-deny`, `rustdoc`, the ban scripts, the
+feature-powerset and the rest have never run in GitHub Actions on this repo. install-action has no
+`manifests/actionlint.json` at v2.82.8, at v2.85.13, or at any tag (absent from the recursive tree,
+from `TOOLS.md`, and from the CHANGELOG); `actionlint` is a Go binary from `rhysd/actionlint`, not a
+crates.io crate, so the default `fallback: cargo-binstall` resolves nothing.
+
+**The pin bump is not the fix** — a stale premise worth recording, because it is the obvious one and
+it is wrong. Dependabot PR #20 (v2.85.11) was already run: run `31583296437` printed the identical
+`install-action does not support actionlint … actionlint is not found`. actionlint is now installed
+from its own release, version- and **sha256-pinned**, with `--version` as the fail-loud presence
+check. `fallback: none` on the install-action steps is the class fix: an unsupported tool name now
+fails *at the name* instead of detouring through binstall — and the action stops being handed
+`github.token`, which it only forwards for that fallback. It is applied to the three `ci.yml` sites
+and deliberately **not** to `fuzz.yml`, whose `cargo-fuzz` has no manifest either and reaches
+crates.io through the binstall fallback successfully.
+
+### `public-API semver` could never have run
+
+The lint job's checkout took the default `fetch-depth: 1`, so `--baseline-rev
+${{ github.event.pull_request.base.sha }}` names a commit that is not in the object store and
+`cargo-semver-checks` exits 101 on `couldn't parse revision`. Invisible until now because the step is
+PR-only and the job died at the tool install on every PR. Fixed with `fetch-depth: 0`.
+
+### The fuzz workflow has never fuzzed anything
+
+`rust-toolchain.toml` pins `channel = "1.96.1"`, and a toolchain **file** outranks `rustup default`,
+which is all `dtolnay/rust-toolchain@nightly` sets. Every run since the workflow landed — 41 of 41,
+from 2026-07-05 — therefore invoked `cargo fuzz` on stable rustc and died on `-Zsanitizer=address`
+before building a target. `RUSTUP_TOOLCHAIN: nightly` is the env-var override that outranks the file,
+and a one-second `rustc -vV | grep -q '^release: .*-nightly'` assertion now names the cause instead
+of leaving it to a sanitizer error wall. Expect the first genuinely-nightly run to surface real work:
+nothing in `fuzz/` has ever been compiled by CI.
+
+### `test-integration` has never run at all
+
+`runs-on: [self-hosted, linux, kvm]`, and `gh api repos/pwnall/vmcell/actions/runners` returns
+`total_count: 0` — no such runner is registered, in any of the runs GitHub retains. The job is never
+assigned, sits queued for the 24-hour limit, and reports as cancelled. Nothing in this pass changes
+that: it is infrastructure, not configuration, and the job is deliberately left exactly as it is
+rather than weakened into a skip. Until a runner exists, the privileged / daemon / unprivileged /
+live-downstream matrix is validated **only** by running the suites on a maintainer's KVM box.

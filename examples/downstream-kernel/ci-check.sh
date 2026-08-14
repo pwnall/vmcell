@@ -136,7 +136,16 @@ if [ "${1:-}" = "tree" ]; then cat "$FAKE_TREE"; exit 0; fi
 echo "stub cargo: unexpected subcommand ${1:-}" >&2; exit 127
 STUB
 chmod +x "$work/bin/cargo"
-cargo tree --locked -e normal --all-features > "$work/real-tree.txt"
+# `--color never` is LOAD-BEARING. `.github/workflows/ci.yml` sets `CARGO_TERM_COLOR: always` at
+# WORKFLOW level, and `cargo tree` then dims the tree glyphs — `\e[2m├──\e[0m vhost v0.16.0 (…)`.
+# The reset escape ends in the lowercase `m`, so `^[^a-z]*vhost` at :141 below can no longer reach
+# the crate name and the filter removes NOTHING: the "absent" fixture is byte-identical to the real
+# tree, the predicate finds the patched vhost in it, and the not-applicable leg fails with the
+# useless message "output does not match /check not applicable/". That is the defect this line
+# fixes, and it is a class — see scripts/check-lean-tree.sh and the ban at
+# scripts/ban-uncolored-cargo-parse.sh. Fix the PRODUCER, not the consumer regex: a regex taught to
+# skip ANSI would leave the next derived fixture to rediscover the trap.
+cargo tree --color never --locked -e normal --all-features > "$work/real-tree.txt"
 sed -E 's@ \(/[^)]*/vendor/vhost[^)]*\)@@' "$work/real-tree.txt" > "$work/unpatched-tree.txt"
 grep -vE '^[^a-z]*vhost(-user-backend)? v' "$work/real-tree.txt" > "$work/absent-tree.txt" || true
 # Non-vacuity: the doctoring must actually have changed something, or the two legs below prove
@@ -144,6 +153,15 @@ grep -vE '^[^a-z]*vhost(-user-backend)? v' "$work/real-tree.txt" > "$work/absent
 if cmp -s "$work/real-tree.txt" "$work/unpatched-tree.txt"; then
     echo "FAIL [vendor red leg setup]: this workspace's tree carries no vendored vhost annotation"
     echo "  — the feature set no longer resolves the patched vhost, so the green leg above is vacuous."
+    fail=1
+fi
+# The same non-vacuity assertion for the OTHER derived fixture. Its absence is precisely why the
+# colour defect above shipped: the filter silently removed zero lines, so the "absent" tree still
+# carried the patched vhost and the leg below reported a confusing regex mismatch instead of naming
+# its own broken setup. A fixture that was not doctored proves nothing about anything.
+if cmp -s "$work/real-tree.txt" "$work/absent-tree.txt"; then
+    echo "FAIL [vendor absent leg setup]: the absent-tree filter removed no vhost lines"
+    echo "  — the 'not applicable' leg below would assert against an unmodified tree."
     fail=1
 fi
 expect "vendor assertion reddens when the stanza is dropped" 1 "resolves from the REGISTRY" \
