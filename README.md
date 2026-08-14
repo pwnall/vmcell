@@ -8,16 +8,19 @@ own crates (`vmcell-firecracker`, `vmcell-qemu`, `vmcell-crosvm`), each dependin
 one `Vmm` trait and the shared jail/seccomp/spawn helpers. Around them sit the lean members —
 `vmcell-protocol` (the shared wire enum), `vmcell-guest-agent` (guest PID 1), `vmcell-test-runner`
 (the privileged-test capability runner), `vmcell-guest-tools` (the in-rootfs multicall helper:
-`ip`/`curl`/`kvm-ok`/`echo-server`), `vmcell-privilege`, the two in-VM artifact builders, the
-`vmcell-artifact-validator` conformance kit, the `vmcell-bench` harness, the CLI, and the
-control-plane tier (`vmcell-daemon`, `vmcelld`, `vmcell-daemon-client`, `vmcelld-ctl`,
-`vmcell-broker`).
+vmcell's own `ip`/`curl`/`kvm-ok`/`echo-server` applets, symlinked into `/vmcell-tools`, which the
+guest agent puts **first** on the guest `PATH` — so an in-guest `curl` is this shim, which
+implements a fixed curl-flag subset and *rejects* anything outside it rather than ignoring it),
+`vmcell-privilege`, the two in-VM artifact builders, the `vmcell-artifact-validator` conformance kit,
+the `vmcell-bench` harness, the CLI, and the control-plane tier (`vmcell-daemon`, `vmcelld`,
+`vmcell-daemon-client`, `vmcelld-ctl`, `vmcell-broker`).
 
 ## CLI (`vmcell`)
 
 The library API is the product surface; the `vmcell` binary is a thin `clap` wrapper for trying it
-out. Build it with `cargo build` (the default feature set) and run subcommands with
-`cargo run -p vmcell --bin vmcell -- <subcommand>`:
+out. The binary lives in the `vmcell-cli` crate (`vmcell` itself declares no binary). Build it with
+`cargo build` (the default feature set) and run subcommands with
+`cargo run -p vmcell-cli --bin vmcell -- <subcommand>`:
 
 | Subcommand | What it does |
 |---|---|
@@ -30,7 +33,7 @@ out. Build it with `cargo build` (the default feature set) and run subcommands w
 | `stats --kernel K --rootfs R` | Boot a micro-VM, sample resource usage, print it as JSON, tear down. |
 | `bundle [-o manifest.json]` | Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel/rootfs/CA/pins.json). |
 | `verify-bundle [-m manifest.json]` | Re-hash every artifact in a manifest and fail loud on any mismatch. |
-| `exec` / `ls` / `rm` / `destroy` | Deferred to the `vmcelld` daemon (§18) (need a cross-process VM registry); these fail loud with a typed error. |
+| `exec` / `ls` / `rm` / `destroy` | Deferred to the `vmcelld` daemon (design §11) (need a cross-process VM registry); these fail loud with a typed error naming the `vmcelld-ctl` route. |
 
 ## Consuming vmcell as a dependency (the downstream contract)
 
@@ -93,8 +96,30 @@ downstream. Build with the overlay; consume through the env contract.
 4. Artifacts: build the rootfs with a vmcell checkout (`vmcell build`, or `vmcell oci2-erofs …
    --inject …` for your own files), then point your harness at it with `VMCELL_ROOTFS` +
    `VMCELL_ARTIFACTS_DIR`. Kernels build downstream through the toolkit with `VMCELL_PINS`.
-5. Privileged runs use **your own** workspace's blessed `vmcell-test-runner` copy (`just bless`) —
-   the blessing is per-workspace by design.
+5. **Privileged runs need a capability runner installed in *your* workspace.** `just bless` is a
+   vmcell-checkout recipe and `vmcell-test-runner` is not a member of your workspace, so do the four
+   steps yourself, once per profile you test under:
+
+   ```sh
+   # (a) build the runner from the vmcell checkout you pinned (same rev as the git dep)
+   cargo build --locked --release -p vmcell-test-runner   # in the vmcell checkout
+   # (b) install it under YOUR workspace, owner-only before it gains caps
+   install -D -m 0700 <vmcell-checkout>/target/release/vmcell-test-runner \
+       .vmcell-bin/release/vmcell-test-runner
+   # (c) grant the three capabilities to that copy (one sudo)
+   sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep .vmcell-bin/release/vmcell-test-runner
+   # (d) wire cargo/nextest's target runner at it
+   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/.vmcell-bin/release/vmcell-test-runner" \
+       cargo nextest run --release …
+   ```
+
+   **The copy must live in your workspace**, and this is the part not to "simplify" away: the runner
+   derives its trusted confinement root from its **own** canonicalized path — the `.vmcell-bin`
+   ancestor's parent, then that workspace's `target/` — and refuses to exec anything outside it. A
+   runner blessed inside the vmcell checkout would therefore refuse *your* test binaries. Mode `0700`
+   is the real security boundary (the runner holds `cap_sys_admin`); on a shared box use a dedicated
+   group + `0750`. Writing a file strips its capabilities, so redo (b)–(c) whenever you rebuild the
+   runner.
 
 ## Development
 
@@ -173,12 +198,13 @@ only *spawned* as an external binary (never linked as a crate), so — exactly l
 does **not** enter the workspace `Cargo.lock`, the `cargo deny` license scan, or the dependency tree.
 
 crosvm's full path (boot, agent-exec, sessions, tap networking, cgroup limits, and **snapshot/restore**)
-is validated live via the opt-in `just test-crosvm` matrix (21/21 on a KVM host with a source-built
-crosvm); virtio-fs and unprivileged-net stay honest-`false`. Snapshot/restore follows the Firecracker
+is validated live via the opt-in `just test-crosvm` matrix — 29/29 on a KVM host with a source-built
+crosvm (2026-08-14); that recipe is the number's source, so read it there rather than from here.
+virtio-fs and unprivileged-net stay honest-`false`. Snapshot/restore follows the Firecracker
 baked-CID pattern (single-lineage, no concurrent fan-out). Its KVM-free gates (unit tests,
-capability-honesty pins, seccomp mapping, clippy) run in `just ci`; the live matrix needs KVM **and** a
-crosvm binary and is deliberately **not** part of `just test-privileged`, so a host without crosvm is
-unaffected — install this only to run the crosvm backend.
+capability-honesty pins, seccomp mapping, clippy) run in `just ci`; the live matrix needs KVM, a
+crosvm binary, and a blessed runner (§6), and is deliberately **not** part of `just test-privileged`,
+so a host without crosvm is unaffected — install this only to run the crosvm backend.
 
 Build from source (Debian / Ubuntu):
 
@@ -263,7 +289,11 @@ Common recipes:
 - `just ci` — `cargo fmt`, clippy, feature-powerset clippy, `cargo deny`, the global-state ban, and
   the unit suite.
 - `just test-unprivileged` — the unprivileged (smoltcp NAT) KVM integration tier.
-- `just test-privileged` — the privileged KVM integration tier (run `just bless` once first; see §5).
+- `just test-privileged` — the privileged KVM integration tier (run `just bless` once first; see §6).
+- `just test-daemon` — the `vmcelld` integration tier (same blessed runner, under a delegated cgroup
+  scope).
+- `just test-crosvm` — the opt-in crosvm live matrix (§5).
+- `just skip-manifest-show` — the capability-driven skips this run recorded; review them.
 
 Built VM artifacts (kernel, rootfs, proxy CA) default to `target/vmcell-artifacts`, overridable via
 `VMCELL_ARTIFACTS_DIR` (with `VMCELL_KERNEL` / `VMCELL_ROOTFS` overriding the individual kernel/rootfs paths).
@@ -284,34 +314,45 @@ cargo run -p vmcell-cli --bin vmcell -- build --kernel-source host-make
 `--kernel-source` (default `prebuilt`) selects the guest-kernel seed. **This is an unprivileged
 build — no `sudo` / root step is involved either way.**
 
+> **`build` overwrites the default `vmlinux`.** Both seeds publish the *same* artifact path, so a
+> bare `vmcell build` (i.e. `--kernel-source prebuilt`) silently replaces a host-make kernel you
+> built earlier — and the next privileged run reddens on the legs below. Re-run `build
+> --kernel-source host-make`, or keep the compiled kernel under a label (see the `host-make` bullet).
+
 - **`prebuilt`** downloads a digest-pinned, SHA256-verified `vmlinux` (Kata's) — no kernel toolchain,
   one large one-time download. It boots and runs `just test-unit`, `just test-unprivileged`, and
   `just test-daemon`, plus most of `just test-privileged`. But that image **omits `CONFIG_KVM_INTEL`
-  and `CONFIG_HW_RANDOM_VIRTIO`**, so six privileged tests fail on it: `nested_virt` /
-  `nested_virt_disabled` (CH + QEMU) need an openable guest `/dev/kvm`, and `snapshot_restore`'s
-  post-restore entropy reseed (CH + FC) needs guest `/dev/hwrng` from virtio-rng.
+  and `CONFIG_HW_RANDOM_VIRTIO`**, so three privileged tests fail on it, once per backend that
+  advertises the capability: `nested_virt` and `nested_virt_disabled` need a guest `/dev/kvm` and a
+  readable `kvm_{intel,amd}.nested` parameter, and `snapshot_restore`'s post-restore entropy reseed
+  needs guest `/dev/hwrng` from virtio-rng.
 - **`host-make`** compiles the pinned Linux source on the host (the `build-essential flex bison bc
   libelf-dev libssl-dev` from §1) and appends vmcell's microvm KConfig, which sets both options —
-  `just test-privileged` then passes in full (102/102 on a KVM host). To keep the fast prebuilt
-  kernel as the default artifact and still run those six, build a host-make kernel under a label with
-  `vmcell build-kernels` and point `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for the
-  privileged run.
+  `just test-privileged` then passes in full (149/149, 5 capability skips, 2026-08-14; run the recipe
+  for the current figure). To keep the fast prebuilt kernel as the default artifact and still run
+  those legs, build a host-make kernel under a label with `vmcell build-kernels` and point
+  `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for the privileged run — a labelled kernel has
+  its own filename, so `build` cannot clobber it.
+- **`in-vm`** compiles the pinned source *inside* a builder micro-VM. It needs a kernel to boot the
+  builder, so it is a typed refusal on `build`; its route is `vmcell build-kernels --kernel-source
+  in-vm`, which stages the bootstrap seed ahead of it.
 
 ### 9. Packages supporting experiments
 
 The groups above are everything the product needs to build and run. The packages below are **only**
-for the *optional* performance experiments and contested-fact benchmarks in the design doc §13 (the
-`bench-vm` macro-harness plus a few out-of-band measurement probes). None is required to build or run
-`vmcell` itself — install only the ones for the experiment you actually want to reproduce.
+for the *optional* performance experiments and contested-fact benchmarks behind design §16 and
+`docs/benchmark-results.md` (the `bench-vm` macro-harness plus a few out-of-band measurement probes).
+None is required to build or run `vmcell` itself — install only the ones for the experiment you
+actually want to reproduce.
 
 ```sh
-# §13.3  static-musl guest-agent experiment (musl vs glibc on-disk size / RSS / rootfs-independence)
+# static-musl guest-agent experiment (musl vs glibc on-disk size / RSS / rootfs-independence)
 sudo apt install -y musl-tools                 # provides `musl-gcc`
 rustup target add x86_64-unknown-linux-musl    # the prebuilt musl libc rustc links against
 #   The all-Rust agent links musl *statically without* `musl-gcc`; `musl-gcc` only becomes
 #   necessary once the agent gains a C / `*-sys` dependency that has to be cross-compiled.
 
-# §13.6  rootfs image-size comparison: OCI slim base vs a minimal mmdebstrap build
+# rootfs image-size comparison: OCI slim base vs a minimal mmdebstrap build
 sudo apt install -y erofs-utils                # provides `mkfs.erofs` for the size/compressor probe.
 #   The production pipeline packs erofs in-crate via `am-fs-erofs`; `mkfs.erofs` is only the
 #   out-of-band yardstick used to compare lz4/zstd/uncompressed sizes.
@@ -321,9 +362,9 @@ sudo apt install -y mmdebstrap                  # build the `--variant=minbase` 
 #   host-side. (Production runs mmdebstrap *inside* a builder micro-VM, so the product itself
 #   needs no host mmdebstrap — this is for the size measurement only.)
 
-# §13.2  benchmark noise-floor discipline: pin the CPU frequency so latency numbers don't drift
+# benchmark noise-floor discipline: pin the CPU frequency so latency numbers don't drift
 sudo apt install -y linux-cpupower             # provides `cpupower` (applying a governor needs root)
 ```
 
-Benchmarks are *tracked metrics, not pass/fail gates* (design §13.7), so a missing package degrades
+Benchmarks are *tracked metrics, not pass/fail gates* (design §16), so a missing package degrades
 an experiment to "not measured here," never a build or test failure.

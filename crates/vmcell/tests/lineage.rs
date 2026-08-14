@@ -62,10 +62,12 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     };
 
     let id = uuid::Uuid::new_v4();
+    // OWNED (`common::TempTree`): the trailing `remove_dir_all` is skipped by every panicking
+    // assertion below, and each lineage node holds a guest-RAM-sized suspend image.
     let scratch =
-        std::env::temp_dir().join(format!("vmcell-lineage-{}-{}", std::process::id(), id));
+        common::TempTree::reserve(&format!("vmcell-lineage-{}-{}", std::process::id(), id));
     // `fork_from_vm` / `branch` create these dirs themselves — do NOT pre-create
-    // them, so the test also proves that dir-creation behavior.
+    // them (`reserve`, not `create`), so the test also proves that dir-creation behavior.
     let root_dir = scratch.join("root");
     let b1_dir = scratch.join("b1");
 
@@ -160,7 +162,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
         "a fork from the ROOT must NOT see the marker — root is the pre-divergence image (negative control)"
     );
     from_root.shutdown().await.expect("shutdown root fork");
-    let _ = std::fs::remove_dir_all(&scratch);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 /// Forks one live clone from `node`, brings its agent up (fail-loud with the serial

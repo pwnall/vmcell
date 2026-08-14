@@ -43,28 +43,43 @@ bless:
       # its 0700 owner-only mode; if any check fails, fall through and RE-bless rather than reporting
       # a no-op "already blessed" that leaves the runner effectively un-capped (review-preflight-priv
       # then reads that as skip==pass).
-      # L-BIN-2: the effective bit is matched as getcap's own FIELD (`=ep` / `+ep`), never a bare
-      # `ep` substring — the getcap line also prints the file PATH, so a path component containing
-      # `ep` (…/deps/…, a username with `ep`) satisfies `*ep*` even on a `+p`-only runner and this
-      # skip would report "already blessed" for a runner whose caps are not raised. Same predicate
-      # shape as scripts/review-preflight-priv.sh's check_runner, which hardened it first.
-      local caps_now; caps_now="$(getcap "$stable" 2>/dev/null || true)"
+      # ONE LAW, ONE PREDICATE: "is this copy still blessed?" is asked here and by
+      # scripts/review-preflight-priv.sh's `check_runner`, and the two copies had already diverged
+      # on strictness (this one matched a bare `ep` SUBSTRING, which the getcap line's file PATH can
+      # satisfy — …/deps/…, a username containing `ep` — so a `+p`-only runner read as "already
+      # blessed"; L-BIN-2 hardened the preflight first). The recipe now CALLS the preflight's probe
+      # (`--check-runner <path>`, exit 0 = blessed) rather than restating it, so the two can never
+      # drift again. The 0700 mode check stays here: it is this recipe's own PRIV-1 obligation, not
+      # a readiness question.
       if [[ -f "$stamp" && -f "$stable" && "$(cat "$stamp")" == "$h" ]] \
-         && [[ "$caps_now" == *cap_net_admin* && "$caps_now" == *cap_sys_admin* \
-               && "$caps_now" == *cap_dac_override* ]] \
-         && [[ "$caps_now" == *"=ep"* || "$caps_now" == *"+ep"* ]] \
+         && ./scripts/review-preflight-priv.sh --check-runner "$stable" >/dev/null 2>&1 \
          && [[ "$(stat -c %a "$stable" 2>/dev/null)" == "700" ]]; then
         echo "bless: $stable already blessed (runner sha256 unchanged, caps +ep, mode 0700); skipping setcap"
         return 0
       fi
-      cp -f "$built" "$stable"
+      # STAGE-THEN-SWAP: bless a TEMP copy beside the target and only then rename it into place.
+      # The obvious order (cp over the live path, then sudo setcap) DESTROYS a working blessing
+      # whenever the setcap does not happen — a declined or unavailable sudo (`sudo: a terminal is
+      # required to authenticate` in a non-interactive shell) leaves the stable path holding a
+      # freshly-copied, cap-less binary, so the preflight flips from READY to BLOCKED-ON-BLESS and
+      # the privileged suites stop running. Measured, not hypothetical. `mv` within the directory
+      # is a rename, so the file capabilities set below survive it. The setcap failure is handled
+      # EXPLICITLY rather than by a RETURN trap: under `set -e` a bare failing command exits the
+      # whole shell, so the trap would never fire and the temp would be left behind.
+      local tmp="$stable.blessing.$$"
+      cp -f "$built" "$tmp"
       # PRIV-1: restrict the capability-carrying runner to its OWNER (0700) BEFORE setcap.
       # The blessed runner holds cap_sys_admin (≈ root); its file mode is the REAL security
       # boundary, not just a note — an other-executable +ep runner is a local priv-esc on a
       # shared host, and the path-confinement is only defense-in-depth. On a shared dev box
       # where a team shares one runner, use `chmod 0750` + a dedicated group instead of 0700.
-      chmod 0700 "$stable"
-      sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep "$stable"
+      chmod 0700 "$tmp"
+      if ! sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep "$tmp"; then
+        rm -f "$tmp"
+        echo "bless: setcap failed for $stable — the previous blessing is UNCHANGED (nothing was replaced)" >&2
+        return 1
+      fi
+      mv -f "$tmp" "$stable"
       echo "$h" > "$stamp"
       echo "bless: $stable (re)blessed (mode 0700, owner-only; caps +ep)"
     }
@@ -283,6 +298,13 @@ ci:
     # crate; the self-test proves the ban fires on the bug and passes on the sanctioned validator.
     ./scripts/ban-artifact-path-join.sh
     ./scripts/test-ban-artifact-path-join.sh
+    # S2 / delta 8 ("one law, one predicate"): `net_sys::setns_net` is the one home for `setns(2)`,
+    # the `build_vmm_cmd` pre_exec site its one exemption (its safety proof is site-specific). The
+    # review found two inline duplicates; nothing but review stopped a third, so grep-ban it. The
+    # self-test proves all three halves red: the call pattern, the one-call cap inside an exempt
+    # file, and the stale-exemption check.
+    ./scripts/ban-inline-setns.sh
+    ./scripts/test-ban-inline-setns.sh
     # The privileged-review preflight's three-way verdict (bless-only sentinel) — self-test only.
     # The real preflight probes a KVM host and runs at review time (not here), but its classifier —
     # bless-remediable (exit 2, BLOCKED-ON-BLESS) vs environmental (exit 1, NOT READY) — is

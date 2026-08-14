@@ -18,7 +18,8 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # the CH hybrid-vsock control connection *intermittently* resets mid-exchange — the guest logs
 # `handle_connection error: failed to fill whole buffer`, the host sees `Agent … timed out`. It is
 # environmental, NOT a code regression: it reproduces on the pre-optimization baseline too and every
-# affected test passes 3/3 in isolation (bisected 2026-07-02; see docs/perf-experiments-log.md).
+# affected test passes 3/3 in isolation (bisected 2026-07-02; see
+# docs/historical/44-claude-perf-experiments.md, "Flake investigation").
 # A fresh-VM retry sidesteps the transient reset; a genuine break still fails all 3 attempts, so
 # real coverage is preserved. The fixed 3s delay lets any transient host/vsock state settle first.
 retries = { backoff = "exponential", count = 3, delay = "5s", max-delay = "20s" }

@@ -22,8 +22,9 @@ fn write_raw_image(path: &std::path::Path, marker: &[u8], size: usize) {
 
 async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let id = uuid::Uuid::new_v4();
-    let tmp = std::env::temp_dir().join(format!("vmcell-test-blk-{}-{}", std::process::id(), id));
-    std::fs::create_dir_all(&tmp).unwrap();
+    // OWNED (`common::TempTree`): the trailing `remove_dir_all` is skipped by every panicking
+    // assertion below, and each leg writes multi-MiB raw disk images.
+    let tmp = common::TempTree::create(&format!("vmcell-test-blk-{}-{}", std::process::id(), id));
     // /dev/vdb: a read-only image seeded with a marker at its start.
     let ro_img = tmp.join("ro.raw");
     write_raw_image(&ro_img, b"VMCELLRO", 1 << 20);
@@ -74,7 +75,7 @@ async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     );
 
     vm.kill().await.unwrap();
-    let _ = std::fs::remove_dir_all(&tmp);
+    // No trailing removal: `tmp` owns the tree and drops here (and on any panic above).
 }
 
 // §4.6 (Extra virtio-blk devices and disk-I/O throttling): disk-I/O fault injection — a DiskIoLimit throttles the device's bandwidth. This
@@ -130,12 +131,13 @@ fn capability_honesty_disk_io_throttle() {
 async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     const MIB: usize = 1 << 20;
     let id = uuid::Uuid::new_v4();
-    let tmp = std::env::temp_dir().join(format!(
+    // OWNED (`common::TempTree`): see `test_extra_block_impl` — same leak-on-panic shape, and
+    // this leg writes two 4 MiB images.
+    let tmp = common::TempTree::create(&format!(
         "vmcell-test-throttle-{}-{}",
         std::process::id(),
         id
     ));
-    std::fs::create_dir_all(&tmp).unwrap();
     // Two 4 MiB disks: vdb unlimited (baseline), vdc capped at 1 MiB/s.
     let fast_img = tmp.join("fast.raw");
     write_raw_image(&fast_img, b"", 4 * MIB);
@@ -199,7 +201,7 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     );
 
     vm.kill().await.unwrap();
-    let _ = std::fs::remove_dir_all(&tmp);
+    // No trailing removal: `tmp` owns the tree and drops here (and on any panic above).
 }
 
 // §4.6 (Extra virtio-blk devices and disk-I/O throttling): "plain virtio-blk composes with snapshot" (§17, Open gaps and future capabilities) — the V:high headline
@@ -225,9 +227,12 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     }
 
     let id = uuid::Uuid::new_v4();
-    let tmp =
-        std::env::temp_dir().join(format!("vmcell-test-blksnap-{}-{}", std::process::id(), id));
-    std::fs::create_dir_all(&tmp).unwrap();
+    // OWNED (`common::TempTree`): this leg also holds a guest-RAM-sized snapshot dir under `tmp`.
+    let tmp = common::TempTree::create(&format!(
+        "vmcell-test-blksnap-{}-{}",
+        std::process::id(),
+        id
+    ));
     // The extra disk image lives at a STABLE path (not the per-VM scratch dir) so the
     // path CH/FC record in the snapshot config is still valid at restore.
     let disk_img = tmp.join("data.raw");
@@ -317,5 +322,5 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         vm.shutdown().await.expect("shutdown restored VM");
     }
 
-    let _ = std::fs::remove_dir_all(&tmp);
+    // No trailing removal: `tmp` owns the tree and drops here (and on any panic above).
 }

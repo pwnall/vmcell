@@ -65,12 +65,11 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
     };
 
     let id = uuid::Uuid::new_v4();
-    let master_dir =
-        std::env::temp_dir().join(format!("vmcell-zygote-{}-{}", std::process::id(), id));
-    if master_dir.exists() {
-        std::fs::remove_dir_all(&master_dir).unwrap();
-    }
-    std::fs::create_dir_all(&master_dir).unwrap();
+    // OWNED (`common::TempTree`): `create` keeps the clear-then-create prologue this had, and adds
+    // the removal the trailing `remove_dir_all` could not do on the panic path — the master
+    // suspend image plus one CoW clone dir per fan-out member is guest-RAM-sized.
+    let master = common::TempTree::create(&format!("vmcell-zygote-{}-{}", std::process::id(), id));
+    let master_dir = master.path().to_path_buf();
 
     let env = vmcell::HostEnv::hermetic();
 
@@ -225,6 +224,5 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "one");
         one.shutdown().await.expect("shutdown single clone");
     }
-
-    let _ = std::fs::remove_dir_all(&master_dir);
+    // No trailing removal: `master` owns the tree and drops here (and on any panic above).
 }

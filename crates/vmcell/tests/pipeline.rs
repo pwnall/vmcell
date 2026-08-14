@@ -2,6 +2,8 @@ use std::path::Path;
 use vmcell::artifact::{Cache, Pipeline, StageOutputs};
 use vmcell::error::Result;
 
+mod common;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DummyStage {
     name: String,
@@ -34,9 +36,10 @@ impl vmcell::artifact::Stage for DummyStage {
 
 #[tokio::test]
 async fn test_pipeline_reset_to() {
-    let tmp_dir = std::env::temp_dir().join(format!("vmcell-test-pipeline-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    std::fs::create_dir_all(&tmp_dir).unwrap();
+    // OWNED (`common::TempTree`): `create` keeps the clear-then-create prologue, and the guard's
+    // `Drop` replaces the trailing `remove_dir_all` that every panicking assert below skipped.
+    let scratch = common::TempTree::create(&format!("vmcell-test-pipeline-{}", std::process::id()));
+    let tmp_dir = scratch.path().to_path_buf();
 
     let cache = Cache::default();
 
@@ -77,7 +80,7 @@ async fn test_pipeline_reset_to() {
         "reset_to on an unknown stage name must return Err"
     );
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 // ARTIFACT-PIPELINE-10. reset_to(stage) must invalidate the named stage and every stage AFTER
@@ -85,11 +88,12 @@ async fn test_pipeline_reset_to() {
 // rebuilds rootfs + snapshot only; the upstream kernel stays cached.
 #[tokio::test]
 async fn test_pipeline_reset_subset_rebuilds_downstream_only() {
-    let tmp_dir = std::env::temp_dir().join(format!(
+    // OWNED: `reserve`, not `create` — the pipeline creates its own target dir.
+    let scratch = common::TempTree::reserve(&format!(
         "vmcell-test-pipeline-reset-sub-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let tmp_dir = scratch.path().to_path_buf();
     let cache = Cache::default();
 
     let kc = Arc::new(AtomicUsize::new(0));
@@ -138,7 +142,7 @@ async fn test_pipeline_reset_subset_rebuilds_downstream_only() {
     assert_eq!(rc.load(Ordering::SeqCst), 2, "rootfs must rebuild");
     assert_eq!(sc.load(Ordering::SeqCst), 2, "snapshot must rebuild");
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 use std::sync::{
@@ -180,9 +184,10 @@ impl vmcell::artifact::Stage for CountingStage {
 
 #[tokio::test]
 async fn test_pipeline_warm_cache_skips() {
-    let tmp_dir =
-        std::env::temp_dir().join(format!("vmcell-test-pipeline-warm-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // OWNED: `reserve`, not `create` — the pipeline creates its own target dir.
+    let scratch =
+        common::TempTree::reserve(&format!("vmcell-test-pipeline-warm-{}", std::process::id()));
+    let tmp_dir = scratch.path().to_path_buf();
     let cache = Cache::default();
 
     let count = Arc::new(AtomicUsize::new(0));
@@ -206,7 +211,7 @@ async fn test_pipeline_warm_cache_skips() {
         "Warm cache should skip run"
     );
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 // ARTIFACT-PIPELINE-10 / TESTS-FEATURES-4. Exercises a REAL stage (`SnapshotStage`) whose
@@ -279,9 +284,10 @@ async fn test_pipeline_determinism() {
 
 #[tokio::test]
 async fn test_pipeline_tampered_digest_aborts() {
-    let tmp_dir =
-        std::env::temp_dir().join(format!("vmcell-test-pipeline-tamp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // OWNED: `reserve`, not `create` — the pipeline creates its own target dir.
+    let scratch =
+        common::TempTree::reserve(&format!("vmcell-test-pipeline-tamp-{}", std::process::id()));
+    let tmp_dir = scratch.path().to_path_buf();
     let cache = Cache::default();
 
     let count = Arc::new(AtomicUsize::new(0));
@@ -305,7 +311,7 @@ async fn test_pipeline_tampered_digest_aborts() {
         "Tampered artifact should cause pipeline to abort"
     );
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 // ART-2: `reset_to` must PURGE a directory output (the snapshot stage's shape), not error
@@ -316,10 +322,10 @@ async fn test_pipeline_tampered_digest_aborts() {
 // returns Err → the `.expect(...)` below goes red on it.
 #[tokio::test]
 async fn test_reset_to_purges_directory_output() {
-    let tmp_dir =
-        std::env::temp_dir().join(format!("vmcell-test-reset-dir-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    std::fs::create_dir_all(&tmp_dir).unwrap();
+    // OWNED: `create` keeps the clear-then-create prologue this test relies on.
+    let scratch =
+        common::TempTree::create(&format!("vmcell-test-reset-dir-{}", std::process::id()));
+    let tmp_dir = scratch.path().to_path_buf();
     let cache = Cache::default();
 
     let pipeline = Pipeline::new(tmp_dir.clone()).add_stage(Box::new(DummyStage {
@@ -346,7 +352,7 @@ async fn test_reset_to_purges_directory_output() {
         "reset_to must remove the .cache_key sidecar too"
     );
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 #[derive(Clone)]
@@ -397,9 +403,10 @@ impl vmcell::artifact::Stage for DirStage {
 // (run count stays 1). The old code reddens both assertions.
 #[tokio::test]
 async fn test_pipeline_dir_output_cached_and_stable() {
-    let tmp_dir =
-        std::env::temp_dir().join(format!("vmcell-test-pipeline-dir-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // OWNED: `reserve`, not `create` — the pipeline creates its own target dir.
+    let scratch =
+        common::TempTree::reserve(&format!("vmcell-test-pipeline-dir-{}", std::process::id()));
+    let tmp_dir = scratch.path().to_path_buf();
     let cache = Cache::default();
 
     let count = Arc::new(AtomicUsize::new(0));
@@ -433,7 +440,7 @@ async fn test_pipeline_dir_output_cached_and_stable() {
         "directory output must be cached across runs (stable content hash)"
     );
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 // ART-1: a byte-corrupted file INSIDE a cached directory output, with the `.cache_key`
@@ -442,11 +449,12 @@ async fn test_pipeline_dir_output_cached_and_stable() {
 // silently rebuilt (returning Ok) → this `is_err` goes red on it.
 #[tokio::test]
 async fn test_pipeline_dir_output_tamper_rejected() {
-    let tmp_dir = std::env::temp_dir().join(format!(
+    // OWNED: `reserve`, not `create` — the pipeline creates its own target dir.
+    let scratch = common::TempTree::reserve(&format!(
         "vmcell-test-pipeline-dir-tamp-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let tmp_dir = scratch.path().to_path_buf();
     let cache = Cache::default();
 
     let count = Arc::new(AtomicUsize::new(0));
@@ -471,7 +479,7 @@ async fn test_pipeline_dir_output_tamper_rejected() {
         "a corrupted file inside a cached directory output must abort on the hit path"
     );
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
 // §18 delta 1 / §10.2 (The stage model and the five cache-key rules) — ARTIFACT HONESTY.
@@ -495,10 +503,10 @@ async fn resolve_pins_publishes_the_merged_document() {
     /// this is an independent copy of the promise, not the constant under test.
     const COMMITTED_PINS: &str = include_str!("../../../pins.json");
 
-    let tmp_dir =
-        std::env::temp_dir().join(format!("vmcell-test-pins-overlay-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    std::fs::create_dir_all(&tmp_dir).unwrap();
+    // OWNED: `create` — this test writes the overlay file into the dir itself.
+    let scratch =
+        common::TempTree::create(&format!("vmcell-test-pins-overlay-{}", std::process::id()));
+    let tmp_dir = scratch.path().to_path_buf();
 
     let overlay_path = tmp_dir.join("overlay.json");
     std::fs::write(
@@ -561,5 +569,111 @@ async fn resolve_pins_publishes_the_merged_document() {
         Some(&merged_out)
     );
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
+}
+
+// ── The residue gate for the tests' OWN scratch trees (`common::TempTree`) ──────────────────────
+//
+// The codebase's residue discipline — assert the artifact EXISTED, then that it is GONE once its
+// owner drops — applied to the test harness itself. It lives in this KVM-free binary so it runs in
+// the default `kind(test)` subset on any host.
+//
+// The defect it guards: a scratch path cleaned by a trailing `let _ = remove_dir_all(&dir)` at the
+// bottom of a test body is NOT cleaned when an assertion between creation and that line panics,
+// and a nextest retry re-runs the whole body — so one flaky live test leaked once per attempt.
+// `tests/snapshot_restore.rs` had no removal on any path, and its ~129 MB guest-RAM snapshot dirs
+// filled this host's `/tmp` until the daemon suite went red on `Disk quota exceeded`.
+//
+// RED ON THE INVERSE: empty `TempTree::drop`'s body (or make it return before `remove_tree`) and
+// both `must be GONE` assertions below flip — the success leg and the panic leg independently.
+#[test]
+fn temp_tree_removes_its_tree_on_success_and_on_panic() {
+    // Success leg: the tree exists while owned, and is gone once the owner drops.
+    let path = {
+        let tree =
+            common::TempTree::create(&format!("vmcell-test-temptree-ok-{}", std::process::id()));
+        std::fs::write(tree.join("payload.bin"), b"residue").unwrap();
+        assert!(
+            tree.path().is_dir(),
+            "the owned tree {} must exist before its owner drops (precheck; without it the \
+             assertion below is vacuous)",
+            tree.path().display()
+        );
+        tree.path().to_path_buf()
+    };
+    assert!(
+        !path.exists(),
+        "the owned tree {} must be GONE after its owner drops (success path)",
+        path.display()
+    );
+
+    // Panic leg: the SAME must hold when the body between creation and the end of scope panics —
+    // which is exactly what the trailing `remove_dir_all` calls this helper replaced could not do.
+    let path =
+        std::env::temp_dir().join(format!("vmcell-test-temptree-panic-{}", std::process::id()));
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen_in = seen.clone();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let tree = common::TempTree::create(&format!(
+            "vmcell-test-temptree-panic-{}",
+            std::process::id()
+        ));
+        std::fs::write(tree.join("payload.bin"), b"residue").unwrap();
+        seen_in.store(tree.path().is_dir(), std::sync::atomic::Ordering::SeqCst);
+        panic!("simulated assertion failure between creation and end of scope");
+    }));
+    assert!(unwound.is_err(), "the closure must actually have panicked");
+    assert!(
+        seen.load(std::sync::atomic::Ordering::SeqCst),
+        "the owned tree {} must have existed before the panic (precheck; without it the \
+         assertion below is vacuous)",
+        path.display()
+    );
+    assert!(
+        !path.exists(),
+        "the owned tree {} must be GONE after an unwind through its owner (panic path)",
+        path.display()
+    );
+}
+
+// `VMCELL_KEEP_TEST_TEMP` is an ACCEPTED INPUT, so it is honored or rejected — never silently
+// ignored (AGENTS.md "Fail loud"). Both halves are driven WITHOUT touching the process-global
+// environment (`keep_from_env_value` takes the value; `retain()` sets the same flag per site),
+// because a `set_var` here would race every other test in this binary under plain `cargo test`.
+// RED on the inverse: make `keep_from_env_value` fall through to `false` on an unknown value and
+// the reject leg goes green-on-nothing; empty the `keep` early-return in `TempTree::drop` and the
+// retention leg flips.
+#[test]
+fn keep_temp_env_is_honored_or_rejected() {
+    use std::ffi::OsStr;
+
+    // Honored, both ways round.
+    assert!(!common::keep_from_env_value(None), "unset means remove");
+    assert!(!common::keep_from_env_value(Some(OsStr::new(""))));
+    assert!(!common::keep_from_env_value(Some(OsStr::new("0"))));
+    assert!(common::keep_from_env_value(Some(OsStr::new("1"))));
+
+    // Rejected: an unparseable value must fail loud, not silently mean "remove".
+    let rejected =
+        std::panic::catch_unwind(|| common::keep_from_env_value(Some(OsStr::new("yes"))));
+    assert!(
+        rejected.is_err(),
+        "an unknown {} value must be rejected, not silently treated as \"remove\"",
+        common::KEEP_TEMP_ENV
+    );
+
+    // And the flag it sets actually suppresses the removal: the retained tree survives its owner.
+    // Removed by hand afterwards so this gate does not itself leak.
+    let kept = {
+        let t =
+            common::TempTree::create(&format!("vmcell-test-temptree-keep-{}", std::process::id()))
+                .retain();
+        t.path().to_path_buf()
+    };
+    assert!(
+        kept.is_dir(),
+        "a retained tree ({}=1 / `retain()`) must survive its owner for post-mortem inspection",
+        common::KEEP_TEMP_ENV
+    );
+    std::fs::remove_dir_all(&kept).expect("hand-cleanup of the deliberately retained tree");
 }

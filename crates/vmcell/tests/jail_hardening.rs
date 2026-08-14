@@ -303,3 +303,63 @@ fn seccomp_deny_list_turns_unshare_into_eperm_via_fork() {
         "without the deny-list, unshare(0) must succeed — the gate must be able to fail"
     );
 }
+
+/// Parses `/proc/<pid>/status`'s `SigIgn:` line — a 64-bit hex mask whose bit `n-1` is set when
+/// signal `n` is ignored.
+fn sig_ign_mask(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+}
+
+// docs/78 M9's second half. `vmcelld`'s cap-holding broker child sets SIGINT/SIGTERM to `SIG_IGN`
+// so a terminal Ctrl-C cannot kill it before its ordered teardown runs — and an IGNORED
+// disposition SURVIVES `execve`, so without a reset every VMM that child spawns would inherit it
+// and stop responding to an operator's `kill`. `build_vmm_cmd`'s `pre_exec` resets both to
+// `SIG_DFL` for exactly that reason.
+//
+// The daemon suite cannot observe this: cloud-hypervisor RE-ARMS its own INT/TERM handlers at
+// start-up (measured `SigIgn: 0x4` under a parent ignoring both), so an assertion there would be
+// vacuous. This is the committed gate the notes ledger recorded as missing — KVM-free and
+// root-free, because the stand-in child is `/bin/cat`, which installs no handlers of its own.
+//
+// Red on the inverse: delete either `libc::signal(…, SIG_DFL)` from `build_vmm_cmd`'s closure and
+// the corresponding bit is still set in the child's mask. The parent-side precondition is the
+// positive control — it proves the mask really was inherited-ignorable, so a green result cannot
+// come from the parent having never ignored the signals.
+#[tokio::test]
+async fn build_vmm_cmd_resets_inherited_ignored_signals_for_the_vmm_child() {
+    const SIGINT_BIT: u64 = 1 << (libc::SIGINT as u64 - 1);
+    const SIGTERM_BIT: u64 = 1 << (libc::SIGTERM as u64 - 1);
+
+    // SAFETY: `signal(2)` with `SIG_IGN` on a valid signal number. nextest runs each test in its
+    // own process, so this disposition is not shared with another test; it is restored below.
+    let prev_int = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    // SAFETY: as above, for SIGTERM.
+    let prev_term = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+
+    let parent = std::fs::read_to_string("/proc/self/status").expect("read own status");
+    let parent_mask = sig_ign_mask(&parent).expect("parent SigIgn");
+    assert_eq!(
+        parent_mask & (SIGINT_BIT | SIGTERM_BIT),
+        SIGINT_BIT | SIGTERM_BIT,
+        "positive control: this process must actually be ignoring INT+TERM, or the child \
+         assertion below proves nothing"
+    );
+
+    let status = spawn_stand_in_and_read_proc(&JailSpec::default()).await;
+
+    // SAFETY: restore the dispositions captured above; valid signal numbers and handlers.
+    unsafe { libc::signal(libc::SIGINT, prev_int) };
+    // SAFETY: as above, for SIGTERM.
+    unsafe { libc::signal(libc::SIGTERM, prev_term) };
+
+    let child_mask = sig_ign_mask(&status).expect("child SigIgn");
+    assert_eq!(
+        child_mask & (SIGINT_BIT | SIGTERM_BIT),
+        0,
+        "a VMM spawned through build_vmm_cmd must NOT inherit an ignored INT/TERM \
+         (child SigIgn {child_mask:#018x}); an operator's kill would be a no-op"
+    );
+}

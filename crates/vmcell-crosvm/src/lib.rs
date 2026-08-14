@@ -346,17 +346,21 @@ fn build_crosvm_run_args(
     // Block devices, in argument order → `/dev/vda`, `/dev/vdb`, … The rootfs MUST be first so it
     // enumerates as `/dev/vda`, which the cmdline boots from. `ro=true` for the read-only EROFS
     // image; a writable Block source (or its overlay) is read-write.
+    //
+    // *Which* host file backs `/dev/vda` is the one law, `RootfsSource::effective_image` — the
+    // same predicate the config boundary's duplicate-backing-file guard uses, so the guard can
+    // never protect a file this argv does not attach. The match stays exhaustive over the
+    // variants (a new `RootfsSource` must be a compile error here) because only the `ro=true`
+    // token is per-variant.
+    let root_image = cfg.rootfs.effective_image().display().to_string();
     match &cfg.rootfs {
-        vmcell::config::RootfsSource::Erofs { image } => {
+        vmcell::config::RootfsSource::Erofs { .. } => {
             args.push("--block".to_string());
-            args.push(format!("path={},ro=true", image.display()));
+            args.push(format!("path={root_image},ro=true"));
         }
-        vmcell::config::RootfsSource::Block { image, overlay } => {
+        vmcell::config::RootfsSource::Block { .. } => {
             args.push("--block".to_string());
-            args.push(format!(
-                "path={}",
-                overlay.as_ref().unwrap_or(image).display()
-            ));
+            args.push(format!("path={root_image}"));
         }
     }
 
@@ -920,6 +924,83 @@ mod tests {
             args.last().map(String::as_str),
             Some("/boot/vmlinux"),
             "the kernel image must be the last positional argument"
+        );
+    }
+
+    // One law, one predicate (§13): the `--block` that becomes `/dev/vda` names
+    // `RootfsSource::effective_image` — the SAME predicate the config boundary's
+    // duplicate-backing-file guard uses. They used to be separate copies of
+    // `overlay.as_ref().unwrap_or(image)`, so a divergence would have let the guard protect a file
+    // this argv does not attach. Expected values are recomputed THROUGH the helper, never a
+    // test-local literal, and asserted on the COMPOSED argv. Buggy impl this guards: emitting the
+    // base image while an overlay is set (guest writes land in the shared base) reddens the
+    // overlay leg.
+    #[test]
+    fn crosvm_root_block_uses_the_effective_image_law() {
+        let base = PathBuf::from("/img/base.raw");
+        let overlay = PathBuf::from("/img/vm-7-overlay.raw");
+
+        let run_args = |rootfs: RootfsSource| {
+            let cfg = VmConfig::builder("/boot/vmlinux", rootfs)
+                .build()
+                .expect("build config");
+            let args = build_crosvm_run_args(
+                &cfg,
+                &test_res(),
+                Path::new("/tmp/c.sock"),
+                Path::new("/tmp/s.log"),
+                3,
+                "root=/dev/vda",
+                None,
+            )
+            .expect("build run args");
+            // The FIRST `--block` value is the root disk (/dev/vda).
+            let idx = args
+                .iter()
+                .position(|a| a == "--block")
+                .expect("a rootfs --block must be present");
+            (cfg, args[idx + 1].clone())
+        };
+
+        // Plain image: no overlay, so the base IS the effective image.
+        let (plain_cfg, plain_spec) = run_args(RootfsSource::Block {
+            image: base.clone(),
+            overlay: None,
+        });
+        assert_eq!(
+            plain_spec,
+            format!("path={}", plain_cfg.rootfs.effective_image().display()),
+            "the root --block must name the effective image"
+        );
+
+        // Overlay set: the overlay backs /dev/vda, the base is never attached.
+        let (ovl_cfg, ovl_spec) = run_args(RootfsSource::Block {
+            image: base.clone(),
+            overlay: Some(overlay),
+        });
+        assert_eq!(
+            ovl_spec,
+            format!("path={}", ovl_cfg.rootfs.effective_image().display()),
+            "with an overlay set, the overlay backs /dev/vda"
+        );
+        // Non-vacuous: the two paths genuinely differ.
+        assert_ne!(
+            ovl_cfg.rootfs.effective_image(),
+            base,
+            "the overlay case must not resolve to the base image"
+        );
+
+        // EROFS: the image itself, read-only.
+        let (erofs_cfg, erofs_spec) = run_args(RootfsSource::Erofs {
+            image: PathBuf::from("/img/rootfs.erofs"),
+        });
+        assert_eq!(
+            erofs_spec,
+            format!(
+                "path={},ro=true",
+                erofs_cfg.rootfs.effective_image().display()
+            ),
+            "an EROFS root is the image itself, read-only"
         );
     }
 

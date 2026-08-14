@@ -245,18 +245,13 @@ impl Zygote {
 /// in hand). Rejecting here avoids minting copy-on-write copies for a pool that
 /// could never restore.
 fn check_clone_eligible(cfg: &VmConfig) -> Result<()> {
-    let feature = if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
-        Some("unprivileged (vhost-user-net) networking")
-    } else if matches!(cfg.net, crate::config::NetConfig::Segment { .. }) {
-        // §6.5 (VM-to-VM segments): segments are snapshot-forbidden at `build()`, but a `Zygote`
-        // over a segment config must fail at THIS config-only gate rather than after minting the
-        // copy-on-write copies — and a fan-out would dual-claim one member slot besides.
-        Some("vm-to-vm segment membership (§6.5)")
-    } else if !cfg.shares.is_empty() {
-        Some("a virtio-fs data share (vhost-user device)")
-    } else {
-        None
-    };
+    // docs/78 S1, second half: this gate USED to open-code its own arm list beside
+    // `orchestrator::clone_ineligible_feature`, and the pair had already diverged — the custom-init
+    // (M2) and host-USB (M4) arms landed in the orchestrator's copy only, so a zygote fan-out of a
+    // custom-init config was still minted and only refused later, per clone, at the restore
+    // boundary. One law, one predicate: the config-only subset lives in exactly one function and
+    // this boundary reads it, so a new arm can never reach one boundary and miss the other.
+    let feature = crate::orchestrator::clone_ineligible_feature(cfg);
     match feature {
         Some(f) => Err(Error::Unsupported {
             vmm: "zygote".to_string(),
@@ -609,6 +604,60 @@ mod tests {
         );
 
         // Positive control: the identical master with a non-segment config is accepted.
+        assert!(
+            Zygote::from_snapshot_dir(master, erofs_cfg()).await.is_ok(),
+            "the same master must still accept an eligible config"
+        );
+    }
+
+    // docs/78 S1 (second half) + M2/M4: this gate reads `orchestrator::clone_ineligible_feature`,
+    // so the arms that landed there — a custom `init=` (which replaces the very agent the
+    // mandatory post-restore resync runs through) and a passed-through host USB device (host state
+    // outside the migration stream) — are refused HERE, before any copy-on-write copy is minted,
+    // not N clones later at the per-clone restore boundary.
+    //
+    // Red on the inverse: restore this gate's old open-coded three-arm list (unprivileged /
+    // segment / shares) and both legs return `Ok` — the exact drift S1 was filed against. The
+    // positive control keeps it non-vacuous.
+    #[tokio::test]
+    async fn custom_init_and_usb_configs_rejected_at_zygote_construction() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let master = root.path().join("zygote");
+        write_master(&master);
+
+        let custom_init = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .network_disabled()
+        .init("/bin/workload")
+        .build()
+        .expect("a non-snapshotting custom-init config builds");
+        let res = Zygote::from_snapshot_dir(master.clone(), custom_init).await;
+        assert!(
+            matches!(&res, Err(Error::Unsupported { feature, .. }) if feature.contains("custom init")),
+            "a custom-init config must be rejected at zygote construction, got {res:?}"
+        );
+
+        let usb = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .network_disabled()
+        .with_usb_host_device(crate::config::UsbHostDevice::new(0x1d6b, 0x0002))
+        .build()
+        .expect("a non-snapshotting USB config builds");
+        let res = Zygote::from_snapshot_dir(master.clone(), usb).await;
+        assert!(
+            matches!(&res, Err(Error::Unsupported { feature, .. }) if feature.contains("USB")),
+            "a host-USB config must be rejected at zygote construction, got {res:?}"
+        );
+
+        // Positive control: the identical master with an eligible config is accepted.
         assert!(
             Zygote::from_snapshot_dir(master, erofs_cfg()).await.is_ok(),
             "the same master must still accept an eligible config"

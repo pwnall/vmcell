@@ -404,6 +404,91 @@ struct NetworkInterface {
     guest_mac: String,
 }
 
+/// Firecracker's `PUT /drives/<drive_id>` body.
+///
+/// `rate_limiter` is a **presence attribute** (`skip_serializing_if`): an unthrottled drive omits
+/// the key entirely, which is FC's default (§4.6, Extra virtio-blk devices and disk-I/O
+/// throttling). FC's engine channel is JSON, and `fc_drives_put_root_first_then_extras` pins the
+/// omission on that codec.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct Drive {
+    drive_id: String,
+    path_on_host: PathBuf,
+    is_root_device: bool,
+    is_read_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limiter: Option<FcRateLimiter>,
+}
+
+/// FC's `rate_limiter` — bandwidth (bytes/s) and ops (IOPS) token buckets, the SAME shape and
+/// `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS` conversion as Cloud Hypervisor (one law, one
+/// predicate, §4.6, Extra virtio-blk devices and disk-I/O throttling).
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct FcRateLimiter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bandwidth: Option<FcTokenBucket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ops: Option<FcTokenBucket>,
+}
+
+/// One token bucket of an [`FcRateLimiter`].
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct FcTokenBucket {
+    size: u64,
+    refill_time: u64,
+}
+
+/// Builds one bucket from a rate, using the shared refill window.
+fn fc_token_bucket(rate: u64) -> FcTokenBucket {
+    FcTokenBucket {
+        size: rate,
+        refill_time: vmcell::config::IO_LIMIT_REFILL_TIME_MS,
+    }
+}
+
+/// Builds the FC drive list in `PUT` order: the **root drive first** (`/dev/vda`), then the extra
+/// virtio-blk devices in configuration order (`/dev/vdb`, `/dev/vdc`, …, §4.6, Extra virtio-blk
+/// devices and disk-I/O throttling). FC enumerates by attachment order, so this ordering is the
+/// load-bearing contract with the cmdline's `root=/dev/vda`; each drive carries its own
+/// `drive_id`, which is also its `PUT /drives/<drive_id>` path.
+///
+/// *Which* host file backs the root drive is the one law,
+/// [`RootfsSource::effective_image`](vmcell::config::RootfsSource::effective_image) — the same
+/// predicate the config boundary's duplicate-backing-file guard uses, so the guard can never
+/// protect a file this wiring does not attach. The match stays exhaustive over the variants (a
+/// new `RootfsSource` must be a compile error here) because `is_read_only` is per-variant.
+///
+/// Pure (mirroring Cloud Hypervisor's `build_ch_disks`) so ordering, the root path and the
+/// throttle mapping are gate-able without KVM: built inline in `create()`, the whole shape was
+/// observable only from the live matrix.
+fn build_fc_drives(cfg: &VmConfig) -> Vec<Drive> {
+    let mut drives = Vec::with_capacity(1 + cfg.extra_disks.len());
+    let is_root_read_only = match &cfg.rootfs {
+        vmcell::config::RootfsSource::Erofs { .. } => true,
+        vmcell::config::RootfsSource::Block { .. } => false,
+    };
+    drives.push(Drive {
+        drive_id: "rootfs".to_string(),
+        path_on_host: cfg.rootfs.effective_image().to_path_buf(),
+        is_root_device: true,
+        is_read_only: is_root_read_only,
+        rate_limiter: None,
+    });
+    for (i, disk) in cfg.extra_disks.iter().enumerate() {
+        drives.push(Drive {
+            drive_id: format!("extra{i}"),
+            path_on_host: disk.image.clone(),
+            is_root_device: false,
+            is_read_only: disk.readonly,
+            rate_limiter: disk.io_limit.as_ref().map(|limit| FcRateLimiter {
+                bandwidth: limit.bandwidth_bytes_per_sec.map(fc_token_bucket),
+                ops: limit.iops.map(fc_token_bucket),
+            }),
+        });
+    }
+    drives
+}
+
 /// One entry of Firecracker 1.8+'s `network_overrides` array on `PUT /snapshot/load`: rebind
 /// the snapshotted interface `iface_id` to a **fresh** host tap instead of the baked one.
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -738,87 +823,14 @@ impl Vmm for Firecracker {
             )
             .await?;
 
-        // Configure Drive
-        #[derive(Serialize)]
-        struct Drive {
-            drive_id: String,
-            path_on_host: PathBuf,
-            is_root_device: bool,
-            is_read_only: bool,
-            /// Optional I/O rate limiter (disk-I/O fault injection, §4.6, Extra virtio-blk devices and disk-I/O throttling). Omitted when
-            /// the drive is unthrottled (FC's default).
-            #[serde(skip_serializing_if = "Option::is_none")]
-            rate_limiter: Option<FcRateLimiter>,
-        }
-        // FC's `rate_limiter` — bandwidth (bytes/s) and ops (IOPS) token buckets, the
-        // SAME shape and `size=rate`/`refill_time=IO_LIMIT_REFILL_TIME_MS` conversion as
-        // Cloud Hypervisor (one law, one predicate, §4.6, Extra virtio-blk devices and disk-I/O throttling).
-        #[derive(Serialize)]
-        struct FcRateLimiter {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            bandwidth: Option<FcTokenBucket>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            ops: Option<FcTokenBucket>,
-        }
-        #[derive(Serialize)]
-        struct FcTokenBucket {
-            size: u64,
-            refill_time: u64,
-        }
-        let fc_rate_limiter = |limit: &vmcell::config::DiskIoLimit| {
-            let bucket = |rate: u64| FcTokenBucket {
-                size: rate,
-                refill_time: vmcell::config::IO_LIMIT_REFILL_TIME_MS,
-            };
-            FcRateLimiter {
-                bandwidth: limit.bandwidth_bytes_per_sec.map(bucket),
-                ops: limit.iops.map(bucket),
-            }
-        };
-
-        let rootfs_path = match &cfg.rootfs {
-            vmcell::config::RootfsSource::Erofs { image } => image.clone(),
-            vmcell::config::RootfsSource::Block { image, overlay } => {
-                overlay.as_ref().unwrap_or(image).clone()
-            }
-        };
-
-        let is_ro = matches!(&cfg.rootfs, vmcell::config::RootfsSource::Erofs { .. });
-
-        instance
-            .api_request(
-                "PUT",
-                "/drives/rootfs",
-                Some(&Drive {
-                    drive_id: "rootfs".to_string(),
-                    path_on_host: rootfs_path,
-                    is_root_device: true,
-                    is_read_only: is_ro,
-                    rate_limiter: None,
-                }),
-            )
-            .await?;
-
-        // Extra virtio-blk devices (§4.6, Extra virtio-blk devices and disk-I/O throttling), PUT AFTER the root drive so they enumerate
-        // `/dev/vdb`, `/dev/vdc`, … in order and never displace `/dev/vda`. Each is a
-        // non-root drive on its own virtio-mmio slot; FC's MMIO region is finite, so a
-        // very large list surfaces fail-loud as the backend's typed API error here,
-        // never a silent drop.
-        for (i, disk) in cfg.extra_disks.iter().enumerate() {
-            let drive_id = format!("extra{i}");
-            instance
-                .api_request(
-                    "PUT",
-                    &format!("/drives/{drive_id}"),
-                    Some(&Drive {
-                        drive_id,
-                        path_on_host: disk.image.clone(),
-                        is_root_device: false,
-                        is_read_only: disk.readonly,
-                        rate_limiter: disk.io_limit.as_ref().map(fc_rate_limiter),
-                    }),
-                )
-                .await?;
+        // Configure the drives: root first, then the extra virtio-blk devices (§4.6, Extra
+        // virtio-blk devices and disk-I/O throttling), PUT in `build_fc_drives` order so they
+        // enumerate `/dev/vda`, `/dev/vdb`, `/dev/vdc`, … and an extra never displaces the root.
+        // Each drive's `drive_id` IS its API path. FC's MMIO region is finite, so a very large
+        // list surfaces fail-loud as the backend's typed API error here, never a silent drop.
+        for drive in build_fc_drives(cfg) {
+            let path = format!("/drives/{}", drive.drive_id);
+            instance.api_request("PUT", &path, Some(&drive)).await?;
         }
 
         // Configure Network
@@ -1258,6 +1270,135 @@ mod tests {
             build_fc_network_interface("vmcell-tap-0", 0).is_err(),
             "vmid 0 has no valid MAC and must fail loud"
         );
+    }
+
+    // The drive list FC is PUT: root first (`/dev/vda`), then the extras in order
+    // (`/dev/vdb`, …), each with its own id/readonly flag, and an unthrottled drive omitting
+    // `rate_limiter` on the codec FC ships over (JSON). Built inline in `create()`, none of this
+    // was observable without a live FC. Buggy impls guarded: extras PUT before the root (root
+    // shifts off `/dev/vda` and the guest cannot mount it), an extra's `readonly` ignored, a
+    // colliding `drive_id` (the second PUT overwrites the first), or a `rate_limiter: null` FC
+    // rejects.
+    #[test]
+    fn fc_drives_put_root_first_then_extras() {
+        use vmcell::config::{BlockDevice, DiskIoLimit, RootfsSource, VmConfig};
+
+        let cfg = VmConfig::builder(
+            "/vmlinux",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .with_extra_disk(BlockDevice::read_only("/img/ro.raw"))
+        .with_extra_disk(
+            BlockDevice::read_write("/img/rw.raw").with_io_limit(DiskIoLimit::bandwidth(2_000_000)),
+        )
+        .build()
+        .expect("build config");
+
+        let drives = build_fc_drives(&cfg);
+        assert_eq!(
+            drives,
+            vec![
+                // /dev/vda — the erofs root, read-only, unthrottled.
+                Drive {
+                    drive_id: "rootfs".to_string(),
+                    path_on_host: cfg.rootfs.effective_image().to_path_buf(),
+                    is_root_device: true,
+                    is_read_only: true,
+                    rate_limiter: None,
+                },
+                // /dev/vdb — the first extra disk, read-only.
+                Drive {
+                    drive_id: "extra0".to_string(),
+                    path_on_host: PathBuf::from("/img/ro.raw"),
+                    is_root_device: false,
+                    is_read_only: true,
+                    rate_limiter: None,
+                },
+                // /dev/vdc — the second extra disk, read-write and bandwidth-throttled with the
+                // same `size=rate`, `refill_time=IO_LIMIT_REFILL_TIME_MS` bucket CH builds.
+                Drive {
+                    drive_id: "extra1".to_string(),
+                    path_on_host: PathBuf::from("/img/rw.raw"),
+                    is_root_device: false,
+                    is_read_only: false,
+                    rate_limiter: Some(FcRateLimiter {
+                        bandwidth: Some(FcTokenBucket {
+                            size: 2_000_000,
+                            refill_time: vmcell::config::IO_LIMIT_REFILL_TIME_MS,
+                        }),
+                        ops: None,
+                    }),
+                },
+            ]
+        );
+
+        // The unthrottled root omits `rate_limiter` entirely on the wire (FC's default).
+        let json = serde_json::to_string(&drives[0]).expect("the request serializes");
+        assert!(
+            !json.contains("rate_limiter"),
+            "an unthrottled drive must omit rate_limiter: {json}"
+        );
+    }
+
+    // One law, one predicate (§13): the drive that becomes `/dev/vda` names
+    // `RootfsSource::effective_image` — the SAME predicate the config boundary's
+    // duplicate-backing-file guard uses. They used to be separate copies of
+    // `overlay.as_ref().unwrap_or(image)`, so a divergence would have let the guard protect a
+    // file this wiring does not attach. Expected values are recomputed THROUGH the helper, never
+    // a test-local literal. Buggy impl this guards: PUTting the base image while an overlay is
+    // set (guest writes land in the shared base) reddens the overlay leg.
+    #[test]
+    fn fc_root_drive_uses_the_effective_image_law() {
+        use vmcell::config::{RootfsSource, VmConfig};
+
+        let base = PathBuf::from("/img/base.raw");
+        let overlay = PathBuf::from("/img/vm-7-overlay.raw");
+
+        let root = |rootfs: RootfsSource| {
+            let cfg = VmConfig::builder("/vmlinux", rootfs)
+                .build()
+                .expect("build config");
+            let drive = build_fc_drives(&cfg).remove(0);
+            (cfg, drive)
+        };
+
+        // Plain image: no overlay, so the base IS the effective image.
+        let (plain_cfg, plain) = root(RootfsSource::Block {
+            image: base.clone(),
+            overlay: None,
+        });
+        assert_eq!(
+            plain.path_on_host,
+            plain_cfg.rootfs.effective_image(),
+            "the root drive must be the effective image"
+        );
+        assert!(!plain.is_read_only, "a Block root is writable");
+
+        // Overlay set: the overlay backs /dev/vda, the base is never attached.
+        let (ovl_cfg, ovl) = root(RootfsSource::Block {
+            image: base.clone(),
+            overlay: Some(overlay),
+        });
+        assert_eq!(
+            ovl.path_on_host,
+            ovl_cfg.rootfs.effective_image(),
+            "with an overlay set, the overlay backs /dev/vda"
+        );
+        // Non-vacuous: the two paths genuinely differ.
+        assert_ne!(
+            ovl_cfg.rootfs.effective_image(),
+            base,
+            "the overlay case must not resolve to the base image"
+        );
+
+        // EROFS: the image itself, read-only.
+        let (erofs_cfg, erofs) = root(RootfsSource::Erofs {
+            image: PathBuf::from("/img/rootfs.erofs"),
+        });
+        assert_eq!(erofs.path_on_host, erofs_cfg.rootfs.effective_image());
+        assert!(erofs.is_read_only, "an EROFS root is read-only");
     }
 
     // docs/78 M1 (`fc-restore-rebinds-baked-tap-name-dead-data-plane`): the `/snapshot/load`

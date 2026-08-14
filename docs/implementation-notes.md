@@ -746,10 +746,16 @@ Delta 9/11 notes above were corrected in the same pass. Justified deviations rec
 - **(fs-reap) the three open-coded `kill(-pgid)`+`waitpid` teardowns in `fs.rs`** (try_wait error,
   socket-wait timeout, `Drop`) now route through the single-source `crate::vmm::reap_process_group`
   (already gated by the existing `Drop`/readiness-failure reap tests).
-  **[DISPROVEN 2026-08-13 — the docs/78 review: the routing never landed.** All three open-coded
-  copies still ship (`fs.rs:166`, `:181`, `:270`); `git log -S reap_process_group -- crates/vmcell/src/fs.rs`
-  is empty. The consolidation is a docs/78 §6 fix item; this entry stands only as the record of
-  what was *intended*.]
+  **[DISPROVEN 2026-08-13, then LANDED 2026-08-14.** The docs/78 review found the routing had never
+  landed — all three open-coded copies still shipped and `git log -S reap_process_group --
+  crates/vmcell/src/fs.rs` was empty — so the entry stood only as a record of what was *intended*.
+  The docs/78 §6 fix (`fs-reap-note-claims-consolidation-that-never-landed`) makes it true: the two
+  start-path copies collapsed into **one** readiness-failure wrapper around `vmm::wait_for_socket`
+  (which absorbed the `try_wait` arm), and `Drop` calls the same helper — three open-coded copies
+  are now two call sites of `crate::vmm::reap_process_group`. Each site re-reads the pgid from the
+  **live** `Child`, so the arm where `wait_for_socket` already reaped is a no-op instead of a signal
+  to a recycled group (H-HOST-1). Gate:
+  `fs::drop_reaps_tests::drop_kills_and_reaps_held_child_process_group`.]
 
 - **(M2) Daemon `Registry::snapshot` checks the VM/state before any filesystem mutation.** The
   `NotFound`/`Conflict` (slot + `require_state(Ready)`) checks now precede `create_dir_all(out_dir)`,
@@ -1120,9 +1126,13 @@ analogue).** The first draft kept crosvm's built-in sandbox on for `Enforcing` (
 multiprocess minijail can't run under the harness's supervision model. So the `"crosvm"` arm of
 `vmm_seccomp_args` is now `Enforcing | Disabled → ["--disable-sandbox"]`, `Log → Unsupported`. To keep the
 `seccomp.rs` "never unconfined by default" invariant (the jailer's own deny-list is opt-in/default-off, so
-`--disable-sandbox` alone would leave crosvm unconfined), **`Crosvm::create` turns the Layer-2 jailer
-deny-list ON for `Enforcing`** (`jail_cfg.seccomp_deny_list = true`) and leaves `cfg.jail` untouched for
-`Disabled`. crosvm is thus the one backend whose confinement is Layer-2 rather than its own filter — the
+`--disable-sandbox` alone would leave crosvm unconfined), **crosvm turns the Layer-2 jailer deny-list
+ON for `Enforcing`** (`jail_cfg.seccomp_deny_list = true`) and passes `cfg.jail` through untouched for
+`Disabled` — so an operator's explicit opt-in is never force-cleared. [CORRECTED 2026-08-14 —
+docs/78 M10: the site is neither `create` nor an inline block in `spawn` but the pure, total
+`effective_jail_config(&VmConfig) -> JailConfig` that `spawn` calls, extracted so the flip has a
+KVM-free gate: `effective_jail_config_turns_the_deny_list_on_only_for_enforcing`. `Log` never
+reaches it — `vmm_seccomp_args` typed-refuses it for crosvm first.] crosvm is thus the one backend whose confinement is Layer-2 rather than its own filter — the
 per-backend deny-list enablement the deny-list was designed for. **Validated:** crosvm boots, execs, and
 does tap/netns networking under the deny-list (the netns `setns` runs in `build_vmm_cmd`'s pre_exec BEFORE
 `apply_jail` loads the filter, so the deny-list's `setns`/`unshare` bans don't break it). The golden test
@@ -1229,7 +1239,7 @@ capability *values* changed, not the struct), so no further version bump beyond 
 
 # v30 — the downstream-platform delta register (design v30 §18), as built
 
-The nine-item register of design v30 (`docs/74-claude-fable-design-v30.md` §18) landed as
+The nine-item register of design v30 (`docs/historical/74-claude-fable-design-v30.md` §18) landed as
 `vmcell` 0.12 → 0.13. Each delta below records the as-built shape, every deviation from the §18
 sketch and why, every design premise this pass found **empirically false** (with the evidence that
 disproved it), and the gate that now pins each claim. Deltas were implemented in the §18 order —
@@ -1508,8 +1518,14 @@ Two further premises are recorded because they were false as worded in §18:
 - **`build-kernels --in-vm` was already broken before this delta.** The in-VM producer needs a
   working `vmlinux` published under the `kernel` artifact key, and `build-kernels` publishes only
   `kernel-<label>` keys, so the path died on "needs a seed `kernel` artifact" regardless of what the
-  operator had already built. Fixed rather than deferred: the CLI prepends `PrebuiltKernelStage`
-  when the in-VM producer is selected. Note the seed writes `<artifacts>/vmlinux`, so on a tree
+  operator had already built. Fixed rather than deferred: **`build-kernels`** prepends
+  `PrebuiltKernelStage` when the in-VM producer is selected. [SCOPED 2026-08-14 — docs/78 M3:
+  `build-kernels` is the only command that does. `vmcell build --kernel-source in-vm` is now a typed
+  `Unsupported` naming `build-kernels` as the route, because a seed prepended *there* would collide
+  with the unlabelled in-VM stage on `name()`, `out_path()` and the `vmlinux` cache key — it
+  previously ran and died on "needs a seed `kernel` artifact". Gate: the stage assembly moved out of
+  `dispatch` into `build_stages`/`build_kernels_stages`, so the roster is asserted through
+  `Stage::name()` rather than a proxy.] Note the seed writes `<artifacts>/vmlinux`, so on a tree
   whose default kernel was built with host-`make` this replaces it with the pinned prebuilt seed
   (both are valid bootable kernels; prebuilt is `vmcell build`'s default) — and, since F2, also
   clears that kernel's now-stale `.config`.
@@ -1759,7 +1775,17 @@ enum variant is minor because the enum is `#[non_exhaustive]`); `cargo machete`;
   10 teardown/shutdown sites plus the deliberately-commented OOM-probe exec discard — and
   `checks.rs:866`'s `let _ = vm.agent(..)` is a **load-bearing** swallow: the `metrics.usage_readable`
   arm passes on a guest that never booted, with the handshake failure reported nowhere (docs/78 §6
-  fix item).] Same for `guest_core_checks`' roster shrinkage when
+  fix item).] **[RESOLVED 2026-08-14 — the load-bearing swallow is gone.** The `metrics.usage_readable`
+  arm is now `usage_readable_after_agent_ready(vm, ready_budget, settle)`, which renders a failed
+  handshake through `explain_boot_failure_at` like every sibling arm; `agent_handshake_base` takes
+  the budget it names, so an injected budget is never misreported, and `concurrency_distinct_ids`'
+  second copy of that sentence composes through it. Gate:
+  `checks::tests::usage_readable_fails_naming_the_boot_failure_when_the_agent_never_handshakes`
+  (KVM-free, `FakeVmm`, 1 s injected budget) — red on the inverse: with the `let _` restored the arm
+  reports "memory controller delegated but ResourceUsage::mem_limit_enforced is false" on a guest
+  that never booted. The residual cluster is now 10: nine best-effort `shutdown()` teardowns plus the
+  deliberately-commented OOM-probe `exec` discard; the class-wide ban script is still the open item.] Same for
+  `guest_core_checks`' roster shrinkage when
   the agent is unreachable (the four `rootfs.*` + `agent.put_file_roundtrip` ids vanish rather than
   failing) — the equivalent shrinkage on the arm delta 4 touches *was* fixed.
 - **`vmcell-artifact-validator/Cargo.toml` has no comment-changelog block** unlike
@@ -2102,10 +2128,24 @@ deviation — the implementation matches the design; the design's premise was wr
   `accept`), so no `exec` in another thread can race an inheritable window.
 - **Connect-loop diagnostics are capped, not frame-sized.** `ConnectAttemptError::Ready` eagerly
   `{:?}`-rendered a whole frame (bounded only by `MAX_FRAME_BYTES` = 16 MiB) on **every** failed
-  boot-wait attempt. `capped_debug(value, READY_DIAGNOSTIC_BYTES = 256)` writes into a sink that
-  returns `Err` at the cap, so `std::fmt` **aborts** — the tail is never rendered, not merely never
-  kept. Gate: `ready_diagnostics_are_capped_not_frame_sized`, which bounds the output for a 1 MiB frame
-  and proves the abort with a `Debug` impl that counts its own writes (<100 of 10 000 chunks run).
+  boot-wait attempt. `capped_debug` writes into a sink that returns `Err` at the cap, so `core::fmt`
+  **aborts** — the tail is never rendered, not merely never kept. [UPDATED 2026-08-14 — docs/78 §6
+  `uncapped-frame-debug-renders`: the helper moved to `vmcell-protocol`, beside `MAX_FRAME_BYTES`, as
+  one law for every site on the plane (`MAX_DEBUG_RENDER_BYTES = 256` + `DEBUG_TRUNCATED_MARKER` +
+  `capped_debug`), shared by the guest agent and both host clients; the per-site
+  `READY_DIAGNOSTIC_BYTES` const is gone. Because the *total* render length is unknowable without
+  rendering it — the abort is the point — the marker states truncation and each desync site quotes
+  the frame's true **wire** size beside the render, which is the more useful number and free while
+  the encoded frame is still in hand. Gates:
+  `capped_debug_truncates_over_cap_values_and_leaves_short_ones_verbatim` (which absorbed the former
+  `ready_diagnostics_are_capped_not_frame_sized`, counting-`Debug` abort proof included) and
+  `capped_debug_truncates_on_a_char_boundary`, plus one per site —
+  `unexpected_exec_frame_is_logged_capped_not_frame_sized`,
+  `unexpected_guest_frame_is_logged_capped_not_frame_sized`,
+  `unexpected_frame_warning_is_capped_not_frame_sized`. The guest agent's `serve_loop` desync arm is
+  not unit-reachable (a concrete `VsockStream` read half and a `VsockStream`-typed writer), so its
+  line is built by `unexpected_frame_warning()` — the reachable seam the gate asserts on; only the
+  arm's one-line call to it is unguarded.]
 - **`prologue_non_ok_line_is_refused` now drives both refusal shapes its comment claimed.** Only `ERR`
   was exercised; `OKAY …` — the prefix trap that only the trailing space in `"OK "` rejects — is now
   driven too, so the narrower `starts_with("OK")` mutation goes red.
@@ -2577,8 +2617,12 @@ long: the argv splice had **no gate at all**, the live leg's guest kernel **did 
   declares no fragments. Both are stale the moment delta 9's entry lands; they were updated minimally
   — the roster gained `"usbhost"`, and the no-`fragments`-key promise is now asserted over the two
   entries that carry no `fragments` key, which keeps the migration promise it was written for.
-- **`UsbHostDevice` is `vmcell::config::UsbHostDevice`, not root-re-exported** (unlike `BlockDevice`).
-  A one-line follow-up left to the orchestrator's public-surface pass.
+- **`UsbHostDevice` is now root-re-exported** (`vmcell::UsbHostDevice`), together with `RootfsSource`
+  and `Egress`, in the docs/78 §9.4 `crate-root-reexport-roster-inconsistent` fix: the root set has
+  to be *callable*, and those three are the types a consumer cannot avoid naming to reach the
+  re-exported builder. Additive (minor-compatible), ledgered in `crates/vmcell/Cargo.toml`'s comment
+  changelog, and gated by `lib.rs`'s `root_reexport_tests`, which builds a full `VmConfig` importing
+  only from the crate root — a dropped re-export is a compile error.
 
 ### Empirically-false premises found in this pass (each now pinned by a gate)
 
@@ -2756,3 +2800,287 @@ the independent parser is what makes it non-vacuous. The **cgroup half**
 radius is the daemon's boot-log line only (`controller_enforceable` is consulted nowhere
 load-bearing today). An injectable probe root (the `SysfsCpuFreq::with_root` pattern) is the fix if
 that ever changes.
+
+## The two docs/78 fix waves (2026-08-14), as built
+
+Wave 1 landed B1 and the majors (`0acf129`), wave 2 the §5–§8 minors (`87dbb8b`). Live after both:
+`just ci` green, `just test-privileged` 149/149, `just test-unprivileged` 4/4, `just test-daemon`
+14/14, `just test-crosvm` 29/29, 16 honest capability skips. The findings and their gates are
+reported in `docs/78-claude-fable-code-review.md`; this section carries only what the waves changed
+about the **record** — the deliberate deviations, the behavior changes a caller can see, and the
+traps measured on the way.
+
+### The jail deny-list carries three syscalls beyond the design §12.3 roster
+
+`vmm::jail::DENIED_SYSCALLS` ships `reboot`, `swapon` and `swapoff` on top of the roster §12.3
+lists. Kept deliberately, not trimmed to match the doc: `reboot(2)` reboots or halts the **host** (a
+guest reboot is a VMM-internal transition, never this syscall), and `swapon`/`swapoff` reconfigure
+host swap. All three are dangerous-and-never-needed-by-a-booting-VMM in exactly the sense every
+roster entry is, so the honest reconciliation is to widen the doc; the design folds them into §12.3
+at its next revision. The const's at-site comment cites this record. Gate:
+`jail::tests::deny_list_is_exactly_the_documented_set_and_compiles`, whose expected set is the
+§12.3 roster verbatim plus these three, pinned as exact membership in both directions. It is
+written out from the **design text**, not derived from the const: the version that had pinned a
+copy *of the const* stayed green while the shipped list silently lacked `process_vm_readv`
+(docs/78 M15).
+
+### `build_vmm_cmd` installs its `pre_exec` unconditionally — the `posix_spawn` trade
+
+The closure now resets SIGINT/SIGTERM to `SIG_DFL` before joining the netns and applying the jail,
+so it is installed for **every** spawned VMM (M9): an ignored disposition survives `execve`, and
+`vmcelld`'s broker child ignores both signals so a terminal Ctrl-C cannot kill the cap-holder before
+its ordered teardown — without the reset the VMM would inherit that deafness and an operator's
+`kill` would stop working. *The trade:* a VMM spawned with neither a netns nor jail work no longer
+takes std's `posix_spawn` fast path and pays a `fork`+`exec` instead. Accepted, and **not measured**
+— it is expected to be noise beside a VMM boot, but it is a real change to the unprivileged/no-jail
+spawn path and is named here so a boot-latency regression has a candidate cause.
+
+*Why the gate is `vmcell`-side and not in the daemon suite:* cloud-hypervisor **re-arms** its own
+INT/TERM handlers at start-up — measured under a parent ignoring both, the VMM's `SigIgn` is `0x4`
+— so a VMM-side `SigIgn` assertion in `group_sigint_tears_down_vms_leaving_no_orphan_vmm` would pass
+with or without the reset. That test therefore asserts the broker child's disposition (the half it
+*can* observe) and states the omission at-site; the reset's own gate needs a spawn, through
+`build_vmm_cmd`, of a program that keeps its inherited dispositions. **That gate is not yet
+committed** (see the open items below) — the reset ships proven only out-of-tree.
+
+### One config-only eligibility predicate — and the delta-9 restore premise corrected in code
+
+The delta-9 record's premise "every backend's `restore()` rejects a non-snapshotting config" was
+empirically false (no backend's `restore()` reads `cfg.snapshotting`), and docs/78 §10 annotated it.
+The correction is now **code**: `orchestrator::clone_ineligible_feature` is the one config-only
+snapshot-eligibility predicate, with five arms — unprivileged (vhost-user-net) networking, segment
+membership, a virtio-fs share, a custom `init=`, and host USB passthrough. The last two are new:
+a custom init replaces the guest agent that the mandatory post-restore resync (§8.2) runs through,
+and a passed-through host USB device is host state living outside guest RAM. `MicroVm::restore_inner`
+calls the predicate; `MicroVm::snapshot` refuses a custom-init VM at the earlier boundary (the one
+that refuses the bad artifact instead of the N restores of it) and names `vmm: "orchestrator"`,
+following the `zygote` / `in-process-virtiofsd` precedent that a non-backend boundary blames itself.
+Gates: `clone_ineligible_feature_covers_every_config_only_arm`, `restore_rejects_a_custom_init_config`,
+`restore_rejects_usb_host_devices_on_a_non_snapshotting_config`, `zygote_clone_rejects_a_custom_init_config`.
+
+**Completed in the same pass:** `zygote::check_clone_eligible` now *wraps* `clone_ineligible_feature`
+instead of open-coding the older, narrower three-arm list. Until it did, the two had already drifted —
+the custom-init and host-USB arms existed only in the orchestrator's copy — so a custom-init `Zygote`
+was accepted, its copy-on-write copies minted, and the refusal surfaced N clones later at the
+per-clone restore boundary. Gate: `zygote::tests::custom_init_and_usb_configs_rejected_at_zygote_construction`
+(KVM-free; red on restoring the open-coded list, with an eligible-config positive control so it
+cannot pass vacuously). The backends' own `restore()` paths remain
+permissive about host USB (none runs the `create()`-side precheck): the orchestrator boundary covers
+every in-tree production path, but `Vmm` is a **public trait**, so a downstream consumer calling
+`vmm.restore()` directly bypasses it. Backend-side defense in depth is the open half — crosvm's
+`reject_disk_io_throttle`, now called from both `create()` and `restore()`, is the shape the rest
+should take.
+
+### The daemon suite is 14 tests
+
+`just test-daemon` was 12 at the docs/78 baseline and is 14 now (`cargo nextest list -p vmcelld
+--run-ignored all`): `group_sigint_tears_down_vms_leaving_no_orphan_vmm` (M9 — a group Ctrl-C must
+leave no orphan VMM, asserting the broker child's `SigIgn` as the fast mechanism check beside the
+slower orphan check) and `broker_parent_serves_with_no_capabilities_child_keeps_them` (M12 — the P2
+posture, with the still-capable child as its positive control). The harness grew what those need:
+`Daemon::pid()`, `wait_exit()`, `start_in_own_process_group()`, and a `Drop` that returns early when
+the child was already reaped so it cannot signal a recycled pid — behavior every other daemon test
+inherits.
+
+### The guest `curl` shim, and what it costs to change a guest applet
+
+The shim now honors-or-rejects every accepted input (an unknown flag, a garbage `--max-time`, a
+discarded `-o`/`-H`/`-A`/`-X`, an unparseable `--resolve` all used to be swallowed). Why this
+mattered beyond the fail-loud rule: **the M13 guest→host NAT gate could not be written until the
+shim could POST.** `/vmcell-tools` is first on the guest PATH (`child_path`) and `vmcell-tools/curl`
+is a symlink onto the multicall shim, so an in-guest `curl` in any test resolves to the shim
+whatever the base image carries — and `nat_window_fill_upload` needs `--data-binary @file`, `-o`,
+`-w '%{http_code}'` and `-H 'Expect:'`, every one of which the old parser accepted and ignored.
+Rejection *is* the faithful emulation: a flag the shim cannot honor exits 2 naming the offender,
+exactly as a missing real-curl feature would. Gates:
+`parse_curl_args_rejects_every_input_it_cannot_honor` plus its positive control
+`parse_curl_args_honors_the_flags_it_accepts` (a blanket "reject everything" passes the first and
+fails the second).
+
+Two operational facts this pass paid for, recorded so the next change does not:
+
+- **Changing `vmcell-guest-tools` or `vmcell-guest-agent` requires rebuilding the rootfs before any
+  live suite means anything.** The applets are baked into `rootfs.erofs` by `vmcell build`, not by
+  `just test-*`; a warm rootfs runs the *old* binary and the suite reports on code that is not the
+  code under test. The `justfile` states this for a **new** applet (a missing `/vmcell-tools` path
+  fails loudly); a **changed** applet is the silent case, and is the one that bit here.
+- **That rebuild must pass `--kernel-source host-make`.** `vmcell build` defaults to
+  `KernelSource::Prebuilt` (only `build-kernels` defaults to `host-make`), so a bare `vmcell build`
+  swaps the locally built guest kernel for the prebuilt seed and reddens `nested_virt` and
+  `snapshot_restore`. Measured this pass; it cost a full privileged suite run to diagnose.
+
+### Config boundary hardening — including one fail-loud behavior change
+
+Three "honored or rejected at construction" holes closed in `VmConfig::build()`:
+
+- **Four cmdline *aliases*** join `RESERVED_CMDLINE_KEYS`: `rw` (inverts the owned `ro` — a Block
+  root would mount writable with `rootflags=noload` still suppressing journal replay) and
+  `quiet`/`debug`/`ignore_loglevel` (override the owned `loglevel=`, because caller args are
+  appended last). The `extra_kernel_args_cannot_clobber_reserved_tokens` coverage test compares
+  emitted *keys*, and an alias shares no key with the token it overrides, so it structurally cannot
+  discover one: the list is hand-maintained and guarded by
+  `reserved_cmdline_keys_cover_owned_token_aliases`, which checks both the predicate and the
+  boundary's actual refusal.
+- **`RootfsSource::effective_image()`** is the one law for which host file backs `/dev/vda`.
+  `build()` seeds the duplicate-backing-file set with it, so an extra disk can no longer alias the
+  effective root image — two attachments of one image is the rw corruption that guard already named.
+  Gate: `extra_disk_cannot_alias_the_root_disk_backing_file`, which recomputes the expected path
+  through the predicate rather than a test-local literal.
+- **A share tag must be exactly one `Component::Normal`.** `fs::VirtioFsDaemon::start` names the
+  vhost-user socket `<vm_tmp>/<tag>.sock`, so a tag carrying a path separator created and truncated
+  a caller-chosen file outside the per-VM scratch dir — outside what teardown sweeps.
+
+**The behavior change:** the rootfs image and overlay now get the same non-empty/absolute boundary
+checks every other host path input gets, so `VmConfig::build()` **rejects an empty or relative**
+rootfs path with `Error::Config` instead of failing late as a VMM "cannot open image". Existence
+stays unchecked, as for shares and extra disks. Two callers pass user-supplied paths straight
+through and are now fail-loud on a relative path: `vmcell-cli`'s `ephemeral_vm` and the validator's
+`base_cfg` (a §10.4 contract-surface crate). Accepted rather than papered over with a
+`canonicalize` at those boundaries — the message names the constraint, and a silently
+cwd-relative VM image is worse than a refusal. Gate: `rootfs_paths_are_validated_at_the_boundary`.
+
+### Firecracker restore rebinds the tap — and needs FC 1.8+ for a tap-bearing restore
+
+M1: FC's `restore()` sends `network_overrides` on `PUT /snapshot/load` so the restored VM binds the
+**fresh** `res.tap_name` instead of re-opening the tap name the snapshot baked (which is an orphan
+in the new netns — a dead data plane that no liveness proxy could see). Two things this does not
+change, stated because both invite the wrong inference: `restore_rotates_host_paths: false` is about
+the **vsock/serial host-socket identity**, not about the tap being baked; and the host tap name is
+not in QEMU's or crosvm's migration stream at all (both rebuild their argv from the fresh
+resources), so neither has an M1 analogue. *The cost:* `network_overrides` needs **Firecracker
+1.8+** — validated here on v1.16.0. An older FC would 400 on the unknown field; the tapless shape is
+unaffected because the key is a presence attribute (`skip_serializing_if`) and is omitted, which is
+also why it is round-tripped on the JSON codec FC actually ships over.
+
+### Recorded (justified): the guest-tools ↔ `netif` kernel-ABI duplication stays duplicated
+
+`vmcell-guest-tools` keeps its own `#[repr(C)]` `IfReq` + link-ioctl stack beside the audited copy in
+`vmcell_guest_agent::netif`, against "kernel ABI structs are defined once". docs/78 §6 offered
+consolidation or a recorded deviation; this is the deviation, and the at-site comments cite it.
+*Why not fold into the agent's lib:* `netif` exports exactly what PID 1 calls
+(`set_loopback_up`/`set_mac_bytes`/`set_ipv4`), while guest-tools also needs `set_link_up(dev, up)`
+and `read_ipv4` (`SIOCGIFADDR`/`SIOCGIFNETMASK`) — code PID 1 never executes. Consolidating grows the
+audited PID-1 surface, and its `unsafe` blocks, with dead-for-PID-1 code, which is backwards for C1;
+it would also make guest-tools link the agent's whole production graph to reuse ~60 lines of `libc`.
+(The lean-agent gate is *not* the objection — it reads `cargo tree -e no-dev -p vmcell-guest-agent`,
+a subtree a dependent cannot enter.) The honest consolidation is a third `libc`-only crate both
+depend on, which is a workspace-layout change, not a review-fix side effect.
+
+*What landed instead*, so the copies cannot drift silently: the request numbers are `libc`'s
+(`SIOC*`/`ARPHRD_ETHER`/`IFF_UP`, never a second local spelling of a kernel ABI value — the rule this
+file already applied to `VMADDR_CID_ANY`); the union sub-offsets are named constants mirroring
+`netif::HWADDR_{FAMILY,MAC}_OFFSET`; `ifreq_is_pinned_field_by_field_to_the_kernel_abi` pins both
+field offsets, both field sizes, the total size, the sockaddr-fits check and the three sub-offsets
+against `libc::ifreq`/`sockaddr`/`sockaddr_in`; and
+`ioctl_requests_match_the_kernel_abi_values_netif_hardcodes` pins the request numbers to the literals
+`netif` hardcodes. The error types now agree (`std::io::Result`, with `InvalidInput` for an overlong
+device name); one difference is deliberate and stated at its site — guest-tools tags each errno with
+the ioctl name, because its errors land on the persisted serial console, a restored guest's only
+observable. *Limit of the guard:* no guest-tools test can observe an edit to the agent's copy. Both
+are anchored to the same `libc` ABI, so a copy that drifts from the ABI reddens in its own crate; a
+*semantic* drift (a different ioctl order) is caught only by the live MAC-rotation legs of the
+restore suites. Retire this entry when the shared crate lands.
+
+### Validator, daemon-store and virtiofsd reconciliations
+
+- **`Level::Full`'s rustdoc is gated prose.** It no longer promises an egress-proxy check or §8.2
+  restore state-rotation assertions — neither ever shipped in `run_full`; it names the shipped roster
+  by check id and points at vmcell's own suite for the two absent legs.
+  `level_full_rustdoc_names_exactly_the_shipped_checks` parses the backticked ids out of the doc
+  block (`include_str!` of `lib.rs`) and asserts set-equality with the ids `run_full` records against
+  a `fail_create` `FakeVmm`. Deliberately scoped to `Level::Full`: each Full arm records or skips its
+  id on every path, so a fake run enumerates the whole roster, whereas the Core/Extended guest-facing
+  ids exist only after a real agent handshake — those rosters stay ungated, recorded here rather than
+  faked.
+- **Daemon snapshot prefixes are create-only, like every other name in the store.**
+  `Registry::snapshot` uses `create_dir` and maps `EEXIST` to `AlreadyExists` (409) instead of
+  silently overwriting. Because a prefix would otherwise be unfreeable, `ArtifactStore::delete` also
+  removes a snapshot prefix directory; one-shot prefixes were rejected as a permanent namespace leak.
+  Prefixes are deliberately **not** covered by the `pins()` delete-in-use guard: `restore_from`
+  copies via CoW at launch, so a booted VM holds no pin, and a DELETE racing an in-flight restore
+  falls under the already-recorded narrow `create` window in `delete_artifact_if_unused`. The
+  `.sha256` reservation is one predicate, `is_reserved_sidecar_name`, consulted by create (400), list
+  (skip) and info/delete (404) — the reaction differs per op, the law does not. Related:
+  `--allow-unauthenticated` is warned **per request** in `server::auth_layer`, driven by the pure
+  `AuthDecision::UnauthenticatedBypass` (so `authorize` stays log-free and unit-testable against its
+  inverses), with `vmcelld`'s one-time boot warn kept as the complementary signal.
+- **virtiofsd readiness is paced by the caller's profile, with one narrowing.**
+  `VirtioFsDaemon::start_paced(share, vm_tmp, &Timeouts)` drives the shared `vmm::wait_for_socket`
+  with `api_socket_poll` as the cadence and a named `SOCKET_READY_TIMEOUT_MS` ceiling (unchanged
+  total budget) instead of a hand-copied 20 ms grid; `start` remains a default-profile shim until the
+  CH and QEMU call sites pass `&cfg.timeouts`. *Deliberate narrowing:* the shared helper folds a
+  failing `try_wait` into the deadline, so a poll error now surfaces as the readiness failure **with**
+  the daemon's stderr rather than as its own message — nothing is swallowed, and the alternative was
+  keeping a second copy of the readiness loop alive to phrase one sentence. virtiofsd also now spawns
+  through `helper_daemon_pre_exec`, which arms `PR_SET_PDEATHSIG(SIGKILL)` after `setpgid(0,0)` and
+  refuses to exec if `getppid()` shows the parent died inside the fork→prctl window; its gate asserts
+  the *behavior*, not the flag, because `pdeath_signal` is per-task and `clone` zeroes it. The same
+  gap remains in QEMU's `vhost-device-vsock` helper and in `build_vmm_cmd`.
+
+### One-law consolidations completed in the same pass
+
+- **`RootfsSource::effective_image()` reaches all four backends.** The predicate landed at the
+  config boundary first; cloud-hypervisor, Firecracker, QEMU and crosvm now each derive the
+  `/dev/vda` backing file through it instead of inlining `overlay.as_ref().unwrap_or(image)`, so the
+  duplicate-backing-file guard and the wiring cannot diverge. Each backend gates it on its own
+  composed device config (e.g. `fc_root_drive_uses_the_effective_image_law`), because the argv/API
+  body is the only place a backend can silently attach the wrong file.
+- **`scripts/ban-inline-setns.sh` + its self-test** give S2's "one home for `setns`" a gate that can
+  go red: the two proxy sites had already been routed through `net_sys::setns_net`, but nothing
+  stopped a third inline `libc::setns` appearing. Allowed sites are `net_sys.rs` and the
+  `vmm/mod.rs` `pre_exec`; wired into `just ci` and the CI lint job beside the other ban scripts.
+- **Test scratch paths are owned, not swept.** `common::TempTree` (RAII, with
+  `VMCELL_KEEP_TEST_TEMP=1` for post-mortems) replaces the trailing
+  `let _ = std::fs::remove_dir_all(&dir)` idiom, which every panicking assertion skipped — and which
+  a nextest retry then leaked once per attempt. `tests/snapshot_restore.rs` had no removal at all,
+  so guest-RAM-sized snapshot dirs accumulated per run per backend until the host temp filesystem
+  hit its quota and the daemon suite went red on `Disk quota exceeded`. Names are unchanged (tests
+  and operators grep for them); only the ownership moved.
+
+### Still open after these two waves
+
+Named here so the next pass does not rediscover them, and so nothing above reads as complete when
+it is not:
+
+- On the backends, host USB is the remaining half of the eligibility law: crosvm's restore now runs
+  `reject_disk_io_throttle` like its create (gated by `restore_rejects_disk_io_throttle_like_create`),
+  but no backend's `restore()` runs the USB precheck its `create()` runs — QEMU splices `usb-host`
+  devices that were never capability-checked nor proven openable, and CH/FC/crosvm drop an accepted
+  `usb_host_devices` list silently. The orchestrator boundary covers every in-tree production path;
+  `Vmm` is a public trait, so a downstream consumer calling `vmm.restore()` directly bypasses it.
+- `vmcell-bench`'s `workspace_root()` is a third copy of the workspace ascent, and its backend-binary
+  table parallels the validator's `harness::*_bin` getters (held to the contract by a parity gate,
+  not by sharing code) — `vmcell`'s own resolvers are `pub(crate)`, so both collapse only via a
+  `vmcell`-side export. Same shape as the recorded `harness::ch_bin()` consolidation item.
+
+### Closed before this pass shipped
+
+Three items were on the list above when it was written and were closed in the same pass; recorded
+here so the ledger is not read as a to-do that was never done:
+
+- **The `build_vmm_cmd` SIG_DFL reset has its gate.** `tests/jail_hardening.rs`'s
+  `build_vmm_cmd_resets_inherited_ignored_signals_for_the_vmm_child` ignores INT/TERM in the test
+  process, asserts that as its positive control (so a green result cannot come from the parent never
+  having ignored them), spawns `/bin/cat /proc/self/status` through `build_vmm_cmd`, and asserts the
+  child's `SigIgn` bits for both signals are clear. KVM-free and root-free — `cat` installs no
+  handlers of its own, which is exactly what cloud-hypervisor does do, and why the daemon suite
+  cannot host this assertion. Red on deleting either `libc::signal(…, SIG_DFL)`, verified.
+- **`tests/common/mod.rs::computed_cgroup_name` recomputes through `vmcell::naming`** (F2). It is
+  consumed by residue checks whose whole purpose is to catch a naming change; a second copy of the
+  composer would have kept passing through the drift it exists to catch.
+- **The `+ep` runner-blessing predicate has one home.** `scripts/review-preflight-priv.sh` grew a
+  `--check-runner <path>` mode (exit 0 blessed / 2 bless-remediable) that dispatches to the same
+  `check_runner` the full preflight uses, and `just bless`'s idempotence skip calls it instead of
+  restating the caps test — the two copies had already diverged once on strictness. While fixing
+  that, a **latent flaw in `bless` itself** surfaced and was fixed: it copied the freshly-built
+  runner over the live stable path *before* `sudo setcap`, so a declined or unavailable sudo
+  (`sudo: a terminal is required to authenticate` in a non-interactive shell) destroyed a working
+  blessing and flipped the preflight from READY to BLOCKED-ON-BLESS. It now stages the copy under a
+  temp name, setcaps that, and renames it into place only on success (a rename preserves file
+  capabilities); a failed setcap removes the temp, says so, and leaves the previous blessing
+  untouched. The failure is handled explicitly rather than by a `RETURN` trap, because under
+  `set -e` a bare failing command exits the whole shell and the trap never fires.
+- `vmcell-bench`'s `workspace_root()` is a third copy of the workspace ascent, and its backend-binary
+  table parallels the validator's `harness::*_bin` getters (held to the contract by a parity gate,
+  not by sharing code) — `vmcell`'s own resolvers are `pub(crate)`, so both collapse only via a
+  `vmcell`-side export. Same shape as the recorded `harness::ch_bin()` consolidation item.

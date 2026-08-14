@@ -1,7 +1,7 @@
 # vmcell — Code Review (docs/78)
 
 A comprehensive review of the tree at `main` @ `5bda3c0` (`vmcell` 0.13.0 — the landed v30
-delta-register pass), against design v30 (`docs/74`), rubric v6 (`docs/75`), quality gates v4
+delta-register pass), against design v30 (`docs/historical/74`), rubric v6 (`docs/75`), quality gates v4
 (`docs/76`), `AGENTS.md`, and `docs/implementation-notes.md`. Dated 2026-08-13.
 
 **Method.** Twelve independent area reviews (core config, orchestrator/teardown, net, vmm/jail/CH,
@@ -317,7 +317,7 @@ Load-bearing properties whose stated gate cannot fail (non-negotiable rule 2):
 
 ### 9.1 Post-landing staleness (the highest-leverage doc fix)
 
-**AGENTS.md / docs/77** *(`agents-md-post-landing-staleness`)* still describes the pre-landing
+**AGENTS.md / docs/historical/77** *(`agents-md-post-landing-staleness`)* still describes the pre-landing
 world: "Current version: `vmcell` 0.12", a delta register "specified but not yet built" (which now
 actively mis-instructs reviews by excusing divergences that are no longer excusable), the stale
 "21/21" crosvm count (justfile says 28/28, dated), the future-tense USB recipe, and "the registry's

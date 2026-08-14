@@ -7,8 +7,13 @@ use vmcell::agent::protocol::{ExecRequest, Message};
 
 #[tokio::test]
 async fn test_exec_vsock_mock() {
-    let tmp = std::env::temp_dir().join(format!("vmcell-test-vsock-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    // OWNED (`common::TempTree`): the mock-server socket used to be removed by a trailing
+    // `remove_file` that any panicking assert below skips. The path has no UUID, so a leaked
+    // socket from a same-pid prior run would break the `bind`; the guard removes it on the panic
+    // path too.
+    let sock_guard =
+        common::TempTree::reserve(&format!("vmcell-test-vsock-{}", std::process::id()));
+    let tmp = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&tmp).expect("Failed to bind UDS");
 
     let vsock_path = tmp.clone();
@@ -83,7 +88,6 @@ async fn test_exec_vsock_mock() {
     assert_eq!(outcome.stdout, b"hello\n");
 
     server_task.await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 }
 
 /// Mock-server helper: accept the UDS connection, complete the `CONNECT`/`OK`
@@ -140,8 +144,9 @@ fn serial_log() -> vmcell::vmm::RealSerialLog {
 // the stale Exit(0) and wrongly return Ok.
 #[tokio::test]
 async fn exec_timeout_desyncs_subsequent_put_file() {
-    let tmp = std::env::temp_dir().join(format!("vmcell-desync-exec-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let sock_guard =
+        common::TempTree::reserve(&format!("vmcell-desync-exec-{}", std::process::id()));
+    let tmp = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();
 
@@ -182,7 +187,6 @@ async fn exec_timeout_desyncs_subsequent_put_file() {
     );
 
     server.abort();
-    let _ = std::fs::remove_file(&tmp);
 }
 
 // H-AGENT-1 (symmetric): after a put_file() timeout desyncs the stream, the next
@@ -191,8 +195,9 @@ async fn exec_timeout_desyncs_subsequent_put_file() {
 // proceed and return Ok(code 0) from the stale frame.
 #[tokio::test]
 async fn put_file_timeout_desyncs_subsequent_exec() {
-    let tmp = std::env::temp_dir().join(format!("vmcell-desync-put-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let sock_guard =
+        common::TempTree::reserve(&format!("vmcell-desync-put-{}", std::process::id()));
+    let tmp = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();
 
@@ -236,7 +241,6 @@ async fn put_file_timeout_desyncs_subsequent_exec() {
     );
 
     server.abort();
-    let _ = std::fs::remove_file(&tmp);
 }
 
 // LOW (asymmetric frame caps): the host codec must accept a frame larger than
@@ -248,8 +252,8 @@ async fn host_codec_accepts_frame_above_default_8mib() {
     let payload = vec![0xABu8; 8 * 1024 * 1024 + 64 * 1024];
     let expected = payload.clone();
 
-    let tmp = std::env::temp_dir().join(format!("vmcell-bigframe-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let sock_guard = common::TempTree::reserve(&format!("vmcell-bigframe-{}", std::process::id()));
+    let tmp = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();
 
@@ -289,7 +293,6 @@ async fn host_codec_accepts_frame_above_default_8mib() {
     assert_eq!(outcome.stdout, expected);
 
     server.await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 }
 
 // M-GUEST-4: the connect loop must FAST-FAIL when the serial log shows a kernel
@@ -301,9 +304,9 @@ async fn host_codec_accepts_frame_above_default_8mib() {
 async fn connect_panic_in_serial_log_fails_fast() {
     // A socket path that does NOT exist: connect must return via the panic check
     // (which precedes `UnixStream::connect`), so it never depends on this path.
-    let vsock_path =
-        std::env::temp_dir().join(format!("vmcell-nopath-{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&vsock_path);
+    let sock_guard =
+        common::TempTree::reserve(&format!("vmcell-nopath-{}.sock", std::process::id()));
+    let vsock_path = sock_guard.path().to_path_buf();
 
     let serial = vmcell::vmm::FakeSerialLog { panicked: true };
 
@@ -340,8 +343,8 @@ async fn connect_panic_in_serial_log_fails_fast() {
 // timeout arm: the follow-up request would NOT fail loud with "reconnect required".
 #[tokio::test]
 async fn stream_error_desyncs_subsequent_request() {
-    let tmp = std::env::temp_dir().join(format!("vmcell-streamerr-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let sock_guard = common::TempTree::reserve(&format!("vmcell-streamerr-{}", std::process::id()));
+    let tmp = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();
 
@@ -381,7 +384,6 @@ async fn stream_error_desyncs_subsequent_request() {
     );
 
     server.await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 }
 
 // M-GUEST-4: reconnect() must CLEAR the desynced flag (mod.rs:224) so requests work
@@ -390,8 +392,8 @@ async fn stream_error_desyncs_subsequent_request() {
 // "reconnect required" instead of succeeding.
 #[tokio::test]
 async fn reconnect_clears_desynced() {
-    let tmp = std::env::temp_dir().join(format!("vmcell-reconnect-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let sock_guard = common::TempTree::reserve(&format!("vmcell-reconnect-{}", std::process::id()));
+    let tmp = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&tmp).expect("bind UDS");
     let vsock_path = tmp.clone();
 
@@ -472,7 +474,6 @@ async fn reconnect_clears_desynced() {
     );
 
     server.await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 }
 
 // ---------------------------------------------------------------------------
@@ -498,10 +499,10 @@ async fn read_connect_line(stream: &mut tokio::net::UnixStream) -> String {
     }
 }
 
-fn dial_socket_path(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("vmcell-dial-{tag}-{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&p);
-    p
+/// Returns an OWNED (`common::TempTree`) mock-bridge socket path: the guard's `Drop` removes it on
+/// the success path and on the panic path, replacing the trailing `remove_file` each caller carried.
+fn dial_socket_path(tag: &str) -> common::TempTree {
+    common::TempTree::reserve(&format!("vmcell-dial-{tag}-{}.sock", std::process::id()))
 }
 
 // The raw dial's happy path over the hybrid AF_UNIX bridge, KVM-free: the mock
@@ -522,7 +523,8 @@ fn dial_socket_path(tag: &str) -> std::path::PathBuf {
 // and `dial_vsock_host_half_close_forwards_*` (the two backends where it works).
 #[tokio::test]
 async fn dial_vsock_round_trips_bytes_over_the_hybrid_bridge() {
-    let sock = dial_socket_path("echo");
+    let sock_guard = dial_socket_path("echo");
+    let sock = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&sock).expect("bind mock bridge");
 
     let server = tokio::spawn(async move {
@@ -582,7 +584,6 @@ async fn dial_vsock_round_trips_bytes_over_the_hybrid_bridge() {
         back, payload,
         "every echoed byte must come back to the host"
     );
-    let _ = std::fs::remove_file(&sock);
 }
 
 // The dead-port signal CH's and Firecracker's in-VMM muxers send: accept the
@@ -593,7 +594,8 @@ async fn dial_vsock_round_trips_bytes_over_the_hybrid_bridge() {
 // `Error::Timeout`) and the elapsed bound (it would spin the full 10 s) flip.
 #[tokio::test]
 async fn dial_vsock_dead_port_fails_fast_with_a_typed_error() {
-    let sock = dial_socket_path("deadport");
+    let sock_guard = dial_socket_path("deadport");
+    let sock = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&sock).expect("bind mock bridge");
 
     let server = tokio::spawn(async move {
@@ -628,7 +630,6 @@ async fn dial_vsock_dead_port_fails_fast_with_a_typed_error() {
         "the dial must FAIL FAST on a dead port (took {elapsed:?}); a dial reusing the \
          agent connect's retry loop would spin to the {budget:?} deadline"
     );
-    let _ = std::fs::remove_file(&sock);
 }
 
 // The other refusal shape, QEMU's external `vhost-device-vsock` daemon on a dead
@@ -641,7 +642,8 @@ async fn dial_vsock_dead_port_fails_fast_with_a_typed_error() {
 // `Error::Agent` (the variant assert).
 #[tokio::test]
 async fn dial_vsock_accept_and_hang_times_out_typed() {
-    let sock = dial_socket_path("hang");
+    let sock_guard = dial_socket_path("hang");
+    let sock = sock_guard.path().to_path_buf();
     let listener = UnixListener::bind(&sock).expect("bind mock bridge");
 
     let server = tokio::spawn(async move {
@@ -675,7 +677,6 @@ async fn dial_vsock_accept_and_hang_times_out_typed() {
         "the per-byte read budget must bound the hang (took {elapsed:?}), far inside the \
          {budget:?} dial budget"
     );
-    let _ = std::fs::remove_file(&sock);
 }
 
 mod common;

@@ -142,7 +142,14 @@ impl std::fmt::Debug for JailSpec {
 
 impl JailSpec {
     /// Returns `true` if this spec would apply no hardening at all (every flag off, no
-    /// rlimits, no filter) — so `build_vmm_cmd` can skip installing a no-op `pre_exec`.
+    /// rlimits, no filter).
+    ///
+    /// Descriptive only — it gates nothing, and has **no production caller** in the workspace.
+    /// `build_vmm_cmd` installs its `pre_exec` closure unconditionally (docs/78 M9): that closure
+    /// also resets SIGINT/SIGTERM to `SIG_DFL` and joins the netns, and both must happen even for
+    /// a no-op jail, so "the jail is a no-op" is not a reason to skip it. The predicate exists for
+    /// the tests that assert [`JailConfig::hardened`] hardens and [`JailConfig::disabled`] does
+    /// not.
     #[must_use]
     pub fn is_noop(&self) -> bool {
         !self.no_new_privs

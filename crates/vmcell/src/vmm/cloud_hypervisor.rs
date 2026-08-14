@@ -178,18 +178,25 @@ fn ch_rate_limiter(limit: &crate::config::DiskIoLimit) -> ChRateLimiter {
 /// contract with the cmdline's `root=/dev/vda`. Pure, so the ordering is unit-testable
 /// without a running VMM. A virtio-fs rootfs contributes no disk (unreachable here —
 /// `create()` rejects it up front, VMM-1 — kept for match exhaustiveness).
+///
+/// *Which* host file backs the root disk comes from the one law,
+/// [`RootfsSource::effective_image`](crate::config::RootfsSource::effective_image) — the same
+/// predicate the config boundary's duplicate-backing-file guard uses, so the guard can never
+/// protect a file this wiring does not attach. The match stays exhaustive over the variants
+/// (a new `RootfsSource` must be a compile error here) because the `readonly` flag is
+/// per-variant.
 fn build_ch_disks(cfg: &VmConfig) -> Vec<ChDisk> {
     let mut disks = Vec::with_capacity(1 + cfg.extra_disks.len());
     match &cfg.rootfs {
-        crate::config::RootfsSource::Erofs { image } => disks.push(ChDisk {
-            path: image.clone(),
+        crate::config::RootfsSource::Erofs { .. } => disks.push(ChDisk {
+            path: cfg.rootfs.effective_image().to_path_buf(),
             readonly: true,
             direct: false,
             image_type: CH_RAW_IMAGE_TYPE,
             rate_limiter_config: None,
         }),
-        crate::config::RootfsSource::Block { image, overlay } => disks.push(ChDisk {
-            path: overlay.as_ref().unwrap_or(image).clone(),
+        crate::config::RootfsSource::Block { .. } => disks.push(ChDisk {
+            path: cfg.rootfs.effective_image().to_path_buf(),
             readonly: false,
             direct: false,
             image_type: CH_RAW_IMAGE_TYPE,
@@ -997,6 +1004,77 @@ mod tests {
             !json.contains("rate_limiter_config"),
             "unthrottled disk must omit rate_limiter_config: {json}"
         );
+    }
+
+    // One law, one predicate (§13, Cross-cutting invariants): the file the root disk is
+    // composed from is `RootfsSource::effective_image` — the SAME predicate the config
+    // boundary's duplicate-backing-file guard uses. The two used to be separate copies of
+    // `overlay.as_ref().unwrap_or(image)`, so a divergence would have let the guard protect a
+    // file this wiring does not attach (an extra disk aliasing the real root would pass
+    // validation, and the guest would get two writable attachments of one image). Expected
+    // values are recomputed THROUGH the helper, never a test-local literal. Buggy impl this
+    // guards: attaching the base image while an overlay is set (the writes then land in the
+    // shared base and every VM corrupts every other) — that reddens the overlay leg here.
+    #[test]
+    fn build_ch_root_disk_uses_the_effective_image_law() {
+        use crate::config::{RootfsSource, VmConfig};
+
+        let base = PathBuf::from("/img/base.raw");
+        let overlay = PathBuf::from("/img/vm-7-overlay.raw");
+
+        // Plain image: no overlay, so the base IS the effective image.
+        let plain = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Block {
+                image: base.clone(),
+                overlay: None,
+            },
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            build_ch_disks(&plain)[0].path,
+            plain.rootfs.effective_image(),
+            "the root disk must be the effective image"
+        );
+
+        // Overlay set: the overlay backs /dev/vda and the base is never attached.
+        let with_overlay = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Block {
+                image: base.clone(),
+                overlay: Some(overlay),
+            },
+        )
+        .build()
+        .unwrap();
+        let disks = build_ch_disks(&with_overlay);
+        assert_eq!(
+            disks[0].path,
+            with_overlay.rootfs.effective_image(),
+            "with an overlay set, the overlay backs /dev/vda"
+        );
+        // Non-vacuous: the two paths genuinely differ, so the assertion above is not
+        // satisfied by the base image.
+        assert_ne!(
+            with_overlay.rootfs.effective_image(),
+            base,
+            "the overlay case must not resolve to the base image"
+        );
+        assert!(!disks[0].readonly, "a Block root is writable");
+
+        // EROFS: the image itself, read-only.
+        let erofs = VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .build()
+        .unwrap();
+        let erofs_disks = build_ch_disks(&erofs);
+        assert_eq!(erofs_disks[0].path, erofs.rootfs.effective_image());
+        assert!(erofs_disks[0].readonly, "an EROFS root is read-only");
     }
 
     // §4.6 (Extra virtio-blk devices and disk-I/O throttling): a DiskIoLimit becomes CH's `rate_limiter_config` token buckets — bandwidth

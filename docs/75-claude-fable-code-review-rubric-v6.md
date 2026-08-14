@@ -5,7 +5,7 @@
 restructure with its (now fully landed) delta register, the post-v28 implementation record
 (`docs/implementation-notes.md`: the 0.9 → 0.10 pass as built, the docs/72 review-fix pass, the
 backend extraction, the QEMU suspend/resume pass, the two crosvm passes), and the **v30 design**
-(`docs/74-claude-fable-design-v30.md` — the downstream-platform pass) with its nine-delta register
+(`docs/historical/74-claude-fable-design-v30.md` — the downstream-platform pass) with its nine-delta register
 (§18) and recorded reversals (Appendix A). Its job is to stop the **classes** of defect those
 sources found from recurring — not to re-list individual findings. This **v6 rubric** supersedes v5
 (`docs/69`, reissued to `docs/historical/`); v6 **re-bases every "delta N" reference on the landed

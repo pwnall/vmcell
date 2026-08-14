@@ -60,14 +60,14 @@ async fn qemu_restore_with_rotated_cid_reaches_agent() {
     };
 
     let id = uuid::Uuid::new_v4();
-    let snapshot_dir = std::env::temp_dir().join(format!(
+    // OWNED (`common::TempTree`): the trailing `remove_dir_all` this used to rely on is skipped by
+    // every panicking assertion below, and a snapshot dir is guest-RAM-sized.
+    let scratch = common::TempTree::reserve(&format!(
         "vmcell-qemu-cid-rotation-{}-{}",
         std::process::id(),
         id
     ));
-    if snapshot_dir.exists() {
-        std::fs::remove_dir_all(&snapshot_dir).unwrap();
-    }
+    let snapshot_dir = scratch.path().to_path_buf();
 
     let env = vmcell::HostEnv::hermetic();
 
@@ -168,6 +168,5 @@ async fn qemu_restore_with_rotated_cid_reaches_agent() {
 
         vm.shutdown().await.expect("shutdown restored");
     }
-
-    let _ = std::fs::remove_dir_all(&snapshot_dir);
+    // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }

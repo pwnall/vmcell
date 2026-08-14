@@ -10,11 +10,17 @@ not pass/fail gates** — absolute numbers are hardware-bound and only meaningfu
 > canonical (it added the first QEMU restore/suspend numbers after the suspend/resume + session-
 > persistence + security-hardening rounds); the **2026-07-04** matrix below that filled the FC/QEMU
 > coverage gaps; the 2026-07-02 section is below that, then the 2026-07-01 profile-matrix baseline
-> plus the `docs/45` experiment pass (EXP-A…E, incl. the Firecracker warm-restore unlock). The
-> historical pass sections further down record how the system got here (CH cold 642→330 ms, CH
+> plus the EXP-A…E experiment pass (incl. the Firecracker warm-restore unlock). The historical
+> pass sections further down record how the system got here (CH cold 642→330 ms, CH
 > restore 166→84→60 ms); the detailed sub-analyses (kernel sweep, eager/lazy) were measured
 > **pre-pass**: their *relative* conclusions still hold, but their absolute cold/restore ms are
 > superseded by the tables below.
+>
+> **Tails do not compare across 2026-07-03.** The percentile helper used `floor(n·q)`, which at N=20
+> returned the sample *maximum* as p95; it was corrected to nearest-rank `ceil(q·n) − 1` on
+> 2026-07-03 (`pcts` in `crates/vmcell-bench/src/bin/bench-vm.rs`), so every p95/p99 in a section
+> dated before that is an upper bound, not a comparable tail — the p50s are unaffected, and the
+> 2026-07-04 matrix is the first measured on the corrected estimator.
 
 ## Full backend×mode matrix (2026-07-17, HEAD `05fe674`) — CANONICAL
 
@@ -613,9 +619,9 @@ gate (`#[ignore]`d; runs in `just test-privileged` via `--run-ignored all`, not 
 `just ci`). *Measurement note:* QEMU `start()` now waits for the control plane to come live, so in a
 future phase-budget re-run its cost shifts from `connect` into `create` (TOTAL unchanged).
 
-## Post-investigation matrix (2026-07-02 — after the docs/45 experiment pass) — PRIOR CANONICAL
+## Post-investigation matrix (2026-07-02 — after the EXP-A…E experiment pass) — PRIOR CANONICAL
 
-The docs/45 investigation (EXP-A…E) landed on top of the 2026-07-01 baseline below. Same
+The EXP-A…E investigation landed on top of the 2026-07-01 baseline below. Same
 substrate/method. What changed: readiness-poll unification (EXP-A), `cryptomgr.notests
 raid=noautodetect` cmdline trims (EXP-B), event-driven guest accept via poll(2) (EXP-C),
 teardown grace deadline-before-RPC + adaptive poll step (EXP-D), and **Firecracker warm restore
@@ -624,6 +630,7 @@ was the real cause of the historical "Agent … timed out" flake — QEMU now dr
 iterations).
 
 **Time-to-ready (latency mode), p50 / p95 ms — Δ vs the 07-01 baseline below:**
+*(Pre-fix estimator: the p95/p99 here are upper bounds — see the header caveat; the p50s compare.)*
 
 | Backend | `default` cold | `default` restore | `low_latency` restore |
 | --- | --- | --- | --- |
@@ -642,14 +649,15 @@ iterations).
 | QEMU cold | 1112 | ~1080 (n=14) |
 
 Per-experiment attribution, mechanisms, bug-risk analysis, and the FC-restore unlock narrative:
-`docs/45-claude-perf-investigation.md`; deviations: `docs/implementation-notes.md`.
+`docs/historical/45-claude-perf-investigation.md`; deviations: `docs/implementation-notes.md`.
 
-## Profile-matrix re-run (2026-07-01, HEAD `37c5067`) — the docs/45 baseline
+## Profile-matrix re-run (2026-07-01, HEAD `37c5067`) — the EXP-A…E baseline
 
 Same substrate as below; N=20 (latency) / N=12 (phase-budget), warmup=3, mem=256 MiB,
 freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matrix.
 
 **Time-to-ready (latency mode: start|restore → agent `Ready`), p50 / p95 ms:**
+*(Pre-fix estimator: the p95/p99 here are upper bounds — see the header caveat; the p50s compare.)*
 
 | Backend | `default` cold | `low_latency` cold | `default` restore | `low_latency` restore |
 | --- | --- | --- | --- | --- |
@@ -671,8 +679,8 @@ freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matr
 - The `throughput` preset (50 ms shutdown grace) cuts **~200 ms** off every graceful lifecycle;
   CH restore e2e lands at **161 ms**. (RAII `Drop` consumers pay ~27 ms teardown regardless.)
 - † QEMU intermittently loses iterations to the known environmental agent-timeout flake
-  (`docs/perf-experiments-log.md` "Flake investigation"): latency-mode counts were 17/20 and
-  16/20, and the throughput phase-budget needed retries to complete a full n=12 pass (a
+  (`docs/historical/44-claude-perf-experiments.md` "Flake investigation"): latency-mode counts
+  were 17/20 and 16/20, and the throughput phase-budget needed retries to complete a full n=12 pass (a
   failure breaks the phase loop). CH/FC dropped zero iterations across the whole matrix.
 - vsock exec RTT floor re-confirmed: **p50 711 µs / p95 852 µs / p99 1013 µs** (CH, 200×).
 
@@ -707,7 +715,8 @@ multi-second VM lifecycle.
 
 N=20, warmup=3, mem=256 MiB. Cold = warm-cache (see caveats). All ms. **As measured right after
 the 2026-07-01 optimization pass** (pre native-resync / pre shared-cmdline-builder; canonical
-current numbers are in the profile-matrix section above):
+current numbers are in the profile-matrix section above).
+*(Pre-fix estimator: the p95/p99 here are upper bounds — see the header caveat; the p50s compare.)*
 
 | Backend | Cold p50 / p95 | Warm restore p50 / p95 |
 | --- | --- | --- |
@@ -736,7 +745,7 @@ The correct-but-slower code (vs earlier buggy-fast versions) carried recoverable
 conservative constants and one always-on grace sleep. This pass recovered it **without relaxing an
 invariant** (fail-loud, the desync flag, the mandatory post-restore clock resync, re-bind-after-
 restore, ordered teardown all preserved). Per-experiment deltas + bug-risk analysis:
-`docs/perf-experiments-log.md`; the deviations: `docs/implementation-notes.md`.
+`docs/historical/44-claude-perf-experiments.md`; the deviations: `docs/implementation-notes.md`.
 
 | Metric (CH, p50) | baseline | final | Δ |
 | --- | --- | --- | --- |
@@ -770,10 +779,11 @@ What changed (each measured independently, all kept):
    OK-read timeout 500→150 ms, CH api-socket poll 20→5 ms. Marginal on CH (**−4 cold / −6 restore**),
    but confirms the connect slack is guest-side and improves worst-case robustness.
 
-## Tunable config knobs + native resync (2026-07-01 follow-up, design 44)
+## Tunable config knobs + native resync (2026-07-01 follow-up, the perf-config design)
 
 Made the pass's constants per-VM tunable and removed the last restore subprocess cost. Details +
-bug-risk per change: `docs/perf-experiments-log.md` (Phases 1–2); deviations: `docs/implementation-notes.md`.
+bug-risk per change: `docs/historical/44-claude-perf-experiments.md` (Phases 1–2); the knob design:
+`docs/historical/44-claude-perf-config-design.md`; deviations: `docs/implementation-notes.md`.
 
 | Result (CH, p50) | value | note |
 | --- | --- | --- |
@@ -789,7 +799,7 @@ bug-risk per change: `docs/perf-experiments-log.md` (Phases 1–2); deviations: 
 clamped guest-side). `perf kvm stat` for a direct exit count is blocked by `perf_event_paranoid=4` on
 this host, so the `verbose`-vs-`balanced` A/B is the exit evidence.
 
-## Console transport knob — virtio-console vs UART (2026-07-02, design 44 §1b)
+## Console transport knob — virtio-console vs UART (2026-07-02, the perf-config design §1b)
 
 `ConsoleMode` (default `Uart`=`ttyS0`; opt-in `VirtioConsole`=`hvc0`) on `VmConfig`. UART is a per-byte
 PIO VM-exit; virtio-console batches over a virtqueue. Measured (CH cold, freq-pinned):
@@ -842,6 +852,7 @@ registry as a tracked alternative.
 ## Macro — Eager vs lazy restore (CH, `prefault`)
 
 N=20, warmup=3, mem=256 MiB. Warm restore → agent response (ms).
+*(Pre-fix estimator: the p95/p99 here are upper bounds — see the header caveat; the p50s compare.)*
 
 | restore-mode | p50 | p95 | max |
 | --- | --- | --- | --- |
@@ -910,6 +921,7 @@ untouched.
 — a sub-millisecond control-plane floor at the base clock, unchanged by the optimization pass (the
 poll-cadence levers touch connect/accept, not the established-stream exec RTT); not an `exec`
 bottleneck.
+*(Pre-fix estimator: the p95/p99 here are upper bounds — see the header caveat; the p50s compare.)*
 
 ## Artifact sizes (§16 — Performance) — OCI base vs mmdebstrap *(kernel-independent; unchanged)*
 
@@ -935,8 +947,23 @@ The OCI base is **~52% smaller** (the official image strips locale/doc/man via `
 musl-static is **6.2% larger**, builds without `musl-gcc` (pure-Rust agent). Real deciding axis is
 toolchain-availability + rootfs-independence, not size → keep glibc-dynamic default.
 
+## Re-running these numbers
+
+`scripts/perf-matrix.sh` drives every mode through `bench-vm` under the blessed runner and a
+delegated cgroup scope; `scripts/run-bench.sh` is the one-invocation form. Two facts post-date the
+2026-07-17 canonical run:
+
+- `--mode daemon-api` now **rejects** a non-`cloud-hypervisor` `--backend` and any `--kernel <label>`
+  (exit 1) rather than mislabeling the results table — the daemon backend is CH and it boots the
+  store's plain `vmlinux`. `perf-matrix.sh` already passes `--backend cloud-hypervisor`; an
+  out-of-tree runbook passing either flag must drop it.
+- `build_vmm_cmd` installs its `pre_exec` closure **unconditionally** (the SIGINT/SIGTERM `SIG_DFL`
+  reset has to hold even with no netns and a no-op jail), so a VMM spawn no longer takes std's
+  `posix_spawn` fast path. One extra `fork`+`exec` against a multi-hundred-ms boot; unmeasured, and
+  the next matrix re-run is where it would show.
+
 ---
-*Full analysis, methodology, and the open-question resolutions are in `implementation-notes.md`
-("Benchmark results — resolving the §16 (Performance) / §15 (Testing strategy) open questions" and the later fix sections). The detailed
-in-notes §16 (Performance) tables were the first pass on the then-pinned 6.6.9 kernel; this doc is the canonical
-re-run on the committed 6.12.94 pin.*
+*This doc is canonical for every measured number; each section states its own substrate and method.
+The per-pass reconciliations live in `docs/implementation-notes.md` — "Coverage-gap perf probes"
+(rounds 1–2) for what each probe measures and does not, and "Perf-script logic moved into the bench
+crate" for the harness move.*

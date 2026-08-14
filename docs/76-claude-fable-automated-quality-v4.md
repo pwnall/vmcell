@@ -4,7 +4,7 @@ Deployable contents for every automatable gate in `docs/75-claude-fable-code-rev
 (rubric v6, Parts D/E). v4 supersedes v3 (`docs/historical/70-claude-fable-automated-quality-v3.md`),
 reconciled against the **as-built v3 landing** (the four justified gate corrections recorded in
 `docs/implementation-notes.md`, "Automated quality gates (docs/70 v3)", are folded in here as the
-authoritative shapes) and against **design v30** (`docs/74-claude-fable-design-v30.md`) with its
+authoritative shapes) and against **design v30** (`docs/historical/74-claude-fable-design-v30.md`) with its
 nine-delta register. Sections are one of two kinds: **full contents** for files this doc owns, or
 **delta** for repo-owned files, giving only the lines to add in the repo's established idiom
 (monolithic `ci` recipe, step-mirrored `ci.yml`, per the docs/historical/54 implementation report

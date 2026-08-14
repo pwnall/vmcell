@@ -154,6 +154,8 @@ jobs:
           ./scripts/test-ban-agent-ip-shellout.sh  # the ip-shellout gate's own red-on-inverse self-test
           ./scripts/ban-artifact-path-join.sh      # P3/B12: no inline `<dir>.join(client)` outside resolve_artifact_path (daemon crate)
           ./scripts/test-ban-artifact-path-join.sh # the artifact-path gate's own red-on-inverse self-test
+          ./scripts/ban-inline-setns.sh            # S2/delta 8: no raw `setns` outside net_sys::setns_net + the one pre_exec site
+          ./scripts/test-ban-inline-setns.sh       # the inline-setns gate's own red-on-inverse self-test
           ./scripts/test-review-preflight-priv.sh  # preflight three-way verdict (bless-only sentinel): classifier red-on-inverse self-test
 
       - name: vendored vhost patch is live (M-VEND-3, here and downstream)

@@ -45,8 +45,10 @@ fn capability_honesty_virtio_fs_shares() {
 
 async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
     let id = uuid::Uuid::new_v4();
+    // OWNED (`common::TempTree`): the trailing `remove_dir_all` is skipped by every panicking
+    // assertion between here and it, and a nextest retry re-runs the whole body.
     let tmp =
-        std::env::temp_dir().join(format!("vmcell-test-shares-{}-{}", std::process::id(), id));
+        common::TempTree::create(&format!("vmcell-test-shares-{}-{}", std::process::id(), id));
     let in_dir = tmp.join("in");
     let out_dir = tmp.join("out");
     std::fs::create_dir_all(&in_dir).unwrap();
@@ -90,5 +92,5 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
         .expect("virtio-fs RO/RW share contract");
 
     vm.kill().await.unwrap();
-    let _ = std::fs::remove_dir_all(tmp);
+    // No trailing removal: `tmp` owns the tree and drops here (and on any panic above).
 }

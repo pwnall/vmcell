@@ -1856,10 +1856,9 @@ impl<V: Vmm> Drop for MicroVm<V> {
 /// arms `MicroVm::restore_inner`'s boundary-2 re-check and the zygote fan-out's fail-fast gate
 /// (`zygote::check_clone_eligible`) had open-coded twice — the pair had already needed lock-step
 /// edits and had drifted arm-for-arm (docs/78 S1), and every new arm (custom init, host USB) would
-/// have been a third copy. `restore_inner` calls it; **`check_clone_eligible` is still to be
-/// routed through it** (that file is outside this change's set — docs/78 S1's remaining half), so
-/// until then the zygote's fail-fast gate carries the older, narrower arm list and the new arms
-/// are enforced for clones at the per-clone restore boundary instead.
+/// have been a third copy. **Both boundaries now read this function**, so an arm can never reach
+/// one and miss the other; the drift it was extracted from is exactly what let a custom-init
+/// config be fanned out into clones whose mandatory resync is unreachable.
 ///
 /// **Config-only by construction**: it takes nothing but a `&VmConfig`, so it runs before any
 /// per-VM resource — or any copy-on-write clone of a suspend image — is minted. The

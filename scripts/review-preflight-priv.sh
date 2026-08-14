@@ -25,7 +25,10 @@
 # exit-2 split exists because agents kept reading a bless-fixable NOT-READY as a genuinely-missing
 # facility and downgrading themselves — the exact reflex AGENTS.md rule 5 removes.
 #
-# Usage: scripts/review-preflight-priv.sh
+# Usage: scripts/review-preflight-priv.sh [--check-runner <runner-path>]
+#   --check-runner runs ONLY the blessed-runner probe against <runner-path> and exits
+#   0 (blessed) / 2 (bless-remediable). It is the ONE home of that predicate: `just bless`'s
+#   idempotence skip calls it instead of restating the caps check.
 # Honors (each defaults to the real host path; overridable ONLY so the red-on-inverse self-test,
 # test-review-preflight-priv.sh, can drive each probe through a fixture. This probe reports whether
 # the suites can run for the reviewer themselves — it is NOT a security boundary, so an overridden
@@ -60,17 +63,8 @@ env_problems=()     # environmental: NOT fixable by `just bless`  ⇒ exit 1, ge
 bless_problems=()   # bless-remediable: runner build/caps/stamp   ⇒ exit 2, BLOCKED-ON-BLESS
 note() { printf '  %s\n' "$1"; }
 
-echo "== vmcell privileged-review preflight =="
-
-# 1) KVM ------------------------------------------------------------ (environmental)
-if [ -e "$KVM_DEV" ] && [ -r "$KVM_DEV" ] && [ -w "$KVM_DEV" ]; then
-  note "KVM        : OK ($KVM_DEV readable+writable)"
-else
-  note "KVM        : MISSING or not accessible ($KVM_DEV)"
-  env_problems+=("No usable $KVM_DEV. Privileged review needs a KVM-capable host with $KVM_DEV rw (kvm group or an ACL grant). This is not something \`just bless\` can fix.")
-fi
-
-# 2) Capability runner blessed with +ep ------------------------- (bless-remediable)
+# The capability-runner probe (bless-remediable). Defined before the banner so
+# `--check-runner` can dispatch to it without running any unrelated probe.
 check_runner() {
   local path="$1" caps
   if [ ! -x "$path" ]; then
@@ -95,6 +89,31 @@ check_runner() {
     bless_problems+=("Capability runner $path lacks cap_net_admin,cap_sys_admin,cap_dac_override with the effective bit (+ep). Caps strip on every rebuild. Run \`just bless\`. (A +p-only blessing is NOT enough — the runner checks the EFFECTIVE set.)")
   fi
 }
+
+# ONE LAW, ONE PREDICATE: `just bless`'s idempotence skip asks the same question this probe does —
+# "does the stable copy still carry all three caps with the EFFECTIVE bit?" — and a second copy of
+# it had already diverged once on strictness (the `*ep*` substring the L-BIN-2 note above describes).
+# `--check-runner <path>` exposes exactly `check_runner` so the recipe calls THIS function instead
+# of restating it: exit 0 = blessed, 2 = bless-remediable, matching the whole-preflight verdict
+# codes. It prints the same one-line note, so a caller can surface it verbatim.
+if [ "${1:-}" = "--check-runner" ]; then
+  [ -n "${2:-}" ] || { echo "usage: $0 --check-runner <runner-path>" >&2; exit 1; }
+  check_runner "$2"
+  [ ${#bless_problems[@]} -eq 0 ] && exit 0
+  exit 2
+fi
+
+echo "== vmcell privileged-review preflight =="
+
+# 1) KVM ------------------------------------------------------------ (environmental)
+if [ -e "$KVM_DEV" ] && [ -r "$KVM_DEV" ] && [ -w "$KVM_DEV" ]; then
+  note "KVM        : OK ($KVM_DEV readable+writable)"
+else
+  note "KVM        : MISSING or not accessible ($KVM_DEV)"
+  env_problems+=("No usable $KVM_DEV. Privileged review needs a KVM-capable host with $KVM_DEV rw (kvm group or an ACL grant). This is not something \`just bless\` can fix.")
+fi
+
+# 2) Capability runner blessed with +ep ------------------------- (bless-remediable)
 check_runner "$RUNNER_DEBUG"     # the one `just test-privileged` uses
 # The release runner is optional for `just test-privileged` (which wraps with the DEBUG build), but
 # `just bless` blesses both. If a release runner IS present, verify it too so a half-blessed install

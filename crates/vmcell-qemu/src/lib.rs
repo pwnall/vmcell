@@ -1049,21 +1049,25 @@ fn build_qemu_command(
             .arg("vhost-user-vsock-pci,chardev=vvsock");
     }
 
+    // *Which* host file backs `/dev/vda` is the one law,
+    // `RootfsSource::effective_image` — the same predicate the config boundary's
+    // duplicate-backing-file guard uses, so the guard can never protect a file this argv does
+    // not attach. The match below stays exhaustive over the variants (a new `RootfsSource` must
+    // be a compile error here) because only the `readonly=on` token is per-variant.
+    let root_image = cfg.rootfs.effective_image().display().to_string();
     match &cfg.rootfs {
-        vmcell::config::RootfsSource::Erofs { image } => {
+        vmcell::config::RootfsSource::Erofs { .. } => {
             cmd.arg("-drive")
                 .arg(format!(
-                    "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
-                    image.display()
+                    "file={root_image},format=raw,id=rfs,if=none,readonly=on,file.locking=off"
                 ))
                 .arg("-device")
                 .arg("virtio-blk-pci,drive=rfs");
         }
-        vmcell::config::RootfsSource::Block { image, overlay } => {
+        vmcell::config::RootfsSource::Block { .. } => {
             cmd.arg("-drive")
                 .arg(format!(
-                    "file={},format=raw,id=rfs,if=none,file.locking=off",
-                    overlay.as_ref().unwrap_or(image).display()
+                    "file={root_image},format=raw,id=rfs,if=none,file.locking=off"
                 ))
                 .arg("-device")
                 .arg("virtio-blk-pci,drive=rfs");
@@ -2066,6 +2070,82 @@ mod tests {
             mac,
             vmcell::net::mac_math(other_res.vmid).expect("mac_math"),
             "two members of one bridge must not share a MAC"
+        );
+    }
+
+    // One law, one predicate (§13): the `-drive file=…` that becomes `/dev/vda` names
+    // `RootfsSource::effective_image` — the SAME predicate the config boundary's
+    // duplicate-backing-file guard uses. They used to be separate copies of
+    // `overlay.as_ref().unwrap_or(image)`, so a divergence would have let the guard protect a file
+    // this argv does not attach. Expected values are recomputed THROUGH the helper, never a
+    // test-local literal, and asserted on the COMPOSED argv. Buggy impl this guards: emitting the
+    // base image while an overlay is set (guest writes land in the shared base) reddens the
+    // overlay leg.
+    #[test]
+    fn qemu_root_drive_uses_the_effective_image_law() {
+        use vmcell::config::{RootfsSource, VmConfig};
+
+        let base = PathBuf::from("/img/base.raw");
+        let overlay = PathBuf::from("/img/vm-7-overlay.raw");
+
+        let root_drive = |rootfs: RootfsSource| {
+            let cfg = VmConfig::builder("/k", rootfs)
+                .build()
+                .expect("build config");
+            let argv = composed_argv(&cfg);
+            let spec = argv
+                .iter()
+                .find(|a| a.contains("id=rfs"))
+                .expect("the root -drive must be present")
+                .clone();
+            (cfg, spec)
+        };
+
+        // Plain image: no overlay, so the base IS the effective image.
+        let (plain_cfg, plain_spec) = root_drive(RootfsSource::Block {
+            image: base.clone(),
+            overlay: None,
+        });
+        assert_eq!(
+            plain_spec,
+            format!(
+                "file={},format=raw,id=rfs,if=none,file.locking=off",
+                plain_cfg.rootfs.effective_image().display()
+            ),
+            "the root -drive must name the effective image"
+        );
+
+        // Overlay set: the overlay backs /dev/vda, the base is never attached.
+        let (ovl_cfg, ovl_spec) = root_drive(RootfsSource::Block {
+            image: base.clone(),
+            overlay: Some(overlay),
+        });
+        assert_eq!(
+            ovl_spec,
+            format!(
+                "file={},format=raw,id=rfs,if=none,file.locking=off",
+                ovl_cfg.rootfs.effective_image().display()
+            ),
+            "with an overlay set, the overlay backs /dev/vda"
+        );
+        // Non-vacuous: the two paths genuinely differ.
+        assert_ne!(
+            ovl_cfg.rootfs.effective_image(),
+            base,
+            "the overlay case must not resolve to the base image"
+        );
+
+        // EROFS: the image itself, read-only.
+        let (erofs_cfg, erofs_spec) = root_drive(RootfsSource::Erofs {
+            image: PathBuf::from("/img/rootfs.erofs"),
+        });
+        assert_eq!(
+            erofs_spec,
+            format!(
+                "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
+                erofs_cfg.rootfs.effective_image().display()
+            ),
+            "an EROFS root is the image itself, read-only"
         );
     }
 

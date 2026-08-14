@@ -168,14 +168,16 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let rootfs_image = common::get_rootfs();
 
     let id = uuid::Uuid::new_v4();
-    let snapshot_dir = std::env::temp_dir().join(format!(
+    // OWNED (`common::TempTree`): a guest-RAM snapshot is ~129 MB per backend per run, and this
+    // test used to remove it on no path at all — the pre-emptive `remove_dir_all` it did carry
+    // could never match, because the name carries a fresh UUID. The guard's `Drop` removes it on
+    // the success path AND on the panic path, so a failed live leg cannot leak it either.
+    let scratch = common::TempTree::reserve(&format!(
         "vmcell-test-snapshot-restore-{}-{}",
         std::process::id(),
         id
     ));
-    if snapshot_dir.exists() {
-        std::fs::remove_dir_all(&snapshot_dir).unwrap();
-    }
+    let snapshot_dir = scratch.path().to_path_buf();
 
     // `mut`: block 2 swaps `env.clock` for an injected `FakeClock` before restore so the one-shot
     // post-restore resync is driven by a controlled time (design §18, Delta register: changes from the validated v27 build — delta 1 folded the clock seam
