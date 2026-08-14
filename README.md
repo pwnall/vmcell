@@ -160,8 +160,15 @@ backs the unprivileged vsock control plane on the QEMU backend.
 ```sh
 cargo install --git https://github.com/cloud-hypervisor/cloud-hypervisor.git cloud-hypervisor
 cargo install virtiofsd --locked
-cargo install vhost-device-vsock --locked   # only needed for the QEMU unprivileged-vsock path
+cargo install vhost-device-vsock --locked
 ```
+
+All three are required for the full suites, `vhost-device-vsock` included: it is the **default** QEMU
+vsock transport (`uses_in_kernel_vsock` returns `cfg.snapshotting` on `Auto`), so every
+non-snapshotting QEMU leg spawns it — by bare name, with a deliberately loud failure if it is
+missing. Cloud Hypervisor also publishes a static `cloud-hypervisor-static` binary on its GitHub
+releases; CI uses that (pinned by digest) instead of the source build above, which is the faster
+route if you do not need a local CH build.
 
 Ensure that `~/.cargo/bin` is in your `$PATH` so the test suite can discover these executables.
 
@@ -305,6 +312,37 @@ Common recipes:
   scope).
 - `just test-crosvm` — the opt-in crosvm live matrix (§5).
 - `just skip-manifest-show` — the capability-driven skips this run recorded; review them.
+
+#### What CI runs, and what only you can run
+
+CI (`.github/workflows/ci.yml`) runs on **GitHub-hosted runners only** — there is no self-hosted
+runner, and nothing here depends on one. Four jobs:
+
+| Job | Covers |
+| --- | --- |
+| `lint` | everything in `just ci` except the test run: fmt, clippy, feature-powerset, `cargo deny`, rustdoc, the ban scripts, shellcheck/actionlint/zizmor/machete/typos, and (on PRs) `cargo semver-checks` |
+| `test-unit` | `just test-unit` — unit, codec and property tests, no KVM |
+| `example-downstream` | the downstream toolkit contract's KVM-free legs |
+| `test-integration` | `just test-unprivileged`, `just bless`, `just test-privileged`, `just test-daemon`, and the downstream example's live leg — **real VMs, on `ubuntu-24.04`** |
+
+`test-integration` boots real guests on a hosted runner: `/dev/kvm` is present there and made
+openable with a udev rule, `kvm_intel.nested = Y` so the nested-virt legs are real, and the suites
+run inside `systemd-run --user --scope -p Delegate=yes` because a hosted runner's own cgroup is not
+delegated. It installs Cloud Hypervisor, Firecracker, `virtiofsd` and `vhost-device-vsock` itself,
+so you do **not** need a KVM host to get integration coverage on a pull request.
+
+Two things CI cannot run, and which therefore need a local run before you trust them:
+
+- **`just test-crosvm`** — the crosvm live matrix. crosvm has no prebuilt binary release and no
+  Debian package (§5), so it is built from source and the matrix is opt-in. Its KVM-free honesty
+  pins do run in `test-unit`.
+- **`just test-usb-passthrough`** — needs a *designated physical USB device*
+  (`VMCELL_TEST_USB_DEVICE`). Without one the privileged suite records a capability skip, which you
+  will see in `just skip-manifest-show`.
+
+Everything else that runs locally also runs in CI. If you are changing guest-side code, remember the
+artifacts are baked: rebuild with `vmcell build --kernel-source host-make` (§8) before believing a
+local live run.
 
 Built VM artifacts (kernel, rootfs, proxy CA) default to `target/vmcell-artifacts`, overridable via
 `VMCELL_ARTIFACTS_DIR` (with `VMCELL_KERNEL` / `VMCELL_ROOTFS` overriding the individual kernel/rootfs paths).

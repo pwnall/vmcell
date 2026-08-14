@@ -268,10 +268,26 @@ jobs:
       - name: nextest (unit/codec/prop)
         run: just test-unit
 
-  # ---- Integration matrix: needs /dev/kvm. Runs the #[ignore]'d suite so it is NOT CI-invisible. ----
+  # ---- Integration matrix: boots real VMs. Runs the #[ignore]'d suite so it is NOT CI-invisible. ----
+  #
+  # This job ran on `[self-hosted, linux, kvm]` until 2026-08-14 — and had therefore NEVER run: no
+  # such runner was ever registered, so every invocation sat queued until GitHub's 24-hour limit and
+  # reported as cancelled. The whole privileged / daemon / unprivileged / live-downstream matrix was
+  # CI-invisible for the repo's entire history.
+  #
+  # It runs on a GitHub-hosted runner now, which was established by probing rather than by argument
+  # (image ubuntu-24.04 20260810.271.1): /dev/kvm is present and openable after the udev rule below,
+  # `kvm_intel.nested = Y`, sudo+setcap work so `just bless` is unmodified, and
+  # `systemd-run --user --scope -p Delegate=yes` gives the delegated cgroup subtree the limit tests
+  # need. Measured on the first green run: unprivileged 4/4, privileged 156/156 (312 s), daemon
+  # 14/14, downstream live green — identical counts to the maintainer's KVM box, with 8 recorded
+  # capability skips that are all backend honesty (Firecracker's unprivileged_vhost_user_net ×4,
+  # nested_virt ×2, virtio_fs_shares; QEMU's no-designated-USB-device), not host gaps.
   test-integration:
-    # Self-hosted runner labelled `kvm`, with /dev/kvm and the runner user in the `kvm` group.
-    runs-on: [self-hosted, linux, kvm]
+    runs-on: ubuntu-24.04
+    # The cold guest-kernel + rootfs build is ~15 min on 4 cores and the privileged suite ~5 min;
+    # the bound is generous for a cold cache, and finite so a wedged VM cannot burn the 6-hour default.
+    timeout-minutes: 120
     env:
       # H-TEST-3: one run-scoped path for the capability-skip manifest, shared by every suite step
       # below (the `just` recipes honor an externally-set value). Until this existed the manifest
@@ -290,59 +306,117 @@ jobs:
         # detouring through cargo-binstall.
         with: { tool: "cargo-nextest,just", fallback: none }
 
+      - name: make /dev/kvm and /dev/vhost-vsock openable by this user
+        run: |
+          # The hosted image ships both as root:kvm 0660 and the runner user is not in `kvm`.
+          # /dev/vhost-vsock is opened by the QEMU in-kernel-vsock legs; the blessed runner's
+          # CAP_DAC_OVERRIDE would cover it, but `just test-unprivileged` runs WITHOUT the runner, so
+          # widen it here rather than lean on a capability that path deliberately does not hold.
+          # The assertion is the gate: a silent failure here surfaces 20 minutes later as an
+          # unexplained boot failure.
+          sudo tee /etc/udev/rules.d/99-vmcell-ci.rules >/dev/null <<'RULES'
+          KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"
+          KERNEL=="vhost-vsock", MODE="0666"
+          KERNEL=="vhost-net", MODE="0666"
+          RULES
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm trigger --name-match=vhost-vsock || true
+          ls -l /dev/kvm /dev/vhost-vsock /dev/vhost-net 2>&1 || true
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is still not openable by this user after the udev rule"
+            exit 1
+          fi
+
+      - name: system packages (README "System Packages")
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential flex bison bc libelf-dev libssl-dev \
+            pkg-config libseccomp-dev libcap-ng-dev libcap2-bin \
+            nftables qemu-system-x86
+
+      - name: install VMM backends (pinned, checksum-verified)
+        env:
+          CH_VERSION: "v53.0"
+          CH_SHA256: "448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc"
+          FC_VERSION: "v1.16.1"
+        run: |
+          # Pinned + checksum-verified, exactly like the actionlint install in the lint job: these
+          # binaries are spawned WITH CAPABILITIES beside the test suite, so `latest` is not an
+          # option. Both projects publish static x86_64 builds, which also avoids the ~15-minute
+          # source builds the README's `cargo install` route would cost on a 4-core runner.
+          set -euo pipefail
+          sudo curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+            -o /usr/local/bin/cloud-hypervisor \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
+          echo "${CH_SHA256}  /usr/local/bin/cloud-hypervisor" | sha256sum -c -
+          sudo chmod +x /usr/local/bin/cloud-hypervisor
+          cloud-hypervisor --version
+
+          # Firecracker publishes its own .sha256.txt beside the tarball — verify against that rather
+          # than a digest copied into this file, and fail loud if either file is missing.
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -O \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -O \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz.sha256.txt"
+          sha256sum -c "firecracker-${FC_VERSION}-x86_64.tgz.sha256.txt"
+          tar -xzf "firecracker-${FC_VERSION}-x86_64.tgz"
+          sudo install -m 0755 "release-${FC_VERSION}-x86_64/firecracker-${FC_VERSION}-x86_64" /usr/local/bin/firecracker
+          firecracker --version
+
+          # virtiofsd has no binary release; `vhost-device-vsock` is NOT the optional extra the
+          # README implies — it is spawned by BARE NAME from vmcell-qemu and is the default QEMU
+          # vsock transport (`uses_in_kernel_vsock` returns `cfg.snapshotting` on `Auto`), so every
+          # non-snapshotting QEMU leg goes through it and its absence is a loud spawn failure.
+          cargo install virtiofsd --locked
+          cargo install vhost-device-vsock --locked
+
       - name: reset the run-scoped skip manifest
         run: just skip-manifest-reset   # so the surfaced skips belong to THIS run, not an accumulated history
 
+      # The long pole (~15 min cold on 4 cores). `--kernel-source host-make` is mandatory: the bare
+      # default silently substitutes a prebuilt vmlinux lacking CONFIG_KVM_INTEL /
+      # CONFIG_HW_RANDOM_VIRTIO and reddens nested_virt and snapshot_restore. The rootfs comes from a
+      # digest-pinned OCI base, which is host-native, so this step needs no KVM.
       - name: build VM artifacts
         run: cargo run --locked -p vmcell-cli --bin vmcell -- build --kernel-source host-make
 
+      # EVERY live suite runs inside a delegated scope. A hosted runner's own cgroup
+      # (system.slice/hosted-compute-agent.service) is not delegated, and `MicroVm::start` needs a
+      # writable cgroup even when no limit is requested — the first hosted trial died on the
+      # unprivileged suite with `Cgroup("create cgroup …: Permission denied (os error 13)")`. The
+      # self-hosted job never wrapped `test-privileged` either; it was silently relying on its
+      # runner's own cgroup being delegated, which is the most self-hosted-shaped thing it did.
+      # `test-daemon`'s recipe carries its own wrapper, so it is invoked bare.
+      #
       # Suite steps invoke the `just` recipes, never a hand-copied cargo line: the copy HAD diverged —
       # this step used to inline the nextest command WITHOUT the recipe's `--features qemu`, so the
       # QEMU smoltcp-NAT leg of the `vmm_matrix_test!` was never even COMPILED in CI (M14). That is an
-      # invisible coverage loss, not a recorded skip — the tests do not exist in the binary, so nothing
-      # lands in the skip manifest — and it hid exactly the path the vendored vhost patch exists for.
-      # `just` is installed above and already drives the reset/daemon/show steps, so local ≡ CI by
-      # construction here. The run-scoped VMCELL_SKIP_MANIFEST set at job level still wins (the recipes
-      # honor an externally-set value).
+      # invisible coverage loss, not a recorded skip.
       - name: unprivileged suite (no elevation — keeps the unprivileged path honest)
-        run: just test-unprivileged
+        run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-unprivileged
 
-      # Bless grants the runner cap_net_admin,cap_sys_admin (debug + release) so the privileged
-      # suite runs under the capability wrapper instead of broad `sudo -E` — mirrors `just test-privileged`.
+      # Bless grants the runner cap_net_admin,cap_sys_admin (+dac_override, +setpcap) so the
+      # privileged suite runs under the capability wrapper instead of broad `sudo -E`.
       - name: bless the capability runner
         run: just bless
 
-      # `just test-privileged` passes `--features firecracker,qemu` (additive to the default
-      # cloud-hypervisor) so the `#[cfg(feature="firecracker")]`/`qemu` tests are actually exercised
-      # here, not just CH (P30), and wraps the test binaries with the blessed runner at the stable
-      # ./.vmcell-bin/ path (v15 §12.8) — the recipe owns both, so this step carries no second copy of
-      # either. The per-backend matrix skips-with-reason when a binary is absent.
       - name: privileged suite (via vmcell-test-runner capability wrapper, not sudo -E)
-        run: just test-privileged
+        run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-privileged
 
-      # KVM job only: the daemon end-to-end suite boots real Cloud Hypervisor VMs THROUGH `vmcelld`.
-      # `just test-daemon` wraps the test binary with the (already-blessed) runner so it holds the
-      # caps and spawns `vmcelld` in a systemd-delegated cgroup scope, then asserts the HTTP surface +
-      # data plane over `vmcell-daemon-client`. The KVM-free daemon gates (auth, OpenAPI parity, the
-      # name-validator inverse battery, delete-in-use) run in the ordinary `test-unit` job — they need
-      # no runner. Mirrors `just test-daemon`.
       - name: daemon end-to-end suite (inverted runner; boots vmcelld → real CH VMs)
         run: just test-daemon
 
-      # The downstream example's LIVE half (design v30 §18 delta 5 — "live leg non-optional": every
-      # assertion below is one the fs-blind fakes structurally cannot make). Builds
-      # `vmlinux-ikconfig` from the example's OWN pins overlay through the library entry point,
-      # asserts the fragment survived in the resolved-config sidecar, runs the conformance battery,
-      # and proves the fragment took on the DATA PLANE by reading /proc/config.gz out of the booted
-      # guest. Placed after the operating-mode suites: it compiles a kernel with host `make`
-      # (minutes), and it consumes the rootfs the artifact build step above produced.
+      # The downstream example's LIVE half (design v30 §18 delta 5): builds `vmlinux-ikconfig` from
+      # the example's OWN pins overlay through the library entry point, asserts the fragment survived
+      # in the resolved-config sidecar, runs the conformance battery, and proves the fragment took on
+      # the DATA PLANE by reading /proc/config.gz out of the booted guest.
       - name: "downstream example (live: labelled kernel build → battery → /proc/config.gz in-guest)"
         env:
-          # The documented downstream configuration (§10.4): an externally managed rootfs plus this
-          # consumer's own artifacts dir, so the example never writes into vmcell's artifact cache.
           VMCELL_ARTIFACTS_DIR: ${{ github.workspace }}/examples/downstream-kernel/target/vmcell-artifacts
           VMCELL_ROOTFS: ${{ github.workspace }}/target/vmcell-artifacts/rootfs.erofs
-        run: cargo run --locked --bin downstream-kernel -- live
+        run: systemd-run --user --scope -p Delegate=yes ../../scripts/with-delegated-scope.sh cargo run --locked --bin downstream-kernel -- live
         working-directory: examples/downstream-kernel
 
       # FINAL step, and `always()`: the capability skips of a FAILING run are exactly the ones worth

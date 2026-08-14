@@ -3375,14 +3375,54 @@ and a one-second `rustc -vV | grep -q '^release: .*-nightly'` assertion now name
 of leaving it to a sanitizer error wall. Expect the first genuinely-nightly run to surface real work:
 nothing in `fuzz/` has ever been compiled by CI.
 
-### `test-integration` has never run at all
+### `test-integration` had never run at all — and did not need a self-hosted runner
 
-`runs-on: [self-hosted, linux, kvm]`, and `gh api repos/pwnall/vmcell/actions/runners` returns
-`total_count: 0` — no such runner is registered, in any of the runs GitHub retains. The job is never
-assigned, sits queued for the 24-hour limit, and reports as cancelled. Nothing in this pass changes
-that: it is infrastructure, not configuration, and the job is deliberately left exactly as it is
-rather than weakened into a skip. Until a runner exists, the privileged / daemon / unprivileged /
-live-downstream matrix is validated **only** by running the suites on a maintainer's KVM box.
+`runs-on: [self-hosted, linux, kvm]`, and `gh api repos/pwnall/vmcell/actions/runners` returned
+`total_count: 0` — no such runner was ever registered, in any of the runs GitHub retains. The job was
+never assigned, sat queued for the 24-hour limit, and reported as cancelled. The entire privileged /
+daemon / unprivileged / live-downstream matrix was CI-invisible for the repo's whole history.
+
+**It now runs on a plain `ubuntu-24.04` hosted runner.** The premise that it could not was never
+tested; probing it took one workflow. What a hosted runner actually provides (image
+`ubuntu-24.04 20260810.271.1`, 2026-08-14):
+
+| facility | hosted runner | what it took |
+| --- | --- | --- |
+| `/dev/kvm` | present, `root:kvm 0660` | a udev rule (`MODE="0666"`), then assert openability |
+| nested virt | `kvm_intel.nested = Y` | nothing — the `nested_virt` legs are real |
+| sudo / `setcap` | passwordless, works | nothing — `just bless` is unmodified |
+| cgroup delegation | own cgroup NOT delegated | `systemd-run --user --scope -p Delegate=yes` |
+| user namespaces | `unshare -Urn` blocked by AppArmor | nothing — same as the dev box; the product does not use them |
+| filesystem | ext4, no reflink | nothing — `reflink_or_copy` treats a full copy as success |
+| backends | only `qemu` | install CH + FC (pinned static releases), `virtiofsd`, `vhost-device-vsock` |
+| host shape | 4 cores, 15 GiB RAM, 87 GiB free | cold kernel + rootfs build measured at **14m46s** |
+
+Measured on the first green run: unprivileged **4/4**, privileged **156/156 in 312 s**, daemon
+**14/14**, downstream live green (`/proc/config.gz` round-tripped 4373 symbols in-guest). Identical
+counts to the maintainer's box (156/156 in 300 s there), with **8 recorded capability skips, all
+backend honesty** — Firecracker's `unprivileged_vhost_user_net` ×4, `nested_virt` ×2,
+`virtio_fs_shares`, and QEMU's no-designated-USB-device — and none from a missing host facility.
+Zero coverage loss.
+
+Two findings the move surfaced, both of which the self-hosted runner had been hiding:
+
+- **`just test-privileged` never carried a delegated-scope wrapper.** `test-daemon`'s recipe has one;
+  the privileged recipe and the CI step did not, so they silently depended on the runner's own cgroup
+  being delegated. That is the most self-hosted-shaped assumption in the job, and it fails as three
+  `metrics_limits` panics deep in a run rather than as a stated precondition. Every live suite is now
+  wrapped in CI.
+- **`vhost-device-vsock` is not optional.** It is spawned by bare name from `vmcell-qemu` and is the
+  *default* QEMU vsock transport (`uses_in_kernel_vsock` returns `cfg.snapshotting` on `Auto`), so
+  every non-snapshotting QEMU leg needs it. The README filed it under "only needed for the QEMU
+  unprivileged-vsock path"; corrected there.
+
+Also corrected while establishing this: the artifact build does **not** use a builder micro-VM — the
+CLI defaults to `RootfsSourceKind::Oci`, which is host-native, so that step needs no KVM at all.
+
+Still local-only, and now stated in the README rather than implied: `just test-crosvm` (no prebuilt
+crosvm binary or Debian package, so it is a source build) and `just test-usb-passthrough` (needs a
+designated physical device via `VMCELL_TEST_USB_DEVICE`; without one the privileged suite records the
+capability skip counted above).
 
 ### `HostEnv::hermetic()` is hermetic in its allocators, not in its host effects
 
