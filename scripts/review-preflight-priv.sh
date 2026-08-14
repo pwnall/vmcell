@@ -53,7 +53,7 @@ ROOTFS="${VMCELL_ROOTFS:-$ART_DIR/rootfs.erofs}"
 KVM_DEV="${VMCELL_KVM_DEV:-/dev/kvm}"
 SUBTREE_CTL="${VMCELL_CGROUP_SUBTREE_CONTROL:-/sys/fs/cgroup/cgroup.subtree_control}"
 SYSTEMD_RUN_BIN="${VMCELL_SYSTEMD_RUN:-systemd-run}"
-NEEDED_CAPS=(cap_net_admin cap_sys_admin cap_dac_override)
+NEEDED_CAPS=(cap_net_admin cap_sys_admin cap_dac_override cap_setpcap)
 
 # Failures split into two buckets so the verdict tells a maintainer's one-sudo `just bless` fix
 # (runner missing / caps stripped / stale stamp) apart from a genuinely absent facility (no KVM, no
@@ -86,7 +86,11 @@ check_runner() {
     note "runner     : OK ($path : ${caps#* })"
   else
     note "runner     : NOT BLESSED ($path : ${caps:-<no caps>})"
-    bless_problems+=("Capability runner $path lacks cap_net_admin,cap_sys_admin,cap_dac_override with the effective bit (+ep). Caps strip on every rebuild. Run \`just bless\`. (A +p-only blessing is NOT enough — the runner checks the EFFECTIVE set.)")
+    # Name the caps from NEEDED_CAPS, never a hand-written list: the set grew a transient
+    # `cap_setpcap` (vmcell_privilege::BLESSED_FILE_CAPS) and a restated list would have kept
+    # printing the old three — telling the operator the runner lacks caps it already has.
+    local needed_list; needed_list="$(IFS=,; echo "${NEEDED_CAPS[*]}")"
+    bless_problems+=("Capability runner $path lacks one of $needed_list with the effective bit (+ep). Caps strip on every rebuild. Run \`just bless\`. (A +p-only blessing is NOT enough — the runner checks the EFFECTIVE set.)")
   fi
 }
 

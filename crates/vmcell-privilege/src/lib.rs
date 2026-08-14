@@ -37,12 +37,12 @@
     )
 )]
 
-use capctl::{CapSet, CapState};
+use capctl::CapState;
 use std::path::Path;
 
 // Re-export the capability type so callers (the runner, the daemon) name caps and probe the
 // supported set without a direct `capctl` dependency — one crate owns the privileged vocabulary.
-pub use capctl::Cap;
+pub use capctl::{Cap, CapSet};
 
 /// Probes the kernel's supported-capability set (the universe for the bounding-set shrink).
 ///
@@ -65,6 +65,52 @@ pub fn probe_supported_caps() -> Vec<Cap> {
 /// build their `need` set from this one constant, so the two never drift.
 pub const PRIVILEGED_CAPS: [Cap; 3] = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
 
+/// The capability set `just bless` puts on the **runner file**: [`PRIVILEGED_CAPS`] plus
+/// `CAP_SETPCAP`, which is **transient** — held only across the privilege transition and gone
+/// before the test runs.
+///
+/// `CAP_SETPCAP` is deliberately *not* in [`PRIVILEGED_CAPS`], because that constant is the set the
+/// runner **delivers** (inheritable → ambient → the exec'd test) and the daemon **retains**. The two
+/// sets answer different questions, and conflating them would be a real widening: `SETPCAP` in
+/// `need` would ride the ambient set into every test and every VMM, *and* — since the bounding drop
+/// is `supported − need` — would keep itself in the bounding set forever, which is the opposite of
+/// the point.
+///
+/// Its one use is `PR_CAPBSET_DROP`, which the kernel gates on `CAP_SETPCAP` in the **effective**
+/// set. Without it, the shared bounding-shrink edge is a warned no-op and the bounding set stays as
+/// wide as the kernel supports, so a child that later execs a file-cap'd or setuid binary could
+/// gain capabilities the jail was supposed to have made unreachable. With it, the bounding set is
+/// shrunk to exactly [`PRIVILEGED_CAPS`] before `exec`.
+///
+/// It grants no authority the runner does not already have: `CAP_SETPCAP` cannot add a capability
+/// to a set the process does not already hold, and the runner already carries `CAP_SYS_ADMIN`
+/// (≈ root). It is dropped twice over by the transition — out of the bounding set by step 3 (it is
+/// in `supported` but not in `need`) and out of permitted/effective by step 5's trim to exactly
+/// `need` — so nothing downstream of the runner ever sees it.
+pub const BLESSED_FILE_CAPS: [Cap; 4] = [
+    Cap::NET_ADMIN,
+    Cap::SYS_ADMIN,
+    Cap::DAC_OVERRIDE,
+    Cap::SETPCAP,
+];
+
+/// Renders `caps` as the argument `setcap(8)` takes: `cap_a,cap_b+ep`, lowercase.
+///
+/// The ONE composer of that string (AGENTS.md "one law, one predicate"). It had been spelled out
+/// by hand in five places — this constant's siblings, the `bless` recipe, the preflight probe, the
+/// README, and [`blessing_remediation`]'s message — and a hand-maintained sixth copy is how a
+/// blessing silently grants the wrong set. `+ep` is load-bearing: the precondition
+/// ([`ensure_blessed_or_explain`]) checks the **effective** set, and a bare `+p` leaves the caps
+/// permitted-but-not-raised, which fails at first use.
+#[must_use]
+pub fn setcap_arg(caps: &[Cap]) -> String {
+    let names: Vec<String> = caps
+        .iter()
+        .map(|c| c.to_string().to_ascii_lowercase())
+        .collect();
+    format!("{}+ep", names.join(","))
+}
+
 /// Builds the operator-facing remediation message shown when a blessed binary lacks
 /// its capabilities.
 ///
@@ -85,8 +131,13 @@ pub fn blessing_remediation(uid: u32, exe: &Path, missing: &[Cap]) -> String {
     format!(
         "error: this vmcell binary is missing {missing_list} in its effective set (uid={uid}, no file caps).\n\
          It was almost certainly rebuilt. Restore its privileges (one-time, until next rebuild):\n\n\
-         sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep {}\n\n\
+         sudo setcap {} {}\n\n\
          Then re-run. See design §13 (Cross-cutting invariants) / §11.2 (Privilege and blessing).",
+        // The printed command grants the FILE set, not just the missing subset: `setcap` REPLACES a
+        // file's capability set rather than adding to it, so echoing back only what is missing
+        // would strip whatever else the file still held — including the transient `CAP_SETPCAP`
+        // that makes the bounding-set shrink work.
+        setcap_arg(&BLESSED_FILE_CAPS),
         shell_single_quote(exe)
     )
 }
@@ -397,9 +448,14 @@ pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
     caps.set_current()
         .map_err(|e| format!("failed to set inheritable capabilities: {e}"))?;
 
-    // 3. Shrink the bounding set (setuid-root form holds CAP_SETPCAP; the file-cap form does not,
-    //    so this is a warned no-op there — design §15, `just bless`). Best-effort — but surface,
-    //    never swallow, a failed drop; the one shared edge does both.
+    // 3. Shrink the bounding set. Both forms can do this now: the setuid-root form has always held
+    //    CAP_SETPCAP, and the file-cap form gets it from `BLESSED_FILE_CAPS` (`just bless` grants
+    //    it). `bounding_drop` is `supported − need`, so CAP_SETPCAP is in the drop list and drops
+    //    ITSELF here — which does not disarm the remaining drops: `PR_CAPBSET_DROP` is gated on
+    //    CAP_SETPCAP in the EFFECTIVE set, and leaving the bounding set does not remove it from
+    //    effective. Best-effort — but surface, never swallow, a failed drop (a host that still has
+    //    no CAP_SETPCAP keeps the old warned-no-op behavior rather than failing to run); the one
+    //    shared edge does both.
     shrink_bounding_set_live(&plan.bounding_drop);
 
     // 4. Raise ambient last, after the bounding set is shrunk and uid is dropped.
@@ -516,9 +572,13 @@ mod tests {
     fn remediation_message_grants_effective_and_permitted() {
         let missing = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::DAC_OVERRIDE];
         let msg = blessing_remediation(1000, Path::new("/x/target/debug/vmcelld"), &missing);
+        // Recomputed through the one composer, never a test-local literal: this test used to spell
+        // the cap list out by hand, which made it a fourth copy — and it went red (correctly) the
+        // moment the blessed set grew `cap_setpcap`. The property it guards is the `+ep` flag, not
+        // the roster; the roster is pinned by `setcap_arg_renders_the_blessed_set_verbatim`.
         assert!(
-            msg.contains("cap_net_admin,cap_sys_admin,cap_dac_override+ep"),
-            "remediation must grant the three caps with +ep: {msg}"
+            msg.contains(&setcap_arg(&BLESSED_FILE_CAPS)),
+            "remediation must grant the blessed file set with +ep: {msg}"
         );
         assert!(!msg.contains("+p "), "must not print a bare +p flag: {msg}");
         assert!(
@@ -852,5 +912,144 @@ mod tests {
                 "the parent must NOT keep the privileged cap {c:?}"
             );
         }
+    }
+
+    // ---- docs/78 follow-up: CAP_SETPCAP, the transient bounding-shrink capability ----
+
+    // The whole point of a SEPARATE constant: `CAP_SETPCAP` must be on the runner FILE and must
+    // NOT be in the delivered set. Conflating them would ride SETPCAP into every test and VMM over
+    // the ambient set AND — because `bounding_drop` is `supported − need` — pin it in the bounding
+    // set permanently, which is the exact opposite of why it is granted.
+    //
+    // RED on the inverse: add `Cap::SETPCAP` to `PRIVILEGED_CAPS` and the delivered-set assertions
+    // below fail; drop it from `BLESSED_FILE_CAPS` and the file-set assertion fails.
+    #[test]
+    fn setpcap_is_a_transient_file_cap_never_delivered_to_the_test() {
+        assert!(
+            !PRIVILEGED_CAPS.contains(&Cap::SETPCAP),
+            "CAP_SETPCAP must NOT be in the delivered/retained set"
+        );
+        assert!(
+            BLESSED_FILE_CAPS.contains(&Cap::SETPCAP),
+            "the blessed FILE set must carry the transient CAP_SETPCAP"
+        );
+        for c in PRIVILEGED_CAPS {
+            assert!(
+                BLESSED_FILE_CAPS.contains(&c),
+                "the blessed file set must be a superset of the delivered set (missing {c:?})"
+            );
+        }
+        assert_eq!(
+            BLESSED_FILE_CAPS.len(),
+            PRIVILEGED_CAPS.len() + 1,
+            "the blessed file set adds exactly one cap (the transient SETPCAP)"
+        );
+
+        // And the plan must actually shed it, twice over: out of the bounding set (it is in
+        // `supported` but not in `need`) and out of the final permitted/effective trim.
+        let supported = [
+            Cap::NET_ADMIN,
+            Cap::SYS_ADMIN,
+            Cap::DAC_OVERRIDE,
+            Cap::SETPCAP,
+            Cap::SYS_PTRACE,
+        ];
+        let plan = plan_privilege_transition(
+            &PRIVILEGED_CAPS,
+            &supported,
+            1000,
+            1000,
+            1000,
+            None,
+            &[1000],
+        );
+        assert!(
+            plan.bounding_drop.contains(&Cap::SETPCAP),
+            "SETPCAP must be dropped from the bounding set, not preserved by being `need`"
+        );
+        for set in [&plan.ambient_raise, &plan.final_caps, &plan.inheritable_add] {
+            assert!(
+                !set.contains(&Cap::SETPCAP),
+                "SETPCAP must never be delivered to the exec'd test: {set:?}"
+            );
+        }
+        // Positive control: the caps that ARE delivered still are.
+        for c in PRIVILEGED_CAPS {
+            assert!(plan.ambient_raise.contains(&c) && plan.final_caps.contains(&c));
+        }
+    }
+
+    // `setcap_arg` is the ONE composer of the `setcap(8)` argument. Pin its exact rendering: the
+    // string is copy-pasted by operators out of `blessing_remediation` and executed verbatim, so a
+    // silent change in spelling or flag is a blessing that grants the wrong set.
+    //
+    // RED on the inverse: render `+p` instead of `+ep` (the permitted-only blessing the precondition
+    // rejects), or upper-case the names (`setcap` refuses `CAP_NET_ADMIN`).
+    #[test]
+    fn setcap_arg_renders_the_blessed_set_verbatim() {
+        assert_eq!(
+            setcap_arg(&BLESSED_FILE_CAPS),
+            "cap_net_admin,cap_sys_admin,cap_dac_override,cap_setpcap+ep"
+        );
+        assert_eq!(
+            setcap_arg(&PRIVILEGED_CAPS),
+            "cap_net_admin,cap_sys_admin,cap_dac_override+ep"
+        );
+        // The remediation an operator copy-pastes grants the FILE set, never the missing subset —
+        // `setcap` REPLACES a file's set, so echoing a subset would silently strip the rest.
+        let msg = blessing_remediation(1000, Path::new("/x/runner"), &[Cap::NET_ADMIN]);
+        assert!(
+            msg.contains(&format!(
+                "sudo setcap {} '/x/runner'",
+                setcap_arg(&BLESSED_FILE_CAPS)
+            )),
+            "remediation must print the whole blessed set: {msg}"
+        );
+    }
+
+    // The cap list also lives in two SHELL files that cannot import this constant: the `bless`
+    // recipe (which grants it) and the preflight probe (which verifies it). That is the duplication
+    // "one law, one predicate" warns about, and it has already bitten once — the two copies drifted
+    // on strictness (`*ep*` substring vs the `=ep`/`+ep` field). Rust cannot share a const with
+    // bash, so the next best thing is a gate that reads both files and fails if either stops naming
+    // exactly this set. `include_str!` (not a runtime read) makes a moved file a COMPILE error
+    // rather than a skipped check; the crate is `publish = false`, so reaching outside it is safe.
+    //
+    // RED on the inverse: drop `cap_setpcap` from the justfile's setcap line, or from the
+    // preflight's NEEDED_CAPS, and this fails naming the file.
+    #[test]
+    fn the_shell_copies_of_the_blessed_set_match_this_constant() {
+        const JUSTFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../justfile"));
+        const PREFLIGHT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/review-preflight-priv.sh"
+        ));
+
+        let arg = setcap_arg(&BLESSED_FILE_CAPS);
+        assert!(
+            JUSTFILE.contains(&format!("sudo setcap {arg} ")),
+            "the `bless` recipe must grant exactly `{arg}`"
+        );
+
+        // The preflight names the caps as a bash array it matches getcap output against; assert
+        // every cap in the blessed set appears there, and that the array is not wider than the set.
+        let needed = PREFLIGHT
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("NEEDED_CAPS=("))
+            .and_then(|l| l.split(')').next())
+            .expect("preflight must declare NEEDED_CAPS=(…)");
+        let listed: Vec<&str> = needed.split_whitespace().collect();
+        for c in BLESSED_FILE_CAPS {
+            let name = c.to_string().to_ascii_lowercase();
+            assert!(
+                listed.contains(&name.as_str()),
+                "preflight NEEDED_CAPS must include {name}, got {listed:?}"
+            );
+        }
+        assert_eq!(
+            listed.len(),
+            BLESSED_FILE_CAPS.len(),
+            "preflight NEEDED_CAPS must be exactly the blessed set, got {listed:?}"
+        );
     }
 }

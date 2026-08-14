@@ -18,7 +18,11 @@ skip-manifest := justfile_directory() + "/target/vmcell-skip-manifest.txt"
 # (which rarely changes) carries file-caps. A standalone/production `vmcelld` is capped by the service
 # manager (systemd `AmbientCapabilities=`) or a one-off `setcap`, off this hot path.
 
-# Grant the three caps the privileged suite needs, durably (v15 §12.8). Builds the runner, copies
+# Grant the privileged suite's capabilities, durably (v15 §12.8). The FILE set is four:
+# `vmcell_privilege::PRIVILEGED_CAPS` (net_admin/sys_admin/dac_override — delivered to the test over
+# the ambient set) plus the TRANSIENT `cap_setpcap`, which exists only so the runner can actually
+# perform `PR_CAPBSET_DROP`; the transition drops it back out of both the bounding set and
+# permitted/effective before `exec`, so no test or VMM ever holds it. Builds the runner, copies
 # it to the stable, gitignored ./.vmcell-bin/ path, and setcaps THAT copy. Idempotent via a
 # content-hash `.blessed` stamp keyed on the RUNNER binary only (never test binaries): a re-run is
 # a transparent no-op (no sudo prompt) until the runner genuinely changes. Because cargo only ever
@@ -39,7 +43,7 @@ bless:
       local h; h="$(sha256sum "$built" | cut -d' ' -f1)"
       # M-BIN-2: the stamp+existence check alone is a FALSE skip if the stable copy silently lost
       # its caps or mode out-of-band (rsync / backup-restore / fs-move strips file xattrs). Also
-      # verify the stable copy STILL carries all three caps with the effective bit (+ep / =ep) AND
+      # verify the stable copy STILL carries every blessed cap with the effective bit (+ep / =ep) AND
       # its 0700 owner-only mode; if any check fails, fall through and RE-bless rather than reporting
       # a no-op "already blessed" that leaves the runner effectively un-capped (review-preflight-priv
       # then reads that as skip==pass).
@@ -74,7 +78,7 @@ bless:
       # shared host, and the path-confinement is only defense-in-depth. On a shared dev box
       # where a team shares one runner, use `chmod 0750` + a dedicated group instead of 0700.
       chmod 0700 "$tmp"
-      if ! sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep "$tmp"; then
+      if ! sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override,cap_setpcap+ep "$tmp"; then
         rm -f "$tmp"
         echo "bless: setcap failed for $stable — the previous blessing is UNCHANGED (nothing was replaced)" >&2
         return 1
@@ -176,6 +180,14 @@ test-crosvm:
 # this test (its filter excludes only unprivileged/smoltcp), so with no designated device it records a
 # capability skip to $VMCELL_SKIP_MANIFEST instead of hard-failing every KVM host — this recipe is
 # the only place it actually exercises a device.
+#
+# AFTER-EFFECT, measured 2026-08-14: QEMU's `usb-host` detaches the device's kernel driver on the
+# host for the duration and does NOT re-bind it on release, so the device stays driverless
+# afterwards (passing the laptop camera left `Driver=[none]` on both interfaces and removed
+# `/dev/video*`). That is WHY the device must be DISPOSABLE, and it is not residue the suite can
+# sweep — the host driver is not vmcell's to restore. Re-bind with
+#   echo -n <iface> | sudo tee /sys/bus/usb/drivers/<driver>/bind   # e.g. 3-7:1.0 -> uvcvideo
+# or re-plug it (a module reload also works: `sudo modprobe -r uvcvideo && sudo modprobe uvcvideo`).
 test-usb-passthrough:
     #!/usr/bin/env bash
     set -euo pipefail

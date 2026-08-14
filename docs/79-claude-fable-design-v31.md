@@ -3450,8 +3450,9 @@ the graceful path (parent death, or `ShutdownAll`/EOF on the bridge) win the rac
 disposition survives `execve` — unlike a caught one — `build_vmm_cmd`'s `pre_exec` resets both to
 `SIG_DFL` in the VMM child, as its first step, so an operator's `kill` and the teardown's own signals
 still work. The parent drops **all** capabilities via the pure `plan_broker_parent_drop`
-(the bounding-set shrink is a warned no-op without `CAP_SETPCAP`, which is fine — the effective/permitted
-drop is what matters). Parent and broker speak a tiny framed enum over a `socketpair`:
+(the bounding-set shrink needs `CAP_SETPCAP`, which `just bless` grants the runner file as a
+transient cap; where it is absent the shrink degrades to a warned no-op and the effective/permitted
+drop — the load-bearing half — still happens). Parent and broker speak a tiny framed enum over a `socketpair`:
 
 ```rust
 pub enum BrokerRequest  { SetupNetwork(NetPlan), CreateCgroup(CgroupPlan), SpawnVmm(VmmPlan),
@@ -3869,8 +3870,15 @@ Two subtleties are load-bearing:
 - **`just bless` installs to a gitignored, mode-checked location.** It copies the runner to
   `./.vmcell-bin/<profile>/`, `chmod 0700`s it, `setcap`s it, and records a content-hash `.blessed` stamp
   **keyed on the runner binary only** (so a rebuild of the runner re-blesses, but a rebuild of an ordinary
-  test binary does not). `CAP_SETPCAP` is typically absent, so the bounding-set shrink is a **warned
-  no-op** (the effective/permitted path is what matters); a `setuid`-fallback path (for hosts without
+  test binary does not). the granted set is `BLESSED_FILE_CAPS` — the three `PRIVILEGED_CAPS` the mode
+  uses plus a **transient `CAP_SETPCAP`**, whose only purpose is `PR_CAPBSET_DROP`: the transition
+  drops it out of the bounding set (it is in `supported` but not in `need`) and out of
+  permitted/effective (step 5 trims to exactly `need`), so no test or VMM ever holds it. Without it
+  the bounding-set shrink is a **warned no-op** and the bounding set stays at the kernel's full
+  width; with it the exec'd test's bounding set is exactly the three delivered caps, gated live by
+  `the_bounding_set_is_shrunk_to_exactly_the_delivered_caps`. `vmcell-privilege::setcap_arg` is the
+  one composer of the `setcap` argument, and a unit gate reads the `bless` recipe and the preflight
+  probe so the shell copies cannot drift from the constant; a `setuid`-fallback path (for hosts without
   file-cap support) is verified by a pure transition test that asserts the uid change happens **before**
   the ambient raise. This whole mechanism is **dev-workstation only** — production `vmcelld` uses
   file-caps or systemd ambient caps (§11.2), never this runner.

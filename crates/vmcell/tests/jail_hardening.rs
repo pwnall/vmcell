@@ -19,11 +19,11 @@ use vmcell::config::JailConfig;
 use vmcell::vmm::build_vmm_cmd;
 use vmcell::vmm::jail::{JailSpec, apply_jail, build_vmm_deny_filter, jail_spec_from_config};
 
-/// `CAP_NET_ADMIN` from `<linux/capability.h>`. The `libc` crate exports no `CAP_*` numbers and
-/// `capctl` is not a `vmcell` dependency, so the one cap the blessed runner is guaranteed to
-/// have raised into the ambient set (§11.2: `cap_net_admin,cap_sys_admin,cap_dac_override`) is
-/// named here.
-const CAP_NET_ADMIN: libc::c_int = 12;
+/// `CAP_NET_ADMIN`'s kernel number, taken from the ONE crate that owns the privileged vocabulary
+/// rather than restated here. `libc` exports no `CAP_*` numbers; `vmcell-privilege` re-exports
+/// `capctl::Cap`, and it is a `vmcell` dev-dependency precisely so these gates can name caps the
+/// same way the transition does (it was a hand-written `12` until the docs/78 CAP_SETPCAP pass).
+const CAP_NET_ADMIN: libc::c_int = vmcell_privilege::Cap::NET_ADMIN as libc::c_int;
 
 /// Spawns `cat /proc/self/status /proc/self/limits` through `build_vmm_cmd` with `jail`
 /// applied (no netns, so no caps are needed) and returns the child's stdout.
@@ -361,5 +361,64 @@ async fn build_vmm_cmd_resets_inherited_ignored_signals_for_the_vmm_child() {
         0,
         "a VMM spawned through build_vmm_cmd must NOT inherit an ignored INT/TERM \
          (child SigIgn {child_mask:#018x}); an operator's kill would be a no-op"
+    );
+}
+
+/// Parses `/proc/<pid>/status`'s `CapBnd:` line — the 64-bit bounding-set mask.
+fn cap_bnd_mask(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapBnd:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+}
+
+// The bounding-set shrink, asserted on the live process instead of on the plan.
+//
+// `apply_privilege_transition` step 3 drops `supported − need` from the bounding set, which needs
+// `CAP_SETPCAP` in the effective set. The runner did not carry it, so every drop failed and the
+// shrink was a **warned no-op**: the bounding set stayed as wide as the kernel supports (41 caps
+// here), and a child that execs a file-cap'd or setuid binary could still gain capabilities the
+// jail is supposed to have made unreachable. `just bless` now grants the transient `CAP_SETPCAP`
+// (`vmcell_privilege::BLESSED_FILE_CAPS`) so the shrink actually happens.
+//
+// This asserts the OUTCOME, not the plan: the unit tests already pin `bounding_drop`, and a plan
+// that is correct while every syscall fails is exactly the state this test exists to catch — the
+// failure was invisible for the same reason, a green unit test beside a no-op syscall.
+//
+// PRIVILEGED-ONLY (`#[ignore]`d, selected by `just test-privileged`): it asserts the state the
+// blessed runner leaves behind, and an unprivileged process never went through the transition at
+// all. Red on the inverse two ways, both real: revert `just bless` to the three-cap set (the drops
+// fail, CapBnd stays at the kernel's full width) or add `Cap::SETPCAP` to `PRIVILEGED_CAPS` (it
+// stops being in `supported − need`, so it survives in the bounding set and the equality fails).
+#[test]
+#[ignore = "asserts the blessed runner's post-transition bounding set (privileged suite)"]
+fn the_bounding_set_is_shrunk_to_exactly_the_delivered_caps() {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read own status");
+    let bnd = cap_bnd_mask(&status).expect("CapBnd");
+
+    // Precondition/positive control: we are actually running under the blessed runner. Without it
+    // the transition never ran and "the bounding set is wide" would be trivially true.
+    let eff = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+        .expect("CapEff");
+    let delivered: vmcell_privilege::CapSet =
+        vmcell_privilege::PRIVILEGED_CAPS.iter().copied().collect();
+    let effective = vmcell_privilege::CapSet::from_bitmask_truncate(eff);
+    assert!(
+        vmcell_privilege::PRIVILEGED_CAPS
+            .iter()
+            .all(|c| effective.has(*c)),
+        "run me under the blessed runner (`just test-privileged`): CapEff {effective:?} lacks one \
+         of the delivered caps {delivered:?}"
+    );
+
+    assert_eq!(
+        vmcell_privilege::CapSet::from_bitmask_truncate(bnd),
+        delivered,
+        "the bounding set must be shrunk to exactly the delivered caps; a wider set means \
+         PR_CAPBSET_DROP failed — the runner is missing the transient CAP_SETPCAP, so re-run \
+         `just bless` (CapBnd {bnd:#018x})"
     );
 }

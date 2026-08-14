@@ -324,9 +324,23 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   (`bridge::tests`) now round-trips every op incl. `create`, so a format regression reddens.
 
 - **(j) The parent drops effective/permitted/inheritable/ambient caps + `no_new_privs`; the bounding-set
-  shrink is a warned no-op without `CAP_SETPCAP`.** The runner raises only NET_ADMIN/SYS_ADMIN/DAC_OVERRIDE
+  shrink needs `CAP_SETPCAP`.** [SUPERSEDED 2026-08-14 for the runner edge: `just bless` now grants the
+  transient `CAP_SETPCAP` (`BLESSED_FILE_CAPS`), so the runner's shrink succeeds and the exec'd test's
+  bounding set is exactly `PRIVILEGED_CAPS`. The DAEMON edge is improved but not closed, and the
+  numbers are worth stating because they look contradictory: `vmcelld` is launched *through* the
+  runner and inherits only the ambient `PRIVILEGED_CAPS`, which deliberately exclude SETPCAP, so
+  `apply_broker_parent_drop`'s own bounding drop still fails — and warns **41**, not 38, because that
+  plan drops *everything* supported (the parent keeps nothing). It reports 41 failures even though
+  only 3 caps are actually present, because `PR_CAPBSET_DROP` checks `CAP_SETPCAP` in the effective
+  set FIRST and returns `EPERM` regardless of whether the cap is still in the bounding set. Yet the
+  parent's bounding set is now **3, not 41** — measured live, `CapBnd: 0000000000201002` on the HTTP
+  parent — because it inherits the set the runner already shrank. So the residual gap is 3 caps
+  wide instead of 41, on a process that drops all of its own caps and then only serves HTTP without
+  ever exec'ing a file-cap'd binary. An operator who wants the last 3 can grant SETPCAP via systemd
+  `AmbientCapabilities` in production. The same live measurement re-confirms P2: parent
+  `CapInh/Prm/Eff/Amb` all zero, broker child holding exactly the three.] The runner raised only NET_ADMIN/SYS_ADMIN/DAC_OVERRIDE
   (not SETPCAP), so `apply_broker_parent_drop`'s bounding drop warns — the **same** file-cap-path
-  limitation the runner has (B9). Dropping your *own* effective/permitted needs no SETPCAP, so the parent
+  limitation the runner had (B9). Dropping your *own* effective/permitted needs no SETPCAP, so the parent
   still ends with **no usable capabilities** (empty effective set + `no_new_privs`), which is the §13 (Cross-cutting invariants)
   win; the wide bounding set is inert under `no_new_privs`.
 
@@ -3131,3 +3145,64 @@ a gate on the claim.** Two of the six were invisible precisely because a green u
 to an unchanged call site. When a fix extracts a predicate, the gate has to bind the *call sites*,
 not just the predicate — a source scan is an acceptable last resort and is what both backends carry
 for the virtiofsd pacing.
+
+### `CAP_SETPCAP`: the bounding-set shrink stops being a warned no-op (2026-08-14)
+
+Every privileged run printed `could not drop 38 bounding-set capabilities (PR_CAPBSET_DROP needs
+CAP_SETPCAP in the effective set)` — 38 being the 41 caps this kernel supports minus the 3 the runner
+held. Nothing failed, which is why it survived: the effective/permitted trim (the load-bearing half)
+always worked, and the design recorded the shrink as an acceptable no-op. But it meant the bounding
+set stayed at the kernel's full width, so a child that later exec'd a file-cap'd or setuid binary
+could still gain capabilities Layer 2 is supposed to have made unreachable.
+
+**As built.** A new `BLESSED_FILE_CAPS` = `PRIVILEGED_CAPS` + `CAP_SETPCAP` is what `just bless`
+grants the runner *file*. `PRIVILEGED_CAPS` is deliberately unchanged, and the split is the whole
+point: that constant is the set the runner **delivers** (inheritable → ambient → the exec'd test) and
+the daemon **retains**, so putting SETPCAP in it would ride the cap into every test and VMM *and* —
+because `bounding_drop` is `supported − need` — pin SETPCAP in the bounding set permanently, the
+exact opposite of the intent. As a file cap it is transient: the transition drops it out of the
+bounding set at step 3 and out of permitted/effective at step 5's trim to exactly `need`.
+
+**No transition code changed.** `shrink_bounding_set_live` already raised SETPCAP from permitted when
+held; it simply never was. Worth stating because it is the reason this was cheap: the plan was
+correct all along and every syscall failed. SETPCAP drops *itself* in step 3 without disarming the
+remaining drops — `PR_CAPBSET_DROP` is gated on the **effective** set, and leaving the bounding set
+does not leave effective.
+
+**Gates.** `setpcap_is_a_transient_file_cap_never_delivered_to_the_test` pins the split (SETPCAP in
+the file set, absent from `ambient_raise`/`final_caps`/`inheritable_add`, present in `bounding_drop`),
+with the delivered caps as the positive control. `setcap_arg_renders_the_blessed_set_verbatim` pins
+the operator-facing string. `the_shell_copies_of_the_blessed_set_match_this_constant` `include_str!`s
+the `bless` recipe and the preflight probe and fails if either stops naming exactly the set — the cap
+list had been spelled out by hand in **five** places, and those two copies had already drifted once
+(the `*ep*` substring vs the `=ep`/`+ep` field). `setcap_arg` is now the one composer, and
+`blessing_remediation` prints the whole file set rather than the missing subset, because `setcap`
+*replaces* a file's set and echoing a subset would strip the rest.
+
+The live gate is the one that matters: `the_bounding_set_is_shrunk_to_exactly_the_delivered_caps`
+(privileged, `#[ignore]`d) reads its own `/proc/self/status` and asserts `CapBnd` **equals** the
+delivered set, with a `CapEff` precondition so it cannot pass on a process that never went through
+the transition. Asserting the plan would have been theater here — a correct plan whose syscalls all
+fail is precisely the state that shipped.
+
+`vmcell-privilege` became a **dev-dependency of `vmcell`** so those gates name caps through the one
+crate that owns the privileged vocabulary instead of re-deriving `CAP_*` numbers (`libc` exports
+none; `jail_hardening.rs` had a hand-written `12` for `CAP_NET_ADMIN`). Dev-only, so `cargo tree
+-e no-dev` — what the lean-tree CI invariants traverse — is unaffected.
+
+**Measured, on this host.** Through the blessed runner: `CapBnd` `000001ffffffffff` (41 caps, the
+kernel's full width) → `0000000000201002` (exactly `DAC_OVERRIDE|NET_ADMIN|SYS_ADMIN`), with
+`CAP_SETPCAP` (bit 8) absent from all five sets — the transient cap is fully shed before the test
+runs. The runner-edge warning that had appeared in every privileged run is gone.
+
+**A measurement trap worth recording.** "No warning appeared in the suite output" is NOT evidence
+here, twice over: nextest captures and discards child output on an all-pass run, and the daemon
+harness redirects `vmcelld`'s stderr into a log inside a `TempDir` that is deleted with the test. A
+first pass at verifying this read zero warnings from both and concluded the daemon edge was fixed;
+it is not. The honest measurements are the ones above — reading `/proc/<pid>/status` of the live
+processes, and running `vmcelld` through the runner with its stderr attached.
+
+**Operational note.** Because the blessing precondition is now four caps, an already-blessed
+three-cap runner reads as NOT BLESSED and `just bless` re-blesses it (one sudo). That is the
+`M-BIN-2` caps-check path doing its job: the stamp matches but the caps do not, so it falls through
+rather than reporting a false no-op.

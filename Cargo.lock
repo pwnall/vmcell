@@ -4534,6 +4534,7 @@ dependencies = [
  "vmcell-artifact-validator",
  "vmcell-crosvm",
  "vmcell-firecracker",
+ "vmcell-privilege",
  "vmcell-protocol",
  "vmcell-qemu",
  "vmm-sys-util",

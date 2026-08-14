@@ -106,8 +106,8 @@ downstream. Build with the overlay; consume through the env contract.
    # (b) install it under YOUR workspace, owner-only before it gains caps
    install -D -m 0700 <vmcell-checkout>/target/release/vmcell-test-runner \
        .vmcell-bin/release/vmcell-test-runner
-   # (c) grant the three capabilities to that copy (one sudo)
-   sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep .vmcell-bin/release/vmcell-test-runner
+   # (c) grant the blessed capability set to that copy (one sudo)
+   sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override,cap_setpcap+ep .vmcell-bin/release/vmcell-test-runner
    # (d) wire cargo/nextest's target runner at it
    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/.vmcell-bin/release/vmcell-test-runner" \
        cargo nextest run --release …
@@ -245,12 +245,23 @@ just bless
 
 This builds the runner (its own workspace member crate — no `--features` needed), installs a copy
 to a **stable path outside `target/`** (the gitignored `./.vmcell-bin/{debug,release}/vmcell-test-runner`),
-and grants *that copy* the three capabilities:
+and grants *that copy* the blessed capability set:
 
 ```sh
-sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep .vmcell-bin/debug/vmcell-test-runner
-sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override+ep .vmcell-bin/release/vmcell-test-runner
+sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override,cap_setpcap+ep .vmcell-bin/debug/vmcell-test-runner
+sudo setcap cap_net_admin,cap_sys_admin,cap_dac_override,cap_setpcap+ep .vmcell-bin/release/vmcell-test-runner
 ```
+
+Three of those four are what the privileged mode actually uses and what the runner **delivers** to
+the test over the ambient set (`vmcell_privilege::PRIVILEGED_CAPS`: `cap_net_admin` for
+netns/tap/nft, `cap_sys_admin` for mount/cgroup, `cap_dac_override` for the root-owned netns bind
+mount). The fourth, `cap_setpcap`, is **transient** and is never delivered anywhere: its only use is
+`PR_CAPBSET_DROP`, which the kernel gates on it, and the runner drops it back out of both the
+bounding set and permitted/effective before it `exec`s the test. Without it that shrink silently
+fails and the bounding set stays as wide as the kernel supports, so a child could still gain
+capabilities through a file-cap'd or setuid binary. `vmcell-privilege` owns the list
+(`BLESSED_FILE_CAPS`), and a unit gate reads this file's siblings — the `bless` recipe and the
+preflight probe — so the copies cannot drift.
 
 **Why the stable path (v15 §12.8):** writing a binary file strips its capabilities, and cargo
 rewrites `target/<profile>/vmcell-test-runner` for reasons unrelated to the runner's own source (a

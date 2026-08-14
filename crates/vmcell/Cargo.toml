@@ -280,6 +280,11 @@ vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "
 vmcell-firecracker = { path = "../vmcell-firecracker", version = "0.1.0" }
 vmcell-qemu = { path = "../vmcell-qemu", version = "0.1.0" }
 vmcell-crosvm = { path = "../vmcell-crosvm", version = "0.1.0" }
+# The jail gates assert the post-transition capability state the blessed runner leaves behind, so
+# they name caps through the ONE crate that owns the privileged vocabulary rather than re-deriving
+# `CAP_*` numbers (`libc` exports none). Dev-only: `cargo tree -e no-dev` — the lean-tree invariant
+# CI asserts — does not traverse it, and `vmcell` gains no production edge.
+vmcell-privilege = { path = "../vmcell-privilege", version = "0.2.0" }
 criterion = { version = "0.8", features = ["html_reports"] }
 # `test-util` enables `#[tokio::test(start_paused = true)]` for the deterministic
 # EXP-D shutdown-timing tests (L-ORCH-5). Test-only: dev-deps do not affect the
