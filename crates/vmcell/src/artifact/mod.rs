@@ -271,29 +271,12 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
     }
 }
 
-/// An advisory `flock(LOCK_EX)` held for the lifetime of the value (nix's safe RAII `Flock`, which
-/// unlocks on drop — so this module keeps its `#![forbid(unsafe_code)]`). Serializes
-/// [`ensure_test_artifacts`] across concurrent test processes so they never race on the rootfs.
+/// Serializes [`ensure_test_artifacts`] across concurrent test processes so they never race on the
+/// rootfs. The lock itself is [`crate::fs::FileLock`] — the ONE cross-process file lock, shared with
+/// the CA publish in `proxy::tls`, because a second copy of a locking primitive is a second chance
+/// to get it subtly different.
 #[cfg(feature = "pipeline")]
-struct BuildLock(
-    #[expect(dead_code, reason = "held only for its Drop, which releases the flock")]
-    nix::fcntl::Flock<std::fs::File>,
-);
-
-#[cfg(feature = "pipeline")]
-impl BuildLock {
-    fn acquire(path: &Path) -> crate::error::Result<Self> {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(crate::error::Error::Io)?;
-        let locked = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
-            .map_err(|(_, e)| crate::error::Error::Io(std::io::Error::from(e)))?;
-        Ok(Self(locked))
-    }
-}
+use crate::fs::FileLock as BuildLock;
 
 /// The cloud-hypervisor binary path: `$VMCELL_CH_BIN`, else bare `cloud-hypervisor`
 /// (resolved on `PATH`).

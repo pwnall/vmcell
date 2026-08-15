@@ -3512,16 +3512,33 @@ call in the same process folds the real PEM instead. Two keys computed either si
 differ for a reason that has nothing to do with what the test asserts. Reproduced exactly by seeding
 an artifacts dir with only `ca.key`.
 
-Fixed at the test layer: one `stabilize_ca()` helper materializes the CA once, with a bounded retry,
-before any of the six key-comparing tests folds it. A single success closes the window for the rest
-of the process (the `new_in` fast path then serves the cached PEM without touching the filesystem),
-and a CA that is *genuinely* half-committed — the crash-between-renames case the refusal exists for —
-now fails loudly naming that, instead of surfacing as a mystified hash mismatch.
+The same race then reddened a SECOND test on the next run — `oci::tests`'s
+`test_oci_pull_cache_hit_reverify_and_tamper`, as a bare `Io(NotFound)` out of the pack tail. That
+test's own comment had already named the cause and called it out of scope ("the pre-existing NET-4
+TOCTOU in `tls.rs`"), mitigating it by consolidating into one test — which stops that test racing
+*itself* and nothing else. Two symptoms, one cause: chasing them per-test is whack-a-mole that
+leaves CI flaky.
 
-**Deliberately NOT changed: the product.** The two-rename publish has the same window for two
-concurrent `vmcell build`s or proxy starts sharing one artifacts dir, and the refusal cannot
-distinguish "another process is mid-publish right now" from "a crash left this half-committed"
-without a publish lock. Making that distinction is a real design question (M-NET-6 territory), not a
-CI fix, and papering over it by regenerating on a partial pair is precisely what the refusal exists
-to prevent — it would present an authority the cached, already-baked rootfs trust store does not
-trust. Recorded here as open rather than silently narrowed.
+**Fixed at the source: `new_in` now takes a cross-process `flock` on `<dir>/.ca.lock`** for the whole
+generate-or-load. The process mutex above it serializes threads; this serializes processes, which is
+the half that was missing. With writers serialized, the partial-CA refusal keeps exactly the meaning
+it was written for — a pair still half-present once the lock is held was left that way by a crash,
+not by a racer mid-publish — so the fail-loud is preserved, not weakened.
+
+The lock is `crate::fs::FileLock`, extracted from `artifact`'s `BuildLock` so there is **one**
+cross-process file lock rather than two copies of the same primitive; `fs` is gated on `host-common`,
+exactly the feature set that brings in `nix`, so both callers reach it without widening any
+dependency. Lock order is process-mutex → flock, and `.build.lock` is always acquired outside this
+one, never within it, so they cannot cycle.
+
+**Proof, both directions.** The natural window is two renames wide, so racing real processes at it is
+not a reliable gate: 12 concurrent processes against a cold dir produced 0 failures with or without
+the lock. Widening the window artificially (a temporary sleep between the renames) made it decisive —
+**6 of 12 processes took the refusal without the lock, 0 of 12 with it.** The permanent gate asserts
+the mechanism instead of the timing: `ca_publish_is_serialized_across_processes_by_the_ca_lock` holds
+`.ca.lock`, proves `new_in` blocks, releases, and proves it then completes. Deleting the
+`FileLock::acquire` line fails it immediately.
+
+`stabilize_ca()` in the rootfs tests is kept as well. It is now belt-and-braces rather than the fix,
+and it still earns its place: it turns a *genuinely* half-committed CA into a named failure at the
+top of the test instead of a mystified hash mismatch further down.

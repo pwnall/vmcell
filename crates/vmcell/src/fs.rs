@@ -14,6 +14,45 @@ use tokio::process::Command;
 #[cfg(feature = "experiment-fuse")]
 mod in_process;
 
+/// An advisory `flock(LOCK_EX)` held for the lifetime of the value (nix's safe RAII `Flock`, which
+/// unlocks on drop, and on process death — so a crashed holder never wedges the next one).
+///
+/// **The one cross-process file lock.** Two places need to serialize writers that share an
+/// artifacts directory, and both must agree on the mechanism or neither is safe:
+///   * `artifact::ensure_test_artifacts` on `<dir>/.build.lock`, so concurrent test runs never
+///     double-write the rootfs;
+///   * `proxy::tls::CaManager::new_in` on `<dir>/.ca.lock`, because the CA is published as TWO
+///     renames and a concurrent reader that looks between them sees a half-present pair.
+///
+/// It lives here rather than in either caller because the second copy is what drifts. `fs` is the
+/// natural home: it is gated on `host-common`, which is exactly the feature set that brings in
+/// `nix`, so both callers can reach it without widening anyone's dependencies.
+pub(crate) struct FileLock(
+    #[expect(dead_code, reason = "held only for its Drop, which releases the flock")]
+    nix::fcntl::Flock<std::fs::File>,
+);
+
+impl FileLock {
+    /// Creates `path` if absent and blocks until the exclusive lock is held.
+    ///
+    /// `truncate(false)` deliberately: the file is a pure lock token, never read, and truncating it
+    /// would be a write the lock is supposed to be protecting.
+    ///
+    /// # Errors
+    /// [`crate::error::Error::Io`] if the lock file cannot be opened or locked.
+    pub(crate) fn acquire(path: &Path) -> crate::error::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(crate::error::Error::Io)?;
+        let locked = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, e)| crate::error::Error::Io(std::io::Error::from(e)))?;
+        Ok(Self(locked))
+    }
+}
+
 /// A running virtiofs daemon instance.
 #[derive(Debug)]
 #[non_exhaustive]

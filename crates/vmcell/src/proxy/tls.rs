@@ -96,6 +96,27 @@ impl CaManager {
 
         std::fs::create_dir_all(&dir)?;
 
+        // NET-4, the CROSS-process half. The mutex above serializes threads; this serializes
+        // PROCESSES, and without it the partial-CA refusal below fires on a pair that is merely
+        // mid-publish rather than half-committed. The publish is two renames (`ca.key`, then
+        // `ca.pem`), so a concurrent reader that looks between them sees exactly one file and gets
+        // told the CA is broken. That is not hypothetical: it reddened CI twice from the unit
+        // suite — once as two unequal rootfs cache keys (the fold turns the refusal into
+        // `ca-read-error:…`, which is NOT cached, so the next call in the same process folds the
+        // real PEM instead) and once as a bare `NotFound` from the pack tail. nextest gives every
+        // test its own process, so a cold artifacts dir has hundreds of them racing here.
+        //
+        // Taking it AFTER `create_dir_all` is required — the lock file lives in `dir`. Lock order
+        // is process-mutex -> flock, and nothing takes them the other way round: the artifact
+        // pipeline's `.build.lock` is a different file and is always acquired *outside* this, never
+        // within it, so the two cannot cycle.
+        //
+        // With writers serialized, the refusal keeps exactly the meaning it was written for: a pair
+        // that is STILL half-present once we hold the lock was left that way by a crash between the
+        // renames, and regenerating over it would present an authority the cached, already-baked
+        // rootfs trust store does not trust (M-NET-6).
+        let _publish_lock = crate::fs::FileLock::acquire(&dir.join(".ca.lock"))?;
+
         let cert_path = dir.join("ca.pem");
         let key_path = dir.join("ca.key");
 
@@ -204,6 +225,60 @@ impl CaManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NET-4, the cross-process half: `new_in` must take the `.ca.lock` flock and BLOCK while
+    // another process holds it. Without that lock a concurrent reader can look between the two
+    // publish renames and get the `partial CA` refusal for a pair that is merely mid-publish —
+    // which reddened CI twice from the KVM-free unit suite (once as two unequal rootfs cache keys,
+    // once as a bare NotFound out of the pack tail).
+    //
+    // The natural window is two renames wide — microseconds — so racing real processes at it is not
+    // a reliable gate. This asserts the mechanism instead: hold the lock, prove `new_in` does not
+    // finish, release it, prove it then does. Red-on-inverse is exact — delete the
+    // `FileLock::acquire` line in `new_in` and the "must block" assertion fires immediately, because
+    // an unlocked `new_in` on a cold dir completes in milliseconds. Measured with the lock removed
+    // and the window artificially widened: 6 of 12 concurrent processes took the refusal; with the
+    // lock, 0 of 12.
+    //
+    // A fresh tempdir is load-bearing: the process-global cache would otherwise short-circuit
+    // `new_in` before it ever reaches the lock.
+    #[test]
+    fn ca_publish_is_serialized_across_processes_by_the_ca_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        let held = crate::fs::FileLock::acquire(&path.join(".ca.lock")).expect("hold the ca lock");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_dir = path.clone();
+        let probe = std::thread::spawn(move || {
+            let r = CaManager::new_in(probe_dir).map(|c| c.ca_cert_pem().to_string());
+            // Ignore a send failure: it only means the test already gave up and dropped the rx.
+            let _ = tx.send(r.is_ok());
+            r
+        });
+
+        // It must still be blocked. A generous window keeps this from flaking on a loaded box while
+        // still being decisive: an UNLOCKED `new_in` mints and returns in milliseconds.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(750))
+                .is_err(),
+            "new_in returned while another holder had .ca.lock — the publish is not serialized \
+             across processes, so a concurrent reader can observe the half-published CA pair"
+        );
+
+        drop(held);
+
+        // …and it completes once the lock is free, so the assertion above is "blocked", not "broken".
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("new_in must proceed once .ca.lock is released");
+        assert!(ok, "new_in failed after the lock was released");
+        probe
+            .join()
+            .expect("probe thread")
+            .expect("ca materialized");
+    }
 
     // Buggy impl guarded (PROXY-6): a process-global cache that is not keyed on
     // the artifacts dir makes a second `new()` with a *different* dir reuse the
