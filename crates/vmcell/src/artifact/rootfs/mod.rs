@@ -602,6 +602,45 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    /// Materialize the shared proxy CA ONCE, before any test below folds it into a cache key.
+    ///
+    /// Every rootfs cache key folds the deployment CA's PEM (`fold_rootfs_injection_identity`), and
+    /// `CaManager::new()` reads it from the process-GLOBAL artifacts dir, minting it when absent.
+    /// Its cache and lock are process-global — but nextest gives every test its own PROCESS, so on a
+    /// cold artifacts dir (any CI runner) hundreds of test processes race to materialize the same
+    /// `ca.pem` / `ca.key`.
+    ///
+    /// The pair is published as TWO renames. A process that looks between them sees
+    /// `cert_exists != key_exists` and gets the deliberate `partial CA in …` refusal, which the fold
+    /// turns into `ca-read-error:…` — and errors are NOT cached, so the very next call in the same
+    /// process folds the real PEM. Two keys computed either side of that window differ for a reason
+    /// that has nothing to do with what the test asserts. Seen exactly once in CI, as
+    /// `test_rootfs_cache_key_order_independent` reporting two unequal hashes on a cold runner.
+    ///
+    /// One SUCCESSFUL call closes the window for the rest of the process: `CaManager::new_in`'s fast
+    /// path then returns the cached PEM without touching the filesystem. The retry exists because
+    /// this call can itself land in another process's publish window; the transient is bounded by
+    /// two renames, so a few short waits cover it, and a CA that is genuinely half-committed still
+    /// fails loudly here — naming the real problem instead of a mystified key mismatch.
+    #[cfg(feature = "proxy")]
+    fn stabilize_ca() {
+        let mut last = String::new();
+        for _ in 0..50 {
+            match crate::proxy::tls::CaManager::new() {
+                Ok(_) => return,
+                Err(e) => {
+                    last = e.to_string();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        panic!("the shared proxy CA never materialized; last error: {last}");
+    }
+
+    /// Without the `proxy` feature no CA is folded, so there is nothing to stabilize.
+    #[cfg(not(feature = "proxy"))]
+    fn stabilize_ca() {}
+
     fn stage() -> RootfsStage {
         RootfsStage {
             image_override: None,
@@ -629,6 +668,7 @@ mod tests {
     // content. Inserted in opposite orders, the content-addressed key must be identical.
     #[test]
     fn test_rootfs_cache_key_order_independent() {
+        stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = write_tmp(dir.path(), "guest_agent", b"agent-bytes");
         let tools = write_tmp(dir.path(), "guest_tools", b"tools-bytes");
@@ -874,6 +914,7 @@ mod tests {
     // path-string fold, (c) an unsorted fold, (d) a fold that omits the mode.
     #[test]
     fn test_rootfs_key_tracks_extra_file_content_mode_and_not_order() {
+        stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
         let a = write_tmp(dir.path(), "acme", b"acme-v1");
         let b = write_tmp(dir.path(), "other", b"other-v1");
@@ -938,6 +979,7 @@ mod tests {
     // kernel, folds it in its own key in `vmcell-rootfs-builder`.)
     #[test]
     fn test_rootfs_oci_key_ignores_kernel() {
+        stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
         let kernel = write_tmp(dir.path(), "vmlinux", b"kernel-v1");
         let mut inputs = StageInputs::default();
@@ -959,6 +1001,7 @@ mod tests {
     // unchanged when a rebuilt upstream artifact lands at the same path.
     #[test]
     fn test_rootfs_cache_key_tracks_upstream_content() {
+        stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
         let p = write_tmp(dir.path(), "guest_agent", b"agent-v1");
         let mut inputs = StageInputs::default();
@@ -978,6 +1021,7 @@ mod tests {
     // stale agent stay baked in; folding it in makes the key sensitive to it.
     #[test]
     fn test_rootfs_cache_key_tracks_guest_agent_src_hash() {
+        stabilize_ca();
         let mut a = StageInputs::default();
         a.pins
             .insert("guest_agent_src_hash".to_string(), "hash-aaa".to_string());
@@ -993,6 +1037,7 @@ mod tests {
     // rootfs. The buggy path-string fold leaves k1 == k2 (same path) -> red here.
     #[test]
     fn test_rootfs_agent_musl_key_tracks_content() {
+        stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = write_tmp(dir.path(), "agent-musl", b"musl-v1");
         let s = RootfsStage {

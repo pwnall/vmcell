@@ -3490,3 +3490,38 @@ Not fixed here, and worth naming: `MicroVm::start` refuses to boot on a non-dele
 run` cannot work on a hosted runner — but tolerating `EACCES` would make a *requested* limit silently
 unenforced, which is the §7.2 failure the fail-loud contract exists to prevent. The two questions are
 kept separate.
+
+### The rootfs cache-key flake: a named mechanism, not "environmental"
+
+`artifact::rootfs::tests::test_rootfs_cache_key_order_independent` failed once on a hosted runner
+with two unequal hashes, having passed locally and on the previous CI run. AGENTS.md's rule applies —
+a flake explanation without a mechanism stays open — so here is the mechanism, confirmed by
+reproducing it deterministically.
+
+Every rootfs cache key folds the deployment CA's PEM (`fold_rootfs_injection_identity`), and
+`CaManager::new()` reads it from the process-**global** artifacts dir, minting it when absent. Its
+cache and lock are process-global; nextest gives every test its own **process**; so on a cold
+artifacts dir hundreds of test processes race to materialize the same pair. The pair is published as
+**two renames** (`tls.rs`: `rename(key_tmp, ca.key)` then `rename(cert_tmp, ca.pem)`), and a process
+that looks between them sees `cert_exists != key_exists` and gets the deliberate
+
+    partial CA in <dir>: ca.key present but ca.pem missing
+
+refusal. The fold turns that into `ca-read-error:…`, and errors are **not** cached — so the very next
+call in the same process folds the real PEM instead. Two keys computed either side of that window
+differ for a reason that has nothing to do with what the test asserts. Reproduced exactly by seeding
+an artifacts dir with only `ca.key`.
+
+Fixed at the test layer: one `stabilize_ca()` helper materializes the CA once, with a bounded retry,
+before any of the six key-comparing tests folds it. A single success closes the window for the rest
+of the process (the `new_in` fast path then serves the cached PEM without touching the filesystem),
+and a CA that is *genuinely* half-committed — the crash-between-renames case the refusal exists for —
+now fails loudly naming that, instead of surfacing as a mystified hash mismatch.
+
+**Deliberately NOT changed: the product.** The two-rename publish has the same window for two
+concurrent `vmcell build`s or proxy starts sharing one artifacts dir, and the refusal cannot
+distinguish "another process is mid-publish right now" from "a crash left this half-committed"
+without a publish lock. Making that distinction is a real design question (M-NET-6 territory), not a
+CI fix, and papering over it by regenerating on a partial pair is precisely what the refusal exists
+to prevent — it would present an authority the cached, already-baked rootfs trust store does not
+trust. Recorded here as open rather than silently narrowed.
