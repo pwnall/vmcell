@@ -3542,3 +3542,81 @@ the mechanism instead of the timing: `ca_publish_is_serialized_across_processes_
 `stabilize_ca()` in the rootfs tests is kept as well. It is now belt-and-braces rather than the fix,
 and it still earns its place: it turns a *genuinely* half-committed CA into a named failure at the
 top of the test instead of a mystified hash mismatch further down.
+
+# The docs/81 review pass (2026-08-14)
+
+`docs/81-claude-opus-code-review.md` reviewed the tree at `7499cba` across fourteen disjoint areas
+with a separate adversarial verifier per area; 76 unique defects survived verification (13 major, 48
+minor, 15 note), and every live suite was run on this host (privileged 156/156, unprivileged 4/4,
+daemon 14/14, crosvm 30/30, `just ci` green). What follows are the entries that pass recorded rather
+than fixed: three places where the **code is right and a document is stale**, and one prior entry the
+design has since superseded. The defects that should be *fixed* are in docs/81 and are not repeated
+here.
+
+## Recorded (justified): the session mux's writer is a channel, not an `Arc<Mutex<SplitSink>>`
+
+Design §3.2 sketches `SessionMux { /* writer sink (Arc<Mutex<SplitSink>>) … */ }` and `Session { … a
+clone of the writer sink }`, and states in prose that "Writes from all `Session` handles + the mux go
+through one `Arc<Mutex<SplitSink>>`". The shipped mux holds no mutex over the sink:
+`agent/session.rs:149-156` is `SessionMux { write_tx: mpsc::UnboundedSender<Bytes>, registry,
+next_id, reader, writer }`, `Session::send` is a `write_tx.send(frame)`, and the sink is owned
+**solely** by `writer_task(mut sink: FrameSink, …)`.
+
+**The code is right and should not move.** A single owning writer task satisfies law C4 (one writer
+per connection) exactly as a mutex would, without holding a lock across an `await` — and the pure-sink
+`writer_task` shape is what the docs/78 M1 fix depends on. The notes name `write_tx`/`writer_task` in
+passing but never record the departure from the sketch, so a reader reconciling §3.2 against the code
+finds an unexplained mismatch in the one place law C4 lives. Recorded here; design §3.2's two sites
+(the struct sketch and the prose sentence) are corrected at the next reissue.
+
+## Recorded (justified): the runner's transition drops uid BEFORE raising ambient
+
+Design §15.5 states the runner as "file-caps → raise the three caps into the **ambient** set → drop to
+the invoking uid → `execvp`", and §11.2 repeats it as "file-caps → raise ambient → drop to the dev uid
+→ `execvp`". **The shipped order is the inverse, deliberately.**
+`vmcell-privilege/src/lib.rs:414-478` sequences uid drop (`setresgid`/`setgroups`/`setresuid`) →
+inheritable add → `shrink_bounding_set_live` → `capctl::ambient::raise` → trim, and the doc comment at
+`:414-416` declares that ordering security-critical: on the `setuid`-root fallback path, raising
+ambient before the uid change would carry capabilities across a uid boundary that
+`setresuid` is entitled to clear.
+
+The design text is backwards, not the code. Also worth stating because §15.5 implies otherwise: on the
+**default file-cap path** there is no uid to drop to — the runner already runs as the invoking user —
+so the drop is a no-op there and the ordering matters only for the `setuid` fallback. That fallback is
+never provisioned by this repo (`just bless` grants file caps), which is why the ordering has no live
+gate; docs/81 m26 records the missing gate as a separate, latent item.
+
+## Recorded (justified): the daemon's start-up sweep is cross-process liveness-blind
+
+Design §11.4 says of the start-up sweep: "(Nothing is live at start-up, so the empty set can never
+sweep a resource in use.)" That parenthetical is false on a host running **more than one process with
+the same `resource_prefix`**. `vmcell-daemon/src/sweep.rs:24-32` drives `sweep_orphans` with two empty
+`BTreeSet`s, and `sweep_orphans` (`orchestrator.rs:2120-2206`) deletes every scanned
+netns / segment-netns / cgroup-slice / scratch-dir whose trailing id is absent from those sets — it
+consults no `/tmp/vmcell-vmid` claim file, and `scan_scratch_dirs` filters on the `<prefix>-vm-` name
+prefix only, **discarding the pid embedded in the name**. So a starting daemon reaps a concurrently
+live sibling's resources if they share a prefix.
+
+**The behavior is acceptable and stays.** The design's own answer to multi-tenancy is `F2`'s prefix
+isolation — "two daemons with distinct prefixes never sweep each other's resources", validated on KVM —
+and the sweep is what makes a hard-killed daemon self-heal, which is worth more than same-prefix
+concurrency. The sibling blindness in `clean_vmcell_netns` is already recorded; this call site was not.
+What is recorded here is the scope: **the guarantee is per-prefix, not absolute**, and §11.4's
+parenthetical over-claims. The obvious future fix is the one already named for the test sweeper — seed
+the live sets from the two claim dirs (an id whose `<id>.lock` names a live `/proc/<pid>` is live) and
+skip a scratch dir whose embedded pid is alive — but note it can only ever cover `HostEnv::shared()`
+callers, since a hermetic allocator writes no claim file.
+
+## Retired: the jail deny-list's three "carry-over" syscalls are no longer a deviation
+
+`vmm/jail.rs:62-67` still reads "Deliberate additions BEYOND the §12.3 roster … the design folds them
+into the roster at the next revision. Do not drop them to 'match the doc' — widen the doc", and this
+file carries the matching justified-deviation entry. **Design v31 already widened the doc**: its §12.3
+fence now lists `reboot`, `swapon` and `swapoff` alongside the rest, and `DENIED_SYSCALLS` (21 entries)
+matches the roster name-for-name in both directions — verified against the tree in the docs/81 pass.
+
+Per AGENTS.md ("retire an entry when it is empirically disproven"), the deviation is retired: there is
+nothing left to deviate from. The at-site comment should be rewritten to state the roster agreement
+(and keep the "never drop one to match a doc" instinct, which is still the right one) rather than to
+describe a gap that closed.
+
