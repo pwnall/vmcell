@@ -174,6 +174,32 @@ test-unprivileged:
     VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
         cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all -E 'kind(test) & (test(unprivileged) | test(smoltcp))'
 
+# The artifact-conformance battery's LIVE smoke suite (`vmcell-artifact-validator`, the §10.4
+# downstream contract surface): the known-good pair must pass `Level::Full` with zero failures, and
+# a garbage kernel must FAIL with a §5.4-clause message. Both tests are `#[ignore]`d (they boot real
+# Cloud Hypervisor VMs), and until this recipe existed NO invocation in the tree selected them —
+# every `--run-ignored all` was scoped to another package — so the only proof that the battery can
+# go red was compiled and skipped. `--no-tests=fail` makes a filter that selects zero tests an
+# error, which is the failure mode that hid this one.
+#
+# Needs KVM and the built artifacts (the getters run the at-most-once rootfs build; the kernel is
+# built out-of-band by `vmcell build --kernel-source host-make`). Runs through the blessed runner
+# like the other live suites, so the Extended/Full capability-gated checks (tap networking,
+# virtio-fs, cgroup limits) actually RUN instead of recording skips — the validator's own report
+# lists any that still skip, and `validate` refuses outright without /dev/kvm rather than emitting a
+# green all-skipped report. Wrap it in a delegated scope for the cgroup leg, exactly like the other
+# live suites: `systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-validator`.
+#
+# Live artifact-conformance battery: the known-good pair must pass Level::Full, a garbage kernel must fail.
+test-validator:
+    # H-TEST-3, like every sibling suite recipe: the validator records its skips in the report the
+    # tests print, but the export keeps a `require_cap!` skip from any vmcell-side helper out of the
+    # per-PID temp file nobody reads.
+    VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
+        cargo nextest run --locked --profile integration -p vmcell-artifact-validator --run-ignored all \
+        --no-tests=fail -E 'binary(smoke)'
+
 # Opt-in crosvm live matrix. crosvm is a secondary backend whose binary is NOT installed on the
 # build/CI hosts, so it is deliberately kept OUT of `test-privileged` (adding it there would hard-fail
 # every KVM host lacking a `crosvm` binary). Its KVM-FREE gates (unit tests, capability-honesty pins,
@@ -250,6 +276,151 @@ skip-manifest-show:
     echo "skip manifest: $n capability skip(s) recorded in $manifest"
     if [ "$n" -gt 0 ]; then sort "$manifest" | uniq -c | sort -rn; fi
 
+# THE ONE ROSTER of repo gates: every ban/check script, every red-on-inverse self-test, and the
+# shellcheck pass over the load-bearing bash. `just ci` calls this recipe and
+# .github/workflows/ci.yml invokes it as `run: just gates` — so a script added HERE is covered in CI
+# BY CONSTRUCTION, because there is no second list to add it to.
+#
+# WHY IT IS A RECIPE AND NOT A CI STEP (AGENTS rule 3: "A CI step that hand-copies a `just` recipe
+# drifts from it — invoke the recipe so local ≡ CI by construction"). ci.yml hand-copied this list
+# and the copy drifted THREE times, twice in a single wave: `ban-readiness-timeout-literal.sh` and
+# `ban-test-support-in-production.sh` both landed in the justfile and never reached ci.yml. Each
+# omission was worse than a lost duplicate. The readiness ban is the backstop for the ONE route the
+# structural fix leaves open (a bare literal handed to `wait_for_socket`), and the test-support ban's
+# entire rationale is that cargo's feature unification makes the fixtures visible to lib targets
+# under `--all-targets` — which is what CI runs and a plain `cargo build` does not. Running only
+# locally was precisely the wrong half of each.
+#
+# The first entry below is the gate for that class: it fails if ci.yml ever names a `scripts/*.sh`
+# directly again, and it asserts this roster is EXACTLY the set of gate-shaped scripts on disk (both
+# directions — an orphan script and a stale entry). It runs first because it is pure text and a
+# broken roster invalidates every verdict after it.
+gates:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The meta-gate, first: one roster, no hand-copy, no orphan. See its header for the three
+    # drift instances that motivated it.
+    ./scripts/ban-ci-script-handcopy.sh
+    ./scripts/test-ban-ci-script-handcopy.sh
+    # `AGENTS.md` is the DEPLOYED copy of `docs/*claude-agents*.md` — two paths, one document. The
+    # docs/81 campaign rewrote AGENTS.md in seven hunks and the source document in one, leaving every
+    # corrected count still wrong in the file AGENTS.md is deployed from — inside the very wave whose
+    # mandate was "rosters quoted in docs are checked against the tree, never from memory". The two
+    # were byte-identical before the campaign, so the invariant existed; it was merely unwritten, and
+    # an unwritten invariant is not a gate.
+    ./scripts/check-agents-md-sync.sh
+    ./scripts/test-check-agents-md-sync.sh
+    # M-VEND-3: assert the carried vhost patch is actually applied. A caret version
+    # bump would silently drop the `[patch.crates-io]` (only a "Patch was not used"
+    # warning), regressing the QEMU-unprivileged SET_VRING_ENABLE quirk with a green
+    # build. ONE predicate, here and downstream (v30 delta 2): this call REPLACES the two
+    # inline cargo-tree greps that used to live here — they had already diverged from the
+    # downstream copy on pattern strictness, the duplication-hides-divergence trap. The
+    # script is path-independent so a git-dep consumer runs the SAME check in its own
+    # workspace (design §10.4).
+    ./scripts/check-vendored-vhost.sh
+    ./scripts/test-check-vendored-vhost.sh
+    # lean-member invariants (§12.8 #4 / §18.1): the guest PID-1 agent, the privileged-window
+    # test-runner, and the `vmcell-privilege` crate BOTH the runner and the daemon link must omit
+    # the host async stack. (Each must also COMPILE standalone; those three `cargo clippy -p …`
+    # calls stay in `ci`/ci.yml beside the other compile gates — this roster is scripts only.)
+    # The three inline `cargo tree | grep` copies that used to live here (and their three twins in
+    # ci.yml) are gone: they were the duplication-hides-divergence trap AND they were DEAD in CI,
+    # because `CARGO_TERM_COLOR: always` makes cargo emit `\e[2m├──\e[0m tokio v…` and the
+    # `── tokio v` pattern then matches nothing. One predicate now, with `--color never` inside it,
+    # plus its red-on-inverse self-test — which runs the predicate under the CI colour condition,
+    # the leg whose absence let the bans die.
+    # `--all` and not a crate list: the script's LEAN_MATRIX is the law, and re-typing three of its
+    # four rows here was a second roster of exactly the kind this recipe exists to abolish — it had
+    # already gone stale on `vmcell-daemon-client`, which the script checked anyway while printing
+    # "replace the crate list with --all so the matrix cannot go stale again".
+    ./scripts/check-lean-tree.sh --all
+    ./scripts/test-check-lean-tree.sh
+    # B9/design §12.4 (erratum-aware): the broker OWNS the engine — tokio + rtnetlink are LEGITIMATE
+    # (it does the netns/tap/nft setup itself), so it is NOT governed by the full lean-tree ban above.
+    # Its lean boundary is the network-facing WEB SERVER, which lives in `vmcell-daemon` (axum). Assert
+    # the broker links NEITHER `vmcell-daemon` NOR `axum`, so the HTTP surface that parses network
+    # input can never share the cap-holding process (§12.23 / P2). NOTE: `hyper` is deliberately NOT
+    # asserted absent — it enters transitively and LEGITIMATELY through vmcell's egress proxy
+    # (hudsucker) and HTTP clients (reqwest/oci-client), which the broker's net subset needs. The
+    # meaningful marker of the *server* stack is axum + the vmcell-daemon crate. (Corrects the
+    # v3/AGENTS.md "axum/hyper" phrasing to the built tree — see implementation-notes.md.)
+    # One predicate + its self-test, for the same reason as the lean-member ban above and one more:
+    # the two inline `2>/dev/null | grep -q .` copies could not fail. `cargo tree -i <absent pkg>`
+    # exits 101 with its message on STDERR, so a rename, an ambiguous spec, or a stale lockfile read
+    # as "absent" exactly like the real thing — a negative security gate with no positive control.
+    ./scripts/check-broker-lean.sh
+    ./scripts/test-check-broker-lean.sh
+    ./scripts/ban-global-state.sh
+    ./scripts/test-ban-global-state.sh
+    ./scripts/ban-legacy-terms.sh
+    ./scripts/test-ban-legacy-terms.sh
+    # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the guest agent + its red-on-inverse self-test.
+    ./scripts/ban-agent-ip-shellout.sh
+    ./scripts/test-ban-agent-ip-shellout.sh
+    # P3/B12: the ONLY function that turns a client-supplied artifact name into a path is
+    # resolve_artifact_path (crates/vmcell-daemon/src/name.rs). A daemon handler that builds
+    # `<artifacts_dir>.join(<client name>)` itself is a traversal hole — grep-ban it in the daemon
+    # crate; the self-test proves the ban fires on the bug and passes on the sanctioned validator.
+    ./scripts/ban-artifact-path-join.sh
+    ./scripts/test-ban-artifact-path-join.sh
+    # S2 / delta 8 ("one law, one predicate"): `net_sys::setns_net` is the one home for `setns(2)`,
+    # the `build_vmm_cmd` pre_exec site its one exemption (its safety proof is site-specific). The
+    # review found two inline duplicates; nothing but review stopped a third, so grep-ban it. The
+    # self-test proves all three halves red: the call pattern, the one-call cap inside an exempt
+    # file, and the stale-exemption check.
+    ./scripts/ban-inline-setns.sh
+    ./scripts/test-ban-inline-setns.sh
+    # docs/81 §8/§9 ("one law, one predicate"): the kernel ARTIFACT-KEY (`kernel-<label>`) and
+    # PIN-KEY (`kernel_<label>_<sub>`) laws were triplicated and unexported — a private method in
+    # `artifact::kernel`, a byte-duplicate in `vmcell-kernel-builder`, and the pin key composed
+    # inline in the pins flattener. Both are now `pub fn kernel_artifact_key` / `kernel_pin_key`
+    # with every site routed through them. Neither drift is a compile error (a lost artifact-map
+    # entry, or a runtime `Missing kernel_… pin`), so grep-ban a second composed spelling. The
+    # self-test proves all four halves red: each arm's pattern, the exact-count check inside the
+    # sanctioned home (extra AND missing composer), and the stale-home check.
+    ./scripts/ban-kernel-key-composers.sh
+    ./scripts/test-ban-kernel-key-composers.sh
+    # docs/81 §8 ("one law, one predicate"): the 1 s VMM-control-socket readiness ceiling was six
+    # inline `1000`s across CH/FC/QEMU/crosvm. The fix is structural — `register_and_await_ready`
+    # and `wait_for_vmm_socket` take NO timeout argument, so a literal there is a compile error —
+    # and this bans the one route left open, a bare number handed to the lower-level
+    # `wait_for_socket` (which keeps its parameter for virtiofsd's profile-paced wait). The
+    # self-test proves all three halves red: each arm's pattern, the wrapped-call join, and the
+    # vacuity check that a tree with no readiness call is a misconfiguration rather than an "ok".
+    ./scripts/ban-readiness-timeout-literal.sh
+    ./scripts/test-ban-readiness-timeout-literal.sh
+    # docs/81 §9: `vmcell`'s `test-support` feature exposes `metrics::FakeCgroupFs` and
+    # `vmm::VmmProcessGroup::already_reaped_for_test` so the backends stop hand-rolling copies. Each
+    # backend takes it as a DEV-dependency, so `cargo build -p <backend>` cannot see them — but
+    # cargo's feature unification DOES make them visible to lib targets under `--all-targets`, which
+    # is what CI runs. Ban a production reference outright; the self-test proves five halves red:
+    # the production hit, the comment/`#[cfg(test)]`/`tests/` exclusions, a moved definition site, a
+    # definition whose feature gate was dropped, and a banned symbol nobody uses (a stale roster).
+    ./scripts/ban-test-support-in-production.sh
+    ./scripts/test-ban-test-support-in-production.sh
+    # AGENTS rule 1, the CARGO_TERM_COLOR class: CI exports `CARGO_TERM_COLOR: always` at WORKFLOW
+    # level, so `cargo tree` dims its glyphs and every pattern anchored on the glyph/name boundary
+    # silently stops matching. Two shipped instances — three lean-member bans passing while proving
+    # nothing, and the downstream example's absent-tree fixture filtering nothing (a red job with a
+    # misleading message). `just ci` does not export the variable, so local ≢ CI and neither showed
+    # up here. Ban parsing colourisable cargo output outright; the self-test pins both directions.
+    ./scripts/ban-uncolored-cargo-parse.sh
+    ./scripts/test-ban-uncolored-cargo-parse.sh
+    # The privileged-review preflight's three-way verdict (bless-only sentinel) — self-test only.
+    # The real preflight probes a KVM host and runs at review time (not here), but its classifier —
+    # bless-remediable (exit 2, BLOCKED-ON-BLESS) vs environmental (exit 1, NOT READY) — is
+    # host-independent and must go red if it ever misroutes a bless-fixable failure to static-only.
+    ./scripts/test-review-preflight-priv.sh
+    # The ban scripts, preflight, bless path, and delegated-scope helper are load-bearing,
+    # security-adjacent bash — lint them all.
+    # ...including the downstream example's contract check (v30 delta 5): it must live beside the
+    # workspace it checks, so the lint glob comes to it rather than the script moving to scripts/.
+    # `scripts/git-pre-commit` is listed EXPLICITLY: a git hook carries no `.sh` extension, so the
+    # glob silently skipped the one hook that runs on every commit. This is a GLOB, not a roster, so
+    # it cannot go stale on a new script — which is why it belongs here rather than in ci.yml.
+    shellcheck scripts/*.sh scripts/git-pre-commit examples/downstream-kernel/*.sh
+
 # Everything the `lint` CI job runs, locally — a faithful mirror of .github/workflows/ci.yml.
 # Shebang recipe so the whole job shares one shell: RUSTFLAGS=-D warnings is exported process-wide
 # (matching CI's workflow-level env, which — unlike a clippy `-- -D warnings` arg — also denies
@@ -269,44 +440,19 @@ ci:
     # above them already catches any drift.
     cargo clippy --locked --workspace --all-targets --all-features
     cargo deny check
-    # M-VEND-3: assert the carried vhost patch is actually applied. A caret version
-    # bump would silently drop the `[patch.crates-io]` (only a "Patch was not used"
-    # warning), regressing the QEMU-unprivileged SET_VRING_ENABLE quirk with a green
-    # build. ONE predicate, here and downstream (v30 delta 2): this call REPLACES the two
-    # inline cargo-tree greps that used to live here — they had already diverged from the
-    # downstream copy on pattern strictness, the duplication-hides-divergence trap. The
-    # script is path-independent so a git-dep consumer runs the SAME check in its own
-    # workspace (design §10.4).
-    ./scripts/check-vendored-vhost.sh
-    ./scripts/test-check-vendored-vhost.sh
-    # lean-member invariants (§12.8 #4 / §18.1): the guest PID-1 agent, the privileged-window
-    # test-runner, and the `vmcell-privilege` crate BOTH the runner and the daemon link must omit
-    # the host async stack — and each must compile standalone. The three inline `cargo tree | grep`
-    # copies that used to live here (and their three twins in ci.yml) are gone: they were the
-    # duplication-hides-divergence trap AND they were DEAD in CI, because `CARGO_TERM_COLOR: always`
-    # makes cargo emit `\e[2m├──\e[0m tokio v…` and the `── tokio v` pattern then matches nothing.
-    # One predicate now, with `--color never` inside it, plus its red-on-inverse self-test — which
-    # runs the predicate under the CI colour condition, the leg whose absence let the bans die.
-    ./scripts/check-lean-tree.sh vmcell-guest-agent vmcell-test-runner vmcell-privilege
-    ./scripts/test-check-lean-tree.sh
+    # THE ONE GATE ROSTER, invoked — never copied. Every ban/check script, every red-on-inverse
+    # self-test, and the shellcheck pass live in the `gates` recipe above; .github/workflows/ci.yml
+    # runs that SAME recipe (`run: just gates`). The list used to be duplicated into ci.yml and the
+    # copy drifted three times, most recently dropping two whole bans (see `gates`'s header). A
+    # recursive `just` is what makes the roster have exactly one home.
+    {{just_executable()}} gates
+    # lean-member invariants (§12.8 #4 / §18.1), compile half: the tree-SHAPE assertion is
+    # `check-lean-tree.sh` inside `gates`; graph inspection is not enough, so each of the three
+    # members is also clippied standalone here — a broken build (e.g. an un-gated host dep) must be
+    # caught in this job, not on a KVM host.
     cargo clippy --locked -p vmcell-guest-agent --all-targets
     cargo clippy --locked -p vmcell-test-runner --all-targets
     cargo clippy --locked -p vmcell-privilege --all-targets
-    # B9/design §12.4 (erratum-aware): the broker OWNS the engine — tokio + rtnetlink are LEGITIMATE
-    # (it does the netns/tap/nft setup itself), so it is NOT governed by the full lean-tree ban above.
-    # Its lean boundary is the network-facing WEB SERVER, which lives in `vmcell-daemon` (axum). Assert
-    # the broker links NEITHER `vmcell-daemon` NOR `axum`, so the HTTP surface that parses network
-    # input can never share the cap-holding process (§12.23 / P2). NOTE: `hyper` is deliberately NOT
-    # asserted absent — it enters transitively and LEGITIMATELY through vmcell's egress proxy
-    # (hudsucker) and HTTP clients (reqwest/oci-client), which the broker's net subset needs. The
-    # meaningful marker of the *server* stack is axum + the vmcell-daemon crate. (Corrects the
-    # v3/AGENTS.md "axum/hyper" phrasing to the built tree — see implementation-notes.md.)
-    # One predicate + its self-test, for the same reason as the lean-member ban above and one more:
-    # the two inline `2>/dev/null | grep -q .` copies could not fail. `cargo tree -i <absent pkg>`
-    # exits 101 with its message on STDERR, so a rename, an ambiguous spec, or a stale lockfile read
-    # as "absent" exactly like the real thing — a negative security gate with no positive control.
-    ./scripts/check-broker-lean.sh
-    ./scripts/test-check-broker-lean.sh
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).
     cargo clippy --locked -p vmcell-guest-tools --all-targets
     # Reduced-host-feature smoke (fast per-backend feedback before the full powerset below). After the
@@ -331,39 +477,6 @@ ci:
     # keeps it to our crates. (Benign cargo warning: the `vmcell` lib and the `vmcell` CLI bin share a
     # doc output path — cosmetic, not a rustdoc lint, so it does not fail the -D-warnings gate.)
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
-    ./scripts/ban-global-state.sh
-    ./scripts/test-ban-global-state.sh
-    ./scripts/ban-legacy-terms.sh
-    ./scripts/test-ban-legacy-terms.sh
-    # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the guest agent + its red-on-inverse self-test.
-    ./scripts/ban-agent-ip-shellout.sh
-    ./scripts/test-ban-agent-ip-shellout.sh
-    # P3/B12: the ONLY function that turns a client-supplied artifact name into a path is
-    # resolve_artifact_path (crates/vmcell-daemon/src/name.rs). A daemon handler that builds
-    # `<artifacts_dir>.join(<client name>)` itself is a traversal hole — grep-ban it in the daemon
-    # crate; the self-test proves the ban fires on the bug and passes on the sanctioned validator.
-    ./scripts/ban-artifact-path-join.sh
-    ./scripts/test-ban-artifact-path-join.sh
-    # S2 / delta 8 ("one law, one predicate"): `net_sys::setns_net` is the one home for `setns(2)`,
-    # the `build_vmm_cmd` pre_exec site its one exemption (its safety proof is site-specific). The
-    # review found two inline duplicates; nothing but review stopped a third, so grep-ban it. The
-    # self-test proves all three halves red: the call pattern, the one-call cap inside an exempt
-    # file, and the stale-exemption check.
-    ./scripts/ban-inline-setns.sh
-    ./scripts/test-ban-inline-setns.sh
-    # AGENTS rule 1, the CARGO_TERM_COLOR class: CI exports `CARGO_TERM_COLOR: always` at WORKFLOW
-    # level, so `cargo tree` dims its glyphs and every pattern anchored on the glyph/name boundary
-    # silently stops matching. Two shipped instances — three lean-member bans passing while proving
-    # nothing, and the downstream example's absent-tree fixture filtering nothing (a red job with a
-    # misleading message). `just ci` does not export the variable, so local ≢ CI and neither showed
-    # up here. Ban parsing colourisable cargo output outright; the self-test pins both directions.
-    ./scripts/ban-uncolored-cargo-parse.sh
-    ./scripts/test-ban-uncolored-cargo-parse.sh
-    # The privileged-review preflight's three-way verdict (bless-only sentinel) — self-test only.
-    # The real preflight probes a KVM host and runs at review time (not here), but its classifier —
-    # bless-remediable (exit 2, BLOCKED-ON-BLESS) vs environmental (exit 1, NOT READY) — is
-    # host-independent and must go red if it ever misroutes a bless-fixable failure to static-only.
-    ./scripts/test-review-preflight-priv.sh
     # ---- Toolchain honesty + non-Rust-surface gates (rubric Part D) ----
     # Toolchain honesty: the declared MSRV (`[workspace.package] rust-version`) equals the pinned
     # `rust-toolchain.toml` channel (the latest stable). An UNDERSTATED rust-version lets MSRV-aware
@@ -372,13 +485,7 @@ ci:
     rv=$(sed -nE 's/^rust-version *= *"([0-9.]+)".*/\1/p' Cargo.toml | head -n1)
     ch=$(sed -nE 's/^channel *= *"([0-9.]+)".*/\1/p' rust-toolchain.toml | head -n1)
     [ -n "$rv" ] && [ "$rv" = "$ch" ] || { echo "MSRV drift: [workspace.package] rust-version=$rv vs rust-toolchain channel=$ch" >&2; exit 1; }
-    # The ban scripts, preflight, bless path, and delegated-scope helper are load-bearing,
-    # security-adjacent bash — lint them all.
-    # ...including the downstream example's contract check (v30 delta 5): it must live beside the
-    # workspace it checks, so the lint glob comes to it rather than the script moving to scripts/.
-    # `scripts/git-pre-commit` is listed EXPLICITLY: a git hook carries no `.sh` extension, so the
-    # glob silently skipped the one hook that runs on every commit.
-    shellcheck scripts/*.sh scripts/git-pre-commit examples/downstream-kernel/*.sh
+    # (shellcheck over the load-bearing bash runs inside `gates`, with the roster it lints.)
     # Workflow files: correctness (actionlint also shellchecks `run:` blocks) + security (zizmor:
     # script injection, over-broad permissions, unpinned actions — the suites run on a SELF-HOSTED
     # KVM runner, where a compromised action is lateral movement onto the host).

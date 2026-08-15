@@ -216,6 +216,131 @@ pub mod backend {
     /// detaching it, so a wedged worker cannot hang teardown forever (NET-3).
     const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    /// Whole-operation budget for the NAT's per-mapping dial to the host-side target
+    /// (`nat-host-dial-unbounded`).
+    ///
+    /// The dial runs on the **single** task that services the entire datapath: while it is
+    /// awaited, no other mapping is pumped, no guest frame is delivered, and the stop flag is not
+    /// re-read. A bare `TcpStream::connect(..).await` therefore hands a black-holed destination the
+    /// power to wedge the whole VM's network until the kernel's own SYN retry budget (~130 s)
+    /// expires — and `SmoltcpProcess::Drop` then waits out its 5 s join and detaches the thread.
+    /// The target is always a loopback address, where a live listener answers in microseconds and
+    /// a closed port refuses immediately, so a second is already generous; anything slower is a
+    /// wedge, not a slow connect.
+    const HOST_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Whether the NAT may open outbound host connections on the guest's behalf
+    /// (`egress-blocked-is-a-silent-no-op`).
+    ///
+    /// The unprivileged half of [`Egress`](crate::config::Egress). `Egress::Blocked` promises "all
+    /// egress traffic is blocked"; on this datapath every byte leaves through a per-mapping host
+    /// dial, so honoring that promise is exactly refusing the dial. `Open`/`Filtered` pass
+    /// [`Allow`](NatEgressPolicy::Allow); `Blocked` passes [`Deny`](NatEgressPolicy::Deny) *and*
+    /// registers no forward ports.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum NatEgressPolicy {
+        /// Dial the host target when a guest socket becomes readable/writable.
+        Allow,
+        /// Never dial: the guest socket is closed instead, so the guest sees a reset rather than a
+        /// silent black hole, and no host connection is ever attempted on its behalf.
+        Deny,
+    }
+
+    /// Dials `target_port` on loopback under a **whole-operation** budget, returning the connected
+    /// stream or a rendered diagnostic (`nat-host-dial-unbounded`).
+    ///
+    /// `connect` is taken as an un-polled future so the budget covers socket creation and the
+    /// handshake, not merely the gaps between polls; the caller passes
+    /// `tokio::net::TcpStream::connect(..)`. The `Err` arm is a *value*, not a discarded result:
+    /// the pre-fix code dropped a failed dial on the floor with no log at all, while its
+    /// neighbouring `send_slice`/`recv` failures logged at `error!` — so a NAT that could not reach
+    /// the host service looked identical to an idle one.
+    async fn bounded_host_dial<Fut>(
+        target_port: u16,
+        budget: std::time::Duration,
+        connect: Fut,
+    ) -> std::result::Result<tokio::net::TcpStream, String>
+    where
+        Fut: std::future::Future<Output = std::io::Result<tokio::net::TcpStream>>,
+    {
+        match tokio::time::timeout(budget, connect).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(format!("dial 127.0.0.1:{target_port} failed: {e}")),
+            Err(_) => Err(format!(
+                "dial 127.0.0.1:{target_port} exceeded its {budget:?} budget; \
+                 the NAT datapath is single-tasked, so a wedged connect stalls the whole VM"
+            )),
+        }
+    }
+
+    /// Consumes every pending signal on the vhost exit event, returning how many reads it took.
+    ///
+    /// `VhostUserHandler::drop` notifies this eventfd to stop its vring workers and **nothing ever
+    /// reads it** (`VringEpollHandler::run` breaks out of its loop on the epoll wakeup without
+    /// consuming the counter). Since one eventfd is shared by every connection this NAT serves, a
+    /// counter left hot by connection *n*'s teardown makes connection *n+1*'s epoll loop see an
+    /// immediate exit and process nothing — a NAT that accepts the re-spawned VMM and then
+    /// silently moves no packets. It is non-blocking, so the drain ends on `WouldBlock`.
+    fn drain_exit_event(consumer: &EventConsumer) -> usize {
+        let mut drained = 0;
+        while consumer.consume().is_ok() {
+            drained += 1;
+        }
+        drained
+    }
+
+    /// Clears everything in [`SharedState`] that belonged to the connection that just ended.
+    ///
+    /// The memory table and vrings are the dead VMM's (`handle_event` latches vrings only while
+    /// `state.vrings.is_none()`, so a stale set would never be replaced), and its queued frames
+    /// must not be delivered to its successor.
+    fn reset_device_state(state: &mut SharedState) {
+        state.mem = None;
+        state.vrings = None;
+        state.tx_queue.clear();
+        state.rx_queue.clear();
+    }
+
+    /// Why a NAT mapping has no host stream this tick.
+    ///
+    /// Typed rather than one string because the two cases are not the same event and must not be
+    /// logged at the same level: a policy refusal is the configured outcome working, a dial failure
+    /// is a host service that could not be reached.
+    #[derive(Debug)]
+    enum HostDialRefusal {
+        /// [`NatEgressPolicy::Deny`]: no socket was created and none ever will be.
+        Policy(String),
+        /// The dial was attempted and failed — refused, or over its budget.
+        Failed(String),
+    }
+
+    /// The NAT's **one** host-dial site: honors [`NatEgressPolicy`], then dials `target_port` on
+    /// loopback under `budget`.
+    ///
+    /// Under [`NatEgressPolicy::Deny`] no socket is created and no packet leaves — the refusal is
+    /// the point, not an error to recover from — and the caller closes the guest socket so the
+    /// guest sees a reset instead of a black hole. Keeping the decision here (rather than at the
+    /// call site) is what makes "a blocked VM opens no outbound connection" a property one test can
+    /// drive against a real listener.
+    async fn dial_host_target(
+        egress: NatEgressPolicy,
+        target_port: u16,
+        budget: std::time::Duration,
+    ) -> std::result::Result<tokio::net::TcpStream, HostDialRefusal> {
+        match egress {
+            NatEgressPolicy::Deny => Err(HostDialRefusal::Policy(format!(
+                "refusing the host dial to 127.0.0.1:{target_port}: this VM's egress is Blocked"
+            ))),
+            NatEgressPolicy::Allow => bounded_host_dial(
+                target_port,
+                budget,
+                tokio::net::TcpStream::connect(format!("127.0.0.1:{target_port}")),
+            )
+            .await
+            .map_err(HostDialRefusal::Failed),
+        }
+    }
+
     /// A NAT port mapping: `(listen_port, target_port, socket, host_stream)`.
     type NatPortMapping = (u16, u16, SocketHandle, Option<tokio::net::TcpStream>);
 
@@ -667,8 +792,18 @@ pub mod backend {
             // Best-effort wakeups so the workers observe the stop flag promptly;
             // errors here are non-fatal (the bounded joins below still apply).
             let _ = self.kill_notifier.notify();
-            // Connect to the socket to unblock listener.accept() if it's stuck.
-            let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
+            // Connect to the socket to unblock listener.accept() if it's stuck. Retried over a
+            // short bounded window because the vhost worker now serves connections in a loop: a
+            // single shot fired while it is *between* listeners (the microseconds after one
+            // connection ends and before the next bind) would hit nothing, and the worker would
+            // then block in `accept` until the join below gave up and detached it.
+            for _ in 0..20 {
+                if self.vhost_thread.as_ref().is_none_or(|t| t.is_finished()) {
+                    break;
+                }
+                let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             // NET-3: bound each join so a wedged worker cannot hang teardown.
             if let Some(t) = self.vhost_thread.take() {
                 join_with_timeout(t, "vhost", JOIN_TIMEOUT);
@@ -682,6 +817,16 @@ pub mod backend {
     impl SmoltcpProcess {
         /// Starts the background network thread to process packets and manage connections.
         ///
+        /// `egress` decides whether the NAT may dial host targets on the guest's behalf at all
+        /// ([`NatEgressPolicy`]).
+        ///
+        /// The vhost-user socket at `socket_path` is bound **here**, on the caller's thread, so it
+        /// exists the moment this returns; the worker then serves connections on it in a loop.
+        /// Serving a **second** connection is load-bearing, not a nicety: `MicroVm::start`'s
+        /// control-plane health gate recovers a VMM bring-up flake by dropping the instance and
+        /// re-spawning the VMM on the *same* per-VM resources, and this NAT is one of them
+        /// (`nat-socket-dies-with-first-vmm`).
+        ///
         /// # Panics
         ///
         /// Panics if the underlying system resources or background threads fail to start.
@@ -690,6 +835,7 @@ pub mod backend {
             forward_ports: Vec<u16>,
             proxy_port: Option<u16>,
             socket_path: PathBuf,
+            egress: NatEgressPolicy,
         ) -> Self {
             if let Err(e) = crate::net::ip_math(vmid) {
                 // NET-4: surface an out-of-range vmid loudly. The signature stays
@@ -715,6 +861,12 @@ pub mod backend {
                     vmm_sys_util::event::EventFlag::NONBLOCK,
                 )
                 .expect("event consumer");
+            // A third handle on the same eventfd, kept by the worker loop. The framework's
+            // `VhostUserHandler::drop` signals THIS event to stop its vring workers, and nothing
+            // ever reads it — so between two connections the counter stays hot and the *next*
+            // connection's epoll loop would see an immediate exit and serve nothing. The worker
+            // drains it after each connection.
+            let kill_evt_drain = kill_evt_consumer.try_clone().expect("clone kill consumer");
             let kill_evt = (
                 kill_evt_consumer,
                 kill_evt_notifier.try_clone().expect("clone notifier"),
@@ -726,31 +878,39 @@ pub mod backend {
                 state: state_clone,
             }));
 
-            let mut listener = Listener::new(&socket_path, true).expect("listener new");
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Bound on the CALLER's thread so the socket exists when `start` returns — the VMM's
+            // socket wait races nothing.
+            let first_listener = Listener::new(&socket_path, true).expect("listener new");
 
             let socket_path_clone = socket_path.clone();
+            let vhost_state = state.clone();
+            let vhost_stop = stop_flag.clone();
             let vhost_thread = std::thread::spawn(move || {
-                let mut vu_daemon = VhostUserDaemon::new(
-                    String::from("vhost-user-net"),
-                    backend,
-                    GuestMemoryAtomic::new(GuestMemoryMmap::new()),
-                )
-                .expect("vu daemon new");
-
-                tracing::info!("vhost-user-net daemon starting on {:?}", socket_path_clone);
-                let res = vu_daemon.start(&mut listener);
-                tracing::info!("vhost-user-net daemon start returned {:?}", res);
-                let wait_res = vu_daemon.wait();
-                tracing::info!("vhost-user-net daemon exited with {:?}", wait_res);
+                Self::serve_vhost_connections(
+                    &socket_path_clone,
+                    first_listener,
+                    &backend,
+                    &kill_evt_drain,
+                    &vhost_state,
+                    &vhost_stop,
+                );
             });
 
-            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_flag_clone = stop_flag.clone();
             let net_thread = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("runtime new");
                 rt.block_on(async move {
-                    Self::run_network(vmid, forward_ports, proxy_port, state, stop_flag_clone)
-                        .await;
+                    Self::run_network(
+                        vmid,
+                        forward_ports,
+                        proxy_port,
+                        egress,
+                        state,
+                        stop_flag_clone,
+                    )
+                    .await;
                 });
             });
 
@@ -763,10 +923,119 @@ pub mod backend {
             }
         }
 
+        /// Serves vhost-user connections on `socket_path` until the stop flag is set
+        /// (`nat-socket-dies-with-first-vmm`).
+        ///
+        /// One connection per iteration, each with its **own** `Listener` + `VhostUserDaemon`,
+        /// because neither is reusable: `VhostUserDaemon::start` is `BackendListener::new` + a
+        /// single `accept` (the `BackendListener` `take()`s the backend on that accept, so a second
+        /// accept could not be served even if one were attempted), and `impl Drop for Listener`
+        /// **unlinks the socket path**. The pre-fix worker did exactly one of each, so the first
+        /// VMM's hang-up deleted the NAT socket: every control-plane re-spawn — the recovery
+        /// `MicroVm::start` performs on the *same* per-VM resources for QEMU's recorded
+        /// `vhost-device-vsock` bring-up flake — then died on the 2 s socket wait, burning every
+        /// attempt to report a control-plane error whose real cause was the unlinked NAT socket.
+        ///
+        /// Between connections the shared device state is reset and the exit event drained, so the
+        /// next VMM starts from a clean device rather than inheriting the dead one's memory table,
+        /// vrings, queued frames, and a hot exit signal.
+        fn serve_vhost_connections(
+            socket_path: &std::path::Path,
+            first_listener: Listener,
+            backend: &Arc<std::sync::RwLock<VhostUserNetBackend>>,
+            kill_evt_drain: &EventConsumer,
+            state: &Arc<Mutex<SharedState>>,
+            stop_flag: &Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let mut pending = Some(first_listener);
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut listener = match pending.take() {
+                    Some(l) => l,
+                    None => match Listener::new(socket_path, true) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            // Fail loud and stop: without a listener there is no NAT, and a silent
+                            // spin would hide that from every later re-spawn.
+                            tracing::error!(
+                                "vhost-user-net: cannot re-bind the NAT socket {:?}: {:?}; \
+                                 no further VMM connection can be served",
+                                socket_path,
+                                e
+                            );
+                            return;
+                        }
+                    },
+                };
+
+                let mut vu_daemon = match VhostUserDaemon::new(
+                    String::from("vhost-user-net"),
+                    backend.clone(),
+                    GuestMemoryAtomic::new(GuestMemoryMmap::new()),
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!(
+                            "vhost-user-net: daemon construction failed for {:?}: {:?}; \
+                             no further VMM connection can be served",
+                            socket_path,
+                            e
+                        );
+                        return;
+                    }
+                };
+
+                tracing::info!("vhost-user-net daemon starting on {:?}", socket_path);
+                // `nat-daemon-start-error-swallowed`: the bring-up result was logged and then
+                // ignored, so a daemon that never accepted anything went straight into `wait()`
+                // and the worker reported a clean exit for a NAT that had never come up. It is
+                // terminal for this worker instead — the caller observes it as an unserved socket
+                // and fails its own bring-up, rather than running a VM with a dead network.
+                if let Err(e) = vu_daemon.start(&mut listener) {
+                    if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Teardown raced the accept (`Drop` connects to the socket to unblock it).
+                        tracing::debug!("vhost-user-net daemon accept ended at teardown: {:?}", e);
+                    } else {
+                        tracing::error!(
+                            "vhost-user-net daemon failed to come up on {:?}: {:?}; \
+                             the NAT is down for this VM",
+                            socket_path,
+                            e
+                        );
+                    }
+                    return;
+                }
+                if let Err(e) = vu_daemon.wait() {
+                    // A VMM hang-up is `Ok` (the framework maps `SocketBroken`), so anything else
+                    // is a real protocol/handler failure worth surfacing — but not fatal: the next
+                    // VMM gets a fresh daemon. At teardown the wakeup connection this worker just
+                    // accepted speaks no vhost-user, so its parse failure is expected, not news.
+                    if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        tracing::debug!("vhost-user-net daemon ended at teardown: {:?}", e);
+                    } else {
+                        tracing::error!("vhost-user-net daemon connection ended with {:?}", e);
+                    }
+                }
+
+                // Drop the daemon FIRST: its handler's `Drop` signals the exit event and joins the
+                // vring worker threads, so nothing is still touching the device state we reset.
+                drop(vu_daemon);
+                // …then the listener, unlinking the path this iteration bound.
+                drop(listener);
+
+                drain_exit_event(kill_evt_drain);
+                reset_device_state(&mut state.lock().unwrap_or_else(|e| e.into_inner()));
+                tracing::info!(
+                    "vhost-user-net: connection closed; re-arming {:?} for a re-spawned VMM",
+                    socket_path
+                );
+            }
+        }
+
         async fn run_network(
             vmid: u32,
             forward_ports: Vec<u16>,
             proxy_port: Option<u16>,
+            egress: NatEgressPolicy,
             state: Arc<Mutex<SharedState>>,
             stop_flag: Arc<std::sync::atomic::AtomicBool>,
         ) {
@@ -1021,20 +1290,40 @@ pub mod backend {
                     }
 
                     if socket.can_send() || socket.can_recv() {
-                        if tcp_stream.is_none()
-                            && let Ok(stream) =
-                                tokio::net::TcpStream::connect(format!("127.0.0.1:{target_port}"))
-                                    .await
-                        {
-                            // TCP_NODELAY is a latency optimization; if the
-                            // setsockopt fails the connection still works
-                            // (merely with Nagle enabled), so the result is
-                            // deliberately ignored.
-                            let _ = stream.set_nodelay(true);
-                            *tcp_stream = Some(stream);
+                        let mut refused = false;
+                        if tcp_stream.is_none() {
+                            match dial_host_target(egress, *target_port, HOST_DIAL_BUDGET).await {
+                                Ok(stream) => {
+                                    // TCP_NODELAY is a latency optimization; if the
+                                    // setsockopt fails the connection still works
+                                    // (merely with Nagle enabled), so the result is
+                                    // deliberately ignored.
+                                    let _ = stream.set_nodelay(true);
+                                    *tcp_stream = Some(stream);
+                                }
+                                // A policy refusal is the configuration working, so it is `info!`;
+                                // a dial that was attempted and failed is `error!`, matching the
+                                // neighbouring `send_slice`/`recv` failures.
+                                Err(HostDialRefusal::Policy(why)) => {
+                                    tracing::info!("smoltcp NAT: {}", why);
+                                    refused = true;
+                                }
+                                Err(HostDialRefusal::Failed(e)) => {
+                                    tracing::error!("smoltcp NAT: {}", e);
+                                    // Close the guest socket (below) on EITHER failure. Under
+                                    // `Deny` there will never be a stream, so leaving it open
+                                    // black-holes the guest. Under `Allow` the pre-fix code left
+                                    // it open and silently re-dialled every 5 ms tick forever:
+                                    // invisible to the guest, and — now that the failure is
+                                    // logged — a 200-lines-per-second console flood. Recovery
+                                    // stays retryable, just observably: the mapping is re-armed as
+                                    // a listener and the guest's next connection dials again.
+                                    refused = true;
+                                }
+                            }
                         }
 
-                        let mut closed = false;
+                        let mut closed = refused;
                         if let Some(stream) = tcp_stream {
                             if socket.can_send() {
                                 // C-NET-1: bound the host read to the socket's
@@ -1585,6 +1874,328 @@ pub mod backend {
             assert_eq!(bounded_tx_read(5, MAX_FRAME_LEN - 5), Some(5));
             assert_eq!(bounded_tx_read(6, MAX_FRAME_LEN - 5), None);
             assert_eq!(bounded_tx_read(1, MAX_FRAME_LEN), None);
+        }
+
+        /// Connects to the NAT's vhost-user socket, retrying until `deadline`.
+        ///
+        /// The socket is bound before `SmoltcpProcess::start` returns and re-bound between
+        /// connections, so a retry window (not a single shot) is what distinguishes "briefly
+        /// re-arming" from "gone forever".
+        fn connect_nat_socket(
+            path: &std::path::Path,
+            deadline: Duration,
+        ) -> std::io::Result<std::os::unix::net::UnixStream> {
+            let until = Instant::now() + deadline;
+            loop {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(s) => return Ok(s),
+                    Err(e) if Instant::now() >= until => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+
+        /// Sends a vhost-user `GET_FEATURES` and reads the reply header, proving the daemon
+        /// **accepted and is serving** this connection — not merely that a bound socket queued it.
+        ///
+        /// The header is 3 native-endian `u32`s (request, flags, size); flags carry the protocol
+        /// version in the low two bits and the reply bit (0x4) on the way back.
+        fn vhost_user_served(sock: &std::os::unix::net::UnixStream) -> std::io::Result<()> {
+            use std::io::{Read, Write};
+            const GET_FEATURES: u32 = 1;
+            const VERSION_1: u32 = 1;
+            const REPLY_BIT: u32 = 0x4;
+
+            sock.set_read_timeout(Some(Duration::from_secs(2)))?;
+            sock.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let mut req = Vec::with_capacity(12);
+            req.extend_from_slice(&GET_FEATURES.to_ne_bytes());
+            req.extend_from_slice(&VERSION_1.to_ne_bytes());
+            req.extend_from_slice(&0u32.to_ne_bytes());
+            (&mut &*sock).write_all(&req)?;
+
+            let mut hdr = [0u8; 12];
+            (&mut &*sock).read_exact(&mut hdr)?;
+            let request = u32::from_ne_bytes(hdr[0..4].try_into().expect("4 bytes"));
+            let flags = u32::from_ne_bytes(hdr[4..8].try_into().expect("4 bytes"));
+            let size = u32::from_ne_bytes(hdr[8..12].try_into().expect("4 bytes"));
+            assert_eq!(request, GET_FEATURES, "reply must answer GET_FEATURES");
+            assert_ne!(flags & REPLY_BIT, 0, "the daemon must mark its reply");
+            assert_eq!(size, 8, "GET_FEATURES carries a u64 feature word");
+            let mut body = vec![0u8; size as usize];
+            (&mut &*sock).read_exact(&mut body)?;
+            Ok(())
+        }
+
+        // `nat-socket-dies-with-first-vmm` (M2): the NAT socket must survive the first VMM's
+        // hang-up and serve the NEXT connection, because `MicroVm::start`'s control-plane health
+        // gate re-spawns the VMM on the same per-VM resources — of which this NAT is one.
+        //
+        // RED on today's single-accept worker, watched before the fix: `Listener`'s `Drop` unlinks
+        // the path when the closure ends, so the second `connect_nat_socket` fails with
+        // `No such file or directory` and the test reports
+        // "the NAT socket must survive the first VMM's disconnect". The `vhost_user_served`
+        // exchange makes it stronger than "the path exists": it proves a *daemon* is behind the
+        // socket, so a worker that re-bound a listener nobody ever accepts on would still be red.
+        #[test]
+        fn nat_socket_serves_a_second_connection_after_the_first_hangs_up() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("smoltcp.sock");
+            let nat =
+                SmoltcpProcess::start(7, vec![], None, socket_path.clone(), NatEgressPolicy::Deny);
+
+            let first = connect_nat_socket(&socket_path, Duration::from_secs(2))
+                .expect("the NAT socket must be connectable once `start` returns");
+            vhost_user_served(&first).expect("the first connection must be served");
+            // The VMM goes away (a crash, or the control-plane health gate dropping the instance).
+            drop(first);
+
+            // Settle: on the pre-fix worker the listener is dropped — and the path unlinked —
+            // within milliseconds of the hang-up, so this window is where the defect shows.
+            std::thread::sleep(Duration::from_millis(300));
+
+            let second = connect_nat_socket(&socket_path, Duration::from_secs(3))
+                .expect("the NAT socket must survive the first VMM's disconnect");
+            vhost_user_served(&second).expect("the re-spawned VMM's connection must be served too");
+            drop(second);
+
+            // Residue: the socket existed (both connects prove it) and teardown removes it — a
+            // re-serving loop must not leave a bound path behind after `Drop`.
+            assert!(
+                socket_path.exists(),
+                "the NAT socket must exist before drop"
+            );
+            drop(nat);
+            let gone_by = Instant::now() + Duration::from_secs(3);
+            while socket_path.exists() && Instant::now() < gone_by {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !socket_path.exists(),
+                "teardown must reclaim the NAT socket, not leave a re-armed listener behind"
+            );
+        }
+
+        // `nat-daemon-start-error-swallowed` (m18): a bring-up failure ENDS the worker, loudly. The
+        // pre-fix code logged `start returned {:?}` and fell through to `wait()` — which returns
+        // `Ok` when no daemon thread was ever started — so a NAT that never came up reported a
+        // clean exit. In the re-serving loop that swallow is worse than cosmetic: falling through
+        // means looping straight back into a bring-up that cannot succeed.
+        //
+        // The arm driven here is the listener re-bind (the one reachable without `unsafe`: the
+        // module is `#![forbid(unsafe_code)]`, so a deliberately broken accept fd cannot be built).
+        // Its sibling — `VhostUserDaemon::new`/`start` failing — is the identical
+        // `error!` + `return` three lines below.
+        //
+        // RED on the inverse (a `continue` that retries, or the pre-fix fall-through): the worker
+        // never returns and the bounded join below reports "the worker must return".
+        #[test]
+        fn a_bring_up_failure_ends_the_vhost_worker_instead_of_being_swallowed() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("smoltcp.sock");
+            let first = Listener::new(&socket_path, true).expect("first listener");
+
+            let (consumer, notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
+                vmm_sys_util::event::EventFlag::NONBLOCK,
+            )
+            .expect("event pair");
+            let drain = consumer.try_clone().expect("clone consumer");
+            let state = Arc::new(Mutex::new(SharedState {
+                tx_queue: VecDeque::new(),
+                rx_queue: VecDeque::new(),
+                mem: None,
+                vrings: None,
+            }));
+            let backend = Arc::new(std::sync::RwLock::new(VhostUserNetBackend {
+                event_idx: false,
+                kill_evt: (consumer, notifier),
+                state: state.clone(),
+            }));
+            // Never set: the worker must stop because bring-up failed, not because it was told to.
+            let stop_flag = Arc::new(AtomicBool::new(false));
+
+            let (worker_path, worker_state, worker_stop) =
+                (socket_path.clone(), state.clone(), stop_flag.clone());
+            let worker = std::thread::spawn(move || {
+                SmoltcpProcess::serve_vhost_connections(
+                    &worker_path,
+                    first,
+                    &backend,
+                    &drain,
+                    &worker_state,
+                    &worker_stop,
+                );
+            });
+
+            // Serve one connection, then make the NEXT bind impossible: an already-bound listener
+            // keeps working after its directory is gone, so this is deterministic — the re-bind
+            // that follows the hang-up hits `ENOENT`.
+            let client = connect_nat_socket(&socket_path, Duration::from_secs(2))
+                .expect("the first listener must be connectable");
+            std::fs::remove_dir_all(dir.path()).expect("remove the socket's directory");
+            drop(client);
+
+            let until = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                worker.is_finished(),
+                "the worker must return when it cannot bring the NAT up again, not swallow the \
+                 failure and loop"
+            );
+            worker.join().expect("worker joined");
+            assert!(
+                !stop_flag.load(Ordering::SeqCst),
+                "this test's exit must come from the bring-up failure, not from a stop request"
+            );
+        }
+
+        // `nat-socket-dies-with-first-vmm` (M2), the between-connections half: the shared device
+        // state and the shared exit event must be reset before the next VMM is served, or the
+        // re-spawn connects to a NAT that carries the dead VM's memory table, vrings and frames —
+        // and whose epoll workers exit immediately on a counter nobody ever consumed.
+        //
+        // RED on the inverse: deleting the drain leaves the consumer readable (the last assert),
+        // and deleting any line of the reset leaves that field populated.
+        #[test]
+        fn between_connections_the_device_and_exit_event_are_reset() {
+            let (consumer, notifier) = vmm_sys_util::event::new_event_consumer_and_notifier(
+                vmm_sys_util::event::EventFlag::NONBLOCK,
+            )
+            .expect("event pair");
+            notifier.notify().expect("signal 1");
+            notifier.notify().expect("signal 2");
+            assert!(
+                drain_exit_event(&consumer) >= 1,
+                "a signalled exit event must be drained"
+            );
+            assert!(
+                consumer.consume().is_err(),
+                "the exit event must be empty afterwards, or the next connection's vring workers \
+                 exit before they process a single frame"
+            );
+
+            let mut state = SharedState {
+                tx_queue: VecDeque::from(vec![vec![1u8, 2, 3]]),
+                rx_queue: VecDeque::from(vec![vec![4u8, 5]]),
+                mem: Some(GuestMemoryAtomic::new(GuestMemoryMmap::new())),
+                // A populated (if empty) vrings latch: seeding `None` here would make the
+                // `vrings.is_none()` assertion below vacuous, and the latch is the one field
+                // `handle_event` never replaces once set.
+                vrings: Some(Vec::new()),
+            };
+            reset_device_state(&mut state);
+            assert!(state.tx_queue.is_empty(), "the dead VM's guest→host frames");
+            assert!(state.rx_queue.is_empty(), "the dead VM's host→guest frames");
+            assert!(state.mem.is_none(), "the dead VM's memory table");
+            assert!(state.vrings.is_none(), "the dead VM's vrings");
+        }
+
+        // `nat-host-dial-unbounded` (m11): the per-mapping host dial is bounded as a WHOLE
+        // operation and its failure is a value the caller can log, not a discarded `Err`.
+        //
+        // RED on the inverse (`TcpStream::connect(..).await` with no timeout and `if let Ok(..)`):
+        // the pending-connect leg never returns, so the OUTER timeout below fires and the assert
+        // reports it — on the single task that services the entire datapath, that is the whole VM's
+        // network wedged behind one connect.
+        #[tokio::test]
+        async fn bounded_host_dial_bounds_the_whole_connect_and_surfaces_the_error() {
+            let budget = Duration::from_millis(120);
+
+            // A connect that never completes (a black-holed destination) must return within its
+            // own budget, with a diagnostic naming the target and the budget.
+            let started = Instant::now();
+            let wedged = tokio::time::timeout(
+                Duration::from_secs(5),
+                bounded_host_dial(9, budget, std::future::pending()),
+            )
+            .await
+            .expect("the dial must return within its own budget, not the test's");
+            let elapsed = started.elapsed();
+            let err = wedged.expect_err("a wedged connect must not report success");
+            assert!(
+                err.contains("127.0.0.1:9") && err.contains("budget"),
+                "the timeout must name its target and its budget: {err}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "the budget must bound the connect itself (took {elapsed:?})"
+            );
+
+            // A refused connect surfaces the OS error instead of being dropped on the floor.
+            let dead_port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                l.local_addr().expect("addr").port() // listener dropped here → port refuses
+            };
+            let refused = bounded_host_dial(
+                dead_port,
+                budget,
+                tokio::net::TcpStream::connect(format!("127.0.0.1:{dead_port}")),
+            )
+            .await
+            .expect_err("a dial to a closed port must fail");
+            assert!(
+                refused.contains(&format!("127.0.0.1:{dead_port}")) && refused.contains("failed"),
+                "a refused dial must be surfaced with its cause: {refused}"
+            );
+
+            // Positive control: a live listener is reached, and the stream is handed back.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let ok = bounded_host_dial(
+                port,
+                budget,
+                tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")),
+            )
+            .await
+            .expect("a live listener must be reachable");
+            assert_eq!(ok.peer_addr().expect("peer").port(), port);
+        }
+
+        // `egress-blocked-is-a-silent-no-op` (M1, NAT half): under `Egress::Blocked` the NAT opens
+        // NO outbound connection — asserted against a real listener that must never see an accept —
+        // with the identical dial under `Allow` reaching it as the positive control.
+        //
+        // RED on the inverse (today's code, which has no policy at all and always dials): the
+        // `Deny` leg returns `Ok` and the listener accepts, so both asserts below fail.
+        #[tokio::test]
+        async fn blocked_egress_opens_no_outbound_connection() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let budget = Duration::from_millis(200);
+
+            let denied = dial_host_target(NatEgressPolicy::Deny, port, budget).await;
+            match denied.expect_err("a Blocked VM must not get a host stream") {
+                // Typed as a POLICY refusal, not a failure: the two are logged at different
+                // levels, and a blocked VM's NAT is not malfunctioning.
+                HostDialRefusal::Policy(why) => assert!(
+                    why.contains("Blocked") && why.contains(&format!("127.0.0.1:{port}")),
+                    "the refusal must name the policy and the target it refused: {why}"
+                ),
+                other => panic!("a policy refusal must not be typed as a dial failure: {other:?}"),
+            }
+            // Nothing arrived: the refusal is "no socket was opened", not "a socket was opened and
+            // then dropped" — which would still have handed the guest a connection to a host port.
+            let stray = tokio::time::timeout(Duration::from_millis(150), listener.accept()).await;
+            assert!(
+                stray.is_err(),
+                "a Blocked VM's NAT must open no outbound connection at all"
+            );
+
+            // Positive control: the same dial under `Allow` reaches the same listener.
+            let allowed = dial_host_target(NatEgressPolicy::Allow, port, budget)
+                .await
+                .expect("Allow must reach the local listener");
+            assert_eq!(allowed.peer_addr().expect("peer").port(), port);
+            let (_accepted, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("the positive control must be accepted")
+                .expect("accept");
         }
 
         // L-NET-2: an RX frame that does not fully fit the guest's writable

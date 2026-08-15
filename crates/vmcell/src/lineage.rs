@@ -120,12 +120,15 @@ impl Lineage {
     /// materialize their copy-on-write copies through the process-wide `env.overlay`
     /// supplied at [`fork`](Lineage::fork) time (invariant S4 — one store for the
     /// whole process). `dir` is **created if it does not exist** (the backend writes
-    /// the suspend image into it); the caller owns its lifecycle.
+    /// the suspend image into it) and is **create-only** — an already-populated
+    /// destination is refused, never overwritten; the caller owns its lifecycle.
     ///
     /// # Errors
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) if `cfg` is not
     /// snapshot-eligible (a vhost-user device, §13, Cross-cutting invariants); [`Error::Io`](crate::error::Error::Io)
-    /// if `dir` cannot be created; otherwise any error from taking the snapshot.
+    /// if `dir` cannot be created or already holds an image (kind
+    /// [`AlreadyExists`](std::io::ErrorKind::AlreadyExists)); otherwise any error
+    /// from taking the snapshot.
     pub async fn fork_from_vm<V: Vmm>(
         vm: &mut MicroVm<V>,
         cfg: VmConfig,
@@ -134,11 +137,11 @@ impl Lineage {
     ) -> Result<Self> {
         let dir = dir.into();
         // The backend writes the suspend image into `dir`, which must exist first
-        // (both CH and FC fail-loud on a missing destination dir). A suspend into a
-        // fresh location is the common case, so create it for the caller.
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(crate::error::Error::Io)?;
+        // (both CH and FC fail-loud on a missing destination dir), and must not
+        // already hold one. `Zygote::suspend` owns BOTH halves through the single
+        // `prepare_snapshot_dest` predicate — this used to keep its own
+        // `create_dir_all` copy, which created the directory and silently accepted a
+        // populated one (one law, one predicate).
         let zygote = Zygote::suspend(vm, cfg, dir).await?;
         Ok(Self::root(zygote, allocator))
     }
@@ -221,8 +224,32 @@ impl Lineage {
         self.zygote.config()
     }
 
+    /// Best-effort probe, **through the [`HostEnv`]'s `OverlayStore` seam**, of
+    /// whether this node's clones will be cheap block-level copies, for an up-front
+    /// cost signal before minting a pool. A `FullCopy` result means every
+    /// [`fork`](Lineage::fork) at this node will pay a full byte copy of the suspend
+    /// image (§8.4, The zygote fan-out and the OverlayStore seam).
+    ///
+    /// The form to use: the cost signal is answered by the **same** store
+    /// [`fork`](Lineage::fork)/[`fork_many`](Lineage::fork_many) will materialize the
+    /// clones with (invariant S4), so an injected store can never be contradicted by
+    /// a filesystem probe run behind its back. Delegates to
+    /// [`Zygote::probe_cow_support_in`] — no second spelling of the seam call.
+    #[must_use]
+    pub fn probe_cow_support_in(&self, env: &HostEnv) -> CowSupport {
+        self.zygote.probe_cow_support_in(env)
+    }
+
     /// Best-effort probe of whether this node's filesystem gives cheap block-level
-    /// copy-on-write for its clones (§8.4, The zygote fan-out and the OverlayStore seam).
+    /// copy-on-write for its clones under the **default production store**
+    /// ([`ReflinkOverlayStore`](crate::overlay::ReflinkOverlayStore), the one
+    /// [`HostEnv::shared`](crate::HostEnv::shared) carries).
+    ///
+    /// Prefer [`probe_cow_support_in`](Lineage::probe_cow_support_in), which asks the
+    /// store the caller actually forks with. This env-less form is only correct for a
+    /// caller running the default store, and reports for it explicitly rather than
+    /// silently (§8.4, The zygote fan-out and the OverlayStore seam) — the same
+    /// caveat [`Zygote::probe_cow_support`] carries, since this delegates to it.
     #[must_use]
     pub fn probe_cow_support(&self) -> CowSupport {
         self.zygote.probe_cow_support()
@@ -265,7 +292,9 @@ impl Lineage {
     ///
     /// Snapshots `child` into `dir` and returns the new node; `child` stays live and
     /// the caller owns `dir`'s lifecycle (like a zygote master, §13, Cross-cutting invariants). `dir` is
-    /// **created if it does not exist**. Every node's clones materialize through the
+    /// **created if it does not exist** and is **create-only** — branching onto an
+    /// already-populated node directory is refused, never overwritten. Every node's
+    /// clones materialize through the
     /// process-wide `env.overlay` supplied at [`fork`](Lineage::fork) time, so a
     /// whole lineage uses one seam by construction (invariant S4). Snapshot-eligibility
     /// (§13, Cross-cutting invariants) is re-checked through the same `check_clone_eligible` predicate the
@@ -274,19 +303,19 @@ impl Lineage {
     /// # Errors
     /// [`Error::Unsupported`](crate::error::Error::Unsupported) if this node's config
     /// is not snapshot-eligible; [`Error::Io`](crate::error::Error::Io) if `dir`
-    /// cannot be created; otherwise any error from snapshotting `child`.
+    /// cannot be created or already holds an image (kind
+    /// [`AlreadyExists`](std::io::ErrorKind::AlreadyExists)); otherwise any error
+    /// from snapshotting `child`.
     pub async fn branch<V: Vmm>(
         &self,
         child: &mut MicroVm<V>,
         dir: impl Into<PathBuf>,
     ) -> Result<Lineage> {
-        // Freeze the child into a NEW immutable master. The backend writes the
-        // suspend image into `dir`, which must exist first (both CH and FC fail-loud
-        // on a missing destination) — create it for the caller.
+        // Freeze the child into a NEW immutable master. The destination is created
+        // (with parents) and refused if populated by `Zygote::suspend`'s single
+        // `prepare_snapshot_dest` predicate — this used to keep a second
+        // `create_dir_all` copy that overwrote a populated node in place.
         let dir = dir.into();
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(crate::error::Error::Io)?;
         // `Zygote::suspend` re-checks eligibility (§13, Cross-cutting invariants) and snapshots the child.
         // The overlay store is no longer carried on the node — it is supplied from
         // `env.overlay` at fork time (invariant S4), so the whole lineage shares one
@@ -318,13 +347,16 @@ mod tests {
     use crate::overlay::RecordingOverlayStore;
     use crate::vmm::FakeVmm;
 
-    // One process-global VMID allocator shared across these tests: fork() mints real
-    // per-VM scratch dirs keyed on vmid, so fresh per-test allocators would collide
-    // under `cargo test`'s in-process parallelism (§9.8, Testability seams, same reason as the zygote
-    // tests). nextest runs each test in its own process, so this is inert there.
-    static SHARED_VMIDS: std::sync::OnceLock<VmidAllocator> = std::sync::OnceLock::new(); // allow-global-state: process-global VMID allocator; §9.8 (Testability seams) requires one shared allocator per test-runner process to avoid concurrent-test scratch-dir collisions
+    // One process-global VMID allocator shared across these tests: fork() mints real per-VM
+    // scratch dirs keyed on vmid, so fresh per-test allocators collide under `cargo test`'s
+    // in-process parallelism (§9.8, Testability seams). It is deliberately the SAME allocator
+    // the zygote tests draw from — these tests mint their clones through that very machinery,
+    // and a second module-local allocator reproduced the collision across the module boundary
+    // (`zygote clone target already exists: …/zygote-snapshot`) even though both modules'
+    // comments claimed "one shared allocator per test-runner process". One law, one allocator:
+    // `crate::zygote::shared_test_vmids`.
     fn shared_vmids() -> VmidAllocator {
-        SHARED_VMIDS.get_or_init(VmidAllocator::new).clone()
+        crate::zygote::shared_test_vmids()
     }
 
     fn erofs_cfg() -> VmConfig {
@@ -725,6 +757,169 @@ mod tests {
         assert_eq!(b1.parent(), Some(root.id()));
         assert_eq!(b1b.parent(), Some(root.id()));
         assert_eq!((b1.generation(), b1b.generation()), (1, 1));
+    }
+
+    // d4: the up-front CoW cost signal on a lineage node must be answered by the store the
+    // caller injected — the same store `fork`/`fork_many` will materialize the clones with
+    // (invariant S4) — not by a filesystem probe run behind that store's back. This is the
+    // seam half of docs/78 `overlay-probe-not-side-effect-free`, which landed on `Zygote` and
+    // not on `Lineage`.
+    //
+    // Host-independent by construction: the fake reports the OPPOSITE of what this filesystem
+    // really says, so the two answers are always distinguishable on reflink and non-reflink
+    // hosts alike.
+    //
+    // RED on the pre-fix shape (a `probe_cow_support_in` that delegates to the env-less
+    // `self.zygote.probe_cow_support()`, i.e. the hardcoded `ReflinkOverlayStore`): it returns
+    // the filesystem's answer, and the seam records no probe at all — both asserts redden.
+    #[tokio::test]
+    async fn probe_cow_support_in_routes_through_the_injected_seam() {
+        use crate::overlay::{OverlayStore, ReflinkOverlayStore};
+
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let master = root_dir.path().join("root");
+        write_master(&master);
+
+        // What the real filesystem under this tempdir says, via the production store…
+        let real = ReflinkOverlayStore.probe(&master);
+        // …and a store that disagrees with it, whatever it said.
+        let dissenting = if real.is_reflink() {
+            CowSupport::FullCopy
+        } else {
+            CowSupport::Reflink
+        };
+        let store = RecordingOverlayStore::with_report(dissenting);
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            overlay: Arc::new(store.clone()),
+            ..HostEnv::for_unit_tests()
+        };
+
+        let lineage =
+            Lineage::from_snapshot_dir(master.clone(), erofs_cfg(), LineageAllocator::new())
+                .await
+                .expect("root lineage");
+
+        assert_eq!(
+            lineage.probe_cow_support_in(&env),
+            dissenting,
+            "the cost signal must be the INJECTED store's answer, not the filesystem's ({real:?})"
+        );
+        assert_eq!(
+            store.probe_calls(),
+            vec![master.clone()],
+            "the seam must have been asked exactly once, about this node's master dir"
+        );
+
+        // The env-less form is the documented default-store reading, and says so by agreeing
+        // with the production store rather than with the injected one.
+        assert_eq!(
+            lineage.probe_cow_support(),
+            real,
+            "the env-less form answers for the default ReflinkOverlayStore"
+        );
+        assert_eq!(
+            store.probe_calls().len(),
+            1,
+            "the env-less form must NOT reach the injected seam"
+        );
+
+        // A probe never writes into the directory it is probing: the master is an immutable
+        // snapshot, so the sentinel goes in a sibling scratch dir (`reflink::probe_reflink`).
+        let mut entries: Vec<String> = std::fs::read_dir(&master)
+            .expect("read master")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["config.json".to_string(), "mem_file".to_string()],
+            "probing must not write into the immutable master"
+        );
+    }
+
+    // m4, both `Lineage` legs: a snapshot destination is CREATE-ONLY, like the daemon's
+    // artifact-store prefix (finding `snapshot-prefix-silent-reuse`). `fork_from_vm` and
+    // `branch` used to `create_dir_all` and then snapshot in place, so re-rooting or
+    // re-branching onto a populated node directory overwrote it file-by-file — a torn mix of
+    // two lineages that no clone restores correctly. Both now route through the ONE
+    // `prepare_snapshot_dest` predicate inside `Zygote::suspend`.
+    //
+    // `FakeVmm` is fs-blind, so the gate supplies the residue itself and proves it SURVIVES.
+    // RED on the inverse (restore either `create_dir_all` here, or drop the
+    // `prepare_snapshot_dest` call in `Zygote::suspend`): the call returns `Ok` and
+    // `expect_err` panics.
+    //
+    // Positive control per leg: the same call into an EMPTY (pre-created) destination and into
+    // a fresh one still succeeds.
+    #[tokio::test]
+    async fn fork_from_vm_and_branch_refuse_a_populated_dir() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let vmm = FakeVmm::default();
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::for_unit_tests()
+        };
+        let mut vm = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("start a live VM");
+
+        // --- fork_from_vm leg ---
+        let taken = root_dir.path().join("taken-root");
+        write_master(&taken);
+        let before = std::fs::read(taken.join("config.json")).expect("read the existing image");
+        let err = Lineage::fork_from_vm(&mut vm, erofs_cfg(), &taken, LineageAllocator::new())
+            .await
+            .expect_err("rooting onto a populated dir must be refused");
+        assert!(
+            matches!(&err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "expected a typed Io(AlreadyExists) refusal, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(taken.join("config.json")).expect("the existing image survives"),
+            before,
+            "the refused root must not have written into the populated dir"
+        );
+
+        // Positive control: an EMPTY pre-created destination still roots a lineage.
+        let empty_root = root_dir.path().join("empty-root");
+        std::fs::create_dir(&empty_root).expect("pre-create an empty destination");
+        let root =
+            Lineage::fork_from_vm(&mut vm, erofs_cfg(), &empty_root, LineageAllocator::new())
+                .await
+                .expect("an empty destination must still root a lineage");
+
+        // --- branch leg ---
+        let mut child = root.fork(&vmm, &env).await.expect("fork a child to branch");
+        let taken_b = root_dir.path().join("taken-branch");
+        write_master(&taken_b);
+        let before_b = std::fs::read(taken_b.join("config.json")).expect("read the existing image");
+        let err = root
+            .branch(&mut child, &taken_b)
+            .await
+            .expect_err("branching onto a populated dir must be refused");
+        assert!(
+            matches!(&err, crate::error::Error::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "expected a typed Io(AlreadyExists) refusal, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(taken_b.join("config.json")).expect("the existing image survives"),
+            before_b,
+            "the refused branch must not have written into the populated dir"
+        );
+
+        // Positive control: an EMPTY pre-created destination still branches.
+        let empty_branch = root_dir.path().join("empty-branch");
+        std::fs::create_dir(&empty_branch).expect("pre-create an empty destination");
+        let b1 = root
+            .branch(&mut child, &empty_branch)
+            .await
+            .expect("an empty destination must still branch");
+        assert_eq!(
+            b1.parent(),
+            Some(root.id()),
+            "the positive control is a real node"
+        );
     }
 
     // branch() creates the target dir (incl. parents) if it does not exist — both CH

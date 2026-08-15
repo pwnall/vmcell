@@ -29,29 +29,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-use super::{AgentClient, ControlStream};
+use super::{AgentClient, ControlStream, encode_frame};
 use crate::error::{Error, Result};
 use crate::vmm::VsockEndpoint;
 use vmcell_protocol::{
-    ExecOutcome, ExecRequest, MAX_FRAME_BYTES, Message, PtyConfig, SessionId, SessionSpec,
-    capped_debug,
+    ExecOutcome, ExecRequest, Message, PtyConfig, SessionId, SessionSpec, capped_debug,
 };
-
-/// Encodes a host→guest frame and enforces the shared `MAX_FRAME_BYTES` cap at
-/// the send boundary, the host mirror of the guest agent's `send_framed`
-/// encode-side check (§13, Cross-cutting invariants). An over-cap frame fails
-/// loud here — before it can reach the writer task, whose codec would otherwise
-/// reject it and silently kill host→guest input for every session on the mux.
-fn encode_frame(msg: &Message) -> Result<::bytes::Bytes> {
-    let bytes = postcard::to_stdvec(msg)?;
-    if bytes.len() > MAX_FRAME_BYTES {
-        return Err(Error::Agent(format!(
-            "session frame exceeds MAX_FRAME_BYTES ({} > {MAX_FRAME_BYTES})",
-            bytes.len()
-        )));
-    }
-    Ok(::bytes::Bytes::from(bytes))
-}
 
 type FramedStream = Framed<ControlStream, LengthDelimitedCodec>;
 type FrameSink = SplitSink<FramedStream, ::bytes::Bytes>;

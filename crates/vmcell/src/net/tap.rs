@@ -22,6 +22,71 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// The bind-mount path of the named network namespace (`/var/run/netns/<name>`).
+///
+/// One law, one predicate: [`in_netns`] and [`crate::net::NetSegment::netns_path`] both compose the
+/// path here, so the directory `iproute2`/`netns_rs` use is spelled in exactly one place.
+pub(crate) fn netns_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new("/var/run/netns").join(name)
+}
+
+/// Runs `f` **inside** the network namespace `netns`, on a thread that exists only for this call.
+///
+/// The one namespace-move discipline for this module (`ns-run-on-pooled-tokio-worker`). Every
+/// caller here is reached synchronously from the async `setup_env`, so the thread that would be
+/// moved is a pooled tokio runtime worker — exactly what [`crate::net_sys::setns_net`]'s contract
+/// forbids: `setns(CLONE_NEWNET)` moves the *calling thread*, and a worker left behind in a VM's
+/// namespace silently originates every later socket the runtime schedules on it. The previous
+/// spelling, `netns_rs`'s `NetNs::run`, is `enter()?; f(self); src_ns.enter()?` with **no**
+/// `catch_unwind`, so a panic inside `f` (reachable: the closures below spawn threads, and
+/// `thread::scope`'s `spawn` panics when the OS refuses one) skipped the restore and stranded that
+/// worker in the VM's namespace for the life of the process.
+///
+/// A dedicated thread makes both halves structural: nothing else can be scheduled on it, and it
+/// **terminates** when `f` returns, so there is no namespace to restore and no un-restored state a
+/// panic can leave behind. `NetSegment::dial_tcp` and the §6.4 proxy already work this way; this is
+/// the same law, not a second copy. A panic in `f` is caught by the join and surfaced as
+/// [`Error::Network`] carrying the real payload.
+///
+/// # Errors
+/// [`Error::Network`] if the namespace cannot be opened or entered, or if `f` panicked.
+fn in_netns<F, T>(netns: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    let path = netns_path(netns);
+    on_dedicated_thread(netns, || {
+        use std::os::fd::AsRawFd;
+        let ns = std::fs::File::open(&path)
+            .map_err(|e| Error::Network(format!("netns open failed ({}): {e}", path.display())))?;
+        crate::net_sys::setns_net(ns.as_raw_fd())
+            .map_err(|e| Error::Network(format!("setns into netns {}: {e}", path.display())))?;
+        Ok(f())
+    })
+}
+
+/// Runs `f` on a thread created for this call and joined before returning, converting a panic in
+/// `f` into an [`Error::Network`] naming `what` instead of unwinding into the caller.
+///
+/// The thread half of [`in_netns`], extracted so the discipline it enforces — *not the caller's
+/// thread*, and *no panic escapes* — is drivable without privileges. `netns_rs`'s `NetNs::run` had
+/// neither property.
+fn on_dedicated_thread<F, T>(what: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        scope.spawn(f).join().unwrap_or_else(|panic| {
+            Err(Error::Network(format!(
+                "netns worker thread panicked in {what}: {}",
+                panic_payload_str(panic.as_ref())
+            )))
+        })
+    })
+}
+
 fn run_in_tokio<F, Fut, T>(f: F) -> std::result::Result<T, String>
 where
     F: FnOnce() -> Fut + Send,
@@ -137,20 +202,19 @@ async fn link_up(handle: &rtnetlink::Handle, index: u32) -> std::result::Result<
         .map_err(|e| format!("link {index} up err: {e}"))
 }
 
-/// Creates `tap_name` inside the already-entered namespace, makes it persistent
-/// (`TUNSETPERSIST`), and drops our fd.
+/// Creates `tap_name` inside the namespace `netns`, makes it persistent (`TUNSETPERSIST`), and
+/// drops our fd.
 ///
 /// A non-multi-queue tap allows a single opener and the VMM must be it (otherwise CH fails with
 /// "Open tap device failed: Device or resource busy"), so the interface is persisted and the
 /// creating fd released. One helper for both the per-VM tap ([`Netlink::setup_tap`]) and the
 /// segment member tap ([`Netlink::setup_tap_on_bridge`]) — the two differ only in addressing.
 /// (The ioctl lives in `crate::net_sys` because this module is `#![forbid(unsafe_code)]`.)
-fn create_persistent_tap_in_ns(ns: &netns_rs::NetNs, tap_name: &str) -> Result<()> {
-    let tn = tap_name.to_string();
-    let tap = ns
-        .run(move |_| tun_tap::Iface::without_packet_info(&tn, tun_tap::Mode::Tap))
-        .map_err(|e| Error::Network(format!("ns run tap fail: {e:?}")))?
-        .map_err(|e| Error::Network(format!("tap create fail: {e}")))?;
+fn create_persistent_tap_in_ns(netns: &str, tap_name: &str) -> Result<()> {
+    let tap = in_netns(netns, || {
+        tun_tap::Iface::without_packet_info(tap_name, tun_tap::Mode::Tap)
+    })?
+    .map_err(|e| Error::Network(format!("tap create fail: {e}")))?;
     {
         use std::os::fd::AsRawFd;
         crate::net_sys::set_tun_persist(tap.as_raw_fd())
@@ -169,9 +233,16 @@ pub trait Netlink: Send + Sync {
     fn add_netns(&self, name: &str) -> Result<()>;
     /// Sets up the TAP interface and IP address inside the namespace.
     ///
+    /// Returns **nothing**: the tap is `TUNSETPERSIST`'d inside `netns` and the creating fd is
+    /// dropped, because a non-multi-queue tap allows a single opener and the VMM must be it
+    /// (`setup-tap-returns-dead-option`). The previous `Result<Option<tun_tap::Iface>>` was always
+    /// `Ok(None)` and read by nobody, while forcing every out-of-tree implementor of this ledgered
+    /// seam to depend on `tun-tap` (which `vmcell` does not re-export) and teaching them to hold
+    /// the tap fd open — the one thing that breaks the single-opener discipline.
+    ///
     /// # Errors
     /// Returns an error if setting up the TAP interface or assigning the IP fails.
-    fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<Option<tun_tap::Iface>>;
+    fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<()>;
     /// Creates a Linux **bridge** inside `netns`, gives it `gateway`/`prefix_len`, and brings it
     /// (and `lo`) up — the segment's shared L2 domain (§6.5, VM-to-VM segments).
     ///
@@ -238,16 +309,13 @@ impl Netlink for RtNetlink {
         Ok(())
     }
 
-    fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<Option<tun_tap::Iface>> {
-        let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
-
-        create_persistent_tap_in_ns(&ns, tap_name)?;
+    fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<()> {
+        create_persistent_tap_in_ns(netns, tap_name)?;
 
         let tap_name = tap_name.to_string();
         let (ip, _, _) = crate::net::ip_math(vmid)?;
 
-        let res = ns.run(move |_| {
+        let res = in_netns(netns, move || {
             run_with_rtnetlink(|handle| async move {
                 let link_idx = link_index(&handle, &tap_name).await?;
 
@@ -265,15 +333,11 @@ impl Netlink for RtNetlink {
 
                 Ok(())
             })
-        });
+        })?;
 
-        match res {
-            // The tap is persistent in the netns and our fd is already dropped, so
-            // there is no handle to return — the VMM opens the interface by name.
-            Ok(Ok(())) => Ok(None),
-            Ok(Err(e)) => Err(Error::Network(e)),
-            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
-        }
+        // The tap is persistent in the netns and our fd is already dropped, so there is nothing to
+        // hand back — the VMM opens the interface by name.
+        res.map_err(Error::Network)
     }
 
     fn create_bridge(
@@ -283,11 +347,9 @@ impl Netlink for RtNetlink {
         gateway: std::net::Ipv4Addr,
         prefix_len: u8,
     ) -> Result<()> {
-        let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
         let bridge_name = bridge.to_string();
 
-        let res = ns.run(move |_| {
+        let res = in_netns(netns, move || {
             run_with_rtnetlink(|handle| async move {
                 // rtnetlink 0.21's typed bridge builder — the first bridge in the tree.
                 handle
@@ -311,28 +373,21 @@ impl Netlink for RtNetlink {
 
                 Ok(())
             })
-        });
+        })?;
 
-        match res {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(Error::Network(e)),
-            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
-        }
+        res.map_err(Error::Network)
     }
 
     fn setup_tap_on_bridge(&self, netns: &str, tap_name: &str, bridge: &str) -> Result<()> {
-        let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
-
         // Nothing exists yet if this fails (in particular, an `EBUSY`/`EEXIST` means the
         // interface of that name is someone else's) — so it returns without any cleanup.
-        create_persistent_tap_in_ns(&ns, tap_name)?;
+        create_persistent_tap_in_ns(netns, tap_name)?;
 
         let name_for_cleanup = tap_name.to_string();
         let tap_name = tap_name.to_string();
         let bridge_name = bridge.to_string();
 
-        let res = ns.run(move |_| {
+        let res = in_netns(netns, move || {
             run_with_rtnetlink(|handle| async move {
                 let tap_idx = link_index(&handle, &tap_name).await?;
                 let br_idx = link_index(&handle, &bridge_name).await?;
@@ -361,7 +416,7 @@ impl Netlink for RtNetlink {
         let enslaved = match res {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(Error::Network(e)),
-            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
+            Err(e) => Err(e),
         };
         if let Err(e) = enslaved {
             // We created this tap moments ago, so deleting it removes only what we made — the
@@ -384,11 +439,9 @@ impl Netlink for RtNetlink {
     }
 
     fn delete_link(&self, netns: &str, link: &str) -> Result<()> {
-        let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
         let link_name = link.to_string();
 
-        let res = ns.run(move |_| {
+        let res = in_netns(netns, move || {
             run_with_rtnetlink(|handle| async move {
                 let idx = link_index(&handle, &link_name).await?;
                 handle
@@ -399,13 +452,9 @@ impl Netlink for RtNetlink {
                     .map_err(|e| format!("link {link_name} del err: {e}"))?;
                 Ok(())
             })
-        });
+        })?;
 
-        match res {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(Error::Network(e)),
-            Err(e) => Err(Error::Network(format!("ns run err: {e:?}"))),
-        }
+        res.map_err(Error::Network)
     }
 
     fn delete_netns(&self, name: &str) -> Result<()> {
@@ -417,68 +466,64 @@ impl Netlink for RtNetlink {
     }
 
     fn setup_tproxy_routing(&self, netns: &str) -> Result<()> {
-        let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Network(format!("netns get failed: {e}")))?;
-        let inner_res = ns
-            .run(|_| {
-                run_with_rtnetlink(|handle| async move {
-                    let lo_idx = handle
-                        .link()
-                        .get()
-                        .match_name("lo".to_string())
-                        .execute()
-                        .try_next()
-                        .await
-                        .map_err(|e| format!("get lo err: {e}"))?
-                        .ok_or_else(|| "lo not found".to_string())?
-                        .header
-                        .index;
+        let inner_res = in_netns(netns, || {
+            run_with_rtnetlink(|handle| async move {
+                let lo_idx = handle
+                    .link()
+                    .get()
+                    .match_name("lo".to_string())
+                    .execute()
+                    .try_next()
+                    .await
+                    .map_err(|e| format!("get lo err: {e}"))?
+                    .ok_or_else(|| "lo not found".to_string())?
+                    .header
+                    .index;
 
-                    let mut rule = handle.rule().add();
-                    let msg = rule.message_mut();
-                    // An FIB rule message with no address family is rejected by the
-                    // kernel with EAFNOSUPPORT; `rule().add()` leaves it AF_UNSPEC, so
-                    // set AF_INET explicitly (equivalent to rtnetlink's `.v4()`).
-                    msg.header.family = netlink_packet_route::AddressFamily::Inet;
-                    msg.header.table = 100;
-                    msg.header.action = netlink_packet_route::rule::RuleAction::ToTable;
-                    msg.attributes
-                        .push(netlink_packet_route::rule::RuleAttribute::FwMark(1));
-                    rule.execute()
-                        .await
-                        .map_err(|e| format!("rule add err: {e}"))?;
+                let mut rule = handle.rule().add();
+                let msg = rule.message_mut();
+                // An FIB rule message with no address family is rejected by the
+                // kernel with EAFNOSUPPORT; `rule().add()` leaves it AF_UNSPEC, so
+                // set AF_INET explicitly (equivalent to rtnetlink's `.v4()`).
+                msg.header.family = netlink_packet_route::AddressFamily::Inet;
+                msg.header.table = 100;
+                msg.header.action = netlink_packet_route::rule::RuleAction::ToTable;
+                msg.attributes
+                    .push(netlink_packet_route::rule::RuleAttribute::FwMark(1));
+                rule.execute()
+                    .await
+                    .map_err(|e| format!("rule add err: {e}"))?;
 
-                    // rtnetlink 0.21: `route().add(..)` now requires a `RouteMessage`; pass a
-                    // default and overwrite every header field below, so the emitted netlink
-                    // bytes are identical to the pre-0.15 `add()` + `message_mut()` path.
-                    let mut route = handle
-                        .route()
-                        .add(netlink_packet_route::route::RouteMessage::default());
-                    let msg = route.message_mut();
-                    // Same as the rule above: an unset address family is rejected with
-                    // EAFNOSUPPORT. This is an IPv4 local route into table 100.
-                    msg.header.address_family = netlink_packet_route::AddressFamily::Inet;
-                    msg.header.table = 100;
-                    // RTPROT_KERNEL (value 2). The previous `Other(2)` carried a
-                    // comment mislabeling 2 as RTPROT_BOOT — boot is 3; 2 is kernel.
-                    msg.header.protocol = netlink_packet_route::route::RouteProtocol::Kernel;
-                    // RTN_LOCAL requires scope >= RT_SCOPE_HOST: the kernel's
-                    // fib_create_info rejects fib_props[RTN_LOCAL].scope (HOST) >
-                    // fc_scope with EINVAL, so RT_SCOPE_LINK is invalid for a local
-                    // route (iproute2 also forces HOST for `ip route add local`).
-                    msg.header.scope = netlink_packet_route::route::RouteScope::Host;
-                    msg.header.kind = netlink_packet_route::route::RouteType::Local;
-                    msg.attributes
-                        .push(netlink_packet_route::route::RouteAttribute::Oif(lo_idx));
-                    route
-                        .execute()
-                        .await
-                        .map_err(|e| format!("route add err: {e}"))?;
+                // rtnetlink 0.21: `route().add(..)` now requires a `RouteMessage`; pass a
+                // default and overwrite every header field below, so the emitted netlink
+                // bytes are identical to the pre-0.15 `add()` + `message_mut()` path.
+                let mut route = handle
+                    .route()
+                    .add(netlink_packet_route::route::RouteMessage::default());
+                let msg = route.message_mut();
+                // Same as the rule above: an unset address family is rejected with
+                // EAFNOSUPPORT. This is an IPv4 local route into table 100.
+                msg.header.address_family = netlink_packet_route::AddressFamily::Inet;
+                msg.header.table = 100;
+                // RTPROT_KERNEL (value 2). The previous `Other(2)` carried a
+                // comment mislabeling 2 as RTPROT_BOOT — boot is 3; 2 is kernel.
+                msg.header.protocol = netlink_packet_route::route::RouteProtocol::Kernel;
+                // RTN_LOCAL requires scope >= RT_SCOPE_HOST: the kernel's
+                // fib_create_info rejects fib_props[RTN_LOCAL].scope (HOST) >
+                // fc_scope with EINVAL, so RT_SCOPE_LINK is invalid for a local
+                // route (iproute2 also forces HOST for `ip route add local`).
+                msg.header.scope = netlink_packet_route::route::RouteScope::Host;
+                msg.header.kind = netlink_packet_route::route::RouteType::Local;
+                msg.attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Oif(lo_idx));
+                route
+                    .execute()
+                    .await
+                    .map_err(|e| format!("route add err: {e}"))?;
 
-                    Ok(())
-                })
+                Ok(())
             })
-            .map_err(|e| Error::Network(format!("ns run err: {e:?}")))?;
+        })?;
         if let Err(e) = inner_res {
             return Err(Error::Network(e));
         }
@@ -490,11 +535,9 @@ impl Netlink for RtNetlink {
 pub struct DefaultNftApplier;
 impl NftApplier for DefaultNftApplier {
     fn apply_rules(&self, netns: &str, rules: &str) -> Result<()> {
-        let ns = netns_rs::NetNs::get(netns)
-            .map_err(|e| Error::Subprocess(format!("netns get failed: {e}")))?;
         let rules_str = rules.to_string();
 
-        let inner_res = ns.run(move |_| {
+        let inner_res = in_netns(netns, move || {
             use std::io::Write;
             let mut child = std::process::Command::new("nft")
                 .args(["-f", "-"])
@@ -530,13 +573,9 @@ impl NftApplier for DefaultNftApplier {
                 ));
             }
             Ok::<(), String>(())
-        });
+        })?;
 
-        match inner_res {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(Error::Subprocess(e)),
-            Err(e) => Err(Error::Subprocess(format!("ns run err: {e}"))),
-        }
+        inner_res.map_err(Error::Subprocess)
     }
 }
 
@@ -550,9 +589,6 @@ pub struct NetNamespace {
     pub vmid: u32,
     /// The Netlink implementation
     netlink: Box<dyn Netlink>,
-    /// Held tap fd. Now always `None`: the tap is made persistent in the netns
-    /// (`TUNSETPERSIST`) and our fd is dropped so the VMM can open the interface.
-    _tap: Option<tun_tap::Iface>,
     /// Whether `delete()` has already torn down the namespace. Makes `delete()`
     /// idempotent so an explicit teardown followed by `Drop` (or a double
     /// `delete()`) is a silent no-op rather than a spurious teardown warning
@@ -586,26 +622,22 @@ impl NetNamespace {
         // is never constructed, so `Drop` cannot reclaim it — tear the namespace
         // back down here. Removing the netns also reaps any half-created persistent
         // tap that setup_tap left inside it, so a failed create() leaks nothing.
-        let tap = match netlink.setup_tap(&name, &tap_name, vmid) {
-            Ok(tap) => tap,
-            Err(e) => {
-                if let Err(cleanup_err) = netlink.delete_netns(&name) {
-                    tracing::warn!(
-                        "NetNamespace::create: failed to clean up netns {} after setup_tap error: {}",
-                        name,
-                        cleanup_err
-                    );
-                }
-                return Err(e);
+        if let Err(e) = netlink.setup_tap(&name, &tap_name, vmid) {
+            if let Err(cleanup_err) = netlink.delete_netns(&name) {
+                tracing::warn!(
+                    "NetNamespace::create: failed to clean up netns {} after setup_tap error: {}",
+                    name,
+                    cleanup_err
+                );
             }
-        };
+            return Err(e);
+        }
 
         Ok(Self {
             name,
             tap_name,
             vmid,
             netlink,
-            _tap: tap,
             deleted: false,
         })
     }
@@ -622,7 +654,9 @@ impl NetNamespace {
         if self.deleted {
             return Ok(());
         }
-        self._tap.take();
+        // Nothing to release before the namespace: the tap is persistent inside it and this
+        // process holds no fd on it (`setup-tap-returns-dead-option`) — removing the namespace
+        // reaps the interface.
         self.netlink.delete_netns(&self.name)?;
         // Only mark deleted after a successful teardown: a failed delete_netns
         // leaves `deleted` false so `Drop` retries and the NET-8 warning still
@@ -647,8 +681,21 @@ impl NetNamespace {
     /// accepts guest traffic addressed to the proxy itself (`gateway:proxy_port`)
     /// so a guest steered with `http_proxy=<gateway>:<proxy_port>` reaches the
     /// same filtering front-end (the explicit-proxy MITM variant of H-PROXY-1).
-    /// Every other packet from the guest tap is logged and dropped, so no egress
-    /// escapes the proxy.
+    /// Every other packet from the guest tap is dropped, so no egress escapes the
+    /// proxy.
+    ///
+    /// **No `log` statement** (`tproxy-drop-log-never-emitted`). The catch-all rule
+    /// carried `log prefix "vmcell-drop: "` for years and emitted nothing: netfilter
+    /// suppresses the syslog `LOG` target in a **non-init** network namespace unless
+    /// the host-global `net.netfilter.nf_log_all_netns` sysctl is `1` (it is `0` by
+    /// default, and the kernel's own nft selftests set it before asserting on such a
+    /// prefix). Every vmcell drop happens in a per-VM namespace, so the rule was a
+    /// promise the kernel never kept. Setting that sysctl is the one alternative and
+    /// it is refused deliberately: it is host-global, so it would route *every* other
+    /// namespace's netfilter logs — other tenants' included — into the host kernel log,
+    /// trading a diagnostic for a cross-namespace disclosure and a flood channel a
+    /// guest can drive. The security property (default-drop) is unchanged and stays
+    /// live-asserted; the diagnostic is simply not promised.
     ///
     /// NET-7 (recorded deviation): this deliberately drops UDP/443 (QUIC). QUIC
     /// cannot be transparently intercepted by the TCP-oriented egress proxy, so
@@ -661,12 +708,51 @@ impl NetNamespace {
             \t\ttype filter hook prerouting priority mangle; policy drop;\n\
             \t\tiifname \"{tap}\" tcp dport {{ 80, 443 }} tproxy to :{port} meta mark set 1 accept\n\
             \t\tiifname \"{tap}\" ip daddr {gw} tcp dport {port} accept\n\
-            \t\tiifname \"{tap}\" log prefix \"vmcell-drop: \" drop\n\
+            \t\t{drop}\n\
             \t}}\n\
             }}",
             tap = self.tap_name,
             port = proxy_port,
-            gw = gateway
+            gw = gateway,
+            drop = self.render_catch_all_drop(),
+        )
+    }
+
+    /// The catch-all drop rule both rendered rulesets end with — the one place the
+    /// "everything off this tap that was not explicitly accepted is dropped" law is
+    /// spelled, so [`Self::render_tproxy_rules`] and [`Self::render_blocked_rules`]
+    /// cannot drift (and neither can grow a `log` statement the kernel discards, see
+    /// [`Self::render_tproxy_rules`]).
+    fn render_catch_all_drop(&self) -> String {
+        format!("iifname \"{tap}\" drop", tap = self.tap_name)
+    }
+
+    /// Render the **accepts-nothing** ruleset for
+    /// [`Egress::Blocked`](crate::config::Egress::Blocked).
+    ///
+    /// [`Self::render_tproxy_rules`]'s shape minus both of its accept rules: a
+    /// `policy drop` prerouting chain whose only rule drops everything arriving on
+    /// the guest tap. `Egress::Blocked`'s rustdoc says "all egress traffic is
+    /// blocked", and until this existed the privileged arm installed **no table at
+    /// all**, leaving the per-VM namespace on the kernel's default `accept` policy —
+    /// so `Blocked` was strictly *more* permissive than `Filtered` and
+    /// indistinguishable from `Open` (`egress-blocked-is-a-silent-no-op`). What it
+    /// admitted is design §6.3's privileged host-endpoint mechanism: a host process
+    /// placed inside the VM's namespace, reachable at the tap gateway, which
+    /// `Filtered` drops.
+    ///
+    /// There is no `tproxy` statement and no accept, so — unlike
+    /// [`Self::emit_proxy_rules`] — applying this needs no proxy and no policy route.
+    #[must_use]
+    pub fn render_blocked_rules(&self) -> String {
+        format!(
+            "table ip proxy {{\n\
+            \tchain prerouting {{\n\
+            \t\ttype filter hook prerouting priority mangle; policy drop;\n\
+            \t\t{drop}\n\
+            \t}}\n\
+            }}",
+            drop = self.render_catch_all_drop(),
         )
     }
 
@@ -679,6 +765,23 @@ impl NetNamespace {
         let rules = self.render_tproxy_rules(proxy_port, &gateway);
         applier.apply_rules(&self.name, &rules)?;
         self.netlink.setup_tproxy_routing(&self.name)?;
+        Ok(())
+    }
+
+    /// Applies the accepts-nothing ruleset of [`Self::render_blocked_rules`] in this VM's
+    /// namespace — the privileged arm's honoring of
+    /// [`Egress::Blocked`](crate::config::Egress::Blocked).
+    ///
+    /// It installs **no** TPROXY policy routing: that route exists to deliver
+    /// `tproxy`-marked packets to a local proxy socket, and a blocked VM has no proxy and
+    /// no accepted packet to deliver. Adding it anyway would be an unreachable route
+    /// whose presence implied an interception path that is not there.
+    ///
+    /// # Errors
+    /// Returns an error if the nftables rules fail to apply.
+    pub fn emit_blocked_rules(&self, applier: &dyn NftApplier) -> Result<()> {
+        let rules = self.render_blocked_rules();
+        applier.apply_rules(&self.name, &rules)?;
         Ok(())
     }
 }
@@ -736,25 +839,23 @@ mod tests {
         fn add_netns(&self, name: &str) -> Result<()> {
             self.calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(format!("add_netns({name})"));
             Ok(())
         }
-        fn setup_tap(
-            &self,
-            netns: &str,
-            tap_name: &str,
-            vmid: u32,
-        ) -> Result<Option<tun_tap::Iface>> {
+        fn setup_tap(&self, netns: &str, tap_name: &str, vmid: u32) -> Result<()> {
             self.calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(format!("setup_tap({netns}, {tap_name})"));
-            self.setup_tap_vmids.lock().unwrap().push(vmid);
+            self.setup_tap_vmids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(vmid);
             if self.fail_setup_tap {
                 return Err(Error::Network("injected setup_tap failure".to_string()));
             }
-            Ok(None)
+            Ok(())
         }
         fn create_bridge(
             &self,
@@ -763,35 +864,41 @@ mod tests {
             gateway: std::net::Ipv4Addr,
             prefix_len: u8,
         ) -> Result<()> {
-            self.calls.lock().unwrap().push(format!(
-                "create_bridge({netns}, {bridge}, {gateway}/{prefix_len})"
-            ));
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!(
+                    "create_bridge({netns}, {bridge}, {gateway}/{prefix_len})"
+                ));
             Ok(())
         }
         fn setup_tap_on_bridge(&self, netns: &str, tap_name: &str, bridge: &str) -> Result<()> {
-            self.calls.lock().unwrap().push(format!(
-                "setup_tap_on_bridge({netns}, {tap_name}, {bridge})"
-            ));
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!(
+                    "setup_tap_on_bridge({netns}, {tap_name}, {bridge})"
+                ));
             Ok(())
         }
         fn delete_link(&self, netns: &str, link: &str) -> Result<()> {
             self.calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(format!("delete_link({netns}, {link})"));
             Ok(())
         }
         fn delete_netns(&self, name: &str) -> Result<()> {
             self.calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(format!("delete_netns({name})"));
             Ok(())
         }
         fn setup_tproxy_routing(&self, netns: &str) -> Result<()> {
             self.calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(format!("setup_tproxy_routing({netns})"));
             Ok(())
         }
@@ -800,6 +907,10 @@ mod tests {
     #[allow(dead_code)]
     pub(super) struct FakeNftApplier {
         pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// The ruleset TEXT of each call, in order, so a test can assert *what* was applied and
+        /// not merely that something was — the difference between gating the `Egress::Blocked`
+        /// ruleset and gating that some ruleset reached the applier.
+        pub rules: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[allow(dead_code)]
@@ -807,16 +918,21 @@ mod tests {
         pub(super) fn new() -> Self {
             Self {
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                rules: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
 
     impl NftApplier for FakeNftApplier {
-        fn apply_rules(&self, netns: &str, _rules: &str) -> Result<()> {
+        fn apply_rules(&self, netns: &str, rules: &str) -> Result<()> {
             self.calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(format!("apply_rules({netns})"));
+            self.rules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(rules.to_string());
             Ok(())
         }
     }
@@ -841,7 +957,6 @@ mod tests {
             tap_name: "test".into(),
             vmid: 42,
             netlink: Box::new(FakeNetlink::new()),
-            _tap: None,
             deleted: false,
         };
         assert_eq!(ns.host_ip().unwrap(), "10.200.43.1");
@@ -854,14 +969,7 @@ mod tests {
     // the golden equality does. vmid 9 maps to gateway 10.200.10.1 via ip_math.
     #[test]
     fn render_tproxy_rules_intercepts_web_and_drops_rest() {
-        let ns = NetNamespace {
-            name: "vmcell-net-9".into(),
-            tap_name: "vmcell-tap-9".into(),
-            vmid: 9,
-            netlink: Box::new(FakeNetlink::new()),
-            _tap: None,
-            deleted: false,
-        };
+        let ns = ns_for_render();
         let gw = ns.host_ip().unwrap();
         assert_eq!(gw, "10.200.10.1", "vmid 9 must map to gateway 10.200.10.1");
         let rules = ns.render_tproxy_rules(5000, &gw);
@@ -871,7 +979,7 @@ mod tests {
             \t\ttype filter hook prerouting priority mangle; policy drop;\n\
             \t\tiifname \"vmcell-tap-9\" tcp dport { 80, 443 } tproxy to :5000 meta mark set 1 accept\n\
             \t\tiifname \"vmcell-tap-9\" ip daddr 10.200.10.1 tcp dport 5000 accept\n\
-            \t\tiifname \"vmcell-tap-9\" log prefix \"vmcell-drop: \" drop\n\
+            \t\tiifname \"vmcell-tap-9\" drop\n\
             \t}\n\
             }";
         assert_eq!(
@@ -884,6 +992,182 @@ mod tests {
         assert!(
             !rules.contains("udp dport 443"),
             "QUIC (UDP/443) must remain un-accepted so all egress stays interceptable: {rules}"
+        );
+
+        // `tproxy-drop-log-never-emitted`: no `log` statement, in either ruleset. netfilter
+        // discards the syslog LOG target in a non-init netns unless the host-global
+        // `net.netfilter.nf_log_all_netns` is 1, and vmcell will not flip a host-global sysctl
+        // that would route every other namespace's netfilter logs into the host kernel log. A
+        // re-added `log prefix …` promises a diagnostic the kernel throws away — RED here.
+        for (what, ruleset) in [
+            ("tproxy", rules.as_str()),
+            ("blocked", &ns.render_blocked_rules()),
+        ] {
+            assert!(
+                !ruleset.contains("log"),
+                "the {what} ruleset must carry no `log` statement (suppressed in a non-init \
+                 netns): {ruleset}"
+            );
+        }
+    }
+
+    /// The namespace both render gates pin their golden text against: vmid 9, whose `ip_math`
+    /// gateway is `10.200.10.1`.
+    fn ns_for_render() -> NetNamespace {
+        NetNamespace {
+            name: "vmcell-net-9".into(),
+            tap_name: "vmcell-tap-9".into(),
+            vmid: 9,
+            netlink: Box::new(FakeNetlink::new()),
+            deleted: false,
+        }
+    }
+
+    // `egress-blocked-is-a-silent-no-op` (M1): pin the accepts-nothing ruleset with the same
+    // GOLDEN-EQUALITY discipline as its TPROXY sibling — it is `render_tproxy_rules`' shape minus
+    // both accept rules. RED on the inverse in both directions: on the pre-fix `Blocked` (which
+    // emitted NO table at all, leaving the kernel's default-accept policy) there is no text to
+    // compare, and on any ruleset that grows an `accept` — including a re-added
+    // `gateway:proxy_port` hole, which is exactly what `Blocked` must not admit — the equality and
+    // the explicit no-`accept` assertion below both go red.
+    #[test]
+    fn render_blocked_rules_accepts_nothing() {
+        let ns = ns_for_render();
+        let rules = ns.render_blocked_rules();
+
+        let expected = "table ip proxy {\n\
+            \tchain prerouting {\n\
+            \t\ttype filter hook prerouting priority mangle; policy drop;\n\
+            \t\tiifname \"vmcell-tap-9\" drop\n\
+            \t}\n\
+            }";
+        assert_eq!(
+            rules, expected,
+            "the Egress::Blocked ruleset drifted from its golden text"
+        );
+        assert!(
+            !rules.contains("accept"),
+            "`Egress::Blocked` must accept nothing — not even the tap gateway (§6.3's privileged \
+             host endpoint, which is what made Blocked more permissive than Filtered): {rules}"
+        );
+        assert!(
+            !rules.contains("tproxy"),
+            "a blocked VM has no proxy to redirect into: {rules}"
+        );
+        assert!(
+            rules.contains("policy drop"),
+            "the chain must default-drop: {rules}"
+        );
+        // The catch-all drop is the SAME composed rule the TPROXY ruleset ends with (one law):
+        // a divergence between the two spellings would let one of them stop matching the tap.
+        let gw = ns.host_ip().unwrap();
+        let tproxy = ns.render_tproxy_rules(5000, &gw);
+        let drop_rule = ns.render_catch_all_drop();
+        assert!(
+            rules.contains(&drop_rule) && tproxy.contains(&drop_rule),
+            "both rulesets must end with the one composed catch-all drop ({drop_rule})"
+        );
+    }
+
+    // M1: `emit_blocked_rules` applies the accepts-nothing ruleset in THIS VM's netns and installs
+    // NO tproxy policy routing (there is no proxy socket to deliver to). RED on the inverse in
+    // both directions: the pre-fix `Blocked` arm applied no ruleset at all (the applier records
+    // nothing), and an implementation that copy-pasted `emit_proxy_rules` would record a
+    // `setup_tproxy_routing` call that must not be there.
+    #[test]
+    fn emit_blocked_rules_applies_accepts_nothing_and_no_tproxy_route() {
+        let netlink = FakeNetlink::new();
+        let netlink_calls = netlink.calls.clone();
+        let ns = NetNamespace::create("vmcell", 7, Box::new(netlink)).unwrap();
+
+        let applier = FakeNftApplier::new();
+        let applier_calls = applier.calls.clone();
+        let applier_rules = applier.rules.clone();
+
+        ns.emit_blocked_rules(&applier).unwrap();
+
+        // Snapshot before asserting: a panic while holding one of these guards would poison the
+        // mutex the fake re-locks from `NetNamespace::drop`, turning a readable assertion failure
+        // into an abort inside a destructor.
+        let calls = applier_calls.lock().unwrap().clone();
+        let rules = applier_rules.lock().unwrap().clone();
+        let nc = netlink_calls.lock().unwrap().clone();
+
+        assert_eq!(
+            calls,
+            vec!["apply_rules(vmcell-net-7)".to_string()],
+            "the blocked ruleset must be applied exactly once, in this VM's netns"
+        );
+        assert_eq!(
+            rules,
+            vec![ns.render_blocked_rules()],
+            "the applied text must be the composed blocked ruleset, not a second copy"
+        );
+        assert!(
+            !nc.iter().any(|c| c.starts_with("setup_tproxy_routing")),
+            "a blocked VM gets no TPROXY policy route (nothing is delivered to a proxy): {nc:?}"
+        );
+    }
+
+    // `ns-run-on-pooled-tokio-worker` (m14): every namespace move in this module runs on a thread
+    // created for that one call, and a panic inside it is converted, never propagated. Both halves
+    // are what `netns_rs::NetNs::run` — `enter()?; f(self); src_ns.enter()?`, with no
+    // `catch_unwind` — did NOT provide: it moved the CALLER's thread (a pooled tokio worker, since
+    // every caller is reached synchronously from the async `setup_env`) and, on a panic in `f`,
+    // skipped the restore, stranding that worker inside the VM's namespace forever.
+    //
+    // RED on the inverse: an `on_dedicated_thread` that simply calls `f()` inline reports the
+    // caller's own `ThreadId` (first assert) and lets the panic unwind out of the helper, so the
+    // second half never returns an `Err` at all — it aborts the test with the panic.
+    #[test]
+    fn namespace_moves_run_on_a_dedicated_thread_and_contain_panics() {
+        let caller = std::thread::current().id();
+        let worker = on_dedicated_thread("probe", || Ok(std::thread::current().id()))
+            .expect("the closure must run");
+        assert_ne!(
+            worker, caller,
+            "a namespace move must not `setns` the calling (pooled runtime) thread"
+        );
+
+        let contained = on_dedicated_thread("probe", || -> Result<()> {
+            panic!("worker-boom");
+        });
+        match contained {
+            Err(Error::Network(msg)) => {
+                assert!(
+                    msg.contains("worker-boom") && msg.contains("probe"),
+                    "a contained panic must name its payload and its site: {msg}"
+                );
+            }
+            other => panic!("a panicking namespace worker must surface a typed error: {other:?}"),
+        }
+    }
+
+    // The unprivileged-observable arm of the real helper: an absent namespace is a typed
+    // `Error::Network` naming the `/var/run/netns` path, and the closure never runs — no panic, no
+    // half-entered thread. RED on an impl that unwraps the open or runs `f` before the `setns`.
+    #[test]
+    fn in_netns_reports_an_absent_namespace_without_running_the_closure() {
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let missing = format!("vmcell-no-such-netns-{}", std::process::id());
+        let res = in_netns(&missing, || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        match res {
+            Err(Error::Network(msg)) => assert!(
+                msg.contains(&missing) && msg.contains("/var/run/netns"),
+                "the error must name the namespace path it could not enter: {msg}"
+            ),
+            other => panic!("an absent namespace must fail typed: {other:?}"),
+        }
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the closure must not run when the namespace could not be entered"
+        );
+        // One law: the path the helper reports is the one composer everything else uses.
+        assert_eq!(
+            netns_path(&missing),
+            std::path::Path::new("/var/run/netns").join(&missing)
         );
     }
 

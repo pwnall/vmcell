@@ -1,16 +1,23 @@
-//! End-to-end smoke tests for the validator. KVM-gated (`#[ignore]`): run on a KVM host with
-//! built artifacts via `cargo test -p vmcell-artifact-validator --test smoke -- --ignored`.
+//! End-to-end smoke tests for the validator: the only proof that the conformance battery can
+//! actually FAIL on a real boot, and that it passes on the known-good pair.
+//!
+//! KVM-gated (`#[ignore]`), and **selected by `just test-validator`** — the recipe the CI
+//! `test-integration` job runs after the artifacts are built and the runner blessed. Before that
+//! recipe existed, both tests were compiled and skipped by every invocation in the tree (`m24`):
+//! an `#[ignore]`d test that no `--run-ignored all` filter selects is a suite that cannot go red.
 
+use vmcell_artifact_validator::harness::{get_rootfs, get_vmlinux};
 use vmcell_artifact_validator::{ArtifactSet, CheckStatus, Level, ValidationOptions, validate};
 
 /// Known-good artifacts must pass the full contract with no failures.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs KVM + built artifacts"]
 async fn validate_known_good_full_is_ok() {
-    let artifacts = ArtifactSet::new(
-        vmcell::artifact::kernel_path(),
-        vmcell::artifact::rootfs_path(),
-    );
+    // Through the §10.4 getters, not `artifact::{kernel_path,rootfs_path}` directly: they run the
+    // at-most-once, hash-gated artifact build first, so an edit to the guest agent or the packer
+    // is validated instead of silently re-validating a stale rootfs, and a missing kernel fails
+    // loud with the one-command fix rather than as a boot timeout.
+    let artifacts = ArtifactSet::new(get_vmlinux(), get_rootfs());
     let report = validate(&artifacts, &ValidationOptions::level(Level::Full))
         .await
         .expect("validation should run on a KVM host with artifacts");
@@ -36,7 +43,7 @@ async fn validate_broken_kernel_reports_failure() {
     // when the VM tries to boot it.
     let bogus = tempfile::NamedTempFile::new().expect("bogus kernel fixture");
     std::fs::write(bogus.path(), b"this is not a kernel").expect("write bogus kernel");
-    let artifacts = ArtifactSet::new(bogus.path(), vmcell::artifact::rootfs_path());
+    let artifacts = ArtifactSet::new(bogus.path(), get_rootfs());
     let report = validate(&artifacts, &ValidationOptions::default())
         .await
         .expect("validation should run (the bogus kernel file exists)");

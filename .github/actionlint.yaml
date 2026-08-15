@@ -1,6 +1,0 @@
-# actionlint config. The integration job runs on a self-hosted runner labelled `kvm` (a box with
-# /dev/kvm and the runner user in the `kvm` group). Declare the custom label so actionlint's
-# runner-label check does not flag `runs-on: [self-hosted, linux, kvm]` as unknown.
-self-hosted-runner:
-  labels:
-    - kvm

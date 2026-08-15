@@ -15,7 +15,7 @@
 //! fs-reading path over fixture logs.
 //!
 //! ## Two renderers, and the difference between them
-//! [`explain_boot_failure`] is for a boot whose console **was captured** (possibly empty: the VM
+//! [`explain_boot_failure_of`] is for a boot whose console **was captured** (possibly empty: the VM
 //! ran and printed nothing, which is itself evidence). [`explain_without_serial`] is for a failure
 //! where **no console evidence exists at all** — the VMM never started, or its log could not be
 //! read — and it names candidate causes instead of asserting a contract violation, because absence
@@ -24,6 +24,15 @@
 //! (`MicroVm::start`) or failed its agent handshake routes through one of the two — Core,
 //! Extended and Full alike, gated by `run_core_records_both_boot_checks_when_the_vm_never_starts`
 //! and `every_extended_and_full_boot_failure_names_the_missing_evidence`.
+//!
+//! ## A restored VM's empty console is not a missing kernel
+//! The captured-console renderer takes a [`BootKind`], because "nothing reached the console" means
+//! opposite things for the two: a **fresh** boot that printed nothing never ran a kernel, while a
+//! **restored** VM's console is empty *by construction* — its kernel printed the banner in the
+//! snapshot source, minutes and one process ago. Feeding a restored VM's console to the fresh-boot
+//! reading told `snapshot.restore_roundtrip` that a kernel which provably just booted "is not a
+//! direct-boot PVH-ELF vmlinux". The kind is an explicit argument at every call site (no default)
+//! so the question is answered, not assumed.
 //!
 //! ## The signatures are the emitters' real text
 //! The strings below were taken from the code that prints them, not from prose:
@@ -42,11 +51,35 @@
 //!   (the agent prints it verbatim for an unrelated `AF_INET` loopback failure). Keying on the
 //!   agent's own stable prefix is both narrower and more reliable.
 
+use std::borrow::Cow;
+
 use crate::kconfig::KconfigValues;
 
-/// How many trailing non-empty serial lines [`explain_boot_failure`] quotes. Bounded so a failure
-/// message never carries a multi-megabyte console log into a caller's report.
+/// How many trailing non-empty serial lines [`explain_boot_failure_of`] quotes.
+///
+/// A line count is **not** a size bound: the console is guest-controlled, and a guest that prints
+/// one un-newlined multi-megabyte line satisfies any line count while carrying the whole flood into
+/// the caller's report. The size promise is kept by [`SERIAL_TAIL_MAX_LINE_BYTES`] and
+/// [`SERIAL_TAIL_MAX_BYTES`]; all three bounds apply, whichever binds first.
 pub const SERIAL_TAIL_LINES: usize = 20;
+
+/// The per-line byte cap on a quoted serial line. A longer line is truncated at a UTF-8 boundary
+/// and marked with [`TRUNCATION_MARKER`] naming the elided byte count, so the reader knows the
+/// quote is partial rather than seeing a silently shortened kernel message.
+pub const SERIAL_TAIL_MAX_LINE_BYTES: usize = 512;
+
+/// The total byte cap over every quoted line together — the bound that actually keeps a
+/// multi-megabyte console out of a caller's report when the flood is spread over many lines.
+/// Lines are taken from the end (it is a *tail*), so the newest output survives the cap.
+///
+/// Larger than [`SERIAL_TAIL_MAX_LINE_BYTES`] by construction, so one capped line always fits and
+/// the tail is never rendered empty for a console that did produce output
+/// (`the_line_cap_fits_inside_the_total_cap`).
+pub const SERIAL_TAIL_MAX_BYTES: usize = 4096;
+
+/// What a truncated tail line ends with, before the elided byte count. Public so a caller matching
+/// on the rendered message has the literal rather than a copy of it.
+pub const TRUNCATION_MARKER: &str = "… truncated, ";
 
 /// The kernel's `init/do_mounts.c` text for "the root **device node** is not there": no virtio
 /// transport or no virtio-blk, so `/dev/vda` never appeared. Checked before
@@ -78,6 +111,25 @@ const VSOCK_SIGNATURES: &[&str] = &[
 /// its own rustdoc — one law, one literal (a second copy would let the poll succeed while
 /// [`classify_serial`] reported [`ContractViolation::NoDirectBootKernel`], or the reverse).
 pub const BANNER_SIGNATURE: &str = "Linux version";
+
+/// Which boot the captured console belongs to — the one fact that decides whether an **absent**
+/// kernel banner is evidence about the kernel image.
+///
+/// Non-exhaustive for the same reason as [`ContractViolation`]: this crate is downstream contract
+/// surface (§10.4), and a third console origin (a zygote clone's, say) must not break a consumer.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum BootKind {
+    /// The VM was started from its kernel entry point (`MicroVm::start`). The kernel banner must
+    /// appear, so its absence is the [`ContractViolation::NoDirectBootKernel`] signature.
+    Fresh,
+    /// The VM was resumed from a snapshot (`MicroVm::restore`). Its kernel booted in the snapshot
+    /// **source** — a different VM, a different console file — so the restored instance's console
+    /// starts empty by construction and an absent banner proves nothing about the kernel image.
+    /// Every other §5.4 signature still applies: a restored guest that prints one reaches the same
+    /// clause a fresh one would.
+    Restored,
+}
 
 /// A §5.4 guest-kernel contract clause that a serial log proves was violated.
 ///
@@ -158,22 +210,35 @@ impl ContractViolation {
     }
 }
 
+/// Classify a **fresh** boot's serial log — [`classify_serial_of`] with [`BootKind::Fresh`].
+///
+/// Kept as the short spelling for the common case (every check that boots a VM from its kernel
+/// entry point); a restored VM's console must go through [`classify_serial_of`] instead, because
+/// the missing-banner arm below does not hold for it.
+#[must_use]
+pub fn classify_serial(log: &str) -> Option<ContractViolation> {
+    classify_serial_of(BootKind::Fresh, log)
+}
+
 /// Classify a serial log **captured from a VM that ran** and whose boot failed.
 ///
 /// `None` means "no known §5.4 signature" — the residual class, which
-/// [`explain_boot_failure`] still reports named-and-loud. A healthy boot log classifies as `None`.
+/// [`explain_boot_failure_of`] still reports named-and-loud. A healthy boot log classifies as
+/// `None`.
 ///
-/// An **empty** log is [`ContractViolation::NoDirectBootKernel`]: the VM ran and its console
-/// produced nothing. That reading is only valid for a captured console — when no console evidence
-/// exists (the VMM never started, the log could not be read) the caller must use
-/// [`explain_without_serial`] instead of feeding an empty string here.
+/// An **empty** log is [`ContractViolation::NoDirectBootKernel`] for a [`BootKind::Fresh`] boot:
+/// the VM ran and its console produced nothing. That reading is only valid for a captured console
+/// — when no console evidence exists (the VMM never started, the log could not be read) the caller
+/// must use [`explain_without_serial`] instead of feeding an empty string here — and only for a
+/// fresh boot: a [`BootKind::Restored`] VM's console is empty by construction, so the arm is not
+/// applied to it and the residual class (`None`) is the honest answer.
 ///
 /// Precedence is most-specific-first: a root-fs panic quotes the banner it printed moments earlier,
 /// and the vsock self-check runs only once userspace is up, so an earlier signature always wins.
 /// Within the root failures the *device* signature outranks the *mount* signature, because a
 /// missing device also ends in the generic `VFS: Unable to mount root fs` panic.
 #[must_use]
-pub fn classify_serial(log: &str) -> Option<ContractViolation> {
+pub fn classify_serial_of(kind: BootKind, log: &str) -> Option<ContractViolation> {
     if ROOT_DEVICE_SIGNATURES.iter().any(|s| log.contains(s)) {
         return Some(ContractViolation::RootDeviceMissing);
     }
@@ -183,7 +248,9 @@ pub fn classify_serial(log: &str) -> Option<ContractViolation> {
     if VSOCK_SIGNATURES.iter().any(|s| log.contains(s)) {
         return Some(ContractViolation::VsockTransport);
     }
-    if !log.contains(BANNER_SIGNATURE) {
+    // Fresh only: a restored VM never re-runs the kernel's early boot, so it never re-prints the
+    // banner (§8.2) and the absence carries no information about the kernel image.
+    if matches!(kind, BootKind::Fresh) && !log.contains(BANNER_SIGNATURE) {
         return Some(ContractViolation::NoDirectBootKernel);
     }
     None
@@ -194,10 +261,25 @@ const CHECKLIST_POINTER: &str = "check the whole §5.4 guest-kernel contract che
      (direct-boot PVH vmlinux; virtio pci/mmio/blk/net/console; vsock; fuse+virtio-fs; \
      erofs+overlay+tmpfs; ip-pnp; 8250 console) against the kernel's resolved .config";
 
+/// The note a restored VM's empty console gets instead of the fresh boot's "not a direct-boot
+/// vmlinux" verdict — the honest reading of the same absence (§8.2).
+const RESTORED_EMPTY_CONSOLE_NOTE: &str = "this console belongs to a VM RESTORED from a snapshot: \
+     its kernel printed the boot banner in the snapshot source, on that VM's console, so an empty \
+     console here is expected and says nothing about the kernel image. Look at the restore path \
+     first (the snapshot directory's contents, the VMM's restore API, the guest agent's post-restore \
+     resync) before the §5.4 kernel contract";
+
+/// Render a boot-failure message for a **fresh** boot whose console was captured —
+/// [`explain_boot_failure_of`] with [`BootKind::Fresh`].
+#[must_use]
+pub fn explain_boot_failure(log: &str, base: &str) -> String {
+    explain_boot_failure_of(BootKind::Fresh, log, base)
+}
+
 /// Render a boot-failure message for a boot whose console **was captured**: `base` (the check's own
 /// "what expired" sentence) followed by the classified §5.4 clause and its symbols, or — for the
 /// residual class — the §5.4 checklist pointer; then the last [`SERIAL_TAIL_LINES`] non-empty lines
-/// of the console.
+/// of the console, bounded by [`SERIAL_TAIL_MAX_LINE_BYTES`] and [`SERIAL_TAIL_MAX_BYTES`].
 ///
 /// With [`explain_without_serial`] this is one of the two renderers every [`crate::checks`] arm
 /// that reports a failed start or a failed agent handshake goes through, so "the message names the
@@ -206,10 +288,14 @@ const CHECKLIST_POINTER: &str = "check the whole §5.4 guest-kernel contract che
 /// console evidence exists**, never by convenience: passing an empty `log` here asserts "the VM ran
 /// and printed nothing", so a failure that produced no log at all belongs in
 /// [`explain_without_serial`].
+///
+/// `kind` decides how the *absence* of a banner reads (see [`BootKind`]); a
+/// [`BootKind::Restored`] console with no banner is reported as the residual class **plus** the
+/// note explaining why its emptiness is expected, never as "this is not a kernel".
 #[must_use]
-pub fn explain_boot_failure(log: &str, base: &str) -> String {
+pub fn explain_boot_failure_of(kind: BootKind, log: &str, base: &str) -> String {
     let mut msg = String::from(base);
-    match classify_serial(log) {
+    match classify_serial_of(kind, log) {
         Some(v) => {
             msg.push_str("\n  contract violation: ");
             msg.push_str(v.clause());
@@ -219,6 +305,10 @@ pub fn explain_boot_failure(log: &str, base: &str) -> String {
         None => {
             msg.push_str("\n  no known §5.4 contract-violation signature in the serial log; ");
             msg.push_str(CHECKLIST_POINTER);
+            if matches!(kind, BootKind::Restored) && !log.contains(BANNER_SIGNATURE) {
+                msg.push_str("\n  note: ");
+                msg.push_str(RESTORED_EMPTY_CONSOLE_NOTE);
+            }
         }
     }
     msg.push_str("\n  serial tail:");
@@ -226,7 +316,7 @@ pub fn explain_boot_failure(log: &str, base: &str) -> String {
     if tail.is_empty() {
         msg.push_str(" (the serial console produced no output)");
     } else {
-        for line in tail {
+        for line in &tail {
             msg.push_str("\n    ");
             msg.push_str(line);
         }
@@ -260,17 +350,56 @@ pub fn explain_without_serial(base: &str, no_evidence_because: &str) -> String {
     msg
 }
 
-/// The last [`SERIAL_TAIL_LINES`] non-empty lines of `log`, in order.
-fn serial_tail(log: &str) -> Vec<&str> {
-    let mut tail: Vec<&str> = log
+/// The last non-empty lines of `log`, in order, under all three bounds: at most
+/// [`SERIAL_TAIL_LINES`] lines, each at most [`SERIAL_TAIL_MAX_LINE_BYTES`] bytes (longer ones are
+/// truncated and marked), and at most [`SERIAL_TAIL_MAX_BYTES`] bytes in total.
+///
+/// The console is **guest-controlled**, so the line count alone bounds nothing: one un-newlined
+/// multi-megabyte line, or 20 one-megabyte ones, satisfy it while flooding the caller's report (and
+/// vmcell's own logs, since these messages are persisted artifacts). Lines are consumed from the
+/// end, so the byte budget is spent on the newest output — the part a boot failure is diagnosed
+/// from.
+fn serial_tail(log: &str) -> Vec<Cow<'_, str>> {
+    let mut tail: Vec<Cow<'_, str>> = Vec::new();
+    let mut budget = SERIAL_TAIL_MAX_BYTES;
+    for line in log
         .lines()
         .map(str::trim_end)
         .filter(|l| !l.is_empty())
         .rev()
         .take(SERIAL_TAIL_LINES)
-        .collect();
+    {
+        let quoted = cap_line(line);
+        // A capped line always fits an untouched budget (`the_line_cap_fits_inside_the_total_cap`),
+        // so this only ever stops a tail that already has lines in it — never renders an empty one
+        // for a console that produced output.
+        if quoted.len() > budget {
+            break;
+        }
+        budget -= quoted.len();
+        tail.push(quoted);
+    }
     tail.reverse();
     tail
+}
+
+/// One tail line, truncated to [`SERIAL_TAIL_MAX_LINE_BYTES`] at a UTF-8 boundary and marked with
+/// the elided byte count. Borrowed unchanged when it already fits.
+fn cap_line(line: &str) -> Cow<'_, str> {
+    if line.len() <= SERIAL_TAIL_MAX_LINE_BYTES {
+        return Cow::Borrowed(line);
+    }
+    // Walk back to a char boundary: a guest can emit multi-byte UTF-8 (or invalid bytes that
+    // `read_to_string` already replaced), and slicing mid-character panics.
+    let mut end = SERIAL_TAIL_MAX_LINE_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = line.get(..end).unwrap_or("");
+    Cow::Owned(format!(
+        "{head}{TRUNCATION_MARKER}{} bytes elided",
+        line.len() - end
+    ))
 }
 
 /// Cross-check a resolved kernel `.config` (delta 3's `vmlinux-<label>.config` sidecar, parsed by
@@ -609,6 +738,187 @@ mod tests {
             SERIAL_TAIL_LINES,
             "exactly {SERIAL_TAIL_LINES} tail lines"
         );
+    }
+
+    // m9, BOTH arms. A restored VM's console is empty BY CONSTRUCTION (its kernel printed the
+    // banner in the snapshot source), so the fresh-boot reading of "no banner" — "this is not a
+    // direct-boot PVH-ELF vmlinux" — diagnosed a kernel that provably just booted as not being a
+    // kernel. Guards the classifier that ignores `BootKind` (either direction): dropping the
+    // `Fresh` conjunct greens the restored assertions but reddens the fresh ones, and hard-coding
+    // `Restored` reddens the fresh ones.
+    #[test]
+    fn a_restored_vms_empty_console_is_not_a_missing_kernel() {
+        // Fresh: unchanged, still the one case we CAN name.
+        assert_eq!(
+            classify_serial_of(BootKind::Fresh, ""),
+            Some(ContractViolation::NoDirectBootKernel)
+        );
+        // Restored: no clause is proven.
+        assert_eq!(classify_serial_of(BootKind::Restored, ""), None);
+        assert_eq!(classify_serial_of(BootKind::Restored, "   \n\n"), None);
+
+        let base = "restored VM: agent handshake failed within the 60s budget";
+        let restored = explain_boot_failure_of(BootKind::Restored, "", base);
+        assert!(restored.starts_with(base), "{restored}");
+        assert!(
+            !restored.contains("contract violation:"),
+            "no §5.4 clause is proven by a restored VM's empty console: {restored}"
+        );
+        assert!(
+            !restored.contains("CONFIG_PVH"),
+            "a restored VM must not be told its kernel is not a direct-boot vmlinux: {restored}"
+        );
+        assert!(
+            restored.contains("RESTORED from a snapshot"),
+            "the message must say why the empty console is expected: {restored}"
+        );
+        assert!(
+            restored.contains("the snapshot directory"),
+            "the message must point at the restore path: {restored}"
+        );
+
+        // The fresh renderer keeps the verdict it earned.
+        let fresh = explain_boot_failure_of(BootKind::Fresh, "", "the banner never appeared");
+        assert!(fresh.contains("CONFIG_PVH"), "{fresh}");
+        assert!(!fresh.contains("RESTORED from a snapshot"), "{fresh}");
+    }
+
+    // The kind relaxes ONLY the banner arm: a restored guest that really does print a §5.4
+    // signature reaches the same clause a fresh one would. Guards a `BootKind::Restored` arm that
+    // short-circuits the whole classifier to `None`.
+    #[test]
+    fn a_restored_console_still_reaches_every_other_clause() {
+        for (log, want) in [
+            (NO_EROFS, ContractViolation::RootFsMount),
+            (NO_VIRTIO_BLK, ContractViolation::RootDeviceMissing),
+            (VSOCK_BIND_FAILS, ContractViolation::VsockTransport),
+        ] {
+            assert_eq!(
+                classify_serial_of(BootKind::Restored, log),
+                Some(want),
+                "a restored VM's console must still classify {want:?}"
+            );
+        }
+        // …and a healthy restored console is still the residual class, with no restored note
+        // (the banner IS there — this console is not the empty-by-construction case).
+        assert_eq!(classify_serial_of(BootKind::Restored, HEALTHY), None);
+        let msg = explain_boot_failure_of(BootKind::Restored, HEALTHY, "handshake failed");
+        assert!(!msg.contains("RESTORED from a snapshot"), "{msg}");
+    }
+
+    // The default spelling is the fresh one, so the short `classify_serial`/`explain_boot_failure`
+    // wrappers cannot drift from the `BootKind::Fresh` path they claim to be.
+    #[test]
+    fn the_short_spellings_are_the_fresh_boot_kind() {
+        for log in ["", HEALTHY, NO_EROFS, NO_VIRTIO_BLK, NO_VSOCK] {
+            assert_eq!(
+                classify_serial(log),
+                classify_serial_of(BootKind::Fresh, log)
+            );
+            assert_eq!(
+                explain_boot_failure(log, "base"),
+                explain_boot_failure_of(BootKind::Fresh, log, "base")
+            );
+        }
+    }
+
+    // m17: the per-line cap must fit inside the total cap, or a single over-long line would blow
+    // the whole budget and `serial_tail` would render an EMPTY tail ("the serial console produced
+    // no output") for a console that produced plenty. Guards a future cap edit that inverts them.
+    #[test]
+    fn the_line_cap_fits_inside_the_total_cap() {
+        // The rendered worst case: a full-length head plus the marker and a 7-digit byte count.
+        let worst =
+            SERIAL_TAIL_MAX_LINE_BYTES + TRUNCATION_MARKER.len() + " bytes elided".len() + 9;
+        assert!(
+            worst < SERIAL_TAIL_MAX_BYTES,
+            "a single capped line ({worst} B) must fit the total budget ({SERIAL_TAIL_MAX_BYTES} B)"
+        );
+    }
+
+    // m17, the headline case. `SERIAL_TAIL_LINES` bounds LINES, and the console is
+    // guest-controlled: one un-newlined multi-megabyte line satisfies the line count while carrying
+    // the whole flood into the caller's report (and into vmcell's persisted logs), which is exactly
+    // what the const's rustdoc promised could not happen. Guards a `serial_tail` with no byte cap:
+    // the length assertion below reddens with a ~4 MB message.
+    #[test]
+    fn explain_bounds_a_single_multi_megabyte_console_line() {
+        let flood = "F".repeat(4 * 1024 * 1024);
+        let mut log = String::from("[    0.000000] Linux version 6.12.94 (build@vmcell)\n");
+        log.push_str("[    1.000000] guest-flood: ");
+        log.push_str(&flood);
+        log.push_str(" END-OF-FLOOD\n");
+        assert!(log.len() > 4 * 1024 * 1024, "the fixture must be a flood");
+
+        let msg = explain_boot_failure(&log, "agent handshake failed");
+        assert!(
+            msg.len() < 8 * 1024,
+            "a failure message must not carry a multi-megabyte console: {} bytes",
+            msg.len()
+        );
+        assert!(
+            !msg.contains("END-OF-FLOOD"),
+            "the over-long line must be truncated, not quoted whole"
+        );
+        assert!(
+            msg.contains(TRUNCATION_MARKER) && msg.contains("bytes elided"),
+            "a truncated quote must say so, with the elided byte count: {msg}"
+        );
+        // The head of the line survives, so the reader still sees what the guest was printing.
+        assert!(msg.contains("guest-flood: FFFF"), "{msg}");
+    }
+
+    // m17, the other direction: many long lines. The per-line cap alone leaves
+    // `SERIAL_TAIL_LINES * SERIAL_TAIL_MAX_LINE_BYTES` bytes reachable, so the TOTAL cap is what
+    // binds here — and it must spend its budget on the NEWEST lines (it is a tail).
+    #[test]
+    fn explain_bounds_the_total_tail_across_many_long_lines() {
+        let mut log = String::from("[    0.000000] Linux version 6.12.94 (build@vmcell)\n");
+        for i in 0..40 {
+            log.push_str(&format!("[    1.0{i:03}] line-{i}: {}\n", "L".repeat(900)));
+        }
+        let msg = explain_boot_failure(&log, "agent handshake failed");
+        assert!(
+            msg.len() < SERIAL_TAIL_MAX_BYTES + 2048,
+            "the quoted tail must respect the total byte cap: {} bytes",
+            msg.len()
+        );
+        let quoted = msg.matches("\n    ").count();
+        assert!(
+            quoted > 0 && quoted < SERIAL_TAIL_LINES,
+            "the total cap must bind before the line cap here (quoted {quoted} lines)"
+        );
+        // Newest first out of the budget: the last line is quoted, an older one is not.
+        assert!(
+            msg.contains("line-39:"),
+            "the tail must reach the end: {msg}"
+        );
+        assert!(
+            !msg.contains("line-20:"),
+            "the byte budget must drop the older lines, not the newer ones: {msg}"
+        );
+    }
+
+    // A multi-byte character straddling the per-line cap must not panic the truncation (the guest
+    // controls the bytes; `read_to_string` yields real UTF-8 with replacement chars). Guards
+    // `&line[..SERIAL_TAIL_MAX_LINE_BYTES]`, which panics mid-character.
+    #[test]
+    fn cap_line_truncates_on_a_char_boundary() {
+        // 'é' is 2 bytes: filling to exactly the cap puts a boundary AT the cap, so shift by one.
+        let line = format!(
+            "{}é{}",
+            "x".repeat(SERIAL_TAIL_MAX_LINE_BYTES - 1),
+            "y".repeat(64)
+        );
+        let capped = cap_line(&line);
+        assert!(capped.len() < line.len(), "the line must be truncated");
+        assert!(capped.contains(TRUNCATION_MARKER), "{capped}");
+        assert!(
+            !capped.contains('é'),
+            "the straddling character is dropped, not split: {capped}"
+        );
+        // A short line is borrowed unchanged.
+        assert!(matches!(cap_line("[    0.1] short"), Cow::Borrowed(_)));
     }
 
     // Every variant carries a clause and at least one symbol. The list comes from `all_violations`,

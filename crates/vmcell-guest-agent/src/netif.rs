@@ -1,29 +1,49 @@
 //! Minimal interface-configuration helpers for the guest agent's native
 //! post-restore resync (§8.2, Restore correctness: a restored VM is not a fresh VM).
 //!
-//! Just enough of the `SIOCSIFHWADDR` MAC-set path to rotate `eth0`'s hardware
-//! address in-process on restore, so PID 1 no longer spawns the multi-MB
-//! `ip`/guest-tools binary for it. The ioctl sequence mirrors the guest-tools
-//! `set_mac` helper — bring the link down (some drivers require it to change the
-//! address), write `ARPHRD_ETHER` + the six MAC bytes into `ifr_hwaddr`, issue
-//! `SIOCSIFHWADDR`, then bring the link back up — but depends only on `libc`, so
-//! the lean-agent dependency assertion (`cargo tree -e no-dev` sees no
+//! Just enough of the `SIOCSIFHWADDR` / `SIOCSIFADDR` / route-ioctl paths to
+//! re-point `eth0`'s hardware and IPv4 identity in-process on restore, so PID 1
+//! no longer spawns the multi-MB `ip`/guest-tools binary for it. The ioctl
+//! sequences mirror the guest-tools helpers but depend only on `libc`, so the
+//! lean-agent dependency assertion (`cargo tree -e no-dev` sees no
 //! tokio/hyper/rtnetlink/reqwest) stays green.
+//!
+//! The module is two halves. `KernelNet` is the thin ioctl layer — one syscall
+//! per method, no ordering. `apply_resync_net` is the *composition*: which arm
+//! bounces the link, in what order, and — the law d1 exists for — who re-installs
+//! the default route the bounce destroyed. The composition runs against the
+//! `NetOps` trait, so it is unit-testable against a recording fake without a
+//! live interface.
 
 use std::os::raw::c_char;
 
-const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
-const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
+// Kernel ABI values, taken from `libc` rather than re-spelled locally (m25): this
+// module is the SECOND copy of the guest-tools `ifreq` stack
+// (`ifreq-stack-duplicated-guest-tools`, docs/78 §6), and the recorded deviation's
+// promise is that "a copy that drifts from the ABI reddens in its own crate".
+// Hardcoded literals cannot do that — they are a second local spelling of a kernel
+// constant, which is exactly what the guest-tools half already refuses to write.
+// `ioctl_requests_and_flags_are_pinned_to_the_kernel_abi` below pins every one of
+// them to its number, so a `libc` renumbering reddens here too.
+const SIOCGIFFLAGS: libc::c_ulong = libc::SIOCGIFFLAGS;
+const SIOCSIFFLAGS: libc::c_ulong = libc::SIOCSIFFLAGS;
+const SIOCSIFHWADDR: libc::c_ulong = libc::SIOCSIFHWADDR;
 // IPv4 address / netmask / route ioctls (H-VMM-1 guest-IP rotation).
-const SIOCSIFADDR: libc::c_ulong = 0x8916;
-const SIOCSIFNETMASK: libc::c_ulong = 0x891c;
-const SIOCADDRT: libc::c_ulong = 0x890b;
-const SIOCDELRT: libc::c_ulong = 0x890c;
-const RTF_UP: u16 = 0x0001;
-const RTF_GATEWAY: u16 = 0x0002;
-const ARPHRD_ETHER: u16 = 1;
-const IFF_UP: i16 = 0x1;
+const SIOCSIFADDR: libc::c_ulong = libc::SIOCSIFADDR;
+const SIOCSIFNETMASK: libc::c_ulong = libc::SIOCSIFNETMASK;
+const SIOCADDRT: libc::c_ulong = libc::SIOCADDRT;
+const SIOCDELRT: libc::c_ulong = libc::SIOCDELRT;
+const RTF_UP: u16 = libc::RTF_UP;
+const RTF_GATEWAY: u16 = libc::RTF_GATEWAY;
+const ARPHRD_ETHER: u16 = libc::ARPHRD_ETHER;
+/// `libc::IFF_UP` narrowed to the `short` the `ifr_flags` union arm carries. A fixed
+/// ABI constant (1), so the narrowing is lossless — and the pin below asserts the
+/// round trip rather than trusting that.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "IFF_UP is the constant 1 — fits the ifr_flags short losslessly; pinned by ioctl_requests_and_flags_are_pinned_to_the_kernel_abi"
+)]
+const IFF_UP: i16 = libc::IFF_UP as i16;
 
 /// Offset of the `ifr_hwaddr` sockaddr's `sa_family` within the `ifru` union.
 const HWADDR_FAMILY_OFFSET: usize = 0;
@@ -129,44 +149,19 @@ pub fn set_loopback_up() -> std::io::Result<()> {
     res
 }
 
-/// Sets `dev`'s hardware (MAC) address to `mac` via `SIOCSIFHWADDR`.
-///
-/// Mirrors the guest-tools `set_mac` sequence: opens an `AF_INET` datagram
-/// socket, brings the link down (best effort — some drivers reject a hwaddr
-/// change while up), issues `SIOCSIFHWADDR` with `ARPHRD_ETHER` + the six MAC
-/// bytes, then brings the link back up. Used by the native post-restore resync
-/// so PID 1 never spawns the `ip` binary.
-///
-/// # Errors
-/// Returns the underlying [`std::io::Error`] if the socket cannot be opened, the
-/// device name is too long, or the `SIOCSIFHWADDR` / link-up ioctl fails. The
-/// caller treats any error as "MAC not applied" and never fails the resync on it.
-pub fn set_mac_bytes(dev: &str, mac: [u8; 6]) -> std::io::Result<()> {
-    let fd = open_inet_socket()?;
-    let res = (|| -> std::io::Result<()> {
-        // Best effort: some drivers require the link down to change its hwaddr.
-        let _ = set_link_up(fd, dev, false);
-        let mut ifr = hwaddr_ifreq(dev, mac)?;
-        // SAFETY: `ifr` is a correctly sized `struct ifreq`; SIOCSIFHWADDR reads
-        // the name and the `ifr_hwaddr` sockaddr from the `ifru` bytes. `fd` is a
-        // valid AF_INET socket opened above.
-        if unsafe { libc::ioctl(fd, SIOCSIFHWADDR, &mut ifr) } < 0 {
-            let err = std::io::Error::last_os_error();
-            // M-GUEST-2: the link was brought down above; re-raise it even on this
-            // failure path so a failed (best-effort) MAC rotation never leaves the
-            // restored guest's eth0 administratively DOWN with no one to re-raise
-            // it. The re-up is itself best-effort — the original error is returned.
-            let _ = set_link_up(fd, dev, true);
-            return Err(err);
-        }
-        set_link_up(fd, dev, true)?;
-        Ok(())
-    })();
-    // SAFETY: `fd` is the socket we opened above and no longer use.
-    unsafe {
-        libc::close(fd);
+/// Sets `dev`'s hardware (MAC) address to `mac` via `SIOCSIFHWADDR` — the ioctl
+/// alone. Bringing the link down around it (some drivers reject a hwaddr change
+/// while up) and back up is the *caller's* sequencing, which lives in
+/// [`apply_resync_net`] so the whole-resync route law can see it.
+fn set_hwaddr(fd: libc::c_int, dev: &str, mac: [u8; 6]) -> std::io::Result<()> {
+    let mut ifr = hwaddr_ifreq(dev, mac)?;
+    // SAFETY: `ifr` is a correctly sized `struct ifreq`; SIOCSIFHWADDR reads
+    // the name and the `ifr_hwaddr` sockaddr from the `ifru` bytes. `fd` is a
+    // valid AF_INET socket opened by the caller.
+    if unsafe { libc::ioctl(fd, SIOCSIFHWADDR, &mut ifr) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    res
+    Ok(())
 }
 
 /// The four netmask octets (network order) for a `/prefix_len` prefix, e.g.
@@ -298,50 +293,556 @@ fn replace_default_route(fd: libc::c_int, gateway: [u8; 4]) -> std::io::Result<(
     Ok(())
 }
 
-/// Rotates the guest's `eth0` IPv4 identity post-restore (H-VMM-1): sets the new
-/// address + `/prefix_len` netmask, brings the link up, and re-points the default
-/// route at the new `gateway`.
+/// Installs `dev`'s IPv4 address and its `/prefix_len` netmask
+/// (`SIOCSIFADDR`/`SIOCSIFNETMASK`) — the two ioctls alone. Bringing the link up
+/// and re-pointing the default route is the caller's sequencing
+/// ([`apply_resync_net`]).
+fn set_inet_addr(fd: libc::c_int, dev: &str, addr: [u8; 4], prefix_len: u8) -> std::io::Result<()> {
+    let mut ifr = IfReq::new(dev)?;
+    write_ifru_sockaddr(&mut ifr.ifru, addr);
+    // SAFETY: `ifr` is a correctly-sized `ifreq` whose `ifru` holds an
+    // `AF_INET` `sockaddr_in`; `fd` is a valid `AF_INET` socket.
+    if unsafe { libc::ioctl(fd, SIOCSIFADDR, &mut ifr) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut ifr = IfReq::new(dev)?;
+    write_ifru_sockaddr(&mut ifr.ifru, netmask_octets(prefix_len));
+    // SAFETY: same shape as above; `SIOCSIFNETMASK` consumes `ifr_netmask`.
+    if unsafe { libc::ioctl(fd, SIOCSIFNETMASK, &mut ifr) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The kernel-facing steps a post-restore resync performs on one interface.
+///
+/// The trait exists so the **composition** — which arm bounces the link, and
+/// therefore which resync has to re-install the default route
+/// ([`resync_restores_route`]) — is unit-testable against a recording fake, while
+/// the ioctl half stays the thin, unfakeable [`KernelNet`] below. The fake is
+/// kernel-blind by construction: the live `snapshot_restore` egress assertion
+/// remains the only proof that `KernelNet`'s ioctls are right.
+trait NetOps {
+    /// Every default route's gateway, in `/proc/net/route` order.
+    fn default_gateways(&self) -> std::io::Result<Vec<[u8; 4]>>;
+    /// Brings the interface administratively up (`true`) or down (`false`).
+    fn set_link_up(&self, up: bool) -> std::io::Result<()>;
+    /// Installs the hardware address (`SIOCSIFHWADDR`).
+    fn set_mac(&self, mac: [u8; 6]) -> std::io::Result<()>;
+    /// Installs the IPv4 address and its `/prefix_len` netmask.
+    fn set_addr(&self, addr: [u8; 4], prefix_len: u8) -> std::io::Result<()>;
+    /// Deletes every existing default route and installs one via `gateway`.
+    fn replace_default_route(&self, gateway: [u8; 4]) -> std::io::Result<()>;
+}
+
+/// [`NetOps`] over a live `AF_INET` socket and one interface name — the real
+/// ioctls, and nothing else: no ordering, no policy.
+struct KernelNet<'a> {
+    fd: libc::c_int,
+    dev: &'a str,
+}
+
+impl NetOps for KernelNet<'_> {
+    fn default_gateways(&self) -> std::io::Result<Vec<[u8; 4]>> {
+        default_gateways_to_delete(std::fs::read_to_string("/proc/net/route"))
+    }
+
+    fn set_link_up(&self, up: bool) -> std::io::Result<()> {
+        set_link_up(self.fd, self.dev, up)
+    }
+
+    fn set_mac(&self, mac: [u8; 6]) -> std::io::Result<()> {
+        set_hwaddr(self.fd, self.dev, mac)
+    }
+
+    fn set_addr(&self, addr: [u8; 4], prefix_len: u8) -> std::io::Result<()> {
+        set_inet_addr(self.fd, self.dev, addr, prefix_len)
+    }
+
+    fn replace_default_route(&self, gateway: [u8; 4]) -> std::io::Result<()> {
+        replace_default_route(self.fd, gateway)
+    }
+}
+
+/// The IPv4 identity a resync installs on the guest's interface (H-VMM-1).
+///
+/// A local type rather than the wire `Ipv4Reconfig` so this module stays
+/// protocol-free — the dispatch converts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4Args {
+    /// The rotated `/30` address.
+    pub addr: [u8; 4],
+    /// Its prefix length (30 on the NAT and tap datapaths).
+    pub prefix_len: u8,
+    /// The default gateway to route through.
+    pub gateway: [u8; 4],
+}
+
+/// Which arms of one resync took effect, reported back on the wire as
+/// `ResyncAck`'s `mac_applied`/`ip_applied`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResyncNetOutcome {
+    /// The hardware address was rotated.
+    pub mac_applied: bool,
+    /// The IPv4 address, netmask, and default route were re-pointed.
+    pub ip_applied: bool,
+    /// The pre-bounce default route was re-installed because no other arm
+    /// installed one (the `resync_restores_route` law). Diagnostic: the host does
+    /// not carry this on the wire, but a fake-driven test asserts on it.
+    pub route_restored: bool,
+}
+
+/// **The resync route law (d1): a resync that bounces the link owns the default
+/// route.**
+///
+/// Downing an interface tears its routes down with it — the kernel's
+/// `NETDEV_DOWN` handler runs `fib_disable_ip`, which marks the default route's
+/// nexthop dead. The MAC arm bounces `eth0` (drivers may reject a hwaddr change
+/// while up), so a `Resync` carrying `mac` **alone** — which the wire type and
+/// the design present as an independent option — used to leave the restored guest
+/// with no default route at all. The IPv4 arm installs its own default route and
+/// therefore covers itself; nothing else does.
+///
+/// One predicate over the resync as a whole, consulted once by
+/// [`apply_resync_net`], so a future third link-bouncing arm inherits the
+/// restoration instead of re-discovering the defect.
+#[must_use]
+fn resync_restores_route(bounced_link: bool, ipv4_installed_route: bool) -> bool {
+    bounced_link && !ipv4_installed_route
+}
+
+/// Rotates the hardware address with the link bounced around it, re-raising the
+/// link on **both** exits (M-GUEST-2): a failed, best-effort MAC rotation must
+/// never strand the restored guest's interface administratively DOWN.
+fn rotate_mac<O: NetOps>(ops: &O, mac: [u8; 6]) -> std::io::Result<()> {
+    // Best effort: a driver that refuses the down-transition may still accept the
+    // hwaddr change, and the `set_mac` below is what decides the outcome.
+    if let Err(e) = ops.set_link_up(false) {
+        tracing::debug!(
+            "vmcell-guest-agent: resync link-down before the MAC rotation failed: {}; continuing",
+            e
+        );
+    }
+    match ops.set_mac(mac) {
+        Ok(()) => ops.set_link_up(true),
+        Err(e) => {
+            if let Err(up) = ops.set_link_up(true) {
+                tracing::warn!(
+                    "vmcell-guest-agent: resync could not re-raise the link after a failed MAC rotation: {}",
+                    up
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Re-points the interface's IPv4 identity: address + netmask, link up, then the
+/// new default route (H-VMM-1).
+fn install_ipv4<O: NetOps>(ops: &O, cfg: Ipv4Args) -> std::io::Result<()> {
+    ops.set_addr(cfg.addr, cfg.prefix_len)?;
+    ops.set_link_up(true)?;
+    ops.replace_default_route(cfg.gateway)
+}
+
+/// Applies one resync's network arms in order and reports which took effect.
+///
+/// Both arms are best-effort — a failure is logged with its cause (L-GUEST-6) and
+/// reported as "not applied", never propagated, because the ack must always be
+/// sent. The default route is handled for the resync **as a whole**: the
+/// pre-bounce gateway is captured before any arm runs and re-installed afterwards
+/// exactly when [`resync_restores_route`] says the resync owes it (d1).
+fn apply_resync_net<O: NetOps>(
+    ops: &O,
+    mac: Option<[u8; 6]>,
+    ipv4: Option<Ipv4Args>,
+) -> ResyncNetOutcome {
+    let mut out = ResyncNetOutcome::default();
+    if mac.is_none() && ipv4.is_none() {
+        return out;
+    }
+
+    // Capture BEFORE the bounce: once the link goes down the kernel has already
+    // torn the default route's nexthop down, so `/proc/net/route` no longer holds
+    // the gateway we would have to restore.
+    let mut saved_gateway: Option<[u8; 4]> = None;
+    if mac.is_some() {
+        match ops.default_gateways() {
+            Ok(gateways) => saved_gateway = gateways.first().copied(),
+            Err(e) if ipv4.is_none() => {
+                // Nothing else will install a route, and we cannot read the one we
+                // are about to destroy: refuse the bounce rather than perform an
+                // irreversible teardown blind. Reported as "MAC not applied".
+                tracing::warn!(
+                    "vmcell-guest-agent: resync cannot read the default route ({}); skipping the MAC rotation so the guest keeps its route",
+                    e
+                );
+                return out;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "vmcell-guest-agent: resync cannot read the default route ({}); the IPv4 arm installs its own, so the link bounce is still safe",
+                    e
+                );
+            }
+        }
+    }
+
+    if let Some(m) = mac {
+        out.mac_applied = match rotate_mac(ops, m) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "vmcell-guest-agent: resync MAC rotation failed: {}; continuing (best-effort)",
+                    e
+                );
+                false
+            }
+        };
+    }
+
+    if let Some(cfg) = ipv4 {
+        out.ip_applied = match install_ipv4(ops, cfg) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "vmcell-guest-agent: resync IP rotation failed: {}; continuing (best-effort)",
+                    e
+                );
+                false
+            }
+        };
+    }
+
+    if resync_restores_route(mac.is_some(), out.ip_applied)
+        && let Some(gateway) = saved_gateway
+    {
+        match ops.replace_default_route(gateway) {
+            Ok(()) => out.route_restored = true,
+            Err(e) => tracing::warn!(
+                "vmcell-guest-agent: resync could not restore the default route after the link bounce: {}",
+                e
+            ),
+        }
+    }
+    out
+}
+
+/// Applies one post-restore resync's network arms to `dev` (H-VMM-1, §8.2).
 ///
 /// The restore/zygote path rotates the vmid, so the guest resumes with the frozen
-/// `ip=` address of the *original* vmid, which no longer matches its rotated
-/// host-side tap/`/30` wiring — this re-points it, exactly as [`set_mac_bytes`]
-/// re-points the hardware address. Uses only `SIOCSIFADDR`/`SIOCSIFNETMASK` and
-/// the route ioctls (no netlink), preserving the zero-netlink-in-PID-1 contract.
+/// MAC and `ip=` address of the *original* vmid, neither of which matches its
+/// rotated host-side tap/`/30` wiring. This re-points both, in-process, using only
+/// `SIOCSIFHWADDR`/`SIOCSIFADDR`/`SIOCSIFNETMASK` and the route ioctls — no
+/// netlink, no spawned `ip` binary (C1/C6).
 ///
 /// # Errors
-/// Returns the underlying [`std::io::Error`] if the socket cannot be opened or any
-/// ioctl fails. The caller treats any error as "IP not applied" and never fails
-/// the resync on it.
-pub fn set_ipv4(dev: &str, addr: [u8; 4], prefix_len: u8, gateway: [u8; 4]) -> std::io::Result<()> {
+/// Returns the underlying [`std::io::Error`] only if the `AF_INET` socket cannot
+/// be opened, which is the one failure that leaves *nothing* attempted. Per-arm
+/// failures are logged and reported through [`ResyncNetOutcome`]'s flags so the
+/// caller can always send its ack.
+pub fn resync_net(
+    dev: &str,
+    mac: Option<[u8; 6]>,
+    ipv4: Option<Ipv4Args>,
+) -> std::io::Result<ResyncNetOutcome> {
     let fd = open_inet_socket()?;
-    let res = (|| -> std::io::Result<()> {
-        let mut ifr = IfReq::new(dev)?;
-        write_ifru_sockaddr(&mut ifr.ifru, addr);
-        // SAFETY: `ifr` is a correctly-sized `ifreq` whose `ifru` holds an
-        // `AF_INET` `sockaddr_in`; `fd` is a valid `AF_INET` socket.
-        if unsafe { libc::ioctl(fd, SIOCSIFADDR, &mut ifr) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut ifr = IfReq::new(dev)?;
-        write_ifru_sockaddr(&mut ifr.ifru, netmask_octets(prefix_len));
-        // SAFETY: same shape as above; `SIOCSIFNETMASK` consumes `ifr_netmask`.
-        if unsafe { libc::ioctl(fd, SIOCSIFNETMASK, &mut ifr) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        set_link_up(fd, dev, true)?;
-        replace_default_route(fd, gateway)?;
-        Ok(())
-    })();
+    let out = apply_resync_net(&KernelNet { fd, dev }, mac, ipv4);
     // SAFETY: `fd` is the socket we opened above and no longer use.
     unsafe {
         libc::close(fd);
     }
-    res
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// One recorded [`NetOps`] call, in the order the composition made it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NetCall {
+        ReadGateways,
+        LinkUp(bool),
+        SetMac([u8; 6]),
+        SetAddr([u8; 4], u8),
+        ReplaceRoute([u8; 4]),
+    }
+
+    /// A recording [`NetOps`] fake: it sees the composition's *order*, which is
+    /// where the d1 law lives. It is kernel-blind — the live `snapshot_restore`
+    /// egress assertion is what covers `KernelNet`'s ioctls.
+    struct FakeNet {
+        calls: RefCell<Vec<NetCall>>,
+        gateways: Option<Vec<[u8; 4]>>,
+        fail_set_mac: bool,
+    }
+
+    impl FakeNet {
+        fn with_gateways(gateways: &[[u8; 4]]) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                gateways: Some(gateways.to_vec()),
+                fail_set_mac: false,
+            }
+        }
+        /// `/proc/net/route` unreadable.
+        fn unreadable_routes() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                gateways: None,
+                fail_set_mac: false,
+            }
+        }
+        fn calls(&self) -> Vec<NetCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl NetOps for FakeNet {
+        fn default_gateways(&self) -> std::io::Result<Vec<[u8; 4]>> {
+            self.calls.borrow_mut().push(NetCall::ReadGateways);
+            self.gateways
+                .clone()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+        fn set_link_up(&self, up: bool) -> std::io::Result<()> {
+            self.calls.borrow_mut().push(NetCall::LinkUp(up));
+            Ok(())
+        }
+        fn set_mac(&self, mac: [u8; 6]) -> std::io::Result<()> {
+            self.calls.borrow_mut().push(NetCall::SetMac(mac));
+            if self.fail_set_mac {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(())
+        }
+        fn set_addr(&self, addr: [u8; 4], prefix_len: u8) -> std::io::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(NetCall::SetAddr(addr, prefix_len));
+            Ok(())
+        }
+        fn replace_default_route(&self, gateway: [u8; 4]) -> std::io::Result<()> {
+            self.calls.borrow_mut().push(NetCall::ReplaceRoute(gateway));
+            Ok(())
+        }
+    }
+
+    const MAC: [u8; 6] = [0x02, 0x00, 0x0a, 0xc8, 0x02, 0x02];
+    const OLD_GW: [u8; 4] = [10, 200, 2, 1];
+    const NEW_IPV4: Ipv4Args = Ipv4Args {
+        addr: [10, 200, 5, 2],
+        prefix_len: 30,
+        gateway: [10, 200, 5, 1],
+    };
+
+    // d1: a `Resync` carrying ONLY `mac` bounces the link, and `NETDEV_DOWN` →
+    // `fib_disable_ip` marks the default route's nexthop dead — so the resync as a
+    // whole owes the route back. RED on the inverse (drop the
+    // `resync_restores_route` step, i.e. the pre-fix code where only `set_ipv4`
+    // ever touched the route table): the trailing `ReplaceRoute(OLD_GW)` is absent
+    // and the guest is left with no default route.
+    #[test]
+    fn mac_only_resync_restores_the_default_route_it_bounced_away() {
+        let ops = FakeNet::with_gateways(&[OLD_GW]);
+        let out = apply_resync_net(&ops, Some(MAC), None);
+
+        assert_eq!(
+            ops.calls(),
+            vec![
+                // Captured BEFORE the bounce — afterwards the route is already gone.
+                NetCall::ReadGateways,
+                NetCall::LinkUp(false),
+                NetCall::SetMac(MAC),
+                NetCall::LinkUp(true),
+                NetCall::ReplaceRoute(OLD_GW),
+            ],
+            "a mac-only resync must re-install the default route it bounced away"
+        );
+        assert!(out.mac_applied);
+        assert!(!out.ip_applied);
+        assert!(out.route_restored, "the route restoration must be reported");
+    }
+
+    // The IPv4 arm installs its own default route, so the resync does NOT owe a
+    // second one: exactly one route op, carrying the NEW gateway. RED if the
+    // restoration were made unconditional on the bounce (the old gateway would be
+    // re-installed after the new one, blackholing the rotated `/30`).
+    #[test]
+    fn mac_and_ipv4_resync_ends_on_the_new_gateway_only() {
+        let ops = FakeNet::with_gateways(&[OLD_GW]);
+        let out = apply_resync_net(&ops, Some(MAC), Some(NEW_IPV4));
+
+        assert_eq!(
+            ops.calls(),
+            vec![
+                NetCall::ReadGateways,
+                NetCall::LinkUp(false),
+                NetCall::SetMac(MAC),
+                NetCall::LinkUp(true),
+                NetCall::SetAddr(NEW_IPV4.addr, NEW_IPV4.prefix_len),
+                NetCall::LinkUp(true),
+                NetCall::ReplaceRoute(NEW_IPV4.gateway),
+            ],
+            "the IPv4 arm owns the route; the stale gateway must not be re-added after it"
+        );
+        assert!(out.mac_applied && out.ip_applied);
+        assert!(
+            !out.route_restored,
+            "the IPv4 arm covers itself — no restoration is owed"
+        );
+    }
+
+    // An ipv4-only resync never downs the link, so it owes nothing extra and must
+    // not even read the route table for a restoration it will not perform.
+    #[test]
+    fn ipv4_only_resync_does_not_bounce_the_link() {
+        let ops = FakeNet::with_gateways(&[OLD_GW]);
+        let out = apply_resync_net(&ops, None, Some(NEW_IPV4));
+
+        assert_eq!(
+            ops.calls(),
+            vec![
+                NetCall::SetAddr(NEW_IPV4.addr, NEW_IPV4.prefix_len),
+                NetCall::LinkUp(true),
+                NetCall::ReplaceRoute(NEW_IPV4.gateway),
+            ]
+        );
+        assert!(!out.mac_applied && out.ip_applied && !out.route_restored);
+    }
+
+    // M-GUEST-2 + d1 on the failure path: a MAC rotation that fails still re-raises
+    // the link AND still owes the route back — the link was downed either way.
+    #[test]
+    fn failed_mac_rotation_still_raises_the_link_and_restores_the_route() {
+        let mut ops = FakeNet::with_gateways(&[OLD_GW]);
+        ops.fail_set_mac = true;
+        let out = apply_resync_net(&ops, Some(MAC), None);
+
+        assert_eq!(
+            ops.calls(),
+            vec![
+                NetCall::ReadGateways,
+                NetCall::LinkUp(false),
+                NetCall::SetMac(MAC),
+                NetCall::LinkUp(true),
+                NetCall::ReplaceRoute(OLD_GW),
+            ]
+        );
+        assert!(!out.mac_applied, "the failed arm must report not-applied");
+        assert!(out.route_restored);
+    }
+
+    // A guest with no default route (a segment member) has nothing to restore: the
+    // bounce runs and no route op is emitted — restoring `0.0.0.0` would be worse
+    // than restoring nothing.
+    #[test]
+    fn resync_with_no_default_route_restores_nothing() {
+        let ops = FakeNet::with_gateways(&[]);
+        let out = apply_resync_net(&ops, Some(MAC), None);
+
+        assert_eq!(
+            ops.calls(),
+            vec![
+                NetCall::ReadGateways,
+                NetCall::LinkUp(false),
+                NetCall::SetMac(MAC),
+                NetCall::LinkUp(true),
+            ]
+        );
+        assert!(out.mac_applied && !out.route_restored);
+    }
+
+    // An unreadable `/proc/net/route` with nothing else to install a route: refuse
+    // the irreversible bounce rather than destroy a route we cannot put back.
+    #[test]
+    fn resync_skips_the_bounce_when_the_route_table_is_unreadable() {
+        let ops = FakeNet::unreadable_routes();
+        let out = apply_resync_net(&ops, Some(MAC), None);
+
+        assert_eq!(
+            ops.calls(),
+            vec![NetCall::ReadGateways],
+            "no link may go down when the route it would destroy cannot be read back"
+        );
+        assert!(!out.mac_applied && !out.route_restored);
+
+        // …but with the IPv4 arm present a route WILL be installed, so the bounce
+        // is safe and must still happen.
+        let ops = FakeNet::unreadable_routes();
+        let out = apply_resync_net(&ops, Some(MAC), Some(NEW_IPV4));
+        assert!(
+            ops.calls().contains(&NetCall::SetMac(MAC)),
+            "the IPv4 arm makes the bounce recoverable: {:?}",
+            ops.calls()
+        );
+        assert!(out.mac_applied && out.ip_applied);
+    }
+
+    // A resync with neither arm touches nothing at all (the clock/reseed-only case).
+    #[test]
+    fn empty_resync_touches_no_interface_state() {
+        let ops = FakeNet::with_gateways(&[OLD_GW]);
+        let out = apply_resync_net(&ops, None, None);
+        assert!(ops.calls().is_empty());
+        assert_eq!(out, ResyncNetOutcome::default());
+    }
+
+    // The law itself, in isolation: only a bounce that nothing else covers owes the
+    // route. RED on `bounced_link` alone (double-installs over the IPv4 arm) or on
+    // a constant `false` (the pre-fix behavior).
+    #[test]
+    fn resync_restores_route_is_bounce_without_a_replacement() {
+        assert!(resync_restores_route(true, false), "d1: the mac-only case");
+        assert!(!resync_restores_route(true, true), "the IPv4 arm covers it");
+        assert!(!resync_restores_route(false, false), "no bounce, no debt");
+        assert!(!resync_restores_route(false, true));
+    }
+
+    // m25 — the `netif` half of the `ifreq-stack-duplicated-guest-tools` divergence
+    // guard (docs/78 §6). The recorded deviation promises "a copy that drifts from
+    // the ABI reddens in its own crate"; that only holds if this crate pins the
+    // values it issues. Every ioctl request number, both `RTF_*` flags, the
+    // `ARPHRD_ETHER` family, and the narrowed `IFF_UP` are asserted against their
+    // kernel numbers — the same numbers the guest-tools half pins, so the two copies
+    // remain checkable against one another.
+    //
+    // RED on: any renumbering (a typo'd `0x891c` → `0x891b` turns a netmask write
+    // into a netmask *read*), a `libc` constant that changes width, or an `IFF_UP`
+    // that does not survive the narrowing to the `ifr_flags` short.
+    #[test]
+    fn ioctl_requests_and_flags_are_pinned_to_the_kernel_abi() {
+        assert_eq!(SIOCGIFFLAGS, 0x8913);
+        assert_eq!(SIOCSIFFLAGS, 0x8914);
+        assert_eq!(SIOCSIFADDR, 0x8916);
+        assert_eq!(SIOCSIFNETMASK, 0x891c);
+        assert_eq!(SIOCSIFHWADDR, 0x8924);
+        assert_eq!(SIOCADDRT, 0x890b);
+        assert_eq!(SIOCDELRT, 0x890c);
+        assert_eq!(RTF_UP, 0x0001);
+        assert_eq!(RTF_GATEWAY, 0x0002);
+        assert_eq!(ARPHRD_ETHER, 1);
+        assert_eq!(IFF_UP, 0x1);
+        assert_eq!(
+            i32::from(IFF_UP),
+            libc::IFF_UP,
+            "IFF_UP must survive the narrowing to the ifr_flags short"
+        );
+        assert_eq!(
+            u32::from(AF_INET_FAMILY),
+            u32::try_from(libc::AF_INET).expect("AF_INET is positive"),
+            "AF_INET must survive the narrowing to sa_family_t"
+        );
+        // The route flags are what tell the kernel this is an UP gateway route; a
+        // widened `rt_flags` field would silently drop the high half.
+        assert_eq!(
+            std::mem::size_of::<u16>(),
+            std::mem::size_of_val(&libc::RTF_UP),
+            "rt_flags is a c_ushort — the RTF_* constants must stay u16"
+        );
+    }
 
     // H-VMM-1: the `/30` netmask math. RED on an off-by-one prefix or a byte-swap.
     #[test]

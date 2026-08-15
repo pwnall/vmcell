@@ -414,7 +414,19 @@ impl<B: BrokerBackend> BrokerServer<B> {
                 prefix,
                 limits,
             } => {
-                let name = vmcell::naming::cgroup_slice_name(&prefix, vmid);
+                // `vm_slice_name`, NOT the bare `cgroup_slice_name` leaf: the name every
+                // `CgroupFs` verb takes is relative to the cgroup-v2 mount root
+                // (`create_slice_at` joins `/sys/fs/cgroup/{name}`; the orphan sweep's scanner
+                // likewise reports root-relative paths), so the leaf alone names a slice at the
+                // ROOT of the hierarchy while the orchestrator places the VM at
+                // `{§13 sibling base}/{leaf}` — a different directory on every systemd host, and
+                // therefore a slice created here that no VMM is ever added to plus an orchestrator
+                // slice this teardown never deletes. It is the same law on both sides because the
+                // base is read from `/proc/self/cgroup` and this process is a plain `fork(2)` of
+                // the supervisor (`fork_privileged_child`) that never moves between cgroups, so it
+                // reads the supervisor's own line. One law, one predicate — pinned by
+                // `cgroup_placement_gate` below.
+                let name = vmcell::naming::vm_slice_name(&prefix, vmid);
                 match self
                     .backend
                     .cgroups()
@@ -436,7 +448,10 @@ impl<B: BrokerBackend> BrokerServer<B> {
                 {
                     errs.push(format!("delete netns: {e}"));
                 }
-                let name = vmcell::naming::cgroup_slice_name(&prefix, vmid);
+                // The same placement law `CreateCgroup` used above (see its comment): a teardown
+                // naming the bare leaf would delete a slice at the hierarchy root and leak the
+                // one the create actually made.
+                let name = vmcell::naming::vm_slice_name(&prefix, vmid);
                 if let Err(e) = self.backend.cgroups().delete_slice(&name) {
                     errs.push(format!("delete cgroup slice: {e}"));
                 }
@@ -696,3 +711,119 @@ pub fn spawn_broker_with<B: BrokerBackend + 'static>(
 
 #[cfg(test)]
 mod tests;
+
+/// Call-site gate for the cgroup **placement** law (§13 sibling placement).
+///
+/// The claim is about the two `dispatch` arms above, not about a helper, so — like
+/// `vmcell-qemu`'s `virtiofs_pacing_gate` — it reads this file's own production text and pins
+/// what those call sites name. A behavioral assertion over a recording `CgroupFs` sees the
+/// *name the broker chose*; it cannot see a future third site that reaches for the leaf again,
+/// which is exactly how the two copies diverged in the first place.
+#[cfg(test)]
+mod cgroup_placement_gate {
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The cgroup-slice names this broker composes: one in `CreateCgroup`, one in `Teardown`.
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — how every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set.
+    const EXPECTED_CALL_SITES: usize = 2;
+
+    /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
+    /// dropped and whitespace collapsed (so a call split across rustfmt lines is still seen
+    /// whole, and prose naming the rejected spelling is not a call site).
+    fn production_code(source: &str) -> String {
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Every cgroup-slice-name composition in `code`, truncated at its statement's `;`.
+    fn slice_name_calls(code: &str) -> Vec<&str> {
+        code.match_indices("slice_name(")
+            .map(|(at, _)| {
+                let start = code[..at]
+                    .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                    .map_or(0, |i| i + 1);
+                let tail = &code[start..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    /// The law: the broker names the slice the ORCHESTRATOR places the VM in — leaf **plus**
+    /// §13 sibling base — never the bare leaf, which names a slice at the cgroup-hierarchy root.
+    fn call_uses_the_placement_law(call: &str) -> bool {
+        call.starts_with("vmcell::naming::vm_slice_name(")
+    }
+
+    #[test]
+    fn every_broker_cgroup_name_is_the_orchestrators_placement() {
+        let code = production_code(SOURCE);
+        let calls = slice_name_calls(&code);
+        assert_eq!(
+            calls.len(),
+            EXPECTED_CALL_SITES,
+            "expected {EXPECTED_CALL_SITES} cgroup-slice names (CreateCgroup, Teardown); found \
+             {}: {calls:?}. If a site was legitimately added or removed, update \
+             EXPECTED_CALL_SITES — do not delete the scan.",
+            calls.len()
+        );
+        for call in &calls {
+            assert!(
+                call_uses_the_placement_law(call),
+                "§13 sibling placement: `{call}` names a cgroup slice the orchestrator does not \
+                 use — `vmcell::naming::cgroup_slice_name` is the bare leaf, which resolves to \
+                 /sys/fs/cgroup/<leaf> while the VM lives at <base>/<leaf>. Use \
+                 `vmcell::naming::vm_slice_name`."
+            );
+        }
+    }
+
+    /// The gate's own red-on-inverse: the predicate must reject the spelling that shipped, so
+    /// the scan above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_placement_predicate_rejects_the_bare_leaf() {
+        assert!(!call_uses_the_placement_law(
+            "vmcell::naming::cgroup_slice_name(&prefix, vmid)"
+        ));
+        assert!(call_uses_the_placement_law(
+            "vmcell::naming::vm_slice_name(&prefix, vmid)"
+        ));
+    }
+
+    /// The two laws are genuinely different — the evidence behind the fix, and what keeps the
+    /// scan above from guarding a distinction without a difference. On a host whose
+    /// `/proc/self/cgroup` carries a unified entry the placed name is strictly longer than the
+    /// leaf and ends with it; with no entry the two coincide and the broker's old spelling was
+    /// accidentally right, which is why the defect was invisible in a container-less unit test.
+    #[test]
+    fn the_placed_name_extends_the_leaf_with_the_sibling_base() {
+        let leaf = vmcell::naming::cgroup_slice_name("vmcell", 7);
+        let placed = vmcell::naming::vm_slice_name("vmcell", 7);
+        assert!(
+            placed.ends_with(&leaf),
+            "the placed slice name must end in the leaf: {placed:?} vs {leaf:?}"
+        );
+        let base = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|c| vmcell::metrics::cgroup_base_from_proc(&c));
+        match base {
+            Some(base) => assert_eq!(
+                placed,
+                format!("{base}/{leaf}"),
+                "with a unified cgroup entry the broker must name the sibling-placed slice"
+            ),
+            None => assert_eq!(
+                placed, leaf,
+                "with no unified cgroup entry there is no base to place under"
+            ),
+        }
+    }
+}

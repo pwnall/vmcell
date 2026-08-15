@@ -388,90 +388,90 @@ pub struct ErrorBody {
     pub message: String,
 }
 
-/// The machine-matchable error kinds carried in [`ErrorBody::error`] and mapped to HTTP status by
-/// the server (design §11.5, The HTTP REST API and its OpenAPI document). Kept as a small enum with a stable string form so the client can
-/// branch on the same conditions the server names — matchability across the boundary.
+/// Declares [`ErrorKind`] **and** everything derived from it — the roster [`ErrorKind::ALL`] the
+/// served OpenAPI schema is generated from, the stable wire strings, and the HTTP status map — from
+/// one per-variant row.
 ///
-/// `Serialize`/`Deserialize` are used only by the internal setup-broker `WireError` (JSON over
-/// the broker socket, §12.4, Layer 3 — the setup broker (network surface never holds caps)) — not by any JSON response, which carries `kind.as_str()` as a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorKind {
+/// This macro is the mechanism, not sugar. A hand-written `ALL` beside a hand-written enum is a
+/// second literal list nothing forces complete: a 12th kind added to the enum alone compiled clean
+/// and shipped absent from the served `ErrorBody.error` enum (an exhaustive `match` in a test
+/// forces the *match arm*, never the roster; a `len()` assert cannot see what was never added).
+/// Here a variant cannot exist without its wire string and status, so it cannot exist outside `ALL`
+/// — and writing a bare `RateLimited,` row is a macro-expansion (compile) error.
+macro_rules! error_kinds {
+    ($( $(#[$meta:meta])* $variant:ident => $wire:literal, $status:literal; )+) => {
+        /// The machine-matchable error kinds carried in [`ErrorBody::error`] and mapped to HTTP
+        /// status by the server (design §11.5, The HTTP REST API and its OpenAPI document). Kept as
+        /// a small enum with a stable string form so the client can branch on the same conditions
+        /// the server names — matchability across the boundary.
+        ///
+        /// Declared through the `error_kinds!` macro together with [`ErrorKind::ALL`], so a kind
+        /// cannot ship undocumented.
+        ///
+        /// `Serialize`/`Deserialize` are used only by the internal setup-broker `WireError` (JSON
+        /// over the broker socket, §12.4, Layer 3 — the setup broker (network surface never holds
+        /// caps)) — not by any JSON response, which carries `kind.as_str()` as a string.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum ErrorKind {
+            $( $(#[$meta])* $variant, )+
+        }
+
+        impl ErrorKind {
+            /// Every kind, in declaration order — the single roster, expanded from the same rows as
+            /// the enum itself, so it structurally cannot omit a variant. The served OpenAPI
+            /// document generates the `ErrorBody.error` enum from this (design §11.5).
+            pub const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
+
+            /// The stable snake_case wire string.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self { $( Self::$variant => $wire, )+ }
+            }
+
+            /// The HTTP status code this kind maps to.
+            #[must_use]
+            pub const fn status_code(self) -> u16 {
+                match self { $( Self::$variant => $status, )+ }
+            }
+        }
+    };
+}
+
+error_kinds! {
     /// 404 — no such vm/artifact.
-    NotFound,
+    NotFound => "not_found", 404;
     /// 409 — create over an existing artifact (the "no update" guard).
-    AlreadyExists,
+    AlreadyExists => "already_exists", 409;
     /// 409 — delete an artifact a live VM pins.
-    InUse,
+    InUse => "in_use", 409;
     /// 409 — op against a VM in the wrong state.
-    Conflict,
+    Conflict => "conflict", 409;
     /// 400 — an artifact name failed validation.
-    InvalidName,
+    InvalidName => "invalid_name", 400;
     /// 400 — malformed body / knob.
-    BadRequest,
+    BadRequest => "bad_request", 400;
     /// 401 — missing/blank bearer credential.
-    Unauthorized,
+    Unauthorized => "unauthorized", 401;
     /// 403 — a present but wrong bearer credential.
-    Forbidden,
+    Forbidden => "forbidden", 403;
     /// 501 — an op the backend does not advertise.
-    Unsupported,
+    Unsupported => "unsupported", 501;
     /// 413 — upload past the size cap.
-    PayloadTooLarge,
+    PayloadTooLarge => "payload_too_large", 413;
     /// 500 — an internal error (wrapped, rendered as its `Display`).
-    Internal,
+    Internal => "internal", 500;
 }
 
 impl ErrorKind {
-    /// The stable snake_case wire string.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotFound => "not_found",
-            Self::AlreadyExists => "already_exists",
-            Self::InUse => "in_use",
-            Self::Conflict => "conflict",
-            Self::InvalidName => "invalid_name",
-            Self::BadRequest => "bad_request",
-            Self::Unauthorized => "unauthorized",
-            Self::Forbidden => "forbidden",
-            Self::Unsupported => "unsupported",
-            Self::PayloadTooLarge => "payload_too_large",
-            Self::Internal => "internal",
-        }
-    }
-
-    /// The HTTP status code this kind maps to.
-    #[must_use]
-    pub const fn status_code(self) -> u16 {
-        match self {
-            Self::NotFound => 404,
-            Self::AlreadyExists | Self::InUse | Self::Conflict => 409,
-            Self::InvalidName | Self::BadRequest => 400,
-            Self::Unauthorized => 401,
-            Self::Forbidden => 403,
-            Self::Unsupported => 501,
-            Self::PayloadTooLarge => 413,
-            Self::Internal => 500,
-        }
-    }
-
     /// Parses the wire string back to a kind (`None` for an unknown/forged value — the client then
     /// falls back to the status code).
+    ///
+    /// Resolved by scanning [`ErrorKind::ALL`] through [`ErrorKind::as_str`] rather than a second
+    /// string table: the former hand-written `match` ended in `_ => None`, which turned a kind with
+    /// no arm into a silent "unknown" instead of a compile error.
     #[must_use]
     pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "not_found" => Self::NotFound,
-            "already_exists" => Self::AlreadyExists,
-            "in_use" => Self::InUse,
-            "conflict" => Self::Conflict,
-            "invalid_name" => Self::InvalidName,
-            "bad_request" => Self::BadRequest,
-            "unauthorized" => Self::Unauthorized,
-            "forbidden" => Self::Forbidden,
-            "unsupported" => Self::Unsupported,
-            "payload_too_large" => Self::PayloadTooLarge,
-            "internal" => Self::Internal,
-            _ => return None,
-        })
+        Self::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 }
 
@@ -492,24 +492,24 @@ mod tests {
     }
 
     // The kind string form and the status map are 1:1 and stable — a client parses the string, a
-    // server maps to status. RED on any drift (a renamed string or a changed code).
+    // server maps to status. RED on any drift (a renamed string or a changed code). Driven off
+    // `ErrorKind::ALL`, the roster the OpenAPI schema is generated from.
+    //
+    // Roster COMPLETENESS is not this test's job and never could be: it is the `error_kinds!` macro
+    // that owns it, by expanding the enum and `ALL` from the same rows (an exhaustive `match` here
+    // would only force a match arm — a 12th kind absent from `ALL` still compiled and shipped
+    // undocumented). The `len()` assert below is the *deliberate-change* tripwire: a roster edit is
+    // a contract event and must be acknowledged, not slipped in.
     #[test]
     fn error_kind_string_and_status_are_stable() {
-        for k in [
-            ErrorKind::NotFound,
-            ErrorKind::AlreadyExists,
-            ErrorKind::InUse,
-            ErrorKind::Conflict,
-            ErrorKind::InvalidName,
-            ErrorKind::BadRequest,
-            ErrorKind::Unauthorized,
-            ErrorKind::Forbidden,
-            ErrorKind::Unsupported,
-            ErrorKind::PayloadTooLarge,
-            ErrorKind::Internal,
-        ] {
+        for k in ErrorKind::ALL.iter().copied() {
             assert_eq!(ErrorKind::from_wire(k.as_str()), Some(k), "roundtrip {k:?}");
         }
+        assert_eq!(
+            ErrorKind::ALL.len(),
+            11,
+            "the roster the OpenAPI error schema is generated from"
+        );
         assert_eq!(ErrorKind::AlreadyExists.status_code(), 409);
         assert_eq!(ErrorKind::Unauthorized.status_code(), 401);
         assert_eq!(ErrorKind::Forbidden.status_code(), 403);

@@ -27,14 +27,9 @@ impl Netlink for FakeNetlink {
         self.log.push(format!("add_netns:{name}"));
         Ok(())
     }
-    fn setup_tap(
-        &self,
-        _netns: &str,
-        tap_name: &str,
-        _vmid: u32,
-    ) -> vmcell::error::Result<Option<tun_tap::Iface>> {
+    fn setup_tap(&self, _netns: &str, tap_name: &str, _vmid: u32) -> vmcell::error::Result<()> {
         self.log.push(format!("setup_tap:{tap_name}"));
-        Ok(None)
+        Ok(())
     }
     fn delete_netns(&self, name: &str) -> vmcell::error::Result<()> {
         self.log.push(format!("delete_netns:{name}"));
@@ -369,7 +364,11 @@ fn dispatch_create_cgroup_then_teardown_deletes_netns_and_cgroup() {
         proxy_port: None,
     });
 
-    let name = vmcell::naming::cgroup_slice_name("vmcell", 3);
+    // `vm_slice_name`, not the bare `cgroup_slice_name` leaf: the broker creates and deletes the
+    // slice the ORCHESTRATOR places the VM in, §13 sibling base included (see the at-site comment
+    // on the `CreateCgroup` arm, and `cgroup_placement_gate`). This expectation is recomputed
+    // through that same law rather than spelled out, so it cannot drift from it.
+    let name = vmcell::naming::vm_slice_name("vmcell", 3);
     let reply = srv.dispatch(BrokerRequest::CreateCgroup {
         vmid: 3,
         prefix: "vmcell".into(),

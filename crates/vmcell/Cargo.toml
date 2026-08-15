@@ -66,7 +66,77 @@ name = "vmcell"
 #     second copy to write. Gated by `vmm::usb`'s unit tests plus the live `usb_passthrough_qemu`.
 # The `vmcell-artifact-validator` half of the contract surface is additive in this pass
 # (`cargo semver-checks -p vmcell-artifact-validator`: no update required).
-version = "0.13.0"
+# 0.13.0 → 0.14.0: the docs/81 review pass, one breaking release. `cargo semver-checks
+# check-release -p vmcell --baseline-rev main` reports exactly the first two edges below and nothing
+# else; the third BREAKING edge and all three BEHAVIOR-ONLY ones are structurally invisible to it
+# (it has no return-type lint, and no lint of any kind sees behavior behind an unchanged signature).
+# That is precisely why they are ledgered by hand: a consumer reads them here instead of discovering
+# them at run time (§10.4, the downstream toolkit contract).
+#   * BREAKING `function_parameter_count_changed`: `vmm::register_and_await_ready` drops its
+#     `timeout_ms` parameter (6 → 5). The VMM control-socket readiness ceiling is now the one
+#     `vmm::VMM_SOCKET_READY_TIMEOUT_MS`, so no backend can spell it as a literal again (it was six
+#     inline `1000`s). Callers delete the argument. There is deliberately no way to pass a different
+#     ceiling; the genuinely per-VM half, `interval_ms`, is still a parameter.
+#   * BREAKING `method_parameter_count_changed`: `net::SmoltcpProcess::start` gained a fifth
+#     parameter, `egress: net::smoltcp::backend::NatEgressPolicy`. The unprivileged NAT opened
+#     outbound host connections on the guest's behalf regardless of the config's `Egress`, so
+#     `Egress::Blocked` — which promises "all egress traffic is blocked" — blocked nothing on that
+#     datapath. The policy now travels into the NAT instead of being assumed. A caller reproducing
+#     the pre-0.14 behavior passes `NatEgressPolicy::Allow`; `Blocked` maps to `Deny`.
+#   * BREAKING, and SEMVER-CHECKS-BLIND (there is no return-type lint):
+#     `net::tap::Netlink::setup_tap` returns `Result<()>`, not `Result<Option<tun_tap::Iface>>`. The
+#     old return was always `Ok(None)` and read by nobody, while forcing every out-of-tree
+#     implementor of this ledgered seam to depend on `tun-tap` — which `vmcell` does not re-export,
+#     so the pin had to be guessed — and teaching them to hold the tap fd open, the one thing that
+#     breaks the single-opener discipline (a non-multi-queue tap admits one opener and the VMM must
+#     be it; the tap is `TUNSETPERSIST`'d and our fd dropped). Implementors return `Ok(())`; callers
+#     drop the discarded binding. `vmcell-broker`, whose `Netlink` fake now compiles with no
+#     `tun-tap` dependency at all, is the living gate against re-introducing the type.
+#   * BEHAVIOR-ONLY — no signature moved, so nothing mechanical will warn a consumer:
+#     - `VmConfigBuilder::build` REJECTS `NetConfig::Unprivileged { egress: Egress::Blocked,
+#       host_services_port: Some(_) }` with `Error::Config` naming both fields (F1). The port was
+#       accepted and silently unused, because `Egress::Blocked` registers no NAT forward. A caller
+#       that paired them drops the port or moves to `Egress::Open`/`Egress::Filtered`. `VmConfig`'s
+#       fields stay public, so assigning `cfg.net` directly still bypasses the check.
+#     - `Zygote::suspend` is create-only. It creates `master_dir` (and any missing parents) when
+#       absent, accepts an existing but EMPTY directory, and refuses a populated one with
+#       `Error::Io` / `ErrorKind::AlreadyExists`. It previously wrote into whatever was already
+#       there, and a snapshot image written file-by-file over another leaves a torn mix of two
+#       lineages — a clone restored from it is neither. `Lineage::fork_from_vm` and `Lineage::branch`
+#       delegate, so they inherit both halves; the daemon's equivalent path already refused this.
+#     - The privileged egress rulesets no longer emit `log prefix "vmcell-drop: "` on the catch-all
+#       drop rule. netfilter discards the syslog LOG target in a non-init netns, so the prefix
+#       promised a diagnostic the kernel threw away: a consumer grepping host logs for `vmcell-drop`
+#       matched nothing before this release and matches nothing after it, but should stop expecting
+#       to. `net::tap::NetNamespace::render_blocked_rules` is the readable form of what is emitted.
+#   * ADDITIVE (ledgered so a consumer reads them here; none of them require action):
+#     - `vmm::VMM_SOCKET_READY_TIMEOUT_MS` and `vmm::wait_for_vmm_socket` — the same ceiling, with no
+#       ceiling argument to get wrong. `vmm::reject_unadvertised_capabilities` — the one
+#       nested-virt/lazy-restore refusal, hoisted out of three byte-identical backend copies, whose
+#       typed-refusal feature string equals the `VmmCapabilities` field name.
+#       `vmm::snapshot_request_timeout` — the guest-RAM-proportional snapshot-RPC budget every
+#       backend now sizes from, instead of the flat control ceiling a multi-GiB guest overruns by
+#       construction. `vmm::unix_api_request_with` — the Unix-socket HTTP helper on a caller-supplied
+#       budget. `vmm::VmmProcessGroup` — the VMM leader's pgid and its one-shot reaped flag owned
+#       together (L1), with the pgid PRIVATE and no accessor, so no code outside `vmm` can construct
+#       `-pgid` for a group the kernel may have recycled.
+#     - `metrics::vm_slice_name`, re-exported as `naming::vm_slice_name`: the §13 sibling-placed
+#       slice path, which four call sites (including this workspace's `vmcell-artifact-validator` and
+#       `vmcell-broker`) had each hand-formatted as a `vmcell-vm-<vmid>` literal that is wrong for
+#       any non-default `resource_prefix`.
+#     - `artifact::kernel::kernel_pin_key` / `kernel_artifact_key`: the flattened pins key
+#       (`kernel_source_url` / `kernel_<label>_source_url`) and the artifact-map key (`kernel` /
+#       `kernel-<label>`), previously composed inline in the pins flattener and byte-duplicated in
+#       `vmcell-kernel-builder` and `vmcell-cli`. Exporting them is what lets a downstream kernel
+#       builder CALL the flattener's spelling instead of re-deriving it. Output is byte-identical to
+#       the pre-consolidation spellings, so no cache key, pin key or artifact key moves (F4).
+#     - `artifact::oci_cache_dir`; `net::smoltcp::backend::NatEgressPolicy`;
+#       `net::tap::NetNamespace::render_blocked_rules` and `emit_blocked_rules`;
+#       `proxy::tls::CaManager::ca_cert_path`; `lineage::Lineage::probe_cow_support_in`.
+#     - The non-default `test-support` feature (see its stanza below), which additionally exposes
+#       `metrics::FakeCgroupFs` and `vmm::VmmProcessGroup::already_reaped_for_test`. It is not in
+#       `default`, so it changes nothing for a consumer that does not ask for it.
+version = "0.14.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -192,7 +262,7 @@ thiserror = "2"
 # the framed postcard wire enum, shared with the guest agent (v15 §10.1). The explicit
 # `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
 # path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.4.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }
 
 # host common
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
@@ -278,7 +348,7 @@ http = { version = "1", optional = true }
 # validator (design §5.4/§8.5). This is a dev-dependency cycle (`vmcell(dev) →
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
-vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.1.0" }
+vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.2.0" }
 # The `vmm_matrix_test!` harness and the FC/QEMU capability/lifecycle/`qemu_*` tests construct the
 # concrete backends, which now live in these crates. Same permitted dev-dependency cycle as the
 # validator above (`vmcell(dev) → vmcell-firecracker/vmcell-qemu → vmcell`), so `vmcell` gains no
@@ -311,6 +381,19 @@ libc = "0.2"
 [features]
 experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
 default = ["cloud-hypervisor", "net-privileged", "net-unprivileged", "proxy", "metrics", "pipeline", "cli"]
+
+# Test-only fixtures shared with the backend crates. NOT in `default`, and never a
+# dependency of a shipped binary: the backend crates take it as a DEV-dependency only, so
+# `cargo build -p vmcell-firecracker` compiles without it and a production reference to a
+# fixture is a compile error. `scripts/ban-test-support-in-production.sh` is the backstop
+# for the `--all-targets` build, where feature unification does make the fixtures visible
+# to the lib target.
+#
+# What it exposes (see the items' own rustdoc): `metrics::FakeCgroupFs` — the in-process
+# `CgroupFs` fake the four backends had each hand-rolled a `TestCgroupFs` copy of — and
+# `vmm::VmmProcessGroup::already_reaped_for_test`, which fabricates the recycled-pgid state
+# the per-backend M-VMM-1 gates need.
+test-support = []
 
 # Collapsed host stack (design §10.5 follow-up "one feature per binary"): enabling
 # any host binary/backend feature (cloud-hypervisor/firecracker/qemu/cli) pulls the

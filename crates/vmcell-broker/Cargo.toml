@@ -1,6 +1,18 @@
 [package]
 name = "vmcell-broker"
-version = "0.1.0"
+# Not contract surface (§10.4 lists neither this crate nor its frames), so `cargo semver-checks` does
+# not cover it and this ledger exists for one reason: the change below is invisible to every
+# mechanical gate — no signature moved, only the cgroup path two request handlers name. Written down
+# so an operator reading `BrokerReply::CgroupReady.name` against an older deployment's logs is not
+# left inferring why the string changed shape.
+# 0.1.0 → 0.2.0: BEHAVIOR-ONLY — `BrokerRequest::CreateCgroup` and `BrokerRequest::Teardown` now name
+# the §13 sibling-placed slice (`vmcell::naming::vm_slice_name`), not the bare
+# `vmcell::naming::cgroup_slice_name` leaf, so `BrokerReply::CgroupReady.name` changes from
+# `<prefix>-vm-<vmid>` to `<base>/<prefix>-vm-<vmid>` on any host where `/proc/self/cgroup` yields a
+# unified base (it is unchanged where it does not). The broker was creating and deleting a
+# root-level slice while the orchestrator placed the VM in the sibling one — so the limits it wrote
+# bound nothing and the teardown deleted the wrong path. Both handlers now route through the one law.
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -12,13 +24,18 @@ publish = false
 # link `vmcell-daemon` / any web stack — the whole point is that the HTTP surface is NOT co-located
 # with the caps. `vmcell` has no edge back here.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.13.0", default-features = false, features = ["cloud-hypervisor"] }
+vmcell = { path = "../vmcell", version = "0.14.0", default-features = false, features = ["cloud-hypervisor"] }
 vmcell-privilege = { path = "../vmcell-privilege", version = "0.2.0" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 libc = "0.2"
 
-[dev-dependencies]
-# The dispatch tests implement a recording `Netlink` fake; the trait's `setup_tap` return type
-# names `tun_tap::Iface`, so the impl must reference the crate (test-only). Pinned to vmcell's `0.1`.
-tun-tap = "0.1"
+# No dev-dependencies, and that ABSENCE is the gate for `setup-tap-returns-dead-option`. The
+# dispatch tests' recording `Netlink` fake needed `tun-tap` only because the trait's `setup_tap`
+# returned a `Result<Option<tun_tap::Iface>>` that was always `Ok(None)` and read by nobody — a
+# ledgered public seam forcing every out-of-tree implementor to depend on a crate `vmcell` does not
+# re-export (so the pin had to be guessed) for a value with no reader. It returns `Result<()>` now,
+# and this crate is the living proof: re-introducing any `tun_tap`-typed value in the trait breaks
+# `cargo check -p vmcell-broker --tests` with "use of undeclared crate or module `tun_tap`", because
+# the fake here implements `Netlink` with no such dependency available. (`cargo machete` does NOT
+# cover this: it does not analyze dev-dependencies.)

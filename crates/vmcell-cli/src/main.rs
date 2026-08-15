@@ -560,11 +560,16 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                     // drop its kernels from this manifest.
                     if let Some(label) = vmcell::artifact::kernel::kernel_label_from_filename(&name)
                     {
+                        // The manifest names a labelled kernel by the library's artifact-key law
+                        // (and its sidecar by the derived config key) rather than re-spelling
+                        // `kernel-<label>` here — a manifest entry the producers do not register
+                        // under is a name no consumer can look up.
+                        let key = vmcell::artifact::kernel::kernel_artifact_key(Some(label));
                         candidates.push((
-                            format!("kernel-{label}-config"),
+                            vmcell::artifact::kernel::config_artifact_key(&key),
                             vmcell::artifact::kernel::resolved_config_path(&e.path()),
                         ));
-                        candidates.push((format!("kernel-{label}"), e.path()));
+                        candidates.push((key, e.path()));
                     }
                 }
             }

@@ -13,12 +13,19 @@ publish = false
 # tests), so the production graph stays acyclic. `host-common` is the minimal feature that compiles
 # the `vmm`/`config`/`metrics`/`net` modules this backend consumes.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.13.0", default-features = false, features = ["host-common"] }
+vmcell = { path = "../vmcell", version = "0.14.0", default-features = false, features = ["host-common"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
 nix = { version = "0.31", features = ["signal", "process"] }
 tracing = "0.1"
 
+# `vmcell/test-support` is a DEV-dependency and never a production one: it exposes
+# `vmcell::metrics::FakeCgroupFs` (the in-process `CgroupFs` fake this crate used to hand-roll a
+# `TestCgroupFs` copy of) and `vmcell::vmm::VmmProcessGroup::already_reaped_for_test`. Declaring it
+# here means `cargo build -p vmcell-firecracker` compiles WITHOUT the feature, so a production reference to
+# either fixture is a compile error; `scripts/ban-test-support-in-production.sh` is the backstop for
+# `--all-targets`, where cargo's feature unification does make them visible to the lib target.
 [dev-dependencies]
 tempfile = "3"
+vmcell = { path = "../vmcell", version = "0.14.0", default-features = false, features = ["host-common", "test-support"] }

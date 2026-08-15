@@ -1,6 +1,40 @@
 [package]
 name = "vmcell-artifact-validator"
-version = "0.1.0"
+# This crate is the second half of the downstream contract surface (§10.4), so `cargo semver-checks`
+# covers it beside `vmcell` and every change to its public API is a deliberate, ledgered bump — the
+# same convention `vmcell`'s and `vmcell-protocol`'s manifests carry. This block starts the ledger;
+# 0.1.0 was the extraction release and needs no entry behind it.
+# 0.1.0 → 0.2.0: the docs/81 review pass. `cargo semver-checks check-release
+# -p vmcell-artifact-validator --baseline-rev main` reports exactly the one BREAKING edge below; the
+# additive items and the two behavior changes are ledgered by hand because no lint sees them.
+#   * BREAKING `function_parameter_count_changed`: `checks::metrics_mem_limit_ooms` gained a
+#     `resource_prefix: &str` parameter (1 → 2). It composed its `memory.events` path from a
+#     hardcoded `vmcell-vm-<vmid>` literal, so `metrics.mem_limit_ooms` read a slice that exists for
+#     NO VM with a non-default `resource_prefix` — the check could only ever pass by accident on a
+#     renamed deployment. The slice name now comes from the one law, `vmcell::metrics::vm_slice_name`
+#     (new in `vmcell` 0.14.0), and the prefix is a required argument with no default, so the wrong
+#     path is not reachable without a caller naming one. Callers pass the `VmConfig::resource_prefix`
+#     the VM was actually started with, not a constant.
+#   * ADDITIVE: `classify::BootKind` (`Fresh` / `Restored`), `classify::classify_serial_of` and
+#     `classify::explain_boot_failure_of` (the same two renderers with the boot kind made explicit),
+#     and the three tail bounds `classify::SERIAL_TAIL_MAX_LINE_BYTES`,
+#     `classify::SERIAL_TAIL_MAX_BYTES`, `classify::TRUNCATION_MARKER` — public so a caller matching
+#     on a rendered message has the literal rather than a copy of it. `classify::classify_serial` and
+#     `classify::explain_boot_failure` keep their signatures and delegate with `BootKind::Fresh`, so
+#     an existing call site classifies exactly as before.
+#   * BEHAVIOR-ONLY — no signature moved:
+#     - `classify::explain_boot_failure`'s serial tail is now byte-bounded as well as line-bounded:
+#       each quoted line is capped at `SERIAL_TAIL_MAX_LINE_BYTES` (truncated at a UTF-8 boundary and
+#       marked with `TRUNCATION_MARKER` plus the elided byte count) and the quoted lines together at
+#       `SERIAL_TAIL_MAX_BYTES`. It previously quoted 20 tail lines at whatever length they were, so
+#       a guest that emitted one multi-megabyte line put all of it in the caller's report. A consumer
+#       asserting on exact message text may now see a truncated quote.
+#     - `checks::snapshot_restore_roundtrip` renders the restored VM's console with
+#       `BootKind::Restored`, so an absent kernel banner is no longer reported as
+#       `NoDirectBootKernel`. A restored instance's console is empty by construction — its kernel
+#       printed the banner in the snapshot SOURCE, a different VM writing a different console file —
+#       so the old reading diagnosed a kernel that provably just booted as not being a kernel.
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -15,11 +49,25 @@ path = "src/lib.rs"
 # The validator boots real vmcell micro-VMs and drives the guest agent, and reuses vmcell's
 # capability descriptors + net math. It needs the host stack: a backend, metrics, pipeline
 # (for artifact_path helpers). `vmcell` has no dependency on this crate.
-vmcell = { path = "../vmcell", version = "0.13.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.14.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+# The applet roster (`GUEST_TOOLS_APPLETS`) only — the validator speaks no wire protocol of its
+# own. `rootfs_guest_tools` composes its PATH probe from that const instead of re-typing the
+# names, so growing the roster extends what the contract battery checks with no edit here. It is
+# the same const the guest binary's dispatch table and the rootfs symlink manifest derive from
+# (design §4.4, docs/81 m22). `vmcell` links it too, but does not re-export it.
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"
 tracing = "0.1"
 tempfile = "3"
 
+# `vmcell/test-support` is a DEV-dependency and never a production one: it exposes
+# `vmcell::metrics::FakeCgroupFs` (the in-process `CgroupFs` fake this crate used to hand-roll a
+# `TestCgroupFs` copy of — docs/81 §9). Declaring it here means `cargo build -p
+# vmcell-artifact-validator` compiles WITHOUT the feature, so a production reference to the fixture
+# is a compile error; `scripts/ban-test-support-in-production.sh` is the backstop for
+# `--all-targets`, where cargo's feature unification does make it visible to the lib target.
+# The feature list mirrors the `[dependencies]` entry above, plus `test-support`.
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+vmcell = { path = "../vmcell", version = "0.14.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }

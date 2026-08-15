@@ -177,7 +177,11 @@ async fn build_rootfs_with(
 
     let layers = puller.resolve_layers(&reference).await?;
 
-    let cache_dir = out.parent().unwrap_or(Path::new(".")).join("oci-cache");
+    // The blob cache is sited on the ARTIFACTS dir, never on `out`'s parent: both in-VM builders
+    // pass an `out` inside a per-run `TempDir`, so an output-relative cache died with the run and
+    // re-pulled this digest-pinned base every time. One composer, `oci_cache_dir` (which also
+    // states why sharing it across outputs is safe).
+    let cache_dir = crate::artifact::oci_cache_dir();
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
@@ -481,26 +485,63 @@ mod tests {
         );
     }
 
+    /// Removes the blobs a test seeded in the SHARED [`oci_cache_dir`](crate::artifact::oci_cache_dir),
+    /// on the success and the panic path alike.
+    ///
+    /// A test's own fixtures are residue too (AGENTS.md, "Writing tests"), and here a leftover is
+    /// not merely untidy: the tamper leg below writes corrupt bytes under a digest-derived name,
+    /// and a corrupt blob left in the shared cache poisons the NEXT run's *cold* build, whose
+    /// every-use re-verify rejects it. The blob contents carry a per-run nonce, so two concurrent
+    /// test processes never name — or clean up — each other's files.
+    #[cfg(feature = "am-fs-erofs")]
+    struct CachedBlobGuard(Vec<std::path::PathBuf>);
+
+    #[cfg(feature = "am-fs-erofs")]
+    impl Drop for CachedBlobGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                match std::fs::remove_file(p) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Never panic in `Drop` (it would abort an unwinding failure); report loud
+                    // instead, since a leftover blob poisons the next run's cold build.
+                    Err(e) => eprintln!(
+                        "test residue: failed to remove the cached blob {}: {e}",
+                        p.display()
+                    ),
+                }
+            }
+        }
+    }
+
     // ART-3: drive the full pull→cache→re-verify→decode→pack chain through the fake, then a
-    // cache HIT, then a tamper — all in ONE test so the CA-materialization tail
-    // (`CaManager::new()` on the shared artifacts dir) is never entered concurrently by two
-    // test processes racing on it (the pre-existing NET-4 TOCTOU in `tls.rs`, out of scope
-    // here). This is the only unit test that reaches that tail.
+    // cache HIT, then a hit from a DIFFERENT output dir, then a tamper — all in ONE test so the
+    // CA-materialization tail (`CaManager::new()` on the shared artifacts dir) is never entered
+    // concurrently by two test processes racing on it. This is the only unit test that reaches
+    // that tail.
     //
     // Asserts: (1) cold build pulls every layer and packs a non-empty erofs — the zstd layer
     // proves decode-SELECTION, since a gzip decoder on zstd bytes would fail the tar read;
     // (2) a warm build re-verifies but does NOT re-pull cached blobs (blob_calls stays ==
-    // layer count); (3) a byte-corrupted cached blob with an intact digest-derived filename
-    // is rejected on the hit path. Each inverse (skip re-verify on hit, re-pull on hit, wrong
-    // decoder) reddens a distinct assertion.
+    // layer count); (3) a build whose OUTPUT DIR is a different, empty directory still hits the
+    // cache — the blob cache is sited on the artifacts dir, not on `out.parent()`, and an
+    // output-relative cache re-pulled the digest-pinned builder base on every in-VM-builder run
+    // (both pass an `out` inside a per-run `TempDir`); (4) a byte-corrupted cached blob with an
+    // intact digest-derived filename is rejected on the hit path. Each inverse (skip re-verify on
+    // hit, re-pull on hit, output-relative cache, wrong decoder) reddens a distinct assertion.
     #[cfg(feature = "am-fs-erofs")]
     #[tokio::test]
     async fn test_oci_pull_cache_hit_reverify_and_tamper() {
+        // A per-run nonce in the layer content makes both blob digests — and therefore both
+        // shared-cache filenames — unique to this run, so a concurrent or previous run can
+        // neither serve nor corrupt this test's cache entries.
+        let nonce = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
         let (gz, gz_dig, gz_mt) = gzip_layer(&[
             ("lib/x86_64-linux-gnu/libc.so.6", b"ELF-libc"),
             ("etc/os-release", b"base"),
+            ("etc/vmcell-test-nonce", nonce.as_bytes()),
         ]);
-        let (zs, zs_dig, zs_mt) = zstd_layer(&[("marker.txt", b"from-zstd")]);
+        let (zs, zs_dig, zs_mt) = zstd_layer(&[("marker.txt", nonce.as_bytes())]);
         let mut blobs = HashMap::new();
         blobs.insert(gz_dig.clone(), gz);
         blobs.insert(zs_dig.clone(), zs);
@@ -512,13 +553,22 @@ mod tests {
                 },
                 OciLayerDesc {
                     media_type: zs_mt,
-                    digest: zs_dig,
+                    digest: zs_dig.clone(),
                 },
             ],
             blobs,
             resolve_calls: AtomicUsize::new(0),
             blob_calls: AtomicUsize::new(0),
         };
+
+        // The cache path is recomputed through the production composer, never a test-local
+        // `join("oci-cache")`, so a siting change cannot leave this test asserting on a stale
+        // location.
+        let cache_file = crate::artifact::oci_cache_dir().join(gz_dig.replace(':', "-"));
+        let _residue = CachedBlobGuard(vec![
+            cache_file.clone(),
+            crate::artifact::oci_cache_dir().join(zs_dig.replace(':', "-")),
+        ]);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("rootfs.erofs");
@@ -557,13 +607,36 @@ mod tests {
             "resolve runs on each build"
         );
 
-        // (3) Tamper a cached blob (intact digest-derived filename) → rejected on the hit
+        // (3) The cache is independent of the OUTPUT dir: build into a fresh, empty directory
+        // (what both in-VM builders do — a per-run `TempDir`) and require no re-pull. With the
+        // cache sited on `out.parent()` this directory has none, so both blobs are pulled again
+        // and `blob_calls` reaches 4.
+        let other_dir = tempfile::tempdir().expect("tempdir");
+        let other_out = other_dir.path().join("builder_rootfs.erofs");
+        build_rootfs_with(
+            &fake,
+            "example.com/img",
+            &digest,
+            &inputs,
+            &other_out,
+            None,
+            &[],
+        )
+        .await
+        .expect("build into a different output dir");
+        assert_eq!(
+            fake.blob_calls.load(Ordering::SeqCst),
+            2,
+            "the blob cache must survive a change of output dir — an output-relative cache \
+             re-pulls the digest-pinned base on every in-VM-builder run"
+        );
+        assert!(
+            !other_dir.path().join("oci-cache").exists(),
+            "the cache must not be created beside the stage output"
+        );
+
+        // (4) Tamper a cached blob (intact digest-derived filename) → rejected on the hit
         // path by the every-use re-verify.
-        let cache_file = out
-            .parent()
-            .unwrap()
-            .join("oci-cache")
-            .join(gz_dig.replace(':', "-"));
         std::fs::write(&cache_file, b"tampered-cache-bytes").unwrap();
         let res =
             build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None, &[]).await;

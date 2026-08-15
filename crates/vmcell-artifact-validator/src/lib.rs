@@ -24,11 +24,14 @@
 //! Full alike — renders through one of the two [`classify`] renderers, chosen by whether console
 //! evidence exists:
 //!
-//! - [`classify::explain_boot_failure`] — the console *was* captured. It maps the known serial
+//! - [`classify::explain_boot_failure_of`] — the console *was* captured. It maps the known serial
 //!   signatures onto the §5.4 guest-kernel contract clause they break (root device, root-fs mount,
 //!   the vsock transport, no direct-boot kernel at all) and, for the residual class, still emits
 //!   the named check, the budget that expired, the serial tail, and a pointer to the §5.4
-//!   checklist.
+//!   checklist. It takes a [`classify::BootKind`], because the "nothing reached the console"
+//!   reading is a fresh boot's: a **restored** VM's console is empty by construction (its kernel
+//!   printed the banner in the snapshot source), so `snapshot.restore_roundtrip` must not diagnose
+//!   a kernel that provably just booted as not being a kernel.
 //! - [`classify::explain_without_serial`] — there is *no* console evidence (the VMM never started,
 //!   or the log could not be read). It names candidate causes instead of asserting a clause,
 //!   because a missing `cloud-hypervisor` binary is not a bad kernel.

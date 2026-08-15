@@ -386,7 +386,12 @@ keeps the caps + owns the `Registry`; the cap-dropped parent serves HTTP and for
   delegate to `Zygote` (one law).
 
 - **(e) `Lineage::fork_from_vm` / `branch` create the target snapshot dir — a real bug the LIVE test
-  caught.** The first draft mirrored `Zygote::suspend`'s "caller creates the dir" contract, so a `branch`
+  caught.** *(Stale in the good direction as of the docs/81 pass: the creation law moved INTO
+  `Zygote::suspend`, whose one `prepare_snapshot_dest` predicate creates the destination with its
+  parents, accepts an existing but empty one, and refuses a populated one. `fork_from_vm` and `branch`
+  delegate and keep no `create_dir_all` of their own — so this is no longer a deviation from
+  `suspend`'s contract, it IS `suspend`'s contract.)* The first draft mirrored `Zygote::suspend`'s
+  then-"caller creates the dir" contract, so a `branch`
   into a not-yet-created dir fails-loud in the backend: CH `"Destination is not a directory"`, FC
   `"Cannot perform open on the snapshot backing file: No such file or directory"`. Both `fork_from_vm` and
   `branch` are "suspend into a location" verbs, so they now `create_dir_all` the destination first. This
@@ -968,8 +973,10 @@ backend, self-skipping where unsupported) and the standalone `scripts/perf-daemo
 - **QEMU vhost-user-net startup race — fixed (readiness gate).** The `net-egress` probe surfaced a real
   QEMU-backend bug the single-VM egress tests never hit: `spawn_qemu` waits for its external
   `vhost-device-vsock` daemon socket (`wait_for_socket`) before launch, but did **not** wait for the
-  smoltcp `vhost-user-net` socket. The smoltcp NAT binds that UDS lazily from a background thread
-  (`VhostUserDaemon::start`, not `Listener::new`); QEMU's `-chardev socket` connects as a client at `exec`
+  smoltcp `vhost-user-net` socket. ~~The smoltcp NAT binds that UDS lazily from a background thread
+  (`VhostUserDaemon::start`, not `Listener::new`)~~ — **that mechanism is false and is withdrawn; see
+  the flake entry below.** The observed failure is real: QEMU's `-chardev socket` connects as a
+  client at `exec`
   with **no retry**, so it raced the bind and died `"-chardev socket …: Failed to connect …: No such file
   or directory"` (~30% of boots). CH's vhost-user-net frontend tolerates a not-yet-bound socket via its own
   client-side reconnect; QEMU does not. *Fix (one law):* `wait_for_socket` now takes `Option<&mut Child>`
@@ -977,16 +984,27 @@ backend, self-skipping where unsupported) and the standalone `scripts/perf-daemo
   gates the smoltcp socket the same way it already gates the vsock daemon — a fail-loud `Timeout` instead of
   a raw QEMU crash. Red-on-inverse: `wait_for_socket_process_less_present_ok_absent_times_out`.
 
-- **DISCOVERED — smoltcp `vhost-user-net` bring-up flake (open; needs a dedicated fix).** Beyond the connect
-  race, ~10% of boots the smoltcp daemon **never binds its socket within the 2 s ceiling** — the daemon
-  thread intermittently fails/errors on start (sibling to the recorded ~11% external-`vhost-device-vsock`
-  bring-up flake, §QEMU-suspend note (a)). Latent because the existing egress tests boot a single VM; the
-  volume probe (13+ networked boots/run) exposes it. **Not root-caused here (out of scope for the perf pass).**
-  Mitigation in the probe: `net-egress` retries a transient boot failure on a fresh VM (bounded
-  `NET_BOOT_RETRIES`, like the QEMU vsock re-spawn), printing `recovered N transient smoltcp-bringup boot
-  failure(s)` so it is surfaced, not hidden. Follow-up owner: make `SmoltcpProcess::start` block until the
-  UDS is bound (signal readiness from the daemon thread) instead of deferring the bind — that would retire
-  both the connect race and this flake at the source.
+- **DISCOVERED — smoltcp `vhost-user-net` bring-up flake. The flake is real; its mechanism is OPEN.**
+  ~10% of boots, the VMM's wait for the smoltcp `vhost-user-net` UDS does not succeed within its 2 s
+  ceiling (sibling in shape to the recorded ~11% external-`vhost-device-vsock` bring-up flake,
+  §QEMU-suspend note (a)). Latent because the existing egress tests boot a single VM; the volume probe
+  (13+ networked boots/run) exposes it. Mitigation in the probe: `net-egress` retries a transient boot
+  failure on a fresh VM (bounded `NET_BOOT_RETRIES`, like the QEMU vsock re-spawn), printing
+  `recovered N transient smoltcp-bringup boot failure(s)` so it is surfaced, not hidden.
+
+  **The recorded mechanism and its named fix are WITHDRAWN (docs/81 §7.3, re-verified here against the
+  tree).** This entry read "the daemon thread intermittently fails/errors on start", with the owner
+  named as "make `SmoltcpProcess::start` block until the UDS is bound instead of deferring the bind".
+  `Listener::new` **is** the bind — `vendor/vhost/src/vhost_user/connection.rs`'s `UnixListener::bind`
+  — and `SmoltcpProcess::start` calls it synchronously on the **caller's** thread before spawning
+  either worker, returning only after (the at-site comment says exactly that). So the named fix would
+  retire nothing: the code already does it. It was never true of this codebase either — `git log -S`
+  on the bind expression puts it on the caller's thread since `7715f21` (2026-06-30), two weeks before
+  this entry was written. The premise was carried, not measured.
+
+  No replacement mechanism is asserted. AGENTS.md governs — *"environmental" is a hypothesis, not a
+  diagnosis* — and what a real diagnosis has to explain is why a socket that is bound before `start`
+  returns is nonetheless not connectable within 2 s. Same withdrawal in design v32 §17.
 
 ## Coverage-gap perf probes, round 2 — privileged net, TLS-MITM, sessions, daemon restore (2026-07-15)
 
@@ -1085,11 +1103,15 @@ crate. `vmcell` bumped `0.10.0 → 0.11.0` (the `Firecracker`/`Qemu` re-exports 
   field/variant into a **compile error in every backend crate** (fail-loud) — the desired discipline
   for a tightly-coupled backend set. Justified because `vmcell` is `publish = false` (no external
   consumer relied on the non-exhaustiveness). This is the load-bearing reversal of the extraction.
-- **`FakeCgroupFs` was NOT exposed.** It is `#[cfg(test)]` and its deliberate `.lock().unwrap()`s would
-  trip `vmcell`'s `#![cfg_attr(not(test), deny(clippy::unwrap_used, …))]` if exposed behind a feature.
-  All four moved backend tests only pass the fake to a **reject-before-spawn** path (cgroups untouched),
-  so each backend crate's test module defines a local no-op `TestCgroupFs: vmcell::metrics::CgroupFs`
-  instead. No `test-util` feature, no new `vmcell` public surface.
+- ~~**`FakeCgroupFs` was NOT exposed.**~~ **RETIRED (docs/81 pass, 2026-08-15) — the obstacle was
+  removable.** The entry read: it is `#[cfg(test)]` and its deliberate `.lock().unwrap()`s would trip
+  `vmcell`'s `#![cfg_attr(not(test), deny(clippy::unwrap_used, …))]` if exposed behind a feature, so
+  each backend crate's test module defines a local no-op `TestCgroupFs: vmcell::metrics::CgroupFs`
+  instead. The `unwrap` class now routes through **one** `FakeCgroupFs::state()` helper carrying a
+  single `#[expect(clippy::unwrap_used, reason = …)]` (AGENTS.md "route repeated legitimate sites
+  through one helper"), so the fake compiles clean outside `cfg(test)`; it is `pub` behind the
+  non-default `test-support` feature, which every backend crate and the validator take as a
+  **dev**-dependency. All four `TestCgroupFs` copies are gone. See the docs/81 section below.
 - **The `firecracker`/`qemu` cargo features were kept as `host-common` aliases.** They no longer gate
   any in-tree module (dropping them would be a semver feature removal, cf. `jip-nftables`); they now
   only gate the FC/QEMU **integration-test legs**, so `just ci`'s `--features firecracker,qemu`
@@ -2570,10 +2592,12 @@ long: the argv splice had **no gate at all**, the live leg's guest kernel **did 
   `-device qemu-xhci,id=vmcell-xhci` regardless of device count, one
   `-device usb-host,vendorid=0x%04x,productid=0x%04x` per device, empty-in/empty-out) **and**
   `build_qemu_command` — a new I/O-free composer holding the **whole** QEMU argv, which
-  `Qemu::spawn_qemu` now calls. `spawn_qemu` keeps the I/O (stale-socket cleanup, the
-  `vhost-device-vsock`/`virtiofsd` starts, and the smoltcp vhost-user-net readiness wait, hoisted out
-  of the `-chardev` branch it gates); `finish_qemu_spawn` keeps the launch tail (spawn → cgroup
-  register → QMP readiness → `SpawnedQemu`). Two small carriers make the split honest:
+  `Qemu::spawn_qemu` now calls. *(Renamed `qemu_launch_plan` in the docs/81 pass, where it also
+  started returning the shared `vmcell::vmm::LaunchPlan` — see that section.)* `spawn_qemu` keeps the
+  I/O (stale-socket cleanup, the `vhost-device-vsock`/`virtiofsd` starts, and the smoltcp
+  vhost-user-net readiness wait, hoisted out of the `-chardev` branch it gates); `finish_qemu_spawn`
+  keeps the launch tail (spawn → cgroup register → QMP readiness → `SpawnedQemu`). Two small
+  carriers make the split honest:
   `QemuSpawnPaths` (the per-VM socket/log paths; virtio-fs daemons enter as *socket paths*, never as
   live `Child` handles) and `SpawnedDaemons` (the helper daemons `finish_qemu_spawn` must reap).
   A `fs_daemon_sockets`/`shares` length mismatch is a typed error rather than a `zip` truncation.
@@ -2600,8 +2624,8 @@ long: the argv splice had **no gate at all**, the live leg's guest kernel **did 
   went one level up.** §18 asks for the fragment helper (the `build_crosvm_run_args` precedent). That
   precedent works only because crosvm's helper **is** the whole argv; QEMU's fragment helper leaves a
   `cmd.args(...)` seam, and that seam is where the defect lived (see the false premise below). The
-  full-argv `build_qemu_command` is the shipped shape; the fragment helper stays as the token-level
-  golden.
+  full-argv `build_qemu_command` (now `qemu_launch_plan`) is the shipped shape; the fragment helper
+  stays as the token-level golden.
 - **A host-device precheck the design does not name.** §2.4 expects QEMU's own open error to surface;
   it does not exist (below). The precheck is the honor-or-reject rule applied to an accepted input.
 - **The live leg is a plain QEMU-only `#[ignore]`d test, not a `vmm_matrix_test!`.**
@@ -2653,8 +2677,9 @@ long: the argv splice had **no gate at all**, the live leg's guest kernel **did 
   `-p vmcell --test usb_passthrough` fully green: QEMU advertised host-USB passthrough while emitting
   **no USB argv at all**. Nothing in the suite could distinguish "advertises and attaches" from
   "advertises and silently drops", because QEMU's argv was observable only by spawning. **Fix:**
-  `build_qemu_command` composes the entire argv without I/O, and the gates assert over
-  `cmd.as_std().get_args()`. Re-injecting the same deletion after the fix reddens
+  `build_qemu_command` (now `qemu_launch_plan`) composes the entire argv without I/O, and the gates
+  assert over the composed argv (`cmd.as_std().get_args()` then; `LaunchPlan::argv()` now).
+  Re-injecting the same deletion after the fix reddens
   `qemu_full_argv_splices_the_usb_fragment` *and* `qemu_usb_capability_matches_the_emitted_argv`
   (observed, then reverted).
 - **"An absent/unopenable host device surfaces QEMU's own fail-loud open error" (§2.4) is false.**
@@ -2830,7 +2855,13 @@ reported in `docs/78-claude-fable-code-review.md`; this section carries only wha
 about the **record** — the deliberate deviations, the behavior changes a caller can see, and the
 traps measured on the way.
 
-### The jail deny-list carries three syscalls beyond the design §12.3 roster
+### ~~The jail deny-list carries three syscalls beyond the design §12.3 roster~~ — RETIRED
+
+**Retired in the docs/81 pass (2026-08-15): superseded, nothing left to deviate from.** The design
+folded `reboot`/`swapon`/`swapoff` into §12.3 at v31 and v32 carries them; `DENIED_SYSCALLS` and the
+roster now agree name-for-name in both directions, and the at-site comment in `vmm/jail.rs` says so
+instead of describing a gap. The full retirement is in the docs/81 section at the end of this file.
+The original record, kept for provenance:
 
 `vmm::jail::DENIED_SYSCALLS` ships `reboot`, `swapon` and `swapoff` on top of the roster §12.3
 lists. Kept deliberately, not trimmed to match the doc: `reboot(2)` reboots or halts the **host** (a
@@ -3172,9 +3203,13 @@ does not leave effective.
 **Gates.** `setpcap_is_a_transient_file_cap_never_delivered_to_the_test` pins the split (SETPCAP in
 the file set, absent from `ambient_raise`/`final_caps`/`inheritable_add`, present in `bounding_drop`),
 with the delivered caps as the positive control. `setcap_arg_renders_the_blessed_set_verbatim` pins
-the operator-facing string. `the_shell_copies_of_the_blessed_set_match_this_constant` `include_str!`s
-the `bless` recipe and the preflight probe and fails if either stops naming exactly the set — the cap
-list had been spelled out by hand in **five** places, and those two copies had already drifted once
+the operator-facing string. The copy-drift gate — landed as
+`the_shell_copies_of_the_blessed_set_match_this_constant`, which `include_str!`d the `bless` recipe
+and the preflight probe, and **superseded in the docs/81 pass** by
+`every_setcap_copy_in_the_tree_matches_this_constant`, which walks the tree at run time (pruning
+`target/`, `.git/` and the frozen `docs/historical/`) over an exact file→count roster — fails if any
+copy stops naming exactly the set. The hand-listed pair claimed to read "every copy" and did not:
+the cap list is spelled out by hand in **five** places, and two of them had already drifted once
 (the `*ep*` substring vs the `=ep`/`+ep` field). `setcap_arg` is now the one composer, and
 `blessing_remediation` prints the whole file set rather than the missing subset, because `setcap`
 *replaces* a file's set and echoing a subset would strip the rest.
@@ -3458,9 +3493,10 @@ unaffected, so the public API and `cargo semver-checks` do not move.
 The two `vmcell-artifact-validator` failures could not be fixed at the test site: both went through
 `harness::try_start_vm`, which builds `hermetic()` internally and exposes no cgroup seam. `try_start_vm`
 is deliberately unchanged — the live battery needs the real seam — and the two tests call
-`MicroVm::start` over a local no-op `TestCgroupFs`, which is the **recorded** shape: exposing
-`FakeCgroupFs` was rejected earlier in this file (its deliberate `.lock().unwrap()`s would trip
-`deny(clippy::unwrap_used)`), and the three backend crates each carry the same local copy.
+`MicroVm::start` over a local no-op `TestCgroupFs`. *(Stale as of the docs/81 pass: the local copy
+was the recorded shape only while exposing `FakeCgroupFs` was believed impossible. All four copies
+are gone — the fake is `pub` behind the non-default `test-support` dev-feature. See the retirement
+above and the docs/81 section below.)*
 
 **Gates, both proven red-on-inverse before landing.**
 `orchestrator::tests::unit_test_env_start_creates_no_slice_in_the_host_cgroup_tree` starts a VM on
@@ -3548,10 +3584,17 @@ top of the test instead of a mystified hash mismatch further down.
 `docs/81-claude-opus-code-review.md` reviewed the tree at `7499cba` across fourteen disjoint areas
 with a separate adversarial verifier per area; 76 unique defects survived verification (13 major, 48
 minor, 15 note), and every live suite was run on this host (privileged 156/156, unprivileged 4/4,
-daemon 14/14, crosvm 30/30, `just ci` green). What follows are the entries that pass recorded rather
-than fixed: three places where the **code is right and a document is stale**, and one prior entry the
-design has since superseded. The defects that should be *fixed* are in docs/81 and are not repeated
-here.
+daemon 14/14, crosvm 30/30, `just ci` green). The review itself appended three entries here — places
+where the **code is right and a document is stale** — plus one prior entry the design had superseded.
+Everything from "As built" onward is the **fix waves'** reconciliation. The defects themselves are in
+docs/81 and are not repeated here; this file records the deviations, the shape shifts, and the gaps
+left open.
+
+**The three review-appended entries below are now CLOSED as design-text items.** Design v32
+(`docs/82-claude-opus-design-v32.md`) folded all three corrections into §3.2, §11.2/§15.5 and §11.4,
+so nothing in the document still disagrees with the code. They are kept for provenance — a reader who
+finds the old text in `docs/historical/79-claude-fable-design-v31.md` needs the reconciliation — not
+as live deviations.
 
 ## Recorded (justified): the session mux's writer is a channel, not an `Arc<Mutex<SplitSink>>`
 
@@ -3609,14 +3652,170 @@ callers, since a hermetic allocator writes no claim file.
 
 ## Retired: the jail deny-list's three "carry-over" syscalls are no longer a deviation
 
-`vmm/jail.rs:62-67` still reads "Deliberate additions BEYOND the §12.3 roster … the design folds them
-into the roster at the next revision. Do not drop them to 'match the doc' — widen the doc", and this
-file carries the matching justified-deviation entry. **Design v31 already widened the doc**: its §12.3
-fence now lists `reboot`, `swapon` and `swapoff` alongside the rest, and `DENIED_SYSCALLS` (21 entries)
-matches the roster name-for-name in both directions — verified against the tree in the docs/81 pass.
+`vmm::jail::DENIED_SYSCALLS`' `reboot`/`swapon`/`swapoff` were recorded as deliberate additions
+*beyond* the design §12.3 roster, to be folded in "at the next revision". **The design already folded
+them in** — v31 did, v32 carries it — so there is nothing left to deviate from. Both the at-site
+comment and the earlier entry in this file are retired; that entry is marked in place, under "The two
+docs/78 fix waves (2026-08-14), as built", with its original text kept for provenance.
 
-Per AGENTS.md ("retire an entry when it is empirically disproven"), the deviation is retired: there is
-nothing left to deviate from. The at-site comment should be rewritten to state the roster agreement
-(and keep the "never drop one to match a doc" instinct, which is still the right one) rather than to
-describe a gap that closed.
+Verified against the tree, not from the review: the const and §12.3's roster block are the same 21
+names in both directions (a `diff` of the two sorted extractions is empty), and
+`jail::tests::deny_list_is_exactly_the_documented_set_and_compiles` proves it the way that matters —
+it **parses** the roster out of whichever non-historical `docs/*.md` carries the §12.3 heading, so it
+is neither comparing the const to a second transcription of itself nor pinned to the design's
+filename. `cargo test -p vmcell --lib vmm::jail` → 4 passed. The version that had pinned a copy *of
+the const* stayed green while the shipped list silently lacked `process_vm_readv` (docs/78 M15); the
+sibling `the_roster_parser_errors_rather_than_reading_an_empty_table` is what keeps the parse from
+passing vacuously.
+
+The at-site comment now states the roster agreement and keeps the "never drop one to match a doc"
+instinct, which is still the right one.
+
+---
+
+# As built: the docs/81 fix waves (2026-08-15)
+
+The waves landed as one breaking release. **The changelog is not here**: every consumer-visible edge
+is ledgered in the crates' own `Cargo.toml` comment changelogs, which is where the version fact is
+produced (§10.4) — `crates/vmcell/Cargo.toml` and `crates/vmcell-artifact-validator/Cargo.toml` are
+the two contract-surface ledgers, and `vmcell-protocol` and `vmcell-broker` bumped alongside. Read
+them for *what changed for a caller*. What follows is what those ledgers cannot carry: the choices
+between two admissible fixes, the shifts away from a sketched name or shape, and the gaps left open.
+
+## The `Egress::Blocked` decision: HONOR it, not reject it
+
+docs/81 M1 offered two fixes and required the choice be recorded. **(a) was chosen: `Blocked` is
+honored on both datapaths.** The rejected (b) — refuse the variant at `build()` — would have made
+`Egress` a two-variant enum in practice while leaving a public, `#[non_exhaustive]`, DTO-carried
+variant that every consumer can still name; a config surface whose third option is a typed error is
+worse documentation than one that works.
+
+Two predicates carry it, each `match`ing exhaustively so a future variant is a compile error rather
+than a fall-through into the most permissive arm — which is precisely how the defect happened
+(`Blocked` shared `Open`'s empty else-path):
+
+- `orchestrator::privileged_egress_rules` → `PrivilegedEgressRules::{Tproxy, Blocked, NoRules}`.
+  `Blocked` emits the accepts-nothing ruleset (the TPROXY shape minus both accept rules).
+- `orchestrator::nat_egress_plan` → `(forward_ports, NatEgressPolicy)`. `Blocked` registers **no**
+  forward port and passes `NatEgressPolicy::Deny`, so the NAT never dials a host target.
+
+Both were split out of `setup_env` *for testability*, and that is the deviation worth naming: neither
+decision is reachable from a unit test in place — `setup_env`'s privileged arm builds its namespace
+through the real `RtNetlink`, and its unprivileged arm cannot be driven with a recording NAT. A law
+that can only be observed live is a law with no KVM-free gate, and the M1 defect was exactly a
+routing decision.
+
+**A partial (b) landed as well, and is the smaller, honest half of it.** `VmConfigBuilder::build`
+rejects `NetConfig::Unprivileged { egress: Egress::Blocked, host_services_port: Some(_) }` naming
+both fields: the port names a host endpoint the guest dials *out* to, which `Blocked` refuses, so the
+pair is unhonorable rather than merely unusual (F1). Making it *unrepresentable* — the stronger move
+delta 4 made for the privileged arm — would mean moving the port onto the `Egress` variants, and
+`Egress` is public, `#[non_exhaustive]`, shared by both datapath arms and matched in the CLI, the
+daemon DTOs, the bench harness and the example workspace, none of which have a port to give. A
+contract break across the whole consumer surface to encode one pair is the trade that was declined;
+the boundary check is what shipped, with the rationale at the site.
+
+## Shape shifts from a sketched name or signature
+
+- **`Netlink::setup_tap` returns `Result<()>`, not `Result<Option<tun_tap::Iface>>`.** The old return
+  was always `Ok(None)` and read by nobody, while forcing every out-of-tree implementor of this
+  ledgered seam to depend on `tun-tap` (which `vmcell` does not re-export, so the pin had to be
+  guessed) and teaching them to hold the tap fd open — the one thing that breaks single-opener
+  discipline. `vmcell-broker`, whose recording `Netlink` fake now compiles with **no** `tun-tap`
+  dependency at all, is the living gate against the type coming back. Breaking, and invisible to
+  `cargo semver-checks` (it has no return-type lint), which is why it is hand-ledgered.
+- **The QEMU argv composer is `qemu_launch_plan`, returning `vmcell::vmm::LaunchPlan`** — not
+  `build_qemu_command` returning a `Command`. Command and jail posture now travel together from
+  composition to exec, so no step can substitute either half; `LaunchPlan::jail` is private, so the
+  two-line defeat (`plan.jail = …`) is a **compile error**, not a gate failure. FC and CH return the
+  same shared type. **crosvm deliberately keeps its own `CrosvmLaunchPlan`**: it must wrap
+  `effective_jail_config` (crosvm's `Enforcing` turns the Layer-2 deny-list on instead of a minijail),
+  which the shared type has no place for. Two production `jail_spec_from_config` call sites remain,
+  one inside each plan constructor (`vmcell::vmm::LaunchPlan::build`, `CrosvmLaunchPlan::build`) —
+  verified by grep across all four backends; every other match is inside a `#[cfg(test)]` scan module.
+  All four backends carry both halves of the treatment (a plan constructor holding the whole composed
+  command, plus a source scan pinning the call-site counts); crosvm's scan is named for its own plan
+  type rather than `jail_composition_gate`.
+- **`reject_unadvertised_capabilities` is one shared law with per-backend name-binding wrappers.** It
+  landed as three byte-identical copies differing only in the `vmm` string. The hoisted
+  `vmcell::vmm::reject_unadvertised_capabilities(vmm, caps, cfg)` covers `nested_virt` and
+  `lazy_restore`; all four backends keep a private one-line wrapper whose only job is binding their
+  own name once. Both branches key off the `VmmCapabilities` value **handed in**, never a hardcoded
+  `false` at the refusal site, so flipping a flag flips its refusal with it. Called from `create()`
+  **and** `restore()`.
+- **`Zygote::suspend` owns the snapshot-destination law** through one `prepare_snapshot_dest`:
+  create-with-parents when absent, accept an existing but empty directory, refuse a populated one.
+  `Lineage::fork_from_vm` and `branch` delegate and keep no `create_dir_all` of their own — see the
+  retirement of entry (e) above, which recorded the opposite arrangement.
+- **`metrics::vm_slice_name` is `pub` and re-exported as `naming::vm_slice_name`.** It is the **full**
+  slice name; `naming::cgroup_slice_name` is only its leaf. (docs/81 §7.3 names the wrong one of the
+  two for the harness — the harness routes through `vm_slice_name`; the tree wins.)
+- **`FakeCgroupFs` is `pub` behind the non-default `test-support` feature**, taken as a
+  **dev**-dependency by the three backend crates and the validator, replacing four hand-rolled
+  `TestCgroupFs` copies. The blocker recorded in this file — the fake's `.lock().unwrap()`s tripping
+  `deny(clippy::unwrap_used)` outside `cfg(test)` — was removable: the class routes through one
+  `state()` helper carrying a single `#[expect(…, reason = …)]`. Feature unification is the real
+  hazard here (under `--all-targets` the fixtures become visible to the lib target too), so
+  `scripts/ban-test-support-in-production.sh` is the backstop, not the `cargo build` behavior.
+
+## Deadline budgets that became named constants
+
+- **`vmcell::vmm::VMM_SOCKET_READY_TIMEOUT_MS`** is the one VMM control-socket readiness ceiling. It
+  is deliberately **not** a parameter: `register_and_await_ready` lost its `timeout_ms` argument (a
+  breaking edge) so a backend cannot spell the ceiling as a literal again. The genuinely per-VM half,
+  `interval_ms`, is still a parameter.
+- **QEMU's `SMOLTCP_SOCKET_READY_TIMEOUT_MS`** is QEMU's one readiness wait that is *not* on that
+  ceiling, named for the same reason rather than folded into it: the producer differs in kind (an
+  in-process NAT thread, no child to fail fast on) and the wait is wider.
+- **The snapshot budget is adopted as `max(own_floor, shared_predicate)`, not as a replacement.**
+  crosvm: `control_budget.max(vmcell::vmm::snapshot_request_timeout(mem_mib))`. QEMU:
+  `MIGRATION_BUDGET.max(snapshot_request_timeout(mem_mib))`, and QEMU's 120 s floor deliberately
+  stays — its migration is not a single dense write but iterative dirty-page passes with a
+  `query-migrate` poll round-trip per iteration, which a pure write-throughput model does not capture.
+  QEMU's crossover is 7361 MiB (≈7.19 GiB) — the smallest `mem_mib` for which
+  `CONTROL_REQUEST_TIMEOUT + ceil(mem_mib / SNAPSHOT_MIN_WRITE_MIB_PER_SEC)` exceeds the 120 s floor,
+  i.e. `5 + ceil(7361/64) = 121 > 120`. Above it the shared predicate takes over, which is the
+  multi-GiB case the shared predicate exists for. (Recompute from the three constants rather than
+  quoting this figure if any of them moves.) Ordinary control ops keep the short flat budget on
+  both backends, so a wedged `powerbtn`/`system_powerdown` cannot delay the force-kill behind it.
+
+## Residual gaps, deliberately left open
+
+- **`VmConfig`'s fields are `pub`, so `build()`'s validations bind the BUILDER, not the struct.** A
+  caller can reach the rejected `Unprivileged { egress: Blocked, host_services_port: Some(p) }` state
+  by assigning `cfg.net` on a built config — `#[non_exhaustive]` blocks the out-of-crate struct
+  literal, not field assignment. This is stated in the ledger and exercised, not merely admitted: the
+  M1 live leg assembles `cfg.net` directly, precisely so the two legs differ in exactly one field
+  **and** so the datapath's own refusal (no forward port, `NatEgressPolicy::Deny`) is what is
+  observed rather than the boundary check. Defense in depth is the answer here, not a stronger type.
+- **Under `Egress::Open` with `host_services_port: None`, an in-guest dial to the host gateway does
+  not reach the host.** `Open` grants no *arbitrary* outbound on this datapath: reachability comes
+  from a registered forward port, and `nat_egress_plan` registers only `host_services_port` and the
+  proxy port. Empirically confirmed by the live leg's own recorded inverse — flipping only
+  `NatEgressPolicy` to `Allow` does **not** redden it, because with no forward port there is no
+  mapping for the NAT to dial through. So the M1 positive control needs `Some(port)`, and a reader
+  must not infer "`Open` ⇒ the guest can reach the host".
+- **The QEMU launch-plan conversion has no live validation in this pass.** It is argv+jail composition
+  only, and every KVM-free gate is green (`cargo test -p vmcell-qemu` → 37 passed, including the
+  composed-argv `-sandbox` assertion, now reading `LaunchPlan::argv()`). But `apply_jail` runs in a
+  post-fork `pre_exec` window that no KVM-free test can observe — which is why the class exists — so
+  the runtime claim is **unverified** until the QEMU live matrix runs.
+- **Two QEMU comment sites still assert the withdrawn lazy-bind mechanism**
+  (`crates/vmcell-qemu/src/lib.rs`: the `SMOLTCP_SOCKET_READY_TIMEOUT_MS` rustdoc, and the
+  `wait_for_socket` call's line comment). The *ceiling* they justify is right for an independent
+  reason — the producer is a thread with no early exit to fail fast on — but the "binds lazily"
+  clause is the same false premise withdrawn above and should go with it.
+
+## Where the design lives now
+
+`docs/79-claude-fable-design-v31.md` moved to `docs/historical/` (frozen at its published bytes) and
+the current design is `docs/82-claude-opus-design-v32.md`. **No reference in this file names the
+design by path** — nor should a new one: two gates find it by **discovery**, and a third mechanism
+pinned its filename and broke on this very reissue. `vmcell::vmm::jail`'s deny-list test parses
+§12.3's roster out of whichever non-historical `docs/*.md` carries that heading;
+`vmcell-privilege`'s blessing-copy scan locates §10.4's `setcap` line by finding the one `docs/*.md`
+whose first line is the design's title, and splices that row into an otherwise fixed roster. Both
+**error** rather than pass vacuously when they find nothing, and both prune `docs/historical/`,
+whose older two- and three-cap grants are the record rather than drift. `cargo test -p vmcell-privilege
+--lib` → 23 passed.
 

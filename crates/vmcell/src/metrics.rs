@@ -122,8 +122,15 @@ pub fn cgroup_base_from_proc(contents: &str) -> Option<String> {
 /// slice a start would have created in order to assert that nothing by that name appears under
 /// /sys/fs/cgroup, and a test-local `format!` would put a second copy of the law inside the very
 /// test whose job is to catch drift in it.
+///
+/// **Public, and re-exported as [`crate::naming::vm_slice_name`]** beside the sibling name
+/// composers, because `pub(crate)` is what forced the copies this rule exists to prevent: an
+/// out-of-crate reader of `memory.events` (the artifact validator) could not reach the law, so it
+/// hand-formatted a `vmcell-vm-<vmid>` literal and silently read a path that does not exist for any
+/// VM configured with a non-default [`crate::naming::DEFAULT_RESOURCE_PREFIX`]. Take the prefix from
+/// the same `VmConfig::resource_prefix` the VM was started with; never assume the default.
 #[must_use]
-pub(crate) fn vm_slice_name(prefix: &str, vmid: u32) -> String {
+pub fn vm_slice_name(prefix: &str, vmid: u32) -> String {
     let leaf = crate::naming::cgroup_slice_name(prefix, vmid);
     match std::fs::read_to_string("/proc/self/cgroup")
         .ok()
@@ -589,19 +596,32 @@ impl CgroupFs for DefaultCgroupFs {
     }
 }
 
-/// A fake CgroupFs implementation for unit testing.
+/// An in-process [`CgroupFs`] fake for unit testing.
+///
+/// **Test-only.** Compiled only under `cfg(test)` or the `test-support` feature, which is
+/// never in `default` and which the backend crates take as a **dev**-dependency — so it
+/// cannot reach a shipped binary. It was `#[cfg(test)]`-only, which made it invisible
+/// outside this crate and left `vmcell-firecracker`, `vmcell-qemu`, `vmcell-crosvm` and
+/// `vmcell-artifact-validator` each carrying a hand-rolled `TestCgroupFs` copy (docs/81
+/// §9); the feature is what lets them share this one.
+///
+/// **It is still structurally blind to the filesystem** (AGENTS rule 4). It models slices,
+/// tasks and controller delegation in a `HashMap` and touches no cgroup sysfs, so no test
+/// driven by it is evidence about on-disk residue — `create_slice_at`'s
+/// no-residue-on-failure law is proven against a real temp directory instead. Exposing it
+/// downstream widens who can use the fake; it does not widen what the fake can see.
 //
 // METRICS-FS-4 note: this is a test-only fake. Its `.lock().unwrap()` calls keep
 // `unwrap` deliberately — the mutex is exercised single-threaded within a test, so a
 // poisoned guard would itself be a test bug we want to surface loudly. Production
 // mutex callers (e.g. `fs::in_process`) recover from poison via `into_inner()`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct FakeCgroupFs {
     state: std::sync::Arc<std::sync::Mutex<FakeCgroupState>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 struct FakeCgroupState {
     pub slices: std::collections::HashMap<String, crate::config::ResourceLimits>,
@@ -613,14 +633,14 @@ struct FakeCgroupState {
     pub delegated: std::collections::HashSet<String>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for FakeCgroupFs {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl FakeCgroupFs {
     /// Creates a new fake cgroup filesystem with every controller delegated, so a
     /// well-configured host is the default and limit application succeeds.
@@ -638,6 +658,27 @@ impl FakeCgroupFs {
         }
     }
 
+    /// The one locked accessor every method below goes through.
+    ///
+    /// A poisoned mutex here means a previous test panicked while holding it, which is itself a
+    /// test bug worth surfacing loudly — so this deliberately panics rather than recovering the
+    /// way production mutex callers do (`fs::in_process` uses `into_inner()`). Routing every
+    /// method through this one helper means the class carries ONE suppression instead of a dozen
+    /// (AGENTS.md "route repeated legitimate sites through one helper"), which matters now that
+    /// the `test-support` feature compiles this fixture outside `cfg(test)`, where
+    /// `clippy::unwrap_used` is denied.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test fixture: a poisoned mutex means an earlier test panicked mid-fixture, \
+                  which must surface loudly rather than be papered over"
+    )]
+    fn state(&self) -> std::sync::MutexGuard<'_, FakeCgroupState> {
+        self.state.lock().unwrap()
+    }
+
     /// Models a controller that is **not** delegated into the slice, so a requested
     /// limit needing it must fail loud with
     /// [`crate::error::Error::CapabilityUnavailable`] instead of a silent `Ok`
@@ -647,30 +688,28 @@ impl FakeCgroupFs {
     /// # Panics
     /// Panics if the internal mutex is poisoned.
     pub fn undelegate(&self, controller: &str) {
-        self.state.lock().unwrap().delegated.remove(controller);
+        self.state().delegated.remove(controller);
     }
 
     /// Checks if a slice exists.
     /// # Panics
     /// Panics if the internal mutex is poisoned.
     pub fn has_slice(&self, name: &str) -> bool {
-        self.state.lock().unwrap().slices.contains_key(name)
+        self.state().slices.contains_key(name)
     }
 
     /// Gets limits for a slice.
     /// # Panics
     /// Panics if the internal mutex is poisoned.
     pub fn get_limits(&self, name: &str) -> Option<crate::config::ResourceLimits> {
-        self.state.lock().unwrap().slices.get(name).cloned()
+        self.state().slices.get(name).cloned()
     }
 
     /// Checks if a task is added.
     /// # Panics
     /// Panics if the internal mutex is poisoned.
     pub fn has_task(&self, name: &str, pid: u32) -> bool {
-        self.state
-            .lock()
-            .unwrap()
+        self.state()
             .tasks
             .get(name)
             .map(|t| t.contains(&pid))
@@ -678,10 +717,10 @@ impl FakeCgroupFs {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl CgroupFs for FakeCgroupFs {
     fn create_slice(&self, name: &str, limits: &crate::config::ResourceLimits) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         // Model the §7.2 (The fail-loud capability contract and HostCapabilities)
         // fail-loud contract: a requested limit whose controller is
         // not delegated cannot be enforced, so return CapabilityUnavailable and do
@@ -704,7 +743,7 @@ impl CgroupFs for FakeCgroupFs {
     }
 
     fn delete_slice(&self, name: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.slices.remove(name);
         state.tasks.remove(name);
         Ok(())
@@ -727,7 +766,7 @@ impl CgroupFs for FakeCgroupFs {
     }
 
     fn add_task(&self, name: &str, pid: u32) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.tasks.entry(name.to_string()).or_default().push(pid);
         Ok(())
     }
@@ -772,6 +811,60 @@ mod tests {
         );
         assert_eq!(cgroup_base_from_proc("2:cpu:/only/v1/lines"), None);
         assert_eq!(cgroup_base_from_proc(""), None);
+    }
+
+    // d3: `vm_slice_name` composes from the prefix it is GIVEN. It was `pub(crate)`, so every
+    // out-of-crate reader of a VM's cgroup files had to re-type the composition — and the artifact
+    // validator's copy hard-coded `vmcell-vm-<vmid>`, silently reading a path that exists for no VM
+    // started with a non-default `resource_prefix` (`memory.events oom_kill` then reads as zero
+    // rather than as an error). The prefix here is deliberately NOT the default, so a hard-coded
+    // `vmcell-` prefix cannot pass this test.
+    #[test]
+    fn vm_slice_name_composes_from_the_given_prefix() {
+        let vmid = 7;
+        for prefix in ["acme", "z9"] {
+            assert_ne!(
+                prefix,
+                crate::naming::DEFAULT_RESOURCE_PREFIX,
+                "this gate is vacuous if it runs on the default prefix"
+            );
+            let name = vm_slice_name(prefix, vmid);
+            let leaf = name
+                .rsplit('/')
+                .next()
+                .expect("rsplit always yields at least one element");
+            // Positive identity through the one composer, never a test-local `format!`.
+            assert_eq!(
+                leaf,
+                crate::naming::cgroup_slice_name(prefix, vmid),
+                "the slice leaf must be composed from the CONFIGURED prefix, not a literal"
+            );
+            assert!(
+                !leaf.starts_with(crate::naming::DEFAULT_RESOURCE_PREFIX),
+                "a hard-coded default-prefix leaf ({leaf:?}) survived a non-default prefix"
+            );
+        }
+
+        // The sibling-placement half stays pinned too: with a base, the name is `{base}/{leaf}`;
+        // without one it is the bare leaf. A slice that lost its base would be created at the
+        // cgroup root instead of beside this process.
+        let name = vm_slice_name("acme", vmid);
+        let leaf = crate::naming::cgroup_slice_name("acme", vmid);
+        match std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .as_deref()
+            .and_then(cgroup_base_from_proc)
+        {
+            Some(base) => assert_eq!(
+                name,
+                format!("{base}/{leaf}"),
+                "with a /proc/self/cgroup base the slice must be placed as its sibling"
+            ),
+            None => assert_eq!(
+                name, leaf,
+                "with no base the slice name is the bare leaf, not an empty-rooted path"
+            ),
+        }
     }
 
     #[test]

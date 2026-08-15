@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Red-on-inverse self-test for scripts/ban-inline-setns.sh (review S2 / delta 8 "one law, one
 # predicate"). Builds fixture trees that mirror the real crate layout (the exemptions are path
-# suffixes, so the layout is load-bearing) and asserts all three halves of the scanner:
+# suffixes, so the layout is load-bearing) and asserts all four halves of the scanner:
 #   * deleting the `setns(` pattern leaves the inline-call fixtures un-flagged  → this test reddens;
 #   * deleting the >1-call check lets a SECOND call inside a sanctioned file pass → reddens;
-#   * deleting the stale-exemption check lets a moved/emptied sanctioned site pass → reddens.
+#   * deleting the stale-exemption check lets a moved/emptied sanctioned site pass → reddens;
+#   * deleting the netns_rs arm lets a `NetNs::run`/`enter` (a setns reached through the dependency,
+#     review m14) pass → reddens, while `rt.enter()` in a non-netns_rs file must stay un-flagged.
 # The last two exist for the reason PRIV-4 added the bare-Mutex/OnceLock fixtures to
 # test-ban-global-state.sh: without them the exempt-file half of the gate could not fail at all.
 set -euo pipefail
@@ -47,6 +49,19 @@ mk_clean_tree() {
   # shellcheck disable=SC2016  # the backticks are literal Rust doc text, not shell expansion (intended)
   printf '//! `setns(CLONE_NEWNET)` needs `CAP_SYS_ADMIN` in the owning user namespace.\nfn f() {}\n' \
     > "$root/vmcell-broker/src/lib.rs"
+  # MUST NOT be flagged by the netns_rs arm: the crate's non-thread-moving API (get/new/remove) in
+  # the one file that legitimately uses it, next to the dedicated-thread helper every move goes
+  # through — plus a `run_in_tokio(`/`run_with_rtnetlink(` call whose name merely BEGINS with `run`.
+  {
+    printf 'fn del(netns: &str) -> Result<()> {\n'
+    printf '    let ns = netns_rs::NetNs::get(netns)?;\n'
+    printf '    ns.remove()?;\n'
+    printf '    in_netns(netns, || run_in_tokio(|| async { Ok(()) }))\n}\n'
+  } > "$root/vmcell/src/net/tap.rs"
+  # MUST NOT be flagged: `rt.enter()` in a file that has nothing to do with netns_rs (the arm is
+  # scoped to files whose code names the crate, so a runtime guard is not a false positive).
+  printf 'fn t() { let rt = Runtime::new().unwrap(); let _g = rt.enter(); }\n' \
+    > "$root/vmcell/src/net/smoltcp.rs"
 }
 
 run_ban() { # run_ban <root> -> sets $out/$rc
@@ -80,6 +95,8 @@ expect_clean 'vmm/mod.rs'
 expect_clean 'segment.rs'
 expect_clean 'jail.rs'
 expect_clean 'lib.rs'
+expect_clean 'tap.rs'
+expect_clean 'smoltcp.rs'
 [[ $fail -ne 0 ]] && dump "case 1"
 
 # --- Case 2: the sanctioned tree alone MUST pass (the positive control) ---------------------------
@@ -118,6 +135,34 @@ before=$fail
 expect_rc 1 "moved sanctioned site"
 expect_flag 'no such file'
 [[ $fail -ne $before ]] && dump "case 5"
+
+# --- Case 6: a `setns` reached through netns_rs is the same law broken (review m14) --------------
+# `NetNs::run`/`run_in`/`enter` move the CALLING thread — invisible to the raw-`setns(` arm, which
+# is exactly how seven pooled-tokio-worker namespace moves survived this gate. Both spellings must
+# be flagged, in a file the raw arm reports as clean.
+mk_clean_tree "$work/dep"
+mkdir -p "$work/dep/vmcell-daemon/src"
+{
+  printf 'fn setup(netns: &str) {\n'
+  printf '    let ns = netns_rs::NetNs::get(netns).unwrap();\n'
+  printf '    let _ = ns.run(move |_| do_netlink_work());\n'
+  printf '}\n'
+} > "$work/dep/vmcell/src/net/route.rs"
+{
+  printf 'use netns_rs::NetNs;\n'
+  printf 'fn enter_it(name: &str) { NetNs::run_in(name, |_| ()).unwrap(); }\n'
+  printf 'fn enter_direct(ns: &NetNs) { ns.enter().unwrap(); }\n'
+} > "$work/dep/vmcell-daemon/src/netns_helper.rs"
+run_ban "$work/dep"
+before=$fail
+expect_rc 1 "netns_rs thread-moving call outside in_netns"
+expect_flag 'route.rs'
+expect_flag 'netns_helper.rs'
+expect_flag 'net::tap::in_netns'
+# The clean tree's legitimate netns_rs usage (get/remove) and the unrelated `rt.enter()` stay clean.
+expect_clean 'tap.rs'
+expect_clean 'smoltcp.rs'
+[[ $fail -ne $before ]] && dump "case 6"
 
 if [[ $fail -ne 0 ]]; then
   echo "ban-inline-setns self-test FAILED"

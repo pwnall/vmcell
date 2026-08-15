@@ -68,6 +68,53 @@ pub fn fragment_pin_key(name: &str) -> String {
     format!("kernel_fragments_{name}")
 }
 
+/// The **flattened pins key** a kernel's `sub_key` resolves to: `kernel_<sub_key>` for the default
+/// kernel, `kernel_<label>_<sub_key>` for a labelled one (§10.2, the pins schema; §5.6, The
+/// downstream kernel toolkit).
+///
+/// The **one** composer for the kernel→pin-key law, in both directions of the pins pipeline: the
+/// flattener (`artifact::flatten_pins_namespace`) EMITS `kernel.source_url` and
+/// `kernels.<label>.source_url` through it, and every consumer — this crate's host-`make`
+/// [`KernelStage`] and the out-of-crate in-VM builder — READS through the same call. Before it was
+/// exported the spelling was composed inline in the flattener and re-derived by each consumer, so a
+/// downstream builder had to guess the flattener's spelling instead of calling it; a producer/
+/// consumer drift there is not a compile error, it is a silent `Missing kernel_… pin` at build time.
+///
+/// The label keeps its dots (`kernel_6.12.94_source_url`): only the on-disk FILENAME is sanitized
+/// (`kernel_filename_suffix`), because the pins key never becomes a path.
+///
+/// `sub_key` is the sub-key under the pins namespace (`source_url` / `source_sha256`) — the same
+/// spelling in the labelled (`kernels.<label>.…`) and default (`kernel.…`) document routes.
+#[must_use]
+pub fn kernel_pin_key(label: Option<&str>, sub_key: &str) -> String {
+    match label {
+        Some(l) => format!("kernel_{l}_{sub_key}"),
+        None => format!("kernel_{sub_key}"),
+    }
+}
+
+/// The [`StageOutputs`]/[`StageInputs`] **artifact-map key** a kernel producer registers its built
+/// `vmlinux` under: `"kernel"` for the default kernel, `"kernel-<label>"` for a labelled one.
+///
+/// The **one** composer for the kernel→artifact-key law. The default (unlabelled) kernel registers
+/// under `"kernel"` — the key every downstream stage (rootfs, snapshot) reads — while each labelled
+/// kernel gets its own key: sharing `"kernel"` collapsed every labelled kernel onto one entry and a
+/// multi-kernel `Artifacts` map lost all but one (M-PIPE-4). [`config_artifact_key`] derives the
+/// resolved-config sidecar's key from this one, so the pair moves together.
+///
+/// Exported for the same reason as [`kernel_pin_key`]: an out-of-crate producer (the in-VM
+/// `vmcell-kernel-builder`, or a downstream builder) must register under the key `vmcell`'s own
+/// consumers read, and byte-duplicating the composition is how those two drift apart silently.
+///
+/// The label keeps its dots, exactly like [`kernel_pin_key`] — this key is a map key, never a path.
+#[must_use]
+pub fn kernel_artifact_key(label: Option<&str>) -> String {
+    match label {
+        Some(l) => format!("kernel-{l}"),
+        None => "kernel".to_string(),
+    }
+}
+
 /// The requested fragment names, **sorted** and de-duplicated (§5.2, The config fragment), so both
 /// the cache key and the on-disk config-append order are independent of the request order.
 ///
@@ -375,20 +422,15 @@ impl KernelStage {
         kernel_filename_suffix(self.label.as_deref())
     }
 
-    /// The pins key holding this kernel's source URL.
+    /// The pins key holding this kernel's source URL — the shared [`kernel_pin_key`] law, never a
+    /// second copy of the `kernel_<label>_<sub_key>` spelling the flattener emits.
     fn url_pin_key(&self) -> String {
-        match &self.label {
-            Some(l) => format!("kernel_{l}_source_url"),
-            None => "kernel_source_url".to_string(),
-        }
+        kernel_pin_key(self.label.as_deref(), "source_url")
     }
 
-    /// The pins key holding this kernel's source SHA256.
+    /// The pins key holding this kernel's source SHA256 — the shared [`kernel_pin_key`] law.
     fn sha_pin_key(&self) -> String {
-        match &self.label {
-            Some(l) => format!("kernel_{l}_source_sha256"),
-            None => "kernel_source_sha256".to_string(),
-        }
+        kernel_pin_key(self.label.as_deref(), "source_sha256")
     }
 
     /// The refusal for a source pin this stage needs but the resolved pins do not carry, naming
@@ -419,18 +461,10 @@ impl KernelStage {
     }
 
     /// The key under which this stage registers its built kernel in the
-    /// [`StageOutputs`]/[`StageInputs`] artifact map.
-    ///
-    /// The default (unlabelled) kernel registers under `"kernel"` — the key every
-    /// downstream stage (rootfs, snapshot) reads — while each labelled kernel
-    /// registers under `"kernel-<label>"`. Without this, every labelled kernel
-    /// collapsed onto the single `"kernel"` key and a multi-kernel `Artifacts` map
-    /// lost all but one entry (M-PIPE-4).
+    /// [`StageOutputs`]/[`StageInputs`] artifact map — the shared [`kernel_artifact_key`] law,
+    /// which carries the M-PIPE-4 rationale and is what the out-of-crate producers register under.
     fn artifact_key(&self) -> String {
-        match &self.label {
-            Some(l) => format!("kernel-{l}"),
-            None => "kernel".to_string(),
-        }
+        kernel_artifact_key(self.label.as_deref())
     }
 }
 
@@ -482,10 +516,12 @@ impl Stage for KernelStage {
                 .unwrap_or_default(),
         );
         hasher.update(SEP);
+        // Every labelled kernel shares the DEFAULT namespace's `microvm_config` (the flattener's
+        // `kernels` arm emits no per-label config), which the unlabelled `kernel_pin_key` states.
         hasher.update(
             inputs
                 .pins
-                .get("kernel_microvm_config")
+                .get(&kernel_pin_key(None, "microvm_config"))
                 .map(|s| s.as_bytes())
                 .unwrap_or_default(),
         );
@@ -515,10 +551,11 @@ impl Stage for KernelStage {
             .pins
             .get(&sha_key)
             .ok_or_else(|| self.missing_source_pin(&sha_key, "source_sha256"))?;
+        let cfg_key = kernel_pin_key(None, "microvm_config");
         let microvm_config = inputs
             .pins
-            .get("kernel_microvm_config")
-            .ok_or_else(|| Error::Artifact("Missing kernel_microvm_config pin".into()))?;
+            .get(&cfg_key)
+            .ok_or_else(|| Error::Artifact(format!("Missing {cfg_key} pin")))?;
 
         let workdir = out
             .parent()
@@ -919,7 +956,9 @@ impl Stage for PrebuiltKernelStage {
         // describing a different kernel as this kernel's `kernel-config` — the exact lying
         // artifact the sidecar exists to prevent. Clear it as part of publishing.
         clear_resolved_config(out).await?;
-        Ok(kernel_outputs(out, "kernel", None))
+        // The prebuilt seed is always the DEFAULT kernel (`reject_labelled_prebuilt` refuses a
+        // label), so it registers under the law's unlabelled key — composed, not spelled inline.
+        Ok(kernel_outputs(out, &kernel_artifact_key(None), None))
     }
 }
 
@@ -1095,6 +1134,129 @@ mod tests {
             config_artifact_key("kernel-6.6.143"),
             "kernel-6.6.143-config"
         );
+    }
+
+    // docs/81 §8, F4 (cache-key rule: an unchanged input keeps its computed key). Both laws were
+    // consolidated out of three hand-written copies, so their OUTPUT is pinned to the exact
+    // pre-consolidation spellings here — literally, not via the function that produces them.
+    // A consolidation that "tidied" `kernel-6.12.94` into the sanitized `kernel-6-12-94`, or
+    // `kernel_6.12.94_source_url` into a normalized form, would silently miss every warm cache and
+    // every pin an existing overlay carries. Red on any respelling of either law.
+    #[test]
+    fn the_two_key_laws_keep_their_exact_pre_consolidation_spellings() {
+        assert_eq!(kernel_pin_key(None, "source_url"), "kernel_source_url");
+        assert_eq!(
+            kernel_pin_key(None, "source_sha256"),
+            "kernel_source_sha256"
+        );
+        assert_eq!(
+            kernel_pin_key(None, "microvm_config"),
+            "kernel_microvm_config"
+        );
+        // The label keeps its DOTS: only the on-disk filename is sanitized (`kernel_filename`),
+        // because a pins key never becomes a path.
+        assert_eq!(
+            kernel_pin_key(Some("6.12.94"), "source_url"),
+            "kernel_6.12.94_source_url"
+        );
+        assert_eq!(
+            kernel_pin_key(Some("6.12.94"), "source_sha256"),
+            "kernel_6.12.94_source_sha256"
+        );
+
+        assert_eq!(kernel_artifact_key(None), "kernel");
+        assert_eq!(kernel_artifact_key(Some("6.12.94")), "kernel-6.12.94");
+        // The sidecar key is DERIVED from the artifact key, so the pair moves together.
+        assert_eq!(
+            config_artifact_key(&kernel_artifact_key(Some("6.12.94"))),
+            "kernel-6.12.94-config"
+        );
+        // The default artifact key is the literal every downstream reader hard-codes
+        // (`vmcell-rootfs-builder`'s seed lookup, the snapshot stage, `vmcell bundle`).
+        assert_eq!(kernel_artifact_key(None), "kernel");
+
+        // The stages route through the laws rather than keeping a copy: same output, both labels.
+        let mk = |label: Option<&str>| KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+            label: label.map(str::to_string),
+            fragments: None,
+        };
+        for label in [None, Some("6.12.94")] {
+            let s = mk(label);
+            assert_eq!(s.url_pin_key(), kernel_pin_key(label, "source_url"));
+            assert_eq!(s.sha_pin_key(), kernel_pin_key(label, "source_sha256"));
+            assert_eq!(s.artifact_key(), kernel_artifact_key(label));
+        }
+    }
+
+    // docs/81 §8 CALL-SITE GATE: emitter↔reader parity for the pin-key law. The pins FLATTENER
+    // emits these keys and every kernel producer READS them; before the consolidation the spelling
+    // was composed inline in the flattener and re-derived by each consumer, and a drift between
+    // them is not a compile error — it is a runtime `Missing kernel_… pin` on a cold build, i.e. a
+    // green test suite and a red build. This drives the REAL flattener over a real pins document
+    // and looks the keys up through the REAL stage accessors, so a second spelling on either side
+    // goes red here (`scripts/ban-kernel-key-composers.sh` is the structural half of the same gate).
+    #[test]
+    fn the_flattener_emits_exactly_the_pin_keys_the_kernel_stages_read() {
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{
+                "kernel": { "source_url": "u-default", "source_sha256": "s-default",
+                            "microvm_config": "CONFIG_DEFAULT=y\n" },
+                "kernels": { "6.12.94": { "source_url": "u-612", "source_sha256": "s-612" } }
+            }"#,
+        )
+        .expect("fixture pins document");
+        let flat = crate::artifact::flatten_pins_document(&doc);
+
+        let default = KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+            label: None,
+            fragments: None,
+        };
+        let labelled = KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+            label: Some("6.12.94".to_string()),
+            fragments: None,
+        };
+
+        assert_eq!(
+            flat.get(&default.url_pin_key()).map(String::as_str),
+            Some("u-default"),
+            "the default kernel's source URL must be readable at the key the stage looks up; \
+             flattened keys were {:?}",
+            flat.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            flat.get(&default.sha_pin_key()).map(String::as_str),
+            Some("s-default")
+        );
+        assert_eq!(
+            flat.get(&kernel_pin_key(None, "microvm_config"))
+                .map(String::as_str),
+            Some("CONFIG_DEFAULT=y\n"),
+            "every labelled kernel shares the DEFAULT namespace's microvm_config"
+        );
+        assert_eq!(
+            flat.get(&labelled.url_pin_key()).map(String::as_str),
+            Some("u-612"),
+            "a labelled kernel's source URL must be readable at the key the stage looks up; \
+             flattened keys were {:?}",
+            flat.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            flat.get(&labelled.sha_pin_key()).map(String::as_str),
+            Some("s-612")
+        );
+
+        // Positive control that the parity above is non-vacuous: a label the document does not
+        // carry resolves to nothing, so the assertions are matching real emitted keys rather than
+        // `None == None`.
+        let absent = KernelStage {
+            http_client: std::sync::Arc::new(ReqwestClient),
+            label: Some("9.9.9".to_string()),
+            fragments: None,
+        };
+        assert_eq!(flat.get(&absent.url_pin_key()), None);
     }
 
     // §5.6 GATE (delta 3, F3): the ONE label-sanitization law and its inverse must round-trip, on

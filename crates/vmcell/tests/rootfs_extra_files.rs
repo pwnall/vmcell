@@ -25,32 +25,22 @@ const MARKER_DEST: &str = "/opt/acme/acme-daemon";
 const MARKER_CONTENT: &str = "vmcell-delta6-extra-file-marker";
 const MARKER_MODE: u32 = 0o755;
 
-/// Points the staging pipeline's OCI blob cache at the **canonical** one.
-///
-/// `oci::build_rootfs` derives its cache as `<out.parent()>/oci-cache`, so a staging dir starts
-/// with a COLD cache and re-pulls the whole digest-pinned base from the registry — on every run and
-/// on every nextest retry. That is what made this leg fail four tries in a row inside the full
-/// privileged suite while passing in isolation: back-to-back anonymous pulls, not a VM problem.
-/// Symlinking the staging cache at the canonical one makes the pack a cache HIT, so the leg tests
-/// the packer (which is its subject) instead of the registry.
-fn share_the_canonical_oci_cache(staging: &std::path::Path) {
-    let canonical = vmcell::artifact::artifacts_dir().join("oci-cache");
-    std::fs::create_dir_all(&canonical).expect("create the canonical oci-cache dir");
-    std::os::unix::fs::symlink(&canonical, staging.join("oci-cache"))
-        .expect("link the staging oci-cache at the canonical one");
-}
-
 /// Packs a rootfs carrying the marker as an [`ExtraFile`], into a staging dir that is never the
 /// canonical artifacts dir (M-BIN-6): building at `artifacts_dir()` itself would clobber the image
 /// every other suite boots. Returns the packed image path.
 ///
 /// Mirrors `vmcell oci2-erofs`'s pipeline: resolve pins → guest agent → guest tools → rootfs.
+///
+/// The staging dir needs no OCI-cache plumbing of its own: the blob cache is sited on
+/// [`oci_cache_dir`](vmcell::artifact::oci_cache_dir) (the artifacts dir), not on the stage's
+/// output dir, so the pack below is a cache HIT off whatever `get_rootfs()` already pulled. It was
+/// the output-relative siting that made this leg re-pull the whole digest-pinned base per run and
+/// fail four nextest tries in a row inside the full privileged suite while passing in isolation.
 async fn pack_rootfs_with_marker(
     staging: &std::path::Path,
     src: &std::path::Path,
 ) -> std::path::PathBuf {
     std::fs::create_dir_all(staging).expect("create the staging dir");
-    share_the_canonical_oci_cache(staging);
     let pipeline = vmcell::artifact::Pipeline::new(staging.to_path_buf())
         .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
             overlay_file: vmcell::artifact::pins_overlay_path(),
@@ -147,6 +137,6 @@ async fn extra_file_is_present_in_guest_with_its_explicit_mode() {
 
     vm.shutdown().await.expect("shutdown");
     // `staging_dir`'s `Drop` removes the ~100 MB image — on this path AND on a panicking one.
-    // It only unlinks the `oci-cache` SYMLINK, never the shared cache it points at.
+    // The shared OCI blob cache lives in the artifacts dir, not here, so it is untouched.
     drop(staging_dir);
 }

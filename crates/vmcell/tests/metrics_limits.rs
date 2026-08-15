@@ -37,6 +37,12 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Cap the host cgroup well below guest RAM.
     cfg.limits.mem_max_mib = Some(256);
 
+    // The prefix this VM's cgroup slice is named after, captured before `cfg` moves into
+    // `MicroVm::start`: `checks::metrics_mem_limit_ooms` composes the `memory.events` path it
+    // reads from it, and takes it as a required argument rather than assuming the default
+    // (docs/81 d3).
+    let resource_prefix = cfg.resource_prefix.clone();
+
     let env = vmcell::HostEnv::hermetic();
     let mut vm = MicroVm::start(vmm, cfg, &env)
         .await
@@ -160,7 +166,7 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // below the 512 MiB guest RAM, so a runaway allocation trips the HOST OOM killer
     // (memory.events oom_kill). This is the extracted `checks::metrics_mem_limit_ooms` the
     // validator runs (§7, Resource monitoring and limits) — one implementation of the OOM-observation.
-    vmcell_artifact_validator::checks::metrics_mem_limit_ooms(&mut vm)
+    vmcell_artifact_validator::checks::metrics_mem_limit_ooms(&mut vm, &resource_prefix)
         .await
         .expect("host cgroup memory cap must be the binding OOM limit");
 

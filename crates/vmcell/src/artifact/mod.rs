@@ -75,6 +75,24 @@ pub fn rootfs_path() -> PathBuf {
         .unwrap_or_else(|| artifacts_dir().join("rootfs.erofs"))
 }
 
+/// The OCI blob cache directory: `<artifacts_dir>/oci-cache`.
+///
+/// The **one** siting rule for the pulled-layer cache, and it is anchored on the artifacts dir —
+/// deliberately NOT on the output path of whatever stage is pulling. Both in-VM builders
+/// (`vmcell-rootfs-builder`, `vmcell-kernel-builder`) pack their builder-base rootfs into a
+/// per-run `tempfile::TempDir`, so an output-relative cache died with the run and re-pulled the
+/// digest-pinned builder base on every single build. On the canonical `vmcell build` path the two
+/// sitings name the same directory, which is why the waste was invisible there.
+///
+/// Sharing one cache across outputs is safe by construction, not by trust: every blob is named by
+/// its `sha256:` digest and re-verified against that digest on **every** use, so a tampered or
+/// truncated cache file is rejected rather than served. It is a pure accelerator — nothing in a
+/// stage's cache key depends on where it lives.
+#[must_use]
+pub fn oci_cache_dir() -> PathBuf {
+    artifacts_dir().join("oci-cache")
+}
+
 /// Ensures the default test VM artifacts (guest-agent, guest-tools, erofs rootfs) are current,
 /// building them **at most once per test session**, driven by the same content hashes the build
 /// pipeline uses. The integration-test harness calls this from `get_vmlinux`/`get_rootfs`, so a
@@ -518,6 +536,38 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
+/// The artifacts the `.cache_key` sidecar at `key_path` registered **under `target_dir`**,
+/// excluding `target_dir` itself.
+///
+/// A stage may publish SIBLING artifacts beside its payload — the kernel's resolved-config sidecar
+/// `<vmlinux>.config` (§5.6) — and records them in the same artifact map [`Pipeline::build`]
+/// republishes on a warm hit. [`Pipeline::reset_to`] reads that map rather than naming any
+/// particular file, which is what keeps `Pipeline` free of per-stage knowledge.
+///
+/// The `target_dir` filter is a safety boundary, not a nicety: an artifact map may name a path a
+/// stage did not create under this pipeline's directory, and `reset_to` deletes only what this
+/// pipeline published. A sidecar in the legacy plain-string format registers nothing — exactly how
+/// `build()` reads it (a miss with no recoverable artifacts).
+///
+/// # Errors
+/// Returns [`crate::error::Error::Io`] if an EXISTING sidecar cannot be read. Same fail-loud rule
+/// as `build()` (L-ART-4): a sidecar that exists but cannot be read is a real I/O error, and
+/// treating it as "nothing registered" would silently leave the siblings behind.
+fn registered_artifacts_under(key_path: &Path, target_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !key_path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(key_path).map_err(crate::error::Error::Io)?;
+    let Ok(metadata) = serde_json::from_str::<CacheMetadata>(&text) else {
+        return Ok(Vec::new());
+    };
+    Ok(metadata
+        .artifacts
+        .into_values()
+        .filter(|p| p.starts_with(target_dir) && p.as_path() != target_dir)
+        .collect())
+}
+
 /// Folds the upstream `artifacts` into `hasher` in a deterministic, key-sorted order,
 /// hashing each artifact's on-disk **content** (the identity that travels) rather than its
 /// absolute path under `target_dir`. An artifact not yet materialized on disk folds a
@@ -693,15 +743,24 @@ fn flatten_pins_namespace(
     out: &mut std::collections::HashMap<String, String>,
 ) -> Option<PinsNamespaceShape> {
     match name {
+        // The default kernel's source pins. The flattened spelling is composed through the one
+        // exported law (`kernel::kernel_pin_key`) that every consumer READS through, so the
+        // emitter and the readers cannot drift into a silent `Missing kernel_… pin`.
         "kernel" => {
             if let Some(sha) = value.get("source_sha256").and_then(|v| v.as_str()) {
-                out.insert("kernel_source_sha256".to_string(), sha.to_string());
+                out.insert(
+                    kernel::kernel_pin_key(None, "source_sha256"),
+                    sha.to_string(),
+                );
             }
             if let Some(url) = value.get("source_url").and_then(|v| v.as_str()) {
-                out.insert("kernel_source_url".to_string(), url.to_string());
+                out.insert(kernel::kernel_pin_key(None, "source_url"), url.to_string());
             }
             if let Some(cfg) = value.get("microvm_config").and_then(|v| v.as_str()) {
-                out.insert("kernel_microvm_config".to_string(), cfg.to_string());
+                out.insert(
+                    kernel::kernel_pin_key(None, "microvm_config"),
+                    cfg.to_string(),
+                );
             }
             Some(PinsNamespaceShape::Object)
         }
@@ -739,10 +798,16 @@ fn flatten_pins_namespace(
             if let Some(kernels) = value.as_object() {
                 for (label, spec) in kernels {
                     if let Some(url) = spec.get("source_url").and_then(|v| v.as_str()) {
-                        out.insert(format!("kernel_{label}_source_url"), url.to_string());
+                        out.insert(
+                            kernel::kernel_pin_key(Some(label), "source_url"),
+                            url.to_string(),
+                        );
                     }
                     if let Some(sha) = spec.get("source_sha256").and_then(|v| v.as_str()) {
-                        out.insert(format!("kernel_{label}_source_sha256"), sha.to_string());
+                        out.insert(
+                            kernel::kernel_pin_key(Some(label), "source_sha256"),
+                            sha.to_string(),
+                        );
                     }
                 }
             }
@@ -1282,12 +1347,12 @@ pub(crate) fn vmcell_source_root() -> Option<PathBuf> {
 ///
 /// # Errors
 /// Returns [`crate::error::Error::Artifact`] if `dir` (or a subdirectory) cannot
-/// be read — the agent logic must exist, so a missing source tree is a hard stop
-/// rather than a silent partial hash.
+/// be read — every crate in a guest binary's build closure must have its sources here, so a
+/// missing source tree is a hard stop rather than a silent partial hash.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         crate::error::Error::Artifact(format!(
-            "failed to read guest-agent source dir {}: {}",
+            "failed to read closure source dir {}: {}",
             dir.display(),
             e
         ))
@@ -1305,95 +1370,185 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Hashes the **full source closure** the `vmcell-guest-agent` binary compiles
-/// from: every `*.rs` under `crates/vmcell-guest-agent/src/` (the binary entry
-/// point plus the reaper library it links — `ReaperCoordinator`,
-/// `exit_code_from_termination`) **plus** every `*.rs` under
-/// `crates/vmcell-protocol/src/` (the shared wire `protocol` it links) **plus**
-/// `Cargo.lock` (the pinned dependency versions). All paths are taken relative to
-/// the workspace root and folded in a deterministic, sorted order.
+/// The workspace-local packages of a `Cargo.lock`, as `name -> dependency names`.
 ///
-/// Hashing only the binary wrapper (the old behavior) left every downstream cache
-/// key blind to a change in the agent's real logic: editing the reaper or the
-/// post-restore vsock re-bind left the hash unchanged, so all three cache keys
-/// (resolve-pins, guest-agent, rootfs) hit and a **stale agent binary was re-baked
-/// into `rootfs.erofs`**. The closure must travel as one identity (H-CACHE-1).
+/// A lock entry with **no** `source =` line is a path member: its sources live in this checkout,
+/// so it belongs in a guest binary's source closure. Everything else is a registry/git package
+/// whose content is already pinned by the lock file itself. Path members are workspace crates
+/// (`crates/<name>`) and the root manifest's `[patch.crates-io]` vendored patches
+/// (`vendor/vhost*`) — the latter map elsewhere than `crates/`, so a closure that reaches one
+/// fails loudly in [`crate_closure_hash`] rather than guessing a directory.
+///
+/// Cargo.lock is machine-generated with a fixed shape (`[[package]]` tables, one
+/// `dependencies = [ … ]` array of `"name"` / `"name version"` strings), which is why the
+/// closure is derived from **it** rather than from hand-parsed manifests: the lock is the only
+/// file in the tree that already states the resolved graph. The dependency array merges normal,
+/// build and dev dependencies, so the derived closure errs toward **over**-invalidation (a
+/// dev-only workspace dep would be folded too) — never toward the stale key F4 exists to prevent.
 ///
 /// # Errors
-/// Returns [`crate::error::Error::Artifact`] if the binary entry point is missing,
-/// either source tree cannot be read, or any closure file cannot be read — a hard
-/// stop, never a silent partial or `"unknown"` hash.
-pub(crate) fn guest_agent_closure_hash(ws_root: &Path) -> Result<String> {
-    // The agent binary entry point is mandatory; its absence is the same hard stop.
-    let main_rs = ws_root.join("crates/vmcell-guest-agent/src/main.rs");
-    if !main_rs.is_file() {
-        return Err(crate::error::Error::Artifact(format!(
-            "guest-agent binary source missing at {}",
-            main_rs.display()
-        )));
+/// Returns [`crate::error::Error::Artifact`] if two workspace-local entries share a name (the
+/// name→crate mapping would be ambiguous, and guessing is exactly how a closure goes stale).
+fn local_lock_packages(lock_text: &str) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    // The entry currently being parsed: (name, has-source, deps).
+    let mut cur: Option<(Option<String>, bool, Vec<String>)> = None;
+    let mut in_deps = false;
+    // Closes an entry, keeping only the source-less (workspace-local) ones.
+    fn flush(
+        entry: Option<(Option<String>, bool, Vec<String>)>,
+        out: &mut std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<()> {
+        let Some((Some(name), has_source, deps)) = entry else {
+            return Ok(());
+        };
+        if has_source {
+            return Ok(());
+        }
+        if out.insert(name.clone(), deps).is_some() {
+            return Err(crate::error::Error::Artifact(format!(
+                "Cargo.lock has two path/workspace packages named {name}; the source closure \
+                 cannot be derived unambiguously"
+            )));
+        }
+        Ok(())
     }
-    let mut files: Vec<PathBuf> = Vec::new();
-    // Every Rust source file the agent binary links: its own crate (main + reaper
-    // lib) plus the shared wire-protocol crate.
-    collect_rs_files(&ws_root.join("crates/vmcell-guest-agent/src"), &mut files)?;
-    collect_rs_files(&ws_root.join("crates/vmcell-protocol/src"), &mut files)?;
-    // Cargo.lock pins the dependency versions the agent compiles against; fold it
-    // if present (a workspace may build the lock only on demand).
-    let lock = ws_root.join("Cargo.lock");
-    if lock.is_file() {
-        files.push(lock);
-    }
-    // Deterministic order regardless of `read_dir` order.
-    files.sort();
 
-    let mut hasher = blake3::Hasher::new();
-    for f in &files {
-        // Fold the workspace-relative path (so a rename/move invalidates) with an
-        // unambiguous delimiter, then the file's content hash.
-        let rel = f.strip_prefix(ws_root).unwrap_or(f.as_path());
-        hasher.update(rel.to_string_lossy().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(guest_agent_src_hash(f)?.as_bytes());
-        hasher.update(b"\0");
+    for line in lock_text.lines() {
+        let trimmed = line.trim();
+        // Inside a `dependencies = [` array: one `"name"` / `"name version"` per line until `]`.
+        if in_deps {
+            if trimmed == "]" {
+                in_deps = false;
+                continue;
+            }
+            let entry = trimmed.trim_end_matches(',').trim_matches('"');
+            if let Some((_, _, deps)) = cur.as_mut()
+                && let Some(name) = entry.split_whitespace().next()
+                && !name.is_empty()
+            {
+                deps.push(name.to_string());
+            }
+            continue;
+        }
+        // Any table header ends the current entry — `[[patch.unused]]` and `[metadata]` carry
+        // their own `name =` lines, and folding those into the last package silently renames it.
+        if trimmed.starts_with('[') {
+            flush(cur.take(), &mut out)?;
+            if trimmed == "[[package]]" {
+                cur = Some((None, false, Vec::new()));
+            }
+            continue;
+        }
+        let Some((name, has_source, _)) = cur.as_mut() else {
+            continue;
+        };
+        if let Some(rest) = trimmed.strip_prefix("name = ") {
+            *name = Some(rest.trim().trim_matches('"').to_string());
+        } else if trimmed.starts_with("source = ") {
+            *has_source = true;
+        } else if let Some(rest) = trimmed.strip_prefix("dependencies = [") {
+            // Cargo writes the array multi-line; tolerate an inline `[]` all the same.
+            in_deps = !rest.trim_start().starts_with(']');
+        }
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    flush(cur.take(), &mut out)?;
+    Ok(out)
 }
 
-/// Hashes the **source closure** the `vmcell-guest-tools` helper binary compiles
-/// from: every `*.rs` under `crates/vmcell-guest-tools/src/` **plus** `Cargo.lock`
-/// (the pinned dependency versions). Files are taken relative to the workspace
-/// root and folded in a deterministic, sorted order with a stable hasher (blake3)
-/// — mirroring [`guest_agent_closure_hash`].
+/// The **workspace-local build closure** of `root_pkg`: itself plus every workspace crate it
+/// links, transitively — derived from `Cargo.lock`, never restated as a second hand-maintained
+/// list (F4: every input that affects a stage's output is folded into its key).
 ///
-/// Folding `Cargo.lock` is the whole point: `vmcell-guest-tools` links
-/// reqwest/rustls, so a dependency bump changes the **built** helper while the
-/// `.rs` source is byte-identical. Hashing only the source (the old behavior) left
-/// the cache key unchanged on a bump, so the stage hit cache and a stale
-/// `ip`/`curl`/`kvm-ok` helper was re-baked into the rootfs (§10.2, The stage model and the five cache-key rules — caching rules
-/// 3-4). The closure must travel as one identity.
+/// This is the fix for a hole that shipped: the guest-tools closure hash listed
+/// `crates/vmcell-guest-tools/src` alone, so when the applet roster moved into
+/// `vmcell-protocol` an edit to the roster changed the **built** helper while leaving the cache
+/// key untouched — a stale `rootfs.erofs` whose symlinks silently disagree with the host's idea
+/// of the roster. Deriving the set means a *future* dependency edit is folded with no second
+/// edit here.
 ///
 /// # Errors
-/// Returns [`crate::error::Error::Artifact`] if the binary source is missing, or
-/// any closure file cannot be read — a hard stop, never a silent partial hash (the
-/// old `if let Ok(content)` swallow that quietly produced a content-blind key).
-#[cfg(feature = "pipeline")]
-pub(crate) fn guest_tools_closure_hash(ws_root: &Path) -> Result<String> {
-    // The bin source is mandatory; its absence is a hard stop.
-    let main_rs = ws_root.join("crates/vmcell-guest-tools/src/main.rs");
+/// Returns [`crate::error::Error::Artifact`] if the lock cannot be parsed unambiguously, or if
+/// `root_pkg` is not a path/workspace package in it (a closure that cannot be derived is a hard
+/// stop, never a silent single-crate fallback).
+fn workspace_source_closure(lock_text: &str, root_pkg: &str) -> Result<Vec<String>> {
+    let local = local_lock_packages(lock_text)?;
+    if !local.contains_key(root_pkg) {
+        return Err(crate::error::Error::Artifact(format!(
+            "Cargo.lock names no path/workspace package {root_pkg}; the source closure cannot \
+             be derived"
+        )));
+    }
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut queue = vec![root_pkg.to_string()];
+    while let Some(pkg) = queue.pop() {
+        let Some(deps) = local.get(&pkg) else {
+            // A dependency name that is not workspace-local: a registry/git package, already
+            // pinned by the lock content itself (which the closure folds).
+            continue;
+        };
+        if !seen.insert(pkg) {
+            continue;
+        }
+        queue.extend(deps.iter().cloned());
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Hashes the **full source closure** a workspace guest binary compiles from: for every crate in
+/// its derived [`workspace_source_closure`], that crate's `Cargo.toml` (which selects its
+/// dependencies and features) plus every `*.rs` under its `src/`, **plus** the workspace
+/// `Cargo.lock` (the pinned dependency versions). Paths are taken relative to `ws_root` and
+/// folded in a deterministic, sorted order with a stable hasher (blake3).
+///
+/// One function for both guest binaries: the closure law is that *everything the binary is built
+/// from* travels as one identity (H-CACHE-1), and every hand-maintained second copy of that list
+/// has gone stale (the agent's wrapper-only hash; the guest-tools list that missed
+/// `vmcell-protocol`). Crate directories are `crates/<package name>`, asserted per member rather
+/// than assumed — a member that does not live there is a hard stop.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if the binary entry point is missing, `Cargo.lock`
+/// is unreadable or does not name `root_pkg`, a closure member has no `crates/<name>/Cargo.toml`,
+/// or any closure file cannot be read — a hard stop, never a silent partial or `"unknown"` hash.
+fn crate_closure_hash(ws_root: &Path, root_pkg: &str, bin_entry_rel: &str) -> Result<String> {
+    // The binary entry point is mandatory; its absence is the hard stop.
+    let main_rs = ws_root.join(bin_entry_rel);
     if !main_rs.is_file() {
         return Err(crate::error::Error::Artifact(format!(
-            "guest-tools binary source missing at {}",
+            "{root_pkg} binary source missing at {}",
             main_rs.display()
         )));
     }
-    let mut files: Vec<PathBuf> = Vec::new();
-    collect_rs_files(&ws_root.join("crates/vmcell-guest-tools/src"), &mut files)?;
-    // Cargo.lock pins the dependency versions the helper compiles against; fold it
-    // if present (a workspace may build the lock only on demand).
+    // Cargo.lock is mandatory too: it is both a closure input (the pinned dependency versions)
+    // and the file the closure SET is derived from, so an absent lock is a key we cannot trust.
     let lock = ws_root.join("Cargo.lock");
-    if lock.is_file() {
-        files.push(lock);
+    let lock_text = std::fs::read_to_string(&lock).map_err(|e| {
+        crate::error::Error::Artifact(format!(
+            "failed to read {} for the {root_pkg} source closure: {e}",
+            lock.display()
+        ))
+    })?;
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    for pkg in workspace_source_closure(&lock_text, root_pkg)? {
+        let dir = ws_root.join("crates").join(&pkg);
+        let manifest = dir.join("Cargo.toml");
+        if !manifest.is_file() {
+            return Err(crate::error::Error::Artifact(format!(
+                "path member {pkg} is in the {root_pkg} build closure but has no manifest at {} \
+                 (the closure maps a lock package to crates/<name>; a vendored \
+                 `[patch.crates-io]` member lives elsewhere and needs its own mapping)",
+                manifest.display()
+            )));
+        }
+        // The manifest selects the crate's dependencies and features, so a feature edit that
+        // leaves both the `.rs` sources and the lock untouched still changes the built binary.
+        files.push(manifest);
+        collect_rs_files(&dir.join("src"), &mut files)?;
     }
+    files.push(lock);
     // Deterministic order regardless of filesystem enumeration.
     files.sort();
 
@@ -1409,6 +1564,54 @@ pub(crate) fn guest_tools_closure_hash(ws_root: &Path) -> Result<String> {
         hasher.update(b"\0");
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Hashes the **full source closure** the `vmcell-guest-agent` binary compiles from — its own
+/// crate (binary entry point plus the reaper library it links) and every workspace crate it
+/// links transitively (`vmcell-protocol`, the shared wire protocol), plus their manifests and
+/// `Cargo.lock`. The closure set is derived by [`crate_closure_hash`], never listed here.
+///
+/// Hashing only the binary wrapper (the original behavior) left every downstream cache
+/// key blind to a change in the agent's real logic: editing the reaper or the
+/// post-restore vsock re-bind left the hash unchanged, so all three cache keys
+/// (resolve-pins, guest-agent, rootfs) hit and a **stale agent binary was re-baked
+/// into `rootfs.erofs`**. The closure must travel as one identity (H-CACHE-1).
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] as [`crate_closure_hash`] does — a hard stop,
+/// never a silent partial or `"unknown"` hash.
+pub(crate) fn guest_agent_closure_hash(ws_root: &Path) -> Result<String> {
+    crate_closure_hash(
+        ws_root,
+        "vmcell-guest-agent",
+        "crates/vmcell-guest-agent/src/main.rs",
+    )
+}
+
+/// Hashes the **full source closure** the `vmcell-guest-tools` helper binary compiles from — its
+/// own crate and every workspace crate it links transitively (`vmcell-protocol`, which owns
+/// `GUEST_TOOLS_APPLETS`, the applet roster the helper's dispatch table and the rootfs symlink
+/// manifest both derive from), plus their manifests and `Cargo.lock`. The closure set is derived
+/// by [`crate_closure_hash`], never listed here.
+///
+/// Folding `Cargo.lock` matters on its own: `vmcell-guest-tools` links reqwest/rustls, so a
+/// dependency bump changes the **built** helper while the `.rs` source is byte-identical. Hashing
+/// only the helper's own sources (the original behavior) left the cache key unchanged on a bump,
+/// and later on a roster edit in `vmcell-protocol`, so the stage hit cache and a stale
+/// `ip`/`curl`/`kvm-ok`/`echo-server` helper was re-baked into the rootfs (§10.2, The stage model
+/// and the five cache-key rules — caching rules 3-4). The closure must travel as one identity.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] as [`crate_closure_hash`] does — a hard stop, never
+/// a silent partial hash (the old `if let Ok(content)` swallow that quietly produced a
+/// content-blind key).
+#[cfg(feature = "pipeline")]
+pub(crate) fn guest_tools_closure_hash(ws_root: &Path) -> Result<String> {
+    crate_closure_hash(
+        ws_root,
+        "vmcell-guest-tools",
+        "crates/vmcell-guest-tools/src/main.rs",
+    )
 }
 
 /// A pipeline of stages to build all necessary test VM artifacts.
@@ -1590,6 +1793,12 @@ impl Pipeline {
 
     /// Resets the pipeline to run a specific stage again.
     ///
+    /// Removes the named stage's payload, its `.cache_key` sidecar **and every sibling artifact
+    /// that sidecar registered under `target_dir`** (the kernel's `<vmlinux>.config`, §5.6) — then
+    /// the same for every stage after it. Leaving a registered sibling behind let a `vmcell bundle`
+    /// taken between the reset and the rebuild carry a `kernel-config` describing bytes that no
+    /// longer exist.
+    ///
     /// # Errors
     /// Returns an error if the reset fails.
     pub fn reset_to(&self, stage: &str, _cache: &Cache) -> Result<()> {
@@ -1602,6 +1811,12 @@ impl Pipeline {
             if found {
                 let out_path = s.out_path(dir);
                 let key_path = out_path.with_extension("cache_key");
+                // The siblings come out of the sidecar's recorded artifact map, so they are read
+                // BEFORE it is removed — and reading the map instead of naming the files is what
+                // keeps `Pipeline` free of per-stage knowledge (it never learns what a kernel is).
+                for sibling in registered_artifacts_under(&key_path, dir)? {
+                    remove_if_present(&sibling)?;
+                }
                 // `reset_to`'s contract is to INVALIDATE the named stage and every
                 // stage after it. A swallowed removal failure (the old `let _ =`)
                 // would report `Ok` while leaving a VALID cached artifact + sidecar,
@@ -2092,10 +2307,21 @@ mod tests {
             b"[package]\nname=\"vmcell-protocol\"\n",
         )
         .expect("write protocol manifest");
+        std::fs::write(
+            root.path().join("crates/vmcell-guest-agent/Cargo.toml"),
+            b"[package]\nname=\"vmcell-guest-agent\"\n",
+        )
+        .expect("write agent manifest");
         std::fs::write(agent_src.join("main.rs"), b"fn main() {}").expect("write bin");
         std::fs::write(agent_src.join("lib.rs"), b"pub fn reaper() {}").expect("write lib");
         std::fs::write(proto_src.join("lib.rs"), b"pub struct Msg;").expect("write proto");
-        std::fs::write(root.path().join("Cargo.lock"), b"# lock v1").expect("write lock");
+        // The lock is both a closure input and the file the closure SET is derived from, so the
+        // fixture carries the real generated shape rather than a placeholder comment.
+        std::fs::write(
+            root.path().join("Cargo.lock"),
+            fixture_lock("vmcell-guest-agent", &["vmcell-protocol"]).as_bytes(),
+        )
+        .expect("write lock");
 
         let h1 = guest_agent_closure_hash(root.path()).expect("closure hash 1");
 
@@ -2244,16 +2470,16 @@ mod tests {
     #[test]
     fn test_guest_tools_closure_hash_tracks_cargo_lock() {
         let root = tempfile::tempdir().expect("tempdir");
-        let tools_src = root.path().join("crates/vmcell-guest-tools/src");
-        std::fs::create_dir_all(&tools_src).expect("mkdir tools src");
-        std::fs::write(tools_src.join("main.rs"), b"fn main() {}").expect("write bin");
-        std::fs::write(root.path().join("Cargo.lock"), b"# lock v1").expect("write lock");
+        write_guest_tools_fixture(root.path());
+        let lock = root.path().join("Cargo.lock");
+        let v1 = fixture_lock("vmcell-guest-tools", &["vmcell-protocol"]);
 
         let h1 = guest_tools_closure_hash(root.path()).expect("closure hash 1");
 
-        // Bump a dependency: Cargo.lock changes, the helper `.rs` source does not.
-        std::fs::write(root.path().join("Cargo.lock"), b"# lock v2 (dep bump)")
-            .expect("rewrite lock");
+        // Bump a dependency: Cargo.lock changes, the helper `.rs` source does not. The bumped
+        // version lives on a REGISTRY package, so the derived closure SET is identical across
+        // the two locks — only their content differs, which is exactly the rule under test.
+        std::fs::write(&lock, v1.replace("1.1.3", "1.1.4").as_bytes()).expect("rewrite lock");
         let h2 = guest_tools_closure_hash(root.path()).expect("closure hash 2");
         assert_ne!(
             h1, h2,
@@ -2261,7 +2487,7 @@ mod tests {
         );
 
         // Sanity: identical inputs hash identically (deterministic).
-        std::fs::write(root.path().join("Cargo.lock"), b"# lock v1").expect("restore lock");
+        std::fs::write(&lock, v1.as_bytes()).expect("restore lock");
         let h1b = guest_tools_closure_hash(root.path()).expect("closure hash 1b");
         assert_eq!(h1, h1b, "identical closure inputs must hash identically");
     }
@@ -2276,6 +2502,236 @@ mod tests {
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "missing guest-tools bin source must be a hard error, got {res:?}"
+        );
+    }
+
+    /// A `Cargo.lock` in the real generated shape: `root` as a path/workspace member depending
+    /// on `deps` (each also a path member) plus one registry package, which is what makes the
+    /// source-less-entry rule under test meaningful.
+    fn fixture_lock(root: &str, deps: &[&str]) -> String {
+        let mut lock = String::from(
+            "# This file is automatically @generated by Cargo.\nversion = 4\n\n\
+             [[package]]\nname = \"postcard\"\nversion = \"1.1.3\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n",
+        );
+        lock.push_str(&format!(
+            "[[package]]\nname = \"{root}\"\nversion = \"0.1.0\"\ndependencies = [\n \"postcard\",\n"
+        ));
+        for dep in deps {
+            lock.push_str(&format!(" \"{dep}\",\n"));
+        }
+        lock.push_str("]\n\n");
+        for dep in deps {
+            lock.push_str(&format!(
+                "[[package]]\nname = \"{dep}\"\nversion = \"0.1.0\"\ndependencies = [\n \"postcard\",\n]\n\n"
+            ));
+        }
+        // A trailing non-`[[package]]` table (`[[patch.unused]]` appears whenever one of the
+        // root manifest's `[patch.crates-io]` entries stops being used; `[metadata]` is the other
+        // shape). It has its own `name =` line, so a parser that does not close the previous
+        // entry on a table header renames the last package and loses it from the closure.
+        lock.push_str(
+            "[[patch.unused]]\nname = \"vhost\"\nversion = \"0.15.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        );
+        lock
+    }
+
+    /// The guest-tools fixture workspace: the helper crate, the `vmcell-protocol` crate it links
+    /// (which owns `GUEST_TOOLS_APPLETS`), a manifest for each, and a matching lock.
+    #[cfg(feature = "pipeline")]
+    fn write_guest_tools_fixture(root: &Path) {
+        for (krate, file, src) in [
+            ("vmcell-guest-tools", "main.rs", "fn main() {}"),
+            (
+                "vmcell-protocol",
+                "lib.rs",
+                "pub const GUEST_TOOLS_APPLETS: &[&str] = &[\"ip\"];",
+            ),
+        ] {
+            let dir = root.join("crates").join(krate);
+            std::fs::create_dir_all(dir.join("src")).expect("mkdir crate src");
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{krate}\"\n").as_bytes(),
+            )
+            .expect("write manifest");
+            std::fs::write(dir.join("src").join(file), src.as_bytes()).expect("write source");
+        }
+        std::fs::write(
+            root.join("Cargo.lock"),
+            fixture_lock("vmcell-guest-tools", &["vmcell-protocol"]).as_bytes(),
+        )
+        .expect("write lock");
+    }
+
+    // F4 GATE (docs/81 m22 follow-up): the guest-tools cache key must fold EVERY workspace crate
+    // the helper links, not just its own `src/`. The applet roster now lives in
+    // `vmcell-protocol::GUEST_TOOLS_APPLETS`, so a roster edit changes the built helper (its
+    // dispatch table is sized and named from that const) and the rootfs symlinks derived from it.
+    // RED on the inverse (a closure that walks only the root crate's own `src/`, i.e. the fold
+    // that shipped): the two hashes below come back EQUAL and a stale `rootfs.erofs` — whose
+    // `/vmcell-tools/<applet>` symlinks disagree with the host's roster — is re-served from cache.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn guest_tools_closure_hash_tracks_a_linked_workspace_crate() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_guest_tools_fixture(root.path());
+        let roster = root.path().join("crates/vmcell-protocol/src/lib.rs");
+
+        let h1 = guest_tools_closure_hash(root.path()).expect("closure hash 1");
+        // Edit the ROSTER, in the crate the helper links. The helper's own sources and the lock
+        // are byte-identical, which is precisely the state the old fold could not see.
+        std::fs::write(
+            &roster,
+            b"pub const GUEST_TOOLS_APPLETS: &[&str] = &[\"ip\", \"kvm-ok\"];",
+        )
+        .expect("edit roster");
+        let h2 = guest_tools_closure_hash(root.path()).expect("closure hash 2");
+        assert_ne!(
+            h1, h2,
+            "editing a workspace crate the guest-tools binary LINKS must change its closure hash"
+        );
+
+        // Positive control that the fold is content-addressed, not order-of-call: restoring the
+        // roster restores the hash.
+        std::fs::write(
+            &roster,
+            b"pub const GUEST_TOOLS_APPLETS: &[&str] = &[\"ip\"];",
+        )
+        .expect("restore roster");
+        assert_eq!(
+            h1,
+            guest_tools_closure_hash(root.path()).expect("closure hash 1b"),
+            "restoring the linked crate's source must restore the closure hash"
+        );
+    }
+
+    // F4 GATE: the closure SET is DERIVED from Cargo.lock, so a future dependency edit is folded
+    // with no second edit in `artifact/mod.rs`. Driven against the REAL workspace lock, because a
+    // fixture cannot prove the derivation matches what cargo actually resolved.
+    // RED on the inverse (a hardcoded `vec![root_pkg]`, the shipped shape): `vmcell-protocol` is
+    // absent from both closures.
+    #[test]
+    fn workspace_source_closure_is_derived_from_the_real_lock() {
+        let lock = std::fs::read_to_string(workspace_root().join("Cargo.lock"))
+            .expect("the workspace lock must be readable");
+        for pkg in ["vmcell-guest-tools", "vmcell-guest-agent"] {
+            let closure = workspace_source_closure(&lock, pkg).expect("derive closure");
+            assert!(
+                closure.iter().any(|c| c == pkg),
+                "{pkg}'s closure must contain itself, got {closure:?}"
+            );
+            assert!(
+                closure.iter().any(|c| c == "vmcell-protocol"),
+                "{pkg} links vmcell-protocol (the wire protocol / applet roster), so its source \
+                 closure must contain it — got {closure:?}"
+            );
+            // Every derived member must map to a real crate dir, which is what
+            // `crate_closure_hash` then walks.
+            for member in &closure {
+                assert!(
+                    workspace_root()
+                        .join("crates")
+                        .join(member)
+                        .join("Cargo.toml")
+                        .is_file(),
+                    "closure member {member} has no crates/{member}/Cargo.toml"
+                );
+            }
+        }
+        // A registry package is NOT a workspace source (its content is pinned by the lock
+        // itself), and an unknown name is a hard stop rather than an empty closure.
+        assert!(
+            !workspace_source_closure(&lock, "vmcell-guest-tools")
+                .expect("derive closure")
+                .iter()
+                .any(|c| c == "libc"),
+            "a registry dependency must not be walked as a workspace source"
+        );
+        assert!(
+            matches!(
+                workspace_source_closure(&lock, "not-a-workspace-crate"),
+                Err(crate::error::Error::Artifact(_))
+            ),
+            "an unknown root package must be a hard error, never an empty closure"
+        );
+    }
+
+    // The lock parser's own contract: transitive workspace deps travel, registry packages do not,
+    // and a trailing `[[patch.unused]]` table (this workspace's lock carries one) must not be
+    // folded into the last `[[package]]`. RED on the inverse (dropping the table-header flush):
+    // `vmcell-protocol` is renamed to `vhost` and disappears from the closure.
+    #[test]
+    fn local_lock_packages_reads_only_path_members() {
+        let lock = fixture_lock("vmcell-guest-tools", &["vmcell-protocol"]);
+        let local = local_lock_packages(&lock).expect("parse lock");
+        assert_eq!(
+            local.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "vmcell-guest-tools".to_string(),
+                "vmcell-protocol".to_string()
+            ],
+            "only source-less (path/workspace) entries are workspace sources"
+        );
+        assert_eq!(
+            local.get("vmcell-guest-tools").map(Vec::as_slice),
+            Some(["postcard".to_string(), "vmcell-protocol".to_string()].as_slice()),
+            "a dependency list must survive parsing, version suffix stripped"
+        );
+        // Two path members with the same name make the name→dir mapping ambiguous: hard stop.
+        let dup = format!("{lock}\n[[package]]\nname = \"vmcell-protocol\"\nversion = \"0.2.0\"\n");
+        assert!(
+            matches!(
+                local_lock_packages(&dup),
+                Err(crate::error::Error::Artifact(_))
+            ),
+            "an ambiguous duplicate path member must be a hard error"
+        );
+    }
+
+    // The hard-stop half of the derivation: a lock that does not name the binary's package (or is
+    // absent entirely) must fail loudly rather than degrade to the root crate alone — a silently
+    // narrowed closure is the stale key F4 exists to prevent.
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn guest_tools_closure_hash_fails_hard_on_an_underivable_closure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_guest_tools_fixture(root.path());
+        // A lock naming some other workspace: the helper's package is absent from it.
+        std::fs::write(
+            root.path().join("Cargo.lock"),
+            fixture_lock("some-other-crate", &[]).as_bytes(),
+        )
+        .expect("rewrite lock");
+        assert!(
+            matches!(
+                guest_tools_closure_hash(root.path()),
+                Err(crate::error::Error::Artifact(_))
+            ),
+            "a lock that does not name the guest-tools package must be a hard error"
+        );
+
+        std::fs::remove_file(root.path().join("Cargo.lock")).expect("remove lock");
+        assert!(
+            matches!(
+                guest_tools_closure_hash(root.path()),
+                Err(crate::error::Error::Artifact(_))
+            ),
+            "an absent Cargo.lock must be a hard error: the pinned dependency versions are a \
+             closure input, not an optional one"
+        );
+
+        // A closure member whose crate dir is missing is a hard stop too (positive control: the
+        // fixture above hashes fine with the dir present).
+        write_guest_tools_fixture(root.path());
+        std::fs::remove_dir_all(root.path().join("crates/vmcell-protocol")).expect("drop crate");
+        assert!(
+            matches!(
+                guest_tools_closure_hash(root.path()),
+                Err(crate::error::Error::Artifact(_))
+            ),
+            "a closure member with no crates/<name> dir must be a hard error"
         );
     }
 
@@ -2485,6 +2941,85 @@ mod tests {
         assert!(
             res.is_err(),
             "an existing-but-unreadable cache sidecar must fail the build loud (L-ART-4)"
+        );
+    }
+
+    /// A stage shaped like the kernel stage: it publishes a payload, registers a SIBLING artifact
+    /// beside it (`<payload>.config`, §5.6) and also registers one artifact that lives OUTSIDE the
+    /// pipeline's target dir — the safety control for `reset_to`'s `target_dir` filter.
+    struct SiblingStage {
+        outside: PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl Stage for SiblingStage {
+        fn name(&self) -> &str {
+            "sibling"
+        }
+        fn cache_key(&self, _: &StageInputs) -> CacheKey {
+            CacheKey("sibling-k".into())
+        }
+        fn out_path(&self, t: &Path) -> PathBuf {
+            t.join("sibling_out")
+        }
+        async fn run(&self, _: &StageInputs, out: &Path) -> Result<StageOutputs> {
+            tokio::fs::write(out, b"payload")
+                .await
+                .map_err(crate::error::Error::Io)?;
+            let config = out.with_extension("config");
+            tokio::fs::write(&config, b"CONFIG_SIBLING=y")
+                .await
+                .map_err(crate::error::Error::Io)?;
+            let mut o = StageOutputs::default();
+            o.artifacts.insert("sibling".into(), out.to_path_buf());
+            o.artifacts.insert("sibling-config".into(), config);
+            o.artifacts.insert("upstream".into(), self.outside.clone());
+            Ok(o)
+        }
+    }
+
+    // `reset_to` must invalidate everything the stage PUBLISHED, not only its payload and sidecar.
+    // The kernel stage registers `<vmlinux>.config` beside `vmlinux` (§5.6), so a `vmcell bundle`
+    // taken between the reset and the rebuild carried a `kernel-config` describing bytes that no
+    // longer exist. RED on the inverse (removing only `out_path` + `key_path`): the `.config`
+    // sibling survives the reset.
+    //
+    // The last assertion is the safety control: an artifact registered from OUTSIDE `target_dir`
+    // is not this pipeline's to delete.
+    #[tokio::test]
+    async fn reset_to_removes_registered_sibling_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let outside = elsewhere.path().join("upstream_input");
+        std::fs::write(&outside, b"not-ours").expect("seed the outside artifact");
+
+        let target = dir.path().to_path_buf();
+        let pipeline = Pipeline::new(target.clone()).add_stage(Box::new(SiblingStage {
+            outside: outside.clone(),
+        }));
+        pipeline.build(&Cache::default()).await.expect("build");
+
+        let payload = target.join("sibling_out");
+        let key_path = payload.with_extension("cache_key");
+        let sibling = payload.with_extension("config");
+        assert!(
+            payload.exists() && key_path.exists() && sibling.exists(),
+            "the fixture must publish payload, sidecar and sibling before the reset"
+        );
+
+        pipeline
+            .reset_to("sibling", &Cache::default())
+            .expect("reset_to must succeed");
+
+        assert!(!payload.exists(), "the payload must be removed");
+        assert!(!key_path.exists(), "the cache sidecar must be removed");
+        assert!(
+            !sibling.exists(),
+            "a registered sibling under target_dir must be removed too — a bundle taken between \
+             the reset and the rebuild would otherwise carry a stale kernel-config"
+        );
+        assert!(
+            outside.exists(),
+            "an artifact registered OUTSIDE target_dir is not this pipeline's to delete"
         );
     }
 

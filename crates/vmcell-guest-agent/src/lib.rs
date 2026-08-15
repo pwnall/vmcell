@@ -216,6 +216,37 @@ impl ReaperCoordinator {
         inner.reservations.insert(pid, pre_spawn_epoch);
     }
 
+    /// Releases a reservation whose waiter will never run.
+    ///
+    /// [`ReaperCoordinator::reserve`]'s entry is normally consumed by the
+    /// [`ReaperCoordinator::wait_for`] that claims the child's status. A session
+    /// that is abandoned *after* its spawn — the PTY-master clone failing, or a
+    /// duplicate session id being refused — kills the child and spawns no waiter,
+    /// so nothing would ever consume the entry: the map is the one structure here
+    /// with no prune (statuses are aged out, reservations are not), and a stale
+    /// epoch left on a pid the kernel later reuses would make the next waiter for
+    /// that pid discard its own child's status and block forever.
+    ///
+    /// A pid with no reservation is a silent no-op, so every post-spawn abandon
+    /// path can call this unconditionally.
+    pub fn cancel_reservation(&self, pid: u32) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reservations
+            .remove(&pid);
+    }
+
+    /// Number of outstanding pid reservations (for diagnostics/tests).
+    #[must_use]
+    pub fn pending_reservations(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reservations
+            .len()
+    }
+
     /// Records a reaped child's `code` for `pid` and wakes any waiter.
     ///
     /// Unclaimed statuses are pruned once `max_statuses` newer statuses have

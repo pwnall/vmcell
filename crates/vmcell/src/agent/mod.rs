@@ -153,6 +153,35 @@ async fn connect_control_stream(endpoint: &VsockEndpoint) -> std::io::Result<Con
     }
 }
 
+/// Encodes a host→guest frame and enforces the shared `MAX_FRAME_BYTES` cap at the
+/// send boundary — the host mirror of the guest agent's `send_framed` encode-side
+/// check (§13, Cross-cutting invariants).
+///
+/// **One law, one predicate**: every host→guest frame is built here, on the
+/// [`SessionMux`](session::SessionMux) path *and* on the one-shot request path
+/// ([`AgentClient::exec`], [`AgentClient::put_file`], [`AgentClient::resync`]). The
+/// one-shot path used to encode inline with no cap check (m8): the codec still refused
+/// the frame, so the stream stayed byte-clean, but the failure surfaced as an opaque
+/// `Error::Io` **and** desynced a stream that nothing had been written to — against
+/// [`AgentClient::finish_request`]'s own "desync only if a stale frame could be in
+/// flight" contract. Callers therefore encode BEFORE entering the request closure, so
+/// an over-cap or unencodable message is a typed, non-desyncing failure.
+///
+/// # Errors
+/// [`Error::Agent`] when the encoded frame exceeds `MAX_FRAME_BYTES`, or the postcard
+/// error when the message cannot be encoded at all.
+#[cfg(feature = "host-common")]
+pub(crate) fn encode_frame(msg: &Message) -> Result<::bytes::Bytes> {
+    let bytes = postcard::to_stdvec(msg)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(Error::Agent(format!(
+            "frame exceeds MAX_FRAME_BYTES ({} > {MAX_FRAME_BYTES})",
+            bytes.len()
+        )));
+    }
+    Ok(::bytes::Bytes::from(bytes))
+}
+
 /// The upper bound on the hybrid prologue's acknowledgement line, in bytes.
 ///
 /// The `OK <port>\n` line a bridge sends is a dozen bytes; the cap exists so a
@@ -161,6 +190,14 @@ async fn connect_control_stream(endpoint: &VsockEndpoint) -> std::io::Result<Con
 /// discipline `MAX_FRAME_BYTES` applies to the framed plane, §13, Cross-cutting invariants).
 #[cfg(feature = "host-common")]
 const MAX_PROLOGUE_LINE_BYTES: usize = 256;
+
+/// Per-attempt cap on the guest's first framed message (`Ready`) during a connect.
+///
+/// One attempt of [`AgentClient::connect_framed_once`] waits at most this long for the
+/// handshake frame before the retry loop re-checks the serial log and tries again — and
+/// **never** longer than the caller's own connect deadline, which clamps it (m10).
+#[cfg(feature = "host-common")]
+const READY_FRAME_READ: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How the hybrid `CONNECT <port>`/`OK` prologue failed, at the granularity its two
 /// callers interpret differently (§3.2, The host side: AgentClient and SessionMux).
@@ -514,6 +551,11 @@ enum ConnectAttemptError {
     /// Socket and prologue completed, but the guest's first frame was not a
     /// decodable `Ready` (the agent is still booting).
     Ready(String),
+    /// The caller's connect deadline elapsed *inside* this attempt (m10). Every step of
+    /// an attempt is bounded by that absolute deadline, so this is terminal: the loop
+    /// returns [`Error::Timeout`] immediately rather than sleeping a backoff it has no
+    /// budget for.
+    Deadline,
 }
 
 #[cfg(feature = "host-common")]
@@ -523,6 +565,7 @@ impl std::fmt::Display for ConnectAttemptError {
             Self::Socket(e) => write!(f, "control-stream connect failed: {e}"),
             Self::Prologue(e) => write!(f, "hybrid prologue failed: {e}"),
             Self::Ready(m) => write!(f, "no Ready handshake: {m}"),
+            Self::Deadline => write!(f, "the connect deadline elapsed mid-attempt"),
         }
     }
 }
@@ -644,8 +687,16 @@ impl AgentClient {
                 return Err(Error::Agent("Panic detected in serial log".into()));
             }
 
-            match Self::connect_framed_once(endpoint, timeouts).await {
+            // The deadline is passed IN, not merely checked between attempts: every
+            // await inside an attempt is bounded by it, so the connect cannot overrun
+            // the caller's budget (m10).
+            match Self::connect_framed_once(endpoint, timeouts, deadline).await {
                 Ok(framed) => return Ok(framed),
+                // Terminal: the attempt consumed the whole budget, so there is nothing
+                // left to back off into.
+                Err(ConnectAttemptError::Deadline) => {
+                    return Err(Error::Timeout("Agent connection timed out".into()));
+                }
                 // ONE retry cadence for every failure arm. Before v30 only two of the
                 // five arms slept at all — a failed `CONNECT` write, a non-decodable
                 // first frame, a postcard error, and a non-`Ready` message each
@@ -678,22 +729,42 @@ impl AgentClient {
     /// every failure shape is a typed value rather than a bare `continue` — the
     /// pre-v30 shape, where four of the five failure arms silently skipped the
     /// backoff.
+    ///
+    /// `deadline` is the **caller's** absolute connect deadline, and it bounds every
+    /// await here — the transport connect, the prologue, and the `Ready` frame read —
+    /// outer-bounds-inner (m10). Before that, the deadline was only checked *between*
+    /// attempts while the attempt itself ran unbounded (a hardcoded 2 s frame read plus
+    /// an unbounded connect), so a single attempt could overrun the caller's whole
+    /// timeout.
     async fn connect_framed_once(
         endpoint: &VsockEndpoint,
         timeouts: &crate::config::Timeouts,
+        deadline: tokio::time::Instant,
     ) -> std::result::Result<Framed<ControlStream, LengthDelimitedCodec>, ConnectAttemptError> {
-        let mut stream = connect_control_stream(endpoint)
-            .await
-            .map_err(ConnectAttemptError::Socket)?;
+        let mut stream =
+            match tokio::time::timeout_at(deadline, connect_control_stream(endpoint)).await {
+                Ok(res) => res.map_err(ConnectAttemptError::Socket)?,
+                Err(_elapsed) => return Err(ConnectAttemptError::Deadline),
+            };
 
         // AF_UNIX bridges (CH/FC/QEMU's external `vhost-device-vsock` daemon)
         // speak the Firecracker-style hybrid `CONNECT <port>`/`OK` prologue; the
         // in-kernel AF_VSOCK transport has no bridge, so there is no prologue and
         // the guest's first framed message is already `Ready`.
         if let Some(port) = hybrid_prologue_port(endpoint) {
-            hybrid_connect_prologue(&mut stream, port, timeouts.connect_ok_read)
-                .await
-                .map_err(ConnectAttemptError::Prologue)?;
+            // `connect_ok_read` bounds each single-byte read; the caller's deadline
+            // bounds the prologue as a whole, because a bridge that dribbles a byte just
+            // under that per-read budget (up to `MAX_PROLOGUE_LINE_BYTES` of them) would
+            // otherwise run far past the caller's timeout.
+            match tokio::time::timeout_at(
+                deadline,
+                hybrid_connect_prologue(&mut stream, port, timeouts.connect_ok_read),
+            )
+            .await
+            {
+                Ok(res) => res.map_err(ConnectAttemptError::Prologue)?,
+                Err(_elapsed) => return Err(ConnectAttemptError::Deadline),
+            }
         }
 
         let mut codec = LengthDelimitedCodec::new();
@@ -702,10 +773,18 @@ impl AgentClient {
         codec.set_max_frame_length(MAX_FRAME_BYTES);
         let mut framed = Framed::new(stream, codec);
 
-        let ready_result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await;
+        // Per-attempt cap on the `Ready` read, clamped by the caller's deadline: an
+        // attempt that started with less than `READY_FRAME_READ` left must not overrun
+        // it (m10). Whichever bound bites, the elapse is reported as the one that
+        // actually applied, so the retry loop can tell "still booting" from "out of
+        // budget".
+        let ready_at = std::cmp::min(deadline, tokio::time::Instant::now() + READY_FRAME_READ);
+        let ready_result = tokio::time::timeout_at(ready_at, framed.next()).await;
         let ready = match ready_result {
             Ok(Some(Ok(bytes))) => bytes,
+            Err(_elapsed) if tokio::time::Instant::now() >= deadline => {
+                return Err(ConnectAttemptError::Deadline);
+            }
             other => {
                 return Err(ConnectAttemptError::Ready(format!(
                     "framed.next() returned: {}",
@@ -775,11 +854,24 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Whether a prior request left the framed stream desynchronized, so every further
+    /// request on it fails [`AgentClient::ensure_synced`] until a reconnect.
+    ///
+    /// Exists so the **owner** of a cached client can act on that state instead of handing
+    /// the dead handle back forever: `MicroVm::agent` evicts a desynced cached client and
+    /// reconnects (finding `M7` — a single exec timeout used to kill one-shot
+    /// `exec`/`put_file`/`resync` on that VM permanently, because `reconnect` had no
+    /// non-test caller in the tree).
+    pub(crate) fn is_desynced(&self) -> bool {
+        self.desynced
+    }
+
     /// Fails loud if a prior request left the framed stream desynchronized.
     ///
     /// Every request method calls this first so a stale in-flight frame from an
     /// abandoned (timed-out or errored) exchange can never be read as the next
-    /// request's response. Recovery is via [`AgentClient::reconnect`].
+    /// request's response. Recovery is via [`AgentClient::reconnect`], or — for the
+    /// orchestrator's cached client — the eviction [`AgentClient::is_desynced`] drives.
     fn ensure_synced(&self) -> Result<()> {
         if self.desynced {
             return Err(Error::Agent(
@@ -833,6 +925,9 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns an error if the request cannot be sent or the outcome cannot be received.
+    /// A request that cannot be encoded, or whose encoded frame exceeds
+    /// `MAX_FRAME_BYTES`, is rejected by `encode_frame` **before** anything is written,
+    /// so it is a typed [`Error::Agent`] that leaves the stream in sync (m8).
     pub async fn exec(&mut self, mut cmd: ExecRequest) -> Result<ExecOutcome> {
         self.ensure_synced()?;
         // Propagate the effective timeout into the request so the guest always
@@ -841,13 +936,14 @@ impl AgentClient {
         let timeout = cmd.timeout.unwrap_or(protocol::DEFAULT_EXEC_TIMEOUT);
         cmd.timeout = Some(timeout);
 
-        let result = tokio::time::timeout(timeout, async {
-            let msg = Message::Exec(cmd);
-            let bytes =
-                postcard::to_stdvec(&msg).map_err(|e| RequestFailure::Transport(e.into()))?;
+        // Encode + cap-check BEFORE the exchange starts (m8): nothing has been written,
+        // so an over-cap request is a typed failure that leaves the stream in sync
+        // instead of an opaque `Error::Io` that desyncs a byte-clean stream.
+        let frame = encode_frame(&Message::Exec(cmd))?;
 
+        let result = tokio::time::timeout(timeout, async {
             self.stream
-                .send(::bytes::Bytes::from(bytes))
+                .send(frame)
                 .await
                 .map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
 
@@ -907,7 +1003,9 @@ impl AgentClient {
     /// [`AgentClient::reconnect`] is required before further requests). Like
     /// [`AgentClient::exec`], a send/decode error or timeout here marks the
     /// stream desynced so the next request fails loud rather than reading this
-    /// exchange's stale frame as its own response.
+    /// exchange's stale frame as its own response — but a file whose encoded frame
+    /// exceeds `MAX_FRAME_BYTES` is rejected by `encode_frame` before the exchange
+    /// starts, so that failure is typed and does **not** desync (m8).
     pub async fn put_file(
         &mut self,
         dst: &str,
@@ -916,15 +1014,16 @@ impl AgentClient {
     ) -> Result<()> {
         self.ensure_synced()?;
         let timeout = timeout.unwrap_or(std::time::Duration::from_secs(10));
+        // Encode + cap-check BEFORE the exchange starts (m8) — a file one byte over the
+        // cap must fail loud and typed, with the stream still usable.
+        let frame = encode_frame(&Message::PutFile {
+            dst: dst.to_string(),
+            bytes: bytes.to_vec(),
+        })?;
+
         let result = tokio::time::timeout(timeout, async {
-            let msg = Message::PutFile {
-                dst: dst.to_string(),
-                bytes: bytes.to_vec(),
-            };
-            let msg_bytes =
-                postcard::to_stdvec(&msg).map_err(|e| RequestFailure::Transport(e.into()))?;
             self.stream
-                .send(::bytes::Bytes::from(msg_bytes))
+                .send(frame)
                 .await
                 .map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
 
@@ -980,17 +1079,18 @@ impl AgentClient {
         ipv4: Option<protocol::Ipv4Reconfig>,
     ) -> Result<ResyncOutcome> {
         self.ensure_synced()?;
+        // Encode + cap-check BEFORE the exchange starts, like the other one-shot
+        // requests (m8), so every host→guest frame is built by the one predicate.
+        let frame = encode_frame(&Message::Resync {
+            unix_secs,
+            unix_nanos,
+            mac,
+            ipv4,
+        })?;
+
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let msg = Message::Resync {
-                unix_secs,
-                unix_nanos,
-                mac,
-                ipv4,
-            };
-            let msg_bytes =
-                postcard::to_stdvec(&msg).map_err(|e| RequestFailure::Transport(e.into()))?;
             self.stream
-                .send(::bytes::Bytes::from(msg_bytes))
+                .send(frame)
                 .await
                 .map_err(|e| RequestFailure::Transport(Error::Io(e)))?;
 
@@ -1055,6 +1155,172 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Binds a mock vsock bridge on `path` and serves every accepted connection with
+    /// `answer`, which receives the freshly accepted stream. The join handle is dropped
+    /// with the runtime at the end of the test.
+    fn spawn_mock_bridge<F, Fut>(path: &std::path::Path, answer: F)
+    where
+        F: Fn(tokio::net::UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind mock bridge");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(answer(stream));
+            }
+        });
+    }
+
+    // Guards m8: an over-cap one-shot request fails loud with the typed cap error
+    // BEFORE anything reaches the wire, and does NOT desync a stream nothing was
+    // written to — the client stays usable, and the guest sees only the in-cap frame.
+    // Inverse (encode inline inside the request closure, no cap check): the codec
+    // refuses the frame as an opaque `Error::Io`, `finish_request` marks the stream
+    // desynced, and the follow-up `put_file` fails with "reconnect required".
+    #[tokio::test]
+    async fn over_cap_one_shot_request_is_typed_and_leaves_the_client_in_sync() {
+        use futures::{SinkExt as _, StreamExt as _};
+
+        let (client_io, server_io) = tokio::net::UnixStream::pair().expect("socketpair");
+        let mut client = AgentClient::from_stream_for_tests(client_io);
+
+        // The guest: read exactly one frame, ack it, and hand the frame back so the
+        // test can prove WHICH request reached the wire.
+        let guest = tokio::spawn(async move {
+            let mut codec = LengthDelimitedCodec::new();
+            codec.set_max_frame_length(MAX_FRAME_BYTES);
+            let mut framed = tokio_util::codec::Framed::new(server_io, codec);
+            let first = framed
+                .next()
+                .await
+                .expect("the guest must receive a frame")
+                .expect("a decodable frame");
+            framed
+                .send(::bytes::Bytes::from(
+                    postcard::to_stdvec(&Message::Exit(0)).expect("encode Exit"),
+                ))
+                .await
+                .expect("ack the put_file");
+            first
+        });
+
+        let err = client
+            .put_file("/over", &vec![0u8; MAX_FRAME_BYTES], None)
+            .await
+            .expect_err("an over-cap put_file must fail loud");
+        assert!(
+            matches!(&err, Error::Agent(m) if m.contains("MAX_FRAME_BYTES")),
+            "expected the typed over-cap error, got {err:?}"
+        );
+
+        // Nothing was written, so the stream is still in sync: the very next request
+        // must go through rather than demanding a reconnect.
+        client
+            .put_file("/small", b"hello", Some(std::time::Duration::from_secs(10)))
+            .await
+            .expect("an over-cap rejection must not desync a byte-clean stream");
+
+        let first = guest.await.expect("guest task");
+        let msg: Message = postcard::from_bytes(&first).expect("decode the guest's frame");
+        assert!(
+            matches!(&msg, Message::PutFile { dst, bytes } if dst == "/small" && bytes == b"hello"),
+            "the over-cap frame must never have reached the wire, got {}",
+            protocol::capped_debug(&msg)
+        );
+    }
+
+    // Guards m10: `connect_framed`'s deadline must bound the whole ATTEMPT, not just the
+    // gaps between attempts. The bridge answers the prologue and then never sends the
+    // `Ready` frame, which used to park the attempt on a hardcoded 2 s read unrelated to
+    // the caller's budget. With a 300 ms budget the call must return a typed Timeout
+    // inside the wall-clock guard.
+    // Inverse (restore `timeout(Duration::from_secs(2), framed.next())` and await
+    // `connect_framed_once` bare): the call returns after ~2 s and the guard reddens.
+    #[tokio::test]
+    async fn connect_framed_deadline_bounds_a_wedged_ready_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("vsock.sock");
+        spawn_mock_bridge(&sock, |mut stream| async move {
+            let _line = read_line(&mut stream).await;
+            if stream.write_all(b"OK 5000\n").await.is_err() {
+                return;
+            }
+            // Accepted, acknowledged — and then silent: no `Ready` frame, ever.
+            std::future::pending::<()>().await;
+        });
+
+        let budget = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let res = AgentClient::connect_framed(
+            &VsockEndpoint::Unix {
+                path: sock,
+                port: 5000,
+            },
+            budget,
+            &crate::config::Timeouts::default(),
+            &crate::vmm::FakeSerialLog { panicked: false },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&res, Err(Error::Timeout(_))),
+            "a bridge that never sends Ready must surface a typed Timeout, got {:?}",
+            res.map(|_| "connected")
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the connect must be bounded by its caller's {budget:?} deadline, took {elapsed:?}"
+        );
+    }
+
+    // The prologue half of m10: a bridge that dribbles one byte just under the per-read
+    // `connect_ok_read` budget never trips that budget, so before the deadline was
+    // propagated the prologue could run `MAX_PROLOGUE_LINE_BYTES` × `connect_ok_read`
+    // (~38 s at the defaults) past the caller's timeout.
+    // Inverse (await `hybrid_connect_prologue` bare inside the attempt): the call runs
+    // for tens of seconds and the wall-clock guard reddens.
+    #[tokio::test]
+    async fn connect_framed_deadline_bounds_a_dribbling_prologue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("vsock.sock");
+        spawn_mock_bridge(&sock, |mut stream| async move {
+            let _line = read_line(&mut stream).await;
+            // One byte per 50 ms — never a newline, and never slow enough to trip the
+            // 150 ms per-read budget.
+            loop {
+                if stream.write_all(b"O").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        let budget = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let res = AgentClient::connect_framed(
+            &VsockEndpoint::Unix {
+                path: sock,
+                port: 5000,
+            },
+            budget,
+            &crate::config::Timeouts::default(),
+            &crate::vmm::FakeSerialLog { panicked: false },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&res, Err(Error::Timeout(_))),
+            "a dribbling bridge must surface a typed Timeout, got {:?}",
+            res.map(|_| "connected")
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the prologue must be bounded by its caller's {budget:?} deadline, took {elapsed:?}"
+        );
     }
 
     // §3.2 (The host side: AgentClient and SessionMux): the extracted prologue is the ONE

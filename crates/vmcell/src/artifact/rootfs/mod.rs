@@ -61,6 +61,10 @@ impl ExtraFile {
 /// covered the moment it is added.
 const VMCELL_TOOLS_DIR: &str = "vmcell-tools";
 
+/// The multicall binary's file name inside [`VMCELL_TOOLS_DIR`] — the target every applet
+/// symlink the manifest emits points at.
+const GUEST_TOOLS_MULTICALL_BIN: &str = "vmcell-guest-tools";
+
 /// Whether `dest` names a path vmcell itself injects and therefore owns (invariant F5).
 ///
 /// The ONE reserved-path list: it is *derived from* `rootfs_injection_manifest` rather than
@@ -434,7 +438,7 @@ pub fn resolve_builder_base(
 /// The ONE inject+pack tail: every rootfs source routes through it (§4.3 obligation 3), so the
 /// `libc6` scan, the `--agent-musl` opt-in, and the downstream `extra` files with their
 /// reserved-path collision guard apply to every source for free. `extra` is validated FIRST —
-/// before any I/O — so a bad dest or mode fails before the CA is written or a byte is packed.
+/// before any I/O — so a bad dest or mode fails before the CA is materialized or a byte is packed.
 ///
 /// # Errors
 /// Returns an error if an `extra` entry is rejected — its `dest` must be an absolute UTF-8
@@ -474,16 +478,19 @@ pub async fn pack_erofs_with_injection(
     // The default (glibc) agent needs libc6 in the base; the static-musl agent does not.
     let require_libc6 = agent_musl.is_none();
 
-    // Generate the proxy CA and actually WRITE it to the path we inject from. Without this
-    // the injected `ca.pem` never exists and the erofs pack aborts (or, by dir coincidence,
-    // bakes in a stale CA from a different directory).
+    // Materialize the deployment CA and inject it from the ONE file `CaManager` publishes —
+    // `<artifacts-dir>/ca.pem`, written under the `.ca.lock` flock as a temp-then-rename.
+    //
+    // This tail used to `std::fs::write` its own copy of the same bytes to
+    // `<out.parent()>/ca.pem`. On the canonical `vmcell build` path that IS the published CA, so
+    // the copy was a bare, unlocked truncate-then-write straight through the publish protocol,
+    // handing a concurrent `CaManager::new()` a window in which the (cert, key) pair reads as
+    // half-present; off that path it injected whatever `ca.pem` happened to sit beside the output.
+    // Naming the published file removes both. `new()` mints the pair when absent, so it exists by
+    // the time we name it — and if it has since been deleted, the injection below fails loud
+    // naming the path instead of baking a stale or foreign CA.
     #[cfg(feature = "proxy")]
-    let ca_path = {
-        let ca_mgr = crate::proxy::tls::CaManager::new()?;
-        let path = out.parent().unwrap_or(Path::new(".")).join("ca.pem");
-        std::fs::write(&path, ca_mgr.ca_cert_pem()).map_err(Error::Io)?;
-        path
-    };
+    let ca_path = crate::proxy::tls::CaManager::new()?.ca_cert_path();
 
     // The guest test-helper (ip/curl/kvm-ok) is baked into the rootfs rather than
     // mounted as a virtio-fs share: virtiofsd cannot enter its sandbox
@@ -500,6 +507,13 @@ pub async fn pack_erofs_with_injection(
         let ca_opt: Option<&Path> = None;
         let (injected_files, injected_symlinks) =
             rootfs_injection_manifest(agent_path.as_path(), ca_opt, tools_path.as_deref());
+        // The manifest's link paths are owned (composed per applet-roster entry); borrow them
+        // back for the packer, whose signature is unchanged. `injected_symlinks` outlives the
+        // call, so the borrows are valid for it.
+        let injected_symlink_refs: Vec<(&str, &str)> = injected_symlinks
+            .iter()
+            .map(|(link, target)| (link.as_str(), *target))
+            .collect();
         // Explicit `Some(mode)`: extra files never inherit the `injected_file_mode` heuristic.
         let extra_files: Vec<InjectFile<'_>> = extra_validated
             .iter()
@@ -512,7 +526,7 @@ pub async fn pack_erofs_with_injection(
             archives,
             extra_files,
             injected_files,
-            injected_symlinks,
+            injected_symlink_refs,
             require_libc6,
         )?;
         std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;
@@ -532,8 +546,13 @@ pub async fn pack_erofs_with_injection(
 #[cfg(feature = "am-fs-erofs")]
 type InjectFile<'a> = crate::artifact::tar2erofs::InjectedFile<'a>;
 /// A `(link_path, symlink_target)` injected into the rootfs.
+///
+/// The link path is owned because the guest-tools links are *composed* per
+/// [`vmcell_protocol::GUEST_TOOLS_APPLETS`] entry rather than written out as literals; the
+/// target is still `'static` (every link points at the one multicall binary). The packer's
+/// `tar_to_erofs` signature is unchanged — the pack tail borrows these back into `&str`.
 #[cfg(feature = "am-fs-erofs")]
-type InjectLink = (&'static str, &'static str);
+type InjectLink = (String, &'static str);
 
 /// The rootfs injection manifest: the single list of `(dest_path, source_path, mode)` files and
 /// `(link, target)` symlinks baked into every rootfs. It is also what
@@ -549,8 +568,13 @@ type InjectLink = (&'static str, &'static str);
 /// installed BOTH at the ca-certificates drop-in AND merged into the `/etc/ssl/certs` bundle the
 /// rustls stack reads at client-build time (gt-curl-truststore): without the bundle, guest-tools
 /// `curl` cannot even build a client, so plain-HTTP egress fails too. `tools` is `Some` when the
-/// GuestToolsStage produced the `ip`/`curl`/`kvm-ok`/`echo-server` multicall; it lands under
-/// `/vmcell-tools` (executable via `injected_file_mode`) with the four names symlinked to it.
+/// GuestToolsStage produced the multicall binary; it lands under `/vmcell-tools` (executable via
+/// `injected_file_mode`) with one symlink per
+/// [`vmcell_protocol::GUEST_TOOLS_APPLETS`] entry pointing at it. Those names are **derived**,
+/// never restated here: design §4.4 requires this manifest and the guest binary's dispatch table
+/// to agree, and while both were literals a one-sided edit stayed green and shipped twice
+/// (docs/81 m22). The guest side is compile-time pinned to the same const, so the drift is now
+/// unrepresentable rather than merely tested for.
 #[cfg(feature = "am-fs-erofs")]
 fn rootfs_injection_manifest<'a>(
     agent: &'a Path,
@@ -567,15 +591,18 @@ fn rootfs_injection_manifest<'a>(
     if let Some(tools) = tools {
         files.push(("vmcell-tools/vmcell-guest-tools", tools, None));
         // busybox-style multicall links resolved on the exec PATH (the guest agent prepends
-        // /vmcell-tools).
-        symlinks.push(("vmcell-tools/ip", "vmcell-guest-tools"));
-        symlinks.push(("vmcell-tools/curl", "vmcell-guest-tools"));
-        symlinks.push(("vmcell-tools/kvm-ok", "vmcell-guest-tools"));
-        // The raw-vsock-dial / segment listener (§3.2, §6.5). Also the one applet
-        // used as a custom `init=` target, which resolves this absolute path before
-        // any agent exists — so the symlink, not just the multicall binary, is what
-        // that boot depends on.
-        symlinks.push(("vmcell-tools/echo-server", "vmcell-guest-tools"));
+        // /vmcell-tools) — ONE per roster entry, derived from the shared const the guest
+        // binary's dispatch table is compile-time pinned to. There is deliberately no name
+        // literal here: `echo-server` (the §3.2 raw-vsock-dial / §6.5 segment listener) is
+        // also the one applet used as a custom `init=` target, which resolves its absolute
+        // path before any agent exists — so a symlink this manifest forgot to emit is a
+        // guest kernel panic, not a missing test helper.
+        for applet in vmcell_protocol::GUEST_TOOLS_APPLETS {
+            symlinks.push((
+                format!("{VMCELL_TOOLS_DIR}/{applet}"),
+                GUEST_TOOLS_MULTICALL_BIN,
+            ));
+        }
     }
     (files, symlinks)
 }
@@ -713,16 +740,30 @@ mod tests {
             "the CA must be merged into the /etc/ssl/certs trust-store bundle"
         );
         assert!(dests.contains(&"usr/local/share/ca-certificates/vmcell-ca.crt"));
-        // The guest-tools multicall + its four exec-PATH names (`echo-server` is the
-        // §3.2 raw-dial / §6.5 segment listener; a live dial gate fails with a
-        // missing /vmcell-tools/echo-server if the symlink is dropped here).
+        // The guest-tools multicall + one exec-PATH symlink per applet. The roster walked
+        // here is `vmcell_protocol::GUEST_TOOLS_APPLETS` — the SAME const the manifest emits
+        // from and the guest binary's dispatch table is compile-time pinned to. It is
+        // deliberately NOT re-typed: a third literal beside the two real ones is precisely
+        // what let a one-sided edit stay green twice (docs/81 m22). This asserts what the
+        // const cannot: that the manifest still emits a link per entry, at the right path,
+        // pointing at the multicall binary — dropping the `for` loop above reddens on the
+        // count, and mis-pathing it reddens on the membership check.
         assert!(dests.contains(&"vmcell-tools/vmcell-guest-tools"));
-        for name in ["ip", "curl", "kvm-ok", "echo-server"] {
-            let link = format!("vmcell-tools/{name}");
+        assert!(
+            !vmcell_protocol::GUEST_TOOLS_APPLETS.is_empty(),
+            "an empty roster would make the loop below vacuous"
+        );
+        assert_eq!(
+            symlinks.len(),
+            vmcell_protocol::GUEST_TOOLS_APPLETS.len(),
+            "the manifest must emit exactly one multicall symlink per applet, no more"
+        );
+        for name in vmcell_protocol::GUEST_TOOLS_APPLETS {
+            let link = format!("{VMCELL_TOOLS_DIR}/{name}");
             assert!(
                 symlinks
                     .iter()
-                    .any(|(l, t)| *l == link && *t == "vmcell-guest-tools"),
+                    .any(|(l, t)| *l == link && *t == GUEST_TOOLS_MULTICALL_BIN),
                 "missing multicall symlink {link}"
             );
         }
@@ -750,7 +791,7 @@ mod tests {
         for dest in files
             .iter()
             .map(|(d, _, _)| *d)
-            .chain(symlinks.iter().map(|(l, _)| *l))
+            .chain(symlinks.iter().map(|(l, _)| l.as_str()))
         {
             assert!(
                 is_reserved_injection_path(dest),
@@ -1117,8 +1158,8 @@ mod tests {
 
     // The extras are validated BEFORE any side effect: this call has no `guest_agent` either,
     // yet the reserved-dest error is what surfaces — proving the check runs ahead of the CA
-    // write and the pack. The buggy order (validate inside/after the blocking pack) reports the
-    // missing-agent error instead, and would already have written the CA to disk.
+    // materialization (which MINTS the pair when it is absent) and the pack. The buggy order
+    // (validate inside/after the blocking pack) reports the missing-agent error instead.
     #[cfg(feature = "am-fs-erofs")]
     #[tokio::test]
     async fn test_pack_erofs_rejects_reserved_extra_dest_before_any_io() {
@@ -1140,9 +1181,71 @@ mod tests {
             msg.contains("vmcell-owned injection path"),
             "the reserved-dest check must run before the missing-agent check, got: {msg}"
         );
+        // Nothing at all may land in the staging dir — asserted over its whole content rather
+        // than over one known filename, so any future side effect ahead of the validation
+        // (not just the output or a CA copy) reddens this.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read the staging dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
         assert!(
-            !out.exists() && !dir.path().join("ca.pem").exists(),
-            "nothing may be written before the extras are validated"
+            leftovers.is_empty(),
+            "nothing may be written before the extras are validated, found {leftovers:?}"
+        );
+    }
+
+    // NET-4: the inject+pack tail must never write the PUBLISHED CA. `<artifacts-dir>/ca.pem` is
+    // published by `CaManager` alone — under the `.ca.lock` flock, temp-then-rename — and this
+    // tail used to `std::fs::write` the same bytes over it with no lock held. Same content, but a
+    // truncate-then-write is a window in which a concurrent `CaManager::new()` reads the
+    // (cert, key) pair as half-present and takes the `partial CA in …` refusal. On the canonical
+    // `vmcell build` path the stage output sits IN the artifacts dir, so the sentinel below stands
+    // exactly where that write landed.
+    //
+    // RED on the inverse (restore `std::fs::write(&path, ca_mgr.ca_cert_pem())` on
+    // `<out.parent()>/ca.pem`): the sentinel comes back as the real PEM. The second half is the
+    // positive control — the CA the manager published is still baked into the image, so "stop
+    // writing it" cannot be satisfied by dropping the injection.
+    #[cfg(all(feature = "am-fs-erofs", feature = "proxy"))]
+    #[tokio::test]
+    async fn pack_tail_never_writes_the_published_ca() {
+        stabilize_ca();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("rootfs.erofs");
+
+        let sentinel = "-----BEGIN CERTIFICATE-----\nsentinel-not-the-published-ca\n";
+        let beside_the_output = dir.path().join("ca.pem");
+        std::fs::write(&beside_the_output, sentinel).expect("seed the sentinel");
+
+        // A static-musl agent: `require_libc6` is then false, so the tail packs with no layers.
+        let musl = dir.path().join("agent-musl");
+        std::fs::write(&musl, b"#!static-agent").expect("write the agent stand-in");
+
+        let inputs = StageInputs::default();
+        pack_erofs_with_injection(vec![], &inputs, &out, Some(&musl), &[])
+            .await
+            .expect("the pack must succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&beside_the_output).expect("read the sentinel back"),
+            sentinel,
+            "the pack tail must not write ca.pem — only CaManager publishes it, under .ca.lock"
+        );
+
+        let pem = crate::proxy::tls::CaManager::new()
+            .expect("the CA must be materialized")
+            .ca_cert_pem()
+            .to_string();
+        let image = std::fs::read(&out).expect("read the packed image");
+        assert!(
+            image.windows(pem.len()).any(|w| w == pem.as_bytes()),
+            "the PUBLISHED CA must still be baked into the image (it is injected from the file \
+             CaManager published, not from a copy this tail wrote)"
         );
     }
 }

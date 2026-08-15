@@ -15,9 +15,24 @@
 /// The default resource-name prefix (`"vmcell"`) — the value hard-coded before this became an option.
 pub const DEFAULT_RESOURCE_PREFIX: &str = "vmcell";
 
-/// The maximum prefix length. Kept short so `<prefix>-net-<vmid>` stays well under the 15-char Linux
-/// network-interface name limit for the derived tap name (`<prefix>-tap-<vmid>` → the tap is what has
-/// the `IFNAMSIZ` limit; a long prefix would make the tap name invalid).
+/// The longest **network-interface** name the Linux kernel accepts: `IFNAMSIZ - 1`, because
+/// `ifreq.ifr_name` is an `IFNAMSIZ`-byte array that must still hold the NUL terminator.
+///
+/// An over-long name is not rejected, it is **silently truncated** — `tun-tap`'s shim does
+/// `strncpy(ifr.ifr_name, name, IFNAMSIZ - 1)` — so the tap comes up under a name nobody composed
+/// and the failure surfaces one step later, at the `rtnetlink` index lookup, far from the composer
+/// that overflowed. `libc::IFNAMSIZ` cannot be named here: `libc` is an optional dependency
+/// (`host-common`) while this module compiles in every feature configuration, so the value is
+/// restated and the `interface_names_fit_ifnamsiz` unit test pins the copy against the real ABI.
+const MAX_INTERFACE_NAME_LEN: usize = 15;
+
+/// The maximum prefix length. Bounded by the **longest** composed interface name,
+/// `<prefix>-tap-<vmid>` ([`tap_name`]): at the highest vmid the addressing math admits (254, three
+/// digits) that is `prefix + 8` bytes, and it must fit `MAX_INTERFACE_NAME_LEN` — so 6 lands on 14,
+/// one byte inside the limit. The segment bridge (`<prefix>-br-<segid>`, [`segment_bridge_name`]) is
+/// shorter and rides the same budget; the netns, cgroup-slice and scratch-dir names carry no such
+/// limit. `interface_names_fit_ifnamsiz` is the gate that measures both interface classes at this
+/// prefix length and the highest id.
 pub const MAX_RESOURCE_PREFIX_LEN: usize = 6;
 
 /// Validates a resource prefix: non-empty, ≤ [`MAX_RESOURCE_PREFIX_LEN`], and only
@@ -35,7 +50,7 @@ pub fn validate_resource_prefix(prefix: &str) -> Result<(), String> {
     if prefix.len() > MAX_RESOURCE_PREFIX_LEN {
         return Err(format!(
             "resource prefix {prefix:?} is longer than {MAX_RESOURCE_PREFIX_LEN} bytes (keeps the \
-             derived tap name under the 15-char interface-name limit)"
+             derived tap name inside the {MAX_INTERFACE_NAME_LEN}-char interface-name limit)"
         ));
     }
     if let Some(bad) = prefix.bytes().find(|b| !b.is_ascii_alphanumeric()) {
@@ -60,10 +75,19 @@ pub fn tap_name(prefix: &str, vmid: u32) -> String {
 
 /// The cgroup slice **leaf** name for `vmid`: `<prefix>-vm-<vmid>` (an ancestor path may be prepended
 /// by the caller for sibling placement, §13, Cross-cutting invariants).
+///
+/// Callers that want the path the orchestrator actually creates — leaf **plus** sibling placement —
+/// want `vm_slice_name` (re-exported below on the `host-common` feature), not this leaf on its own.
 #[must_use]
 pub fn cgroup_slice_name(prefix: &str, vmid: u32) -> String {
     format!("{prefix}-vm-{vmid}")
 }
+
+/// The **full** cgroup slice name the orchestrator creates for a VM — the [`cgroup_slice_name`] leaf
+/// plus §13 sibling placement — re-exported here beside the composers it belongs with so a consumer
+/// reading a VM's cgroup files never hand-formats the path. See [`crate::metrics::vm_slice_name`].
+#[cfg(feature = "host-common")]
+pub use crate::metrics::vm_slice_name;
 
 /// The per-VM scratch-directory name: `<prefix>-vm-<pid>-<vmid>` (both ids so two processes' VMs never
 /// collide, §13, Cross-cutting invariants).
@@ -81,8 +105,10 @@ pub fn segment_netns_name(prefix: &str, segid: u32) -> String {
 }
 
 /// The segment **bridge** interface name for `segid`: `<prefix>-br-<segid>` (§6.5, VM-to-VM
-/// segments). The short `-br-` stem keeps the name inside `IFNAMSIZ` (≤ 6 + 4 + 3 = 13 < 15) for
-/// the longest legal prefix and segid.
+/// segments). The short `-br-` stem keeps it well inside `MAX_INTERFACE_NAME_LEN` — shorter than
+/// the tap, which is the class that sets the [`MAX_RESOURCE_PREFIX_LEN`] budget. The figure is not
+/// restated here: `interface_names_fit_ifnamsiz` measures this name at the longest legal prefix and
+/// the highest segid, so the budget is checked rather than remembered.
 #[must_use]
 pub fn segment_bridge_name(prefix: &str, segid: u32) -> String {
     format!("{prefix}-br-{segid}")
@@ -168,11 +194,63 @@ mod tests {
                 !netns_name(prefix, vmid).starts_with(&segment_netns_sweep_prefix(prefix)),
                 "a per-VM netns must not be swept against live segids for prefix {prefix:?}"
             );
-            // The bridge lives inside the segment netns and dies with it, so it has no sweep
-            // filter — but its name must still stay inside IFNAMSIZ (15) for the longest prefix.
+            // (The bridge lives inside the segment netns and dies with it, so it has no sweep
+            // filter. Its IFNAMSIZ budget — and the tap's, which is longer — is measured by
+            // `interface_names_fit_ifnamsiz`, the one place that owns that law.)
+        }
+    }
+
+    // The IFNAMSIZ budget, in ONE place, for EVERY composed interface-name class, at the worst
+    // case the accepted-input validators admit: the longest legal prefix and the highest id.
+    //
+    // The defect this closes: the only length assertion this module had measured the *shorter*
+    // segment bridge name (`<prefix>-br-<segid>`). `tap_name` — the longest interface name, and the
+    // whole reason `MAX_RESOURCE_PREFIX_LEN` exists — was never measured, so a stem rename or a
+    // prefix-budget bump stayed green through the entire KVM-free suite and surfaced as a
+    // truncated-and-then-not-found tap at rtnetlink, on a privileged host, at boot.
+    #[test]
+    fn interface_names_fit_ifnamsiz() {
+        // The ABI pin. `MAX_INTERFACE_NAME_LEN` is a deliberate second copy of a kernel constant
+        // (the module compiles without `libc`, which is optional); a deliberate copy is GUARDED,
+        // never trusted. `libc` is an unconditional dev-dependency, so this runs in every feature
+        // configuration the unit tests are built in.
+        assert_eq!(
+            MAX_INTERFACE_NAME_LEN,
+            libc::IFNAMSIZ - 1,
+            "MAX_INTERFACE_NAME_LEN must be IFNAMSIZ minus the NUL terminator ifr_name must hold"
+        );
+
+        // The widest id either interface class can embed. `net::MAX_SEGMENT_ID` documents itself as
+        // "the highest segment id (and the highest vmid) the addressing math can carry", so it is
+        // the one law for both classes; it lives behind `host-common`, hence the mirror plus the
+        // equality assert wherever both are compiled.
+        let max_id: u32 = 254;
+        #[cfg(feature = "host-common")]
+        assert_eq!(
+            max_id,
+            crate::net::MAX_SEGMENT_ID,
+            "the id ceiling this budget assumes must be the addressing math's own ceiling"
+        );
+
+        // The longest prefix `validate_resource_prefix` accepts — asserted accepted, so this is the
+        // real worst case and not a hypothetical one.
+        let longest = "z".repeat(MAX_RESOURCE_PREFIX_LEN);
+        assert!(
+            validate_resource_prefix(&longest).is_ok(),
+            "a prefix of exactly MAX_RESOURCE_PREFIX_LEN bytes must be accepted"
+        );
+
+        // Every composed name that becomes a network interface. A new interface composer added to
+        // this module belongs in this list — nothing else in the KVM-free suite measures it.
+        for (class, name) in [
+            ("tap", tap_name(&longest, max_id)),
+            ("segment bridge", segment_bridge_name(&longest, max_id)),
+        ] {
             assert!(
-                segment_bridge_name(prefix, 254).len() < 15,
-                "segment bridge name must stay under IFNAMSIZ for prefix {prefix:?}"
+                name.len() <= MAX_INTERFACE_NAME_LEN,
+                "{class} name {name:?} is {} bytes; the kernel silently truncates anything over \
+                 {MAX_INTERFACE_NAME_LEN}, so this must be caught here and not at rtnetlink",
+                name.len()
             );
         }
     }

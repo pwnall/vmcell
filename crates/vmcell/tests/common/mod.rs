@@ -15,17 +15,13 @@ pub use vmcell_artifact_validator::harness::{
 
 /// Recomputes the cgroup-v2 slice name the orchestrator assigns to a VM, so a residue check can
 /// target the *actual* (possibly systemd-/runner-nested) path. Test-only (residue tooling).
+///
+/// F2 / d3: the whole composition — leaf **and** sibling placement — is delegated to
+/// `vmcell::naming::vm_slice_name`, the one law. This helper used to re-type the `{base}/{leaf}`
+/// join, which made it a second copy of the very rule the residue checks exist to catch drift in;
+/// the law is now `pub`, so there is nothing left to copy.
 pub fn computed_cgroup_name(vmid: u32) -> String {
-    // F2: the leaf is recomputed through `vmcell::naming`, never a test-local `format!` — this
-    // helper is consumed by residue checks that exist to catch a naming change, and a second copy
-    // of the composer would keep passing through exactly the drift it is meant to catch.
-    let leaf = vmcell::naming::cgroup_slice_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, vmid);
-    if let Ok(cgroup_str) = std::fs::read_to_string("/proc/self/cgroup")
-        && let Some(base) = vmcell::metrics::cgroup_base_from_proc(&cgroup_str)
-    {
-        return format!("{base}/{leaf}");
-    }
-    leaf
+    vmcell::naming::vm_slice_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, vmid)
 }
 
 /// The environment variable that keeps a [`TempTree`] on disk for post-mortem inspection.

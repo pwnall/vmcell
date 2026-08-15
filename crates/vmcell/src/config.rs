@@ -459,6 +459,10 @@ pub(crate) const DEFAULT_INIT: &str = "/usr/sbin/vmcell-guest-agent";
 /// Aliases are therefore listed by hand and guarded by their own negative test
 /// (`reserved_cmdline_keys_cover_owned_token_aliases`) — adding a boot token whose kernel
 /// semantics have an alias means adding the alias here too (finding `f3-alias-clobber-gap`).
+///
+/// Spelling here is free: [`is_reserved_cmdline_arg`] normalizes `-` to `_` on **both**
+/// sides before comparing, exactly as the kernel's own parser does, so an entry written
+/// `kvm-intel.nested` also reserves `kvm_intel.nested` and vice versa.
 const RESERVED_CMDLINE_KEYS: &[&str] = &[
     "console",
     "loglevel",
@@ -496,11 +500,31 @@ const RESERVED_CMDLINE_KEYS: &[&str] = &[
 /// [`RESERVED_CMDLINE_KEYS`] or starts with `vmcell_` (every guest-agent-trusted
 /// token, §5.3, The kernel command line). The single predicate behind the append-only contract (§5.3, The kernel command line); the
 /// key is the text before the first `=` (or the whole bare token).
+///
+/// The comparison is **dash/underscore-insensitive**, because the kernel's own parser is:
+/// `kernel/params.c`'s `dash2underscore` folds `-` to `_` inside a parameter name for every
+/// `parameq`/`parameqn` comparison — which is the only reason the `kvm-intel.nested=0` token
+/// vmcell emits reaches a module parameter registered as `kvm_intel.nested` at all. A
+/// byte-exact membership test therefore admitted the *respelling* of every reserved key
+/// (`kvm_intel.nested=1`, `random.trust-cpu=off`, `ignore-loglevel`); caller args are
+/// appended **last**, and the kernel applies duplicates in order, so the respelling silently
+/// overrode the token vmcell owns (finding `m1`). Normalizing lives here, in the one
+/// predicate, so every call site — and every future one — inherits it.
 pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
-    let key = arg.split('=').next().unwrap_or(arg);
+    let key = normalize_cmdline_key(arg.split('=').next().unwrap_or(arg));
     // The guest agent trusts every `vmcell_*` token (shares, accept/rebind cadence);
     // a caller arg spoofing one would mis-mount a share or busy-spin PID 1.
-    key.starts_with("vmcell_") || RESERVED_CMDLINE_KEYS.contains(&key)
+    key.starts_with("vmcell_")
+        || RESERVED_CMDLINE_KEYS
+            .iter()
+            .any(|reserved| normalize_cmdline_key(reserved) == key)
+}
+
+/// Folds a kernel-cmdline parameter name to the spelling the kernel compares on
+/// (`kernel/params.c`'s `dash2underscore`). Private to [`is_reserved_cmdline_arg`]'s law so
+/// there is exactly one normalizer.
+fn normalize_cmdline_key(key: &str) -> String {
+    key.replace('-', "_")
 }
 
 /// Appends the validated append-only caller args to `cmdline`, one whitespace-
@@ -1006,6 +1030,12 @@ pub enum NetConfig {
         /// Egress proxy configuration.
         egress: Egress,
         /// Optional port for host services accessible from the guest.
+        ///
+        /// Rejected by [`VmConfigBuilder::build`] when `egress` is [`Egress::Blocked`]: that
+        /// variant refuses the outbound dial this port is reached by, so the pair cannot be
+        /// honored (F1). It stays a field here rather than moving onto the `Egress` variants
+        /// because `Egress` is public, `#[non_exhaustive]` and shared with the privileged arm —
+        /// see the at-site rationale in `build()`.
         host_services_port: Option<u16>,
     },
     /// Shared L2 **segment** membership: the VM's tap lives in the segment's namespace, enslaved to
@@ -1070,12 +1100,35 @@ pub(crate) fn assert_tap_wiring_matches(
 }
 
 /// Egress filtering strategy for outbound network traffic.
+///
+/// The three variants are ordered from most to least mediated, and **each one is honored on
+/// both networking arms** — the privileged (netns + nft) arm and the unprivileged (smoltcp
+/// NAT) arm. That was not always true: `Blocked` used to share `Open`'s empty else-path in
+/// `setup_env`, so it installed no ruleset at all and was in fact *more* permissive than
+/// `Filtered` (finding `M1`). Both arms now match this enum exhaustively, so a new variant is
+/// a compile error rather than a silent fall-through into the most permissive behavior.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Egress {
     /// Traffic is transparently routed through a proxy.
+    ///
+    /// Privileged: an nft ruleset with `policy drop` that admits only tcp/80,443 (redirected
+    /// by TPROXY into the per-VM proxy) and the gateway's proxy port. Unprivileged: the proxy
+    /// port is registered as a permanent NAT forward so a guest configured with
+    /// `http_proxy=<gateway>:<port>` reaches it.
     Filtered(ProxyConfig),
     /// All egress traffic is blocked.
+    ///
+    /// Privileged: an accepts-nothing nft ruleset — `render_tproxy_rules`' shape minus both
+    /// accept rules, and no TPROXY routing (there is no proxy to route to), so the per-VM
+    /// netns drops everything including the §6.3 host-endpoint mechanism that `Open` leaves
+    /// reachable. Unprivileged: no forward port is registered at all — neither a proxy port
+    /// nor `host_services_port` — and the NAT refuses to open outbound host connections on
+    /// the guest's behalf.
+    ///
+    /// Because there is no way to honor a `host_services_port` under this variant,
+    /// [`VmConfigBuilder::build`] **rejects** the pair rather than accepting a port it would
+    /// silently ignore (F1).
     Blocked,
     /// No egress **interception** is configured (no proxy is started).
     ///
@@ -1415,7 +1468,10 @@ impl VmConfigBuilder {
     /// - a [`UsbHostDevice`] with a zero vendor or product ID (QEMU reads a zero as
     ///   *unset* — match-any — not as a literal ID), two USB devices naming the same
     ///   `(vendor_id, product_id)` pair, or any USB device combined with
-    ///   `snapshotting` (a passed-through host device is not migratable, §2.4, QEMU q35 — the fallback and most-proven nester).
+    ///   `snapshotting` (a passed-through host device is not migratable, §2.4, QEMU q35 — the fallback and most-proven nester);
+    /// - [`Egress::Blocked`] combined with a `host_services_port` — the port names a host
+    ///   endpoint the guest dials *out* to, which `Blocked` refuses, so honoring both is
+    ///   impossible and the port would be silently unused (F1).
     ///
     /// This validates internal consistency only; it does **not** check that the
     /// kernel, rootfs, or share paths exist on disk.
@@ -1583,6 +1639,34 @@ impl VmConfigBuilder {
         // (Design §18, Delta register — delta 4: `host_services_port` now lives only on
         // `NetConfig::Unprivileged`, so a privileged config carrying it is unrepresentable — the
         // former accept-then-reject at this boundary is gone.)
+
+        // F1, the residual half of finding `M1`: `Egress::Blocked` together with a
+        // `host_services_port` is a contradiction, and it was being ACCEPTED with the port
+        // silently unused. The port names a host endpoint the guest dials **out** to, which is
+        // precisely what `Blocked` promises to refuse, so `nat_egress_plan` registers no forward
+        // for it — a caller who asked for both got neither an endpoint nor a diagnostic. Every
+        // accepted input is honored or rejected at construction; this one is rejected, naming
+        // both fields.
+        //
+        // Why not make it unrepresentable (the stronger move delta 4 made for the privileged
+        // arm): the port would have to migrate onto the egress variants
+        // (`Open { host_services_port } | Filtered { proxy, host_services_port }`), and `Egress`
+        // is public, `#[non_exhaustive]`, shared by BOTH datapath arms, and matched in the CLI,
+        // the daemon DTOs, the bench harness and the example workspace — none of which have a
+        // port to give. That is a contract break across the whole consumer surface to encode one
+        // pair, so the boundary check is the deliberate trade; see implementation-notes.
+        if let NetConfig::Unprivileged {
+            egress: Egress::Blocked,
+            host_services_port: Some(port),
+        } = &self.net
+        {
+            return Err(crate::error::Error::Config(format!(
+                "host_services_port = {port} cannot be combined with egress = Blocked: \
+                 `Egress::Blocked` blocks all egress, and a host services port is a host \
+                 endpoint the guest dials out to, so the port would be silently unused. Use \
+                 `Egress::Open` (or `Egress::Filtered`) to reach it, or drop the port."
+            )));
+        }
 
         let mut tags = std::collections::HashSet::new();
         let mut guest_paths = std::collections::HashSet::new();
@@ -2024,6 +2108,47 @@ mod tests {
         })
         .build()
         .expect("unprivileged host_services_port is supported");
+    }
+
+    // F1 (residual half of `M1`): `Egress::Blocked` + `host_services_port` is an invalid state
+    // the type permits, and it used to build — the port was then silently unused, because
+    // `nat_egress_plan` registers no forward under `Blocked`. An accepted input that no datapath
+    // reads is the defect class M1 records, so it is refused at construction, naming BOTH fields
+    // so the caller knows which one to drop.
+    //
+    // Buggy impl this guards: a `build()` that accepts the pair (i.e. deleting the check), and
+    // — via the positive controls — one that over-rejects by refusing the port outright or
+    // refusing `Blocked` itself.
+    #[test]
+    fn blocked_egress_with_a_host_services_port_is_refused() {
+        let mk = |egress: Egress, port: Option<u16>| {
+            VmConfig::builder(
+                PathBuf::from("/vmlinux"),
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/rootfs.erofs"),
+                },
+            )
+            .net(NetConfig::Unprivileged {
+                egress,
+                host_services_port: port,
+            })
+            .build()
+        };
+
+        let err = mk(Egress::Blocked, Some(8080))
+            .expect_err("`Blocked` + host_services_port must be refused, not silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("host_services_port") && msg.contains("Blocked"),
+            "the refusal must name BOTH fields so the caller knows what to change: {msg}"
+        );
+
+        // Positive controls: the port is honored on both variants that can reach it, and
+        // `Blocked` on its own is a perfectly valid config.
+        mk(Egress::Open, Some(8080)).expect("`Open` + host_services_port is the reachable pair");
+        mk(Egress::Filtered(ProxyConfig::default()), Some(8080))
+            .expect("`Filtered` + host_services_port is the reachable pair");
+        mk(Egress::Blocked, None).expect("`Blocked` with no port is valid");
     }
 
     // L-ORCH-7: an empty or relative `host_path` is a boundary config error, not a
@@ -3408,6 +3533,72 @@ mod tests {
         .expect("an append-only arg that is not an owned-token alias must build");
         let c = build_kernel_cmdline(&cfg, &test_res(4), "").unwrap();
         assert!(c.ends_with(" quiet_boot=1 rwsem.debug=0"), "{c}");
+    }
+
+    // Finding `m1`: F3's alias law is spelled in terms of KEYS, and the kernel's own parser
+    // folds `-` to `_` inside a parameter name (`kernel/params.c`'s `dash2underscore`, applied
+    // by `parameq`/`parameqn`) — which is precisely why the `kvm-intel.nested=0` vmcell emits
+    // binds a module parameter registered as `kvm_intel.nested`. A byte-exact membership test
+    // therefore let the RESPELLING of every reserved key through (`kvm_intel.nested=1`,
+    // `random.trust-cpu=off`, `ignore-loglevel`), and since caller args are appended LAST and
+    // the kernel applies duplicates in order, the respelling overrode vmcell's own token.
+    //
+    // This iterates `RESERVED_CMDLINE_KEYS` itself rather than a hand-typed list, so a key
+    // added to the const is covered in both spellings the day it lands. Buggy impl this
+    // guards: `RESERVED_CMDLINE_KEYS.contains(&key)` on the raw key.
+    #[test]
+    fn reserved_cmdline_keys_are_refused_in_both_dash_and_underscore_spellings() {
+        for reserved in RESERVED_CMDLINE_KEYS {
+            for spelling in [reserved.replace('-', "_"), reserved.replace('_', "-")] {
+                assert!(
+                    is_reserved_cmdline_arg(&spelling),
+                    "{spelling:?} is the kernel's own respelling of the reserved key \
+                     {reserved:?} and must be refused"
+                );
+                assert!(
+                    is_reserved_cmdline_arg(&format!("{spelling}=1")),
+                    "{spelling:?}=1 must be refused: it overrides the owned {reserved:?} token"
+                );
+                // …and the boundary must actually refuse it, not just the predicate.
+                let err = VmConfig::builder(
+                    PathBuf::from("/vmlinux"),
+                    RootfsSource::Block {
+                        image: PathBuf::from("/rootfs.img"),
+                        overlay: None,
+                    },
+                )
+                .with_kernel_arg(format!("{spelling}=1"))
+                .build()
+                .unwrap_err();
+                assert!(
+                    matches!(err, crate::error::Error::Config(_))
+                        && err
+                            .to_string()
+                            .contains("collides with a boot token vmcell owns"),
+                    "extra arg {spelling:?}=1 must be rejected at the boundary: {err}"
+                );
+            }
+        }
+        // The `vmcell_*` prefix is guest-agent-trusted and normalizes identically.
+        assert!(
+            is_reserved_cmdline_arg("vmcell-share=x:/x:rw"),
+            "the dash respelling of a vmcell_ token is trusted by the guest agent too"
+        );
+        // Positive control (over-rejection inverse): keys that are NOT reserved stay
+        // acceptable in both spellings — normalization must not swallow the whole namespace.
+        for allowed in [
+            "mitigations=off",
+            "systemd.unit=rescue.target",
+            "foo-bar.baz=1",
+            "foo_bar.baz=1",
+            "quiet_boot=1",
+            "quiet-boot=1",
+        ] {
+            assert!(
+                !is_reserved_cmdline_arg(allowed),
+                "{allowed:?} collides with no owned token and must stay append-able"
+            );
+        }
     }
 
     // §5.3 (The kernel command line): build() rejects an extra arg that clobbers a reserved token, spoofs a

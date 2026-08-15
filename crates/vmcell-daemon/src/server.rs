@@ -14,13 +14,13 @@ use crate::dto::{
     ResourceUsageDto, SnapshotInfo, SnapshotRequest, VmId, VmInfo,
 };
 use crate::error::{DaemonError, DaemonResult};
-use crate::openapi::openapi_document;
+use crate::openapi::{API_ROUTES, RouteDef, openapi_document};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::{MethodRouter, any, delete, get, post, put};
 use axum::{Json, Router};
 use std::sync::Arc;
 
@@ -45,31 +45,72 @@ pub struct AppState {
     pub max_artifact_bytes: usize,
 }
 
-/// Builds the full router: the authenticated routes behind the bearer layer, plus the two open
-/// meta routes. The routes mounted here are exactly [`crate::openapi::API_ROUTES`] (invariant §13, Cross-cutting invariants).
+/// The handler for one [`RouteDef`], or `None` when the table names a route this module does not
+/// implement.
+///
+/// The one place a `(method, path)` pair from [`API_ROUTES`] becomes a handler. Because
+/// [`build_router`] *folds over the table* rather than hand-listing routes, the mounted surface and
+/// the served OpenAPI document are the same list **by construction** — the P5 parity claim used to
+/// be a comment, and a route added to `build_router` alone was mounted, undocumented, and green
+/// (finding `router-and-openapi-parity-compares-the-table-to-itself`).
+fn method_router_for(route: &RouteDef) -> Option<MethodRouter<AppState>> {
+    Some(match (route.method, route.path) {
+        ("PUT", "/v1/artifacts/{name}") => put(create_artifact),
+        ("GET", "/v1/artifacts") => get(list_artifacts),
+        ("GET", "/v1/artifacts/{name}") => get(get_artifact),
+        ("DELETE", "/v1/artifacts/{name}") => delete(delete_artifact),
+        ("POST", "/v1/vms") => post(create_vm),
+        ("GET", "/v1/vms") => get(list_vms),
+        ("GET", "/v1/vms/{id}") => get(get_vm),
+        ("DELETE", "/v1/vms/{id}") => delete(destroy_vm),
+        ("POST", "/v1/vms/{id}/exec") => post(exec_vm),
+        ("GET", "/v1/vms/{id}/stats") => get(stats_vm),
+        ("POST", "/v1/vms/{id}/snapshot") => post(snapshot_vm),
+        ("GET", "/healthz") => get(health),
+        ("GET", "/openapi.json") => get(openapi_handler),
+        _ => return None,
+    })
+}
+
+/// The loud placeholder for a table row with no handler: a 500 that names the row. A daemon must
+/// not panic while building its router, and `every_api_route_has_a_handler` reddens in CI long
+/// before such a row could ship.
+fn unwired(route: &RouteDef) -> MethodRouter<AppState> {
+    let (method, path) = (route.method, route.path);
+    any(move || async move {
+        DaemonError::Internal(format!(
+            "{method} {path} is listed in API_ROUTES but no handler is wired for it"
+        ))
+    })
+}
+
+/// Builds the full router by **folding over [`API_ROUTES`]**: each row is mounted with its own
+/// method and path, into the authenticated subtree (behind the bearer layer) or the open one, as
+/// the row's `authenticated` flag says. The mounted surface is therefore exactly the table the
+/// OpenAPI document is generated from (invariant §13, Cross-cutting invariants) — structurally, not
+/// by assertion.
 pub fn build_router(state: AppState) -> Router {
     let max_body = state.max_artifact_bytes;
-    let protected = Router::new()
-        .route("/v1/artifacts", get(list_artifacts))
-        .route(
-            "/v1/artifacts/{name}",
-            put(create_artifact).get(get_artifact).delete(delete_artifact),
-        )
-        .route("/v1/vms", post(create_vm).get(list_vms))
-        .route("/v1/vms/{id}", get(get_vm).delete(destroy_vm))
-        .route("/v1/vms/{id}/exec", post(exec_vm))
-        .route("/v1/vms/{id}/stats", get(stats_vm))
-        .route("/v1/vms/{id}/snapshot", post(snapshot_vm))
-        // Auth is a route-layer over exactly these routes — the open routes below are NOT wrapped
-        // (invariant §13, Cross-cutting invariants: authenticated by default, two named opt-outs).
+    let (protected, open) = API_ROUTES.iter().fold(
+        (Router::new(), Router::new()),
+        |(protected, open), route| {
+            let handler = method_router_for(route).unwrap_or_else(|| unwired(route));
+            if route.authenticated {
+                (protected.route(route.path, handler), open)
+            } else {
+                (protected, open.route(route.path, handler))
+            }
+        },
+    );
+
+    let protected = protected
+        // Auth is a route-layer over exactly the authenticated rows — the open subtree is NOT
+        // wrapped (invariant §13, Cross-cutting invariants: authenticated by default, two named
+        // opt-outs, and the row's own flag decides which subtree it landed in).
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))
         // Raise the body limit so a multi-MB kernel/rootfs upload is accepted; the store enforces the
         // real per-artifact cap. Applied only to the protected (upload-bearing) subtree.
         .layer(DefaultBodyLimit::max(max_body));
-
-    let open = Router::new()
-        .route("/healthz", get(health))
-        .route("/openapi.json", get(openapi_handler));
 
     protected.merge(open).with_state(state)
 }
@@ -396,6 +437,107 @@ mod tests {
         assert_eq!(
             status_of("/v1/nonsense", Some("Bearer secret")).await,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Substitutes a probe value for every `{param}` segment, so a table path becomes a request URI.
+    fn concrete_path(path: &str) -> String {
+        path.split('/')
+            .map(|seg| if seg.starts_with('{') { "probe" } else { seg })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    async fn status_for(app: &Router, method: &str, uri: &str, auth: Option<&str>) -> StatusCode {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(a) = auth {
+            b = b.header(header::AUTHORIZATION, a);
+        }
+        let req = b.body(Body::empty()).expect("request");
+        app.clone().oneshot(req).await.expect("response").status()
+    }
+
+    // P5, router side (finding `router-and-openapi-parity-compares-the-table-to-itself`): EVERY row
+    // of `API_ROUTES` is mounted with its own method and path, in the subtree its `authenticated`
+    // flag names. An unmounted row answers 404; a row that landed in the open subtree by mistake
+    // answers 200 without a token. The whole authenticated set is exercised here — before this, ten
+    // of the eleven had no router-side auth coverage at all. RED on the inverse: drop a row's
+    // handler (404), or flip a row to `authenticated: false` (200 instead of 401).
+    #[tokio::test]
+    async fn every_api_route_is_mounted_in_the_subtree_its_flag_names() {
+        let app = app();
+        for route in API_ROUTES {
+            let uri = concrete_path(route.path);
+            let no_token = status_for(&app, route.method, &uri, None).await;
+            assert_ne!(
+                no_token,
+                StatusCode::NOT_FOUND,
+                "{} {} is in API_ROUTES but is not mounted",
+                route.method,
+                route.path
+            );
+            if route.authenticated {
+                assert_eq!(
+                    no_token,
+                    StatusCode::UNAUTHORIZED,
+                    "{} {} must be behind the bearer layer",
+                    route.method,
+                    route.path
+                );
+                assert_eq!(
+                    status_for(&app, route.method, &uri, Some("Bearer wrong")).await,
+                    StatusCode::FORBIDDEN,
+                    "{} {} must reject a wrong key",
+                    route.method,
+                    route.path
+                );
+            } else {
+                assert_eq!(
+                    no_token,
+                    StatusCode::OK,
+                    "{} {} is an open route and must serve without a token",
+                    route.method,
+                    route.path
+                );
+            }
+        }
+    }
+
+    // Every row of the table names a real handler. RED on the inverse: add a row to `API_ROUTES`
+    // without wiring it — the router would mount `unwired`'s loud 500 instead of a handler.
+    #[test]
+    fn every_api_route_has_a_handler() {
+        for route in API_ROUTES {
+            assert!(
+                method_router_for(route).is_some(),
+                "{} {} has no handler in `method_router_for`",
+                route.method,
+                route.path
+            );
+        }
+    }
+
+    // The structural half of P5: the router is a FOLD over the table and mounts nothing else, so a
+    // route cannot be added here alone (the exact drift the old prose claim could not catch). Two
+    // mount sites, one per subtree, both inside the fold. RED on the inverse: hand-add any
+    // `.route(...)` call to the production half and the count goes to three.
+    #[test]
+    fn the_router_is_a_fold_over_the_route_table_and_mounts_nothing_else() {
+        let src = include_str!("server.rs");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production half of this file");
+        assert!(
+            prod.contains("API_ROUTES.iter().fold("),
+            "build_router must be generated FROM the route table"
+        );
+        assert_eq!(
+            prod.matches(".route(").count(),
+            2,
+            "exactly two mount sites — the protected and open arms of the fold — may exist; a \
+             hand-written route would be mounted without a table row (and so without an OpenAPI \
+             operation and possibly without auth)"
         );
     }
 }

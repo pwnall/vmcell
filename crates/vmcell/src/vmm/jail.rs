@@ -59,12 +59,15 @@ pub const DENIED_SYSCALLS: &[(&str, i64)] = &[
     ("request_key", libc::SYS_request_key),
     ("setns", libc::SYS_setns),
     ("unshare", libc::SYS_unshare),
-    // Deliberate additions BEYOND the §12.3 roster, kept (docs/78 M15) because they are
-    // dangerous-and-never-needed by a booting VMM in exactly the sense the roster entries are:
-    // `reboot` reboots/halts the HOST (a guest reboot is a VMM-internal transition, not this
-    // syscall), and `swapon`/`swapoff` reconfigure host swap. Recorded as a justified deviation
-    // in docs/implementation-notes.md; the design folds them into the roster at the next
-    // revision. Do not drop them to "match the doc" — widen the doc.
+    // Part of the §12.3 roster since design v31, which folded in what had been a recorded
+    // deviation (docs/78 M15): they are dangerous-and-never-needed by a booting VMM in exactly
+    // the sense the other entries are — `reboot` reboots/halts the HOST (a guest reboot is a
+    // VMM-internal transition, not this syscall), and `swapon`/`swapoff` reconfigure host swap.
+    // This const and the §12.3 table match name-for-name in both directions, and
+    // `deny_list_is_exactly_the_documented_set_and_compiles` proves it by PARSING that table out
+    // of the current design document at run time — not by comparing this const to a second
+    // hand-transcribed list, which would prove only that the transcription was copied correctly.
+    // Do not drop them to "match the doc" — the doc already carries them.
     ("reboot", libc::SYS_reboot),
     ("swapon", libc::SYS_swapon),
     ("swapoff", libc::SYS_swapoff),
@@ -285,55 +288,278 @@ pub fn apply_jail(spec: &JailSpec) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
-    // Guards §13 (Cross-cutting invariants) / §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): the shipped deny-list is EXACTLY the documented set, and compiles
-    // to a non-empty BPF program. Pinned as an exact membership so the filter cannot silently
-    // drift from design §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)) in either direction — dropping a syscall (e.g. `kexec_file_load`,
-    // the file-based kexec variant that stays reachable if only `kexec_load` is blocked) OR
-    // adding an undocumented one reddens here. The expected set is the §12.3 roster VERBATIM
-    // plus the three recorded carry-overs (`reboot`/`swapon`/`swapoff`, see the at-site
-    // rationale on the const and docs/implementation-notes.md) — this test pinned a copy that
-    // had silently DROPPED `process_vm_readv` (docs/78 M15), which is why the expected list is
-    // written out here from the design text rather than derived from the const. The behavioral
-    // "mount → EPERM" proof is the KVM-free stand-in integration test (tests/jail_hardening.rs).
+    // ---- the §12.3 roster gate ------------------------------------------------------------
+    //
+    // The design's §12.3 table and [`DENIED_SYSCALLS`] are two copies of one roster, and the
+    // doc's own text says the table "is checked against it, in both directions". The previous
+    // version of this gate compared the const to a THIRD copy — a 21-name literal transcribed
+    // into the test body — so it proved `const == transcription` and would have stayed green if
+    // §12.3 changed. It also could not see the drift it was written for: the const had silently
+    // dropped `process_vm_readv` while the design carried it (docs/78 M15).
+    //
+    // So the expected set is now PARSED OUT OF THE DESIGN at run time. The document is found by
+    // its **§12.3 heading**, never by filename: the design is reissued under a new number every
+    // campaign (v31 lives in `docs/79-…`, its successor will not), and a hardcoded path would
+    // either break on the rename or, worse, keep reading the frozen copy in `docs/historical/`.
+    // Directories are not descended, so `docs/historical/` — whose older tables are the record,
+    // not drift — is skipped by construction. Same reissue-proof shape as
+    // `vmcell-privilege`'s `every_setcap_copy_in_the_tree_matches_this_constant`.
+    //
+    // Every failure to FIND the table is an error, never an empty expected set: a text-scanning
+    // gate that matches nothing passes vacuously, which is the failure mode that makes this
+    // class of gate theater.
+
+    /// The design section that carries the deny-list roster.
+    const DESIGN_SECTION: &str = "12.3";
+
+    /// The smallest roster this gate accepts as "a real table" — a second non-vacuity guard
+    /// behind the parser's own empty-table error, in case a future table is parsed down to one
+    /// stray token.
+    const MIN_ROSTER: usize = 15;
+
+    /// Heading level of `line` (`###` → 3), or `None` when it is not a heading.
+    fn heading_level(line: &str) -> Option<usize> {
+        let hashes = line.trim_start().chars().take_while(|&c| c == '#').count();
+        (hashes > 0).then_some(hashes)
+    }
+
+    /// True when `line` opens the design section named by `section` (`### 12.3 Layer 2 …`).
+    /// Matches on the section NUMBER only — the heading's prose is free to change — and
+    /// requires a boundary after it so `12.30` is not mistaken for `12.3`.
+    fn is_section_heading(line: &str, section: &str) -> bool {
+        if heading_level(line).is_none() {
+            return false;
+        }
+        let rest = line.trim_start().trim_start_matches('#').trim_start();
+        rest.strip_prefix(section)
+            .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_digit() || c == '.'))
+    }
+
+    /// The body of section `section` in `markdown` — the lines after its heading, up to the next
+    /// heading at the same or a shallower level. Headings *inside* fenced code blocks are
+    /// ignored (a `# comment` line in a fence is not a section break).
+    fn section_body<'a>(markdown: &'a str, section: &str) -> Option<Vec<&'a str>> {
+        let mut lines = markdown.lines();
+        let level = lines.find_map(|l| {
+            if is_section_heading(l, section) {
+                heading_level(l)
+            } else {
+                None
+            }
+        })?;
+        let mut body = Vec::new();
+        let mut in_fence = false;
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            } else if !in_fence && heading_level(line).is_some_and(|l| l <= level) {
+                break;
+            }
+            body.push(line);
+        }
+        Some(body)
+    }
+
+    /// The syscall roster in section `section` of `markdown`.
+    ///
+    /// The roster is the section's single ```` ```text ```` fenced block: comma-separated
+    /// syscall names per line, each line optionally ending in a `#` comment. Every departure
+    /// from that shape — no such section, no ```` ```text ```` block, more than one, an empty
+    /// table, a token that is not a syscall identifier — is an `Err`, so the comparison below
+    /// can never silently run against an empty expected set.
+    fn design_roster(
+        markdown: &str,
+        section: &str,
+    ) -> std::result::Result<BTreeSet<String>, String> {
+        let body = section_body(markdown, section)
+            .ok_or_else(|| format!("no §{section} heading in this document"))?;
+        let mut blocks: Vec<Vec<&str>> = Vec::new();
+        let mut current: Option<Vec<&str>> = None;
+        for line in body {
+            let trimmed = line.trim_start();
+            if let Some(info) = trimmed.strip_prefix("```") {
+                match current.take() {
+                    Some(block) => blocks.push(block),
+                    None => {
+                        if info.trim() == "text" {
+                            current = Some(Vec::new());
+                        }
+                    }
+                }
+            } else if let Some(block) = current.as_mut() {
+                block.push(line);
+            }
+        }
+        if blocks.len() != 1 {
+            return Err(format!(
+                "§{section} must carry exactly one ```text roster block; found {}",
+                blocks.len()
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for line in blocks.into_iter().flatten() {
+            let code = line.split('#').next().unwrap_or("");
+            for token in code.split(',') {
+                let name = token.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                {
+                    return Err(format!(
+                        "§{section} roster entry {name:?} is not a syscall name — the table's \
+                         shape changed and this parser no longer reads it"
+                    ));
+                }
+                names.insert(name.to_string());
+            }
+        }
+        if names.is_empty() {
+            return Err(format!("§{section}'s roster block parsed to zero syscalls"));
+        }
+        Ok(names)
+    }
+
+    /// Every non-historical `docs/*.md` that carries a §12.3 roster, as `(file name, roster)`.
+    ///
+    /// Reading the directory at run time (rather than `include_str!`) is what makes the gate
+    /// survive the design's reissue: the successor document is picked up by its heading the
+    /// moment it lands. Sub-directories are not descended, so `docs/historical/` is out of
+    /// scope. Panics — never returns an empty roster — if the design cannot be found or parsed.
+    fn design_rosters() -> Vec<(String, BTreeSet<String>)> {
+        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs");
+        let entries =
+            std::fs::read_dir(&docs).unwrap_or_else(|e| panic!("read_dir {}: {e}", docs.display()));
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| panic!("docs entry: {e}"));
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            if !text.lines().any(|l| is_section_heading(l, DESIGN_SECTION)) {
+                continue;
+            }
+            match design_roster(&text, DESIGN_SECTION) {
+                Ok(roster) => out.push((name, roster)),
+                Err(e) => errors.push(format!("{name}: {e}")),
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "a document carries a §{DESIGN_SECTION} heading but its roster could not be read — \
+             fix the parser or the table, never let this gate fall back to an empty set: \
+             {errors:?}"
+        );
+        assert!(
+            !out.is_empty(),
+            "no document under {} carries a §{DESIGN_SECTION} roster — the design was renamed or \
+             moved and this gate is reading nothing (it must not pass vacuously)",
+            docs.display()
+        );
+        out
+    }
+
+    // Guards §13 (Cross-cutting invariants) / §12.3 (Layer 2 — the jailer-equivalent (JailSpec +
+    // apply_jail)): the shipped deny-list is EXACTLY the roster the current design documents, and
+    // compiles to a non-empty BPF program. Guarded in both directions — dropping a syscall (e.g.
+    // `kexec_file_load`, the file-based kexec variant that stays reachable if only `kexec_load` is
+    // blocked) OR adding an undocumented one reddens here, and so does deleting a name from the
+    // design's table without deleting it from the const. The behavioral "mount → EPERM" proof is
+    // the KVM-free stand-in integration test (tests/jail_hardening.rs).
     #[test]
     fn deny_list_is_exactly_the_documented_set_and_compiles() {
-        use std::collections::BTreeSet;
-        let expected: BTreeSet<&str> = [
-            "mount",
-            "umount2",
-            "pivot_root",
-            "kexec_load",
-            "kexec_file_load",
-            "init_module",
-            "finit_module",
-            "delete_module",
-            "ptrace",
-            "process_vm_readv",
-            "process_vm_writev",
-            "bpf",
-            "perf_event_open",
-            "add_key",
-            "keyctl",
-            "request_key",
-            "setns",
-            "unshare",
-            "reboot",
-            "swapon",
-            "swapoff",
-        ]
-        .into_iter()
-        .collect();
-        let actual: BTreeSet<&str> = DENIED_SYSCALLS.iter().map(|&(n, _)| n).collect();
-        assert_eq!(
-            actual, expected,
-            "the VMM deny-list must exactly match design §12.3 (Layer 2 — the jailer-equivalent), guarded both directions"
-        );
+        let actual: BTreeSet<String> = DENIED_SYSCALLS
+            .iter()
+            .map(|&(n, _)| n.to_string())
+            .collect();
+        for (doc, expected) in design_rosters() {
+            assert!(
+                expected.len() >= MIN_ROSTER,
+                "{doc}: §{DESIGN_SECTION}'s roster parsed to only {} entries ({expected:?}) — \
+                 that is not the table, and a short expected set would let the const drift",
+                expected.len()
+            );
+            assert_eq!(
+                actual, expected,
+                "the VMM deny-list must exactly match {doc} §{DESIGN_SECTION} (Layer 2 — the \
+                 jailer-equivalent), guarded both directions: add a syscall to BOTH, never drop \
+                 one from the const to \"match the doc\""
+            );
+        }
         let bpf = build_vmm_deny_filter().expect("deny-list must compile on this arch");
         assert!(
             !bpf.is_empty(),
             "a non-empty deny-list must compile to a non-empty BPF program"
         );
+    }
+
+    // The parser's own red-on-inverse (AGENTS.md rule 2): every way the design can stop carrying
+    // a readable roster must be an `Err`, because an `Ok(empty)` would make the gate above pass
+    // over nothing at all. Also pins the shape it DOES accept, so the positive path is not
+    // accidental.
+    #[test]
+    fn the_roster_parser_errors_rather_than_reading_an_empty_table() {
+        const GOOD: &str = "## 12 Security\n\
+             ### 12.3 Layer 2\n\
+             prose\n\
+             ```rust\n\
+             pub struct JailSpec { /* ### 12.4 is not a heading in here */ }\n\
+             ```\n\
+             ```text\n\
+             mount, umount2   # filesystem-namespace escape\n\
+             ptrace\n\
+             ```\n\
+             ### 12.4 Layer 3\n\
+             ```text\n\
+             not_the_roster\n\
+             ```\n";
+        assert_eq!(
+            design_roster(GOOD, "12.3").expect("the documented shape must parse"),
+            ["mount", "umount2", "ptrace"]
+                .into_iter()
+                .map(String::from)
+                .collect::<BTreeSet<String>>(),
+            "the roster is this section's own ```text block: fenced `###` lines are not section \
+             breaks, and the NEXT section's block must not leak in"
+        );
+
+        for (case, markdown) in [
+            ("missing section", "## 12 Security\n### 12.4 Layer 3\n"),
+            (
+                "section number is a prefix of another",
+                "### 12.30 Layer 2\n```text\nmount\n```\n",
+            ),
+            (
+                "no ```text block",
+                "### 12.3 Layer 2\n```rust\nmount\n```\n",
+            ),
+            (
+                "two ```text blocks",
+                "### 12.3 L2\n```text\nmount\n```\n```text\nptrace\n```\n",
+            ),
+            ("empty table", "### 12.3 Layer 2\n```text\n\n```\n"),
+            (
+                "prose where the roster should be",
+                "### 12.3 Layer 2\n```text\nThe list is default-allow.\n```\n",
+            ),
+        ] {
+            assert!(
+                design_roster(markdown, "12.3").is_err(),
+                "{case}: the parser must ERROR rather than hand the gate an empty or bogus roster"
+            );
+        }
     }
 
     // Guards §13 (Cross-cutting invariants): `jail_spec_from_config` maps every flag through, and only builds a

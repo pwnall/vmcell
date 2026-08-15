@@ -521,15 +521,16 @@ fn power_off_never_returns() -> ! {
 
 /// vsock control-plane port the host's `AgentClient` connects to.
 const VSOCK_PORT: u32 = 5000;
-/// Compiled **default** retry cadence for a *failed vsock `bind`*, used when the
-/// host does not emit `vmcell_accept_poll_ms=` on the cmdline (§5.3, The kernel command line).
+/// Compiled **default** recovery cadence for the vsock control plane, used when
+/// the host does not emit `vmcell_accept_poll_ms=` on the cmdline (§5.3, The kernel command line).
 ///
 /// **Semantic change (OPP-2):** the accept path itself is now event-driven — a
 /// blocking `poll(2)` on the listener fd wakes sub-millisecond on connection
-/// arrival — so this cadence no longer bounds connect latency. It governs only
-/// how often [`serve_vsock`] retries after `bind_vsock_listener` fails. The
-/// `parse_ms` floor clamp (1 ms) stays load-bearing on that path: a hostile
-/// `vmcell_accept_poll_ms=0` must not turn the bind-retry loop into a busy-spin.
+/// arrival — so this cadence no longer bounds connect latency. It paces
+/// [`serve_vsock`]'s *failure* recovery: the `bind` retry, and every reason
+/// [`recovery_backoff`] rate-limits. The `parse_ms` floor clamp (1 ms) stays
+/// load-bearing on those paths: a hostile `vmcell_accept_poll_ms=0` must not turn
+/// a bind→poll→fail loop into a busy-spin.
 const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// Compiled **default** re-bind idle window, used when the host does not emit
 /// `vmcell_rebind_idle_ms=` on the cmdline (§5.3, The kernel command line): re-bind the listener after this
@@ -633,6 +634,119 @@ fn poll_timeout(remaining: Duration) -> rustix::time::Timespec {
     }
 }
 
+/// Why the accept loop is pausing or dropping its listener — the input to the one
+/// back-off law, [`recovery_backoff`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryReason {
+    /// The idle window elapsed with no accepted connection: re-bind onto the
+    /// *current* vhost-vsock device (§8.2). Not a failure.
+    IdleWindowElapsed,
+    /// `poll(2)` reported the listener itself failed (`POLLERR`/`POLLHUP`/`POLLNVAL`).
+    ListenerFailed,
+    /// `poll(2)` failed with an errno other than `EINTR`.
+    PollFailed,
+    /// `accept(2)` failed with something other than `EAGAIN`.
+    AcceptFailed,
+    /// The OS refused a thread for an accepted connection.
+    ThreadRefused,
+}
+
+/// L-GUEST-4: how long the accept loop pauses before recovering.
+///
+/// **One predicate, so "every recover-by-rebind path is rate-limited" is a fact
+/// about this `match` instead of a claim each arm had to remember** — the
+/// `POLLERR` arm did not, and the comment two arms over said it did. Every
+/// *failure* pauses `accept_poll`: a persistent listener failure, poll errno,
+/// accept errno, or thread famine would otherwise spin bind→poll→fail with no
+/// pause at all. The idle-window exit is not a failure and needs no extra pause —
+/// it just waited `rebind_idle`.
+fn recovery_backoff(reason: RecoveryReason, accept_poll: Duration) -> Duration {
+    match reason {
+        RecoveryReason::IdleWindowElapsed => Duration::ZERO,
+        RecoveryReason::ListenerFailed
+        | RecoveryReason::PollFailed
+        | RecoveryReason::AcceptFailed
+        | RecoveryReason::ThreadRefused => accept_poll,
+    }
+}
+
+/// What one `poll(2)` wake means for the accept loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PollAction {
+    /// Timed out inside the idle window: re-poll with the recomputed remainder.
+    Repoll,
+    /// `EINTR` (PID 1 takes `SIGCHLD` and `poll` is never auto-restarted): re-poll,
+    /// deadline untouched.
+    Interrupted,
+    /// The listener is readable: `accept`.
+    Accept,
+    /// Drop this listener and re-bind, after [`recovery_backoff`].
+    Recover(RecoveryReason),
+}
+
+/// Classifies one `poll(2)` return plus its `revents`.
+///
+/// Pure, so every arm is unit-tested — including the `POLLERR` one, whose live
+/// reproduction would need a broken vhost-vsock device.
+fn classify_poll(
+    polled: Result<usize, rustix::io::Errno>,
+    revents: rustix::event::PollFlags,
+) -> PollAction {
+    use rustix::event::PollFlags;
+    match polled {
+        Ok(0) => PollAction::Repoll,
+        Ok(_) if revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) => {
+            PollAction::Recover(RecoveryReason::ListenerFailed)
+        }
+        Ok(_) => PollAction::Accept,
+        Err(rustix::io::Errno::INTR) => PollAction::Interrupted,
+        Err(_) => PollAction::Recover(RecoveryReason::PollFailed),
+    }
+}
+
+/// Serves one accepted connection and logs how it ended — the body of the
+/// per-connection thread, named so the accept arm stays one line.
+fn serve_connection_logged(stream: VsockStream, reaper: &Arc<ReaperCoordinator>) {
+    if let Err(e) = serve_connection(stream, reaper) {
+        // A clean host disconnect surfaces as `read_framed`'s `UnexpectedEof` (the
+        // length prefix's `read_exact` hits EOF between requests): that is the
+        // normal end of a connection, not a fault, so log it at info. Reserve error
+        // level for genuine protocol/transport failures (L-GUEST-10).
+        let clean_eof = e
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
+        if clean_eof {
+            tracing::info!("vmcell-guest-agent: host closed the connection");
+        } else {
+            tracing::error!("vmcell-guest-agent: handle_connection error: {}", e);
+        }
+    }
+}
+
+/// Hands `stream` to its own thread, or returns the OS's refusal so the caller can
+/// back off and keep serving.
+///
+/// `std::thread::spawn` **panics** when `pthread_create` fails (`EAGAIN` under
+/// `RLIMIT_NPROC`/`threads-max`, `ENOMEM`). In the accept loop that panic unwinds
+/// the *detached* listener thread, which nobody joins: PID 1's control plane would
+/// vanish with no exit code, no kernel panic, and no supervisor — the one C1
+/// failure mode the "never exit" rule cannot catch, because the process does not
+/// exit. `Builder::spawn` reports the refusal instead.
+///
+/// `builder` is the seam: production passes a named `Builder`, and the unit test
+/// passes one with an unsatisfiable stack size to drive the real `EAGAIN` refusal,
+/// so the shipped path carries no `#[cfg(test)]` branch.
+fn dispatch_connection(
+    builder: std::thread::Builder,
+    stream: VsockStream,
+    reaper: &Arc<ReaperCoordinator>,
+) -> std::io::Result<()> {
+    let conn_reaper = Arc::clone(reaper);
+    builder
+        .spawn(move || serve_connection_logged(stream, &conn_reaper))
+        .map(drop)
+}
+
 /// Serves the vsock control plane, re-binding the listener across snapshot
 /// restores.
 ///
@@ -654,19 +768,20 @@ fn poll_timeout(remaining: Duration) -> rustix::time::Timespec {
 /// the agent sub-millisecond while the idle window still elapses exactly as
 /// before. The deadline is `Instant`-based ([`remaining_idle`]) and only a real
 /// accept restarts it ([`next_deadline`]); `EINTR` and spurious wakeups re-poll
-/// with the recomputed remainder. `accept_poll` now paces only the bind-failure
-/// retry (see [`ACCEPT_POLL`]). Any poll-level listener failure
+/// with the recomputed remainder. `accept_poll` paces only failure recovery (see
+/// [`ACCEPT_POLL`] and [`recovery_backoff`], the one predicate that decides which
+/// exits are rate-limited). Any poll-level listener failure
 /// (`POLLERR`/`POLLHUP`/`POLLNVAL`, or an errno other than `EINTR`) is logged
-/// and treated like the deaf-listener case — re-bind, never exit: PID 1 must
-/// never give up the control plane.
+/// and treated like the deaf-listener case — re-bind, never exit; an OS that
+/// refuses a connection thread costs that one connection, not the loop
+/// ([`dispatch_connection`]). PID 1 must never give up the control plane.
 fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_idle: Duration) {
     use rustix::event::{PollFd, PollFlags};
 
     loop {
         let Some(listener) = bind_vsock_listener() else {
-            // Bind-failure retry cadence: the one remaining consumer of
-            // `accept_poll`, still floor-clamped by `parse_ms` so a cmdline `0`
-            // cannot busy-spin PID 1.
+            // Bind-failure retry cadence, still floor-clamped by `parse_ms` so a
+            // cmdline `0` cannot busy-spin PID 1.
             std::thread::sleep(accept_poll);
             continue;
         };
@@ -677,89 +792,20 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
         // `break`s on a listener-level failure — fall out, drop this listener,
         // and re-bind on the current device (§8.2, Restore correctness: a restored VM is not a fresh VM).
         let mut deadline = Instant::now() + rebind_idle;
+        // The one exit reason: every path out of the accept loop names why it is
+        // leaving, and the single back-off below rate-limits it (L-GUEST-4).
+        let mut reason = RecoveryReason::IdleWindowElapsed;
         while let Some(remaining) = remaining_idle(deadline, Instant::now()) {
             let mut fds = [PollFd::new(&listener, PollFlags::IN)];
             // rustix 1.x `poll` takes `Option<&Timespec>`; `Some(&ts)` preserves the finite
             // timeout — `None` would block forever and defeat the idle-rebind deadline.
             let timeout = poll_timeout(remaining);
-            match rustix::event::poll(&mut fds, Some(&timeout)) {
+            let polled = rustix::event::poll(&mut fds, Some(&timeout));
+            match classify_poll(polled, fds[0].revents()) {
                 // Timed out: loop back — the recomputed remainder hits zero (or
                 // re-polls a sub-ms tail once) and triggers the re-bind.
-                Ok(0) => {}
-                Ok(_) => {
-                    let revents = fds[0].revents();
-                    if revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
-                        tracing::warn!(
-                            "vmcell-guest-agent: vsock listener poll revents {:?}; re-binding",
-                            revents
-                        );
-                        break;
-                    }
-                    // POLLIN: the (still non-blocking) listener should have a
-                    // connection ready.
-                    match listener.accept() {
-                        Ok((s, _)) => {
-                            deadline = next_deadline(
-                                deadline,
-                                Instant::now(),
-                                rebind_idle,
-                                AcceptOutcome::Accepted,
-                            );
-                            tracing::info!("vmcell-guest-agent: accepted connection");
-                            let conn_reaper = Arc::clone(reaper);
-                            std::thread::spawn(move || {
-                                if let Err(e) = serve_connection(s, &conn_reaper) {
-                                    // A clean host disconnect surfaces as
-                                    // `read_framed`'s `UnexpectedEof` (the length
-                                    // prefix's `read_exact` hits EOF between
-                                    // requests): that is the normal end of a
-                                    // connection, not a fault, so log it at info.
-                                    // Reserve error level for genuine
-                                    // protocol/transport failures (L-GUEST-10).
-                                    let clean_eof =
-                                        e.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                                            io.kind() == std::io::ErrorKind::UnexpectedEof
-                                        });
-                                    if clean_eof {
-                                        tracing::info!(
-                                            "vmcell-guest-agent: host closed the connection"
-                                        );
-                                    } else {
-                                        tracing::error!(
-                                            "vmcell-guest-agent: handle_connection error: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            });
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Spurious wakeup: re-poll with the recomputed
-                            // remainder. MUST NOT restart the idle window — a
-                            // deaf listener has to run out the clock and re-bind.
-                            deadline = next_deadline(
-                                deadline,
-                                Instant::now(),
-                                rebind_idle,
-                                AcceptOutcome::SpuriousReadable,
-                            );
-                        }
-                        Err(e) => {
-                            tracing::info!("vmcell-guest-agent: accept error: {}; re-binding", e);
-                            // L-GUEST-4: back off before the outer loop re-binds.
-                            // A persistent accept error (e.g. EMFILE) would
-                            // otherwise spin: break → immediate re-bind → poll →
-                            // accept error → … with no pause. The bind-failure
-                            // path already sleeps `accept_poll`; mirror it here so
-                            // every recover-by-rebind path is rate-limited.
-                            std::thread::sleep(accept_poll);
-                            break;
-                        }
-                    }
-                }
-                Err(rustix::io::Errno::INTR) => {
-                    // PID 1 takes SIGCHLD and poll(2) is never auto-restarted:
-                    // re-poll with the recomputed remainder, deadline untouched.
+                PollAction::Repoll => {}
+                PollAction::Interrupted => {
                     deadline = next_deadline(
                         deadline,
                         Instant::now(),
@@ -767,20 +813,69 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                         AcceptOutcome::Interrupted,
                     );
                 }
-                Err(e) => {
-                    // Fail loud, then recover: any other poll failure is treated
-                    // like the deaf-listener case — re-bind rather than exit.
+                // Fail loud, then recover: a listener-level failure is treated like
+                // the deaf-listener case — re-bind rather than exit.
+                PollAction::Recover(r) => {
                     tracing::warn!(
-                        "vmcell-guest-agent: vsock listener poll failed: {}; re-binding",
-                        e
+                        "vmcell-guest-agent: vsock listener re-binding ({:?}): poll {:?}, revents {:?}",
+                        r,
+                        polled,
+                        fds[0].revents()
                     );
-                    // L-GUEST-4: back off before re-binding so a persistent poll
-                    // failure cannot spin the bind→poll→error loop.
-                    std::thread::sleep(accept_poll);
+                    reason = r;
                     break;
                 }
+                // POLLIN: the (still non-blocking) listener should have a
+                // connection ready.
+                PollAction::Accept => match listener.accept() {
+                    Ok((s, _)) => {
+                        deadline = next_deadline(
+                            deadline,
+                            Instant::now(),
+                            rebind_idle,
+                            AcceptOutcome::Accepted,
+                        );
+                        tracing::info!("vmcell-guest-agent: accepted connection");
+                        let builder =
+                            std::thread::Builder::new().name("vmcell-vsock-conn".to_string());
+                        if let Err(e) = dispatch_connection(builder, s, reaper) {
+                            // The OS refused a thread. C1: never exit, never die —
+                            // the connection is dropped (its fd closes, so the host
+                            // sees a reset instead of a silent hang) and the loop
+                            // keeps serving, paced so a sustained thread famine
+                            // cannot spin accept→spawn-fail.
+                            tracing::error!(
+                                "vmcell-guest-agent: the OS refused a connection thread: {}; dropping this connection and continuing to serve",
+                                e
+                            );
+                            std::thread::sleep(recovery_backoff(
+                                RecoveryReason::ThreadRefused,
+                                accept_poll,
+                            ));
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Spurious wakeup: re-poll with the recomputed
+                        // remainder. MUST NOT restart the idle window — a
+                        // deaf listener has to run out the clock and re-bind.
+                        deadline = next_deadline(
+                            deadline,
+                            Instant::now(),
+                            rebind_idle,
+                            AcceptOutcome::SpuriousReadable,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::info!("vmcell-guest-agent: accept error: {}; re-binding", e);
+                        reason = RecoveryReason::AcceptFailed;
+                        break;
+                    }
+                },
             }
         }
+        // The ONE recovery pause: whichever way the accept loop ended, its reason
+        // decides the rate limit, so no arm can re-bind without one (L-GUEST-4).
+        std::thread::sleep(recovery_backoff(reason, accept_poll));
     }
 }
 
@@ -1053,48 +1148,38 @@ fn handle_resync(
         }
     };
 
-    // 3. MAC rotation (best-effort): install the new eth0 hwaddr in-process via
-    //    SIOCSIFHWADDR (no in-guest netlink). Absent MAC → not applied. Log the
-    //    io::Error cause on failure (L-GUEST-6) instead of discarding it via
-    //    `.is_ok()`.
-    let mac_applied = match mac {
-        None => false,
-        Some(m) => match netif::set_mac_bytes("eth0", m) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    "vmcell-guest-agent: resync MAC rotation failed: {}; continuing (best-effort)",
-                    e
-                );
-                false
-            }
-        },
-    };
-
-    // 4. IPv4 rotation (best-effort, H-VMM-1): the restore/zygote path rotates the
-    //    vmid, so the guest resumes with the frozen `ip=` address of the original
-    //    vmid — re-point `eth0` + the default route to the rotated `/30`, in-process
-    //    via SIOCSIFADDR/route ioctls (no in-guest netlink), exactly as the MAC
-    //    rotation above. Absent config → not applied. Log the cause on failure.
-    let ip_applied = match ipv4 {
-        None => false,
-        Some(cfg) => match netif::set_ipv4("eth0", cfg.addr, cfg.prefix_len, cfg.gateway) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    "vmcell-guest-agent: resync IP rotation failed: {}; continuing (best-effort)",
-                    e
-                );
-                false
-            }
-        },
+    // 3+4. MAC and IPv4 rotation (best-effort): installed in-process via
+    //      SIOCSIFHWADDR / SIOCSIFADDR + the route ioctls (no in-guest netlink).
+    //      Both arms go through ONE call because the default route is a property of
+    //      the resync as a whole (d1): the MAC arm bounces eth0 and the kernel tears
+    //      the default route's nexthop down with it, so whoever bounces the link
+    //      owes the route back — `netif::apply_resync_net` decides that once, for
+    //      every arm, and logs each arm's io::Error cause (L-GUEST-6) rather than
+    //      collapsing it to a bare bool.
+    let net = match netif::resync_net(
+        "eth0",
+        mac,
+        ipv4.map(|cfg| netif::Ipv4Args {
+            addr: cfg.addr,
+            prefix_len: cfg.prefix_len,
+            gateway: cfg.gateway,
+        }),
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::warn!(
+                "vmcell-guest-agent: resync could not open the config socket: {}; no interface arm applied",
+                e
+            );
+            netif::ResyncNetOutcome::default()
+        }
     };
 
     let ack = Message::ResyncAck {
         clock_error,
         reseed_applied,
-        mac_applied,
-        ip_applied,
+        mac_applied: net.mac_applied,
+        ip_applied: net.ip_applied,
     };
     send_msg(writer, &ack)?;
     Ok(())
@@ -1486,24 +1571,58 @@ fn open_failed(writer: &Writer, session: SessionId, msg: &str) {
     let _ = send_msg(writer, &Message::SessionExit { session, code: 127 });
 }
 
-/// Registers a session's handle in the per-connection table. A reused id (the
-/// host is authoritative and monotonic, so this should not happen) kills the
-/// displaced session rather than leaking it.
-fn register_session(sessions: &Sessions, id: SessionId, handle: SessionHandle) {
-    // Insert under the lock; kill + join the displaced session's stdin writer
-    // outside it, the same order teardown uses (M6).
-    let displaced = {
-        let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
-        table.insert(id, handle)
-    };
-    if let Some(old) = displaced {
-        tracing::warn!(
-            "vmcell-guest-agent: session id {:?} reused; killing the displaced session",
-            id
-        );
-        kill_group(old.pid);
-        old.shutdown_stdin();
+/// Registers a session's handle in the per-connection table, **rejecting** a
+/// duplicate of a still-live id: the new handle comes back in the `Err` so the
+/// caller can abandon the session it just opened.
+///
+/// The host is authoritative and monotonic, so a repeated id is a protocol
+/// violation, not a normal event. The pre-fix insert *displaced* the live entry,
+/// which is the worse of the two failures: the displaced session's own waiter
+/// thread later removes `id` from the table — now the **new** session's entry — so
+/// its `Stdin`/`Winsize`/`CloseSession` all silently stop resolving while its
+/// child keeps running. Refusing the duplicate leaves the live session
+/// untouched, and the caller reports the refusal through the one terminal-frame
+/// convention ([`open_failed`]).
+fn register_session(
+    sessions: &Sessions,
+    id: SessionId,
+    handle: SessionHandle,
+) -> Result<(), SessionHandle> {
+    use std::collections::hash_map::Entry;
+    let mut table = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    match table.entry(id) {
+        Entry::Occupied(_) => {
+            tracing::warn!(
+                "vmcell-guest-agent: session id {:?} is already live; refusing the duplicate",
+                id
+            );
+            Err(handle)
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(handle);
+            Ok(())
+        }
     }
+}
+
+/// Abandons a session whose child has already been spawned: kill its process
+/// group, release the reaper reservation that spawn took, and report the failure
+/// through the one terminal-frame convention ([`open_failed`]).
+///
+/// **One helper for every post-spawn failure path**, so none of them can forget
+/// the reservation: `reserve` records an entry that only a `wait_for` consumes,
+/// and these paths spawn no waiter — the un-pruned reservation map would grow one
+/// entry per failure and leave a stale epoch on a pid the kernel later reuses.
+fn abandon_spawned_session(
+    writer: &Writer,
+    session: SessionId,
+    reaper: &Arc<ReaperCoordinator>,
+    pid: u32,
+    msg: &str,
+) {
+    kill_group(pid);
+    reaper.cancel_reservation(pid);
+    open_failed(writer, session, msg);
 }
 
 /// Spawns a reader thread that pumps a child stream to the host, wrapping each
@@ -1625,21 +1744,30 @@ fn run_pipe_session(
         }
     };
     let stdin = child.stdin.take();
+    let pid = child.id();
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        open_failed(writer, session, "failed to capture child stdio");
-        kill_group(child.id());
+        abandon_spawned_session(
+            writer,
+            session,
+            reaper,
+            pid,
+            "failed to capture child stdio",
+        );
         return;
     };
-    let pid = child.id();
     reaper.reserve(pid, epoch);
 
-    register_session(
+    if let Err(rejected) = register_session(
         sessions,
         session,
         // The `ChildStdin` becomes a bare `OwnedFd` owned by the session's stdin
         // writer thread (M6) — one fd write path for both sink kinds.
         SessionHandle::new(session, stdin.map(|s| StdinSink::Pipe(s.into())), None, pid),
-    );
+    ) {
+        abandon_spawned_session(writer, session, reaper, pid, "session id is already in use");
+        rejected.shutdown_stdin();
+        return;
+    }
 
     let out = spawn_pump(stdout, Arc::clone(writer), move |data| {
         Message::SessionStdout { session, data }
@@ -1763,13 +1891,21 @@ fn run_pty_session(
     let master_read = match master.try_clone() {
         Ok(m) => std::fs::File::from(m),
         Err(e) => {
-            open_failed(writer, session, &format!("pty master clone failed: {e}"));
-            kill_group(pid);
+            // The child is already spawned and reserved: abandon it through the one
+            // helper so the reservation is released with it (nothing else ever
+            // would — this path spawns no waiter).
+            abandon_spawned_session(
+                writer,
+                session,
+                reaper,
+                pid,
+                &format!("pty master clone failed: {e}"),
+            );
             return;
         }
     };
     let master_arc = Arc::new(master);
-    register_session(
+    if let Err(rejected) = register_session(
         sessions,
         session,
         SessionHandle::new(
@@ -1778,7 +1914,11 @@ fn run_pty_session(
             Some(Arc::clone(&master_arc)),
             pid,
         ),
-    );
+    ) {
+        abandon_spawned_session(writer, session, reaper, pid, "session id is already in use");
+        rejected.shutdown_stdin();
+        return;
+    }
 
     let pump = spawn_pump(master_read, Arc::clone(writer), move |data| {
         Message::SessionStdout { session, data }
@@ -2491,5 +2631,237 @@ mod tests {
             "a writer parked on a full stdin must give up within one STDIN_POLL_SLICE of `closing`"
         );
         thread.join().expect("writer thread");
+    }
+
+    /// A connected pair for driving the real `VsockStream` type without a vsock
+    /// device: `VsockStream` is a thin `OwnedFd` wrapper whose `Read`/`Write` are
+    /// plain `recv`/`send`, so an `AF_UNIX` socketpair drives it verbatim. The
+    /// second half is the "host" end the test reads frames from.
+    fn vsock_pair() -> (VsockStream, std::os::unix::net::UnixStream) {
+        let (agent, host) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        (VsockStream::from(OwnedFd::from(agent)), host)
+    }
+
+    /// Decodes one framed [`Message`] from the host end of a [`vsock_pair`].
+    fn read_msg(host: &mut std::os::unix::net::UnixStream) -> Message {
+        let mut len = [0u8; 4];
+        host.read_exact(&mut len).expect("frame length");
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        host.read_exact(&mut body).expect("frame body");
+        postcard::from_bytes(&body).expect("decode")
+    }
+
+    /// A live child in its own process group, for the paths that `kill_group` it.
+    /// Using a real child keeps `kill_group` honest — a made-up pid would either
+    /// be a no-op (vacuous) or, at pid 0, kill the test runner's own group.
+    fn spawn_group_child() -> std::process::Child {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        cmd.process_group(0);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        cmd.spawn().expect("spawn a test child")
+    }
+
+    // m13 — "every recover-by-rebind path is rate-limited" is now a fact about ONE
+    // predicate instead of a claim each arm had to remember; the POLLERR arm did
+    // not, and the comment two arms over said it did.
+    //
+    // RED on the inverse (`RecoveryReason::ListenerFailed => Duration::ZERO`, the
+    // pre-fix POLLERR arm): the loop re-binds a broken listener with no pause.
+    #[test]
+    fn every_listener_failure_recovery_is_rate_limited() {
+        let poll = Duration::from_millis(37);
+        for reason in [
+            RecoveryReason::ListenerFailed,
+            RecoveryReason::PollFailed,
+            RecoveryReason::AcceptFailed,
+            RecoveryReason::ThreadRefused,
+        ] {
+            assert_eq!(
+                recovery_backoff(reason, poll),
+                poll,
+                "{reason:?} must be rate-limited (L-GUEST-4)"
+            );
+        }
+        assert_eq!(
+            recovery_backoff(RecoveryReason::IdleWindowElapsed, poll),
+            Duration::ZERO,
+            "the idle exit is not a failure — it already waited rebind_idle"
+        );
+    }
+
+    // The classification the back-off law is applied to. `POLLERR`/`POLLHUP`/
+    // `POLLNVAL` each mean the listener itself is gone (the post-restore deaf
+    // device), never "a connection is ready" — a live reproduction would need a
+    // broken vhost-vsock device, so this is where those arms are pinned.
+    #[test]
+    fn classify_poll_maps_every_wake() {
+        use rustix::event::PollFlags;
+        assert_eq!(
+            classify_poll(Ok(0), PollFlags::empty()),
+            PollAction::Repoll,
+            "a timeout re-polls the remainder"
+        );
+        assert_eq!(classify_poll(Ok(1), PollFlags::IN), PollAction::Accept);
+        for bad in [PollFlags::ERR, PollFlags::HUP, PollFlags::NVAL] {
+            assert_eq!(
+                classify_poll(Ok(1), PollFlags::IN | bad),
+                PollAction::Recover(RecoveryReason::ListenerFailed),
+                "{bad:?} is a listener failure even alongside POLLIN"
+            );
+        }
+        assert_eq!(
+            classify_poll(Err(rustix::io::Errno::INTR), PollFlags::empty()),
+            PollAction::Interrupted,
+            "EINTR must not consume the idle window"
+        );
+        assert_eq!(
+            classify_poll(Err(rustix::io::Errno::NOMEM), PollFlags::empty()),
+            PollAction::Recover(RecoveryReason::PollFailed)
+        );
+    }
+
+    // m12 — PID 1's listener must survive the OS refusing a thread. The accepted
+    // connection is handed off through `dispatch_connection`, which REPORTS the
+    // refusal; `std::thread::spawn` panics on it, and that panic unwinds the
+    // detached listener thread with nobody observing it — the control plane stops
+    // accepting with no exit and no supervisor.
+    //
+    // The refusal is real, not simulated: a 64 TiB thread stack cannot be mapped,
+    // so `pthread_create` returns EAGAIN — the same errno a `RLIMIT_NPROC` famine
+    // gives — without touching a process-wide rlimit.
+    //
+    // RED on the inverse (`std::thread::spawn(move || …)` in `dispatch_connection`):
+    // this test panics with "failed to spawn thread: … (os error 11)".
+    #[test]
+    fn dispatch_connection_reports_a_refused_thread_instead_of_panicking() {
+        let reaper = Arc::new(ReaperCoordinator::new());
+
+        let (agent_side, host_side) = vsock_pair();
+        let refused = dispatch_connection(
+            std::thread::Builder::new().stack_size(1 << 46),
+            agent_side,
+            &reaper,
+        )
+        .expect_err("an unmappable thread stack must be refused, not spawned");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "EAGAIN is the thread-famine refusal: {refused}"
+        );
+        drop(host_side);
+
+        // Positive control: the same call with an ordinary builder does spawn, so
+        // the assertion above is about the refusal and not about a broken helper.
+        let (agent_side, host_side) = vsock_pair();
+        dispatch_connection(
+            std::thread::Builder::new().name("vmcell-vsock-conn-test".to_string()),
+            agent_side,
+            &reaper,
+        )
+        .expect("an ordinary builder must spawn the connection thread");
+        drop(host_side);
+    }
+
+    // m31 — re-registering a LIVE session id must not unregister the live session.
+    // The pre-fix insert displaced it, and the displaced session's waiter then
+    // removed `id` from the table — i.e. the *new* session's entry — so the new
+    // session's Stdin/Winsize/CloseSession silently stopped resolving while its
+    // child ran on.
+    //
+    // RED on the inverse (`table.insert(id, handle)` returning `Ok(())`): the table
+    // holds the second pid and the refusal never happens.
+    #[test]
+    fn register_session_refuses_a_duplicate_live_id() {
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let id = SessionId(9);
+
+        let live = SessionHandle::new(id, None, None, 4242);
+        assert!(
+            register_session(&sessions, id, live).is_ok(),
+            "the first registration must succeed"
+        );
+
+        let duplicate = SessionHandle::new(id, None, None, 5353);
+        let rejected = register_session(&sessions, id, duplicate)
+            .expect_err("a duplicate live id must be refused");
+        assert_eq!(
+            rejected.pid, 5353,
+            "the REJECTED handle comes back so the caller can abandon it"
+        );
+        rejected.shutdown_stdin();
+
+        let table = sessions.lock().expect("sessions");
+        assert_eq!(
+            table.get(&id).map(|h| h.pid),
+            Some(4242),
+            "the live session must survive the duplicate untouched"
+        );
+    }
+
+    // m32 — a post-spawn failure (the PTY-master clone, or the refused duplicate
+    // above) must not leak the reaper reservation its spawn took: nothing else ever
+    // consumes it (these paths spawn no waiter) and the reservation map has no
+    // prune. The one abandon helper releases it, kills the child's group, and
+    // reports the failure through the terminal-frame convention.
+    //
+    // RED on the inverse (drop `reaper.cancel_reservation(pid)` from
+    // `abandon_spawned_session`): `pending_reservations` stays at 1.
+    #[test]
+    fn abandoning_a_spawned_session_releases_its_reaper_reservation() {
+        let reaper = Arc::new(ReaperCoordinator::new());
+        let (agent_side, mut host_side) = vsock_pair();
+        let writer: Writer = Arc::new(Mutex::new(agent_side));
+        let session = SessionId(11);
+
+        let mut child = spawn_group_child();
+        let pid = child.id();
+        let epoch = reaper.pre_spawn_epoch();
+        reaper.reserve(pid, epoch);
+        assert_eq!(
+            reaper.pending_reservations(),
+            1,
+            "the spawn's reservation must exist before the abandon, or this gate is vacuous"
+        );
+
+        abandon_spawned_session(
+            &writer,
+            session,
+            &reaper,
+            pid,
+            "pty master clone failed: test",
+        );
+
+        assert_eq!(
+            reaper.pending_reservations(),
+            0,
+            "an abandoned session must release the reservation nothing else will consume"
+        );
+
+        // The child's group was actually killed (not merely marked), and the host
+        // got the one open-failure convention: stderr then exit 127.
+        let status = child.wait().expect("reap the killed child");
+        assert!(
+            !status.success(),
+            "the abandoned session's process group must be killed: {status:?}"
+        );
+        match read_msg(&mut host_side) {
+            Message::SessionStderr { session: s, data } => {
+                assert_eq!(s, session);
+                assert!(
+                    String::from_utf8_lossy(&data).contains("pty master clone failed"),
+                    "the failure must name itself: {:?}",
+                    String::from_utf8_lossy(&data)
+                );
+            }
+            other => panic!("expected SessionStderr, got {other:?}"),
+        }
+        assert_eq!(
+            read_msg(&mut host_side),
+            Message::SessionExit { session, code: 127 },
+            "an open failure ends with the 127 terminal frame"
+        );
     }
 }

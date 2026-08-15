@@ -140,7 +140,7 @@ impl NetSegment {
     /// # Errors
     /// - [`Error::Config`] if `prefix` is invalid.
     /// - [`Error::CapabilityUnavailable`] if the host does not offer the privileged network
-    ///   datapath (`CAP_NET_ADMIN` + a reachable `/var/run/netns`) — segments are
+    ///   datapath (`CAP_NET_ADMIN` + `CAP_SYS_ADMIN` + a reachable `/var/run/netns`) — segments are
     ///   privileged-capability-class only, and this is probed, never presumed.
     /// - [`Error::Exhaustion`] if no segment id is free, or [`Error::Network`] if the namespace or
     ///   bridge cannot be created.
@@ -149,9 +149,9 @@ impl NetSegment {
         if !caps.privileged_net_available() {
             return Err(Error::CapabilityUnavailable {
                 op: "vm-to-vm segment creation".to_string(),
-                needed: "effective CAP_NET_ADMIN and a reachable /var/run/netns (segments are \
-                         privileged-capability-class; run under the blessed capability runner, \
-                         `just bless`)"
+                needed: "effective CAP_NET_ADMIN and CAP_SYS_ADMIN and a reachable /var/run/netns \
+                         (segments are privileged-capability-class; run under the blessed \
+                         capability runner, `just bless`)"
                     .to_string(),
             });
         }
@@ -239,7 +239,9 @@ impl NetSegment {
     /// typed impairment API).
     #[must_use]
     pub fn netns_path(&self) -> std::path::PathBuf {
-        std::path::Path::new("/var/run/netns").join(&self.0.netns)
+        // One law: the `/var/run/netns` layout is composed in exactly one place, shared with the
+        // module's own namespace-entry helper (`net::tap::in_netns`).
+        crate::net::tap::netns_path(&self.0.netns)
     }
 
     /// The bridge interface name (`<prefix>-br-<segid>`), a stable documented accessor.
@@ -499,17 +501,12 @@ pub(crate) mod testing {
                 .push(format!("add_netns({name})"));
             Ok(())
         }
-        fn setup_tap(
-            &self,
-            netns: &str,
-            tap_name: &str,
-            _vmid: u32,
-        ) -> Result<Option<tun_tap::Iface>> {
+        fn setup_tap(&self, netns: &str, tap_name: &str, _vmid: u32) -> Result<()> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("setup_tap({netns}, {tap_name})"));
-            Ok(None)
+            Ok(())
         }
         fn create_bridge(
             &self,

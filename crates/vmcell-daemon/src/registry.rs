@@ -9,8 +9,10 @@
 //!
 //! Each VM sits behind its own async mutex, so ops on **different** VMs run concurrently while ops on
 //! **one** VM serialize on its single vsock control channel. The immutable identity of a VM (id, vmid,
-//! the artifact names it pins) is read lock-free; only the handle + lifecycle state are behind the
-//! per-VM lock.
+//! the artifact names it pins) is read lock-free and its observable **status** (lifecycle state plus
+//! the snapshot prefix being written) sits behind a tiny sync lock; the async per-VM lock holds
+//! **only the handle**, so a long op — a snapshot writes guest RAM under it — never blocks a status
+//! read, and `GET /v1/vms` never queues behind one VM's snapshot.
 
 use crate::artifact_store::ArtifactStore;
 use crate::dto::{
@@ -27,7 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 /// One owned VM. The identity fields are immutable (set once at create) so a pin check reads them
-/// lock-free; the mutable handle + state sit behind [`VmSlot::inner`].
+/// lock-free; the observable status sits behind a tiny sync lock ([`VmSlot::status`]) and only the
+/// VM **handle** — the single vsock control channel — sits behind the async [`VmSlot::inner`].
 struct VmSlot {
     id: VmId,
     vmid: u32,
@@ -38,36 +41,105 @@ struct VmSlot {
     extra_disks: Vec<String>,
     vcpus: u8,
     mem_mib: u32,
+    /// The observable status, deliberately **outside** `inner` (finding
+    /// `snapshotting-state-unobservable-and-list-blocks`): a snapshot holds `inner` for the whole
+    /// guest-RAM write, so a state read that took `inner` could never observe `Snapshotting` and
+    /// made `GET /v1/vms` — which reads every slot — block behind one VM's snapshot. Held only for
+    /// the few instructions of a read/assignment and **never across an `.await`**.
+    status: std::sync::Mutex<SlotStatus>,
     inner: Mutex<VmInner>,
+}
+
+/// The lock-free-readable half of a slot: what `info`/`list`/`require_state`/`pins` need.
+#[derive(Debug)]
+struct SlotStatus {
+    /// The lifecycle state reported by `GET /v1/vms{,/id}` and enforced by
+    /// [`VmSlot::require_state`].
+    state: VmState,
+    /// `Some(prefix)` while a snapshot is writing into `<artifacts-dir>/<prefix>/` — the pin that
+    /// makes `delete_artifact_if_unused` refuse the prefix for the write's duration (finding
+    /// `snapshot-prefix-unpinned-during-the-write`, where a racing delete `remove_dir_all`'d the
+    /// prefix and the snapshot still returned 200 with an empty file list).
+    snapshot_prefix: Option<String>,
 }
 
 struct VmInner {
     /// `None` once torn down (a racing op that cloned the `Arc` before removal then sees `None`).
     handle: Option<Box<dyn VmHandle>>,
-    state: VmState,
 }
 
 impl VmSlot {
-    /// Whether this VM pins `artifact_name` as its kernel, rootfs, or one of its extra disks — the
-    /// single delete-in-use predicate (design §11.3, The artifact store; §11.4, The VM registry and
-    /// the start-up sweep). Read lock-free off the immutable identity fields. Every caller
+    /// The status lock, poison-tolerant (a panicking holder leaves a consistent two-field struct).
+    fn status(&self) -> std::sync::MutexGuard<'_, SlotStatus> {
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The current lifecycle state (no `inner` hold — see [`VmSlot::status`]).
+    fn state(&self) -> VmState {
+        self.status().state
+    }
+
+    fn set_state(&self, state: VmState) {
+        self.status().state = state;
+    }
+
+    /// The one state predicate every op shares: `Conflict` (409) unless the VM is in `want`.
+    fn require_state(&self, want: VmState, id: &VmId) -> DaemonResult<()> {
+        let state = self.state();
+        if state == want {
+            Ok(())
+        } else {
+            Err(DaemonError::Conflict(format!(
+                "vm {id} is {state:?}, not {want:?}"
+            )))
+        }
+    }
+
+    /// Whether this VM pins `artifact_name` as its kernel, rootfs, one of its extra disks, or the
+    /// snapshot prefix it is writing **right now** — the single delete-in-use predicate (design
+    /// §11.3, The artifact store; §11.4, The VM registry and the start-up sweep). Every caller
     /// (`is_artifact_in_use`, `delete_artifact_if_unused`) shares this one law — never a second copy.
     fn pins(&self, artifact_name: &str) -> bool {
         self.kernel == artifact_name
             || self.rootfs == artifact_name
             || self.extra_disks.iter().any(|d| d == artifact_name)
+            || self.status().snapshot_prefix.as_deref() == Some(artifact_name)
     }
 
-    async fn info(&self) -> VmInfo {
+    fn info(&self) -> VmInfo {
         VmInfo {
             id: self.id.clone(),
-            state: self.inner.lock().await.state,
+            state: self.state(),
             vmid: self.vmid,
             kernel: self.kernel.clone(),
             rootfs: self.rootfs.clone(),
             vcpus: self.vcpus,
             mem_mib: self.mem_mib,
         }
+    }
+}
+
+/// Holds a VM's snapshot-prefix pin for the duration of the write and releases it on **every** exit
+/// path — success, an early `?`, or a panic — so a failed snapshot can never leave an artifact name
+/// permanently undeletable (finding `snapshot-prefix-unpinned-during-the-write`).
+struct SnapshotPin<'a> {
+    slot: &'a VmSlot,
+}
+
+impl<'a> SnapshotPin<'a> {
+    /// Claims the pin. Taken **before** the prefix directory exists, so there is no window in which
+    /// the directory is on disk and unpinned.
+    fn claim(slot: &'a VmSlot, prefix: &str) -> Self {
+        slot.status().snapshot_prefix = Some(prefix.to_string());
+        Self { slot }
+    }
+}
+
+impl Drop for SnapshotPin<'_> {
+    fn drop(&mut self) {
+        self.slot.status().snapshot_prefix = None;
     }
 }
 
@@ -211,12 +283,15 @@ impl Registry {
             extra_disks: pinned_disks,
             vcpus: req.vcpus,
             mem_mib: req.mem_mib,
+            status: std::sync::Mutex::new(SlotStatus {
+                state: VmState::Ready,
+                snapshot_prefix: None,
+            }),
             inner: Mutex::new(VmInner {
                 handle: Some(handle),
-                state: VmState::Ready,
             }),
         });
-        let info = slot.info().await;
+        let info = slot.info();
         self.vms.lock().await.insert(id.clone(), slot);
 
         let Some(cmd) = req.command else {
@@ -236,13 +311,11 @@ impl Registry {
         })
     }
 
-    /// Lists every owned VM, sorted by id.
+    /// Lists every owned VM, sorted by id. Each slot's info is read off its sync status lock, so a
+    /// VM in the middle of a snapshot (holding its `inner` for the whole write) neither blocks this
+    /// call nor hides behind a stale `Ready`.
     pub async fn list(&self) -> Vec<VmInfo> {
-        let slots: Vec<Arc<VmSlot>> = self.vms.lock().await.values().cloned().collect();
-        let mut out = Vec::with_capacity(slots.len());
-        for slot in slots {
-            out.push(slot.info().await);
-        }
+        let mut out: Vec<VmInfo> = self.vms.lock().await.values().map(|s| s.info()).collect();
         out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         out
     }
@@ -252,7 +325,7 @@ impl Registry {
     /// # Errors
     /// [`DaemonError::NotFound`] if there is no such VM.
     pub async fn get(&self, id: &VmId) -> DaemonResult<VmInfo> {
-        Ok(self.slot(id).await?.info().await)
+        Ok(self.slot(id).await?.info())
     }
 
     /// Runs a command in a `Ready` VM.
@@ -261,8 +334,15 @@ impl Registry {
     /// [`DaemonError::NotFound`] (gone) / [`DaemonError::Conflict`] (not `Ready`) / mapped exec error.
     pub async fn exec(&self, id: &VmId, req: ExecRequestDto) -> DaemonResult<ExecOutcomeDto> {
         let slot = self.slot(id).await?;
+        // Check the state BEFORE queueing on the handle lock: an exec against a snapshotting VM
+        // must 409 promptly. Waiting for `inner` first meant the snapshot had already finished and
+        // reset the state to `Ready` by the time the check ran, so the promised conflict never
+        // fired (finding `snapshotting-state-unobservable-and-list-blocks`).
+        slot.require_state(VmState::Ready, id)?;
         let mut inner = slot.inner.lock().await;
-        require_state(&inner, VmState::Ready, id)?;
+        // Re-check under the handle lock: the state can move while we queue (a destroy, or a
+        // snapshot that started in the gap). Same predicate, no second copy of the law.
+        slot.require_state(VmState::Ready, id)?;
         handle_mut(&mut inner, id)?.exec(req).await
     }
 
@@ -277,13 +357,15 @@ impl Registry {
     }
 
     /// Writes a warm snapshot of a `Ready` VM into the artifact store under `artifact_prefix/`,
-    /// returning the file names written. The prefix is **create-only**, like every other name in
-    /// the store: an existing one is refused, not written into.
+    /// returning the (sorted) file names written. The prefix is **create-only**, like every other
+    /// name in the store: an existing one is refused, not written into. For the duration of the
+    /// write the prefix is **pinned** on the slot, so the delete-in-use guard refuses it.
     ///
     /// # Errors
-    /// [`DaemonError::InvalidName`] for a bad prefix, [`DaemonError::AlreadyExists`] for a prefix
-    /// the store already holds, [`DaemonError::NotFound`]/[`DaemonError::Conflict`],
-    /// or the mapped snapshot error (`Unsupported` for an ineligible config, design §13, Cross-cutting invariants).
+    /// [`DaemonError::InvalidName`] for a bad or reserved prefix, [`DaemonError::AlreadyExists`]
+    /// for a prefix the store already holds, [`DaemonError::NotFound`]/[`DaemonError::Conflict`],
+    /// [`DaemonError::Internal`] if the written directory cannot be read back, or the mapped
+    /// snapshot error (`Unsupported` for an ineligible config, design §13, Cross-cutting invariants).
     pub async fn snapshot(&self, id: &VmId, artifact_prefix: &str) -> DaemonResult<SnapshotInfo> {
         // The prefix names a subdirectory of the artifact store — validate it as a single safe
         // component (invariant §13, Cross-cutting invariants) so a snapshot cannot escape the store.
@@ -294,8 +376,9 @@ impl Registry {
         // rejection leaves zero residue (the "mid-op faults leave zero residue" discipline). Only
         // then create the snapshot dir, under the per-VM lock.
         let slot = self.slot(id).await?;
+        slot.require_state(VmState::Ready, id)?;
         let mut inner = slot.inner.lock().await;
-        require_state(&inner, VmState::Ready, id)?;
+        slot.require_state(VmState::Ready, id)?;
         // `create_dir`, NOT `create_dir_all`: the store is create-only (design §11.3, The artifact
         // store) and a snapshot prefix is part of that namespace, so an existing prefix is a 409,
         // never a write into a populated directory. The old `create_dir_all` let a second snapshot
@@ -304,6 +387,13 @@ impl Registry {
         // EEXIST check is the kernel's, so it is atomic against a concurrent snapshot to the same
         // prefix — no check-then-act window. Free the name with DELETE /v1/artifacts/{prefix},
         // which removes a snapshot prefix dir (`ArtifactStore::delete`).
+        //
+        // PIN the prefix first (released by `Drop` on every exit path): `delete_artifact_if_unused`
+        // holds only the `vms` lock and this op holds only `slot.inner`, so without the pin the two
+        // did not exclude each other — a delete could `remove_dir_all` the prefix mid-write and the
+        // snapshot still reported 200 (finding `snapshot-prefix-unpinned-during-the-write`).
+        // Claimed BEFORE `create_dir` so the directory is never on disk unpinned.
+        let _pin = SnapshotPin::claim(&slot, artifact_prefix);
         std::fs::create_dir(&out_dir).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 DaemonError::AlreadyExists(format!(
@@ -314,24 +404,49 @@ impl Registry {
                 DaemonError::Internal(format!("cannot create snapshot dir {out_dir:?}: {e}"))
             }
         })?;
-        inner.state = VmState::Snapshotting;
-        let result = handle_mut(&mut inner, id)?.snapshot(&out_dir).await;
-        inner.state = VmState::Ready; // still live whether or not the snapshot succeeded
+        // The state is set only once the handle is in hand, so a torn-down VM cannot leave the slot
+        // stuck in `Snapshotting` on the `?` path.
+        let result = match handle_mut(&mut inner, id) {
+            Ok(handle) => {
+                slot.set_state(VmState::Snapshotting);
+                let r = handle.snapshot(&out_dir).await;
+                slot.set_state(VmState::Ready); // still live whether or not the snapshot succeeded
+                r
+            }
+            Err(e) => Err(e),
+        };
         if result.is_err() {
             // A failed snapshot leaves no residue: drop the dir we just created if it is empty
-            // (a partial-write backend leaves files; those are preserved for diagnosis).
-            let _ = std::fs::remove_dir(&out_dir);
+            // (a partial-write backend leaves files; `remove_dir` then fails with ENOTEMPTY and
+            // those files are preserved for diagnosis — logged, never silently discarded).
+            if let Err(e) = std::fs::remove_dir(&out_dir) {
+                tracing::debug!(dir = ?out_dir, error = %e, "failed snapshot: prefix dir kept (not empty)");
+            }
         }
         result?;
 
         // Enumerate the artifacts CH wrote into the snapshot dir, so a later restore can name them.
-        let files = std::fs::read_dir(&out_dir)
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // Fail loud: this read used to be `.unwrap_or_default()`, which turned a vanished prefix
+        // (deleted mid-write) or an unreadable dir into a 200 with `files: []` — a snapshot the
+        // caller believes exists (finding `snapshot-prefix-unpinned-during-the-write`, second half).
+        let rd = std::fs::read_dir(&out_dir).map_err(|e| {
+            DaemonError::Internal(format!("cannot read back snapshot dir {out_dir:?}: {e}"))
+        })?;
+        let mut files = Vec::new();
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                DaemonError::Internal(format!(
+                    "cannot read snapshot dir entry in {out_dir:?}: {e}"
+                ))
+            })?;
+            let name = entry.file_name().into_string().map_err(|raw| {
+                DaemonError::Internal(format!(
+                    "snapshot file name {raw:?} in {out_dir:?} is not valid UTF-8"
+                ))
+            })?;
+            files.push(name);
+        }
+        files.sort(); // deterministic order (readdir order is filesystem-dependent)
         Ok(SnapshotInfo {
             artifact_prefix: artifact_prefix.to_string(),
             files,
@@ -350,7 +465,7 @@ impl Registry {
         }
         .ok_or_else(|| DaemonError::NotFound(format!("no vm {id}")))?;
         let mut inner = slot.inner.lock().await;
-        inner.state = VmState::Destroying;
+        slot.set_state(VmState::Destroying);
         match inner.handle.take() {
             Some(h) => h.shutdown().await,
             None => Ok(()),
@@ -407,7 +522,7 @@ impl Registry {
         };
         for slot in slots {
             let mut inner = slot.inner.lock().await;
-            inner.state = VmState::Destroying;
+            slot.set_state(VmState::Destroying);
             if let Some(h) = inner.handle.take()
                 && let Err(e) = h.shutdown().await
             {
@@ -424,17 +539,6 @@ impl Registry {
     /// Whether the registry owns no VMs.
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
-    }
-}
-
-fn require_state(inner: &VmInner, want: VmState, id: &VmId) -> DaemonResult<()> {
-    if inner.state == want {
-        Ok(())
-    } else {
-        Err(DaemonError::Conflict(format!(
-            "vm {id} is {:?}, not {want:?}",
-            inner.state
-        )))
     }
 }
 
@@ -460,10 +564,35 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::AtomicUsize;
 
+    /// What a fake `snapshot` does beyond writing its one state file — the effects the fs-blind
+    /// default cannot exercise (AGENTS.md: name what the fake cannot see, then drive it).
+    #[derive(Clone, Default)]
+    enum SnapshotBehavior {
+        /// Write `state.json` and return.
+        #[default]
+        Normal,
+        /// Signal `entered`, then block until `release` is notified — the in-flight window a
+        /// concurrent delete / `get` / `list` / `exec` races against.
+        Blocked(Arc<SnapshotGate>),
+        /// Remove the snapshot directory before returning `Ok` — exactly what a racing
+        /// `delete_artifact_if_unused` did to an unpinned prefix, so the read-back must fail loud
+        /// instead of reporting `files: []`.
+        RemovesDir,
+    }
+
+    /// The rendezvous a `Blocked` snapshot uses: `entered` fires when the backend write starts,
+    /// `release` lets it finish. `Notify` stores one permit, so neither side can miss the other.
+    #[derive(Default)]
+    struct SnapshotGate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
     /// A recording fake handle — no KVM. Counts execs + shutdowns.
     struct FakeHandle {
         vmid: u32,
         shutdowns: Arc<AtomicUsize>,
+        snapshot_behavior: SnapshotBehavior,
     }
 
     #[async_trait]
@@ -496,8 +625,17 @@ mod tests {
         /// filesystem effect is what lets the prefix-reuse gate below prove that a refused second
         /// snapshot did not overwrite the first VM's state.
         async fn snapshot(&mut self, dir: &std::path::Path) -> DaemonResult<()> {
+            if let SnapshotBehavior::Blocked(gate) = &self.snapshot_behavior {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             std::fs::write(dir.join("state.json"), format!("vmid={}", self.vmid))
                 .map_err(|e| DaemonError::Internal(format!("fake snapshot write failed: {e}")))?;
+            if matches!(self.snapshot_behavior, SnapshotBehavior::RemovesDir) {
+                std::fs::remove_dir_all(dir).map_err(|e| {
+                    DaemonError::Internal(format!("fake snapshot dir removal failed: {e}"))
+                })?;
+            }
             Ok(())
         }
         async fn pause(&mut self) -> DaemonResult<()> {
@@ -515,6 +653,7 @@ mod tests {
     struct FakeLauncher {
         next_vmid: AtomicU64,
         shutdowns: Arc<AtomicUsize>,
+        snapshot_behavior: SnapshotBehavior,
     }
 
     #[async_trait]
@@ -523,11 +662,18 @@ mod tests {
             Ok(Box::new(FakeHandle {
                 vmid: self.next_vmid.fetch_add(1, Ordering::SeqCst) as u32,
                 shutdowns: self.shutdowns.clone(),
+                snapshot_behavior: self.snapshot_behavior.clone(),
             }))
         }
     }
 
     fn registry() -> (Registry, Arc<AtomicUsize>, tempfile::TempDir) {
+        registry_with(SnapshotBehavior::Normal)
+    }
+
+    fn registry_with(
+        snapshot_behavior: SnapshotBehavior,
+    ) -> (Registry, Arc<AtomicUsize>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifacts =
             ArtifactStore::open(dir.path().join("artifacts"), 1 << 20).expect("artifacts");
@@ -537,6 +683,7 @@ mod tests {
         let launcher = FakeLauncher {
             next_vmid: AtomicU64::new(1),
             shutdowns: shutdowns.clone(),
+            snapshot_behavior,
         };
         let reg = Registry::new(Box::new(launcher), artifacts, 0xdead_beef);
         (reg, shutdowns, dir)
@@ -781,6 +928,173 @@ mod tests {
         assert!(
             !reg.artifacts().exists("del-me"),
             "unpinned delete removes the file"
+        );
+    }
+
+    // The reserved `.sha256` suffix is refused on the snapshot verb too, because it lives in
+    // `validate_artifact_name` — the validator EVERY name-taking path uses (finding
+    // `snapshot-skips-the-reserved-sidecar-predicate`). Before the fold, `snapshot(&id,
+    // "rootfs.sha256")` returned Ok and created a directory that `info`/`list`/`delete` all hid,
+    // permanently breaking uploads of `rootfs`. RED on the inverse (a `validate_artifact_name`
+    // without the suffix arm): the prefix is accepted and the directory appears.
+    #[tokio::test]
+    async fn snapshot_rejects_a_reserved_sidecar_prefix() {
+        let (reg, _s, _d) = registry();
+        let created = reg.create(create_req()).await.expect("create");
+        let err = reg
+            .snapshot(&created.info.id, "k.sha256")
+            .await
+            .expect_err("a reserved sidecar prefix must be refused");
+        assert!(matches!(err, DaemonError::InvalidName(_)), "got {err:?}");
+        assert_eq!(err.kind().status_code(), 400);
+        assert!(
+            !reg.artifacts().dir().join("k.sha256").exists(),
+            "the refused prefix must leave no directory (it would be undeletable via the API)"
+        );
+        // Positive control: the same stem without the reserved suffix still snapshots.
+        let info = reg
+            .snapshot(&created.info.id, "k")
+            .await
+            .expect("a non-reserved prefix snapshots");
+        assert_eq!(info.files, vec!["state.json".to_string()]);
+    }
+
+    // §11.3/§11.4, the delete-in-use guard extended to an IN-FLIGHT snapshot prefix (finding
+    // `snapshot-prefix-unpinned-during-the-write`): with the backend write blocked mid-snapshot, a
+    // delete of the prefix is refused (409 InUse) and the directory survives; when the write
+    // finishes the pin releases and the same delete succeeds (positive control). RED on the inverse
+    // (a `pins` that ignores `snapshot_prefix`): the delete returns Ok and `remove_dir_all`s the
+    // prefix out from under the running snapshot.
+    #[tokio::test]
+    async fn delete_refuses_a_prefix_a_snapshot_is_writing_then_allows_it_after() {
+        let gate = Arc::new(SnapshotGate::default());
+        let (reg, _s, _d) = registry_with(SnapshotBehavior::Blocked(gate.clone()));
+        let reg = Arc::new(reg);
+        let created = reg.create(create_req()).await.expect("create");
+        let prefix_dir = reg.artifacts().dir().join("snap-live");
+
+        let snap_reg = reg.clone();
+        let id = created.info.id.clone();
+        let snap = tokio::spawn(async move { snap_reg.snapshot(&id, "snap-live").await });
+        gate.entered.notified().await; // the backend write is now in flight
+
+        let err = reg
+            .delete_artifact_if_unused("snap-live")
+            .await
+            .expect_err("a prefix being written must be pinned");
+        assert!(matches!(err, DaemonError::InUse(_)), "got {err:?}");
+        assert_eq!(err.kind().status_code(), 409);
+        assert!(
+            prefix_dir.is_dir(),
+            "the refused delete must leave the in-flight snapshot dir"
+        );
+
+        gate.release.notify_one();
+        let info = snap.await.expect("join").expect("snapshot");
+        assert_eq!(info.files, vec!["state.json".to_string()]);
+
+        // Positive control: the pin releases with the write, so the same delete now succeeds.
+        reg.delete_artifact_if_unused("snap-live")
+            .await
+            .expect("the prefix is deletable once the write is done");
+        assert!(!prefix_dir.exists(), "prefix gone after the delete");
+    }
+
+    // The second half of the same finding: the snapshot dir read-back is FAIL-LOUD. The fake
+    // removes the directory before returning (exactly what a racing delete did to an unpinned
+    // prefix), and the caller must see an Internal error naming the prefix — not the 200 with
+    // `files: []` that `.unwrap_or_default()` produced for a snapshot that no longer exists. RED on
+    // the inverse (restore `.unwrap_or_default()`): the call returns Ok.
+    #[tokio::test]
+    async fn snapshot_read_back_failure_surfaces_instead_of_an_empty_file_list() {
+        let (reg, _s, _d) = registry_with(SnapshotBehavior::RemovesDir);
+        let created = reg.create(create_req()).await.expect("create");
+        let err = reg
+            .snapshot(&created.info.id, "snap-gone")
+            .await
+            .expect_err("a vanished snapshot dir must fail loud");
+        assert!(matches!(err, DaemonError::Internal(_)), "got {err:?}");
+        assert_eq!(err.kind().status_code(), 500);
+        assert!(
+            err.message().contains("snap-gone"),
+            "the error must name the prefix: {}",
+            err.message()
+        );
+    }
+
+    // §11.4 + the `require_state` contract (finding
+    // `snapshotting-state-unobservable-and-list-blocks`): while one VM writes a snapshot, its state
+    // is OBSERVABLE as `Snapshotting`, `get`/`list` return promptly (no head-of-line blocking
+    // across VMs), and an `exec` against it is a prompt 409. RED on the inverse (state back inside
+    // `VmInner`, `require_state` after the `inner` lock): every one of these waits for the whole
+    // snapshot — the timeouts fire — and the state read back is a stale `Ready`.
+    #[tokio::test]
+    async fn snapshotting_state_is_observable_and_blocks_neither_reads_nor_other_vms() {
+        let gate = Arc::new(SnapshotGate::default());
+        let (reg, _s, _d) = registry_with(SnapshotBehavior::Blocked(gate.clone()));
+        let reg = Arc::new(reg);
+        let busy = reg.create(create_req()).await.expect("vm a");
+        let idle = reg.create(create_req()).await.expect("vm b");
+
+        let snap_reg = reg.clone();
+        let id = busy.info.id.clone();
+        let snap = tokio::spawn(async move { snap_reg.snapshot(&id, "snap-state").await });
+        gate.entered.notified().await;
+
+        let budget = std::time::Duration::from_millis(500);
+        let info = tokio::time::timeout(budget, reg.get(&busy.info.id))
+            .await
+            .expect("get must not queue behind the snapshot")
+            .expect("get");
+        assert_eq!(
+            info.state,
+            VmState::Snapshotting,
+            "the documented Snapshotting state must be observable"
+        );
+
+        let list = tokio::time::timeout(budget, reg.list())
+            .await
+            .expect("list must not queue behind one VM's snapshot");
+        assert_eq!(list.len(), 2);
+        assert!(
+            list.iter()
+                .any(|v| v.id == busy.info.id && v.state == VmState::Snapshotting),
+            "the snapshotting VM reports its state in the listing"
+        );
+        assert!(
+            list.iter()
+                .any(|v| v.id == idle.info.id && v.state == VmState::Ready),
+            "the OTHER VM is listed as Ready — no head-of-line blocking"
+        );
+
+        let err = tokio::time::timeout(
+            budget,
+            reg.exec(&busy.info.id, ExecRequestDto::new(vec!["echo".into()])),
+        )
+        .await
+        .expect("exec must not queue behind the snapshot")
+        .expect_err("exec against a snapshotting VM must conflict");
+        assert_eq!(err.kind().status_code(), 409, "{}", err.message());
+
+        // Positive control: the idle VM still execs while its neighbour snapshots.
+        let out = tokio::time::timeout(
+            budget,
+            reg.exec(
+                &idle.info.id,
+                ExecRequestDto::new(vec!["echo".into(), "ok".into()]),
+            ),
+        )
+        .await
+        .expect("the idle VM's exec must not queue behind another VM's snapshot")
+        .expect("exec");
+        assert_eq!(out.stdout().expect("decode"), b"echo ok");
+
+        gate.release.notify_one();
+        snap.await.expect("join").expect("snapshot");
+        assert_eq!(
+            reg.get(&busy.info.id).await.expect("get").state,
+            VmState::Ready,
+            "the state returns to Ready after the write"
         );
     }
 

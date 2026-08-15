@@ -5,6 +5,10 @@
 //! what lets the guest agent be a standalone, host-stack-free workspace member
 //! (§8.1, Workspace layout). It defines the messages exchanged over the vsock connection and
 //! the framing bound both ends must agree on.
+//!
+//! It carries one non-wire item for the same reason: [`GUEST_TOOLS_APPLETS`], the
+//! host↔guest **agreement** on the multicall applet roster. `vmcell-guest-tools` links
+//! this crate for that const alone; it speaks no protocol.
 #![forbid(unsafe_code)]
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
@@ -135,6 +139,27 @@ pub fn capped_debug(value: &dyn core::fmt::Debug) -> String {
 /// this, a `None` timeout would let a runaway guest child outlive the host's
 /// abandoned wait and leak.
 pub const DEFAULT_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The **one** guest-tools multicall applet roster: every exec-PATH name the
+/// `vmcell-guest-tools` binary dispatches, in injection order.
+///
+/// Design §4.4 requires the guest binary's dispatch table and the host's
+/// `vmcell::artifact::rootfs` injection manifest to agree. They were independent literals,
+/// so a one-sided edit stayed green: a `/vmcell-tools/<name>` symlink with no dispatch arm
+/// prints a usage error and exits 2 — and because `echo-server` is also used as a custom
+/// `init=` target, an exit-2 PID 1 is an immediate guest kernel panic. That regression
+/// shipped twice (docs/81 m22), so the roster lives here, in the one crate both sides link,
+/// and **both sides derive from it**:
+///
+/// * `vmcell-guest-tools` sizes its dispatch table to `GUEST_TOOLS_APPLETS.len()` and
+///   `const`-asserts the names element-wise, so a one-sided edit is a *compile* error.
+/// * `vmcell`'s `rootfs_injection_manifest` emits exactly one `/vmcell-tools/<name>`
+///   symlink per entry — there is no name literal on that side to edit at all.
+///
+/// Order is the injection order and the dispatch-table order; it carries no other meaning.
+/// Names must be unique (the dispatch lookup is first-match) — pinned by
+/// `guest_tools_applet_roster_is_unique_and_non_empty`.
+pub const GUEST_TOOLS_APPLETS: &[&str] = &["ip", "curl", "kvm-ok", "echo-server"];
 
 /// IPv4 reconfiguration the guest applies to `eth0` during a post-restore resync
 /// (H-VMM-1 — "rotate everything").
@@ -466,6 +491,33 @@ impl Default for ExecOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The roster both sides derive from must be a usable lookup key set. Both consumers do a
+    // first-match lookup (`vmcell-guest-tools`' dispatch, `is_reserved_injection_path`'s
+    // membership scan) and the manifest emits one symlink per entry, so a duplicate name
+    // would make the second copy permanently unreachable AND emit a duplicate symlink into
+    // the packer's node map. An empty roster would silently un-bake every applet.
+    // RED on the inverse: add a second `"ip"` (the dedup assert fires naming it); empty the
+    // const (the non-empty assert fires).
+    #[test]
+    fn guest_tools_applet_roster_is_unique_and_non_empty() {
+        assert!(
+            !GUEST_TOOLS_APPLETS.is_empty(),
+            "an empty roster un-bakes every guest-tools applet"
+        );
+        let mut seen: Vec<&str> = Vec::new();
+        for name in GUEST_TOOLS_APPLETS {
+            assert!(
+                !name.is_empty() && !name.contains('/'),
+                "{name:?} is not a usable exec-PATH file name"
+            );
+            assert!(
+                !seen.contains(name),
+                "duplicate applet name {name:?}: the second copy is unreachable"
+            );
+            seen.push(name);
+        }
+    }
 
     // docs/78 §6 (`uncapped-frame-debug-renders`): the ONE renderer every desync log
     // site on this plane goes through. A frame is peer-chosen and `MAX_FRAME_BYTES`

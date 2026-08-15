@@ -56,11 +56,40 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use vmcell::config::{ConsoleMode, VmConfig};
 use vmcell::error::{Error, Result};
 use vmcell::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities, VsockEndpoint};
 
 use tokio::process::Child;
+
+/// The wall-clock budget bounding **every** crosvm control-client invocation — the one named
+/// lifecycle bound this backend has (M5).
+///
+/// crosvm's control plane is a short-lived client process per operation (`crosvm resume|suspend|
+/// powerbtn|stop <socket>`, `crosvm snapshot take …`), and a wedged VMM leaves that client blocked
+/// on the socket forever: `run_control` and `snapshot_take` used to be a bare `status().await`, so
+/// `boot()`, `request_shutdown()`, `pause()`, `resume()` and `snapshot()` were unbounded. The
+/// damage is not just a hung call — `shutdown()` awaits `request_shutdown()` **before** the ORCH-7
+/// grace poll and before the guaranteed `kill()` fallback, so one wedged `powerbtn` blocked the
+/// force-kill that is supposed to be unconditional and the VM's netns/tap/cgroup/scratch/vmid were
+/// never reclaimed. Every sibling backend bounds this class (CH/FC's 5 s `REQUEST_TIMEOUT`, QEMU's
+/// 2 s control timeout + `MIGRATION_BUDGET`); this is crosvm's.
+///
+/// **Sizing.** Deliberately larger than CH/FC's generic 5 s ceiling because two crosvm control ops
+/// do guest-RAM work: `snapshot take` writes the suspend image (≈268 MB for a 256 MiB guest, design
+/// §16), and the first `resume --full` after `--restore` waits for that image to load. 10 s clears
+/// both with margin on any real disk while keeping teardown prompt — `kill()`'s graceful `stop` is
+/// bounded by this same budget (it carries no second literal of its own), so a wedged VM's forced
+/// teardown is bounded by it too. The budget exists to convert an infinite wedge into a typed
+/// [`Error::Timeout`], not to enforce a latency SLA; a guest-RAM-proportional snapshot budget is
+/// the (cross-backend) M6-class follow-up.
+///
+/// Read once by [`Crosvm::new`] into [`Crosvm`]'s `control_budget`, which every instance inherits at
+/// spawn — a field rather than a bare const read at the call sites so the KVM-free wedged-client
+/// gate can shrink it and prove the bound end-to-end through the real `create()` path (the shape
+/// `vmcell-qemu`'s migration-budget gate uses).
+const CROSVM_CONTROL_BUDGET: Duration = Duration::from_secs(10);
 
 /// The crosvm VMM backend.
 #[derive(Debug, Clone)]
@@ -69,6 +98,11 @@ pub struct Crosvm {
     /// Path to the `crosvm` executable (used both to launch the VM and, re-invoked as a client,
     /// to drive the control socket).
     pub binary_path: PathBuf,
+    // The budget every control-client invocation of this backend's instances is bounded by,
+    // seeded from `CROSVM_CONTROL_BUDGET` (the one named value — never a second literal at a call
+    // site). Private: it is backend policy, not caller configuration; it is a field only so the
+    // KVM-free gate can shrink it.
+    control_budget: Duration,
 }
 
 impl Crosvm {
@@ -77,6 +111,7 @@ impl Crosvm {
     pub fn new(binary_path: impl Into<PathBuf>) -> Self {
         Self {
             binary_path: binary_path.into(),
+            control_budget: CROSVM_CONTROL_BUDGET,
         }
     }
 }
@@ -88,17 +123,27 @@ pub struct CrosvmInstance {
     process: Child,
     /// The `crosvm` binary, re-invoked as a client for every control operation.
     binary_path: PathBuf,
+    // The wall-clock bound on every control-client invocation this instance makes, inherited from
+    // the backend at spawn (`CROSVM_CONTROL_BUDGET`). One value for `run_control` AND
+    // `snapshot_take`, so no control op is unbounded and none carries its own literal (M5).
+    control_budget: Duration,
+    // The wall-clock bound on the guest-RAM-proportional `crosvm snapshot take` (M6): the larger
+    // of `control_budget` and the ONE shared `vmcell::vmm::snapshot_request_timeout(mem_mib)`,
+    // computed once at spawn. Ordinary control ops deliberately keep `control_budget` — a wedged
+    // `powerbtn` must stay promptly bounded, since `shutdown()` awaits it BEFORE the guaranteed
+    // `kill()`. A field, like `control_budget`, only so the KVM-free gates can shrink it.
+    snapshot_budget: Duration,
     control_socket: PathBuf,
     /// Vestigial AF_UNIX path returned by [`VmInstance::vsock_path`] for API parity; crosvm's vsock
     /// is in-kernel AF_VSOCK, so [`CrosvmInstance::vsock_endpoint`] is what the host actually dials.
     vsock_path: PathBuf,
     serial_path: PathBuf,
     cid: u32,
-    pgid: Option<u32>,
-    // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the leader is reaped
-    // the kernel can recycle its pgid, so `kill`/`Drop` must NOT re-`SIGKILL` the process group or
-    // they could hit an unrelated group (M-VMM-1).
-    reaped: bool,
+    // The VMM leader's process group AND the one-shot "already reaped" flag, owned together by the
+    // one shared helper (`vmcell::vmm::VmmProcessGroup`, L1): `kill`, `has_exited` and `Drop` all
+    // route through it, so no copy can forget the M-VMM-1 guard and SIGKILL a pgid the kernel has
+    // since recycled.
+    group: vmcell::vmm::VmmProcessGroup,
     // `true` on an instance returned by `restore()`: the VM was launched `--suspended --restore`, so
     // the FIRST `resume()` must be `--full` (wake devices + vCPUs) to complete the restore. Consumed
     // (set false) only after that resume succeeds, so a transient failure stays retryable.
@@ -162,6 +207,39 @@ fn reject_disk_io_throttle(cfg: &VmConfig) -> Result<()> {
     Ok(())
 }
 
+/// Refuses the two config levers crosvm advertises as **false** and would otherwise accept and
+/// silently degrade (d7).
+///
+/// §2.1's contract is that every backend self-checks its own descriptor instead of assuming the
+/// caller consulted it, and three sibling fields (`virtio_console`, `disk_io_throttle`,
+/// `usb_host_passthrough`) already do. These two did not:
+///
+/// - `nested_virt` — crosvm documents no working guest `/dev/kvm`, yet the SHARED
+///   [`vmcell::config::build_kernel_cmdline`] emits `kvm-intel.nested=1` for **every** backend on
+///   `cfg.nested_virt`, so an accepted request boots a guest whose L1 `/dev/kvm` never appears: the
+///   lever reads as applied and is not.
+/// - `lazy_restore` — no userfaultfd/demand-paged restore backend is wired (`restore()` loads the
+///   snapshot eagerly via `crosvm run --restore`), so
+///   [`RestoreMode::Lazy`](vmcell::config::RestoreMode::Lazy) would fault eagerly under a config
+///   that asked for demand paging.
+///
+/// Both branches live in the **one** shared predicate
+/// [`vmcell::vmm::reject_unadvertised_capabilities`], which keys off the
+/// [`crosvm_capabilities`] value handed in — never a hardcoded `false` at the refusal site — so
+/// flipping a flag flips its refusal with it, and each feature string IS the
+/// [`VmmCapabilities`] field name (N-VMM-1). This wrapper exists only to bind the `"crosvm"`
+/// name once; it landed as three byte-identical per-backend copies and was hoisted.
+///
+/// Called from `create()` **and** `restore()`, exactly like [`reject_disk_io_throttle`] (M4): a
+/// `restore()` that accepted what `create()` rejects is the same defect one path over, and
+/// `restore_mode` is precisely the field a restore consumes.
+///
+/// # Errors
+/// [`Error::Unsupported`] `{ vmm: "crosvm", feature }` naming the unadvertised capability.
+fn reject_unadvertised_capabilities(caps: &VmmCapabilities, cfg: &VmConfig) -> Result<()> {
+    vmcell::vmm::reject_unadvertised_capabilities("crosvm", caps, cfg)
+}
+
 /// The [`JailConfig`](vmcell::config::JailConfig) actually handed to
 /// [`apply_jail`](vmcell::vmm::jail::apply_jail) for a crosvm launch — the pure, total mapping from
 /// the requested `(cfg.jail, cfg.vmm_seccomp)` pair to the Layer-2 posture that ships.
@@ -177,7 +255,9 @@ fn reject_disk_io_throttle(cfg: &VmConfig) -> Result<()> {
 ///
 /// Pure (a `Copy` in, a `Copy` out) so a KVM-free test can pin BOTH directions. M10: this flip lived
 /// inline in `spawn` and deleting it left every KVM-free gate *and* the whole live `test-crosvm`
-/// matrix green while crosvm ran with no seccomp filter at all.
+/// matrix green while crosvm ran with no seccomp filter at all. M11: its one caller is now
+/// [`crosvm_launch_plan`], so *which* posture `spawn` ships is a returned value under gate too — a
+/// test on this function alone was never a gate on the call.
 fn effective_jail_config(cfg: &VmConfig) -> vmcell::config::JailConfig {
     let mut jail = cfg.jail; // JailConfig is Copy
     if matches!(cfg.vmm_seccomp, vmcell::config::VmmSeccomp::Enforcing) {
@@ -397,6 +477,155 @@ fn crosvm_control_args(subcmd: &str, socket: &Path, extra: &[&str]) -> Vec<Strin
     args
 }
 
+/// Everything a crosvm launch is: the **fully composed command**, plus a record of the two
+/// inputs it was composed from.
+///
+/// `spawn` receives this and spawns [`Self::cmd`]; it never holds a
+/// [`JailConfig`](vmcell::config::JailConfig), a `JailSpec` or an argv of its own, so there is
+/// no window between "decide the posture" and "apply the posture" for anything to change it.
+/// That window is exactly what defeated M11's first shape: with the plan carrying a mutable
+/// `jail` that `spawn` later compiled, a two-line
+/// `let mut plan = …; plan.jail = cfg.jail;` shipped every crosvm VM with no seccomp filter and
+/// left the whole suite green, because the source scan's predicate was satisfied by the mutated
+/// binding.
+///
+/// [`jail`](Self::jail) and [`run_args`](Self::run_args) are **records, not inputs**: the
+/// command is already built when the plan exists, so mutating either changes nothing about what
+/// ships. They exist so a KVM-free test can assert on the posture and argv that WERE used —
+/// and, because [`Self::build`] is the only constructor and takes each of them exactly once, the
+/// record provably IS what was used.
+#[derive(Debug)]
+struct CrosvmLaunchPlan {
+    /// The composed `crosvm run …` command, with the netns join and the jail already applied by
+    /// [`build_vmm_cmd`](vmcell::vmm::build_vmm_cmd). Moved out and spawned by `spawn`.
+    cmd: tokio::process::Command,
+    /// A record of the effective jail posture ([`effective_jail_config`]) the command's
+    /// `JailSpec` was compiled from. Inert — see the type doc.
+    ///
+    /// Read only by the M11 gate, which is the point: it exists so a KVM-free test can name the
+    /// posture that shipped. `cfg_attr(not(test), …)` rather than a bare `#[expect]`, because in a
+    /// test build the field IS read and an unconditional expectation would go unfulfilled.
+    ///
+    /// The expectation is load-bearing, not decoration: it says "production never touches this".
+    /// Any production write — including the exact
+    /// `let mut plan = crosvm_launch_plan(…)?; plan.jail = cfg.jail;` that defeated M11's first
+    /// shape — makes the field no longer dead, the expectation unfulfilled, and the shipped build
+    /// a hard error under `RUSTFLAGS=-D warnings` (which `just ci` sets). Verified by applying
+    /// that edit and observing `error: this lint expectation is unfulfilled`. So the mutation is
+    /// both INERT (the command is already composed; see
+    /// `mutating_the_plans_recorded_jail_cannot_change_what_ships`) and unbuildable.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the shipped posture, recorded for the M11 gate; the command already carries it"
+        )
+    )]
+    jail: vmcell::config::JailConfig,
+    /// A record of the `crosvm run` arguments appended after the subcommand and the
+    /// seccomp/sandbox flags. Inert — see the type doc.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the shipped argv, recorded for the M11 gate; the command already carries it"
+        )
+    )]
+    run_args: Vec<String>,
+}
+
+impl CrosvmLaunchPlan {
+    /// The **only** constructor: compiles `jail` into the `JailSpec`, builds the command with
+    /// that spec, and records the very same `jail` value.
+    ///
+    /// One value, two uses, no window between them — so a plan whose recorded posture disagrees
+    /// with its command's posture is unrepresentable. The one remaining way to ship the wrong
+    /// posture is to hand the wrong `jail` in at the single call site, and that is a *behavioral*
+    /// difference the M11 gate catches directly (`plan.jail == effective_jail_config(cfg)` and
+    /// `plan.jail != cfg.jail`), not something a source scan has to infer.
+    ///
+    /// # Errors
+    /// Propagates [`jail_spec_from_config`](vmcell::vmm::jail::jail_spec_from_config)'s error
+    /// (an unsupported jail request).
+    fn build(
+        binary_path: &Path,
+        netns_name: Option<&str>,
+        jail: vmcell::config::JailConfig,
+        seccomp_args: &[String],
+        run_args: Vec<String>,
+    ) -> Result<Self> {
+        let spec = vmcell::vmm::jail::jail_spec_from_config(&jail)?;
+        let mut cmd = vmcell::vmm::build_vmm_cmd(binary_path, netns_name, &spec);
+        cmd.arg("run");
+        cmd.args(seccomp_args);
+        cmd.args(&run_args);
+        Ok(Self {
+            cmd,
+            jail,
+            run_args,
+        })
+    }
+}
+
+/// The two per-VM paths a crosvm launch names, bundled so [`crosvm_launch_plan`] stays inside
+/// clippy's argument budget — the same shape `vmcell-qemu`'s `QemuSpawnPaths` uses. Both are
+/// derived from `res.tmp_dir` by `spawn`, which owns the scratch directory.
+struct CrosvmSpawnPaths<'a> {
+    /// The `--socket` control socket crosvm binds, and the readiness gate `spawn` waits on.
+    control_socket: &'a Path,
+    /// The serial log file the guest console is written to.
+    serial_path: &'a Path,
+}
+
+/// The pure, total mapping from a config to the pair a crosvm launch is made of (M11).
+///
+/// `spawn` builds through this and uses **only** what it returns, so the jail posture that ships is
+/// a *returned value* a KVM-free test can assert on rather than an inline argument no gate can see.
+/// That distinction is the whole point: crosvm always runs `--disable-sandbox`, so the Layer-2
+/// deny-list `effective_jail_config` turns on is its ONLY seccomp confinement — and while that flip
+/// lived as an inline `jail_spec_from_config(&effective_jail_config(cfg))` argument, rewriting the
+/// one token to `&cfg.jail` shipped every crosvm VM unconfined with `cargo test`, `just ci` and the
+/// entire live `test-crosvm` matrix green (the deny-list is default-allow/EPERM, so no functional
+/// leg notices).
+///
+/// # Errors
+/// Propagates [`build_crosvm_run_args`]'s error (the guest MAC derivation),
+/// [`vmm_seccomp_args`](vmcell::vmm::seccomp::vmm_seccomp_args)'s typed refusal of
+/// [`VmmSeccomp::Log`](vmcell::config::VmmSeccomp::Log), and
+/// [`CrosvmLaunchPlan::build`]'s jail-compilation error.
+fn crosvm_launch_plan(
+    binary_path: &Path,
+    cfg: &VmConfig,
+    res: &PerVmResources,
+    paths: &CrosvmSpawnPaths<'_>,
+    guest_cid: u32,
+    cmdline: &str,
+    restore_from: Option<&Path>,
+) -> Result<CrosvmLaunchPlan> {
+    // The argv half of the sandbox posture: always `--disable-sandbox` for crosvm, and the one
+    // typed refusal of `VmmSeccomp::Log`. Computed here, before any spawn, so a `Log` config is
+    // refused without a process ever being created.
+    let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("crosvm", cfg.vmm_seccomp)?;
+    let run_args = build_crosvm_run_args(
+        cfg,
+        res,
+        paths.control_socket,
+        paths.serial_path,
+        guest_cid,
+        cmdline,
+        restore_from,
+    )?;
+    // The confinement half: the ONE `effective_jail_config` call, handed straight to the one
+    // constructor that both compiles it and records it.
+    CrosvmLaunchPlan::build(
+        binary_path,
+        res.netns_name.as_deref(),
+        effective_jail_config(cfg),
+        &seccomp_args,
+        run_args,
+    )
+}
+
 impl Crosvm {
     async fn spawn(
         &self,
@@ -426,25 +655,25 @@ impl Crosvm {
         // the confinement half is the Layer-2 deny-list `effective_jail_config` turns on — crosvm is
         // the one backend whose confinement is Layer 2 rather than its own filter, and it is the
         // per-backend deny-list enablement the deny-list was designed for (validated: crosvm boots +
-        // execs + does tap/netns networking under the deny-list). The mapping is pure and pinned
-        // KVM-free in both directions (M10) rather than open-coded here.
-        let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("crosvm", cfg.vmm_seccomp)?;
-        let jail = vmcell::vmm::jail::jail_spec_from_config(&effective_jail_config(cfg))?;
-        let run_args = build_crosvm_run_args(
+        // execs + does tap/netns networking under the deny-list).
+        //
+        // M11: the whole launch — jail spec, netns, argv — is composed inside `crosvm_launch_plan`,
+        // so `spawn` holds NO `JailConfig` and NO `JailSpec` and there is no window in which the
+        // posture could be swapped between deciding it and applying it. `plan.jail` is an inert
+        // record the KVM-free gate asserts on; mutating it here would change nothing.
+        let plan = crosvm_launch_plan(
+            &self.binary_path,
             cfg,
             res,
-            &control_socket,
-            &serial_path,
+            &CrosvmSpawnPaths {
+                control_socket: &control_socket,
+                serial_path: &serial_path,
+            },
             guest_cid,
             &cmdline,
             restore_from,
         )?;
-
-        let mut cmd =
-            vmcell::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
-        cmd.arg("run");
-        cmd.args(&seccomp_args);
-        cmd.args(&run_args);
+        let mut cmd = plan.cmd;
 
         // Debug level (not info): the full command line is diagnostic noise on every create.
         tracing::debug!("crosvm CMD: {cmd:?}");
@@ -463,7 +692,6 @@ impl Crosvm {
             cgroups,
             &res.cgroup_name,
             &control_socket,
-            1000,
             cfg.timeouts.api_socket_poll.as_millis() as u64,
         )
         .await?;
@@ -471,12 +699,20 @@ impl Crosvm {
         Ok(CrosvmInstance {
             process,
             binary_path: self.binary_path.clone(),
+            // Every control op this instance makes is bounded by the backend's budget (M5).
+            control_budget: self.control_budget,
+            // M6: the take writes a suspend image that tracks guest RAM ~1:1 (≈268 MB for a
+            // 256 MiB guest, §16), so it rides the shared guest-RAM-proportional predicate over
+            // this backend's flat control budget as a floor — never the flat budget alone, which a
+            // multi-GiB guest overruns by construction.
+            snapshot_budget: self
+                .control_budget
+                .max(vmcell::vmm::snapshot_request_timeout(cfg.mem_mib)),
             control_socket,
             vsock_path,
             serial_path,
             cid: guest_cid,
-            pgid,
-            reaped: false,
+            group: vmcell::vmm::VmmProcessGroup::new(pgid),
             // A restore-spawned instance is returned paused; its first `resume()` must be `--full`.
             restored: restore_from.is_some(),
             has_vhost_user_device: vmcell::vmm::config_has_vhost_user_device(cfg, res),
@@ -533,6 +769,10 @@ impl Vmm for Crosvm {
         // §2.5), so there is no bus to attach a host device to. Refuse through the ONE shared
         // predicate rather than silently ignoring the accepted input.
         vmcell::vmm::reject_usb_host_devices("crosvm", &caps, &cfg.usb_host_devices)?;
+        // `nested_virt` and `RestoreMode::Lazy` are advertised false and have no crosvm
+        // realization; refuse them here rather than boot a VM whose requested lever reads as
+        // applied and is not (d7). Same predicate `restore()` uses.
+        reject_unadvertised_capabilities(&caps, cfg)?;
 
         self.spawn(cfg, res, cgroups, None, res.guest_cid).await
     }
@@ -561,6 +801,10 @@ impl Vmm for Crosvm {
         // unguarded restore would silently attach the throttled disk unthrottled. One predicate,
         // both paths.
         reject_disk_io_throttle(cfg)?;
+        // Same law for the two unadvertised levers (d7): `restore_mode` is the field a restore
+        // consumes, so a `RestoreMode::Lazy` accepted here would fault eagerly under a config that
+        // asked for demand paging.
+        reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
 
         // Eligibility (S1, §8.1), defense in depth alongside `config::build()`, the orchestrator
         // re-check, and `check_clone_eligible`. crosvm has no external vhost-user devices, so a share
@@ -621,19 +865,70 @@ impl Vmm for Crosvm {
 
 impl CrosvmInstance {
     /// Runs one crosvm control subcommand against this instance's side socket and fails if crosvm
-    /// exits non-zero.
+    /// exits non-zero — bounded by [`CROSVM_CONTROL_BUDGET`] (M5).
     ///
     /// Each control op re-invokes the crosvm binary as a short-lived client (`crosvm <subcmd>
     /// <socket>`) — the socket protocol is unstable binary and is never hand-rolled. Awaiting the
     /// child reaps it. Not jailed or netns-entered: it is a host-side client, not the VMM.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] naming the subcommand if the client does not exit within the budget (the
+    /// abandoned client is SIGKILLed and reaped by `kill_on_drop`, so a wedged VMM leaks no client
+    /// process); [`Error::Vmm`] if it exits non-zero; [`Error::Io`] if it cannot be spawned.
     async fn run_control(&self, subcmd: &str, extra: &[&str]) -> Result<()> {
-        let status = tokio::process::Command::new(&self.binary_path)
-            .args(crosvm_control_args(subcmd, &self.control_socket, extra))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .await?;
+        self.invoke_control(
+            subcmd,
+            self.control_budget,
+            crosvm_control_args(subcmd, &self.control_socket, extra)
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect(),
+        )
+        .await
+    }
+
+    /// The **one** bounded control-client invocation: spawn `crosvm <args>`, wait at most `budget`,
+    /// and fail loud if it elapses or exits non-zero.
+    ///
+    /// One law, one predicate — and specifically one `budget` binding. `budget` is used TWICE here,
+    /// for the wall-clock bound AND for the typed elapse that reports it, from the same parameter:
+    /// when those were two separate expressions (`timeout(self.snapshot_budget, …)` beside
+    /// `control_timeout(…, self.snapshot_budget)`), swapping only the first silently put
+    /// `snapshot take` back on the flat control budget while the error message — and therefore the
+    /// gate reading it — still said otherwise. Threading one parameter makes that divergence
+    /// unrepresentable, which is what lets
+    /// `crosvm_control_ops_are_bounded_by_the_control_budget` tell the two budgets apart.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] naming `subcmd` and `budget` if the client does not exit in time (the
+    /// abandoned client is SIGKILLed and reaped by `kill_on_drop`, so a wedged VMM leaks no client
+    /// process); [`Error::Vmm`] if it exits non-zero; [`Error::Io`] if it cannot be spawned.
+    async fn invoke_control(
+        &self,
+        subcmd: &str,
+        budget: Duration,
+        // `OsString`, not `String`: the snapshot path and the control socket are host paths and
+        // must reach `execve` byte-for-byte, exactly as the former `.arg(path)` passed them.
+        args: Vec<std::ffi::OsString>,
+    ) -> Result<()> {
+        let status = tokio::time::timeout(
+            budget,
+            tokio::process::Command::new(&self.binary_path)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                // The budget only bounds the *wait*; without this the abandoned client would stay
+                // blocked on the wedged VMM's socket forever.
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .map_err(|_| {
+            Error::Timeout(format!(
+                "crosvm {subcmd} control command did not complete within {budget:?}"
+            ))
+        })??;
         if !status.success() {
             return Err(Error::Vmm(format!(
                 "crosvm {subcmd} control command failed: {status}"
@@ -643,24 +938,30 @@ impl CrosvmInstance {
     }
 
     /// Writes a snapshot of the (already-suspended) VM to `path` via `crosvm snapshot take <path>
-    /// <VM_SOCKET>`. The snapshot subcommand's positional order is `<snapshot_path> <VM_SOCKET>` — the
-    /// path comes BEFORE the socket, so it does not fit `crosvm_control_args` (socket-first) and takes
-    /// its own arg vector.
+    /// <VM_SOCKET>`, bounded by this instance's `snapshot_budget` (M6) rather than the flat
+    /// [`CROSVM_CONTROL_BUDGET`] every other control op rides (M5): the take writes a suspend image
+    /// that tracks guest RAM ~1:1, so a multi-GiB guest overruns a flat ceiling by construction and
+    /// a spurious `Timeout` here strands the VM fully suspended with a half-written image.
+    /// The snapshot subcommand's positional order is `<snapshot_path> <VM_SOCKET>` — the path comes
+    /// BEFORE the socket, so it does not fit `crosvm_control_args` (socket-first) and takes its own
+    /// arg vector.
+    ///
+    /// # Errors
+    /// [`Error::Timeout`] naming `snapshot take` if the client does not exit within the budget;
+    /// [`Error::Vmm`] if it exits non-zero; [`Error::Io`] if it cannot be spawned.
     async fn snapshot_take(&self, path: &Path) -> Result<()> {
-        let status = tokio::process::Command::new(&self.binary_path)
-            .arg("snapshot")
-            .arg("take")
-            .arg(path)
-            .arg(&self.control_socket)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .await?;
-        if !status.success() {
-            return Err(Error::Vmm(format!("crosvm snapshot take failed: {status}")));
-        }
-        Ok(())
+        self.invoke_control(
+            "snapshot take",
+            // The ONE guest-RAM-proportional budget on this backend (M6) — not `control_budget`.
+            self.snapshot_budget,
+            vec![
+                std::ffi::OsString::from("snapshot"),
+                std::ffi::OsString::from("take"),
+                path.as_os_str().to_os_string(),
+                self.control_socket.as_os_str().to_os_string(),
+            ],
+        )
+        .await
     }
 }
 
@@ -680,39 +981,25 @@ impl VmInstance for CrosvmInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
-        // Best-effort graceful stop first (bounded), then SIGKILL the process group and reap.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            self.run_control("stop", &[]),
-        )
-        .await;
-
-        // Skip the group SIGKILL if the leader was already reaped (its pgid may be recycled) —
-        // M-VMM-1.
-        if let Some(pgid) = self.pgid
-            && !self.reaped
-        {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        // Best-effort graceful stop first, then SIGKILL the process group and reap. The bound is
+        // `run_control`'s own `CROSVM_CONTROL_BUDGET` — kill() carries no second literal of its own
+        // (M5) — and the failure is logged, never silently discarded: the SIGKILL below is the
+        // guarantee, so a failed stop is diagnostic, not fatal.
+        if let Err(e) = self.run_control("stop", &[]).await {
+            tracing::debug!("crosvm kill: graceful stop failed, forcing SIGKILL: {e}");
         }
-        let _ = self.process.wait().await;
-        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
-        self.reaped = true;
+
+        // The one shared signal/wait/flag sequence (L1): SIGKILL the group unless the leader was
+        // already reaped, await it, record the reap (M-VMM-1).
+        self.group.kill_and_wait(&mut self.process).await;
         Ok(())
     }
 
     async fn has_exited(&mut self) -> bool {
         // Non-blocking reap of the crosvm leader; `Ok(Some(_))` means it exited after
-        // `request_shutdown` (`powerbtn`). Record the reap so `kill()`/`Drop` do NOT re-`SIGKILL`
-        // the process group — once the leader is reaped the kernel may recycle its pgid (M-VMM-1).
-        if matches!(self.process.try_wait(), Ok(Some(_))) {
-            self.reaped = true;
-            true
-        } else {
-            false
-        }
+        // `request_shutdown` (`powerbtn`). The shared helper records the reap so `kill()`/`Drop`
+        // cannot re-`SIGKILL` a possibly-recycled pgid.
+        self.group.note_exit(&mut self.process)
     }
 
     async fn pause(&mut self) -> Result<()> {
@@ -788,19 +1075,10 @@ impl VmInstance for CrosvmInstance {
 impl Drop for CrosvmInstance {
     fn drop(&mut self) {
         // Teardown order (AGENTS.md): reap the VMM process group first — before touching the
-        // socket — so cleanup never races a live VMM. Skip the SIGKILL + reap if the leader was
-        // already reaped (via `has_exited`/`kill`): its pgid may have been recycled (M-VMM-1).
-        if let Some(pgid) = self.pgid
-            && !self.reaped
-        {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            if let Some(pid) = self.process.id() {
-                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
-            }
-        }
+        // socket — so cleanup never races a live VMM. Same helper, same order as the graceful
+        // `kill()` path (L1); the SIGKILL + blocking reap is skipped if the leader was already
+        // reaped, since its pgid may have been recycled (M-VMM-1).
+        self.group.reap_now(&mut self.process);
         // Unlink our own control socket; the per-VM directory itself is owned and removed once by
         // the orchestrator's `VmTempDir` guard after this instance is dropped. Mirrors CH/QEMU.
         let _ = std::fs::remove_file(&self.control_socket);
@@ -812,30 +1090,18 @@ mod tests {
     use super::*;
     use vmcell::config::{RootfsSource, VmConfig};
 
-    /// A no-op [`vmcell::metrics::CgroupFs`] for the reject-before-spawn tests below, which exercise
-    /// `create` capability guards that return **before** any cgroup interaction — so the fake's
-    /// methods are never called.
-    #[derive(Debug)]
-    struct TestCgroupFs;
-
-    impl vmcell::metrics::CgroupFs for TestCgroupFs {
-        fn create_slice(
-            &self,
-            _name: &str,
-            _limits: &vmcell::config::ResourceLimits,
-        ) -> Result<()> {
-            Ok(())
-        }
-        fn delete_slice(&self, _name: &str) -> Result<()> {
-            Ok(())
-        }
-        fn read_stats(&self, _name: &str) -> Result<vmcell::metrics::ResourceUsage> {
-            Ok(vmcell::metrics::ResourceUsage::default())
-        }
-        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
-            Ok(())
-        }
-    }
+    /// The shared [`vmcell::metrics::FakeCgroupFs`], exposed by `vmcell`'s `test-support`
+    /// feature (a dev-dependency of this crate). It replaces the hand-rolled per-crate
+    /// `CgroupFs` fake this crate carried while `FakeCgroupFs` was `#[cfg(test)]`-only and
+    /// therefore invisible downstream — one of four such copies (docs/81 §9). Most tests below
+    /// exercise `create` capability guards that return **before** any cgroup interaction; the
+    /// control-budget gate does reach `register_and_await_ready`, whose `add_task` this accepts.
+    ///
+    /// It is still structurally blind to the filesystem (AGENTS rule 4): it models slices,
+    /// tasks and delegation in memory and writes no cgroup sysfs, so nothing driven by it is
+    /// evidence about real cgroup residue or enforcement. That is the live `just test-crosvm`
+    /// matrix.
+    use vmcell::metrics::FakeCgroupFs;
 
     fn test_res() -> PerVmResources {
         PerVmResources {
@@ -1176,7 +1442,7 @@ mod tests {
             ..test_res()
         };
         let err = crosvm
-            .create(&cfg, &res, &TestCgroupFs)
+            .create(&cfg, &res, &FakeCgroupFs::new())
             .await
             .expect_err("unprivileged net must be Unsupported on crosvm v1");
         assert!(
@@ -1199,7 +1465,7 @@ mod tests {
                 Path::new("/nonexistent-crosvm-snapshot-dir"),
                 &cfg,
                 &test_res(),
-                &TestCgroupFs,
+                &FakeCgroupFs::new(),
             )
             .await
             .expect_err(
@@ -1331,7 +1597,7 @@ mod tests {
                 Path::new("/nonexistent-crosvm-snapshot-dir"),
                 &cfg,
                 &test_res(),
-                &TestCgroupFs,
+                &FakeCgroupFs::new(),
             )
             .await
             .expect_err("a throttled disk must be refused on restore, exactly as on create");
@@ -1350,7 +1616,7 @@ mod tests {
                 Path::new("/nonexistent-crosvm-snapshot-dir"),
                 &erofs_cfg(),
                 &test_res(),
-                &TestCgroupFs,
+                &FakeCgroupFs::new(),
             )
             .await
             .expect_err("the control path still fails on the missing snapshot artifact");
@@ -1358,5 +1624,729 @@ mod tests {
             matches!(&err, Error::Vmm(msg) if msg.contains("snapshot artifact")),
             "expected the un-throttled control to reach the missing-artifact error, got {err:?}"
         );
+    }
+
+    /// Writes an executable stand-in for the `crosvm` binary into `dir` and returns its path.
+    ///
+    /// Launched as `run …`, it creates the control socket path the readiness gate polls for (`-s
+    /// <path>`) and then **wedges** (`exec sleep`, so the wedge IS the process the pgid names and a
+    /// SIGKILL to the group reclaims it — no orphan sleep). Re-invoked as a control client
+    /// (`resume`/`powerbtn`/`stop`/`snapshot take`) it carries no `-s` pair and wedges immediately:
+    /// exactly what a hung crosvm presents to its short-lived client, and the only shape that can
+    /// prove the control budget bounds the wait. KVM-free and crosvm-binary-free.
+    fn wedged_crosvm_stand_in(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("crosvm-stand-in.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 if [ \"$1\" = \"-s\" ]; then : > \"$2\"; fi\n\
+             \x20 shift\n\
+             done\n\
+             exec sleep 600\n",
+        )
+        .expect("write the crosvm stand-in");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make the crosvm stand-in executable");
+        script
+    }
+
+    // M5 GATE (KVM-free, crosvm-free): EVERY crosvm control op is bounded by the ONE named
+    // `CROSVM_CONTROL_BUDGET`. `run_control` and `snapshot_take` were a bare `status().await`, so
+    // `boot()`, `request_shutdown()`, `pause()`, `resume()` and `snapshot()` hung forever against a
+    // wedged VMM — and because `shutdown()` awaits `request_shutdown()` BEFORE the grace poll and
+    // before the guaranteed `kill()`, one wedged `powerbtn` blocked the force-kill that is supposed
+    // to be unconditional, leaking the VM's netns/tap/cgroup/scratch/vmid.
+    //
+    // Driven through the REAL `create()` so the chain under test is the shipped one (backend budget
+    // → instance → every control invocation), against a stand-in binary that wedges. RED on the
+    // inverse (drop either `timeout` wrapper): the call never returns and the wall-clock GUARD — 30×
+    // the budget — fires with a naming panic instead of hanging the suite.
+    //
+    // What the stand-in structurally cannot see: that a REAL `crosvm resume|powerbtn|snapshot take`
+    // succeeds inside the budget. That is the live `just test-crosvm` matrix (boot, snapshot,
+    // restore), which is where the shipped `CROSVM_CONTROL_BUDGET` value — as opposed to the bound
+    // itself — is exercised.
+    #[tokio::test]
+    async fn crosvm_control_ops_are_bounded_by_the_control_budget() {
+        const BUDGET: Duration = Duration::from_millis(300);
+        // Deliberately different from BUDGET: the typed elapse renders the budget it timed out
+        // against, so the two are told apart by the assertions below.
+        const SNAPSHOT_BUDGET: Duration = Duration::from_millis(700);
+        const GUARD: Duration = Duration::from_secs(9);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = wedged_crosvm_stand_in(dir.path());
+
+        let mut crosvm = Crosvm::new(&script);
+        // The shipped default is the one named const — `new` invents no literal of its own.
+        assert_eq!(
+            crosvm.control_budget, CROSVM_CONTROL_BUDGET,
+            "Crosvm::new must seed the control budget from CROSVM_CONTROL_BUDGET"
+        );
+        // Shrink it for the gate (the QEMU migration-budget gate's shape): the law under test is
+        // that the budget bounds the wait, not its shipped value.
+        crosvm.control_budget = BUDGET;
+
+        let res = PerVmResources {
+            tap_name: None,
+            tmp_dir: dir.path().to_path_buf(),
+            ..test_res()
+        };
+        let mut inst = crosvm
+            .create(&erofs_cfg(), &res, &FakeCgroupFs::new())
+            .await
+            .expect("the stand-in binds its control socket, so create() reaches a live instance");
+        // `snapshot take` rides the SEPARATE, guest-RAM-proportional `snapshot_budget` (M6), whose
+        // shipped floor is seconds. Shrink it too — but to a DIFFERENT, distinguishable value, so
+        // this gate also proves WHICH budget each op is bounded by. The typed elapse renders the
+        // budget it timed out against, so a `snapshot take` that silently fell back to
+        // `control_budget` names 300ms instead of 700ms and reddens. (Asserting only that the field
+        // is seeded correctly would be a gate on the field, not on the call — the M6 gate does that
+        // half; this is the other half.)
+        inst.snapshot_budget = SNAPSHOT_BUDGET;
+        assert_ne!(
+            BUDGET, SNAPSHOT_BUDGET,
+            "the two budgets must be distinguishable or this gate cannot tell them apart"
+        );
+
+        // Every op a caller can wedge on, with the subcommand each must name in its typed error and
+        // the budget each must be bounded by. `boot()` and `resume()` are distinct call sites of
+        // `run_control`; `snapshot take` is the second, separately-wrapped client invocation, and
+        // the ONLY one on the snapshot budget.
+        let legs: [(&str, &str, Duration); 4] = [
+            ("boot", "resume", BUDGET),
+            ("request_shutdown", "powerbtn", BUDGET),
+            ("resume", "resume", BUDGET),
+            ("snapshot_take", "snapshot take", SNAPSHOT_BUDGET),
+        ];
+        for (op, subcmd, budget) in legs {
+            let result = match op {
+                "boot" => tokio::time::timeout(GUARD, inst.boot()).await,
+                "request_shutdown" => tokio::time::timeout(GUARD, inst.request_shutdown()).await,
+                "resume" => tokio::time::timeout(GUARD, inst.resume()).await,
+                _ => {
+                    tokio::time::timeout(GUARD, inst.snapshot_take(&dir.path().join("snap"))).await
+                }
+            };
+            let result = result.unwrap_or_else(|_| {
+                panic!(
+                    "M5: {op}() hung past its {budget:?} budget against a wedged crosvm client — \
+                     `crosvm {subcmd}` is unbounded"
+                )
+            });
+            let err = result.expect_err("a wedged control client must surface a typed error");
+            let rendered = format!("{budget:?}");
+            assert!(
+                matches!(&err, Error::Timeout(msg)
+                    if msg.contains(subcmd)
+                        && msg.contains("control command")
+                        && msg.contains(&rendered)),
+                "M5/M6: expected a typed Timeout naming `{subcmd}` and its {budget:?} budget, \
+                 got {err:?}"
+            );
+        }
+
+        // `kill()` carries no budget literal of its own: its graceful `stop` rides the same bound,
+        // so the guaranteed SIGKILL is reached — the property a wedged `powerbtn` used to block.
+        tokio::time::timeout(GUARD, inst.kill())
+            .await
+            .expect("M5: kill() must not be blocked by a wedged graceful stop")
+            .expect("kill() force-kills the group and reaps");
+    }
+
+    // Guards d7's crosvm half: the two capability fields that are advertised FALSE and were
+    // nevertheless accepted. `nested_virt` is the sharper one — the SHARED `build_kernel_cmdline`
+    // emits `kvm-intel.nested=1` for every backend, so the request read as applied while crosvm
+    // exposes no guest `/dev/kvm` at all; `RestoreMode::Lazy` silently degraded to eager. Both now
+    // refuse like the three sibling flags, with the `VmmCapabilities` field name as the feature
+    // string (N-VMM-1). KVM-free: the refusal precedes any spawn. Inverse: deleting either branch
+    // reddens, and the positive control keeps the assertions honest — the SAME config with the
+    // levers at their advertised values gets past the guard and dies on the missing binary.
+    #[tokio::test]
+    async fn create_rejects_the_unadvertised_nested_virt_and_lazy_restore_levers() {
+        use vmcell::config::RestoreMode;
+
+        let crosvm = Crosvm::new("/nonexistent-crosvm-binary");
+        let cfg = |nested: bool, mode: RestoreMode| {
+            VmConfig::builder(
+                "/boot/vmlinux",
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/img/rootfs.erofs"),
+                },
+            )
+            .nested_virt(nested)
+            .restore_mode(mode)
+            .build()
+            .expect("build config")
+        };
+
+        let err = crosvm
+            .create(
+                &cfg(true, RestoreMode::Default),
+                &test_res(),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err(
+                "nested_virt is advertised false and must be refused, not silently dropped",
+            );
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "crosvm" && feature == "nested_virt"),
+            "expected a nested_virt Unsupported naming the VmmCapabilities field, got {err:?}"
+        );
+
+        let err = crosvm
+            .create(
+                &cfg(false, RestoreMode::Lazy),
+                &test_res(),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("lazy_restore is advertised false and must be refused");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "crosvm" && feature == "lazy_restore"),
+            "expected a lazy_restore Unsupported naming the VmmCapabilities field, got {err:?}"
+        );
+
+        // Positive control: the advertised values pass the guard and reach the spawn, which fails
+        // on the absent binary — so the refusals above are about these two levers, not about
+        // `create()` refusing everything.
+        let err = crosvm
+            .create(
+                &cfg(false, RestoreMode::Eager),
+                &test_res(),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("the stand-in binary does not exist");
+        assert!(
+            matches!(&err, Error::Io(_)),
+            "expected the control config to reach the spawn (an Io error), got {err:?}"
+        );
+
+        // `restore()` refuses exactly what `create()` refuses — the M4 law, applied to the field a
+        // restore actually consumes. Non-vacuous: the snapshot dir does not exist, so an unguarded
+        // restore would reach the missing-artifact `Vmm` error instead.
+        let err = crosvm
+            .restore(
+                Path::new("/nonexistent-crosvm-snapshot-dir"),
+                &cfg(false, RestoreMode::Lazy),
+                &test_res(),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("a lazy restore must be refused on restore(), exactly as on create()");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "crosvm" && feature == "lazy_restore"),
+            "expected a lazy_restore Unsupported from restore(), got {err:?}"
+        );
+    }
+
+    // M6 GATE (KVM-free): the guest-RAM-proportional `crosvm snapshot take` must NOT ride the flat
+    // control budget every other control op does — a 4 GiB guest's suspend image is ~4 GB of dense
+    // writes, which a 10 s ceiling overruns by construction, and a spurious Timeout mid-take leaves
+    // the VM fully suspended with a half-written image. Driven through the REAL `create()`, so what
+    // is asserted is the SHIPPED seeding, not a helper's arithmetic.
+    //
+    // Inverses, both observed red: (a) seed `snapshot_budget` from `self.control_budget` alone and
+    // the large/small strict inequality fails; (b) seed `control_budget` from
+    // `snapshot_request_timeout` too — collapsing the two — and the "ordinary ops keep the short
+    // budget" assert fails.
+    #[tokio::test]
+    async fn snapshot_budget_grows_with_guest_ram_over_the_control_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = wedged_crosvm_stand_in(dir.path());
+        let crosvm = Crosvm::new(&script);
+
+        let instance_with_mem = async |mem_mib: u32, leg: &str| {
+            let cfg = VmConfig::builder(
+                "/boot/vmlinux",
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/img/rootfs.erofs"),
+                },
+            )
+            .mem_mib(mem_mib)
+            .build()
+            .expect("build config");
+            let res = PerVmResources {
+                tap_name: None,
+                tmp_dir: dir.path().join(leg),
+                ..test_res()
+            };
+            std::fs::create_dir_all(&res.tmp_dir).expect("per-VM dir");
+            crosvm
+                .create(&cfg, &res, &FakeCgroupFs::new())
+                .await
+                .expect("the stand-in binds its control socket")
+        };
+
+        let small = instance_with_mem(128, "small").await;
+        let large = instance_with_mem(32 * 1024, "large").await;
+
+        assert!(
+            large.snapshot_budget > small.snapshot_budget,
+            "a 32 GiB guest must get MORE snapshot budget than a 128 MiB one: {:?} vs {:?}",
+            large.snapshot_budget,
+            small.snapshot_budget
+        );
+        // The guest-RAM term is the SHARED predicate's, not a local re-derivation.
+        assert_eq!(
+            large.snapshot_budget,
+            vmcell::vmm::snapshot_request_timeout(32 * 1024),
+            "above the floor the snapshot budget IS the shared predicate"
+        );
+        // …and this backend's flat control budget still holds underneath it.
+        assert_eq!(
+            small.snapshot_budget, CROSVM_CONTROL_BUDGET,
+            "below the floor the snapshot budget is the flat control budget"
+        );
+        // The two must NOT be collapsed: an ordinary control op keeps the short bound, because
+        // `shutdown()` awaits a `powerbtn` BEFORE the guaranteed force-kill.
+        assert_eq!(
+            large.control_budget, CROSVM_CONTROL_BUDGET,
+            "a large guest must not widen the ordinary control budget — only the snapshot one"
+        );
+    }
+
+    // POSITIVE CONTROL for the gate above, and the gate on `Drop`'s OWN job: an instance whose
+    // group has NOT been reaped must have its process group SIGKILLed + reaped when it is dropped
+    // (L1 — `Drop` is the panic path of the one teardown order). Without this leg the
+    // "must not signal a recycled pgid" assertion is satisfied by a `Drop` that reaps NOTHING —
+    // which is precisely the regression the crosvm consolidation introduced and this leg caught: a
+    // dropped-but-never-killed VM would leak its whole process group.
+    //
+    // Inverse (observed red): delete `self.group.reap_now(&mut self.process)` from `Drop` and the
+    // stand-in survives, so `gone` stays false.
+    #[tokio::test]
+    async fn drop_reaps_an_unreaped_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let standin = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("60");
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+            tokio::process::Command::from(c)
+                .spawn()
+                .expect("spawn stand-in VMM")
+        };
+        let live_pid = standin.id().expect("stand-in pid") as i32;
+        let inst = CrosvmInstance {
+            group: vmcell::vmm::VmmProcessGroup::new(standin.id()),
+            process: standin,
+            binary_path: dir.path().join("absent-crosvm"),
+            control_budget: Duration::from_millis(50),
+            snapshot_budget: Duration::from_millis(50),
+            control_socket: dir.path().join("crosvm.sock"),
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            cid: 3,
+            restored: false,
+            has_vhost_user_device: false,
+            snapshot_restore_capable: true,
+        };
+        drop(inst);
+
+        let mut gone = false;
+        for _ in 0..100 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(live_pid), None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Best-effort cleanup if the drop did NOT reap, so a red run leaves no stray process.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-live_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            gone,
+            "Drop on an UN-reaped instance must SIGKILL and reap its VMM process group"
+        );
+    }
+
+    // M-VMM-1 GATE (KVM-free) on the SHIPPED call sites, not on the extracted helper: once the
+    // crosvm leader is reaped its pgid can be recycled, so neither `CrosvmInstance::kill` NOR its
+    // `Drop` may SIGKILL `-pgid`. A live decoy in its own process group stands in for that recycled
+    // group, and BOTH teardown paths are driven against the same already-reaped instance. crosvm had
+    // no such gate before (CH and FC did) — it is one of the copies §9 found.
+    //
+    // Inverse (observed red): replace `self.group.kill_and_wait(&mut self.process).await` in `kill`
+    // — or `self.group.reap_now(&mut self.process)` in `Drop` — with an unguarded
+    // `vmcell::vmm::reap_process_group(&mut self.process, Some(decoy))`, and the decoy dies.
+    #[tokio::test]
+    async fn kill_and_drop_do_not_signal_pgid_when_reaped() {
+        let mut decoy = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("60");
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+            tokio::process::Command::from(c)
+                .spawn()
+                .expect("spawn decoy")
+        };
+        let decoy_pid = decoy.id().expect("decoy pid") as i32;
+
+        // A fast-exiting child as the instance's own leader so `kill()`'s `process.wait()` returns
+        // promptly instead of blocking on a live process.
+        let leader = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true` leader");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut inst = CrosvmInstance {
+            process: leader,
+            // An absent binary: `kill()`'s best-effort graceful `stop` fails fast and is logged,
+            // never fatal — the reap path below is what is under test.
+            binary_path: dir.path().join("absent-crosvm"),
+            control_budget: Duration::from_millis(50),
+            snapshot_budget: Duration::from_millis(50),
+            control_socket: dir.path().join("crosvm.sock"),
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            cid: 3,
+            // The recycled-pgid state, which only the `test-support` constructor can fabricate:
+            // no production path can mark a group reaped over a foreign pgid.
+            group: vmcell::vmm::VmmProcessGroup::already_reaped_for_test(Some(decoy_pid as u32)),
+            restored: false,
+            has_vhost_user_device: false,
+            snapshot_restore_capable: true,
+        };
+        inst.kill().await.expect("kill");
+        assert!(
+            inst.group.is_reaped(),
+            "the group must still read as reaped after kill() — the flag is one-shot"
+        );
+        drop(inst);
+
+        // A SIGKILL to the (recycled) pgid would land within a few ms; give it time.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let decoy_status = decoy.try_wait().expect("try_wait decoy");
+        // Clean up the decoy regardless of the outcome — a test's own fixtures are residue too.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-decoy_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = decoy.wait().await;
+
+        assert!(
+            decoy_status.is_none(),
+            "kill()/Drop on a reaped crosvm instance must not SIGKILL a (recycled) pgid"
+        );
+    }
+
+    /// This file's own source, for the M11 call-site scan below.
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The number of `jail_spec_from_config` call sites this backend ships: one, inside
+    /// [`CrosvmLaunchPlan::build`].
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set, and a second (possibly
+    /// unlaundered) call site reddens too.
+    const EXPECTED_JAIL_CALL_SITES: usize = 1;
+
+    /// The number of [`CrosvmLaunchPlan::build`] call sites this backend ships: one, in
+    /// [`crosvm_launch_plan`]. Asserted exactly, for the same anti-vacuity reason.
+    const EXPECTED_PLAN_BUILD_SITES: usize = 1;
+
+    /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
+    /// dropped and whitespace collapsed. The same shape `vmcell-qemu`'s `virtiofs_pacing_gate`
+    /// uses — a deliberate second reader of a law, not a second copy of one.
+    fn production_code(source: &str) -> String {
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Every `jail_spec_from_config(` call expression in `code`, each truncated at its statement's
+    /// `;` and normalized to start at the function name (the path prefix is irrelevant).
+    fn jail_spec_calls(code: &str) -> Vec<&str> {
+        code.match_indices("jail_spec_from_config(")
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    /// Every `CrosvmLaunchPlan::build(` call expression in `code`, truncated at its statement's
+    /// `;` — the site that decides which posture is compiled AND recorded.
+    fn plan_build_calls(code: &str) -> Vec<&str> {
+        code.match_indices("CrosvmLaunchPlan::build(")
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    /// The law, half one: the only `jail_spec_from_config` call compiles the `jail` **parameter**
+    /// of [`CrosvmLaunchPlan::build`] — the same binding the plan records — never `cfg.jail` and
+    /// never a freshly-built config. `&jail)` matches only the bare parameter: `&cfg.jail)` and
+    /// `&plan.jail)` do not contain it (there is no `&` immediately before `jail`).
+    fn call_compiles_the_recorded_jail(call: &str) -> bool {
+        call.starts_with("jail_spec_from_config(") && call.contains("&jail)")
+    }
+
+    /// The law, half two: the one plan-build site hands in `effective_jail_config(cfg)`, so the
+    /// value that gets both compiled and recorded is the EFFECTIVE posture.
+    fn build_site_names_the_effective_config(call: &str) -> bool {
+        call.contains("effective_jail_config(cfg)")
+    }
+
+    // M11 GATE (KVM-free). crosvm always runs `--disable-sandbox`, so the Layer-2 deny-list is its
+    // ONLY seccomp confinement — and while the flip rode inline as
+    // `jail_spec_from_config(&effective_jail_config(cfg))`, rewriting that one token to `&cfg.jail`
+    // shipped every crosvm VM with no filter at all while `cargo test -p vmcell-crosvm`, `just ci`
+    // and the entire live `test-crosvm` matrix stayed green (the deny-list is default-allow/EPERM,
+    // so no functional leg notices). Both halves of that hole are closed here:
+    //   (1) the pure `crosvm_launch_plan` returns the jail posture, so it is a VALUE to assert on;
+    //   (2) the shipped `jail_spec_from_config` call site is scanned to prove `spawn` uses that
+    //       value — the assertion (1) alone structurally cannot make.
+    // RED on the inverse in both directions: rewriting the plan's `effective_jail_config(cfg)` to
+    // `cfg.jail` reddens (1); rewriting `spawn`'s `&plan.jail` to `&cfg.jail` reddens (2).
+    #[test]
+    fn the_crosvm_jail_spec_comes_from_effective_jail_config() {
+        use vmcell::config::{JailConfig, VmmSeccomp};
+
+        let cfg = VmConfig::builder(
+            "/boot/vmlinux",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/img/rootfs.erofs"),
+            },
+        )
+        .vmm_seccomp(VmmSeccomp::Enforcing)
+        .jail(JailConfig::hardened())
+        .build()
+        .expect("build config");
+        // Precondition: the REQUESTED posture ships the deny-list off, so "effective" and
+        // "requested" genuinely differ here and the assertions below are non-vacuous.
+        assert!(
+            !cfg.jail.seccomp_deny_list,
+            "precondition: the hardened default ships the Layer-2 deny-list OFF"
+        );
+
+        let plan = crosvm_launch_plan(
+            Path::new("/usr/bin/crosvm"),
+            &cfg,
+            &test_res(),
+            &CrosvmSpawnPaths {
+                control_socket: Path::new("/tmp/c.sock"),
+                serial_path: Path::new("/tmp/s.log"),
+            },
+            3,
+            "root=/dev/vda",
+            None,
+        )
+        .expect("build the launch plan");
+
+        // (1) The pair's jail half IS the effective posture, not the requested one.
+        assert_eq!(
+            plan.jail,
+            effective_jail_config(&cfg),
+            "the launch plan must ship `effective_jail_config(cfg)`"
+        );
+        assert_ne!(
+            plan.jail, cfg.jail,
+            "…and that is not `cfg.jail`: with Enforcing, the deny-list must be turned ON"
+        );
+        assert!(
+            plan.jail.seccomp_deny_list,
+            "crosvm's ONLY seccomp confinement must be on in the shipped jail"
+        );
+        // Compiled, the difference is a filter versus no filter at all — what shipping `cfg.jail`
+        // would have produced (the positive control keeps the assertion above from being a
+        // tautology about two structs).
+        assert!(
+            vmcell::vmm::jail::jail_spec_from_config(&plan.jail)
+                .expect("compile the shipped spec")
+                .seccomp
+                .is_some(),
+            "the shipped JailSpec must carry the compiled deny-list"
+        );
+        assert!(
+            vmcell::vmm::jail::jail_spec_from_config(&cfg.jail)
+                .expect("compile the requested spec")
+                .seccomp
+                .is_none(),
+            "control: the REQUESTED posture compiles to no filter — the unconfined VMM this guards"
+        );
+
+        // The args half of the pair is the run-args builder's output verbatim, so the plan cannot
+        // quietly become a second device-model builder.
+        assert_eq!(
+            plan.run_args,
+            build_crosvm_run_args(
+                &cfg,
+                &test_res(),
+                Path::new("/tmp/c.sock"),
+                Path::new("/tmp/s.log"),
+                3,
+                "root=/dev/vda",
+                None,
+            )
+            .expect("build run args"),
+            "the plan's run args must be `build_crosvm_run_args`'s output"
+        );
+
+        // (2) The BACKSTOP scan. It is no longer the only defence: `CrosvmLaunchPlan::build` is
+        // the sole constructor and compiles the very `jail` it records, so a plan whose record and
+        // command disagree cannot be built, and `spawn` holds no jail value to mutate. What the
+        // scan still adds is a check that a SECOND compilation site has not appeared, and that the
+        // one build site is handed the effective posture.
+        let code = production_code(SOURCE);
+        let calls = jail_spec_calls(&code);
+        assert_eq!(
+            calls.len(),
+            EXPECTED_JAIL_CALL_SITES,
+            "expected {EXPECTED_JAIL_CALL_SITES} shipped jail_spec_from_config call, inside \
+             `CrosvmLaunchPlan::build`; found {}: {calls:?}. If a site was legitimately added or \
+             removed, update EXPECTED_JAIL_CALL_SITES — do not delete the scan.",
+            calls.len()
+        );
+        for call in &calls {
+            assert!(
+                call_compiles_the_recorded_jail(call),
+                "M11: the shipped JailSpec must be compiled from the very `jail` the plan records \
+                 — `{call}` must be `jail_spec_from_config(&jail)`"
+            );
+        }
+        let builds = plan_build_calls(&code);
+        assert_eq!(
+            builds.len(),
+            EXPECTED_PLAN_BUILD_SITES,
+            "expected {EXPECTED_PLAN_BUILD_SITES} CrosvmLaunchPlan::build call; found {}: \
+             {builds:?}",
+            builds.len()
+        );
+        for call in &builds {
+            assert!(
+                build_site_names_the_effective_config(call),
+                "M11: the one plan-build site must hand in `effective_jail_config(cfg)` — `{call}`"
+            );
+        }
+    }
+
+    // The M11 defeat, replayed as a gate. The verifier's two-line edit was
+    // `let mut plan = crosvm_launch_plan(…)?;` + `plan.jail = cfg.jail;` before the compile — it
+    // satisfied the old scan (the predicate matched the mutated binding) and shipped every crosvm
+    // VM unconfined. The equivalent mutation is now INERT: the command already carries the
+    // compiled spec, so writing `plan.jail` afterwards changes the record and nothing else.
+    //
+    // This asserts that inertness directly. Inverse: move the `jail_spec_from_config` +
+    // `build_vmm_cmd` back out of `CrosvmLaunchPlan::build` into `spawn`, and the argv below stops
+    // being fixed at construction — the `EXPECTED_JAIL_CALL_SITES` scan and the `&jail)` predicate
+    // both redden first, because the call site can no longer name the constructor's parameter.
+    #[test]
+    fn mutating_the_plans_recorded_jail_cannot_change_what_ships() {
+        use vmcell::config::{JailConfig, VmmSeccomp};
+
+        let cfg = VmConfig::builder(
+            "/boot/vmlinux",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/img/rootfs.erofs"),
+            },
+        )
+        .vmm_seccomp(VmmSeccomp::Enforcing)
+        .jail(JailConfig::hardened())
+        .build()
+        .expect("build config");
+
+        let build_plan = || {
+            crosvm_launch_plan(
+                Path::new("/usr/bin/crosvm"),
+                &cfg,
+                &test_res(),
+                &CrosvmSpawnPaths {
+                    control_socket: Path::new("/tmp/c.sock"),
+                    serial_path: Path::new("/tmp/s.log"),
+                },
+                3,
+                "root=/dev/vda",
+                None,
+            )
+            .expect("build the launch plan")
+        };
+
+        let argv_of = |plan: &CrosvmLaunchPlan| -> Vec<String> {
+            plan.cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let untouched = build_plan();
+        let baseline = argv_of(&untouched);
+
+        // The verifier's edit, verbatim in spirit: overwrite the recorded posture with the
+        // REQUESTED one after the plan exists.
+        let mut mutated = build_plan();
+        mutated.jail = cfg.jail;
+        mutated.run_args = Vec::new();
+
+        assert_eq!(
+            argv_of(&mutated),
+            baseline,
+            "M11: the command is composed inside the plan's only constructor, so overwriting \
+             `plan.jail`/`plan.run_args` afterwards must not change a single argument that ships"
+        );
+        assert!(
+            !baseline.is_empty(),
+            "control: the composed argv is non-empty, so the equality above is not vacuous"
+        );
+    }
+
+    // The scan's own red-on-inverse: the predicate must reject the regression shape and the scanner
+    // must see a wrapped call while ignoring prose, so the gate above is not a test that can only
+    // ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_jail_call_site_scanner_rejects_the_requested_config_shape() {
+        // The compile-site predicate: only the constructor's own `jail` parameter passes. Both
+        // regression shapes — the requested config, and the mutated-plan shape that DEFEATED the
+        // previous gate — are rejected.
+        assert!(!call_compiles_the_recorded_jail(
+            "jail_spec_from_config(&cfg.jail)?"
+        ));
+        assert!(!call_compiles_the_recorded_jail(
+            "jail_spec_from_config(&JailConfig::hardened())?"
+        ));
+        assert!(!call_compiles_the_recorded_jail(
+            "jail_spec_from_config(&plan.jail)?"
+        ));
+        assert!(call_compiles_the_recorded_jail(
+            "jail_spec_from_config(&jail)?"
+        ));
+
+        // The build-site predicate: the effective posture passes, the requested one does not.
+        assert!(build_site_names_the_effective_config(
+            "CrosvmLaunchPlan::build(b, n, effective_jail_config(cfg), &s, r)"
+        ));
+        assert!(!build_site_names_the_effective_config(
+            "CrosvmLaunchPlan::build(b, n, cfg.jail, &s, r)"
+        ));
+
+        let synthetic = "// jail_spec_from_config(&cfg.jail) in a comment is not a call site\n\
+             let spec =\n    vmcell::vmm::jail::jail_spec_from_config(\n    &jail)?;\n\
+             let p = CrosvmLaunchPlan::build(b, n,\n effective_jail_config(cfg), &s, r)?;\n\
+             #[cfg(test)]\nmod tests { jail_spec_from_config(&cfg.jail); }";
+        let code = production_code(synthetic);
+        let calls = jail_spec_calls(&code);
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert!(call_compiles_the_recorded_jail(calls[0]), "got {calls:?}");
+        let builds = plan_build_calls(&code);
+        assert_eq!(builds.len(), 1, "got {builds:?}");
+        assert!(build_site_names_the_effective_config(builds[0]));
     }
 }

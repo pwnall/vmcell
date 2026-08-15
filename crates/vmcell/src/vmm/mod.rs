@@ -71,13 +71,51 @@ impl SerialLog for FakeSerialLog {
     }
 }
 
-/// Helper to send an HTTP request over a Unix domain socket.
+/// The generic VMM control-plane ceiling: the budget for an RPC whose duration is
+/// **flat in guest state** (`create`, `boot`, `pause`, `resume`, `shutdown`).
+///
+/// Deliberately *not* used for the snapshot RPC, whose duration is proportional to
+/// guest RAM — that one budget comes from [`snapshot_request_timeout`].
+const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The conservative floor on sustained snapshot write throughput, in MiB of guest RAM
+/// per second, used to size [`snapshot_request_timeout`].
+///
+/// A suspend image tracks guest RAM ~1:1 (`docs/benchmark-results.md`: a 256 MiB guest
+/// snapshots to 268.5 MB on CH and 268.4 MB on FC, ≈100 % memory file), so the write is
+/// `mem_mib` MiB of dense data. 64 MiB/s is far below any modern host's sustained write
+/// rate and is chosen as the *floor* — the budget exists to catch a wedged VMM, not to
+/// second-guess a slow or contended disk.
+const SNAPSHOT_MIN_WRITE_MIB_PER_SEC: u64 = 64;
+
+/// The control-plane budget for the guest-RAM-proportional snapshot RPC
+/// (CH `PUT /api/v1/vm.snapshot`, FC `PUT /snapshot/create` and `PUT /snapshot/load`).
+///
+/// **One law, one predicate**: every backend sizes that RPC here, never on the flat
+/// `CONTROL_REQUEST_TIMEOUT`, which a multi-GiB guest overruns by construction —
+/// a spurious `Error::Timeout` mid-snapshot leaves the VM paused with a half-written
+/// image (M6). The budget is the flat ceiling plus the write time implied by
+/// `SNAPSHOT_MIN_WRITE_MIB_PER_SEC`, rounded up, so it degrades to the flat ceiling
+/// for a zero-RAM (probe) instance and grows linearly with the guest.
+#[must_use]
+pub fn snapshot_request_timeout(mem_mib: u32) -> std::time::Duration {
+    CONTROL_REQUEST_TIMEOUT
+        + std::time::Duration::from_secs(
+            u64::from(mem_mib).div_ceil(SNAPSHOT_MIN_WRITE_MIB_PER_SEC),
+        )
+}
+
+/// Helper to send an HTTP request over a Unix domain socket, on the generic
+/// `CONTROL_REQUEST_TIMEOUT` ceiling.
 ///
 /// Bounds the whole connect → handshake → send → collect sequence with a fixed
-/// ceiling so a wedged VMM control socket can never hang a `create`/`boot`/`pause`/
-/// `snapshot` RPC forever — the failure surfaces as a typed
+/// ceiling so a wedged VMM control socket can never hang a `create`/`boot`/`pause`
+/// RPC forever — the failure surfaces as a typed
 /// [`Error::Timeout`](crate::error::Error::Timeout) before an outer readiness timeout
 /// could mask it (M-VMM-2). The QMP path already caps at 2 s; this uses a wider margin.
+///
+/// The snapshot RPC does **not** belong here: its duration scales with guest RAM, so it
+/// goes through [`unix_api_request_with`] carrying [`snapshot_request_timeout`].
 ///
 /// # Errors
 /// Returns an error if the request cannot be sent, the server returns a non-2xx
@@ -90,9 +128,27 @@ pub async fn unix_api_request<T: Serialize>(
     path: &str,
     body: Option<&T>,
 ) -> Result<()> {
-    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    unix_api_request_with(api_socket, method, path, body, CONTROL_REQUEST_TIMEOUT).await
+}
 
-    tokio::time::timeout(REQUEST_TIMEOUT, async move {
+/// [`unix_api_request`] with an explicit budget, for an RPC whose duration is a
+/// function of the VM rather than a constant.
+///
+/// `budget` bounds the **whole** connect → handshake → send → collect sequence, not the
+/// gaps between its steps. The only caller-sized budget today is
+/// [`snapshot_request_timeout`]; a caller that reaches for a bare literal here is
+/// re-introducing the fixed ceiling M6 removed.
+///
+/// # Errors
+/// As [`unix_api_request`], with the elapse reported against `budget`.
+pub async fn unix_api_request_with<T: Serialize>(
+    api_socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&T>,
+    budget: std::time::Duration,
+) -> Result<()> {
+    tokio::time::timeout(budget, async move {
         let stream = tokio::net::UnixStream::connect(api_socket).await?;
 
         let io = hyper_util::rt::TokioIo::new(stream);
@@ -143,7 +199,7 @@ pub async fn unix_api_request<T: Serialize>(
     .await
     .map_err(|_| {
         crate::error::Error::Timeout(format!(
-            "VMM API request {method} {path} did not complete within {REQUEST_TIMEOUT:?}"
+            "VMM API request {method} {path} did not complete within {budget:?}"
         ))
     })?
 }
@@ -298,6 +354,114 @@ pub fn build_vmm_cmd(
     tokio::process::Command::from(std_cmd)
 }
 
+/// The one compile-and-record constructor for a jailed VMM launch (M11).
+///
+/// Its own module, not a bare item in [`crate::vmm`], for one load-bearing reason: a private
+/// field is readable by the defining module **and its descendants**, and every backend in this
+/// crate (`vmm::cloud_hypervisor`) is a descendant of `vmm`. Making `launch` a *sibling* of the
+/// backend modules puts [`LaunchPlan::jail`] out of reach of all four backends alike — the
+/// in-tree primary included — so the mutation that defeated M11's first shape is a **compile
+/// error** everywhere rather than merely inert in three crates out of four.
+pub mod launch {
+    use crate::error::Result;
+    use std::path::Path;
+
+    /// A composed VMM launch: the `Command` to spawn, plus a **record** of the
+    /// [`JailConfig`](crate::config::JailConfig) its `JailSpec` was compiled from.
+    ///
+    /// # Why this type exists (M11)
+    ///
+    /// The jail posture a VMM ships with is applied in
+    /// [`build_vmm_cmd`](super::build_vmm_cmd)'s post-fork `pre_exec` closure, which no
+    /// KVM-free test can observe. While each backend wrote
+    /// `jail_spec_from_config(&…)?` inline in its spawn function, the argument was an
+    /// **inline expression no gate could see**: rewriting that one token shipped a different —
+    /// on crosvm, an absent — confinement with `cargo test`, `just ci` and the entire live
+    /// matrix green, because the deny-list is default-allow/`EPERM` and no functional leg
+    /// notices.
+    ///
+    /// Routing every backend through this constructor turns the posture into a **returned
+    /// value**: [`Self::jail`] is what a unit test asserts on, and because [`Self::build`] is
+    /// the only constructor and consumes its `jail` argument exactly twice — once to compile,
+    /// once to record — a plan whose record disagrees with its command is unrepresentable.
+    ///
+    /// The field is private with no setter, so the two-line defeat
+    /// (`let mut plan = …; plan.jail = cfg.jail;`) does not compile in any backend. The one
+    /// remaining way to ship the wrong posture is to hand the wrong value to [`Self::build`],
+    /// and that is a *behavioral* difference each backend's gate asserts on directly rather
+    /// than a source property a scan has to infer.
+    #[derive(Debug)]
+    pub struct LaunchPlan {
+        /// The composed command, with the netns join and the compiled jail already installed.
+        cmd: tokio::process::Command,
+        /// The posture `cmd`'s `JailSpec` was compiled from. A record, not an input.
+        jail: crate::config::JailConfig,
+    }
+
+    impl LaunchPlan {
+        /// Compiles `jail` into a `JailSpec`, builds the VMM command with that spec, and
+        /// records the very same `jail` value.
+        ///
+        /// One value, two uses, no window between them. This is the **only**
+        /// [`jail_spec_from_config`](super::jail::jail_spec_from_config) call in any shipping
+        /// launch path; each backend gates the absence of a second one over its own source.
+        ///
+        /// # Errors
+        /// Propagates [`jail_spec_from_config`](super::jail::jail_spec_from_config)'s error
+        /// (a seccomp deny-list that fails to compile).
+        pub fn build(
+            binary_path: &Path,
+            netns_name: Option<&str>,
+            jail: crate::config::JailConfig,
+        ) -> Result<Self> {
+            let spec = super::jail::jail_spec_from_config(&jail)?;
+            let cmd = super::build_vmm_cmd(binary_path, netns_name, &spec);
+            Ok(Self { cmd, jail })
+        }
+
+        /// The jail posture this plan's command was compiled from.
+        ///
+        /// `JailConfig` is `Copy`, so this hands out a value, not a handle: a caller still
+        /// cannot reach the record.
+        #[must_use]
+        pub fn jail(&self) -> crate::config::JailConfig {
+            self.jail
+        }
+
+        /// The composed command, for appending backend arguments.
+        pub fn command_mut(&mut self) -> &mut tokio::process::Command {
+            &mut self.cmd
+        }
+
+        /// The composed command, for inspection (the argv gates read it through here).
+        #[must_use]
+        pub fn command(&self) -> &tokio::process::Command {
+            &self.cmd
+        }
+
+        /// Consumes the plan, yielding the command to spawn.
+        #[must_use]
+        pub fn into_command(self) -> tokio::process::Command {
+            self.cmd
+        }
+
+        /// The composed argv (arguments only, not `argv[0]`), lossily decoded.
+        ///
+        /// The one accessor every backend's composed-argv gate reads, so "assert on the whole
+        /// command, never a fragment" needs no per-crate helper (docs/78 M11).
+        #[must_use]
+        pub fn argv(&self) -> Vec<String> {
+            self.cmd
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        }
+    }
+}
+
+pub use launch::LaunchPlan;
+
 /// Waits until the given socket path appears, or times out.
 ///
 /// Polls for the socket's existence on an absolute deadline. If the spawned process
@@ -353,6 +517,68 @@ pub async fn wait_for_socket(
     ))
 }
 
+/// The **one** wall-clock ceiling, in milliseconds, for a VMM control socket to appear
+/// after the VMM (or one of its helper daemons) is exec'd.
+///
+/// Every backend used to spell this `1000` inline at its own
+/// `register_and_await_ready`/`wait_for_socket` call site — six bare literals across CH,
+/// Firecracker, QEMU and crosvm, with nothing tying them together (docs/81 §8). The
+/// ceiling is now named here and **cannot** be passed from a call site: neither
+/// [`register_and_await_ready`] nor [`wait_for_vmm_socket`] takes a timeout argument, so
+/// re-introducing a literal is a compile error rather than a silent per-backend drift.
+///
+/// Sizing: the VMM binds its control socket as one of its first acts, well inside 1 s on
+/// any host; the ceiling exists to convert a never-starting VMM into a typed
+/// [`Error::Timeout`](crate::error::Error::Timeout) promptly, so the caller's bounded
+/// retry gets a fresh VM instead of the suite hanging. It is deliberately NOT the budget
+/// for anything guest-RAM-proportional — that is [`snapshot_request_timeout`] — nor for
+/// virtiofsd, whose readiness wait is paced from the `VmConfig` timeout profile
+/// (`crate::fs`).
+pub const VMM_SOCKET_READY_TIMEOUT_MS: u64 = 1000;
+
+/// [`wait_for_socket`] on the one shared [`VMM_SOCKET_READY_TIMEOUT_MS`] ceiling, for a
+/// VMM (or VMM helper daemon) control socket.
+///
+/// The ceiling is not a parameter, so no backend can spell it as a literal again (§8);
+/// `interval_ms` stays caller-supplied because it is genuine per-VM configuration
+/// (`VmConfig::timeouts.api_socket_poll`, §9.4 — one profile paces every readiness wait
+/// of a VM).
+///
+/// # Errors
+/// As [`wait_for_socket`], with the elapse reported against
+/// [`VMM_SOCKET_READY_TIMEOUT_MS`].
+pub async fn wait_for_vmm_socket(
+    socket_path: &Path,
+    process: Option<&mut tokio::process::Child>,
+    interval_ms: u64,
+) -> Result<()> {
+    wait_for_socket(
+        socket_path,
+        process,
+        VMM_SOCKET_READY_TIMEOUT_MS,
+        interval_ms,
+    )
+    .await
+}
+
+/// `SIGKILL` to `-pgid`, best-effort.
+///
+/// The **one** place this crate spells the negated-pgid signal, so every caller —
+/// [`reap_process_group`] and [`VmmProcessGroup`] — shares one `SAFETY`-equivalent
+/// rationale and one suppression of the send error. Best-effort by design: it runs on
+/// teardown paths where the group may already be gone (`ESRCH`) and there is no `Result`
+/// to surface.
+fn sigkill_process_group(pgid: u32) {
+    // A failure here is `ESRCH` (the group is already gone) or `EPERM`; neither is
+    // actionable on a teardown path, and every caller's next step (waitpid / Child::wait)
+    // establishes the real outcome. This is the ONE site in the crate that discards a
+    // `kill(-pgid)` result, which is why it is a named function rather than an idiom.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-(pgid as i32)),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
 /// Force-kills a just-spawned VMM process *group* (`SIGKILL` to `-pgid`) and reaps
 /// the leader. Use on the error paths between spawning a VMM and constructing the
 /// owning instance (whose `Drop` would otherwise do this): a failure there — e.g. a
@@ -362,12 +588,119 @@ pub fn reap_process_group(process: &mut tokio::process::Child, pgid: Option<u32>
     let Some(pgid) = pgid else {
         return;
     };
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(-(pgid as i32)),
-        nix::sys::signal::Signal::SIGKILL,
-    );
+    sigkill_process_group(pgid);
     if let Some(pid) = process.id() {
         let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+    }
+}
+
+/// A VMM leader's process group **and** the one-shot "the leader has been reaped" flag
+/// that guards signalling it (M-VMM-1) — owned together, so the flag cannot be set by one
+/// site and ignored by another.
+///
+/// **Why this is a type and not two fields.** Every backend instance carried
+/// `pgid: Option<u32>` beside `reaped: bool` and re-implemented the same three-step dance
+/// in `kill()`, `has_exited()` and `Drop` — twelve copies across CH, Firecracker, QEMU and
+/// crosvm (docs/81 §9). The sequence is safety-critical: once the leader is reaped the
+/// kernel is free to recycle its pgid, so a `SIGKILL` to `-pgid` after that point can land
+/// on an **unrelated process group**. A single copy that forgot the `!reaped` guard, or
+/// forgot to set the flag, is a signal to someone else's processes.
+///
+/// The pgid is **private and never handed back out**: there is no accessor, so no code
+/// outside this module can construct `-pgid` for a VMM leader's group at all. That makes
+/// "re-signal after the flag is set" unrepresentable rather than merely scanned for — the
+/// only ways to signal the group are [`Self::kill_and_wait`] and [`Self::reap_now`], both
+/// of which consult and then set the flag.
+#[derive(Debug)]
+pub struct VmmProcessGroup {
+    /// The VMM leader's process-group id, captured at spawn (`Child::id()` of a leader
+    /// spawned with `process_group(0)`). `None` when the leader was already reaped before
+    /// the id could be captured, in which case there is nothing to signal.
+    pgid: Option<u32>,
+    /// `true` once the leader has been reaped (by `has_exited`, `kill`, or `Drop`). After
+    /// that the kernel may recycle the pgid, so the group must never be signalled again.
+    reaped: bool,
+}
+
+impl VmmProcessGroup {
+    /// Adopts a freshly-spawned VMM leader's process group. The group has not been reaped
+    /// yet, so the first teardown call is the one that signals it.
+    #[must_use]
+    pub fn new(pgid: Option<u32>) -> Self {
+        Self {
+            pgid,
+            reaped: false,
+        }
+    }
+
+    /// `true` once the leader has been reaped and the group must not be signalled again.
+    ///
+    /// Read-only: there is no setter, so a call site cannot clear the flag and re-arm a
+    /// signal to a possibly-recycled pgid.
+    #[must_use]
+    pub fn is_reaped(&self) -> bool {
+        self.reaped
+    }
+
+    /// The graceful teardown path (`VmInstance::kill`): `SIGKILL` the group unless the
+    /// leader was already reaped, then await the leader and record the reap.
+    ///
+    /// `process` must be the group's leader. Backend-specific steps that bracket this —
+    /// QEMU's QMP `quit` and USB re-bind, crosvm's `stop` — stay at the call site; only
+    /// the signal/wait/flag ordering lives here.
+    pub async fn kill_and_wait(&mut self, process: &mut tokio::process::Child) {
+        // Skip the group SIGKILL if the leader was already reaped: its pgid may have been
+        // recycled onto an unrelated group (M-VMM-1).
+        if !self.reaped
+            && let Some(pgid) = self.pgid
+        {
+            sigkill_process_group(pgid);
+        }
+        // Await the leader unconditionally: on the already-reaped path this returns the
+        // cached status immediately, and on the signalled path it is what actually reaps.
+        let _ = process.wait().await;
+        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
+        self.reaped = true;
+    }
+
+    /// The `Drop` teardown path: `SIGKILL` the group and blocking-`waitpid` the leader,
+    /// unless it was already reaped.
+    ///
+    /// Same ordering and same guard as [`Self::kill_and_wait`], in the synchronous form
+    /// `Drop` needs (L1: `Drop` is the panic path, `kill` the graceful one, one helper for
+    /// both). Idempotent: a second call after the flag is set is a no-op.
+    pub fn reap_now(&mut self, process: &mut tokio::process::Child) {
+        if !self.reaped {
+            reap_process_group(process, self.pgid);
+            self.reaped = true;
+        }
+    }
+
+    /// The `VmInstance::has_exited` path: non-blocking `try_wait` on the leader, recording
+    /// the reap when it reports an exit.
+    ///
+    /// Returns `true` when the leader has exited (the guest powered off after
+    /// `request_shutdown`). Recording the reap here is what stops a later `kill()`/`Drop`
+    /// from signalling a pgid the kernel may since have recycled (M-VMM-1).
+    pub fn note_exit(&mut self, process: &mut tokio::process::Child) -> bool {
+        if matches!(process.try_wait(), Ok(Some(_))) {
+            self.reaped = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Builds an **already-reaped** group over `pgid`, for tests that need the
+    /// recycled-pgid state without actually reaping a leader.
+    ///
+    /// Test-only: gated behind the `test-support` feature so production code cannot
+    /// fabricate the state. The per-backend M-VMM-1 gates use it to point a reaped group
+    /// at a live decoy process and assert the decoy survives teardown.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn already_reaped_for_test(pgid: Option<u32>) -> Self {
+        Self { pgid, reaped: true }
     }
 }
 
@@ -386,12 +719,41 @@ pub fn reap_process_group(process: &mut tokio::process::Child, pgid: Option<u32>
 /// instance (whose `Drop` reaps) is not constructed until the caller returns. Returns
 /// the captured pgid on success.
 ///
+/// The readiness ceiling is **not** a parameter: it is the one shared
+/// [`VMM_SOCKET_READY_TIMEOUT_MS`], so a backend cannot spell it as a literal again (§8).
+///
 /// # Errors
 /// Returns — after reaping the process group — the raw underlying error: the cgroup
 /// `add_task` failure, or the readiness [`Error::Timeout`](crate::error::Error::Timeout)/process-exited-early
 /// `Error` from [`wait_for_socket`]. The error is returned verbatim and identically
 /// across backends, so no backend can silently diverge on how it wraps it.
 pub async fn register_and_await_ready(
+    process: &mut tokio::process::Child,
+    cgroups: &dyn crate::metrics::CgroupFs,
+    cgroup_name: &str,
+    socket_path: &Path,
+    interval_ms: u64,
+) -> Result<Option<u32>> {
+    register_and_await_ready_within(
+        process,
+        cgroups,
+        cgroup_name,
+        socket_path,
+        VMM_SOCKET_READY_TIMEOUT_MS,
+        interval_ms,
+    )
+    .await
+}
+
+/// The one body of the register+await-ready sequence, with the readiness ceiling still a
+/// parameter.
+///
+/// **Private**, and that is the point: it is the seam this module's own reap-on-failure
+/// gate uses to pass a ceiling short enough to keep the KVM-free suite fast, and it is
+/// unreachable from every backend crate, so no shipped call site can reach for a ceiling
+/// of its own (§8). The public entry point is [`register_and_await_ready`], which has no
+/// ceiling argument at all.
+async fn register_and_await_ready_within(
     process: &mut tokio::process::Child,
     cgroups: &dyn crate::metrics::CgroupFs,
     cgroup_name: &str,
@@ -445,6 +807,65 @@ pub fn reject_unsupported_console(
         return Err(crate::error::Error::Unsupported {
             vmm: vmm.into(),
             feature: "virtio_console".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a [`crate::config::VmConfig`] that asks for a capability the backend's
+/// **own** descriptor advertises as `false`, for the two config fields no other guard
+/// covers: `nested_virt` and `lazy_restore` (docs/81 d7).
+///
+/// §2.1's contract is that every backend self-checks its own descriptor instead of assuming
+/// the caller consulted it, and three sibling fields (`virtio_console`, `disk_io_throttle`,
+/// `usb_host_passthrough`) already route through one shared predicate each. These two
+/// silently degraded instead:
+///
+/// - `nested_virt` — the SHARED [`crate::config::build_kernel_cmdline`] emits
+///   `kvm-intel.nested=1` for **every** backend on `cfg.nested_virt`, so a backend that
+///   exposes no VMX/SVM to the guest (Firecracker, crosvm) accepted the request and booted
+///   a guest whose L1 `/dev/kvm` never appears. The lever reads as applied and is not.
+/// - `lazy_restore` — a backend with no userfaultfd/demand-paged restore backend wired
+///   (Firecracker hardcodes `backend_type: "File"`; QEMU and crosvm load eagerly) faulted
+///   eagerly under a [`RestoreMode::Lazy`](crate::config::RestoreMode::Lazy) config that had
+///   asked for demand paging — an accepted input silently downgraded.
+///
+/// **One law, one predicate.** This landed as three byte-identical per-backend copies
+/// differing only in the `vmm` string; the copies are now one function every backend calls
+/// (docs/81 d7 follow-up). Both branches key off the **one** [`VmmCapabilities`] value handed
+/// in — never a hardcoded `false` at the refusal site — so flipping a flag flips its refusal
+/// with it, and each feature string IS the `VmmCapabilities` field name (N-VMM-1). A backend
+/// whose flag is `true` today (QEMU's `nested_virt`) keeps a dormant branch rather than a
+/// deleted one, exactly like [`reject_usb_host_devices`]: a deliberate re-gate turns every
+/// such config into the typed refusal here, with no second site to update.
+///
+/// Called from `create()` **and** `restore()`, before any spawn: a `restore()` that accepted
+/// exactly what `create()` rejects is the crosvm M4 defect one path over, and `restore_mode`
+/// is precisely the field a restore consumes.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`](crate::error::Error::Unsupported) `{ vmm, feature }` naming
+/// the unadvertised capability: `"nested_virt"` when `cfg.nested_virt` is set and
+/// `caps.nested_virt` is `false`, `"lazy_restore"` when `cfg.restore_mode` is
+/// [`RestoreMode::Lazy`](crate::config::RestoreMode::Lazy) and `caps.lazy_restore` is
+/// `false`; `Ok(())` otherwise.
+pub fn reject_unadvertised_capabilities(
+    vmm: &str,
+    caps: &VmmCapabilities,
+    cfg: &crate::config::VmConfig,
+) -> Result<()> {
+    if cfg.nested_virt && !caps.nested_virt {
+        return Err(crate::error::Error::Unsupported {
+            vmm: vmm.into(),
+            // N-VMM-1: the feature string IS the VmmCapabilities field name.
+            feature: "nested_virt".into(),
+        });
+    }
+    if matches!(cfg.restore_mode, crate::config::RestoreMode::Lazy) && !caps.lazy_restore {
+        return Err(crate::error::Error::Unsupported {
+            vmm: vmm.into(),
+            // N-VMM-1: the feature string IS the VmmCapabilities field name.
+            feature: "lazy_restore".into(),
         });
     }
     Ok(())
@@ -1225,8 +1646,11 @@ mod tests {
         let never = std::env::temp_dir().join("vmcell-nonexistent-readiness.sock");
         let _ = std::fs::remove_file(&never);
 
+        // The private `_within` seam, so this gate keeps its short ceiling: the public
+        // `register_and_await_ready` takes no ceiling argument at all (§8).
         let result =
-            register_and_await_ready(&mut process, &cgroups, "vmcell-test", &never, 100, 20).await;
+            register_and_await_ready_within(&mut process, &cgroups, "vmcell-test", &never, 100, 20)
+                .await;
         assert!(
             matches!(result, Err(crate::error::Error::Timeout(_))),
             "readiness failure must surface a Timeout, got {result:?}"
@@ -1246,6 +1670,209 @@ mod tests {
             gone,
             "register_and_await_ready must reap the process group on a readiness failure"
         );
+    }
+
+    // Guards §8: the readiness ceiling has exactly ONE home. `register_and_await_ready`
+    // and `wait_for_vmm_socket` must take no ceiling argument (a backend that could pass
+    // one would re-create the six bare `1000`s docs/81 §8 found), and the value they use
+    // must be the named const. Inverse: change either wrapper to forward a literal of its
+    // own instead of `VMM_SOCKET_READY_TIMEOUT_MS` and the elapsed-time assert reddens;
+    // re-adding a ceiling parameter to either signature reddens at COMPILE time, since
+    // these calls pass none.
+    #[tokio::test]
+    async fn vmm_socket_readiness_rides_the_one_named_ceiling() {
+        let never = std::env::temp_dir().join("vmcell-nonexistent-vmm-ready-ceiling.sock");
+        let _ = std::fs::remove_file(&never);
+
+        let started = std::time::Instant::now();
+        let result = wait_for_vmm_socket(&never, None, 20).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(crate::error::Error::Timeout(_))),
+            "an absent socket must time out, got {result:?}"
+        );
+        // The wrapper passes VMM_SOCKET_READY_TIMEOUT_MS and nothing else, so the elapse
+        // brackets it. The upper bound is generous (a loaded CI box) but far below any
+        // plausible second literal a backend would reach for.
+        let ceiling = std::time::Duration::from_millis(VMM_SOCKET_READY_TIMEOUT_MS);
+        assert!(
+            elapsed >= ceiling,
+            "wait_for_vmm_socket returned after {elapsed:?}, before its {ceiling:?} ceiling"
+        );
+        assert!(
+            elapsed < ceiling * 4,
+            "wait_for_vmm_socket took {elapsed:?}, far past the {ceiling:?} ceiling it must ride"
+        );
+    }
+
+    // Guards M-VMM-1 / L1 for the shared owner of the reaped flag. Once the leader is
+    // reaped the kernel may recycle its pgid, so NEITHER teardown path may signal the
+    // group again. A live decoy in its own process group stands in for that recycled
+    // group; both `kill_and_wait` (the graceful path) and `reap_now` (the `Drop` path)
+    // are driven against the SAME already-reaped group, because a helper that guards one
+    // and not the other is exactly the divergence this type exists to prevent.
+    //
+    // Inverse: drop the `!self.reaped` guard in either method and the decoy is SIGKILLed,
+    // so `try_wait` reports it exited — reddening the assert for that leg.
+    #[tokio::test]
+    async fn reaped_process_group_never_signals_a_recycled_pgid() {
+        let mut decoy = spawn_group_standin();
+        let decoy_pgid = decoy.id().expect("decoy pid");
+
+        let mut group = VmmProcessGroup::already_reaped_for_test(Some(decoy_pgid));
+        assert!(group.is_reaped(), "the fixture must start already-reaped");
+
+        // A fast-exiting stand-in leader so `kill_and_wait`'s `process.wait()` returns
+        // promptly instead of blocking on a live process.
+        let mut leader = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true` leader");
+        group.kill_and_wait(&mut leader).await;
+        group.reap_now(&mut leader);
+
+        // A SIGKILL to the (recycled) pgid would land within a few ms; give it time.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let decoy_status = decoy.try_wait().expect("try_wait decoy");
+        // Clean up the decoy regardless of the outcome — a test's own fixtures are
+        // residue too.
+        sigkill_process_group(decoy_pgid);
+        let _ = decoy.wait().await;
+
+        assert!(
+            decoy_status.is_none(),
+            "a reaped VmmProcessGroup must not SIGKILL its (recycled) pgid — the decoy died"
+        );
+    }
+
+    // The POSITIVE control for the test above: a group that has NOT been reaped is
+    // signalled, so the negative result there is about the flag and not about a helper
+    // that never signals anything. Inverse: make `kill_and_wait` skip the signal
+    // unconditionally and the group survives, reddening `gone`.
+    #[tokio::test]
+    async fn unreaped_process_group_is_signalled_and_flagged() {
+        let mut leader = spawn_group_standin();
+        let pid = leader.id().expect("stand-in pid") as i32;
+
+        let mut group = VmmProcessGroup::new(Some(pid as u32));
+        assert!(!group.is_reaped(), "a fresh group is not reaped");
+        group.kill_and_wait(&mut leader).await;
+        assert!(
+            group.is_reaped(),
+            "kill_and_wait must record the reap so Drop cannot re-signal (M-VMM-1)"
+        );
+
+        let mut gone = false;
+        for _ in 0..50 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "kill_and_wait must SIGKILL an un-reaped process group"
+        );
+    }
+
+    // Guards M-VMM-1's other half: `note_exit` must RECORD the reap, or a later
+    // `kill()`/`Drop` re-signals a pgid the kernel may already have recycled. Inverse:
+    // return the bool without setting the flag and `is_reaped()` stays false.
+    #[tokio::test]
+    async fn note_exit_records_the_reap() {
+        let mut leader = spawn_group_standin();
+        let pgid = leader.id().expect("stand-in pid");
+        sigkill_process_group(pgid);
+
+        let mut group = VmmProcessGroup::new(Some(pgid));
+        let mut exited = false;
+        for _ in 0..100 {
+            if group.note_exit(&mut leader) {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(exited, "note_exit must report the killed leader as exited");
+        assert!(
+            group.is_reaped(),
+            "note_exit must record `reaped` after reaping the leader (M-VMM-1)"
+        );
+    }
+
+    // Guards d7's law in its ONE home: each branch keys off the descriptor value handed
+    // in (never a hardcoded bool), the feature string EQUALS the `VmmCapabilities` field
+    // name (N-VMM-1), and the `vmm` string is the caller's. Inverse: hardcode either
+    // refusal (so an advertised capability is still refused) and the advertised legs
+    // redden; misspell a feature string and its assert reddens.
+    #[test]
+    fn reject_unadvertised_capabilities_keys_off_the_descriptor_it_is_handed() {
+        let caps = |nested: bool, lazy: bool| VmmCapabilities {
+            snapshot_restore: true,
+            lazy_restore: lazy,
+            virtio_fs_shares: true,
+            unprivileged_vhost_user_net: true,
+            nested_virt: nested,
+            virtio_console: true,
+            restore_rotates_host_paths: true,
+            disk_io_throttle: true,
+            usb_host_passthrough: false,
+        };
+        let cfg = |nested: bool, mode: crate::config::RestoreMode| {
+            crate::config::VmConfig::builder(
+                "/k",
+                crate::config::RootfsSource::Erofs {
+                    image: PathBuf::from("/i"),
+                },
+            )
+            .nested_virt(nested)
+            .restore_mode(mode)
+            .build()
+            .expect("a minimal erofs config builds")
+        };
+
+        // Advertised: both pass.
+        reject_unadvertised_capabilities(
+            "probe",
+            &caps(true, true),
+            &cfg(true, crate::config::RestoreMode::Lazy),
+        )
+        .expect("an advertised capability must be accepted");
+
+        // Unadvertised nested_virt.
+        let err = reject_unadvertised_capabilities(
+            "probe",
+            &caps(false, true),
+            &cfg(true, crate::config::RestoreMode::Default),
+        )
+        .expect_err("nested_virt on an incapable descriptor must be refused");
+        assert!(
+            matches!(&err, crate::error::Error::Unsupported { vmm, feature }
+                if vmm == "probe" && feature == "nested_virt"),
+            "expected Unsupported{{vmm: probe, feature: nested_virt}}, got {err:?}"
+        );
+
+        // Unadvertised lazy_restore.
+        let err = reject_unadvertised_capabilities(
+            "probe",
+            &caps(true, false),
+            &cfg(false, crate::config::RestoreMode::Lazy),
+        )
+        .expect_err("RestoreMode::Lazy on an incapable descriptor must be refused");
+        assert!(
+            matches!(&err, crate::error::Error::Unsupported { vmm, feature }
+                if vmm == "probe" && feature == "lazy_restore"),
+            "expected Unsupported{{vmm: probe, feature: lazy_restore}}, got {err:?}"
+        );
+
+        // Eager restore is never the lazy_restore case, whatever the flag says.
+        reject_unadvertised_capabilities(
+            "probe",
+            &caps(true, false),
+            &cfg(false, crate::config::RestoreMode::Eager),
+        )
+        .expect("Eager restore must not trip the lazy_restore guard");
     }
 
     // Guards the interval clamp in `wait_for_socket`: the interval is caller-supplied
@@ -1347,6 +1974,36 @@ mod tests {
             matches!(result, Err(crate::error::Error::Timeout(_))),
             "an absent socket with no process must Time Out, got {result:?}"
         );
+    }
+
+    // Guards M6: the snapshot RPC's budget is a function of guest RAM, not the flat
+    // control ceiling. Pure math against known values, so a regression to a constant is
+    // caught KVM-free. Inverse (`snapshot_request_timeout` returning
+    // `CONTROL_REQUEST_TIMEOUT`) reddens every assert but the zero-RAM one.
+    #[test]
+    fn snapshot_request_timeout_scales_with_guest_ram() {
+        use std::time::Duration;
+
+        // A zero-RAM instance (the FC CPU-template probe) degrades to the flat ceiling.
+        assert_eq!(snapshot_request_timeout(0), CONTROL_REQUEST_TIMEOUT);
+        // 64 MiB/s floor, rounded UP: 256 MiB ⇒ 4 s of write on top of the ceiling.
+        assert_eq!(snapshot_request_timeout(256), Duration::from_secs(5 + 4));
+        // A partial second still costs a whole one (`div_ceil`), never zero.
+        assert_eq!(snapshot_request_timeout(1), Duration::from_secs(5 + 1));
+        assert_eq!(snapshot_request_timeout(2048), Duration::from_secs(5 + 32));
+        // The 4 GiB guest the flat 5 s ceiling could not have finished under any
+        // plausible disk: strictly more than a minute of budget.
+        assert!(snapshot_request_timeout(4096) > Duration::from_secs(60));
+        // Monotone non-decreasing across the range.
+        let mut prev = snapshot_request_timeout(0);
+        for mib in (0..=8192).step_by(97) {
+            let now = snapshot_request_timeout(mib);
+            assert!(
+                now >= prev,
+                "budget must not shrink as guest RAM grows ({mib} MiB)"
+            );
+            prev = now;
+        }
     }
 
     // Guards M-VMM-2: a control socket that accepts a connection but never speaks must

@@ -73,8 +73,11 @@ fn insert_injected_file(
 /// insert order is the structural backstop.
 ///
 /// # Errors
-/// Returns [`crate::error::Error::Artifact`] if an injected file or an archive entry
-/// cannot be read.
+/// Returns [`crate::error::Error::Artifact`] if an injected file or an archive entry cannot be
+/// read, or if an archive member carries an entry type this packer has no node for (contiguous,
+/// GNU-sparse, an unfolded `x`/`L`/`K` extension header, or an unknown type byte) — such a member
+/// is rejected, never dropped, because a dropped member packs a rootfs that boots as if complete.
+/// The archive-wide pax global header (`g`) names no filesystem object and is the one skipped type.
 #[cfg(feature = "am-fs-erofs")]
 fn build_node_map<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
@@ -237,7 +240,32 @@ fn build_node_map<'a, R: Read + 'a>(
                         }
                     }
                 }
-                _ => continue,
+                // A pax GLOBAL header (`g`) carries archive-wide records and names no
+                // filesystem object, so skipping it drops nothing. It is the one member type
+                // `tar`'s reader hands us unconsumed on a well-formed archive (the per-member
+                // `x`/`L`/`K` headers are folded into the member that follows), and real
+                // registry layers do carry one.
+                tar::EntryType::XGlobalHeader => continue,
+                // Every other type is REJECTED, never dropped (AGENTS.md "every accepted input
+                // is honored or rejected"; the same fail-loud law as `check_layer_media_type`
+                // one level up). The old `_ => continue` left the member out of the packed
+                // rootfs, which then boots as if complete — silent corruption. Reaching here
+                // means one of:
+                //   * `x`/`L`/`K` surfacing at all: `tar` could not fold the header into the
+                //     following member (its magic is neither ustar nor GNU), so that member may
+                //     keep a TRUNCATED 100-byte path — a mis-named file, not just a missing one;
+                //   * `7` (contiguous) or `S` (GNU sparse): real file content this packer has
+                //     no node for;
+                //   * an unknown type byte: a format this packer has never seen.
+                other => {
+                    return Err(crate::error::Error::Artifact(format!(
+                        "unsupported tar entry type {other:?} (type byte {:?}) for {}: this \
+                         packer has no node for it and dropping it would pack an incomplete \
+                         rootfs that boots as if complete",
+                        char::from(other.as_byte()),
+                        path.display()
+                    )));
+                }
             };
 
             let file_name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -1133,5 +1161,191 @@ mod tests {
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a child under a non-directory parent must fail loud (L-ART-6), got {res:?}"
         );
+    }
+
+    /// A one-member archive whose entry carries `entry_type`, written with `header`'s format.
+    ///
+    /// The header FORMAT is a parameter because it decides what surfaces: `tar`'s reader folds an
+    /// `x`/`L`/`K` extension header into the member that follows only when the magic is ustar or
+    /// GNU, so a v7 (`new_old`) header is what makes an unfolded one reach the packer.
+    fn tar_with_entry(mut header: tar::Header, entry_type: tar::EntryType, path: &str) -> Vec<u8> {
+        let mut tar_data = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_data);
+            header.set_entry_type(entry_type);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_path(path).expect("set the member path");
+            header.set_cksum();
+            b.append(&header, std::io::empty()).expect("append");
+            b.finish().expect("finish");
+        }
+        tar_data
+    }
+
+    // AGENTS.md, "every accepted input is honored or rejected": a member type this packer has no
+    // node for must be a hard error naming it — never the old `_ => continue`, which dropped the
+    // member and packed a rootfs that boots as if complete (the silent-corruption class
+    // `check_layer_media_type` refuses one level up).
+    //
+    // RED on that inverse: with `_ => continue` every arm below returns `Ok`, so
+    // `expect_err` panics.
+    #[test]
+    fn unsupported_tar_entry_types_are_rejected_not_dropped() {
+        let cases: Vec<(&str, tar::Header, tar::EntryType)> = vec![
+            (
+                "contiguous",
+                tar::Header::new_gnu(),
+                tar::EntryType::Continuous,
+            ),
+            (
+                "unknown type byte",
+                tar::Header::new_gnu(),
+                tar::EntryType::new(b'A'),
+            ),
+            (
+                "unfolded pax extended header",
+                tar::Header::new_old(),
+                tar::EntryType::XHeader,
+            ),
+            (
+                "unfolded gnu long name",
+                tar::Header::new_old(),
+                tar::EntryType::GNULongName,
+            ),
+            (
+                "unfolded gnu long link",
+                tar::Header::new_old(),
+                tar::EntryType::GNULongLink,
+            ),
+        ];
+        for (label, header, entry_type) in cases {
+            let tar_data = tar_with_entry(header, entry_type, "odd/member");
+            let archive = tar::Archive::new(std::io::Cursor::new(tar_data));
+            let err = build_node_map(vec![archive], vec![], vec![], vec![])
+                .expect_err(&format!("{label} must be rejected, not silently dropped"));
+            let crate::error::Error::Artifact(msg) = &err else {
+                panic!("{label}: expected Error::Artifact, got {err:?}");
+            };
+            assert!(
+                msg.contains("odd/member") && msg.contains("unsupported tar entry type"),
+                "{label}: the refusal must name the member and the type, got: {msg}"
+            );
+        }
+    }
+
+    // The positive control for the rejection above: every member type this packer DOES have a
+    // node for still packs, and the one metadata-only type (`g`, the archive-wide pax global
+    // header that real registry layers carry) is still skipped without an error. RED if the
+    // rejection is widened to swallow a handled type or the `g` skip is dropped.
+    #[test]
+    fn handled_tar_entry_types_still_pack() {
+        let mut tar_data = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_data);
+            // The archive-wide pax global header: names no filesystem object, must not error.
+            let mut g = tar::Header::new_gnu();
+            g.set_entry_type(tar::EntryType::XGlobalHeader);
+            g.set_size(0);
+            g.set_mode(0o644);
+            g.set_path("pax_global_header").expect("path");
+            g.set_cksum();
+            b.append(&g, std::io::empty()).expect("append pax global");
+
+            let mut d = tar::Header::new_gnu();
+            d.set_entry_type(tar::EntryType::Directory);
+            d.set_size(0);
+            d.set_mode(0o755);
+            d.set_path("dir").expect("path");
+            d.set_cksum();
+            b.append(&d, std::io::empty()).expect("append dir");
+
+            append_file(&mut b, "dir/regular", b"body");
+
+            let mut s = tar::Header::new_gnu();
+            s.set_entry_type(tar::EntryType::Symlink);
+            s.set_size(0);
+            s.set_mode(0o777);
+            s.set_path("dir/symlink").expect("path");
+            s.set_link_name("regular").expect("link name");
+            s.set_cksum();
+            b.append(&s, std::io::empty()).expect("append symlink");
+
+            for (et, path) in [
+                (tar::EntryType::Char, "dev/chr"),
+                (tar::EntryType::Block, "dev/blk"),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(et);
+                h.set_size(0);
+                h.set_mode(0o600);
+                h.set_device_major(1).expect("major");
+                h.set_device_minor(3).expect("minor");
+                h.set_path(path).expect("path");
+                h.set_cksum();
+                b.append(&h, std::io::empty()).expect("append device");
+            }
+
+            let mut f = tar::Header::new_gnu();
+            f.set_entry_type(tar::EntryType::Fifo);
+            f.set_size(0);
+            f.set_mode(0o600);
+            f.set_path("dir/fifo").expect("path");
+            f.set_cksum();
+            b.append(&f, std::io::empty()).expect("append fifo");
+
+            let mut l = tar::Header::new_gnu();
+            l.set_entry_type(tar::EntryType::Link);
+            l.set_size(0);
+            l.set_mode(0o644);
+            l.set_path("dir/hardlink").expect("path");
+            l.set_link_name("dir/regular").expect("link target");
+            l.set_cksum();
+            b.append(&l, std::io::empty()).expect("append hardlink");
+
+            b.finish().expect("finish");
+        }
+        let archive = tar::Archive::new(std::io::Cursor::new(tar_data));
+        let map = build_node_map(vec![archive], vec![], vec![], vec![])
+            .expect("every handled member type must pack, and the pax global header be skipped");
+
+        assert!(
+            !map.contains_key(Path::new("pax_global_header")),
+            "the pax global header names no filesystem object and must not become a node"
+        );
+        assert!(
+            matches!(map.get(Path::new("dir")), Some(Node::Dir { .. })),
+            "the directory member must pack"
+        );
+        assert!(
+            matches!(map.get(Path::new("dir/regular")), Some(Node::File { .. })),
+            "the regular member must pack"
+        );
+        assert!(
+            matches!(
+                map.get(Path::new("dir/symlink")),
+                Some(Node::Symlink { .. })
+            ),
+            "the symlink member must pack"
+        );
+        assert!(
+            matches!(map.get(Path::new("dev/chr")), Some(Node::Device { .. })),
+            "the char-device member must pack"
+        );
+        assert!(
+            matches!(map.get(Path::new("dev/blk")), Some(Node::Device { .. })),
+            "the block-device member must pack"
+        );
+        assert!(
+            matches!(map.get(Path::new("dir/fifo")), Some(Node::Special { .. })),
+            "the fifo member must pack"
+        );
+        match map.get(Path::new("dir/hardlink")) {
+            Some(Node::File { data, .. }) => assert_eq!(
+                data, b"body",
+                "the hardlink must materialize its target's content"
+            ),
+            other => panic!("expected the hardlink materialized as a file, got {other:?}"),
+        }
     }
 }

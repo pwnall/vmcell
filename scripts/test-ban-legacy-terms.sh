@@ -6,6 +6,12 @@
 # This is the "red on the inverse" guard: drop any banned pattern from the scanner and a fixture
 # below stops being flagged; break comment-stripping and the prose fixture trips; break the
 # exemption marker and the exempted fixture trips.
+#
+# It also drives the ROSTER, not just the patterns (docs/81 M13): the scanner used to gate its
+# collector on `[[ -d "$d" ]]`, so the default roster's `justfile` — a regular file — was never
+# opened, while the success line named it anyway. The regular-file / mixed-roster / empty-roster /
+# missing-entry legs below are the red-on-inverse for that: restore the `-d` gate and the
+# justfile-shaped fixture goes green, which fails this test.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,10 +80,78 @@ set -e
 if [[ $clean_rc -ne 0 ]]; then echo "FAIL: clean tree exit code = $clean_rc, expected 0"; fail=1; fi
 if ! grep -q '^ok:' <<<"$clean_out"; then echo "FAIL: clean tree missing 'ok:' line"; fail=1; fi
 
+# --- The roster legs: a REGULAR FILE in the roster must actually be scanned ----------------
+# docs/81 M13: the collector was `[[ -d "$d" ]] && find "$d" -type f -print0`, so the default
+# roster's `justfile` — a regular file — was dropped, while the success line kept naming it. The
+# fixture below is the review's own reproduction (a justfile-shaped file carrying `test-rootless:`
+# and `echo imp-testing`); it exited 0 on the old collector. `justfile` has no extension, so it
+# takes the `#`-stripping branch — the banned tokens are on live recipe lines, not in comments, so
+# the fixture stays non-vacuous under that branch.
+printf 'test-rootless:\n    echo imp-testing\n' > "$work/justfile"
+set +e
+jf_out="$("$ban" "$work/justfile" 2>&1)"
+jf_rc=$?
+set -e
+if [[ $jf_rc -ne 1 ]]; then
+  echo "FAIL [regular-file roster]: scanning a justfile-shaped file exited $jf_rc, expected 1."
+  echo "  The collector is gating on directories again — a regular-file roster entry is being"
+  echo "  dropped while the success line names it (docs/81 M13)."
+  fail=1
+fi
+if ! grep -q 'justfile:1' <<<"$jf_out"; then echo "FAIL [regular-file roster]: 'test-rootless:' not flagged"; fail=1; fi
+if ! grep -q 'justfile:2' <<<"$jf_out"; then echo "FAIL [regular-file roster]: 'echo imp-testing' not flagged"; fail=1; fi
+
+# A mixed roster (directory + regular file) resolves both halves, and the success line reports the
+# FILE COUNT — so a roster that silently resolves to nothing cannot print a reassuring message.
+printf 'vmcell recipe:\n    echo vmcell\n' > "$work/clean-justfile"
+set +e
+mixed_out="$("$ban" "$work/clean" "$work/clean-justfile" 2>&1)"
+mixed_rc=$?
+set -e
+if [[ $mixed_rc -ne 0 ]]; then
+  echo "FAIL [mixed roster]: exit code = $mixed_rc, expected 0"; fail=1
+fi
+if ! grep -q 'scanned 2 files' <<<"$mixed_out"; then
+  echo "FAIL [mixed roster]: expected 'scanned 2 files' (1 dir member + 1 regular file), got:"
+  printf '  %s\n' "$mixed_out"
+  fail=1
+fi
+
+# An empty roster is a caller bug, not an "ok" — exit 2, and NOT the "ok:" line (the L-HOST-1
+# contracts-self-guard shape, same as check-lean-tree.sh's usage leg).
+mkdir -p "$work/nothing"
+set +e
+empty_out="$("$ban" "$work/nothing" 2>&1)"
+empty_rc=$?
+set -e
+if [[ $empty_rc -eq 0 ]]; then
+  echo "FAIL [empty roster]: a roster resolving to 0 files exited 0 — it must fail loud."; fail=1
+fi
+if grep -q '^ok:' <<<"$empty_out"; then
+  echo "FAIL [empty roster]: printed an 'ok:' line for a scan that opened nothing."; fail=1
+fi
+
+# A roster entry that does not exist is rejected, not skipped (every accepted input is honoured or
+# rejected — a typo'd path must never read as a clean scan).
+set +e
+missing_out="$("$ban" "$work/no-such-path" 2>&1)"
+missing_rc=$?
+set -e
+if [[ $missing_rc -eq 0 ]]; then
+  echo "FAIL [missing roster entry]: a nonexistent path exited 0 instead of failing loud."; fail=1
+fi
+if grep -q '^ok:' <<<"$missing_out"; then
+  echo "FAIL [missing roster entry]: printed an 'ok:' line for a path that does not exist."; fail=1
+fi
+
 if [[ $fail -ne 0 ]]; then
   echo "---- scanner output (fixture tree) ----"; printf '%s\n' "$out"
   echo "---- scanner output (clean tree) ----"; printf '%s\n' "$clean_out"
+  echo "---- scanner output (justfile fixture) ----"; printf '%s\n' "$jf_out"
+  echo "---- scanner output (mixed roster) ----"; printf '%s\n' "$mixed_out"
+  echo "---- scanner output (empty roster) ----"; printf '%s\n' "$empty_out"
+  echo "---- scanner output (missing roster entry) ----"; printf '%s\n' "$missing_out"
   echo "ban-legacy-terms self-test FAILED"
   exit 1
 fi
-echo "ok: ban-legacy-terms self-test passed"
+echo "ok: ban-legacy-terms self-test passed (incl. the regular-file roster entry, the file count, and the empty/missing roster refusals)"

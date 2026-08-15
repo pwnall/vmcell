@@ -1,8 +1,8 @@
 # AGENTS.md — vmcell
 
 Deploy at the repository root as `AGENTS.md`. Terse by design; the reasoning lives in
-`docs/75-claude-fable-code-review-rubric-v6.md` (rubric v6) and `docs/79-claude-fable-design-v31.md`
-(design v31).
+`docs/75-claude-fable-code-review-rubric-v6.md` (rubric v6) and `docs/82-claude-opus-design-v32.md`
+(design v32; v31 is now `docs/historical/79-claude-fable-design-v31.md`).
 
 ## What this is
 
@@ -26,7 +26,10 @@ capability runner), `vmcell-guest-tools`, the rootfs/kernel builders, `vmcell-pr
 cap/blessing predicates), and the control-plane tier: `vmcell-daemon` (lib), `vmcelld` (binary),
 `vmcell-daemon-client`, `vmcelld-ctl`, and `vmcell-broker` (the privileged spawn helper). Two
 operating modes: **unprivileged** (KVM group only, smoltcp NAT) and **privileged** (three caps,
-netns/tap/nft, the only snapshot-eligible mode). Current version: `vmcell` 0.13.
+netns/tap/nft, the only snapshot-eligible mode). Crate versions are **not quoted here** — the one
+that used to be went stale inside a single review pass. Read the `version` from the crate's own
+`Cargo.toml`; `vmcell`'s and `vmcell-artifact-validator`'s carry the ledgered comment changelog a
+contract-surface bump must extend (see "The downstream toolkit contract").
 
 ## Read before changing anything
 
@@ -51,9 +54,8 @@ netns/tap/nft, the only snapshot-eligible mode). Current version: `vmcell` 0.13.
 ## The delta register binds implementations, not the baseline
 
 Design §18's register is the mechanism for directing changes that are **specified but not yet
-built**. The v30 downstream-platform register (deltas 1–9) is **landed**; `vmcell` is 0.13 and the
-code no longer legitimately differs from it. When a future register is open, these conventions
-stand:
+built**. The v30 downstream-platform register (deltas 1–9) is **landed**; the code no longer
+legitimately differs from it. When a future register is open, these conventions stand:
 
 - Until an item lands, the code legitimately matches the last validated release — a delta-item
   divergence is a finding **only** in the change that claims to implement that delta.
@@ -77,6 +79,15 @@ stand:
    and clippied (a `cargo tree`-only check compiles nothing), accepted-red steps run last or
    non-gating so they never short-circuit other gates. A CI step that hand-copies a `just` recipe
    drifts from it — invoke the recipe (`run: just test-unprivileged`) so local ≡ CI by construction.
+   That applies to the **gate roster** too: every ban/check script, every red-on-inverse self-test,
+   and the `shellcheck` pass live in the one `gates` recipe, which both `just ci` and `ci.yml` call
+   (`run: just gates`); a new script is added to that recipe and nowhere else. The hand-copy had
+   already drifted three times, so `scripts/ban-ci-script-handcopy.sh` is the meta-gate: it runs
+   first, fails if `ci.yml` names a `scripts/*.sh` directly, and asserts the recipe's roster equals
+   the gate-shaped scripts on disk in **both** directions (orphan script *and* stale entry).
+   Anything parsing `cargo` output belongs in a script, not a `run:` block: CI exports
+   `CARGO_TERM_COLOR: always` and `just ci` does not, which silently killed three `cargo tree` bans
+   — `ban-uncolored-cargo-parse.sh` is that class's gate.
 4. Enumerate what the suite structurally cannot reach — error branches, non-default configs and
    flows, defaults, window-filling payloads **in both directions**, security inverses, **and the
    effect classes your fakes are blind to** (`FakeVmm` never touches the filesystem — the lineage
@@ -130,8 +141,24 @@ stand:
   (§5.3), `segment_ip_math` beside `ip_math`/`mac_math`, the one vsock `CONNECT/OK` prologue
   (shared by `connect_framed` and `dial_vsock`), the one id-claim core (`flock` + `hard_link`)
   under both `VmidAllocator` and `SegmentIdAllocator`, `MAX_FRAME_BYTES`/`MAX_BROKER_FRAME_BYTES`
-  and the `capped_debug` renderer beside them, `pcts`, and the cache-key rules (F4). Never write a
-  second copy — every duplicate so far has diverged.
+  and the `capped_debug` renderer beside them, `pcts`, and the cache-key rules (F4). The docs/81
+  pass added six more, each because the duplicate form had already diverged:
+  `vmm::reject_unadvertised_capabilities` (`nested_virt` / `lazy_restore`) beside its siblings
+  `reject_unsupported_console` and `reject_usb_host_devices` — one shared refusal per capability
+  field, keyed off the descriptor handed in, never a hardcoded `false` at the refusal site;
+  `vmm::VMM_SOCKET_READY_TIMEOUT_MS`, the one VMM-control-socket readiness ceiling, which
+  `register_and_await_ready`/`wait_for_vmm_socket` take as *no argument at all* so a per-backend
+  literal is a compile error; `vmcell_protocol::GUEST_TOOLS_APPLETS`, the host↔guest applet roster
+  the guest-tools dispatch table is `const`-asserted against element-wise and the rootfs injection
+  manifest emits from; `VmmProcessGroup::is_reaped`, the read-only reaped flag (no setter, so no
+  call site can re-arm a signal at a recycled pgid); `metrics::vm_slice_name` — now `pub` and
+  re-exported as `naming::vm_slice_name` — the **full** cgroup slice name, of which
+  `naming::cgroup_slice_name` is only the leaf, so no reader hand-formats the path; and
+  `artifact::kernel::kernel_artifact_key`/`kernel_pin_key`, the kernel artifact-key and pin-key
+  composers. Never write a second copy — every duplicate so far has diverged. Where a law's drift is
+  **not** a compile error it carries a grep-ban plus a red-on-inverse self-test —
+  `ban-inline-setns.sh`, `ban-kernel-key-composers.sh`, `ban-readiness-timeout-literal.sh`,
+  `ban-artifact-path-join.sh`; `just gates` is the full roster. A new law of that shape earns one.
 - Recovery stays retryable: consume one-shot flags (`restored`, desync) only after the recovery
   succeeds; a transient failure leaves the next call able to retry, and a failed resync evicts the
   cached client so nothing wedges.
@@ -304,11 +331,19 @@ fragment is the one defended exception shape and never carries a consumer's usbi
 - "Am I on a KVM host?" is answered by `scripts/review-preflight-priv.sh`, never by assumption.
   Hesitating instead of probing is the exact failure mode the preflight exists to remove.
 - The blessed runner exists so that *you*, unprivileged, can run the privileged suite: nextest
-  invokes `.vmcell-bin/release/vmcell-test-runner`, which holds the three file capabilities — no
-  sudo, no root shell; cargo and the tests stay yours. The daemon suite (`just test-daemon`) uses
-  the same runner and delegated scope.
-- Preflight green → run `just test-privileged`, the unprivileged suite, and `just test-daemon`
-  yourself.
+  invokes `.vmcell-bin/debug/vmcell-test-runner` (the `runner` variable at the top of the
+  `justfile`), which carries `BLESSED_FILE_CAPS` — the delivered `PRIVILEGED_CAPS` plus the
+  **transient** `CAP_SETPCAP` the bounding-set shrink needs, dropped again before `exec`, so no test
+  or VMM ever holds it. No sudo, no root shell; cargo and the tests stay yours. `just bless` also
+  blesses a release copy, which no recipe invokes today. Every runner-wrapped recipe
+  (`test-privileged`, `test-daemon`, `test-validator`, `test-crosvm`, `test-usb-passthrough`) uses
+  that same debug runner; `test-unprivileged` deliberately runs without it, which is what keeps the
+  unprivileged path honest. `test-daemon` wraps itself in the delegated scope; every other live
+  suite is wrapped at the call site (`systemd-run --user --scope -p Delegate=yes
+  scripts/with-delegated-scope.sh just <recipe>`), the way `ci.yml` invokes them — the cgroup legs
+  need a delegated subtree and fail without one.
+- Preflight green → run `just test-privileged`, the unprivileged suite, `just test-daemon`, and
+  `just test-validator` yourself.
 - Preflight failing only on blessing (runner missing, stale stamp, not `+ep`) → ask the maintainer
   to run `just bless` (one sudo), then rerun preflight and the suites. Never attempt the bless
   yourself; never silently skip.
@@ -325,11 +360,14 @@ fragment is the one defended exception shape and never carries a consumer's usbi
 
 ## Done means
 
-- `just ci` green locally (it is the CI definition; both set `RUSTFLAGS=-D warnings`).
+- `just ci` green locally (it is the CI definition — it calls the same `just gates` recipe `ci.yml`
+  does; both set `RUSTFLAGS=-D warnings`).
 - For host-facing changes: both operating-mode suites green per the section above, all backends the
   change touches, `just test-daemon` for daemon-touching changes, `just test-crosvm` for
-  crosvm-touching ones, the example-workspace job for contract-touching changes, and the skip
-  manifest reviewed.
+  crosvm-touching ones, `just test-validator` for changes to the artifact-conformance battery (its
+  live legs are `#[ignore]`d and only that recipe selects them), the example-workspace job for
+  contract-touching changes, and the skip manifest reviewed (`just skip-manifest-reset` before the
+  sequence, `just skip-manifest-show` after, so the skips belong to this run).
 - New public API: rustdoc complete (`missing_docs` denies), `cargo semver-checks` clean (both contract
   crates — the toolkit section above). A change implementing a delta-register item ships that item's
   named gate and reconciles `docs/implementation-notes.md`.

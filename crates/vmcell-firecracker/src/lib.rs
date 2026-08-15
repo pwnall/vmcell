@@ -115,6 +115,27 @@ fn fc_capabilities() -> VmmCapabilities {
     }
 }
 
+/// Refuses a [`VmConfig`] asking for `nested_virt`/`lazy_restore` that [`fc_capabilities`]
+/// advertises as `false`, through the **one** shared predicate
+/// [`vmcell::vmm::reject_unadvertised_capabilities`] (docs/81 d7).
+///
+/// FC's stake in it: it exposes no VMX/SVM to the guest, yet the SHARED
+/// [`vmcell::config::build_kernel_cmdline`] emits `kvm-intel.nested=1` for **every** backend
+/// on `cfg.nested_virt` — so an accepted request used to boot a guest whose L1 `/dev/kvm`
+/// never appears; and no UFFD page-fault backend is wired (`restore` hardcodes
+/// `backend_type: "File"`), so [`RestoreMode::Lazy`](vmcell::config::RestoreMode::Lazy) would
+/// fault eagerly under a config that asked for demand paging.
+///
+/// This wrapper exists only to bind the `"firecracker"` name once; the law, both branches and
+/// the N-VMM-1 feature strings live in the shared predicate. It landed as three byte-identical
+/// per-backend copies and was hoisted.
+///
+/// # Errors
+/// [`Error::Unsupported`] `{ vmm: "firecracker", feature }` naming the unadvertised capability.
+fn reject_unadvertised_capabilities(caps: &VmmCapabilities, cfg: &VmConfig) -> Result<()> {
+    vmcell::vmm::reject_unadvertised_capabilities("firecracker", caps, cfg)
+}
+
 /// Serializes and writes the host vsock UDS path and guest CID Firecracker baked into
 /// a snapshot to the [`HOST_PATHS_SIDECAR`] file in `dir`. The sidecar is part of the
 /// snapshot artifact and `restore()` hard-requires it, so a serialize or write
@@ -236,21 +257,26 @@ pub struct FcInstance {
     vsock_path: PathBuf,
     serial_path: PathBuf,
     cid: u32,
-    pgid: Option<u32>,
+    /// The VMM leader's process group AND the one-shot "already reaped" flag, owned
+    /// together by the one shared helper ([`vmcell::vmm::VmmProcessGroup`], L1): `kill`,
+    /// `has_exited` and `Drop` all route through it, so no copy can forget the M-VMM-1
+    /// guard and SIGKILL a pgid the kernel has since recycled.
+    group: vmcell::vmm::VmmProcessGroup,
     /// True if an external vhost-user-net device is attached. Such a VM is not
     /// snapshot-eligible (§2.5, The capability matrix); `snapshot()` self-guards on it. Always `false` on
     /// FC today because `create()` rejects every vhost-user device up front, but the
     /// field keeps the snapshot guard correct by construction. Mirrors CH.
     vhost_user_net: bool,
+    /// The guest's RAM size, carried from `VmConfig::mem_mib` at construction: the
+    /// snapshot RPCs' budget is a function of it
+    /// ([`vmcell::vmm::snapshot_request_timeout`], M6), because a suspend image tracks
+    /// guest RAM ~1:1 and therefore cannot ride the flat control-plane ceiling.
+    mem_mib: u32,
     /// True if this instance came from a snapshot `restore()`. A restored FC VM is
     /// returned **paused** by `POST /snapshot/load {resume_vm:false}` and resumed via
     /// `resume()`, never `boot()` — so `boot()` self-guards on this flag and refuses
     /// to `InstanceStart` a restored VM (VMM-6). Mirrors CH's `restored` field.
     restored: bool,
-    /// True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
-    /// leader is reaped the kernel can recycle its pgid, so `kill`/`Drop` must NOT
-    /// re-`SIGKILL` the process group or they could hit an unrelated group (M-VMM-1).
-    reaped: bool,
 }
 
 impl FcInstance {
@@ -262,6 +288,57 @@ impl FcInstance {
     ) -> Result<()> {
         vmcell::vmm::unix_api_request(&self.api_socket, method, path, body).await
     }
+
+    /// The same RPC on an explicit budget, for the snapshot create/load pair — whose
+    /// duration scales with guest RAM and therefore cannot ride the flat control
+    /// ceiling (M6). Sized through the shared `vmcell::vmm::snapshot_request_timeout`,
+    /// never a local literal.
+    async fn api_request_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&impl Serialize>,
+        budget: std::time::Duration,
+    ) -> Result<()> {
+        vmcell::vmm::unix_api_request_with(&self.api_socket, method, path, body, budget).await
+    }
+}
+
+/// The pure, total mapping from a config to the complete Firecracker launch (M11).
+///
+/// `spawn_fc` builds through this and spawns **only** what it returns, so the jail posture that
+/// ships is a *returned value* a KVM-free test can assert on
+/// ([`LaunchPlan::jail`](vmcell::vmm::LaunchPlan::jail)) rather than an inline
+/// `jail_spec_from_config(&…)` argument no gate can see. The confinement is applied in
+/// `build_vmm_cmd`'s post-fork `pre_exec` window, which nothing KVM-free observes — so while it
+/// rode inline, rewriting the one `&cfg.jail` token to a weaker config shipped every Firecracker
+/// VM with a different Layer-2 posture and `cargo test`, `just ci` and the whole live matrix
+/// stayed green. That is the M11 defect class, proven on crosvm and representable here.
+///
+/// Performs no I/O (the serial-log `File::create` and the stale-socket unlink stay in the
+/// caller), so a unit test can build a `VmConfig`, call this, and assert over the composed argv.
+///
+/// # Errors
+/// Propagates [`vmm_seccomp_args`](vmcell::vmm::seccomp::vmm_seccomp_args)'s typed refusal of
+/// [`VmmSeccomp::Log`](vmcell::config::VmmSeccomp::Log) (Firecracker has no observe-only mode)
+/// and [`LaunchPlan::build`](vmcell::vmm::LaunchPlan::build)'s jail-compilation error.
+fn firecracker_launch_plan(
+    binary_path: &Path,
+    cfg: &VmConfig,
+    res: &PerVmResources,
+    api_socket: &Path,
+) -> Result<vmcell::vmm::LaunchPlan> {
+    // §12.2 (Layer 1): FC's built-in filter is on unless `--no-seccomp` (Disabled); `Log` is the
+    // one typed refusal, and it fires here — before any process or log file exists.
+    let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("firecracker", cfg.vmm_seccomp)?;
+    // §12.3 (Layer 2): the ONE posture value, handed to the one constructor that both compiles it
+    // into the `pre_exec` jail and records it.
+    let mut plan =
+        vmcell::vmm::LaunchPlan::build(binary_path, res.netns_name.as_deref(), cfg.jail)?;
+    let cmd = plan.command_mut();
+    cmd.args(&seccomp_args);
+    cmd.arg("--api-sock").arg(api_socket);
+    Ok(plan)
 }
 
 impl Firecracker {
@@ -286,18 +363,17 @@ impl Firecracker {
         // Firecracker expects the socket to not exist before it creates it.
         let _ = tokio::fs::remove_file(&api_socket).await;
 
-        // §12.2 (Layer 1 — the VMM's own seccomp filter)/§12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): FC's built-in seccomp filter is on unless `--no-seccomp` (Disabled);
-        // the jailer-equivalent hardening is applied in build_vmm_cmd's forked-child window.
-        let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("firecracker", cfg.vmm_seccomp)?;
-        let jail = vmcell::vmm::jail::jail_spec_from_config(&cfg.jail)?;
-        let mut cmd =
-            vmcell::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
-        cmd.args(&seccomp_args);
+        // M11: the whole launch — seccomp flag, jail spec, netns, argv — is composed inside
+        // `firecracker_launch_plan`, so `spawn_fc` holds NO `JailConfig` and NO `JailSpec` and
+        // there is no window in which the posture could be swapped between deciding it and
+        // applying it. The plan's recorded posture is private to `vmcell::vmm::launch`, so the
+        // two-line defeat (`let mut plan = …; plan.jail = weaker;`) does not compile; the
+        // KVM-free gate asserts on the value it returns.
+        let plan = firecracker_launch_plan(&self.binary_path, cfg, res, &api_socket)?;
 
         let log_file = std::fs::File::create(&serial_path)?;
-        let mut process = cmd
-            .arg("--api-sock")
-            .arg(&api_socket)
+        let mut process = plan
+            .into_command()
             .stdin(Stdio::null())
             .stdout(log_file)
             .stderr(Stdio::inherit())
@@ -311,7 +387,6 @@ impl Firecracker {
             cgroups,
             &res.cgroup_name,
             &api_socket,
-            1000,
             cfg.timeouts.api_socket_poll.as_millis() as u64,
         )
         .await?;
@@ -386,17 +461,33 @@ fn noxsave_fallback(has_cpu_template: bool) -> &'static str {
     if has_cpu_template { "" } else { "noxsave " }
 }
 
-/// The **one** Firecracker interface id vmcell programs, shared by the create path's
-/// `PUT /network-interfaces/<id>` and the restore path's `network_overrides` entry.
+/// The **one** Firecracker interface id vmcell programs, shared by all THREE sites that name
+/// it: the create path's `PUT /network-interfaces/<id>` URL ([`fc_network_interface_path`]),
+/// that request's body ([`build_fc_network_interface`]), and the restore path's
+/// `network_overrides` entry ([`build_fc_snapshot_load`]).
 ///
 /// One law, one predicate: FC's `network_overrides` matches an override to a snapshotted
 /// device *by this id*, so a create/restore mismatch is a silently ignored override — the
 /// restore would fall back to the snapshot's baked `host_dev_name` with no error at all
 /// (docs/78 M1, `fc-restore-rebinds-baked-tap-name-dead-data-plane`). A second literal is
-/// exactly the divergence this const removes.
+/// exactly the divergence this const removes — the URL was one until docs/81 d6, which is why
+/// the third site now derives from here and a source-level gate keeps it that way.
 const FC_IFACE_ID: &str = "eth0";
 
-/// Firecracker's `PUT /network-interfaces/eth0` body.
+/// The `PUT /network-interfaces/<id>` API path for the interface whose body carries `iface_id`.
+///
+/// The third copy of the id — FC matches the API path against the body's `iface_id`, so the path
+/// is **derived** from it exactly as each drive's `drive_id` IS its `/drives/<drive_id>` path.
+/// The create path open-coded `"/network-interfaces/eth0"` here (docs/81 d6) while the body and
+/// the restore override both composed from [`FC_IFACE_ID`], which is precisely the divergence
+/// that const's own doc claims to remove. Gated by
+/// `fc_iface_id_single_source_gate::every_network_interface_path_here_is_composed_from_the_one_const`,
+/// which reddens on a re-baked literal — the identity asserts alone cannot see a call site.
+fn fc_network_interface_path(iface_id: &str) -> String {
+    format!("/network-interfaces/{iface_id}")
+}
+
+/// Firecracker's `PUT /network-interfaces/<id>` body.
 #[derive(Serialize, Debug, PartialEq, Eq)]
 struct NetworkInterface {
     iface_id: String,
@@ -623,10 +714,9 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
     // fails fast on an early exit) instead of a hand-rolled `try_exists`-only loop,
     // and reap the process *group* via `reap_process_group` on failure instead of the
     // leader-only, non-blocking `process.kill()` (which orphans the group).
-    if vmcell::vmm::wait_for_socket(
+    if vmcell::vmm::wait_for_vmm_socket(
         &api_socket,
         Some(&mut process),
-        1000,
         cfg.timeouts.api_socket_poll.as_millis() as u64,
     )
     .await
@@ -642,10 +732,10 @@ async fn probe_t2_template(vmm: &Firecracker, cfg: &VmConfig) -> T2Probe {
         vsock_path: PathBuf::new(),
         serial_path: PathBuf::new(),
         cid: 0,
-        pgid,
+        group: vmcell::vmm::VmmProcessGroup::new(pgid),
+        mem_mib: cfg.mem_mib,
         vhost_user_net: false,
         restored: false,
-        reaped: false,
     };
 
     #[derive(Serialize)]
@@ -731,6 +821,10 @@ impl Vmm for Firecracker {
         )?;
 
         let caps = self.capabilities();
+        // The two descriptor `false`s the rest of `create()` cannot see (`nested_virt`,
+        // `lazy_restore`): refuse them here rather than boot a VM whose requested lever is
+        // silently void.
+        reject_unadvertised_capabilities(&caps, cfg)?;
         if let vmcell::config::NetConfig::Unprivileged { .. } = cfg.net
             && !caps.unprivileged_vhost_user_net
         {
@@ -773,14 +867,14 @@ impl Vmm for Firecracker {
             vsock_path: vsock_path.clone(),
             serial_path: serial_path.clone(),
             cid: res.guest_cid,
-            pgid,
+            group: vmcell::vmm::VmmProcessGroup::new(pgid),
             // Always false here: the vhost-user-socket rejection above already
             // returned `Unsupported`. Computed from `res` to mirror CH and stay
             // correct if that guard ever moves.
+            mem_mib: cfg.mem_mib,
             vhost_user_net: res.vhost_user_socket.is_some(),
             // Cold boot: `boot()` issues `InstanceStart` (not a resume).
             restored: false,
-            reaped: false,
         };
 
         #[derive(Serialize)]
@@ -833,15 +927,14 @@ impl Vmm for Firecracker {
             instance.api_request("PUT", &path, Some(&drive)).await?;
         }
 
-        // Configure Network
+        // Configure Network. Like the drives above, the interface's `iface_id` IS its API path
+        // — composed through `fc_network_interface_path` from the one `FC_IFACE_ID`, so the
+        // path, the body, and the restore path's `network_overrides` entry cannot drift apart
+        // (a mismatch makes FC silently ignore the override and re-open the baked device).
         if let Some(tap) = &res.tap_name {
-            instance
-                .api_request(
-                    "PUT",
-                    "/network-interfaces/eth0",
-                    Some(&build_fc_network_interface(tap, res.vmid)?),
-                )
-                .await?;
+            let iface = build_fc_network_interface(tap, res.vmid)?;
+            let path = fc_network_interface_path(&iface.iface_id);
+            instance.api_request("PUT", &path, Some(&iface)).await?;
         }
 
         // Configure the entropy device (virtio-rng -> guest /dev/hwrng). The
@@ -893,6 +986,9 @@ impl Vmm for Firecracker {
             &self.capabilities(),
             cfg.console_mode,
         )?;
+        // Same self-check `create()` makes, on the path that actually consumes
+        // `cfg.restore_mode`: a restore must not accept what create rejects.
+        reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
         // VMM-5: self-check the capability descriptor rather than assuming the
         // backend supports restore.
         if !self.capabilities().snapshot_restore {
@@ -949,27 +1045,31 @@ impl Vmm for Firecracker {
             // is loaded verbatim); report that, not the orchestrator's fresh allocation
             // (M-VMM-3).
             cid: host_paths.cid,
-            pgid,
+            group: vmcell::vmm::VmmProcessGroup::new(pgid),
+            mem_mib: cfg.mem_mib,
             // Guarded false above; computed from `res` to mirror CH.
             vhost_user_net: res.vhost_user_socket.is_some(),
             // Restored VMs are returned paused and resumed via `resume()`; `boot()`
             // self-guards on this and refuses to `InstanceStart` (VMM-6).
             restored: true,
-            reaped: false,
         };
 
         // Load snapshot, rebinding the snapshotted interface onto THIS restore's freshly
         // allocated tap (`network_overrides`) — without it FC re-opens the baked
         // `<prefix>-tap-<old vmid>` and post-restore egress is silently dead (docs/78 M1; see
         // `build_fc_snapshot_load`).
+        // Same guest-RAM-proportional class as `/snapshot/create` (M6): the load reads
+        // the mem file back, so it is sized by the same shared predicate rather than the
+        // flat control ceiling.
         instance
-            .api_request(
+            .api_request_with(
                 "PUT",
                 "/snapshot/load",
                 Some(&build_fc_snapshot_load(
                     snapshot_dir,
                     res.tap_name.as_deref(),
                 )),
+                vmcell::vmm::snapshot_request_timeout(instance.mem_mib),
             )
             .await?;
 
@@ -1028,33 +1128,17 @@ impl VmInstance for FcInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
-        if let Some(pgid) = self.pgid {
-            // Skip the group SIGKILL if the leader was already reaped (its pgid may be
-            // recycled) — M-VMM-1.
-            if !self.reaped {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-        }
-        let _ = self.process.wait().await;
-        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
-        self.reaped = true;
+        // The one shared signal/wait/flag sequence (L1): SIGKILL the group unless the
+        // leader was already reaped, await it, record the reap (M-VMM-1).
+        self.group.kill_and_wait(&mut self.process).await;
         Ok(())
     }
 
     async fn has_exited(&mut self) -> bool {
         // Non-blocking reap of the VMM leader; `Ok(Some(_))` means it exited after
-        // `request_shutdown`. Record the reap so `kill()`/`Drop` do NOT re-`SIGKILL`
-        // the process group: once the leader is reaped the kernel may recycle its pgid
-        // and signalling `-pgid` could hit an unrelated group (M-VMM-1).
-        if matches!(self.process.try_wait(), Ok(Some(_))) {
-            self.reaped = true;
-            true
-        } else {
-            false
-        }
+        // `request_shutdown`. The shared helper records the reap so `kill()`/`Drop`
+        // cannot re-`SIGKILL` a possibly-recycled pgid.
+        self.group.note_exit(&mut self.process)
     }
 
     async fn pause(&mut self) -> Result<()> {
@@ -1114,8 +1198,12 @@ impl VmInstance for FcInstance {
 
         self.pause().await?;
 
+        // M6: `/snapshot/create` writes a dense mem file that tracks guest RAM ~1:1, so
+        // it is budgeted against `mem_mib` through the shared predicate — the flat
+        // control ceiling is a guaranteed spurious timeout on a multi-GiB guest, and a
+        // spurious timeout here would strand the VM paused.
         let snap_res = self
-            .api_request(
+            .api_request_with(
                 "PUT",
                 "/snapshot/create",
                 Some(&SnapshotCreate {
@@ -1123,6 +1211,7 @@ impl VmInstance for FcInstance {
                     snapshot_path: dir.join("snapshot_file"),
                     mem_file_path: dir.join("mem_file"),
                 }),
+                vmcell::vmm::snapshot_request_timeout(self.mem_mib),
             )
             .await;
 
@@ -1164,19 +1253,10 @@ impl Drop for FcInstance {
         // Teardown order (AGENTS.md): VMM process group first — reaping it before
         // touching the sockets or the per-VM directory means cleanup never races a
         // live VMM.
-        if let Some(pgid) = self.pgid {
-            // Skip the group SIGKILL + reap if the leader was already reaped (via
-            // `has_exited`/`kill`): its pgid may have been recycled (M-VMM-1).
-            if !self.reaped {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                if let Some(pid) = self.process.id() {
-                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
-                }
-            }
-        }
+        // Same helper, same order as the graceful `kill()` path (L1): the group SIGKILL +
+        // blocking reap is skipped if the leader was already reaped, since its pgid may
+        // have been recycled (M-VMM-1).
+        self.group.reap_now(&mut self.process);
         // Unlink our own sockets. The per-VM directory itself is owned and removed
         // once by the orchestrator's `VmTempDir` guard (after this instance and the
         // smoltcp process are dropped), not here. Mirrors CH.
@@ -1199,38 +1279,15 @@ impl Drop for FcInstance {
 mod tests {
     use super::*;
 
-    /// A no-op [`vmcell::metrics::CgroupFs`] for the reject-before-spawn tests below, which
-    /// exercise `create`/`restore` capability guards that return **before** any cgroup
-    /// interaction — so the fake's methods are never called. Replaces the former
-    /// `vmcell::metrics::FakeCgroupFs` (a `#[cfg(test)]`-only fixture that is not visible to a
-    /// downstream crate's test build).
-    #[derive(Debug)]
-    struct TestCgroupFs;
-
-    impl TestCgroupFs {
-        fn new() -> Self {
-            Self
-        }
-    }
-
-    impl vmcell::metrics::CgroupFs for TestCgroupFs {
-        fn create_slice(
-            &self,
-            _name: &str,
-            _limits: &vmcell::config::ResourceLimits,
-        ) -> Result<()> {
-            Ok(())
-        }
-        fn delete_slice(&self, _name: &str) -> Result<()> {
-            Ok(())
-        }
-        fn read_stats(&self, _name: &str) -> Result<vmcell::metrics::ResourceUsage> {
-            Ok(vmcell::metrics::ResourceUsage::default())
-        }
-        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
-            Ok(())
-        }
-    }
+    /// The shared [`vmcell::metrics::FakeCgroupFs`], exposed by `vmcell`'s `test-support`
+    /// feature (a dev-dependency of this crate). It replaces the hand-rolled per-crate
+    /// `CgroupFs` fake this crate carried while `FakeCgroupFs` was `#[cfg(test)]`-only and
+    /// therefore invisible downstream — one of four such copies (docs/81 §9).
+    ///
+    /// It is still structurally blind to the filesystem (AGENTS rule 4): it models slices,
+    /// tasks and delegation in memory and writes no cgroup sysfs, so nothing driven by it is
+    /// evidence about real cgroup residue or enforcement. That is `just test-privileged`.
+    use vmcell::metrics::FakeCgroupFs;
 
     // v30 §18 delta 8, review fix: FC's guest MAC comes from the ONE `mac_math(vmid)` law, and the
     // JSON firecracker actually receives carries it.
@@ -1545,6 +1602,112 @@ mod tests {
             .expect("spawn sleep stand-in")
     }
 
+    /// Spawns a stand-in Firecracker API socket on `sock`: it answers `204` to every
+    /// request immediately, except on `stall_path`, where it first waits `stall`
+    /// (`None` = never answers). Returns the shared log of `"<METHOD> <path>"` in
+    /// arrival order — which is how the snapshot test observes that the VM was resumed.
+    ///
+    /// One connection per request (that is what `unix_api_request` does), so each is
+    /// served on its own task and a stalled snapshot cannot block the resume behind it.
+    fn spawn_fake_fc_api(
+        sock: &Path,
+        stall_path: &'static str,
+        stall: Option<std::time::Duration>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let listener = tokio::net::UnixListener::bind(sock).expect("bind fake FC API socket");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let mut words = head.split_whitespace();
+                    let method = words.next().unwrap_or_default().to_string();
+                    let path = words.next().unwrap_or_default().to_string();
+                    log.lock()
+                        .expect("fake API log")
+                        .push(format!("{method} {path}"));
+                    if path == stall_path {
+                        match stall {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }
+                    // The client may already have timed out and dropped the connection;
+                    // a write to that closed peer is expected, not a test failure.
+                    if stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if stream.flush().await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                });
+            }
+        });
+        seen
+    }
+
+    // Guards M6 on the Firecracker side: `/snapshot/create` writes a mem file that
+    // tracks guest RAM ~1:1, so it rides `vmcell::vmm::snapshot_request_timeout(mem_mib)`,
+    // NOT the flat 5 s control ceiling every other RPC uses. The fake API stalls 6 s on
+    // the create — past that ceiling, well inside a 2 GiB guest's budget (37 s) — so the
+    // snapshot must SUCCEED, and pause → create → resume must all reach the wire (a
+    // snapshot that leaves the VM paused is a wedged VM). Real time deliberately: a
+    // paused clock auto-advances past the budget while hyper's multi-hop reply is still
+    // in flight.
+    // Inverse (route `/snapshot/create` back through the shared-ceiling `api_request`):
+    // the 6 s stall exceeds 5 s and the `expect` on Ok reddens with a typed Timeout.
+    #[tokio::test]
+    async fn snapshot_rpc_is_budgeted_against_guest_ram_not_the_control_ceiling() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("api.sock");
+        let seen = spawn_fake_fc_api(
+            &sock,
+            "/snapshot/create",
+            Some(std::time::Duration::from_secs(6)),
+        );
+
+        let child = spawn_group_standin();
+        let mut inst = FcInstance {
+            group: vmcell::vmm::VmmProcessGroup::new(child.id()),
+            process: child,
+            api_socket: sock,
+            vsock_path: dir.path().join("vsock.sock"),
+            serial_path: PathBuf::new(),
+            cid: 3,
+            mem_mib: 2048,
+            vhost_user_net: false,
+            restored: false,
+        };
+
+        inst.snapshot(dir.path())
+            .await
+            .expect("a 6 s /snapshot/create must fit a 2 GiB guest's budget");
+
+        let calls = seen.lock().expect("fake API log").clone();
+        assert_eq!(
+            calls,
+            vec![
+                "PATCH /vm".to_string(),
+                "PUT /snapshot/create".to_string(),
+                "PATCH /vm".to_string(),
+            ],
+            "snapshot must be pause → create → resume"
+        );
+        inst.kill().await.expect("reap the stand-in VMM");
+    }
+
     // The T2-probe `wait_for_socket`-failure branch must unlink its API socket: no
     // FcInstance owns it there, so `Drop` never does. Residue check: the socket exists
     // before, is gone after. RED on the inverse (reap-only, no remove_file): the file
@@ -1572,7 +1735,7 @@ mod tests {
     fn instance_with(restored: bool) -> FcInstance {
         let child = spawn_group_standin();
         FcInstance {
-            pgid: child.id(),
+            group: vmcell::vmm::VmmProcessGroup::new(child.id()),
             process: child,
             // A deliberately-absent api socket: a restored VM must refuse boot BEFORE
             // any api_request, so this path is never dialed on that branch.
@@ -1580,9 +1743,9 @@ mod tests {
             vsock_path: PathBuf::new(),
             serial_path: PathBuf::new(),
             cid: 3,
+            mem_mib: 128,
             vhost_user_net: false,
             restored,
-            reaped: false,
         }
     }
 
@@ -1727,7 +1890,7 @@ mod tests {
             guest_cid: 3,
             tmp_dir: std::env::temp_dir().join("vmcell-fc-restore-vfs-test"),
         };
-        let cgroups = TestCgroupFs::new();
+        let cgroups = FakeCgroupFs::new();
         let err = fc
             .restore(Path::new("/nonexistent-snapshot"), &cfg, &res, &cgroups)
             .await
@@ -1769,7 +1932,7 @@ mod tests {
             guest_cid: 3,
             tmp_dir: std::env::temp_dir().join("vmcell-fc-unpriv-test"),
         };
-        let cgroups = TestCgroupFs::new();
+        let cgroups = FakeCgroupFs::new();
         let err = fc
             .create(&cfg, &res, &cgroups)
             .await
@@ -1781,16 +1944,210 @@ mod tests {
         );
     }
 
+    /// Resources for the reject-before-spawn tests: `tmp_dir` deliberately names a directory
+    /// that does not exist, so a config that passes every guard dies in `spawn_fc`'s
+    /// `File::create(serial.log)` with an I/O error — fast, and leaving no residue to clean up.
+    fn reject_test_resources(tag: &str) -> PerVmResources {
+        PerVmResources {
+            cgroup_name: "vmcell-test".to_string(),
+            tap_name: None,
+            netns_name: None,
+            segment: None,
+            vhost_user_socket: None,
+            vmid: 1,
+            guest_cid: 3,
+            tmp_dir: std::env::temp_dir().join(format!("vmcell-fc-absent-{tag}")),
+        }
+    }
+
+    /// A backend whose binary does not exist either, for the positive controls: an ACCEPTED
+    /// config must travel past the capability guards into the spawn, where it fails with
+    /// something that is not a typed capability refusal.
+    fn firecracker_that_cannot_spawn() -> Firecracker {
+        Firecracker::new("/nonexistent/vmcell-fc-positive-control")
+    }
+
+    fn erofs_builder() -> vmcell::config::VmConfigBuilder {
+        VmConfig::builder(
+            "/k",
+            vmcell::config::RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+    }
+
+    // docs/81 d7: the descriptor says `nested_virt: false`, but the SHARED
+    // `build_kernel_cmdline` emits `kvm-intel.nested=1` for every backend on `cfg.nested_virt`
+    // — so an accepted request used to boot a guest whose L1 `/dev/kvm` never appears. The
+    // refusal must fire before any spawn, with the `VmmCapabilities` field name as the feature
+    // string (N-VMM-1). Inverse (deleting the `reject_unadvertised_capabilities` call, or
+    // spelling the feature `nested` / `nested-virt`) reddens the assert.
+    #[tokio::test]
+    async fn create_rejects_nested_virt_with_capability_field_name() {
+        let fc = Firecracker::new("/usr/bin/firecracker");
+        let cfg = erofs_builder()
+            .nested_virt(true)
+            .build()
+            .expect("build nested-virt config");
+        let err = fc
+            .create(&cfg, &reject_test_resources("nested"), &FakeCgroupFs::new())
+            .await
+            .expect_err("FC advertises nested_virt: false");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature == "nested_virt"),
+            "expected a nested_virt Unsupported, got {err:?}"
+        );
+    }
+
+    // docs/81 d7: `lazy_restore` is honest-false (no UFFD backend; `restore` hardcodes
+    // `backend_type: "File"`), so a `RestoreMode::Lazy` config silently faulted eagerly. Both
+    // entry points must refuse it — `restore()` is the one that actually consumes
+    // `restore_mode`, and a restore that accepts what create rejects is the crosvm M4 defect.
+    // Inverse (dropping either call site) reddens that leg's assert.
+    #[tokio::test]
+    async fn create_and_restore_reject_lazy_restore_with_capability_field_name() {
+        let fc = Firecracker::new("/usr/bin/firecracker");
+        let cfg = erofs_builder()
+            .restore_mode(vmcell::config::RestoreMode::Lazy)
+            .build()
+            .expect("build lazy-restore config");
+        for err in [
+            fc.create(&cfg, &reject_test_resources("lazy"), &FakeCgroupFs::new())
+                .await
+                .expect_err("FC advertises lazy_restore: false"),
+            fc.restore(
+                Path::new("/nonexistent-snapshot"),
+                &cfg,
+                &reject_test_resources("lazy-restore"),
+                &FakeCgroupFs::new(),
+            )
+            .await
+            .expect_err("restore must refuse exactly what create refuses"),
+        ] {
+            assert!(
+                matches!(&err, Error::Unsupported { vmm, feature }
+                    if vmm == "firecracker" && feature == "lazy_restore"),
+                "expected a lazy_restore Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    // The positive control for both refusals above (AGENTS.md: a negative security/capability
+    // result needs a positive control): the ALLOWED configs — `nested_virt: false`, and each
+    // `RestoreMode` the descriptor can honor — must travel PAST the capability guards. They
+    // cannot reach a booted VM without KVM, so the control asserts on where they die: in the
+    // spawn, never as one of these typed refusals. Inverse (a guard that ignores `caps` and
+    // refuses unconditionally) reddens this immediately.
+    #[tokio::test]
+    async fn create_accepts_what_the_descriptor_advertises() {
+        let fc = firecracker_that_cannot_spawn();
+        for mode in [
+            vmcell::config::RestoreMode::Default,
+            vmcell::config::RestoreMode::Eager,
+        ] {
+            let cfg = erofs_builder()
+                .nested_virt(false)
+                .restore_mode(mode)
+                .build()
+                .expect("build an advertised config");
+            let err = fc
+                .create(
+                    &cfg,
+                    &reject_test_resources("positive-control"),
+                    &FakeCgroupFs::new(),
+                )
+                .await
+                .expect_err("the absent binary and scratch dir end the spawn");
+            assert!(
+                !matches!(&err, Error::Unsupported { feature, .. }
+                    if feature == "nested_virt" || feature == "lazy_restore"),
+                "an advertised config must reach the spawn, not a capability refusal: {err:?}"
+            );
+        }
+    }
+
+    // The refusals must key off the ONE descriptor value, not a hardcoded `false` beside the
+    // check — otherwise a future flag flip leaves the refusal behind (the divergence class
+    // `reject_usb_host_devices` exists to prevent). Feeding a synthetic descriptor that
+    // advertises both proves the branch reads `caps`: inverse (`if cfg.nested_virt {` with no
+    // `&& !caps.nested_virt`) reddens the `advertised` leg.
+    #[test]
+    fn capability_refusals_read_the_descriptor_not_a_hardcoded_bool() {
+        let cfg = erofs_builder()
+            .nested_virt(true)
+            .restore_mode(vmcell::config::RestoreMode::Lazy)
+            .build()
+            .expect("build a config asking for both");
+        // The shipped descriptor: both refused, and the feature strings ARE the field names.
+        let shipped = fc_capabilities();
+        assert!(!shipped.nested_virt && !shipped.lazy_restore);
+        let err = reject_unadvertised_capabilities(&shipped, &cfg)
+            .expect_err("the shipped descriptor advertises neither");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature == "nested_virt"),
+            "expected a nested_virt Unsupported, got {err:?}"
+        );
+        // A descriptor that advertised them accepts the same config, at the same call site.
+        let advertised = VmmCapabilities {
+            nested_virt: true,
+            lazy_restore: true,
+            ..shipped
+        };
+        reject_unadvertised_capabilities(&advertised, &cfg)
+            .expect("a descriptor that advertises both must accept the same config");
+    }
+
+    // docs/81 d6: FC matches a `network_overrides` entry to a snapshotted device BY ITS ID, so
+    // the create-path URL, the create-path body, and the restore override must all derive from
+    // the one `FC_IFACE_ID` — a drifted URL is an FC 400, a drifted override id is a silently
+    // ignored override and a dead post-restore data plane. The last assert proves the path is
+    // COMPOSED (a re-baked literal would ignore its argument); the call site itself is guarded
+    // by `fc_iface_id_single_source_gate`, which this identity test structurally cannot see.
+    #[test]
+    fn iface_id_is_the_one_source_for_url_body_and_restore_override() {
+        let iface = build_fc_network_interface("vmcell-tap-42", 42).expect("a valid vmid builds");
+        assert_eq!(iface.iface_id, FC_IFACE_ID, "the create-path body's id");
+
+        let url = fc_network_interface_path(&iface.iface_id);
+        assert_eq!(
+            url.rsplit('/').next(),
+            Some(iface.iface_id.as_str()),
+            "the create-path URL's last segment IS the body's iface_id, got {url}"
+        );
+
+        let load = build_fc_snapshot_load(Path::new("/snap/lineage-1"), Some("vmcell-tap-42"));
+        let override_id = &load
+            .network_overrides
+            .first()
+            .expect("a tap-bearing restore carries one override")
+            .iface_id;
+        assert_eq!(override_id, &iface.iface_id, "the restore override's id");
+
+        assert_eq!(
+            fc_network_interface_path("eth9"),
+            "/network-interfaces/eth9",
+            "the URL must be composed from the id it is given, never a baked literal"
+        );
+    }
+
     // Guards M-VMM-1: `has_exited` must RECORD the leader's reap so `kill`/`Drop` do not
-    // re-`SIGKILL` a possibly-recycled pgid. Inverse: `has_exited` returns the bool
-    // without setting `reaped` and the field stays false, reddening the assert.
+    // re-`SIGKILL` a possibly-recycled pgid. The flag now lives inside the shared
+    // `vmcell::vmm::VmmProcessGroup`, so this asserts it through `is_reaped()` — the only
+    // reader there is; nothing outside `vmcell::vmm` can set it.
+    //
+    // Inverse: route `has_exited` to a bare `self.process.try_wait()` instead of
+    // `self.group.note_exit(...)` and the flag stays false, reddening the assert.
     #[tokio::test]
     async fn has_exited_records_reaped() {
         let mut inst = instance_with(false);
-        // Kill the stand-in leader's group so `has_exited` observes an exited process.
-        if let Some(pgid) = inst.pgid {
+        // Kill the stand-in leader so `has_exited` observes an exited process. By pid,
+        // not `-pgid`: the group is owned by `VmmProcessGroup` and deliberately hands
+        // its pgid back to nobody.
+        if let Some(pid) = inst.process.id() {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-(pgid as i32)),
+                nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
@@ -1804,24 +2161,66 @@ mod tests {
         }
         assert!(exited, "has_exited must report the killed leader as exited");
         assert!(
-            inst.reaped,
+            inst.group.is_reaped(),
             "has_exited must record `reaped` after reaping the leader (M-VMM-1)"
         );
     }
 
-    // Guards M-VMM-1: once the leader is reaped, its pgid can be recycled — `kill` must
-    // NOT `SIGKILL` `-pgid` or it could hit an unrelated group. A live decoy process
-    // stands in for that recycled group. Inverse: drop the `!self.reaped` guard in
-    // `kill` and the decoy is SIGKILLed, so `try_wait` reports it exited — reddening
-    // the assert.
+    // POSITIVE CONTROL for the gate above, and the gate on `Drop`'s OWN job: an instance whose
+    // group has NOT been reaped must have its process group SIGKILLed + reaped when it is dropped
+    // (L1 — `Drop` is the panic path of the one teardown order). Without this leg the
+    // "must not signal a recycled pgid" assertion is satisfied by a `Drop` that reaps NOTHING —
+    // which is precisely the regression the Firecracker consolidation introduced and this leg caught: a
+    // dropped-but-never-killed VM would leak its whole process group.
+    //
+    // Inverse (observed red): delete `self.group.reap_now(&mut self.process)` from `Drop` and the
+    // stand-in survives, so `gone` stays false.
     #[tokio::test]
-    async fn kill_does_not_signal_pgid_when_reaped() {
+    async fn drop_reaps_an_unreaped_process_group() {
+        let inst = instance_with(false);
+        let live_pid = inst.process.id().expect("stand-in pid") as i32;
+        drop(inst);
+
+        let mut gone = false;
+        for _ in 0..100 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(live_pid), None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Best-effort cleanup if the drop did NOT reap, so a red run leaves no stray process.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-live_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            gone,
+            "Drop on an UN-reaped instance must SIGKILL and reap its VMM process group"
+        );
+    }
+
+    // Guards M-VMM-1 on the SHIPPED call sites (not on the extracted helper): once the
+    // leader is reaped its pgid can be recycled, so neither `FcInstance::kill` NOR
+    // `FcInstance`'s `Drop` may `SIGKILL` `-pgid`. A live decoy process in its own group
+    // stands in for that recycled group, and BOTH teardown paths are driven against the
+    // same already-reaped instance — a backend that routed only one of them through the
+    // shared helper is exactly the divergence this consolidation removes.
+    //
+    // Inverses, each observed red: (a) replace `self.group.kill_and_wait(&mut
+    // self.process).await` in `kill` with a raw `reap_process_group(&mut self.process,
+    // Some(decoy))`-style unguarded signal, or (b) replace `self.group.reap_now(&mut
+    // self.process)` in `Drop` with a raw `vmcell::vmm::reap_process_group(...)` — either
+    // kills the decoy and reddens the assert below.
+    #[tokio::test]
+    async fn kill_and_drop_do_not_signal_pgid_when_reaped() {
         // Decoy occupying a pgid, in its own process group.
         let mut decoy = spawn_group_standin();
         let decoy_pid = decoy.id().expect("decoy pid") as i32;
 
-        // The instance's own leader is already gone (reaped == true). Use a fast-exiting
-        // child so `kill`'s `process.wait()` returns promptly instead of blocking.
+        // The instance's own leader is already gone (the group is already reaped). Use a
+        // fast-exiting child so `kill`'s `process.wait()` returns promptly instead of
+        // blocking.
         let leader = tokio::process::Command::new("true")
             .spawn()
             .expect("spawn `true` leader");
@@ -1831,17 +2230,26 @@ mod tests {
             vsock_path: PathBuf::new(),
             serial_path: PathBuf::new(),
             cid: 3,
-            pgid: Some(decoy_pid as u32),
+            // The recycled-pgid state, which only the `test-support` constructor can
+            // fabricate: no production path can mark a group reaped over a foreign pgid.
+            group: vmcell::vmm::VmmProcessGroup::already_reaped_for_test(Some(decoy_pid as u32)),
+            mem_mib: 128,
             vhost_user_net: false,
             restored: false,
-            reaped: true,
         };
         inst.kill().await.expect("kill");
+        assert!(
+            inst.group.is_reaped(),
+            "the group must still read as reaped after kill() — the flag is one-shot"
+        );
+        // The `Drop` leg: dropping the instance must not re-signal either.
+        drop(inst);
 
         // A SIGKILL to the (recycled) pgid would land within a few ms; give it time.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let decoy_status = decoy.try_wait().expect("try_wait decoy");
-        // Clean up the decoy regardless of the outcome.
+        // Clean up the decoy regardless of the outcome — a test's own fixtures are
+        // residue too.
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-decoy_pid),
             nix::sys::signal::Signal::SIGKILL,
@@ -1850,7 +2258,7 @@ mod tests {
 
         assert!(
             decoy_status.is_none(),
-            "kill() on a reaped instance must not SIGKILL a (recycled) pgid — the decoy died"
+            "kill()/Drop on a reaped instance must not SIGKILL a (recycled) pgid — the decoy died"
         );
     }
 
@@ -1945,5 +2353,315 @@ mod tests {
             missing.parent().expect("parent").is_dir(),
             "the baked path's parent dir must be (re)created for FC's verbatim re-bind"
         );
+    }
+
+    // M11 GATE, Firecracker leg (KVM-free). The jail posture is applied in `build_vmm_cmd`'s
+    // post-fork `pre_exec` closure, which NOTHING KVM-free can observe: while `spawn_fc` wrote
+    // `jail_spec_from_config(&cfg.jail)?` inline, rewriting that one token to a weakened config
+    // shipped every Firecracker VM with a different Layer-2 posture and left `cargo test`,
+    // `just ci` and the whole live matrix green. `firecracker_launch_plan` makes the posture a
+    // RETURNED VALUE, so it is assertable — and `LaunchPlan::jail` is private to
+    // `vmcell::vmm::launch`, so the two-line defeat (`let mut plan = …; plan.jail = weaker;`)
+    // does not even compile here.
+    //
+    // Red on the inverse: rewrite the plan's `cfg.jail` to `JailConfig::disabled()` (or any other
+    // value) and the first assertion reddens.
+    #[test]
+    fn the_firecracker_launch_plan_ships_the_configured_jail_posture() {
+        use vmcell::config::{JailConfig, VmmSeccomp};
+
+        let plan_for = |jail: JailConfig| {
+            let cfg = erofs_builder()
+                .vmm_seccomp(VmmSeccomp::Enforcing)
+                .jail(jail)
+                .build()
+                .expect("build config");
+            let plan = firecracker_launch_plan(
+                Path::new("/usr/bin/firecracker"),
+                &cfg,
+                &reject_test_resources("plan"),
+                Path::new("/tmp/api.sock"),
+            )
+            .expect("build the launch plan");
+            (cfg, plan)
+        };
+
+        // The plan's jail half IS the configured posture.
+        let (cfg, plan) = plan_for(JailConfig::hardened());
+        assert_eq!(
+            plan.jail(),
+            cfg.jail,
+            "the launch plan must ship `cfg.jail`, not a locally-built posture"
+        );
+
+        // Positive control, so the equality above is not a tautology about two identical
+        // structs: a DIFFERENT requested posture produces a different record, and compiled, the
+        // difference is real hardening versus none at all — what shipping the wrong value does.
+        let (disabled_cfg, disabled_plan) = plan_for(JailConfig::disabled());
+        assert_eq!(disabled_plan.jail(), disabled_cfg.jail);
+        assert_ne!(
+            plan.jail(),
+            disabled_plan.jail(),
+            "control: the two postures differ, so the plan is not returning a constant"
+        );
+        assert!(
+            !vmcell::vmm::jail::jail_spec_from_config(&plan.jail())
+                .expect("compile the shipped spec")
+                .is_noop(),
+            "the shipped hardened posture must compile to real hardening"
+        );
+        assert!(
+            vmcell::vmm::jail::jail_spec_from_config(&disabled_plan.jail())
+                .expect("compile the disabled spec")
+                .is_noop(),
+            "control: the disabled posture compiles to no hardening — what a wrong value ships"
+        );
+    }
+
+    // The argv half of the same plan, asserted on the COMPOSED command rather than a fragment
+    // (docs/78 M11): a perfect per-fragment helper whose result never reaches the `Command` is
+    // exactly the defect a composed assertion catches. Both seccomp postures are covered because
+    // Firecracker's Enforcing arm emits NO flag — the empty-splice case a `contains` assertion
+    // cannot tell from a deleted splice.
+    //
+    // Red on the inverse: drop the `cmd.args(&seccomp_args)` splice and the `Disabled` leg
+    // reddens; drop the `--api-sock` splice and both legs redden.
+    #[test]
+    fn the_firecracker_launch_plan_composes_the_whole_argv() {
+        use vmcell::config::VmmSeccomp;
+
+        let argv_for = |policy: VmmSeccomp| {
+            let cfg = erofs_builder()
+                .vmm_seccomp(policy)
+                .build()
+                .expect("build config");
+            firecracker_launch_plan(
+                Path::new("/usr/bin/firecracker"),
+                &cfg,
+                &reject_test_resources("argv"),
+                Path::new("/tmp/api.sock"),
+            )
+            .expect("build the launch plan")
+            .argv()
+        };
+
+        assert_eq!(
+            argv_for(VmmSeccomp::Enforcing),
+            ["--api-sock", "/tmp/api.sock"],
+            "FC's built-in filter is already on, so Enforcing adds no flag — the whole argv is \
+             the API socket"
+        );
+        assert_eq!(
+            argv_for(VmmSeccomp::Disabled),
+            ["--no-seccomp", "--api-sock", "/tmp/api.sock"],
+            "Disabled splices `--no-seccomp` BEFORE the API socket"
+        );
+
+        // The typed refusal fires inside the plan, before any process or log file exists.
+        let cfg = erofs_builder()
+            .vmm_seccomp(VmmSeccomp::Log)
+            .build()
+            .expect("build config");
+        let err = firecracker_launch_plan(
+            Path::new("/usr/bin/firecracker"),
+            &cfg,
+            &reject_test_resources("log"),
+            Path::new("/tmp/api.sock"),
+        )
+        .expect_err("Firecracker has no observe-only seccomp mode");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "firecracker" && feature == "seccomp_log"),
+            "expected a seccomp_log Unsupported, got {err:?}"
+        );
+    }
+}
+
+/// Source-level gate for docs/81 d6: the Firecracker interface id lives in exactly one place,
+/// [`FC_IFACE_ID`], and **every** site that names it — the create-path URL, the create-path body,
+/// the restore `network_overrides` entry — derives from that const.
+///
+/// Scans this file's own text because the defect is invisible to a behavioral test: the shipped
+/// URL literal `"/network-interfaces/eth0"` was byte-identical to the composed path, so
+/// `fc_snapshot_load_body_shapes`' three-way identity assert stayed green while the third copy
+/// sat one edit away from drifting (an id change would have moved the body and the override and
+/// left the URL behind — FC 400s the mismatch, loudly, but only on a live boot). Precedent for
+/// scanning source rather than behavior: `vmcell::vmm::cloud_hypervisor::virtiofs_pacing_gate`,
+/// whose module doc carries the full rationale, and `vmcell-qemu`'s copy of it.
+///
+/// It catches: any `/network-interfaces…` string literal in production code whose id segment is
+/// baked rather than interpolated. It cannot catch: a drift outside this file, or an
+/// interpolation of the wrong variable — which
+/// `tests::iface_id_is_the_one_source_for_url_body_and_restore_override` covers from the other
+/// side.
+#[cfg(test)]
+mod fc_iface_id_single_source_gate {
+    use super::FC_IFACE_ID;
+
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The number of `/network-interfaces` string literals this backend ships: one, the
+    /// `fc_network_interface_path` composer.
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set.
+    const EXPECTED_COMPOSERS: usize = 1;
+
+    /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
+    /// dropped and whitespace collapsed.
+    ///
+    /// Dropping comments keeps a rustdoc mention of the API path (`PUT /network-interfaces/<id>`)
+    /// from being scanned as code; collapsing whitespace keeps a rustfmt line break from hiding
+    /// half of a literal.
+    ///
+    /// `pub(super)` so this file's other source-level gate ([`super::jail_composition_gate`])
+    /// reads the SAME normalizer instead of carrying a second copy of it — two readers of one
+    /// law, not two laws.
+    pub(super) fn production_code(source: &str) -> String {
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Every `/network-interfaces…` string literal in `code`, each without its quotes.
+    fn network_interface_literals(code: &str) -> Vec<&str> {
+        code.match_indices("\"/network-interfaces")
+            .map(|(at, _)| {
+                let tail = &code[at + 1..];
+                &tail[..tail.find('"').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    /// The law: the id segment of the path is an interpolation, never a baked id.
+    fn path_id_segment_is_interpolated(literal: &str) -> bool {
+        literal
+            .strip_prefix("/network-interfaces/")
+            .is_some_and(|segment| segment.starts_with('{') && segment.ends_with('}'))
+    }
+
+    #[test]
+    fn every_network_interface_path_here_is_composed_from_the_one_const() {
+        let code = production_code(SOURCE);
+        let literals = network_interface_literals(&code);
+        assert_eq!(
+            literals.len(),
+            EXPECTED_COMPOSERS,
+            "expected {EXPECTED_COMPOSERS} `/network-interfaces` literal (the composer in \
+             `fc_network_interface_path`); found {}: {literals:?}. If a site was legitimately \
+             added or removed, update EXPECTED_COMPOSERS — do not delete the scan.",
+            literals.len()
+        );
+        for literal in &literals {
+            assert!(
+                path_id_segment_is_interpolated(literal),
+                "`{literal}` bakes the interface id into the URL; compose it from FC_IFACE_ID \
+                 via `fc_network_interface_path` so the URL, the body, and the restore override \
+                 cannot drift apart (docs/81 d6)"
+            );
+        }
+        // Named directly, and derived from the const so THIS file never carries the banned
+        // literal itself: the exact text d6 found must not come back by any route.
+        let banned = format!("/network-interfaces/{FC_IFACE_ID}");
+        assert!(
+            !code.contains(&banned),
+            "production code must not name `{banned}` literally"
+        );
+    }
+}
+
+/// Source-level gate for M11's structural half on this backend: the launch is composed in
+/// **one** place, and no second `JailSpec` compilation can reappear beside it.
+///
+/// [`the_firecracker_launch_plan_ships_the_configured_jail_posture`](tests::the_firecracker_launch_plan_ships_the_configured_jail_posture)
+/// asserts the posture the plan *returns*; [`vmcell::vmm::LaunchPlan`]'s private field makes
+/// overwriting that record a compile error. Neither can see the one remaining regression: moving
+/// `jail_spec_from_config` + `build_vmm_cmd` back out of the plan into `spawn_fc`, which re-opens
+/// the window between deciding the posture and applying it and leaves the plan's record
+/// describing a command nobody spawns. That is a property of this file's *text*, so it is
+/// scanned — the same shape as the sibling [`fc_iface_id_single_source_gate`], whose
+/// `production_code` normalizer this reuses rather than copies.
+///
+/// It catches: a raw `jail_spec_from_config` call in this backend, a second launch-plan
+/// construction, and a deleted one. It cannot catch: the wrong `JailConfig` handed to the plan —
+/// that is behavioral, and the KVM-free plan gate asserts it directly.
+#[cfg(test)]
+mod jail_composition_gate {
+    use super::fc_iface_id_single_source_gate::production_code;
+
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The number of launch-plan constructions this backend ships: one, in
+    /// [`super::firecracker_launch_plan`].
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set, and a second
+    /// (possibly divergent) construction reddens too.
+    const EXPECTED_PLAN_BUILD_SITES: usize = 1;
+
+    /// Every call expression naming `needle` in `code`, truncated at its statement's `;`.
+    fn calls<'a>(code: &'a str, needle: &str) -> Vec<&'a str> {
+        code.match_indices(needle)
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_launch_is_composed_only_in_the_plan() {
+        let code = production_code(SOURCE);
+
+        let raw = calls(&code, "jail_spec_from_config(");
+        assert!(
+            raw.is_empty(),
+            "M11: this backend must compile no `JailSpec` of its own — the one compilation lives \
+             in `vmcell::vmm::LaunchPlan::build`, which records the very value it compiles. \
+             Found {raw:?}"
+        );
+        let raw_cmd = calls(&code, "build_vmm_cmd(");
+        assert!(
+            raw_cmd.is_empty(),
+            "M11: this backend must not build a VMM command outside the launch plan. Found \
+             {raw_cmd:?}"
+        );
+
+        // The anti-vacuity half: the two assertions above are satisfied by a file with no launch
+        // at all, so the launch must be here, exactly once.
+        let builds = calls(&code, "LaunchPlan::build(");
+        assert_eq!(
+            builds.len(),
+            EXPECTED_PLAN_BUILD_SITES,
+            "expected {EXPECTED_PLAN_BUILD_SITES} `LaunchPlan::build` call; found {}: {builds:?}. \
+             If a site was legitimately added or removed, update EXPECTED_PLAN_BUILD_SITES — do \
+             not delete the scan.",
+            builds.len()
+        );
+    }
+
+    /// The scanner's own controls: a prose mention is not a call site, a call split across two
+    /// rustfmt lines is still seen whole, and the regression shape is genuinely detected — so the
+    /// scan above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_scanner_sees_the_regression_and_ignores_comments() {
+        let regressed = "// the plan calls jail_spec_from_config for us\n\
+             let jail =\n    vmcell::vmm::jail::jail_spec_from_config(\n    &cfg.jail)?;\n\
+             #[cfg(test)]\nmod tests { LaunchPlan::build(x); }";
+        let code = production_code(regressed);
+        assert_eq!(calls(&code, "jail_spec_from_config(").len(), 1);
+        assert!(calls(&code, "LaunchPlan::build(").is_empty());
+
+        let composed = "// jail_spec_from_config in prose is not a call\n\
+             let mut plan =\n    vmcell::vmm::LaunchPlan::build(b, n,\n    cfg.jail)?;";
+        let code = production_code(composed);
+        assert!(calls(&code, "jail_spec_from_config(").is_empty());
+        assert_eq!(calls(&code, "LaunchPlan::build(").len(), 1);
     }
 }

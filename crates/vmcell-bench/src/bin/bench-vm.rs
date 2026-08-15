@@ -259,16 +259,9 @@ async fn run_bench<V: Vmm>(
     // L-BIN-7: resolve artifact paths and build the VM config through the SAME
     // helpers every other mode uses, instead of a hand-rolled duplicate that could
     // drift (it lacked `ksm_mergeable`, and re-derived the config knobs).
-    let (dir, kernel_path, rootfs_path) = artifact_paths(args.kernel.as_deref());
+    let (dir, kernel_path, rootfs_path) = artifact_paths(args.kernel.as_deref())?;
 
-    // Fail LOUD (M-BIN-1) rather than exit-0 when the artifacts are absent: the
-    // harness measured nothing, so automation must not read it as success. Still
-    // KVM-independent — we check before booting, which would otherwise hang on the
-    // agent-connect timeout.
-    if !kernel_path.exists() || !rootfs_path.exists() {
-        println!("{name}: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("{name}: missing artifacts in {dir}");
-    }
+    require_artifacts(name, &dir, &kernel_path, &rootfs_path)?;
 
     let cfg = build_cfg(args, kernel_path, rootfs_path, false, is_restore);
     let mut env = HostEnv::hermetic();
@@ -428,13 +421,23 @@ async fn main() -> anyhow::Result<()> {
     validate_mode(&args.mode)?;
     validate_daemon_api_knobs(&args)?;
     validate_vm_params(&args)?;
+    // Resolve the §10.4 artifact contract here too, before any side effect: a `--kernel <label>`
+    // that contradicts a `$VMCELL_KERNEL` redirect must exit non-zero at the boundary, not after
+    // the CPU-freq pin and a mode's first boot. The modes re-resolve (it is pure); this call is
+    // the early refusal AND the source of the attribution line below.
+    let (artifacts_dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
 
     println!("Running benchmarks with backend: {}", args.backend);
+    // The RESOLVED paths, not a re-derived filename: with `$VMCELL_KERNEL`/`$VMCELL_ROOTFS` set,
+    // the files this run boots are not under the artifacts dir at all, and a run's attribution
+    // must name what it actually measured (`bench-ignores-contract-artifact-overrides`).
     println!(
         "kernel: {} (label={})",
-        kernel_filename(args.kernel.as_deref()),
+        kernel.display(),
         args.kernel.as_deref().unwrap_or("default")
     );
+    println!("rootfs: {}", rootfs.display());
+    println!("artifacts dir: {artifacts_dir}");
     // H-BIN-1: echo the resolved profile/verbosity/console so a run's actual knobs
     // are visible (and provably not silently defaulted from a rejected typo).
     println!("{}", resolved_knobs_line(&args));
@@ -875,15 +878,118 @@ fn is_tmpfs(path: &Path) -> bool {
     }
 }
 
-/// Resolves the (dir, kernel, rootfs) artifact paths from `VMCELL_ARTIFACTS_DIR`,
-/// selecting `vmlinux-<label>` when a kernel-version label is given.
-fn artifact_paths(kernel_label: Option<&str>) -> (String, PathBuf, PathBuf) {
-    let dir = vmcell::artifact::artifacts_dir()
-        .to_string_lossy()
-        .into_owned();
-    let kernel = PathBuf::from(&dir).join(kernel_filename(kernel_label));
-    let rootfs = PathBuf::from(&dir).join("rootfs.erofs");
-    (dir, kernel, rootfs)
+/// Resolves the (dir, kernel, rootfs) artifact paths a run uses.
+///
+/// The kernel and rootfs come from the §10.4 toolkit getters — [`vmcell::artifact::kernel_path`]
+/// and [`vmcell::artifact::rootfs_path`], the ONE place `$VMCELL_KERNEL` / `$VMCELL_ROOTFS` are
+/// resolved — for the same reason every VMM binary comes from [`resolve_vmm_binary`]: a harness
+/// that re-derives `<artifacts-dir>/vmlinux` itself honors no override, so a box pointed at a
+/// custom kernel by every other tool silently benchmarked the default one and attributed the
+/// numbers to the override (`bench-ignores-contract-artifact-overrides`). `$VMCELL_ROOTFS` also
+/// makes the workspace artifact bootstrap a full no-op (§10.4), which is exactly the "I built
+/// these myself" case a benchmark must measure rather than second-guess.
+///
+/// # Errors
+/// `--kernel <label>` and `$VMCELL_KERNEL` cannot both be honored — see
+/// [`resolve_artifact_paths`].
+fn artifact_paths(kernel_label: Option<&str>) -> anyhow::Result<(String, PathBuf, PathBuf)> {
+    resolve_artifact_paths(
+        &vmcell::artifact::artifacts_dir(),
+        vmcell::artifact::kernel_path(),
+        vmcell::artifact::rootfs_path(),
+        kernel_label,
+    )
+}
+
+/// The pure core of [`artifact_paths`]: the toolkit getters' answers are passed in, so the override
+/// behavior is unit-testable without mutating (and racing on) the process environment — the same
+/// shape as [`resolve_vmm_binary`]'s injected lookup.
+///
+/// `$VMCELL_KERNEL` names ONE exact file, so a `--kernel <label>` selection (`vmlinux-<label>`
+/// under the artifacts dir) cannot also be honored. Two accepted inputs that contradict each other
+/// are rejected at the boundary rather than one silently winning (AGENTS.md: every accepted input
+/// is honored or rejected). `$VMCELL_ROOTFS` has no such conflict — nothing else selects a rootfs.
+///
+/// Existence is NOT checked here: `$VMCELL_KERNEL` is a path redirect that still requires the file
+/// to exist (§10.4), and that check belongs to [`require_artifacts`], which each mode runs against
+/// the pair it is about to boot and which names the resolved paths in its refusal.
+///
+/// # Errors
+/// Returns an error when `kernel_label` is set while `toolkit_kernel` is a `$VMCELL_KERNEL`
+/// redirect (i.e. not the artifacts dir's default `vmlinux`).
+fn resolve_artifact_paths(
+    dir: &Path,
+    toolkit_kernel: PathBuf,
+    toolkit_rootfs: PathBuf,
+    kernel_label: Option<&str>,
+) -> anyhow::Result<(String, PathBuf, PathBuf)> {
+    // "Was the kernel redirected?" asked by comparing against the dir's default — not by reading
+    // $VMCELL_KERNEL again here, which would be a second copy of the resolution rule.
+    let redirected = toolkit_kernel != dir.join(kernel_filename(None));
+    let kernel = match kernel_label {
+        Some(label) if redirected => anyhow::bail!(
+            "--kernel {label} selects {} under the artifacts dir, but $VMCELL_KERNEL redirects the \
+             kernel to {}: the two name different files. Drop one — unset $VMCELL_KERNEL to use \
+             the label, or drop --kernel to benchmark the redirected kernel.",
+            kernel_filename(Some(label)),
+            toolkit_kernel.display()
+        ),
+        Some(label) => dir.join(kernel_filename(Some(label))),
+        None => toolkit_kernel,
+    };
+    Ok((dir.to_string_lossy().into_owned(), kernel, toolkit_rootfs))
+}
+
+/// The two store-relative artifact names the `daemon-api` mode's REST bodies name. The store's
+/// entries keep these names whatever the host files are called — the daemon resolves a client name
+/// against its own `--artifacts-dir` (B12), so the link NAME is the daemon's contract while the
+/// link TARGET is whatever [`artifact_paths`] resolved.
+const DAEMON_STORE_NAMES: (&str, &str) = ("vmlinux", "rootfs.erofs");
+
+/// Symlinks the resolved artifact pair into `store` under [`DAEMON_STORE_NAMES`] (the store reads
+/// through symlinks — no copy of a 150 MB rootfs).
+///
+/// The targets are the **resolved** paths, not `<artifacts-dir>/<name>`: with `$VMCELL_KERNEL` or
+/// `$VMCELL_ROOTFS` set, re-deriving the source from the dir stages a file the run never validated
+/// — the same d8 defect one level down, and here it would either dangle or silently benchmark the
+/// default artifact under the override's name.
+///
+/// # Errors
+/// Returns an error naming the entry whose symlink could not be created.
+fn stage_artifact_store(store: &Path, kernel: &Path, rootfs: &Path) -> anyhow::Result<()> {
+    let (kernel_name, rootfs_name) = DAEMON_STORE_NAMES;
+    for (name, src) in [(kernel_name, kernel), (rootfs_name, rootfs)] {
+        std::os::unix::fs::symlink(src, store.join(name))
+            .map_err(|e| anyhow::anyhow!("daemon-api: symlink {name} -> {}: {e}", src.display()))?;
+    }
+    Ok(())
+}
+
+/// The one "are the artifacts really there?" refusal, shared by every mode.
+///
+/// Fails LOUD (M-BIN-1) rather than exit-0 when either file is absent: the harness measured
+/// nothing, so automation must not read it as success. It is also the existence half of the
+/// `$VMCELL_KERNEL` contract (§10.4: a path redirect that still requires existence), which is why
+/// the message names the missing **paths** and not just the artifacts dir — under an override the
+/// missing file is not under that dir at all, and `"missing artifacts in <dir>"` sent the reader to
+/// a directory where nothing was wrong. KVM-independent: it runs before any boot, which would
+/// otherwise hang on the agent-connect timeout.
+///
+/// # Errors
+/// Returns an error naming every missing path, after printing the mode's "No successful runs"
+/// report line (the two together are what the dry-path test asserts).
+fn require_artifacts(name: &str, dir: &str, kernel: &Path, rootfs: &Path) -> anyhow::Result<()> {
+    let missing: Vec<String> = [kernel, rootfs]
+        .iter()
+        .filter(|p| !p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let missing = missing.join(", ");
+    println!("{name}: No successful runs (missing artifacts in {dir}: {missing})");
+    anyhow::bail!("{name}: missing artifacts in {dir}: {missing}");
 }
 
 /// Builds the standard network-disabled erofs VM config used by every mode,
@@ -1159,11 +1265,8 @@ async fn run_footprint<V: Vmm>(
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("footprint: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("footprint: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("footprint", &dir, &kernel, &rootfs)?;
     // N-BIN-2: `--count 0` is rejected loudly in `validate_vm_params`, so `count` is
     // >= 1 here (no silent `.max(1)` clamp).
     let count = args.count;
@@ -1388,11 +1491,8 @@ async fn run_suspend_size<V: Vmm>(
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("suspend-size: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("suspend-size: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("suspend-size", &dir, &kernel, &rootfs)?;
     if !vmm.capabilities().snapshot_restore {
         // Genuine capability skip → success (M-BIN-1), not a failure.
         println!("suspend-size: backend {backend} has no snapshot support; skipping");
@@ -1622,11 +1722,8 @@ async fn run_phase_budget<V: Vmm>(
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("phase-budget: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("phase-budget: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("phase-budget", &dir, &kernel, &rootfs)?;
     let cfg = build_cfg(args, kernel, rootfs, false, true);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator;
@@ -1673,11 +1770,8 @@ async fn run_vsock_rtt<V: Vmm>(
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("vsock-rtt: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("vsock-rtt: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("vsock-rtt", &dir, &kernel, &rootfs)?;
     let cfg = build_cfg(args, kernel, rootfs, false, false);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator;
@@ -1870,11 +1964,8 @@ async fn run_net_egress_plain<V: Vmm>(
         println!("net-egress: backend {backend} has no unprivileged vhost-user-net; skipping");
         return Ok(());
     }
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("net-egress: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("net-egress: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("net-egress", &dir, &kernel, &rootfs)?;
 
     // Host endpoint the guest NATs to, owned in a Drop guard (reaped even on panic).
     let responder = HostResponder::start()
@@ -2133,11 +2224,8 @@ async fn run_net_egress_filtered<V: Vmm>(
         return Ok(());
     }
 
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("net-egress[{label}]: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("net-egress[{label}]: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts(&format!("net-egress[{label}]"), &dir, &kernel, &rootfs)?;
 
     let egress = Egress::Filtered(mitm_proxy_config());
     let net = if privileged {
@@ -2397,11 +2485,8 @@ async fn run_zygote<V: Vmm>(
         1
     };
 
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("zygote: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("zygote: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("zygote", &dir, &kernel, &rootfs)?;
     // snapshotting=true: QEMU needs the in-kernel vhost-vsock transport to restore.
     let cfg = build_cfg(args, kernel, rootfs, false, true);
     let mut env = HostEnv::hermetic();
@@ -2528,11 +2613,8 @@ async fn run_session<V: Vmm>(
     args: &Args,
     allocator: VmidAllocator,
 ) -> anyhow::Result<()> {
-    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("session: No successful runs (missing artifacts in {dir})");
-        anyhow::bail!("session: missing artifacts in {dir}");
-    }
+    let (dir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("session", &dir, &kernel, &rootfs)?;
     let cfg = build_cfg(args, kernel, rootfs, false, false);
     let mut env = HostEnv::hermetic();
     env.vmids = allocator;
@@ -2773,19 +2855,13 @@ async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
         );
     }
 
-    let (adir, kernel, rootfs) = artifact_paths(args.kernel.as_deref());
-    if !kernel.exists() || !rootfs.exists() {
-        println!("daemon-api: No successful runs (missing artifacts in {adir})");
-        anyhow::bail!("daemon-api: missing artifacts in {adir}");
-    }
+    let (adir, kernel, rootfs) = artifact_paths(args.kernel.as_deref())?;
+    require_artifacts("daemon-api", &adir, &kernel, &rootfs)?;
 
     // Private ephemeral artifact store: symlink the two prebuilt artifacts in (the store
     // reads through symlinks — no copy). Dropped (cleaned) at function end.
     let store = tempfile::tempdir().map_err(|e| anyhow::anyhow!("daemon-api: tempdir: {e}"))?;
-    for name in ["vmlinux", "rootfs.erofs"] {
-        std::os::unix::fs::symlink(PathBuf::from(&adir).join(name), store.path().join(name))
-            .map_err(|e| anyhow::anyhow!("daemon-api: symlink {name}: {e}"))?;
-    }
+    stage_artifact_store(store.path(), &kernel, &rootfs)?;
 
     // Free ephemeral port so a stale/parallel daemon does not collide.
     let port = {
@@ -2854,7 +2930,11 @@ async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
         );
     }
 
-    let create_body = serde_json::json!({ "kernel": "vmlinux", "rootfs": "rootfs.erofs" });
+    // The store entry names, from the one const `stage_artifact_store` links them under — the
+    // daemon resolves a client-named artifact against its own --artifacts-dir (B12), so a literal
+    // here that drifts from the staging names is a 404 mid-benchmark.
+    let (kernel_name, rootfs_name) = DAEMON_STORE_NAMES;
+    let create_body = serde_json::json!({ "kernel": kernel_name, "rootfs": rootfs_name });
     let exec_body = serde_json::json!({ "argv": ["/bin/true"] });
 
     // --- Lifecycle loop: create -> destroy, timing each (warmup excluded) ---
@@ -2899,7 +2979,7 @@ async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
     let (_, src_id) = daemon_create(
         &http,
         &base,
-        &serde_json::json!({ "kernel": "vmlinux", "rootfs": "rootfs.erofs", "snapshotting": true }),
+        &serde_json::json!({ "kernel": kernel_name, "rootfs": rootfs_name, "snapshotting": true }),
     )
     .await?;
     daemon_timed(
@@ -2909,7 +2989,7 @@ async fn run_daemon_api(args: &Args) -> anyhow::Result<()> {
     )
     .await?;
     let restore_body = serde_json::json!({
-        "kernel": "vmlinux", "rootfs": "rootfs.erofs", "snapshotting": true, "restore_from": "snap0"
+        "kernel": kernel_name, "rootfs": rootfs_name, "snapshotting": true, "restore_from": "snap0"
     });
     let mut restore_us = Vec::with_capacity(iters);
     for i in 0..total {
@@ -3043,6 +3123,98 @@ mod tests {
         assert_eq!(
             vmm_binary("cloud-hypervisor").expect("CH resolver"),
             vmcell::artifact::ch_binary_path()
+        );
+    }
+
+    // d8: the same §10.4 consistency for the ARTIFACTS. `artifact_paths` composed
+    // `<artifacts-dir>/vmlinux` + `/rootfs.erofs` itself and never consulted
+    // `$VMCELL_KERNEL`/`$VMCELL_ROOTFS`, so an override every other tool honors was invisible to a
+    // benchmark run — including its attribution. The resolver takes the toolkit getters' answers as
+    // arguments (the `resolve_vmm_binary` shape), so this pins the behavior without touching the
+    // process environment; `bench_vm_honors_the_toolkit_artifact_overrides` drives the real binary
+    // to prove the getters are actually where the answers come from. RED on the inverse (paths
+    // re-derived from `dir`): the overridden asserts below fail.
+    #[test]
+    fn artifact_paths_resolve_through_the_toolkit_getters() {
+        let dir = PathBuf::from("/artifacts");
+
+        // No override: the getters answer with the dir's defaults, which pass through unchanged.
+        let (d, k, r) =
+            resolve_artifact_paths(&dir, dir.join("vmlinux"), dir.join("rootfs.erofs"), None)
+                .expect("no label, no conflict");
+        assert_eq!(d, "/artifacts");
+        assert_eq!(k, dir.join(kernel_filename(None)));
+        assert_eq!(r, dir.join("rootfs.erofs"));
+
+        // Overridden: whatever the getters returned is what the run boots and reports.
+        let (_, k, r) = resolve_artifact_paths(
+            &dir,
+            PathBuf::from("/elsewhere/vmlinux-custom"),
+            PathBuf::from("/elsewhere/custom-rootfs.erofs"),
+            None,
+        )
+        .expect("no label, no conflict");
+        assert_eq!(k, PathBuf::from("/elsewhere/vmlinux-custom"));
+        assert_eq!(r, PathBuf::from("/elsewhere/custom-rootfs.erofs"));
+    }
+
+    // d8, one level down: the `daemon-api` mode stages the pair into an ephemeral store by
+    // SYMLINK, and it re-derived the sources as `<artifacts-dir>/<store name>` — so under
+    // `$VMCELL_KERNEL`/`$VMCELL_ROOTFS` it staged files the run never validated (dangling, or the
+    // default artifact wearing the override's name). RED on the inverse (`dir.join(name)` as the
+    // link target): both `read_link` asserts below fail.
+    #[test]
+    fn the_daemon_store_stages_the_resolved_pair_not_the_dir_defaults() {
+        let store = tempfile::tempdir().expect("store dir");
+        let kernel = PathBuf::from("/elsewhere/vmlinux-custom");
+        let rootfs = PathBuf::from("/elsewhere/custom-rootfs.erofs");
+        stage_artifact_store(store.path(), &kernel, &rootfs).expect("staging succeeds");
+
+        let (kernel_name, rootfs_name) = DAEMON_STORE_NAMES;
+        // The ENTRY names are the daemon's contract (the REST bodies name them)…
+        assert_eq!(
+            std::fs::read_link(store.path().join(kernel_name)).expect("kernel link"),
+            kernel,
+            "the store entry must point at the RESOLVED kernel"
+        );
+        assert_eq!(
+            std::fs::read_link(store.path().join(rootfs_name)).expect("rootfs link"),
+            rootfs,
+            "the store entry must point at the RESOLVED rootfs"
+        );
+    }
+
+    // The label still works — and contradicting the redirect is REJECTED, not silently resolved
+    // one way (AGENTS.md: an accepted input is honored or rejected). RED on the inverse (`Some(label)`
+    // unconditionally winning, or the redirect unconditionally winning): the `expect_err` fails.
+    #[test]
+    fn artifact_paths_reject_a_label_that_contradicts_the_kernel_redirect() {
+        let dir = PathBuf::from("/artifacts");
+
+        // A label without a redirect: the label picks the file, through the real composer.
+        let (_, k, _) = resolve_artifact_paths(
+            &dir,
+            dir.join("vmlinux"),
+            dir.join("rootfs.erofs"),
+            Some("6.12.94"),
+        )
+        .expect("a label alone is not a conflict");
+        assert_eq!(k, dir.join(kernel_filename(Some("6.12.94"))));
+
+        // A label WITH a redirect names two different files.
+        let err = resolve_artifact_paths(
+            &dir,
+            PathBuf::from("/elsewhere/vmlinux-custom"),
+            dir.join("rootfs.erofs"),
+            Some("6.12.94"),
+        )
+        .expect_err("a label and a $VMCELL_KERNEL redirect cannot both be honored")
+        .to_string();
+        assert!(err.contains("$VMCELL_KERNEL"), "{err}");
+        assert!(err.contains("/elsewhere/vmlinux-custom"), "{err}");
+        assert!(
+            err.contains(&kernel_filename(Some("6.12.94"))),
+            "the refusal must name both candidates: {err}"
         );
     }
 

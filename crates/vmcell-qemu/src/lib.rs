@@ -89,17 +89,22 @@ pub struct QemuInstance {
     /// [`Qemu::capabilities`] at construction so `snapshot()` can self-guard on the
     /// descriptor without a handle back to the backend (M-RESTORE-3, the CH shape).
     snapshot_restore_capable: bool,
-    pgid: Option<u32>,
+    /// The VMM leader's process group AND the one-shot "already reaped" flag, owned
+    /// together by the one shared helper ([`vmcell::vmm::VmmProcessGroup`], L1): `kill`,
+    /// `has_exited` and `Drop` all route through it, so no copy can forget the M-VMM-1
+    /// guard and SIGKILL a pgid the kernel has since recycled.
+    group: vmcell::vmm::VmmProcessGroup,
     vsock_pgid: Option<u32>,
+    /// The guest's RAM size, carried from [`vmcell::config::VmConfig::mem_mib`] at
+    /// construction, because the snapshot's migration stream is a function of it
+    /// ([`vmcell::vmm::snapshot_request_timeout`], M6): the stream is guest RAM plus
+    /// device state, so a multi-GiB guest cannot ride a flat control-plane ceiling.
+    mem_mib: u32,
     /// The host USB driver bindings this VM's passthrough displaced, taken before the spawn
     /// by [`vmcell::vmm::usb::claim_usb_host_devices`] and put back by teardown. The whole
     /// law is shared (`usb_host_passthrough` is a capability, so only the argv above is
     /// QEMU's); this backend owns just *when* to claim and *when* to restore.
     usb_claim: vmcell::vmm::usb::UsbHostClaim,
-    // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
-    // leader is reaped the kernel can recycle its pgid, so `kill`/`Drop` must NOT
-    // re-`SIGKILL` the process group or they could hit an unrelated group (M-VMM-1).
-    reaped: bool,
 }
 
 /// The kind of a single QMP protocol line.
@@ -171,10 +176,33 @@ fn check_qmp_reply(reply: &str) -> Result<()> {
 /// (`restore_rotates_host_paths: true`, §2.4), so no baked-CID sidecar is carried — the
 /// `guest-cid` is a QEMU device property, not part of this migration stream.
 const SNAPSHOT_STATE_FILE: &str = "state.bin";
-/// Upper bound on `migrate`/`migrate-incoming` completion. Migration writes/reads
-/// guest-RAM-sized bytes to a local file, so it completes far faster; this only bounds
-/// a wedged migration so it surfaces as a typed error instead of hanging.
+/// QEMU's measured **floor** on `migrate`/`migrate-incoming` completion (docs/78 M7).
+///
+/// It is a floor and not the budget: the budget is
+/// [`QemuInstance::snapshot_budget`], which takes the larger of this and the shared
+/// guest-RAM-proportional [`vmcell::vmm::snapshot_request_timeout`] (M6). The floor stays
+/// because QEMU migration is not a single dense write the way CH/FC suspend images are —
+/// it makes iterative dirty-page passes and a `query-migrate` poll round-trip per
+/// iteration, which a pure write-throughput model does not capture. Above ≈7.3 GiB of
+/// guest RAM the shared predicate exceeds it and takes over, which is exactly the
+/// multi-GiB case M6 exists for.
+///
+/// This bounds only a **wedged** migration so it surfaces as a typed error instead of
+/// hanging; it is not a latency SLA.
 const MIGRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The ceiling, in milliseconds, for the **smoltcp NAT's** vhost-user socket to appear before QEMU
+/// is exec'd — QEMU's one readiness wait that is NOT on
+/// [`vmcell::vmm::VMM_SOCKET_READY_TIMEOUT_MS`], and named here for the same reason that one is
+/// named: a bare literal at a call site is how six of them drifted apart (docs/81 §8).
+///
+/// It is deliberately wider than the VMM ceiling because the producer is different in kind: the
+/// orchestrator's smoltcp NAT binds this UDS lazily from a background *thread*, not a child
+/// process, so there is no early-exit to fail fast on. Normally the socket appears in <10 ms; 2 s
+/// covers a bind thread scheduled late under a freq-pinned, many-thread load while still abandoning
+/// a truly-failed bring-up promptly, so the caller's bounded retry recovers on a fresh VM (the ~10 %
+/// flake the net-egress probe surfaced).
+const SMOLTCP_SOCKET_READY_TIMEOUT_MS: u64 = 2000;
 
 /// Reads QMP lines from `reader` past any asynchronous `{"event": ...}` notifications
 /// to the first command result (`{"return": ...}` or `{"error": ...}`), leaving it in
@@ -211,6 +239,7 @@ impl QemuInstance {
         spawned: SpawnedQemu,
         snapshot_restore_capable: bool,
         usb_claim: vmcell::vmm::usb::UsbHostClaim,
+        mem_mib: u32,
     ) -> Self {
         let SpawnedQemu {
             qmp_socket,
@@ -236,11 +265,25 @@ impl QemuInstance {
             endpoint,
             has_vhost_user_device,
             snapshot_restore_capable,
-            pgid,
+            group: vmcell::vmm::VmmProcessGroup::new(pgid),
             vsock_pgid,
-            reaped: false,
+            mem_mib,
             usb_claim,
         }
+    }
+
+    /// The wall-clock budget for THIS instance's snapshot/restore migration: the larger
+    /// of QEMU's measured [`MIGRATION_BUDGET`] floor and the shared, guest-RAM-proportional
+    /// [`vmcell::vmm::snapshot_request_timeout`] (M6).
+    ///
+    /// **One law, one predicate**: the guest-RAM term is not re-derived here — every
+    /// backend's snapshot RPC sizes it in `vmcell::vmm`, and this backend contributes only
+    /// its floor (see [`MIGRATION_BUDGET`] for why QEMU has one). Ordinary control ops
+    /// (`stop`/`cont`/`system_powerdown`/`quit`) deliberately do NOT use this: they are flat
+    /// in guest state and stay on `qmp_command`'s short 2 s ceiling, so a wedged
+    /// `system_powerdown` cannot block the unconditional force-kill behind it.
+    fn snapshot_budget(&self) -> std::time::Duration {
+        MIGRATION_BUDGET.max(vmcell::vmm::snapshot_request_timeout(self.mem_mib))
     }
 
     async fn qmp_command(&self, cmd: &str) -> Result<String> {
@@ -304,9 +347,30 @@ impl QemuInstance {
     /// plain `file:` target — never `exec:`, which QEMU's `-sandbox …,spawn=deny`
     /// (`§12.2`, Layer 1 — the VMM's own seccomp filter) would kill, and never `fd:`, which the line-based QMP client can't do
     /// `getfd`/SCM_RIGHTS for. Polls until `query-migrate` reports `completed`; a
-    /// `failed`/`cancelled` status or the [`MIGRATION_BUDGET`] elapsing is a typed
-    /// error, never a silent timeout-through.
-    async fn drive_migration(&self, execute_cmd: &str, budget: std::time::Duration) -> Result<()> {
+    /// `failed`/`cancelled` status or the budget elapsing is a typed error, never a silent
+    /// timeout-through.
+    ///
+    /// The budget is **not** a parameter: it is this instance's [`Self::snapshot_budget`], the
+    /// guest-RAM-proportional one (M6). Both shipped call sites — `snapshot()`'s `migrate` and
+    /// `restore()`'s `migrate-incoming` — move the same guest-RAM-sized stream, so neither may
+    /// reach for the flat [`MIGRATION_BUDGET`] floor on its own; with the budget an argument, a
+    /// call site that did was invisible to a gate on `snapshot_budget()` itself (docs/81 §8's
+    /// "a gate on the helper is not a gate on the call"). Now it is a compile error.
+    async fn drive_migration(&self, execute_cmd: &str) -> Result<()> {
+        self.drive_migration_within(execute_cmd, self.snapshot_budget())
+            .await
+    }
+
+    /// [`Self::drive_migration`] with an explicit budget.
+    ///
+    /// **Private**, and that is the point: it is the seam the M7 wedged-session gate uses to pass a
+    /// budget short enough to keep the KVM-free suite fast, and no shipped call site may use it —
+    /// `migration_budget_gate` scans for exactly that.
+    async fn drive_migration_within(
+        &self,
+        execute_cmd: &str,
+        budget: std::time::Duration,
+    ) -> Result<()> {
         let deadline = tokio::time::Instant::now() + budget;
         // The budget bounds the WHOLE QMP session, not the gaps between polls (M7). A
         // QEMU whose main loop is wedged (or whose snapshot filesystem has stalled)
@@ -562,6 +626,28 @@ fn require_snapshot_restore_capable(snapshot_restore_capable: bool) -> Result<()
     Ok(())
 }
 
+/// Refuses a [`VmConfig`] asking for `nested_virt`/`lazy_restore` that this backend's
+/// descriptor advertises as `false`, through the **one** shared predicate
+/// [`vmcell::vmm::reject_unadvertised_capabilities`] (docs/81 d7).
+///
+/// QEMU's stake in it: `lazy_restore` is honest-false (no UFFD/demand-paged restore backend,
+/// §17), so a [`RestoreMode::Lazy`](vmcell::config::RestoreMode::Lazy) config faulted eagerly
+/// under a caller that had asked for demand paging — an accepted input silently downgraded.
+/// QEMU advertises `nested_virt: true` (`-cpu host` exposes VMX and the cmdline sets
+/// `kvm-intel.nested=1`), so that branch is dormant *today* — exactly like the
+/// `reject_usb_host_devices` call in `create()`, whose flag is also `true`: a deliberate re-gate
+/// of either flag turns every such config into the typed refusal, with no second site to update.
+///
+/// This wrapper exists only to bind the `"qemu"` name once; the law, both branches and the
+/// N-VMM-1 feature strings live in the shared predicate. It landed as three byte-identical
+/// per-backend copies and was hoisted.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] `{ vmm: "qemu", feature }` naming the unadvertised capability.
+fn reject_unadvertised_capabilities(caps: &VmmCapabilities, cfg: &VmConfig) -> Result<()> {
+    vmcell::vmm::reject_unadvertised_capabilities("qemu", caps, cfg)
+}
+
 /// QEMU's authoritative snapshot-eligibility guard (S1, §8.1), checked at `snapshot()`
 /// time on the instance itself. Three independent requirements, each a fail-loud typed
 /// `Unsupported`:
@@ -607,7 +693,7 @@ fn qemu_snapshot_eligibility(
 
 /// Per-spawn transport/lifecycle knobs shared by `create` and `restore`, so both
 /// drive the one [`Qemu::spawn_qemu`] path — and through it the one
-/// [`build_qemu_command`] composer — instead of forking the argv construction (the
+/// [`qemu_launch_plan`] composer — instead of forking the argv construction (the
 /// source/destination topology must stay congruent for migration, so a second builder
 /// would be a divergence hazard).
 struct SpawnParams {
@@ -628,7 +714,7 @@ struct SpawnParams {
 }
 
 /// The per-VM host paths the QEMU argv references, computed by [`Qemu::spawn_qemu`] and
-/// consumed by the I/O-free composer [`build_qemu_command`].
+/// consumed by the I/O-free composer [`qemu_launch_plan`].
 ///
 /// Passing the virtio-fs daemons' *socket paths* (not the live `VirtioFsDaemon` handles)
 /// is what keeps the composer free of process ownership: it reads paths, spawns nothing,
@@ -721,10 +807,9 @@ impl Qemu {
             // Wait for the vhost-vsock socket to appear; on failure reap the daemon's
             // group before the RAII guard takes ownership, so a half-started daemon
             // never leaks.
-            if let Err(e) = vmcell::vmm::wait_for_socket(
+            if let Err(e) = vmcell::vmm::wait_for_vmm_socket(
                 &vhost_vsock,
                 Some(&mut vsock_daemon),
-                1000,
                 cfg.timeouts.api_socket_poll.as_millis() as u64,
             )
             .await
@@ -774,7 +859,7 @@ impl Qemu {
         // smoltcp bring-up promptly (the ~10% flake the net-egress probe surfaced) so
         // the caller's bounded retry recovers on a fresh VM. Fails loud on timeout; the
         // mid-`start` teardown releases smoltcp. It runs HERE rather than beside the
-        // `-chardev` it gates so that `build_qemu_command` performs no I/O at all and
+        // `-chardev` it gates so that `qemu_launch_plan` performs no I/O at all and
         // the composed argv is assertable from a unit test.
         if res.tap_name.is_none()
             && let Some(socket) = &res.vhost_user_socket
@@ -782,7 +867,7 @@ impl Qemu {
             vmcell::vmm::wait_for_socket(
                 socket,
                 None,
-                2000,
+                SMOLTCP_SOCKET_READY_TIMEOUT_MS,
                 cfg.timeouts.api_socket_poll.as_millis() as u64,
             )
             .await?;
@@ -795,38 +880,56 @@ impl Qemu {
             serial_path: &serial_path,
             fs_daemon_sockets: &fs_daemon_sockets,
         };
-        let cmd = build_qemu_command(&self.binary_path, cfg, res, params, &paths)?;
+        // M11: the whole launch — seccomp flag, jail spec, netns, argv — is composed inside
+        // `qemu_launch_plan`, so `spawn_qemu` holds NO `JailConfig` and NO `JailSpec` and there
+        // is no window in which the posture could be swapped between deciding it and applying
+        // it. The plan's recorded posture is private to `vmcell::vmm::launch`, so the two-line
+        // defeat (`let mut plan = …; plan.jail = weaker;`) does not compile; the KVM-free gate
+        // asserts on the value it returns.
+        let plan = qemu_launch_plan(&self.binary_path, cfg, res, params, &paths)?;
         let daemons = SpawnedDaemons {
             vsock: vsock_guard,
             fs: fs_daemons,
         };
-        finish_qemu_spawn(cmd, cfg, res, cgroups, params, daemons, &paths).await
+        finish_qemu_spawn(plan, cfg, res, cgroups, params, daemons, &paths).await
     }
 }
 
-/// Composes the **complete** QEMU argv for one launch (§2.4) — every flag the process is
-/// exec'd with, and nothing else.
+/// The pure, total mapping from a config to the complete QEMU launch (§2.4, M11) — every flag
+/// the process is exec'd with, plus the jail posture it is confined by, and nothing else.
 ///
-/// Split out of [`Qemu::spawn_qemu`] so the argv is **observable without spawning**: it
+/// Split out of [`Qemu::spawn_qemu`] so the launch is **observable without spawning**: it
 /// performs no I/O (the daemon starts and the vhost-user-net readiness wait stay in the
 /// caller), so a unit test can build a `VmConfig`, call this, and assert over
-/// `cmd.as_std().get_args()`. That is what a pure per-*fragment* helper cannot do:
-/// `build_qemu_usb_args` can be perfect while its result never reaches the `Command`,
-/// and only a test over the *composed* argv sees the difference — the deleted-splice
+/// [`LaunchPlan::argv`](vmcell::vmm::LaunchPlan::argv). That is what a pure per-*fragment*
+/// helper cannot do: `build_qemu_usb_args` can be perfect while its result never reaches the
+/// `Command`, and only a test over the *composed* argv sees the difference — the deleted-splice
 /// defect its gate (`qemu_full_argv_splices_the_usb_fragment`) now catches.
+///
+/// The jail half is the same story one layer down. It is applied in `build_vmm_cmd`'s post-fork
+/// `pre_exec` window, which nothing KVM-free observes, so while this function wrote
+/// `jail_spec_from_config(&cfg.jail)?` inline the posture was an argument no gate could see:
+/// rewriting that one token shipped every QEMU VM with a weaker — or absent — Layer-2
+/// confinement and left `cargo test`, `just ci` and the whole live matrix green, because the
+/// deny-list is default-allow/`EPERM` and no functional leg notices. Routing through
+/// [`LaunchPlan::build`](vmcell::vmm::LaunchPlan::build) makes the posture a **returned value**
+/// ([`LaunchPlan::jail`](vmcell::vmm::LaunchPlan::jail)) that
+/// `the_qemu_launch_plan_ships_the_configured_jail_posture` asserts on, and the plan's record is
+/// private to `vmcell::vmm::launch`, so the two-line defeat (`let mut plan = …;
+/// plan.jail = weaker;`) does not compile here at all.
 ///
 /// # Errors
 /// Propagates the seccomp-spec, jail-spec, MAC-math and kernel-cmdline builders, and
 /// fails loud when `paths.fs_daemon_sockets` does not carry one entry per configured
 /// share (a length mismatch would otherwise `zip`-truncate a share's device out of the
 /// argv silently).
-fn build_qemu_command(
+fn qemu_launch_plan(
     binary_path: &Path,
     cfg: &VmConfig,
     res: &PerVmResources,
     params: &SpawnParams,
     paths: &QemuSpawnPaths<'_>,
-) -> Result<tokio::process::Command> {
+) -> Result<vmcell::vmm::LaunchPlan> {
     if paths.fs_daemon_sockets.len() != cfg.shares.len() {
         return Err(Error::Vmm(format!(
             "virtio-fs daemon sockets ({}) do not match the configured shares ({})",
@@ -839,8 +942,11 @@ fn build_qemu_command(
     // libseccomp sandbox (a QEMU built without libseccomp errors fail-loud on it, the
     // desired behavior); the jailer-equivalent hardening is applied in build_vmm_cmd.
     let seccomp_args = vmcell::vmm::seccomp::vmm_seccomp_args("qemu", cfg.vmm_seccomp)?;
-    let jail = vmcell::vmm::jail::jail_spec_from_config(&cfg.jail)?;
-    let mut cmd = vmcell::vmm::build_vmm_cmd(binary_path, res.netns_name.as_deref(), &jail);
+    // §12.3 (Layer 2): the ONE posture value, handed to the one constructor that both compiles
+    // it into the `pre_exec` jail and records it — never a `JailSpec` this backend holds.
+    let mut plan =
+        vmcell::vmm::LaunchPlan::build(binary_path, res.netns_name.as_deref(), cfg.jail)?;
+    let cmd = plan.command_mut();
     cmd.args(&seccomp_args);
 
     cmd.arg("-M")
@@ -852,7 +958,7 @@ fn build_qemu_command(
     // Fixed, config-independent flags — including `-S` to freeze the guest vCPUs at
     // launch so `boot()`'s `cont` is the real start point (H-VMM-2). The former
     // `-trace vhost_user_*` debug residue is dropped (L-VMM-4).
-    push_fixed_qemu_flags(&mut cmd);
+    push_fixed_qemu_flags(cmd);
     cmd.arg("-object")
         .arg(format!(
             "memory-backend-file,id=mem,size={}M,mem-path=/dev/shm,share=on",
@@ -1041,12 +1147,16 @@ fn build_qemu_command(
         cmd.arg("-incoming").arg("defer");
     }
 
-    Ok(cmd)
+    Ok(plan)
 }
 
-/// Launches the composed `cmd`, registers it in its cgroup, waits for QMP, and hands the
+/// Launches the composed `plan`, registers it in its cgroup, waits for QMP, and hands the
 /// caller the [`SpawnedQemu`] record — the I/O half of [`Qemu::spawn_qemu`], split from
 /// the argv composition so that half can stay pure.
+///
+/// Takes the [`LaunchPlan`](vmcell::vmm::LaunchPlan) by value and spawns **exactly** what it
+/// carries: the command and the jail posture it was compiled from travel together from
+/// [`qemu_launch_plan`] to the `exec`, so no step between them can substitute either half.
 ///
 /// Takes ownership of the still-armed helper `daemons`: every fallible step below must
 /// reap them, and `?` here does exactly that.
@@ -1054,7 +1164,7 @@ fn build_qemu_command(
 /// # Errors
 /// Propagates the spawn, cgroup-registration and QMP-readiness failures.
 async fn finish_qemu_spawn(
-    mut cmd: tokio::process::Command,
+    plan: vmcell::vmm::LaunchPlan,
     cfg: &VmConfig,
     res: &PerVmResources,
     cgroups: &dyn vmcell::metrics::CgroupFs,
@@ -1066,6 +1176,7 @@ async fn finish_qemu_spawn(
         vsock: vsock_guard,
         fs: fs_daemons,
     } = daemons;
+    let mut cmd = plan.into_command();
     let cmd_str = format!("{cmd:?}");
     // Debug level (not info): the full command line is diagnostic noise on every
     // create, and with stderr inherited it should not clutter harness output
@@ -1089,7 +1200,6 @@ async fn finish_qemu_spawn(
         cgroups,
         &res.cgroup_name,
         paths.qmp_socket,
-        1000,
         cfg.timeouts.api_socket_poll.as_millis() as u64,
     )
     .await?;
@@ -1147,6 +1257,9 @@ impl Vmm for Qemu {
         // `spawn_qemu` are both driven by `cfg.console_mode`; gate an unsupported
         // mode up front so they can never desync into a silent `serial.log`.
         vmcell::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
+        // The descriptor `false` no other guard here can see: `lazy_restore`. Refuse a
+        // `RestoreMode::Lazy` config rather than accept it and demand-page nothing.
+        reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
         // Self-check against our OWN descriptor rather than assuming QEMU semantics
         // (the §2.1 trait contract, and the same shape as CH's `snapshot_restore`
         // self-check): today `usb_host_passthrough` is `true`, so this passes — but a
@@ -1170,6 +1283,7 @@ impl Vmm for Qemu {
             self.spawn_qemu(cfg, res, cgroups, &params).await?,
             self.capabilities().snapshot_restore,
             usb_claim,
+            cfg.mem_mib,
         ))
     }
 
@@ -1186,6 +1300,9 @@ impl Vmm for Qemu {
         // descriptor says cannot do it. One predicate with `snapshot()`'s self-guard.
         require_snapshot_restore_capable(self.capabilities().snapshot_restore)?;
         vmcell::vmm::reject_unsupported_console("qemu", &self.capabilities(), cfg.console_mode)?;
+        // Same self-check `create()` makes, on the path that actually consumes
+        // `cfg.restore_mode`: a restore must not accept what create rejects.
+        reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
 
         // Eligibility (S1, §8.1, The warm-snapshot path and the eligibility law), defense in depth alongside `config::build()` and the
         // orchestrator re-check. The shared predicate catches a virtio-fs share or
@@ -1239,6 +1356,7 @@ impl Vmm for Qemu {
             // at the one orchestrator boundary before any backend is reached (docs/78 M4),
             // so a restored VM never displaces a host driver and has nothing to put back.
             vmcell::vmm::usb::UsbHostClaim::default(),
+            cfg.mem_mib,
         );
 
         // Drive the incoming migration on the now-ready QMP socket and wait for it to
@@ -1251,9 +1369,10 @@ impl Vmm for Qemu {
             "{{\"execute\": \"migrate-incoming\", \"arguments\": {{\"uri\": \"file:{}\"}}}}",
             state.display()
         );
-        instance
-            .drive_migration(&migrate_incoming, MIGRATION_BUDGET)
-            .await?;
+        // M6: the incoming stream is the same guest-RAM-proportional artifact the
+        // outgoing one is, so it rides the same budget (the FC precedent, which budgets
+        // `/snapshot/create` AND `/snapshot/load` through the one predicate).
+        instance.drive_migration(&migrate_incoming).await?;
         Ok(instance)
     }
 
@@ -1349,19 +1468,9 @@ impl VmInstance for QemuInstance {
         )
         .await;
 
-        if let Some(pgid) = self.pgid {
-            // Skip the group SIGKILL if the leader was already reaped (its pgid may be
-            // recycled) — M-VMM-1.
-            if !self.reaped {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-        }
-        let _ = self.process.wait().await;
-        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
-        self.reaped = true;
+        // The one shared signal/wait/flag sequence (L1): SIGKILL the group unless the
+        // leader was already reaped, await it, record the reap (M-VMM-1).
+        self.group.kill_and_wait(&mut self.process).await;
 
         // QEMU is gone, so the usbfs fds it held are closed and the interfaces are free:
         // put back the host drivers passthrough displaced. Ordered AFTER the reap on
@@ -1382,16 +1491,9 @@ impl VmInstance for QemuInstance {
 
     async fn has_exited(&mut self) -> bool {
         // Non-blocking reap of the QEMU leader; `Ok(Some(_))` means it exited after
-        // `request_shutdown` (`system_powerdown`). Record the reap so `kill()`/`Drop`
-        // do NOT re-`SIGKILL` the process group: once the leader is reaped the kernel
-        // may recycle its pgid and signalling `-pgid` could hit an unrelated group
-        // (M-VMM-1).
-        if matches!(self.process.try_wait(), Ok(Some(_))) {
-            self.reaped = true;
-            true
-        } else {
-            false
-        }
+        // `request_shutdown` (`system_powerdown`). The shared helper records the reap so
+        // `kill()`/`Drop` cannot re-`SIGKILL` a possibly-recycled pgid.
+        self.group.note_exit(&mut self.process)
     }
 
     async fn snapshot(&mut self, dir: &Path) -> Result<()> {
@@ -1418,7 +1520,11 @@ impl VmInstance for QemuInstance {
         );
         // The migration stream is the whole snapshot; its `completed`/`failed` status is
         // the result. No sidecar is written — restore programs a fresh CID (§2.4).
-        let result = self.drive_migration(&migrate_cmd, MIGRATION_BUDGET).await;
+        // M6: the stream is guest RAM + device state, so the budget is
+        // `snapshot_budget()` — the shared guest-RAM-proportional predicate over QEMU's
+        // measured floor — NOT the flat control ceiling `qmp_command` uses for
+        // `stop`/`cont`/`system_powerdown`.
+        let result = self.drive_migration(&migrate_cmd).await;
 
         // Resume the source VM regardless (best-effort, warn-only — matches FC/CH); the
         // snapshot `result` is what determines success.
@@ -1482,19 +1588,10 @@ impl Drop for QemuInstance {
         // Teardown order (AGENTS.md): VMM process group first — reaping it before
         // touching the daemons, sockets or the per-VM directory means cleanup never
         // races a live VMM.
-        if let Some(pgid) = self.pgid {
-            // Skip the group SIGKILL + reap if the leader was already reaped (via
-            // `has_exited`/`kill`): its pgid may have been recycled (M-VMM-1).
-            if !self.reaped {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                if let Some(pid) = self.process.id() {
-                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
-                }
-            }
-        }
+        // Same helper, same order as the graceful `kill()` path (L1): the group SIGKILL +
+        // blocking reap is skipped if the leader was already reaped, since its pgid may
+        // have been recycled (M-VMM-1).
+        self.group.reap_now(&mut self.process);
         // With the VMM reaped, the host USB drivers it displaced can go back (same step,
         // same order, as the graceful `kill()` path — one helper, never a second copy).
         self.usb_claim.restore();
@@ -1527,37 +1624,15 @@ impl Drop for QemuInstance {
 mod tests {
     use super::*;
 
-    /// A no-op [`vmcell::metrics::CgroupFs`] for the reject-before-spawn tests below, which
-    /// exercise `restore` capability guards that return **before** any cgroup interaction — so the
-    /// fake's methods are never called. Replaces the former `vmcell::metrics::FakeCgroupFs` (a
-    /// `#[cfg(test)]`-only fixture that is not visible to a downstream crate's test build).
-    #[derive(Debug)]
-    struct TestCgroupFs;
-
-    impl TestCgroupFs {
-        fn new() -> Self {
-            Self
-        }
-    }
-
-    impl vmcell::metrics::CgroupFs for TestCgroupFs {
-        fn create_slice(
-            &self,
-            _name: &str,
-            _limits: &vmcell::config::ResourceLimits,
-        ) -> Result<()> {
-            Ok(())
-        }
-        fn delete_slice(&self, _name: &str) -> Result<()> {
-            Ok(())
-        }
-        fn read_stats(&self, _name: &str) -> Result<vmcell::metrics::ResourceUsage> {
-            Ok(vmcell::metrics::ResourceUsage::default())
-        }
-        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
-            Ok(())
-        }
-    }
+    /// The shared [`vmcell::metrics::FakeCgroupFs`], exposed by `vmcell`'s `test-support`
+    /// feature (a dev-dependency of this crate). It replaces the hand-rolled per-crate
+    /// `CgroupFs` fake this crate carried while `FakeCgroupFs` was `#[cfg(test)]`-only and
+    /// therefore invisible downstream — one of four such copies (docs/81 §9).
+    ///
+    /// It is still structurally blind to the filesystem (AGENTS rule 4): it models slices,
+    /// tasks and delegation in memory and writes no cgroup sysfs, so nothing driven by it is
+    /// evidence about real cgroup residue or enforcement. That is `just test-privileged`.
+    use vmcell::metrics::FakeCgroupFs;
 
     // Guards H-VMM-2: every QEMU launch must carry `-S` so the guest stays frozen until
     // boot() issues `cont`. Without it create() spawns an already-running guest and
@@ -1639,12 +1714,11 @@ mod tests {
         builder.build().expect("build config")
     }
 
-    /// The **composed** argv `spawn_qemu` would exec for `cfg` — the real `Command`, read
-    /// back through `as_std().get_args()` without spawning anything.
+    /// The launch plan `spawn_qemu` would exec for `cfg`, built without spawning anything.
     ///
-    /// This is the observation point a per-fragment helper test cannot reach: it sees the
-    /// `cmd.args(...)` splices themselves, so deleting one reddens.
-    fn composed_argv(cfg: &VmConfig) -> Vec<String> {
+    /// One helper for both halves of the plan — the composed argv and the recorded jail posture
+    /// — so no gate can assert on a launch some other gate did not see.
+    fn test_plan(cfg: &VmConfig) -> vmcell::vmm::LaunchPlan {
         let params = SpawnParams {
             in_kernel_vsock: false,
             guest_cid: 3,
@@ -1657,18 +1731,23 @@ mod tests {
             serial_path: Path::new("/tmp/vmcell-argv-test/serial.log"),
             fs_daemon_sockets: &[],
         };
-        let cmd = build_qemu_command(
+        qemu_launch_plan(
             Path::new("/usr/bin/qemu-system-x86_64"),
             cfg,
             &restore_test_res(),
             &params,
             &paths,
         )
-        .expect("the argv composes");
-        cmd.as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
+        .expect("the launch plan composes")
+    }
+
+    /// The **composed** argv `spawn_qemu` would exec for `cfg` — the real `Command`, read back
+    /// through the shared [`vmcell::vmm::LaunchPlan::argv`] accessor without spawning anything.
+    ///
+    /// This is the observation point a per-fragment helper test cannot reach: it sees the
+    /// `cmd.args(...)` splices themselves, so deleting one reddens.
+    fn composed_argv(cfg: &VmConfig) -> Vec<String> {
+        test_plan(cfg).argv()
     }
 
     // v30 §18 delta 9 GATE, over the COMPOSED argv (the fragment→`Command` seam). The
@@ -1755,10 +1834,82 @@ mod tests {
         .expect("build config")
     }
 
+    // M11 GATE, QEMU leg (KVM-free) — the LAYER-2 half, the sibling of the Layer-1 sandbox gate
+    // below. The jail posture is applied in `build_vmm_cmd`'s post-fork `pre_exec` closure, which
+    // NOTHING KVM-free can observe: while `qemu_launch_plan` wrote
+    // `jail_spec_from_config(&cfg.jail)?` inline, rewriting that one token to a weakened config
+    // shipped every QEMU VM with a different Layer-2 posture and left `cargo test`, `just ci` and
+    // the whole live matrix green (the deny-list is default-allow/`EPERM`, so no functional leg
+    // notices). Routing through `vmcell::vmm::LaunchPlan` makes the posture a RETURNED VALUE, so
+    // it is assertable — and `LaunchPlan::jail` is private to `vmcell::vmm::launch`, so the
+    // two-line defeat (`let mut plan = …; plan.jail = weaker;`) does not even compile here.
+    //
+    // Red on the inverse: hand `qemu_launch_plan`'s `LaunchPlan::build` any value other than
+    // `cfg.jail` — `JailConfig::disabled()` is the interesting one — and the first assertion
+    // reddens.
+    #[test]
+    fn the_qemu_launch_plan_ships_the_configured_jail_posture() {
+        use vmcell::config::{JailConfig, RootfsSource};
+
+        let plan_for = |jail: JailConfig| {
+            let cfg = VmConfig::builder(
+                "/k",
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/i"),
+                },
+            )
+            .jail(jail)
+            .build()
+            .expect("build config");
+            let plan = test_plan(&cfg);
+            (cfg, plan)
+        };
+
+        // The plan's jail half IS the configured posture.
+        let (cfg, plan) = plan_for(JailConfig::hardened());
+        assert_eq!(
+            plan.jail(),
+            cfg.jail,
+            "the launch plan must ship `cfg.jail`, not a locally-built posture"
+        );
+
+        // Positive control, so the equality above is not a tautology about two identical structs:
+        // a DIFFERENT requested posture produces a different record, and compiled, the difference
+        // is real hardening versus none at all — what shipping the wrong value does.
+        let (disabled_cfg, disabled_plan) = plan_for(JailConfig::disabled());
+        assert_eq!(disabled_plan.jail(), disabled_cfg.jail);
+        assert_ne!(
+            plan.jail(),
+            disabled_plan.jail(),
+            "control: the two postures differ, so the plan is not returning a constant"
+        );
+        assert!(
+            !vmcell::vmm::jail::jail_spec_from_config(&plan.jail())
+                .expect("compile the shipped spec")
+                .is_noop(),
+            "the shipped hardened posture must compile to real hardening"
+        );
+        assert!(
+            vmcell::vmm::jail::jail_spec_from_config(&disabled_plan.jail())
+                .expect("compile the disabled spec")
+                .is_noop(),
+            "control: the disabled posture compiles to no hardening — what a wrong value ships"
+        );
+
+        // …and the two postures are the ONLY difference: the argv is byte-identical either way,
+        // so this gate and the argv gates below observe one and the same launch (a plan that
+        // smuggled a jail difference into the command line would redden here).
+        assert_eq!(
+            plan.argv(),
+            disabled_plan.argv(),
+            "the jail posture is a `pre_exec` property, never an argv one"
+        );
+    }
+
     // M11 / §12.2 (Layer 1 — the VMM's own seccomp filter) GATE, over the COMPOSED argv.
     // `vmm_seccomp_args` has its own golden in `vmcell`, but that says nothing about
     // whether the tokens ever reach the process: deleting `cmd.args(&seccomp_args)` from
-    // `build_qemu_command` left every gate green while QEMU — which has NO sandbox unless
+    // `qemu_launch_plan` left every gate green while QEMU — which has NO sandbox unless
     // the flag is passed — ran unconfined. This is the test that reddens on that deletion,
     // the same fragment-vs-composed seam the delta-9 pass closed for USB. It pins:
     // (a) `Enforcing` puts `-sandbox` and its spec CONTIGUOUSLY in the launched argv
@@ -1811,7 +1962,7 @@ mod tests {
     // actually execs — a `true` with no `qemu-xhci` in the COMPOSED argv is the
     // silent-drop failure the capability exists to prevent. Red on the inverse: flip the
     // flag, make `build_qemu_usb_args` return empty for a non-empty list, or delete the
-    // splice in `build_qemu_command`.
+    // splice in `qemu_launch_plan`.
     #[test]
     fn qemu_usb_capability_matches_the_emitted_argv() {
         let caps = Qemu::new("/usr/bin/qemu-system-x86_64").capabilities();
@@ -1985,7 +2136,7 @@ mod tests {
         )
         .build()
         .expect("build config");
-        let cgroups = TestCgroupFs::new();
+        let cgroups = FakeCgroupFs::new();
 
         let err = qemu
             .restore(
@@ -2022,7 +2173,7 @@ mod tests {
         .snapshotting(true)
         .build()
         .expect("build snapshotting config");
-        let cgroups = TestCgroupFs::new();
+        let cgroups = FakeCgroupFs::new();
 
         let err = qemu
             .restore(
@@ -2060,6 +2211,152 @@ mod tests {
             caps.restore_rotates_host_paths,
             "QEMU restore rotates the host-global guest CID to a fresh res.guest_cid, so \
              concurrent zygote fan-out is supported (§2.4, validated live)"
+        );
+    }
+
+    // docs/81 d7: `lazy_restore` is honest-false (no UFFD backend), so a `RestoreMode::Lazy`
+    // config used to be accepted and faulted eagerly — an accepted input silently downgraded.
+    // Both entry points must refuse it with the `VmmCapabilities` field name as the feature
+    // string (N-VMM-1): `restore()` is the path that actually consumes `restore_mode`, and a
+    // restore that accepts what create rejects is the crosvm M4 defect. Both legs are KVM-free
+    // (the guard returns before any spawn — and, on the restore leg, before the state-file
+    // check, which is what proves it ran). Inverse (dropping either call site) reddens that leg.
+    #[tokio::test]
+    async fn create_and_restore_reject_lazy_restore_with_capability_field_name() {
+        use vmcell::config::{RestoreMode, RootfsSource, VmConfig};
+
+        let qemu = Qemu::new("/usr/bin/qemu-system-x86_64");
+        let cfg = VmConfig::builder(
+            "/k",
+            RootfsSource::Erofs {
+                image: PathBuf::from("/i"),
+            },
+        )
+        .snapshotting(true)
+        .restore_mode(RestoreMode::Lazy)
+        .build()
+        .expect("build lazy-restore config");
+        let cgroups = FakeCgroupFs::new();
+
+        for err in [
+            qemu.create(&cfg, &restore_test_res(), &cgroups)
+                .await
+                .expect_err("QEMU advertises lazy_restore: false"),
+            qemu.restore(
+                Path::new("/nonexistent-snapshot"),
+                &cfg,
+                &restore_test_res(),
+                &cgroups,
+            )
+            .await
+            .expect_err("restore must refuse exactly what create refuses"),
+        ] {
+            assert!(
+                matches!(&err, Error::Unsupported { vmm, feature }
+                    if vmm == "qemu" && feature == "lazy_restore"),
+                "expected a lazy_restore Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    // The positive control for the refusal above (AGENTS.md: a negative capability result needs
+    // a positive control): the ALLOWED configs — every `RestoreMode` the descriptor can honor,
+    // and `nested_virt: true`, which QEMU DOES advertise — must travel PAST the guard. Without
+    // KVM they cannot reach a booted VM, so the control asserts on where they die: in the spawn
+    // of a binary that does not exist, never as a typed capability refusal. `snapshotting(true)`
+    // keeps the path daemon-free (in-kernel vsock), so nothing is spawned but QEMU itself, and
+    // the scratch dir is absent so no artifact is left behind. Inverse (a guard that ignores
+    // `cfg`/`caps` and refuses unconditionally) reddens this immediately.
+    #[tokio::test]
+    async fn create_accepts_what_the_descriptor_advertises() {
+        use vmcell::config::{RestoreMode, RootfsSource, VmConfig};
+
+        let qemu = Qemu::new("/nonexistent/vmcell-qemu-positive-control");
+        let cgroups = FakeCgroupFs::new();
+        for mode in [RestoreMode::Default, RestoreMode::Eager] {
+            let cfg = VmConfig::builder(
+                "/k",
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/i"),
+                },
+            )
+            .snapshotting(true)
+            .nested_virt(true)
+            .restore_mode(mode)
+            .build()
+            .expect("build an advertised config");
+            let res = PerVmResources {
+                tmp_dir: PathBuf::from("/tmp/vmcell-qemu-absent-positive-control"),
+                ..restore_test_res()
+            };
+            let err = qemu
+                .create(&cfg, &res, &cgroups)
+                .await
+                .expect_err("the absent binary ends the spawn");
+            assert!(
+                !matches!(&err, Error::Unsupported { feature, .. }
+                    if feature == "nested_virt" || feature == "lazy_restore"),
+                "an advertised config must reach the spawn, not a capability refusal: {err:?}"
+            );
+        }
+    }
+
+    // The refusals must key off the ONE descriptor value, not a hardcoded bool beside the check
+    // — otherwise a flag flip leaves the refusal behind (the divergence class the shared
+    // `reject_usb_host_devices` exists to prevent). Feeding synthetic descriptors proves each
+    // branch reads `caps`: inverse (`if matches!(cfg.restore_mode, Lazy) {` with no
+    // `&& !caps.lazy_restore`) reddens the `advertised` leg, and a `nested_virt` branch that
+    // ignored `caps` would reject a config QEMU accepts today.
+    #[test]
+    fn capability_refusals_read_the_descriptor_not_a_hardcoded_bool() {
+        use vmcell::config::{RestoreMode, RootfsSource, VmConfig};
+
+        let cfg = |nested: bool, mode: RestoreMode| {
+            VmConfig::builder(
+                "/k",
+                RootfsSource::Erofs {
+                    image: PathBuf::from("/i"),
+                },
+            )
+            .nested_virt(nested)
+            .restore_mode(mode)
+            .build()
+            .expect("build config")
+        };
+        let shipped = Qemu::new("/usr/bin/qemu-system-x86_64").capabilities();
+        assert!(shipped.nested_virt && !shipped.lazy_restore);
+
+        // The shipped descriptor: nested virt is advertised, so it is ACCEPTED (the positive
+        // control for the dormant branch); lazy restore is not, so it is refused by field name.
+        reject_unadvertised_capabilities(&shipped, &cfg(true, RestoreMode::Default))
+            .expect("QEMU advertises nested_virt, so a nested config must be accepted");
+        let err = reject_unadvertised_capabilities(&shipped, &cfg(false, RestoreMode::Lazy))
+            .expect_err("QEMU does not advertise lazy_restore");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "qemu" && feature == "lazy_restore"),
+            "expected a lazy_restore Unsupported, got {err:?}"
+        );
+
+        // A descriptor that advertised lazy restore accepts the same config, at the same site.
+        let with_lazy = VmmCapabilities {
+            lazy_restore: true,
+            ..shipped.clone()
+        };
+        reject_unadvertised_capabilities(&with_lazy, &cfg(false, RestoreMode::Lazy))
+            .expect("a descriptor advertising lazy_restore must accept a Lazy config");
+        // …and one that re-gated nested virt refuses it, with no second site to update.
+        let without_nested = VmmCapabilities {
+            nested_virt: false,
+            ..shipped
+        };
+        let err =
+            reject_unadvertised_capabilities(&without_nested, &cfg(true, RestoreMode::Default))
+                .expect_err("a re-gated nested_virt must refuse a nested config");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "qemu" && feature == "nested_virt"),
+            "expected a nested_virt Unsupported, got {err:?}"
         );
     }
 
@@ -2265,10 +2562,11 @@ mod tests {
         })
     }
 
-    /// A [`QemuInstance`] whose only real wiring is `qmp_socket`, so the QMP-driving
-    /// methods can run against a fake server with no VMM. The process is a live child in
-    /// its own group, so `Drop`'s reap stays honest rather than being skipped.
-    fn instance_on_socket(qmp_socket: &Path) -> QemuInstance {
+    /// A [`QemuInstance`] whose only real wiring is `qmp_socket` and `mem_mib`, so the
+    /// QMP-driving methods can run against a fake server with no VMM. The process is a
+    /// live child in its own group, so `Drop`'s reap stays honest rather than being
+    /// skipped.
+    fn instance_on_socket_with_mem(qmp_socket: &Path, mem_mib: u32) -> QemuInstance {
         let (process, _pid) = spawn_group_standin();
         let pgid = process.id();
         QemuInstance {
@@ -2283,10 +2581,15 @@ mod tests {
             has_vhost_user_device: false,
             usb_claim: vmcell::vmm::usb::UsbHostClaim::default(),
             snapshot_restore_capable: true,
-            pgid,
+            group: vmcell::vmm::VmmProcessGroup::new(pgid),
             vsock_pgid: None,
-            reaped: false,
+            mem_mib,
         }
+    }
+
+    /// [`instance_on_socket_with_mem`] on the 128 MiB default the QMP gates use.
+    fn instance_on_socket(qmp_socket: &Path) -> QemuInstance {
+        instance_on_socket_with_mem(qmp_socket, 128)
     }
 
     // M7 GATE (KVM-free): `MIGRATION_BUDGET` must bound the WHOLE QMP session. It used to
@@ -2311,7 +2614,7 @@ mod tests {
 
             let result = tokio::time::timeout(
                 GUARD,
-                instance.drive_migration(
+                instance.drive_migration_within(
                     "{\"execute\": \"migrate\", \"arguments\": {\"uri\": \"file:/dev/null\"}}",
                     BUDGET,
                 ),
@@ -2361,6 +2664,154 @@ mod tests {
             .expect("spawn sleep stand-in");
         let pid = child.id().expect("child pid") as i32;
         (child, pid)
+    }
+
+    // M6 GATE (KVM-free): the snapshot/restore migration is budgeted against GUEST RAM,
+    // not a flat ceiling. QEMU keeps `MIGRATION_BUDGET` as a measured floor and takes the
+    // larger of it and the ONE shared `vmcell::vmm::snapshot_request_timeout` — so a
+    // multi-GiB guest gets strictly more budget than a small one, while an ordinary
+    // control op keeps its short bound.
+    //
+    // Inverse (observed red): revert `snapshot_budget()` to a bare `MIGRATION_BUDGET` and
+    // the 32 GiB leg equals the 128 MiB leg, reddening the strict inequality. Inverse 2:
+    // route `qmp_command`'s 2 s control ceiling through `snapshot_budget()` too and the
+    // "ordinary control ops stay short" assert reddens.
+    // `#[tokio::test]`: the fixture spawns a real stand-in child, which needs a reactor.
+    #[tokio::test]
+    async fn snapshot_budget_grows_with_guest_ram_over_the_migration_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("qmp-budget.sock");
+
+        let small = instance_on_socket_with_mem(&socket, 128);
+        let large = instance_on_socket_with_mem(&socket, 32 * 1024);
+
+        assert!(
+            large.snapshot_budget() > small.snapshot_budget(),
+            "a 32 GiB guest must get MORE snapshot budget than a 128 MiB one: {:?} vs {:?}",
+            large.snapshot_budget(),
+            small.snapshot_budget()
+        );
+        // The guest-RAM term is the SHARED predicate's, not a local re-derivation.
+        assert_eq!(
+            large.snapshot_budget(),
+            vmcell::vmm::snapshot_request_timeout(32 * 1024),
+            "above the floor the budget IS the shared predicate"
+        );
+        // …and QEMU's measured floor still holds underneath it.
+        assert_eq!(
+            small.snapshot_budget(),
+            MIGRATION_BUDGET,
+            "below the floor the budget is QEMU's measured MIGRATION_BUDGET"
+        );
+        // An ordinary control op is NOT on this budget: `qmp_command` bounds
+        // stop/cont/system_powerdown/quit at a flat 2 s so a wedged powerdown cannot
+        // block the force-kill behind it. If that ever collapsed into `snapshot_budget()`,
+        // the flat ceiling would be at least the 120 s floor.
+        assert!(
+            std::time::Duration::from_secs(2) < small.snapshot_budget(),
+            "the control ceiling and the snapshot budget must not be the same value"
+        );
+    }
+
+    // POSITIVE CONTROL for the gate above, and the gate on `Drop`'s OWN job: an instance whose
+    // group has NOT been reaped must have its process group SIGKILLed + reaped when it is dropped
+    // (L1 — `Drop` is the panic path of the one teardown order). Without this leg the
+    // "must not signal a recycled pgid" assertion is satisfied by a `Drop` that reaps NOTHING —
+    // which is precisely the regression the QEMU consolidation introduced and this leg caught: a
+    // dropped-but-never-killed VM would leak its whole process group.
+    //
+    // Inverse (observed red): delete `self.group.reap_now(&mut self.process)` from `Drop` and the
+    // stand-in survives, so `gone` stays false.
+    #[tokio::test]
+    async fn drop_reaps_an_unreaped_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = instance_on_socket(&dir.path().join("absent-qmp.sock"));
+        let live_pid = inst.process.id().expect("stand-in pid") as i32;
+        drop(inst);
+
+        let mut gone = false;
+        for _ in 0..100 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(live_pid), None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Best-effort cleanup if the drop did NOT reap, so a red run leaves no stray process.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-live_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            gone,
+            "Drop on an UN-reaped instance must SIGKILL and reap its VMM process group"
+        );
+    }
+
+    // M-VMM-1 GATE (KVM-free) on the SHIPPED call sites, not on the extracted helper:
+    // once the QEMU leader is reaped its pgid can be recycled, so neither
+    // `QemuInstance::kill` NOR its `Drop` may SIGKILL `-pgid`. A live decoy in its own
+    // process group stands in for the recycled group; BOTH teardown paths are driven
+    // against the same already-reaped instance, because a backend that routed only one of
+    // them through the shared helper is the divergence this consolidation removes. QEMU
+    // had no such gate before (CH and FC did) — it is one of the copies §9 found.
+    //
+    // Inverse (observed red): replace `self.group.kill_and_wait(&mut self.process).await`
+    // in `kill` — or `self.group.reap_now(&mut self.process)` in `Drop` — with an
+    // unguarded `vmcell::vmm::reap_process_group(...)` over the same pgid, and the decoy
+    // dies, reddening the assert.
+    #[tokio::test]
+    async fn kill_and_drop_do_not_signal_pgid_when_reaped() {
+        let (mut decoy, decoy_pid) = spawn_group_standin();
+
+        // A fast-exiting child as the instance's own leader so `kill()`'s `process.wait()`
+        // returns promptly instead of blocking on a live process.
+        let leader = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true` leader");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut inst = QemuInstance {
+            process: leader,
+            qmp_socket: dir.path().join("absent-qmp.sock"),
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            _fs_daemons: Vec::new(),
+            _vsock_daemon: None,
+            cid: 3,
+            endpoint: VsockEndpoint::Vsock { cid: 3, port: 5000 },
+            has_vhost_user_device: false,
+            usb_claim: vmcell::vmm::usb::UsbHostClaim::default(),
+            snapshot_restore_capable: true,
+            // The recycled-pgid state, which only the `test-support` constructor can
+            // fabricate: no production path can mark a group reaped over a foreign pgid.
+            group: vmcell::vmm::VmmProcessGroup::already_reaped_for_test(Some(decoy_pid as u32)),
+            vsock_pgid: None,
+            mem_mib: 128,
+        };
+        // `kill()` first tries a QMP `quit` against an absent socket; that fails fast and
+        // is best-effort by design, so the reap path below is what is under test.
+        inst.kill().await.expect("kill");
+        assert!(
+            inst.group.is_reaped(),
+            "the group must still read as reaped after kill() — the flag is one-shot"
+        );
+        drop(inst);
+
+        // A SIGKILL to the (recycled) pgid would land within a few ms; give it time.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let decoy_status = decoy.try_wait().expect("try_wait decoy");
+        // Clean up the decoy regardless of the outcome — a test's own fixtures are
+        // residue too.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-decoy_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = decoy.wait().await;
+
+        assert!(
+            decoy_status.is_none(),
+            "kill()/Drop on a reaped QEMU instance must not SIGKILL a (recycled) pgid"
+        );
     }
 
     // H-QEMU-1: dropping the guard MUST SIGKILL the daemon's process group and reap it.
@@ -2413,6 +2864,115 @@ mod tests {
     }
 }
 
+/// Source-level gate for M6's "the migration budget is the instance's, never a call site's" — the
+/// backstop behind the structural fix.
+///
+/// [`QemuInstance::drive_migration`] takes no budget argument, so a call site that reached for the
+/// flat [`MIGRATION_BUDGET`] floor is a compile error. What a compiler cannot catch is a shipped
+/// call site reaching for the private `drive_migration_within` seam that the M7 gate uses — same
+/// file, same crate, one extra word. This scans for exactly that, in the same shape as
+/// [`virtiofs_pacing_gate`] (whose doc carries the full rationale for scanning source).
+#[cfg(test)]
+mod migration_budget_gate {
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The number of migrations this backend drives: two — `snapshot()`'s `migrate` and
+    /// `restore()`'s `migrate-incoming`.
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set.
+    const EXPECTED_MIGRATIONS: usize = 2;
+
+    /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
+    /// dropped and whitespace collapsed.
+    fn production_code(source: &str) -> String {
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Method-call occurrences of `name` — the leading `.` is what separates a call from the
+    /// `async fn name(` definition, which would otherwise inflate every count by one.
+    fn method_call_count(code: &str, name: &str) -> usize {
+        code.match_indices(&format!(".{name}(")).count()
+    }
+
+    /// Every `.drive_migration_within(` call expression in `code`, truncated at its statement's
+    /// `;` so the budget it passes is visible.
+    fn within_calls(code: &str) -> Vec<&str> {
+        code.match_indices(".drive_migration_within(")
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    // M6 GATE (KVM-free): both shipped migrations ride the instance's guest-RAM-proportional
+    // budget. The `drive_migration(` count is the non-vacuity anchor; the `drive_migration_within(`
+    // count is the law — the private short-budget seam belongs to the M7 gate alone.
+    //
+    // RED on the inverse: change either shipped call to `drive_migration_within(&cmd,
+    // MIGRATION_BUDGET)` and the second assertion fires (and the first drops to 1).
+    #[test]
+    fn every_shipped_migration_rides_the_instance_budget() {
+        let code = production_code(SOURCE);
+        assert_eq!(
+            method_call_count(&code, "drive_migration"),
+            EXPECTED_MIGRATIONS,
+            "expected {EXPECTED_MIGRATIONS} shipped `drive_migration(` calls (snapshot + restore). \
+             If one was legitimately added or removed, update EXPECTED_MIGRATIONS — do not delete \
+             the scan."
+        );
+        // The private short-budget seam has exactly ONE production caller — `drive_migration`'s
+        // own delegation — and it must hand in the instance's guest-RAM-proportional budget. A
+        // second caller, or this one passing anything else, is a shipped migration on the wrong
+        // budget.
+        let within = within_calls(&code);
+        assert_eq!(
+            within.len(),
+            1,
+            "`drive_migration_within` is the M7 gate's private seam: its only production caller \
+             is `drive_migration`'s own delegation. A shipped migration goes through \
+             `drive_migration`, which has no budget argument to get wrong (M6). Found: {within:?}"
+        );
+        assert!(
+            within[0].contains("self.snapshot_budget()"),
+            "the one `drive_migration_within` call must pass `self.snapshot_budget()`, never the \
+             flat MIGRATION_BUDGET floor: `{}`",
+            within[0]
+        );
+    }
+
+    /// The scanner's own controls: prose in a comment is not a call, and a rustfmt-wrapped call is
+    /// still seen whole — so the gate above is not a test that can only ever pass (AGENTS rule 2).
+    #[test]
+    fn the_migration_scanner_ignores_comments_and_survives_line_breaks() {
+        let synthetic = "// self.drive_migration(&cmd) in a comment is not a call site\n\
+             let r = self.drive_migration(\n    &migrate_cmd).await;\n\
+             async fn drive_migration_within(&self, c: &str, b: Duration) {}\n\
+             #[cfg(test)]\nmod tests { self.drive_migration_within(&c, BUDGET); }";
+        let code = production_code(synthetic);
+        // The wrapped call is seen whole; the comment and the `#[cfg(test)]` seam call are not.
+        assert_eq!(method_call_count(&code, "drive_migration"), 1, "{code}");
+        // The `_within` DEFINITION is present but is not a call, so no call is collected.
+        assert!(within_calls(&code).is_empty(), "{code}");
+        // …and a production `_within` CALL is seen, with the budget it passes visible — the
+        // regression shape the law forbids.
+        let regressed =
+            production_code("let r = self.drive_migration_within(&c, MIGRATION_BUDGET);");
+        let calls = within_calls(&regressed);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(!calls[0].contains("self.snapshot_budget()"), "{calls:?}");
+    }
+}
+
 /// Source-level gate for §9.4's "`api_socket_poll` paces **every** daemon readiness wait" on the
 /// shipped QEMU path — the sibling of `vmcell`'s `cloud_hypervisor::virtiofs_pacing_gate`, whose
 /// module doc carries the full rationale for scanning source instead of behavior.
@@ -2435,7 +2995,10 @@ mod virtiofs_pacing_gate {
 
     /// This file's production text: everything before the first `#[cfg(test)]`, comment lines
     /// dropped and whitespace collapsed.
-    fn production_code(source: &str) -> String {
+    ///
+    /// `pub(super)` so the sibling [`jail_composition_gate`](super::jail_composition_gate) reuses
+    /// this normalizer instead of carrying a third copy of it.
+    pub(super) fn production_code(source: &str) -> String {
         let production = source
             .split_once("#[cfg(test)]")
             .map_or(source, |(before, _)| before);
@@ -2510,5 +3073,95 @@ mod virtiofs_pacing_gate {
         let calls = virtiofs_start_calls(&code);
         assert_eq!(calls.len(), 1, "got {calls:?}");
         assert!(call_is_paced_by_the_vm_config(calls[0]), "got {calls:?}");
+    }
+}
+
+/// Source-level gate for M11's structural half on this backend: the launch is composed in
+/// **one** place, and no second `JailSpec` compilation can reappear beside it.
+///
+/// [`the_qemu_launch_plan_ships_the_configured_jail_posture`](tests::the_qemu_launch_plan_ships_the_configured_jail_posture)
+/// asserts the posture the plan *returns*; [`vmcell::vmm::LaunchPlan`]'s private field makes
+/// overwriting that record a compile error. Neither can see the one remaining regression:
+/// moving `jail_spec_from_config` + `build_vmm_cmd` back out of the plan into `qemu_launch_plan`
+/// or `spawn_qemu`, which re-opens the window between deciding the posture and applying it and
+/// leaves the plan's record describing a command nobody spawns. That is a property of this
+/// file's *text*, so it is scanned — the same shape as the sibling [`virtiofs_pacing_gate`],
+/// whose `production_code` normalizer this reuses rather than copies.
+///
+/// It catches: a raw `jail_spec_from_config` call in this backend, a second launch-plan
+/// construction, and a deleted one. It cannot catch: the wrong `JailConfig` handed to the plan —
+/// that is behavioral, and the KVM-free plan gate asserts it directly.
+#[cfg(test)]
+mod jail_composition_gate {
+    use super::virtiofs_pacing_gate::production_code;
+
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The number of launch-plan constructions this backend ships: one, in
+    /// [`super::qemu_launch_plan`].
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set, and a second
+    /// (possibly divergent) construction reddens too.
+    const EXPECTED_PLAN_BUILD_SITES: usize = 1;
+
+    /// Every call expression naming `needle` in `code`, truncated at its statement's `;`.
+    fn calls<'a>(code: &'a str, needle: &str) -> Vec<&'a str> {
+        code.match_indices(needle)
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_launch_is_composed_only_in_the_plan() {
+        let code = production_code(SOURCE);
+
+        let raw = calls(&code, "jail_spec_from_config(");
+        assert!(
+            raw.is_empty(),
+            "M11: this backend must compile no `JailSpec` of its own — the one compilation lives \
+             in `vmcell::vmm::LaunchPlan::build`, which records the very value it compiles. \
+             Found {raw:?}"
+        );
+        let raw_cmd = calls(&code, "build_vmm_cmd(");
+        assert!(
+            raw_cmd.is_empty(),
+            "M11: this backend must not build a VMM command outside the launch plan. Found \
+             {raw_cmd:?}"
+        );
+
+        // The anti-vacuity half: the two assertions above are satisfied by a file with no launch
+        // at all, so the launch must be here, exactly once.
+        let builds = calls(&code, "LaunchPlan::build(");
+        assert_eq!(
+            builds.len(),
+            EXPECTED_PLAN_BUILD_SITES,
+            "expected {EXPECTED_PLAN_BUILD_SITES} `LaunchPlan::build` call; found {}: {builds:?}. \
+             If a site was legitimately added or removed, update EXPECTED_PLAN_BUILD_SITES — do \
+             not delete the scan.",
+            builds.len()
+        );
+    }
+
+    /// The scanner's own controls: a prose mention is not a call site, a call split across two
+    /// rustfmt lines is still seen whole, and the regression shape is genuinely detected — so the
+    /// scan above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_scanner_sees_the_regression_and_ignores_comments() {
+        let regressed = "// the plan calls jail_spec_from_config for us\n\
+             let jail =\n    vmcell::vmm::jail::jail_spec_from_config(\n    &cfg.jail)?;\n\
+             #[cfg(test)]\nmod tests { LaunchPlan::build(x); }";
+        let code = production_code(regressed);
+        assert_eq!(calls(&code, "jail_spec_from_config(").len(), 1);
+        assert!(calls(&code, "LaunchPlan::build(").is_empty());
+
+        let composed = "// jail_spec_from_config in prose is not a call\n\
+             let mut plan =\n    vmcell::vmm::LaunchPlan::build(b, n,\n    cfg.jail)?;";
+        let code = production_code(composed);
+        assert!(calls(&code, "jail_spec_from_config(").is_empty());
+        assert_eq!(calls(&code, "LaunchPlan::build(").len(), 1);
     }
 }

@@ -19,8 +19,9 @@ fn vminfo(id: &str) -> VmInfo {
 }
 
 /// A fake engine with no KVM. `slow_get` sleeps so a concurrency test can prove the multiplex; a
-/// `get` of `"nope"` returns a typed `NotFound` so the error path round-trips.
-struct FakeEngine {
+/// `get` of `"nope"` returns a typed `NotFound` so the error path round-trips. Shared with the
+/// sibling deadline gates rather than copied (one fake, one behavior to reason about).
+pub(super) struct FakeEngine {
     slow_get_ms: u64,
 }
 
@@ -89,7 +90,9 @@ impl VmEngine for FakeEngine {
     async fn shutdown_all(&self) {}
 }
 
-fn serve_fake(slow_get_ms: u64) -> BrokerClientEngine {
+/// A [`FakeEngine`] served over a real socketpair, with the parent-side client wired to the
+/// **derived** per-request budget (`BrokerClientEngine::new`, i.e. `call_budget`) — not an override.
+pub(super) fn serve_fake(slow_get_ms: u64) -> BrokerClientEngine {
     let (client_sock, broker_sock) = tokio::net::UnixStream::pair().expect("socketpair");
     let engine: Arc<dyn VmEngine> = Arc::new(FakeEngine { slow_get_ms });
     tokio::spawn(serve_engine(engine, broker_sock));

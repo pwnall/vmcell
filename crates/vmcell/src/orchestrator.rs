@@ -102,9 +102,18 @@ struct FsIdClaim {
 impl FsIdClaim {
     /// Attempts to claim `id` in the cross-process lock directory.
     ///
-    /// Returns `true` when there is no cross-process locking configured (hermetic
-    /// mode) or the claim succeeded; `false` when another **live** process already
-    /// holds it.
+    /// Returns `Ok(true)` when there is no cross-process locking configured (hermetic
+    /// mode) or the claim succeeded; `Ok(false)` when another **live** process already
+    /// holds it; and a typed [`Error::Io`](crate::error::Error::Io) naming the failing
+    /// operation, the path and the errno when the lock directory itself could not be
+    /// used.
+    ///
+    /// That third arm is the point (finding `m3`): every I/O failure here used to
+    /// collapse into `false`, which the callers' full sweep then renders as
+    /// `Exhaustion("No available VMIDs (limit 254)")` — so an operator whose
+    /// `/tmp/vmcell-vmid` is unwritable, or occupied by a regular file, chases a
+    /// phantom capacity limit instead of reading `EACCES`. "This id is taken" and
+    /// "I cannot tell" are different answers and must stay distinguishable.
     ///
     /// Correctness under contention (H-ORCH-4): the whole read→decide→(re)claim runs
     /// while holding an **exclusive advisory lock** (`flock`) on a per-id
@@ -118,12 +127,13 @@ impl FsIdClaim {
     /// lock) sees `/proc/<pid>` is absent and reclaims it. The lock file is created
     /// *already carrying* the owner pid (never the old create-then-write two-step
     /// that could leave an empty, unreclaimable lock).
-    fn try_claim(&self, id: u32) -> bool {
+    fn try_claim(&self, id: u32) -> Result<bool> {
         use std::os::unix::io::AsRawFd;
         let Some(dir) = &self.dir else {
-            return true;
+            return Ok(true);
         };
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Self::claim_io_error("create the id-lock directory", dir, id, &e))?;
         let lock_path = dir.join(format!("{id}.lock"));
 
         // Serialize every cross-process claim/reclaim of THIS id on an exclusive
@@ -131,50 +141,123 @@ impl FsIdClaim {
         // open file descriptions is mutually exclusive even within one process, so
         // this serializes threads (the blessed-runner suite) *and* processes.
         let coord_path = dir.join(format!("{id}.coord"));
-        let Ok(coord) = std::fs::OpenOptions::new()
+        let coord = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
             .open(&coord_path)
-        else {
-            // Cannot coordinate → refuse rather than risk a dual-claim.
-            return false;
-        };
+            // Cannot coordinate → refuse rather than risk a dual-claim, and say why:
+            // this is the arm an unwritable lock directory lands in.
+            .map_err(|e| {
+                Self::claim_io_error("open the id coordination file", &coord_path, id, &e)
+            })?;
         // SAFETY: `flock(2)` on the valid open fd of `coord`; `coord` is borrowed for
         // the whole scope so the fd stays open, and the exclusive lock is released
         // when `coord` (its owning `File`) is dropped at the end of this function.
         if unsafe { libc::flock(coord.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return false;
+            return Err(Self::claim_io_error(
+                "flock the id coordination file",
+                &coord_path,
+                id,
+                &std::io::Error::last_os_error(),
+            ));
         }
 
         // Under the coordination lock. A lock file that exists blocks the claim only
         // while its owner is alive; a dead/empty (crashed-owner) lock is reclaimed.
         if lock_path.exists() {
-            let owner_alive = std::fs::read_to_string(&lock_path)
-                .ok()
-                .and_then(|c| c.trim().parse::<u32>().ok())
-                .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+            let owner_alive = match std::fs::read_to_string(&lock_path) {
+                Ok(contents) => contents
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()),
+                // The lock vanished between `exists()` and the read: nobody owns it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                // Anything else (EACCES on the lock file, EIO) means we cannot tell
+                // whether the owner is alive — never guess "dead" and steal the id.
+                Err(e) => {
+                    return Err(Self::claim_io_error(
+                        "read the id lock owner",
+                        &lock_path,
+                        id,
+                        &e,
+                    ));
+                }
+            };
             if owner_alive {
-                return false;
+                return Ok(false);
             }
-            let _ = std::fs::remove_file(&lock_path);
+            if let Err(e) = std::fs::remove_file(&lock_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(Self::claim_io_error(
+                    "remove the stale id lock",
+                    &lock_path,
+                    id,
+                    &e,
+                ));
+            }
         }
         // The path is free and we exclusively hold the coordination lock: claim it.
         Self::atomic_claim(dir, &lock_path, id)
     }
 
+    /// The **one** renderer for an id-lock I/O failure: names the operation, the path
+    /// and the errno, so the resulting [`Error::Io`](crate::error::Error::Io) can never
+    /// be mistaken for the `Exhaustion` a genuinely full id space produces.
+    fn claim_io_error(
+        op: &str,
+        path: &std::path::Path,
+        id: u32,
+        e: &std::io::Error,
+    ) -> crate::error::Error {
+        crate::error::Error::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "cannot {op} for id {id} at {}: {e} — this is an I/O failure, not an \
+                 exhausted id space",
+                path.display()
+            ),
+        ))
+    }
+
     /// Creates `lock_path` as a fresh hard link to a temp file already containing
     /// our pid. `hard_link` fails if `lock_path` exists, giving mutual exclusion,
     /// and the winning lock is never observably empty. The temp is always removed.
-    fn atomic_claim(dir: &std::path::Path, lock_path: &std::path::Path, id: u32) -> bool {
+    ///
+    /// `Ok(false)` is reserved for the one meaning "another claimer got there first"
+    /// (`EEXIST` on the link); a write or link failure of any other shape is the typed
+    /// I/O error, never a silent "taken" (finding `m3`).
+    fn atomic_claim(dir: &std::path::Path, lock_path: &std::path::Path, id: u32) -> Result<bool> {
         let tmp = dir.join(format!("{id}.lock.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, std::process::id().to_string()).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return false;
+        if let Err(e) = std::fs::write(&tmp, std::process::id().to_string()) {
+            Self::remove_claim_tmp(&tmp);
+            return Err(Self::claim_io_error("write the id lock", &tmp, id, &e));
         }
-        let linked = std::fs::hard_link(&tmp, lock_path).is_ok();
-        let _ = std::fs::remove_file(&tmp);
+        let linked = match std::fs::hard_link(&tmp, lock_path) {
+            Ok(()) => Ok(true),
+            // The only "someone else owns it" shape; every other errno is an I/O fault.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(Self::claim_io_error("link the id lock", lock_path, id, &e)),
+        };
+        Self::remove_claim_tmp(&tmp);
         linked
+    }
+
+    /// Removes the claim scratch file. Best-effort by construction — the claim's outcome
+    /// is already decided — but warned rather than discarded, so a lock directory that
+    /// starts accumulating `*.tmp` leftovers is visible instead of silent.
+    fn remove_claim_tmp(tmp: &std::path::Path) {
+        if let Err(e) = std::fs::remove_file(tmp)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "failed to remove id-claim temp file {}: {}",
+                tmp.display(),
+                e
+            );
+        }
     }
 
     /// Releases the cross-process lock for `id`, if any.
@@ -294,12 +377,15 @@ impl VmidAllocator {
     /// Allocates and returns the next available unique VMID.
     ///
     /// # Errors
-    /// Returns an error if all 254 VMIDs are currently in use.
+    /// Returns [`crate::error::Error::Exhaustion`] if all 254 VMIDs are currently in
+    /// use, or [`crate::error::Error::Io`] naming the path and errno if the
+    /// cross-process lock directory cannot be used at all — an unusable lock directory
+    /// is **not** a full id space and must not be reported as one (finding `m3`).
     pub fn allocate(&self) -> Result<u32> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         // The one seeded search order (ORCH-8), shared with `SegmentIdAllocator`.
         for vmid in seeded_id_order(&*self.clock, 254) {
-            if !active.contains(&vmid) && self.claim.try_claim(vmid) {
+            if !active.contains(&vmid) && self.claim.try_claim(vmid)? {
                 active.insert(vmid);
                 return Ok(vmid);
             }
@@ -313,8 +399,10 @@ impl VmidAllocator {
     ///
     /// # Errors
     /// Returns [`crate::error::Error::Config`] if `vmid` is out of the `1..=254`
-    /// range, or [`crate::error::Error::Exhaustion`] if it is already reserved
-    /// (in-process or by another live process).
+    /// range, [`crate::error::Error::Exhaustion`] if it is already reserved
+    /// (in-process or by another live process), or [`crate::error::Error::Io`] if the
+    /// cross-process lock directory could not be used (finding `m3` — an I/O failure
+    /// is never reported as a conflict).
     pub fn reserve(&self, vmid: u32) -> Result<u32> {
         if !(1..=254).contains(&vmid) {
             return Err(crate::error::Error::Config(format!(
@@ -327,7 +415,7 @@ impl VmidAllocator {
                 "VMID {vmid} already reserved"
             )));
         }
-        if !self.claim.try_claim(vmid) {
+        if !self.claim.try_claim(vmid)? {
             return Err(crate::error::Error::Exhaustion(format!(
                 "VMID {vmid} already in use by another process"
             )));
@@ -459,11 +547,14 @@ impl SegmentIdAllocator {
     ///
     /// # Errors
     /// Returns [`crate::error::Error::Exhaustion`] when all
-    /// [`crate::net::MAX_SEGMENT_ID`] ids are in use.
+    /// [`crate::net::MAX_SEGMENT_ID`] ids are in use, or [`crate::error::Error::Io`]
+    /// naming the path and errno when the cross-process lock directory cannot be used
+    /// (finding `m3` — the same distinction the vmid allocator makes, through the same
+    /// claim core).
     pub fn allocate(&self) -> Result<u32> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         for segid in seeded_id_order(&*self.clock, crate::net::MAX_SEGMENT_ID) {
-            if !active.contains(&segid) && self.claim.try_claim(segid) {
+            if !active.contains(&segid) && self.claim.try_claim(segid)? {
                 active.insert(segid);
                 return Ok(segid);
             }
@@ -554,8 +645,11 @@ pub struct MicroVm<V: Vmm> {
     cid: Option<CidGuard>,
     /// The per-VM scratch-directory guard. Created early in `start()`/`restore()`
     /// (before networking) so a partway construction failure still reclaims it,
-    /// and dropped LAST on teardown — after the instance, smoltcp, and daemons
-    /// whose sockets live inside it are gone.
+    /// and dropped on teardown after the instance, smoltcp, and daemons whose
+    /// sockets live inside it are gone — but **before** the vmid, because its path
+    /// is a pure function of `(prefix, pid, vmid)` and releasing the id first lets a
+    /// same-process reallocation mint the same directory only for this guard to
+    /// delete it (finding `m2`).
     tmp_dir: Option<crate::vmm::VmTempDir>,
     /// Per-VM hot-path timing knobs captured from the [`VmConfig`] at
     /// construction, so `agent()`'s connect cadence and `shutdown()`'s grace
@@ -598,18 +692,23 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// Transient holder for the resources `setup_env` allocates before the VMM
-/// instance exists. On the happy path each resource is `take()`n into `MicroVm` (and
-/// the `cgroup_guard` disarmed) before the instance is built; on any mid-construction
-/// failure (`create`/`boot`/`restore`/`resume`) the **explicit [`Drop`]** below
-/// releases the un-taken resources through the shared [`release_net_before_netns`]
-/// helper — the SAME ordered net teardown `teardown_post_instance` uses (design §18,
-/// Delta register: changes from the validated v27 build, delta 7, L1, §9.4,
-/// Timeouts and the lifecycle nuances). Making the order explicit (not a fragile field-declaration
-/// order) means a field reorder can no longer silently delete the netns before the
-/// proxy running inside it. `cid_guard` is `Option` so the success path can `take()`
-/// it out (a field of a type that implements `Drop` cannot be moved out).
-struct EnvSetup {
+/// The per-VM **net** resources, owned by one guard from the instant the first of them
+/// exists until they are either handed to a [`MicroVm`] or released.
+///
+/// This exists because ownership, not tidiness, is what makes law L1 hold. `setup_env`
+/// used to hold `netns` / `proxy` / `smoltcp` / `segment` as four separate locals and only
+/// gather them into [`EnvSetup`] at the very end — after
+/// [`assert_tap_wiring_matches`](crate::config::assert_tap_wiring_matches),
+/// `create_slice` and `cids.allocate`. Every `?` in that window released them by
+/// **reverse-declaration order** (segment → proxy → smoltcp → netns) instead of the law's
+/// order, which is a fourth teardown path outside L1's three, benign only by the accident
+/// of which local happened to be declared first (finding `d2`). Constructing this guard
+/// **before** any fallible step closes the window: there is no instant at which a net
+/// resource is owned by anything but the one ordered helper.
+///
+/// [`Drop`] is explicit (never field-declaration order) and routes through
+/// [`release_net_before_netns`], the SAME helper `teardown_post_instance` uses.
+struct StagedNet {
     proxy: Option<EgressProxy>,
     #[cfg(feature = "net-unprivileged")]
     smoltcp: Option<SmoltcpProcess>,
@@ -617,52 +716,221 @@ struct EnvSetup {
     /// This VM's segment slot + tap, when it is a member (§6.5). Released through the same shared
     /// [`release_net_before_netns`] helper as every other net resource.
     segment: Option<crate::net::SegmentMember>,
-    cgroup_guard: CgroupGuard,
-    cid_guard: Option<CidGuard>,
-    res: PerVmResources,
+    /// Optional release recorder — `None` on every production path, `Some` only for the `d2`
+    /// order gate (see [`ReleaseTimeline`]).
+    timeline: Option<ReleaseTimeline>,
 }
 
-/// The single ordered net teardown both the success path ([`MicroVm::teardown_post_instance`]) and
-/// the mid-`start()` error path ([`EnvSetup`]'s [`Drop`]) route through (design §18, Delta register:
-/// changes from the validated v27 build, delta 7, L1, §9.4, Timeouts and the lifecycle nuances).
-/// The egress proxy and the smoltcp NAT hold sockets/threads INSIDE the netns, so they are
-/// released BEFORE the netns is deleted — deleting a netns while a process still holds interfaces in
-/// it hangs/leaks. One helper, never a second copy: a field reorder cannot silently invert this.
-fn release_net_before_netns(
-    proxy: &mut Option<EgressProxy>,
-    #[cfg(feature = "net-unprivileged")] smoltcp: &mut Option<SmoltcpProcess>,
-    netns: &mut Option<NetNamespace>,
-    segment: &mut Option<crate::net::SegmentMember>,
-) {
-    #[cfg(feature = "net-unprivileged")]
-    drop(smoltcp.take());
-    drop(proxy.take());
-    // `NetNamespace::Drop` performs the single idempotent teardown, surfacing a genuine failure via
-    // the NET-8 warning; dropping the taken value tears it down exactly once.
-    drop(netns.take());
-    // §6.5 (VM-to-VM segments): a member releases its SLOT and its TAP here — never the segment
-    // namespace, which dies with the last `NetSegment` Arc holder (this guard holds one, so the
-    // namespace necessarily outlives the VMM this teardown already reaped). The segment path
-    // leaves `netns == None`, so the take above is a no-op for it; the order is still one law.
-    drop(segment.take());
+/// The deterministic seam the `d2` teardown-order gate observes: each net resource's release is
+/// appended here, by [`release_slot`], the instant after that resource's own [`Drop`] has run.
+///
+/// It exists because the first version of that gate read a **thread-local `tracing` subscriber**
+/// (`set_default`) for `SmoltcpProcess`/`EgressProxy`'s own drop events, while tracing's
+/// callsite-interest cache is process-global: a sibling test that dropped a `SmoltcpProcess` with
+/// no subscriber installed cached `Interest::never()` for that callsite, after which the event was
+/// never delivered to anyone — so the gate failed with `"SmoltcpProcess dropping!" not recorded`
+/// in whole-suite runs and passed in isolation. A gate that reddens for reasons unrelated to its
+/// property is worse than no gate. This recorder is handed to exactly one `StagedNet`, is read
+/// only by its owner, and shares no process-global state, so parallelism cannot reach it.
+///
+/// It is deliberately NOT a [`HostEnv`] field: `HostEnv` is public contract surface, and this
+/// observes one private guard's `Drop`, not a host facility.
+#[derive(Clone, Default)]
+struct ReleaseTimeline(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+impl ReleaseTimeline {
+    /// Appends one release. Poison-tolerant: a panicking sibling must not turn this gate into a
+    /// second panic that hides the first.
+    fn note(&self, slot: &'static str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+    }
+
+    /// The releases recorded so far, in order. Read by the one gate that attaches a recorder —
+    /// cfg'd to exactly that test's own configuration so a build without it carries no dead code.
+    #[cfg(all(test, feature = "net-unprivileged", feature = "proxy"))]
+    fn releases(&self) -> Vec<&'static str> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
-impl Drop for EnvSetup {
+/// Releases one staged net resource and — when a recorder is attached — notes it.
+///
+/// The note is *bound to the drop*: the value is moved out of `slot` and destroyed by this
+/// function, and the label is recorded only afterwards, so a recorded label proves that
+/// resource's `Drop` ran here, and reordering the calls in [`release_net_before_netns`] reorders
+/// the timeline with them. An empty slot records nothing (a resource that never existed cannot be
+/// released).
+fn release_slot<T>(timeline: Option<&ReleaseTimeline>, slot: &'static str, held: &mut Option<T>) {
+    let Some(resource) = held.take() else {
+        return;
+    };
+    drop(resource);
+    if let Some(t) = timeline {
+        t.note(slot);
+    }
+}
+
+impl StagedNet {
+    /// An empty staging guard — the state before the `cfg.net` match allocates anything.
+    ///
+    /// `timeline` is `None` everywhere but the `d2` order gate.
+    fn empty(timeline: Option<ReleaseTimeline>) -> Self {
+        Self {
+            proxy: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            netns: None,
+            segment: None,
+            timeline,
+        }
+    }
+}
+
+impl Drop for StagedNet {
     fn drop(&mut self) {
-        // Mid-`start()` error path: release the net resources (proxy/smoltcp before the netns)
-        // through the shared helper, then the struct's own fields drop in declaration order —
-        // `cgroup_guard` (armed → deletes the slice) before `cid_guard` (releases the CID). On the
-        // success path these were `take()`n / disarmed, so this is a no-op. Same net → cgroup → cid
-        // order as `teardown_post_instance`.
         release_net_before_netns(
             &mut self.proxy,
             #[cfg(feature = "net-unprivileged")]
             &mut self.smoltcp,
             &mut self.netns,
             &mut self.segment,
+            self.timeline.as_ref(),
         );
     }
 }
+
+/// Transient holder for the resources `setup_env` allocates before the VMM
+/// instance exists. On the happy path each resource is `take()`n into `MicroVm` (and
+/// the `cgroup_guard` disarmed) before the instance is built; on any mid-construction
+/// failure (`create`/`boot`/`restore`/`resume`) the un-taken resources are released
+/// through [`StagedNet`]'s explicit [`Drop`] — the SAME ordered net teardown
+/// `teardown_post_instance` uses (design §18, Delta register: changes from the validated
+/// v27 build, delta 7, L1, §9.4, Timeouts and the lifecycle nuances). Making the order
+/// explicit (not a fragile field-declaration order) means a field reorder can no longer
+/// silently delete the netns before the proxy running inside it. `cid_guard` is `Option`
+/// so the success path can `take()` it out.
+///
+/// `net` is declared **first** so the net → cgroup → cid order also holds for this
+/// struct's own fields, matching `teardown_post_instance`.
+struct EnvSetup {
+    net: StagedNet,
+    cgroup_guard: CgroupGuard,
+    cid_guard: Option<CidGuard>,
+    res: PerVmResources,
+}
+
+/// The single ordered net teardown both the success path ([`MicroVm::teardown_post_instance`]) and
+/// the mid-`start()` error path ([`StagedNet`]'s [`Drop`]) route through (design §18, Delta register:
+/// changes from the validated v27 build, delta 7, L1, §9.4, Timeouts and the lifecycle nuances).
+/// The egress proxy and the smoltcp NAT hold sockets/threads INSIDE the netns, so they are
+/// released BEFORE the netns is deleted — deleting a netns while a process still holds interfaces in
+/// it hangs/leaks. One helper, never a second copy: a field reorder cannot silently invert this.
+///
+/// `timeline` is the `d2` gate's recorder ([`ReleaseTimeline`]) and is `None` on every production
+/// path; each release notes itself through [`release_slot`], so the recorded order IS this
+/// function's statement order and a release that happened somewhere else records nothing.
+fn release_net_before_netns(
+    proxy: &mut Option<EgressProxy>,
+    #[cfg(feature = "net-unprivileged")] smoltcp: &mut Option<SmoltcpProcess>,
+    netns: &mut Option<NetNamespace>,
+    segment: &mut Option<crate::net::SegmentMember>,
+    timeline: Option<&ReleaseTimeline>,
+) {
+    #[cfg(feature = "net-unprivileged")]
+    release_slot(timeline, "smoltcp", smoltcp);
+    release_slot(timeline, "proxy", proxy);
+    // `NetNamespace::Drop` performs the single idempotent teardown, surfacing a genuine failure via
+    // the NET-8 warning; dropping the taken value tears it down exactly once.
+    release_slot(timeline, "netns", netns);
+    // §6.5 (VM-to-VM segments): a member releases its SLOT and its TAP here — never the segment
+    // namespace, which dies with the last `NetSegment` Arc holder (this guard holds one, so the
+    // namespace necessarily outlives the VMM this teardown already reaped). The segment path
+    // leaves `netns == None`, so the take above is a no-op for it; the order is still one law.
+    release_slot(timeline, "segment", segment);
+}
+
+/// What a per-VM netns's nft ruleset must be, for a given [`Egress`](crate::config::Egress).
+///
+/// See [`privileged_egress_rules`].
+#[derive(Debug, PartialEq, Eq)]
+enum PrivilegedEgressRules<'a> {
+    /// `Filtered`: start the transparent proxy in the netns and emit the TPROXY ruleset
+    /// pointing at it (`policy drop`, admitting tcp/80,443 via TPROXY plus the proxy port).
+    Tproxy(&'a crate::config::ProxyConfig),
+    /// `Blocked`: emit the accepts-nothing ruleset — the TPROXY shape minus both accept
+    /// rules — and no TPROXY routing, because there is no proxy to route to.
+    Blocked,
+    /// `Open`: emit nothing. The netns keeps whatever its datapath natively provides.
+    NoRules,
+}
+
+/// The **one** privileged-arm egress law (M1): which nft ruleset a per-VM netns is given.
+///
+/// Split out of `setup_env` for the same reason as [`nat_egress_plan`] — that function builds
+/// its namespace through the real `RtNetlink`, so the routing decision is unreachable from a
+/// unit test without CAP_NET_ADMIN, and the defect this records was precisely a routing
+/// decision: `Blocked` shared `Open`'s empty else-path, so **no nft table was installed at
+/// all** and the netns kept the kernel's default `accept` policy — strictly more permissive
+/// than `Filtered`, while the variant's rustdoc promised the opposite. The `match` is
+/// exhaustive, so a new variant is a compile error here rather than another silent
+/// fall-through.
+fn privileged_egress_rules(egress: &crate::config::Egress) -> PrivilegedEgressRules<'_> {
+    match egress {
+        crate::config::Egress::Filtered(proxy_cfg) => PrivilegedEgressRules::Tproxy(proxy_cfg),
+        crate::config::Egress::Blocked => PrivilegedEgressRules::Blocked,
+        crate::config::Egress::Open => PrivilegedEgressRules::NoRules,
+    }
+}
+
+/// The **one** unprivileged-arm egress law (M1): which forward ports the smoltcp NAT
+/// registers, and whether it may dial host targets on the guest's behalf at all.
+///
+/// Split out of `setup_env` because that is the only way the decision is testable: everything
+/// downstream of it lives inside the NAT's own threads and guest-side stack, invisible from a
+/// host unit test, and `setup_env`'s unprivileged arm cannot be driven with a recording NAT.
+/// The `match` is exhaustive, so a new [`Egress`](crate::config::Egress) variant is a compile
+/// error here instead of a silent fall-through into the most permissive arm — which is
+/// exactly the defect M1 records (`Blocked` shared `Open`'s empty else-path and was therefore
+/// indistinguishable from it).
+///
+/// Under `Blocked`: no forward port at all. Not the proxy port (no proxy is started), and not
+/// `host_services_port` either — that is a host endpoint the guest dials **out** to, so it is
+/// egress by any reading of the variant's promise. The NAT additionally refuses the
+/// per-mapping host dial ([`NatEgressPolicy::Deny`](crate::net::smoltcp::backend::NatEgressPolicy::Deny)),
+/// because on this datapath every byte leaves through that dial.
+#[cfg(feature = "net-unprivileged")]
+fn nat_egress_plan(
+    egress: &crate::config::Egress,
+    host_services_port: Option<u16>,
+    proxy_port: Option<u16>,
+) -> (Vec<u16>, crate::net::smoltcp::backend::NatEgressPolicy) {
+    use crate::net::smoltcp::backend::NatEgressPolicy;
+    match egress {
+        crate::config::Egress::Blocked => (Vec::new(), NatEgressPolicy::Deny),
+        crate::config::Egress::Filtered(_) | crate::config::Egress::Open => {
+            let mut ports = Vec::new();
+            if let Some(p) = host_services_port {
+                ports.push(p);
+            }
+            // Register the egress proxy's port as a permanent forward-port so a guest
+            // configured with `http_proxy=<gateway>:<proxy_port>` reaches it: permanent
+            // listeners are pre-armed and re-armed (unlike the dynamic SYN-intercept path),
+            // which the explicit-proxy egress tests rely on.
+            if let Some(p) = proxy_port {
+                ports.push(p);
+            }
+            (ports, NatEgressPolicy::Allow)
+        }
+    }
+}
+
+// `EnvSetup` deliberately has NO `Drop` of its own: the mid-`start()` error path is served by
+// `StagedNet`'s explicit `Drop` (the net resources, in the one helper's order), and this
+// struct's remaining fields then drop in declaration order — `net` (already released),
+// `cgroup_guard` (armed → deletes the slice), `cid_guard` (releases the CID). Same
+// net → cgroup → cid order as `teardown_post_instance`. Adding a `Drop` here would also make
+// the success path's `take()`s the only way to move resources out; keeping it absent is what
+// lets `StagedNet` own the ordering law alone.
 
 /// Minimal guest-resync seam the one-shot post-restore resync needs.
 ///
@@ -919,19 +1187,27 @@ impl<V: Vmm> MicroVm<V> {
         self.proxy.as_ref()
     }
 
+    /// Allocates every per-VM resource that must exist before the VMM instance does.
+    ///
+    /// `release_timeline` is the `d2` order gate's recorder ([`ReleaseTimeline`]) and is `None`
+    /// on both production call sites. It is a parameter rather than a [`HostEnv`] field because
+    /// `HostEnv` is public contract surface and this observes one private guard's `Drop`; it is
+    /// a parameter rather than ambient state (a thread-local, a global, a `tracing` subscriber)
+    /// because ambient state is exactly what made the first version of that gate flaky.
     async fn setup_env(
         vmid: u32,
         tmp_dir: &std::path::Path,
         cfg: &VmConfig,
         env: &HostEnv,
+        release_timeline: Option<ReleaseTimeline>,
     ) -> Result<EnvSetup> {
-        let mut netns = None;
-        #[cfg(feature = "net-unprivileged")]
-        let mut smoltcp = None;
-        let mut proxy = None;
+        // d2: the net resources are owned by ONE guard from the instant the first of them
+        // exists. Every `?` below — inside the match and, crucially, in the three fallible
+        // steps after it — therefore releases them through the one ordered helper
+        // (smoltcp → proxy → netns → segment) instead of by reverse-declaration order.
+        let mut net = StagedNet::empty(release_timeline);
         let mut tap_name = None;
         let mut netns_name = None;
-        let mut segment_member: Option<crate::net::SegmentMember> = None;
         let mut res_segment: Option<crate::net::SegmentMembership> = None;
         // `mut`: reassigned on the `net-unprivileged` leg below, which `host-common` always enables
         // (and this fn only compiles under `host-common`), so the binding is unconditionally mutated.
@@ -939,11 +1215,8 @@ impl<V: Vmm> MicroVm<V> {
 
         match &cfg.net {
             crate::config::NetConfig::Privileged { egress } => {
-                // `egress` is consumed below only under `feature = "proxy"`; the
-                // discard silences the unused binding when the proxy is compiled
-                // out (it is a config selector, not a resource). `host_services_port`
-                // is not a privileged-path field any more (design §18, Delta register: changes from the validated v27 build, delta 4).
-                let _ = egress;
+                // `host_services_port` is not a privileged-path field any more (design §18,
+                // Delta register: changes from the validated v27 build, delta 4).
                 let ns = NetNamespace::create(
                     &cfg.resource_prefix,
                     vmid,
@@ -951,57 +1224,91 @@ impl<V: Vmm> MicroVm<V> {
                 )?;
                 tap_name = Some(ns.tap_name.clone());
                 netns_name = Some(ns.name.clone());
+                // Owned by the staging guard before the first fallible step below (d2).
+                net.netns = Some(ns);
 
-                if let crate::config::Egress::Filtered(proxy_cfg) = egress {
-                    #[cfg(feature = "proxy")]
-                    {
-                        // Privileged egress front-end: the nft TPROXY ruleset
-                        // (`tproxy to :<port>`, emitted below) redirects the guest's
-                        // tcp/80,443 into this listener, so it MUST be an
-                        // `IP_TRANSPARENT` socket for the kernel to deliver the
-                        // redirected connections and preserve the original
-                        // destination (H-PROXY-1). `start_transparent` fails loud if
-                        // `IP_TRANSPARENT` cannot be set (e.g. missing CAP_NET_ADMIN)
-                        // rather than silently degrading to a non-transparent bind
-                        // that TPROXY cannot deliver to. NOTE: hudsucker is an
-                        // explicit-proxy MITM (expects CONNECT/absolute-form), so a
-                        // fully transparent HTTP MITM additionally needs absolute-form
-                        // reconstruction from the recovered destination; that is
-                        // tracked as follow-up — see implementation-notes.md.
-                        let px = EgressProxy::start_transparent(crate::proxy::ProxyConfig {
-                            port: 0,
-                            netns: Some(crate::naming::netns_name(&cfg.resource_prefix, vmid)),
-                            doubles: proxy_cfg.doubles.clone(),
-                            blocked_domains: proxy_cfg.blocked_domains.clone(),
-                        })
-                        .await?;
-                        ns.emit_proxy_rules(px.port, &crate::net::tap::DefaultNftApplier)?;
-                        proxy = Some(px);
+                // Which ruleset this netns gets is the one `privileged_egress_rules` law (M1);
+                // only the *effects* live here. The old `if let Egress::Filtered(..)` gave
+                // `Blocked` and `Open` one shared empty else-path, so `Blocked` — whose
+                // rustdoc promised "all egress traffic is blocked" — installed NO nft table
+                // at all and left the netns on the kernel's default `accept` policy: strictly
+                // MORE permissive than `Filtered`.
+                match privileged_egress_rules(egress) {
+                    PrivilegedEgressRules::Tproxy(proxy_cfg) => {
+                        #[cfg(feature = "proxy")]
+                        {
+                            // Privileged egress front-end: the nft TPROXY ruleset
+                            // (`tproxy to :<port>`, emitted below) redirects the guest's
+                            // tcp/80,443 into this listener, so it MUST be an
+                            // `IP_TRANSPARENT` socket for the kernel to deliver the
+                            // redirected connections and preserve the original
+                            // destination (H-PROXY-1). `start_transparent` fails loud if
+                            // `IP_TRANSPARENT` cannot be set (e.g. missing CAP_NET_ADMIN)
+                            // rather than silently degrading to a non-transparent bind
+                            // that TPROXY cannot deliver to. NOTE: hudsucker is an
+                            // explicit-proxy MITM (expects CONNECT/absolute-form), so a
+                            // fully transparent HTTP MITM additionally needs absolute-form
+                            // reconstruction from the recovered destination; that is
+                            // tracked as follow-up — see implementation-notes.md.
+                            let px = EgressProxy::start_transparent(crate::proxy::ProxyConfig {
+                                port: 0,
+                                netns: Some(crate::naming::netns_name(&cfg.resource_prefix, vmid)),
+                                doubles: proxy_cfg.doubles.clone(),
+                                blocked_domains: proxy_cfg.blocked_domains.clone(),
+                            })
+                            .await?;
+                            let proxy_port = px.port;
+                            net.proxy = Some(px);
+                            net.netns
+                                .as_ref()
+                                .expect("the netns was stored above")
+                                .emit_proxy_rules(
+                                    proxy_port,
+                                    &crate::net::tap::DefaultNftApplier,
+                                )?;
+                        }
                     }
+                    // NOT behind `feature = "proxy"`: an accepts-nothing ruleset needs no
+                    // proxy, and gating it there is what would re-open the silent-no-op hole
+                    // on a proxy-less build.
+                    PrivilegedEgressRules::Blocked => {
+                        net.netns
+                            .as_ref()
+                            .expect("the netns was stored above")
+                            .emit_blocked_rules(&crate::net::tap::DefaultNftApplier)?;
+                    }
+                    // No interception and no ruleset: connectivity is whatever the privileged
+                    // datapath natively provides (see `Egress::Open`'s rustdoc).
+                    PrivilegedEgressRules::NoRules => {}
                 }
-
-                netns = Some(ns);
             }
             crate::config::NetConfig::Unprivileged {
                 egress,
                 host_services_port,
             } => {
-                let _ = host_services_port;
                 let mut _proxy_port = 0;
 
-                if let crate::config::Egress::Filtered(proxy_cfg) = egress {
-                    #[cfg(feature = "proxy")]
-                    {
-                        let px = EgressProxy::start(ProxyConfig {
-                            port: 0,
-                            netns: None,
-                            doubles: proxy_cfg.doubles.clone(),
-                            blocked_domains: proxy_cfg.blocked_domains.clone(),
-                        })
-                        .await?;
-                        _proxy_port = px.port;
-                        proxy = Some(px);
+                // Starting the proxy is the only *effect* this arm's egress selector has
+                // before the NAT is built; everything else it decides lives in the one
+                // `nat_egress_plan` law below. Exhaustive for the same reason as the
+                // privileged arm above (M1).
+                match egress {
+                    crate::config::Egress::Filtered(proxy_cfg) => {
+                        #[cfg(feature = "proxy")]
+                        {
+                            let px = EgressProxy::start(ProxyConfig {
+                                port: 0,
+                                netns: None,
+                                doubles: proxy_cfg.doubles.clone(),
+                                blocked_domains: proxy_cfg.blocked_domains.clone(),
+                            })
+                            .await?;
+                            _proxy_port = px.port;
+                            net.proxy = Some(px);
+                        }
                     }
+                    // No proxy is started under either of these.
+                    crate::config::Egress::Blocked | crate::config::Egress::Open => {}
                 }
                 #[cfg(feature = "net-unprivileged")]
                 {
@@ -1010,26 +1317,36 @@ impl<V: Vmm> MicroVm<V> {
                     // handed to BOTH the smoltcp helper (which binds/unlinks it) and
                     // the VMM (via `vhost_user_socket`) so both sides agree.
                     let socket_path = tmp_dir.join("smoltcp.sock");
-                    let mut ports = vec![];
                     let proxy_port_opt = if _proxy_port > 0 {
                         Some(_proxy_port)
                     } else {
                         None
                     };
-                    if let Some(p) = host_services_port {
-                        ports.push(*p);
-                    }
-                    // Register the egress proxy's port as a permanent forward-port so a guest
-                    // configured with `http_proxy=<gateway>:<proxy_port>` reaches it: permanent
-                    // listeners are pre-armed and re-armed (unlike the dynamic SYN-intercept
-                    // path), which the explicit-proxy egress tests rely on.
-                    if let Some(p) = proxy_port_opt {
-                        ports.push(p);
-                    }
-                    let p = SmoltcpProcess::start(vmid, ports, proxy_port_opt, socket_path.clone());
+                    let (ports, nat_egress) =
+                        nat_egress_plan(egress, *host_services_port, proxy_port_opt);
+                    let p = SmoltcpProcess::start(
+                        vmid,
+                        ports,
+                        proxy_port_opt,
+                        socket_path.clone(),
+                        nat_egress,
+                    );
                     vhost_user_socket = Some(socket_path);
-                    smoltcp = Some(p);
+                    // Owned by the staging guard before the first fallible step below (d2).
+                    net.smoltcp = Some(p);
                 }
+                // Without the NAT there is no unprivileged datapath at all, so an
+                // `Unprivileged` config cannot be honored — refuse it rather than boot a VM
+                // with silently different networking (F1: honored or rejected). Unreachable
+                // in practice: this module only compiles under `host-common`, which always
+                // enables `net-unprivileged`.
+                #[cfg(not(feature = "net-unprivileged"))]
+                return Err(crate::error::Error::CapabilityUnavailable {
+                    op: format!(
+                        "NetConfig::Unprivileged (host_services_port {host_services_port:?})"
+                    ),
+                    needed: "the `net-unprivileged` feature (the smoltcp NAT datapath)".to_string(),
+                });
             }
             crate::config::NetConfig::Segment { segment } => {
                 // §6.5 (VM-to-VM segments): a member has NO per-VM netns. Its tap is created in
@@ -1041,7 +1358,8 @@ impl<V: Vmm> MicroVm<V> {
                 tap_name = Some(member.membership().tap_name.clone());
                 netns_name = Some(member.membership().netns.clone());
                 res_segment = Some(member.membership().clone());
-                segment_member = Some(member);
+                // Owned by the staging guard before the first fallible step below (d2).
+                net.segment = Some(member);
             }
             crate::config::NetConfig::None => {}
         }
@@ -1090,11 +1408,7 @@ impl<V: Vmm> MicroVm<V> {
             res,
             cid_guard: Some(cid_guard),
             cgroup_guard,
-            netns,
-            segment: segment_member,
-            #[cfg(feature = "net-unprivileged")]
-            smoltcp,
-            proxy,
+            net,
         })
     }
 
@@ -1134,7 +1448,7 @@ impl<V: Vmm> MicroVm<V> {
         // so its guard reclaims it even if setup or create/boot fails partway, and
         // so the smoltcp NAT socket can live inside it.
         let tmp_dir = crate::vmm::VmTempDir::create(&cfg.resource_prefix, vmid.vmid).await?;
-        let mut staged = Self::setup_env(vmid.vmid, tmp_dir.path(), &cfg, env).await?;
+        let mut staged = Self::setup_env(vmid.vmid, tmp_dir.path(), &cfg, env, None).await?;
 
         let mut instance = vmm.create(&cfg, &staged.res, &*env.cgroups).await?;
         info!("Booting instance...");
@@ -1149,8 +1463,16 @@ impl<V: Vmm> MicroVm<V> {
         // probes it with a bounded budget; a wedged VM is re-spawned rather than
         // handed back to reveal the wedge ~10 s later as an agent-connect timeout. A
         // healthy transport answers well within the budget, so this adds no wait on
-        // the common path. Re-spawn recreates on the SAME per-VM resources
-        // (netns/tap/cgroup/CID/dir); `spawn_qemu` pre-cleans stale sockets.
+        // the common path.
+        //
+        // What a re-spawn does and does not re-create (M2 — the earlier "recreates on the
+        // SAME per-VM resources" phrasing is what let the NAT be overlooked): only the VMM
+        // *instance* is dropped and re-created. Everything in `staged` is untouched and
+        // re-used verbatim — the netns/tap, the cgroup slice, the CID, the scratch dir, the
+        // egress proxy, and the smoltcp NAT process, including the vhost-user socket it
+        // bound. `spawn_qemu` pre-cleans the VMM's own stale sockets. A per-VM resource
+        // whose lifetime is coupled to the FIRST VMM process therefore does not survive a
+        // re-spawn, and no amount of re-spawning will fix it.
         // A custom `init=` (§5.3, The kernel command line) replaces the guest agent, so there is no agent vsock
         // transport to health-gate — skip the probe (which QEMU uses to catch a wedged
         // `vhost-device-vsock` bring-up); otherwise a custom-init QEMU VM would re-spawn
@@ -1185,11 +1507,11 @@ impl<V: Vmm> MicroVm<V> {
         Ok(Self {
             vmid: Some(vmid),
             instance: Some(instance),
-            netns: staged.netns.take(),
-            segment: staged.segment.take(),
+            netns: staged.net.netns.take(),
+            segment: staged.net.segment.take(),
             #[cfg(feature = "net-unprivileged")]
-            smoltcp: staged.smoltcp.take(),
-            proxy: staged.proxy.take(),
+            smoltcp: staged.net.smoltcp.take(),
+            proxy: staged.net.proxy.take(),
             cgroup_name: Some(staged.res.cgroup_name.clone()),
             env: env.clone(),
             agent_client: None,
@@ -1366,7 +1688,7 @@ impl<V: Vmm> MicroVm<V> {
             )
         };
 
-        let mut staged = Self::setup_env(vmid.vmid, tmp_dir.path(), &cfg, env).await?;
+        let mut staged = Self::setup_env(vmid.vmid, tmp_dir.path(), &cfg, env, None).await?;
 
         info!("Restoring instance...");
         let mut instance = vmm
@@ -1379,11 +1701,11 @@ impl<V: Vmm> MicroVm<V> {
         let vm = Self {
             vmid: Some(vmid),
             instance: Some(instance),
-            netns: staged.netns.take(),
-            segment: staged.segment.take(),
+            netns: staged.net.netns.take(),
+            segment: staged.net.segment.take(),
             #[cfg(feature = "net-unprivileged")]
-            smoltcp: staged.smoltcp.take(),
-            proxy: staged.proxy.take(),
+            smoltcp: staged.net.smoltcp.take(),
+            proxy: staged.net.proxy.take(),
             cgroup_name: Some(staged.res.cgroup_name.clone()),
             env: env.clone(),
             agent_client: None,
@@ -1432,6 +1754,25 @@ impl<V: Vmm> MicroVm<V> {
                  it via the serial log, a shared directory, an extra block device, or networking."
                     .into(),
             ));
+        }
+        // M7: a cached client that a prior timeout or transport failure marked desynced
+        // fails `ensure_synced` on EVERY later request, and `AgentClient::reconnect` has no
+        // other caller in the tree — so handing the cached handle back verbatim killed
+        // one-shot `exec`/`put_file`/`resync` on this VM permanently. The race is not
+        // theoretical: the host wraps its wait in the same duration it puts in `cmd.timeout`
+        // while the guest sleeps that duration BEFORE killing and only then sends `Exit`, so
+        // the host's timer can fire first on an exec behaving exactly as specified. Evict
+        // here and let the connect below re-establish the stream — the same eviction the
+        // resync-failure path already performs, applied at the one place that owns the cache.
+        if self
+            .agent_client
+            .as_ref()
+            .is_some_and(AgentClient::is_desynced)
+        {
+            tracing::warn!(
+                "cached agent client is desynchronized by a prior timeout; reconnecting"
+            );
+            self.agent_client = None;
         }
         if self.agent_client.is_none() {
             // Connect over the instance's own endpoint, so a snapshot-eligible QEMU
@@ -1741,6 +2082,9 @@ impl<V: Vmm> MicroVm<V> {
             &mut self.smoltcp,
             &mut self.netns,
             &mut self.segment,
+            // The success/`Drop` path is never observed by the `d2` recorder: what that gate
+            // guards is the mid-`start()` error window, whose only owner is `StagedNet`.
+            None,
         );
         // The cgroup backend lives on the captured `HostEnv` (no longer a standalone
         // `cgroup_fs` field); `cgroup_name.take()` is the once-only guard so a second
@@ -1757,12 +2101,17 @@ impl<V: Vmm> MicroVm<V> {
             tracing::warn!("failed to delete cgroup slice {}: {}", cg_name, e);
         }
         drop(self.cid.take());
-        drop(self.vmid.take());
-        // The per-VM scratch dir goes LAST: the instance (VMM process group +
+        // The per-VM scratch dir goes after the instance (VMM process group +
         // virtiofsd/vhost-vsock daemons) and the smoltcp process — all dropped
-        // above — own sockets that live inside it, so removing it any earlier
-        // would race a live process still holding a socket there.
+        // above — because they own sockets that live inside it, so removing it any
+        // earlier would race a live process still holding a socket there.
         drop(self.tmp_dir.take());
+        // The VMID is released LAST, after every resource named after it — the same
+        // rule the netns, tap and cgroup slice already follow. The scratch path is a
+        // pure function of (prefix, pid, vmid), so releasing the id first opens a
+        // window in which a same-process reallocation mints the *same* directory and
+        // the departing VM then deletes it out from under the new one (finding `m2`).
+        drop(self.vmid.take());
     }
 
     /// Shuts down the VM and cleans up associated resources.
@@ -1834,9 +2183,10 @@ impl<V: Vmm> Drop for MicroVm<V> {
     fn drop(&mut self) {
         // Teardown order: VMM instance (process group + virtiofsd/vhost-vsock
         // daemons) FIRST, then the shared post-instance teardown
-        // (proxy/smoltcp → netns → cgroup → cid → vmid → scratch dir). Routing
+        // (proxy/smoltcp → netns → cgroup → cid → scratch dir → vmid). Routing
         // through the same helper as `shutdown()` keeps the two paths identical
-        // (ORCH-2).
+        // (ORCH-2). The vmid is last because every resource named after it must
+        // already be gone before it can be handed out again (finding `m2`).
         drop(self.instance.take());
         self.teardown_post_instance();
     }
@@ -2292,7 +2642,8 @@ mod tests {
             dir: Some(path.to_path_buf()),
         };
         assert!(
-            a.try_claim(5),
+            a.try_claim(5)
+                .expect("a writable lock dir must not fail I/O"),
             "an empty (crashed-mid-claim) lock must reclaim"
         );
         let content = std::fs::read_to_string(path.join("5.lock")).unwrap();
@@ -2307,7 +2658,88 @@ mod tests {
         let b = FsIdClaim {
             dir: Some(path.to_path_buf()),
         };
-        assert!(b.try_claim(6), "a dead owner's lock must be reclaimable");
+        assert!(
+            b.try_claim(6)
+                .expect("a writable lock dir must not fail I/O"),
+            "a dead owner's lock must be reclaimable"
+        );
+    }
+
+    // Finding `m3`: "this id is taken" and "I could not tell" are different answers.
+    // `try_claim` used to collapse every I/O failure into `false` — the discarded
+    // `create_dir_all`, an `EACCES` open, a failed `flock`, a failed write — and a full
+    // sweep of `false`s is exactly what `allocate` renders as
+    // `Exhaustion("No available VMIDs (limit 254)")`. An operator whose lock directory is
+    // unusable therefore chased a phantom capacity limit.
+    //
+    // BOTH arms are pinned here. The I/O arm makes the lock directory path a REGULAR FILE,
+    // which `create_dir_all` cannot turn into a directory *for any uid* — so the gate is
+    // deterministic under the blessed runner and under a root shell alike, unlike a
+    // chmod-based fixture. Buggy impl this guards: `let _ = std::fs::create_dir_all(dir)`
+    // followed by a `false` return on the ensuing coordination-file failure.
+    #[test]
+    fn unusable_lock_dir_reports_io_not_exhaustion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let occupied = dir.path().join("vmcell-vmid");
+        std::fs::write(&occupied, b"not a directory").expect("seed a file where the dir goes");
+
+        let alloc = VmidAllocator::shared_at(&occupied);
+        let err = alloc
+            .allocate()
+            .expect_err("an unusable lock directory must fail loud");
+        assert!(
+            matches!(err, crate::error::Error::Io(_)),
+            "an unusable lock directory is an I/O failure, not a full id space: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&occupied.display().to_string()),
+            "the error must name the path an operator has to fix: {msg}"
+        );
+        assert!(
+            !msg.contains("No available VMIDs"),
+            "an I/O failure must never be reported as exhaustion: {msg}"
+        );
+        // `reserve` (the caller-pinned-vmid path) reaches the same claim core and must
+        // make the same distinction rather than reporting a cross-process conflict.
+        assert!(
+            matches!(alloc.reserve(9), Err(crate::error::Error::Io(_))),
+            "reserve() must surface the I/O failure, not an Exhaustion conflict"
+        );
+        // The segment id space claims through the SAME core, so it inherits the fix.
+        let segids = SegmentIdAllocator::shared_at(&occupied);
+        assert!(
+            matches!(segids.allocate(), Err(crate::error::Error::Io(_))),
+            "the segment allocator shares the one claim core and must report I/O too"
+        );
+    }
+
+    // The other half of `m3`'s distinction: a genuinely full id space must STILL report
+    // exhaustion. Every id in `1..=254` is locked by a live owner (this very process), so
+    // the sweep legitimately finds nothing — and no I/O ever fails. Without this leg the
+    // fix above could be "make everything an I/O error" and still look green.
+    #[test]
+    fn a_genuinely_full_id_space_still_reports_exhaustion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for id in 1..=254u32 {
+            std::fs::write(
+                dir.path().join(format!("{id}.lock")),
+                std::process::id().to_string(),
+            )
+            .expect("seed a live-owner lock");
+        }
+        let alloc = VmidAllocator::shared_at(dir.path());
+        let err = alloc
+            .allocate()
+            .expect_err("a fully claimed id space must fail");
+        assert!(
+            matches!(err, crate::error::Error::Exhaustion(_)),
+            "a full id space is exhaustion, not I/O: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("No available VMIDs"),
+            "the exhaustion message must still name the limit: {err}"
+        );
     }
 
     // v30 §18 delta 8: BOTH allocators claim through the one extracted core, in their OWN lock
@@ -2472,7 +2904,10 @@ mod tests {
                             dir: Some(dir.path().to_path_buf()),
                         };
                         barrier.wait();
-                        if alloc.try_claim(VMID) {
+                        if alloc
+                            .try_claim(VMID)
+                            .expect("a writable lock dir must not fail I/O")
+                        {
                             wins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     });
@@ -2559,13 +2994,8 @@ mod tests {
         fn add_netns(&self, _name: &str) -> Result<()> {
             Ok(())
         }
-        fn setup_tap(
-            &self,
-            _netns: &str,
-            _tap: &str,
-            _vmid: u32,
-        ) -> Result<Option<tun_tap::Iface>> {
-            Ok(None)
+        fn setup_tap(&self, _netns: &str, _tap: &str, _vmid: u32) -> Result<()> {
+            Ok(())
         }
         fn create_bridge(
             &self,
@@ -2631,11 +3061,62 @@ mod tests {
         }
     }
 
-    // Builds a `MicroVm` whose instance-drop, netns-teardown, and cgroup-delete all
-    // record into one shared timeline, so their relative order is observable.
+    // Finding `m20`: the drop-order gate used to build its `MicroVm` with
+    // `vmid: None, cid: None, tmp_dir: None`, so the whole then-`cid → vmid → scratch dir`
+    // tail of the order it claims to assert executed three no-ops — and `m2` (the VMID released
+    // before the directory named after it) lived in exactly that unreachable region.
+    //
+    // Those three guards are concrete types with no injectable recorder, so the ONE seam
+    // available is the `Arc<dyn Clock>` a departing `VmidGuard`'s allocator drops with it:
+    // this witness IS that clock, and its `Drop` therefore runs at the exact instant the
+    // vmid becomes re-allocatable. What it records are the two facts that must already be
+    // true by then.
     #[cfg(feature = "net-privileged")]
-    fn micro_vm_for_order_test(
+    struct VmidReleaseWitness {
         log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// The per-VM scratch dir, whose path is a pure function of (prefix, pid, vmid).
+        scratch: std::path::PathBuf,
+        /// Shared with the `CidGuard` under test, so a successful re-`reserve` proves the
+        /// CID is already back in the pool.
+        cids: std::sync::Arc<crate::vmm::CidAllocator>,
+        cid: u32,
+    }
+
+    #[cfg(feature = "net-privileged")]
+    impl Clock for VmidReleaseWitness {
+        fn now(&self) -> std::time::SystemTime {
+            // Only the search-start seed reads this; the teardown gate never does.
+            std::time::UNIX_EPOCH
+        }
+    }
+
+    #[cfg(feature = "net-privileged")]
+    impl Drop for VmidReleaseWitness {
+        fn drop(&mut self) {
+            let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+            // The CID must already be back in the pool.
+            if self.cids.reserve(self.cid).is_ok() {
+                log.push("cid_release".to_string());
+            }
+            // …and the scratch dir named after THIS vmid must already be gone. Otherwise a
+            // same-process reallocation of the vmid inside this window is handed a fresh
+            // directory at the same path that the departing VM is about to delete out from
+            // under it (finding `m2`).
+            if !self.scratch.exists() {
+                log.push("tmp_dir_remove".to_string());
+            }
+            log.push("vmid_release".to_string());
+        }
+    }
+
+    // Builds a `MicroVm` whose instance-drop, netns-teardown, cgroup-delete, CID release,
+    // scratch-dir removal and VMID release all record into one shared timeline, so their
+    // relative order is observable. `vmid` distinguishes the concurrent tests' scratch
+    // directories, which are a pure function of (prefix, pid, vmid).
+    #[cfg(feature = "net-privileged")]
+    async fn micro_vm_for_order_test(
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        vmid: u32,
     ) -> MicroVm<crate::vmm::FakeVmm> {
         let instance = crate::vmm::FakeVmInstance {
             vsock_path: std::path::PathBuf::from("/tmp/vmcell-order-vsock.sock"),
@@ -2644,18 +3125,40 @@ mod tests {
             faults: Default::default(),
             control_plane_probes: Default::default(),
         };
-        let netns =
-            NetNamespace::create("vmcell", 7, Box::new(TimelineNetlink { log: log.clone() }))
-                .expect("fake netns create must succeed with a recording netlink");
+        let netns = NetNamespace::create(
+            "vmcell",
+            vmid,
+            Box::new(TimelineNetlink { log: log.clone() }),
+        )
+        .expect("fake netns create must succeed with a recording netlink");
+        // A REAL scratch dir: its removal is the fs effect `m2` is about, and the guard
+        // reclaims it on the panic path as well as the success path (a test's own fixture
+        // owns its cleanup).
+        let tmp_dir = crate::vmm::VmTempDir::create("vmcell-order", vmid)
+            .await
+            .expect("per-VM scratch dir");
+        let scratch = tmp_dir.path().to_path_buf();
+        let cids = std::sync::Arc::new(crate::vmm::CidAllocator::new());
+        let cid = cids.allocate().expect("cid");
         MicroVm::<crate::vmm::FakeVmm> {
-            vmid: None,
+            // The witness is the allocator's ONLY `Arc<dyn Clock>` holder, so it is dropped
+            // exactly when this guard releases the vmid.
+            vmid: Some(VmidGuard {
+                vmid,
+                allocator: VmidAllocator::with_clock(std::sync::Arc::new(VmidReleaseWitness {
+                    log: log.clone(),
+                    scratch,
+                    cids: cids.clone(),
+                    cid,
+                })),
+            }),
             instance: Some(instance),
             netns: Some(netns),
             segment: None,
             #[cfg(feature = "net-unprivileged")]
             smoltcp: None,
             proxy: None,
-            cgroup_name: Some("vmcell-vm-7".to_string()),
+            cgroup_name: Some(crate::metrics::vm_slice_name("vmcell", vmid)),
             env: HostEnv {
                 cgroups: std::sync::Arc::new(TimelineCgroupFs { log }),
                 ..HostEnv::for_unit_tests()
@@ -2663,16 +3166,27 @@ mod tests {
             agent_client: None,
             restored: false,
             restore_reseed_applied: None,
-            cid: None,
-            tmp_dir: None,
+            cid: Some(CidGuard {
+                cid,
+                allocator: cids,
+            }),
+            tmp_dir: Some(tmp_dir),
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
         }
     }
 
-    // Asserts the full teardown order: instance drop -> netns delete -> cgroup
-    // delete. Goes red on the inverse — e.g. `MicroVm::Drop` deleting the cgroup or
-    // the netns before dropping the instance (the documented hang/leak).
+    // Asserts the WHOLE teardown order: instance drop -> netns delete -> cgroup delete ->
+    // CID release -> scratch-dir removal -> VMID release. Goes red on the inverse — e.g.
+    // `MicroVm::Drop` deleting the cgroup or the netns before dropping the instance (the
+    // documented hang/leak), or releasing the VMID before the directory named after it
+    // (finding `m2`).
+    //
+    // The first three are timeline events recorded by the doubles as they happen. The last
+    // three are recorded by `VmidReleaseWitness`, which fires at the vmid-release instant:
+    // there, PRESENCE is the ordering claim — `cid_release` is recorded only if the CID was
+    // already back in the pool, `tmp_dir_remove` only if the scratch dir was already gone.
+    // A late release/removal simply never records, and the lookup below names it.
     #[cfg(feature = "net-privileged")]
     fn assert_full_teardown_order(log: &[String]) {
         let idx = |needle: &str| {
@@ -2683,30 +3197,34 @@ mod tests {
         let instance = idx("drop");
         let netns = idx("netns_delete");
         let cgroup = idx("cgroup_delete");
+        let cid = idx("cid_release");
+        let tmp_dir = idx("tmp_dir_remove");
+        let vmid = idx("vmid_release");
         assert!(
-            instance < netns && netns < cgroup,
-            "teardown must be instance -> netns -> cgroup; got timeline: {log:?}"
+            instance < netns && netns < cgroup && cgroup < cid && cid < tmp_dir && tmp_dir < vmid,
+            "teardown must be instance -> netns -> cgroup -> cid -> scratch dir -> vmid; \
+             got timeline: {log:?}"
         );
     }
 
     #[cfg(feature = "net-privileged")]
-    #[test]
-    fn test_drop_order_full_chain_normal() {
+    #[tokio::test]
+    async fn test_drop_order_full_chain_normal() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         {
-            let _vm = micro_vm_for_order_test(log.clone());
+            let _vm = micro_vm_for_order_test(log.clone(), 7).await;
         }
         let calls = log.lock().unwrap_or_else(|e| e.into_inner());
         assert_full_teardown_order(&calls);
     }
 
     #[cfg(feature = "net-privileged")]
-    #[test]
-    fn test_drop_order_full_chain_on_panic() {
+    #[tokio::test]
+    async fn test_drop_order_full_chain_on_panic() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let log_in = log.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _vm = micro_vm_for_order_test(log_in);
+        let vm = micro_vm_for_order_test(log.clone(), 17).await;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _vm = vm;
             panic!("simulate panic inside scope");
         }));
         assert!(result.is_err(), "the closure must have panicked");
@@ -2730,11 +3248,16 @@ mod tests {
                 NetNamespace::create("vmcell", 8, Box::new(TimelineNetlink { log: log.clone() }))
                     .expect("recording netns create must succeed");
             let staged = EnvSetup {
-                proxy: None,
-                #[cfg(feature = "net-unprivileged")]
-                smoltcp: None,
-                netns: Some(netns),
-                segment: None,
+                net: StagedNet {
+                    proxy: None,
+                    #[cfg(feature = "net-unprivileged")]
+                    smoltcp: None,
+                    netns: Some(netns),
+                    segment: None,
+                    // This gate reads the cgroup/netns timeline through `TimelineCgroupFs`, not
+                    // the net-release recorder.
+                    timeline: None,
+                },
                 cgroup_guard: CgroupGuard {
                     name: "vmcell-vm-8".to_string(),
                     fs: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
@@ -2768,6 +3291,254 @@ mod tests {
             idx("netns_delete") < idx("cgroup_delete"),
             "the error-path EnvSetup::drop must release the netns before the cgroup slice — the same \
              order as the success path (delta 7): {calls:?}"
+        );
+    }
+
+    // Finding `M1` (orchestrator half): `Egress` has three variants, and `setup_env`'s two
+    // arms both used `if let Egress::Filtered(..)`, so `Blocked` and `Open` shared one empty
+    // else-path. On the unprivileged arm that meant `Blocked` still registered
+    // `host_services_port` as a permanent NAT forward and the NAT still dialled out on the
+    // guest's behalf — i.e. `Blocked` was a third spelling of `Open`, while its rustdoc read
+    // "All egress traffic is blocked".
+    //
+    // The decision now lives in the one `nat_egress_plan` law with an exhaustive match, so a
+    // future `Egress` variant is a compile error rather than a silent fall-through into the
+    // most permissive arm. Buggy impl this guards: any plan that hands `Blocked` a forward
+    // port, or `Allow`.
+    #[cfg(feature = "net-unprivileged")]
+    #[test]
+    fn blocked_egress_registers_no_nat_forward_and_denies_the_host_dial() {
+        use crate::net::smoltcp::backend::NatEgressPolicy;
+        let (ports, policy) =
+            nat_egress_plan(&crate::config::Egress::Blocked, Some(8080), Some(9090));
+        assert!(
+            ports.is_empty(),
+            "`Blocked` must register NO forward port — not the proxy's, and not \
+             host_services_port, which is a host endpoint the guest dials OUT to: {ports:?}"
+        );
+        assert_eq!(
+            policy,
+            NatEgressPolicy::Deny,
+            "on the NAT datapath every byte leaves through the per-mapping host dial, so \
+             honoring `Blocked` is exactly refusing that dial"
+        );
+
+        // Positive controls (the over-rejection inverse): the other two variants must keep
+        // registering exactly what they always did, and keep dialling.
+        let (ports, policy) = nat_egress_plan(&crate::config::Egress::Open, Some(8080), None);
+        assert_eq!(
+            ports,
+            vec![8080],
+            "`Open` still registers host_services_port: {ports:?}"
+        );
+        assert_eq!(policy, NatEgressPolicy::Allow);
+
+        let (ports, policy) = nat_egress_plan(
+            &crate::config::Egress::Filtered(crate::config::ProxyConfig::default()),
+            Some(8080),
+            Some(9090),
+        );
+        assert_eq!(
+            ports,
+            vec![8080, 9090],
+            "`Filtered` still registers host_services_port AND the proxy port: {ports:?}"
+        );
+        assert_eq!(policy, NatEgressPolicy::Allow);
+    }
+
+    // Finding `M1` (privileged half): the netns's ruleset is decided by the one
+    // `privileged_egress_rules` law. `Blocked` must select the accepts-nothing ruleset — NOT
+    // `NoRules`, which is what the pre-fix `if let Egress::Filtered(..)` gave it, leaving the
+    // per-VM netns on the kernel's default `accept` policy and therefore strictly MORE
+    // permissive than `Filtered`.
+    //
+    // This gates the ROUTING decision, which is all a KVM-free test can reach: `setup_env`
+    // builds its namespace through the real `RtNetlink`. That the selected ruleset actually
+    // accepts nothing is gated in `net/tap.rs` (`render_blocked_rules_accepts_nothing`,
+    // `emit_blocked_rules_applies_accepts_nothing_and_no_tproxy_route`); the live in-guest
+    // leg — a dial to `10.200.<n>.1:<host_port>` failing under `Blocked` with the identical
+    // dial under `Open` succeeding as the positive control — is the privileged suite's.
+    //
+    // Buggy impl this guards: `Blocked` mapped to `NoRules` (or grouped with `Open`).
+    #[test]
+    fn privileged_blocked_egress_selects_the_accepts_nothing_ruleset() {
+        assert_eq!(
+            privileged_egress_rules(&crate::config::Egress::Blocked),
+            PrivilegedEgressRules::Blocked,
+            "`Blocked` must install the accepts-nothing ruleset; selecting no ruleset leaves \
+             the netns on the kernel's default accept policy"
+        );
+        // Positive controls: the other two variants keep their existing selection.
+        assert_eq!(
+            privileged_egress_rules(&crate::config::Egress::Open),
+            PrivilegedEgressRules::NoRules,
+            "`Open` deliberately installs no ruleset (see its rustdoc)"
+        );
+        assert!(
+            matches!(
+                privileged_egress_rules(&crate::config::Egress::Filtered(
+                    crate::config::ProxyConfig::default()
+                )),
+                PrivilegedEgressRules::Tproxy(_)
+            ),
+            "`Filtered` still selects the TPROXY ruleset"
+        );
+    }
+
+    // The `M1` seam, end to end on the arm a unit test can drive: `setup_env` must honor
+    // `Blocked` by BUILDING the VM environment (the NAT stays wired — `Blocked` narrows what it
+    // forwards, it does not delete the datapath), not by rejecting the config.
+    //
+    // The port is `None` here because `Blocked` + `host_services_port` is now refused at
+    // construction (F1, `config::tests::blocked_egress_with_a_host_services_port_is_refused`):
+    // an accepted-but-unread input is the very defect class M1 records, so the pair can no
+    // longer reach `setup_env` at all.
+    //
+    // FAKE-BLIND AXIS: whether the plan REACHES the NAT is not observable here —
+    // `SmoltcpProcess` retains neither its port list nor its policy (both are moved into its
+    // worker thread), so no assertion on `staged` can see them. That wiring is gated by
+    // `nat_plan_gate` below, and whether a guest packet is actually dropped by
+    // `tests/host_endpoint.rs`'s live `Blocked`/`Open` pair.
+    #[cfg(feature = "net-unprivileged")]
+    #[tokio::test]
+    async fn setup_env_honors_blocked_egress_on_the_unprivileged_arm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = VmConfig::builder(
+            std::path::PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: std::path::PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(crate::config::NetConfig::Unprivileged {
+            egress: crate::config::Egress::Blocked,
+            host_services_port: None,
+        })
+        .build()
+        .expect("unprivileged + blocked config builds");
+        let staged = MicroVm::<crate::vmm::FakeVmm>::setup_env(
+            23,
+            tmp.path(),
+            &cfg,
+            &HostEnv::for_unit_tests(),
+            None,
+        )
+        .await
+        .expect("setup_env must honor Blocked, not reject it");
+        assert!(
+            staged.res.vhost_user_socket.is_some(),
+            "the NAT is still wired: `Blocked` narrows what it forwards, it does not remove \
+             the datapath"
+        );
+        drop(staged);
+    }
+
+    #[cfg(all(feature = "net-unprivileged", feature = "proxy"))]
+    #[derive(Debug)]
+    struct CreateSliceFailsCgroupFs;
+
+    #[cfg(all(feature = "net-unprivileged", feature = "proxy"))]
+    impl crate::metrics::CgroupFs for CreateSliceFailsCgroupFs {
+        fn create_slice(&self, _name: &str, _limits: &crate::config::ResourceLimits) -> Result<()> {
+            Err(crate::error::Error::Cgroup(
+                "scripted create_slice failure".into(),
+            ))
+        }
+        fn delete_slice(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn read_stats(&self, _name: &str) -> Result<ResourceUsage> {
+            Ok(ResourceUsage::default())
+        }
+        fn add_task(&self, _name: &str, _pid: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // Finding `d2`: `setup_env`'s three fallible steps after the net resources exist —
+    // `assert_tap_wiring_matches`, `create_slice`, `cids.allocate` — used to run while those
+    // resources were still four separate LOCALS, gathered into `EnvSetup` only at the very
+    // end. An early return in that window therefore released them by reverse-declaration
+    // order (segment → proxy → smoltcp → netns) instead of the one helper's law
+    // (smoltcp → proxy → netns → segment): a fourth teardown path outside L1's three, benign
+    // only by the accident of which local happened to be declared first. `StagedNet` closes
+    // it by owning them from the instant they exist.
+    //
+    // This drives the REAL `setup_env` on the unprivileged arm — the one arm that allocates
+    // two orderable net resources (the egress proxy AND the smoltcp NAT) — and fails it at
+    // `create_slice`, squarely inside the window. The law says smoltcp before proxy; the
+    // window's reverse-declaration order said proxy before smoltcp. That inversion is the
+    // assertion.
+    //
+    // THE SEAM IS INJECTED, NOT AMBIENT. The first version of this gate read a thread-local
+    // `tracing` subscriber for the two types' own drop messages, and tracing's callsite-interest
+    // cache is process-global: a sibling test that dropped a `SmoltcpProcess` with no subscriber
+    // installed cached `Interest::never()` for that callsite, after which the message was never
+    // delivered here — the gate then failed 5/5 in whole-lib runs with `"SmoltcpProcess
+    // dropping!" not recorded` and passed in isolation. It now records through a
+    // `ReleaseTimeline` handed to this one `StagedNet` (see `release_slot`), which shares no
+    // process state with anything, so the result depends only on the code under test.
+    //
+    // RED on the inverse: reintroduce the window (take the four resources back out of
+    // `StagedNet` into locals declared netns/smoltcp/proxy/segment before `create_slice`, and
+    // restore them afterwards) and the timeline stops being the helper's — the locals drop by
+    // reverse declaration, outside `release_net_before_netns`, so NOTHING is recorded and the
+    // exact-order assertion below reddens naming the empty timeline. A `StagedNet::drop` that
+    // leans on field order instead of the shared helper reddens the same way, and reordering
+    // the helper's own releases flips the recorded pair.
+    //
+    // FAKE-BLIND AXIS: the proxy and NAT here are the real processes, but no guest traffic
+    // ever flows — `tests/egress_proxy.rs` and the NAT-window battery cover the datapath.
+    #[cfg(all(feature = "net-unprivileged", feature = "proxy"))]
+    #[tokio::test]
+    async fn setup_env_failure_after_net_releases_through_the_one_ordered_helper() {
+        let timeline = ReleaseTimeline::default();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = VmConfig::builder(
+            std::path::PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: std::path::PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .net(crate::config::NetConfig::Unprivileged {
+            // `Filtered` is what makes the arm allocate BOTH orderable resources.
+            egress: crate::config::Egress::Filtered(crate::config::ProxyConfig::default()),
+            host_services_port: None,
+        })
+        .build()
+        .expect("unprivileged + filtered config builds");
+        let env = HostEnv {
+            cgroups: std::sync::Arc::new(CreateSliceFailsCgroupFs),
+            ..HostEnv::for_unit_tests()
+        };
+
+        let err = match MicroVm::<crate::vmm::FakeVmm>::setup_env(
+            21,
+            tmp.path(),
+            &cfg,
+            &env,
+            Some(timeline.clone()),
+        )
+        .await
+        {
+            Ok(_) => panic!("the scripted create_slice failure must abort setup_env"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::error::Error::Cgroup(_)),
+            "the failure must be the scripted create_slice one (i.e. the window really was \
+             entered with the net resources live): {err:?}"
+        );
+
+        // An EXACT sequence, not a pair of indexes: this arm allocates exactly these two
+        // orderable resources (no netns, no segment), so any release that happened somewhere
+        // other than the one ordered helper is a missing entry, and any reordering is a
+        // different vector.
+        assert_eq!(
+            timeline.releases(),
+            vec!["smoltcp", "proxy"],
+            "an early return after the net resources exist must release them through the ONE \
+             ordered helper (smoltcp -> proxy -> netns -> segment); an empty timeline means they \
+             were released somewhere else entirely (the reverse-declaration window)"
         );
     }
 
@@ -4002,6 +4773,143 @@ mod tests {
         );
     }
 
+    // A minimal stand-in for the in-guest agent listener, over AF_UNIX: it speaks the
+    // Firecracker-style hybrid `CONNECT <port>` / `OK <n>` prologue, sends one framed
+    // `Ready`, and then goes silent forever — never answering a request. That is exactly
+    // the shape that drives a host `exec` into its timeout, which is what marks the client
+    // desynced. It accepts repeatedly, so a reconnect is served like the first connect.
+    //
+    // Returned handle aborts the task on drop, so the fixture owns its cleanup on the panic
+    // path too.
+    fn spawn_fake_agent_listener(path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind fake agent listener");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Consume the `CONNECT <port>\n` line one byte at a time (the host writes
+                // it before any framing, so a buffered read here would be fine either way).
+                loop {
+                    let mut byte = [0u8; 1];
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if stream.write_all(b"OK 1234\n").await.is_err() {
+                    return;
+                }
+                // One `Ready`, length-delimited exactly as `LengthDelimitedCodec` expects
+                // (4-byte big-endian prefix).
+                let ready = postcard::to_stdvec(&crate::agent::protocol::Message::Ready)
+                    .expect("encode Ready");
+                let len = u32::try_from(ready.len()).expect("Ready frame fits in u32");
+                if stream.write_all(&len.to_be_bytes()).await.is_err()
+                    || stream.write_all(&ready).await.is_err()
+                {
+                    return;
+                }
+                // Hold the connection open and answer nothing.
+                held.push(stream);
+            }
+        })
+    }
+
+    // Finding `M7`: `agent()` populated the cache only when it was `None` and otherwise
+    // handed the cached handle back verbatim. A client marks itself desynced on a send
+    // error **or a timeout**, `ensure_synced` then fails every later request with "reconnect
+    // required", and `AgentClient::reconnect` had no non-test caller in the tree — so one
+    // exec timeout permanently killed one-shot `exec`/`put_file`/`resync` on that VM. The
+    // race is real, not theoretical: the host wraps its wait in the same duration it puts in
+    // `cmd.timeout` while the guest sleeps that duration BEFORE killing and only then sends
+    // `Exit`, so the host's timer can fire first on an exec behaving exactly as specified.
+    //
+    // KVM-free: the "guest" is the AF_UNIX listener above. Buggy impl this guards:
+    // `if self.agent_client.is_none() { … }` with no desync check — the second `agent()`
+    // then returns the dead handle and the exec after it fails "reconnect required" instead
+    // of timing out against a live connection.
+    #[tokio::test]
+    async fn agent_evicts_and_reconnects_a_desynced_cached_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("vsock.sock");
+        let serial = dir.path().join("serial.log");
+        std::fs::write(&serial, b"").expect("seed an empty serial log");
+        let listener = spawn_fake_agent_listener(sock.clone());
+
+        let instance = crate::vmm::FakeVmInstance {
+            vsock_path: sock,
+            serial,
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            faults: Default::default(),
+            control_plane_probes: Default::default(),
+        };
+        let mut vm = MicroVm::<crate::vmm::FakeVmm> {
+            vmid: None,
+            instance: Some(instance),
+            netns: None,
+            segment: None,
+            #[cfg(feature = "net-unprivileged")]
+            smoltcp: None,
+            proxy: None,
+            cgroup_name: None,
+            env: HostEnv::for_unit_tests(),
+            agent_client: None,
+            restored: false,
+            restore_reseed_applied: None,
+            cid: None,
+            tmp_dir: None,
+            timeouts: crate::config::Timeouts::default(),
+            control_plane_disabled: false,
+        };
+
+        // Drive one exec into its timeout: the silent listener never answers.
+        let timed_out = vm
+            .agent(Some(std::time::Duration::from_secs(5)))
+            .await
+            .expect("first agent() connects")
+            .exec(
+                crate::agent::protocol::ExecRequest::new(vec!["true".into()])
+                    .with_timeout(std::time::Duration::from_millis(50)),
+            )
+            .await
+            .expect_err("a listener that never answers must time the exec out");
+        assert!(
+            matches!(timed_out, crate::error::Error::Timeout(_)),
+            "the fixture must produce a TIMEOUT (which is what sets `desynced`): {timed_out:?}"
+        );
+
+        // The next `agent()` must hand back a USABLE client, not the dead one.
+        let client = vm
+            .agent(Some(std::time::Duration::from_secs(5)))
+            .await
+            .expect("agent() must recover from a desynced cached client");
+        let err = client
+            .exec(
+                crate::agent::protocol::ExecRequest::new(vec!["true".into()])
+                    .with_timeout(std::time::Duration::from_millis(50)),
+            )
+            .await
+            .expect_err("the silent listener still never answers");
+        assert!(
+            matches!(err, crate::error::Error::Timeout(_)),
+            "the recovered client must reach the transport and time out — not fail \
+             `ensure_synced` with \"reconnect required\": {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("desynchronized"),
+            "a desynced cached client must be evicted, never handed back: {err}"
+        );
+
+        listener.abort();
+    }
+
     // Builds a `MicroVm` around `instance` with a live cached `AgentClient`
     // seeded over one end of a socketpair, so a test can observe whether a
     // lifecycle verb invalidates the cache. Returns the peer end too: dropping
@@ -4240,13 +5148,8 @@ mod tests {
         fn add_netns(&self, _name: &str) -> Result<()> {
             Ok(())
         }
-        fn setup_tap(
-            &self,
-            _netns: &str,
-            _tap: &str,
-            _vmid: u32,
-        ) -> Result<Option<tun_tap::Iface>> {
-            Ok(None)
+        fn setup_tap(&self, _netns: &str, _tap: &str, _vmid: u32) -> Result<()> {
+            Ok(())
         }
         fn create_bridge(
             &self,
@@ -4325,10 +5228,20 @@ mod tests {
         let live_segids: std::collections::BTreeSet<u32> = [9].into_iter().collect();
 
         // Real scratch dirs so removal is observable on disk (unique per process).
+        //
+        // The prefix is deliberately NOT the production `vmcell` one. `vmcell-vm-{pid}-{vmid}`
+        // is the process-global path every clone-minting test (zygote, lineage) really creates
+        // through `VmTempDir`, drawing its vmid from `shared_test_vmids()` — so hard-coding
+        // ids 3 and 7 under that prefix let a concurrent clone that happened to draw 3 or 7
+        // delete this test's fixture out from under it under `cargo test --lib`'s in-process
+        // parallelism, reddening "the live scratch dir must be kept" for a reason that has
+        // nothing to do with the sweep. Nothing here depends on the prefix: the scanner is
+        // handed these paths explicitly and `trailing_id` parses the id off the end either
+        // way.
         let base = std::env::temp_dir();
         let pid = std::process::id();
-        let orphan_dir = base.join(format!("vmcell-vm-{pid}-3"));
-        let live_dir = base.join(format!("vmcell-vm-{pid}-7"));
+        let orphan_dir = base.join(format!("vmcell-sweeptest-vm-{pid}-3"));
+        let live_dir = base.join(format!("vmcell-sweeptest-vm-{pid}-7"));
         std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
         std::fs::create_dir_all(&live_dir).expect("live dir");
 
@@ -4396,13 +5309,8 @@ mod tests {
         fn add_netns(&self, _name: &str) -> Result<()> {
             Ok(())
         }
-        fn setup_tap(
-            &self,
-            _netns: &str,
-            _tap: &str,
-            _vmid: u32,
-        ) -> Result<Option<tun_tap::Iface>> {
-            Ok(None)
+        fn setup_tap(&self, _netns: &str, _tap: &str, _vmid: u32) -> Result<()> {
+            Ok(())
         }
         fn delete_netns(&self, name: &str) -> Result<()> {
             let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
@@ -4873,5 +5781,218 @@ mod tests {
             "a 50 ms grace must poll on a 5 ms step (>= 4 polls), not the coarse \
              20 ms grid (exactly 3): {polls} polls, {log:?}"
         );
+    }
+}
+
+/// Call-site gate for the `M1` NAT-egress law: the plan `nat_egress_plan` computes is the plan
+/// `SmoltcpProcess::start` is actually handed.
+///
+/// The claim is about the CALL SITE in `setup_env`, not about the law, and the law's own unit test
+/// (`blocked_egress_registers_no_nat_forward_and_denies_the_host_dial`) cannot see the difference:
+/// a `setup_env` that computed the plan and then passed `NatEgressPolicy::Allow` — or re-derived
+/// the port list inline — keeps that test green while shipping `Blocked` as a third spelling of
+/// `Open`, which is exactly the defect M1 records. Nor can a behavioral test see it:
+/// `SmoltcpProcess` moves both the port list and the policy into its worker thread and retains
+/// neither, so nothing observable on the returned handle names them.
+///
+/// So this reads this file's own production text, the shape `vmcell-qemu`'s `virtiofs_pacing_gate`
+/// established. Its limit is stated honestly: a source scan sees spellings, not values, and a
+/// deliberate shadowing rebind between the two statements would defeat it — which is why it also
+/// requires the plan's bindings to reach the call **unshadowed and unread in between**.
+#[cfg(test)]
+mod nat_plan_gate {
+    const SOURCE: &str = include_str!("orchestrator.rs");
+
+    /// The NAT start this orchestrator ships: one, on `setup_env`'s unprivileged arm.
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — how every source-scanning gate
+    /// fails vacuously — reddens instead of passing over an empty set.
+    const EXPECTED_NAT_STARTS: usize = 1;
+
+    /// The destructuring that binds the plan. Both names must then appear, unchanged, as the
+    /// forward-port and egress-policy arguments of the NAT start.
+    const PLAN_BINDING: &str = "let (ports, nat_egress) = nat_egress_plan(";
+
+    /// This file's production text: everything before the unit-test module, comment lines dropped
+    /// and whitespace collapsed (so a call split across rustfmt lines is still seen whole, and a
+    /// rustdoc mention of a spelling is not a call site).
+    fn production_code(source: &str) -> String {
+        let (production, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("orchestrator.rs must carry its `#[cfg(test)] mod tests` marker");
+        production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The top-level argument expressions of the call whose `(` follows `code[at..]`'s head.
+    fn call_args(code: &str, at: usize) -> Vec<&str> {
+        let open = at + code[at..].find('(').expect("a call has an argument list");
+        let mut depth = 0usize;
+        let mut args = Vec::new();
+        let mut start = open + 1;
+        for (i, c) in code[open..].char_indices().map(|(i, c)| (open + i, c)) {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        args.push(code[start..i].trim());
+                        break;
+                    }
+                }
+                ',' if depth == 1 => {
+                    args.push(code[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        // A trailing comma leaves one empty tail argument; it is punctuation, not an argument.
+        args.into_iter().filter(|a| !a.is_empty()).collect()
+    }
+
+    /// Checks that `code` computes the NAT plan once and hands exactly that plan to the NAT.
+    /// `Err` names the specific violation — this is the gate's assertion, factored out so the
+    /// test below can drive it against buggy inputs (AGENTS.md rule 2).
+    fn plan_reaches_the_nat(code: &str) -> Result<(), String> {
+        // Exactly one *call* to the law (the `fn nat_egress_plan(` definition is not one), and it
+        // must be the destructuring binding.
+        let calls = code
+            .match_indices("nat_egress_plan(")
+            .filter(|&(at, _)| !code[..at].ends_with("fn "))
+            .count();
+        if calls != 1 {
+            return Err(format!(
+                "expected exactly 1 `nat_egress_plan(` call site; found {calls}"
+            ));
+        }
+        let plan_at = code
+            .find(PLAN_BINDING)
+            .ok_or_else(|| format!("the plan must be bound as `{PLAN_BINDING}…`"))?;
+
+        let starts: Vec<usize> = code
+            .match_indices("SmoltcpProcess::start(")
+            .map(|(at, _)| at)
+            .collect();
+        if starts.len() != EXPECTED_NAT_STARTS {
+            return Err(format!(
+                "expected {EXPECTED_NAT_STARTS} `SmoltcpProcess::start(` call site; found {}. If \
+                 one was legitimately added or removed, update EXPECTED_NAT_STARTS — do not \
+                 delete the scan.",
+                starts.len()
+            ));
+        }
+        let start_at = starts[0];
+        if start_at < plan_at {
+            return Err("the NAT is started before the plan is computed".to_string());
+        }
+
+        let args = call_args(code, start_at);
+        if args.len() != 5 {
+            return Err(format!(
+                "`SmoltcpProcess::start` takes 5 arguments; the call site passes {}: {args:?}",
+                args.len()
+            ));
+        }
+        if args[1] != "ports" {
+            return Err(format!(
+                "the NAT's forward-port list must be the one `nat_egress_plan` computed \
+                 (`ports`), not {:?}",
+                args[1]
+            ));
+        }
+        if args[4] != "nat_egress" {
+            return Err(format!(
+                "the NAT's egress policy must be the one `nat_egress_plan` computed \
+                 (`nat_egress`), not {:?} — a literal policy here is exactly how `Egress::Blocked` \
+                 became a third spelling of `Open` (M1)",
+                args[4]
+            ));
+        }
+
+        // Nothing may rebind either name between the plan and the call: a source scan sees
+        // spellings, so `let nat_egress = NatEgressPolicy::Allow;` in the gap would otherwise
+        // slip past the argument check above.
+        let plan_end = plan_at
+            + code[plan_at..]
+                .find(';')
+                .ok_or("the plan binding is not a statement")?;
+        let gap = &code[plan_end..start_at];
+        if gap.contains("ports") || gap.contains("nat_egress") {
+            return Err(format!(
+                "the plan's bindings are re-read or shadowed between the plan and the NAT start: \
+                 {gap:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn setup_env_hands_the_nat_the_plan_it_computed() {
+        plan_reaches_the_nat(&production_code(SOURCE)).unwrap_or_else(|e| {
+            panic!("M1: the unprivileged arm must honor `nat_egress_plan`'s decision — {e}")
+        });
+    }
+
+    /// The gate's own red-on-inverse: each way the wiring can rot must be rejected, so the scan
+    /// above is not a test that can only ever pass.
+    #[test]
+    fn the_wiring_predicate_rejects_every_way_the_plan_can_be_dropped() {
+        const GOOD: &str = "let (ports, nat_egress) = nat_egress_plan(egress, p, q); \
+             let p = SmoltcpProcess::start( vmid, ports, proxy_port_opt, socket_path.clone(), \
+             nat_egress, );";
+        plan_reaches_the_nat(GOOD).expect("the shipped shape must pass");
+
+        for (case, code) in [
+            (
+                "a literal policy",
+                GOOD.replace("nat_egress, );", "NatEgressPolicy::Allow, );"),
+            ),
+            (
+                "a re-derived port list",
+                GOOD.replace("vmid, ports,", "vmid, vec![host_port],"),
+            ),
+            (
+                "the plan computed and then ignored",
+                GOOD.replace(
+                    "let (ports, nat_egress) = nat_egress_plan(egress, p, q); ",
+                    "",
+                ),
+            ),
+            (
+                "a shadowing rebind in the gap",
+                GOOD.replace(
+                    "let p = SmoltcpProcess::start(",
+                    "let nat_egress = NatEgressPolicy::Allow; let p = SmoltcpProcess::start(",
+                ),
+            ),
+            (
+                "a second NAT start that bypasses the plan",
+                format!("{GOOD} SmoltcpProcess::start(vmid, vec![], None, s, a);"),
+            ),
+        ] {
+            assert!(
+                plan_reaches_the_nat(&code).is_err(),
+                "{case}: the wiring predicate must reject this"
+            );
+        }
+    }
+
+    /// The scanner's own controls: prose naming a spelling is not a call site, the definition of
+    /// the law is not a call to it, and a call split across rustfmt lines is still seen whole.
+    #[test]
+    fn the_scanner_ignores_comments_and_survives_line_breaks() {
+        let synthetic = "// a SmoltcpProcess::start( in a comment is not a call site\n\
+             /// nor is `nat_egress_plan(` in rustdoc\n\
+             fn nat_egress_plan(\n    egress: &Egress,\n) -> (Vec<u16>, NatEgressPolicy) { }\n\
+             let (ports, nat_egress) =\n    nat_egress_plan(egress, *host_services_port, q);\n\
+             let p = SmoltcpProcess::start(\n    vmid,\n    ports,\n    proxy_port_opt,\n    \
+             socket_path.clone(),\n    nat_egress,\n);\n#[cfg(test)]\nmod tests { }";
+        let code = production_code(synthetic);
+        plan_reaches_the_nat(&code).expect("the real formatting must scan cleanly");
     }
 }

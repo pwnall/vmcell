@@ -77,12 +77,22 @@ impl HostCapabilities {
     }
 
     /// Whether the **privileged** (tap + netns) networking datapath is available (§6.1, The two operating modes): effective
-    /// `CAP_NET_ADMIN` **and** a reachable netns directory. Mode selection falls back to the
-    /// unprivileged smoltcp NAT when this is `false` — the decision that keeps the box usable
-    /// without root.
+    /// `CAP_NET_ADMIN` **and** effective `CAP_SYS_ADMIN` **and** a reachable netns directory. Mode
+    /// selection falls back to the unprivileged smoltcp NAT when this is `false` — the decision that
+    /// keeps the box usable without root.
+    ///
+    /// `CAP_SYS_ADMIN` is a conjunct because *creating* and *entering* a network namespace is
+    /// gated on it, not on `CAP_NET_ADMIN`: `unshare(CLONE_NEWNET)`, the `/var/run/netns` bind
+    /// mount, and `setns(CLONE_NEWNET)` all require it. Without it a `CAP_NET_ADMIN`-only host got
+    /// an untyped `Error::Network` out of `netns_rs` instead of the typed
+    /// [`Error::CapabilityUnavailable`](crate::error::Error::CapabilityUnavailable) this predicate
+    /// exists to produce (`privileged-net-available-omits-sys-admin`). `CAP_DAC_OVERRIDE` — the
+    /// third member of `vmcell_privilege::PRIVILEGED_CAPS` — is not probed here: this descriptor
+    /// carries only the two capability fields, and the two shipped privileged entry points check
+    /// all three through `ensure_blessed_or_explain`.
     #[must_use]
     pub fn privileged_net_available(&self) -> bool {
-        self.cap_net_admin && self.netns_reachable
+        self.cap_net_admin && self.cap_sys_admin && self.netns_reachable
     }
 
     /// Whether a *requested* limit for `controller` (`"memory"`/`"cpu"`/`"io"`/`"pids"`) can be
@@ -278,6 +288,29 @@ mod tests {
         assert!(
             !no_net_admin.privileged_net_available(),
             "no CAP_NET_ADMIN → unprivileged NAT, not the privileged tap path"
+        );
+
+        // `privileged-net-available-omits-sys-admin`: creating and entering a netns is gated on
+        // CAP_SYS_ADMIN, so a NET_ADMIN-only host must be refused **here**, with the typed
+        // `CapabilityUnavailable`, rather than failing later as an untyped `Error::Network` from
+        // inside `netns_rs`. RED on the inverse (`cap_net_admin && netns_reachable`), which reports
+        // the privileged datapath available on a host that cannot create a namespace at all.
+        let no_sys_admin = HostCapabilities {
+            cap_sys_admin: false,
+            ..full.clone()
+        };
+        assert!(
+            !no_sys_admin.privileged_net_available(),
+            "no CAP_SYS_ADMIN → no netns creation/entry, so the privileged datapath is unavailable"
+        );
+        // …and the netns directory stays a conjunct of its own (neither cap substitutes for it).
+        let no_netns_dir = HostCapabilities {
+            netns_reachable: false,
+            ..full.clone()
+        };
+        assert!(
+            !no_netns_dir.privileged_net_available(),
+            "no /var/run/netns → the privileged datapath has nowhere to keep its namespaces"
         );
 
         // Undelegated memory → a requested memory limit is UNENFORCEABLE and must fail loud, never

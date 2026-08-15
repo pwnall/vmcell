@@ -96,10 +96,14 @@ pub const BLESSED_FILE_CAPS: [Cap; 4] = [
 
 /// Renders `caps` as the argument `setcap(8)` takes: `cap_a,cap_b+ep`, lowercase.
 ///
-/// The ONE composer of that string (AGENTS.md "one law, one predicate"). It had been spelled out
-/// by hand in five places — this constant's siblings, the `bless` recipe, the preflight probe, the
-/// README, and [`blessing_remediation`]'s message — and a hand-maintained sixth copy is how a
-/// blessing silently grants the wrong set. `+ep` is load-bearing: the precondition
+/// The ONE composer of that string (AGENTS.md "one law, one predicate"). Every other rendering is
+/// a hand-maintained copy that cannot import this constant — the `bless` recipe, the preflight
+/// probe's `NEEDED_CAPS` array, the README's operator and downstream blocks, the design doc's
+/// downstream-consumer route — and that is exactly how a blessing silently grants the wrong set:
+/// the design's copy kept naming the three delivered caps after [`BLESSED_FILE_CAPS`] grew the
+/// transient `CAP_SETPCAP`, so a consumer following it got a warned-no-op bounding-set shrink. The
+/// drift gate (`every_setcap_copy_in_the_tree_matches_this_constant`) therefore walks the whole
+/// tree, not a hand-listed pair of files. `+ep` is load-bearing: the precondition
 /// ([`ensure_blessed_or_explain`]) checks the **effective** set, and a bare `+p` leaves the caps
 /// permitted-but-not-raised, which fails at first use.
 #[must_use]
@@ -408,75 +412,162 @@ pub fn plan_privilege_transition(
     }
 }
 
+/// One step of a [`PrivilegePlan`], in the order [`PrivilegePlan::steps`] emits them.
+///
+/// A struct has no sequence, so [`PrivilegePlan`]'s fields are **order-blind**: the
+/// security-critical ordering (uid drop BEFORE the ambient raise) used to live only in the
+/// statement order of [`apply_privilege_transition`], where no test could observe it and design
+/// §15.5's promised "pure transition test that asserts the uid change happens before the ambient
+/// raise" had nothing to assert against. Emitting the transition as an ordered step list makes the
+/// order **data**: [`PrivilegePlan::steps`] is the ONE place it is written (AGENTS.md "one law, one
+/// predicate"), [`apply_privilege_transition`] executes exactly that sequence, and both facts are
+/// gated by unit tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivilegeStep {
+    /// Drop gid → supplementary groups → uid to the invoking user (setuid-root form only), with
+    /// `PR_SET_KEEPCAPS` so the permitted set survives the uid change.
+    DropUid(UidDrop),
+    /// Add these caps to the inheritable set so the ambient set can hold them.
+    AddInheritable(Vec<Cap>),
+    /// Drop these caps from the bounding set — best-effort, warned on failure.
+    ShrinkBounding(Vec<Cap>),
+    /// Raise these caps into the ambient set so they survive `execve` into the test.
+    RaiseAmbient(Vec<Cap>),
+    /// Trim permitted/effective down to exactly these caps.
+    TrimCaps(Vec<Cap>),
+}
+
+impl PrivilegePlan {
+    /// The transition as an ordered step list — **the one place the order is written**.
+    ///
+    /// The ORDER is security-critical: the uid drop (setuid-root form) MUST come BEFORE the
+    /// ambient raise, so a root process never reaches `exec` holding ambient caps. The bounding
+    /// shrink precedes the raise so ambient caps are raised into an already-narrowed set. The
+    /// file-cap form never changed uid, so it emits no [`PrivilegeStep::DropUid`].
+    #[must_use]
+    pub fn steps(&self) -> Vec<PrivilegeStep> {
+        let mut steps = Vec::with_capacity(5);
+        // 1. Setuid-root form: drop to the invoking user BEFORE raising ambient.
+        if let Some(drop) = &self.uid_drop {
+            steps.push(PrivilegeStep::DropUid(drop.clone()));
+        }
+        // 2. Add the needed caps to the inheritable set so ambient can hold them.
+        steps.push(PrivilegeStep::AddInheritable(self.inheritable_add.clone()));
+        // 3. Shrink the bounding set (before the raise, so ambient lands inside the narrowed set).
+        steps.push(PrivilegeStep::ShrinkBounding(self.bounding_drop.clone()));
+        // 4. Raise ambient, after the bounding set is shrunk and uid is dropped.
+        steps.push(PrivilegeStep::RaiseAmbient(self.ambient_raise.clone()));
+        // 5. Trim permitted/effective down to exactly the caps we need.
+        steps.push(PrivilegeStep::TrimCaps(self.final_caps.clone()));
+        steps
+    }
+}
+
+/// Runs a plan's [`PrivilegeStep`]s through `run`, in [`PrivilegePlan::steps`] order, stopping at
+/// the first failure.
+///
+/// The executor is INJECTED for the same reason [`shrink_bounding_set`]'s dropper is: the order
+/// the live edge actually applies is then observable to a unit test on any host, without
+/// privileges and without syscalls. [`apply_privilege_transition`] passes the real syscall runner;
+/// `apply_executes_the_planned_steps_in_order` passes a recorder. Stopping at the first error is
+/// load-bearing — continuing past a failed uid drop would raise ambient caps while still root,
+/// which is exactly the hazard the ordering exists to prevent.
+fn execute_privilege_steps(
+    plan: &PrivilegePlan,
+    mut run: impl FnMut(&PrivilegeStep) -> Result<(), String>,
+) -> Result<(), String> {
+    for step in plan.steps() {
+        run(&step)?;
+    }
+    Ok(())
+}
+
+/// Performs ONE [`PrivilegeStep`] against the live process — the only syscall site of each edge,
+/// pinned there by `the_uid_drop_and_ambient_raise_syscalls_live_only_in_the_step_dispatch`.
+fn apply_privilege_step(step: &PrivilegeStep) -> Result<(), String> {
+    match step {
+        PrivilegeStep::DropUid(drop) => {
+            // PR_SET_KEEPCAPS preserves the permitted set across the uid change.
+            capctl::prctl::set_keepcaps(true)
+                .map_err(|e| format!("failed to set keepcaps: {e}"))?;
+            // SAFETY: single-threaded pre-exec context; we return (and the caller exits) on any
+            // failure and spawn no threads. Drops the real/effective/saved gid to the invoking
+            // user's gid.
+            if unsafe { libc::setresgid(drop.gid, drop.gid, drop.gid) } != 0 {
+                return Err("setresgid failed".to_string());
+            }
+            // SAFETY: `groups` is non-empty and `setgroups` reads exactly `groups.len()` gids from
+            // the valid pointer `drop.groups.as_ptr()`; still single-threaded pre-exec.
+            if unsafe { libc::setgroups(drop.groups.len(), drop.groups.as_ptr()) } != 0 {
+                return Err("setgroups failed".to_string());
+            }
+            // SAFETY: performed AFTER the gid drop + setgroups (the order is load-bearing — uid
+            // must go last, while the gid/group changes still have privilege); single-threaded
+            // pre-exec context.
+            if unsafe { libc::setresuid(drop.uid, drop.uid, drop.uid) } != 0 {
+                return Err("setresuid failed".to_string());
+            }
+            Ok(())
+        }
+        PrivilegeStep::AddInheritable(caps) => {
+            let mut state = CapState::get_current()
+                .map_err(|e| format!("failed to get current capabilities: {e}"))?;
+            for &c in caps {
+                state.inheritable.add(c);
+            }
+            state
+                .set_current()
+                .map_err(|e| format!("failed to set inheritable capabilities: {e}"))
+        }
+        // Both forms can shrink: the setuid-root form has always held CAP_SETPCAP, and the
+        // file-cap form gets it from `BLESSED_FILE_CAPS` (`just bless` grants it). `bounding_drop`
+        // is `supported − need`, so CAP_SETPCAP is in the drop list and drops ITSELF here — which
+        // does not disarm the remaining drops: `PR_CAPBSET_DROP` is gated on CAP_SETPCAP in the
+        // EFFECTIVE set, and leaving the bounding set does not remove it from effective.
+        // Best-effort — but surface, never swallow, a failed drop (a host that still has no
+        // CAP_SETPCAP keeps the old warned-no-op behavior rather than failing to run); the one
+        // shared edge does both.
+        PrivilegeStep::ShrinkBounding(caps) => {
+            shrink_bounding_set_live(caps);
+            Ok(())
+        }
+        PrivilegeStep::RaiseAmbient(caps) => {
+            for &c in caps {
+                capctl::ambient::raise(c)
+                    .map_err(|e| format!("failed to raise ambient capability {c:?}: {e}"))?;
+            }
+            Ok(())
+        }
+        PrivilegeStep::TrimCaps(caps) => {
+            let mut state = CapState::get_current()
+                .map_err(|e| format!("failed to read capabilities before trim: {e}"))?;
+            state.permitted.clear();
+            state.effective.clear();
+            for &c in caps {
+                state.permitted.add(c);
+                state.effective.add(c);
+            }
+            state
+                .set_current()
+                .map_err(|e| format!("failed to trim capabilities: {e}"))
+        }
+    }
+}
+
 /// Executes a [`PrivilegePlan`] against the live process — the thin syscall edge,
 /// integration-only.
 ///
 /// The ORDER is security-critical: the uid drop (setuid-root form) MUST happen BEFORE the
-/// ambient raise, so a root process never reaches `exec` holding ambient caps. The pure
-/// plan separates the two; this applies them in that fixed order.
+/// ambient raise, so a root process never reaches `exec` holding ambient caps. That order is not
+/// this function's statement order — it is [`PrivilegePlan::steps`]'s output, which this walks in
+/// sequence through the private `apply_privilege_step`, so the ordering is asserted by a pure unit test
+/// rather than being invisible source layout (design §15.5).
 ///
 /// # Errors
-/// Returns a diagnostic string on any failed syscall; the caller exits non-zero.
+/// Returns a diagnostic string on any failed syscall; the caller exits non-zero. The first failing
+/// step aborts the transition — no later step runs.
 pub fn apply_privilege_transition(plan: &PrivilegePlan) -> Result<(), String> {
-    // 1. Setuid-root form: drop to the invoking user BEFORE raising ambient.
-    //    PR_SET_KEEPCAPS preserves the permitted set across the uid change.
-    if let Some(drop) = &plan.uid_drop {
-        capctl::prctl::set_keepcaps(true).map_err(|e| format!("failed to set keepcaps: {e}"))?;
-        // SAFETY: single-threaded pre-exec context; we return (and the caller exits) on any failure
-        // and spawn no threads. Drops the real/effective/saved gid to the invoking user's gid.
-        if unsafe { libc::setresgid(drop.gid, drop.gid, drop.gid) } != 0 {
-            return Err("setresgid failed".to_string());
-        }
-        // SAFETY: `groups` is non-empty and `setgroups` reads exactly `groups.len()` gids from the
-        // valid pointer `drop.groups.as_ptr()`; still single-threaded pre-exec.
-        if unsafe { libc::setgroups(drop.groups.len(), drop.groups.as_ptr()) } != 0 {
-            return Err("setgroups failed".to_string());
-        }
-        // SAFETY: performed AFTER the gid drop + setgroups (the order is load-bearing — uid must go
-        // last, while the gid/group changes still have privilege); single-threaded pre-exec context.
-        if unsafe { libc::setresuid(drop.uid, drop.uid, drop.uid) } != 0 {
-            return Err("setresuid failed".to_string());
-        }
-    }
-
-    // 2. Add the needed caps to the inheritable set so ambient can hold them.
-    let mut caps =
-        CapState::get_current().map_err(|e| format!("failed to get current capabilities: {e}"))?;
-    for &c in &plan.inheritable_add {
-        caps.inheritable.add(c);
-    }
-    caps.set_current()
-        .map_err(|e| format!("failed to set inheritable capabilities: {e}"))?;
-
-    // 3. Shrink the bounding set. Both forms can do this now: the setuid-root form has always held
-    //    CAP_SETPCAP, and the file-cap form gets it from `BLESSED_FILE_CAPS` (`just bless` grants
-    //    it). `bounding_drop` is `supported − need`, so CAP_SETPCAP is in the drop list and drops
-    //    ITSELF here — which does not disarm the remaining drops: `PR_CAPBSET_DROP` is gated on
-    //    CAP_SETPCAP in the EFFECTIVE set, and leaving the bounding set does not remove it from
-    //    effective. Best-effort — but surface, never swallow, a failed drop (a host that still has
-    //    no CAP_SETPCAP keeps the old warned-no-op behavior rather than failing to run); the one
-    //    shared edge does both.
-    shrink_bounding_set_live(&plan.bounding_drop);
-
-    // 4. Raise ambient last, after the bounding set is shrunk and uid is dropped.
-    for &c in &plan.ambient_raise {
-        capctl::ambient::raise(c)
-            .map_err(|e| format!("failed to raise ambient capability {c:?}: {e}"))?;
-    }
-
-    // 5. Trim permitted/effective down to exactly the caps we need.
-    let mut final_caps = CapState::get_current()
-        .map_err(|e| format!("failed to read capabilities before trim: {e}"))?;
-    final_caps.permitted.clear();
-    final_caps.effective.clear();
-    for &c in &plan.final_caps {
-        final_caps.permitted.add(c);
-        final_caps.effective.add(c);
-    }
-    final_caps
-        .set_current()
-        .map_err(|e| format!("failed to trim capabilities: {e}"))?;
-    Ok(())
+    execute_privilege_steps(plan, apply_privilege_step)
 }
 
 /// A PURE description of the **setup-broker parent's** capability drop (design §12.4,
@@ -749,6 +840,180 @@ mod tests {
         assert_eq!(unheld.uid_drop.expect("setuid form").groups, vec![1000]);
     }
 
+    // ---- design §15.5's promised ordering gate: uid drop BEFORE the ambient raise ----
+
+    // GATE for design §15.5's "a `setuid`-fallback path … verified by a pure transition test that
+    // asserts the uid change happens **before** the ambient raise" — which did not exist, because
+    // `PrivilegePlan` is a struct and a struct has no sequence: the ordering lived only in
+    // `apply_privilege_transition`'s statement order, invisible to every test. `PrivilegePlan::steps()`
+    // now IS the order, so it can be asserted.
+    //
+    // The order is not stylistic. Raising ambient first would give a root process ambient caps that
+    // survive `execve`, and the uid drop that follows would NOT remove them — the exec'd test would
+    // run at the dev uid holding caps the runner meant to have narrowed.
+    //
+    // RED on the inverse: swap the `DropUid` and `RaiseAmbient` pushes in `steps()`; both the index
+    // comparison and the exact-sequence assert fail.
+    #[test]
+    fn the_setuid_plan_drops_uid_before_raising_ambient() {
+        let need = [Cap::NET_ADMIN, Cap::SYS_ADMIN];
+        let supported = [Cap::NET_ADMIN, Cap::SYS_ADMIN, Cap::CHOWN];
+        // euid 0 + uid 1000 = the setuid-root form, the only one that carries a uid drop.
+        let plan = plan_privilege_transition(&need, &supported, 0, 1000, 1000, Some(108), &[108]);
+        let steps = plan.steps();
+
+        let drop_at = steps
+            .iter()
+            .position(|s| matches!(s, PrivilegeStep::DropUid(_)))
+            .expect("the setuid-root form must carry a uid drop");
+        let raise_at = steps
+            .iter()
+            .position(|s| matches!(s, PrivilegeStep::RaiseAmbient(_)))
+            .expect("every form raises ambient");
+        assert!(
+            drop_at < raise_at,
+            "the uid drop must precede the ambient raise (a root process must never reach exec \
+             holding ambient caps); got {steps:?}"
+        );
+
+        // The whole sequence, pinned: a reorder anywhere reddens, not just this one pair.
+        assert_eq!(
+            steps,
+            vec![
+                PrivilegeStep::DropUid(UidDrop {
+                    gid: 1000,
+                    groups: vec![1000, 108],
+                    uid: 1000,
+                }),
+                PrivilegeStep::AddInheritable(need.to_vec()),
+                PrivilegeStep::ShrinkBounding(vec![Cap::CHOWN]),
+                PrivilegeStep::RaiseAmbient(need.to_vec()),
+                PrivilegeStep::TrimCaps(need.to_vec()),
+            ],
+            "the transition sequence is security-critical and pinned here"
+        );
+    }
+
+    // The file-cap form (the one this repo actually provisions) never changed uid, so it must emit
+    // NO uid-drop step — and the remaining four keep the same relative order.
+    #[test]
+    fn the_file_cap_plan_emits_no_uid_drop_step() {
+        let need = [Cap::NET_ADMIN];
+        let supported = [Cap::NET_ADMIN, Cap::CHOWN];
+        let steps =
+            plan_privilege_transition(&need, &supported, 1000, 1000, 1000, None, &[]).steps();
+        assert!(
+            !steps.iter().any(|s| matches!(s, PrivilegeStep::DropUid(_))),
+            "the file-cap form must not drop uid: {steps:?}"
+        );
+        assert_eq!(
+            steps,
+            vec![
+                PrivilegeStep::AddInheritable(need.to_vec()),
+                PrivilegeStep::ShrinkBounding(vec![Cap::CHOWN]),
+                PrivilegeStep::RaiseAmbient(need.to_vec()),
+                PrivilegeStep::TrimCaps(need.to_vec()),
+            ]
+        );
+    }
+
+    // The plan's order is only worth asserting if the live edge executes THAT order. The executor is
+    // injected (the `shrink_bounding_set` shape), so this runs on any host, unprivileged, with no
+    // syscalls — and covers the abort-on-failure half the syscall edge structurally hides.
+    //
+    // RED on the inverse: swap the `DropUid`/`RaiseAmbient` pushes in `steps()` (the recorded order
+    // no longer starts with the uid drop), or replace `run(&step)?` with a discarded
+    // `let _ = run(&step);` (the failed-step assertion sees all five steps run).
+    #[test]
+    fn apply_executes_the_planned_steps_in_order() {
+        let plan = plan_privilege_transition(
+            &[Cap::NET_ADMIN],
+            &[Cap::NET_ADMIN, Cap::CHOWN],
+            0,
+            1000,
+            1000,
+            None,
+            &[],
+        );
+
+        let mut seen = Vec::new();
+        execute_privilege_steps(&plan, |s| {
+            seen.push(s.clone());
+            Ok(())
+        })
+        .expect("an all-Ok executor must complete the transition");
+        assert_eq!(
+            seen,
+            plan.steps(),
+            "the live edge must execute exactly the planned sequence, in order"
+        );
+        assert!(
+            matches!(seen.first(), Some(PrivilegeStep::DropUid(_))),
+            "the setuid-root form must execute the uid drop FIRST: {seen:?}"
+        );
+
+        // A failed step aborts the rest. Continuing past a failed uid drop would raise ambient caps
+        // while still root — the exact hazard the ordering exists to prevent.
+        let mut seen = Vec::new();
+        let err = execute_privilege_steps(&plan, |s| {
+            seen.push(s.clone());
+            if matches!(s, PrivilegeStep::DropUid(_)) {
+                Err("setresuid failed".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("a failed uid drop must abort the transition");
+        assert_eq!(err, "setresuid failed", "the step's error must propagate");
+        assert_eq!(
+            seen.len(),
+            1,
+            "nothing may run after a failed uid drop — least of all the ambient raise: {seen:?}"
+        );
+    }
+
+    // GATE, the direction the injected-executor test structurally cannot see: it proves the ORDER
+    // the step list is walked in, not that the real syscalls still live inside the step dispatch. A
+    // re-inlined uid drop or ambient raise in `apply_privilege_transition` would restore the
+    // order-blind statement-order arrangement while leaving every test above green. Same shape (and
+    // same rationale) as `the_raw_bounding_drop_call_exists_only_in_the_shared_warned_edge`.
+    //
+    // RED on the inverse: paste either syscall back into `apply_privilege_transition` and the count
+    // for that needle goes to 2.
+    #[test]
+    fn the_uid_drop_and_ambient_raise_syscalls_live_only_in_the_step_dispatch() {
+        const SOURCE: &str = include_str!("lib.rs");
+        // Production half only — the first `#[cfg(test)]` in the file is this module's attribute,
+        // and the needles are quoted verbatim in the prose below.
+        let prod = SOURCE
+            .split_once("#[cfg(test)]")
+            .expect("the test module is gated in this file")
+            .0;
+        // The dispatch's exact window: from its own `fn` line to the public edge defined directly
+        // after it. Bounding the window (rather than taking the whole tail) is what makes the
+        // "inside the dispatch" half non-vacuous.
+        let dispatch = prod
+            .split_once("fn apply_privilege_step(")
+            .expect("the step dispatch is defined in this file")
+            .1
+            .split_once("pub fn apply_privilege_transition(")
+            .expect("the dispatch is defined immediately before the public edge")
+            .0;
+        for needle in ["libc::setresuid(", "capctl::ambient::raise("] {
+            assert_eq!(
+                prod.matches(needle).count(),
+                1,
+                "`{needle}` must have exactly one call site (in `apply_privilege_step`); a second \
+                 copy puts the security-critical ordering back into invisible statement order"
+            );
+            assert!(
+                dispatch.contains(needle),
+                "the one `{needle}` call site must be inside the step dispatch, so \
+                 `PrivilegePlan::steps()` stays the only place the order is written"
+            );
+        }
+    }
+
     #[test]
     fn merge_preserved_groups_keeps_kvm_only_when_held() {
         let g = merge_preserved_groups(1000, Some(108), &[108, 4, 27]);
@@ -1007,28 +1272,232 @@ mod tests {
         );
     }
 
-    // The cap list also lives in two SHELL files that cannot import this constant: the `bless`
-    // recipe (which grants it) and the preflight probe (which verifies it). That is the duplication
-    // "one law, one predicate" warns about, and it has already bitten once — the two copies drifted
-    // on strictness (`*ep*` substring vs the `=ep`/`+ep` field). Rust cannot share a const with
-    // bash, so the next best thing is a gate that reads both files and fails if either stops naming
-    // exactly this set. `include_str!` (not a runtime read) makes a moved file a COMPILE error
-    // rather than a skipped check; the crate is `publish = false`, so reaching outside it is safe.
+    /// Every copy-pasteable capability argument in `text`, in source order.
+    ///
+    /// A *copy* is an occurrence of the literal `setcap` followed by a space whose next
+    /// whitespace-delimited token — skipping a `\` line-continuation, then stripped of Markdown
+    /// backticks and shell quotes — begins with the `cap_` prefix. The `sudo` is deliberately NOT
+    /// part of the match: a copy written without it (a root shell, a Dockerfile, an ansible task)
+    /// is still a copy, and the earlier scan that keyed on the literal `sudo ` would have walked
+    /// straight past one. The `cap_` prefix is what separates a command from prose: a backticked
+    /// mention never matches (no trailing space), and prose like "the setcap failed" matches the
+    /// literal but yields a token that is not a capability list.
+    ///
+    /// Known shape limit, stated rather than glossed: the capability list must BE the argument. A
+    /// copy that hides it behind a flag (`setcap -v …`) is not matched — that form verifies rather
+    /// than grants, and widening the match to "any `cap_` token later on the line" would flag
+    /// ordinary prose that names one cap.
+    fn setcap_copies(text: &str) -> Vec<&str> {
+        text.match_indices("setcap ")
+            .filter_map(|(at, m)| text.get(at + m.len()..))
+            .filter_map(|tail| tail.split_whitespace().find(|t| *t != "\\"))
+            .map(|tok| tok.trim_matches(['`', '"', '\'']))
+            .filter(|tok| tok.starts_with("cap_"))
+            .collect()
+    }
+
+    /// Collects every tree file that could carry a hand-written copy — Markdown, shell, Rust,
+    /// TOML, YAML, and the `justfile` — rooted at `dir`, with paths relative to `root`.
+    ///
+    /// Prunes `target/` at any depth (build output — the example workspace's built kernel tree
+    /// alone is gigabytes and ships selftests that legitimately grant `cap_sys_boot`), `.git/`, and
+    /// `docs/historical/`. Historical designs are frozen snapshots: they name the two- and
+    /// three-cap sets vmcell used to bless with, and rewriting them would falsify the record.
+    fn collect_scannable(dir: &Path, root: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("scan: read_dir {}: {e}", dir.display()));
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|e| panic!("scan: entry under {}: {e}", dir.display()));
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ty = entry
+                .file_type()
+                .unwrap_or_else(|e| panic!("scan: file_type {}: {e}", path.display()));
+            if ty.is_dir() {
+                if name == "target"
+                    || name == ".git"
+                    || path == root.join("docs").join("historical")
+                {
+                    continue;
+                }
+                collect_scannable(&path, root, out);
+            } else if ty.is_file() {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if name == "justfile"
+                    || matches!(
+                        ext,
+                        "md" | "sh" | "bash" | "rs" | "toml" | "yml" | "yaml" | "just"
+                    )
+                {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
+    /// The repo-relative path of the **current** design document: the one non-historical
+    /// `docs/*.md` whose first non-empty line is the design's title.
+    ///
+    /// Discovered at run time, never hardcoded. The design is reissued under a new file name every
+    /// campaign (v31 was `docs/79-…`, v32 is `docs/82-…`), and its §10.4 downstream route carries a
+    /// blessing copy the roster below must cover; a pinned filename would therefore turn every
+    /// reissue into a build break — which is exactly what happened, and is the hazard this function
+    /// removes. Sub-directories are not descended, so the frozen copies in `docs/historical/` — old
+    /// two- and three-cap grants that are the record, not drift — are out of scope by construction,
+    /// the same way [`collect_scannable`] prunes them.
+    ///
+    /// Panics unless **exactly one** document claims the title: a text-scanning gate that resolves
+    /// to nothing passes vacuously, which is what makes this class of gate theater. Same
+    /// reissue-proof shape as `vmcell::vmm::jail`'s deny-list gate, which finds the same document
+    /// by its §12.3 section heading.
+    fn current_design_doc(root: &Path) -> String {
+        /// The design's title line, up to its version number. Stable across every revision since
+        /// v28; matched on the FIRST non-empty line, so a review or notes document that *quotes*
+        /// the title further down does not masquerade as the design.
+        const TITLE_PREFIX: &str = "# vmcell — Design Document (v";
+
+        let docs = root.join("docs");
+        let entries = std::fs::read_dir(&docs)
+            .unwrap_or_else(|e| panic!("design scan: read_dir {}: {e}", docs.display()));
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| panic!("design scan: docs entry: {e}"));
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("design scan: read {}: {e}", path.display()));
+            if text
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|l| l.starts_with(TITLE_PREFIX))
+            {
+                found.push(
+                    path.strip_prefix(root)
+                        .expect("a docs/ path is under the repo root")
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+        found.sort();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one current design document under {} (a file whose first line \
+             starts with {TITLE_PREFIX:?}), found {found:?} — with none, the roster below would \
+             pass vacuously over a design whose blessing copy nobody checked; with two, one of \
+             them belongs in docs/historical/",
+            docs.display()
+        );
+        found.into_iter().next().expect("exactly one, asserted")
+    }
+
+    // The cap list also lives in files that cannot import this constant: the `bless` recipe (which
+    // grants it), the preflight probe (which verifies it), THREE copy-pasteable command lines in
+    // the README, and ONE in the current design doc's downstream-consumer route (which is the only
+    // blessing instruction a git-dep consumer following the design ever sees, since `just bless`
+    // belongs to the vmcell checkout). That is the duplication "one law, one predicate" warns
+    // about, and it has bitten twice — two copies drifted on strictness (`*ep*` substring vs the
+    // `=ep`/`+ep` field), and the design's copy sat on the three-cap delivered set for a whole
+    // release after `CAP_SETPCAP` joined the file set, precisely because the first version of this
+    // gate read a hand-listed pair of files and claimed to read "every copy".
     //
-    // RED on the inverse: drop `cap_setpcap` from the justfile's setcap line, or from the
-    // preflight's NEEDED_CAPS, and this fails naming the file.
+    // So it now reads every copy that names its capability list as the `setcap` argument (the one
+    // shape `setcap_copies` documents, `sudo` or not): a walk of the tree — minus `target/`,
+    // `.git/`, and the frozen `docs/historical/`, whose old two- and three-cap grants are the
+    // record, not drift — over every file type that can carry one. The roster below pins
+    // WHICH files carry a copy and HOW MANY each carries, so the scan can neither pass vacuously
+    // (an empty find is not the expected roster) nor let a new, uncovered copy appear in a new doc.
+    // Reading at runtime rather than through `include_str!` is what makes coverage automatic; a
+    // file that moves away reddens on the roster instead of the compile, which is the trade.
+    //
+    // The design document's row is DISCOVERED, not pinned (`current_design_doc`): pinning its
+    // filename here made every design reissue a build break, since the design is renumbered each
+    // campaign. Discovery is not a weakening — `current_design_doc` demands exactly one current
+    // design and panics on none, so deleting the document, or the section carrying the copy, still
+    // reddens.
+    //
+    // RED on the inverse: drop `cap_setpcap` from the justfile's grant, from the preflight's
+    // NEEDED_CAPS, from any of the README's three command lines, or from the design's §10.4 route,
+    // and this fails naming the file and the copy index. Delete the `sudo` from any of them and it
+    // still holds (the scan does not key on it); add a copy to a new doc and the roster reddens.
     #[test]
-    fn the_shell_copies_of_the_blessed_set_match_this_constant() {
-        const JUSTFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../justfile"));
+    fn every_setcap_copy_in_the_tree_matches_this_constant() {
         const PREFLIGHT: &str = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/review-preflight-priv.sh"
         ));
+        /// Every **fixed-name** file carrying a copy-pasteable blessing command, and how many each
+        /// carries: the `bless` recipe (1) and the README's downstream-consumer step 5 plus the two
+        /// lines `just bless` runs (3). The design document carries one more (§10.4's
+        /// downstream-consumer route) and is deliberately NOT listed here: it is renamed on every
+        /// reissue, so it is discovered at run time by [`current_design_doc`] and spliced in below.
+        /// Asserted as an exact roster, so a scan that silently matched nothing — how every
+        /// text-scanning gate fails vacuously — reddens instead of passing over an empty set. If a
+        /// copy is legitimately added, removed, or moved, update this roster; never delete the scan.
+        const EXPECTED_FIXED: &[(&str, usize)] = &[("README.md", 3), ("justfile", 1)];
+        /// How many blessing copies the current design document carries: §10.4's downstream route.
+        const DESIGN_COPIES: usize = 1;
+        /// The roster's total, stated once more on its own so the count is impossible to satisfy
+        /// by deleting roster rows.
+        const TOTAL_COPIES: usize = 5;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("repo root must resolve");
+        let mut files = Vec::new();
+        collect_scannable(&root, &root, &mut files);
+        assert!(
+            files.len() > 50,
+            "the tree walk found only {} scannable files — it is not scanning the tree",
+            files.len()
+        );
 
         let arg = setcap_arg(&BLESSED_FILE_CAPS);
-        assert!(
-            JUSTFILE.contains(&format!("sudo setcap {arg} ")),
-            "the `bless` recipe must grant exactly `{arg}`"
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("scan: read {}: {e}", path.display()));
+            let copies = setcap_copies(&text);
+            if copies.is_empty() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .expect("scanned path is under the repo root")
+                .display()
+                .to_string();
+            for (i, got) in copies.iter().enumerate() {
+                assert_eq!(
+                    *got,
+                    arg,
+                    "{rel}: blessing copy #{} must grant exactly `{arg}`",
+                    i + 1
+                );
+            }
+            found.push((rel, copies.len()));
+        }
+        found.sort();
+        let mut expected: Vec<(String, usize)> = EXPECTED_FIXED
+            .iter()
+            .map(|&(p, n)| (p.replace('/', std::path::MAIN_SEPARATOR_STR), n))
+            .collect();
+        expected.push((current_design_doc(&root), DESIGN_COPIES));
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "the tree's blessing-copy roster changed; cover the new copy and update EXPECTED_FIXED \
+             (the design document's row is discovered, not listed)"
+        );
+        assert_eq!(
+            found.iter().map(|(_, n)| n).sum::<usize>(),
+            TOTAL_COPIES,
+            "expected {TOTAL_COPIES} blessing copies in the tree, found {found:?}"
         );
 
         // The preflight names the caps as a bash array it matches getcap output against; assert

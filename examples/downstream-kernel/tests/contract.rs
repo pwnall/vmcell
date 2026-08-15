@@ -29,13 +29,16 @@ fn the_overlay_adds_this_consumers_label_and_fragment() {
     assert_eq!(entry.label, KERNEL_LABEL);
     assert_eq!(entry.fragments, vec![FRAGMENT_NAME.to_string()]);
 
-    // …and the fragment NAME resolves to fragment TEXT, under the flattened pin key the toolkit
-    // documents (`kernel_fragments_<NAME>`). A label that resolved without its fragment text would
+    // …and the fragment NAME resolves to fragment TEXT, under the flattened pin key vmcell's own
+    // flattener emits. The key is composed by `fragment_pin_key` — the exported law — never by a
+    // local `format!`: re-deriving the spelling here is exactly the drift the composer was
+    // exported to remove, and a consumer that guesses it gets a `Missing kernel_… pin` at build
+    // time rather than a compile error. A label that resolved without its fragment text would
     // build an unmodified kernel and report success.
     let pins = vmcell::artifact::resolve_pins(Some(&overlay_path()))
         .expect("the overlay must resolve into the flat pin map");
     let text = pins
-        .get(&format!("kernel_fragments_{FRAGMENT_NAME}"))
+        .get(&vmcell::artifact::kernel::fragment_pin_key(FRAGMENT_NAME))
         .expect("the overlay's fragment must reach the flat pin map");
     for symbol in REQUIRED_SYMBOLS {
         assert!(
@@ -44,11 +47,84 @@ fn the_overlay_adds_this_consumers_label_and_fragment() {
         );
     }
     // The label's own source pins come from the overlay too (a labelled build with no source URL
-    // would fail deep inside the producer instead of here).
+    // would fail deep inside the producer instead of here). Composed through `kernel_pin_key` for
+    // the same reason.
     assert!(
-        pins.contains_key(&format!("kernel_{KERNEL_LABEL}_source_url")),
+        pins.contains_key(&vmcell::artifact::kernel::kernel_pin_key(
+            Some(KERNEL_LABEL),
+            "source_url"
+        )),
         "the overlay's kernels entry must contribute its source URL"
     );
+}
+
+#[test]
+fn the_pin_keys_are_composed_by_vmcell_not_by_this_consumer() {
+    // The pin-key spellings are contract surface, exactly like the sidecar path below, and this is
+    // where the consumer position pins them. Both composers are called from
+    // `the_overlay_adds_this_consumers_label_and_fragment` above, so that test moves WITH the law
+    // and can no longer redden on a spelling change — which is correct (a consumer calling the law
+    // is correct by construction) but would leave a silent change to the law unobserved
+    // downstream. This test is the observation point: it asserts the composed spellings against
+    // literals, so a change to either law reddens THIS example — the intended failure mode of
+    // contract drift (§10.4) — instead of surfacing as a `Missing kernel_… pin` in a consumer's
+    // build weeks later.
+    //
+    // Every expectation below is a BARE literal, never an interpolation of this consumer's own
+    // constants. Two reasons, and both are load-bearing: an interpolated expectation moves with
+    // `KERNEL_LABEL`, so it would keep passing if the label changed *and* stop pinning the law;
+    // and `scripts/ban-kernel-key-composers.sh` bans exactly the interpolated shapes
+    // (`"kernel_{`, `"kernel-{`) as re-derivations of the law, while sanctioning bare literals as
+    // the way a test pins its output. Writing the pin the banned way would make this gate the
+    // thing the other gate has to exempt.
+    use vmcell::artifact::kernel::{fragment_pin_key, kernel_pin_key};
+
+    assert_eq!(
+        fragment_pin_key(FRAGMENT_NAME),
+        "kernel_fragments_IKCONFIG",
+        "the fragment pin-key law changed: `kernel_fragments_<NAME>` is what this consumer's \
+         overlay and every downstream builder resolve through"
+    );
+
+    assert_eq!(
+        kernel_pin_key(Some(KERNEL_LABEL), "source_url"),
+        "kernel_ikconfig_source_url",
+        "the labelled kernel pin-key law changed"
+    );
+    // A dotted label survives verbatim — the pin key never becomes a path, and a consumer that
+    // sanitized it here would miss every labelled pin of a real kernel version.
+    assert_eq!(
+        kernel_pin_key(Some("6.12.94"), "source_sha256"),
+        "kernel_6.12.94_source_sha256",
+        "a dotted label must survive verbatim into the pin key"
+    );
+
+    // …and the unlabelled default route, which is a DIFFERENT shape (no label segment at all) —
+    // without this leg a composer that ignored `None` and always inserted a segment would pass.
+    assert_eq!(
+        kernel_pin_key(None, "source_url"),
+        "kernel_source_url",
+        "the default (unlabelled) kernel pin-key law changed"
+    );
+
+    // The artifact-map key is the third exported spelling a downstream PRODUCER must register
+    // under; a builder that guessed it would publish a `vmlinux` no vmcell stage ever reads.
+    // Note the separator differs from the pin keys' (`-`, not `_`) — re-deriving that by hand is
+    // precisely how a producer and its consumers drift apart with no compile error.
+    assert_eq!(
+        vmcell::artifact::kernel::kernel_artifact_key(Some(KERNEL_LABEL)),
+        "kernel-ikconfig"
+    );
+    assert_eq!(
+        vmcell::artifact::kernel::kernel_artifact_key(None),
+        "kernel"
+    );
+
+    // Non-vacuity for the four label-bearing legs above: they are literals, so they would all
+    // still pass if this consumer renamed its label out from under them. Anchoring the literals to
+    // the constants the rest of this file uses is what keeps them honest.
+    assert_eq!(KERNEL_LABEL, "ikconfig");
+    assert_eq!(FRAGMENT_NAME, "IKCONFIG");
 }
 
 #[test]

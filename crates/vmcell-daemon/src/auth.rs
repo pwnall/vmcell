@@ -232,6 +232,76 @@ mod tests {
         assert!(key.verify(b"abcdef"), "positive control");
     }
 
+    /// The production half of this file (everything before the test module) — the text the shape
+    /// gate below reasons about, so a `==` written *in a test* cannot mask a `==` in the real
+    /// compare.
+    fn production_source() -> &'static str {
+        include_str!("auth.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production half of this file")
+    }
+
+    /// The `{ … }` body of the function whose signature starts with `signature`, by brace counting.
+    fn fn_body(src: &str, signature: &str) -> String {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` not found — did the signature change?"));
+        let rest = src.get(start..).expect("in-bounds");
+        let open = rest.find('{').expect("a function body");
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices().skip(open) {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return rest.get(open..=i).expect("in-bounds").to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after `{signature}`");
+    }
+
+    // Design §11.6 promises "a timing test that the compare is constant-time IN SHAPE guards
+    // against a future `==` regression". A value test cannot deliver that: both sides are hashed to
+    // a fixed 32 bytes first, so a plain `==` passes every behavioural assertion unchanged
+    // (finding `constant-time-compare-has-no-gate`). This gate is therefore on the production TEXT:
+    // the secret comparison goes through `subtle`'s `ct_eq`, and neither the compare nor its one
+    // caller carries an `==`/`!=`. RED on the inverse — rewrite the body to
+    // `got == self.digest`, or make `authorize` compare the digests itself.
+    #[test]
+    fn verify_compares_through_the_constant_time_primitive_not_equality() {
+        let prod = production_source();
+        assert!(
+            prod.contains("use subtle::ConstantTimeEq;"),
+            "the constant-time primitive must be the one this module links"
+        );
+
+        let verify = fn_body(prod, "pub fn verify(&self, presented: &[u8]) -> bool");
+        assert!(
+            verify.contains(".ct_eq("),
+            "`verify` must compare through subtle's `ct_eq`, got:\n{verify}"
+        );
+        assert!(
+            !verify.contains("==") && !verify.contains("!="),
+            "`verify` must not compare the secret with `==`/`!=` — that short-circuits on the \
+             first differing byte, which is exactly the timing regression §11.6 names:\n{verify}"
+        );
+
+        let authorize = fn_body(prod, "pub fn authorize(");
+        assert!(
+            authorize.contains("key.verify("),
+            "`authorize` must route the check through `ApiKey::verify`, got:\n{authorize}"
+        );
+        assert!(
+            !authorize.contains("==") && !authorize.contains("!="),
+            "`authorize` must not compare the credential itself:\n{authorize}"
+        );
+    }
+
     #[test]
     fn load_api_key_file_refuses_world_readable() {
         use std::os::unix::fs::PermissionsExt as _;

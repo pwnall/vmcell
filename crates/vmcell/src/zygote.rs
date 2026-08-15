@@ -69,17 +69,28 @@ impl Zygote {
     /// it is what each clone restores with. The caller still owns `vm` and may
     /// shut it down once the zygote is captured.
     ///
+    /// `master_dir` is **created if absent** (with any missing parents) and is
+    /// **create-only**: a destination that already holds anything is refused, never
+    /// written into — `prepare_snapshot_dest` is the one predicate every
+    /// suspend/branch destination goes through (private, so no rustdoc link).
+    ///
     /// # Errors
     /// [`Error::Unsupported`] if `cfg` is not snapshot-eligible (carries a
     /// vhost-user device — a virtio-fs data share or unprivileged networking,
-    /// §13, Cross-cutting invariants); otherwise any error from taking the snapshot.
+    /// §13, Cross-cutting invariants); [`Error::Io`] with
+    /// [`ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists) if
+    /// `master_dir` is a non-empty directory, or any other I/O error creating it;
+    /// otherwise any error from taking the snapshot.
     pub async fn suspend<V: Vmm>(
         vm: &mut MicroVm<V>,
         cfg: VmConfig,
         master_dir: impl Into<PathBuf>,
     ) -> Result<Self> {
         let master_dir = master_dir.into();
+        // Eligibility BEFORE the directory is touched, so a refused suspend leaves
+        // zero residue (the "mid-op faults leave zero residue" discipline).
         check_clone_eligible(&cfg)?;
+        prepare_snapshot_dest(&master_dir).await?;
         vm.snapshot(&master_dir).await?;
         Ok(Self::from_parts(master_dir, cfg))
     }
@@ -270,6 +281,62 @@ impl Zygote {
     }
 }
 
+/// Prepares `dir` as a snapshot destination and refuses a populated one — **the one
+/// predicate** every suspend/branch destination in this crate goes through
+/// ([`Zygote::suspend`], and therefore [`Lineage::fork_from_vm`](crate::Lineage::fork_from_vm)
+/// and [`Lineage::branch`](crate::Lineage::branch), which delegate to it).
+///
+/// Creates `dir` (and any missing parents) when absent; accepts an existing but
+/// **empty** directory (callers that pre-create their own scratch dir); refuses
+/// anything else. A snapshot image is written file-by-file into its destination, so
+/// re-snapshotting into a populated master overwrites *part* of it and leaves a torn
+/// mix of two lineages — a clone restored from that image is neither. The daemon's
+/// equivalent path already refuses this (`create_dir` + EEXIST ⇒ 409, finding
+/// `snapshot-prefix-silent-reuse`); the library's did not, which is what this closes.
+///
+/// The `create_dir` EEXIST test is the kernel's, so the common "fresh destination"
+/// case is atomic against a concurrent suspend to the same path. The
+/// empty-directory arm is check-then-act by necessity — the contract has always let
+/// a caller pre-create the directory — and is the caller's to serialize.
+///
+/// # Errors
+/// [`Error::Io`] with [`ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists)
+/// if `dir` exists and is not empty, with
+/// [`ErrorKind::InvalidInput`](std::io::ErrorKind::InvalidInput) if it exists and is
+/// not a directory, or the underlying error if it cannot be created or read.
+async fn prepare_snapshot_dest(dir: &Path) -> Result<()> {
+    // Parents first, then the destination itself with a NON-recursive `create_dir`, so
+    // the "already there" answer comes from the kernel rather than a racy pre-check.
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
+    }
+    match tokio::fs::create_dir(dir).await {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(Error::Io(e)),
+    }
+
+    let meta = tokio::fs::metadata(dir).await.map_err(Error::Io)?;
+    if !meta.is_dir() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("snapshot destination is not a directory: {}", dir.display()),
+        )));
+    }
+    let mut entries = tokio::fs::read_dir(dir).await.map_err(Error::Io)?;
+    if entries.next_entry().await.map_err(Error::Io)?.is_some() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "snapshot destination {} already holds an image — a suspend/branch never \
+                 overwrites one (delete it, or pick a fresh directory)",
+                dir.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
 /// Fail-fast snapshot-eligibility check for a clone config (the config-only subset
 /// of the §13 (Cross-cutting invariants) law; the per-clone restore boundary re-checks with the resources
 /// in hand). Rejecting here avoids minting copy-on-write copies for a pool that
@@ -293,6 +360,31 @@ fn check_clone_eligible(cfg: &VmConfig) -> Result<()> {
     }
 }
 
+/// **The one** process-global VMID allocator the clone-minting unit tests share — this
+/// module's fan-out tests *and* [`lineage`](crate::lineage)'s, which mint clones through
+/// the very same [`Zygote`] machinery.
+///
+/// Under `cargo test`'s in-process thread parallelism, separate allocators hand concurrent
+/// tests overlapping vmids that then collide on the process-global `vmcell-vm-{pid}-{vmid}`
+/// scratch dir and on the per-clone CoW target inside it (`zygote clone target already
+/// exists: …/zygote-snapshot`). §9.3 (The public API surface) mandates ONE shared allocator
+/// per test-runner process for exactly this reason — and until this consolidation there were
+/// **two**, one per module, so the invariant both modules' comments claimed was false across
+/// the module boundary. Worse than merely "two": `seeded_id_order` seeds from the clock, so
+/// two allocators built moments apart walk the *same* order and collide head-on.
+///
+/// nextest runs each test in its own process, so this is inert there; it only de-flakes
+/// `cargo test --lib`. CID sharing is unneeded — the scratch dir is keyed on vmid only, and
+/// the fake instances never open a real vsock.
+#[cfg(test)]
+pub(crate) fn shared_test_vmids() -> crate::orchestrator::VmidAllocator {
+    static SHARED_VMIDS: std::sync::OnceLock<crate::orchestrator::VmidAllocator> =
+        std::sync::OnceLock::new(); // allow-global-state: THE process-global VMID allocator for the clone-minting unit tests; §9.3 (The public API surface) requires one shared allocator per test-runner process to avoid concurrent-test scratch-dir collisions
+    SHARED_VMIDS
+        .get_or_init(crate::orchestrator::VmidAllocator::new)
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,18 +397,10 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // A process-global VMID allocator shared across these fan-out tests. Under
-    // `cargo test`'s in-process thread parallelism, fresh per-test allocators hand
-    // concurrent tests overlapping low vmids that then collide on the
-    // process-global `vmcell-vm-{pid}-{vmid}` scratch dir (idempotent
-    // `create_dir_all`) and on the per-clone CoW target inside it — the design
-    // mandates ONE shared allocator per test-runner process for exactly this reason
-    // (§9.3, The public API surface). nextest runs each test in its own process, so this is inert there;
-    // it only de-flakes `cargo test --lib`. CID sharing is unneeded — the scratch
-    // dir is keyed on vmid only, and the fake instance never opens a real vsock.
-    static SHARED_VMIDS: std::sync::OnceLock<VmidAllocator> = std::sync::OnceLock::new(); // allow-global-state: process-global VMID allocator; §9.3 (The public API surface) requires one shared allocator per test-runner process to avoid concurrent-test scratch-dir collisions
+    // Every `HostEnv` below draws from the ONE allocator above (see its doc for why one, and
+    // why it lives at module scope rather than in here).
     fn shared_vmids() -> VmidAllocator {
-        SHARED_VMIDS.get_or_init(VmidAllocator::new).clone()
+        super::shared_test_vmids()
     }
 
     /// A recording fake backend for the fan-out unit tests. It records the exact
@@ -762,6 +846,83 @@ mod tests {
             entries,
             vec!["config.json".to_string(), "mem_file".to_string()],
             "probing must not write into the immutable master"
+        );
+    }
+
+    // m4, `Zygote::suspend` leg: a snapshot destination is CREATE-ONLY, exactly like the
+    // daemon's artifact-store prefix (`create_dir` + EEXIST ⇒ 409, finding
+    // `snapshot-prefix-silent-reuse`). Suspending onto a populated master used to write the
+    // new image file-by-file over the old one, leaving a torn mix of two lineages that no
+    // clone can restore correctly. `FakeVmInstance::snapshot` is fs-blind, so the gate
+    // supplies the residue itself and proves it SURVIVES the refusal.
+    //
+    // RED on the inverse (delete the `prepare_snapshot_dest` call in `suspend`): the second
+    // suspend returns `Ok` and `expect_err` panics.
+    //
+    // Positive controls, both arms the predicate accepts: a NON-EXISTENT destination (created,
+    // with parents) and an existing but EMPTY one (the pre-create contract `bench-vm` and the
+    // live zygote suite rely on).
+    #[tokio::test]
+    async fn suspend_refuses_a_populated_master_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv {
+            vmids: shared_vmids(),
+            ..HostEnv::for_unit_tests()
+        };
+        let mut vm = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("start a live VM");
+
+        // A populated destination — a previous node's image — is refused, typed.
+        let populated = root.path().join("populated");
+        write_master(&populated);
+        let before = std::fs::read(populated.join("config.json")).expect("read the existing image");
+        let err = Zygote::suspend(&mut vm, erofs_cfg(), &populated)
+            .await
+            .expect_err("suspending onto a populated master must be refused");
+        match err {
+            Error::Io(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "the refusal must be AlreadyExists, got {e:?}"
+            ),
+            other => panic!("expected a typed Io(AlreadyExists) refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(populated.join("config.json")).expect("the existing image survives"),
+            before,
+            "the refused suspend must not have written into the populated master"
+        );
+
+        // Positive control 1: a fresh (nested, non-existent) destination is created and used.
+        let fresh = root.path().join("nested/deeper/master");
+        let z = Zygote::suspend(&mut vm, erofs_cfg(), &fresh)
+            .await
+            .expect("a fresh destination must still suspend");
+        assert_eq!(z.master_dir(), fresh, "the master is the requested dir");
+        assert!(
+            fresh.is_dir(),
+            "suspend creates the destination and parents"
+        );
+
+        // Positive control 2: an existing but EMPTY destination is accepted (the caller may
+        // pre-create its own scratch dir).
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).expect("pre-create an empty destination");
+        Zygote::suspend(&mut vm, erofs_cfg(), &empty)
+            .await
+            .expect("an existing EMPTY destination must still suspend");
+
+        // And a destination that is a FILE is a typed InvalidInput, not a silent overwrite.
+        let as_file = root.path().join("a-file");
+        std::fs::write(&as_file, b"not a dir").expect("write file");
+        let err = Zygote::suspend(&mut vm, erofs_cfg(), &as_file)
+            .await
+            .expect_err("a non-directory destination must be refused");
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "expected Io(InvalidInput), got {err:?}"
         );
     }
 

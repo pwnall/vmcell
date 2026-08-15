@@ -4,7 +4,8 @@
 # the retired tokens so a stray re-introduction (a copy-pasted env var, an old binary name, the
 # `rootless`/`TestVm` spellings, an `imp-*` internal prefix) fails CI instead of silently landing.
 #
-# Flagged tokens (in src/ tests/ benches/ by default; any file kind, not just *.rs):
+# Flagged tokens (everywhere in the roster — `crates/` + the `justfile` by default; any file kind,
+# not just *.rs):
 #   * `TestVm`                                         (renamed harness type → VmCell)
 #   * `[Rr]ootless`                                    (renamed network/integration tier → unprivileged)
 #   * `imp[_-]testing` / `Imp-testing`                 (old crate / project name → vmcell)
@@ -34,7 +35,10 @@
 #   let old = "imp-testing"; // allow-legacy-term: <reason>
 # so every surviving legacy token is justified in place and shows up in review.
 #
-# Usage: ban-legacy-terms.sh [DIR ...]   (defaults to the crates/ member trees + the justfile)
+# Usage: ban-legacy-terms.sh [PATH ...]  (defaults to the crates/ member trees + the justfile)
+# A PATH is a directory (every file under it is scanned) or a regular file (it is scanned). A PATH
+# that does not exist, or a roster that resolves to zero files, is a caller bug and exits 2 — never
+# a reassuring "ok" (docs/81 M13).
 set -euo pipefail
 
 dirs=("$@")
@@ -51,14 +55,41 @@ fi
 violations=""
 append() { if [[ -n "$1" ]]; then violations+="$1"$'\n'; fi; }
 
-# Gather candidate files once (NUL-safe). Scan every file kind, not just *.rs — env vars and
+# Resolve the roster to a FILE LIST (NUL-safe). Scan every file kind, not just *.rs — env vars and
 # legacy names hide in shell/toml/markdown fixtures too.
+#
+# COLLECT FILES, DO NOT GATE ON DIRECTORIES. The previous collector was
+# `[[ -d "$d" ]] && find "$d" -type f -print0`, so every regular-file roster entry was silently
+# dropped — including the default roster's own `justfile`, which this gate has named in its success
+# line since it was written while never opening a byte of it (docs/81 M13; a copy of the real
+# justfile carrying `test-rootless:` + `echo imp-testing` still exited 0). A gate that reports
+# scanning a target it never read is theater, so the roster is now resolved element by element and
+# the success line reports the FILE COUNT: a roster that resolves to nothing cannot print a
+# reassuring message, because it cannot print a count.
+for p in "${dirs[@]}"; do
+  [[ -e "$p" ]] && continue
+  echo "ban-legacy-terms: roster entry does not exist: $p" >&2
+  echo "  (a mistyped path must fail loud — it must not read as a clean scan)" >&2
+  exit 2
+done
+
+files=()
 mapfile -d '' -t files < <(
   for d in "${dirs[@]}"; do
-    [[ -d "$d" ]] && find "$d" -type f -print0
+    if [[ -d "$d" ]]; then
+      find "$d" -type f -print0
+    else
+      printf '%s\0' "$d"
+    fi
   done
 )
-[[ ${#files[@]} -eq 0 ]] && { echo "ok: no files to scan under: ${dirs[*]}"; exit 0; }
+
+# An empty resolution is a broken roster, never a clean tree: the only way to scan zero files is to
+# have been pointed at nothing. Exit non-zero so it reads as the caller bug it is.
+if [[ ${#files[@]} -eq 0 ]]; then
+  echo "ban-legacy-terms: roster resolved to 0 files: ${dirs[*]}" >&2
+  exit 2
+fi
 
 for f in "${files[@]}"; do
   # Skip binary files: -I makes grep report no match for binary, `.` matches any text line.
@@ -98,4 +129,6 @@ if [[ -n "${violations//[$'\n']/}" ]]; then
   printf '%s\n' "$violations" | grep -vE '^[[:space:]]*$'
   exit 1
 fi
-echo "ok: no legacy imp-testing/rootless/TestVm/imp-*/Imp tokens (scanned: ${dirs[*]})"
+plural="s"
+if [[ ${#files[@]} -eq 1 ]]; then plural=""; fi
+echo "ok: no legacy imp-testing/rootless/TestVm/imp-*/Imp tokens (scanned ${#files[@]} file${plural} under: ${dirs[*]})"

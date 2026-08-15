@@ -258,13 +258,27 @@ neutral self-proving `IKCONFIG`/`IKCONFIG_PROC` fragment. Its CI job:
       - run: cd examples/downstream-kernel && ./ci-check.sh   # overlay + getters + CLI + vendor legs
 
   # The live half (build vmlinux-ikconfig, boot it, validate, prove /proc/config.gz on the data
-  # plane) joins the existing KVM job on [self-hosted, linux, kvm], after the operating-mode suites.
+  # plane) joins the existing `test-integration` job, after the operating-mode suites.
 ```
+
+**The runner fact, stated once.** Every `ci.yml` job runs on a GitHub-hosted image;
+`test-integration` is `ubuntu-24.04`, which widens the KVM/vhost device nodes with an in-job udev
+rule (the rule file it writes is also the roster its assertion loop reads back) and runs every live
+suite inside a delegated cgroup scope — `systemd-run --user --scope -p Delegate=yes` at the step,
+except `test-daemon`, whose recipe carries its own wrapper and is therefore invoked bare. A hosted
+runner's own cgroup is not delegated and `MicroVm::start` needs a writable one even with no limit
+requested, so this is load-bearing, not hygiene. The `[self-hosted, linux, kvm]` runner this sketch
+was originally written against was never registered, so the job never ran at all — every invocation
+queued until GitHub's 24-hour limit and reported cancelled. `docs/implementation-notes.md` records
+the move and the two findings it surfaced. `.github/actionlint.yaml` went with it: a
+`self-hosted-runner.labels` whitelist **disarms** actionlint's runner-label check for the labels it
+names, so one kept for a label no job uses is a gate switched off. Re-introducing a self-hosted
+label must redden `actionlint` first.
 
 Two further `ci.yml` deltas ride along: the PRs-only semver step widens to **both contract crates**
 (`cargo semver-checks --baseline-rev "${{ github.event.pull_request.base.sha }}" -p vmcell
 -p vmcell-artifact-validator` — without this, the delta-2 gate exists locally but not on PRs,
-violating the local ≡ CI meta-rule), and the KVM job **surfaces the skip manifest**: the suite
+violating the local ≡ CI meta-rule), and `test-integration` **surfaces the skip manifest**: the suite
 recipes export `VMCELL_SKIP_MANIFEST` to a run-scoped path and the job prints it (count + contents)
 as its final step — until now the manifest defaulted to a temp file nobody surfaced, making the
 "skip manifest surfaced in CI output" rubric row unenforced (gate theater by our own meta-rules).

@@ -16,3 +16,9 @@ path = "src/main.rs"
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 libc = "0.2"
+# The applet roster (`GUEST_TOOLS_APPLETS`) only — this binary speaks no protocol. It is the
+# one crate this binary and the host `vmcell` lib both link, which is what lets the dispatch
+# table and the rootfs injection manifest DERIVE from one list instead of restating it
+# (docs/81 m22, design §4.4). The explicit `version` (alongside `path`) keeps the cargo-deny
+# `wildcards = "deny"` gate happy — a bare path dep reads as a `*` requirement.
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }

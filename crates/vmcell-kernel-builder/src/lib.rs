@@ -78,18 +78,16 @@ pub struct InVmKernelStage {
     pub cid_alloc: Arc<CidAllocator>,
 }
 
-/// The pins keys holding this kernel's source URL / SHA256 (label-aware, mirrors `KernelStage`).
+/// The pins keys holding this kernel's source URL / SHA256 — `vmcell`'s shared
+/// [`kernel::kernel_pin_key`] law, which is also what the pins FLATTENER emits through. This used
+/// to be a byte-duplicate of `KernelStage`'s private spelling, so an out-of-tree builder had to
+/// re-derive the flattener's key shape instead of calling it, and a drift would have surfaced only
+/// as a runtime `Missing kernel_… pin`.
 fn url_pin_key(label: &Option<String>) -> String {
-    match label {
-        Some(l) => format!("kernel_{l}_source_url"),
-        None => "kernel_source_url".to_string(),
-    }
+    kernel::kernel_pin_key(label.as_deref(), "source_url")
 }
 fn sha_pin_key(label: &Option<String>) -> String {
-    match label {
-        Some(l) => format!("kernel_{l}_source_sha256"),
-        None => "kernel_source_sha256".to_string(),
-    }
+    kernel::kernel_pin_key(label.as_deref(), "source_sha256")
 }
 
 /// The filename suffix (`""` or `-<sanitized-label>`) — `vmcell`'s shared
@@ -99,13 +97,11 @@ fn suffix(label: &Option<String>) -> String {
     kernel::kernel_filename_suffix(label.as_deref())
 }
 
-/// The artifact-map key this stage registers its `vmlinux` under (`"kernel"` for the default,
-/// `"kernel-<label>"` for a labelled build), matching the bootstrap kernel stages.
+/// The artifact-map key this stage registers its `vmlinux` under — `vmcell`'s shared
+/// [`kernel::kernel_artifact_key`] law, so this out-of-crate producer registers under exactly the
+/// key `vmcell`'s own downstream stages read (never a second copy of the `kernel-<label>` rule).
 fn artifact_key(label: &Option<String>) -> String {
-    match label {
-        Some(l) => format!("kernel-{l}"),
-        None => "kernel".to_string(),
-    }
+    kernel::kernel_artifact_key(label.as_deref())
 }
 
 /// The full concatenated KConfig text appended after `make defconfig kvm_guest.config`: the
@@ -120,10 +116,13 @@ fn artifact_key(label: &Option<String>) -> String {
 /// # Errors
 /// [`Error::Artifact`] if the base pin or a requested fragment name is absent from the pins.
 fn kconfig_append(inputs: &StageInputs, fragments: &[String]) -> Result<String> {
+    // Unlabelled: every labelled kernel shares the DEFAULT namespace's config (the flattener emits
+    // no per-label `microvm_config`), so the key is composed with `None`, not spelled inline.
+    let cfg_key = kernel::kernel_pin_key(None, "microvm_config");
     let base = inputs
         .pins
-        .get("kernel_microvm_config")
-        .ok_or_else(|| Error::Artifact("Missing kernel_microvm_config pin".into()))?;
+        .get(&cfg_key)
+        .ok_or_else(|| Error::Artifact(format!("Missing {cfg_key} pin")))?;
     kernel::kconfig_append(base, &inputs.pins, fragments)
 }
 
@@ -272,7 +271,7 @@ impl Stage for InVmKernelStage {
         hasher.update(
             inputs
                 .pins
-                .get("kernel_microvm_config")
+                .get(&kernel::kernel_pin_key(None, "microvm_config"))
                 .map(String::as_bytes)
                 .unwrap_or_default(),
         );
@@ -585,6 +584,48 @@ mod tests {
         let text = kconfig_append(&inputs(), &["KASAN".to_string()]).expect("append");
         assert!(text.contains("CONFIG_BASE=y"));
         assert!(text.contains("CONFIG_KASAN=y"));
+    }
+
+    // docs/81 §8/§9 CROSS-CRATE GATE: this out-of-`vmcell` producer must register its `vmlinux`
+    // under the key `vmcell`'s downstream stages READ, and must read its source pins at the keys
+    // `vmcell`'s pins FLATTENER EMITS. Both spellings used to be byte-duplicated here — "the same
+    // trap `InVmKernelStage` already fell into" — and a drift is not a compile error: it is a
+    // silently-lost artifact, or a runtime `Missing kernel_… pin` on a cold build.
+    //
+    // Asserting against `vmcell`'s exported laws (not against local literals) is what makes this a
+    // gate on the CLAIM: re-introducing a private copy here goes red the moment its spelling moves,
+    // and the whole point of the export is that a downstream builder can make exactly this call.
+    #[test]
+    fn the_in_vm_producer_uses_vmcells_own_key_laws() {
+        for label in [None, Some("6.12.94".to_string())] {
+            assert_eq!(
+                url_pin_key(&label),
+                kernel::kernel_pin_key(label.as_deref(), "source_url")
+            );
+            assert_eq!(
+                sha_pin_key(&label),
+                kernel::kernel_pin_key(label.as_deref(), "source_sha256")
+            );
+            assert_eq!(
+                artifact_key(&label),
+                kernel::kernel_artifact_key(label.as_deref())
+            );
+            // The on-disk name law is already shared; pinned here so the three move together.
+            assert_eq!(
+                format!("vmlinux{}", suffix(&label)),
+                kernel::kernel_filename(label.as_deref())
+            );
+        }
+        // Non-vacuous: the labelled and default spellings really differ, so the loop above is not
+        // comparing one constant to itself.
+        assert_ne!(
+            artifact_key(&Some("6.12.94".to_string())),
+            artifact_key(&None)
+        );
+        assert_ne!(
+            url_pin_key(&Some("6.12.94".to_string())),
+            url_pin_key(&None)
+        );
     }
 
     // §5.2 (The config fragment): the fragment set is content-addressed by its SORTED form — the same set in any

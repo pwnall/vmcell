@@ -66,7 +66,13 @@ fn main() {
         match args.get(1) {
             Some(c) => (c.clone(), args.get(2..).unwrap_or(&[])),
             None => {
-                eprintln!("usage: vmcell-guest-tools <ip|curl|kvm-ok|echo-server> [args…]");
+                // Rendered from the roster, never re-typed: a usage line that lists a name
+                // the binary cannot dispatch (or omits one it can) is the same drift in
+                // its most user-visible form.
+                eprintln!(
+                    "usage: vmcell-guest-tools <{}> [args…]",
+                    vmcell_protocol::GUEST_TOOLS_APPLETS.join("|")
+                );
                 // expect(disallowed_methods): a busy-box multicall helper relays its status as the
                 // process exit code; nothing is owned to unwind here (usage error before any work).
                 #[expect(
@@ -103,16 +109,76 @@ fn basename(path: &str) -> String {
 /// whole class).
 type Applet = fn(&[String]) -> i32;
 
-/// The **one** applet roster: the `argv[0]` symlink-name test and the dispatch read
-/// the same table, so a new applet cannot be added to one and forgotten in the other
-/// (that split is how a symlinked applet silently degrades to the usage error). The
-/// injected symlinks in `vmcell::artifact::rootfs`'s manifest are this list.
-const APPLETS: &[(&str, Applet)] = &[
+/// The applet dispatch table: one implementation per
+/// [`vmcell_protocol::GUEST_TOOLS_APPLETS`] entry, in the roster's order.
+///
+/// The roster is NOT restated here. Its length is this array's length (a mismatch is a
+/// type error) and the `const` assertion below compares the names element-wise — so
+/// growing, dropping, renaming, or reordering the roster without the matching
+/// edit here fails to **compile**. That is the point: `vmcell`'s
+/// `rootfs_injection_manifest` derives its `/vmcell-tools/<name>` symlinks from the same
+/// const, so a symlink can no longer exist without a dispatch arm. Before docs/81 m22 the
+/// two sides were independent literals and the one-sided edit shipped twice — a symlinked
+/// name with no arm exits 2, which as a custom `init=` panics the guest kernel.
+const APPLETS: [(&str, Applet); vmcell_protocol::GUEST_TOOLS_APPLETS.len()] = [
     ("ip", run_ip),
     ("curl", run_curl),
-    ("kvm-ok", |_args| run_kvm_ok()),
+    ("kvm-ok", run_kvm_ok_applet),
     ("echo-server", run_echo_server),
 ];
+
+// Compile-time proof that `APPLETS` names exactly the roster, element-wise and in order.
+// The array type above already pins the COUNT; this pins the NAMES, which is what catches a
+// rename and an insert-in-the-middle (both of which keep the counts equal while silently
+// re-pairing a name with another applet's implementation).
+const _: () = assert!(
+    applet_names_match_roster(),
+    "APPLETS must name vmcell_protocol::GUEST_TOOLS_APPLETS element-wise, in order"
+);
+
+/// Element-wise name equality between [`APPLETS`] and the roster, evaluable in a `const`.
+const fn applet_names_match_roster() -> bool {
+    let roster = vmcell_protocol::GUEST_TOOLS_APPLETS;
+    let mut i = 0;
+    while i < roster.len() {
+        // expect(indexing_slicing): a `const fn` has no iterator, and `<[T]>::get` is not
+        // const here; `i < roster.len()` bounds both slices (APPLETS' length IS
+        // `roster.len()`, by its type). Any slip is a compile error, never a guest panic.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "const-context element walk; `i < roster.len()` bounds both slices, and APPLETS' length is roster.len() by type"
+        )]
+        let paired = str_eq(APPLETS[i].0, roster[i]);
+        if !paired {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `&str` equality usable in a `const` (`PartialEq` is not const).
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        // expect(indexing_slicing): same const-context reason as above; `i < a.len()` and
+        // the lengths are equal, so both index expressions are in bounds.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "const-context byte walk; `i < a.len()` and the two lengths are equal"
+        )]
+        let same = a[i] == b[i];
+        if !same {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 fn applet(name: &str) -> Option<Applet> {
     APPLETS
@@ -128,6 +194,43 @@ fn is_known(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 // `kvm-ok` — nested-virt probe (cpu-checker stand-in).
 // ---------------------------------------------------------------------------
+
+/// The exit code `curl`, `echo-server` and `kvm-ok` use for an invocation they cannot honor.
+///
+/// It is deliberately NOT one of `kvm-ok`'s own answers (0 = KVM usable, 1 = not usable), so a
+/// rejected argv can never be read as "nested virt is unavailable" — the assertion
+/// `nested_virt.rs` makes. The `ip` applet is the one exception, answering 1: that is the code
+/// its `ip link set` rejection has always used and what its callers already distinguish.
+const EXIT_USAGE: i32 = 2;
+
+/// Validates `kvm-ok`'s argv. Pure, so the accept/reject law is unit-testable without `/dev/kvm`.
+///
+/// `kvm-ok` probes one fixed thing — whether `/dev/kvm` can be opened read-write — so there is no
+/// argument it can honor, and every argument is therefore rejected naming it. The applet used to
+/// be registered as `|_args| run_kvm_ok()`, silently discarding whatever it was handed: a caller
+/// asking `kvm-ok --verbose` (or a typo'd `kvm-ok -q`) got the plain probe's exit code and could
+/// not tell the flag had been dropped. That is the same accept-then-ignore hazard the `curl` and
+/// `ip` shims were made fail-loud over — an accepted-but-ignored flag silently voids whatever
+/// property the caller passed it for.
+fn parse_kvm_ok_args(args: &[String]) -> Result<(), String> {
+    if let Some(first) = args.first() {
+        return Err(format!(
+            "unexpected argument {first:?} — this is vmcell's kvm-ok shim \
+             (/vmcell-tools/kvm-ok), not cpu-checker; it probes /dev/kvm and takes no arguments"
+        ));
+    }
+    Ok(())
+}
+
+/// The `kvm-ok` applet: rejects any argv it cannot honor, then runs the probe.
+fn run_kvm_ok_applet(args: &[String]) -> i32 {
+    if let Err(msg) = parse_kvm_ok_args(args) {
+        eprintln!("kvm-ok: {msg}");
+        eprintln!("usage: kvm-ok");
+        return EXIT_USAGE;
+    }
+    run_kvm_ok()
+}
 
 fn run_kvm_ok() -> i32 {
     match std::fs::OpenOptions::new()
@@ -496,38 +599,200 @@ fn echo_until_eof<S: std::io::Read + std::io::Write>(stream: &mut S) -> std::io:
 }
 
 // ---------------------------------------------------------------------------
-// `ip` — read-only network state from sysfs/procfs (exit 0 diagnostic).
+// `ip` — read-only network state from sysfs/procfs, plus the one form that really
+// writes (`ip link set … address`, the post-restore MAC rotation).
 // ---------------------------------------------------------------------------
 
-fn run_ip(args: &[String]) -> i32 {
-    match args.first().map(String::as_str).unwrap_or("addr") {
-        "link" | "l" => run_ip_link(args.get(1..).unwrap_or(&[])),
-        "addr" | "a" | "address" => {
-            // Read form (`ip addr`) lists interfaces; write forms
-            // (`add`/`flush`/`del`/…) are accepted as no-ops so the orchestrator's
-            // post-restore `ip addr …` chain succeeds without clobbering the
-            // boot-time (kernel `ip=`) address. In-guest IP rotation on restore is
-            // intentionally not performed (see module docs / the zero-netlink
-            // invariant); only MAC rotation is applied, via `ip link set`.
-            if !is_write_verb(args.get(1)) {
-                print_links();
+/// The `ip` invocations this shim implements, parsed and validated before any state is read or
+/// written.
+///
+/// The pre-fix dispatch had a catch-all that printed the interface list and exited **0** for
+/// every spelling it did not recognize — `ip -6 addr`, `ip tunnel add`, `ip link add veth0`, a
+/// typo'd object. That is the accept-then-ignore hazard the `curl` and `ip link set` parsers were
+/// already made fail-loud over, one step removed: a caller that asked for something the shim
+/// cannot do got a success and a plausible-looking listing. Rejection *is* the faithful
+/// emulation — an unimplemented form fails loudly, exactly as a missing real-`ip` feature would.
+#[derive(Debug, PartialEq, Eq)]
+enum IpCommand {
+    /// List interfaces, narrowed to one device when the caller named one (`ip addr show eth0`).
+    /// The filter is **honored**, not dropped: printing every interface for a caller that asked
+    /// about one is how an assertion about `eth1` passes on `eth0`'s address.
+    Links {
+        /// The device to list, or `None` for all of them.
+        dev: Option<String>,
+    },
+    /// Print the kernel routing table (`/proc/net/route`).
+    Routes,
+    /// Print the neighbour table (`/proc/net/arp`).
+    Neigh,
+    /// An address/route/neighbour **write** verb, deliberately accepted as a no-op so a caller's
+    /// post-restore `ip addr …` chain succeeds without clobbering the boot-time (kernel `ip=`)
+    /// address. In-guest IP rotation on restore is intentionally not performed (see the module
+    /// docs / the zero-netlink invariant); only MAC rotation is applied, via `ip link set`. This
+    /// is a recorded, deliberate exception to the honor-or-reject law, kept as it shipped — and
+    /// it is why `ip link add`/`del` is *rejected* rather than folded in here: a shim that
+    /// silently "succeeds" at creating an interface is a lie about the guest's topology, not a
+    /// preserved boot-time address.
+    NoOpWrite,
+    /// `ip link set …` — the argv after `set`, for the one form that really writes.
+    LinkSet(Vec<String>),
+}
+
+/// Parses `ip`'s argv. Pure, so the whole accept/reject matrix is unit-testable without an
+/// interface, mirroring [`parse_ip_link_set`] and [`parse_curl_args`].
+fn parse_ip_args(args: &[String]) -> Result<IpCommand, String> {
+    let mut idx = 0;
+    while let Some(arg) = args.get(idx) {
+        if !arg.starts_with('-') {
+            break;
+        }
+        match arg.as_str() {
+            // Every vmcell guest datapath — the NAT /30, the privileged tap /30, and the segment
+            // /24 — is IPv4-only, so `-4` is what already happens (the same reasoning the `curl`
+            // shim's `-4` arm carries). `-6` is therefore un-honorable and rejected.
+            "-4" => {}
+            "-6" => {
+                return Err("-6 cannot be honored: vmcell guest networking is IPv4-only".into());
             }
-            0
+            other => {
+                return Err(format!(
+                    "unknown option {other} — this is vmcell's ip shim (/vmcell-tools/ip), not \
+                     iproute2; it implements only `[-4] {{addr|link|route|neigh}} …`"
+                ));
+            }
+        }
+        idx += 1;
+    }
+    let rest = args.get(idx..).unwrap_or(&[]);
+    // A bare `ip` (or `ip -4`) lists interfaces, as this shim has always done.
+    let Some((object, tail)) = rest.split_first() else {
+        return Ok(IpCommand::Links { dev: None });
+    };
+    match object.as_str() {
+        "link" | "l" => match tail.split_first() {
+            Some((verb, after)) if verb == "set" => Ok(IpCommand::LinkSet(after.to_vec())),
+            Some((verb, _)) if is_write_verb(Some(verb)) => Err(format!(
+                "`ip link {verb}` is not implemented: this shim reads interface state and sets \
+                 an existing link's address/flags — it cannot create or destroy interfaces"
+            )),
+            _ => Ok(IpCommand::Links {
+                dev: parse_listing_tail(tail)?,
+            }),
+        },
+        "addr" | "a" | "address" => {
+            if is_write_verb(tail.first()) {
+                return Ok(IpCommand::NoOpWrite);
+            }
+            Ok(IpCommand::Links {
+                dev: parse_listing_tail(tail)?,
+            })
         }
         "route" | "r" => {
-            if !is_write_verb(args.get(1)) {
-                print_routes();
+            if is_write_verb(tail.first()) {
+                return Ok(IpCommand::NoOpWrite);
             }
-            0
+            parse_unfiltered_listing(tail, "route", IpCommand::Routes)
         }
         "neigh" | "n" | "neighbour" | "neighbor" => {
+            if is_write_verb(tail.first()) {
+                return Ok(IpCommand::NoOpWrite);
+            }
+            parse_unfiltered_listing(tail, "neigh", IpCommand::Neigh)
+        }
+        other => Err(format!(
+            "unknown object {other:?} — this is vmcell's ip shim (/vmcell-tools/ip), not \
+             iproute2; it implements only `addr`, `link`, `route` and `neigh`"
+        )),
+    }
+}
+
+/// The listing verbs (`ip addr show`, `ip link list`) — read forms that take an optional device.
+fn is_read_verb(tok: &str) -> bool {
+    matches!(tok, "show" | "list" | "l" | "ls")
+}
+
+/// Parses a listing's tail: an optional read verb followed by an optional `[dev] <name>` filter
+/// (`ip addr show eth0`, `ip addr show dev eth0`, `ip a eth0`, or nothing at all).
+///
+/// Anything else is rejected naming it, because the alternative — dropping it — is what let
+/// `ip addr show eth0` print every interface and a caller assert on the wrong one's address.
+fn parse_listing_tail(tail: &[String]) -> Result<Option<String>, String> {
+    let rest = match tail.split_first() {
+        None => return Ok(None),
+        // `show`/`list` consume the verb slot; a bare token is the device itself.
+        Some((verb, after)) if is_read_verb(verb) => after,
+        Some(_) => tail,
+    };
+    let mut it = rest.iter();
+    let Some(first) = it.next() else {
+        return Ok(None);
+    };
+    let dev = if first == "dev" {
+        it.next()
+            .ok_or_else(|| "dev needs a device name".to_string())?
+    } else if first.starts_with('-') {
+        return Err(format!(
+            "unknown option {first} — this is vmcell's ip shim (/vmcell-tools/ip); options go \
+             before the object, and only `-4` is implemented"
+        ));
+    } else {
+        first
+    };
+    if let Some(extra) = it.next() {
+        return Err(format!(
+            "unsupported argument {extra:?} — this is vmcell's ip shim (/vmcell-tools/ip), not \
+             iproute2; a listing takes at most `[show] [dev] <name>`"
+        ));
+    }
+    Ok(Some(dev.clone()))
+}
+
+/// Parses the tail of a listing this shim prints **whole** (`ip route`, `ip neigh`): the optional
+/// read verb and nothing else. A filter it cannot apply is rejected rather than ignored — `ip
+/// route show dev eth0` returning every route reads as "this route exists on eth0".
+fn parse_unfiltered_listing(
+    tail: &[String],
+    object: &str,
+    cmd: IpCommand,
+) -> Result<IpCommand, String> {
+    let rest = match tail.split_first() {
+        None => return Ok(cmd),
+        Some((verb, after)) if is_read_verb(verb) => after,
+        Some(_) => tail,
+    };
+    match rest.first() {
+        None => Ok(cmd),
+        Some(extra) => Err(format!(
+            "unsupported argument {extra:?} — this is vmcell's ip shim (/vmcell-tools/ip), not \
+             iproute2; `ip {object}` prints the whole table and implements no selector"
+        )),
+    }
+}
+
+fn run_ip(args: &[String]) -> i32 {
+    let cmd = match parse_ip_args(args) {
+        Ok(cmd) => cmd,
+        Err(msg) => {
+            eprintln!("ip: {msg}");
+            // 1, not `EXIT_USAGE`: the code this applet's `ip link set` rejection already uses.
+            return 1;
+        }
+    };
+    match cmd {
+        IpCommand::Links { dev } => {
+            print_links(dev.as_deref());
+            0
+        }
+        IpCommand::Routes => {
+            print_routes();
+            0
+        }
+        IpCommand::Neigh => {
             print_neigh();
             0
         }
-        _ => {
-            print_links();
-            0
-        }
+        IpCommand::NoOpWrite => 0,
+        IpCommand::LinkSet(argv) => run_ip_link_set(&argv),
     }
 }
 
@@ -538,42 +803,84 @@ fn is_write_verb(verb: Option<&String>) -> bool {
     )
 }
 
-/// Handles `ip link …`. Implements `set <dev> address <mac>` (and `up`/`down`)
-/// for real via interface ioctls — the orchestrator's post-restore MAC rotation
-/// depends on it. Any other `ip link` form lists interfaces.
-fn run_ip_link(args: &[String]) -> i32 {
-    if args.first().map(String::as_str) != Some("set") {
-        print_links();
-        return 0;
-    }
+/// The `ip link set` forms this shim implements, parsed and **validated** before
+/// any ioctl runs.
+///
+/// Every field is something the shim genuinely performs — the same law the `curl`
+/// applet below already enforces (`curl-shim-silently-ignores-unknown-flags`).
+/// The pre-fix parser had a catch-all that swallowed `mtu 9000`, `master br0` and
+/// `promisc on` and still exited 0, and a bare `address` with no value became
+/// `None`, which the consumer skipped: a test that asked for an MTU change, an
+/// enslave, or a MAC rotation and then asserted on the result lost the property it
+/// was written to assert. Rejection *is* the faithful emulation — an unimplemented
+/// form fails loudly, exactly as a missing real-`ip` feature would.
+struct IpLinkSet {
+    dev: String,
+    mac: Option<[u8; 6]>,
+    up: Option<bool>,
+}
 
+/// Parses `ip link set …`'s argv (everything after `set`), or returns the message
+/// to print before exiting 1.
+///
+/// Pure, so the whole accept/reject matrix is unit-testable without an interface.
+fn parse_ip_link_set(args: &[String]) -> Result<IpLinkSet, String> {
     let mut dev: Option<String> = None;
-    let mut mac: Option<String> = None;
+    let mut mac: Option<[u8; 6]> = None;
     let mut up: Option<bool> = None;
-    let mut it = args.get(1..).unwrap_or(&[]).iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "dev" => dev = it.next().cloned(),
-            "address" | "addr" => mac = it.next().cloned(),
+    let mut it = args.iter();
+    // Every value-consuming keyword goes through this, so a keyword at the end of
+    // argv is a named rejection rather than a silently-dropped option.
+    macro_rules! value {
+        ($kw:expr) => {
+            it.next().ok_or_else(|| format!("{} needs a value", $kw))?
+        };
+    }
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "dev" => dev = Some(value!("dev").clone()),
+            "address" | "addr" => {
+                let raw = value!("address");
+                mac = Some(parse_mac(raw).ok_or_else(|| format!("invalid MAC address {raw:?}"))?);
+            }
             "up" => up = Some(true),
             "down" => up = Some(false),
             other => {
-                // `ip link set eth0 …` — first bare token is the device.
-                if dev.is_none() {
-                    dev = Some(other.to_string());
+                // `ip link set eth0 …` — the first bare token is the device.
+                if dev.is_some() {
+                    return Err(format!(
+                        "unsupported argument {other:?} — this is vmcell's ip shim \
+                         (/vmcell-tools/ip), not iproute2; it implements only \
+                         `set [dev] <name> [address <mac>] [up|down]`"
+                    ));
                 }
+                dev = Some(other.to_string());
             }
         }
     }
+    let dev = dev.ok_or_else(|| "no device specified".to_string())?;
+    Ok(IpLinkSet { dev, mac, up })
+}
 
-    let Some(dev) = dev else {
-        eprintln!("ip link set: no device specified");
-        return 1;
+/// Applies `ip link set …` — `args` is the argv **after** `set`, as carried by
+/// [`IpCommand::LinkSet`].
+///
+/// Implements `<dev> address <mac>` (and `up`/`down`) for real via interface
+/// ioctls — the orchestrator's post-restore MAC rotation depends on it. Any form
+/// the shim cannot honor is rejected by [`parse_ip_link_set`], never ignored.
+fn run_ip_link_set(args: &[String]) -> i32 {
+    let IpLinkSet { dev, mac, up } = match parse_ip_link_set(args) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("ip link set: {msg}");
+            return 1;
+        }
     };
+
     if let Some(mac) = mac
-        && let Err(e) = set_mac(&dev, &mac)
+        && let Err(e) = set_mac(&dev, mac)
     {
-        eprintln!("ip link set {dev} address {mac}: {e}");
+        eprintln!("ip link set {dev} address: {e}");
         return 1;
     }
     if let Some(up) = up {
@@ -597,7 +904,13 @@ fn run_ip_link(args: &[String]) -> i32 {
     0
 }
 
-fn print_links() {
+/// Prints the interface listing, narrowed to `only` when the caller named a device.
+///
+/// The filter is HONORED, not dropped: printing every interface for a caller that asked about one is
+/// how an assertion about `eth1` passes on `eth0`'s address. A named device that does not exist
+/// prints nothing, which is what real `ip` reports through its non-zero exit — the shim's callers
+/// assert on the emitted lines, so an empty listing is the observable difference.
+fn print_links(only: Option<&str>) {
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
         println!("(no /sys/class/net)");
         return;
@@ -605,6 +918,7 @@ fn print_links() {
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| only.is_none_or(|want| want == name))
         .collect();
     names.sort();
     for (idx, name) in names.iter().enumerate() {
@@ -655,8 +969,8 @@ fn read_trim(path: &str) -> Option<String> {
 // routes; this is the RECORDED-deviation route (b), with a strengthened divergence
 // guard. Why not route (a), consolidating onto the agent's lib target:
 //
-//   * `netif` deliberately exports only what PID 1 calls — `set_loopback_up`,
-//     `set_mac_bytes`, `set_ipv4`. Guest-tools additionally needs a general
+//   * `netif` deliberately exports only what PID 1 calls — `set_loopback_up` and
+//     the one composed `resync_net`. Guest-tools additionally needs a general
 //     `set_link_up(dev, up)` (for `ip link set … up|down`) and `read_ipv4`
 //     (`SIOCGIFADDR`/`SIOCGIFNETMASK`, for `ip addr`'s `inet` line), neither of
 //     which PID 1 has any use for. Consolidating means GROWING the audited PID-1
@@ -677,7 +991,9 @@ fn read_trim(path: &str) -> Option<String> {
 // `netif::HWADDR_{FAMILY,MAC}_OFFSET`, and
 // `ifreq_is_pinned_field_by_field_to_the_kernel_abi` pins offsets + sizes against
 // `libc::ifreq`/`sockaddr`/`sockaddr_in`. Both copies are anchored to the same ABI,
-// so a drift in either reddens in its own crate.
+// so a drift in either reddens in its own crate — the agent half now holds up its
+// end too (m25): `netif` takes its request numbers from `libc` and pins them in
+// `netif::tests::ioctl_requests_and_flags_are_pinned_to_the_kernel_abi`.
 //
 // The error-type divergence the review named IS resolved: this stack now returns
 // `std::io::Result`, exactly as `netif` does, so the remaining difference between
@@ -846,13 +1162,9 @@ fn read_ipv4(dev: &str) -> Option<([u8; 4], u8)> {
     res
 }
 
-fn set_mac(dev: &str, mac_str: &str) -> std::io::Result<()> {
-    let mac = parse_mac(mac_str).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid MAC: {mac_str}"),
-        )
-    })?;
+/// Installs `mac` on `dev`. The address is already validated — [`parse_ip_link_set`]
+/// rejects a malformed one before any ioctl runs, so this never sees a bad MAC.
+fn set_mac(dev: &str, mac: [u8; 6]) -> std::io::Result<()> {
     let fd = open_inet_socket()?;
     let res = (|| -> std::io::Result<()> {
         // Some drivers require the link down to change its hardware address; bring
@@ -1474,21 +1786,32 @@ mod tests {
         }
     }
 
-    // The multicall roster is ONE table: `argv[0]` symlink dispatch and the
-    // sub-command dispatch read it, so the `/vmcell-tools/echo-server` symlink the
-    // rootfs manifest injects actually resolves. RED on the pre-v30 shape (a
-    // `matches!` name list beside an independent dispatch `match`), where adding the
-    // applet to only one degrades the symlink to exit 2 — which, as a custom `init=`,
-    // is an immediate kernel panic.
+    // The multicall roster is ONE list, and it is `vmcell_protocol::GUEST_TOOLS_APPLETS` —
+    // the same const `vmcell`'s `rootfs_injection_manifest` derives its
+    // `/vmcell-tools/<name>` symlinks from. No name is re-typed here: a third literal is
+    // exactly what let the two real ones drift (docs/81 m22), so this walks the roster.
+    //
+    // The roster↔dispatch agreement itself is a COMPILE error (the `const _: () = assert!`
+    // beside `APPLETS`), not this test — adding an applet to one side only does not reach a
+    // test run at all. What this test still catches, and the const cannot: a broken
+    // `applet`/`is_known` lookup (both negative controls below fail if it degenerates to
+    // "always Some"), and a roster entry that the dispatch table cannot actually resolve
+    // through the public lookup path.
     #[test]
     fn applet_roster_is_one_list_and_carries_echo_server() {
-        for name in ["ip", "curl", "kvm-ok", "echo-server"] {
+        assert!(
+            !vmcell_protocol::GUEST_TOOLS_APPLETS.is_empty(),
+            "an empty roster would make every assertion below vacuous"
+        );
+        for name in vmcell_protocol::GUEST_TOOLS_APPLETS {
             assert!(is_known(name), "{name} must be dispatchable by argv[0]");
             assert!(
                 applet(name).is_some(),
                 "{name} must resolve to a run function"
             );
         }
+        // Negative controls: the multicall binary's own `argv[0]` must fall through to the
+        // `<cmd>`-argument form, and an unknown name must not dispatch.
         assert!(!is_known("vmcell-guest-tools"));
         assert!(applet("nope").is_none());
     }
@@ -1645,6 +1968,129 @@ mod tests {
         // Non-hex octet.
         assert_eq!(parse_mac("zz:00:00:00:00:00"), None);
         assert_eq!(parse_mac(""), None);
+    }
+
+    /// `ip link set` argv as the applet receives it (everything after `set`).
+    fn link_set(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // m5 — the `ip` shim REJECTS any `ip link set` spelling it cannot honor, the
+    // same law the sibling `curl` applet enforces
+    // (`curl-shim-silently-ignores-unknown-flags`, docs/78). The pre-fix catch-all
+    // (`other => if dev.is_none() { dev = Some(other) }`) accepted every argv below
+    // and exited 0 with nothing performed — an accepted-but-ignored flag is the
+    // `-k`-on-a-TLS-test hazard one step removed, one applet over.
+    //
+    // RED on that catch-all: each of these parses Ok and the request vanishes.
+    #[test]
+    fn ip_link_set_rejects_argv_it_cannot_honor() {
+        for argv in [
+            // The three spellings the review named…
+            vec!["eth0", "mtu", "9000"],
+            vec!["eth0", "master", "br0"],
+            vec!["eth0", "promisc", "on"],
+            // …the same, past an explicit `dev`.
+            vec!["dev", "eth0", "mtu", "9000"],
+            // A second bare token is not a second device.
+            vec!["eth0", "eth1"],
+        ] {
+            let err = parse_ip_link_set(&link_set(&argv))
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be rejected, not silently ignored"));
+            assert!(
+                err.contains("unsupported argument"),
+                "{argv:?} must name the offender: {err}"
+            );
+        }
+    }
+
+    // A value-taking keyword at the end of argv is a named rejection, never a
+    // silently-dropped option: bare `address` used to yield `mac: None`, which the
+    // consumer skipped — the MAC rotation simply did not happen and exit 0 said it
+    // had. RED on `mac = it.next().cloned()`.
+    #[test]
+    fn ip_link_set_rejects_a_keyword_with_no_value() {
+        for (argv, want) in [
+            (vec!["eth0", "address"], "address needs a value"),
+            (vec!["eth0", "addr"], "address needs a value"),
+            (vec!["dev"], "dev needs a value"),
+        ] {
+            let err = parse_ip_link_set(&link_set(&argv))
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} must be rejected"));
+            assert_eq!(err, want, "{argv:?}");
+        }
+        // A malformed MAC is rejected at parse time, before any ioctl.
+        let err = parse_ip_link_set(&link_set(&["eth0", "address", "zz:00"]))
+            .err()
+            .expect("a malformed MAC must be rejected");
+        assert!(err.contains("invalid MAC address"), "{err}");
+        // …and so is an argv naming no device at all.
+        assert_eq!(
+            parse_ip_link_set(&[]).err().as_deref(),
+            Some("no device specified")
+        );
+    }
+
+    // The positive control: every spelling the shim really does honor still parses,
+    // with the value it will act on. Without this, "reject everything" would pass
+    // the rejection tests above.
+    #[test]
+    fn ip_link_set_accepts_the_forms_it_implements() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+
+        let bare_dev = parse_ip_link_set(&link_set(&["eth0", "address", "aa:bb:cc:dd:ee:ff"]))
+            .expect("bare-dev + address is implemented");
+        assert_eq!(bare_dev.dev, "eth0");
+        assert_eq!(bare_dev.mac, Some(mac));
+        assert_eq!(bare_dev.up, None, "no up/down was asked for");
+
+        let explicit = parse_ip_link_set(&link_set(&[
+            "dev",
+            "eth0",
+            "addr",
+            "aa:bb:cc:dd:ee:ff",
+            "up",
+        ]))
+        .expect("`dev <name>` + `addr` + `up` is implemented");
+        assert_eq!(explicit.dev, "eth0");
+        assert_eq!(explicit.mac, Some(mac));
+        assert_eq!(explicit.up, Some(true));
+
+        let down = parse_ip_link_set(&link_set(&["eth0", "down"])).expect("down is implemented");
+        assert_eq!(down.dev, "eth0");
+        assert_eq!(down.mac, None);
+        assert_eq!(down.up, Some(false));
+    }
+
+    // The applet itself consults the parser: a rejected form exits non-zero instead
+    // of the pre-fix 0. (Only the reject path is driven here — the accept path would
+    // reconfigure the *host's* interfaces.)
+    #[test]
+    fn run_ip_link_exits_nonzero_on_an_unhonorable_form() {
+        let argv = link_set(&["eth0", "mtu", "9000"]);
+        assert_eq!(
+            run_ip_link_set(&argv),
+            1,
+            "an `ip link set` form the shim cannot honor must fail loudly"
+        );
+    }
+
+    // The applet's own dispatch reaches the same rejection: `run_ip` must route
+    // `ip link set …` to the validating path, not to a listing that exits 0. Red if
+    // `IpCommand::LinkSet` is ever folded into `NoOpWrite`.
+    #[test]
+    fn run_ip_routes_an_unhonorable_link_set_to_the_rejecting_path() {
+        let argv: Vec<String> = ["link", "set", "eth0", "mtu", "9000"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            run_ip(&argv),
+            1,
+            "`ip link set` must reach parse_ip_link_set through run_ip's dispatch"
+        );
     }
 
     #[test]

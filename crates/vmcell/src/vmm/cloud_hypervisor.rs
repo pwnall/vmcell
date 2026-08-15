@@ -45,14 +45,19 @@ pub struct ChInstance {
     // handle to the backend (M-RESTORE-3).
     snapshot_restore_capable: bool,
     cid: u32,
-    pgid: Option<u32>,
+    // The VMM leader's process group AND the one-shot "already reaped" flag, owned
+    // together by the one shared helper (`vmm::VmmProcessGroup`, L1): `kill`, `has_exited`
+    // and `Drop` all route through it, so no copy can forget the M-VMM-1 guard and
+    // SIGKILL a pgid the kernel has since recycled.
+    group: crate::vmm::VmmProcessGroup,
+    // The guest's RAM size, carried from `VmConfig::mem_mib` at construction, because
+    // the snapshot RPC's budget is a function of it (`vmm::snapshot_request_timeout`,
+    // M6): a suspend image tracks guest RAM ~1:1, so the write cannot ride the flat
+    // control-plane ceiling.
+    mem_mib: u32,
     // True if a vhost-user-net device is attached (unprivileged NAT). Such a VM is
     // not snapshot-eligible.
     vhost_user_net: bool,
-    // True once the VMM leader has been reaped (via `has_exited`/`kill`). After the
-    // leader is reaped the kernel can recycle its pgid, so `kill`/`Drop` must NOT
-    // re-`SIGKILL` the process group or they could hit an unrelated group (M-VMM-1).
-    reaped: bool,
 }
 
 /// Pre-flight self-checks for the `ChInstance::snapshot` path.
@@ -336,6 +341,18 @@ impl ChInstance {
     ) -> Result<()> {
         crate::vmm::unix_api_request(&self.api_socket, method, path, body).await
     }
+
+    /// The same RPC on an explicit budget, for `vm.snapshot` — whose duration scales
+    /// with guest RAM and therefore cannot ride the flat control ceiling (M6).
+    async fn api_request_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&impl Serialize>,
+        budget: std::time::Duration,
+    ) -> Result<()> {
+        crate::vmm::unix_api_request_with(&self.api_socket, method, path, body, budget).await
+    }
 }
 
 /// The paths and handles produced by [`CloudHypervisor::spawn_ch`].
@@ -428,6 +445,86 @@ fn rewrite_restore_config(
     Ok(())
 }
 
+/// Refuses a [`VmConfig`] asking for `nested_virt`/`lazy_restore` that this backend's
+/// descriptor advertises as `false`, through the **one** shared predicate
+/// [`crate::vmm::reject_unadvertised_capabilities`] (docs/81 d7).
+///
+/// Cloud Hypervisor advertises **both** as `true` (`-cpu host`-equivalent VMX exposure plus the
+/// cmdline's `kvm-intel.nested=1`; `--restore source_url=…,prefault=off` for demand paging), so
+/// both branches are dormant *today* — exactly like the `reject_usb_host_devices` call in
+/// `create()` on QEMU, whose flag is also `true`. Routing the primary backend through the shared
+/// predicate anyway is what makes it a **law** rather than a convention three secondary backends
+/// happen to follow: a deliberate re-gate of either flag (a host without nested KVM, a CH build
+/// whose `prefault=off` regressed) turns every such config into the typed refusal here, with no
+/// second site to write and no window in which CH silently accepts what its own descriptor
+/// denies.
+///
+/// This wrapper exists only to bind the `"cloud-hypervisor"` name once; the law, both branches
+/// and the N-VMM-1 feature strings live in the shared predicate.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] `{ vmm: "cloud-hypervisor", feature }` naming the unadvertised
+/// capability.
+fn reject_unadvertised_capabilities(caps: &VmmCapabilities, cfg: &VmConfig) -> Result<()> {
+    crate::vmm::reject_unadvertised_capabilities("cloud-hypervisor", caps, cfg)
+}
+
+/// The `--restore` argument for a snapshot directory under a given [`RestoreMode`].
+///
+/// §8.3 eager-vs-lazy restore: CH v52's `--restore` accepts a `prefault=on|off` modifier on the
+/// `source_url`. `on` eagerly faults all guest memory in at restore time; `off` selects
+/// lazy/userfaultfd demand-paging; [`RestoreMode::Default`](crate::config::RestoreMode::Default)
+/// omits the modifier and uses CH's own default. Pure, so the mapping is unit-testable without
+/// spawning CH — and so [`ch_launch_plan`] can compose the whole argv with no I/O.
+fn ch_restore_arg(dir: &Path, restore_mode: crate::config::RestoreMode) -> String {
+    let mut arg = format!("source_url=file://{}", dir.display());
+    match restore_mode {
+        crate::config::RestoreMode::Eager => arg.push_str(",prefault=on"),
+        crate::config::RestoreMode::Lazy => arg.push_str(",prefault=off"),
+        crate::config::RestoreMode::Default => {}
+    }
+    arg
+}
+
+/// The pure, total mapping from a config to the complete Cloud Hypervisor launch (M11).
+///
+/// `spawn_ch` builds through this and spawns **only** what it returns, so the jail posture that
+/// ships is a *returned value* a KVM-free test can assert on
+/// ([`LaunchPlan::jail`](crate::vmm::LaunchPlan::jail)) rather than an inline
+/// `jail_spec_from_config(&…)` argument no gate can see. The confinement is applied in
+/// `build_vmm_cmd`'s post-fork `pre_exec` window, which nothing KVM-free observes — so without
+/// this, rewriting the one `&cfg.jail` token to a weakened config ships every CH VM with a
+/// different posture and the whole suite stays green (the M11 defect class, crosvm leg).
+///
+/// Performs **no I/O**: the restore path's `config.json` read/rewrite stays in `spawn_ch` and
+/// reaches here only as the already-composed `restore_arg`, so a unit test can build a
+/// `VmConfig`, call this, and assert over the composed argv.
+///
+/// # Errors
+/// Propagates [`vmm_seccomp_args`](crate::vmm::seccomp::vmm_seccomp_args)'s typed refusal (CH
+/// honors all three policies, so this cannot fire today) and
+/// [`LaunchPlan::build`](crate::vmm::LaunchPlan::build)'s jail-compilation error.
+fn ch_launch_plan(
+    binary_path: &Path,
+    cfg: &VmConfig,
+    res: &PerVmResources,
+    api_socket: &Path,
+    restore_arg: Option<&str>,
+) -> Result<crate::vmm::LaunchPlan> {
+    // §12.2 (Layer 1): the VMM's own seccomp flag, one predicate.
+    let seccomp_args = crate::vmm::seccomp::vmm_seccomp_args("cloud-hypervisor", cfg.vmm_seccomp)?;
+    // §12.3 (Layer 2): the ONE posture value, handed to the one constructor that both compiles
+    // it into the `pre_exec` jail and records it.
+    let mut plan = crate::vmm::LaunchPlan::build(binary_path, res.netns_name.as_deref(), cfg.jail)?;
+    let cmd = plan.command_mut();
+    cmd.args(&seccomp_args);
+    if let Some(arg) = restore_arg {
+        cmd.arg("--restore").arg(arg);
+    }
+    cmd.arg("--api-socket").arg(api_socket);
+    Ok(plan)
+}
+
 impl CloudHypervisor {
     async fn spawn_ch(
         &self,
@@ -443,14 +540,24 @@ impl CloudHypervisor {
         let vsock_path = res.tmp_dir.join("vsock.sock");
         let serial_path = res.tmp_dir.join("serial.log");
 
-        // §12.2 (Layer 1 — the VMM's own seccomp filter) / §12.3 (Layer 2 — the jailer-equivalent (JailSpec + apply_jail)): the VMM's own seccomp flag (one predicate) + the jailer-equivalent
-        // pre-exec hardening applied in build_vmm_cmd's forked-child window.
-        let seccomp_args =
-            crate::vmm::seccomp::vmm_seccomp_args("cloud-hypervisor", cfg.vmm_seccomp)?;
-        let jail = crate::vmm::jail::jail_spec_from_config(&cfg.jail)?;
-        let mut cmd =
-            crate::vmm::build_vmm_cmd(&self.binary_path, res.netns_name.as_deref(), &jail);
-        cmd.args(&seccomp_args);
+        // M11: the whole launch — seccomp flag, jail spec, netns, argv — is composed inside
+        // `ch_launch_plan`, so `spawn_ch` holds NO `JailConfig` and NO `JailSpec` and there is no
+        // window in which the posture could be swapped between deciding it and applying it. The
+        // plan's recorded posture is private to `vmm::launch`, so it cannot be overwritten here
+        // even deliberately; the KVM-free gate asserts on it.
+        //
+        // The `--restore` modifier is pure (`ch_restore_arg`), so it is computed here, before the
+        // snapshot's `config.json` is read — keeping the side-effect order (and every error
+        // path's residue) byte-identical to the inline composition this replaced.
+        let plan = ch_launch_plan(
+            &self.binary_path,
+            cfg,
+            res,
+            &api_socket,
+            snapshot_dir
+                .map(|dir| ch_restore_arg(dir, restore_mode))
+                .as_deref(),
+        )?;
 
         // The guest CID a restored snapshot baked in (populated from config.json in the
         // restore branch below); `None` on a cold create (M-VMM-3).
@@ -484,23 +591,10 @@ impl CloudHypervisor {
                 res.tap_name.as_deref(),
             )?;
             tokio::fs::write(&config_path, serde_json::to_string(&config)?).await?;
-
-            // §8.3 (Density levers) eager-vs-lazy restore: CH v52's `--restore` accepts a
-            // `prefault=on|off` modifier on the `source_url`. `on` eagerly faults
-            // all guest memory in at restore time; `off` selects lazy/userfaultfd
-            // demand-paging. `Default` omits the modifier and uses CH's own default.
-            let mut restore_arg = format!("source_url=file://{}", dir.display());
-            match restore_mode {
-                crate::config::RestoreMode::Eager => restore_arg.push_str(",prefault=on"),
-                crate::config::RestoreMode::Lazy => restore_arg.push_str(",prefault=off"),
-                crate::config::RestoreMode::Default => {}
-            }
-            cmd.arg("--restore").arg(restore_arg);
         }
 
-        let mut process = cmd
-            .arg("--api-socket")
-            .arg(&api_socket)
+        let mut process = plan
+            .into_command()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -514,7 +608,6 @@ impl CloudHypervisor {
             cgroups,
             &res.cgroup_name,
             &api_socket,
-            1000,
             cfg.timeouts.api_socket_poll.as_millis() as u64,
         )
         .await?;
@@ -557,6 +650,13 @@ impl Vmm for CloudHypervisor {
             &cfg.usb_host_devices,
         )?;
 
+        // §2.1: every backend self-checks its OWN descriptor rather than assuming the caller
+        // consulted it. Both branches are dormant on CH's shipped descriptor (it advertises
+        // `nested_virt` and `lazy_restore`), which is exactly why the call must be here: a
+        // re-gate of either flag has no second site to update, and the primary backend is not
+        // the one exception to the law.
+        reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
+
         let SpawnedCh {
             api_socket,
             vsock_path,
@@ -585,9 +685,9 @@ impl Vmm for CloudHypervisor {
             restored: false,
             snapshot_restore_capable: self.capabilities().snapshot_restore,
             cid,
-            pgid,
+            group: crate::vmm::VmmProcessGroup::new(pgid),
+            mem_mib: cfg.mem_mib,
             vhost_user_net: res.vhost_user_socket.is_some(),
-            reaped: false,
         };
 
         let mut ch_fs = Vec::new();
@@ -675,6 +775,11 @@ impl Vmm for CloudHypervisor {
             &self.capabilities(),
             cfg.console_mode,
         )?;
+        // The same descriptor self-check as `create()`. `restore()` is the path that actually
+        // consumes `cfg.restore_mode` (it becomes `--restore source_url=…,prefault=on|off`), so
+        // a restore that accepted exactly what create rejects is the crosvm M4 defect one path
+        // over — dormant flags or not.
+        reject_unadvertised_capabilities(&self.capabilities(), cfg)?;
         // C1 / snapshot-eligibility law: a snapshot-eligible VM has no vhost-user
         // device. Reject a virtio-fs *rootfs* or data share, unprivileged net, or an
         // external vhost-user-net *before* we would otherwise start virtiofsd
@@ -722,9 +827,9 @@ impl Vmm for CloudHypervisor {
             restored: true,
             snapshot_restore_capable: self.capabilities().snapshot_restore,
             cid,
-            pgid,
+            group: crate::vmm::VmmProcessGroup::new(pgid),
+            mem_mib: cfg.mem_mib,
             vhost_user_net: res.vhost_user_socket.is_some(),
-            reaped: false,
         };
 
         Ok(instance)
@@ -780,34 +885,17 @@ impl VmInstance for ChInstance {
     }
 
     async fn kill(&mut self) -> Result<()> {
-        if let Some(pgid) = self.pgid {
-            // Skip the group SIGKILL if the leader was already reaped (its pgid may be
-            // recycled) — M-VMM-1.
-            if !self.reaped {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-        }
-        let _ = self.process.wait().await;
-        // The leader is reaped now; `Drop` must not re-signal a possibly-recycled pgid.
-        self.reaped = true;
+        // The one shared signal/wait/flag sequence (L1): SIGKILL the group unless the
+        // leader was already reaped, await it, record the reap (M-VMM-1).
+        self.group.kill_and_wait(&mut self.process).await;
         Ok(())
     }
 
     async fn has_exited(&mut self) -> bool {
         // Non-blocking reap of the VMM leader; `Ok(Some(_))` means it exited (the
-        // guest powered off after `request_shutdown`). Record the reap so `kill()`/
-        // `Drop` do NOT re-`SIGKILL` the process group: once the leader is reaped the
-        // kernel may recycle its pgid and signalling `-pgid` could hit an unrelated
-        // group (M-VMM-1).
-        if matches!(self.process.try_wait(), Ok(Some(_))) {
-            self.reaped = true;
-            true
-        } else {
-            false
-        }
+        // guest powered off after `request_shutdown`). The shared helper records the
+        // reap so `kill()`/`Drop` cannot re-`SIGKILL` a possibly-recycled pgid.
+        self.group.note_exit(&mut self.process)
     }
 
     async fn pause(&mut self) -> Result<()> {
@@ -842,9 +930,20 @@ impl VmInstance for ChInstance {
         };
         self.api_request("PUT", "/api/v1/vm.pause", None::<&()>)
             .await?;
+        // M6: `vm.snapshot` writes a dense memory file that tracks guest RAM ~1:1, so it
+        // is budgeted against `mem_mib` — the flat control ceiling is a guaranteed
+        // spurious timeout on a multi-GiB guest.
         let res = self
-            .api_request("PUT", "/api/v1/vm.snapshot", Some(&req))
+            .api_request_with(
+                "PUT",
+                "/api/v1/vm.snapshot",
+                Some(&req),
+                crate::vmm::snapshot_request_timeout(self.mem_mib),
+            )
             .await;
+        // Resume on EVERY exit path, timeout included: a paused VM left behind by a
+        // failed snapshot is a wedged VM, so the resume is attempted unconditionally and
+        // only its own failure is warn-and-continue.
         if let Err(e) = self
             .api_request("PUT", "/api/v1/vm.resume", None::<&()>)
             .await
@@ -872,19 +971,10 @@ impl Drop for ChInstance {
         // Teardown order (AGENTS.md): VMM process group first — reaping it before
         // touching virtiofsd or the per-VM directory means cleanup never races a
         // live VMM.
-        if let Some(pgid) = self.pgid {
-            // Skip the group SIGKILL + reap if the leader was already reaped (via
-            // `has_exited`/`kill`): its pgid may have been recycled (M-VMM-1).
-            if !self.reaped {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-(pgid as i32)),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                if let Some(pid) = self.process.id() {
-                    let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
-                }
-            }
-        }
+        // Same helper, same order as the graceful `kill()` path (L1): the group SIGKILL +
+        // blocking reap is skipped if the leader was already reaped, since its pgid may
+        // have been recycled (M-VMM-1).
+        self.group.reap_now(&mut self.process);
         // virtiofsd next: dropping each daemon kills it and removes its own socket
         // before the orchestrator removes the shared per-VM directory.
         self._fs_daemons.clear();
@@ -899,6 +989,163 @@ impl Drop for ChInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawns a stand-in CH API socket on `sock`: it answers `204` to every request
+    /// immediately, except on `stall_path`, where it first waits `stall`
+    /// (`None` = never answers at all). Returns the shared log of requested paths in
+    /// arrival order, which is how the snapshot tests below observe whether the VM was
+    /// left paused.
+    ///
+    /// One connection per request (that is what `unix_api_request` does), so each
+    /// connection is served on its own task and a stalled snapshot cannot block the
+    /// `vm.resume` that follows it.
+    fn spawn_fake_ch_api(
+        sock: &Path,
+        stall_path: &'static str,
+        stall: Option<std::time::Duration>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let listener = tokio::net::UnixListener::bind(sock).expect("bind fake CH API socket");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    log.lock().expect("fake API log").push(path.clone());
+                    if path == stall_path {
+                        match stall {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }
+                    // The client may already have timed out and dropped the connection;
+                    // a write to that closed peer is the expected outcome, not a failure.
+                    if stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if stream.flush().await.is_err() {
+                        return;
+                    }
+                    // Hold the connection open long enough for the client to read the
+                    // reply before the socket closes.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                });
+            }
+        });
+        seen
+    }
+
+    /// A `ChInstance` wired to `api_socket` with `mem_mib` of guest RAM, owning a
+    /// stand-in child process so `Drop`/`kill` have something real to reap.
+    fn ch_instance_on(api_socket: PathBuf, mem_mib: u32) -> ChInstance {
+        let mut std_cmd = std::process::Command::new("sleep");
+        std_cmd.arg("60");
+        use std::os::unix::process::CommandExt;
+        std_cmd.process_group(0);
+        let child = tokio::process::Command::from(std_cmd)
+            .spawn()
+            .expect("spawn stand-in VMM");
+        ChInstance {
+            group: crate::vmm::VmmProcessGroup::new(child.id()),
+            process: child,
+            api_socket,
+            vsock_path: PathBuf::new(),
+            serial_path: PathBuf::new(),
+            _fs_daemons: Vec::new(),
+            restored: false,
+            snapshot_restore_capable: true,
+            cid: 3,
+            mem_mib,
+            vhost_user_net: false,
+        }
+    }
+
+    // Guards M6: `vm.snapshot` writes a memory file that tracks guest RAM ~1:1, so it
+    // rides `snapshot_request_timeout(mem_mib)`, NOT the flat 5 s control ceiling. The
+    // fake API stalls 6 s on `vm.snapshot` — past the shared ceiling, well inside a
+    // 2 GiB guest's budget (37 s) — so the snapshot must SUCCEED and the three RPCs must
+    // land in order. Real time, deliberately: the clock cannot be paused here, because
+    // auto-advance races the multi-hop hyper response and expires the budget while the
+    // reply is still in flight (observed: a spurious `vm.pause` timeout).
+    // Inverse (route vm.snapshot back through the shared-ceiling `api_request`): the
+    // stall exceeds 5 s and the `expect` on Ok reddens with a typed Timeout.
+    #[tokio::test]
+    async fn snapshot_rpc_is_budgeted_against_guest_ram_not_the_control_ceiling() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("api.sock");
+        let seen = spawn_fake_ch_api(
+            &sock,
+            "/api/v1/vm.snapshot",
+            Some(std::time::Duration::from_secs(6)),
+        );
+        let mut inst = ch_instance_on(sock, 2048);
+
+        inst.snapshot(dir.path())
+            .await
+            .expect("a 6 s vm.snapshot must fit a 2 GiB guest's budget");
+
+        let paths = seen.lock().expect("fake API log").clone();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/v1/vm.pause".to_string(),
+                "/api/v1/vm.snapshot".to_string(),
+                "/api/v1/vm.resume".to_string(),
+            ],
+            "snapshot must be pause → snapshot → resume"
+        );
+        inst.kill().await.expect("reap the stand-in VMM");
+    }
+
+    // Guards M6's second half: when the snapshot RPC really does exceed its (sized)
+    // budget, the failure is a typed Timeout AND the VM is RESUMED — a paused VM left
+    // behind by a failed snapshot is a wedged VM. The fake never answers `vm.snapshot`,
+    // so the wait is this guest's whole budget (64 MiB ⇒ 6 s) in real time.
+    // Inverse (resume only on the `res` Ok path): no `vm.resume` is ever requested and
+    // the ordered-paths assert reddens.
+    #[tokio::test]
+    async fn a_timed_out_snapshot_still_resumes_the_vm() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sock = dir.path().join("api.sock");
+        let seen = spawn_fake_ch_api(&sock, "/api/v1/vm.snapshot", None);
+        let mut inst = ch_instance_on(sock, 64);
+
+        let err = inst
+            .snapshot(dir.path())
+            .await
+            .expect_err("a never-answered vm.snapshot must time out");
+        assert!(
+            matches!(&err, Error::Timeout(m) if m.contains("vm.snapshot")),
+            "expected a typed Timeout naming the RPC, got {err:?}"
+        );
+
+        let paths = seen.lock().expect("fake API log").clone();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/v1/vm.pause".to_string(),
+                "/api/v1/vm.snapshot".to_string(),
+                "/api/v1/vm.resume".to_string(),
+            ],
+            "a timed-out snapshot must still issue vm.resume, or the VM stays paused"
+        );
+        inst.kill().await.expect("reap the stand-in VMM");
+    }
 
     #[test]
     fn test_ch_vm_config_serialization() {
@@ -1180,7 +1427,7 @@ mod tests {
             .spawn()
             .expect("spawn stand-in");
         let mut inst = ChInstance {
-            pgid: child.id(),
+            group: crate::vmm::VmmProcessGroup::new(child.id()),
             process: child,
             api_socket: std::env::temp_dir().join("vmcell-ch-boot-test-nonexistent.sock"),
             vsock_path: PathBuf::new(),
@@ -1189,8 +1436,8 @@ mod tests {
             restored: true,
             snapshot_restore_capable: true,
             cid: 3,
+            mem_mib: 128,
             vhost_user_net: false,
-            reaped: false,
         };
         let err = inst
             .boot()
@@ -1204,12 +1451,50 @@ mod tests {
         let _ = inst.kill().await;
     }
 
-    // Guards M-VMM-1 (CH): once the leader is reaped its pgid can be recycled — kill()
-    // must NOT SIGKILL `-pgid`. A live decoy process stands in for that recycled group.
-    // Inverse: drop the `!self.reaped` guard in kill() and the decoy is SIGKILLed
-    // (try_wait then reports it exited), reddening the assert.
+    // POSITIVE CONTROL for the gate above, and the gate on `Drop`'s OWN job: an instance whose
+    // group has NOT been reaped must have its process group SIGKILLed + reaped when it is dropped
+    // (L1 — `Drop` is the panic path of the one teardown order). Without this leg the
+    // "must not signal a recycled pgid" assertion is satisfied by a `Drop` that reaps NOTHING —
+    // which is precisely the regression the Cloud Hypervisor consolidation introduced and this leg caught: a
+    // dropped-but-never-killed VM would leak its whole process group.
+    //
+    // Inverse (observed red): delete `self.group.reap_now(&mut self.process)` from `Drop` and the
+    // stand-in survives, so `gone` stays false.
     #[tokio::test]
-    async fn kill_does_not_signal_pgid_when_reaped() {
+    async fn drop_reaps_an_unreaped_process_group() {
+        let inst = ch_instance_on(PathBuf::new(), 128);
+        let live_pid = inst.process.id().expect("stand-in pid") as i32;
+        drop(inst);
+
+        let mut gone = false;
+        for _ in 0..100 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(live_pid), None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Best-effort cleanup if the drop did NOT reap, so a red run leaves no stray process.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-live_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            gone,
+            "Drop on an UN-reaped instance must SIGKILL and reap its VMM process group"
+        );
+    }
+
+    // Guards M-VMM-1 (CH) on the SHIPPED call sites, not on the extracted helper: once the
+    // leader is reaped its pgid can be recycled, so neither `kill()` NOR `Drop` may SIGKILL
+    // `-pgid`. A live decoy process stands in for that recycled group, and BOTH teardown paths
+    // are driven against the same already-reaped instance.
+    //
+    // Inverse (observed red): drop the `!self.reaped` guard in `VmmProcessGroup::kill_and_wait`
+    // or `::reap_now` and the decoy is SIGKILLed — `try_wait` then reports it exited, reddening
+    // the assert.
+    #[tokio::test]
+    async fn kill_and_drop_do_not_signal_pgid_when_reaped() {
         let mut decoy = {
             let mut c = std::process::Command::new("sleep");
             c.arg("60");
@@ -1235,11 +1520,22 @@ mod tests {
             restored: false,
             snapshot_restore_capable: true,
             cid: 3,
-            pgid: Some(decoy_pid as u32),
+            // Already-reaped, pointing at the live decoy's group: the recycled-pgid
+            // state, which only the `test-support` constructor can fabricate.
+            group: crate::vmm::VmmProcessGroup::already_reaped_for_test(Some(decoy_pid as u32)),
+            mem_mib: 128,
             vhost_user_net: false,
-            reaped: true,
         };
         inst.kill().await.expect("kill");
+        assert!(
+            inst.group.is_reaped(),
+            "the group must still read as reaped after kill() — the flag is one-shot"
+        );
+        // The `Drop` leg: dropping the instance must not re-signal either. Both teardown paths
+        // are driven against the SAME already-reaped instance, because a backend that routed
+        // only one of them through the shared helper is the divergence this consolidation
+        // removes (the sibling backends' `kill_and_drop_do_not_signal_pgid_when_reaped`).
+        drop(inst);
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let decoy_status = decoy.try_wait().expect("try_wait decoy");
@@ -1251,7 +1547,7 @@ mod tests {
 
         assert!(
             decoy_status.is_none(),
-            "kill() on a reaped CH instance must not SIGKILL a (recycled) pgid"
+            "kill()/Drop on a reaped CH instance must not SIGKILL a (recycled) pgid"
         );
     }
 
@@ -1483,6 +1779,243 @@ mod tests {
         // Capable backend, snapshot-eligible VM: allowed.
         assert!(snapshot_precheck(true, false).is_ok());
     }
+
+    // docs/81 d7, CH leg. CH is the PRIMARY backend and the only one in the `vmcell` lib; a law
+    // the three secondary backends obey and it does not is not one law. Both of CH's flags are
+    // `true`, so the refusal is DORMANT on the shipped descriptor — which is precisely why this
+    // gate keys off descriptor VALUES rather than end-to-end behavior: the branch that must
+    // never rot is the one that fires after a future re-gate.
+    //
+    // Red on the inverse: hardcode either refusal (drop the `&& !caps.*` conjunct in the shared
+    // predicate) and the `shipped` positive control reddens; misspell either feature string and
+    // its `matches!` reddens; drop the shared predicate's `lazy_restore` branch entirely and the
+    // `without_lazy` leg reddens.
+    #[test]
+    fn capability_refusals_read_the_descriptor_not_a_hardcoded_bool() {
+        let cfg = |nested: bool, mode: crate::config::RestoreMode| {
+            VmConfig::builder(
+                "/k",
+                crate::config::RootfsSource::Erofs {
+                    image: PathBuf::from("/i"),
+                },
+            )
+            .nested_virt(nested)
+            .restore_mode(mode)
+            .build()
+            .expect("build config")
+        };
+        let shipped = CloudHypervisor::new("/usr/bin/cloud-hypervisor").capabilities();
+
+        // The dormancy claim, asserted rather than asserted-in-prose: routing CH through the
+        // shared predicate changes NOTHING about what CH accepts today, because it advertises
+        // both. If a future descriptor edit flips either flag, this line reddens first and the
+        // behavior change is deliberate instead of discovered.
+        assert!(
+            shipped.nested_virt && shipped.lazy_restore,
+            "CH advertises both capabilities, so both refusals are dormant: {shipped:?}"
+        );
+
+        // Positive control: the config asking for BOTH travels past the guard on the shipped
+        // descriptor. A guard that ignored `caps` and refused unconditionally reddens here.
+        reject_unadvertised_capabilities(&shipped, &cfg(true, crate::config::RestoreMode::Lazy))
+            .expect("CH advertises both, so a config asking for both must be accepted");
+
+        // …and a descriptor that re-gated nested virt refuses it, at the same call site, with no
+        // second site to update.
+        let without_nested = VmmCapabilities {
+            nested_virt: false,
+            ..shipped.clone()
+        };
+        let err = reject_unadvertised_capabilities(
+            &without_nested,
+            &cfg(true, crate::config::RestoreMode::Default),
+        )
+        .expect_err("a re-gated nested_virt must refuse a nested config");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "cloud-hypervisor" && feature == "nested_virt"),
+            "expected a nested_virt Unsupported, got {err:?}"
+        );
+
+        // Same for lazy restore — the field `restore()` actually consumes.
+        let without_lazy = VmmCapabilities {
+            lazy_restore: false,
+            ..shipped
+        };
+        let err = reject_unadvertised_capabilities(
+            &without_lazy,
+            &cfg(false, crate::config::RestoreMode::Lazy),
+        )
+        .expect_err("a re-gated lazy_restore must refuse a Lazy config");
+        assert!(
+            matches!(&err, Error::Unsupported { vmm, feature }
+                if vmm == "cloud-hypervisor" && feature == "lazy_restore"),
+            "expected a lazy_restore Unsupported, got {err:?}"
+        );
+    }
+
+    /// A minimal `PerVmResources` for the pure launch-plan gates below.
+    fn plan_test_res() -> PerVmResources {
+        PerVmResources {
+            cgroup_name: String::new(),
+            tap_name: None,
+            netns_name: None,
+            segment: None,
+            vhost_user_socket: None,
+            vmid: 7,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-plan-test"),
+        }
+    }
+
+    // The `--restore` modifier mapping (§8.3), pure and exhaustive over `RestoreMode`. It moved
+    // out of `spawn_ch` so `ch_launch_plan` could stay I/O-free; that made it testable, so it is
+    // tested. Inverse (swapping `prefault=on`/`off`, or emitting a modifier for `Default`)
+    // reddens the corresponding leg — and swapping them is a silent eager/lazy inversion, the
+    // exact "accepted input silently downgraded" class d7 exists for.
+    #[test]
+    fn ch_restore_arg_maps_each_mode_to_its_prefault_modifier() {
+        let dir = Path::new("/snap/dir");
+        assert_eq!(
+            ch_restore_arg(dir, crate::config::RestoreMode::Default),
+            "source_url=file:///snap/dir"
+        );
+        assert_eq!(
+            ch_restore_arg(dir, crate::config::RestoreMode::Eager),
+            "source_url=file:///snap/dir,prefault=on"
+        );
+        assert_eq!(
+            ch_restore_arg(dir, crate::config::RestoreMode::Lazy),
+            "source_url=file:///snap/dir,prefault=off"
+        );
+    }
+
+    // M11 GATE, CH leg (KVM-free). The jail posture is applied in `build_vmm_cmd`'s post-fork
+    // `pre_exec` closure, which NOTHING KVM-free can observe: while `spawn_ch` wrote
+    // `jail_spec_from_config(&cfg.jail)?` inline, rewriting that one token to a weakened config
+    // shipped every CH VM with a different Layer-2 posture and left `cargo test`, `just ci` and
+    // the whole live matrix green. `ch_launch_plan` makes the posture a RETURNED VALUE, so it is
+    // assertable — and `LaunchPlan::jail` is private to the sibling `vmm::launch` module, so the
+    // two-line defeat (`let mut plan = …; plan.jail = weaker;`) does not even compile here.
+    //
+    // Red on the inverse: rewrite `ch_launch_plan`'s `cfg.jail` to `JailConfig::disabled()` (or
+    // any other value) and the first assertion reddens.
+    #[test]
+    fn the_ch_launch_plan_ships_the_configured_jail_posture() {
+        use crate::config::{JailConfig, VmmSeccomp};
+
+        let plan_for = |jail: JailConfig| {
+            let cfg = VmConfig::builder(
+                "/boot/vmlinux",
+                crate::config::RootfsSource::Erofs {
+                    image: PathBuf::from("/img/rootfs.erofs"),
+                },
+            )
+            .vmm_seccomp(VmmSeccomp::Enforcing)
+            .jail(jail)
+            .build()
+            .expect("build config");
+            let plan = ch_launch_plan(
+                Path::new("/usr/bin/cloud-hypervisor"),
+                &cfg,
+                &plan_test_res(),
+                Path::new("/tmp/api.sock"),
+                None,
+            )
+            .expect("build the launch plan");
+            (cfg, plan)
+        };
+
+        // The plan's jail half IS the configured posture.
+        let (cfg, plan) = plan_for(JailConfig::hardened());
+        assert_eq!(
+            plan.jail(),
+            cfg.jail,
+            "the launch plan must ship `cfg.jail`, not a locally-built posture"
+        );
+
+        // Positive control, so the equality above is not a tautology about two identical
+        // structs: a DIFFERENT requested posture produces a different recorded posture, and
+        // compiled, the difference is real hardening versus none at all — which is what shipping
+        // the wrong value would have produced.
+        let (disabled_cfg, disabled_plan) = plan_for(JailConfig::disabled());
+        assert_eq!(disabled_plan.jail(), disabled_cfg.jail);
+        assert_ne!(
+            plan.jail(),
+            disabled_plan.jail(),
+            "control: the two postures differ, so the plan is not returning a constant"
+        );
+        assert!(
+            !crate::vmm::jail::jail_spec_from_config(&plan.jail())
+                .expect("compile the shipped spec")
+                .is_noop(),
+            "the shipped hardened posture must compile to real hardening"
+        );
+        assert!(
+            crate::vmm::jail::jail_spec_from_config(&disabled_plan.jail())
+                .expect("compile the disabled spec")
+                .is_noop(),
+            "control: the disabled posture compiles to no hardening — what a wrong value ships"
+        );
+    }
+
+    // The argv half of the same plan, asserted on the COMPOSED command rather than a fragment
+    // (docs/78 M11): a perfect per-fragment helper whose result never reaches the `Command` is
+    // exactly the defect the composed assertion catches. Both shapes are covered because the
+    // restore path is the one that adds an argument.
+    //
+    // Red on the inverse: drop the `cmd.args(&seccomp_args)` splice, or the `--restore` splice,
+    // and the corresponding `assert_eq!` reddens.
+    #[test]
+    fn the_ch_launch_plan_composes_the_whole_argv() {
+        use crate::config::{RestoreMode, VmmSeccomp};
+
+        let cfg = VmConfig::builder(
+            "/boot/vmlinux",
+            crate::config::RootfsSource::Erofs {
+                image: PathBuf::from("/img/rootfs.erofs"),
+            },
+        )
+        .vmm_seccomp(VmmSeccomp::Enforcing)
+        .build()
+        .expect("build config");
+
+        let cold = ch_launch_plan(
+            Path::new("/usr/bin/cloud-hypervisor"),
+            &cfg,
+            &plan_test_res(),
+            Path::new("/tmp/api.sock"),
+            None,
+        )
+        .expect("build the cold-create plan");
+        assert_eq!(
+            cold.argv(),
+            ["--seccomp", "true", "--api-socket", "/tmp/api.sock"],
+            "a cold create is the seccomp flag plus the API socket, in that order"
+        );
+
+        let restore_arg = ch_restore_arg(Path::new("/snap"), RestoreMode::Lazy);
+        let restored = ch_launch_plan(
+            Path::new("/usr/bin/cloud-hypervisor"),
+            &cfg,
+            &plan_test_res(),
+            Path::new("/tmp/api.sock"),
+            Some(&restore_arg),
+        )
+        .expect("build the restore plan");
+        assert_eq!(
+            restored.argv(),
+            [
+                "--seccomp",
+                "true",
+                "--restore",
+                "source_url=file:///snap,prefault=off",
+                "--api-socket",
+                "/tmp/api.sock",
+            ],
+            "a restore splices `--restore <arg>` between the seccomp flag and the API socket"
+        );
+    }
 }
 
 /// Source-level gate for §9.4's "`api_socket_poll` paces **every** daemon readiness wait" on the
@@ -1519,7 +2052,11 @@ mod virtiofs_pacing_gate {
     ///
     /// Dropping comments keeps a prose mention of an entry point from being scanned as a call;
     /// collapsing whitespace keeps a rustfmt line break from hiding half of one.
-    fn production_code(source: &str) -> String {
+    ///
+    /// `pub(super)` so this file's other source-level gate
+    /// ([`super::capability_guard_gate`]) reads the SAME normalizer instead of carrying a second
+    /// copy of it — two readers of one law, not two laws.
+    pub(super) fn production_code(source: &str) -> String {
         let production = source
             .split_once("#[cfg(test)]")
             .map_or(source, |(before, _)| before);
@@ -1595,5 +2132,220 @@ mod virtiofs_pacing_gate {
         let calls = virtiofs_start_calls(&code);
         assert_eq!(calls.len(), 1, "got {calls:?}");
         assert!(call_is_paced_by_the_vm_config(calls[0]), "got {calls:?}");
+    }
+}
+
+/// Source-level gate for §2.1's "every backend self-checks its **own** descriptor" on the
+/// primary backend, where the check is *dormant* and therefore invisible to behavior.
+///
+/// Why a scan rather than a test that observes a refusal: CH advertises both `nested_virt` and
+/// `lazy_restore`, so [`reject_unadvertised_capabilities`] returns `Ok(())` for every config CH
+/// can be handed today. Deleting either call site changes **no** observable behavior — every
+/// unit test, `just ci`, and the whole live matrix stay green — until someone re-gates a flag
+/// and discovers the primary backend never consulted its descriptor. That is the same
+/// gate-shaped hole M11 named for crosvm's jail posture, one law over; the sibling
+/// [`virtiofs_pacing_gate`] is the in-file precedent for closing it, and this module reuses that
+/// module's `production_code` normalizer rather than copying it.
+///
+/// It catches: a deleted or moved guard in either entry point, a guard that stopped reading
+/// `self.capabilities()`, and a guard that drifted *after* the spawn it is supposed to precede.
+/// It cannot catch: a wrong `vmm` string or a wrong feature spelling (the descriptor-keyed
+/// `capability_refusals_read_the_descriptor_not_a_hardcoded_bool` covers those), or the shared
+/// predicate's own logic (its home gate in `vmm::mod` covers that).
+#[cfg(test)]
+mod capability_guard_gate {
+    use super::virtiofs_pacing_gate::production_code;
+
+    const SOURCE: &str = include_str!("cloud_hypervisor.rs");
+
+    /// The exact call shape both entry points ship. Naming `&self.capabilities()` in the
+    /// pattern is load-bearing: it is what makes the refusal key off the ONE descriptor rather
+    /// than a locally-built `VmmCapabilities` a re-gate would not reach. The wrapper's own
+    /// definition and body do not contain this substring, so the scan sees call sites only.
+    const GUARD_CALL: &str = "reject_unadvertised_capabilities(&self.capabilities(), cfg)";
+
+    /// The spawn every guard must precede. Both entry points reach the VMM through this one
+    /// call, so "before any spawn" is a position in the text, not a claim in a comment.
+    ///
+    /// Deliberately unqualified: rustfmt breaks the shipped call as `= self\n.spawn_ch(…)`, which
+    /// [`production_code`] collapses to `= self .spawn_ch(…)` — a receiver-qualified marker would
+    /// silently match nothing and the gate would pass on an absent spawn. (Caught by this gate on
+    /// its first run.) The `async fn spawn_ch(` definition sits in the earlier `impl
+    /// CloudHypervisor` block, outside both scanned regions, so it cannot be mistaken for a call.
+    const SPAWN_CALL: &str = "spawn_ch(";
+
+    /// Splits `code` into the production bodies of `create` and `restore`, in that order.
+    ///
+    /// `create` runs to the start of `restore`; `restore` runs to the end of the production
+    /// text (`capabilities()` follows it in the same impl, which is harmless — it contains
+    /// neither marker). Returns `None` if either entry point is missing, so a rename reddens
+    /// loudly instead of scanning an empty region.
+    fn entry_point_bodies(code: &str) -> Option<(&str, &str)> {
+        let create_at = code.find("async fn create(")?;
+        let restore_at = code.find("async fn restore(")?;
+        // `create` is declared before `restore` in the `impl Vmm` block; if that ever inverts,
+        // the subtraction below would panic, so fail the gate explicitly instead.
+        if restore_at <= create_at {
+            return None;
+        }
+        Some((&code[create_at..restore_at], &code[restore_at..]))
+    }
+
+    /// The law, per entry point: exactly one descriptor self-check, and it precedes the spawn.
+    fn guards_before_spawn(body: &str) -> bool {
+        let guards: Vec<_> = body.match_indices(GUARD_CALL).collect();
+        let Some(spawn_at) = body.find(SPAWN_CALL) else {
+            return false;
+        };
+        matches!(guards.as_slice(), [(guard_at, _)] if *guard_at < spawn_at)
+    }
+
+    #[test]
+    fn create_and_restore_both_self_check_the_descriptor_before_spawning() {
+        let code = production_code(SOURCE);
+        let (create, restore) =
+            entry_point_bodies(&code).expect("both `create` and `restore` must exist, in order");
+        for (name, body) in [("create", create), ("restore", restore)] {
+            assert!(
+                guards_before_spawn(body),
+                "§2.1: `{name}` must call `{GUARD_CALL}` exactly once, before `{SPAWN_CALL}`. \
+                 CH advertises both capabilities, so deleting this call is behaviorally silent \
+                 today and a silent accept the day a flag is re-gated."
+            );
+        }
+    }
+
+    /// The gate's own red-on-inverse: the predicate must reject every regression shape, so the
+    /// scan above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_guard_predicate_rejects_the_regression_shapes() {
+        let with_guard = "fn create() { reject_unadvertised_capabilities(&self.capabilities(), \
+                          cfg)?; let x = self.spawn_ch(cfg).await?; }";
+        assert!(guards_before_spawn(with_guard));
+
+        // Deleted guard — the M11-shaped hole this exists for.
+        assert!(!guards_before_spawn(
+            "fn create() { let x = self.spawn_ch(cfg).await?; }"
+        ));
+        // Guard present but AFTER the spawn: the VMM process already exists.
+        assert!(!guards_before_spawn(
+            "fn create() { let x = self.spawn_ch(cfg).await?; \
+             reject_unadvertised_capabilities(&self.capabilities(), cfg)?; }"
+        ));
+        // Guard fed a locally-built descriptor instead of the one `capabilities()` returns.
+        assert!(!guards_before_spawn(
+            "fn create() { reject_unadvertised_capabilities(&local_caps, cfg)?; \
+             let x = self.spawn_ch(cfg).await?; }"
+        ));
+        // Two guards is as wrong as none: a second, possibly divergent, site.
+        assert!(!guards_before_spawn(
+            "fn create() { reject_unadvertised_capabilities(&self.capabilities(), cfg)?; \
+             reject_unadvertised_capabilities(&self.capabilities(), cfg)?; \
+             let x = self.spawn_ch(cfg).await?; }"
+        ));
+    }
+
+    /// The splitter's own controls: a renamed entry point is a hard failure, not an empty scan,
+    /// and the two bodies really are disjoint.
+    #[test]
+    fn the_entry_point_splitter_fails_loud_instead_of_scanning_nothing() {
+        assert!(entry_point_bodies("async fn create() {} fn other() {}").is_none());
+        assert!(entry_point_bodies("async fn restore() {}").is_none());
+        assert!(entry_point_bodies("async fn restore() {} async fn create() {}").is_none());
+
+        let (create, restore) =
+            entry_point_bodies("async fn create(A) {a} async fn restore(B) {b}")
+                .expect("both markers present, in order");
+        assert!(create.contains("{a}") && !create.contains("{b}"));
+        assert!(restore.contains("{b}") && !restore.contains("{a}"));
+    }
+}
+
+/// Source-level gate for M11's structural half on this backend: the launch is composed in
+/// **one** place, and no second `JailSpec` compilation can reappear beside it.
+///
+/// [`the_ch_launch_plan_ships_the_configured_jail_posture`](tests::the_ch_launch_plan_ships_the_configured_jail_posture)
+/// asserts the posture the plan *returns*; [`crate::vmm::LaunchPlan`]'s private field makes
+/// overwriting that record a compile error. Neither can see the one remaining regression:
+/// moving `jail_spec_from_config` + `build_vmm_cmd` back out of the plan into `spawn_ch`, which
+/// re-opens the window between deciding the posture and applying it and leaves the plan's record
+/// describing a command nobody spawns. That is a property of this file's *text*, so it is
+/// scanned — the same shape as the sibling [`virtiofs_pacing_gate`], whose `production_code`
+/// normalizer this reuses.
+///
+/// It catches: a raw `jail_spec_from_config` call in this backend, a second launch-plan
+/// construction, and a deleted one. It cannot catch: the wrong `JailConfig` handed to the plan —
+/// that is behavioral, and the KVM-free plan gate asserts it directly.
+#[cfg(test)]
+mod jail_composition_gate {
+    use super::virtiofs_pacing_gate::production_code;
+
+    const SOURCE: &str = include_str!("cloud_hypervisor.rs");
+
+    /// The number of launch-plan constructions this backend ships: one, in [`super::ch_launch_plan`].
+    ///
+    /// Asserted exactly, so a scan that silently matched nothing — the way every source-scanning
+    /// gate fails vacuously — reddens instead of passing over an empty set, and a second
+    /// (possibly divergent) construction reddens too.
+    const EXPECTED_PLAN_BUILD_SITES: usize = 1;
+
+    /// Every call expression naming `needle` in `code`, truncated at its statement's `;`.
+    fn calls<'a>(code: &'a str, needle: &str) -> Vec<&'a str> {
+        code.match_indices(needle)
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_launch_is_composed_only_in_the_plan() {
+        let code = production_code(SOURCE);
+
+        let raw = calls(&code, "jail_spec_from_config(");
+        assert!(
+            raw.is_empty(),
+            "M11: this backend must compile no `JailSpec` of its own — the one compilation lives \
+             in `vmcell::vmm::LaunchPlan::build`, which records the very value it compiles. \
+             Found {raw:?}"
+        );
+        let raw_cmd = calls(&code, "build_vmm_cmd(");
+        assert!(
+            raw_cmd.is_empty(),
+            "M11: this backend must not build a VMM command outside the launch plan. Found \
+             {raw_cmd:?}"
+        );
+
+        // The anti-vacuity half: the two assertions above are satisfied by a file with no launch
+        // at all, so the launch must be here, exactly once.
+        let builds = calls(&code, "LaunchPlan::build(");
+        assert_eq!(
+            builds.len(),
+            EXPECTED_PLAN_BUILD_SITES,
+            "expected {EXPECTED_PLAN_BUILD_SITES} `LaunchPlan::build` call; found {}: {builds:?}. \
+             If a site was legitimately added or removed, update EXPECTED_PLAN_BUILD_SITES — do \
+             not delete the scan.",
+            builds.len()
+        );
+    }
+
+    /// The scanner's own controls: a prose mention is not a call site, a call split across two
+    /// rustfmt lines is still seen whole, and the regression shape is genuinely detected — so the
+    /// scan above is not a test that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_scanner_sees_the_regression_and_ignores_comments() {
+        let regressed = "// the plan calls jail_spec_from_config for us\n\
+             let jail =\n    crate::vmm::jail::jail_spec_from_config(\n    &cfg.jail)?;\n\
+             #[cfg(test)]\nmod tests { LaunchPlan::build(x); }";
+        let code = production_code(regressed);
+        assert_eq!(calls(&code, "jail_spec_from_config(").len(), 1);
+        assert!(calls(&code, "LaunchPlan::build(").is_empty());
+
+        let composed = "// jail_spec_from_config in prose is not a call\n\
+             let mut plan =\n    crate::vmm::LaunchPlan::build(b, n,\n    cfg.jail)?;";
+        let code = production_code(composed);
+        assert!(calls(&code, "jail_spec_from_config(").is_empty());
+        assert_eq!(calls(&code, "LaunchPlan::build(").len(), 1);
     }
 }

@@ -20,7 +20,9 @@ use vmcell::config::{
 use vmcell::orchestrator::MicroVm;
 use vmcell::vmm::{VmInstance, Vmm};
 
-use crate::classify::{BANNER_SIGNATURE, explain_boot_failure, explain_without_serial};
+use crate::classify::{
+    BANNER_SIGNATURE, BootKind, explain_boot_failure_of, explain_without_serial,
+};
 use crate::harness::{cgroup_memory_delegated, try_start_vm};
 use crate::{ArtifactSet, CheckOutcome, Level};
 
@@ -45,16 +47,20 @@ const USAGE_SETTLE: Duration = Duration::from_secs(2);
 const BANNER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Reads `serial_log` and renders the classified boot failure — the one composition every arm with
-/// a **live VM** uses (`fs` + [`explain_boot_failure`]).
+/// a **live VM** uses (`fs` + [`explain_boot_failure_of`]).
 ///
 /// The unreadable case is not silently rendered as an empty console: an empty captured log means
-/// "the VM ran and printed nothing" (a real §5.4 signature), while an unreadable log is *absence of
-/// evidence*, so it routes through [`explain_without_serial`] instead. Either way the message names
-/// the console it consulted, so the reader can go look at it.
-async fn explain_boot_failure_at(serial_log: &Path, base: &str) -> String {
+/// "the VM ran and printed nothing" (a real §5.4 signature *for a fresh boot*), while an unreadable
+/// log is *absence of evidence*, so it routes through [`explain_without_serial`] instead. Either
+/// way the message names the console it consulted, so the reader can go look at it.
+///
+/// `kind` is explicit at every call site (no default): the only VM in this module whose console is
+/// empty **by construction** is the restored one in [`snapshot_restore_roundtrip`], and rendering
+/// it as a fresh boot accused a kernel that had provably just booted of not being a kernel.
+async fn explain_boot_failure_at(kind: BootKind, serial_log: &Path, base: &str) -> String {
     let base = format!("{base} (serial log {})", serial_log.display());
     match tokio::fs::read_to_string(serial_log).await {
-        Ok(text) => explain_boot_failure(&text, &base),
+        Ok(text) => explain_boot_failure_of(kind, &text, &base),
         Err(e) => {
             tracing::warn!(
                 path = %serial_log.display(),
@@ -66,10 +72,13 @@ async fn explain_boot_failure_at(serial_log: &Path, base: &str) -> String {
     }
 }
 
-/// [`explain_boot_failure_at`] against a VM's own console — the single place a serial-log path is
-/// derived from a [`MicroVm`].
+/// [`explain_boot_failure_at`] against a **freshly booted** VM's own console — the single place a
+/// serial-log path is derived from a [`MicroVm`]. A restored VM's console goes through
+/// [`explain_boot_failure_at`] with [`BootKind::Restored`]; there is no `MicroVm` predicate for
+/// "was this restored?" (the orchestrator's `restored` flag is private and one-shot), so the
+/// distinction is made where the restore happens.
 async fn explain_boot_failure_for<V: Vmm>(vm: &MicroVm<V>, base: &str) -> String {
-    explain_boot_failure_at(vm.instance().serial_log(), base).await
+    explain_boot_failure_at(BootKind::Fresh, vm.instance().serial_log(), base).await
 }
 
 /// The message every `MicroVm::start` failure records — one shape for all of them, since they all
@@ -120,7 +129,7 @@ async fn exec(agent: &mut AgentClient, argv: &[&str]) -> Result<vmcell::ExecOutc
 /// bounded window (← `boot.rs`). A kernel that never boots (bad config, wrong format) reddens.
 ///
 /// On failure the message names the §5.4 contract clause the serial log proves was broken
-/// ([`explain_boot_failure`]) — never a bare timeout (§5.6).
+/// ([`explain_boot_failure_of`]) — never a bare timeout (§5.6).
 ///
 /// # Errors
 /// Returns `Err` if the kernel never reaches userspace within the boot window (bad config / wrong format) or the console cannot be read.
@@ -132,7 +141,7 @@ pub async fn kernel_banner<V: Vmm>(vm: &MicroVm<V>) -> Result<(), String> {
 /// deadline is an [`tokio::time::Instant`], computed once and bounding the whole loop).
 ///
 /// Both failure shapes are distinguished, because they have different causes: a console that was
-/// *read* and lacks the banner is evidence for [`explain_boot_failure`] to classify, while a
+/// *read* and lacks the banner is evidence for [`explain_boot_failure_of`] to classify, while a
 /// console file the VMM never created is *no* evidence and routes through
 /// [`explain_without_serial`].
 async fn await_kernel_banner(serial_log: &Path, budget: Duration) -> Result<(), String> {
@@ -159,7 +168,9 @@ async fn await_kernel_banner(serial_log: &Path, budget: Duration) -> Result<(), 
         serial_log.display()
     );
     Err(match last {
-        Some(text) => explain_boot_failure(&text, &base),
+        // Fresh: `await_kernel_banner` only ever polls a VM booted from its kernel entry point,
+        // so an absent banner IS the §5.4 no-direct-boot-kernel signature here.
+        Some(text) => explain_boot_failure_of(BootKind::Fresh, &text, &base),
         None => explain_without_serial(
             &base,
             "the VMM never created the serial log, so no console was captured",
@@ -256,23 +267,64 @@ pub async fn rootfs_ca_cert(agent: &mut AgentClient) -> Result<(), String> {
     Ok(())
 }
 
-/// The in-rootfs guest-tools multicall is present and its `ip`/`curl`/`kvm-ok` names resolve on
-/// the agent's exec PATH (← §4.4, The in-rootfs guest-tools helper).
+/// The shell command that proves **every** guest-tools applet resolves on the exec PATH:
+/// `command -v <applet> >/dev/null` per [`vmcell_protocol::GUEST_TOOLS_APPLETS`] entry, `&&`-ed.
+///
+/// Composed from the roster, never re-typed. The roster is the one list the helper's dispatch
+/// table, the rootfs symlink manifest, and this check all derive from (design §4.4), and this
+/// module held the last re-typed copy — three of the four names in a shell string, which is how a
+/// roster grows an applet that nothing on the contract surface ever checks for.
 ///
 /// # Errors
-/// Returns `Err` if the guest-tools multicall or its `ip`/`curl`/`kvm-ok` names do not resolve on the exec PATH.
+/// Returns `Err` as [`probe_command_for`] does.
+fn guest_tools_probe_command() -> Result<String, String> {
+    probe_command_for(vmcell_protocol::GUEST_TOOLS_APPLETS)
+}
+
+/// [`guest_tools_probe_command`]'s composition, taking the roster as an argument so its accept /
+/// reject matrix is unit-testable against rosters the shipped const cannot express.
+///
+/// # Errors
+/// Returns `Err` if a roster entry is not a bare word (it would need quoting to survive `sh -c`,
+/// and a probe that silently mis-parses is a check that passes for the wrong reason) or if the
+/// roster is empty (a probe of nothing passes vacuously).
+fn probe_command_for(roster: &[&str]) -> Result<String, String> {
+    if roster.is_empty() {
+        return Err("GUEST_TOOLS_APPLETS is empty: the PATH probe would pass vacuously".into());
+    }
+    let mut probes = Vec::with_capacity(roster.len());
+    for applet in roster {
+        if applet.is_empty()
+            || !applet
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return Err(format!(
+                "guest-tools applet {applet:?} is not a bare word; the `sh -c` PATH probe cannot \
+                 carry it unquoted"
+            ));
+        }
+        probes.push(format!("command -v {applet} >/dev/null"));
+    }
+    Ok(probes.join(" && "))
+}
+
+/// The in-rootfs guest-tools multicall is present and **every**
+/// [`vmcell_protocol::GUEST_TOOLS_APPLETS`] name resolves on the agent's exec PATH
+/// (← §4.4, The in-rootfs guest-tools helper).
+///
+/// # Errors
+/// Returns `Err` if the roster cannot be composed into a probe, or if any roster name does not
+/// resolve on the exec PATH.
 pub async fn rootfs_guest_tools(agent: &mut AgentClient) -> Result<(), String> {
-    let out = exec(
-        agent,
-        &[
-            "sh",
-            "-c",
-            "command -v ip >/dev/null && command -v curl >/dev/null && command -v kvm-ok >/dev/null",
-        ],
-    )
-    .await?;
+    let probe = guest_tools_probe_command()?;
+    let out = exec(agent, &["sh", "-c", probe.as_str()]).await?;
     if out.code != 0 {
-        return Err("guest-tools ip/curl/kvm-ok not all resolvable on PATH (§5.3)".into());
+        return Err(format!(
+            "not every guest-tools applet resolves on PATH (§5.3); the roster is {} and the probe \
+             was `{probe}`",
+            vmcell_protocol::GUEST_TOOLS_APPLETS.join(", ")
+        ));
     }
     Ok(())
 }
@@ -327,6 +379,7 @@ pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
         Ok(a) => a,
         Err(e) => {
             return Err(explain_boot_failure_at(
+                BootKind::Fresh,
                 &serial_log,
                 &agent_handshake_base(&e, AGENT_READY_BUDGET),
             )
@@ -462,9 +515,12 @@ async fn usage_readable_after_agent_ready<V: Vmm>(
     // Captured before the `&mut` agent borrow (see `guest_core_checks`).
     let serial_log = vm.instance().serial_log().to_path_buf();
     if let Err(e) = vm.agent(Some(ready_budget)).await {
-        return Err(
-            explain_boot_failure_at(&serial_log, &agent_handshake_base(&e, ready_budget)).await,
-        );
+        return Err(explain_boot_failure_at(
+            BootKind::Fresh,
+            &serial_log,
+            &agent_handshake_base(&e, ready_budget),
+        )
+        .await);
     }
     // Agent-ready: let the guest consume some memory before the counters are read back.
     tokio::time::sleep(settle).await;
@@ -524,6 +580,7 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
                 // budget it must name), not a second copy of the phrasing that only differed in
                 // which const it read.
                 return Err(explain_boot_failure_at(
+                    BootKind::Fresh,
                     &serial_log,
                     &format!(
                         "a concurrently-started VM: {}",
@@ -587,7 +644,12 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
                 "restored VM: {}",
                 agent_handshake_base(&e, AGENT_READY_BUDGET)
             );
-            return Err(explain_boot_failure_at(&restored_serial, &base).await);
+            // THE restored console (m9): empty by construction — the guest kernel printed its
+            // banner in the snapshot SOURCE, on that VM's console file. Reading it as a fresh boot
+            // told this check that a kernel which had just booted, snapshotted and resumed "is not
+            // a direct-boot PVH-ELF vmlinux". `checks_render_a_restored_console_as_restored` pins
+            // this argument.
+            return Err(explain_boot_failure_at(BootKind::Restored, &restored_serial, &base).await);
         }
     };
     let out = exec(agent, &["true"]).await?;
@@ -602,10 +664,18 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
 /// host OOM killer, observable via `memory.events` `oom_kill` (← `metrics_limits.rs`, §7, Resource monitoring and limits). The VM
 /// must be booted with `mem_mib=512, limits.mem_max_mib=Some(256)`.
 ///
+/// `resource_prefix` must be the [`VmConfig::resource_prefix`] the VM was **started** with: it is
+/// what names the cgroup slice this check reads. It is a required parameter and not a default,
+/// because assuming the default silently pointed the read at a path that exists for no VM
+/// configured with any other prefix (docs/81 d3) — a check that then fails for the wrong reason.
+///
 /// # Errors
 /// Returns `Err` if the capped allocation does not trip the host OOM killer (no `oom_kill` observed) or the metric cannot be read.
-pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
-    let events_path = cgroup_events_path(vm.vmid());
+pub async fn metrics_mem_limit_ooms<V: Vmm>(
+    vm: &mut MicroVm<V>,
+    resource_prefix: &str,
+) -> Result<(), String> {
+    let events_path = cgroup_events_path(resource_prefix, vm.vmid());
     // Fire a runaway allocation; the VMM may itself be OOM-killed, so ignore the exec result —
     // the binding signal is the host counter.
     {
@@ -615,6 +685,7 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), S
             Ok(a) => a,
             Err(e) => {
                 return Err(explain_boot_failure_at(
+                    BootKind::Fresh,
                     &serial_log,
                     &agent_handshake_base(&e, AGENT_READY_BUDGET),
                 )
@@ -638,14 +709,22 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), S
     ))
 }
 
-/// The `/sys/fs/cgroup/<slice>/memory.events` path for a vmid, using vmcell's canonical cgroup
-/// base parser so it matches the orchestrator's slice placement.
-fn cgroup_events_path(vmid: u32) -> std::path::PathBuf {
-    let name = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|c| vmcell::metrics::cgroup_base_from_proc(&c))
-        .map(|base| format!("{base}/vmcell-vm-{vmid}"))
-        .unwrap_or_else(|| format!("vmcell-vm-{vmid}"));
+/// The `/sys/fs/cgroup/<slice>/memory.events` path for the VM `vmid` started with
+/// `resource_prefix`.
+///
+/// The slice name comes from [`vmcell::metrics::vm_slice_name`] — the one law that spells both the
+/// `<prefix>-vm-<vmid>` leaf and its §13 sibling placement under the base parsed out of
+/// `/proc/self/cgroup`. This function used to compose that itself, as
+/// `format!("{base}/vmcell-vm-{vmid}")`, under a rustdoc claiming it "matches the orchestrator's
+/// slice placement": it matched only for a VM left on the default
+/// [`vmcell::naming::DEFAULT_RESOURCE_PREFIX`], and read a path that exists for **no** VM
+/// configured with any other prefix (docs/81 d3). The prefix is now a parameter with no default,
+/// so the wrong path is not reachable without a caller naming it.
+///
+/// Gated by `cgroup_events_path_composes_from_the_configured_prefix` (the composition) and
+/// `the_oom_check_reads_the_slice_of_the_vm_it_booted` (the call site that supplies the prefix).
+fn cgroup_events_path(resource_prefix: &str, vmid: u32) -> std::path::PathBuf {
+    let name = vmcell::metrics::vm_slice_name(resource_prefix, vmid);
     std::path::PathBuf::from(format!("/sys/fs/cgroup/{name}/memory.events"))
 }
 
@@ -752,8 +831,12 @@ async fn guest_core_checks<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<(&'static str, Re
     let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
-            let msg =
-                explain_boot_failure_at(&serial_log, &format!("agent unavailable: {e}")).await;
+            let msg = explain_boot_failure_at(
+                BootKind::Fresh,
+                &serial_log,
+                &format!("agent unavailable: {e}"),
+            )
+            .await;
             return vec![("agent.exec_roundtrip", Err(msg))];
         }
     };
@@ -869,6 +952,7 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                         let res = match vm.agent(Some(AGENT_READY_BUDGET)).await {
                             Ok(agent) => nested_kvm_ok(agent).await,
                             Err(e) => Err(explain_boot_failure_at(
+                                BootKind::Fresh,
                                 &serial_log,
                                 &agent_handshake_base(&e, AGENT_READY_BUDGET),
                             )
@@ -1014,6 +1098,7 @@ async fn run_shares_check<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
             let res = match vm.agent(Some(AGENT_READY_BUDGET)).await {
                 Ok(agent) => virtiofs_shares(agent, &out_dir).await,
                 Err(e) => Err(explain_boot_failure_at(
+                    BootKind::Fresh,
                     &serial_log,
                     &agent_handshake_base(&e, AGENT_READY_BUDGET),
                 )
@@ -1070,6 +1155,11 @@ pub async fn run_full<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
             ),
             Ok(mut cfg) => {
                 cfg.limits.mem_max_mib = Some(256);
+                // The slice this check reads is named after the prefix the VM is really started
+                // with (docs/81 d3), captured here because `cfg` moves into `try_start_vm`. A
+                // literal here would put back the default-prefix assumption the fix removed, and
+                // `the_oom_check_reads_the_slice_of_the_vm_it_booted` reddens on one.
+                let resource_prefix = cfg.resource_prefix.clone();
                 match try_start_vm(vmm, cfg).await {
                     Err(e) => record(
                         outcomes,
@@ -1082,7 +1172,7 @@ pub async fn run_full<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
                             outcomes,
                             "metrics.mem_limit_ooms",
                             Level::Full,
-                            metrics_mem_limit_ooms(&mut vm).await,
+                            metrics_mem_limit_ooms(&mut vm, &resource_prefix).await,
                         );
                         let _ = vm.shutdown().await;
                     }
@@ -1104,8 +1194,9 @@ mod tests {
     use super::*;
     use vmcell::vmm::{FakeVmm, FaultMenu};
 
-    /// A no-op [`vmcell::metrics::CgroupFs`] for the two KVM-free tests below, which drive a
-    /// `FakeVmm` through `MicroVm::start` only to obtain a handle and never look at a cgroup.
+    /// `try_start_vm`'s env with the cgroup seam swapped for the shared
+    /// [`vmcell::metrics::FakeCgroupFs`], for the KVM-free tests below that drive a `FakeVmm`
+    /// through `MicroVm::start` only to obtain a handle and never look at a cgroup.
     ///
     /// They cannot use [`try_start_vm`]: it builds `vmcell::HostEnv::hermetic()` internally and
     /// exposes no cgroup seam, and `hermetic()` wires the REAL sysfs backend — which `mkdir`s
@@ -1116,43 +1207,20 @@ mod tests {
     /// deliberately left alone: it is the contract-surface harness the LIVE battery uses, and the
     /// `metrics.usage_readable` check needs the real seam to read real counters.
     ///
-    /// This is a local copy by the recorded decision, not by oversight: `vmcell::metrics::FakeCgroupFs`
-    /// is `#[cfg(test)]` and invisible to a downstream crate's test build, and exposing it was
-    /// rejected (its deliberate `.lock().unwrap()`s would trip `vmcell`'s
-    /// `deny(clippy::unwrap_used)`) — see docs/implementation-notes.md. The three backend crates
-    /// carry the same copy for the same reason.
+    /// The fake is `vmcell`'s own, reached through its non-default `test-support` feature taken as
+    /// a **dev**-dependency (docs/81 §9). This crate used to hand-roll a fourth `TestCgroupFs`
+    /// copy of it beside the three backend crates' — every one of them an always-`Ok` no-op that
+    /// recorded nothing, so nothing about the seam was assertable from any of them.
     ///
-    /// FAKE-BLIND AXIS: it touches no filesystem, so the real slice create/limit/readback path is
-    /// covered only by the live `metrics.usage_readable` arm of a `Level::Extended` run on a KVM
-    /// host, never here.
-    #[derive(Debug)]
-    struct TestCgroupFs;
-
-    impl vmcell::metrics::CgroupFs for TestCgroupFs {
-        fn create_slice(
-            &self,
-            _name: &str,
-            _limits: &vmcell::config::ResourceLimits,
-        ) -> vmcell::Result<()> {
-            Ok(())
-        }
-        fn delete_slice(&self, _name: &str) -> vmcell::Result<()> {
-            Ok(())
-        }
-        fn read_stats(&self, _name: &str) -> vmcell::Result<vmcell::metrics::ResourceUsage> {
-            Ok(vmcell::metrics::ResourceUsage::default())
-        }
-        fn add_task(&self, _name: &str, _pid: u32) -> vmcell::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// `try_start_vm`'s env with the cgroup seam swapped out. Assignment, not
-    /// `..HostEnv::hermetic()`: `HostEnv` is `#[non_exhaustive]`, so functional-update syntax is
-    /// rejected outside `vmcell`.
+    /// Assignment, not `..HostEnv::hermetic()`: `HostEnv` is `#[non_exhaustive]`, so
+    /// functional-update syntax is rejected outside `vmcell`.
+    ///
+    /// FAKE-BLIND AXIS: `FakeCgroupFs` models slices in a `HashMap` and touches no filesystem, so
+    /// the real slice create/limit/readback path is covered only by the live
+    /// `metrics.usage_readable` arm of a `Level::Extended` run on a KVM host, never here.
     fn unit_test_env() -> vmcell::HostEnv {
         let mut env = vmcell::HostEnv::hermetic();
-        env.cgroups = std::sync::Arc::new(TestCgroupFs);
+        env.cgroups = std::sync::Arc::new(vmcell::metrics::FakeCgroupFs::new());
         env
     }
 
@@ -1160,6 +1228,65 @@ mod tests {
     fn test_parse_oom_kill() {
         assert_eq!(parse_oom_kill("low 0\noom_kill 3\n"), Some(3));
         assert_eq!(parse_oom_kill("low 0\nhigh 1\n"), None);
+    }
+
+    // CONTRACT GATE (design §4.4, docs/81 m22 follow-up): the guest-tools PATH probe is COMPOSED
+    // from `vmcell_protocol::GUEST_TOOLS_APPLETS`, so adding an applet to the roster extends what
+    // the validator battery checks with no edit in this file. This module held the last re-typed
+    // copy of the roster — three of four names in a shell string.
+    // RED on the inverse (restore
+    // `"command -v ip >/dev/null && command -v curl >/dev/null && command -v kvm-ok >/dev/null"`):
+    // the per-entry assertion fires on `echo-server`, which that string never probed, and the
+    // count assertion fires at 3 != 4.
+    #[test]
+    fn guest_tools_probe_is_composed_from_the_roster() {
+        let roster = vmcell_protocol::GUEST_TOOLS_APPLETS;
+        let probe = guest_tools_probe_command().expect("the shipped roster must compose");
+        for applet in roster {
+            assert!(
+                probe.contains(&format!("command -v {applet} >/dev/null")),
+                "the probe must test every roster entry; {applet} is missing from `{probe}`"
+            );
+        }
+        // No name beyond the roster, and none dropped: a probe that tests MORE than the roster is
+        // the same drift in the other direction (it would redden on a legitimately removed applet).
+        assert_eq!(
+            probe.matches("command -v ").count(),
+            roster.len(),
+            "the probe must name the roster exactly, got `{probe}`"
+        );
+        // Every probe is `&&`-chained, so a missing applet fails the command rather than being
+        // masked by a later success.
+        assert_eq!(
+            probe.matches(" && ").count(),
+            roster.len() - 1,
+            "the probes must be &&-chained, got `{probe}`"
+        );
+    }
+
+    // The composition's reject legs, driven against rosters the shipped const cannot express: a
+    // probe of nothing passes vacuously, and a name needing shell quoting would be mis-parsed by
+    // `sh -c` (a check that passes for the wrong reason). The positive control is the shipped
+    // roster in the test above.
+    #[test]
+    fn guest_tools_probe_rejects_a_roster_it_cannot_carry() {
+        assert!(
+            probe_command_for(&[]).is_err(),
+            "an empty roster must be rejected, not composed into a vacuous probe"
+        );
+        for bad in ["ip curl", "$(id)", "curl;rm", "", "kvm ok"] {
+            let err = probe_command_for(&[bad])
+                .expect_err(&format!("{bad:?} must be rejected, not composed"));
+            assert!(
+                err.contains("bare word") || err.contains("empty"),
+                "the rejection must name the cause, got {err:?}"
+            );
+        }
+        // Positive control for the accept side of the same matrix: the shapes a real applet name
+        // takes (including the hyphenated and dotted ones) compose.
+        let ok = probe_command_for(&["ip", "kvm-ok", "echo-server", "foo.sh"])
+            .expect("bare-word applet names must compose");
+        assert_eq!(ok.matches("command -v ").count(), 4, "got `{ok}`");
     }
 
     /// A guest that panicked mounting the erofs root, as the console really records it. Written to
@@ -1187,7 +1314,7 @@ mod tests {
         let log = dir.path().join("serial.log");
         std::fs::write(&log, PANICKED_CONSOLE).expect("write console");
 
-        let msg = explain_boot_failure_at(&log, "agent handshake failed").await;
+        let msg = explain_boot_failure_at(BootKind::Fresh, &log, "agent handshake failed").await;
         assert!(msg.starts_with("agent handshake failed"), "{msg}");
         assert!(
             msg.contains("contract violation:") && msg.contains("CONFIG_EROFS_FS"),
@@ -1207,7 +1334,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("never-created.log");
 
-        let msg = explain_boot_failure_at(&missing, "agent handshake failed").await;
+        let msg =
+            explain_boot_failure_at(BootKind::Fresh, &missing, "agent handshake failed").await;
         assert!(msg.contains("no serial evidence:"), "{msg}");
         assert!(msg.contains("it could not be read"), "{msg}");
         assert!(
@@ -1370,6 +1498,239 @@ mod tests {
         );
     }
 
+    /// docs/81 d3, end to end and KVM-free: the slice the **orchestrator really creates** for a VM
+    /// with a non-default `resource_prefix`, and the slice `metrics_mem_limit_ooms` reads, are the
+    /// same name. This is the loop the finding left open — the two halves below each pin one side
+    /// of it, and this pins that they meet.
+    ///
+    /// It is only assertable because the cgroup seam is now `vmcell`'s **recording**
+    /// [`vmcell::metrics::FakeCgroupFs`] (docs/81 §9): the hand-rolled `TestCgroupFs` this crate
+    /// used to carry — one of four byte-alike copies — was an always-`Ok` no-op that remembered
+    /// nothing, so no test driven by it could say which slice was created.
+    ///
+    /// FAKE-BLIND AXIS: the fake models slices in a `HashMap`, so this is evidence about the
+    /// *name*, never about a real cgroup existing on disk. The live `metrics.mem_limit_ooms` arm
+    /// of a `Level::Full` run on a KVM host is what proves the path is readable.
+    #[tokio::test]
+    async fn the_oom_path_names_the_slice_the_orchestrator_actually_created() {
+        let vmm = FakeVmm::default();
+        let prefix = "acme";
+        let cfg = base_cfg(&ArtifactSet::new(
+            "/nonexistent/vmlinux",
+            "/nonexistent/rootfs.erofs",
+        ))
+        .resource_prefix(prefix)
+        .network_disabled()
+        .build()
+        .expect("config builds");
+
+        let cgroups = std::sync::Arc::new(vmcell::metrics::FakeCgroupFs::new());
+        let mut env = vmcell::HostEnv::hermetic();
+        env.cgroups = cgroups.clone();
+        let mut vm = MicroVm::start(&vmm, cfg, &env)
+            .await
+            .expect("the fake backend starts");
+        let vmid = vm.vmid();
+
+        let slice = vmcell::metrics::vm_slice_name(prefix, vmid);
+        let default_slice =
+            vmcell::metrics::vm_slice_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, vmid);
+        assert!(
+            cgroups.has_slice(&slice),
+            "the orchestrator created no slice named {slice} (is the default-prefix \
+             {default_slice} there instead? {})",
+            cgroups.has_slice(&default_slice)
+        );
+        assert_eq!(
+            cgroup_events_path(prefix, vmid),
+            std::path::PathBuf::from(format!("/sys/fs/cgroup/{slice}/memory.events")),
+            "the check reads a slice the orchestrator never created"
+        );
+
+        vm.kill().await.expect("the fake backend stops");
+    }
+
+    /// docs/81 d3, the composition half: the `memory.events` path `metrics.mem_limit_ooms` reads
+    /// is named by the ONE law, [`vmcell::metrics::vm_slice_name`], from the prefix it is handed —
+    /// not by a hardcoded `vmcell-vm-` literal, which named a slice that exists for **no** VM
+    /// configured with a non-default `resource_prefix`.
+    ///
+    /// Behavioural, not a scan: it calls the shipped composer with a non-default prefix. Restoring
+    /// the old `format!("{base}/vmcell-vm-{vmid}")` reddens the first assertion, because the
+    /// composed path then names `vmcell-vm-7` for a VM whose slice is `acme-vm-7`. Hermetic on any
+    /// host: whether `/proc/self/cgroup` yields a sibling base or not only changes the prefix of
+    /// the path, never its final two components.
+    #[test]
+    fn cgroup_events_path_composes_from_the_configured_prefix() {
+        let non_default = "acme";
+        assert_ne!(
+            non_default,
+            vmcell::naming::DEFAULT_RESOURCE_PREFIX,
+            "the whole point of this test is a prefix the old hardcoded literal could not spell"
+        );
+
+        let path = cgroup_events_path(non_default, 7);
+        let rendered = path.display().to_string();
+        assert!(
+            rendered.ends_with("/acme-vm-7/memory.events"),
+            "the OOM counter must be read from the slice of a VM started with \
+             `resource_prefix = {non_default:?}`, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("vmcell-vm-"),
+            "the default prefix is hardcoded into the path of a non-default VM: {rendered}"
+        );
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(format!(
+                "/sys/fs/cgroup/{}/memory.events",
+                vmcell::metrics::vm_slice_name(non_default, 7)
+            )),
+            "the slice name must come from `vmcell::metrics::vm_slice_name`, not a second copy \
+             of the composition"
+        );
+
+        // Positive control: the default prefix still resolves to the slice it always named, so
+        // the assertions above are about the prefix flowing through — not about `acme` in
+        // particular — and the two paths really do differ.
+        let default = cgroup_events_path(vmcell::naming::DEFAULT_RESOURCE_PREFIX, 7);
+        assert!(
+            default
+                .display()
+                .to_string()
+                .ends_with("/vmcell-vm-7/memory.events"),
+            "the default-prefix path must be unchanged: {}",
+            default.display()
+        );
+        assert_ne!(
+            default, path,
+            "a composer that ignored its prefix argument would make both assertions vacuous"
+        );
+    }
+
+    /// docs/81 d3, the call-site half. The gate above proves `cgroup_events_path` honours the
+    /// prefix it is *given*; this proves the shipped caller gives it the prefix of the VM it
+    /// actually booted, and that no hand-formatted slice name survives in this module.
+    ///
+    /// A source scan, in the shape of `vmcell-qemu`'s `virtiofs_pacing_gate`, because the property
+    /// lives on one line inside an orchestrator that needs a real KVM host to run: nothing
+    /// KVM-free can observe which string that call passed. Its own predicate and scanner controls
+    /// are `the_oom_call_site_scanner_rejects_the_regression_shapes` below, so this is not a test
+    /// that can only ever pass (AGENTS.md rule 2).
+    #[test]
+    fn the_oom_check_reads_the_slice_of_the_vm_it_booted() {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs"));
+        /// The shipped calls to the check in this module: one, in `run_full`.
+        ///
+        /// Asserted exactly, so a scan that silently matched nothing — the way every
+        /// source-scanning gate fails vacuously — reddens instead of passing over an empty set.
+        const EXPECTED_OOM_CALL_SITES: usize = 1;
+
+        let code = production_code(SRC);
+        let calls = calls_to(&code, "metrics_mem_limit_ooms");
+        assert_eq!(
+            calls.len(),
+            EXPECTED_OOM_CALL_SITES,
+            "expected {EXPECTED_OOM_CALL_SITES} `metrics_mem_limit_ooms` call in `run_full`; \
+             found {}: {calls:?}. If a site was legitimately added or removed, update \
+             EXPECTED_OOM_CALL_SITES — do not delete the scan.",
+            calls.len()
+        );
+        for call in &calls {
+            assert!(
+                call_names_the_configured_prefix(call),
+                "docs/81 d3: this check must be handed the `resource_prefix` of the `VmConfig` \
+                 the VM was started with, never a literal or the default — `{call}`"
+            );
+        }
+
+        // …and no second copy of the composition survives anywhere in this module's production
+        // text: the `-vm-` infix is `vmcell::naming`'s to spell, not this crate's.
+        assert!(
+            !code.contains("-vm-"),
+            "a slice/resource name is hand-formatted in this module; compose it through \
+             `vmcell::naming` (docs/81 d3): {}",
+            code.match_indices("-vm-")
+                .map(|(at, _)| &code[at.saturating_sub(60)..(at + 20).min(code.len())])
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+
+    /// This module's production text: everything before the first `#[cfg(test)]`, whole-line
+    /// comments (`//`, and therefore `///` too) dropped and the rest joined, per the in-repo
+    /// source-scan convention. Joining is what lets the scan see a rustfmt-wrapped call whole.
+    fn production_code(source: &str) -> String {
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Every call expression naming `callee` in `code`, each truncated at its statement's `;`.
+    /// A **definition** (`fn callee(`) is not a call and is skipped, so a signature change that
+    /// drops the generics cannot inflate the count into a confusing red.
+    fn calls_to<'a>(code: &'a str, callee: &str) -> Vec<&'a str> {
+        let needle = format!("{callee}(");
+        code.match_indices(&needle)
+            .filter(|(at, _)| !code[..*at].ends_with("fn "))
+            .map(|(at, _)| {
+                let tail = &code[at..];
+                &tail[..tail.find(';').unwrap_or(tail.len())]
+            })
+            .collect()
+    }
+
+    /// The law: the shipped call hands the check the prefix the VM was **configured** with — the
+    /// binding taken off the `VmConfig` before it moved into `try_start_vm` — never a string
+    /// literal and never the default const.
+    fn call_names_the_configured_prefix(call: &str) -> bool {
+        call.contains("&resource_prefix")
+            && !call.contains('"')
+            && !call.contains("DEFAULT_RESOURCE_PREFIX")
+    }
+
+    /// The scanner's own red-on-inverse: the predicate must reject every way of putting the
+    /// default prefix back, and the scanner must see a wrapped call whole while ignoring prose,
+    /// definitions and `#[cfg(test)]` text.
+    #[test]
+    fn the_oom_call_site_scanner_rejects_the_regression_shapes() {
+        assert!(!call_names_the_configured_prefix(
+            "metrics_mem_limit_ooms(&mut vm, \"vmcell\").await"
+        ));
+        assert!(!call_names_the_configured_prefix(
+            "metrics_mem_limit_ooms(&mut vm, vmcell::naming::DEFAULT_RESOURCE_PREFIX).await"
+        ));
+        assert!(call_names_the_configured_prefix(
+            "metrics_mem_limit_ooms(&mut vm, &resource_prefix).await"
+        ));
+
+        let synthetic = "// metrics_mem_limit_ooms(&mut vm, \"vmcell\") in a comment is not a call\n\
+             pub async fn metrics_mem_limit_ooms(vm: &mut MicroVm<V>, p: &str) {}\n\
+             record(o, metrics_mem_limit_ooms(\n    &mut vm, &resource_prefix).await);\n\
+             #[cfg(test)]\nmod tests { metrics_mem_limit_ooms(&mut vm, \"vmcell\"); }";
+        let code = production_code(synthetic);
+        let calls = calls_to(&code, "metrics_mem_limit_ooms");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the comment, the definition and the `#[cfg(test)]` call must all be invisible: {code}"
+        );
+        assert!(
+            call_names_the_configured_prefix(calls[0]),
+            "a rustfmt-wrapped call must be seen whole: {calls:?}"
+        );
+        // The banned infix really is detectable in production text (so its assertion is not
+        // vacuous), and really is invisible in a comment.
+        assert!(production_code("let n = format!(\"{p}-vm-{vmid}\");").contains("-vm-"));
+        assert!(!production_code("// <prefix>-vm-<vmid> in prose").contains("-vm-"));
+    }
+
     // `metrics.usage_readable` must FAIL, naming the boot failure, when the guest never hands
     // shakes. The handshake was a bare `let _` (`usage-readable-swallows-agent-handshake`), so the
     // arm walked into the cgroup readout on a guest that never booted and reported anything but the
@@ -1391,7 +1752,7 @@ mod tests {
         .build()
         .expect("config builds");
         // `MicroVm::start` over `unit_test_env()` rather than `try_start_vm`, which has no cgroup
-        // seam — see `TestCgroupFs` above.
+        // seam — see `unit_test_env` above.
         let mut vm = MicroVm::start(&vmm, cfg, &unit_test_env())
             .await
             .expect("the fake backend starts");
@@ -1428,7 +1789,7 @@ mod tests {
         .build()
         .expect("config builds");
         // `MicroVm::start` over `unit_test_env()` rather than `try_start_vm`, which has no cgroup
-        // seam — see `TestCgroupFs` above.
+        // seam — see `unit_test_env` above.
         let mut vm = MicroVm::start(&vmm, cfg, &unit_test_env())
             .await
             .expect("the fake backend starts");
@@ -1440,5 +1801,76 @@ mod tests {
             "the message must name the VM's own serial log ({expected}): {msg}"
         );
         vm.kill().await.expect("the fake backend stops");
+    }
+
+    // m9, the fs-reading half: a RESTORED VM's console file exists and is empty (the VMM created
+    // it; the guest kernel printed its banner in the snapshot source, on another console). Read as
+    // a fresh boot, that file said "not a direct-boot PVH-ELF vmlinux" about a kernel that had just
+    // booted, snapshotted and resumed. `classify.rs` gates the pure classifier; this drives the
+    // real read, which is the composition `snapshot_restore_roundtrip` actually calls.
+    #[tokio::test]
+    async fn explain_boot_failure_at_reads_a_restored_console_as_restored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("restored-serial.log");
+        std::fs::write(&log, "").expect("write the empty restored console");
+
+        let msg = explain_boot_failure_at(
+            BootKind::Restored,
+            &log,
+            "restored VM: agent handshake failed within the 60s budget",
+        )
+        .await;
+        assert!(
+            !msg.contains("contract violation:") && !msg.contains("CONFIG_PVH"),
+            "a restored VM's empty console proves no §5.4 clause: {msg}"
+        );
+        assert!(
+            msg.contains("RESTORED from a snapshot"),
+            "the message must explain why the console is empty: {msg}"
+        );
+        assert!(msg.contains(&log.display().to_string()), "{msg}");
+
+        // The positive control: the SAME empty file, read as the fresh boot it is not, still
+        // renders the verdict fresh boots earn — so the difference is the kind, not the file.
+        let fresh =
+            explain_boot_failure_at(BootKind::Fresh, &log, "the banner never appeared").await;
+        assert!(fresh.contains("CONFIG_PVH"), "{fresh}");
+    }
+
+    // m9, the WIRING half. The classifier and the fs read are both gated above, but which kind
+    // `snapshot_restore_roundtrip` passes is only observable on a KVM host with a snapshot-capable
+    // backend — the one thing the KVM-free suite structurally cannot reach (AGENTS.md rule 4). This
+    // reads the source instead: inside that function, the console rendered AFTER `MicroVm::restore`
+    // must be the restored one, and the snapshot-source arm before it must not be. Guards the
+    // argument being swapped back (either direction) by a later edit.
+    #[test]
+    fn snapshot_restore_roundtrip_renders_the_restored_console_as_restored() {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs"));
+        let after = SRC
+            .split("pub async fn snapshot_restore_roundtrip")
+            .nth(1)
+            .expect("the function must exist");
+        // The first column-0 `}` closes the function, so the slice below is its body alone — not
+        // this test's own needles further down the file.
+        let end = after
+            .find("\n}\n")
+            .expect("the function has a closing brace");
+        let body = after.get(..end).expect("a char boundary at a newline");
+
+        let restore_call = body
+            .find("MicroVm::restore(")
+            .expect("the check must restore a VM");
+        let restored_kind = body
+            .find("BootKind::Restored")
+            .expect("the restored VM's console must be rendered with BootKind::Restored");
+        assert!(
+            restored_kind > restore_call,
+            "the restored rendering must belong to the restored VM, not the snapshot source"
+        );
+        let source_arm = body.get(..restore_call).expect("a char boundary");
+        assert!(
+            !source_arm.contains("BootKind::Restored"),
+            "the snapshot SOURCE boots fresh; its console must not be read as a restored one"
+        );
     }
 }

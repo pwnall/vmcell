@@ -34,6 +34,9 @@ pub enum InvalidName {
     /// `\0`, whitespace, and every path separator, so no subdirectory or traversal is
     /// representable).
     IllegalByte(u8),
+    /// The name is well-formed but ends in the reserved [`SHA256_SIDECAR_SUFFIX`] (digest sidecars
+    /// are the store's own bookkeeping, never a client-nameable artifact).
+    ReservedSuffix,
 }
 
 impl std::fmt::Display for InvalidName {
@@ -52,6 +55,10 @@ impl std::fmt::Display for InvalidName {
                 f,
                 "artifact name may only contain [A-Za-z0-9._-]; found byte {b:#04x}"
             ),
+            Self::ReservedSuffix => write!(
+                f,
+                "artifact name must not end in `{SHA256_SIDECAR_SUFFIX}` (reserved for digest sidecars)"
+            ),
         }
     }
 }
@@ -67,10 +74,32 @@ const fn is_allowed_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
 }
 
+/// The reserved suffix for digest sidecars (design §11.3, The artifact store). `<artifact>.sha256`
+/// holds the hex SHA-256 computed once at upload so `list`/`info` read it back in O(1) instead of
+/// re-hashing the whole body. A client cannot name an artifact with this suffix (it would shadow a
+/// real artifact's sidecar and vanish from `list`).
+pub const SHA256_SIDECAR_SUFFIX: &str = ".sha256";
+
+/// The ONE reserved-name predicate (AGENTS.md "one law, one predicate"): true iff `name` names a
+/// digest sidecar rather than a client artifact.
+///
+/// [`validate_artifact_name`] itself rejects such a name, so **no verb can pick a weaker
+/// validator** — the reservation used to live in `ArtifactStore::create`/`info`/`delete` only, and
+/// `Registry::snapshot`, which validates through [`validate_artifact_name`], happily created an
+/// undeletable `<name>.sha256` **directory** that then broke every later upload of `<name>`
+/// (finding `snapshot-skips-the-reserved-sidecar-predicate`). The store still consults this
+/// predicate directly, but only to pick its per-verb *reaction* (400 on create, 404 on info/delete,
+/// skip in list) — never to decide the law.
+#[must_use]
+pub fn is_reserved_sidecar_name(name: &str) -> bool {
+    name.ends_with(SHA256_SIDECAR_SUFFIX)
+}
+
 /// Validates a client-supplied artifact name (the pure predicate; no filesystem access).
 ///
 /// Accept rule: non-empty, ≤ [`MAX_ARTIFACT_NAME_LEN`] bytes, every byte in `[A-Za-z0-9._-]`, not
-/// `.`/`..`, and not starting with `-` or `.`.
+/// `.`/`..`, not starting with `-` or `.`, and not ending in the reserved
+/// [`SHA256_SIDECAR_SUFFIX`].
 ///
 /// # Errors
 /// Returns the specific [`InvalidName`] reason so the operator sees exactly what was wrong.
@@ -93,6 +122,12 @@ pub fn validate_artifact_name(name: &str) -> Result<(), InvalidName> {
         if !is_allowed_byte(b) {
             return Err(InvalidName::IllegalByte(b));
         }
+    }
+    // The reserved digest-sidecar suffix is part of the NAME law, not of one verb's manners: every
+    // caller of this predicate — the store's four verbs, `Registry::snapshot`'s prefix, a
+    // `restore_from` prefix, and the client's pre-upload check — inherits it.
+    if is_reserved_sidecar_name(name) {
+        return Err(InvalidName::ReservedSuffix);
     }
     Ok(())
 }
@@ -169,5 +204,29 @@ mod tests {
         let dir = Path::new("/store");
         assert!(resolve_artifact_path(dir, "../escape").is_err());
         assert!(resolve_artifact_path(dir, "ok").is_ok());
+    }
+
+    // The reserved digest-sidecar suffix is part of THE name law, so a caller cannot pick a weaker
+    // validator (finding `snapshot-skips-the-reserved-sidecar-predicate`: `Registry::snapshot`
+    // validated with this function, which did not carry the rule, and created an undeletable
+    // `<name>.sha256` directory). RED on the inverse — a `validate_artifact_name` without the
+    // suffix arm accepts `rootfs.sha256`.
+    #[test]
+    fn validate_rejects_the_reserved_sidecar_suffix() {
+        for reserved in ["rootfs.sha256", "k.sha256", "a.b.sha256"] {
+            assert_eq!(
+                validate_artifact_name(reserved),
+                Err(InvalidName::ReservedSuffix),
+                "must reject {reserved:?}"
+            );
+            assert!(is_reserved_sidecar_name(reserved));
+            assert!(resolve_artifact_path(Path::new("/store"), reserved).is_err());
+        }
+        // Positive control: the same stems without the reserved suffix are accepted, and a name
+        // that merely CONTAINS the suffix text is not reserved.
+        for good in ["rootfs", "k", "sha256", "k.sha256.img"] {
+            assert!(validate_artifact_name(good).is_ok(), "must accept {good:?}");
+            assert!(!is_reserved_sidecar_name(good));
+        }
     }
 }

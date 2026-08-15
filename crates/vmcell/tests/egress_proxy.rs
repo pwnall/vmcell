@@ -451,7 +451,7 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // the exact inverse the finding names: an impl that emits no ruleset makes
     // `nft list table ip proxy` fail (returns None -> panic below); an
     // accept-all policy drops the `policy drop` substring -> assert red.
-    let netns = format!("vmcell-net-{vmid}");
+    let netns = vmcell::naming::netns_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, vmid);
     let ruleset = common::nft_list_table_in_netns(&netns, "ip proxy").unwrap_or_else(|| {
         panic!(
             "privileged transparent egress must apply an nft ruleset in netns {netns}; \
@@ -471,8 +471,15 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         "egress ruleset must TPROXY-redirect web traffic to the live proxy port {proxy_port}; \
          applied ruleset:\n{ruleset}"
     );
+    // The catch-all drop, recomputed through the real name composer (never a test-local
+    // `format!`). It carries no `log prefix` any more: netfilter discards the syslog LOG target in
+    // a non-init netns unless the host-global `net.netfilter.nf_log_all_netns` is 1, so the old
+    // `vmcell-drop` marker asserted the presence of a diagnostic that never emitted a line
+    // (`tproxy-drop-log-never-emitted`). The rule itself — the security property — is what is
+    // asserted here.
+    let tap = vmcell::naming::tap_name(vmcell::naming::DEFAULT_RESOURCE_PREFIX, vmid);
     assert!(
-        ruleset.contains("vmcell-drop"),
+        ruleset.contains(&format!("iifname \"{tap}\" drop")),
         "egress ruleset must carry the catch-all drop for non-web traffic; applied ruleset:\n{ruleset}"
     );
 

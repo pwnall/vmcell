@@ -8,7 +8,7 @@
 
 use crate::dto::ArtifactInfo;
 use crate::error::DaemonError;
-use crate::name::resolve_artifact_path;
+use crate::name::{SHA256_SIDECAR_SUFFIX, is_reserved_sidecar_name, resolve_artifact_path};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -62,15 +62,18 @@ impl ArtifactStore {
     /// - [`DaemonError::AlreadyExists`] — an artifact of that name already exists.
     /// - [`DaemonError::Internal`] — an I/O failure while writing or renaming.
     pub fn create(&self, name: &str, bytes: &[u8]) -> Result<ArtifactInfo, DaemonError> {
-        let path = self.path_for(name)?;
         // The `.sha256` suffix is reserved for digest sidecars (delta 10); an artifact with that
         // name would shadow a real artifact's sidecar and vanish from `list`. Reject before disk
-        // (a 400, not a name-syntax error — the name is well-formed, just reserved).
+        // (a 400, not a name-syntax error — the name is well-formed, just reserved). Checked
+        // BEFORE `path_for` only to keep this verb's *reaction* (a `BadRequest` naming the
+        // reservation); the law itself is in `validate_artifact_name`, which `path_for` also
+        // enforces, so a verb that forgets this line still refuses the name.
         if is_reserved_sidecar_name(name) {
             return Err(DaemonError::BadRequest(format!(
                 "artifact name {name:?} must not end in `{SHA256_SIDECAR_SUFFIX}` (reserved for digest sidecars)"
             )));
         }
+        let path = self.path_for(name)?;
         if bytes.len() as u64 > self.max_bytes {
             return Err(DaemonError::PayloadTooLarge(format!(
                 "artifact {name:?} is {} bytes; the per-upload cap is {} bytes",
@@ -122,12 +125,17 @@ impl ArtifactStore {
     /// # Errors
     /// [`DaemonError::InvalidName`] / [`DaemonError::NotFound`] / [`DaemonError::Internal`].
     pub fn info(&self, name: &str) -> Result<ArtifactInfo, DaemonError> {
-        let path = self.path_for(name)?;
         // The reserved-suffix guard used to live in `create` only, so a client could GET (and, in
         // `delete` below, remove) a live artifact's internal digest record — store bookkeeping is
         // not a client-visible surface (finding `sidecar-suffix-guard-is-create-only`). 404, not
-        // the create path's 400: to a client the name simply does not name an artifact.
-        if is_reserved_sidecar_name(name) || !path.is_file() {
+        // the create path's 400: to a client the name simply does not name an artifact. This picks
+        // the reaction; `validate_artifact_name` (via `path_for`) is what makes the law
+        // unbypassable.
+        if is_reserved_sidecar_name(name) {
+            return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
+        }
+        let path = self.path_for(name)?;
+        if !path.is_file() {
             return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
         }
         artifact_info(name, &path)
@@ -181,13 +189,13 @@ impl ArtifactStore {
     /// # Errors
     /// [`DaemonError::InvalidName`] / [`DaemonError::NotFound`] / [`DaemonError::Internal`].
     pub fn delete(&self, name: &str) -> Result<(), DaemonError> {
-        let path = self.path_for(name)?;
         // Same reserved-suffix law as `info` (finding `sidecar-suffix-guard-is-create-only`): a
         // client that could DELETE `<artifact>.sha256` would strip a live artifact's digest record
         // while the artifact itself stayed bootable.
         if is_reserved_sidecar_name(name) {
             return Err(DaemonError::NotFound(format!("no artifact {name:?}")));
         }
+        let path = self.path_for(name)?;
         // `symlink_metadata`, not `is_file`/`is_dir`: those follow symlinks, and the recursive
         // directory delete below must never walk out of the store through one planted out-of-band.
         let Ok(meta) = path.symlink_metadata() else {
@@ -211,22 +219,6 @@ impl ArtifactStore {
         let _ = std::fs::remove_file(sidecar_path(&path));
         Ok(())
     }
-}
-
-/// The reserved suffix for digest sidecars (delta 10, §11.3, The artifact store). `<artifact>.sha256` holds the hex
-/// SHA-256 computed once at upload so `list`/`info` read it back in O(1) instead of re-hashing the
-/// whole body on every call. A client cannot create an artifact whose name ends in this suffix (it
-/// would shadow a real artifact's sidecar and vanish from `list`).
-const SHA256_SIDECAR_SUFFIX: &str = ".sha256";
-
-/// The ONE reserved-name predicate (AGENTS.md "one law, one predicate"): true iff `name` names a
-/// digest sidecar rather than a client artifact. Every store op consults this single function —
-/// `create` rejects it (400: well-formed but reserved), `list` skips it, and `info`/`delete` report
-/// it as absent (404). The reaction differs per op; the *law* does not, so a second `ends_with`
-/// copy can never drift from it (the guard used to exist only in `create`, which is exactly how
-/// `info`/`delete` came to accept sidecar names).
-fn is_reserved_sidecar_name(name: &str) -> bool {
-    name.ends_with(SHA256_SIDECAR_SUFFIX)
 }
 
 /// The sidecar path for an artifact, derived by **appending** the suffix to the already-validated,

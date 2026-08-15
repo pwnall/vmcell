@@ -117,7 +117,7 @@ impl CaManager {
         // rootfs trust store does not trust (M-NET-6).
         let _publish_lock = crate::fs::FileLock::acquire(&dir.join(".ca.lock"))?;
 
-        let cert_path = dir.join("ca.pem");
+        let cert_path = Self::cert_path_in(&dir);
         let key_path = dir.join("ca.key");
 
         // The CA is an atomic (ca.pem, ca.key) pair. Regenerate ONLY when BOTH are
@@ -207,6 +207,27 @@ impl CaManager {
     /// Returns the CA certificate in PEM format for baking into the rootfs
     pub fn ca_cert_pem(&self) -> &str {
         &self.ca_cert_pem
+    }
+
+    /// `<dir>/ca.pem` — the one composer for the published certificate's location.
+    fn cert_path_in(dir: &std::path::Path) -> PathBuf {
+        dir.join("ca.pem")
+    }
+
+    /// The on-disk path of the **published** CA certificate for this manager's directory.
+    ///
+    /// The one publish location: `CaManager::new_in` writes it under the `.ca.lock` flock as a
+    /// temp-then-rename, so a consumer that needs the CA as a FILE — the rootfs inject+pack tail
+    /// bakes it into the guest trust store — reads *that* file instead of writing a copy of its
+    /// own. A second, unlocked `write` to this path is exactly the truncate window in which a
+    /// concurrent `new_in` reads the (cert, key) pair as half-present and refuses.
+    ///
+    /// The path is where the CA *was published*; it is not re-checked here. A caller that finds it
+    /// missing (deleted after this process cached the CA in memory) must fail loud naming it,
+    /// never substitute bytes of its own.
+    #[must_use]
+    pub fn ca_cert_path(&self) -> PathBuf {
+        Self::cert_path_in(&self.dir)
     }
 
     /// Returns the `SharedAuthority` for use with `hudsucker`

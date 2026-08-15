@@ -5,9 +5,19 @@
 //! strictest practical one on each backend, **fail loud** when a policy cannot be
 //! honored, and never leave a backend unconfined by default.
 //! [`vmm_seccomp_args`](crate::vmm::seccomp::vmm_seccomp_args) is the single place a
-//! [`VmmSeccomp`](crate::config::VmmSeccomp) policy becomes a backend's native CLI flag, so a new
-//! backend that skips it — or wires the wrong flag — reddens the one-law golden test, the
+//! [`VmmSeccomp`](crate::config::VmmSeccomp) policy becomes a backend's native CLI flag, the
 //! same discipline as `mac_math` / `config_has_vhost_user_device`.
+//!
+//! What the golden tests here actually cover, precisely (m34): the dispatch below is the
+//! **authoritative roster** — `roster::dispatched_backend_ids` scans *this file's own* match
+//! arms — so the gates pin the flag each dispatched backend gets, and pin the prose against
+//! those arms in both directions. A backend that wires the wrong flag, or ships an arm the
+//! module doc never describes, reddens. What no gate here can see is a future backend crate
+//! that adds no arm at all: it contributes nothing to the scan. That case is covered by
+//! construction rather than by a test — the dispatch is closed, so an unlisted id hits the
+//! catch-all and every caller gets a typed `Unsupported { feature: "vmm_seccomp" }` instead of
+//! an unconfined VMM (`vmm_seccomp_args_unknown_backend_is_unsupported`). A backend crate that
+//! never calls this predicate at all is outside both, and stays a review obligation.
 //!
 //! The verified native semantics this encodes:
 //! - **Cloud Hypervisor** `--seccomp <true|false|log>` (default `true`); passed
@@ -318,6 +328,23 @@ mod tests {
                  undocumented is the stale-roster defect this guards"
             );
         }
+
+        // m34: the doc must state what these gates actually cover. `dispatched_backend_ids`
+        // scans THIS file's arms, so a backend crate that never adds one contributes nothing —
+        // promising that a gate here catches it is an overclaim. The honest guarantee is the
+        // closed dispatch's typed refusal, pinned by
+        // `vmm_seccomp_args_unknown_backend_is_unsupported`.
+        assert!(
+            module_doc.contains("catch-all")
+                && module_doc.contains(r#"Unsupported { feature: "vmm_seccomp" }"#),
+            "the module doc must name the closed dispatch's typed refusal as the guarantee for \
+             an un-dispatched backend, not gate coverage it cannot have"
+        );
+        assert!(
+            !module_doc.contains("a new backend that skips it"),
+            "retired overclaim: a backend that never adds a dispatch arm is invisible to the \
+             source scan, so no golden test in this module reddens for it"
+        );
 
         // The crosvm bullet specifically: the reversal it records (always `--disable-sandbox`,
         // Enforcing = Layer-2 deny-list ON) is what the dispatch implements, so the doc must not

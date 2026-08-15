@@ -257,6 +257,9 @@ fn run_broker_child_inner(cli: &Cli, ch_bin: String, sock: std::os::unix::net::U
         tracing::info!("vmcelld broker: serving (holds caps; owns the registry)");
         // Serves until the parent sends `ShutdownAll` (VMs torn down, then returns) or closes the
         // channel (then dropping `registry` at end of scope runs each VM's ordered teardown).
+        // Both exits DRAIN the dispatch jobs still in flight first, so the `_exit` below cannot cut
+        // off a `create` between its VMM launch and the registry insert — that VMM would be in
+        // nobody's table and survive as an orphan on the graceful path.
         serve_engine(registry, sock).await;
         0
     })

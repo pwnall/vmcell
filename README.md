@@ -267,8 +267,10 @@ mount). The fourth, `cap_setpcap`, is **transient** and is never delivered anywh
 bounding set and permitted/effective before it `exec`s the test. Without it that shrink silently
 fails and the bounding set stays as wide as the kernel supports, so a child could still gain
 capabilities through a file-cap'd or setuid binary. `vmcell-privilege` owns the list
-(`BLESSED_FILE_CAPS`), and a unit gate reads this file's siblings — the `bless` recipe and the
-preflight probe — so the copies cannot drift.
+(`BLESSED_FILE_CAPS`), and a unit gate walks the tree for every `setcap` command copy outside
+`docs/historical/` — this file's three, the `bless` recipe's one, the design doc's downstream-consumer
+one — and asserts each names exactly that set, with the preflight probe's `NEEDED_CAPS` array checked
+alongside, so no copy can drift.
 
 **Why the stable path (v15 §12.8):** writing a binary file strips its capabilities, and cargo
 rewrites `target/<profile>/vmcell-test-runner` for reasons unrelated to the runner's own source (a
@@ -377,11 +379,16 @@ build — no `sudo` / root step is involved either way.**
   needs guest `/dev/hwrng` from virtio-rng.
 - **`host-make`** compiles the pinned Linux source on the host (the `build-essential flex bison bc
   libelf-dev libssl-dev` from §1) and appends vmcell's microvm KConfig, which sets both options —
-  `just test-privileged` then passes in full (149/149, 5 capability skips, 2026-08-14; run the recipe
-  for the current figure). To keep the fast prebuilt kernel as the default artifact and still run
-  those legs, build a host-make kernel under a label with `vmcell build-kernels` and point
-  `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for the privileged run — a labelled kernel has
-  its own filename, so `build` cannot clobber it.
+  `just test-privileged` then passes in full. No tally is quoted here — an embedded pass/total moves
+  with every suite change and this one had already gone stale twice. Run `just test-privileged` for
+  the pass/total and `just skip-manifest-show` for the capability skips. Those are **two different
+  quantities**, and they sit one line apart in the same output: nextest's `N skipped` summary field
+  counts *deselected* tests (filtered out before running), whereas a **capability** skip is a
+  `require_cap!` record written to `$VMCELL_SKIP_MANIFEST`. Reading the first as the second is
+  exactly how the number that used to be here was wrong. To keep the fast prebuilt kernel as the
+  default artifact and still run those legs, build a host-make kernel under a label with
+  `vmcell build-kernels` and point `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for the
+  privileged run — a labelled kernel has its own filename, so `build` cannot clobber it.
 - **`in-vm`** compiles the pinned source *inside* a builder micro-VM. It needs a kernel to boot the
   builder, so it is a typed refusal on `build`; its route is `vmcell build-kernels --kernel-source
   in-vm`, which stages the bootstrap seed ahead of it.

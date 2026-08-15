@@ -17,7 +17,19 @@ publish = false
 # side socket), so — like QEMU — this crate needs NO serde/JSON: the crosvm control-socket protocol
 # is unstable binary and must never be hand-rolled.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.13.0", default-features = false, features = ["host-common"] }
+vmcell = { path = "../vmcell", version = "0.14.0", default-features = false, features = ["host-common"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
 nix = { version = "0.31", features = ["signal", "process"] }
 tracing = "0.1"
+
+# `tempfile` (like the sibling backend crates): the KVM-free control-budget gate spawns a stand-in
+# "crosvm" script and needs a fixture tree that cleans itself up on the PANIC path too.
+# `vmcell/test-support` is a DEV-dependency and never a production one: it exposes
+# `vmcell::metrics::FakeCgroupFs` (the in-process `CgroupFs` fake this crate used to hand-roll a
+# `TestCgroupFs` copy of) and `vmcell::vmm::VmmProcessGroup::already_reaped_for_test`. Declaring it
+# here means `cargo build -p vmcell-crosvm` compiles WITHOUT the feature, so a production reference to
+# either fixture is a compile error; `scripts/ban-test-support-in-production.sh` is the backstop for
+# `--all-targets`, where cargo's feature unification does make them visible to the lib target.
+[dev-dependencies]
+tempfile = "3"
+vmcell = { path = "../vmcell", version = "0.14.0", default-features = false, features = ["host-common", "test-support"] }

@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "am-fs-erofs",
  "assert_cmd",
@@ -4544,13 +4544,14 @@ dependencies = [
 
 [[package]]
 name = "vmcell-artifact-validator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures 0.3.32",
  "tempfile",
  "tokio 1.52.3",
  "tracing",
  "vmcell",
+ "vmcell-protocol",
 ]
 
 [[package]]
@@ -4578,12 +4579,11 @@ dependencies = [
 
 [[package]]
 name = "vmcell-broker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "postcard",
  "serde",
- "tun-tap",
  "vmcell",
  "vmcell-privilege",
 ]
@@ -4604,6 +4604,7 @@ name = "vmcell-crosvm"
 version = "0.1.0"
 dependencies = [
  "nix 0.31.3",
+ "tempfile",
  "tokio 1.52.3",
  "tracing",
  "vmcell",
@@ -4674,6 +4675,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "reqwest",
+ "vmcell-protocol",
 ]
 
 [[package]]
@@ -4700,7 +4702,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "postcard",
  "proptest",

@@ -7,6 +7,7 @@
 //! non-open operation carries the bearer security requirement, and that the only unauthenticated
 //! routes are `/healthz` and `/openapi.json` — a route that forgot auth is a RED test, not a hope.
 
+use crate::dto::ErrorKind;
 use serde_json::{Value, json};
 
 /// One route: an OpenAPI-style path (`{param}`), its HTTP method, operation id, whether it requires
@@ -123,6 +124,43 @@ pub const API_ROUTES: &[RouteDef] = &[
 /// The exact set of unauthenticated route paths (design §13, Cross-cutting invariants). Everything else is guarded.
 pub const OPEN_ROUTES: &[&str] = &["/healthz", "/openapi.json"];
 
+/// The name of the error-body schema in `components.schemas`. One const, so the definition site and
+/// every `$ref` to it cannot drift (§11.5: the error body is documented as an OpenAPI component).
+pub const ERROR_SCHEMA_NAME: &str = "ErrorBody";
+
+/// The JSON-Pointer reference to [`ERROR_SCHEMA_NAME`] — built once, never spelled out at a call
+/// site.
+fn error_schema_ref() -> Value {
+    json!({ "$ref": format!("#/components/schemas/{ERROR_SCHEMA_NAME}") })
+}
+
+/// The `ErrorBody` schema (design §11.5): the machine-matchable `error` kind plus the human
+/// `message`, mirroring [`crate::dto::ErrorBody`].
+///
+/// The `error` enum is generated from [`ErrorKind::ALL`] — never a second literal list — so a new
+/// kind cannot ship undocumented. Before this existed, `components` carried `securitySchemes` only
+/// and every operation's `default` response had no `content`, which made P5's "every named schema
+/// exists" assertion vacuous and left clients with no machine-readable error contract.
+fn error_body_schema() -> Value {
+    let kinds: Vec<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
+    json!({
+        "type": "object",
+        "description": "The structured error body every non-2xx response carries.",
+        "required": ["error", "message"],
+        "properties": {
+            "error": {
+                "type": "string",
+                "description": "The machine-matchable error kind; determines the HTTP status.",
+                "enum": kinds,
+            },
+            "message": {
+                "type": "string",
+                "description": "The human-readable message (never a Debug struct-dump).",
+            },
+        },
+    })
+}
+
 /// Builds the OpenAPI 3.1 document from [`API_ROUTES`] — the single generator, so the doc and the
 /// router share one table (invariant §13, Cross-cutting invariants).
 #[must_use]
@@ -134,9 +172,17 @@ pub fn openapi_document() -> Value {
         let mut op = serde_json::Map::new();
         op.insert("operationId".into(), json!(r.op_id));
         op.insert("summary".into(), json!(r.summary));
+        // The `default` response is the ERROR contract: every non-2xx reply is an `ErrorBody`
+        // (`DaemonError`'s single `IntoResponse`), so it `$ref`s the one declared schema rather
+        // than being a description-only stub a client cannot generate against.
         op.insert(
             "responses".into(),
-            json!({ "default": { "description": "See the design doc (§18.5)." } }),
+            json!({
+                "default": {
+                    "description": "Error: the structured ErrorBody (kind + human message).",
+                    "content": { "application/json": { "schema": error_schema_ref() } },
+                }
+            }),
         );
         if r.authenticated {
             op.insert("security".into(), json!([{ "bearerAuth": [] }]));
@@ -157,7 +203,8 @@ pub fn openapi_document() -> Value {
         "components": {
             "securitySchemes": {
                 "bearerAuth": { "type": "http", "scheme": "bearer" }
-            }
+            },
+            "schemas": { ERROR_SCHEMA_NAME: error_body_schema() }
         }
     })
 }
@@ -235,6 +282,95 @@ mod tests {
         assert_eq!(
             doc["components"]["securitySchemes"]["bearerAuth"],
             json!({ "type": "http", "scheme": "bearer" })
+        );
+    }
+
+    /// Collects every `$ref` string anywhere in the document.
+    fn collect_refs(value: &Value, out: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    if k == "$ref"
+                        && let Some(s) = v.as_str()
+                    {
+                        out.insert(s.to_string());
+                    }
+                    collect_refs(v, out);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|v| collect_refs(v, out)),
+            _ => {}
+        }
+    }
+
+    // P5's "every named schema exists", made NON-vacuous (deviation d5): the document now names a
+    // schema, and every `$ref` in it resolves to a declared one. RED on the inverse: drop the
+    // `components.schemas` object (the lookup below fails) or drop the operations' `$ref` (the
+    // "must reference at least one schema" assertion fails, which is exactly the vacuous state the
+    // gate used to pass in).
+    #[test]
+    fn every_ref_resolves_to_a_declared_schema() {
+        let doc = openapi_document();
+        let declared: BTreeSet<String> = doc["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas must exist")
+            .keys()
+            .cloned()
+            .collect();
+        let mut refs = BTreeSet::new();
+        collect_refs(&doc, &mut refs);
+        assert!(
+            !refs.is_empty(),
+            "a document with no $ref makes 'every named schema exists' vacuous"
+        );
+        for r in &refs {
+            let name = r
+                .strip_prefix("#/components/schemas/")
+                .unwrap_or_else(|| panic!("unsupported $ref form {r}"));
+            assert!(declared.contains(name), "$ref {r} names no declared schema");
+        }
+    }
+
+    // Every operation carries the machine-readable error contract, so a generated client can decode
+    // a failure instead of guessing. RED on the inverse: a `default` response with no `content`.
+    #[test]
+    fn every_operation_documents_the_error_body() {
+        let doc = openapi_document();
+        let want = json!(format!("#/components/schemas/{ERROR_SCHEMA_NAME}"));
+        for r in API_ROUTES {
+            let op = &doc["paths"][r.path][r.method.to_ascii_lowercase()];
+            assert_eq!(
+                op["responses"]["default"]["content"]["application/json"]["schema"]["$ref"], want,
+                "{} {} must document its error body",
+                r.method, r.path
+            );
+        }
+    }
+
+    // The schema's `error` enum IS the `ErrorKind` roster — recomputed through the real type, never
+    // a literal list in the document. RED on the inverse: a hand-written enum in the schema drifts
+    // the moment a kind is added or renamed.
+    #[test]
+    fn the_error_schema_enumerates_every_error_kind() {
+        let doc = openapi_document();
+        let listed: Vec<String> =
+            doc["components"]["schemas"][ERROR_SCHEMA_NAME]["properties"]["error"]["enum"]
+                .as_array()
+                .expect("the error enum")
+                .iter()
+                .map(|v| v.as_str().expect("a string kind").to_string())
+                .collect();
+        let expected: Vec<String> = ErrorKind::ALL
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "the documented kinds must be ErrorKind::ALL"
+        );
+        assert!(
+            listed.contains(&ErrorKind::NotFound.as_str().to_string()),
+            "sanity: the roster is not empty"
         );
     }
 }

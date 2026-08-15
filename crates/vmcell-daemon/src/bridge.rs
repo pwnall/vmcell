@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 
@@ -36,6 +37,40 @@ use tokio::sync::{Mutex, oneshot};
 /// captured stdout/stderr; enforced before allocation on both ends (the internal channel is
 /// trusted, but a corrupt length prefix must still not drive an unbounded allocation).
 pub const MAX_BRIDGE_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// How long a `ShutdownAll` waits for the dispatch jobs already in flight before the broker stops
+/// serving (finding `shutdown-all-returns-while-dispatch-jobs-run`).
+///
+/// A `create` job that has launched its VMM but not yet inserted the slot is in **nobody's** table:
+/// `Registry::shutdown_all` walks the table only, and `run_broker_child` `_exit`s the moment
+/// [`serve_engine`] returns. Without this drain the VMM survives as an orphan pinning guest RAM and
+/// `/dev/kvm` — on the **graceful** path, the one the broker's `SIG_IGN` design exists to let win.
+/// Generous because the job being waited on is a whole VM boot; bounded because a wedged job must
+/// never stop the daemon from exiting.
+const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(60);
+
+/// The parent-side ceiling on one forwarded **control** call (no guest work: list/get/stats and the
+/// artifact guards). Bounds a *stalled* broker — one that is alive but not replying — which the
+/// EOF drain in [`BrokerClientEngine::new`] cannot see because the socket never closes.
+const BROKER_CONTROL_CALL_BUDGET: Duration = Duration::from_secs(60);
+
+/// The parent-side ceiling on one forwarded **VM-lifecycle** call (create/exec/snapshot/destroy/
+/// shutdown-all). Far larger than the control budget because these run real guest work — a boot, a
+/// guest command, a guest-RAM-proportional snapshot write — and a legitimate slow op must not be
+/// mistaken for a stall. It is the *floor* for an `exec`, never its ceiling — see [`call_budget`].
+const BROKER_VM_CALL_BUDGET: Duration = Duration::from_secs(900);
+
+/// How far an `exec`'s bridge budget must exceed the guest timeout the client asked for, so the
+/// **guest's** timeout is always the one that fires: it covers the vsock round-trip, the guest-side
+/// kill + output capture, and writing a reply that can carry the whole capture back.
+const EXEC_BUDGET_MARGIN: Duration = Duration::from_secs(60);
+
+/// The fallback horizon when `now + budget` would overflow the monotonic clock — reachable because
+/// `ExecRequestDto::timeout_secs` is a client-supplied `u64` and `Instant + Duration` **panics** on
+/// overflow (a client-triggered panic in the cap-dropped parent is a denial of service). A year is
+/// past any real exec and inside tokio's timer range; a broker that dies is still covered by the
+/// reader task's EOF drain, which needs no deadline at all.
+const CALL_DEADLINE_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 // ---------------------------------------------------------------------------------------------
 // The engine seam the HTTP handlers call — implemented locally by `Registry` (broker side) and by
@@ -191,10 +226,15 @@ enum EngineReply {
 // format the HTTP API itself speaks.
 // ---------------------------------------------------------------------------------------------
 
-async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> std::io::Result<()> {
-    let len = u32::try_from(payload.len())
+/// The one write-side frame-length law: `payload`'s 4-byte big-endian length prefix, or an error if
+/// it is over [`MAX_BRIDGE_FRAME_BYTES`]. [`write_frame`] and the pre-write check in
+/// [`BrokerClientEngine::send_request`] both go through it, so the cap is stated once and an
+/// over-cap payload is knowably rejected **before** any byte reaches the stream.
+fn frame_len_prefix(payload: &[u8]) -> std::io::Result<[u8; 4]> {
+    u32::try_from(payload.len())
         .ok()
         .filter(|_| payload.len() <= MAX_BRIDGE_FRAME_BYTES)
+        .map(u32::to_be_bytes)
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -203,8 +243,12 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> std
                     payload.len()
                 ),
             )
-        })?;
-    w.write_all(&len.to_be_bytes()).await?;
+        })
+}
+
+async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> std::io::Result<()> {
+    let len = frame_len_prefix(payload)?;
+    w.write_all(&len).await?;
     w.write_all(payload).await?;
     w.flush().await
 }
@@ -319,22 +363,84 @@ async fn write_reply<W: AsyncWriteExt + Unpin>(wr: &Mutex<W>, id: u64, reply: En
     }
 }
 
+/// Awaits every still-running dispatch job, bounded by `budget` measured from **now** (one deadline
+/// for the whole drain, not one per job).
+///
+/// A job that is still running at the deadline is left detached and **named in a warning** — the
+/// alternative, aborting it, is precisely the orphan the drain exists to prevent (a `create` killed
+/// between `launch` and `insert` leaves the VMM behind).
+async fn drain_dispatch_jobs(jobs: Vec<tokio::task::JoinHandle<()>>, budget: Duration) {
+    if jobs.is_empty() {
+        return;
+    }
+    let total = jobs.len();
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut unfinished = 0usize;
+    for job in jobs {
+        match tokio::time::timeout_at(deadline, job).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("broker: a dispatch job did not complete cleanly: {e}"),
+            Err(_) => unfinished += 1,
+        }
+    }
+    if unfinished > 0 {
+        tracing::warn!(
+            total,
+            unfinished,
+            ?budget,
+            "broker: dispatch jobs still running at the shutdown-drain deadline; VMs they were \
+             starting may survive as orphans until the next start-up sweep"
+        );
+    }
+}
+
 /// Serves `engine` over `sock` until the peer closes it or a `ShutdownAll` is handled (after which
 /// the broker returns so its caller can `_exit`). Each request is dispatched on its own task so a
 /// long `exec` does not block other VMs' ops; replies carry the request id and are written behind a
 /// shared write lock. Runs in the **broker** child (which holds the caps and owns the registry).
+///
+/// Both exits — the `ShutdownAll` and the peer-closed EOF — first **drain the dispatch jobs in
+/// flight** (bounded by `SHUTDOWN_DRAIN_BUDGET`), so a `create` that is between
+/// `MicroVmLauncher::launch` and the registry insert finishes and becomes visible to `shutdown_all`
+/// / the registry `Drop` instead of leaving an orphaned VMM behind
+/// (finding `shutdown-all-returns-while-dispatch-jobs-run`).
 pub async fn serve_engine(engine: Arc<dyn VmEngine>, sock: tokio::net::UnixStream) {
     let (mut rd, wr) = sock.into_split();
     let wr = Arc::new(Mutex::new(wr));
+    let mut jobs: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     loop {
         let frame = match read_frame(&mut rd).await {
             Ok(f) => f,
-            // Parent closed the channel (shutdown / crash): stop serving.
-            Err(_) => return,
+            // Parent closed the channel (shutdown / crash): stop serving, after the drain below.
+            Err(_) => break,
         };
-        let Ok((id, req)) = serde_json::from_slice::<(u64, EngineRequest)>(&frame) else {
-            tracing::warn!("broker: dropping an undecodable request frame");
-            continue;
+        let (id, req) = match serde_json::from_slice::<(u64, EngineRequest)>(&frame) {
+            Ok(v) => v,
+            Err(e) => {
+                // Mirror `write_reply`'s reply-side fallback: the parent's `call` is waiting on
+                // this frame's id, so an undecodable request is answered with a typed `Err` for
+                // that id rather than dropped (finding `serve-engine-drops-undecodable-requests`).
+                // The id is the tuple's first element, so a permissive decode recovers it.
+                match serde_json::from_slice::<(u64, serde_json::Value)>(&frame) {
+                    Ok((id, _)) => {
+                        tracing::warn!(id, "broker: undecodable request frame: {e}");
+                        write_reply(
+                            wr.as_ref(),
+                            id,
+                            EngineReply::Err(WireError {
+                                kind: ErrorKind::Internal,
+                                message: format!("broker could not decode the request: {e}"),
+                            }),
+                        )
+                        .await;
+                    }
+                    // No id to answer to: nothing can be waiting on a frame we cannot identify.
+                    Err(_) => tracing::warn!(
+                        "broker: dropping an undecodable request frame with no recoverable id: {e}"
+                    ),
+                }
+                continue;
+            }
         };
         let shutdown = matches!(req, EngineRequest::ShutdownAll);
         let engine = engine.clone();
@@ -344,12 +450,18 @@ pub async fn serve_engine(engine: Arc<dyn VmEngine>, sock: tokio::net::UnixStrea
             write_reply(wr.as_ref(), id, reply).await;
         };
         if shutdown {
-            // Run inline (so the reply is written) and then stop serving — the broker exits next.
+            // Drain FIRST: `shutdown_all` must see every VM an in-flight `create` is registering.
+            drain_dispatch_jobs(std::mem::take(&mut jobs), SHUTDOWN_DRAIN_BUDGET).await;
+            // Then run the shutdown inline (so its reply is written) and stop serving.
             job.await;
             return;
         }
-        tokio::spawn(job);
+        // Reap the handles of jobs that already finished, so a long-lived broker's list does not
+        // grow without bound.
+        jobs.retain(|h| !h.is_finished());
+        jobs.push(tokio::spawn(job));
     }
+    drain_dispatch_jobs(jobs, SHUTDOWN_DRAIN_BUDGET).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -358,13 +470,65 @@ pub async fn serve_engine(engine: Arc<dyn VmEngine>, sock: tokio::net::UnixStrea
 
 type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<EngineReply>>>>;
 
+/// The per-request budget for a forwarded call — ONE pure function of the request, so no call site
+/// picks its own ceiling. VM-lifecycle ops run real guest work and get at least
+/// [`BROKER_VM_CALL_BUDGET`]; the control ops get [`BROKER_CONTROL_CALL_BUDGET`]. The match is
+/// exhaustive on purpose: a new [`EngineRequest`] variant must choose a budget.
+///
+/// An `exec` **derives** its budget from the request instead of taking the fixed ceiling, because
+/// `ExecRequestDto::timeout_secs` is an accepted input the guest honors: a fixed 900 s bridge budget
+/// would 500 an `exec { timeout_secs: 3600 }` at fifteen minutes while the guest command kept
+/// running — an outer deadline *smaller* than the legitimate inner one, and an accepted input
+/// silently not honored. Deriving (rather than rejecting a long timeout with a 400) is the right
+/// half of that choice: the client already owns the VM, a long build or test run is exactly what a
+/// per-exec timeout is for, and the bridge has no business being the shorter of the two. The result
+/// always exceeds `timeout_secs` by [`EXEC_BUDGET_MARGIN`], so the guest's own timeout fires first
+/// and the client gets the real outcome instead of a bridge error. Saturating, so an absurd
+/// `u64::MAX` cannot wrap into a *tiny* budget (the deadline it feeds is clamped in
+/// [`deadline_from`]).
+fn call_budget(req: &EngineRequest) -> Duration {
+    match req {
+        EngineRequest::Exec(_, r) => match r.timeout_secs {
+            Some(secs) => Duration::from_secs(secs)
+                .saturating_add(EXEC_BUDGET_MARGIN)
+                .max(BROKER_VM_CALL_BUDGET),
+            None => BROKER_VM_CALL_BUDGET,
+        },
+        EngineRequest::Create(_)
+        | EngineRequest::Snapshot(..)
+        | EngineRequest::Destroy(_)
+        | EngineRequest::ShutdownAll => BROKER_VM_CALL_BUDGET,
+        EngineRequest::List
+        | EngineRequest::Get(_)
+        | EngineRequest::Stats(_)
+        | EngineRequest::IsArtifactInUse(_)
+        | EngineRequest::DeleteArtifactIfUnused(_) => BROKER_CONTROL_CALL_BUDGET,
+    }
+}
+
+/// `now + budget`, saturating at [`CALL_DEADLINE_HORIZON`] instead of **panicking** on the `Instant`
+/// overflow a client-supplied `timeout_secs: u64::MAX` produces (`Instant + Duration` panics; this
+/// runs in the cap-dropped, network-facing parent, so that panic is client-reachable).
+fn deadline_from(budget: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(budget)
+        .unwrap_or_else(|| now + CALL_DEADLINE_HORIZON)
+}
+
 /// The parent-side [`VmEngine`] that forwards each op to the broker over the framed RPC and awaits
 /// its reply. A background task reads replies and resolves the matching per-request `oneshot`, so
 /// concurrent HTTP requests are in flight together (multiplexed by request id).
 pub struct BrokerClientEngine {
-    wr: Mutex<tokio::net::unix::OwnedWriteHalf>,
+    /// The shared request writer, or `None` once the stream has been **torn down** — see
+    /// [`BrokerClientEngine::send_request`]. A framed stream that lost a write part-way through a
+    /// frame can never be handed to the next caller, so the slot is emptied instead (dropping the
+    /// `OwnedWriteHalf` shuts the write half down).
+    wr: Mutex<Option<tokio::net::unix::OwnedWriteHalf>>,
     pending: Pending,
     next_id: AtomicU64,
+    /// Overrides [`call_budget`] for **every** call when set (see
+    /// [`BrokerClientEngine::with_call_budget`]).
+    budget: Option<Duration>,
 }
 
 impl BrokerClientEngine {
@@ -372,6 +536,14 @@ impl BrokerClientEngine {
     /// inside a tokio runtime** (it spawns the reader task).
     #[must_use]
     pub fn new(sock: tokio::net::UnixStream) -> Arc<Self> {
+        Self::with_call_budget(sock, None)
+    }
+
+    /// Like [`BrokerClientEngine::new`], but pins every call's deadline to `budget` instead of the
+    /// per-request default (`call_budget`). The stalled-broker gate uses it to bound a call in
+    /// milliseconds instead of minutes; an embedder can use it to tighten the ceiling.
+    #[must_use]
+    pub fn with_call_budget(sock: tokio::net::UnixStream, budget: Option<Duration>) -> Arc<Self> {
         let (mut rd, wr) = sock.into_split();
         let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let reader_pending = pending.clone();
@@ -402,29 +574,112 @@ impl BrokerClientEngine {
             }
         });
         Arc::new(Self {
-            wr: Mutex::new(wr),
+            wr: Mutex::new(Some(wr)),
             pending,
             next_id: AtomicU64::new(1),
+            budget,
         })
     }
 
+    /// Drops a request's slot from the multiplex table, so neither an error path nor an expired
+    /// deadline leaves a stale sender behind.
+    fn forget(&self, id: u64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    /// Encodes and writes one request frame, bounded by the call's `deadline`.
+    ///
+    /// The deadline covers **both** waiting for the shared writer and the write itself — but the two
+    /// are bounded separately, because a write that has begun cannot simply be dropped. Wrapping
+    /// lock-acquire + `write_frame` in one `timeout_at` lets the deadline expire *inside*
+    /// `write_all`: the future is dropped after a partial frame, the lock is released, and the next
+    /// request's bytes land **inside** the truncated frame — desyncing the framed stream and every
+    /// later reply on it (the same hazard as discarding a partial `write` return).
+    ///
+    /// So a write that is cut short — by the deadline or by an I/O error, which is equally
+    /// possibly-partial — **tears the stream down**: the writer is taken out of its slot and
+    /// dropped, which shuts the write half down. The broker sees a clean EOF after the truncated
+    /// frame, this side's reply reader then fails every in-flight request with its typed error, and
+    /// later callers are refused outright instead of writing into a desynced stream.
+    ///
+    /// An over-cap payload is rejected **before** the lock is taken (through the same
+    /// [`frame_len_prefix`] law `write_frame` uses), so one oversized request cannot tear down a
+    /// healthy connection.
+    async fn send_request(
+        &self,
+        id: u64,
+        req: EngineRequest,
+        deadline: tokio::time::Instant,
+    ) -> DaemonResult<()> {
+        let bytes = serde_json::to_vec(&(id, req))
+            .map_err(|e| DaemonError::Internal(format!("broker encode: {e}")))?;
+        frame_len_prefix(&bytes)
+            .map_err(|e| DaemonError::PayloadTooLarge(format!("broker request: {e}")))?;
+        let mut slot = tokio::time::timeout_at(deadline, self.wr.lock())
+            .await
+            .map_err(|_| {
+                DaemonError::Internal(
+                    "the broker write channel did not free up within the call budget".to_string(),
+                )
+            })?;
+        let written = {
+            let Some(w) = slot.as_mut() else {
+                return Err(DaemonError::Internal(
+                    "the broker stream was torn down after a partial frame write".to_string(),
+                ));
+            };
+            tokio::time::timeout_at(deadline, write_frame(w, &bytes)).await
+        };
+        match written {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                *slot = None;
+                Err(DaemonError::Internal(format!(
+                    "broker write: {e}; the broker stream was torn down (the frame may be partial)"
+                )))
+            }
+            Err(_) => {
+                *slot = None;
+                Err(DaemonError::Internal(
+                    "broker write did not complete within the call budget; the broker stream was \
+                     torn down rather than left desynced by a partial frame"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
     async fn call(&self, req: EngineRequest) -> DaemonResult<EngineReply> {
+        // ONE deadline bounds the WHOLE call — waiting for the write lock, the framed write, and the
+        // reply await — not the gaps between them. The reader task's EOF drain covers a broker that
+        // *died*; this covers one that is alive and simply never answers, which no drain can see.
+        let budget = self.budget.unwrap_or_else(|| call_budget(&req));
+        let deadline = deadline_from(budget);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, tx);
-        let bytes = serde_json::to_vec(&(id, req))
-            .map_err(|e| DaemonError::Internal(format!("broker encode: {e}")))?;
-        {
-            let mut w = self.wr.lock().await;
-            write_frame(&mut *w, &bytes)
-                .await
-                .map_err(|e| DaemonError::Internal(format!("broker write: {e}")))?;
+        if let Err(e) = self.send_request(id, req, deadline).await {
+            self.forget(id);
+            return Err(e);
         }
-        rx.await
-            .map_err(|_| DaemonError::Internal("broker dropped the request".to_string()))
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(DaemonError::Internal(
+                "broker dropped the request".to_string(),
+            )),
+            Err(_) => {
+                self.forget(id);
+                Err(DaemonError::Internal(format!(
+                    "broker call timed out after {budget:?} (the broker is alive but not replying)"
+                )))
+            }
+        }
     }
 }
 
@@ -508,12 +763,19 @@ impl VmEngine for BrokerClientEngine {
         }
     }
     async fn shutdown_all(&self) {
-        // Best-effort: ask the broker to tear every VM down gracefully; ignore transport errors
-        // (the reap on the child handle is the backstop).
-        let _ = self.call(EngineRequest::ShutdownAll).await;
+        // Best-effort: ask the broker to tear every VM down gracefully. A transport error is
+        // LOGGED, never swallowed silently (the reap on the child handle is the backstop, and the
+        // next daemon's start-up sweep reclaims whatever the reap could not).
+        if let Err(e) = self.call(EngineRequest::ShutdownAll).await {
+            tracing::warn!(error = %e, "broker shutdown_all did not complete; relying on the child reap and the next start-up sweep");
+        }
     }
 }
 
+#[cfg(test)]
+mod deadline_tests;
+#[cfg(test)]
+mod shutdown_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
