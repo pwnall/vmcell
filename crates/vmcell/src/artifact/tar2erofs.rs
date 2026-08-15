@@ -331,6 +331,25 @@ fn build_node_map<'a, R: Read + 'a>(
     Ok(entries)
 }
 
+/// Fuzz-only entry point onto `build_node_map`: the merged-tree KEYS an OCI layer set produces,
+/// without the EROFS pack (non-default `fuzzing` feature; see the feature's stanza in `Cargo.toml`).
+///
+/// [`tar_to_erofs`] returns the packed image bytes, so the path set a registry-authored archive
+/// folds into is not observable through it — and the path set is where the confinement property
+/// lives (every key relative, non-empty, and free of `..`, since `normalize_path` POPS a parent
+/// component rather than escaping with it). Returns the keys only; the `Node` values stay private.
+///
+/// # Errors
+/// Propagates `build_node_map`'s error for an unreadable or unsupported archive member.
+#[cfg(all(feature = "fuzzing", feature = "am-fs-erofs"))]
+pub fn fuzz_node_paths<'a, R: Read + 'a>(
+    archives: impl IntoIterator<Item = tar::Archive<R>>,
+) -> crate::error::Result<Vec<PathBuf>> {
+    Ok(build_node_map(archives, vec![], vec![], vec![])?
+        .into_keys()
+        .collect())
+}
+
 /// Converts a tar archive to an EROFS filesystem image.
 ///
 /// `extra_files` are the downstream [`ExtraFile`](crate::artifact::rootfs::ExtraFile)s and are

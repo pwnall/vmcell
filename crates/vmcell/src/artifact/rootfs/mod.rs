@@ -190,6 +190,24 @@ fn validate_extra_files(extra: &[ExtraFile]) -> Result<Vec<(String, PathBuf, u16
     Ok(out)
 }
 
+/// Fuzz-only entry point onto `validate_extra_files`, the F5 injection-dest law (non-default
+/// `fuzzing` feature; see the feature's stanza in `Cargo.toml`).
+///
+/// [`is_reserved_injection_path`] is already public, but it is only *half* of the law — the escapes
+/// this validator actually caught were normal-form ones (`/usr/sbin/./vmcell-guest-agent`, whose
+/// raw string is not a reserved path, and `/opt/.`, whose raw leaf normalizes away), plus the
+/// duplicate-dest case. Fuzzing the public half alone would report coverage of the reserved-list
+/// membership test while missing every shape that defeated it. Reads no file: an
+/// [`ExtraFile`]'s `src` is opened by the packer, never by this validator, so the entry point stays
+/// pure.
+///
+/// # Errors
+/// Propagates `validate_extra_files`'s [`Error::Artifact`] rejection verbatim.
+#[cfg(all(feature = "fuzzing", feature = "am-fs-erofs"))]
+pub fn fuzz_validate_extra_files(extra: &[ExtraFile]) -> Result<Vec<(String, PathBuf, u16)>> {
+    validate_extra_files(extra)
+}
+
 /// A pipeline stage that builds a root filesystem from an OCI base image (the in-`vmcell`
 /// bootstrap source, §4.2, Rootfs sources and the one packer). The in-VM `mmdebstrap` source is `vmcell-rootfs-builder`.
 pub struct RootfsStage {

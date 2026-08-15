@@ -136,6 +136,14 @@ name = "vmcell"
 #     - The non-default `test-support` feature (see its stanza below), which additionally exposes
 #       `metrics::FakeCgroupFs` and `vmm::VmmProcessGroup::already_reaped_for_test`. It is not in
 #       `default`, so it changes nothing for a consumer that does not ask for it.
+#     - The non-default `fuzzing` feature (see its stanza below), which exposes three thin
+#       fuzz-only entry points onto predicates that are otherwise private — the egress deny-list
+#       matcher (`proxy::doubles::fuzz_is_blocked`), the tar-layer merged-tree key set
+#       (`artifact::tar2erofs::fuzz_node_paths`) and the F5 injection-dest validator
+#       (`artifact::rootfs::fuzz_validate_extra_files`) — so the nightly `cargo fuzz` job can drive
+#       each against a property rather than a bare no-panic check. Not in `default`, so
+#       `cargo semver-checks` (which runs on default features) sees nothing and a consumer that does
+#       not ask for it is unaffected.
 version = "0.14.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
@@ -394,6 +402,24 @@ default = ["cloud-hypervisor", "net-privileged", "net-unprivileged", "proxy", "m
 # `vmm::VmmProcessGroup::already_reaped_for_test`, which fabricates the recycled-pgid state
 # the per-backend M-VMM-1 gates need.
 test-support = []
+
+# Fuzz-only entry points onto predicates that stay private in every shipped configuration. NOT in
+# `default`, and never a dependency of a shipped binary: the only consumer is the workspace-EXCLUDED
+# `fuzz/` crate (root `Cargo.toml`'s `exclude = ["fuzz"]`), whose feature selection therefore cannot
+# unify into `cargo build --workspace` / nextest / `--all-targets` the way a dev-dependency's can.
+#
+# `vmcell` IS a `cargo semver-checks` contract crate, so this MUST stay out of `default`: a
+# non-default feature adds no default public API, so semver-checks sees nothing and no consumer's
+# build can start depending on it by accident.
+#
+# What it exposes (see the items' own rustdoc): `proxy::doubles::fuzz_is_blocked` — the egress
+# deny-list label-boundary matcher, fuzzed against the normalization/sibling-label properties;
+# `artifact::tar2erofs::fuzz_node_paths` — the merged-tree key set an OCI layer produces, fuzzed for
+# path confinement; `artifact::rootfs::fuzz_validate_extra_files` — the F5 injection-dest validator,
+# fuzzed for the reserved/duplicate escape law (`/usr/sbin/./vmcell-guest-agent`, `/opt/.`). Each is
+# a thin `#[cfg(feature = "fuzzing")]` wrapper that CALLS the production predicate — never a second
+# copy of its logic.
+fuzzing = []
 
 # Collapsed host stack (design §10.5 follow-up "one feature per binary"): enabling
 # any host binary/backend feature (cloud-hypervisor/firecracker/qemu/cli) pulls the

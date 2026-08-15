@@ -32,6 +32,20 @@ server = [
     "dep:vmcell",
 ]
 
+# Fuzz-only decode entry points onto the bridge's two wire enums (`bridge::fuzz_decode_engine_request`
+# / `fuzz_decode_engine_reply`). NOT in `default`, and the only consumer is the workspace-EXCLUDED
+# `fuzz/` crate, so `cargo build -p vmcell-daemon` cannot reach them and no feature unification can
+# pull them into a shipped binary.
+#
+# It exposes DECODE FUNCTIONS, not the enums: `EngineRequest`/`EngineReply` stay private, so this
+# commits to no wire schema — the entry point hands back the value re-serialized on the same codec,
+# which is all a round-trip property needs. `vmcell-daemon` is `publish = false` and is not one of
+# the two `cargo semver-checks` contract crates (`vmcell`, `vmcell-artifact-validator`), so the
+# ledger cost is this comment rather than a version bump. Deliberately NOT enrolled in
+# `scripts/ban-test-support-in-production.sh`: that gate polices test FIXTURES against production
+# use, and these are production types reached through a fuzz-only door.
+fuzzing = ["server"]
+
 [dependencies]
 # Always compiled — the wire schema shared with the client.
 serde = { version = "1", features = ["derive"] }

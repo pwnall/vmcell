@@ -1,11 +1,68 @@
 name: fuzz-nightly
 
 # Non-blocking by construction: it is scheduled (gates no PR), but a red run is visible on the
-# Actions tab and any crash uploads its reproducer. Covers the rubric B10 decode surfaces — the
-# framed postcard `Message` guest-wire decoder (protocol_decode) and the broker's cross-privilege
-# framed `BrokerRequest` decoder (broker_frame; a panic there is a crash in the cap-holding process).
-# `cargo fuzz list` auto-discovers every `[[bin]]`, so a new target runs with no workflow edit. Add a
-# target per new parser guest or network bytes reach (CH REST/chunked response, OCI/tar layer ingest).
+# Actions tab and any crash uploads its reproducer.
+#
+# ROSTER — 15 targets, grouped by WHO SUPPLIES THE BYTES, which is the only grouping that ranks
+# them. Every target file states its own trust boundary, the production precondition it mirrors and
+# the buggy implementation it was driven red against; this index does not restate that reasoning.
+# `cargo fuzz list` auto-discovers every `[[bin]]`, so a new target runs with no workflow edit — but
+# this prose index CAN go stale, which is why GUARD 5 asserts the roster against the tree in both
+# directions rather than against anything written here.
+#
+#   GUEST -> HOST — bytes a booted VM controls; the boundary vmcell exists to hold
+#     protocol_decode            framed postcard `Message`, the guest agent wire (rubric B10)
+#     protocol_message_render    `capped_debug` over a decoded `Message`; an uncapped render is a
+#                                flood written into the persisted serial-console artifact
+#     egress_host_blocklist      the deny-list matcher over the guest's own `Host` header / URI
+#                                authority — a label-boundary miss is an egress-filter bypass
+#     validator_classify_serial  the console classifier over guest-owned `/dev/console` text;
+#                                downstream contract surface, so a panic is consumer-visible
+#     validator_kconfig_parse    the `.config` sidecar parser, also reached from an in-guest
+#                                `zcat /proc/config.gz`; likewise contract surface
+#
+#   REMOTE REST CLIENT -> vmcelld — off-host HTTP
+#     daemon_auth_bearer         `authorize`/`extract_bearer`, parsed with NO credential presented:
+#                                the one target on the pre-authentication path
+#     daemon_artifact_name       `resolve_artifact_path`, the single client-name -> path law (P3)
+#     daemon_create_vm_dto       the three `Json<T>` request bodies, incl. their presence attributes
+#     kernel_cmdline_args        `extra_kernel_args` -> `is_reserved_cmdline_arg` -> the guest kernel
+#                                command line (F3); the kernel applies duplicate keys in order
+#
+#   CROSS-PRIVILEGE — the cap-dropped HTTP parent <-> the cap-HOLDING broker child (P2)
+#     broker_frame               parent -> child, framed postcard `BrokerRequest`: a panic here is a
+#                                crash in the process still holding the three caps
+#     broker_reply_frame         child -> parent, framed postcard `BrokerReply` — the other
+#                                direction, per AGENTS.md's both-directions rule
+#     daemon_bridge_frame        the JSON engine bridge, both arms, incl. the permissive id-recovery
+#                                decode that re-parses the same hostile bytes a second time
+#
+#   THIRD-PARTY IMAGE — an OCI registry's bytes; a digest pin fixes WHICH bytes arrive, not WHOSE
+#     oci_layer_tar              tar layer -> `tar_to_erofs`, the merged tree that becomes the rootfs
+#     oci_layer_zstd             the zstd arm — the only LINKED C parser in the tree that sees
+#                                off-host bytes (that file records what ASan does and does not cover
+#                                there: cargo-fuzz sets no CFLAGS, so libzstd is uninstrumented)
+#
+#   LOCAL BUILD CONFIG — contract surface, not a remote boundary
+#     injection_dest             the F5 injection-dest law; ranked for its real evasion history
+#                                (`/usr/sbin/./vmcell-guest-agent`, `/opt/.`), not for remote reach
+#
+# ADDING A TARGET: land it in BOTH `fuzz/fuzz_targets/<name>.rs` and a `[[bin]]` stanza in
+# `fuzz/Cargo.toml` — GUARD 5 fails the job loudly if either is missing, because a target file
+# without its stanza is invisible to `cargo fuzz list` and is silently never fuzzed. State the trust
+# boundary and the mirrored production precondition in the file, add a line to the index above, and
+# re-read the budget arithmetic at GUARD 6 before assuming the window is free. Per AGENTS.md, build
+# the buggy implementation the target guards and confirm it goes red: a no-panic assertion over a
+# function that is total by construction is this repo's "reports success while covering nothing"
+# defect in fuzz-target form, so prefer a property, and check the property is reachable at
+# libFuzzer's default `-max_len` — several targets here needed a committed seed corpus to be able to
+# fail at all. `fuzz/.gitignore`'s re-include rules are the seed roster; do not restate the count
+# here, because a second copy of it was wrong within a day of being written.
+#
+# RETIRED, not outstanding: this header used to ask for a "CH REST/chunked response" target. There
+# is no vmcell-authored HTTP response parser to point one at — `unix_api_request_with` hands the
+# socket to `hyper`, and vmcell touches only `res.status()` and `from_utf8_lossy` on the collected
+# error body — so the request is withdrawn rather than left standing as permanent unmet debt.
 
 on:
   schedule:
@@ -22,6 +79,20 @@ concurrency:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    # DERIVED from FUZZ_BUDGET_CEILING_SECONDS below: 240 min of fuzzing + 90 min for checkout, the
+    # from-source cargo-fuzz build, the 15 per-target builds and the upload. Keep the two in step —
+    # a timeout under the ceiling would kill healthy runs GUARD 6 had already approved, and one at or
+    # above GitHub's 360 min would never fire at all.
+    #
+    # This exists for the HANG, which GUARD 6 cannot see: GUARD 6 projects
+    # `roster_count * FUZZ_SECONDS` and refuses a roster that would overrun, but it projects what
+    # libFuzzer is ASKED to do. A target that ignores `-max_total_time` — an infinite loop in a
+    # harness, a parser that blocks on a lock or a socket — is not in that projection, and without
+    # this the job would sit until GitHub's own 360 min kill, which reports as an opaque platform
+    # cancellation with no step attribution. Failing at OUR bound instead names the step that hung.
+    # The repo is public, so runner minutes are free and unmetered; this is about getting an
+    # actionable failure, not about cost.
+    timeout-minutes: 330
     env:
       # `rust-toolchain.toml` pins channel 1.96.1, and a toolchain FILE outranks `rustup default`,
       # which is all `dtolnay/rust-toolchain@nightly` sets. So every run of this workflow since it
@@ -29,6 +100,15 @@ jobs:
       # `-Zsanitizer=address` before building a single target — the workflow has never fuzzed
       # anything. `RUSTUP_TOOLCHAIN` is the env-var override, which outranks the file.
       RUSTUP_TOOLCHAIN: nightly
+      # The per-target fuzzing window, named ONCE for the whole job. Two steps need it — the
+      # preflight to project the total budget (GUARD 6), the run loop to pass `-max_total_time` and
+      # to derive its did-it-actually-run floor — and two literals would drift. The reasoning behind
+      # the value, and behind keeping it FIXED as the roster grows, is at GUARD 6.
+      FUZZ_SECONDS: "300"
+      # The wall-clock ceiling GUARD 6 holds the projected fuzz loop under: 240 min. GitHub's
+      # per-job limit is 360 min, so this leaves 2 h of headroom for checkout, the cargo-fuzz source
+      # build, the per-target builds and the reproducer upload.
+      FUZZ_BUDGET_CEILING_SECONDS: "14400"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
@@ -57,7 +137,7 @@ jobs:
         # choose the platform.
         with: { tool: "cargo-fuzz", fallback: cargo-install }
 
-      - name: preflight (toolchain, target, roster) + build every fuzz target
+      - name: preflight (toolchain, target, roster, budget) + build every fuzz target
         id: preflight
         run: |
           set -euo pipefail
@@ -117,9 +197,10 @@ jobs:
           # GUARD 5 — the roster. An empty target list is the silent-green failure mode of a
           # discovery loop: `cargo fuzz list` auto-discovers every `[[bin]]`, so a renamed fuzz dir
           # or a mangled list would run zero targets and exit 0, reporting a fuzz run that fuzzed
-          # nothing. Two surfaces are documented at the top of this file; fewer than two is a
-          # regression, not a config choice. It is asserted HERE, before the build and the loop, so
-          # a broken roster costs a second rather than a whole job.
+          # nothing. The roster INDEX at the top of this file is prose and can go stale; the
+          # three-way agreement below is the fact, so nothing here is checked against that list.
+          # It is asserted HERE, before the build and the loop, so a broken roster costs a second
+          # rather than a whole job.
           # `cargo fuzz list` is NOT in the CARGO_TERM_COLOR class, checked rather than assumed:
           # this workflow sets no such env, and the list prints through cargo-fuzz's own
           # `list_targets()`, not cargo's renderer. It also has no `--color` flag to add — its only
@@ -153,8 +234,44 @@ jobs:
           fi
           echo "roster (${roster_count}, matching ${declared} [[bin]] stanza(s) and ${on_disk} target file(s)): $(tr '\n' ' ' < "${roster}")"
 
+          # GUARD 6 — the RUNTIME BUDGET. Asserted here, in a second, rather than discovered as a
+          # platform kill four hours in.
+          #
+          # THE ARITHMETIC. The loop below is SERIAL and gives every rostered target its own
+          # `-max_total_time` window, which `-max_total_time` then actually burns (it has no
+          # early-exit path), so wall time is roster_count * FUZZ_SECONDS:
+          #     2 targets * 300 s =  10 min   the roster this job shipped with
+          #    15 targets * 300 s =  75 min   today, plus ~4 min of build
+          #    48 targets * 300 s = 240 min   FUZZ_BUDGET_CEILING_SECONDS, where this guard fires
+          #
+          # THE DECISION, because the 2 -> 15 expansion forced one. The alternative design is a
+          # fixed TOTAL budget divided across the roster (3600 s / 15 = 240 s each today). It bounds
+          # wall time for free, and it is REJECTED: it makes every existing target's window a
+          # function of how many targets exist, so landing a 16th surface would quietly cut the
+          # other 15 from 240 s to 225 s each. Nobody reviewing a diff that adds one fuzz target
+          # would see that it weakened fifteen unrelated ones, and no gate would go red — that is
+          # exactly this repo's silent-weakening shape, applied to a coverage budget. It also
+          # inverts the incentive on a roster we want people to grow: a target should never cost its
+          # neighbours coverage. So the PER-TARGET WINDOW IS FIXED and WALL TIME IS LINEAR in the
+          # roster. That trade is affordable here specifically because this job is nightly, gates no
+          # PR, and cancels its own in-flight run — its cost is runner minutes, not correctness.
+          #
+          # What linear growth must NOT be allowed to do is walk into GitHub's 360-minute per-job
+          # ceiling, and that is a correctness matter rather than a cost one: a job killed at the
+          # ceiling has its remaining targets never run AND every later step skipped, so `upload
+          # crash reproducers` never executes and a genuine finding from an EARLIER target is
+          # destroyed along with the run. Failing loudly here instead costs one night of fuzzing and
+          # names the two ways out (shard the roster across a matrix, or lower FUZZ_SECONDS as a
+          # deliberate, reviewed change) — neither of which should happen silently.
+          budget_seconds=$(( roster_count * ${FUZZ_SECONDS:?} ))
+          if [ "${budget_seconds}" -gt "${FUZZ_BUDGET_CEILING_SECONDS:?}" ]; then
+            echo "::error::fuzz budget exceeded: ${roster_count} targets * ${FUZZ_SECONDS}s = $(( budget_seconds / 60 )) min of fuzzing, over the $(( FUZZ_BUDGET_CEILING_SECONDS / 60 )) min ceiling (GitHub kills a job at 360 min, which would skip the reproducer upload and destroy any finding from an earlier target). Do NOT fix this by shrinking FUZZ_SECONDS silently — that weakens every existing target at once. Either shard the roster across a job matrix, or lower FUZZ_SECONDS deliberately and say so here."
+            exit 1
+          fi
+          echo "budget: ${roster_count} targets * ${FUZZ_SECONDS}s = $(( budget_seconds / 60 )) min of fuzzing (ceiling $(( FUZZ_BUDGET_CEILING_SECONDS / 60 )) min, room for $(( FUZZ_BUDGET_CEILING_SECONDS / FUZZ_SECONDS )) targets at this window)"
+
           # Build every target BEFORE the timed loop. A build failure is then reported in seconds
-          # with a named cause, instead of surfacing 5 minutes into the first target's window and
+          # with a named cause, instead of surfacing partway into the first target's window and
           # starving the rest. `cargo fuzz run` reuses this exact build (same default BuildOptions),
           # so this front-loads work the loop would do anyway rather than adding any.
           if ! cargo fuzz build --target "${fuzz_target}"; then
@@ -162,7 +279,7 @@ jobs:
             exit 1
           fi
 
-          # GUARD 6 — the effective target, observed rather than assumed. cargo-fuzz lays its
+          # GUARD 7 — the effective target, observed rather than assumed. cargo-fuzz lays its
           # binaries down at <fuzz-dir>/target/<triple>/release/<name>, so the triple in that path
           # IS the platform the build actually chose. If a cargo-fuzz whose baked-in default
           # disagrees ever ignores or outranks the `--target` above, the binaries land under a
@@ -177,7 +294,9 @@ jobs:
           done < "${roster}"
           echo "all ${roster_count} targets built for ${fuzz_target}"
 
-      - name: run all fuzz targets (5 min each)
+      # Name interpolated from the single `FUZZ_SECONDS` fact rather than restating "5 min", so the
+      # window shown in the Actions UI cannot claim one budget while the loop spends another.
+      - name: run every fuzz target (${{ env.FUZZ_SECONDS }}s each)
         id: fuzz
         run: |
           set -euo pipefail
@@ -188,18 +307,21 @@ jobs:
           # end instead, so the run still reports (and uploads reproducers for) all of them.
           # The roster is the file the preflight built and asserted against, not a second discovery
           # that could disagree with it; `--target` is the preflight's derived host triple. The
-          # count check below is NOT a second copy of the preflight's ">= 2 surfaces" law — that law
-          # lives there, once. This only asserts the handoff file survived between steps, because a
-          # vanished roster would otherwise mean a loop over nothing that exits 0.
+          # count check below is NOT a second copy of the preflight's three-way roster law — that
+          # law lives there, once. This only asserts the handoff file survived between steps,
+          # because a vanished roster would otherwise mean a loop over nothing that exits 0.
           roster="${RUNNER_TEMP}/fuzz-targets.txt"
           roster_count=$(grep -c . "${roster}" || true)
           if [ "${roster_count:-0}" -lt 1 ]; then
             echo "::error::the preflight roster at ${roster} is empty or missing at run time; refusing to report a fuzz run that fuzzed nothing."
             exit 1
           fi
-          # The per-target window, named ONCE: the run flag and the did-it-actually-run floor below
-          # are both derived from it, so they cannot drift apart the way two literals would.
-          fuzz_seconds=300
+          # The per-target window comes from the job-level `FUZZ_SECONDS`, which is the ONE place it
+          # is written: the preflight's budget projection (GUARD 6), the `-max_total_time` flag
+          # below and the did-it-actually-run floor are all derived from that single fact, so they
+          # cannot drift apart the way separate literals would. `:?` because an unset window would
+          # otherwise become `-max_total_time=` and fuzz for an unintended length.
+          fuzz_seconds="${FUZZ_SECONDS:?}"
           # A target that returns 0 without spending its window did not fuzz its surface. This is
           # not hypothetical: `-runs=1` exits 0 after ~931 runs in under a second, and the loop
           # would have counted that as a fuzzed target and reported the job green. `-max_total_time`

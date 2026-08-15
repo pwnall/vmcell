@@ -219,6 +219,38 @@ enum EngineReply {
     Err(WireError),
 }
 
+/// Fuzz-only entry point onto the REQUEST decode [`serve_engine`] performs (non-default `fuzzing`
+/// feature; see the feature's stanza in `Cargo.toml`). `frame` is one already-de-framed payload —
+/// the bytes `read_frame` hands to `serde_json` after enforcing [`MAX_BRIDGE_FRAME_BYTES`].
+///
+/// `None` means the frame did not decode (the ordinary, expected outcome for arbitrary bytes; the
+/// serve loop answers it with a typed `Err` reply). `Some` carries `(re-serialized bytes, the
+/// decoded value's `Debug` render)`, so a caller can assert the presence-attribute round-trip the
+/// forwarded DTOs need (`#[serde(skip_serializing_if)]` / `default`, Appendix A reversal 10)
+/// without the private `EngineRequest` ever being nameable outside this crate. The `Debug` render is
+/// what carries the VALUE across the boundary: comparing only the re-serialized bytes would miss a
+/// field dropped on the FIRST encode, since the second encode drops it identically. An inner `Err`
+/// is a value that decoded but will not re-encode — a finding, not an expected outcome.
+#[cfg(feature = "fuzzing")]
+#[must_use]
+pub fn fuzz_decode_engine_request(frame: &[u8]) -> Option<serde_json::Result<(Vec<u8>, String)>> {
+    let decoded = serde_json::from_slice::<(u64, EngineRequest)>(frame).ok()?;
+    let rendered = format!("{decoded:?}");
+    Some(serde_json::to_vec(&decoded).map(|bytes| (bytes, rendered)))
+}
+
+/// Fuzz-only entry point onto the REPLY decode the parent's reader task performs
+/// ([`BrokerClientEngine::with_call_budget`]'s loop). Same shape and same round-trip contract as
+/// [`fuzz_decode_engine_request`]; this is the downward direction (cap-holding child → cap-dropped
+/// parent), which the request-side target does not cover.
+#[cfg(feature = "fuzzing")]
+#[must_use]
+pub fn fuzz_decode_engine_reply(frame: &[u8]) -> Option<serde_json::Result<(Vec<u8>, String)>> {
+    let decoded = serde_json::from_slice::<(u64, EngineReply)>(frame).ok()?;
+    let rendered = format!("{decoded:?}");
+    Some(serde_json::to_vec(&decoded).map(|bytes| (bytes, rendered)))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Framed async codec (length-prefixed JSON; over-cap rejected before allocation). JSON (not a
 // non-self-describing format like postcard) because the reused DTOs carry `#[serde(skip_serializing_if)]`

@@ -85,6 +85,20 @@ fn is_blocked(host: &str, blocked: &[String]) -> bool {
     })
 }
 
+/// Fuzz-only entry point onto `is_blocked`, the egress deny-list predicate (non-default
+/// `fuzzing` feature; see the feature's stanza in `Cargo.toml`).
+///
+/// The bytes it matches are **guest-chosen**: `ProxyHandler::route_request` lifts the host from
+/// the guest's own `Host` header / request-URI authority. The predicate cannot panic, so the value
+/// of fuzzing it is entirely in the *properties* — DNS-label-boundary matching, case folding and
+/// the single trailing dot — whose divergence is an egress-filter bypass (H-PROXY-2). This wrapper
+/// CALLS the production predicate rather than restating it, so there is still one law.
+#[cfg(feature = "fuzzing")]
+#[must_use]
+pub fn fuzz_is_blocked(host: &str, blocked: &[String]) -> bool {
+    is_blocked(host, blocked)
+}
+
 impl ProxyHandler {
     /// Routes a single request, returning either a synthesized response (an
     /// egress block or a test double) or the request to forward upstream.

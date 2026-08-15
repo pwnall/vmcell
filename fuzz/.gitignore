@@ -1,8 +1,48 @@
 # cargo-fuzz working state — build output, evolving corpus, and crash reproducers are all local.
 /target
-/corpus
+/corpus/*
 /artifacts
 /coverage
+
+# ...with an exception, for the FIVE targets whose re-include rules are listed below. They ship a
+# committed SEED corpus. Do not restate that count in prose elsewhere — the re-include rules at the
+# bottom of this file are the roster, and `git add -An fuzz/corpus` prints exactly what ships.
+#
+# For FOUR of them the seed is a CORRECTNESS dependency: random bytes cannot reach their parser
+# inside a nightly window at all. `oci_layer_zstd` measured cov 759 from a cold start versus cov 1286
+# with one real `.tar.zst` seed — a cold target spends its 300 s rediscovering the zstd frame magic
+# and never reaches the packer behind it, which is the "reports success while covering nothing" shape
+# this whole workflow exists to prevent.
+#
+# `validator_classify_serial` is the fifth and is NOT in that class: its seed is a SPEED-UP only. The
+# property was measured red from a completely empty corpus at libFuzzer's default 4096-byte
+# `-max_len`, in ~900k runs (~7 s), because `cap_line` does not merely truncate — it APPENDS
+# `"{head}{TRUNCATION_MARKER}{n} bytes elided"`, so a sub-4096-byte log can render PAST the ceiling.
+# It is called out because the opposite claim was written down twice during this pass and is false;
+# the target is stronger than its seed suggests.
+#
+# `cargo fuzz run` uses `corpus/<target>/` as its working corpus dir by DEFAULT, so committing seeds
+# there needs no workflow flag; everything the fuzzer then discovers stays ignored by the rule above.
+#
+# The seeds also set libFuzzer's `-max_len`: with no explicit flag it guesses from the largest corpus
+# unit, so the 10 KiB tar seed lifts the tar target past the 4 KiB default (eight tar blocks) into
+# the whiteout/hardlink/parent-synthesis tail, and the deliberately INCOMPRESSIBLE zstd seed keeps
+# that target's ceiling off the 280-byte structured one.
+!/corpus/oci_layer_tar/
+/corpus/oci_layer_tar/*
+!/corpus/oci_layer_tar/seed-*
+!/corpus/oci_layer_zstd/
+/corpus/oci_layer_zstd/*
+!/corpus/oci_layer_zstd/seed-*
+!/corpus/validator_classify_serial/
+/corpus/validator_classify_serial/*
+!/corpus/validator_classify_serial/seed-*
+!/corpus/daemon_create_vm_dto/
+/corpus/daemon_create_vm_dto/*
+!/corpus/daemon_create_vm_dto/seed-*
+!/corpus/daemon_bridge_frame/
+/corpus/daemon_bridge_frame/*
+!/corpus/daemon_bridge_frame/seed-*
 # The lock is working state here too, deliberately, against the usual "commit the lock for a crate
 # that builds binaries" rule. It first appeared only when the nightly job was repaired — for 41 runs
 # nothing ever resolved this crate — and two facts decide it:
