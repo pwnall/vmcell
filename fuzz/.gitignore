@@ -3,3 +3,14 @@
 /corpus
 /artifacts
 /coverage
+# The lock is working state here too, deliberately, against the usual "commit the lock for a crate
+# that builds binaries" rule. It first appeared only when the nightly job was repaired — for 41 runs
+# nothing ever resolved this crate — and two facts decide it:
+#   * `.github/dependabot.yml` covers `/` only, so a committed fuzz lock has nobody to update it; and
+#   * cargo-fuzz 0.13.2 has no `--locked` passthrough, so the lock would not be ENFORCED either.
+# Committing it would therefore pin stale transitive versions for the one job whose whole purpose is
+# finding memory-safety bugs, with no mechanism to refresh them — the opposite of what the root
+# workspace's `--locked` + dependabot policy achieves for shipped code. This crate is
+# workspace-excluded, ships nothing, and is rebuilt from scratch on an ephemeral runner every night,
+# so resolving fresh is both safe and what we want. Revisit if dependabot ever covers /fuzz.
+/Cargo.lock

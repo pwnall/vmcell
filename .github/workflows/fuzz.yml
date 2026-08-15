@@ -35,49 +35,243 @@ jobs:
       - uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae  # nightly branch
         with: { toolchain: nightly }
       - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907  # v2
-        with: { tool: "cargo-fuzz" }
+        # `fallback: cargo-install` is load-bearing — do not drop it back to the default. This pin
+        # ships NO manifest for cargo-fuzz ("install-action does not support cargo-fuzz … fallback
+        # to cargo-binstall" appears in every run log), and the DEFAULT fallback is cargo-binstall,
+        # which silently fetched a prebuilt x86_64-unknown-linux-MUSL cargo-fuzz onto this gnu
+        # runner. `cargo fuzz`'s `--target` defaults to the triple its OWN BINARY was compiled for,
+        # so that musl binary passed `--target x86_64-unknown-linux-musl` to every fuzz build and
+        # produced `error: sanitizer is incompatible with statically linked libc` plus
+        # `error[E0463]: can't find crate for 'core'` — cause 2 of the 41-run drought. A silent
+        # substitution that changes the built-for platform is the same hazard class `fallback: none`
+        # already guards in ci.yml.
+        # `cargo-install` builds cargo-fuzz from source with the runner's own toolchain, so the
+        # binary is host-native and its baked-in default equals the host BY CONSTRUCTION (verified:
+        # `cargo install --locked cargo-fuzz` on a gnu host yields a binary reporting
+        # `--target … [default: x86_64-unknown-linux-gnu]`; the binstall musl build reported musl).
+        # It also stops install-action forwarding `github.token`, which action.yml hands to the
+        # cargo-binstall fallback only — the supply-chain reasoning behind ci.yml's `fallback: none`.
+        # NOT `none`: with no manifest, `none` aborts the job and fuzzes nothing at all.
+        # This is defence in depth, not the fix. The fix is the explicit `--target` below, asserted
+        # against the artifacts the build actually produced, so even a substituted cargo-fuzz cannot
+        # choose the platform.
+        with: { tool: "cargo-fuzz", fallback: cargo-install }
+
+      - name: preflight (toolchain, target, roster) + build every fuzz target
+        id: preflight
+        run: |
+          set -euo pipefail
+          # Everything cheap and named runs BEFORE anything that costs minutes. Both causes of the
+          # 41-run drought were one-line config errors that only announced themselves deep inside a
+          # per-target build, as a rustc error wall nobody read. Each guard below states the defect
+          # it exists to prevent, costs about a second, and names its own cause.
+
+          # GUARD 1 — the toolchain override (cause 1, the RUSTUP_TOOLCHAIN env note above).
+          # Read into a variable instead of `rustc -vV | grep -q`: under `set -o pipefail` a
+          # short-circuiting `grep -q` can surface the pipeline as SIGPIPE and redden a healthy run.
+          rustc_release=$(rustc -vV | sed -n 's/^release: //p')
+          case "${rustc_release}" in
+            *-nightly) ;;
+            *)
+              echo "::error::effective rustc is not nightly (release: ${rustc_release:-<unreadable>}) — cargo fuzz cannot build; the RUSTUP_TOOLCHAIN override regressed (rust-toolchain.toml outranks \`rustup default\`)"
+              exit 1
+              ;;
+          esac
+
+          # GUARD 2 — the build target (cause 2). `cargo fuzz`'s `--target` defaults to the triple
+          # its own binary was COMPILED for, not the one rustc targets, and nothing in this repo
+          # requests musl (no `.cargo/`, no CARGO_BUILD_TARGET, no musl in any manifest). Derive the
+          # target from rustc's own host line and pass it explicitly to every build below, so the
+          # fuzz build always targets the platform this toolchain actually has std and sanitizer
+          # support for — never the platform the cargo-fuzz binary happened to be built for.
+          # A derivation that resolves to nothing is an error, not an empty `--target`.
+          fuzz_target=$(rustc -vV | sed -n 's/^host: //p')
+          if [ -z "${fuzz_target}" ]; then
+            echo "::error::could not read a host triple out of \`rustc -vV\` — the fuzz build target is undeterminable; refusing to fall back to cargo-fuzz's baked-in default (that default is what built for musl for 41 runs). Full output: $(rustc -vV | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "FUZZ_TARGET=${fuzz_target}" >> "${GITHUB_ENV}"
+          echo "fuzz target: ${fuzz_target} (rustc host)"
+
+          # GUARD 3 — statically linked libc is fundamentally incompatible with the sanitizer
+          # cargo-fuzz enables by default, which is the first error the musl runs printed. It stays
+          # true even when std IS installed for the target, so it is checked before GUARD 4.
+          target_cfg=$(rustc --print cfg --target "${fuzz_target}")
+          if grep -q '^target_feature="crt-static"$' <<<"${target_cfg}"; then
+            echo "::error::fuzz target ${fuzz_target} links libc statically (target_feature=\"crt-static\"); \`error: sanitizer is incompatible with statically linked libc\` is the exact failure that produced 0 fuzzed bytes for 41 runs. Fuzzing needs a dynamically linked target."
+            exit 1
+          fi
+
+          # GUARD 4 — std for the target must actually be installed, or every fuzz build dies with
+          # `error[E0463]: can't find crate for 'core'` after minutes of setup. `--build-std` is on
+          # by default in cargo-fuzz, but it still needs the target's std sources/rlibs present.
+          if ! target_libdir=$(rustc --print target-libdir --target "${fuzz_target}" 2>&1); then
+            echo "::error::rustc does not know target ${fuzz_target}: ${target_libdir}"
+            exit 1
+          fi
+          if ! compgen -G "${target_libdir}/libcore-*.rlib" > /dev/null; then
+            echo "::error::no std/core rlibs under ${target_libdir} — the ${fuzz_target} target is not installed for this toolchain, so every fuzz build would fail with \`can't find crate for 'core'\`. Install it (rustup target add ${fuzz_target}) or fix the toolchain."
+            exit 1
+          fi
+
+          # GUARD 5 — the roster. An empty target list is the silent-green failure mode of a
+          # discovery loop: `cargo fuzz list` auto-discovers every `[[bin]]`, so a renamed fuzz dir
+          # or a mangled list would run zero targets and exit 0, reporting a fuzz run that fuzzed
+          # nothing. Two surfaces are documented at the top of this file; fewer than two is a
+          # regression, not a config choice. It is asserted HERE, before the build and the loop, so
+          # a broken roster costs a second rather than a whole job.
+          # `cargo fuzz list` is NOT in the CARGO_TERM_COLOR class, checked rather than assumed:
+          # this workflow sets no such env, and the list prints through cargo-fuzz's own
+          # `list_targets()`, not cargo's renderer. It also has no `--color` flag to add — its only
+          # option is `--fuzz-dir` — so "defensively" passing one would abort here and fuzz nothing.
+          roster="${RUNNER_TEMP}/fuzz-targets.txt"
+          if ! cargo fuzz list > "${roster}"; then
+            echo "::error::\`cargo fuzz list\` failed; the target roster is unknown and nothing was fuzzed"
+            exit 1
+          fi
+          roster_count=$(grep -c . "${roster}" || true)
+          if [ "${roster_count:-0}" -lt 1 ]; then
+            echo "::error::cargo fuzz list produced ${roster_count:-0} target(s); a discovery loop that runs nothing must not report success."
+            exit 1
+          fi
+          # The floor is DERIVED from the tree, not restated as a literal. A hardcoded `-lt 2` is
+          # only ever right until the day a third surface lands, and it cannot see the failure that
+          # actually matters here: a target added as a FILE without its `[[bin]]` stanza is
+          # invisible to `cargo fuzz list`, so the job would fuzz two surfaces, exit 0, and quietly
+          # contradict this file's own header claim that "a new target runs with no workflow edit".
+          # Both directions are checked, because each is a real one-sided edit:
+          #   file without stanza  -> the surface is never fuzzed (silent under-coverage);
+          #   stanza without file  -> `cargo fuzz list` names a target that cannot build.
+          # This is the same derive-rather-than-restate rule the packer's reserved-path list follows.
+          declared=$(grep -c '^\[\[bin\]\]' fuzz/Cargo.toml || true)
+          on_disk=$(find fuzz/fuzz_targets -maxdepth 1 -name '*.rs' -type f | wc -l)
+          if [ "${roster_count}" -ne "${declared}" ] || [ "${roster_count}" -ne "${on_disk}" ]; then
+            echo "::error::fuzz target roster disagrees with the tree: \`cargo fuzz list\` names ${roster_count}, fuzz/Cargo.toml declares ${declared} [[bin]] stanza(s), fuzz/fuzz_targets/ holds ${on_disk} .rs file(s). A target file without its [[bin]] stanza is never fuzzed and the job would still report success."
+            echo "  listed:   $(tr '\n' ' ' < "${roster}")"
+            echo "  on disk:  $(find fuzz/fuzz_targets -maxdepth 1 -name '*.rs' -type f -printf '%f ')"
+            exit 1
+          fi
+          echo "roster (${roster_count}, matching ${declared} [[bin]] stanza(s) and ${on_disk} target file(s)): $(tr '\n' ' ' < "${roster}")"
+
+          # Build every target BEFORE the timed loop. A build failure is then reported in seconds
+          # with a named cause, instead of surfacing 5 minutes into the first target's window and
+          # starving the rest. `cargo fuzz run` reuses this exact build (same default BuildOptions),
+          # so this front-loads work the loop would do anyway rather than adding any.
+          if ! cargo fuzz build --target "${fuzz_target}"; then
+            echo "::error::a fuzz target failed to BUILD for ${fuzz_target} — nothing was fuzzed. This is a code or dependency break in the fuzz crate, not a crash finding; there is no reproducer to look for."
+            exit 1
+          fi
+
+          # GUARD 6 — the effective target, observed rather than assumed. cargo-fuzz lays its
+          # binaries down at <fuzz-dir>/target/<triple>/release/<name>, so the triple in that path
+          # IS the platform the build actually chose. If a cargo-fuzz whose baked-in default
+          # disagrees ever ignores or outranks the `--target` above, the binaries land under a
+          # different triple and this fires by name — the musl substitution can never again be
+          # discovered as an error wall five minutes into a fuzz window.
+          while IFS= read -r t; do
+            [ -n "${t}" ] || continue
+            if [ ! -x "fuzz/target/${fuzz_target}/release/${t}" ]; then
+              echo "::error::fuzz target ${t} was not built for ${fuzz_target} (no executable at fuzz/target/${fuzz_target}/release/${t}). cargo fuzz built for: $(find fuzz/target -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null). \`cargo fuzz --target\` defaults to the triple the cargo-fuzz BINARY was compiled for, so a substituted (e.g. musl-static) cargo-fuzz can pick a platform this toolchain cannot build for."
+              exit 1
+            fi
+          done < "${roster}"
+          echo "all ${roster_count} targets built for ${fuzz_target}"
 
       - name: run all fuzz targets (5 min each)
+        id: fuzz
         run: |
+          set -euo pipefail
           # Every target gets its full window even when an earlier one crashes: under `bash -e` a
           # single failing `cargo fuzz run` aborts the loop, so the FIRST crashing target starves
           # every later one of its nightly budget until someone fixes it — the second decode surface
           # then silently stops being fuzzed at all. Record the failure per target and fail at the
           # end instead, so the run still reports (and uploads reproducers for) all of them.
-          # The toolchain override is the thing that has silently failed here for 41 runs, so assert
-          # it before spending five minutes per target discovering it again through a -Zsanitizer
-          # error wall. One second, and it names its own cause.
-          rustc -vV | grep -q '^release: .*-nightly' || {
-            echo "::error::effective rustc is not nightly ($(rustc -vV | sed -n 2p)) — cargo fuzz cannot build; the RUSTUP_TOOLCHAIN override regressed (rust-toolchain.toml outranks \`rustup default\`)"
-            exit 1
-          }
-          rc=0
-          # NOT in the CARGO_TERM_COLOR class, checked rather than assumed: this workflow sets no
-          # such env, and `cargo fuzz list` prints target names through cargo-fuzz's own
-          # `list_targets()`, not cargo's renderer. It also has no `--color` flag to add — its only
-          # option is `--fuzz-dir` — so "defensively" passing one would abort the loop on an
-          # unexpected argument and fuzz nothing. Left alone deliberately; the empty-list hazard is
-          # covered by the target-count assertion below instead.
-          targets=0
-          for t in $(cargo fuzz list); do
-            targets=$((targets + 1))
-            echo "::group::cargo fuzz run $t"
-            cargo fuzz run "$t" -- -max_total_time=300 || rc=1
-            echo "::endgroup::"
-          done
-          # An empty target list is the silent-green failure mode of a discovery loop: `cargo fuzz
-          # list` auto-discovers every `[[bin]]`, so a renamed fuzz dir or a mangled list would run
-          # zero targets and exit 0, reporting a fuzz run that fuzzed nothing. Two surfaces are
-          # documented at the top of this file; fewer than two is a regression, not a config choice.
-          if [ "$targets" -lt 2 ]; then
-            echo "::error::cargo fuzz list produced $targets target(s); this repo documents two decode surfaces (protocol_decode, broker_frame). A discovery loop that runs nothing must not report success."
+          # The roster is the file the preflight built and asserted against, not a second discovery
+          # that could disagree with it; `--target` is the preflight's derived host triple. The
+          # count check below is NOT a second copy of the preflight's ">= 2 surfaces" law — that law
+          # lives there, once. This only asserts the handoff file survived between steps, because a
+          # vanished roster would otherwise mean a loop over nothing that exits 0.
+          roster="${RUNNER_TEMP}/fuzz-targets.txt"
+          roster_count=$(grep -c . "${roster}" || true)
+          if [ "${roster_count:-0}" -lt 1 ]; then
+            echo "::error::the preflight roster at ${roster} is empty or missing at run time; refusing to report a fuzz run that fuzzed nothing."
             exit 1
           fi
-          exit $rc
+          # The per-target window, named ONCE: the run flag and the did-it-actually-run floor below
+          # are both derived from it, so they cannot drift apart the way two literals would.
+          fuzz_seconds=300
+          # A target that returns 0 without spending its window did not fuzz its surface. This is
+          # not hypothetical: `-runs=1` exits 0 after ~931 runs in under a second, and the loop
+          # would have counted that as a fuzzed target and reported the job green. `-max_total_time`
+          # has no early-exit path — a healthy target burns the whole budget whether or not it finds
+          # new coverage — so anything well under the window means the arguments or the harness
+          # stopped fuzzing, which is exactly the "reports success while covering nothing" shape this
+          # workflow existed in for 41 runs. 80% absorbs runner scheduling jitter.
+          fuzz_min_seconds=$(( fuzz_seconds * 4 / 5 ))
+          rc=0
+          ran=0
+          for_upload=false
+          while IFS= read -r t; do
+            [ -n "${t}" ] || continue
+            ran=$((ran + 1))
+            echo "::group::cargo fuzz run ${t}"
+            t_rc=0
+            t_start=$(date +%s)
+            if ! cargo fuzz run "${t}" --target "${FUZZ_TARGET:?}" -- -max_total_time="${fuzz_seconds}"; then
+              t_rc=1
+              rc=1
+              # A failing run is supposed to leave a reproducer under fuzz/artifacts/<target>/
+              # (libFuzzer writes crash-/oom-/timeout-/leak- files there via -artifact_prefix). With
+              # the build already proven green by the preflight, a failure with NO reproducer is not
+              # a crash — it is infrastructure — and the upload step below would otherwise report
+              # success while carrying nothing. Name it here, at the target that produced it.
+              if ! compgen -G "fuzz/artifacts/${t}/*" > /dev/null; then
+                echo "::error::${t} failed but wrote no reproducer under fuzz/artifacts/${t}/ — this is not a crash (the preflight already built it); the failure is in the fuzzing run itself and there is nothing to upload."
+              fi
+            fi
+            t_elapsed=$(( $(date +%s) - t_start ))
+            # Only meaningful on the SUCCESS path: a crash legitimately exits early, and it has
+            # already set rc=1 and left a reproducer above.
+            if [ "${t_rc}" -eq 0 ] && [ "${t_elapsed}" -lt "${fuzz_min_seconds}" ]; then
+              echo "::error::${t} exited 0 after ${t_elapsed}s of its ${fuzz_seconds}s window (floor ${fuzz_min_seconds}s) — \`-max_total_time\` has no early-exit path, so a clean early return means the run arguments or the harness body stopped fuzzing this surface. Refusing to report a fuzz run that fuzzed nothing."
+              rc=1
+            else
+              echo "${t}: ${t_elapsed}s of a ${fuzz_seconds}s window"
+            fi
+            echo "::endgroup::"
+          done < "${roster}"
+          # Publish the upload flag BEFORE any early exit below. Ordering is load-bearing: a short
+          # loop that also produced a real crash would otherwise exit without ever writing this
+          # output, the upload step's condition would read false, and the reproducer for a genuine
+          # finding would be dropped on the floor. The job stays red either way, so this masks
+          # EVIDENCE rather than the verdict — which is precisely the kind of loss that makes a red
+          # run unactionable the next morning.
+          if compgen -G "fuzz/artifacts/*/*" > /dev/null; then
+            for_upload=true
+          fi
+          echo "reproducers=${for_upload}" >> "${GITHUB_OUTPUT}"
+          # The loop must fuzz the whole roster the preflight asserted. A short loop (a mangled
+          # roster line, an early `break` added later) would otherwise leave a surface unfuzzed and
+          # still exit 0 — the same silent-green shape as an empty target list.
+          if [ "${ran}" -ne "${roster_count}" ]; then
+            echo "::error::ran ${ran} of ${roster_count} rostered fuzz targets; a discovery loop that skips a surface must not report success."
+            exit 1
+          fi
+          echo "fuzzed ${ran} target(s) on ${FUZZ_TARGET}; reproducers=${for_upload}"
+          exit "${rc}"
 
+      # Gated on reproducers actually existing, not on `failure()` alone. Every failed run so far
+      # died in the build/preflight, which legitimately produces no reproducers — and the action's
+      # default `if-no-files-found: warn` turned that into a green step whose only trace was
+      # "No files were found with the provided path: fuzz/artifacts/". Correct, but it trains the
+      # reader to ignore the warning, and it reads identically to the case that matters: a real
+      # crash whose reproducer went missing. Split: nothing to upload => the step does not run at
+      # all; something to upload => `if-no-files-found: error`, so this path and the `compgen -G`
+      # in the step above disagreeing about `fuzz/artifacts/` is loud instead of a warning.
       - name: upload crash reproducers
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.fuzz.outputs.reproducers == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
+          if-no-files-found: error
