@@ -677,3 +677,70 @@ fn keep_temp_env_is_honored_or_rejected() {
     );
     std::fs::remove_dir_all(&kept).expect("hand-cleanup of the deliberately retained tree");
 }
+
+// The `.cache_key` sidecar path belongs to the STAGE, and `RootfsFeaturesStage` is the one stage
+// that overrides the default — because `rootfs.erofs` and its §7.4 declaration sidecar
+// `rootfs.features` both `with_extension("cache_key")` to the SAME `rootfs.cache_key`.
+//
+// Under the default (replace) law the two stages overwrite each other's cache metadata on every
+// build: each finds the other's key, misses, and re-runs. For the rootfs that means re-packing a
+// multi-minute image on every single build, forever, while every functional test stays green — the
+// exact silent-cost class §10.5's "the canonical artifacts stay byte-identical" clause exists over.
+//
+// RED on deleting `RootfsFeaturesStage::cache_sidecar_path` (or on routing `Pipeline::build` back
+// through `out_path.with_extension("cache_key")` instead of `stage.cache_sidecar_path`): the image
+// stage's run count is 2 on the second build.
+#[tokio::test]
+async fn a_sidecar_stage_sharing_a_stem_does_not_evict_the_image_stages_cache() {
+    // OWNED: `reserve`, not `create` — the pipeline creates its own target dir.
+    let scratch =
+        common::TempTree::reserve(&format!("vmcell-test-pipeline-stem-{}", std::process::id()));
+    let tmp_dir = scratch.path().to_path_buf();
+    let cache = Cache::default();
+
+    let packs = Arc::new(AtomicUsize::new(0));
+    // The real filename law, so this gate keeps testing the real collision rather than a
+    // hand-spelled name that could drift away from it.
+    let image_name = vmcell::artifact::rootfs::rootfs_filename(None);
+    let pipeline = || {
+        Pipeline::new(tmp_dir.clone())
+            .add_stage(Box::new(CountingStage {
+                name: image_name.clone(),
+                content: "packed image bytes".into(),
+                run_count: packs.clone(),
+            }))
+            .add_stage(Box::new(
+                vmcell::artifact::rootfs::RootfsFeaturesStage::labelled(None),
+            ))
+    };
+
+    pipeline().build(&cache).await.unwrap();
+    assert_eq!(
+        packs.load(Ordering::SeqCst),
+        1,
+        "the cold build packs exactly once"
+    );
+
+    // The collision is REAL, not hypothetical: assert the two sidecars are different files, so a
+    // future default that happened to avoid it would not leave this gate quietly vacuous.
+    let image = tmp_dir.join(&image_name);
+    let declaration = tmp_dir.join("rootfs.features");
+    assert!(image.exists() && declaration.exists());
+    assert!(
+        tmp_dir.join("rootfs.cache_key").exists(),
+        "the image stage keeps the replace-law sidecar every reader already knows"
+    );
+    assert!(
+        tmp_dir.join("rootfs.features.cache_key").exists(),
+        "the declaration stage's sidecar must be its OWN file"
+    );
+
+    // The warm build re-runs neither: this is the assertion the collision breaks.
+    pipeline().build(&cache).await.unwrap();
+    assert_eq!(
+        packs.load(Ordering::SeqCst),
+        1,
+        "a warm build must not re-pack the image — a stem-sharing sidecar stage that wrote over \
+         `rootfs.cache_key` would make every build a cold one"
+    );
+}

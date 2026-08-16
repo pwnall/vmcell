@@ -3,7 +3,7 @@ name: fuzz-nightly
 # Non-blocking by construction: it is scheduled (gates no PR), but a red run is visible on the
 # Actions tab and any crash uploads its reproducer.
 #
-# ROSTER — 15 targets, grouped by WHO SUPPLIES THE BYTES, which is the only grouping that ranks
+# ROSTER — 17 targets, grouped by WHO SUPPLIES THE BYTES, which is the only grouping that ranks
 # them. Every target file states its own trust boundary, the production precondition it mirrors and
 # the buggy implementation it was driven red against; this index does not restate that reasoning.
 # `cargo fuzz list` auto-discovers every `[[bin]]`, so a new target runs with no workflow edit — but
@@ -49,6 +49,10 @@ name: fuzz-nightly
 #     feature_manifest           the F6 feature-manifest sidecar parser; ranked because ABSENCE is
 #                                the silent direction — a typo'd declaration that read as
 #                                "unsupported" would pass every downstream check
+#     registry_entry             the F7 artifact-registry entry parsers (`rootfs`/`handlers`),
+#                                driven through the pins overlay's strict parse and the merge, so
+#                                the legacy-singleton reject and the sanitized-filename collision
+#                                reject are in scope beside the per-entry shape/digest rules
 #
 # ADDING A TARGET: land it in BOTH `fuzz/fuzz_targets/<name>.rs` and a `[[bin]]` stanza in
 # `fuzz/Cargo.toml` — GUARD 5 fails the job loudly if either is missing, because a target file
@@ -83,7 +87,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     # DERIVED from FUZZ_BUDGET_CEILING_SECONDS below: 240 min of fuzzing + 90 min for checkout, the
-    # from-source cargo-fuzz build, the 15 per-target builds and the upload. Keep the two in step —
+    # from-source cargo-fuzz build, the 17 per-target builds and the upload. Keep the two in step —
     # a timeout under the ceiling would kill healthy runs GUARD 6 had already approved, and one at or
     # above GitHub's 360 min would never fire at all.
     #
@@ -244,11 +248,12 @@ jobs:
           # `-max_total_time` window, which `-max_total_time` then actually burns (it has no
           # early-exit path), so wall time is roster_count * FUZZ_SECONDS:
           #     2 targets * 300 s =  10 min   the roster this job shipped with
-          #    16 targets * 300 s =  80 min   today, plus ~4 min of build
+          #    17 targets * 300 s =  85 min   today, plus ~4 min of build
           #    48 targets * 300 s = 240 min   FUZZ_BUDGET_CEILING_SECONDS, where this guard fires
           #
           # THE DECISION, because the 2 -> 15 expansion forced one. The alternative design is a
-          # fixed TOTAL budget divided across the roster (3600 s / 15 = 240 s each today). It bounds
+          # fixed TOTAL budget divided across the roster (3600 s / 15 = 240 s each at the 15-target
+          # roster this argument was written against; the illustration below is that roster's). It bounds
           # wall time for free, and it is REJECTED: it makes every existing target's window a
           # function of how many targets exist, so landing a 16th surface would quietly cut the
           # other 15 from 240 s to 225 s each. Nobody reviewing a diff that adds one fuzz target

@@ -1,0 +1,1 @@
+{"handlers":{"acme":{"digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","source":{"url":"https://example.invalid/guest-tools"},"applets":["acme-probe","acme-net"]}}}

@@ -39,8 +39,8 @@ fn registry_err(overlay: &Path) -> String {
 
 // §5.5/§5.6 GATE (delta 3): a `kernels.<label>` entry may declare `fragments: [<NAME>, …]`, and
 // that is what makes the LABEL ALONE determine the build — before v30 a fragment set was reachable
-// only by constructing a `KernelStage` programmatically, so `vmcell build-kernels` could never
-// build one. RED on the inverse (a reader that ignores the `fragments` key, i.e. today's flatten,
+// only by constructing a `KernelStage` programmatically, so `vmcell build-kernels <label>` could
+// never build one. RED on the inverse (a reader that ignores the `fragments` key, i.e. today's flatten,
 // which drops every key inside a registry entry it does not name): `fragments` comes back empty.
 #[test]
 fn kernel_registry_entry_declares_its_fragments() {

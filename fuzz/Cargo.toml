@@ -34,7 +34,7 @@ postcard = { version = "1", features = ["use-std"] }
 # The host library, declared DIRECTLY rather than leaned on through `vmcell-broker`'s transitive
 # edge: the tar/erofs packer (`artifact::tar2erofs`), the kernel-cmdline composer (`config`) and the
 # egress deny-list predicate all need it, and a transitive edge's feature set is not ours to rely on.
-# `fuzzing` is the non-default feature that opens the three otherwise-private predicates (see its
+# `fuzzing` is the non-default feature that opens the six otherwise-private predicates (see its
 # stanza in crates/vmcell/Cargo.toml).
 vmcell = { path = "../crates/vmcell", features = ["fuzzing"] }
 # The control-plane daemon: the pre-authentication bearer parser, the artifact-name → path predicate
@@ -147,5 +147,15 @@ doc = false
 [[bin]]
 name = "feature_manifest"
 path = "fuzz_targets/feature_manifest.rs"
+test = false
+doc = false
+
+# v33 §10.5: the artifact-registry entry parsers (F7) — the `rootfs` and `handlers` label maps,
+# reached through the pins overlay's strict parse and the merge, so the legacy-singleton reject
+# (which only fires on the MERGED document) and the sanitized-filename collision reject are in
+# scope beside the per-entry shape, digest, `unpinned_path` and `features` rules.
+[[bin]]
+name = "registry_entry"
+path = "fuzz_targets/registry_entry.rs"
 test = false
 doc = false

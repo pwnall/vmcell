@@ -90,7 +90,7 @@ struct Args {
     ksm_mergeable: bool,
 
     /// Kernel-version label to benchmark — selects `vmlinux-<label>` from
-    /// `VMCELL_ARTIFACTS_DIR` (built by `vmcell build-kernels`). Omit to use the
+    /// `VMCELL_ARTIFACTS_DIR` (built by `vmcell build-kernels <label>`). Omit to use the
     /// default `vmlinux`. This is the kernel-version benchmark dimension.
     #[arg(long)]
     kernel: Option<String>,

@@ -25,7 +25,7 @@ out. The binary lives in the `vmcell-cli` crate (`vmcell` itself declares no bin
 | Subcommand | What it does |
 |---|---|
 | `build` | Build all VM artifacts (kernel, erofs rootfs, proxy CA) from `pins.json`. |
-| `build-kernels` | Build every kernel in the `pins.kernels` registry to `vmlinux-<label>`. |
+| `build-kernels <label>… \| --all` | Build the **named** kernels from the `pins.kernels` registry to `vmlinux-<label>`; `--all` builds the whole registry. Selection is explicit — naming neither form is a typed error (§10.5). |
 | `oci2-erofs IMAGE@sha256:DIGEST -o out.erofs` | Convert any **digest-pinned** OCI base image into an erofs rootfs (verify blobs → whiteouts → inject steward/CA/tools → pack). Tags are rejected; a libc6-less base fails loud unless `--steward-musl <path>` supplies a static-musl steward. |
 | `run --kernel K --rootfs R [-- CMD…]` | Boot a fresh micro-VM, run `CMD` (default `/bin/true`) over vsock, tear down, and exit with the guest's exit code. |
 | `create --kernel K --rootfs R` | Boot a micro-VM and confirm the steward is ready, then tear down (a boot smoke test). |
@@ -387,11 +387,11 @@ build — no `sudo` / root step is involved either way.**
   `require_cap!` record written to `$VMCELL_SKIP_MANIFEST`. Reading the first as the second is
   exactly how the number that used to be here was wrong. To keep the fast prebuilt kernel as the
   default artifact and still run those legs, build a host-make kernel under a label with
-  `vmcell build-kernels` and point `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for the
-  privileged run — a labelled kernel has its own filename, so `build` cannot clobber it.
+  `vmcell build-kernels <label>` and point `VMCELL_KERNEL` at the resulting `vmlinux-<label>` for
+  the privileged run — a labelled kernel has its own filename, so `build` cannot clobber it.
 - **`in-vm`** compiles the pinned source *inside* a builder micro-VM. It needs a kernel to boot the
-  builder, so it is a typed refusal on `build`; its route is `vmcell build-kernels --kernel-source
-  in-vm`, which stages the bootstrap seed ahead of it.
+  builder, so it is a typed refusal on `build`; its route is `vmcell build-kernels --all
+  --kernel-source in-vm` (or with the labels named), which stages the bootstrap seed ahead of it.
 
 ### 9. Packages supporting experiments
 

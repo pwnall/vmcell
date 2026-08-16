@@ -96,12 +96,25 @@ pub enum HandlerSource {
     },
     /// A digest-pinned download — the consumer form, authoritative and verified before use.
     Registered {
-        /// The `sha256:<64 hex>` digest of the handler binary. Authoritative: the `source` below is
+        /// The `sha256:<64 lowercase hex>` digest of the handler binary. Authoritative: the `source` below is
         /// a fetch *instruction*, and a digest stored but never checked has passing output
         /// identical to its not-running output.
         digest: String,
         /// Where to fetch it from.
         url: String,
+    },
+    /// `"unpinned_path": "/path/to/handler"` — the **dev path-override** (§10.5, F7), the third and
+    /// last shape.
+    ///
+    /// The one shape whose identity is not a digest: it means "whatever is at that location today",
+    /// which is exactly why it is a *development* registration. The consequences follow from that
+    /// one sentence and are enforced rather than documented — the stage reads the file's content
+    /// hash into its cache key (so editing the file re-keys the artifact), resolution `warn!`s, and
+    /// `vmcell bundle` refuses an artifacts dir whose resolved pins name one, because a bundle is a
+    /// durable provenance claim and this shape cannot make one.
+    UnpinnedPath {
+        /// The local file whose bytes **are** the handler, exactly as registered.
+        path: std::path::PathBuf,
     },
 }
 
@@ -141,9 +154,11 @@ impl HandlerRegistryEntry {
 
 /// Parses one `handlers.<label>` entry — **strictly** (§10.5, F7).
 ///
-/// Exactly one registration shape per entry: `build` or `digest`, never both and never neither.
-/// "Nothing else parses" is F7's own wording, and it is what keeps a registry entry from meaning
-/// "whatever is at that location today".
+/// Exactly one registration shape per entry: `build`, `digest`, or the `unpinned_path` dev
+/// override — never two and never none. "Nothing else parses" is F7's own wording, and it is what
+/// keeps a registry entry from meaning "whatever is at that location today" **by accident**; the
+/// override is the one shape that means it deliberately, under its own named key, and pays for it
+/// at `bundle`.
 ///
 /// # Errors
 /// [`Error::Artifact`] naming the label and what is wrong with it.
@@ -151,25 +166,58 @@ pub(crate) fn handler_registry_entry(
     label: &str,
     spec: &serde_json::Value,
 ) -> Result<HandlerRegistryEntry> {
+    use crate::artifact::registry::UNPINNED_PATH_KEY;
     let obj = spec.as_object().ok_or_else(|| {
         Error::Artifact(format!(
             "pins `handlers.{label}` must be an object naming exactly one registration shape: \
-             `build` (a workspace member, vmcell's own defaults only) or `digest` + `source.url`"
+             `build` (a workspace member, vmcell's own defaults only), `digest` + `source.url`, or \
+             `{UNPINNED_PATH_KEY}` (the dev override)"
         ))
     })?;
     for key in obj.keys() {
-        if !matches!(key.as_str(), "build" | "digest" | "source" | "applets") {
+        if !matches!(key.as_str(), "build" | "digest" | "source" | "applets")
+            && key != UNPINNED_PATH_KEY
+        {
             return Err(Error::Artifact(format!(
                 "pins `handlers.{label}` carries unknown key `{key}`; a silently ignored \
                  declaration is one a consumer builds a fixture on (known keys: build, digest, \
-                 source, applets)"
+                 source, applets, {UNPINNED_PATH_KEY})"
             )));
         }
     }
 
     let build = obj.get("build").and_then(|v| v.as_str());
     let digest = obj.get("digest").and_then(|v| v.as_str());
+    let unpinned = obj.get(UNPINNED_PATH_KEY);
+    // The shape-exclusivity law is the shared one (`reject_multiple_registration_shapes`), applied
+    // to this kind's three shape keys. Checked BEFORE any of them is read, so an entry naming two
+    // shapes is refused naming both rather than silently resolving to whichever the match arm
+    // below happens to reach first.
+    crate::artifact::registry::reject_multiple_registration_shapes(
+        "handlers",
+        label,
+        &[
+            ("build", build.is_some()),
+            ("digest", digest.is_some()),
+            (UNPINNED_PATH_KEY, unpinned.is_some()),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(k, _)| *k)
+        .collect::<Vec<_>>(),
+    )?;
+    if let Some(value) = unpinned {
+        let path = crate::artifact::registry::unpinned_path_registration("handlers", label, value)?;
+        return Ok(HandlerRegistryEntry {
+            label: label.to_string(),
+            source: HandlerSource::UnpinnedPath { path },
+            applets: handler_entry_applets(label, obj)?,
+        });
+    }
     let source = match (build, digest) {
+        // Unreachable by construction — the exclusivity law above already refused it — but written
+        // as a refusal rather than an `unreachable!` because a future fourth shape landing without
+        // its exclusivity entry must fail loud, not panic in a library.
         (Some(_), Some(_)) => {
             return Err(Error::Artifact(format!(
                 "pins `handlers.{label}` names BOTH `build` and `digest`: an entry has exactly one \
@@ -178,8 +226,8 @@ pub(crate) fn handler_registry_entry(
         }
         (None, None) => {
             return Err(Error::Artifact(format!(
-                "pins `handlers.{label}` names neither `build` nor `digest`: registration is a \
-                 digest (§10.5, F7) — a path or an absent source would make the label mean \
+                "pins `handlers.{label}` names none of `build`, `digest` or `{UNPINNED_PATH_KEY}`: \
+                 registration is a digest (§10.5, F7) — an absent source would make the label mean \
                  \"whatever is at that location today\", which no consumer's provenance discipline \
                  can cite"
             )));
@@ -200,7 +248,7 @@ pub(crate) fn handler_registry_entry(
             }
         }
         (None, Some(digest)) => {
-            reject_unpinned_digest(label, digest)?;
+            crate::artifact::registry::reject_unpinned_digest("handlers", label, digest)?;
             let url = obj
                 .get("source")
                 .and_then(|s| s.get("url"))
@@ -220,37 +268,7 @@ pub(crate) fn handler_registry_entry(
         }
     };
 
-    let applets = match obj.get("applets") {
-        None => Vec::new(),
-        Some(value) => {
-            let array = value.as_array().ok_or_else(|| {
-                Error::Artifact(format!(
-                    "pins `handlers.{label}.applets` must be an array of applet names \
-                     (e.g. [\"acme-probe\"]), each injected as one `<tools_dir>/<name>` symlink"
-                ))
-            })?;
-            array
-                .iter()
-                .map(|item| match item.as_str() {
-                    // A name that is not a bare file name would inject a symlink outside the tools
-                    // dir, which `is_reserved_injection_path` guards for vmcell's own paths but
-                    // cannot guard for a roster it is handed.
-                    Some(name)
-                        if !name.is_empty()
-                            && !name.contains('/')
-                            && name != "."
-                            && name != ".." =>
-                    {
-                        Ok(name.to_string())
-                    }
-                    _ => Err(Error::Artifact(format!(
-                        "pins `handlers.{label}.applets` must hold non-empty bare NAMES with no \
-                         path separator, got {item}"
-                    ))),
-                })
-                .collect::<Result<Vec<String>>>()?
-        }
-    };
+    let applets = handler_entry_applets(label, obj)?;
     if let HandlerSource::WorkspaceBuild { .. } = source
         && !applets.is_empty()
     {
@@ -269,15 +287,45 @@ pub(crate) fn handler_registry_entry(
     })
 }
 
-/// Rejects a digest that is not `sha256:<64 hex>` — the `oci2-erofs` rule adopted as the registry's.
-fn reject_unpinned_digest(label: &str, digest: &str) -> Result<()> {
-    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
-    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok(());
-    }
-    Err(Error::Artifact(format!(
-        "pins `handlers.{label}.digest` must be `sha256:<64 hex>`, got `{digest}`"
-    )))
+/// Parses one entry's `applets` roster — strict-parsed, because the const-assert that keeps the
+/// default handler's roster honest binds the **default** handler only.
+///
+/// Extracted so the digest shape and the `unpinned_path` shape read one roster law: an unpinned
+/// handler is a consumer's own binary exactly as a registered one is, so its roster is data too,
+/// and a second inline copy of this parse is how the two shapes come to accept different names.
+///
+/// # Errors
+/// [`Error::Artifact`] naming the label when the value is not an array of non-empty bare names.
+fn handler_entry_applets(
+    label: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>> {
+    let Some(value) = obj.get("applets") else {
+        return Ok(Vec::new());
+    };
+    let array = value.as_array().ok_or_else(|| {
+        Error::Artifact(format!(
+            "pins `handlers.{label}.applets` must be an array of applet names \
+             (e.g. [\"acme-probe\"]), each injected as one `<tools_dir>/<name>` symlink"
+        ))
+    })?;
+    array
+        .iter()
+        .map(|item| match item.as_str() {
+            // A name that is not a bare file name would inject a symlink outside the tools
+            // dir, which `is_reserved_injection_path` guards for vmcell's own paths but
+            // cannot guard for a roster it is handed.
+            Some(name)
+                if !name.is_empty() && !name.contains('/') && name != "." && name != ".." =>
+            {
+                Ok(name.to_string())
+            }
+            _ => Err(Error::Artifact(format!(
+                "pins `handlers.{label}.applets` must hold non-empty bare NAMES with no \
+                 path separator, got {item}"
+            ))),
+        })
+        .collect::<Result<Vec<String>>>()
 }
 
 /// The lowercase-hex SHA-256 of `bytes`, as the registry's digests are written.

@@ -1,0 +1,1 @@
+{"rootfs":{"6.12.94":{"unpinned_path":"/var/tmp/a.erofs"},"6-12-94":{"unpinned_path":"/var/tmp/b.erofs"}},"handlers":{"x":{"build":"workspace:vmcell-guest-tools","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}}

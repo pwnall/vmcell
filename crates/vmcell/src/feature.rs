@@ -302,6 +302,33 @@ pub struct FeatureDeclaration {
     pub stances: BTreeMap<Feature, bool>,
 }
 
+/// The feature-manifest sidecar path that travels beside `artifact` (§7.4): `rootfs.erofs` →
+/// `rootfs.features`, `rootfs-debian-systemd.erofs` → `rootfs-debian-systemd.features`,
+/// `vmlinux` → `vmlinux.features`.
+///
+/// The **one** composer, called by the reader ([`FeatureDeclaration::load_beside`]) and by the
+/// producer ([`crate::artifact::rootfs::RootfsFeaturesStage`]) alike. A sidecar whose writer and
+/// reader spell the name separately is a declaration that silently stops being read: the reader
+/// finds nothing, falls back to the baseline exactly as it is *supposed* to for an un-annotated
+/// artifact, and says nothing about it.
+///
+/// **It REPLACES the extension** (`Path::with_extension`), which is the dominant sidecar law in the
+/// artifacts dir — the pipeline derives every stage's `.cache_key` the same way, and the
+/// label-sanitizing filename suffixes (`rootfs_filename_suffix`, `kernel_filename_suffix`) exist
+/// precisely to make replacement safe for a dotted label. §7.4 spells the file
+/// `rootfs-debian-systemd.features`, and `load_beside` shipped with this law in §18 delta 2, so
+/// changing it now would silently orphan any sidecar already written.
+///
+/// **Deliberately not the law [`crate::artifact::kernel::resolved_config_path`] uses**, which
+/// APPENDS (`vmlinux-6.12.94` → `vmlinux-6.12.94.config`). That one takes a path whose *label* may
+/// carry dots, where replacement would eat the trailing `.94` and point two labels at one config.
+/// The tree therefore holds two sidecar-naming laws on purpose; each states its reason at its own
+/// site, and neither is the default to reach for without reading the other.
+#[must_use]
+pub fn feature_manifest_path(artifact: &std::path::Path) -> std::path::PathBuf {
+    artifact.with_extension("features")
+}
+
 impl FeatureDeclaration {
     /// The baseline declaration: what the canonical artifacts provide, with no stance of their own.
     ///
@@ -368,9 +395,9 @@ impl FeatureDeclaration {
     /// Loads the feature-manifest sidecar that travels beside `artifact`, or the **baseline**
     /// when there is none.
     ///
-    /// The sidecar path is `artifact.with_extension("features")` — the same law the `.cache_key`
-    /// sidecar already uses, so `rootfs-debian-systemd.erofs` carries
-    /// `rootfs-debian-systemd.features` exactly as §7.4 spells it.
+    /// The sidecar path is [`feature_manifest_path`], the one composer the producer
+    /// ([`crate::artifact::rootfs::RootfsFeaturesStage`]) writes through, so reader and writer
+    /// cannot drift onto two spellings of one file.
     ///
     /// **An absent sidecar is the baseline, stated** (§7.4): the canonical artifacts *are* the
     /// baseline, so every pre-v33 artifact keeps working unchanged. It is deliberately not "declare
@@ -383,7 +410,7 @@ impl FeatureDeclaration {
     /// hard error, never a fallback to the baseline: falling back would let a typo'd declaration
     /// read as "no declaration", which is the same silent-absence failure one level up.
     pub fn load_beside(artifact: &std::path::Path, source: Source) -> Result<Self> {
-        let sidecar = artifact.with_extension("features");
+        let sidecar = feature_manifest_path(artifact);
         match std::fs::read_to_string(&sidecar) {
             Ok(body) => FeatureDeclaration::parse_manifest(&body, source)
                 .map_err(|e| Error::Artifact(format!("{}: {e}", sidecar.display()))),
@@ -968,6 +995,79 @@ mod host_tests {
         )
         .expect_err("a duplicate stance must not parse");
         assert!(e.to_string().contains("twice"), "{e}");
+    }
+
+    /// The one sidecar-name law, pinned over every artifact filename shape the artifacts dir holds
+    /// — including the dotted-label hazard the REPLACE law makes real.
+    ///
+    /// The producer (`RootfsFeaturesStage::out_path`) and the reader (`load_beside`) both compose
+    /// through this function, so what this pins is the *shape*: `.erofs` is eaten, a suffixed
+    /// filename keeps its whole suffix, an extension-less kernel gains one — and a filename whose
+    /// LABEL still carries dots (`vmlinux-6.12.94`) would have its `.94` eaten, which is exactly
+    /// why the filename composers sanitize `.`→`-` before a sidecar is ever named. The sanitized
+    /// spelling is the one that actually reaches this function.
+    ///
+    /// RED on switching the law to APPEND (`kernel::resolved_config_path`'s): every expectation
+    /// below gains the payload's own extension.
+    #[test]
+    fn the_feature_manifest_path_law_is_replace_and_round_trips_the_artifact_names() {
+        for (artifact, sidecar) in [
+            ("rootfs.erofs", "rootfs.features"),
+            (
+                "rootfs-debian-systemd.erofs",
+                "rootfs-debian-systemd.features",
+            ),
+            ("vmlinux", "vmlinux.features"),
+            ("vmlinux-6-12-94", "vmlinux-6-12-94.features"),
+        ] {
+            assert_eq!(
+                feature_manifest_path(std::path::Path::new("/artifacts").join(artifact).as_path()),
+                std::path::Path::new("/artifacts").join(sidecar),
+                "`{artifact}` must carry `{sidecar}`"
+            );
+        }
+
+        // The dotted spelling the sanitizers exist to keep out of the artifacts dir: named here so
+        // the hazard is recorded as a *property of the law*, not rediscovered by a labelled build.
+        assert_eq!(
+            feature_manifest_path(std::path::Path::new("vmlinux-6.12.94")),
+            std::path::Path::new("vmlinux-6.12.features"),
+        );
+    }
+
+    /// The producer→reader round trip at the type level: a stance map renders to a manifest,
+    /// travels as bytes, and parses back to the same stances beside the artifact it describes.
+    ///
+    /// The registry half (`rootfs.<label>.features` → this map) is gated in `rootfs_registry.rs`;
+    /// what this pins is that the two halves of the sidecar are one law — `render_manifest` writes
+    /// what `load_beside` reads, at the path `feature_manifest_path` names.
+    ///
+    /// RED on a producer that writes to a hand-composed path: `load_beside` finds nothing and
+    /// returns the baseline, whose stances are empty.
+    #[test]
+    fn a_declaration_round_trips_through_the_sidecar_beside_its_artifact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let artifact = tmp.path().join("rootfs.erofs");
+        std::fs::write(&artifact, b"not really an image").expect("write the artifact");
+
+        let declared = FeatureDeclaration {
+            source: None,
+            stances: BTreeMap::from([
+                (Feature::SnapshotRestore, false),
+                (Feature::XattrPreserved, false),
+            ]),
+        };
+        std::fs::write(feature_manifest_path(&artifact), declared.render_manifest())
+            .expect("write the sidecar");
+
+        let loaded = FeatureDeclaration::load_beside(&artifact, Source::Rootfs("rootfs".into()))
+            .expect("the sidecar parses");
+        assert_eq!(
+            loaded.stances.get(&Feature::SnapshotRestore),
+            Some(&false),
+            "the declared stance must survive the round trip"
+        );
+        assert_eq!(loaded.stances, declared.stances);
     }
 }
 

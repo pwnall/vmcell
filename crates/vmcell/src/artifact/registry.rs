@@ -118,6 +118,170 @@ pub fn registry_label(label: &str) -> Option<&str> {
     (label != DEFAULT_LABEL).then_some(label)
 }
 
+/// The **one** unknown-label refusal every registry selector shares (§10.5): it names the label
+/// that was asked for, the labels that ARE registered, and the route that adds one.
+///
+/// `kind` is the noun the operator typed (`kernel`), `namespace` the pins key it lives under
+/// (`kernels`); the two differ per kind and neither is derivable from the other, which is why both
+/// are parameters rather than one string with a rule for turning it into the other.
+///
+/// # Why the shared core does not raise this itself
+///
+/// `resolve_registry` resolves an absent namespace to an **empty** registry, never an error,
+/// because only the verb that wanted a label can say which labels exist — see the module doc. That
+/// leaves the message to the verb, which is exactly the shape that drifts once each verb writes its
+/// own `format!`: by v33 delta 6c there were **four** copies (the CLI's kernel, rootfs and handler
+/// selectors, plus [`crate::artifact::build_labelled_kernel`]'s pre-flight), held together only by a
+/// byte-equality test between two of them. `vmcell build-kernels <label>` and the library entry
+/// point are two documented routes to the same build (§5.6/§10.4), so a consumer who reads one
+/// sentence and gets the other has learned nothing about which route produced it.
+///
+/// Public because the fourth copy lives in this crate's own public entry point *and* the CLI is a
+/// separate crate: a composer only one of the two can reach is a composer the other re-writes.
+#[must_use]
+pub fn unknown_label_error(kind: &str, namespace: &str, label: &str, registered: &[&str]) -> Error {
+    Error::Artifact(format!(
+        "unknown {kind} label `{label}`: the resolved pins `{namespace}` registry holds [{}] \
+         (add yours through a pins overlay, §10.2)",
+        registered.join(", ")
+    ))
+}
+
+/// The **one explicitly named override key** an F7 dev path-override registers under (§10.5,
+/// v33 delta 6c) — the third registration shape, on every kind that has one.
+///
+/// # Why an entry key and not a reserved label
+///
+/// §10.5 says only "under one explicitly named override key" and leaves the reading open between an
+/// entry key (`{"acme": {"unpinned_path": "…"}}`) and a reserved *label*
+/// (`{"unpinned:acme": {"path": "…"}}`). The entry key is the reading the rest of the paragraph
+/// forces: it frames a shape as a property of *an entry* ("Three registration shapes exist,
+/// exhaustively … Nothing else parses"), and a reserved label would move the shape into the label
+/// namespace, where it would collide with a consumer's own label and would have to be re-reserved
+/// on every verb that names a label — the reserved-suffix defect class, re-armed for no gain.
+///
+/// Both kinds spell it from this const, so the two parsers, the two flattener arms and the
+/// `bundle` refusal cannot come to disagree about what an unpinned entry looks like.
+pub const UNPINNED_PATH_KEY: &str = "unpinned_path";
+
+/// Rejects a registration digest that is not `sha256:` followed by 64 **lowercase** hex digits —
+/// the **one** registration-is-a-digest format law (F7, §10.5), shared by every kind that has one.
+///
+/// It was written twice before it was written once: `handlers` carried its own
+/// `reject_unpinned_digest` and `rootfs` an inline copy with a different message, so the two kinds
+/// already disagreed about what an operator is told about the same malformed value. F7 *is* this
+/// rule, which makes a second copy of it the delta's own law drifting.
+///
+/// # Why lowercase, and why that is a tightening rather than a nicety
+///
+/// The looser `is_ascii_hexdigit` form both copies used accepted `sha256:ABCD…`. Nothing else in
+/// the tree does: [`super::handler::sha256_hex`] emits lowercase and every verification site
+/// (`verify_handler_digest`, `cached_blob_matches`) compares the strings **case-sensitively**. So an
+/// uppercase registration parsed clean and could then never verify — the operator got a "digest
+/// mismatch" after a network round trip, naming two digests that look identical until you notice the
+/// case. That is an accepted-but-unhonorable input, which AGENTS.md's fail-loud rule forbids: it is
+/// rejected here, at registration, with the lowercased form to paste.
+///
+/// # Errors
+/// [`Error::Artifact`] naming the namespace, the label, the offending value — and, when only the
+/// case is wrong, the exact string that would have been accepted.
+pub(crate) fn reject_unpinned_digest(namespace: &str, label: &str, digest: &str) -> Result<()> {
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Ok(());
+    }
+    // The case-only failure gets the fix spelled out: `sha256:ABC…` and `sha256:abc…` name the same
+    // bytes to a human and different strings to every comparison site in the tree.
+    let remedy = if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!(
+            " — this digest is well formed but UPPERCASE, and vmcell writes and compares digests \
+             lowercase, so it would be accepted here and then never verify. Register it as \
+             `sha256:{}`",
+            hex.to_ascii_lowercase()
+        )
+    } else {
+        String::new()
+    };
+    Err(Error::Artifact(format!(
+        "pins `{namespace}.{label}.digest` must be `sha256:<64 lowercase hex>`, got `{digest}`: a \
+         registry entry that resolves to a mutable tag means \"whatever is at that location \
+         today\", which no consumer's provenance discipline can cite{remedy}"
+    )))
+}
+
+/// Rejects an entry naming more than one registration shape, naming **every** shape it named
+/// (§10.5's "Nothing else parses", F7).
+///
+/// The **one** shape-exclusivity predicate, shared by the `rootfs` and `handlers` parsers: the two
+/// kinds accept different shape keys (`handlers` has `build`; `rootfs` does not) but the law over
+/// them is identical, and a second copy of it is how the kind that gained a shape later ends up
+/// enforcing a different rule than the kind that had one first.
+///
+/// Two shapes in one entry is not a preference to resolve — the two could disagree about which
+/// bytes the label means, and whichever one loses is a registration the operator wrote and vmcell
+/// silently ignored.
+///
+/// # Errors
+/// [`Error::Artifact`] naming the namespace, the label, and every shape key present.
+pub(crate) fn reject_multiple_registration_shapes(
+    namespace: &str,
+    label: &str,
+    named: &[&str],
+) -> Result<()> {
+    if named.len() < 2 {
+        return Ok(());
+    }
+    let shapes = named
+        .iter()
+        .map(|k| format!("`{k}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Err(Error::Artifact(format!(
+        "pins `{namespace}.{label}` names {} registration shapes — {shapes}: an entry names \
+         EXACTLY ONE shape (§10.5, F7 — a digest, a workspace `build`, or the \
+         `{UNPINNED_PATH_KEY}` dev override), or the shapes could disagree about which bytes the \
+         label means and the loser is a registration vmcell silently ignored",
+        named.len()
+    )))
+}
+
+/// Parses an `unpinned_path` value into the local file the override points at — the **one** F7
+/// dev-override parse, shared by both kinds (§10.5).
+///
+/// This is also the **one** place an unpinned registration is announced: resolution is the moment
+/// the operator's durable-looking registration turns out to mean "whatever is at that path today",
+/// and a `warn!` here reaches every route into the registry (the CLI, the toolkit entry points, the
+/// daemon) without a second announcement site to keep in agreement.
+///
+/// # Errors
+/// [`Error::Artifact`] naming the namespace and label when the value is not a non-empty string.
+pub(crate) fn unpinned_path_registration(
+    namespace: &str,
+    label: &str,
+    value: &serde_json::Value,
+) -> Result<std::path::PathBuf> {
+    let path = value
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            Error::Artifact(format!(
+                "pins `{namespace}.{label}.{UNPINNED_PATH_KEY}` must be a non-empty string naming \
+                 a local file, got {value}"
+            ))
+        })
+        .map(std::path::PathBuf::from)?;
+    tracing::warn!(
+        "UNPINNED registration: `{}.{}` resolves through the `{}` dev override at {} — its \
+         artifact identity is whatever is at that path today, not a digest any consumer can cite, \
+         and `vmcell bundle` refuses it (§10.5, F7)",
+        namespace,
+        label,
+        UNPINNED_PATH_KEY,
+        path.display()
+    );
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

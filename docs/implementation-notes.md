@@ -4296,10 +4296,130 @@ One message re-worded with it ("still in use" → "may still be in use"), and th
 assertion moved to `"accepted a probe connection"` — which keeps it *discriminating*: the
 inconclusive arm can no longer satisfy the live-listener leg.
 
+## v33 delta 6c — laziness, declarations, and the `unpinned` override (design §18 delta 6, §10.5, §7.4, invariant F7), as built
+
+**What landed.** The rest of delta 6: `build-kernels <label>…` / `--all`; the `unpinned_path` dev
+registration on both kinds with `bundle`'s refusal of it; `features` declarations on rootfs entries;
+the `.features` sidecar producer; and the `registry_entry` fuzz target. Delta 6 was landed in three
+commits — 6a (the shared core + the rootfs kind), 6b (the handler kind), 6c (this) — because one
+commit carrying all of it would have been unreviewable. The register treats delta 6 as one item;
+the split is a landing decision, not a scope change, and each third shipped its own gates.
+
+**`build-kernels` names its selection, and the consumer gate caught what the notes missed.**
+Selection lives in one predicate (`select_kernel_labels`) called from the CLI handler *between*
+the resolver and `build_kernels_stages` — deliberately not inside `build_kernels_stages`, whose
+three assembly tests take a hand-built registry slice and would have stayed green while asserting
+nothing about selection. That is the "green test beside an unchanged call site" shape the register's
+own conventions name. The handoff notes recorded the migration's blast radius as "four prose sites";
+it was not. `examples/downstream-kernel/ci-check.sh` makes **two executable** `build-kernels --pins`
+invocations that `.github/workflows/ci.yml` runs, each matching a specific substring — so the change
+reddens the living consumer gate, which is the intended failure mode of contract drift. Both legs
+gained `--all` in this commit, and a third leg was added asserting the bare-verb refusal itself.
+`reject_seed_needing_source_for_build`'s remedial advice moved with it: it had been telling the
+operator to run a command that is now a refusal.
+
+**One law, one predicate, four times over.** The pass collapsed four duplicated laws rather than
+adding a fifth: the unknown-label refusal (three CLI copies plus `build_labelled_kernel`'s, now one
+`registry` composer), the `sha256:<64 hex>` registry-digest check (two copies with two messages, and
+F7 *is* that rule), the registration-shape exclusivity reject, and the `"unpinned_path"` spelling
+(one const, `UNPINNED_PATH_KEY`). The last two earned grep-bans with red-on-inverse twins, per the
+rule that a law whose drift is not a compile error carries one.
+
+**Uppercase digests were accepted at registration and could never verify.** The digest check
+admitted either hex case while `sha256_hex` emits lowercase and the blob comparison is
+case-sensitive, so `sha256:ABCD…` registered cleanly and then failed at fetch time with a digest
+mismatch — an accepted input that cannot be honored. The shared predicate is lowercase-only now,
+and refuses at registration naming the case.
+
+**`unpinned_path` is an entry key, not a reserved label.** §10.5 says "one explicitly named override
+key" without saying which namespace it lives in. The entry-key reading is what the rest of the
+paragraph forces: it frames every shape as a property of an entry ("Three registration shapes exist,
+exhaustively … Nothing else parses"), and a reserved *label* would have to be re-reserved on every
+verb that names a label — the reserved-suffix defect class, re-armed for nothing. The override is
+honored, not merely parsed: both stages publish the pointed-at bytes and fold the file's **content**
+hash into their cache key, because an unpinned registration means "whatever is at that location
+today" and its identity has to be read from the file rather than from the registration.
+
+**`bundle` refuses by reading `resolved_pins.json`, and stays flag-free.** The alternative was a
+`--pins` flag, which would judge a bundle of a previously-built directory against *today's* overlay —
+the wrong fact. The resolved-pins document is already a bundle candidate and already carries the
+resolved registry into the artifacts dir, so the refusal is reachable from a bare artifacts dir. The
+negative result ships with the positive control the rules require: the same fixture bundles cleanly
+with the unpinned pin removed.
+
+**The declaration sidecar is its own stage, and that is §7.4's requirement rather than a preference.**
+§7.4 splits cache identity: a build-affecting property folds into the *image* identity and re-packs,
+while a declaration-only edit re-emits the *sidecar* — "content-addressed on its own" — and leaves
+the image key unmoved. A single-key stage cannot express that, so folding `features` into
+`RootfsStage::cache_key` would have made every declaration edit re-pack the image it describes.
+`RootfsFeaturesStage` folds only its stage version, its label and the declaration. The gate asserts
+both halves: the sidecar key moves and the image key is byte-identical.
+
+**The sidecar stage collided with the cache sidecar, invisibly and expensively.** `Pipeline::build`
+derived every stage's metadata path as `out_path.with_extension("cache_key")`, so `rootfs.erofs` and
+`rootfs.features` both resolved to `rootfs.cache_key`: the two stages overwrote each other's key,
+every build missed, and the multi-minute OCI re-pack would have run on **every** build forever with
+every functional test still green. `Stage` grew a provided `cache_sidecar_path` used by both
+`Pipeline::build` and `Pipeline::reset_to` — writer and remover cannot disagree — which the
+declaration stage overrides to *append*. Found by building it, not by reading it.
+
+**Two sidecar-naming laws now coexist deliberately.** `feature_manifest_path` **replaces** the
+extension (`rootfs.erofs` → `rootfs.features`), matching the dominant `.cache_key` law and the
+dot-sanitizing filename suffixes that exist to make it safe; `kernel::resolved_config_path`
+**appends**, because a dotted kernel label's trailing `.NNN` would otherwise be eaten and point two
+labels at one config. Each states its rationale at its own site, and `load_beside` now routes
+through the composer so producer and consumer cannot drift.
+
+**The sidecar is emitted even when nothing is declared.** The alternative — emit conditionally, plus
+a `clear_*` counterpart like the kernel's — leaves a build that *stops* declaring with a stale
+sidecar that `load_beside` would read forever and `bundle` would pin. An empty manifest round-trips
+to empty stances, which is what "absent" already means, so unconditional emission costs nothing and
+removes the whole stale class.
+
+**The canonical rootfs now declares what its packer actually does.** `rootfs.default` declares
+`xattr_preserved: false`. Before this, no sidecar existed on disk, `FeatureDeclaration::baseline`
+returned empty stances, nothing removed `Feature::XattrPreserved`, and every cell reported the
+feature **present** for an artifact whose packer strips every xattr. This is the F1-clean seam in the
+other direction: 6c *honors* an explicit `xattr_preserved` token, and delta 7 adds the `xattrs` key
+that `XattrPreserved` is derived from — at which point an explicit token beside `xattrs` becomes a
+hard error naming the derivation. The seam is recorded at the parse site so the migration is a
+decision rather than a discovery.
+
+**Two pre-existing defects closed because 6c made them reachable or inconsistent.** The OCI pack
+tail registered its output under the hardcoded artifact-map key `"rootfs"` regardless of label —
+the M-PIPE-4 collapse that `rootfs_artifact_key`'s own rustdoc describes — and the new unpinned
+publish path used the correct law, so the two publish paths disagreed for a labelled entry. And
+`vmcell build --rootfs-label default` died on `Missing rootfs_default_image pin`, because the CLI
+passed `default` through verbatim while the flattener normalizes it to the un-suffixed keys. The
+label reaches the pack tail as a **`PackOptions` field**, not as a parameter: that is the growth
+seam 6b built the options struct for, and using it keeps §10.4's `pack_erofs_with_injection`
+signature — ledgered as breaking exactly once, one delta ago — intact.
+
+**The third digest check kept its own law, and got the same fix.** `vmcell-cli::validate_oci_digest`
+backs the `oci2erofs --digest` flag: no pins namespace, no registry label, an operator-typed
+reference rather than a registration. Folding it into the registry predicate would mean a message
+saying "pins `…`" about a CLI flag, so it stays separate and `ban-registry-digest-check.sh` names it
+(and `vmcell-daemon`'s upload-sidecar hex check) in its header as deliberately out of scope. It did
+carry the identical uppercase hazard, and that is fixed at the flag with its own message.
+
+**`OCI_ROOTFS_STAGE_VERSION` 4 → 5.** The identity fold gained the unpinned registration, and
+AGENTS.md states the every-new-fold-bumps rule categorically. The cost is real — the first build
+after this re-packs every warm OCI rootfs once.
+
+**Recorded gaps.** The `tracing::warn!` announcing an unpinned resolution runs on every resolution
+but its *content* is unasserted: `vmcell` has no tracing-capture harness and `tracing-subscriber` is
+an optional feature, so building one for a single line was out of proportion. And an `mmdebstrap`
+rootfs carries no declaration by construction (it reads no registry entry), so an artifacts dir that
+held an OCI build first keeps that build's `rootfs.features` beside it — harmless today, since both
+packers strip, but an honest gap rather than a covered case.
+
 ## Where the v33 pass stands
 
-Deltas 1–5 of the §18 register are landed, pushed and live-validated; **6a and 6b are landed and
-pushed but NOT yet live-validated**; 6c and 7–10 are not started.
+Deltas 1–5 of the §18 register are landed, pushed and live-validated. **6a and 6b were live-validated
+at this pass's start** — privileged 177/177, unprivileged 4/4, daemon 14/14, validator 3/3, seven
+capability skips, all Firecracker. (`docs/88`'s stated bar of "privileged 162/162" was itself the
+*delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **6c is
+landed**; 7–10 follow.
 
 `docs/88-claude-handoff-notes-v4.md` is the pick-up point. It carries the remaining inventory, what
 6a/6b moved under deltas 7–10, the operational knowledge that is not a design fact and so has no

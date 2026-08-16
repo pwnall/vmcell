@@ -22,8 +22,9 @@ Editing the consumer to match a silently-changed contract inverts the gate.
    is forked.
 2. **Builds `vmlinux-ikconfig` through the library entry point** —
    `vmcell::artifact::build_labelled_kernel(label, target_dir, overlay)` — the entry a git-dep
-   consumer calls from its own harness. (The CLI entry point, `vmcell build-kernels --pins <file>`
-   from a vmcell checkout, is exercised by `ci-check.sh`.)
+   consumer calls from its own harness. (The CLI entry point, `vmcell build-kernels <label>… --pins
+   <file>` — `--all` for the whole registry, §10.5 — from a vmcell checkout, is exercised by
+   `ci-check.sh`.)
 3. **Asserts against the result, not the fragment.** `make olddefconfig` silently drops any symbol
    whose dependencies are unmet, so the assertion reads the resolved-config sidecar
    (`vmlinux-ikconfig.config`) through `vmcell_artifact_validator::kconfig::KconfigValues`.

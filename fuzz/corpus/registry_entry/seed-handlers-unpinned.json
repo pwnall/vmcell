@@ -1,0 +1,1 @@
+{"handlers":{"dev":{"unpinned_path":"/var/tmp/guest_tools-dev","applets":["acme-probe"]},"default":{"build":"workspace:vmcell-guest-tools"}}}

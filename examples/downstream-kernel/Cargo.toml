@@ -12,8 +12,8 @@
 # all, since the rev would not exist yet. Everything else is consumer-shaped: its own Cargo.lock,
 # its own pins overlay (`pins-overlay.json`), its own artifacts dir, and no reach from the crate
 # into the vmcell workspace (the documented CLI legs in `ci-check.sh` do invoke the CLI from the
-# vmcell checkout — which is what §5.6 documents: `vmcell build-kernels --pins <file>`, *from a
-# vmcell checkout*).
+# vmcell checkout — which is what §5.6 documents: `vmcell build-kernels <label>… --pins <file>`,
+# *from a vmcell checkout*).
 #
 # The path deps carry no `version = "…"` requirement on purpose: a consumer pins by `rev`, and a
 # duplicated version requirement here would be a second place the 0.12 → 0.13 ledger bump has to

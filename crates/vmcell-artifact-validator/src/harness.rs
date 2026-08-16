@@ -24,8 +24,8 @@ use vmcell::{MicroVm, VmConfig, Vmm};
 /// only adds a sentence to an already-failing path.
 const TWO_STEP_ROUTE: &str = "\n  Consuming vmcell as a dependency? The workspace artifact \
      bootstrap cannot run against your checkout. Two steps instead: (1) BUILD — kernels through \
-     the toolkit (`vmcell::artifact::build_labelled_kernel`, or `vmcell build-kernels --pins \
-     <overlay>` from a vmcell checkout), the rootfs with that checkout's `vmcell build` / \
+     the toolkit (`vmcell::artifact::build_labelled_kernel`, or `vmcell build-kernels <label>… \
+     --pins <overlay>` from a vmcell checkout), the rootfs with that checkout's `vmcell build` / \
      `vmcell oci2-erofs`; (2) CONSUME — point `VMCELL_KERNEL` and `VMCELL_ROOTFS` at those outputs \
      (`VMCELL_ROOTFS` makes the bootstrap a full no-op). See design §10.4 / the README's \
      \"Consuming vmcell as a dependency\" section.";

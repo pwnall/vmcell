@@ -4,18 +4,20 @@
 /artifacts
 /coverage
 
-# ...with an exception, for the FIVE targets whose re-include rules are listed below. They ship a
+# ...with an exception, for the SIX targets whose re-include rules are listed below. They ship a
 # committed SEED corpus. Do not restate that count in prose elsewhere — the re-include rules at the
 # bottom of this file are the roster, and `git add -An fuzz/corpus` prints exactly what ships.
 #
-# For FOUR of them the seed is a CORRECTNESS dependency: random bytes cannot reach their parser
+# For FIVE of them the seed is a CORRECTNESS dependency: random bytes cannot reach their parser
 # inside a nightly window at all. `oci_layer_zstd` measured cov 759 from a cold start versus cov 1286
 # with one real `.tar.zst` seed — a cold target spends its 300 s rediscovering the zstd frame magic
 # and never reaches the packer behind it, which is the "reports success while covering nothing" shape
-# this whole workflow exists to prevent.
+# this whole workflow exists to prevent. `registry_entry` is the same shape one layer up: its first
+# gate is `parse_pins_overlay`, which refuses any top-level key that is not one of ten known pins
+# namespaces, so without a seed the target spends its whole window never reaching a registry entry.
 #
-# `validator_classify_serial` is the fifth and is NOT in that class: its seed is a SPEED-UP only. The
-# property was measured red from a completely empty corpus at libFuzzer's default 4096-byte
+# `validator_classify_serial` is the odd one out and is NOT in that class: its seed is a SPEED-UP
+# only. The property was measured red from a completely empty corpus at libFuzzer's default 4096-byte
 # `-max_len`, in ~900k runs (~7 s), because `cap_line` does not merely truncate — it APPENDS
 # `"{head}{TRUNCATION_MARKER}{n} bytes elided"`, so a sub-4096-byte log can render PAST the ceiling.
 # It is called out because the opposite claim was written down twice during this pass and is false;
@@ -43,6 +45,9 @@
 !/corpus/daemon_bridge_frame/
 /corpus/daemon_bridge_frame/*
 !/corpus/daemon_bridge_frame/seed-*
+!/corpus/registry_entry/
+/corpus/registry_entry/*
+!/corpus/registry_entry/seed-*
 # The lock is working state here too, deliberately, against the usual "commit the lock for a crate
 # that builds binaries" rule. It first appeared only when the nightly job was repaired — for 41 runs
 # nothing ever resolved this crate — and two facts decide it:

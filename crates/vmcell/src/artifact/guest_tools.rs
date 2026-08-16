@@ -106,7 +106,8 @@ impl Stage for GuestToolsStage {
         // Bumped to 2 with the Cargo.lock-aware closure hash.
         // Bumped to 3 with v33 delta 6: the stage folds its registration identity (label + source),
         // so a registered handler cannot be served from a workspace build's cache entry.
-        const STAGE_VERSION: u32 = 3;
+        // Bumped to 4 with v33 delta 6c: the fold gained the F7 `unpinned_path` arm.
+        const STAGE_VERSION: u32 = 4;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&STAGE_VERSION.to_le_bytes());
         hasher.update(self.label().unwrap_or_default().as_bytes());
@@ -120,6 +121,24 @@ impl Stage for GuestToolsStage {
                 hasher.update(digest.as_bytes());
                 hasher.update(b"\0");
                 hasher.update(url.as_bytes());
+            }
+            Some(HandlerSource::UnpinnedPath { path }) => {
+                // The F7 dev override (§10.5, §18 delta 6c). A registered handler's identity is its
+                // digest because the digest IS the promise; an unpinned one promises nothing — it
+                // means "whatever is at that location today" — so its identity is read FROM THE
+                // FILE. Path and content both: the path so two labels pointing at different files
+                // stay two artifacts, the content hash so an in-place `cargo build` of the pointed
+                // -at helper re-keys instead of re-baking yesterday's binary into the rootfs.
+                hasher.update(b"unpinned\0");
+                hasher.update(path.as_os_str().as_encoded_bytes());
+                hasher.update(b"\0");
+                match crate::artifact::hash_file(path) {
+                    Ok(h) => hasher.update(h.as_bytes()),
+                    // A read failure folds a DISTINCT marker rather than degrading to a stable,
+                    // content-blind key that hits a stale cache — the same ART-11 rule the
+                    // workspace arm below applies to its closure hash.
+                    Err(e) => hasher.update(format!("unpinned-handler-read-error:{e}").as_bytes()),
+                };
             }
             Some(HandlerSource::WorkspaceBuild { .. }) | None => {
                 hasher.update(b"workspace\0");
@@ -150,6 +169,9 @@ impl Stage for GuestToolsStage {
         match &self.source {
             Some(HandlerSource::Registered { digest, url }) => {
                 self.publish_registered(out, digest, url).await?;
+            }
+            Some(HandlerSource::UnpinnedPath { path }) => {
+                self.publish_unpinned(out, path).await?;
             }
             Some(HandlerSource::WorkspaceBuild { .. }) | None => {
                 self.publish_workspace_build(out).await?;
@@ -201,6 +223,44 @@ impl GuestToolsStage {
         let tools_path = target_dir.join(format!("x86_64-unknown-linux-gnu/release/{crate_name}"));
 
         tokio::fs::copy(tools_path, out).await.map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Publishes an F7 dev path-override's local file as this label's handler (§10.5, §18 delta
+    /// 6c) — no download, and therefore no digest to verify against.
+    ///
+    /// There is deliberately nothing to verify here: the shape's whole meaning is "whatever is at
+    /// that location today", and a check invented for it would be a provenance claim vmcell cannot
+    /// back. What replaces the verify is the *identity* — `cache_key` reads the file's content hash
+    /// — plus the resolution `warn!` and `bundle`'s refusal.
+    ///
+    /// # Errors
+    /// [`Error::Artifact`] naming the label AND the path when the file cannot be read: an unpinned
+    /// registration's whole failure mode is that the path stopped being true since it was written.
+    async fn publish_unpinned(&self, out: &Path, path: &Path) -> Result<()> {
+        let label = self.label().unwrap_or("default");
+        if let Some(parent) = out.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::copy(path, out).await.map_err(|e| {
+            Error::Artifact(format!(
+                "handler `{label}` is registered through the `{}` dev override at {}, which could \
+                 not be read: {e}. An unpinned registration means \"whatever is at that path \
+                 today\" (§10.5, F7) — point it at a readable binary, or register a digest + \
+                 `source.url`",
+                crate::artifact::registry::UNPINNED_PATH_KEY,
+                path.display()
+            ))
+        })?;
+        // Same reason the registered arm sets it: the handler is exec'd in-guest through the
+        // tools-dir symlinks, and the packer's mode heuristic reads the injected file's own mode.
+        // Set unconditionally rather than copied from the source file, so a dev override that lost
+        // its exec bit (a `cargo build` output moved through a zip, say) still boots.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            tokio::fs::set_permissions(out, std::fs::Permissions::from_mode(0o755)).await?;
+        }
         Ok(())
     }
 
@@ -389,6 +449,102 @@ mod tests {
         assert_eq!(
             ws, explicit_default,
             "naming the default registration explicitly must not move the default's cache key"
+        );
+    }
+
+    // F7's dev override, honored (§10.5, §18 delta 6c). Three claims, because an accepted-but-
+    // ignored override would satisfy any two of them:
+    //
+    //  1. the pointed-at BYTES are what gets published — asserted on content, never on "the file
+    //     exists", which a workspace build would also satisfy;
+    //  2. editing the pointed-at file MOVES the stage's cache key, because an unpinned registration
+    //     means "whatever is at that location today" and an identity read from the registration
+    //     alone would serve yesterday's binary forever;
+    //  3. a path that does not exist is a loud error naming the label AND the path.
+    //
+    // RED on the inverse, three ways: (1) a `run` arm that falls through to the workspace build —
+    // the published bytes are a compiled binary, not the fixture's; (2) a `cache_key` that folds
+    // only the path string — the two keys in claim 2 are equal; (3) a `publish_unpinned` that
+    // swallows the copy error — `run` returns Ok with no file at `out`.
+    #[tokio::test]
+    async fn an_unpinned_handler_publishes_the_pointed_at_bytes_and_tracks_their_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("my-handler");
+        std::fs::write(&src, b"#!/bin/sh\necho v1\n").expect("seed the override target");
+        let out = dir.path().join("guest_tools-acme");
+        let unpinned = |p: &std::path::Path| HandlerSource::UnpinnedPath {
+            path: p.to_path_buf(),
+        };
+        let stage = GuestToolsStage::labelled(Some("acme"), Some(unpinned(&src)));
+
+        // 1. The bytes.
+        stage
+            .run(&StageInputs::default(), &out)
+            .await
+            .expect("the dev override publishes");
+        assert_eq!(
+            tokio::fs::read(&out)
+                .await
+                .expect("read the published file"),
+            b"#!/bin/sh\necho v1\n",
+            "the override's own bytes must be published, not a workspace build's"
+        );
+        // …executable, because the guest execs it through the tools-dir symlinks and the packer's
+        // mode heuristic reads the injected file's own mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&out).expect("stat").permissions().mode() & 0o111,
+                0o111,
+                "a published handler must be executable"
+            );
+        }
+
+        // 2. The identity tracks the FILE's content, not the registration string.
+        let inputs = StageInputs::default();
+        let before = stage.cache_key(&inputs);
+        std::fs::write(&src, b"#!/bin/sh\necho v2\n").expect("edit the override target");
+        assert_ne!(
+            before,
+            stage.cache_key(&inputs),
+            "editing the pointed-at file must re-key: an unpinned registration's identity is read \
+             from the file, because the registration itself promises nothing"
+        );
+        // …and an UNRELATED file moving does not, which is what makes the claim above non-vacuous
+        // (a key that folded the whole directory would also pass the edit leg).
+        let unrelated = dir.path().join("something-else");
+        std::fs::write(&unrelated, b"noise").expect("write");
+        let after_edit = stage.cache_key(&inputs);
+        std::fs::write(&unrelated, b"more noise").expect("rewrite");
+        assert_eq!(
+            after_edit,
+            stage.cache_key(&inputs),
+            "a file this registration does not name must not move its key"
+        );
+        // Two labels pointing at DIFFERENT files are two artifacts even when the bytes agree.
+        let twin = dir.path().join("twin-handler");
+        std::fs::write(&twin, b"#!/bin/sh\necho v2\n").expect("write");
+        assert_ne!(
+            stage.cache_key(&inputs),
+            GuestToolsStage::labelled(Some("acme"), Some(unpinned(&twin))).cache_key(&inputs),
+            "two paths are two registrations, even with momentarily identical bytes"
+        );
+
+        // 3. A path that is not there is loud, and names both facts.
+        let gone = dir.path().join("never-existed");
+        let err = GuestToolsStage::labelled(Some("acme"), Some(unpinned(&gone)))
+            .run(&StageInputs::default(), &dir.path().join("out-missing"))
+            .await
+            .expect_err("an unreadable override path is a hard stop");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acme"),
+            "the failure must name the label: {msg}"
+        );
+        assert!(
+            msg.contains(&gone.display().to_string()),
+            "the failure must name the path: {msg}"
         );
     }
 

@@ -200,7 +200,7 @@ fn usbhost_kernel_label_and_fragment_are_pinned() {
         .find(|e| e.label == "usbhost")
         .unwrap_or_else(|| {
             panic!(
-                "pins `kernels.usbhost` is missing, so `vmcell build-kernels`/\
+                "pins `kernels.usbhost` is missing, so `vmcell build-kernels usbhost`/\
                  `build_labelled_kernel(\"usbhost\")` cannot produce the kernel \
                  `just test-usb-passthrough` requires; registry holds {:?}",
                 registry.iter().map(|e| &e.label).collect::<Vec<_>>()

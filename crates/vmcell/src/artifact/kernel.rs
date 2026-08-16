@@ -239,7 +239,8 @@ pub fn kernel_filename(label: Option<&str>) -> String {
 /// or `None` when `name` is not a labelled kernel image.
 ///
 /// `vmcell bundle` walks the artifacts dir with this so the manifest covers every
-/// `vmlinux-<label>` built by `build-kernels`, not just the default `vmlinux` (N-BIN-4).
+/// `vmlinux-<label>` built by `build-kernels <label>…`/`--all`, not just the default `vmlinux`
+/// (N-BIN-4).
 ///
 /// The bare `vmlinux` (no suffix) and an empty label return `None`, and so does a remainder
 /// containing `.`: [`kernel_filename_suffix`] sanitizes `.`→`-`, so every dotted `vmlinux-…` name

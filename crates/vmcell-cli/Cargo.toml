@@ -17,7 +17,7 @@ name = "vmcell"
 path = "src/main.rs"
 
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.17.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"] }
+vmcell = { path = "../vmcell", version = "0.18.0", features = ["cloud-hypervisor", "metrics", "pipeline", "cli"] }
 vmcell-rootfs-builder = { path = "../vmcell-rootfs-builder", version = "0.1.0" }
 vmcell-kernel-builder = { path = "../vmcell-kernel-builder", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
@@ -28,3 +28,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-
 # re-read of `pins.json`, retired by §18 delta 1 in favour of `vmcell::artifact::resolve_kernel_labels`
 # (which resolves baseline + overlay through the one pin schema). `cargo machete` (a `just ci` step)
 # is the gate: re-adding the dep without a consumer turns it red.
+
+# `tempfile` is TEST-ONLY: the `bundle` refusal gate (§10.5, F7) drives `bundle_artifacts`
+# against a fixture artifacts dir, and a fixture tree owns its cleanup on the panic path as
+# well as the success path. Not a runtime dep — `cargo machete` is the gate on it staying so.
+[dev-dependencies]
+tempfile = "3"

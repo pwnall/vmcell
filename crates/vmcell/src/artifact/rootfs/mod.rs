@@ -165,6 +165,15 @@ pub struct PackOptions {
     /// const the guest binary's dispatch table is compile-time asserted against. A registered
     /// consumer handler supplies its own, strict-parsed from its registry entry (§10.5).
     pub applets: Vec<String>,
+    /// The registry label whose image this pack produces — `None` is the default rootfs (§10.5).
+    ///
+    /// The tail registers its output under [`rootfs_artifact_key`] of this label, which is the only
+    /// reason the tail is told about it: it packs the same way either way. It hardcoded `"rootfs"`
+    /// instead until v33 delta 6c, so **every** labelled rootfs registered under the default key —
+    /// the M-PIPE-4 collapse `rootfs_artifact_key`'s own rustdoc exists to forbid, live in the one
+    /// path that produces vmcell's canonical image. Nothing caught it because a map-key mismatch is
+    /// not a compile error and the default label's key is the same either way.
+    pub label: Option<String>,
 }
 
 impl PackOptions {
@@ -196,6 +205,13 @@ impl PackOptions {
     #[must_use]
     pub fn with_applets(mut self, applets: Vec<String>) -> Self {
         self.applets = applets;
+        self
+    }
+
+    /// Sets the registry label the packed image is registered under (§10.5); `None` is the default.
+    #[must_use]
+    pub fn with_label(mut self, label: Option<&str>) -> Self {
+        self.label = label.map(str::to_string);
         self
     }
 
@@ -486,6 +502,26 @@ impl RootfsStage {
         self
     }
 
+    /// The F7 dev path-override registered for this stage's label, if any (§10.5, §18 delta 6c).
+    ///
+    /// The **one** place this stage decides "is this label unpinned?", read by `cache_key` and by
+    /// `run` so the identity and the build can never disagree about which shape they are serving —
+    /// the two-readers drift that the `image`/`digest` pair above already pays for with a duplicated
+    /// `match`.
+    ///
+    /// An explicit [`RootfsStage::with_image_override`] wins: `oci2erofs` names a digest-pinned base
+    /// on the invocation itself, which is a stronger statement of intent than anything a registry
+    /// entry carries, and the two are never both set by any shipped call site.
+    fn unpinned_path(&self, inputs: &StageInputs) -> Option<std::path::PathBuf> {
+        inputs
+            .pins
+            .get(&rootfs_pin_key(
+                self.label(),
+                crate::artifact::registry::UNPINNED_PATH_KEY,
+            ))
+            .map(std::path::PathBuf::from)
+    }
+
     /// What this stage tells the one inject+pack tail.
     #[must_use]
     pub fn pack_options(&self) -> PackOptions {
@@ -493,6 +529,10 @@ impl RootfsStage {
             steward_musl: self.steward_musl.clone(),
             extra: self.extra.clone(),
             applets: self.applets.clone(),
+            // The SAME label the stage's name, out_path and pin keys are composed from, so the key
+            // the tail registers under and the key `RootfsStage::publish_unpinned` registers under
+            // are one law rather than two that agree only for the default label.
+            label: self.label.clone(),
         }
     }
 }
@@ -506,10 +546,14 @@ impl RootfsStage {
 /// moved into [`fold_rootfs_injection_identity`] (called first), which reorders the hashed byte
 /// stream. A one-time OCI-rootfs rebuild is harmless.
 /// v30 (§18 delta 6): bumped to 4 — the fold gained the sorted downstream extra-file triples.
+/// v33 (§18 delta 6c): bumped to 5 — the fold gained the F7 `unpinned_path` dev-override arm
+/// (registration path + the pointed-at file's content hash). The arm is *conditional*, so no
+/// artifacts dir in existence can hold a key this change would silently re-serve — the bump is the
+/// project's identity-fold discipline applied anyway, and one OCI-rootfs re-pack is harmless.
 ///
 /// Module-level (rather than a `fn`-local `const`) so the bump itself is assertable KVM-free:
-/// `rootfs_stage_version_pins_the_delta6_bump`.
-const OCI_ROOTFS_STAGE_VERSION: u32 = 4;
+/// `rootfs_stage_version_pins_the_identity_fold_bumps`.
+const OCI_ROOTFS_STAGE_VERSION: u32 = 5;
 
 #[async_trait]
 impl Stage for RootfsStage {
@@ -538,24 +582,49 @@ impl Stage for RootfsStage {
         // oci2erofs: the CLI-provided digest-pinned base is an INPUT (not a pin) and
         // must be content-addressed directly; otherwise a stale erofs is reused for a
         // different IMAGE@DIGEST. Fall back to the pins for the default `vmcell build`.
-        let (image, digest) = match &self.image_override {
-            Some((i, d)) => (i.as_str(), d.as_str()),
-            None => (
-                inputs
-                    .pins
-                    .get(&rootfs_pin_key(self.label(), "image"))
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                inputs
-                    .pins
-                    .get(&rootfs_pin_key(self.label(), "digest"))
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-            ),
-        };
-        hasher.update(image.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(digest.as_bytes());
+        match (&self.image_override, self.unpinned_path(inputs)) {
+            // The F7 dev override (§10.5, §18 delta 6c). A digest registration's identity is the
+            // digest, and folding the string is enough because the string IS the promise. An
+            // UNPINNED registration promises nothing — it means "whatever is at that location
+            // today" — so its identity has to be READ FROM THE FILE, or editing the pointed-at
+            // image would leave the artifacts dir serving yesterday's bytes under a key that
+            // still says "this is mine". Path AND content, both: the path so two labels pointing
+            // at different files are two artifacts even when the bytes momentarily agree, the
+            // content hash so an in-place edit re-keys.
+            (None, Some(path)) => {
+                hasher.update(b"unpinned\0");
+                hasher.update(path.as_os_str().as_encoded_bytes());
+                hasher.update(b"\0");
+                match crate::artifact::hash_file(&path) {
+                    Ok(h) => hasher.update(h.as_bytes()),
+                    // A read failure must NOT degrade to a stable, content-blind key that hits a
+                    // stale cache (ART-11, the `GuestToolsStage` precedent). Fold a DISTINCT error
+                    // marker so the key cannot collide with a good one; the resulting miss drives
+                    // `run`, which fails hard naming the label and the path.
+                    Err(e) => hasher.update(format!("unpinned-rootfs-read-error:{e}").as_bytes()),
+                };
+            }
+            (image_override, _) => {
+                let (image, digest) = match image_override {
+                    Some((i, d)) => (i.as_str(), d.as_str()),
+                    None => (
+                        inputs
+                            .pins
+                            .get(&rootfs_pin_key(self.label(), "image"))
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                        inputs
+                            .pins
+                            .get(&rootfs_pin_key(self.label(), "digest"))
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                    ),
+                };
+                hasher.update(image.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(digest.as_bytes());
+            }
+        }
         // Hash only the upstream artifacts this stage actually CONSUMES (ART-9), in a
         // deterministic key-sorted order over their on-disk content. Folding *every*
         // upstream artifact meant a `kernel` rebuild invalidated the OCI rootfs, which does
@@ -575,6 +644,16 @@ impl Stage for RootfsStage {
     }
 
     async fn run(&self, inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        // The F7 dev override (§10.5, §18 delta 6c): the label's image IS the registered file, so
+        // this stage publishes it instead of packing one. Honoring it here is not decoration — an
+        // accepted input that changes no behavior is the accept-then-ignore class the whole pins
+        // schema is strict about, and an `unpinned_path` that parsed but built the OCI base anyway
+        // would be exactly that, with a `warn!` claiming otherwise.
+        if self.image_override.is_none()
+            && let Some(path) = self.unpinned_path(inputs)
+        {
+            return self.publish_unpinned(&path, out).await;
+        }
         // oci2erofs (§4.2, Rootfs sources and the one packer): the CLI override pulls an explicit digest-pinned base;
         // the default `vmcell build` resolves the pinned Debian image from the pins.
         let (image, digest) = match &self.image_override {
@@ -603,6 +682,234 @@ impl Stage for RootfsStage {
             }
         };
         oci::build_rootfs(&image, &digest, inputs, out, &self.pack_options()).await
+    }
+}
+
+impl RootfsStage {
+    /// Publishes an F7 dev path-override's file as this label's image (§10.5, §18 delta 6c).
+    ///
+    /// The registered file is the *finished* image, not a base to pack from — that is what "a
+    /// development registration with a path" means for a kind whose artifact is a single packed
+    /// file, and it is the only reading under which the operator gets what they pointed at. Nothing
+    /// is injected into it: the steward, the tools and the CA are baked by the packer, and this
+    /// shape has no packer, so an operator overriding the image owns its contents. The declaration
+    /// sidecar beside it still travels ([`RootfsFeaturesStage`]), which is how an override that
+    /// removes a capability can still say so.
+    ///
+    /// # Errors
+    /// [`Error::Artifact`] naming the label AND the path when the file cannot be read — the two
+    /// facts an operator needs, because an unpinned registration's whole failure mode is that the
+    /// path stopped being true since the day it was written.
+    async fn publish_unpinned(&self, path: &Path, out: &Path) -> Result<StageOutputs> {
+        let label = self
+            .label()
+            .unwrap_or(crate::artifact::registry::DEFAULT_LABEL);
+        if let Some(parent) = out.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
+        }
+        // `copy`, not a symlink: the artifacts dir is a published tree that `bundle`, the cache's
+        // content hash and every consumer read as bytes, and a dangling link would turn "the path
+        // stopped being true" from this loud error into a mystery at boot.
+        tokio::fs::copy(path, out).await.map_err(|e| {
+            Error::Artifact(format!(
+                "rootfs `{label}` is registered through the `{}` dev override at {}, which could \
+                 not be read: {e}. An unpinned registration means \"whatever is at that path \
+                 today\" (§10.5, F7) — point it at a readable image, or register a digest",
+                crate::artifact::registry::UNPINNED_PATH_KEY,
+                path.display()
+            ))
+        })?;
+        let mut outputs = StageOutputs::default();
+        outputs
+            .artifacts
+            .insert(rootfs_artifact_key(self.label()), out.to_path_buf());
+        Ok(outputs)
+    }
+}
+
+/// The [`StageOutputs`] artifact key of the §7.4 feature-declaration sidecar produced beside the
+/// rootfs registered under `rootfs_key` (`"rootfs"` → `"rootfs-features"`, `"rootfs-<label>"` →
+/// `"rootfs-<label>-features"`).
+///
+/// DERIVED from the payload's key rather than re-composed from the label, exactly as
+/// [`crate::artifact::kernel::config_artifact_key`] is for the kernel's resolved-config sidecar:
+/// registering the sidecar under its own key is what content-addresses it *with* the artifact it
+/// describes, and deriving the name means the two keys cannot come to disagree about which label
+/// they belong to.
+#[must_use]
+pub fn features_artifact_key(rootfs_key: &str) -> String {
+    format!("{rootfs_key}-features")
+}
+
+/// The feature-declaration stage's cache-key version. Bump when this stage's emission logic or its
+/// folded identity changes, so a stale sidecar is not served.
+///
+/// Module-level (rather than a `fn`-local `const`) for the same reason
+/// [`OCI_ROOTFS_STAGE_VERSION`] is: the bump itself stays assertable KVM-free.
+const ROOTFS_FEATURES_STAGE_VERSION: u32 = 1;
+
+/// Emits the **feature-manifest sidecar** beside a packed rootfs — the travel form of the
+/// `rootfs.<label>.features` declaration its registry entry carries (§7.4, §10.5; §18 delta 6c).
+///
+/// The registry entry is the one authority and this sidecar is how the declaration reaches a cell
+/// that only ever sees the built artifact: [`crate::feature::FeatureDeclaration::load_beside`]
+/// reads it at boot, and `resolve_cell_features` intersects it into the cell's feature set. Without
+/// a producer the reader has nothing to read and every artifact reports the baseline — which is how
+/// the canonical rootfs came to claim `xattr_preserved` while its packer stripped every xattr.
+///
+/// # Why this is its own stage rather than a sibling artifact of [`RootfsStage`]
+///
+/// §7.4's cache-identity split, verbatim: *"a build-affecting property (`xattrs`, §4.7) folds into
+/// the **image** identity and re-packs; a declaration-only edit re-emits the **sidecar**
+/// (content-addressed on its own) and leaves the image key unmoved — a declaration change must not
+/// rebuild the image it describes."* Both simpler shapes get exactly one half of that right:
+///
+/// * folding `features` into [`RootfsStage::cache_key`] re-packs a multi-minute image because
+///   somebody wrote down a fact *about* it, which is the half the design forbids by name;
+/// * emitting from `RootfsStage::run` (the kernel's resolved-config shape) never re-emits at all,
+///   because a declaration-only edit leaves the image key unmoved, a warm hit republishes the
+///   recorded artifacts, and `run` is not called on a hit — so the edited declaration would sit in
+///   `pins.json` and never reach the artifact.
+///
+/// A separately content-addressed stage is the only shape that gets both halves; the
+/// `a_declaration_edit_moves_the_sidecar_key_and_not_the_image_key` gate is what pins it.
+///
+/// # Why it emits even when the declaration is empty
+///
+/// An empty declaration renders to the manifest's two comment lines and parses back to empty
+/// stances, which is semantically **identical** to an absent sidecar (both are
+/// [`crate::feature::FeatureDeclaration::baseline`]) — so unconditional emission changes nothing
+/// for an undeclared label, and it removes the stale-sidecar hazard entirely. The conditional
+/// alternative needs a remover for the "this label stopped declaring things" transition —
+/// [`crate::artifact::kernel::clear_resolved_config`] is exactly that, and it exists because the
+/// kernel's sidecar *is* conditional. One law with no second path beats two laws that have to agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootfsFeaturesStage {
+    /// The `rootfs` registry label whose declaration travels; `None` is `rootfs.default`.
+    ///
+    /// Private for the same reason [`RootfsStage`]'s is: [`Stage::name`] returns a `&str` and so
+    /// reads a precomputed name, and a public label beside a public name would let a caller set one
+    /// without the other.
+    label: Option<String>,
+    /// The stances to render, keyed by the parsed [`crate::feature::Feature`] — so the only way to
+    /// populate it is through the registry parser, which is the only place `Feature::parse` runs.
+    features: std::collections::BTreeMap<crate::feature::Feature, bool>,
+    /// [`Stage::name`]'s return value, composed from `label` at construction.
+    stage_name: String,
+}
+
+impl RootfsFeaturesStage {
+    /// The declaration producer for the registry label `label`; `None` is `rootfs.default`.
+    ///
+    /// The declaration starts empty — [`RootfsFeaturesStage::with_features`] states it, from the
+    /// registry entry the image stage beside it resolves from.
+    #[must_use]
+    pub fn labelled(label: Option<&str>) -> Self {
+        RootfsFeaturesStage {
+            label: label.map(str::to_string),
+            features: std::collections::BTreeMap::new(),
+            // The sidecar's artifact key IS its stage name, mirroring `RootfsStage`, so a labelled
+            // declaration stage cannot collide with the default one on the pipeline's own sidecar.
+            stage_name: features_artifact_key(&rootfs_artifact_key(label)),
+        }
+    }
+
+    /// Sets the stances this stage renders — the `features` map of the **same** registry entry the
+    /// image stage beside it was built from ([`crate::artifact::resolve_rootfs_entry`]).
+    ///
+    /// Label and declaration are set separately, and deliberately so: the sidecar's name is derived
+    /// from the image's filename, so the label this stage carries must be the one
+    /// [`RootfsStage::labelled`] carries in the same pipeline — including the `Some("default")` vs
+    /// `None` spelling, which the two composers treat as different files. A constructor that took
+    /// the entry and normalized the label itself would silently produce `rootfs.features` beside a
+    /// `rootfs-default.erofs`, which is exactly the pairing this split makes visible at the call
+    /// site.
+    #[must_use]
+    pub fn with_features(
+        mut self,
+        features: std::collections::BTreeMap<crate::feature::Feature, bool>,
+    ) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// The registry label this stage declares for, as the key composers take it.
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
+
+#[async_trait]
+impl Stage for RootfsFeaturesStage {
+    fn name(&self) -> &str {
+        &self.stage_name
+    }
+
+    fn out_path(&self, target_dir: &std::path::Path) -> std::path::PathBuf {
+        // Both laws, called and never re-spelled: `rootfs_filename` names the image this
+        // declaration is about, and `feature_manifest_path` is the one sidecar-name composer the
+        // READER (`FeatureDeclaration::load_beside`) goes through.
+        crate::feature::feature_manifest_path(&target_dir.join(rootfs_filename(self.label())))
+    }
+
+    fn cache_sidecar_path(&self, out: &Path) -> PathBuf {
+        // APPEND, never the default replace: `rootfs.features`.with_extension("cache_key") is
+        // `rootfs.cache_key` — the RootfsStage's OWN sidecar — so the default would have the two
+        // stages overwrite each other's metadata and re-pack the image on every build forever.
+        // See `Stage::cache_sidecar_path` for the whole rationale.
+        let mut name = out.as_os_str().to_os_string();
+        name.push(".cache_key");
+        PathBuf::from(name)
+    }
+
+    fn cache_key(&self, _inputs: &StageInputs) -> CacheKey {
+        // The declaration and nothing else. Deliberately blind to the pins' `(image, digest)` and
+        // to every upstream artifact: this stage describes the image, it does not build it, so
+        // folding what the image folds would re-emit a byte-identical sidecar on every re-pack —
+        // and, read the other way, would tempt somebody to fold the declaration into the image.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&ROOTFS_FEATURES_STAGE_VERSION.to_le_bytes());
+        hasher.update(self.stage_name.as_bytes());
+        hasher.update(b"\0");
+        for (feature, stance) in &self.features {
+            // `Feature::name()` is F6's one token spelling — the same bytes the manifest carries,
+            // so the key moves exactly when the emitted file would.
+            hasher.update(feature.name().as_bytes());
+            hasher.update(if *stance { b"=true\0" } else { b"=false\0" });
+        }
+        CacheKey(format!("rootfs-features-{}", hasher.finalize().to_hex()))
+    }
+
+    async fn run(&self, _inputs: &StageInputs, out: &Path) -> Result<StageOutputs> {
+        // `source` is `None` because provenance is the READER's to assign: `load_beside` is handed
+        // the `Source` of the axis it is loading for, and a source baked in here would be a second,
+        // stale answer to a question the reader already answers.
+        let declaration = crate::feature::FeatureDeclaration {
+            source: None,
+            stances: self.features.clone(),
+        };
+        tokio::fs::write(out, declaration.render_manifest())
+            .await
+            .map_err(|e| {
+                Error::Artifact(format!(
+                    "cannot write the feature manifest {}: {e} — the declaration in \
+                     `rootfs.{}.features` would never reach the artifact it describes (§7.4)",
+                    out.display(),
+                    self.label()
+                        .unwrap_or(crate::artifact::registry::DEFAULT_LABEL)
+                ))
+            })?;
+        let mut outputs = StageOutputs::default();
+        // Registered under its own key, the `config_artifact_key` shape one kind over: that is what
+        // puts the sidecar in the `Artifacts` map every downstream reader (`vmcell bundle`
+        // included) names files through, and what content-addresses it with the image it describes.
+        // Writing the file without registering it produces an artifact nothing can cite.
+        outputs.artifacts.insert(
+            features_artifact_key(&rootfs_artifact_key(self.label())),
+            out.to_path_buf(),
+        );
+        Ok(outputs)
     }
 }
 
@@ -755,6 +1062,8 @@ pub async fn pack_erofs_with_injection(
     let extra = options.extra.as_slice();
     let applets = options.applet_roster();
     let out_buf = out.to_path_buf();
+    // Composed here (not inside the blocking task) so the label borrow ends before the move.
+    let artifact_key = rootfs_artifact_key(options.label.as_deref());
 
     // Validate the caller-supplied extras before any side effect (the CA write below is one):
     // the injection tail is the validation boundary, since an `ExtraFile` never passes through
@@ -832,7 +1141,10 @@ pub async fn pack_erofs_with_injection(
         )?;
         std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;
         let mut outputs = StageOutputs::default();
-        outputs.artifacts.insert("rootfs".into(), out_buf);
+        // Through the ONE artifact-key law, never the bare literal: `rootfs_artifact_key(None)` IS
+        // `"rootfs"`, so the default label's key is byte-identical, while a labelled pack stops
+        // registering under the default's key and overwriting it on the artifact map.
+        outputs.artifacts.insert(artifact_key, out_buf);
         Ok(outputs)
     })
     .await
@@ -1239,17 +1551,23 @@ mod tests {
         }
     }
 
-    // Quality-gates v4 row 6: the OCI stage's cache-key version must carry the v30 delta-6
-    // bump. `fold_rootfs_injection_identity` grew the extra-file triples, so an un-bumped
-    // version serves the previously-packed rootfs — which has no injected extra files — from
-    // the warm cache while every KVM-free test stays green (the recorded v20 precedent).
-    // RED on the inverse: reverting the const to 3.
+    // Quality-gates v4 row 6, carried forward: the OCI stage's cache-key version must be bumped by
+    // every change to what the stage FOLDS, because an un-bumped version serves the
+    // previously-packed rootfs from the warm cache while every KVM-free test stays green (the
+    // recorded v20 precedent). Two bumps live behind this literal today: v30 delta 6 (→ 4, the
+    // extra-file triples entering `fold_rootfs_injection_identity`) and v33 delta 6c (→ 5, the F7
+    // `unpinned_path` arm).
+    //
+    // A literal-value assertion on purpose: it is a TRIPWIRE, not a derivation, so it goes red on
+    // the next fold change and forces the author to state which bump they are making. RED on the
+    // inverse: reverting the const to 4.
     #[test]
-    fn rootfs_stage_version_pins_the_delta6_bump() {
+    fn rootfs_stage_version_pins_the_identity_fold_bumps() {
         assert_eq!(
-            OCI_ROOTFS_STAGE_VERSION, 4,
-            "the v30 delta-6 identity-fold change requires this stage-version bump; \
-             without it a stale rootfs (no extra files) is served from the warm cache"
+            OCI_ROOTFS_STAGE_VERSION, 5,
+            "an identity-fold change requires this stage-version bump; without it a stale rootfs \
+             is served from the warm cache. If you changed what `cache_key` folds, bump the const \
+             and this literal together and record the reason in the const's doc comment"
         );
     }
 
@@ -1562,5 +1880,91 @@ mod tests {
             "the PUBLISHED CA must still be baked into the image (it is injected from the file \
              CaManager published, not from a copy this tail wrote)"
         );
+    }
+
+    // §10.5 / §18 delta 6c: the inject+pack TAIL registers its output under the one artifact-key
+    // law, `rootfs_artifact_key(label)` — not the bare `"rootfs"` literal it hardcoded, which
+    // collapsed every labelled rootfs onto the default's entry (the M-PIPE-4 defect
+    // `rootfs_artifact_key`'s own rustdoc names, live in the path that packs vmcell's canonical
+    // image). Nothing else could have caught it: an artifact-map key is a `String`, so a producer
+    // registering under a name no consumer reads is not a compile error, and the two keys are
+    // IDENTICAL for the default label — which is the only label the suite used to pack.
+    //
+    // Two halves, because a gate binds the call site and not just the predicate:
+    //   1. the tail keys off the label it is HANDED (both legs, real packs);
+    //   2. `RootfsStage` hands it the same label its name, out_path and pin keys are composed from.
+    //
+    // RED on the inverse: restore `outputs.artifacts.insert("rootfs".into(), out_buf)` and the
+    // labelled leg fails naming both keys; drop `label` from `RootfsStage::pack_options()` and
+    // half 2 fails while half 1 still passes — the "green predicate beside an unchanged call site"
+    // shape, kept visible on purpose.
+    #[cfg(all(feature = "am-fs-erofs", feature = "proxy"))]
+    #[tokio::test]
+    async fn the_pack_tail_registers_under_the_labelled_artifact_key() {
+        stabilize_ca();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A static-musl steward stand-in: `require_libc6` is then false, so the tail packs with no
+        // layers and the test needs no registry.
+        let musl = dir.path().join("steward-musl");
+        std::fs::write(&musl, b"#!static-steward").expect("write the steward stand-in");
+        let inputs = StageInputs::default();
+
+        let pack = async |label: Option<&str>| -> StageOutputs {
+            let out = dir.path().join(rootfs_filename(label));
+            pack_erofs_with_injection(
+                vec![],
+                &inputs,
+                &out,
+                &PackOptions::new()
+                    .with_steward_musl(Some(musl.clone()))
+                    .with_label(label),
+            )
+            .await
+            .expect("the pack must succeed")
+        };
+
+        // The default label's key is UNMOVED — `rootfs_artifact_key(None)` is `"rootfs"`, the key
+        // `SnapshotStage` and every pre-v33 reader look up. This half must stay byte-identical or
+        // the fix would have been a break.
+        let default_out = pack(None).await;
+        assert_eq!(
+            default_out
+                .artifacts
+                .get(&rootfs_artifact_key(None))
+                .map(PathBuf::as_path),
+            Some(dir.path().join(rootfs_filename(None)).as_path()),
+            "the default label must still register under `rootfs`: {default_out:?}"
+        );
+
+        // The labelled leg: its own key, and NOT the default's — the assertion the bug failed.
+        let labelled_out = pack(Some("acme")).await;
+        assert_eq!(
+            labelled_out
+                .artifacts
+                .get(&rootfs_artifact_key(Some("acme")))
+                .map(PathBuf::as_path),
+            Some(dir.path().join(rootfs_filename(Some("acme"))).as_path()),
+            "a labelled pack must register under `{}`: {labelled_out:?}",
+            rootfs_artifact_key(Some("acme"))
+        );
+        assert!(
+            !labelled_out
+                .artifacts
+                .contains_key(&rootfs_artifact_key(None)),
+            "a labelled pack must not also claim the DEFAULT key — that is the collapse: a \
+             pipeline building both would keep whichever ran last, and every consumer of \
+             `artifacts[\"rootfs\"]` would silently read the wrong image: {labelled_out:?}"
+        );
+
+        // Half 2, the call site: the stage hands the tail the same label it composes its own name,
+        // out_path and pin keys from. Without this the tail could be perfectly correct and still
+        // never see a label.
+        for label in [None, Some("acme")] {
+            assert_eq!(
+                RootfsStage::labelled(label).pack_options().label.as_deref(),
+                label,
+                "`RootfsStage::labelled({label:?})` must tell the pack tail which label it packs"
+            );
+        }
     }
 }

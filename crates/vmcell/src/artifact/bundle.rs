@@ -144,6 +144,60 @@ impl ArtifactManifest {
     }
 }
 
+/// Refuses to bundle an artifacts dir whose **resolved pins** name an F7 dev path-override
+/// (§10.5's "…and is **refused by `bundle`**"; §18 delta 6c).
+///
+/// # Why the resolved pins, and not a `--pins` overlay
+///
+/// A bundle is a claim about a directory that *already exists*. `vmcell bundle` therefore takes no
+/// overlay and resolves no registry: judging a previously-built dir against **today's** overlay
+/// would answer a different question than the one asked, and would pass or fail on a file the
+/// build never read. `resolved_pins.json` is the document the pipeline published *into that dir*,
+/// is already a manifest entry, and is the only honest answer to "what was this built from" that a
+/// bare artifacts dir can give.
+///
+/// An **absent** `resolved_pins.json` is not a refusal: a dir with no pipeline output has nothing
+/// to be unpinned about, and `bundle` already reports the absence in its skipped-artifact notice.
+///
+/// # Errors
+/// [`Error::Artifact`] naming every unpinned pin key (each of which names its label) when one is
+/// present, or when the document exists but cannot be read or parsed — a resolved-pins document
+/// that cannot be read is a dir whose provenance cannot be checked, which is not the same as one
+/// that has none.
+pub fn reject_unpinned_registrations(resolved_pins: &Path) -> Result<()> {
+    if !resolved_pins.exists() {
+        return Ok(());
+    }
+    let json = std::fs::read_to_string(resolved_pins).map_err(|e| {
+        Error::Artifact(format!(
+            "failed to read {} to check for unpinned registrations: {e}",
+            resolved_pins.display()
+        ))
+    })?;
+    let doc: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
+        Error::Artifact(format!(
+            "malformed resolved pins at {}: {e}",
+            resolved_pins.display()
+        ))
+    })?;
+    let unpinned = crate::artifact::unpinned_registration_pins(&doc);
+    if unpinned.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Artifact(format!(
+        "refusing to bundle: {} artifact registration(s) in {} resolve through the `{}` dev \
+         override ({}). A bundle is a DURABLE PROVENANCE CLAIM — every entry is a digest a \
+         consumer re-verifies later — and an unpinned registration means \"whatever was at that \
+         path that day\", which no later verify can reproduce (§10.5, F7). Re-register the \
+         label(s) with an `image` + `digest` (rootfs) or a `digest` + `source.url` (handler), \
+         rebuild, and bundle that.",
+        unpinned.len(),
+        resolved_pins.display(),
+        crate::artifact::registry::UNPINNED_PATH_KEY,
+        unpinned.join(", ")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +268,96 @@ mod tests {
 
         ArtifactManifest::verify_file(&mb)
             .expect("a moved manifest + artifact must still verify (paths travel)");
+    }
+
+    /// Writes a resolved-pins document into `dir` and returns its path.
+    fn write_resolved_pins(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("resolved_pins.json");
+        std::fs::write(&path, body).expect("write resolved pins");
+        path
+    }
+
+    // §10.5's F7, last clause: an unpinned registration is **refused by `bundle`**. A bundle is a
+    // durable provenance claim — every entry is a digest a consumer re-verifies later — and an
+    // unpinned registration means "whatever was at that path that day", which no later verify can
+    // reproduce.
+    //
+    // Both kinds, because the two registries share one law and a refusal that covered only the
+    // rootfs would let a consumer's own handler slip a dev binary into a bundle.
+    //
+    // RED on the inverse, two ways: (a) a refusal that only checks the `rootfs` namespace — the
+    // handler leg passes; (b) a refusal keyed on the pin key's SUFFIX alone — the negative control
+    // below (a `kernel_fragments` fragment named `unpinned_path`) is falsely refused.
+    #[test]
+    fn a_resolved_pins_document_naming_an_unpinned_registration_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (kind, body, named) in [
+            (
+                "rootfs",
+                r#"{"rootfs": {"acme": {"unpinned_path": "/tmp/dev.erofs"}}}"#,
+                "rootfs_acme_unpinned_path",
+            ),
+            (
+                "handler",
+                r#"{"handlers": {"acme": {"unpinned_path": "/tmp/dev-handler"}}}"#,
+                "handler_acme_unpinned_path",
+            ),
+            (
+                "the default label",
+                r#"{"rootfs": {"default": {"unpinned_path": "/tmp/dev.erofs"}}}"#,
+                "rootfs_unpinned_path",
+            ),
+        ] {
+            let path = write_resolved_pins(dir.path(), body);
+            let msg = match reject_unpinned_registrations(&path) {
+                Err(e) => e.to_string(),
+                Ok(()) => panic!("an unpinned {kind} registration must be refused"),
+            };
+            assert!(
+                msg.contains(named),
+                "the refusal must name the unpinned entry `{named}`: {msg}"
+            );
+            assert!(
+                msg.contains("bundle"),
+                "the refusal must say what it refused to do: {msg}"
+            );
+        }
+
+        // POSITIVE CONTROL, the one AGENTS.md demands for every negative result: the same document
+        // with the unpinned entry replaced by a digest registration passes. Without it this test
+        // would also pass against a `bundle` that refused everything.
+        let pinned = write_resolved_pins(
+            dir.path(),
+            &format!(
+                r#"{{"rootfs": {{"acme": {{"image": "i", "digest": "sha256:{}"}}}},
+                    "handlers": {{"acme": {{"digest": "sha256:{}",
+                                            "source": {{"url": "https://example.invalid/h"}}}}}}}}"#,
+                "a".repeat(64),
+                "b".repeat(64)
+            ),
+        );
+        reject_unpinned_registrations(&pinned).expect("a fully digest-pinned document must bundle");
+
+        // …and a fragment that merely ENDS in the key is not an unpinned registration: refusing it
+        // would be a false accusation with a real cost (an un-bundleable artifacts dir).
+        let lookalike = write_resolved_pins(
+            dir.path(),
+            r#"{"kernel_fragments": {"unpinned_path": "CONFIG_X=y"}}"#,
+        );
+        reject_unpinned_registrations(&lookalike)
+            .expect("a kernel fragment is not a registration shape");
+
+        // An ABSENT document is not a refusal: a dir with no pipeline output has nothing to be
+        // unpinned about, and `bundle` already reports the absence in its skip notice.
+        reject_unpinned_registrations(&dir.path().join("nope.json"))
+            .expect("an absent resolved-pins document is not an unpinned one");
+
+        // A document that exists but cannot be parsed IS a hard stop: a dir whose provenance cannot
+        // be read is not the same as one that has none.
+        let broken = write_resolved_pins(dir.path(), "{not json");
+        assert!(
+            reject_unpinned_registrations(&broken).is_err(),
+            "an unreadable resolved-pins document must not be silently treated as pinned"
+        );
     }
 }

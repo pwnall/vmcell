@@ -9,7 +9,7 @@
 #                                          paths; WITHOUT it the getters fail loud naming the
 #                                          two-step route (separate processes: `ensure_test_artifacts`
 #                                          memoizes its outcome per process)
-#   3. the DOCUMENTED CLI invocations    — `vmcell build-kernels --pins …` and
+#   3. the DOCUMENTED CLI invocations    — `vmcell build-kernels <label>…|--all --pins …` and
 #                                          `vmcell oci2-erofs … --inject …`, the half of the contract
 #                                          `cargo semver-checks` cannot see. Exercised on their
 #                                          fail-fast contract boundaries so the leg needs no network
@@ -96,15 +96,25 @@ expect "getters fail loud without the override set" nonzero \
 group "3. the documented CLI invocations (§10.4), on their fail-fast boundaries"
 cd "$repo"
 cli=(cargo run --locked -q -p vmcell-cli --bin vmcell --)
+# `--all` is not decoration: v33 delta 6 made `build-kernels`' selection explicit (§10.5), so a
+# bare invocation now refuses itself naming both forms — and these two legs assert on OTHER
+# messages, which is exactly the contract drift this script exists to surface. The migration is to
+# name the selection, in the same commit that changed the verb.
+#
 # `--pins` is honored by the CLI, not only by the library: a typo'd top-level key must be rejected
 # NAMING it. If `--pins` were ignored this resolves the baseline and the command proceeds.
 printf '%s\n' '{"kernel_fragmets": {"IKCONFIG": "CONFIG_IKCONFIG=y\n"}}' > "$work/typo-overlay.json"
 expect "build-kernels --pins rejects a typo'd overlay key" nonzero "kernel_fragmets" \
-    "${cli[@]}" build-kernels --pins "$work/typo-overlay.json"
+    "${cli[@]}" build-kernels --all --pins "$work/typo-overlay.json"
 # A label/fragment set with the non-compiling producer is a typed error (§5.6): before v30 this arm
 # silently dropped both and reported a labelled build that never happened.
 expect "build-kernels --pins --kernel-source prebuilt is a typed error" nonzero "prebuilt" \
-    "${cli[@]}" build-kernels --pins "$overlay" --kernel-source prebuilt
+    "${cli[@]}" build-kernels --all --pins "$overlay" --kernel-source prebuilt
+# …and the selection law itself, on the same documented surface: a bare `build-kernels` is a typed
+# refusal naming BOTH forms (§10.5, v33 delta 6), never a silent build of the whole registry.
+expect "build-kernels with no selection refuses naming both forms" nonzero \
+    "pass one or more labels.*--all" \
+    "${cli[@]}" build-kernels --pins "$overlay"
 # `--inject`'s value parser: the positive control is that a well-formed triple PARSES (the command
 # then stops on the un-pinned image digest, which is why this leg needs no network at all).
 expect "oci2-erofs --inject accepts a well-formed triple" nonzero "digest-pinned" \

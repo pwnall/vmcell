@@ -224,7 +224,8 @@ test-crosvm:
 # The guest kernel is the `usbhost` label built through the §5.6 toolkit (a vmcell-owned GENERIC
 # xhci/USB-core fragment — never the consumer usbip/gadget closure; design §2.4 defends this).
 # Build it first with
-#   cargo run -p vmcell-cli -- build-kernels          # builds every `kernels` label
+#   cargo run -p vmcell-cli -- build-kernels usbhost   # v33 delta 6: selection is explicit
+#                                                     # (`--all` builds every `kernels` label)
 # and point VMCELL_KERNEL at the resulting `<artifacts>/vmlinux-usbhost`. (The fragment PINS the
 # xhci/USB-core symbols; it does not conjure them — measured 2026-08-12, `make olddefconfig`
 # inherits CONFIG_USB_XHCI_PCI=y from the x86_64 defconfig, so the fragment-less labels carry it
@@ -391,6 +392,26 @@ gates:
     # already diverged, which is the only reason either sibling above exists.
     ./scripts/ban-handler-key-composers.sh
     ./scripts/test-ban-handler-key-composers.sh
+    # §10.5 / v33 delta 6c, F7: the dev-override ENTRY KEY is spelled once, in
+    # `registry::UNPINNED_PATH_KEY`. Six sites read it (both entry parsers, both flattener arms,
+    # both stages' override arms, and `bundle`'s refusal scan) and the dangerous drift direction is
+    # SILENT — a refusal scan looking for a different spelling bundles an unpinned registration,
+    # which is the one thing F7 promises vmcell will not do. The self-test proves five halves red:
+    # the literal scan, the exact-count check inside the sanctioned home (extra AND missing), the
+    # stale-home check, and the non-vacuity check; plus four near misses that must stay clean
+    # (prose, the identifier, a `#[cfg(test)]` JSON fixture, a `tests/` fixture).
+    ./scripts/ban-unpinned-path-literal.sh
+    ./scripts/test-ban-unpinned-path-literal.sh
+    # §10.5 / v33 delta 6c, F7 again: the registry DIGEST-FORMAT check ("registration is a digest")
+    # had two copies — `handler.rs`'s own function and an inline one in `artifact/mod.rs` — whose
+    # bodies matched and whose MESSAGES did not, so one malformed value told two operators two
+    # things; and when the check was tightened to reject uppercase hex, only one would have moved.
+    # One `registry::reject_unpinned_digest` now, and this bans a second re-derivation. The
+    # self-test pins the two spellings that actually shipped, both count halves, the stale home, the
+    # non-vacuity check, and the near misses that must stay clean — the `strip_prefix("sha256:")`
+    # sites that COMPARE bytes, which banning would delete the verification F7 exists to enable.
+    ./scripts/ban-registry-digest-check.sh
+    ./scripts/test-ban-registry-digest-check.sh
     # docs/81 §8 ("one law, one predicate"): the 1 s VMM-control-socket readiness ceiling was six
     # inline `1000`s across CH/FC/QEMU/crosvm. The fix is structural — `register_and_await_ready`
     # and `wait_for_vmm_socket` take NO timeout argument, so a literal there is a compile error —

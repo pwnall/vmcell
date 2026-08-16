@@ -270,6 +270,17 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
     // The pins baseline is embedded (`COMMITTED_PINS`), so this bootstrap no longer hunts the
     // workspace for `pins.json`; only the optional `$VMCELL_PINS` overlay is a path (§10.2).
     let overlay_file = pins_overlay_path();
+    // §7.4's declaration sidecar travels with the image this bootstrap packs, so a live suite reads
+    // the same `rootfs.features` a `vmcell build` writes. Without it the two artifact dirs would
+    // disagree about what the canonical rootfs declares — and the test dir, being the one nobody
+    // inspects, would be the one intersecting against the baseline.
+    // `None` on both stages, the same spelling the image stage above uses — the sidecar's name is
+    // derived from the image's filename, so the two labels have to match.
+    let features = crate::artifact::rootfs::RootfsFeaturesStage::labelled(None).with_features(
+        resolve_rootfs_entry(None, overlay_file.as_deref())?
+            .map(|e| e.features)
+            .unwrap_or_default(),
+    );
     let joined = std::thread::scope(|s| {
         s.spawn(move || -> crate::error::Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -284,6 +295,7 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
                         crate::artifact::guest_tools::GuestToolsStage::new(),
                     ))
                     .add_stage(Box::new(crate::artifact::rootfs::RootfsStage::new()))
+                    .add_stage(Box::new(features))
                     .build(&Cache::default())
                     .await
                     .map(|_| ())
@@ -372,6 +384,26 @@ pub trait Stage: Send + Sync {
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey;
     /// Returns the target path for the artifact.
     fn out_path(&self, target_dir: &Path) -> PathBuf;
+    /// The path of this stage's `.cache_key` sidecar, derived from its payload path.
+    ///
+    /// The default REPLACES the payload's extension (`rootfs.erofs` → `rootfs.cache_key`) — the law
+    /// the artifacts dir has always used, and the one the label-sanitizing filename suffixes
+    /// (`rootfs_filename_suffix`, `kernel_filename_suffix`) exist to make safe for a dotted label.
+    ///
+    /// **Override it when this stage's payload shares a filename stem with another stage's.**
+    /// `rootfs.erofs` and the §7.4 declaration sidecar `rootfs.features` both replace to
+    /// `rootfs.cache_key`, so under the default the two stages overwrite each other's cache
+    /// metadata: every build finds the other stage's key, misses, and re-runs — which for the
+    /// rootfs means re-packing a multi-minute image forever, with nothing anywhere saying why.
+    /// [`crate::artifact::rootfs::RootfsFeaturesStage`] is the one stage that overrides this today.
+    ///
+    /// The sidecar path is derived rather than stored so [`Pipeline::build`] and
+    /// [`Pipeline::reset_to`] cannot disagree about which file a stage's metadata lives in: a
+    /// `reset_to` that removed a *different* path than `build` writes would report success and
+    /// leave the stale artifact served.
+    fn cache_sidecar_path(&self, out: &Path) -> PathBuf {
+        out.with_extension("cache_key")
+    }
     /// Executes the stage, building the output artifact at the given path.
     ///
     /// # Errors
@@ -849,7 +881,12 @@ fn flatten_pins_namespace(
             if let Some(entries) = value.as_object() {
                 for (label, spec) in entries {
                     let key_label = registry::registry_label(label);
-                    for sub in ["image", "digest"] {
+                    // `unpinned_path` rides the same loop because it IS a scalar: the F7 dev
+                    // override's value flattens exactly like an image or a digest, which is what
+                    // carries it into `resolved_pins.json`'s flattening — the document `bundle`
+                    // reads to refuse an unpinned artifacts dir — and into `RootfsStage`, which
+                    // reads its inputs from the flat map and nowhere else.
+                    for sub in ["image", "digest", registry::UNPINNED_PATH_KEY] {
                         if let Some(v) = spec.get(sub).and_then(|v| v.as_str()) {
                             out.insert(rootfs::rootfs_pin_key(key_label, sub), v.to_string());
                         }
@@ -884,6 +921,19 @@ fn flatten_pins_namespace(
                         .and_then(|v| v.as_str())
                     {
                         out.insert(handler::handler_pin_key(key_label, "url"), url.to_string());
+                    }
+                    // The F7 dev override, one kind over — a scalar, so it flattens (§10.5). This
+                    // is what puts the fact into `resolved_pins.json`'s flattening, where
+                    // `bundle`'s refusal reads it without gaining a `--pins` flag it would have to
+                    // resolve against TODAY's overlay rather than the one the dir was built from.
+                    if let Some(path) = spec
+                        .get(registry::UNPINNED_PATH_KEY)
+                        .and_then(|v| v.as_str())
+                    {
+                        out.insert(
+                            handler::handler_pin_key(key_label, registry::UNPINNED_PATH_KEY),
+                            path.to_string(),
+                        );
                     }
                 }
             }
@@ -921,6 +971,34 @@ fn flatten_pins_namespace(
         }
         _ => None,
     }
+}
+
+/// Every flattened pin key in a **resolved-pins document** that registers an F7 dev path-override,
+/// sorted (§10.5, v33 delta 6c).
+///
+/// The key names its label (`rootfs_acme_unpinned_path`, `handler_unpinned_path`), which is what a
+/// refusal has to say out loud. Answered by running the document through the **one** flattener
+/// rather than by a second walk of the `rootfs`/`handlers` namespaces: a namespace that gains the
+/// override key later gets this reader for free, and a reader that hand-walked the document would
+/// be the copy that missed it.
+///
+/// Takes the *document* rather than a path so the caller decides where a resolved-pins document
+/// comes from — `vmcell bundle` reads the one the pipeline published into the artifacts dir, which
+/// is the only honest source for "what was this dir built from".
+#[must_use]
+pub fn unpinned_registration_pins(resolved: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = flatten_pins_document(resolved)
+        .into_keys()
+        .filter(|k| {
+            // Anchored at both ends: the suffix alone would also match a `kernel_fragments`
+            // fragment somebody named `unpinned_path`, and refusing a bundle over that would be a
+            // false accusation with a real cost.
+            (k.starts_with("rootfs_") || k.starts_with("handler_"))
+                && k.ends_with(registry::UNPINNED_PATH_KEY)
+        })
+        .collect();
+    keys.sort();
+    keys
 }
 
 /// The declared shape of the pins namespace `name`, or `None` when it is not a namespace.
@@ -1065,15 +1143,52 @@ fn merge_pins_documents(baseline: &mut serde_json::Value, overlay: &serde_json::
 /// impossibility, checked anyway rather than swallowed), or if the overlay cannot be read or fails
 /// the strict parse.
 fn resolve_pins_document(overlay_file: Option<&Path>) -> Result<serde_json::Value> {
+    let overlay = match overlay_file {
+        Some(path) => Some(parse_pins_overlay(&read_pins_overlay(path)?, path)?),
+        None => None,
+    };
+    merged_pins_document(overlay.as_ref())
+}
+
+/// The **file-free** half of [`resolve_pins_document`]: the committed baseline with an
+/// already-parsed `overlay` merged over it, then the legacy-shape reject applied to the RESULT.
+///
+/// Split at exactly the point the file ends, for one reason: the non-default `fuzzing` feature's
+/// `fuzz_merged_pins_document` drives this chain from an overlay's *bytes*, and a fuzz target that
+/// wrote every input to a temp file would be doing I/O on its hot path — which every target in
+/// `fuzz/` deliberately avoids. Splitting here rather than restating the merge order in the fuzz
+/// wrapper keeps one composition: baseline → merge → reject, in that order, for both callers.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if the embedded baseline is malformed (a build-time
+/// impossibility, checked anyway rather than swallowed), or if the merged document carries a
+/// retired v32 singleton shape.
+fn merged_pins_document(overlay: Option<&serde_json::Value>) -> Result<serde_json::Value> {
     let mut doc = serde_json::from_str::<serde_json::Value>(COMMITTED_PINS).map_err(|e| {
         crate::error::Error::Artifact(format!("malformed committed pins.json: {e}"))
     })?;
-    if let Some(path) = overlay_file {
-        let overlay = parse_pins_overlay(&read_pins_overlay(path)?, path)?;
-        merge_pins_documents(&mut doc, &overlay);
+    if let Some(overlay) = overlay {
+        merge_pins_documents(&mut doc, overlay);
     }
     reject_legacy_pins_shapes(&doc)?;
     Ok(doc)
+}
+
+/// Fuzz-only entry point onto the pins-overlay chain — strict parse, leaf-wise merge over the
+/// committed baseline, legacy-singleton reject — from an overlay's TEXT rather than from a file
+/// (non-default `fuzzing` feature; see the feature's stanza in `Cargo.toml`).
+///
+/// Skips `read_pins_overlay` and **nothing else**. That matters for the reject in particular:
+/// `reject_legacy_pins_shapes` fires only on the MERGED document, because an overlay's label map
+/// laid over a singleton baseline is what produces the hybrid it refuses — so a fuzz entry point
+/// that parsed the overlay alone would cover the shape the check was written to miss.
+///
+/// # Errors
+/// Propagates the chain's [`crate::error::Error::Artifact`] verbatim.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_merged_pins_document(overlay: &str) -> Result<serde_json::Value> {
+    let overlay = parse_pins_overlay(overlay, Path::new("<fuzz overlay>"))?;
+    merged_pins_document(Some(&overlay))
 }
 
 /// Rejects a pre-v33 pins shape, naming the migration (§10.5, v33 delta 6).
@@ -1148,7 +1263,7 @@ pub struct KernelRegistryEntry {
 }
 
 /// The merged `kernels` registry in **sorted label order** — the set, and the per-label fragment
-/// sets, that `vmcell build-kernels` builds.
+/// sets, that `vmcell build-kernels <label>…` selects from and `--all` builds whole (§10.5).
 ///
 /// Resolved through the same baseline+overlay merge as the pipeline stage, so a downstream-added
 /// `kernels.<label>` is buildable by the exact CLI command the toolkit contract advertises. A
@@ -1191,23 +1306,67 @@ pub fn resolve_kernel_registry(overlay_file: Option<&Path>) -> Result<Vec<Kernel
     )
 }
 
-/// One entry of the merged `rootfs` registry: a label and the digest-pinned OCI base it names
-/// (§10.5, v33 delta 6).
+/// Where one registered rootfs's bytes come from — the registration shapes §10.5 allows for this
+/// kind, exhaustively (F7).
+///
+/// A **shape per entry**, rather than an `image`/`digest` pair beside an optional path, because
+/// "an unpinned entry has no image and no digest" is then unrepresentable instead of being a pair
+/// of empty strings every reader has to remember to check. The mirror of
+/// [`crate::artifact::handler::HandlerSource`], one kind over — the `handlers` kind additionally
+/// has the workspace-build shape, which is vmcell-owned and has no rootfs analogue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootfsRegistration {
+    /// A digest-pinned OCI base — the consumer form, authoritative and verified before use.
+    Digest {
+        /// The OCI base image reference, without the digest.
+        image: String,
+        /// The `sha256:<64 lowercase hex>` digest the base is pinned to. Authoritative: a label resolves to a
+        /// digest, never a mutable tag (the `oci2-erofs` rule, promoted to the registry's).
+        digest: String,
+    },
+    /// `"unpinned_path": "/path/to/rootfs.erofs"` — the **dev path-override** (§10.5, F7).
+    ///
+    /// The one shape whose identity is not a digest: it means "whatever is at that location today".
+    /// The consequences are enforced rather than documented —
+    /// [`crate::artifact::rootfs::RootfsStage`] publishes the pointed-at file as the label's image
+    /// and folds the file's own content hash into its cache key (so editing it re-keys), resolution
+    /// `warn!`s, and `vmcell bundle` refuses an artifacts dir whose resolved pins name one.
+    UnpinnedPath {
+        /// The local file whose bytes **are** the label's image, exactly as registered.
+        path: PathBuf,
+    },
+}
+
+/// One entry of the merged `rootfs` registry: a label and the registration it names (§10.5,
+/// v33 delta 6).
 ///
 /// The label alone fully determines the artifact — that is the whole point of the registry, and the
-/// reason `image`/`digest` are required rather than optional: an entry that resolves to "whatever
-/// is at that location today" is un-citable by any consumer's provenance discipline.
+/// reason the consumer shape is a digest: an entry that resolves to "whatever is at that location
+/// today" is un-citable by any consumer's provenance discipline. Exactly one shape says that
+/// deliberately ([`RootfsRegistration::UnpinnedPath`]), under its own named key, and pays for it at
+/// `bundle`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RootfsRegistryEntry {
     /// The registry label, e.g. `"default"` — the `rootfs.<label>` key and the
     /// `rootfs-<label>.erofs` artifact name.
     pub label: String,
-    /// The OCI base image reference, without the digest.
-    pub image: String,
-    /// The `sha256:<64 hex>` digest the base is pinned to. Authoritative: a label resolves to a
-    /// digest, never a mutable tag (the `oci2-erofs` rule, promoted to the registry's).
-    pub digest: String,
+    /// Where this label's image comes from.
+    pub registration: RootfsRegistration,
+    /// The **non-derivable** feature stances this entry declares (§10.5's `features` key, §7.4).
+    ///
+    /// Keyed by the parsed [`crate::feature::Feature`] rather than by its token, so a misspelling
+    /// cannot survive resolution: the map can only be built through
+    /// [`crate::feature::Feature::parse`], which is F6's one token table.
+    ///
+    /// Empty when the entry declares nothing — the **baseline, stated**: an artifact that says
+    /// nothing about a feature is not declaring it absent, it simply has no stance to contribute
+    /// (the [`crate::feature::FeatureDeclaration::baseline`] rule, one level up).
+    ///
+    /// This map is the entry's *authority* half; the `<artifact>.features` sidecar beside the
+    /// packed image is its travel form, emitted by
+    /// [`crate::artifact::rootfs::RootfsFeaturesStage`].
+    pub features: std::collections::BTreeMap<crate::feature::Feature, bool>,
 }
 
 /// The merged `rootfs` registry in **sorted label order** (§10.5, v33 delta 6).
@@ -1219,12 +1378,26 @@ pub struct RootfsRegistryEntry {
 ///
 /// # Errors
 /// As [`resolve_pins`], plus [`crate::error::Error::Artifact`] when an entry is malformed (naming
-/// the label and the key), when its digest is not `sha256:<64 hex>`, or when two labels sanitize to
-/// one on-disk artifact filename (naming both).
+/// the label and the key), when its digest is not `sha256:<64 lowercase hex>`, when its `features`
+/// declaration names an unknown feature token or a non-boolean stance, or when two labels sanitize
+/// to one on-disk artifact filename (naming both).
 pub fn resolve_rootfs_registry(overlay_file: Option<&Path>) -> Result<Vec<RootfsRegistryEntry>> {
-    let doc = resolve_pins_document(overlay_file)?;
+    rootfs_registry_from_doc(&resolve_pins_document(overlay_file)?)
+}
+
+/// The document half of [`resolve_rootfs_registry`] — the kind descriptor and the parse, without
+/// the overlay read.
+///
+/// Split out so the `fuzzing`-feature entry point drives the **same** [`registry::RegistryKind`]
+/// this ships with. A fuzz wrapper that rebuilt the descriptor would be a second copy of the
+/// namespace, the filename law and the collision message, and every duplicate in this file so far
+/// has diverged.
+///
+/// # Errors
+/// As [`resolve_rootfs_registry`], minus the overlay read.
+fn rootfs_registry_from_doc(doc: &serde_json::Value) -> Result<Vec<RootfsRegistryEntry>> {
     registry::resolve_registry(
-        &doc,
+        doc,
         &registry::RegistryKind {
             namespace: "rootfs",
             filename: &|label: &str| rootfs::rootfs_filename(registry::registry_label(label)),
@@ -1236,17 +1409,50 @@ pub fn resolve_rootfs_registry(overlay_file: Option<&Path>) -> Result<Vec<Rootfs
     )
 }
 
+/// Fuzz-only entry point onto the `rootfs` registry resolution over an already-merged document
+/// (non-default `fuzzing` feature; see the feature's stanza in `Cargo.toml`).
+///
+/// [`resolve_rootfs_registry`] is public but takes a `Path`, so the only fuzzable form of it writes
+/// a file per iteration. This is the same call one step in, and it is the whole per-entry law:
+/// `rootfs_registry_entry`'s unknown-key, shape-exclusivity, digest-format, `unpinned_path` and
+/// `features` rejections, plus the shared sort and the sanitized-filename collision reject.
+///
+/// # Errors
+/// As [`resolve_rootfs_registry`], minus the overlay read.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_rootfs_registry(doc: &serde_json::Value) -> Result<Vec<RootfsRegistryEntry>> {
+    rootfs_registry_from_doc(doc)
+}
+
+/// Fuzz-only entry point onto the `handlers` registry resolution over an already-merged document —
+/// the sibling of [`fuzz_rootfs_registry`], one kind over.
+///
+/// Kept a **separate** call rather than folded into one both-kinds wrapper: a single entry point
+/// returning one `Result` would let either kind's first rejection mask every input the other kind
+/// would have seen, so half the surface would go unfuzzed while the target still reported coverage.
+///
+/// # Errors
+/// As [`resolve_handler_registry`], minus the overlay read.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_handler_registry(
+    doc: &serde_json::Value,
+) -> Result<Vec<handler::HandlerRegistryEntry>> {
+    handler_registry_from_doc(doc)
+}
+
 /// Parses one `rootfs.<label>` entry — **strictly** (§10.5, F7).
 ///
 /// Every key is honored or rejected naming it (law F1), because a silently-ignored key in a
-/// registry entry is a declaration a consumer built a fixture on. Two keys are rejected with a
-/// forward reference rather than a bare "unknown", because the design's own §10.5 sketch shows
-/// them and a consumer copying that sketch deserves to be told *when* rather than merely *no*:
-/// `xattrs` and `features` arrive with §18 delta 7 and its successor.
+/// registry entry is a declaration a consumer built a fixture on. One key is rejected with a
+/// forward reference rather than a bare "unknown", because the design's own §10.5 sketch shows it
+/// and a consumer copying that sketch deserves to be told *when* rather than merely *no*: `xattrs`
+/// arrives with §18 delta 7. That forward reference is the F1-clean seam between the two deltas —
+/// `xattrs` is refused here and honored there, never accepted-and-ignored in between.
 ///
 /// # Errors
 /// [`crate::error::Error::Artifact`] naming the label and the offending key.
 fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<RootfsRegistryEntry> {
+    use registry::UNPINNED_PATH_KEY;
     let obj = spec.as_object().ok_or_else(|| {
         crate::error::Error::Artifact(format!(
             "pins `rootfs.{label}` must be an object of the form \
@@ -1254,48 +1460,141 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
         ))
     })?;
     for key in obj.keys() {
-        let known = matches!(key.as_str(), "image" | "digest");
+        let known = matches!(key.as_str(), "image" | "digest" | "features")
+            || key.as_str() == UNPINNED_PATH_KEY;
         if !known {
             let arriving = match key.as_str() {
                 "xattrs" => " (§4.7's xattr policy arrives with §18 delta 7)",
-                "features" => " (§7.4 feature declarations arrive with §18 delta 6c)",
+                // A BARE `path` stays refused, and naming the override key is the whole point of
+                // the message: R7 settled that a path is not a registration, so the shape exists
+                // only under the one explicitly named key that also carries the consequences.
+                "path" | "source" | "build" => {
+                    " (a path is an OVERRIDE, not a registration — §10.5, F7 — so the dev shape is \
+                     spelled `unpinned_path`, and `vmcell bundle` refuses it)"
+                }
                 _ => "",
             };
             return Err(crate::error::Error::Artifact(format!(
                 "pins `rootfs.{label}` carries unknown key `{key}`{arriving}; a silently ignored \
-                 declaration is one a consumer builds a fixture on (known keys: image, digest)"
+                 declaration is one a consumer builds a fixture on (known keys: image, digest, \
+                 features, {UNPINNED_PATH_KEY})"
             )));
         }
     }
-    let field = |name: &str| -> Result<String> {
-        obj.get(name)
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                crate::error::Error::Artifact(format!(
-                    "pins `rootfs.{label}` must carry a non-empty string `{name}`"
-                ))
-            })
+    // The shape-exclusivity law is the shared one, applied to this kind's shape keys. `image` and
+    // `digest` are two halves of ONE shape, so they are named together: an entry carrying either
+    // beside `unpinned_path` is naming two shapes at once.
+    let digest_shape = obj.contains_key("image") || obj.contains_key("digest");
+    let unpinned = obj.get(UNPINNED_PATH_KEY);
+    registry::reject_multiple_registration_shapes(
+        "rootfs",
+        label,
+        &[
+            ("image`/`digest", digest_shape),
+            (UNPINNED_PATH_KEY, unpinned.is_some()),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(k, _)| *k)
+        .collect::<Vec<_>>(),
+    )?;
+    let registration = match unpinned {
+        Some(value) => RootfsRegistration::UnpinnedPath {
+            path: registry::unpinned_path_registration("rootfs", label, value)?,
+        },
+        None => {
+            let field = |name: &str| -> Result<String> {
+                obj.get(name)
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        crate::error::Error::Artifact(format!(
+                            "pins `rootfs.{label}` must carry a non-empty string `{name}`"
+                        ))
+                    })
+            };
+            let image = field("image")?;
+            let digest = field("digest")?;
+            // A label resolves to a DIGEST, never a mutable tag — the `oci2-erofs` rule adopted as
+            // the registry's (§10.5). Checked here rather than at the pull, so a mis-registered
+            // label fails at resolution instead of after a network round trip; and checked through
+            // the ONE shared predicate, because this kind and `handlers` used to hold two spellings
+            // of it that already disagreed about what the operator is told.
+            registry::reject_unpinned_digest("rootfs", label, &digest)?;
+            RootfsRegistration::Digest { image, digest }
+        }
     };
-    let image = field("image")?;
-    let digest = field("digest")?;
-    // A label resolves to a DIGEST, never a mutable tag — the `oci2-erofs` rule adopted as the
-    // registry's (§10.5). Checked here rather than at the pull, so a mis-registered label fails at
-    // resolution instead of after a network round trip.
-    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(crate::error::Error::Artifact(format!(
-            "pins `rootfs.{label}.digest` must be `sha256:<64 hex>`, got `{digest}`: a registry \
-             entry that resolves to a mutable tag means \"whatever is at that location today\", \
-             which no consumer's provenance discipline can cite"
-        )));
-    }
     Ok(RootfsRegistryEntry {
         label: label.to_string(),
-        image,
-        digest,
+        registration,
+        features: rootfs_entry_features(label, obj)?,
     })
+}
+
+/// Parses a `rootfs.<label>.features` declaration map — the **non-derivable** stances §10.5's pins
+/// sketch shows, strict-parsed (§7.4, invariant F6).
+///
+/// `features` stays **document-only**: the flattened pins map is scalars, so a map-valued key never
+/// reaches it — exactly the precedent `kernels.<label>.fragments` and `handlers.<label>.applets`
+/// set. The registry resolver reads the document, and this is where it reads it.
+///
+/// Three strictness rules, each because its silent form is the failure F6 exists to close:
+///
+///  1. every key goes through [`crate::feature::Feature::parse`] — the **one** token table. A
+///     second matcher here is exactly the drift that would let a token this parser accepts be a
+///     token nothing else knows. An unknown token is a hard error naming it and listing the valid
+///     ones, never a silent absence.
+///  2. a value that is not a JSON boolean is a hard error naming the key. `{"snapshot_restore":
+///     "false"}` must not read as a stance at all — `as_bool()` on a string is `None`, and a
+///     `map_or(true, …)` there would have read the *opposite* of what was written.
+///  3. a duplicate key has **no** counterpart rule here, and that is a fact about the format rather
+///     than an omission: `serde_json` collapses duplicate object keys while parsing the document,
+///     so by the time this sees `obj` there is exactly one entry per token. The sidecar reader
+///     ([`crate::feature::FeatureDeclaration::parse_manifest`]) carries the duplicate reject
+///     because its line-oriented format genuinely can express one.
+///
+/// **`xattr_preserved` is a legal token in this delta**, and that is a decision rather than a gap.
+/// §10.5's sketch says an explicit `xattr_preserved` beside an `xattrs` key must be a hard error
+/// naming the derivation — but `xattrs` does not exist until §18 delta 7, so there is nothing to
+/// contradict yet and refusing the token now would leave the one artifact property vmcell's packer
+/// actually decides undeclarable. **The seam:** delta 7 adds the `xattrs` key, *derives*
+/// `Feature::XattrPreserved` from it, and at that point an explicit `xattr_preserved` token beside
+/// an `xattrs` key becomes a hard error naming the derivation — one fact, one key, so the two can
+/// never desync. Until then the explicit token is the only way to say it, and the committed
+/// `rootfs.default` entry uses it.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] naming the label and the offending token or value.
+fn rootfs_entry_features(
+    label: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<std::collections::BTreeMap<crate::feature::Feature, bool>> {
+    let Some(value) = obj.get("features") else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let declared = value.as_object().ok_or_else(|| {
+        crate::error::Error::Artifact(format!(
+            "pins `rootfs.{label}.features` must be an object of `<feature>: true|false` \
+             (e.g. {{\"snapshot_restore\": false}}), got `{value}`"
+        ))
+    })?;
+    let mut stances = std::collections::BTreeMap::new();
+    for (token, stance) in declared {
+        let feature = crate::feature::Feature::parse(token).map_err(|e| {
+            crate::error::Error::Artifact(format!("pins `rootfs.{label}.features`: {e}"))
+        })?;
+        let stance = stance.as_bool().ok_or_else(|| {
+            crate::error::Error::Artifact(format!(
+                "pins `rootfs.{label}.features.{token}` must be the boolean `true` or `false`, \
+                 got `{stance}`: a stance is stated or the entry is rejected — never defaulted, \
+                 because a defaulted stance is indistinguishable from the one the declaration \
+                 meant to overturn"
+            ))
+        })?;
+        stances.insert(feature, stance);
+    }
+    Ok(stances)
 }
 
 /// The merged `handlers` registry in **sorted label order** (§10.5, v33 delta 6).
@@ -1309,9 +1608,20 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
 pub fn resolve_handler_registry(
     overlay_file: Option<&Path>,
 ) -> Result<Vec<handler::HandlerRegistryEntry>> {
-    let doc = resolve_pins_document(overlay_file)?;
+    handler_registry_from_doc(&resolve_pins_document(overlay_file)?)
+}
+
+/// The document half of [`resolve_handler_registry`], split for the reason
+/// [`rootfs_registry_from_doc`] is: one kind descriptor, shared with the `fuzzing`-feature entry
+/// point.
+///
+/// # Errors
+/// As [`resolve_handler_registry`], minus the overlay read.
+fn handler_registry_from_doc(
+    doc: &serde_json::Value,
+) -> Result<Vec<handler::HandlerRegistryEntry>> {
     registry::resolve_registry(
-        &doc,
+        doc,
         &registry::RegistryKind {
             namespace: "handlers",
             filename: &|label: &str| handler::handler_filename(registry::registry_label(label)),
@@ -1331,6 +1641,27 @@ pub fn resolve_handler_labels(overlay_file: Option<&Path>) -> Result<Vec<String>
         .into_iter()
         .map(|e| e.label)
         .collect())
+}
+
+/// The merged `rootfs` registry entry `label` names — `None` selects `rootfs.default` — or `None`
+/// when the registry holds no entry under that label.
+///
+/// The **one** label→entry lookup, so the verb that validates a `--rootfs-label` and the stage that
+/// reads that label's `features` declaration (§7.4) cannot resolve two different entries from two
+/// separate reads. An absent label is `Ok(None)` rather than an error because only the verb that
+/// took the label can say which labels exist and what the operator should type instead — the same
+/// division [`resolve_handler_registry`] leaves to its callers.
+///
+/// # Errors
+/// As [`resolve_rootfs_registry`].
+pub fn resolve_rootfs_entry(
+    label: Option<&str>,
+    overlay_file: Option<&Path>,
+) -> Result<Option<RootfsRegistryEntry>> {
+    let wanted = label.unwrap_or(registry::DEFAULT_LABEL);
+    Ok(resolve_rootfs_registry(overlay_file)?
+        .into_iter()
+        .find(|e| e.label == wanted))
 }
 
 /// The labels of the merged `rootfs` registry, sorted.
@@ -1379,7 +1710,8 @@ fn kernel_entry_fragments(label: &str, spec: &serde_json::Value) -> Result<Vec<S
         .collect()
 }
 
-/// The labels of the merged `kernels` registry, sorted — the set `vmcell build-kernels` builds.
+/// The labels of the merged `kernels` registry, sorted — the set `vmcell build-kernels --all`
+/// builds, and the set `build-kernels <label>…` selects from (§10.5).
 ///
 /// The label half of [`resolve_kernel_registry`], which it delegates to so the roster and the
 /// per-label fragment sets can never come from two different readers.
@@ -1408,7 +1740,7 @@ pub fn pins_overlay_or_env(flag: Option<&Path>) -> Option<PathBuf> {
 /// the path of the built `vmlinux-<label>` (§5.6, The downstream kernel toolkit; §18 delta 3).
 ///
 /// This is the **library** build entry point a git-dep consumer calls from its own harness, the
-/// counterpart of `vmcell build-kernels --pins <file>`: it assembles
+/// counterpart of `vmcell build-kernels <label> --pins <file>`: it assembles
 /// [`ResolvePinsStage`] (baseline + overlay) → [`kernel::KernelStage`] with the label's declared
 /// fragments and runs that pipeline. The resolved-config sidecar lands beside the kernel at
 /// [`kernel::resolved_config_path`], which is what a fragment author asserts against.
@@ -1420,7 +1752,7 @@ pub fn pins_overlay_or_env(flag: Option<&Path>) -> Option<PathBuf> {
 /// &env)`).** It offers the host-`make` producer only — the one compiling producer `vmcell` can
 /// name. The in-VM builder lives in `vmcell-kernel-builder`, which depends on `vmcell`; naming it
 /// here would invert that edge and break §9.1's acyclicity, so the in-VM producer stays reachable
-/// through the composition root (`vmcell build-kernels --kernel-source in-vm`). With no in-VM
+/// through the composition root (`vmcell build-kernels --all --kernel-source in-vm`). With no in-VM
 /// producer there is no `CidAllocator` to inject either, so the sketch's `&HostEnv` parameter would
 /// carry nothing this function uses and is replaced by the explicit `target_dir` + `overlay_file`.
 ///
@@ -1446,15 +1778,20 @@ pub async fn build_labelled_kernel(
     let overlay = pins_overlay_or_env(overlay_file);
     let registry = resolve_kernel_registry(overlay.as_deref())?;
     let entry = registry.iter().find(|e| e.label == label).ok_or_else(|| {
-        crate::error::Error::Artifact(format!(
-            "unknown kernel label `{label}`: the resolved pins `kernels` registry holds [{}] \
-                 (add yours through a pins overlay, §10.2)",
-            registry
+        // The ONE composer, shared with the CLI's three selectors (§10.5): this pre-flight and
+        // `vmcell build-kernels <label>` are two documented routes to the same build, and a
+        // consumer who reads one sentence and gets the other has learned nothing about which route
+        // it came from. It used to be a fourth hand-rolled `format!` pinned only by a
+        // byte-equality test across the crate boundary.
+        registry::unknown_label_error(
+            "kernel",
+            "kernels",
+            label,
+            &registry
                 .iter()
                 .map(|e| e.label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
+                .collect::<Vec<_>>(),
+        )
     })?;
     let stage = kernel::KernelStage {
         http_client: std::sync::Arc::new(kernel::ReqwestClient),
@@ -1869,7 +2206,7 @@ impl Pipeline {
             let out_path = stage.out_path(dir);
 
             let key = stage.cache_key(&inputs);
-            let key_path = out_path.with_extension("cache_key");
+            let key_path = stage.cache_sidecar_path(&out_path);
 
             let mut cached = false;
             let mut cached_pins = std::collections::HashMap::new();
@@ -2012,7 +2349,7 @@ impl Pipeline {
             }
             if found {
                 let out_path = s.out_path(dir);
-                let key_path = out_path.with_extension("cache_key");
+                let key_path = s.cache_sidecar_path(&out_path);
                 // The siblings come out of the sidecar's recorded artifact map, so they are read
                 // BEFORE it is removed — and reading the map instead of naming the files is what
                 // keeps `Pipeline` free of per-stage knowledge (it never learns what a kernel is).
@@ -2380,7 +2717,7 @@ mod tests {
         // The label roster is the same reader, so it refuses too — no route around the check.
         assert!(
             resolve_kernel_labels(Some(&overlay)).is_err(),
-            "the roster `build-kernels` builds must refuse the collision as well"
+            "the roster `build-kernels --all` builds must refuse the collision as well"
         );
 
         // Positive control: a label that does NOT collide after sanitization still resolves, so the
@@ -3478,7 +3815,7 @@ mod tests {
             merged.get("kernel_9.9.9_source_url").map(String::as_str),
             Some("https://d.example/l.tar.xz")
         );
-        // …and the added label is enumerable by the roster `vmcell build-kernels` builds, so a
+        // …and the added label is enumerable by the roster `vmcell build-kernels --all` builds, so a
         // downstream label is not merely resolvable but buildable (the gate-blindness this closes).
         let labels = resolve_kernel_labels(Some(&overlay)).expect("labels resolve");
         assert!(
