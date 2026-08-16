@@ -259,6 +259,34 @@ fn fast_artifacts_fingerprint_with(overlay_file: Option<&Path>) -> crate::error:
     Ok(h.finalize().to_hex().to_string())
 }
 
+/// The image + declaration stages the fast bootstrap builds `rootfs.default` from, composed from
+/// that label's resolved registry entry.
+///
+/// Pure, and split out of [`build_fast_pipeline`] so the one thing that can silently go wrong here
+/// is assertable KVM-free: an entry property that reaches neither stage. The §4.7 xattr policy has
+/// to reach the **image** stage (it decides the packed bytes and the image's identity) and the §7.4
+/// declaration has to reach the **sidecar** stage (it decides what the artifact claims). Drop
+/// either and every test stays green while the test artifacts dir quietly disagrees with what
+/// `vmcell build` produces into the real one.
+///
+/// `None` on both labels, deliberately: this bootstrap builds `rootfs.default`, whose filename is
+/// the un-suffixed one, and the two filename composers treat `Some("default")` and `None` as
+/// different files.
+#[cfg(feature = "pipeline")]
+fn fast_rootfs_stages(
+    entry: Option<&RootfsRegistryEntry>,
+) -> (
+    crate::artifact::rootfs::RootfsStage,
+    crate::artifact::rootfs::RootfsFeaturesStage,
+) {
+    (
+        crate::artifact::rootfs::RootfsStage::new()
+            .with_xattrs(entry.map_or_else(XattrPolicy::default, |e| e.xattrs)),
+        crate::artifact::rootfs::RootfsFeaturesStage::labelled(None)
+            .with_features(entry.map(|e| e.features.clone()).unwrap_or_default()),
+    )
+}
+
 /// Runs the kernel-less build pipeline (ResolvePins → steward → guest-tools → rootfs) once,
 /// hash-gated. The OCI rootfs stage does not consume the kernel (ART-9), so omitting the slow
 /// kernel stage is sound. Executed on a fresh current-thread runtime in a dedicated OS thread: this
@@ -274,13 +302,8 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
     // the same `rootfs.features` a `vmcell build` writes. Without it the two artifact dirs would
     // disagree about what the canonical rootfs declares — and the test dir, being the one nobody
     // inspects, would be the one intersecting against the baseline.
-    // `None` on both stages, the same spelling the image stage above uses — the sidecar's name is
-    // derived from the image's filename, so the two labels have to match.
-    let features = crate::artifact::rootfs::RootfsFeaturesStage::labelled(None).with_features(
-        resolve_rootfs_entry(None, overlay_file.as_deref())?
-            .map(|e| e.features)
-            .unwrap_or_default(),
-    );
+    let entry = resolve_rootfs_entry(None, overlay_file.as_deref())?;
+    let (rootfs, features) = fast_rootfs_stages(entry.as_ref());
     let joined = std::thread::scope(|s| {
         s.spawn(move || -> crate::error::Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -294,7 +317,7 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
                     .add_stage(Box::new(
                         crate::artifact::guest_tools::GuestToolsStage::new(),
                     ))
-                    .add_stage(Box::new(crate::artifact::rootfs::RootfsStage::new()))
+                    .add_stage(Box::new(rootfs))
                     .add_stage(Box::new(features))
                     .build(&Cache::default())
                     .await
@@ -885,8 +908,15 @@ fn flatten_pins_namespace(
                     // override's value flattens exactly like an image or a digest, which is what
                     // carries it into `resolved_pins.json`'s flattening — the document `bundle`
                     // reads to refuse an unpinned artifacts dir — and into `RootfsStage`, which
-                    // reads its inputs from the flat map and nowhere else.
-                    for sub in ["image", "digest", registry::UNPINNED_PATH_KEY] {
+                    // reads its inputs from the flat map and nowhere else. `xattrs` (§4.7, §18
+                    // delta 7) rides it for the first half of that reason only: it is a scalar and
+                    // it belongs in the published `resolved_pins.json`, so a consumer reading a
+                    // built artifacts dir can see which policy its image was packed under. The
+                    // STAGE does not read it from here — the policy travels typed, from the
+                    // resolved registry entry through `RootfsStage::with_xattrs`, because
+                    // `oci2-erofs --image` packs a base no registry entry describes and a pin read
+                    // would hand it the default label's declaration.
+                    for sub in ["image", "digest", "xattrs", registry::UNPINNED_PATH_KEY] {
                         if let Some(v) = spec.get(sub).and_then(|v| v.as_str()) {
                             out.insert(rootfs::rootfs_pin_key(key_label, sub), v.to_string());
                         }
@@ -1306,6 +1336,82 @@ pub fn resolve_kernel_registry(overlay_file: Option<&Path>) -> Result<Vec<Kernel
     )
 }
 
+/// What the one inject+pack tail does with a source layer's extended attributes (design §4.7).
+///
+/// A **per-artifact** property, declared in the rootfs registry entry (`"xattrs": "preserve"`,
+/// §10.5) and carried to the packer as a [`crate::artifact::rootfs::PackOptions`] field. It
+/// defaults to [`XattrPolicy::Strip`], so the canonical artifact stays byte-identical: the strip
+/// was never a law, it was a decision scoped to the one base vmcell ships (whose layers carry no
+/// `SCHILY.xattr` record at all), and an artifact that needs `security.capability` to survive says
+/// so in its own entry rather than asking every other artifact to change.
+///
+/// The policy governs only what arrives **from a source layer**. vmcell's own injected files (the
+/// steward, the CA, the guest-tools multicall binary and its applet symlinks) and the directories
+/// the packer synthesizes carry no xattrs under either policy — those injections are unconditional
+/// and authoritative (§4.2, invariant F5), and a policy that could add attributes to them would
+/// make vmcell's own contribution to the image depend on a consumer's declaration.
+///
+/// Defined **here**, in the ungated artifact module, and re-exported as
+/// `vmcell::artifact::rootfs::XattrPolicy` (the §10.4 contract-surface name) and as
+/// `vmcell::artifact::tar2erofs::XattrPolicy` (the packer that honors it). This module is the only
+/// one of the three compiled in every feature configuration, and the entry that *declares* the
+/// policy ([`RootfsRegistryEntry::xattrs`]) is parsed here: a definition behind `pipeline` or
+/// `am-fs-erofs` would not exist for its own declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XattrPolicy {
+    /// Drop every source xattr (the default, and the pre-v33 behavior).
+    #[default]
+    Strip,
+    /// Carry each source entry's `SCHILY.xattr.*` PAX records into the packed inode.
+    Preserve,
+}
+
+impl XattrPolicy {
+    /// The registry entry's spelling of this policy (`"strip"` / `"preserve"`), and the only one:
+    /// [`XattrPolicy::parse`] reads what this writes, so the two cannot drift.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            XattrPolicy::Strip => "strip",
+            XattrPolicy::Preserve => "preserve",
+        }
+    }
+
+    /// The [`crate::feature::Feature::XattrPreserved`] stance this policy implies — **the one
+    /// derivation** (§4.7, §18 delta 7).
+    ///
+    /// One fact, one key: the entry states the policy and the feature stance follows from it, so
+    /// the packer's behavior and the artifact's declaration cannot desync. The other direction is
+    /// closed by the parser, which refuses an explicit `xattr_preserved` token in the same entry's
+    /// `features` map (see `rootfs_entry_features`) — between them, both desync directions are
+    /// unrepresentable rather than merely discouraged.
+    #[must_use]
+    pub fn preserves(self) -> bool {
+        matches!(self, XattrPolicy::Preserve)
+    }
+
+    /// Parses a registry entry's `"xattrs"` token — **strictly** (§10.5, law F1).
+    ///
+    /// An unknown word is a hard error naming both valid ones, never a silent fall back to the
+    /// default: a consumer who wrote `"presevre"` and got a stripped image would have declared a
+    /// property, watched it be ignored, and built a fixture on the result.
+    ///
+    /// # Errors
+    /// [`crate::error::Error::Artifact`] naming the offending token and both valid spellings.
+    pub fn parse(token: &str) -> crate::error::Result<Self> {
+        match token {
+            "strip" => Ok(XattrPolicy::Strip),
+            "preserve" => Ok(XattrPolicy::Preserve),
+            other => Err(crate::error::Error::Artifact(format!(
+                "unknown xattr policy `{other}`: an artifact's `xattrs` declaration is one of \
+                 `{}` (the default — every source xattr is dropped) or `{}` (§4.7)",
+                XattrPolicy::Strip.name(),
+                XattrPolicy::Preserve.name()
+            ))),
+        }
+    }
+}
+
 /// Where one registered rootfs's bytes come from — the registration shapes §10.5 allows for this
 /// kind, exhaustively (F7).
 ///
@@ -1337,6 +1443,35 @@ pub enum RootfsRegistration {
     },
 }
 
+impl RootfsRegistration {
+    /// Whether vmcell's own packer produces this registration's image — design §4.7's
+    /// "**a vmcell-built rootfs entry**", as one predicate.
+    ///
+    /// The two shapes ask genuinely different questions, and this is where the difference is
+    /// written down once instead of three times:
+    ///
+    /// * [`RootfsRegistration::Digest`] says *"pack this OCI base under the policy I declare"* — so
+    ///   the `xattrs` key is an instruction vmcell carries out, and
+    ///   [`crate::feature::Feature::XattrPreserved`] is a fact vmcell can DERIVE from it, which is
+    ///   why declaring the stance by hand is refused there;
+    /// * [`RootfsRegistration::UnpinnedPath`] says *"here are bytes I made myself"* —
+    ///   [`crate::artifact::rootfs::RootfsStage`] publishes them verbatim and never packs, so the
+    ///   `xattrs` key would be accept-then-ignore (refused, law F1) and there is nothing to derive
+    ///   a stance FROM. The stance is therefore the operator's to declare, and only they can know
+    ///   it: a foreign image that really does preserve `security.capability` has no other way to
+    ///   say so.
+    ///
+    /// Every site that needs "did vmcell pack this?" reads this, so the `xattrs` refusal, the
+    /// derivation, and the derived-token refusal cannot come to disagree about which shape they are
+    /// talking about.
+    fn is_vmcell_built(&self) -> bool {
+        match self {
+            RootfsRegistration::Digest { .. } => true,
+            RootfsRegistration::UnpinnedPath { .. } => false,
+        }
+    }
+}
+
 /// One entry of the merged `rootfs` registry: a label and the registration it names (§10.5,
 /// v33 delta 6).
 ///
@@ -1353,15 +1488,40 @@ pub struct RootfsRegistryEntry {
     pub label: String,
     /// Where this label's image comes from.
     pub registration: RootfsRegistration,
-    /// The **non-derivable** feature stances this entry declares (§10.5's `features` key, §7.4).
+    /// This artifact's extended-attribute policy (§10.5's `xattrs` key, §4.7; §18 delta 7).
+    ///
+    /// [`XattrPolicy::Strip`] when the entry declares nothing, which is what keeps an undeclared
+    /// entry byte-identical to its pre-delta-7 self. Build-affecting, so it folds into the
+    /// **image's** identity ([`crate::artifact::rootfs::RootfsStage::cache_key`]) rather than into
+    /// the declaration sidecar's — the §7.4 split, from the other side of `features` below.
+    ///
+    /// Always the default on a registration vmcell does not build
+    /// ([`RootfsRegistration::UnpinnedPath`]): the `xattrs` key is *refused* on that shape, because
+    /// nothing packs those bytes for a policy to govern.
+    pub xattrs: XattrPolicy,
+    /// The feature stances this entry contributes (§10.5's `features` key, §7.4) — the
+    /// non-derivable ones it *declares*, plus the one this delta *derives*.
     ///
     /// Keyed by the parsed [`crate::feature::Feature`] rather than by its token, so a misspelling
     /// cannot survive resolution: the map can only be built through
     /// [`crate::feature::Feature::parse`], which is F6's one token table.
     ///
-    /// Empty when the entry declares nothing — the **baseline, stated**: an artifact that says
-    /// nothing about a feature is not declaring it absent, it simply has no stance to contribute
-    /// (the [`crate::feature::FeatureDeclaration::baseline`] rule, one level up).
+    /// On a **vmcell-built** entry — one whose registration is [`RootfsRegistration::Digest`], so
+    /// vmcell's own packer produces the image —
+    /// [`crate::feature::Feature::XattrPreserved`] is always present and never declared: it is
+    /// derived from [`RootfsRegistryEntry::xattrs`] through [`XattrPolicy::preserves`] (§4.7, §18
+    /// delta 7), and an explicit `xattr_preserved` token in the `features` map is a hard error
+    /// naming that derivation. One fact, one key.
+    ///
+    /// On an [`RootfsRegistration::UnpinnedPath`] entry it is the exact mirror: vmcell packs
+    /// nothing, so it derives nothing, and the token IS declarable — the key is present only if the
+    /// operator wrote it. §4.7 scopes the derivation to "a vmcell-built rootfs entry" for this
+    /// reason, and a reader must not treat the key's absence here as "not preserved": that is the
+    /// [`crate::feature::FeatureDeclaration::baseline`] rule, unchanged.
+    ///
+    /// Otherwise empty when the entry declares nothing — the **baseline, stated**: an artifact that
+    /// says nothing about a feature is not declaring it absent, it simply has no stance to
+    /// contribute (the [`crate::feature::FeatureDeclaration::baseline`] rule, one level up).
     ///
     /// This map is the entry's *authority* half; the `<artifact>.features` sidecar beside the
     /// packed image is its travel form, emitted by
@@ -1443,11 +1603,9 @@ pub fn fuzz_handler_registry(
 /// Parses one `rootfs.<label>` entry — **strictly** (§10.5, F7).
 ///
 /// Every key is honored or rejected naming it (law F1), because a silently-ignored key in a
-/// registry entry is a declaration a consumer built a fixture on. One key is rejected with a
-/// forward reference rather than a bare "unknown", because the design's own §10.5 sketch shows it
-/// and a consumer copying that sketch deserves to be told *when* rather than merely *no*: `xattrs`
-/// arrives with §18 delta 7. That forward reference is the F1-clean seam between the two deltas —
-/// `xattrs` is refused here and honored there, never accepted-and-ignored in between.
+/// registry entry is a declaration a consumer built a fixture on. `§18 delta 7` closed the last
+/// forward reference this parser carried (`xattrs`), so every key §10.5's sketch shows is now
+/// honored and the remaining named rejections are about *spelling* rather than about *timing*.
 ///
 /// # Errors
 /// [`crate::error::Error::Artifact`] naming the label and the offending key.
@@ -1460,11 +1618,10 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
         ))
     })?;
     for key in obj.keys() {
-        let known = matches!(key.as_str(), "image" | "digest" | "features")
+        let known = matches!(key.as_str(), "image" | "digest" | "features" | "xattrs")
             || key.as_str() == UNPINNED_PATH_KEY;
         if !known {
             let arriving = match key.as_str() {
-                "xattrs" => " (§4.7's xattr policy arrives with §18 delta 7)",
                 // A BARE `path` stays refused, and naming the override key is the whole point of
                 // the message: R7 settled that a path is not a registration, so the shape exists
                 // only under the one explicitly named key that also carries the consequences.
@@ -1477,7 +1634,7 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
             return Err(crate::error::Error::Artifact(format!(
                 "pins `rootfs.{label}` carries unknown key `{key}`{arriving}; a silently ignored \
                  declaration is one a consumer builds a fixture on (known keys: image, digest, \
-                 features, {UNPINNED_PATH_KEY})"
+                 features, xattrs, {UNPINNED_PATH_KEY})"
             )));
         }
     }
@@ -1525,11 +1682,82 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
             RootfsRegistration::Digest { image, digest }
         }
     };
+    let xattrs = rootfs_entry_xattrs(label, &registration, obj)?;
+    let mut features = rootfs_entry_features(label, &registration, obj)?;
+    // §4.7's DERIVATION, scoped to "a vmcell-built rootfs entry" by the design's own words and by
+    // the one predicate that spells them: the entry states its xattr POLICY, and
+    // `Feature::XattrPreserved` follows from it — which is the reason `rootfs_entry_features`
+    // refuses the token it inserts here. Derived for EVERY vmcell-built entry, including one with
+    // no `xattrs` key at all: that derives `false` from the default `Strip`, exactly the stance the
+    // committed `rootfs.default` used to spell out by hand.
+    //
+    // An `unpinned_path` entry gets NOTHING here, deliberately. vmcell did not pack those bytes, so
+    // a derived `false` would be a claim it cannot support — and, because the derived key would
+    // then occupy the map, the operator would have no way to state the truth about a foreign image
+    // that really does preserve its attributes. For that shape the token is theirs to declare.
+    if registration.is_vmcell_built() {
+        features.insert(crate::feature::Feature::XattrPreserved, xattrs.preserves());
+    }
     Ok(RootfsRegistryEntry {
         label: label.to_string(),
         registration,
-        features: rootfs_entry_features(label, obj)?,
+        xattrs,
+        features,
     })
+}
+
+/// Parses a `rootfs.<label>.xattrs` declaration — the §4.7 per-artifact extended-attribute policy
+/// (§10.5, §18 delta 7).
+///
+/// Absent is [`XattrPolicy::Strip`], stated as a *default* rather than as an absence: the packer
+/// has always stripped, so an entry that says nothing keeps its pre-delta-7 bytes and its
+/// pre-delta-7 cache key. The token itself goes through [`XattrPolicy::parse`], the one spelling
+/// table — a second matcher here is how `"preserve"` would come to mean one thing to the registry
+/// and another to the packer.
+///
+/// A non-string value is rejected naming the key rather than falling back to the default: the pins
+/// FLATTENER reads this key with `as_str()` and simply skips a non-string, so a `{"xattrs": true}`
+/// entry that resolved clean here would emit no `rootfs_xattrs` pin at all and leave
+/// `resolved_pins.json` silently claiming a policy nobody declared.
+///
+/// The key is refused outright on a registration vmcell does not build
+/// ([`RootfsRegistration::is_vmcell_built`]): `xattrs` is an instruction to the PACKER, and
+/// [`crate::artifact::rootfs::RootfsStage`] publishes an F7 override's bytes verbatim
+/// (`publish_unpinned`) rather than packing them, so accepting it there would be accept-then-ignore
+/// on the one key whose whole purpose is to change the image's contents (law F1).
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] naming the label, and the token, its type, or the shape that
+/// cannot honor it.
+fn rootfs_entry_xattrs(
+    label: &str,
+    registration: &RootfsRegistration,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<XattrPolicy> {
+    let Some(value) = obj.get("xattrs") else {
+        return Ok(XattrPolicy::default());
+    };
+    if !registration.is_vmcell_built() {
+        return Err(crate::error::Error::Artifact(format!(
+            "pins `rootfs.{label}` carries `xattrs` beside `{}`: the §4.7 policy \
+             instructs the PACKER, and an unpinned registration is published verbatim rather than \
+             packed, so the declaration could never take effect. Register a digest to have vmcell \
+             pack under a policy — or, if the image you are pointing at already preserves its \
+             attributes, declare `\"features\": {{\"{}\": true}}` instead, which is the one thing \
+             only you can know about bytes vmcell did not produce",
+            registry::UNPINNED_PATH_KEY,
+            crate::feature::Feature::XattrPreserved.name(),
+        )));
+    }
+    let token = value.as_str().ok_or_else(|| {
+        crate::error::Error::Artifact(format!(
+            "pins `rootfs.{label}.xattrs` must be the string `{}` or `{}`, got `{value}` (§4.7)",
+            XattrPolicy::Strip.name(),
+            XattrPolicy::Preserve.name()
+        ))
+    })?;
+    XattrPolicy::parse(token)
+        .map_err(|e| crate::error::Error::Artifact(format!("pins `rootfs.{label}.xattrs`: {e}")))
 }
 
 /// Parses a `rootfs.<label>.features` declaration map — the **non-derivable** stances §10.5's pins
@@ -1554,20 +1782,27 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
 ///     ([`crate::feature::FeatureDeclaration::parse_manifest`]) carries the duplicate reject
 ///     because its line-oriented format genuinely can express one.
 ///
-/// **`xattr_preserved` is a legal token in this delta**, and that is a decision rather than a gap.
-/// §10.5's sketch says an explicit `xattr_preserved` beside an `xattrs` key must be a hard error
-/// naming the derivation — but `xattrs` does not exist until §18 delta 7, so there is nothing to
-/// contradict yet and refusing the token now would leave the one artifact property vmcell's packer
-/// actually decides undeclarable. **The seam:** delta 7 adds the `xattrs` key, *derives*
-/// `Feature::XattrPreserved` from it, and at that point an explicit `xattr_preserved` token beside
-/// an `xattrs` key becomes a hard error naming the derivation — one fact, one key, so the two can
-/// never desync. Until then the explicit token is the only way to say it, and the committed
-/// `rootfs.default` entry uses it.
+/// **`xattr_preserved` is not a declarable token on a vmcell-built entry** (§18 delta 7): there it
+/// is DERIVED from the entry's `xattrs` key through [`XattrPolicy::preserves`], so an explicit
+/// stance is a hard error naming the derivation and the key to use instead. That is rule 4, and it
+/// closes the second desync direction — the first being closed by deriving the stance rather than
+/// reading it. The reject does not depend on an `xattrs` key being *present*: the derivation runs
+/// for every vmcell-built entry (no `xattrs` derives `false` from the default `Strip`), so there is
+/// always a derived fact for an explicit token to contradict, and the shape that would otherwise
+/// survive — `{"features": {"xattr_preserved": true}}` with no `xattrs` — is exactly the artifact
+/// that claims preserved attributes while its packer strips every one of them.
+///
+/// It **is** declarable on an [`RootfsRegistration::UnpinnedPath`] entry, and that is §4.7's own
+/// scoping rather than an exception to it: vmcell packs no bytes for that shape, so it derives
+/// nothing, so there is nothing to contradict — and the operator pointing at a foreign image is the
+/// only party who can state whether it preserves attributes. Refusing the token there would leave
+/// the truth unsayable.
 ///
 /// # Errors
 /// [`crate::error::Error::Artifact`] naming the label and the offending token or value.
 fn rootfs_entry_features(
     label: &str,
+    registration: &RootfsRegistration,
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<std::collections::BTreeMap<crate::feature::Feature, bool>> {
     let Some(value) = obj.get("features") else {
@@ -1584,6 +1819,25 @@ fn rootfs_entry_features(
         let feature = crate::feature::Feature::parse(token).map_err(|e| {
             crate::error::Error::Artifact(format!("pins `rootfs.{label}.features`: {e}"))
         })?;
+        // The contradictory-pair reject (§4.7, §18 delta 7). Refused BEFORE the stance is read, so
+        // a declaration that happens to agree with the derivation is refused too: a second spelling
+        // of one fact is a desync waiting for the day somebody edits one of them.
+        //
+        // Scoped to the shape that HAS a derivation, through the one predicate: on an
+        // `unpinned_path` entry vmcell derives nothing (see `rootfs_registry_entry`), so the token
+        // is not a second spelling of anything — it is the only spelling, and the only party who
+        // knows the answer is the operator who produced the bytes.
+        if feature == crate::feature::Feature::XattrPreserved && registration.is_vmcell_built() {
+            return Err(crate::error::Error::Artifact(format!(
+                "pins `rootfs.{label}.features.{token}` cannot be declared: `{token}` is DERIVED \
+                 from this entry's `xattrs` key (§4.7) — `\"xattrs\": \"{}\"` derives \
+                 `{token} = true`, and `\"{}\"` (the default) derives `{token} = false`. Declare \
+                 the policy, not the stance: one fact, one key, so the packer and the artifact's \
+                 own manifest can never disagree",
+                XattrPolicy::Preserve.name(),
+                XattrPolicy::Strip.name()
+            )));
+        }
         let stance = stance.as_bool().ok_or_else(|| {
             crate::error::Error::Artifact(format!(
                 "pins `rootfs.{label}.features.{token}` must be the boolean `true` or `false`, \
@@ -4223,6 +4477,75 @@ mod tests {
         assert_ne!(
             none_key, empty,
             "an empty overlay file must not alias the no-overlay marker"
+        );
+    }
+
+    // THE CALL-SITE SCAN for the fast test bootstrap (§18 delta 7): the resolved `rootfs.default`
+    // entry's §4.7 xattr policy has to reach the IMAGE stage and its §7.4 declaration has to reach
+    // the SIDECAR stage. Two properties, two stages, one entry — and each of them is invisible to
+    // every other test in the tree if it is dropped here, because the fast bootstrap is what builds
+    // the artifacts dir the live suites boot from.
+    //
+    // RED on the inverse, either half: `RootfsStage::new()` without `.with_xattrs(...)` (the image
+    // packs under `Strip` while the entry says `Preserve`, and the cache-key assertion fails with
+    // two equal keys), or `RootfsFeaturesStage::labelled(None)` without `.with_features(...)` (the
+    // sidecar claims the baseline for an artifact that declared otherwise).
+    #[cfg(feature = "pipeline")]
+    #[test]
+    fn the_fast_bootstrap_carries_the_entry_policy_and_declaration() {
+        use crate::artifact::rootfs::RootfsStage;
+
+        let entry = RootfsRegistryEntry {
+            label: registry::DEFAULT_LABEL.to_string(),
+            registration: RootfsRegistration::Digest {
+                image: "i".to_string(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+            xattrs: XattrPolicy::Preserve,
+            features: [
+                (crate::feature::Feature::XattrPreserved, true),
+                (crate::feature::Feature::SnapshotRestore, false),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let (image, features) = fast_rootfs_stages(Some(&entry));
+
+        // The policy is observable only through the stage's IDENTITY, which is the honest place to
+        // read it: `cache_key` is what decides whether a warm artifacts dir is served, so a policy
+        // that does not move the key is a policy that never re-packs.
+        let inputs = StageInputs::default();
+        assert_eq!(
+            image.cache_key(&inputs),
+            RootfsStage::new()
+                .with_xattrs(XattrPolicy::Preserve)
+                .cache_key(&inputs),
+            "the entry's §4.7 policy must reach the image stage"
+        );
+        assert_ne!(
+            image.cache_key(&inputs),
+            RootfsStage::new()
+                .with_xattrs(XattrPolicy::Strip)
+                .cache_key(&inputs),
+            "…and the two policies must be two artifacts (non-vacuity)"
+        );
+        assert_eq!(
+            features.cache_key(&inputs),
+            crate::artifact::rootfs::RootfsFeaturesStage::labelled(None)
+                .with_features(entry.features.clone())
+                .cache_key(&inputs),
+            "the entry's §7.4 declaration must reach the sidecar stage"
+        );
+
+        // No entry at all (pins with no `rootfs` registry) is the pre-delta-7 packer exactly.
+        let (image, features) = fast_rootfs_stages(None);
+        assert_eq!(
+            image.cache_key(&inputs),
+            RootfsStage::new().cache_key(&inputs)
+        );
+        assert_eq!(
+            features.cache_key(&inputs),
+            crate::artifact::rootfs::RootfsFeaturesStage::labelled(None).cache_key(&inputs)
         );
     }
 }

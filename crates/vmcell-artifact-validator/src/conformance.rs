@@ -159,6 +159,17 @@ pub trait FeatureProbe {
 pub enum ProbePlan {
     /// Decidable by attempting the thing: snapshot the cell and restore it.
     SnapshotRoundTrip,
+    /// Decidable by reading attributes back in-guest: boot the artifact and walk its own rootfs
+    /// asking the `xattr` applet whether any path carries an extended attribute (§4.7, §18 delta 7).
+    ///
+    /// It became decidable when delta 7 landed the reader: before the applet there was no way to
+    /// ask a guest the question at all, which is why this feature sat on [`ProbePlan::Undecidable`]
+    /// with the rest. What it measures is stated exactly in
+    /// [`crate::checks::xattr_preserved_probe`] — "this artifact carries at least one extended
+    /// attribute" — and, deliberately, it does not distinguish a policy that stripped them from a
+    /// base that had none: both are the same fact about the artifact under test, which is the fact
+    /// the declaration claims.
+    XattrReadback,
     /// Not decidable by any observation this kit can make; the string says why, and what a
     /// decidable probe would need.
     Undecidable(&'static str),
@@ -193,6 +204,11 @@ pub fn probe_plan(feature: Feature) -> ProbePlan {
         // Decidable exactly as §10.6 says: "snapshot absence is testable by attempting a snapshot".
         Feature::SnapshotRestore => ProbePlan::SnapshotRoundTrip,
         Feature::NestedVirt => ProbePlan::Undecidable(NESTED_VIRT_UNDECIDABLE),
+        // Decidable since §18 delta 7 put a reader in the guest. Left `Undecidable` while the
+        // `xattr` applet did not exist; leaving it there once it did would have been the
+        // accepted-but-not-honored shape — a kit reporting "no data-plane probe" for the one
+        // artifact property it can now actually observe.
+        Feature::XattrPreserved => ProbePlan::XattrReadback,
         Feature::LazyRestore
         | Feature::VirtioFsShares
         | Feature::UnprivilegedVhostUserNet
@@ -201,7 +217,6 @@ pub fn probe_plan(feature: Feature) -> ProbePlan {
         | Feature::DiskIoThrottle
         | Feature::UsbHostPassthrough
         | Feature::ControlPlane
-        | Feature::XattrPreserved
         | Feature::ProcConfigGz => ProbePlan::Undecidable(NO_PROBE_YET),
     }
 }
@@ -519,7 +534,15 @@ pub fn judge(obs: &PairedObservation<'_>) -> CheckStatus {
 /// exercise — `crate::checks::snapshot_restore_roundtrip` needs a real guest to hand shake, so a
 /// fake-driven run of it would take the full handshake budget and always answer `DoesNotWork`. Its
 /// *dispatch* is unit-gated ([`probe_plan`]); its *execution* is covered only by the live
-/// `#[ignore]`d conformance leg in `tests/smoke.rs`, which `just test-validator` selects.
+/// `#[ignore]`d conformance legs in `tests/smoke.rs`, which `just test-validator` selects — one per
+/// decidable plan ([`ProbePlan::SnapshotRoundTrip`] and [`ProbePlan::XattrReadback`]).
+///
+/// What the xattr leg does **not** cover, stated rather than implied: the artifacts the validator
+/// suite has on hand are packed under [`vmcell::artifact::XattrPolicy::Strip`] (that is what
+/// `rootfs.default` declares), so the live leg drives the probe's `DoesNotWork` answer and its
+/// control pairing, never its `Works` answer. The `Works` side is proved against a real
+/// `Preserve`-packed image by `crates/vmcell/tests/xattr_policy.rs`, one crate over, which packs
+/// one and reads the attributes back through the same applet.
 #[derive(Clone, Copy, Debug)]
 pub struct LiveProbe<'a, V: Vmm> {
     vmm: &'a V,
@@ -542,6 +565,9 @@ impl<V: Vmm> FeatureProbe for LiveProbe<'_, V> {
                     Ok(()) => ProbeOutcome::Works,
                     Err(e) => ProbeOutcome::DoesNotWork(e),
                 }
+            }
+            ProbePlan::XattrReadback => {
+                crate::checks::xattr_preserved_probe(self.vmm, &subject.artifacts).await
             }
             ProbePlan::Undecidable(why) => ProbeOutcome::NotRun(why.to_string()),
         }
@@ -1414,6 +1440,29 @@ mod tests {
         assert!(
             why.contains("-cpu host"),
             "the reason must state WHY the obvious probe is not causal: {why}"
+        );
+    }
+
+    // §18 delta 7's promotion, as a plan assertion: the applet made the question askable, so the
+    // kit must stop saying it has no probe. The `NO_PROBE_YET` half is the discriminating one —
+    // a variant that merely gained a name would still carry the old reason.
+    //
+    // RED on the inverse: re-map `XattrPreserved` onto `ProbePlan::Undecidable(NO_PROBE_YET)`.
+    #[test]
+    fn the_xattr_stance_is_decided_by_an_in_guest_readback() {
+        assert_eq!(
+            probe_plan(Feature::XattrPreserved),
+            ProbePlan::XattrReadback,
+            "the `xattr` applet (§4.7, §18 delta 7) put a reader in the guest, so this feature is \
+             no longer undecidable — a kit that keeps saying `NO_PROBE_YET` for a question it can \
+             now answer is the accepted-but-not-honored shape"
+        );
+        // Non-vacuity: the promotion must not have been a blanket one. A feature with genuinely no
+        // probe still says so, and still says WHY.
+        assert_eq!(
+            probe_plan(Feature::ProcConfigGz),
+            ProbePlan::Undecidable(NO_PROBE_YET),
+            "promoting one feature must not promote the roster"
         );
     }
 

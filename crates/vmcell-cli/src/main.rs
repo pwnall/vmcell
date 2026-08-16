@@ -137,6 +137,26 @@ enum Commands {
         /// hard error, never a silent overwrite. A `,` cannot appear in a path.
         #[arg(long = "inject", value_parser = parse_inject)]
         inject: Vec<vmcell::artifact::rootfs::ExtraFile>,
+        /// Inject this prebuilt `vmcell-guest-tools` binary instead of building one from a vmcell
+        /// checkout (§4.2, v33 delta 7) — `--steward-musl`'s missing mirror, and what makes a
+        /// repack runnable from **outside** a checkout. Its CONTENT hash is what the cache keys
+        /// on, never this path, so re-staging the same binary under a fresh directory is a cache
+        /// hit. Without it, and with no vmcell sources above the working directory, the build
+        /// refuses naming `vmcell-guest-tools` rather than packing an image with no applets.
+        /// A durable alternative is a digest-pinned `handlers` registration (§10.5); this flag is
+        /// the per-run override shape, so an image packed with it carries no provenance for the
+        /// binary it baked.
+        #[arg(long)]
+        tools: Option<PathBuf>,
+        /// Parent directory for this invocation's staging tree (§4.2, v33 delta 7). Defaults to
+        /// the artifacts dir (`$VMCELL_ARTIFACTS_DIR`, else `<workspace>/target/vmcell-artifacts`),
+        /// which downstream lands under the caller's own `target/`. vmcell creates — and, at the
+        /// end, deletes — a per-invocation `oci2erofs-stage-<pid>` directory **inside** it, and
+        /// never touches the directory named here, so pointing this at a populated tree is safe.
+        /// The pulled-layer blob cache is not moved by this flag: it is a shared accelerator sited
+        /// on the artifacts dir, and `$VMCELL_ARTIFACTS_DIR` is its knob.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
         /// Pins overlay layered over vmcell's committed baseline (§10.2). Overrides `$VMCELL_PINS`.
         #[arg(long)]
         pins: Option<PathBuf>,
@@ -470,6 +490,7 @@ fn build_stages(
             rootfs_source,
             release,
             rootfs_label,
+            rootfs_entry.as_ref(),
             handler
                 .as_ref()
                 .map(vmcell::artifact::handler::HandlerRegistryEntry::applet_roster),
@@ -835,6 +856,7 @@ fn rootfs_stage(
     source: RootfsSourceKind,
     release: String,
     rootfs_label: Option<&str>,
+    rootfs_entry: Option<&vmcell::artifact::RootfsRegistryEntry>,
     applets: Option<Vec<String>>,
     cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
 ) -> Box<dyn vmcell::artifact::Stage> {
@@ -844,7 +866,15 @@ fn rootfs_stage(
         // invocation), so both arms compose nothing.
         RootfsSourceKind::Oci => Box::new(
             vmcell::artifact::rootfs::RootfsStage::labelled(rootfs_label)
-                .with_applets(applets.unwrap_or_default()),
+                .with_applets(applets.unwrap_or_default())
+                // §4.7's per-artifact xattr policy (§18 delta 7), from the SAME resolved entry the
+                // declaration stage beside it renders — so the bytes the packer produces and the
+                // `xattr_preserved` stance the sidecar claims are derived from one declaration.
+                // No entry (an artifacts dir built against pins with no `rootfs` registry) is the
+                // default `Strip`, which is the pre-delta-7 packer exactly.
+                .with_xattrs(
+                    rootfs_entry.map_or_else(vmcell::artifact::XattrPolicy::default, |e| e.xattrs),
+                ),
         ),
         // The mmdebstrap source builds from a release suite, not from a registered digest, so it
         // has no label to honor. `dispatch` refuses the combination before this point rather than
@@ -911,6 +941,8 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             output,
             steward_musl,
             inject,
+            tools,
+            work_dir,
             pins,
         } => {
             oci2erofs(
@@ -918,6 +950,8 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                 output,
                 steward_musl.as_deref(),
                 inject,
+                tools.as_deref(),
+                work_dir.as_deref(),
                 pins.as_deref(),
             )
             .await
@@ -1334,6 +1368,132 @@ fn format_usage_json(u: &vmcell::ResourceUsage) -> String {
     )
 }
 
+/// The handler stage `oci2-erofs` runs: `--tools`'s bytes when the flag is present, the pre-delta-7
+/// workspace build when it is not (§4.2, v33 delta 7).
+///
+/// Extracted from the pipeline assembly so the threading is assertable without running a build —
+/// the composition root is where a flag gets silently dropped, and a green unit test beside an
+/// unchanged call site is exactly the invisible PARTIAL the delta register warns about.
+///
+/// `oci2-erofs` exposes no `--handler-label`, so there is no registry entry here for the override to
+/// disagree with — and there could not be one anyway: the stage holds ONE source slot, which makes
+/// "two sources for one artifact" unrepresentable rather than merely refused.
+fn oci2erofs_tools_stage(
+    tools: Option<&std::path::Path>,
+) -> vmcell::artifact::guest_tools::GuestToolsStage {
+    match tools {
+        Some(path) => vmcell::artifact::guest_tools::GuestToolsStage::labelled(
+            None,
+            Some(vmcell::artifact::handler::HandlerSource::Prebuilt {
+                path: path.to_path_buf(),
+            }),
+        ),
+        None => vmcell::artifact::guest_tools::GuestToolsStage::new(),
+    }
+}
+
+/// Validates `--tools` (§4.2, v33 delta 7): the value must name a readable regular file.
+///
+/// Checked here rather than at the stage, so a typo costs an error message instead of a full OCI
+/// pull followed by one — and so the flag is *honored or rejected at construction* rather than
+/// accepted and discovered later (F1). A directory is called out separately because it is the
+/// mistake this flag invites: `--tools target/release` instead of `target/release/vmcell-guest-tools`.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] naming the flag, the path, and what was found there.
+fn validate_tools_binary(tools: Option<&std::path::Path>) -> vmcell::Result<Option<PathBuf>> {
+    let Some(path) = tools else {
+        return Ok(None);
+    };
+    let meta = std::fs::metadata(path).map_err(|e| {
+        vmcell::Error::Artifact(format!(
+            "`--tools {}` cannot be read: {e}. It must name a prebuilt `vmcell-guest-tools` \
+             binary — the mirror of `--steward-musl` (§4.2)",
+            path.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(vmcell::Error::Artifact(format!(
+            "`--tools {}` is not a regular file. It must name the prebuilt `vmcell-guest-tools` \
+             BINARY itself, not the directory holding it (§4.2)",
+            path.display()
+        )));
+    }
+    Ok(Some(path.to_path_buf()))
+}
+
+/// Resolves `--work-dir` to the parent the per-invocation staging tree is composed under (§4.2,
+/// v33 delta 7); `None` is the artifacts dir, which is the pre-delta-7 behavior exactly.
+///
+/// The directory is created if absent — a build flag that demands the operator `mkdir` first is a
+/// flag they will script around — and a non-directory is a loud refusal rather than a confusing
+/// failure three stages later.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] naming the flag and the path when it cannot be made a directory.
+fn resolve_work_dir(work_dir: Option<&std::path::Path>) -> vmcell::Result<PathBuf> {
+    let Some(dir) = work_dir else {
+        return Ok(vmcell::artifact::artifacts_dir());
+    };
+    std::fs::create_dir_all(dir).map_err(|e| {
+        vmcell::Error::Artifact(format!(
+            "`--work-dir {}` cannot be used as a staging parent: {e}. It must name a directory \
+             vmcell may create a per-invocation `oci2erofs-stage-<pid>` tree inside (§4.2)",
+            dir.display()
+        ))
+    })?;
+    Ok(dir.to_path_buf())
+}
+
+/// The per-invocation `oci2erofs-stage-<pid>` tree, owned — it is removed when this value drops, on
+/// **every** path out of [`oci2erofs`].
+///
+/// Teardown is ownership (AGENTS.md), and this tree used to be swept by two hand-placed
+/// `remove_dir_all` calls that between them covered the happy path and the copy's error path only:
+/// a `pipeline.build(...)?` failure returned early and left the tree on disk. Harmless while the
+/// parent was always the artifacts dir; an operator-visible accumulation in a directory they named
+/// once `--work-dir` existed (§4.2, v33 delta 7).
+///
+/// **The leaf is composed here and nowhere else**, which is what keeps the rule "the only directory
+/// vmcell may delete is one it composed itself" structural rather than remembered: this type cannot
+/// be handed an operator's `--work-dir` to remove, only a `<parent>/oci2erofs-stage-<pid>` it
+/// appended itself.
+struct StagingTree {
+    /// The composed leaf, and the only path this value will ever remove.
+    path: PathBuf,
+}
+
+impl StagingTree {
+    /// Composes (and creates) the per-invocation staging leaf under `parent`.
+    ///
+    /// Pre-cleans a leftover from a prior run killed hard enough to skip this type's `Drop` — the
+    /// same pid can come round again, and a stale tree would be served to the new run's stages.
+    ///
+    /// # Errors
+    /// [`vmcell::Error::Io`] if the leaf cannot be created; that is a refusal before any blob is
+    /// pulled, not a failure discovered by a stage minutes later.
+    fn compose_under(parent: &std::path::Path) -> vmcell::Result<Self> {
+        let path = parent.join(format!("oci2erofs-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).map_err(vmcell::Error::Io)?;
+        Ok(StagingTree { path })
+    }
+
+    /// The staging leaf the pipeline builds into.
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for StagingTree {
+    fn drop(&mut self) {
+        // Best-effort, and deliberately so: `Drop` cannot report, and a leftover scratch tree is
+        // not worth aborting a run that otherwise succeeded. The gate is that it RUNS on every
+        // path, which a `?` on the build call is what defeated.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Runs the full rootfs pipeline against an arbitrary digest-pinned OCI base image and
 /// writes the resulting erofs to `output` (v15 §4.2, Rootfs sources and the one packer).
 ///
@@ -1343,11 +1503,23 @@ fn format_usage_json(u: &vmcell::ResourceUsage) -> String {
 /// inject+pack tail as `vmcell build` — verify-every-blob → whiteouts → inject steward/CA/tools
 /// → erofs — only the base image (and the steward) are parameterized, so the runtime stays
 /// erofs-only.
+///
+/// `tools` (`--tools`) and `work_dir` (`--work-dir`) are §4.2's two severances (v33 delta 7): the
+/// first supplies a prebuilt `vmcell-guest-tools` so the pipeline needs no vmcell checkout, the
+/// second names where the staging tree lands. **Both absent reproduces the pre-delta-7 behavior
+/// exactly**, including the cache keys.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] when the image is not digest-pinned, when `--tools` does not name a
+/// readable file, or when `--work-dir` cannot be used as a directory — all three before any
+/// network work, so a mistyped argument costs no pull.
 async fn oci2erofs(
     image_ref: &str,
     output: &std::path::Path,
     steward_musl: Option<&std::path::Path>,
     inject: &[vmcell::artifact::rootfs::ExtraFile],
+    tools: Option<&std::path::Path>,
+    work_dir: Option<&std::path::Path>,
     pins: Option<&std::path::Path>,
 ) -> vmcell::Result<()> {
     // Reject a tag: require `IMAGE@sha256:DIGEST`. The digest is whatever follows the last `@`.
@@ -1361,17 +1533,27 @@ async fn oci2erofs(
     // `sha256:` followed by anything (empty, wrong length, non-hex).
     validate_oci_digest(digest)?;
 
+    // Both flags are honored-or-rejected HERE, before the pipeline is assembled and therefore
+    // before any blob is pulled: a mistyped `--tools` must cost an error message, not a download.
+    let tools = validate_tools_binary(tools)?;
+    let work_parent = resolve_work_dir(work_dir)?;
+
     // Build into a per-invocation staging dir, NOT the canonical `artifacts_dir` root
     // (M-BIN-6): the rootfs stage writes `<target_dir>/rootfs.erofs`, so building at
     // `artifacts_dir` would clobber the canonical `rootfs.erofs` that every test/bench
     // boots. The staging dir is a *distinct sibling* under `artifacts_dir` (same real
     // disk — not the system temp dir, which is often a size-limited tmpfs), so a large
-    // rootfs has room. Copy only the final image out to `--output`. Trade-off: the
-    // staging dir has no cache history, so the steward/tools/rootfs stages rebuild.
-    let stage_dir =
-        vmcell::artifact::artifacts_dir().join(format!("oci2erofs-stage-{}", std::process::id()));
-    // Best-effort pre-clean of a stale staging dir from a prior aborted run.
-    let _ = std::fs::remove_dir_all(&stage_dir);
+    // rootfs has room. `--work-dir` renames that parent and nothing else (§4.2, v33 delta 7):
+    // the per-pid leaf stays, because the leaf is DELETED when this scope ends and the only
+    // directory vmcell may ever delete is one it composed itself. Copy only the final image out
+    // to `--output`. Trade-off: the staging dir has no cache history, so the steward/tools/rootfs
+    // stages rebuild.
+    //
+    // Owned by `StagingTree`, so the sweep covers the `?` below as well as the success path: two
+    // hand-placed `remove_dir_all`s used to cover the happy path and the copy's error path, and a
+    // failed `pipeline.build(...)` returned between them and left the tree behind.
+    let stage = StagingTree::compose_under(&work_parent)?;
+    let stage_dir = stage.path().to_path_buf();
     let mut pipeline = vmcell::artifact::Pipeline::new(stage_dir.clone()).add_stage(Box::new(
         vmcell::artifact::ResolvePinsStage {
             overlay_file: pins_overlay(pins),
@@ -1383,9 +1565,7 @@ async fn oci2erofs(
         pipeline = pipeline.add_stage(Box::new(vmcell::artifact::steward::StewardStage {}));
     }
     pipeline = pipeline
-        .add_stage(Box::new(
-            vmcell::artifact::guest_tools::GuestToolsStage::new(),
-        ))
+        .add_stage(Box::new(oci2erofs_tools_stage(tools.as_deref())))
         .add_stage(Box::new(
             vmcell::artifact::rootfs::RootfsStage::new()
                 .with_image_override(image.to_string(), digest.to_string())
@@ -1400,12 +1580,10 @@ async fn oci2erofs(
     // The rootfs stage writes `<stage_dir>/rootfs.erofs`; copy it to the requested
     // output, leaving the canonical `artifacts_dir/rootfs.erofs` untouched (M-BIN-6).
     let built = stage_dir.join("rootfs.erofs");
-    let copy_res = std::fs::copy(&built, output).map_err(vmcell::Error::Io);
-    // Best-effort cleanup of the staging dir regardless of the copy result; it is a
-    // per-pid scratch dir under the artifacts dir (a distinct sibling of the canonical
-    // rootfs, M-BIN-6), so a leftover is not actionable.
-    let _ = std::fs::remove_dir_all(&stage_dir);
-    copy_res?;
+    // No cleanup call here: `stage` sweeps the tree when this scope ends, which is the same moment
+    // on the copy's error path and on the success path — and, unlike the two calls this replaced,
+    // also on the `?` above.
+    std::fs::copy(&built, output).map_err(vmcell::Error::Io)?;
     println!("vmcell: wrote erofs rootfs to {}", output.display());
     Ok(())
 }
@@ -1868,6 +2046,78 @@ mod tests {
         );
     }
 
+    // THE CALL-SITE SCAN for `vmcell build` (§18 delta 7): the selected label's §4.7 xattr policy
+    // reaches the IMAGE stage the pipeline actually runs, not merely the entry `build_stages`
+    // resolved. A policy that stops at the entry is a declaration a consumer built a fixture on —
+    // the image packs under the pre-delta-7 default while the sidecar beside it claims the
+    // attributes survived.
+    //
+    // Read through `Stage::cache_key`, which is the only observable a `dyn Stage` has and the
+    // honest one anyway: the key is what decides whether the warm artifacts dir is served, so a
+    // policy that does not move it is a policy that never re-packs.
+    //
+    // RED on dropping `.with_xattrs(...)` from `rootfs_stage`'s OCI arm: the assembled stage keys
+    // as `Strip`, so the first assertion fails (`left` = the `Strip` key) and the second — the
+    // non-vacuity control — starts passing for the wrong reason, which is why both are here.
+    #[test]
+    fn the_build_pipelines_rootfs_stage_carries_the_labels_xattr_policy() {
+        use vmcell::artifact::rootfs::{RootfsStage, rootfs_artifact_key};
+        use vmcell::artifact::{Stage, StageInputs, XattrPolicy, resolve_pins};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay.json");
+        std::fs::write(
+            &overlay,
+            format!(
+                r#"{{ "rootfs": {{ "{}": {{ "image": "docker.io/library/debian",
+                     "digest": "sha256:{}", "xattrs": "preserve" }} }} }}"#,
+                vmcell::artifact::registry::DEFAULT_LABEL,
+                "a".repeat(64)
+            ),
+        )
+        .expect("write overlay");
+
+        let stages = build_stages(
+            KernelSource::Prebuilt,
+            RootfsSourceKind::Oci,
+            "trixie".to_string(),
+            None,
+            None,
+            Some(&overlay),
+            std::sync::Arc::new(vmcell::vmm::CidAllocator::new()),
+        )
+        .expect("a declaring registry entry must assemble");
+
+        let mut inputs = StageInputs::default();
+        inputs.pins = resolve_pins(Some(&overlay)).expect("the overlay resolves");
+        let image = stages
+            .iter()
+            .find(|s| s.name() == rootfs_artifact_key(None))
+            .expect("the image stage");
+        // Same applet roster the composition root hands it, so the comparison isolates the ONE
+        // property under test rather than depending on which fields the key happens to fold.
+        let applets = resolve_handler_entry(None, Some(&overlay))
+            .expect("the handler registry resolves")
+            .map(|e| e.applet_roster())
+            .unwrap_or_default();
+        let expected = |policy| {
+            RootfsStage::labelled(None)
+                .with_applets(applets.clone())
+                .with_xattrs(policy)
+                .cache_key(&inputs)
+        };
+        assert_eq!(
+            image.cache_key(&inputs),
+            expected(XattrPolicy::Preserve),
+            "the entry's `xattrs` policy must reach the image stage `vmcell build` runs (§4.7)"
+        );
+        assert_ne!(
+            image.cache_key(&inputs),
+            expected(XattrPolicy::Strip),
+            "…and the two policies must be two artifacts (non-vacuity)"
+        );
+    }
+
     // M3's other half, and delta 3's own gate: the in-VM producer's working route STILL works —
     // `build-kernels` stages the prebuilt seed (the `kernel` key the builder VM boots from) ahead
     // of the labelled stages, which is exactly what `build` structurally cannot do. RED on the
@@ -2321,6 +2571,309 @@ mod tests {
         assert!(
             manifest.exists(),
             "the positive control must actually produce a manifest"
+        );
+    }
+
+    // §4.2 (v33 delta 7): the `--tools`/`--work-dir` argument surface, on the same terms
+    // `parse_inject` is held to — a well-formed value PARSES and reaches the variant, and a
+    // malformed one is named rather than ignored. Neither flag has a `value_parser` (both are
+    // plain paths), so "malformed" is semantic: a `--tools` that names nothing, or names a
+    // directory instead of the binary; a `--work-dir` that cannot be a directory.
+    //
+    // RED on the inverse, four ways: (a) drop either field from the `Oci2Erofs` variant — this
+    // does not compile, the strongest form; (b) make `validate_tools_binary` return `Ok` for a
+    // missing path — the pipeline then runs a full OCI pull before failing, and the operator's
+    // typo costs a download; (c) drop the `is_file` check — `--tools target/release` is accepted
+    // and the copy fails three stages later naming a directory the operator did not type;
+    // (d) make `resolve_work_dir` ignore its argument — the staging tree lands in the artifacts
+    // dir the flag existed to move it out of.
+    #[test]
+    fn oci2erofs_tools_and_work_dir_are_honored_or_named() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tools = dir.path().join("vmcell-guest-tools");
+        std::fs::write(&tools, b"prebuilt").expect("seed the --tools target");
+
+        // 1. The positive control: both flags parse and land on the variant.
+        let parsed = Cli::try_parse_from([
+            "vmcell",
+            "oci2-erofs",
+            "debian:trixie-slim@sha256:abc",
+            "-o",
+            "/tmp/out.erofs",
+            "--tools",
+            tools.to_str().expect("utf-8 fixture path"),
+            "--work-dir",
+            "/tmp/vmcell-wd",
+        ])
+        .expect("both flags must parse");
+        match parsed.command {
+            Commands::Oci2Erofs {
+                tools: t,
+                work_dir: w,
+                ..
+            } => {
+                assert_eq!(t.as_deref(), Some(tools.as_path()));
+                assert_eq!(w.as_deref(), Some(std::path::Path::new("/tmp/vmcell-wd")));
+            }
+            other => panic!(
+                "expected Oci2Erofs, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        // …and their ABSENCE parses to `None`, which is what "additive, absence reproduces
+        // today's behavior" has to mean at the argument surface.
+        match Cli::try_parse_from(["vmcell", "oci2-erofs", "img@sha256:abc", "-o", "/tmp/o"])
+            .expect("the flags are optional")
+            .command
+        {
+            Commands::Oci2Erofs {
+                tools: t,
+                work_dir: w,
+                ..
+            } => assert!(t.is_none() && w.is_none()),
+            other => panic!(
+                "expected Oci2Erofs, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // 2. `--tools`, honored and refused.
+        assert_eq!(
+            validate_tools_binary(None).expect("absent is legal"),
+            None,
+            "an absent `--tools` is the pre-delta-7 workspace build, not an error"
+        );
+        assert_eq!(
+            validate_tools_binary(Some(&tools)).expect("a readable file is legal"),
+            Some(tools.clone())
+        );
+        for (label, path, needle) in [
+            (
+                "a path that is not there",
+                dir.path().join("nope"),
+                "--tools",
+            ),
+            (
+                "a directory",
+                dir.path().to_path_buf(),
+                "not a regular file",
+            ),
+        ] {
+            let msg = validate_tools_binary(Some(&path))
+                .map(|v| format!("{v:?}"))
+                .expect_err(&format!("{label} must be refused"))
+                .to_string();
+            assert!(
+                msg.contains(needle) && msg.contains(&path.display().to_string()),
+                "{label} must be named ({needle} + the path), got: {msg}"
+            );
+        }
+
+        // 3. `--work-dir`, honored and refused. Absent is the artifacts dir — the one fact that
+        // makes "absence reproduces today's behavior exactly" true of the staging tree.
+        assert_eq!(
+            resolve_work_dir(None).expect("absent is legal"),
+            vmcell::artifact::artifacts_dir()
+        );
+        let wanted = dir.path().join("nested/work");
+        assert_eq!(
+            resolve_work_dir(Some(&wanted)).expect("a nameable directory is legal"),
+            wanted
+        );
+        assert!(
+            wanted.is_dir(),
+            "`--work-dir` must be created, not demanded"
+        );
+        let a_file = dir.path().join("a-file");
+        std::fs::write(&a_file, b"not a dir").expect("seed");
+        let msg = resolve_work_dir(Some(&a_file))
+            .map(|p| p.display().to_string())
+            .expect_err("a file cannot be a staging parent")
+            .to_string();
+        assert!(
+            msg.contains("--work-dir") && msg.contains(&a_file.display().to_string()),
+            "the refusal must name the flag and the path, got: {msg}"
+        );
+    }
+
+    // The call-site scan beside the gate above (§4.2, v33 delta 7): `--tools` must reach the stage
+    // `oci2-erofs` actually runs, and its absence must leave that stage byte-identical to the
+    // pre-delta-7 `GuestToolsStage::new()`. The observable is `Stage::cache_key` — the only one a
+    // stage has, and the honest one, since the key is what decides a warm-cache hit.
+    //
+    // RED on the inverse: `oci2erofs_tools_stage` ignoring its argument (the "green unit test
+    // beside an unchanged call site" shape) collapses the two keys into one.
+    #[test]
+    fn the_tools_flag_reaches_the_stage_oci2erofs_runs() {
+        use vmcell::artifact::Stage as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tools = dir.path().join("vmcell-guest-tools");
+        std::fs::write(&tools, b"prebuilt").expect("seed");
+        let inputs = vmcell::artifact::StageInputs::default();
+
+        let with = oci2erofs_tools_stage(Some(&tools)).cache_key(&inputs);
+        let without = oci2erofs_tools_stage(None).cache_key(&inputs);
+        assert_ne!(
+            with, without,
+            "`--tools` must reach the stage; an ignored flag would pack a workspace build under \
+             the operator's nose"
+        );
+        assert_eq!(
+            without,
+            vmcell::artifact::guest_tools::GuestToolsStage::new().cache_key(&inputs),
+            "no `--tools` is the pre-delta-7 stage exactly — the migration promise is that the \
+             default cache key does not move"
+        );
+        assert_eq!(
+            with,
+            vmcell::artifact::guest_tools::GuestToolsStage::labelled(
+                None,
+                Some(vmcell::artifact::handler::HandlerSource::Prebuilt {
+                    path: tools.clone()
+                })
+            )
+            .cache_key(&inputs),
+            "the flag must compose the per-run OVERRIDE shape, not a registration"
+        );
+    }
+
+    // The two flags are validated BEFORE the pipeline is assembled, so a mistyped argument costs
+    // an error message rather than a full digest-pinned OCI pull. Driven through the verb itself
+    // (not the validators) because that ordering is a property of the verb: a check that exists
+    // but runs after `Pipeline::build` is a check the operator waits minutes for.
+    //
+    // RED on the inverse (move `validate_tools_binary` below the `pipeline.build(...)` call): this
+    // test stops returning promptly and starts trying to reach a registry.
+    #[test]
+    fn a_bad_tools_path_is_refused_before_any_pull() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = rt
+            .block_on(oci2erofs(
+                &format!("debian:trixie-slim@sha256:{}", "a".repeat(64)),
+                &dir.path().join("out.erofs"),
+                None,
+                &[],
+                Some(&dir.path().join("no-such-tools")),
+                Some(&dir.path().join("wd")),
+                None,
+            ))
+            .expect_err("a `--tools` path that is not there is a hard stop");
+        assert!(
+            err.to_string().contains("--tools"),
+            "the verb must surface the flag's own refusal, got: {err}"
+        );
+        // Nothing was staged for the refused run: the staging tree is composed after the checks.
+        assert!(
+            !dir.path()
+                .join("wd")
+                .join(format!("oci2erofs-stage-{}", std::process::id()))
+                .exists(),
+            "a refused invocation must leave no staging residue"
+        );
+    }
+
+    // THE RESIDUE SHAPE, on the owner itself: the tree exists before the drop and is gone after it
+    // (AGENTS.md's residue rule, stated in that order so the check cannot pass vacuously against a
+    // tree that was never created).
+    //
+    // Also the composition law: the value can only ever remove a leaf IT appended, which is what
+    // makes "the only directory vmcell may delete is one it composed itself" structural. An
+    // operator's `--work-dir` is the parent and must survive — asserted, because a `StagingTree`
+    // that took the parent verbatim would `rm -rf` the directory they named.
+    //
+    // RED on the inverse: drop the `Drop` impl (the second assertion fails), or have
+    // `compose_under` keep `parent` as its own path (the third fails, and the operator's directory
+    // is gone).
+    #[test]
+    fn the_staging_tree_is_swept_on_drop_and_only_ever_owns_what_it_composed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("work");
+        let leaf = {
+            let stage = StagingTree::compose_under(&parent).expect("composing the staging leaf");
+            assert!(
+                stage.path().is_dir(),
+                "the staging tree must exist while the run owns it, or the residue check below \
+                 proves nothing"
+            );
+            assert!(
+                stage.path().starts_with(&parent) && stage.path() != parent,
+                "the leaf must be composed UNDER the parent and never be the parent itself: {}",
+                stage.path().display()
+            );
+            stage.path().to_path_buf()
+        };
+        assert!(
+            !leaf.exists(),
+            "the staging tree must be gone once its owner drops: {}",
+            leaf.display()
+        );
+        assert!(
+            parent.is_dir(),
+            "the operator's `--work-dir` is the PARENT and must survive; only the composed leaf is \
+             vmcell's to delete"
+        );
+    }
+
+    // The gap the owner closes, end to end through the verb: a run whose PIPELINE fails must leave
+    // no staging residue. The two hand-placed `remove_dir_all`s this replaced covered the happy
+    // path and the copy's error path; `pipeline.build(...)?` returned between them, so every failed
+    // pack accumulated a tree in the directory `--work-dir` names.
+    //
+    // The failure is forced with an unreadable `--pins` overlay: `ResolvePinsStage` is the FIRST
+    // stage, so this reaches `pipeline.build` and fails there without a network round trip — and
+    // the refusal is the pipeline's, not one of the pre-pipeline flag checks, which is asserted so
+    // the leg cannot silently degrade into a copy of `a_bad_tools_path_is_refused_before_any_pull`.
+    //
+    // Non-vacuity: `--work-dir` is a fresh directory, so "no residue" is "the parent is EMPTY", and
+    // the sibling test above is what proves the tree was really created in the first place.
+    //
+    // RED on the inverse: restore the two hand-placed sweeps and drop the `StagingTree` owner —
+    // the parent is left holding `oci2erofs-stage-<pid>`.
+    #[test]
+    fn a_failed_pipeline_leaves_no_staging_residue() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bad_pins = dir.path().join("broken-pins.json");
+        std::fs::write(&bad_pins, b"{ this is not json").expect("write the broken overlay");
+        let work = dir.path().join("wd");
+
+        let err = rt
+            .block_on(oci2erofs(
+                &format!("debian:trixie-slim@sha256:{}", "a".repeat(64)),
+                &dir.path().join("out.erofs"),
+                None,
+                &[],
+                None,
+                Some(&work),
+                Some(&bad_pins),
+            ))
+            .expect_err("an unreadable pins overlay must fail the pipeline");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("--tools") && !msg.contains("--work-dir"),
+            "this leg must reach the PIPELINE, not a pre-pipeline flag refusal; got: {msg}"
+        );
+        assert!(
+            work.is_dir(),
+            "`--work-dir` is created up front and is the operator's, so it survives the failure"
+        );
+        let residue: Vec<_> = std::fs::read_dir(&work)
+            .expect("the work dir is readable")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "a failed pipeline must leave no staging tree in the directory the operator named, \
+             found {residue:?}"
         );
     }
 }

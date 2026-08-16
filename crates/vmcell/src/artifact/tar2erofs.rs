@@ -8,6 +8,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// The artifact's extended-attribute policy (design §4.7), re-exported where the packer that
+/// honors it lives.
+///
+/// **Defined** in [`crate::artifact`] rather than here, and that is forced rather than stylistic:
+/// the policy is an entry-level property of a `rootfs` registry entry
+/// ([`crate::artifact::RootfsRegistryEntry::xattrs`], §18 delta 7), the registry parser is compiled
+/// in **every** feature configuration, and this module is gated on `am-fs-erofs`. A definition here
+/// would not exist for the entry that declares it.
+pub use crate::artifact::XattrPolicy;
+
 /// A `(dest_path, source_path, mode)` file inserted into the merged tree after every layer.
 ///
 /// `mode` is `None` for vmcell's own manifest entries — they take the
@@ -50,10 +60,112 @@ fn insert_injected_file(
         mode,
         data: content,
         meta,
+        // NOT a policy site (§4.7, invariant F5): vmcell's own injections — and the downstream
+        // `ExtraFile`s, which are regular files a caller named, never a source layer — carry no
+        // xattrs under EITHER policy. `ExtraFile` has no xattr field to carry, and the steward/CA/
+        // guest-tools entries are vmcell's, so nothing a consumer declares may add attributes to
+        // them. Leaving this `vec![]` is the requirement, not a missed site.
         xattrs: vec![],
     };
     entries.insert(normalize_path(Path::new(dest_path)), node);
     Ok(())
+}
+
+/// The PAX-record prefix every `SCHILY.xattr.<full name>` extended attribute arrives under.
+#[cfg(feature = "am-fs-erofs")]
+const PAX_SCHILY_XATTR: &str = "SCHILY.xattr.";
+
+/// Reads one tar entry's extended attributes as EROFS [`XattrSpec`]s, honoring `policy` (§4.7).
+///
+/// The ONE tar→xattr decode: the six tar-derived node arms below all call it, so the namespace
+/// mapping and the `Strip` short-circuit exist in exactly one place and no arm can quietly grow a
+/// second reading of the same PAX records.
+///
+/// Under [`XattrPolicy::Strip`] it reads nothing at all — not the records, not the entry — so the
+/// default artifact's pack is byte-for-byte the pre-v33 pack and cannot fail on a record shape it
+/// never looks at.
+///
+/// # Scope
+/// `SCHILY.xattr.*` only — the convention GNU tar, libarchive's `--xattrs` and every OCI layer
+/// producer in practice emit. `LIBARCHIVE.xattr.*` (whose values are base64) is deliberately NOT
+/// decoded: guessing at an encoding would fabricate attribute bytes, and a base carrying only that
+/// shape is better served by re-tarring it than by vmcell inventing a second reading.
+///
+/// The namespace prefix is folded into EROFS's `name_index` the way `mkfs.erofs` does; a name
+/// under no known namespace is stored raw (`ns::RAW`), which `fs_erofs::xattr::resolve_full_name`
+/// reconstructs byte-for-byte. The result is sorted by `(name_index, name)` so an image's inode
+/// bytes do not depend on the order a producer happened to write the records in.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] when a PAX record cannot be parsed or its key is not UTF-8 —
+/// fail loud, never a silent drop: under `Preserve` the caller asked for these bytes, so packing
+/// an image that quietly lacks them is exactly the accepted-then-ignored class.
+#[cfg(feature = "am-fs-erofs")]
+fn tar_entry_xattrs<R: Read>(
+    file: &mut tar::Entry<'_, R>,
+    policy: XattrPolicy,
+) -> crate::error::Result<Vec<fs_erofs::mkfs::XattrSpec>> {
+    if policy == XattrPolicy::Strip {
+        return Ok(vec![]);
+    }
+    // A pax header entry that reaches the caller's match is either skipped (`g`, the archive-wide
+    // global header, which names no filesystem object) or REJECTED naming the member (`x`, an
+    // unfolded local header — `tar` could not attach it to the member that follows, so that member
+    // may carry a truncated path). Reading its body here would consume bytes neither outcome does,
+    // and would replace that named refusal with a decode error. Neither carries attributes for a
+    // node, because neither becomes one.
+    let entry_type = file.header().entry_type();
+    if entry_type.is_pax_global_extensions() || entry_type.is_pax_local_extensions() {
+        return Ok(vec![]);
+    }
+    let Some(extensions) = file
+        .pax_extensions()
+        .map_err(|e| crate::error::Error::Artifact(format!("cannot read pax extensions: {e}")))?
+    else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for extension in extensions {
+        let extension = extension.map_err(|e| {
+            crate::error::Error::Artifact(format!("malformed pax extension record: {e}"))
+        })?;
+        let key = extension.key().map_err(|e| {
+            crate::error::Error::Artifact(format!("pax extension key is not UTF-8: {e}"))
+        })?;
+        let Some(full_name) = key.strip_prefix(PAX_SCHILY_XATTR) else {
+            // Every other pax record (`path`, `mtime`, `size`, GNU sparse…) describes the member
+            // itself and is consumed by `tar` already; it is not an extended attribute.
+            continue;
+        };
+        out.push(xattr_spec(full_name, extension.value_bytes()));
+    }
+    out.sort_by(|a, b| (a.name_index, &a.name).cmp(&(b.name_index, &b.name)));
+    Ok(out)
+}
+
+/// Splits a full attribute name (`security.capability`) into EROFS's `(name_index, suffix)` form.
+///
+/// Pure and separate from the PAX walk above so the namespace table is unit-testable without
+/// building a tar. The ACL slots (`system.posix_acl_access`/`_default`) carry their whole name in
+/// the index and an EMPTY suffix — that is the on-disk shape, not an omission.
+#[cfg(feature = "am-fs-erofs")]
+fn xattr_spec(full_name: &str, value: &[u8]) -> fs_erofs::mkfs::XattrSpec {
+    use fs_erofs::xattr::ns;
+    let (name_index, suffix) = match full_name {
+        "system.posix_acl_access" => (ns::POSIX_ACL_ACCESS, ""),
+        "system.posix_acl_default" => (ns::POSIX_ACL_DEFAULT, ""),
+        _ => match full_name.split_once('.') {
+            Some(("user", rest)) => (ns::USER, rest),
+            Some(("trusted", rest)) => (ns::TRUSTED, rest),
+            Some(("security", rest)) => (ns::SECURITY, rest),
+            Some(("lustre", rest)) => (ns::LUSTRE, rest),
+            // No known namespace prefix: store the name RAW (index 0), which is what
+            // `resolve_full_name` reads back unchanged. Rejecting it would fail a pack over an
+            // attribute the kernel itself would have accepted.
+            _ => (ns::RAW, full_name),
+        },
+    };
+    fs_erofs::mkfs::XattrSpec::new(name_index, suffix.as_bytes().to_vec(), value.to_vec())
 }
 
 /// Builds the flat `path -> Node` map from the injected files/symlinks and the given tar
@@ -72,18 +184,23 @@ fn insert_injected_file(
 /// dest that collides with vmcell's own list, so the two sets are disjoint by construction; the
 /// insert order is the structural backstop.
 ///
+/// `xattrs` is the artifact's [`XattrPolicy`] (§4.7) and governs the **tar-derived** nodes only:
+/// the injected and synthesized nodes carry none under either policy (invariant F5).
+///
 /// # Errors
 /// Returns [`crate::error::Error::Artifact`] if an injected file or an archive entry cannot be
 /// read, or if an archive member carries an entry type this packer has no node for (contiguous,
 /// GNU-sparse, an unfolded `x`/`L`/`K` extension header, or an unknown type byte) — such a member
 /// is rejected, never dropped, because a dropped member packs a rootfs that boots as if complete.
 /// The archive-wide pax global header (`g`) names no filesystem object and is the one skipped type.
+/// Under [`XattrPolicy::Preserve`], also if a member's PAX records cannot be decoded.
 #[cfg(feature = "am-fs-erofs")]
 fn build_node_map<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
     extra_files: Vec<InjectedFile<'_>>,
     injected_files: Vec<InjectedFile<'_>>,
     injected_symlinks: Vec<(&str, &str)>,
+    xattr_policy: XattrPolicy,
 ) -> crate::error::Result<HashMap<PathBuf, Node>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
@@ -113,30 +230,35 @@ fn build_node_map<'a, R: Read + 'a>(
 
             let mode = file.header().mode().unwrap_or(0) as u16;
 
+            // This member's source xattrs, read ONCE through the one decode (§4.7). Read here,
+            // before the arms, because the `Regular` arm consumes the entry body below and the
+            // PAX records have to be taken off the entry first. `Strip` reads nothing.
+            let xattrs = tar_entry_xattrs(&mut file, xattr_policy)?;
+
             let node = match file.header().entry_type() {
                 tar::EntryType::Regular => {
                     let mut data = Vec::new();
                     file.read_to_end(&mut data)
                         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
-                    // Accepted limitation: PAX SCHILY.xattr records (incl.
-                    // `security.capability`) are intentionally NOT preserved — the
-                    // steward and every in-guest `exec` run as root (§4.2), so
-                    // file capabilities are moot; the erofs Node/XattrSpec plumbing
-                    // exists but is unused. Pinned by
-                    // `tests::test_pax_xattrs_are_not_preserved`. Retire this note if
-                    // xattr passthrough is implemented.
+                    // The artifact's xattr policy decides (§4.7, §18 delta 7), and this arm is
+                    // the one the decision was written for: `security.capability` rides a
+                    // regular file. Under `Strip` — the default, and every artifact vmcell
+                    // itself ships — `xattrs` is empty and the packed bytes are what the
+                    // pre-v33 packer produced. Under `Preserve` the member's PAX
+                    // `SCHILY.xattr.*` records are carried into the inode. Both directions are
+                    // pinned by the `tests::pax_xattrs_are_*` pair.
                     Node::File {
                         mode: mode | fs_erofs::inode::S_IFREG,
                         data,
                         meta,
-                        xattrs: vec![],
+                        xattrs,
                     }
                 }
                 tar::EntryType::Directory => Node::Dir {
                     mode: mode | fs_erofs::inode::S_IFDIR,
                     entries: BTreeMap::new(),
                     meta,
-                    xattrs: vec![],
+                    xattrs,
                 },
                 tar::EntryType::Symlink => {
                     let target = file
@@ -149,7 +271,7 @@ fn build_node_map<'a, R: Read + 'a>(
                         mode: mode | fs_erofs::inode::S_IFLNK,
                         target,
                         meta,
-                        xattrs: vec![],
+                        xattrs,
                     }
                 }
                 tar::EntryType::Char => {
@@ -167,7 +289,7 @@ fn build_node_map<'a, R: Read + 'a>(
                         mode: mode | fs_erofs::inode::S_IFCHR,
                         rdev: libc::makedev(major as libc::c_uint, minor as libc::c_uint) as u32,
                         meta,
-                        xattrs: vec![],
+                        xattrs,
                     }
                 }
                 tar::EntryType::Block => {
@@ -185,13 +307,13 @@ fn build_node_map<'a, R: Read + 'a>(
                         mode: mode | fs_erofs::inode::S_IFBLK,
                         rdev: libc::makedev(major as libc::c_uint, minor as libc::c_uint) as u32,
                         meta,
-                        xattrs: vec![],
+                        xattrs,
                     }
                 }
                 tar::EntryType::Fifo => Node::Special {
                     mode: mode | fs_erofs::inode::S_IFIFO,
                     meta,
-                    xattrs: vec![],
+                    xattrs,
                 },
                 // A hardlink must NOT be silently dropped (H-ART-2): the default Debian base
                 // carries e.g. `usr/bin/perl5.NN` -> `usr/bin/perl`, which would otherwise
@@ -201,6 +323,14 @@ fn build_node_map<'a, R: Read + 'a>(
                 // merged tree. Fail loud (never `_ => continue`) only if the target is absent
                 // or is not a regular file. (`tar::EntryType` is non-exhaustive, so the
                 // trailing `_` still catches genuinely-unknown future types.)
+                //
+                // XATTRS (§4.7, §18 delta 7): this arm keeps the merged TARGET's xattrs and
+                // discards this member's own, under both policies — the eleventh
+                // node-construction site, and the one §4.7's "ten" does not count. It is not an
+                // oversight: xattrs are an inode property, a hardlink IS the target's inode, so a
+                // link entry cannot legitimately carry a different set, and this arm already
+                // discards this member's `mode` and `meta` for exactly that reason. Pinned by
+                // `tests::hardlink_inherits_the_targets_xattrs`.
                 tar::EntryType::Link => {
                     let target = file
                         .link_name()
@@ -217,12 +347,14 @@ fn build_node_map<'a, R: Read + 'a>(
                             mode,
                             data,
                             meta,
-                            xattrs,
+                            xattrs: target_xattrs,
                         }) => Node::File {
                             mode: *mode,
                             data: data.clone(),
                             meta: *meta,
-                            xattrs: xattrs.clone(),
+                            // The TARGET's, deliberately — see the arm's comment above. `xattrs`
+                            // (this member's own) is dropped here under both policies.
+                            xattrs: target_xattrs.clone(),
                         },
                         Some(_) => {
                             return Err(crate::error::Error::Artifact(format!(
@@ -323,6 +455,9 @@ fn build_node_map<'a, R: Read + 'a>(
                 mtime: 0,
                 mtime_nsec: 0,
             },
+            // NOT a policy site (§4.7, invariant F5): an applet symlink is vmcell's own,
+            // synthesized from the handler roster rather than read from a source layer, so it has
+            // no source xattrs to preserve and a consumer's declaration may not give it any.
             xattrs: vec![],
         };
         entries.insert(normalize_path(Path::new(dest_path)), node);
@@ -339,15 +474,22 @@ fn build_node_map<'a, R: Read + 'a>(
 /// lives (every key relative, non-empty, and free of `..`, since `normalize_path` POPS a parent
 /// component rather than escaping with it). Returns the keys only; the `Node` values stay private.
 ///
+/// `xattr_policy` is the artifact's [`XattrPolicy`]: `Preserve` additionally drives the PAX
+/// `SCHILY.xattr.*` decode, which is a parse surface fed by the same registry-authored bytes and
+/// is unreachable under the default `Strip`.
+///
 /// # Errors
 /// Propagates `build_node_map`'s error for an unreadable or unsupported archive member.
 #[cfg(all(feature = "fuzzing", feature = "am-fs-erofs"))]
 pub fn fuzz_node_paths<'a, R: Read + 'a>(
     archives: impl IntoIterator<Item = tar::Archive<R>>,
+    xattr_policy: XattrPolicy,
 ) -> crate::error::Result<Vec<PathBuf>> {
-    Ok(build_node_map(archives, vec![], vec![], vec![])?
-        .into_keys()
-        .collect())
+    Ok(
+        build_node_map(archives, vec![], vec![], vec![], xattr_policy)?
+            .into_keys()
+            .collect(),
+    )
 }
 
 /// Converts a tar archive to an EROFS filesystem image.
@@ -358,6 +500,10 @@ pub fn fuzz_node_paths<'a, R: Read + 'a>(
 /// authoritative. Missing parent directories of any entry — including an extra file placed
 /// under a directory the base image does not ship — are synthesized `0o755 root:root` below.
 ///
+/// `xattr_policy` is the artifact's [`XattrPolicy`] (§4.7): the tar-derived nodes keep their
+/// source `SCHILY.xattr.*` records under `Preserve` and none under `Strip` (the default).
+/// vmcell's own injected and synthesized nodes carry none either way (invariant F5).
+///
 /// # Errors
 /// Returns an error if reading the archive or generating the EROFS image fails.
 #[cfg(feature = "am-fs-erofs")]
@@ -367,8 +513,15 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
     injected_files: Vec<InjectedFile<'_>>,
     injected_symlinks: Vec<(&str, &str)>,
     require_libc6: bool,
+    xattr_policy: XattrPolicy,
 ) -> crate::error::Result<Vec<u8>> {
-    let mut entries = build_node_map(archives, extra_files, injected_files, injected_symlinks)?;
+    let mut entries = build_node_map(
+        archives,
+        extra_files,
+        injected_files,
+        injected_symlinks,
+        xattr_policy,
+    )?;
 
     // Fail loud on a base image without glibc (§4.2, Rootfs sources and the one packer / oci2erofs §8.2). One pass over the
     // merged path set for a file named `libc.so.6` at ANY path in the tree (the scan keys
@@ -414,6 +567,9 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
                             mtime: 0,
                             mtime_nsec: 0,
                         },
+                        // NOT a policy site (§4.7, invariant F5): a SYNTHESIZED parent has no
+                        // source entry at all — no layer described it — so there is nothing to
+                        // preserve, and inventing attributes for it would be fabrication.
                         xattrs: vec![],
                     },
                 );
@@ -435,6 +591,9 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
                     mtime: 0,
                     mtime_nsec: 0,
                 },
+                // NOT a policy site (§4.7, invariant F5): the synthesized root, same reason as
+                // the synthesized parents above. A base that ships its own `./` entry takes the
+                // tar-derived `Directory` arm instead and DOES get its xattrs under `Preserve`.
                 xattrs: vec![],
             },
         );
@@ -544,7 +703,14 @@ mod tests {
         let archive = tar::Archive::new(reader);
         // require_libc6=false: this packs an empty tar (no steward injected), so the
         // glibc-presence requirement does not apply.
-        let image = tar_to_erofs(vec![archive], vec![], vec![], vec![], false);
+        let image = tar_to_erofs(
+            vec![archive],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            XattrPolicy::Strip,
+        );
         assert!(
             image.is_ok(),
             "Failed to convert empty tar to EROFS: {:?}",
@@ -568,7 +734,14 @@ mod tests {
             builder.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar_data));
-        tar_to_erofs(vec![archive], vec![], vec![], vec![], require_libc6)
+        tar_to_erofs(
+            vec![archive],
+            vec![],
+            vec![],
+            vec![],
+            require_libc6,
+            XattrPolicy::Strip,
+        )
     }
 
     // oci2erofs §8.2 fail-loud guard. With `require_libc6=true`, a base that contains a
@@ -663,7 +836,8 @@ mod tests {
             b.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let map = build_node_map(vec![archive], vec![], vec![], vec![]).expect("node map");
+        let map = build_node_map(vec![archive], vec![], vec![], vec![], XattrPolicy::Strip)
+            .expect("node map");
 
         match map.get(Path::new("dev/mychar")) {
             Some(Node::Device { rdev, mode, .. }) => {
@@ -731,7 +905,8 @@ mod tests {
         }
         let a1 = tar::Archive::new(std::io::Cursor::new(lower));
         let a2 = tar::Archive::new(std::io::Cursor::new(upper));
-        let map = build_node_map(vec![a1, a2], vec![], vec![], vec![]).expect("node map");
+        let map = build_node_map(vec![a1, a2], vec![], vec![], vec![], XattrPolicy::Strip)
+            .expect("node map");
 
         assert!(
             map.contains_key(Path::new("etc/keep")),
@@ -786,7 +961,8 @@ mod tests {
             ),
             ("usr/sbin/vmcell-steward", steward.as_path(), None),
         ];
-        let map = build_node_map(vec![empty], vec![], injected, vec![]).expect("node map");
+        let map = build_node_map(vec![empty], vec![], injected, vec![], XattrPolicy::Strip)
+            .expect("node map");
         match map.get(&normalize_path(Path::new(
             "usr/local/share/ca-certificates/vmcell-ca.crt",
         ))) {
@@ -807,14 +983,13 @@ mod tests {
         }
     }
 
-    // Accepted limitation (recorded): the packer does NOT preserve PAX SCHILY.xattr
-    // records (including `security.capability`). The steward and every in-guest
-    // `exec` run as root (design §4.2), so file capabilities are moot — preserving
-    // them is forward work. This test PINS the current drop: it reddens the day xattr
-    // passthrough is added without also updating the documented limitation, forcing a
-    // conscious decision + doc/impl-notes reconciliation.
-    #[test]
-    fn test_pax_xattrs_are_not_preserved() {
+    /// The one fixture the whole xattr battery packs: a single `usr/bin/ping` regular file
+    /// carrying one PAX `SCHILY.xattr.security.capability` record.
+    ///
+    /// Shared by both policy legs deliberately — the SAME bytes must produce an empty xattr set
+    /// under `Strip` and this exact attribute under `Preserve`, so a leg that quietly packed a
+    /// different fixture could pass both ways.
+    fn pax_xattr_fixture_tar() -> Vec<u8> {
         let mut tar = Vec::new();
         {
             let mut b = tar::Builder::new(&mut tar);
@@ -830,17 +1005,478 @@ mod tests {
             b.append_data(&mut h, "usr/bin/ping", &body[..]).unwrap();
             b.finish().unwrap();
         }
-        let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let map = build_node_map(vec![archive], vec![], vec![], vec![]).expect("node map");
-        match map.get(&normalize_path(Path::new("usr/bin/ping"))) {
-            Some(Node::File { xattrs, .. }) => assert!(
+        tar
+    }
+
+    /// The fixture's node, packed under `policy`.
+    fn pax_fixture_node(policy: XattrPolicy) -> Node {
+        let archive = tar::Archive::new(std::io::Cursor::new(pax_xattr_fixture_tar()));
+        let mut map =
+            build_node_map(vec![archive], vec![], vec![], vec![], policy).expect("node map");
+        map.remove(&normalize_path(Path::new("usr/bin/ping")))
+            .expect("the fixture's regular file node")
+    }
+
+    // The `Strip` leg of the §15.4 xattr battery (design §4.7, §18 delta 7). Formerly
+    // `test_pax_xattrs_are_not_preserved`, when the drop was unconditional and a recorded
+    // limitation; delta 7 made it the DEFAULT POLICY's behavior, so the name and the message move
+    // with it. It is no longer waiting to be retired: it is what keeps the canonical artifact
+    // byte-identical, and it must stay green forever.
+    //
+    // RED on the inverse: make `tar_entry_xattrs` read the records regardless of policy (drop its
+    // `Strip` short-circuit).
+    #[test]
+    fn pax_xattrs_are_stripped_under_the_default_policy() {
+        match pax_fixture_node(XattrPolicy::Strip) {
+            Node::File { xattrs, .. } => assert!(
                 xattrs.is_empty(),
-                "PAX SCHILY.xattr records are intentionally dropped (accepted limitation); \
-                 if this now fails, xattr passthrough was added — update the recorded \
-                 limitation + implementation-notes before flipping this assertion"
+                "`XattrPolicy::Strip` is the default and MUST drop every source xattr: the \
+                 canonical artifact's bytes and cache key depend on it (§4.7). If this fails, a \
+                 policy-blind read crept back into the tar arms"
             ),
             other => panic!("expected a regular file node, got {other:?}"),
         }
+        // The default is `Strip`, not merely equal to it by coincidence — the migration claim
+        // ("none by default") rests on this, so it is asserted rather than assumed.
+        assert_eq!(XattrPolicy::default(), XattrPolicy::Strip);
+    }
+
+    // The `Preserve` twin: the SAME fixture's `security.capability` survives into the packed node,
+    // with the EROFS namespace folded into `name_index` the way `mkfs.erofs` does.
+    //
+    // RED on the inverse: revert any tar arm to `xattrs: vec![]`, or drop the `security.` arm from
+    // `xattr_spec` (the name_index assertion catches the second, which an `is_empty()`-style
+    // assertion would not).
+    #[test]
+    fn pax_xattrs_are_preserved_under_the_preserve_policy() {
+        match pax_fixture_node(XattrPolicy::Preserve) {
+            Node::File { xattrs, .. } => {
+                assert_eq!(
+                    xattrs.len(),
+                    1,
+                    "the fixture carries exactly one SCHILY.xattr record; got {xattrs:?}"
+                );
+                let x = &xattrs[0];
+                assert_eq!(
+                    x.name_index,
+                    fs_erofs::xattr::ns::SECURITY,
+                    "`security.capability` must fold into the SECURITY namespace index, not be \
+                     stored raw — a raw name reads back as `security.capability` only if the \
+                     reader guesses"
+                );
+                assert_eq!(
+                    x.name,
+                    b"capability".to_vec(),
+                    "the namespace-stripped suffix"
+                );
+                assert_eq!(
+                    x.value,
+                    b"\x01\x00\x00\x02\x00\x20\x00\x00".to_vec(),
+                    "the value bytes travel verbatim, NUL bytes and all"
+                );
+                // The round trip through the reader's own composer, so the assertion is on what a
+                // guest would actually see rather than on our own encoding of it.
+                assert_eq!(
+                    fs_erofs::xattr::resolve_full_name(x.name_index, &x.name),
+                    b"security.capability".to_vec()
+                );
+            }
+            other => panic!("expected a regular file node, got {other:?}"),
+        }
+    }
+
+    // The registry token parse is STRICT (§10.5, law F1): both valid spellings round-trip through
+    // `name()`, and anything else is a hard error that NAMES the offending token and both valid
+    // ones. A silent fall back to the default would let `"presevre"` pack a stripped image while
+    // the consumer's manifest claimed otherwise — the accept-then-ignore class.
+    //
+    // RED on the inverse: add `_ => Ok(XattrPolicy::Strip)` to `XattrPolicy::parse`.
+    #[test]
+    fn xattr_policy_parses_strictly() {
+        for policy in [XattrPolicy::Strip, XattrPolicy::Preserve] {
+            assert_eq!(
+                XattrPolicy::parse(policy.name()).expect("round trip"),
+                policy,
+                "`name()` and `parse()` are one law: what one writes the other reads"
+            );
+        }
+        for bad in ["", "Preserve", "presevre", "keep", "strip ", "true"] {
+            let err = XattrPolicy::parse(bad).expect_err("must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains(bad), "the message must name `{bad}`: {msg}");
+            assert!(
+                msg.contains("strip") && msg.contains("preserve"),
+                "the message must name BOTH valid spellings so the fix is in it: {msg}"
+            );
+        }
+    }
+
+    // The packed attribute order is CANONICAL, not the order a producer happened to write its PAX
+    // records in: two tars carrying the same two attributes in opposite order must pack the same
+    // inode bytes. Without it, re-tarring an unchanged base with a different tool would produce a
+    // different image for the same content — a warm-cache miss and a bogus artifact diff.
+    //
+    // RED on the inverse: drop the `sort_by` at the tail of `tar_entry_xattrs`.
+    #[test]
+    fn xattr_order_is_canonicalized_not_producer_order() {
+        let pack_with = |records: [(&str, &[u8]); 2]| {
+            let mut tar = Vec::new();
+            {
+                let mut b = tar::Builder::new(&mut tar);
+                b.append_pax_extensions(records).unwrap();
+                append_file(&mut b, "f", b"x");
+                b.finish().unwrap();
+            }
+            let map = build_node_map(
+                vec![tar::Archive::new(std::io::Cursor::new(tar))],
+                vec![],
+                vec![],
+                vec![],
+                XattrPolicy::Preserve,
+            )
+            .expect("node map");
+            match map.get(&normalize_path(Path::new("f"))) {
+                Some(Node::File { xattrs, .. }) => xattrs
+                    .iter()
+                    .map(|x| (x.name_index, x.name.clone()))
+                    .collect::<Vec<_>>(),
+                other => panic!("expected a regular file node, got {other:?}"),
+            }
+        };
+        let user = ("SCHILY.xattr.user.zeta", &b"z"[..]);
+        let security = ("SCHILY.xattr.security.capability", &b"\x01\x00"[..]);
+        let forward = pack_with([user, security]);
+        let reverse = pack_with([security, user]);
+        assert_eq!(forward.len(), 2, "both records must survive: {forward:?}");
+        assert_eq!(
+            forward, reverse,
+            "the packed xattr order must be canonical (sorted by namespace index then name), not \
+             the order the producer wrote the PAX records in"
+        );
+    }
+
+    // The namespace table, unit-tested without building a tar. Each arm reddens a specific
+    // mis-mapping: a missing `security.` arm stores the name raw (index 0), and a `split_once`
+    // that kept the prefix would double it on read-back.
+    #[test]
+    fn xattr_spec_folds_every_known_namespace() {
+        use fs_erofs::xattr::ns;
+        for (full, index, suffix) in [
+            ("security.capability", ns::SECURITY, &b"capability"[..]),
+            ("user.acme", ns::USER, &b"acme"[..]),
+            (
+                "trusted.overlay.opaque",
+                ns::TRUSTED,
+                &b"overlay.opaque"[..],
+            ),
+            ("lustre.lov", ns::LUSTRE, &b"lov"[..]),
+            ("system.posix_acl_access", ns::POSIX_ACL_ACCESS, &b""[..]),
+            ("system.posix_acl_default", ns::POSIX_ACL_DEFAULT, &b""[..]),
+            // No known prefix: stored RAW so `resolve_full_name` reads it back unchanged.
+            ("wat", ns::RAW, &b"wat"[..]),
+            ("system.other", ns::RAW, &b"system.other"[..]),
+        ] {
+            let spec = xattr_spec(full, b"v");
+            assert_eq!(spec.name_index, index, "namespace index for {full}");
+            assert_eq!(spec.name, suffix.to_vec(), "suffix for {full}");
+            assert_eq!(
+                fs_erofs::xattr::resolve_full_name(spec.name_index, &spec.name),
+                full.as_bytes().to_vec(),
+                "{full} must survive the fold/resolve round trip"
+            );
+        }
+    }
+
+    // Non-xattr PAX records (`path`, `mtime`, …) describe the member, not its attributes, and must
+    // NOT become xattrs. RED on the inverse: drop the `SCHILY.xattr.` prefix filter in
+    // `tar_entry_xattrs` — then `mtime` packs as an attribute named `mtime`.
+    #[test]
+    fn non_xattr_pax_records_are_not_attributes() {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            b.append_pax_extensions([
+                ("mtime", &b"1700000000"[..]),
+                ("SCHILY.xattr.user.kept", &b"yes"[..]),
+            ])
+            .unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "f", std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        let map = build_node_map(
+            vec![tar::Archive::new(std::io::Cursor::new(tar))],
+            vec![],
+            vec![],
+            vec![],
+            XattrPolicy::Preserve,
+        )
+        .expect("node map");
+        match map.get(&normalize_path(Path::new("f"))) {
+            Some(Node::File { xattrs, .. }) => {
+                assert_eq!(xattrs.len(), 1, "only the SCHILY.xattr record: {xattrs:?}");
+                assert_eq!(xattrs[0].name, b"kept".to_vec());
+                assert_eq!(xattrs[0].name_index, fs_erofs::xattr::ns::USER);
+            }
+            other => panic!("expected a regular file node, got {other:?}"),
+        }
+    }
+
+    // The ELEVENTH node-construction site (design §4.7 counts ten): a materialized hardlink keeps
+    // the merged TARGET's xattrs and discards its own. xattrs are an inode property and a hardlink
+    // IS the target's inode, so a link entry cannot legitimately carry a different set — the same
+    // reason this arm already discards the link entry's `mode` and `meta`.
+    //
+    // The fixture makes the two answers DISTINGUISHABLE: the target carries `user.target` and the
+    // link entry carries `user.link`, so a per-entry read (the plausible wrong implementation)
+    // reddens instead of passing vacuously.
+    #[test]
+    fn hardlink_inherits_the_targets_xattrs() {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            b.append_pax_extensions([("SCHILY.xattr.user.target", &b"t"[..])])
+                .unwrap();
+            let body = b"content";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "usr/bin/perl", &body[..]).unwrap();
+
+            b.append_pax_extensions([("SCHILY.xattr.user.link", &b"l"[..])])
+                .unwrap();
+            let mut lh = tar::Header::new_gnu();
+            lh.set_size(0);
+            lh.set_mode(0o755);
+            lh.set_entry_type(tar::EntryType::Link);
+            lh.set_link_name("usr/bin/perl").unwrap();
+            lh.set_cksum();
+            b.append_data(&mut lh, "usr/bin/perl5.36", std::io::empty())
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let map = build_node_map(
+            vec![tar::Archive::new(std::io::Cursor::new(tar))],
+            vec![],
+            vec![],
+            vec![],
+            XattrPolicy::Preserve,
+        )
+        .expect("node map");
+        match map.get(&normalize_path(Path::new("usr/bin/perl5.36"))) {
+            Some(Node::File { xattrs, .. }) => {
+                assert_eq!(xattrs.len(), 1, "one inherited attribute: {xattrs:?}");
+                assert_eq!(
+                    xattrs[0].name,
+                    b"target".to_vec(),
+                    "a materialized hardlink carries the TARGET's xattrs (an inode property), \
+                     never the link entry's own"
+                );
+            }
+            other => panic!("expected the materialized hardlink file node, got {other:?}"),
+        }
+    }
+
+    // vmcell's own injected and synthesized nodes carry NO xattrs under either policy (§4.7,
+    // invariant F5): the injections are unconditional and authoritative, so a consumer's
+    // declaration must not be able to add attributes to them. This is the call-site scan for the
+    // four `vec![]` sites the policy is deliberately NOT threaded into — a unit test on
+    // `tar_entry_xattrs` alone would never see them.
+    //
+    // RED on the inverse: thread `xattrs` into `insert_injected_file` or into either synthesized
+    // `Node::Dir`.
+    #[test]
+    fn injected_and_synthesized_nodes_carry_no_xattrs_under_preserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("acme");
+        std::fs::write(&src, b"x").unwrap();
+
+        // The source layer carries an xattr on a DIRECTORY too, so a policy that leaked into the
+        // synthesized-parent arm would have something to leak.
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            b.append_pax_extensions([("SCHILY.xattr.user.fromlayer", &b"v"[..])])
+                .unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_mode(0o755);
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_cksum();
+            b.append_data(&mut h, "usr/", std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        let map = build_node_map(
+            vec![tar::Archive::new(std::io::Cursor::new(tar))],
+            vec![("/opt/acme/probe", src.as_path(), Some(0o755))],
+            vec![("/usr/sbin/vmcell-steward", src.as_path(), None)],
+            vec![("/vmcell-tools/ip", "/vmcell-tools/vmcell-guest-tools")],
+            XattrPolicy::Preserve,
+        )
+        .expect("node map");
+        for dest in [
+            "/opt/acme/probe",
+            "/usr/sbin/vmcell-steward",
+            "/vmcell-tools/ip",
+        ] {
+            let node = map
+                .get(&normalize_path(Path::new(dest)))
+                .unwrap_or_else(|| panic!("{dest} must be in the merged tree"));
+            let xattrs = match node {
+                Node::File { xattrs, .. } | Node::Symlink { xattrs, .. } => xattrs,
+                other => panic!("unexpected node kind for {dest}: {other:?}"),
+            };
+            assert!(
+                xattrs.is_empty(),
+                "{dest} is vmcell's own injection: it carries no xattrs under EITHER policy \
+                 (§4.7, invariant F5), got {xattrs:?}"
+            );
+        }
+        // The tar-derived directory DID get its attribute — the positive control that proves the
+        // assertions above are not vacuously green because `Preserve` never took effect.
+        match map.get(&normalize_path(Path::new("usr"))) {
+            Some(Node::Dir { xattrs, .. }) => assert_eq!(
+                xattrs.len(),
+                1,
+                "positive control: a tar-derived directory keeps its xattr under `Preserve`"
+            ),
+            other => panic!("expected the tar-derived directory node, got {other:?}"),
+        }
+    }
+
+    /// FNV-1a-64 over `bytes` — the image digest the byte-identity gate below pins.
+    ///
+    /// Hand-rolled rather than `blake3::hash`, and it is not fussiness: `blake3` is an OPTIONAL
+    /// dependency enabled by the `pipeline` feature, while this module (and this test module) are
+    /// gated on `am-fs-erofs`, which the feature-powerset gate builds on its own. It resolves
+    /// today only through dev-dependency feature unification — a fact no one wrote down and one
+    /// edit away from turning this gate into a powerset-row compile error. `std`'s own
+    /// `DefaultHasher` is explicitly not stable across releases, so it cannot pin a literal.
+    /// FNV-1a is 4 lines, fixed forever, and a byte-identity tripwire needs no collision
+    /// resistance — nothing adversarial chooses these bytes.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    // Migration is free, half 1 (§18 delta 7: "`Strip` + flag-absent behavior byte-identical").
+    // The literal below digests the image the packer produced at commit `ae723fc` — the last
+    // commit before this delta — over `pax_xattr_fixture_tar()`, captured by running the
+    // pre-change packer. It pins the claim that the DEFAULT policy changed no packed byte.
+    //
+    // A change that legitimately moves the packed bytes (an EROFS writer bump, a new synthesized
+    // node) reddens this: re-capture the literal and say so in the same commit — do not delete the
+    // gate, which is the only thing standing between "we did not change the default" and a hope.
+    //
+    // RED on the inverse: pack the fixture with `XattrPolicy::Preserve` here — the image gains the
+    // inline xattr and the digest moves.
+    #[test]
+    fn the_default_policy_packs_the_pre_delta7_bytes() {
+        let archive = tar::Archive::new(std::io::Cursor::new(pax_xattr_fixture_tar()));
+        let image = tar_to_erofs(
+            vec![archive],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            XattrPolicy::default(),
+        )
+        .expect("pack");
+        assert_eq!(
+            (image.len(), fnv1a64(&image)),
+            (20480, 0xb46a_722d_260f_dc55),
+            "the default (`Strip`) pack must be byte-identical to the pre-delta-7 packer's \
+             output over the same fixture"
+        );
+    }
+
+    // The pack-twice byte-determinism gate (§18 delta 7 adds it because the delta's own
+    // migration claim leans on it). The merged tree is a `HashMap`, and `tar_to_erofs` sorts its
+    // keys only by component COUNT — not a total order — so same-depth ties resolve in randomized
+    // iteration order. That is unobservable only because every child attaches into its parent's
+    // `BTreeMap`, which re-sorts by name at each level. This gate is what turns that argument into
+    // a fact, under BOTH policies (the `Preserve` leg additionally pins that the xattr order a
+    // producer wrote is canonicalized rather than carried).
+    //
+    // RED on the inverse: make any node's `meta.mtime` a clock read (e.g. the synthesized parent
+    // dirs) — both legs redden. Note what does NOT redden it, so the gate is not oversold:
+    // dropping the `sort_by` in `tar_entry_xattrs` keeps this green, because PAX record order is
+    // itself deterministic for a fixed input; that sort is a CANONICALIZATION (two producers that
+    // wrote the same attributes in different orders pack the same image), and the ordering it
+    // fixes is pinned by `xattr_order_is_canonicalized_not_producer_order` instead.
+    #[test]
+    fn packing_the_same_input_twice_is_byte_identical() {
+        for policy in [XattrPolicy::Strip, XattrPolicy::Preserve] {
+            let pack = || {
+                let archive = tar::Archive::new(std::io::Cursor::new(multi_entry_fixture_tar()));
+                tar_to_erofs(vec![archive], vec![], vec![], vec![], false, policy).expect("pack")
+            };
+            let first = pack();
+            let second = pack();
+            assert_eq!(
+                first, second,
+                "packing the same input twice under {policy:?} must produce byte-identical \
+                 images; the merged tree's HashMap order must not reach the image"
+            );
+            assert!(
+                !first.is_empty(),
+                "the fixture must actually pack something"
+            );
+        }
+    }
+
+    /// A fixture broad enough for the determinism gate to mean something: several same-depth
+    /// siblings (where the merged tree's `HashMap` order is unconstrained), a nested directory, a
+    /// symlink, a hardlink, and two xattr records on one file in non-sorted order.
+    fn multi_entry_fixture_tar() -> Vec<u8> {
+        let mut tar = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar);
+            for name in [
+                "usr/bin/aa",
+                "usr/bin/bb",
+                "usr/bin/cc",
+                "etc/one",
+                "etc/two",
+            ] {
+                append_file(&mut b, name, name.as_bytes());
+            }
+            // Two records, deliberately NOT in sorted order, on one file.
+            b.append_pax_extensions([
+                ("SCHILY.xattr.user.zeta", &b"z"[..]),
+                ("SCHILY.xattr.security.capability", &b"\x01\x00"[..]),
+            ])
+            .unwrap();
+            append_file(&mut b, "usr/bin/dd", b"dd");
+
+            let mut sh = tar::Header::new_gnu();
+            sh.set_size(0);
+            sh.set_mode(0o777);
+            sh.set_entry_type(tar::EntryType::Symlink);
+            sh.set_link_name("aa").unwrap();
+            sh.set_cksum();
+            b.append_data(&mut sh, "usr/bin/link", std::io::empty())
+                .unwrap();
+
+            let mut lh = tar::Header::new_gnu();
+            lh.set_size(0);
+            lh.set_mode(0o644);
+            lh.set_entry_type(tar::EntryType::Link);
+            lh.set_link_name("etc/one").unwrap();
+            lh.set_cksum();
+            b.append_data(&mut lh, "etc/one-hard", std::io::empty())
+                .unwrap();
+            b.finish().unwrap();
+        }
+        tar
     }
 
     // OCI opaque-whiteout ordering contract (recorded assumption). `.wh..wh..opq` clears
@@ -869,6 +1505,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            XattrPolicy::Strip,
         )
         .expect("node map");
         assert!(
@@ -896,6 +1533,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            XattrPolicy::Strip,
         )
         .expect("node map");
         assert!(
@@ -926,7 +1564,8 @@ mod tests {
             b.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let entries = build_node_map(vec![archive], vec![], vec![], vec![]).expect("build");
+        let entries = build_node_map(vec![archive], vec![], vec![], vec![], XattrPolicy::Strip)
+            .expect("build");
         let link = entries
             .get(&normalize_path(Path::new("usr/bin/perl5.40.1")))
             .expect("the hardlink must be materialized, not dropped");
@@ -955,7 +1594,7 @@ mod tests {
         let archive = tar::Archive::new(std::io::Cursor::new(orphan));
         assert!(
             matches!(
-                build_node_map(vec![archive], vec![], vec![], vec![]),
+                build_node_map(vec![archive], vec![], vec![], vec![], XattrPolicy::Strip),
                 Err(crate::error::Error::Artifact(_))
             ),
             "a hardlink to a missing target must still fail loud"
@@ -1005,7 +1644,14 @@ mod tests {
             ),
             ("usr/sbin/vmcell-steward", steward.as_path(), None),
         ];
-        let map = build_node_map(vec![a1, a2], vec![], injected_files, vec![]).expect("node map");
+        let map = build_node_map(
+            vec![a1, a2],
+            vec![],
+            injected_files,
+            vec![],
+            XattrPolicy::Strip,
+        )
+        .expect("node map");
 
         // (1) The injected CA survives the whiteout that deleted the CA dir.
         match map.get(Path::new("usr/local/share/ca-certificates/vmcell-ca.crt")) {
@@ -1071,6 +1717,7 @@ mod tests {
             extra,
             vec![],
             vec![],
+            XattrPolicy::Strip,
         )
         .expect("node map");
 
@@ -1119,6 +1766,7 @@ mod tests {
             vec![("/usr/sbin/vmcell-steward", impostor.as_path(), Some(0o755))],
             vec![("usr/sbin/vmcell-steward", steward.as_path(), None)],
             vec![],
+            XattrPolicy::Strip,
         )
         .expect("node map");
         match map.get(&normalize_path(Path::new("usr/sbin/vmcell-steward"))) {
@@ -1153,6 +1801,7 @@ mod tests {
             vec![],
             vec![],
             true,
+            XattrPolicy::Strip,
         )
         .expect("an extra file under a directory absent from the base must pack");
         assert!(!image.is_empty(), "EROFS image bytes should not be empty");
@@ -1171,7 +1820,14 @@ mod tests {
             b.finish().unwrap();
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let res = tar_to_erofs(vec![archive], vec![], vec![], vec![], false);
+        let res = tar_to_erofs(
+            vec![archive],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            XattrPolicy::Strip,
+        );
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a child under a non-directory parent must fail loud (L-ART-6), got {res:?}"
@@ -1234,17 +1890,66 @@ mod tests {
                 tar::EntryType::GNULongLink,
             ),
         ];
+        // BOTH policies (§18 delta 7): the refusal must keep naming the member and the type under
+        // `Preserve` too. The "unfolded pax extended header WITH A BODY" leg below is why — a real
+        // `x` header always carries one (that is where its records live), and under `Preserve` the
+        // packer reads PAX records, so without the local-pax guard in `tar_entry_xattrs` that body
+        // is decoded and the named refusal is replaced by a decode error about bytes the packer
+        // was never going to use.
+        //
+        // RED on the inverse: drop `is_pax_local_extensions()` from `tar_entry_xattrs`' early
+        // return — the body-carrying `x` leg reddens under `Preserve`. (Note the zero-size `x`
+        // leg in `cases` does NOT redden on that inverse: an empty body reads back as no records
+        // at all, which is exactly why the body-carrying leg exists beside it.)
         for (label, header, entry_type) in cases {
-            let tar_data = tar_with_entry(header, entry_type, "odd/member");
+            for policy in [XattrPolicy::Strip, XattrPolicy::Preserve] {
+                let tar_data = tar_with_entry(header.clone(), entry_type, "odd/member");
+                let archive = tar::Archive::new(std::io::Cursor::new(tar_data));
+                let err = build_node_map(vec![archive], vec![], vec![], vec![], policy)
+                    .expect_err(&format!("{label} must be rejected, not silently dropped"));
+                let crate::error::Error::Artifact(msg) = &err else {
+                    panic!("{label} under {policy:?}: expected Error::Artifact, got {err:?}");
+                };
+                assert!(
+                    msg.contains("odd/member") && msg.contains("unsupported tar entry type"),
+                    "{label} under {policy:?}: the refusal must name the member and the type, \
+                     got: {msg}"
+                );
+            }
+        }
+
+        // The body-carrying unfolded `x` header, in both directions (see the note above).
+        for policy in [XattrPolicy::Strip, XattrPolicy::Preserve] {
+            let mut tar_data = Vec::new();
+            {
+                let mut b = tar::Builder::new(&mut tar_data);
+                let mut h = tar::Header::new_old();
+                h.set_entry_type(tar::EntryType::XHeader);
+                // An UNDECODABLE body, deliberately. An unfolded `x` header only reaches this
+                // packer on an already-irregular archive (`tar` could not attach it to the member
+                // that follows, because the header magic is neither ustar nor GNU), so its body
+                // may be anything at all. The member is rejected by TYPE either way; the point is
+                // that the packer must not decode bytes it will never use and report THAT
+                // failure instead — a "malformed pax extension record" says nothing about the
+                // member, its path, or what to do next.
+                let body: &[u8] = b"not a pax record body\n";
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_path("odd/member").expect("set the member path");
+                h.set_cksum();
+                b.append(&h, body).expect("append");
+                b.finish().expect("finish");
+            }
             let archive = tar::Archive::new(std::io::Cursor::new(tar_data));
-            let err = build_node_map(vec![archive], vec![], vec![], vec![])
-                .expect_err(&format!("{label} must be rejected, not silently dropped"));
+            let err = build_node_map(vec![archive], vec![], vec![], vec![], policy)
+                .expect_err("a body-carrying unfolded pax header must be rejected");
             let crate::error::Error::Artifact(msg) = &err else {
-                panic!("{label}: expected Error::Artifact, got {err:?}");
+                panic!("expected Error::Artifact under {policy:?}, got {err:?}");
             };
             assert!(
                 msg.contains("odd/member") && msg.contains("unsupported tar entry type"),
-                "{label}: the refusal must name the member and the type, got: {msg}"
+                "under {policy:?} the refusal must still name the member and the type — the \
+                 packer must not consume an unfolded pax body it will reject anyway, got: {msg}"
             );
         }
     }
@@ -1321,7 +2026,7 @@ mod tests {
             b.finish().expect("finish");
         }
         let archive = tar::Archive::new(std::io::Cursor::new(tar_data));
-        let map = build_node_map(vec![archive], vec![], vec![], vec![])
+        let map = build_node_map(vec![archive], vec![], vec![], vec![], XattrPolicy::Strip)
             .expect("every handled member type must pack, and the pax global header be skipped");
 
         assert!(

@@ -87,8 +87,18 @@ fn bench_tar_to_erofs(c: &mut Criterion) {
             let reader = std::io::Cursor::new(tar_data.clone());
             let archive = tar::Archive::new(reader);
             // require_libc6=false: the bench packs a synthetic tar without an injected steward.
-            // No downstream extra files, no vmcell injections, no symlinks.
-            let image = tar_to_erofs(vec![archive], vec![], vec![], vec![], false).unwrap();
+            // No downstream extra files, no vmcell injections, no symlinks. `XattrPolicy::Strip`
+            // is the default artifact's policy (§4.7), so this stays the shipped-path measurement;
+            // the `Preserve` PAX decode is a different cost and would need its own bench.
+            let image = tar_to_erofs(
+                vec![archive],
+                vec![],
+                vec![],
+                vec![],
+                false,
+                vmcell::artifact::rootfs::XattrPolicy::Strip,
+            )
+            .unwrap();
             black_box(image);
         })
     });

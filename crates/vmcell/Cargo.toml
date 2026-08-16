@@ -260,9 +260,11 @@ name = "vmcell"
 #     label map that path names a registry entry, not a pin. The top-level
 #     `debian_snapshot_timestamp` namespace, the only form the committed baseline ever carried, is
 #     unchanged.
-#     NOT YET: a `rootfs` entry's `xattrs` and `features` keys are REFUSED naming the delta that
-#     adds them (7 and 6c). Accepting either now would mean an accepted-then-ignored declaration —
-#     an F1 violation for as long as the next delta took.
+#     NOT YET AT 0.17.0: a `rootfs` entry's `xattrs` and `features` keys were REFUSED naming the
+#     delta that adds them (7 and 6c). Accepting either then would have meant an accepted-then-
+#     ignored declaration — an F1 violation for as long as the next delta took. `features` is
+#     honored from 0.18.0 and `xattrs` from 0.19.0; this paragraph records what a consumer saw AT
+#     0.17.0 and is deliberately not rewritten.
 #
 #   * DELTA 6b — the artifact registry, handler kind (§10.5, invariant F7).
 #     PINS-SCHEMA ADDITION: a `handlers` namespace, whose committed `default` entry names the
@@ -347,7 +349,49 @@ name = "vmcell"
 #     `xattr_preserved: false`, which is simply the truth: the packer strips every xattr, and until
 #     this delta every cell reported the feature PRESENT because no sidecar existed to say
 #     otherwise.
-version = "0.18.0"
+# 0.18.0 → 0.19.0: design v33 §18 deltas 2-7 CONCLUDED — the last version of the one breaking
+# release, which spans 0.16.0 through 0.19.0 for the reason each entry above already gives: each
+# landed version became the published baseline, and `cargo semver-checks` measures against the
+# baseline rather than against the release narrative.
+#
+#   * DELTA 7 — external repacking + per-artifact xattr policy (§4.2, §4.7).
+#     PINS-SCHEMA ADDITION: `rootfs.<label>.xattrs` — `"strip"` (the default) or `"preserve"`.
+#     Any other word is a hard error naming both. It is refused on an `unpinned_path`
+#     registration, where vmcell packs nothing and so has no policy to apply.
+#     CONSUMER-VISIBLE BEHAVIOR, both fail-safe:
+#       - `Feature::XattrPreserved` is now **derived** from that key for a vmcell-built entry and
+#         is no longer declarable there — an explicit `xattr_preserved` token in the same entry's
+#         `features` map is a hard error naming the derivation, in either order of appearance, so
+#         the two spellings of one fact can never desync. On an `unpinned_path` entry the token IS
+#         declarable and nothing is derived: those are bytes vmcell did not pack, so a derived
+#         stance would be a claim it cannot support.
+#       - the committed `rootfs.default` therefore drops the explicit token 0.18.0 added. The
+#         emitted sidecar's BYTES are unchanged — gated against a literal captured from the
+#         0.18.0 tree — because the default policy derives the same stance the token stated.
+#     ADDITIVE: `artifact::XattrPolicy` (re-exported as `artifact::rootfs::XattrPolicy`, the §10.4
+#     contract name) with `name()`/`parse()`; `PackOptions::{xattrs, with_xattrs, label}`;
+#     `RootfsStage::{xattrs, with_xattrs}`; `RootfsRegistryEntry::xattrs`; `oci2-erofs --tools`
+#     and `--work-dir`.
+#     BREAKING `enum_variant_added`: `HandlerSource::Prebuilt` — `--tools`, the mirror of
+#     `--steward-musl` that §4.2 names, so a rootfs can be repacked from outside a vmcell checkout.
+#     Its identity is the binary's CONTENT hash, never the path string (F4 rule 3).
+#     BREAKING `function_parameter_count_changed`: `tar2erofs::tar_to_erofs` gained the policy;
+#     `fold_rootfs_injection_identity` 4 → 3, because it now takes `&PackOptions` and destructures
+#     it EXHAUSTIVELY. That is the point of the shape: a `PackOptions` field nobody folded is now
+#     `error[E0027]` at the fold site rather than a silent cache collision. It closed a live one —
+#     `applets` was never folded, so two registered handlers with different applet rosters over the
+#     same binary shared a cache key and produced different images, and the warm cache served the
+#     wrong symlink set.
+#     ARTIFACT: `OCI_ROOTFS_STAGE_VERSION` 5 → 6 and `MMDEBSTRAP_STAGE_VERSION` 2 → 3 (the identity
+#     fold gained the policy and the roster), and `GUEST_TOOLS_APPLETS` grows `xattr`
+#     (vmcell-protocol 0.6 → 0.7), so the rootfs re-bakes and `vmcell-artifact-validator`'s
+#     `rootfs.guest_tools` check FAILS against any rootfs packed before this bump until it is
+#     re-packed with `vmcell build --kernel-source host-make`.
+#     UNCHANGED BY DEFAULT, and gated: a pack that declares no policy produces BYTE-IDENTICAL
+#     image bytes to the pre-delta packer, and folds to the same key as an explicit `"strip"`. The
+#     STAGE_VERSION bump moves the key itself by design, so "unmoved" is asserted on the bytes and
+#     on the undeclared-≡-Strip equivalence, never on equality with the pre-delta key.
+version = "0.19.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -473,7 +517,7 @@ thiserror = "2"
 # the framed postcard wire enum, shared with the steward (v15 §10.1). The explicit
 # `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
 # path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.7.0" }
 
 # host common
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
@@ -559,7 +603,7 @@ http = { version = "1", optional = true }
 # validator (design §5.4/§8.5). This is a dev-dependency cycle (`vmcell(dev) →
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
-vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.4.0" }
+vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.5.0" }
 # The `vmm_matrix_test!` harness and the FC/QEMU capability/lifecycle/`qemu_*` tests construct the
 # concrete backends, which now live in these crates. Same permitted dev-dependency cycle as the
 # validator above (`vmcell(dev) → vmcell-firecracker/vmcell-qemu → vmcell`), so `vmcell` gains no
@@ -588,6 +632,12 @@ env_logger = "0.11"
 # The jailer-equivalent hardening gate (tests/jail_hardening.rs, §20.4) forks a stand-in and
 # reads its `/proc/self/status`; it calls raw prctl/syscall/waitpid directly.
 libc = "0.2"
+# The §15.4 xattr battery (tests/xattr_policy.rs, §18 delta 7) synthesizes the one tar layer that
+# carries PAX `SCHILY.xattr.*` records — the pinned Debian base carries none, so a `Preserve` leg
+# has no input without it. Dev-only here because the production `tar` dependency above is optional
+# (`am-fs-erofs`), and an integration test cannot see an optional dependency of its own crate.
+# Same version requirement, so the lockfile is unmoved.
+tar = "0.4"
 
 [features]
 experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]

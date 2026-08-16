@@ -24,7 +24,17 @@ name = "vmcell-protocol"
 # generic init that starts the steward as a service, and it exists because live-validating the
 # `Service` placement requires an init that is not the steward and neither the pinned base nor CI
 # can supply one (the law-G1 defense recorded in §3.5).
-version = "0.6.0"
+# 0.6 → 0.7: `GUEST_TOOLS_APPLETS` GROWS AGAIN — `xattr` joins it (v33 §18 delta 7, §4.7). Same
+# consequences as the 0.5 → 0.6 entry above, for the same mechanical reasons: the rootfs gains a
+# `/vmcell-tools/xattr` symlink, the guest-tools dispatch table gains an arm (a COMPILE error until
+# it does), the closure hash moves so the rootfs re-bakes, and **a rootfs packed before this bump
+# fails the validator's `rootfs.guest_tools` check until it is re-packed**
+# (`vmcell build --kernel-source host-make`). `xattr get <path> <name>` / `xattr list <path>` is
+# read-only and calls `getxattr(2)`/`listxattr(2)` directly: delta 7's whole claim is that a
+# `Preserve` artifact's xattrs survive into the guest, and that is only assertable by reading one
+# back IN-guest. There is deliberately no `set` — a write primitive in a test guest with no gate
+# behind it is surface for nothing.
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

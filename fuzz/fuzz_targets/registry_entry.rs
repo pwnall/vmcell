@@ -222,14 +222,30 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             let declared = spec.get("features").and_then(serde_json::Value::as_object);
+            // `xattr_preserved` is the ONE stance that is not always a declaration (§4.7, §18
+            // delta 7): a digest registration DERIVES it from its `xattrs` policy and refuses the
+            // explicit token, while an `unpinned_path` registration derives nothing and may declare
+            // it — vmcell packed none of those bytes, so only the operator knows. Counted out of
+            // the declaration comparison on exactly the shape that derives it; comparing the raw
+            // lengths would panic on every digest entry the corpus reaches, i.e. on valid input.
+            let derives = matches!(entry.registration, RootfsRegistration::Digest { .. });
             assert_eq!(
                 entry.features.len(),
-                declared.map_or(0, serde_json::Map::len),
-                "accepted `rootfs.{label}` resolved {} stance(s) from {} declaration(s); a dropped \
-                 stance reads as the baseline, which is indistinguishable from the one the \
-                 declaration meant to overturn (§7.4, F6)",
+                declared.map_or(0, serde_json::Map::len) + usize::from(derives),
+                "accepted `rootfs.{label}` resolved {} stance(s) from {} declaration(s) plus {} \
+                 derived; a dropped stance reads as the baseline, which is indistinguishable from \
+                 the one the declaration meant to overturn (§7.4, F6)",
                 entry.features.len(),
-                declared.map_or(0, serde_json::Map::len)
+                declared.map_or(0, serde_json::Map::len),
+                usize::from(derives)
+            );
+            assert_eq!(
+                derives,
+                entry.features.contains_key(&Feature::XattrPreserved)
+                    && declared.is_none_or(|d| d.get(Feature::XattrPreserved.name()).is_none()),
+                "accepted `rootfs.{label}` disagrees with itself about where its \
+                 `xattr_preserved` stance came from: a digest entry derives it and refuses the \
+                 token, an unpinned entry derives nothing and may declare it"
             );
             for (feature, stance) in &entry.features {
                 assert_eq!(
@@ -238,6 +254,16 @@ fuzz_target!(|data: &[u8]| {
                     "accepted `rootfs.{label}.features` holds a key that `Feature::parse` refuses; \
                      that would be two token tables where F6 says one"
                 );
+                if derives && *feature == Feature::XattrPreserved {
+                    // The derived stance answers to the POLICY, not to a declaration.
+                    assert_eq!(
+                        *stance,
+                        entry.xattrs.preserves(),
+                        "accepted `rootfs.{label}` derived a stance its own `xattrs` policy does \
+                         not imply (§4.7): the artifact would contradict its own manifest"
+                    );
+                    continue;
+                }
                 assert_eq!(
                     declared
                         .and_then(|d| d.get(feature.name()))
@@ -308,6 +334,17 @@ fuzz_target!(|data: &[u8]| {
                         "accepted `handlers.{label}` pins a digest with an empty `source.url`; the \
                          digest is authoritative and the source is the instruction verified \
                          against it"
+                    );
+                }
+                // The `--tools` per-run override is NOT a registration shape (§4.2, R7, v33 delta
+                // 7): no accepted `handlers.<label>` document may resolve to it, whatever its
+                // bytes. The unit gate states this for three hand-written shapes; this states it
+                // for every document the corpus reaches.
+                HandlerSource::Prebuilt { path } => {
+                    panic!(
+                        "accepted `handlers.{label}` resolved to the `--tools` per-run override \
+                         ({path:?}); registration is a digest, an override is an argument (R7) — \
+                         no pins key may produce this shape"
                     );
                 }
                 HandlerSource::UnpinnedPath { path } => {

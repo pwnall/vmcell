@@ -79,10 +79,17 @@ pub struct MmdebstrapRootfsStage {
 ///
 /// v30 (§18 delta 6): bumped to 2 — [`fold_rootfs_injection_identity`] gained the sorted
 /// downstream extra-file triples.
+/// v33 (§18 delta 7): bumped to 3 — the same shared fold gained the artifact's `XattrPolicy`,
+/// which it folds unconditionally, so every key this stage has ever produced moves, **and** the
+/// handler applet roster (the delta-6b gap, folded in the same bump because neither had shipped in
+/// a released version). The fold now takes the whole `PackOptions`, which is what makes a
+/// never-folded field a compile error there instead of a stale-cache hit here. The OCI
+/// stage's own version bumps in the same edit and for the same reason: one fold, two callers,
+/// and a caller that skipped the bump would serve its stale image while the other re-packed.
 ///
 /// Module-level (rather than a `fn`-local `const`) so the bump itself is assertable KVM-free:
-/// `mmdebstrap_stage_version_pins_the_delta6_bump`.
-const MMDEBSTRAP_STAGE_VERSION: u32 = 2;
+/// `mmdebstrap_stage_version_pins_the_identity_fold_bumps`.
+const MMDEBSTRAP_STAGE_VERSION: u32 = 3;
 
 /// The `deb` source line pointing at the pinned `snapshot.debian.org` archive. Kept a **pure**
 /// function so the pin-driven mirror string is unit-testable. `[check-valid-until=no]` disables
@@ -127,7 +134,10 @@ impl Stage for MmdebstrapRootfsStage {
         // downstream extra files), ONE implementation reused from `vmcell` (§4.3, The
         // rootfs-construction contract). mmdebstrap always uses the default glibc steward (its
         // Debian rootfs ships libc6), so no musl override.
-        fold_rootfs_injection_identity(&mut hasher, inputs, None, &self.extra);
+        // Through `pack_options()` — the same struct `run` packs with — so the policy folded here
+        // is by construction the policy the tail honors.
+        let options = self.pack_options();
+        fold_rootfs_injection_identity(&mut hasher, inputs, &options);
         hasher.update(b"mmdebstrap");
         hasher.update(self.release.as_bytes());
         hasher.update(
@@ -277,13 +287,22 @@ impl Stage for MmdebstrapRootfsStage {
         }
         let tar_file = std::fs::File::open(&tar_path).map_err(Error::Io)?;
         let tar_stream: Box<dyn std::io::Read + Send> = Box::new(tar_file);
-        pack_erofs_with_injection(
-            vec![tar_stream],
-            inputs,
-            out,
-            &vmcell::artifact::rootfs::PackOptions::new().with_extra(self.extra.clone()),
-        )
-        .await
+        pack_erofs_with_injection(vec![tar_stream], inputs, out, &self.pack_options()).await
+    }
+}
+
+impl MmdebstrapRootfsStage {
+    /// What this source tells the one inject+pack tail — read by `cache_key` AND by `run`, the
+    /// way [`vmcell::artifact::rootfs::RootfsStage::pack_options`] is, so the identity this stage
+    /// folds and the options it actually packs with cannot drift into agreeing by accident.
+    fn pack_options(&self) -> vmcell::artifact::rootfs::PackOptions {
+        vmcell::artifact::rootfs::PackOptions::new()
+            .with_extra(self.extra.clone())
+            // `Strip`, stated rather than defaulted: this source BUILDS its base with mmdebstrap
+            // instead of resolving a registry entry, so there is no `xattrs` declaration to honor
+            // (§4.7 puts the policy on the artifact, and this artifact has no entry). The day an
+            // mmdebstrap-built rootfs becomes registrable, this is the one line that moves.
+            .with_xattrs(vmcell::artifact::rootfs::XattrPolicy::Strip)
     }
 }
 
@@ -299,17 +318,82 @@ mod tests {
         }
     }
 
-    // Quality-gates v4 row 6: the mmdebstrap stage's cache-key version must carry the v30
-    // delta-6 bump. `fold_rootfs_injection_identity` grew the extra-file triples, so an
-    // un-bumped version serves the previously-packed rootfs — which has no injected extra
-    // files — while every KVM-free test stays green (the recorded v20 precedent). RED on the
-    // inverse: reverting the const to 1.
+    // Quality-gates v4 row 6, carried forward: this stage shares
+    // `fold_rootfs_injection_identity` with the OCI stage, so EVERY change to what that fold
+    // hashes must bump this const too — an un-bumped version serves the previously-packed rootfs
+    // from the warm cache while every KVM-free test stays green (the recorded v20 precedent).
+    // Two bumps live behind this literal: v30 delta 6 (→ 2, the extra-file triples) and v33
+    // delta 7 (→ 3, the `XattrPolicy` folded unconditionally, plus the delta-6b applet roster).
+    //
+    // A literal-value assertion on purpose: a TRIPWIRE, not a derivation. RED on the inverse:
+    // reverting the const to 2.
     #[test]
-    fn mmdebstrap_stage_version_pins_the_delta6_bump() {
+    fn mmdebstrap_stage_version_pins_the_identity_fold_bumps() {
         assert_eq!(
-            MMDEBSTRAP_STAGE_VERSION, 2,
-            "the v30 delta-6 identity-fold change requires this stage-version bump; \
-             without it a stale rootfs (no extra files) is served from the warm cache"
+            MMDEBSTRAP_STAGE_VERSION, 3,
+            "an identity-fold change requires this stage-version bump; without it a stale rootfs \
+             is served from the warm cache. `fold_rootfs_injection_identity` is SHARED with the \
+             OCI stage — if you bumped OCI_ROOTFS_STAGE_VERSION, bump this one too"
+        );
+    }
+
+    // §18 delta 7, from the CONSUMER's position: this crate calls the shared, contract-surface
+    // `fold_rootfs_injection_identity`, so it is this crate's key that goes stale if that fold
+    // ever stops distinguishing the policies. Asserted here rather than only in `vmcell` because
+    // the failure mode is cross-crate: `vmcell` could keep its own gate green with a fold that
+    // reads the policy from somewhere this caller does not pass it.
+    //
+    // NOT asserted here: `stage().pack_options().xattrs == Strip`. That was the first draft, and
+    // it CANNOT FAIL — `Strip` is the default, so deleting the `.with_xattrs(...)` line it exists
+    // to guard leaves it green. It is recorded as documentation in `pack_options`' own comment
+    // instead, where it is a stated choice rather than a gate pretending to be one.
+    //
+    // RED on the inverse: delete the `xattrs` fold at the tail of
+    // `fold_rootfs_injection_identity` — both digests collapse to one.
+    /// Folds one `PackOptions` through the shared, contract-surface identity fold. A helper so the
+    /// two gates below differ in exactly the field under test and nothing else.
+    fn fold_of(options: &vmcell::artifact::rootfs::PackOptions) -> String {
+        let mut hasher = blake3::Hasher::new();
+        fold_rootfs_injection_identity(&mut hasher, &StageInputs::default(), options);
+        hasher.finalize().to_hex().to_string()
+    }
+
+    #[test]
+    fn the_shared_fold_distinguishes_the_xattr_policies() {
+        use vmcell::artifact::rootfs::{PackOptions, XattrPolicy};
+        assert_ne!(
+            fold_of(&PackOptions::new().with_xattrs(XattrPolicy::Strip)),
+            fold_of(&PackOptions::new().with_xattrs(XattrPolicy::Preserve)),
+            "the shared injected-content fold must make the xattr policy part of the rootfs \
+             identity, or this stage serves a `Strip`-packed image for a `Preserve` declaration"
+        );
+    }
+
+    // §18 delta 6b's gap, closed in delta 7, asserted from the CONSUMER's position for the same
+    // reason the policy gate above is: this crate calls the shared fold, so it is this crate's key
+    // that goes stale if the fold ever stops distinguishing rosters. The roster decides which
+    // `<tools_dir>/<applet>` symlinks the tail bakes — the binary's content is identical either
+    // way, so nothing else in the key moves when the roster does.
+    //
+    // RED on the inverse: delete the `applets` fold at the tail of
+    // `fold_rootfs_injection_identity` — the two digests collapse to one.
+    #[test]
+    fn the_shared_fold_distinguishes_the_applet_rosters() {
+        use vmcell::artifact::rootfs::PackOptions;
+        let one = PackOptions::new().with_applets(vec!["ip".into(), "curl".into()]);
+        let other = PackOptions::new().with_applets(vec!["ip".into()]);
+        assert_ne!(
+            fold_of(&one),
+            fold_of(&other),
+            "the shared injected-content fold must make the applet roster part of the rootfs \
+             identity, or two handlers over one multicall binary share a key and this stage serves \
+             the first roster's symlink set for the second roster's declaration"
+        );
+        assert_eq!(
+            fold_of(&one),
+            fold_of(&PackOptions::new().with_applets(vec!["ip".into(), "curl".into()])),
+            "the same roster must fold to the same identity — a key that moved without the image \
+             moving re-packs a multi-minute artifact for nothing"
         );
     }
 

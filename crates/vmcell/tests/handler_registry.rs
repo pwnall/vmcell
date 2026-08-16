@@ -445,3 +445,66 @@ fn overlay_handlers_are_additive_and_sorted() {
         ]
     );
 }
+
+// R7's line, drawn where v33 delta 7 puts it: `HandlerSource::Prebuilt` is the `oci2-erofs
+// --tools` per-run OVERRIDE, and no registry entry may ever resolve to it. A registration is a
+// durable claim that outlives the session that made it; an override is one operator's per-run act.
+// The two are already distinguished by their cache-key laws (`--tools` folds content only,
+// `unpinned_path` folds the path as well), so a registry shape that leaked into the override
+// variant would silently change the identity of every artifact built from it.
+//
+// RED on the inverse two ways: (a) point the `unpinned_path` arm of `handler_registry_entry` at
+// `HandlerSource::Prebuilt` — the first loop reddens naming the shape; (b) add `"prebuilt"` (or
+// `"tools"`) to the entry's accepted-key set — the second loop reddens because the key stops being
+// refused.
+#[test]
+fn no_registry_shape_resolves_to_the_per_run_override() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Every registration shape §10.5 allows, resolved and inspected. The positive control is the
+    // same loop: each shape DOES resolve, so "never `Prebuilt`" is a statement about which variant
+    // came back, not about a parse that failed.
+    for (shape, body) in [
+        (
+            "build",
+            r#"{ "build": "workspace:vmcell-guest-tools" }"#.to_string(),
+        ),
+        ("digest", registered('a')),
+        (
+            UNPINNED_PATH_KEY,
+            format!(r#"{{ "{UNPINNED_PATH_KEY}": "/tmp/my-handler" }}"#),
+        ),
+    ] {
+        // A distinct directory per shape: `write_overlay` reuses one filename, and a shared one
+        // would make every leg after the first assert against the previous leg's document.
+        let dir = tmp.path().join(shape);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let overlay = write_overlay(&dir, &format!(r#"{{ "handlers": {{ "acme": {body} }} }}"#));
+        let registry = resolve_handler_registry(Some(&overlay))
+            .unwrap_or_else(|e| panic!("the `{shape}` shape must resolve: {e}"));
+        let acme = registry
+            .iter()
+            .find(|e| e.label == "acme")
+            .unwrap_or_else(|| panic!("the `{shape}` entry"));
+        assert!(
+            !matches!(acme.source, HandlerSource::Prebuilt { .. }),
+            "the `{shape}` registration must not resolve to the `--tools` per-run override \
+             (R7: a registration is a digest, an override is an argument), got {:?}",
+            acme.source
+        );
+    }
+    // …and the override has no pins spelling at all: the two names it might plausibly claim are
+    // refused as unknown keys, naming them.
+    for key in ["prebuilt", "tools"] {
+        let dir = tmp.path().join(format!("key-{key}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let overlay = write_overlay(
+            &dir,
+            &format!(r#"{{ "handlers": {{ "acme": {{ "{key}": "/tmp/my-handler" }} }} }}"#),
+        );
+        let msg = registry_err(&overlay);
+        assert!(
+            msg.contains(key),
+            "an override spelled as a registry key must be refused NAMING it, got: {msg}"
+        );
+    }
+}

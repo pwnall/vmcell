@@ -64,7 +64,19 @@ name = "vmcell-artifact-validator"
 #     `Ok(())`. A consumer's pass/fail decision does not move under this bump.
 #   * ADDITIVE: the `conformance` module (`ConformanceOptions`, `Substrate`, the paired
 #     absence-probe/positive-control machinery), `ValidationReport::warnings`/`unverified`.
-version = "0.4.0"
+# 0.4.0 → 0.5.0: v33 §18 delta 7 — `conformance.xattr_preserved` stops being undecidable.
+#   * BREAKING `enum_variant_added`: `ProbePlan::XattrReadback`. `ProbePlan` is exhaustive, so an
+#     out-of-tree matcher gains an arm. It was `Undecidable(NO_PROBE_YET)` only because nothing
+#     could read an xattr inside a guest; delta 7's `xattr` guest-tools applet is exactly that, and
+#     leaving the plan undecidable once the probe exists is the accepted-but-not-honored shape the
+#     kit exists to catch.
+#   * ADDITIVE: `checks::xattr_preserved_probe` — an in-guest walk that short-circuits on the first
+#     xattr found. A COMPLETE walk finding none is a decided `DoesNotWork` (so a `Strip` artifact
+#     PASSES rather than skipping); a walk that hits its cap, or cannot run, is `NotRun` →
+#     `Unverified`, and the verdict REPORTS the cap rather than implying completeness.
+#     Driven live both ways: `Works` against a `Preserve` image, and `DoesNotWork` against the
+#     canonical `Strip` artifacts after walking 3276 paths.
+version = "0.5.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -79,13 +91,13 @@ path = "src/lib.rs"
 # The validator boots real vmcell micro-VMs and drives the steward, and reuses vmcell's
 # capability descriptors + net math. It needs the host stack: a backend, metrics, pipeline
 # (for artifact_path helpers). `vmcell` has no dependency on this crate.
-vmcell = { path = "../vmcell", version = "0.18.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.19.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
 # The applet roster (`GUEST_TOOLS_APPLETS`) only — the validator speaks no wire protocol of its
 # own. `rootfs_guest_tools` composes its PATH probe from that const instead of re-typing the
 # names, so growing the roster extends what the contract battery checks with no edit here. It is
 # the same const the guest binary's dispatch table and the rootfs symlink manifest derive from
 # (design §4.4, docs/81 m22). `vmcell` links it too, but does not re-export it.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.7.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"
 tracing = "0.1"
@@ -100,4 +112,4 @@ tempfile = "3"
 # The feature list mirrors the `[dependencies]` entry above, plus `test-support`.
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-vmcell = { path = "../vmcell", version = "0.18.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }
+vmcell = { path = "../vmcell", version = "0.19.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }

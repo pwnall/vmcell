@@ -20,7 +20,8 @@ use vmcell::artifact::rootfs::{
 };
 use vmcell::artifact::{
     Cache, CacheKey, Pipeline, RootfsRegistration, RootfsRegistryEntry, Stage, StageInputs,
-    resolve_pins, resolve_rootfs_entry, resolve_rootfs_labels, resolve_rootfs_registry,
+    XattrPolicy, resolve_pins, resolve_rootfs_entry, resolve_rootfs_labels,
+    resolve_rootfs_registry,
 };
 use vmcell::error::Error;
 use vmcell::feature::{Feature, FeatureDeclaration, Source, feature_manifest_path};
@@ -171,21 +172,22 @@ fn a_hybrid_of_the_two_shapes_is_rejected_too() {
     );
 }
 
-// Every accepted key is honored; every other key is REJECTED naming it (law F1). The one the design
-// sketch shows but this delta does not implement — `xattrs` (§4.7) — is rejected with a forward
-// reference rather than a bare "unknown", because a consumer copying §10.5's example deserves to be
-// told WHEN rather than merely NO.
+// Every accepted key is honored; every other key is REJECTED naming it (law F1).
 //
-// This is also the F1-clean seam between deltas 6 and 7: `xattrs` is refused here and honored there,
-// never accepted-and-ignored in between. `features` USED to sit in this table with a "delta 6c"
-// forward reference; delta 6c honors it, so it moved to the accept-legs below — which is the whole
-// point of writing the seam as a table entry rather than as a bare "unknown key" message.
+// The forward-reference rows this table used to carry are GONE, and that is the point of having
+// written the seam as table rows rather than as a bare "unknown key" message: `features` carried a
+// "delta 6c" reference until 6c honored it, `xattrs` carried a "delta 7" one until §18 delta 7
+// honored it, and each moved to an accept-leg in the same change that implemented it — never
+// accepted-and-ignored in between. What is left is about SPELLING rather than about timing.
+//
+// `xattr` (singular) is deliberately the near-miss row: the honored key is `xattrs`, and a
+// near-miss that resolved silently would leave a consumer's `preserve` declaration stripped.
 #[test]
 fn an_unknown_entry_key_is_rejected_naming_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let digest = format!("sha256:{}", "b".repeat(64));
     for (key, value, expected) in [
-        ("xattrs", "\"preserve\"", "delta 7"),
+        ("xattr", "\"preserve\"", "known keys"),
         ("imgae", "\"typo\"", "known keys"),
         // A BARE `path` is refused pointing at the one named override key — R7 settled that a path
         // is an OVERRIDE and not a registration, so the shape exists only under a key that also
@@ -537,44 +539,53 @@ fn a_features_declaration_is_strict_parsed_through_the_one_token_table() {
     assert!(msg.contains("features"), "{msg}");
 
     // (c) The positive control: a well-formed declaration resolves onto the entry, keyed by the
-    // parsed `Feature` rather than by the token it was written as.
-    let overlay = entry("{\"snapshot_restore\": false, \"xattr_preserved\": true}");
+    // parsed `Feature` rather than by the token it was written as. `xattr_preserved` is NOT in this
+    // declaration — as of §18 delta 7 it is derived, and declaring it is its own hard error
+    // (`a_declared_xattr_preserved_stance_is_refused_naming_the_derivation`).
+    let overlay = entry("{\"snapshot_restore\": false}");
     let registry = resolve_rootfs_registry(Some(&overlay)).expect("a valid declaration resolves");
     let acme = registry
         .iter()
         .find(|e| e.label == "acme")
         .expect("`acme` resolves");
     assert_eq!(acme.features.get(&Feature::SnapshotRestore), Some(&false));
-    assert_eq!(acme.features.get(&Feature::XattrPreserved), Some(&true));
 
-    // An entry that declares nothing carries an EMPTY map — the baseline, stated. Not `None`, and
-    // not "everything absent": an artifact that says nothing is not declaring anything absent.
+    // An entry that declares nothing carries exactly ONE stance — the derived `xattr_preserved`
+    // (§4.7) — and no other. That is the baseline, stated: an artifact that says nothing is not
+    // declaring anything absent, and the one stance it does carry it did not declare at all.
     let plain = write_overlay(
         tmp.path(),
         &format!(r#"{{ "rootfs": {{ "acme": {{ "image": "i", "digest": "{digest}" }} }} }}"#),
     );
     let registry = resolve_rootfs_registry(Some(&plain)).expect("resolves");
-    assert!(
-        registry
-            .iter()
-            .find(|e| e.label == "acme")
-            .expect("`acme` resolves")
-            .features
-            .is_empty(),
-        "an undeclared entry contributes no stances"
+    let acme = registry
+        .iter()
+        .find(|e| e.label == "acme")
+        .expect("`acme` resolves");
+    assert_eq!(
+        acme.features,
+        [(Feature::XattrPreserved, false)].into_iter().collect(),
+        "an undeclared entry contributes only the derived stance"
     );
 }
 
-// The committed `rootfs.default` declares `xattr_preserved = false`, and this is the assertion that
+// The committed `rootfs.default` says `xattr_preserved = false`, and this is the assertion that
 // keeps the canonical artifact honest rather than merely quiet.
 //
-// vmcell's own packer strips every xattr (the recorded PAX-xattr limitation, §4.2), yet before this
-// delta the canonical `rootfs.erofs` carried no declaration at all — so `load_beside` returned the
-// baseline, nothing removed `XattrPreserved`, and `FeatureSet::has(XattrPreserved)` answered TRUE
-// for an artifact that preserves none. The declaration is what makes the intersection say what the
-// packer does.
+// vmcell's own packer strips every xattr under the default policy (§4.7), yet before 6c the
+// canonical `rootfs.erofs` carried no declaration at all — so `load_beside` returned the baseline,
+// nothing removed `XattrPreserved`, and `FeatureSet::has(XattrPreserved)` answered TRUE for an
+// artifact that preserves none.
 //
-// RED on deleting the `features` key from `pins.json`'s `rootfs.default`.
+// THE ROUTE CHANGED IN §18 DELTA 7 AND THE TRUTH DID NOT. 6c said it with an explicit
+// `"features": {"xattr_preserved": false}` token in `pins.json`; delta 7 makes that token a hard
+// error and DERIVES the stance from the entry's `xattrs` policy instead. The second assertion below
+// is what proves the route rather than merely the answer: declaring the stance is refused, so the
+// baseline — which resolves clean — cannot be declaring it.
+//
+// RED on deleting the `features.insert(XattrPreserved, …)` derivation in `rootfs_registry_entry`:
+// the committed default goes back to carrying no stance and the first assertion fails with
+// `left: None`.
 #[test]
 fn the_committed_default_declares_what_its_packer_actually_does() {
     let default = resolve_rootfs_entry(None, None)
@@ -583,8 +594,470 @@ fn the_committed_default_declares_what_its_packer_actually_does() {
     assert_eq!(
         default.features.get(&Feature::XattrPreserved),
         Some(&false),
-        "the canonical rootfs must DECLARE that its packer strips xattrs (§4.7/§7.4); with no \
-         declaration the intersection reports the feature present"
+        "the canonical rootfs must say that its packer strips xattrs (§4.7/§7.4); with no stance \
+         at all the intersection reports the feature present"
+    );
+    assert_eq!(
+        default.xattrs,
+        XattrPolicy::Strip,
+        "the canonical artifact is packed under the default policy, which is what the stance above \
+         has to be derived from"
+    );
+
+    // The stance is DERIVED, not declared — proved by the fact that declaring it is refused while
+    // the committed baseline resolves. A `pins.json` that re-added the explicit token would fail
+    // `resolve_rootfs_entry(None, None)` above, loudly, at every call site in the tree.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "rootfs": {{ "{DEFAULT_LABEL}": {{ "image": "i", "digest": "sha256:{}",
+                 "features": {{"xattr_preserved": false}} }} }} }}"#,
+            "a".repeat(64)
+        ),
+    );
+    assert!(
+        registry_err(&overlay).contains("DERIVED"),
+        "spelling the stance out must be refused, which is what makes the baseline's stance \
+         necessarily a derived one"
+    );
+}
+
+// The MIGRATION CLAIM of §18 delta 7, in bytes: replacing 6c's explicit `xattr_preserved` token
+// with delta 7's derivation moved the fact's *route* and not the fact, so the canonical artifact's
+// `.features` sidecar is byte-identical across the change.
+//
+// The literal below was captured from the tree at delta 6c — before `pins.json` lost its `features`
+// key and before the derivation existed — by rendering the committed default's declaration. It is
+// therefore a genuine before/after comparison and not a restatement of what the code now does.
+//
+// The `xattrs` policy is the OTHER half and is deliberately not asserted byte-wise here: it is
+// build-affecting, so it belongs to the image's identity (`rootfs_key_tracks_the_xattr_policy`),
+// and part A already bumped `OCI_ROOTFS_STAGE_VERSION` for it.
+//
+// RED two ways: (a) make `XattrPolicy::Preserve` the default — the rendered stance flips to `true`;
+// (b) drop the derivation — the manifest loses its only line.
+#[test]
+fn the_committed_defaults_sidecar_bytes_are_unmoved_by_the_derivation() {
+    const DELTA_6C_MANIFEST: &str = "# vmcell feature manifest (design §7.4). Emitted from the \
+                                     resolved registry entry;\n# the entry is the one authority \
+                                     and this is its travel form.\nxattr_preserved = false\n";
+    let default = resolve_rootfs_entry(None, None)
+        .expect("the baseline registry resolves")
+        .expect("the committed baseline must register a `default` rootfs");
+    let rendered = FeatureDeclaration {
+        source: None,
+        stances: default.features.clone(),
+    }
+    .render_manifest();
+    assert_eq!(
+        rendered, DELTA_6C_MANIFEST,
+        "the canonical rootfs's `.features` sidecar must be byte-identical to the one delta 6c \
+         emitted — delta 7 moved where the stance comes from, not what it says"
+    );
+}
+
+// §10.5's `xattrs` key (§4.7, §18 delta 7): declared per artifact, parsed strictly, and carried to
+// the ONE pack tail as a `PackOptions` field.
+//
+// The pack-options leg is the load-bearing one. A policy that parses onto the entry and stops there
+// is a declaration a consumer built a fixture on — the exact F1 failure the `xattrs` key was
+// refused-with-a-forward-reference to avoid during deltas 6a–6c.
+//
+// RED three ways: (a) `rootfs_entry_xattrs` returning `Ok(XattrPolicy::default())` for an unknown
+// token — the `banana` leg resolves instead of erroring; (b) dropping `"xattrs"` from
+// `rootfs_registry_entry`'s accepted-key set — the `preserve` leg fails as an unknown key;
+// (c) dropping the `xattrs` line from `RootfsStage::pack_options()` — the pack-options assertion
+// fails with `left: Strip, right: Preserve`.
+#[test]
+fn a_declared_xattr_policy_parses_and_reaches_the_pack_options() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "e".repeat(64));
+    let entry_for = |label: &str, xattrs: &str| {
+        let path = tmp.path().join(format!("{label}.json"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "rootfs": {{ "{label}": {{ "image": "i", "digest": "{digest}"{xattrs} }} }} }}"#
+            ),
+        )
+        .expect("write overlay");
+        path
+    };
+
+    for (label, declared, expected) in [
+        (
+            "preserving",
+            ", \"xattrs\": \"preserve\"",
+            XattrPolicy::Preserve,
+        ),
+        ("stripping", ", \"xattrs\": \"strip\"", XattrPolicy::Strip),
+        // Absent is the default, and the default is what the pre-delta-7 packer did.
+        ("silent", "", XattrPolicy::Strip),
+    ] {
+        let overlay = entry_for(label, declared);
+        let entry = resolve_rootfs_entry(Some(label), Some(&overlay))
+            .unwrap_or_else(|e| panic!("`{label}` must resolve: {e}"))
+            .unwrap_or_else(|| panic!("`{label}` must be registered"));
+        assert_eq!(entry.xattrs, expected, "`{label}`'s declared policy");
+        // …and it reaches the one inject+pack tail, which is the whole point of declaring it.
+        assert_eq!(
+            RootfsStage::labelled(Some(label))
+                .with_xattrs(entry.xattrs)
+                .pack_options()
+                .xattrs,
+            expected,
+            "`{label}`'s policy must reach the pack options (§4.7), not merely the entry"
+        );
+    }
+
+    // A word that is neither is a hard error naming the offender AND both valid spellings — never a
+    // silent fall back to the default, which is how `"presevre"` would produce a stripped image
+    // that every downstream check calls correct.
+    let msg = registry_err(&entry_for("acme", ", \"xattrs\": \"banana\""));
+    for named in ["banana", "acme", "strip", "preserve"] {
+        assert!(msg.contains(named), "the refusal must name {named}: {msg}");
+    }
+
+    // …and a non-string value, which the pins FLATTENER would silently skip (it reads this key with
+    // `as_str()`), leaving `resolved_pins.json` claiming no policy for an entry that named one.
+    let msg = registry_err(&entry_for("acme", ", \"xattrs\": true"));
+    assert!(
+        msg.contains("xattrs") && msg.contains("acme"),
+        "a non-string policy must be refused naming the label and the key: {msg}"
+    );
+
+    // The policy instructs the PACKER, and the F7 dev override is published verbatim rather than
+    // packed — so declaring one on that shape is refused naming the shape, not accepted and
+    // silently unable to take effect (law F1). RED on dropping that arm: the entry resolves with a
+    // `Preserve` policy that changes nothing about the bytes it publishes.
+    let unpinned = tmp.path().join("unpinned.json");
+    std::fs::write(
+        &unpinned,
+        format!(
+            r#"{{ "rootfs": {{ "acme": {{ "{UNPINNED_PATH_KEY}": "/tmp/rootfs.erofs",
+                 "xattrs": "preserve" }} }} }}"#
+        ),
+    )
+    .expect("write overlay");
+    let msg = registry_err(&unpinned);
+    for named in ["xattrs", UNPINNED_PATH_KEY, "acme"] {
+        assert!(msg.contains(named), "the refusal must name {named}: {msg}");
+    }
+    // Positive control: the same shape without the policy resolves — the rejection is about the
+    // pairing, not about the override shape.
+    let bare = tmp.path().join("unpinned-bare.json");
+    std::fs::write(
+        &bare,
+        format!(
+            r#"{{ "rootfs": {{ "acme": {{ "{UNPINNED_PATH_KEY}": "/tmp/rootfs.erofs" }} }} }}"#
+        ),
+    )
+    .expect("write overlay");
+    assert!(
+        resolve_rootfs_entry(Some("acme"), Some(&bare))
+            .expect("the bare override resolves")
+            .is_some()
+    );
+}
+
+// §4.7's DERIVATION, both directions, and all the way to the artifact: `Feature::XattrPreserved`'s
+// stance comes from the entry's `xattrs` policy, and it travels in the `.features` sidecar a cell
+// reads with `FeatureDeclaration::load_beside`.
+//
+// The sidecar leg is what makes this a gate rather than a restatement: the derived stance living
+// only on the in-process entry would leave every booted cell reading the baseline — which is the
+// exact desync (`has(XattrPreserved) == true` for an artifact that strips) 6c's producer existed to
+// close and this delta re-routes.
+//
+// RED on deleting the `features.insert(XattrPreserved, xattrs.preserves())` derivation: the
+// `preserving` leg's entry assertion fails with `left: None`. RED on a derivation written as
+// `!xattrs.preserves()`: both legs fail with the stances swapped.
+#[tokio::test]
+async fn the_xattr_preserved_stance_is_derived_from_the_policy_and_reaches_the_sidecar() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "rootfs": {{
+                 "preserving": {{ "image": "i", "digest": "{digest}", "xattrs": "preserve" }},
+                 "stripping":  {{ "image": "i", "digest": "{digest}", "xattrs": "strip" }},
+                 "silent":     {{ "image": "i", "digest": "{digest}" }} }} }}"#
+        ),
+    );
+
+    for (label, expected) in [
+        ("preserving", true),
+        ("stripping", false),
+        ("silent", false),
+    ] {
+        let dir = tmp.path().join(label);
+        let entry = resolve_rootfs_entry(Some(label), Some(&overlay))
+            .expect("resolves")
+            .unwrap_or_else(|| panic!("`{label}` must be registered"));
+        assert_eq!(
+            entry.features.get(&Feature::XattrPreserved),
+            Some(&expected),
+            "`{label}`'s stance must be derived from its policy (§4.7)"
+        );
+
+        // Through the real producer, onto disk, and back out the READER's side.
+        Pipeline::new(dir.clone())
+            .add_stage(Box::new(
+                RootfsFeaturesStage::labelled(Some(label)).with_features(entry.features.clone()),
+            ))
+            .build(&Cache::default())
+            .await
+            .expect("the declaration stage runs");
+        let declaration = FeatureDeclaration::load_beside(
+            &RootfsStage::labelled(Some(label)).out_path(&dir),
+            Source::Rootfs(rootfs_filename(Some(label))),
+        )
+        .expect("the emitted sidecar parses");
+        assert_eq!(
+            declaration.stances.get(&Feature::XattrPreserved),
+            Some(&expected),
+            "`{label}`'s derived stance must reach the artifact a cell actually reads"
+        );
+    }
+}
+
+// THE CONTRADICTORY-PAIR REJECT (§4.7, §10.5): an explicit `xattr_preserved` token in a `features`
+// map is a hard error naming the derivation. One fact, one key — with the derivation closing one
+// desync direction and this reject closing the other, an artifact whose manifest disagrees with its
+// own packer is unrepresentable rather than merely discouraged.
+//
+// Both ORDERS of the two keys in the JSON, and both with and WITHOUT an `xattrs` key beside it: the
+// reject is unconditional, because the derivation always runs (no `xattrs` derives `false` from the
+// default `Strip`), and the shape that would otherwise survive a "only when contradicted" reading —
+// `{"features": {"xattr_preserved": true}}` alone — is precisely the artifact that claims preserved
+// attributes while its packer strips every one of them.
+//
+// RED on deleting the reject arm from `rootfs_entry_features`: every leg resolves, and the
+// `xattrs`-bearing ones resolve to whichever of the two facts the parser wrote last.
+#[test]
+fn a_declared_xattr_preserved_stance_is_refused_naming_the_derivation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "d".repeat(64));
+    let body = |keys: &str| {
+        let path = tmp.path().join(format!("{:x}.json", md5ish(keys)));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "rootfs": {{ "acme": {{ "image": "i", "digest": "{digest}"{keys} }} }} }}"#
+            ),
+        )
+        .expect("write overlay");
+        path
+    };
+    for keys in [
+        // features BEFORE xattrs…
+        ", \"features\": {\"xattr_preserved\": true}, \"xattrs\": \"preserve\"",
+        // …and after.
+        ", \"xattrs\": \"preserve\", \"features\": {\"xattr_preserved\": true}",
+        // AGREEING with the derivation is refused too: a second spelling of one fact is a desync
+        // waiting for the day somebody edits one of them.
+        ", \"xattrs\": \"strip\", \"features\": {\"xattr_preserved\": false}",
+        // And with no `xattrs` key at all — the shape that used to be the ONLY way to say it.
+        ", \"features\": {\"xattr_preserved\": false}",
+        // Beside a legitimately declarable stance, so the reject is about the token and not about
+        // `features` maps carrying more than one key.
+        ", \"features\": {\"snapshot_restore\": false, \"xattr_preserved\": true}",
+    ] {
+        let msg = registry_err(&body(keys));
+        for named in ["xattr_preserved", "DERIVED", "xattrs", "acme"] {
+            assert!(
+                msg.contains(named),
+                "the refusal must name {named} for `{keys}`: {msg}"
+            );
+        }
+    }
+
+    // Positive control: the same entry saying it the ONE supported way resolves, and says exactly
+    // what the refused form was trying to say. So the rejection is about the second spelling, not
+    // about the fact.
+    let ok = body(", \"xattrs\": \"preserve\", \"features\": {\"snapshot_restore\": false}");
+    let entry = resolve_rootfs_entry(Some("acme"), Some(&ok))
+        .expect("the supported spelling resolves")
+        .expect("`acme` must be registered");
+    assert_eq!(entry.features.get(&Feature::XattrPreserved), Some(&true));
+    assert_eq!(entry.features.get(&Feature::SnapshotRestore), Some(&false));
+}
+
+// §4.7 SCOPES the derivation and the reject to "**a vmcell-built rootfs entry**", and this is that
+// scoping from both sides. An `unpinned_path` registration points at bytes vmcell did not pack:
+//
+//  * it derives NOTHING — a derived `xattr_preserved = false` would be a claim vmcell cannot
+//    support, and (worse) the derived key would occupy the map, leaving the operator no way to
+//    state the truth about a foreign image that really does preserve its attributes;
+//  * so the explicit token IS declarable there, and travels to the sidecar a cell reads;
+//  * while the `xattrs` KEY stays refused, because there is still no vmcell pack for a policy to
+//    govern (that leg lives in `a_declared_xattr_policy_parses_and_reaches_the_pack_options`).
+//
+// The digest control is in the same test on purpose: it is what makes this a scoping rather than a
+// removal. RED three ways: (a) deriving unconditionally — the "no derived key" assertion fails with
+// `left: Some(false)`; (b) refusing the token unconditionally — the declaration leg fails with an
+// Artifact rejection; (c) scoping the derivation or the reject to the WRONG shape — the digest
+// control's two assertions fail.
+#[tokio::test]
+async fn an_unpinned_registration_derives_no_stance_and_may_declare_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let unpinned = |keys: &str| {
+        let path = tmp.path().join(format!("{:x}.json", md5ish(keys)));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "rootfs": {{ "acme": {{ "{UNPINNED_PATH_KEY}": "/tmp/rootfs.erofs"{keys} }} }} }}"#
+            ),
+        )
+        .expect("write overlay");
+        path
+    };
+    let resolve = |overlay: &Path| {
+        resolve_rootfs_entry(Some("acme"), Some(overlay))
+            .expect("the unpinned registration resolves")
+            .expect("`acme` must be registered")
+    };
+
+    // (1) Nothing declared: nothing derived. NOT `Some(false)` — an absent key is the baseline
+    // (`FeatureDeclaration::baseline`), which is "vmcell has no stance", and that is the honest
+    // answer about bytes it never produced.
+    let bare = resolve(&unpinned(""));
+    assert_eq!(
+        bare.features.get(&Feature::XattrPreserved),
+        None,
+        "an unpinned registration must derive NO xattr_preserved stance: vmcell packed none of \
+         those bytes, so it has nothing to derive one from (§4.7 scopes the derivation to a \
+         vmcell-built entry)"
+    );
+    assert_eq!(
+        bare.xattrs,
+        XattrPolicy::default(),
+        "…and its policy stays the default, since the `xattrs` key is refused on that shape"
+    );
+
+    // (2) Declared: honored, and it travels. This is the case that was UNSAYABLE while the reject
+    // was unconditional — a foreign image that really does preserve `security.capability`.
+    let declared = resolve(&unpinned(
+        ", \"features\": {\"xattr_preserved\": true, \"snapshot_restore\": false}",
+    ));
+    assert_eq!(
+        declared.features.get(&Feature::XattrPreserved),
+        Some(&true),
+        "an unpinned registration MAY declare the stance: it is the only party that knows it"
+    );
+    assert_eq!(
+        declared.features.get(&Feature::SnapshotRestore),
+        Some(&false),
+        "…beside every other declarable stance, unchanged"
+    );
+    let dir = tmp.path().join("declared");
+    Pipeline::new(dir.clone())
+        .add_stage(Box::new(
+            RootfsFeaturesStage::labelled(Some("acme")).with_features(declared.features.clone()),
+        ))
+        .build(&Cache::default())
+        .await
+        .expect("the declaration stage runs");
+    let manifest = FeatureDeclaration::load_beside(
+        &RootfsStage::labelled(Some("acme")).out_path(&dir),
+        Source::Rootfs(rootfs_filename(Some("acme"))),
+    )
+    .expect("the emitted sidecar parses");
+    assert_eq!(
+        manifest.stances.get(&Feature::XattrPreserved),
+        Some(&true),
+        "the declared stance must reach the artifact a cell actually reads — an entry-only fact is \
+         one no booted cell ever sees"
+    );
+
+    // (3) The digest control, in the same test, so a scoping that drifts to the wrong shape is red
+    // here rather than silently correct-looking. A vmcell-built entry still DERIVES…
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let built = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "rootfs": {{ "acme": {{ "image": "i", "digest": "{digest}",
+                 "xattrs": "preserve" }} }} }}"#
+        ),
+    );
+    assert_eq!(
+        resolve_rootfs_entry(Some("acme"), Some(&built))
+            .expect("the digest registration resolves")
+            .expect("`acme` must be registered")
+            .features
+            .get(&Feature::XattrPreserved),
+        Some(&true),
+        "a vmcell-built entry still derives its stance from its policy"
+    );
+    // …and still REFUSES the token, which is the half that keeps one fact to one key where there
+    // genuinely is a derivation to contradict.
+    let contradicting = tmp.path().join("built-contradiction.json");
+    std::fs::write(
+        &contradicting,
+        format!(
+            r#"{{ "rootfs": {{ "acme": {{ "image": "i", "digest": "{digest}",
+                 "features": {{"xattr_preserved": true}} }} }} }}"#
+        ),
+    )
+    .expect("write overlay");
+    let msg = registry_err(&contradicting);
+    assert!(
+        msg.contains("xattr_preserved") && msg.contains("DERIVED"),
+        "a vmcell-built entry must still refuse the declared stance naming the derivation: {msg}"
+    );
+}
+
+// A distinct filename per overlay body. `write_overlay` reuses one name, which would leave the legs
+// above reading whichever body was written last — the vacuity bug 6c's gates already paid for once.
+fn md5ish(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+// The policy is a SCALAR, so it flattens through the one `rootfs_pin_key` composer and lands in the
+// published `resolved_pins.json` — which is how a consumer inspecting a built artifacts dir can see
+// which policy its image was packed under (`bundle` reads that same document, §10.5).
+//
+// The last assertion is the migration half: the committed baseline declares no policy, so it emits
+// no `rootfs_xattrs` pin at all and an undeclared build's `resolved_pins.json` is byte-identical to
+// its pre-delta-7 self.
+//
+// RED on dropping `"xattrs"` from the flattener's sub-key loop: both `get`s return `None`.
+#[test]
+fn a_declared_policy_flattens_into_the_resolved_pins() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "9".repeat(64));
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "rootfs": {{
+                 "acme": {{ "image": "i", "digest": "{digest}", "xattrs": "preserve" }},
+                 "{DEFAULT_LABEL}": {{ "image": "i", "digest": "{digest}", "xattrs": "strip" }}
+               }} }}"#
+        ),
+    );
+    let pins = resolve_pins(Some(&overlay)).expect("the overlay resolves");
+    assert_eq!(
+        pins.get(&rootfs_pin_key(Some("acme"), "xattrs")),
+        Some(&XattrPolicy::Preserve.name().to_string()),
+        "a labelled policy must reach the flat pins under the one composed key"
+    );
+    // The reserved default contributes no suffix, exactly as its image and digest do.
+    assert_eq!(
+        pins.get(&rootfs_pin_key(None, "xattrs")),
+        Some(&XattrPolicy::Strip.name().to_string()),
+        "the default label's policy must flatten to the un-suffixed key"
+    );
+
+    let baseline = resolve_pins(None).expect("the committed baseline resolves");
+    assert!(
+        !baseline.contains_key(&rootfs_pin_key(None, "xattrs")),
+        "the committed baseline declares no policy, so it must emit no `{}` pin — an undeclared \
+         build's `resolved_pins.json` is unmoved by this delta",
+        rootfs_pin_key(None, "xattrs")
     );
 }
 

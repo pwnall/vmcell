@@ -140,6 +140,21 @@ impl Stage for GuestToolsStage {
                     Err(e) => hasher.update(format!("unpinned-handler-read-error:{e}").as_bytes()),
                 };
             }
+            Some(HandlerSource::Prebuilt { path }) => {
+                // The `--tools` per-run override (§4.2, §18 delta 7). Its identity is the file's
+                // CONTENT and nothing else — the path string is deliberately NOT folded (F4 rule
+                // 3), so the same binary staged under a fresh temp dir on every CI run is one
+                // artifact rather than one per run. This is where it parts company with
+                // `UnpinnedPath` above, whose path IS part of the registration that was written
+                // down. A read failure folds a distinct marker rather than degrading to a stable,
+                // content-blind key that hits a stale cache — the same ART-11 rule the other
+                // path-shaped arms apply.
+                hasher.update(b"prebuilt\0");
+                match crate::artifact::hash_file(path) {
+                    Ok(h) => hasher.update(h.as_bytes()),
+                    Err(e) => hasher.update(format!("prebuilt-handler-read-error:{e}").as_bytes()),
+                };
+            }
             Some(HandlerSource::WorkspaceBuild { .. }) | None => {
                 hasher.update(b"workspace\0");
                 hasher.update(self.workspace_crate().as_bytes());
@@ -150,7 +165,9 @@ impl Stage for GuestToolsStage {
                 // catches a dependency bump: the helper links reqwest/rustls, so a bump
                 // changes the BUILT binary while the `.rs` is byte-identical. The old
                 // source-only hash missed that and re-served a stale ip/curl/kvm-ok helper.
-                match crate::artifact::guest_tools_closure_hash(&crate::artifact::workspace_root())
+                match self
+                    .require_source_checkout()
+                    .and_then(|root| crate::artifact::guest_tools_closure_hash(&root))
                 {
                     Ok(h) => hasher.update(h.as_bytes()),
                     // A read failure must NOT silently degrade to a stable, content-blind key
@@ -173,6 +190,9 @@ impl Stage for GuestToolsStage {
             Some(HandlerSource::UnpinnedPath { path }) => {
                 self.publish_unpinned(out, path).await?;
             }
+            Some(HandlerSource::Prebuilt { path }) => {
+                self.publish_prebuilt(out, path).await?;
+            }
             Some(HandlerSource::WorkspaceBuild { .. }) | None => {
                 self.publish_workspace_build(out).await?;
             }
@@ -186,11 +206,80 @@ impl Stage for GuestToolsStage {
 }
 
 impl GuestToolsStage {
+    /// The **one** "can a workspace build even happen here" answer (§4.2, §18 delta 7), shared by
+    /// [`Stage::cache_key`]'s workspace arm and [`Self::publish_workspace_build`].
+    ///
+    /// A workspace build is the one handler shape that needs vmcell's own sources on disk. Outside
+    /// a checkout there are none, and the pre-delta-7 code asked [`crate::artifact::workspace_root`]
+    /// — which *always* answers, falling back to the caller's own directory — so a repack from a
+    /// consumer's workspace either shelled `cargo build -p vmcell-guest-tools` into that
+    /// workspace or died on a bare "binary source missing at …" naming a path the operator never
+    /// wrote. Neither says what to pass. This does.
+    ///
+    /// Inside a checkout it returns exactly what `workspace_root()` returns, so the default
+    /// stage's cache key is unmoved by delta 7.
+    ///
+    /// # Errors
+    /// [`Error::Artifact`] naming the crate that cannot be built, the directory searched, and the
+    /// two ways to supply the binary instead (`--tools`, or a digest-pinned registration).
+    fn require_source_checkout(&self) -> Result<std::path::PathBuf> {
+        let crate_name = self.workspace_crate();
+        crate::artifact::vmcell_source_root().ok_or_else(|| {
+            Error::Artifact(format!(
+                "cannot build `{crate_name}` here: this is not a vmcell source checkout (no \
+                 `crates/vmcell-protocol/Cargo.toml` above {}), and a workspace build is the one \
+                 handler shape that needs vmcell's own sources. Pass `--tools <path>` with a \
+                 prebuilt `{crate_name}` binary — the mirror of `--steward-musl` (§4.2) — or \
+                 register a digest-pinned handler (§10.5). Refusing rather than packing a rootfs \
+                 with no applets in it.",
+                crate::artifact::workspace_root().display()
+            ))
+        })
+    }
+
+    /// Publishes the `--tools` per-run override's bytes as this label's handler (§4.2, §18 delta
+    /// 7) — no build, no download, and therefore no cargo and no checkout.
+    ///
+    /// The mirror of `--steward-musl`, which skips its stage entirely; a handler has nowhere to be
+    /// skipped *to* (the rootfs pack tail reads the artifact map), so the stage stays and its
+    /// source becomes the file.
+    ///
+    /// # Errors
+    /// [`Error::Artifact`] naming the flag AND the path when the file cannot be read: `--tools` is
+    /// an operator's per-run claim about a file, and a claim that is wrong must not degrade into a
+    /// silent workspace build.
+    async fn publish_prebuilt(&self, out: &Path, path: &Path) -> Result<()> {
+        if let Some(parent) = out.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::copy(path, out).await.map_err(|e| {
+            Error::Artifact(format!(
+                "`--tools {}` could not be read: {e}. It must name a prebuilt \
+                 `{}` binary (§4.2, the `--steward-musl` mirror)",
+                path.display(),
+                self.workspace_crate()
+            ))
+        })?;
+        // Same reason the registered and unpinned arms set it: the handler is exec'd in-guest
+        // through the tools-dir symlinks and the packer's mode heuristic reads the injected file's
+        // own mode. Set unconditionally rather than copied, so a binary that lost its exec bit in
+        // transit (a CI artifact unzipped, say) still boots.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            tokio::fs::set_permissions(out, std::fs::Permissions::from_mode(0o755)).await?;
+        }
+        Ok(())
+    }
+
     /// Compiles the handler from a workspace member and publishes it at `out`.
     async fn publish_workspace_build(&self, out: &Path) -> Result<()> {
         // v15 workspace: the helper is its own member crate, built by `-p` from the
-        // workspace root into the shared workspace `target/`.
-        let ws_root = crate::artifact::workspace_root();
+        // workspace root into the shared workspace `target/`. `require_source_checkout` is the one
+        // predicate that says whether those sources are here at all (§4.2, §18 delta 7) — asked
+        // BEFORE `cargo` is spawned, so a consumer-position run is refused naming `--tools`
+        // instead of compiling into somebody else's workspace.
+        let ws_root = self.require_source_checkout()?;
         // Fail hard if the helper's source closure (`.rs` source + `Cargo.lock`) is
         // unreadable — never silently build and serve a stale helper. Mirrors the
         // steward stage's run()-side hard stop; the returned hash is needed only
@@ -545,6 +634,139 @@ mod tests {
         assert!(
             msg.contains(&gone.display().to_string()),
             "the failure must name the path: {msg}"
+        );
+    }
+
+    // §4.2's `--tools` half (v33 delta 7): a prebuilt handler is injected VERBATIM — no cargo, no
+    // download, no checkout. Three claims, because an accepted-but-ignored `--tools` would satisfy
+    // any two:
+    //
+    //  1. the pointed-at BYTES are published — asserted on content, never on "the file exists",
+    //     which a workspace build would also satisfy;
+    //  2. the published file is executable, because the guest execs it through the tools-dir
+    //     symlinks and the packer's mode heuristic reads the injected file's own mode;
+    //  3. a path that cannot be read is a loud error naming the FLAG and the path — never a
+    //     silent fall-through to the workspace build, which is how an operator ends up with an
+    //     image carrying no applets.
+    //
+    // The "does not shell out to cargo" half of the gate cannot be asserted in-process (PATH is
+    // process-global) and lives in `tests/repack_outside_checkout.rs`, which sets it on a child.
+    #[tokio::test]
+    async fn a_prebuilt_handler_publishes_the_pointed_at_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("prebuilt-guest-tools");
+        std::fs::write(&src, b"#!/bin/sh\necho prebuilt\n").expect("seed the --tools target");
+        let out = dir.path().join("guest_tools");
+        let stage =
+            GuestToolsStage::labelled(None, Some(HandlerSource::Prebuilt { path: src.clone() }));
+
+        stage
+            .run(&StageInputs::default(), &out)
+            .await
+            .expect("`--tools` publishes");
+        assert_eq!(
+            tokio::fs::read(&out)
+                .await
+                .expect("read the published file"),
+            b"#!/bin/sh\necho prebuilt\n",
+            "`--tools`'s own bytes must be published, not a workspace build's"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&out).expect("stat").permissions().mode() & 0o111,
+                0o111,
+                "a published handler must be executable"
+            );
+        }
+
+        let gone = dir.path().join("never-existed");
+        let err =
+            GuestToolsStage::labelled(None, Some(HandlerSource::Prebuilt { path: gone.clone() }))
+                .run(&StageInputs::default(), &dir.path().join("out-missing"))
+                .await
+                .expect_err("an unreadable `--tools` path is a hard stop");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--tools"),
+            "the failure must name the flag the operator typed: {msg}"
+        );
+        assert!(
+            msg.contains(&gone.display().to_string()),
+            "the failure must name the path: {msg}"
+        );
+    }
+
+    // F4 rule 3, on the shape the design names explicitly (§4.2): `--tools`'s identity is the
+    // binary's CONTENT and nothing else, so a CI job that stages the same binary under a fresh
+    // temp dir on every run hits the cache instead of re-packing. Its inverse — folding the path
+    // string — is the defect this pins.
+    //
+    // The last leg is the *contrast*, and it is deliberate: `UnpinnedPath` (delta 6c) folds the
+    // path TOO, because there the path is part of a registration somebody wrote down. Both
+    // behaviors are pinned here so that a later "these two are the same thing, unify them" edit
+    // reddens with the reason attached rather than silently changing one of them.
+    #[test]
+    fn the_prebuilt_key_is_the_content_not_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = StageInputs::default();
+        let here = dir.path().join("here/vmcell-guest-tools");
+        let there = dir.path().join("there/vmcell-guest-tools");
+        for p in [&here, &there] {
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, b"the same binary").expect("write");
+        }
+        let prebuilt = |p: &std::path::Path| {
+            GuestToolsStage::labelled(
+                None,
+                Some(HandlerSource::Prebuilt {
+                    path: p.to_path_buf(),
+                }),
+            )
+            .cache_key(&inputs)
+        };
+        assert_eq!(
+            prebuilt(&here),
+            prebuilt(&there),
+            "the same binary at two paths is ONE artifact: `--tools` folds the content hash, never \
+             the path string (F4 rule 3, §4.2)"
+        );
+        // …and the claim is not vacuous, which the equality alone cannot show: editing the file
+        // at the SAME path must re-key.
+        let before = prebuilt(&here);
+        std::fs::write(&here, b"a different binary").expect("rewrite");
+        assert_ne!(
+            before,
+            prebuilt(&here),
+            "a changed binary at the same path must re-key, or yesterday's helper gets re-baked"
+        );
+        // …and a prebuilt override is not a workspace build, so it cannot be served from one's
+        // cache entry.
+        assert_ne!(
+            prebuilt(&here),
+            GuestToolsStage::new().cache_key(&inputs),
+            "`--tools` bytes and a workspace build are two artifacts"
+        );
+
+        // The contrast (see the comment above): the registry's unpinned dev override folds the
+        // path as well, so the same bytes at two paths stay two artifacts THERE.
+        std::fs::write(&here, b"the same binary").expect("restore");
+        let unpinned = |p: &std::path::Path| {
+            GuestToolsStage::labelled(
+                Some("acme"),
+                Some(HandlerSource::UnpinnedPath {
+                    path: p.to_path_buf(),
+                }),
+            )
+            .cache_key(&inputs)
+        };
+        assert_ne!(
+            unpinned(&here),
+            unpinned(&there),
+            "delta 6c's `unpinned_path` deliberately folds the path (a registration names one \
+             location); if this ever equalizes, the two shapes have been unified — decide which \
+             identity law wins and say so, do not let it drift"
         );
     }
 

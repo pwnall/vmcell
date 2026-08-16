@@ -159,7 +159,8 @@ pub const DEFAULT_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Order is the injection order and the dispatch-table order; it carries no other meaning.
 /// Names must be unique (the dispatch lookup is first-match) — pinned by
 /// `guest_tools_applet_roster_is_unique_and_non_empty`.
-pub const GUEST_TOOLS_APPLETS: &[&str] = &["ip", "curl", "kvm-ok", "echo-server", "mini-init"];
+pub const GUEST_TOOLS_APPLETS: &[&str] =
+    &["ip", "curl", "kvm-ok", "echo-server", "mini-init", "xattr"];
 
 /// The vsock port the steward listens on and the host dials — **one definition**, here, because
 /// this is the crate the host and the guest already share (design §3.5, v33 delta 4).

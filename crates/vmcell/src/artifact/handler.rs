@@ -79,8 +79,14 @@ pub fn handler_label_from_filename(name: &str) -> Option<&str> {
     }
 }
 
-/// Where one registered handler's bytes come from — the three registration shapes §10.5 allows,
-/// exhaustively (F7).
+/// Where one handler's bytes come from — the three **registration** shapes §10.5 allows,
+/// exhaustively (F7), plus the one per-run **override** that is not a registration at all
+/// ([`HandlerSource::Prebuilt`], §4.2).
+///
+/// The split is R7's: a registration is a durable claim that outlives the session that made it, so
+/// it is a digest; an override is a deliberate per-run act by an operator who knows what they are
+/// pointing at, exactly as `VMCELL_KERNEL`/`VMCELL_ROOTFS` are. Only the first three are ever
+/// produced by the `handlers` entry parser — no pins key resolves to `Prebuilt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandlerSource {
     /// `"build": "workspace:<crate>"` — compiled from a workspace member.
@@ -114,6 +120,24 @@ pub enum HandlerSource {
     /// durable provenance claim and this shape cannot make one.
     UnpinnedPath {
         /// The local file whose bytes **are** the handler, exactly as registered.
+        path: std::path::PathBuf,
+    },
+    /// `vmcell oci2-erofs --tools <path>` — a prebuilt handler binary injected verbatim, the
+    /// missing mirror of `--steward-musl` (§4.2, §18 delta 7).
+    ///
+    /// **Not a registration shape.** No pins key produces it and the `handlers` entry parser never
+    /// returns it; it exists so a repack can run from **outside a vmcell checkout**, where the
+    /// workspace build ([`HandlerSource::WorkspaceBuild`]) has no sources to compile and would
+    /// otherwise leave the operator with a rootfs carrying no applets.
+    ///
+    /// **Its identity is the file's content hash and nothing else** — never the path string (F4
+    /// rule 3), exactly as the `--steward-musl` fold works. That is the one place it differs from
+    /// [`HandlerSource::UnpinnedPath`], and the difference is the shapes': an unpinned
+    /// *registration* is a durable line in a pins file, so the path it names is part of what was
+    /// registered, while `--tools` is a per-run argument whose path is scratch — a CI job staging
+    /// the same binary under a fresh temp dir every run must hit the cache, not re-pack.
+    Prebuilt {
+        /// The local file whose bytes are injected as the handler.
         path: std::path::PathBuf,
     },
 }

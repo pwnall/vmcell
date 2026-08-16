@@ -184,6 +184,37 @@ const fn probe_permits_unlink(probe: BakedVsockProbe) -> bool {
     matches!(probe, BakedVsockProbe::Refused)
 }
 
+/// `connect(2)` refused the path — the only errno that proves no listener owns it.
+///
+/// Empirically the answer for **every** dead shape a baked path can take: a stream socket whose
+/// listener is gone, a leftover regular file, and even a directory all return `ECONNREFUSED`.
+const CONNECT_REFUSED: i32 = nix::errno::Errno::ECONNREFUSED as i32;
+
+/// The path vanished between the existence check and the connect — also proof that nothing owns it.
+const CONNECT_MISSING: i32 = nix::errno::Errno::ENOENT as i32;
+
+/// Which `connect` FAILURES prove the baked path is dead (§8.2's restore guard).
+///
+/// The arm this closes is the sibling of the timeout arm `c5a01a1` closed, and it was left blanket:
+/// the guard read *any* `Err` from `connect` as "nothing owns the path" while its own rustdoc
+/// claimed the narrow set. It is not narrow — `connect` also fails with `EMFILE`/`ENFILE` under fd
+/// pressure, `EACCES` on a path it may not reach, `EAGAIN` when a **live** listener's backlog is
+/// full, and `EINTR`. Every one of those says nothing about liveness, and every one of them made
+/// the guard unlink a live VM's steward transport and let the restore proceed. Reproduced: with
+/// `RLIMIT_NOFILE` low enough that `connect` returns `EMFILE`, the live-listener test's
+/// `expect_err` panicked with `a live listener on the baked path must be rejected: ()` — the guard
+/// had returned `Ok` for a socket a listener was sitting on.
+///
+/// Same direction as every other decision in this guard: only a **proof** of absence unlinks, and
+/// everything else refuses, because refusing costs a loud retryable re-run while unlinking is
+/// silent and severs a live VM.
+const fn connect_failure_proves_dead(raw_os_error: Option<i32>) -> BakedVsockProbe {
+    match raw_os_error {
+        Some(CONNECT_REFUSED | CONNECT_MISSING) => BakedVsockProbe::Refused,
+        _ => BakedVsockProbe::Inconclusive,
+    }
+}
+
 /// Pre-restore guard + cleanup for the snapshot's baked host vsock UDS path
 /// (`restore_rotates_host_paths: false` — FC re-binds this exact path verbatim).
 ///
@@ -199,7 +230,15 @@ const fn probe_permits_unlink(probe: BakedVsockProbe) -> bool {
 /// re-creation matters because the baked path lives in the long-gone base VM's
 /// scratch dir, and a missing parent fails `PUT /snapshot/load` with ENOENT.
 ///
-/// **A probe TIMEOUT is inconclusive, and inconclusive fails closed.** It used to be
+/// **A probe that did not PROVE the path dead is inconclusive, and inconclusive fails closed.**
+/// Two arms have had to learn this, a release apart. First the timeout (below). Then the error
+/// arm, which read *any* `connect` failure as "nothing owns the path" while this very paragraph
+/// claimed the narrow `ECONNREFUSED`/`ENOENT` set: `connect` also fails `EMFILE`/`ENFILE` under fd
+/// pressure, `EAGAIN` when a **live** listener's backlog is full, `EACCES`, and `EINTR` — none of
+/// which say anything about liveness, and all of which unlinked a running VM's socket. That arm is
+/// now [`connect_failure_proves_dead`], and it is a pure predicate for the reason the other one is.
+///
+/// **A probe TIMEOUT is inconclusive too.** It used to be
 /// grouped with the dead-path answers, on the reasoning that a live listener answers
 /// a local `connect` instantly. Under load it does not: a full `cargo test
 /// --workspace` made a live-listener connect exceed the 100 ms budget, and this
@@ -224,15 +263,20 @@ async fn reject_live_baked_vsock(path: &Path) -> Result<()> {
         .await;
         let probe = match probe {
             Ok(Ok(_stream)) => BakedVsockProbe::Accepted,
-            Ok(Err(_dead)) => BakedVsockProbe::Refused,
+            // NOT a blanket "an error means dead": only the errnos that PROVE absence unlink.
+            Ok(Err(failed)) => connect_failure_proves_dead(failed.raw_os_error()),
             Err(_elapsed) => BakedVsockProbe::Inconclusive,
         };
         if !probe_permits_unlink(probe) {
             let why = match probe {
                 BakedVsockProbe::Accepted => "a live listener accepted a probe connection",
-                _ => {
-                    "the probe connect did not complete within its budget, which does not prove \
-                     the path is dead"
+                // `Refused` cannot reach here — `probe_permits_unlink` admits it — but it is named
+                // rather than swept into a `_` so a fourth outcome is a compile error here instead
+                // of silently inheriting somebody else's sentence.
+                BakedVsockProbe::Inconclusive | BakedVsockProbe::Refused => {
+                    "the probe neither reached a listener nor proved the path dead: it either did \
+                     not complete within its budget, or it failed for a reason that says nothing \
+                     about liveness (a resource limit, a permission error, a full backlog)"
                 }
             };
             return Err(Error::Vmm(format!(
@@ -2370,6 +2414,47 @@ mod tests {
         );
     }
 
+    /// Creates a socket file at `path` whose listener is **verifiably** gone.
+    ///
+    /// `bind` then `drop` is the obvious construction and it is RACY, which is the mechanism behind
+    /// a flake this suite carried for two passes ("the first run after a cold build fails, warm runs
+    /// pass"): a listening fd open in one libtest thread is duplicated into every `fork` another
+    /// thread performs in that instant, and until that child reaches `execve` (where `CLOEXEC`
+    /// finally closes it) the socket is **still bound and still accepting**. So the guard probes it,
+    /// gets a genuine `Ok` from `connect`, and correctly refuses to unlink a path something is
+    /// listening on — and the test, which assumed its own fixture was dead, fails.
+    ///
+    /// Measured rather than argued: 3000 `bind`/`drop`/`connect` cycles per process, one process,
+    /// sequential — **zero** anomalies in 96 000 iterations. The same loop inside the full test
+    /// binary with 24 copies running concurrently (i.e. with sibling tests spawning processes) —
+    /// 1 to 4 anomalies per 3000, and a plain `std::os::unix::net::UnixStream::connect` succeeds on
+    /// them too, so this is the kernel's answer and not a tokio artifact.
+    ///
+    /// The fix is to stop assuming: bind, drop, then **confirm** the path refuses before handing it
+    /// to the test. Confirmation is stable once it holds — the duplicate can only have been made
+    /// while the fd was open, and it dies at the child's `execve` — so this converges rather than
+    /// merely re-rolling the dice. A path that will not go quiet is a loud failure naming the race,
+    /// never a silent skip.
+    async fn stale_socket_file(path: &Path) {
+        for attempt in 0..64 {
+            let _ = std::fs::remove_file(path);
+            drop(tokio::net::UnixListener::bind(path).expect("bind then drop = stale socket file"));
+            assert!(path.exists(), "precondition: the stale socket file exists");
+            match tokio::net::UnixStream::connect(path).await {
+                Err(e) if e.raw_os_error() == Some(CONNECT_REFUSED) => return,
+                other => {
+                    assert!(
+                        attempt < 63,
+                        "could not build a provably-dead socket file at {}: the listening fd keeps \
+                         being duplicated into a concurrently forking sibling test, so the path \
+                         stays live (last probe: {other:?})",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
     // Guards the pre-restore liveness guard (`restore_rotates_host_paths: false`):
     // a baked vsock path with a LIVE listener (the snapshotted VM or a prior
     // restore of the lineage still running) must be rejected with a typed
@@ -2405,10 +2490,11 @@ mod tests {
 
         // Stale leftover (a dead socket file, no listener): cleared, parent kept —
         // the sequential-restore case where the bind would otherwise EADDRINUSE.
+        // Through `stale_socket_file`, which VERIFIES the fixture is dead instead of assuming a
+        // dropped listener is: see that helper for the fd-duplication race this used to flake on.
         let stale = dir.path().join("gone-vm").join("stale.sock");
         std::fs::create_dir_all(stale.parent().expect("parent")).expect("mk parent");
-        drop(tokio::net::UnixListener::bind(&stale).expect("bind then drop = stale file"));
-        assert!(stale.exists(), "precondition: the stale socket file exists");
+        stale_socket_file(&stale).await;
         reject_live_baked_vsock(&stale)
             .await
             .expect("a stale socket file must be cleared, not rejected");
@@ -2458,6 +2544,75 @@ mod tests {
         );
     }
 
+    // THE ERROR-ARM DIRECTION — the sibling of the timeout arm above, and the same defect one
+    // release later. `Ok(Err(_))` was read as "nothing owns the path" while the guard's own rustdoc
+    // claimed the narrow ECONNREFUSED/ENOENT set. It is not narrow: `connect` also fails EMFILE /
+    // ENFILE under fd pressure, EAGAIN when a LIVE listener's backlog is full, EACCES, and EINTR.
+    // Every one of those unlinked a running VM's steward transport and let the restore proceed.
+    //
+    // REPRODUCED, not reasoned: with `ulimit -n 32` the whole test binary's live-listener leg
+    // panicked `a live listener on the baked path must be rejected: ()` — the guard returned `Ok`
+    // for a socket a listener was sitting on.
+    //
+    // Driven over the PREDICATE, for the reason the timeout one is: EMFILE is not producible from
+    // a test without shrinking the process's own rlimit, which every sibling test on the same
+    // threads would then trip. RED on the inverse (`_ => Refused`, i.e. the shipped-until-now
+    // blanket): every row in the second table fails, naming its errno.
+    #[test]
+    fn only_a_proof_of_absence_errno_permits_unlinking_the_baked_path() {
+        use nix::errno::Errno;
+        for (errno, why) in [
+            (
+                Errno::ECONNREFUSED,
+                "the socket file is there and nothing is listening — the stale leftover the guard \
+                 exists to clear, empirically also the answer for a leftover regular file",
+            ),
+            (
+                Errno::ENOENT,
+                "the path went away between the existence check and the connect",
+            ),
+        ] {
+            assert_eq!(
+                connect_failure_proves_dead(Some(errno as i32)),
+                BakedVsockProbe::Refused,
+                "{errno:?} PROVES nothing owns the path ({why}); refusing it would break every \
+                 sequential restore"
+            );
+        }
+        for (errno, why) in [
+            (
+                Errno::EMFILE,
+                "the process is out of descriptors — the probe never reached the socket at all",
+            ),
+            (Errno::ENFILE, "the SYSTEM is out of descriptors"),
+            (
+                Errno::EAGAIN,
+                "a LIVE listener's backlog is full: this is evidence of liveness, not of absence",
+            ),
+            (
+                Errno::EACCES,
+                "the probe may not reach the path; the VM that owns it can",
+            ),
+            (Errno::EINTR, "a signal interrupted the connect"),
+            (
+                Errno::EPROTOTYPE,
+                "something else is bound there; what it is, is not established",
+            ),
+        ] {
+            assert_eq!(
+                connect_failure_proves_dead(Some(errno as i32)),
+                BakedVsockProbe::Inconclusive,
+                "{errno:?} says NOTHING about liveness ({why}); unlinking on it silently severs a \
+                 live VM's steward transport, while refusing costs a loud, retryable re-run"
+            );
+        }
+        assert_eq!(
+            connect_failure_proves_dead(None),
+            BakedVsockProbe::Inconclusive,
+            "an error with no errno at all is the least evidence of any; it must not unlink"
+        );
+    }
+
     // The two socket-level outcomes end to end, so the predicate above is wired to the real probe
     // rather than merely correct in isolation: a live listener refuses and keeps its socket, a
     // provably dead one clears.
@@ -2473,8 +2628,10 @@ mod tests {
         assert!(matches!(&err, Error::Vmm(msg) if msg.contains("wired-live.sock")));
         assert!(live.exists(), "a refused path must not be unlinked");
 
+        // Same verified fixture as the sibling test, and for the same reason: a dropped listener is
+        // not reliably a dead one while other threads are forking (see `stale_socket_file`).
         let dead = dir.path().join("wired-dead.sock");
-        drop(tokio::net::UnixListener::bind(&dead).expect("bind then drop = stale file"));
+        stale_socket_file(&dead).await;
         reject_live_baked_vsock(&dead)
             .await
             .expect("a provably dead path clears");

@@ -30,7 +30,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Explicit `version` alongside `path` keeps the cargo-deny `wildcards = "deny"` gate happy.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.7.0" }
 postcard = { version = "1", features = ["use-std"] }
 vsock = "0.5"
 # `event` powers the event-driven vsock accept loop (poll(2) on the listener fd,

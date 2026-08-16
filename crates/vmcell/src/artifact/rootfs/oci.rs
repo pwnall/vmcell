@@ -144,6 +144,31 @@ pub async fn build_rootfs(
     build_rootfs_with(&RealOciPuller::new(), image, digest, inputs, out, options).await
 }
 
+/// The digest-pinned base image's layers, decoded into tar streams **in layer order** — the
+/// pull→cache→re-verify→decode half of [`build_rootfs`], stopping short of the pack.
+///
+/// Public because §4.2's external repacking is "compose more layers over a *registered* base": a
+/// caller that wants the pinned base plus its own tar layer has to be able to name the base's
+/// layers without re-implementing the digest verification that makes them trustworthy. It is the
+/// **same** implementation [`build_rootfs`] runs — one pull→verify→decode law, two callers — so a
+/// composed pack can never resolve the base differently from a plain one. The one in-tree consumer
+/// today is the §15.4 xattr battery, whose `Preserve` input is a synthetic PAX layer merged over
+/// this base (the pinned Debian rootfs carries no `SCHILY.xattr` record of its own).
+///
+/// The returned streams are lazy decoders over the on-disk blob cache: nothing is read until the
+/// packer reads it.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Artifact`] if `digest` is not `sha256:`-pinned, if the manifest
+/// or a blob cannot be fetched or fails its digest re-verification, or if a layer's media type is
+/// one this builder cannot decode.
+pub async fn base_layer_tar_streams(
+    image: &str,
+    digest: &str,
+) -> Result<Vec<Box<dyn std::io::Read + Send>>> {
+    layer_tar_streams_with(&RealOciPuller::new(), image, digest).await
+}
+
 /// The pull→cache→re-verify→decode→pack core, parameterized over an injectable
 /// [`OciPuller`] so the whole chain is testable without a registry (ART-3).
 async fn build_rootfs_with(
@@ -154,6 +179,17 @@ async fn build_rootfs_with(
     out: &Path,
     options: &super::PackOptions,
 ) -> Result<StageOutputs> {
+    let streams = layer_tar_streams_with(puller, image, digest).await?;
+    super::pack_erofs_with_injection(streams, inputs, out, options).await
+}
+
+/// The pull→cache→re-verify→decode half, parameterized over the same injectable [`OciPuller`]
+/// so the fake-driven chain tests keep covering it.
+async fn layer_tar_streams_with(
+    puller: &dyn OciPuller,
+    image: &str,
+    digest: &str,
+) -> Result<Vec<Box<dyn std::io::Read + Send>>> {
     // Digest-pinned pulls only: a tag (or any non-`sha256:` reference) is the §10.2 (The
     // stage model and the five cache-key rules) provenance hard stop and is rejected BEFORE
     // any network I/O — never a tag fallback.
@@ -218,7 +254,7 @@ async fn build_rootfs_with(
         }
     }
 
-    super::pack_erofs_with_injection(streams, inputs, out, options).await
+    Ok(streams)
 }
 
 /// The OCI/Docker layer media types this builder can decode (gzip and zstd

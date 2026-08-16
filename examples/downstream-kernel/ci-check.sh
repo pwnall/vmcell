@@ -10,11 +10,17 @@
 #                                          two-step route (separate processes: `ensure_test_artifacts`
 #                                          memoizes its outcome per process)
 #   3. the DOCUMENTED CLI invocations    — `vmcell build-kernels <label>…|--all --pins …` and
-#                                          `vmcell oci2-erofs … --inject …`, the half of the contract
-#                                          `cargo semver-checks` cannot see. Exercised on their
-#                                          fail-fast contract boundaries so the leg needs no network
-#                                          and no 6-minute kernel compile; the real labelled build is
-#                                          the live leg on the KVM job.
+#                                          `vmcell oci2-erofs … --inject/--tools/--work-dir …`, the
+#                                          half of the contract `cargo semver-checks` cannot see.
+#                                          Mostly exercised on their fail-fast contract boundaries so
+#                                          the leg needs no network and no 6-minute kernel compile;
+#                                          the real labelled build is the live leg on the KVM job.
+#                                          The v33 delta-7 pair is the exception that proves the rest
+#                                          of the group's shape: it runs the BUILT BINARY from a
+#                                          directory with no vmcell checkout above it — the
+#                                          consumer's actual position — and pins that a repack there
+#                                          refuses without `--tools` and proceeds with it. It still
+#                                          stops short of completing a pack, which needs a real pull.
 #   4. the vendored-vhost assertion trio — green (this workspace IS delta 2's positive control),
 #                                          red on a dropped stanza, and not-applicable.
 #
@@ -60,8 +66,42 @@ expect() {
         fail=1
         return
     fi
-    if ! grep -qE "$want_re" <<<"$out"; then
+    # `--` before the pattern: several legs assert that a FLAG is named in the refusal, and a
+    # pattern beginning `--tools` would otherwise be eaten by grep as an option.
+    if ! grep -qE -- "$want_re" <<<"$out"; then
         echo "FAIL [$name]: output does not match /$want_re/"
+        printf '  ---- output ----\n%s\n' "$out"
+        fail=1
+        return
+    fi
+    echo "ok   [$name]"
+}
+
+# The inverse of `expect`'s output check, for the one place a leg's meaning IS an absence: with
+# `--tools`, the repack must no longer fail on `vmcell-guest-tools`. A bare "it failed differently"
+# would prove little on its own, so it is only ever used as the second half of a discriminating
+# pair — the same command with the flag removed, asserted to name that string.
+expect_absent() {
+    local name="$1" want_rc="$2" absent_re="$3"
+    shift 3
+    local out rc
+    set +e
+    out="$("$@" 2>&1)"
+    rc=$?
+    set -e
+    local rc_ok=1
+    case "$want_rc" in
+        nonzero) [ "$rc" -ne 0 ] || rc_ok=0 ;;
+        *) [ "$rc" = "$want_rc" ] || rc_ok=0 ;;
+    esac
+    if [ "$rc_ok" -eq 0 ]; then
+        echo "FAIL [$name]: exit $rc, expected $want_rc"
+        printf '  ---- output ----\n%s\n' "$out"
+        fail=1
+        return
+    fi
+    if grep -qE -- "$absent_re" <<<"$out"; then
+        echo "FAIL [$name]: output still matches /$absent_re/"
         printf '  ---- output ----\n%s\n' "$out"
         fail=1
         return
@@ -124,6 +164,70 @@ expect "oci2-erofs --inject accepts a well-formed triple" nonzero "digest-pinned
 expect "oci2-erofs --inject names an unknown key" nonzero "owner" \
     "${cli[@]}" oci2-erofs debian:trixie-slim -o "$work/out.erofs" \
         --inject "dest=/opt/acme/probe,src=$here/README.md,mode=0755,owner=root"
+# §4.2 (v33 delta 7): `--tools` + `--work-dir`, on the same terms. Well-formed values PARSE and the
+# command still stops on the un-pinned digest — the boundary is unmoved, which is what "both flags
+# are additive" has to mean at the argument surface.
+expect "oci2-erofs --tools/--work-dir accept well-formed paths" nonzero "digest-pinned" \
+    "${cli[@]}" oci2-erofs debian:trixie-slim -o "$work/out.erofs" \
+        --tools "$here/README.md" --work-dir "$work/wd-parse"
+# …and each is refused BY NAME when it cannot be honored. These need a digest-PINNED image, which
+# is itself the ordering they pin: the argument checks run before any registry is contacted, so a
+# typo costs an error message rather than a pull. (`sha256:` + 64 hex; the bytes never matter, the
+# run stops long before anything is fetched.)
+pinned_image="debian:trixie-slim@sha256:$(printf 'a%.0s' $(seq 64))"
+expect "oci2-erofs --tools names a path that is not there" nonzero "--tools" \
+    "${cli[@]}" oci2-erofs "$pinned_image" -o "$work/out.erofs" \
+        --tools "$work/no-such-guest-tools" --work-dir "$work/wd-parse"
+touch "$work/not-a-directory"
+expect "oci2-erofs --work-dir names a non-directory" nonzero "--work-dir" \
+    "${cli[@]}" oci2-erofs "$pinned_image" -o "$work/out.erofs" \
+        --tools "$here/README.md" --work-dir "$work/not-a-directory"
+
+# THE CONSUMER-POSITION PAIR (§4.2, v33 delta 7) — the legs this script's own header used to say
+# were missing: before delta 7 no rootfs pipeline had ever been run from the consumer's position in
+# CI, only from its fail-fast argument boundaries.
+#
+# These run the BUILT BINARY, not `cargo run`, and that is load-bearing: cargo sets
+# `CARGO_MANIFEST_DIR` for the process it launches, and vmcell's source-root ascent starts there —
+# so a `cargo run` leg is inside the checkout whatever its CWD is, and the pair below would pass
+# vacuously. `env -u CARGO_MANIFEST_DIR` plus a CWD under `$work` (a `mktemp -d`, outside this
+# repo) is the consumer's real position.
+cargo build --locked -q -p vmcell-cli --bin vmcell
+vmcell_bin="${CARGO_TARGET_DIR:-$repo/target}/debug/vmcell"
+[ -x "$vmcell_bin" ] || {
+    echo "FAIL: $vmcell_bin was not built — the consumer-position legs need the binary itself"
+    exit 1
+}
+outside="$work/consumer"
+mkdir -p "$outside"
+# A stand-in for each prebuilt input. Neither is inspected before the stage that uses it, and the
+# pair below stops in the handler stage, so their contents are irrelevant — what matters is that
+# `--steward-musl` skips the steward's own checkout dependency, leaving the handler as the only one.
+printf 'steward\n' > "$outside/steward-musl"
+printf 'tools\n' > "$outside/guest-tools"
+cd "$outside"
+# RED HALF: no `--tools` and no checkout is a refusal that NAMES the crate it cannot build — never
+# a silent image with no applets in it, and never a `cargo build` fired into the consumer's own
+# workspace (which is what `workspace_root()`'s always-answers fallback used to produce).
+# The regex demands the REMEDY as well as the crate, deliberately: the pre-delta-7 tree already
+# failed here with "vmcell-guest-tools binary source missing at <a path the operator never typed>",
+# so a leg matching only the crate name would have passed before this delta existed.
+expect "oci2-erofs outside a checkout refuses without --tools" nonzero \
+    "vmcell-guest-tools.*--tools" \
+    env -u CARGO_MANIFEST_DIR "$vmcell_bin" oci2-erofs "$pinned_image" \
+        -o "$outside/out.erofs" --steward-musl "$outside/steward-musl" --work-dir "$outside/wd"
+# GREEN HALF, as far as a network-free job can carry it: the SAME command plus `--tools` no longer
+# fails on the handler at all — it gets past that stage and dies fetching the (deliberately
+# unresolvable) image. One variable changes between the two legs, so the pair is discriminating.
+# What this job does NOT do is complete the pack: that needs a real digest-pinned pull, which this
+# script has no network for (see the header). The pack itself is proven at the stage level by
+# `crates/vmcell/tests/repack_outside_checkout.rs`, which re-execs into this same position.
+expect_absent "oci2-erofs outside a checkout gets past the handler with --tools" nonzero \
+    "vmcell-guest-tools" \
+    env -u CARGO_MANIFEST_DIR "$vmcell_bin" oci2-erofs "vmcell.invalid/acme@sha256:$(printf 'a%.0s' $(seq 64))" \
+        -o "$outside/out.erofs" --steward-musl "$outside/steward-musl" \
+        --tools "$outside/guest-tools" --work-dir "$outside/wd"
+cd "$repo"
 
 group "4. the vendored-vhost assertion (delta 2), this workspace being its positive control"
 cd "$here"

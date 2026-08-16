@@ -169,3 +169,92 @@ async fn conformance_live_underclaim_warns_with_its_positive_control() {
         report.failures().collect::<Vec<_>>()
     );
 }
+
+/// The **live** wiring of the second decidable plan (`ProbePlan::XattrReadback`, §4.7/§18 delta 7):
+/// the probe boots the artifact, walks its rootfs through the in-guest `xattr` applet, and comes
+/// back with a completed observation.
+///
+/// This is the fake-blind half of that probe. A scripted probe proves the judgement; nothing but a
+/// real guest proves that `sh` is there, that `find` is there, that `xattr` resolves on the exec
+/// PATH, and that the walk terminates inside its budget — and every one of those failing would
+/// otherwise surface as a plausible-looking `Unverified` nobody reads twice.
+///
+/// **What it can and cannot show, stated rather than implied.** The artifacts this suite has on
+/// hand are packed under `XattrPolicy::Strip` — that is what `rootfs.default` declares — so the
+/// probe's honest answer here is "walked the image, found none". That drives the `DoesNotWork`
+/// answer and the control pairing; it does **not** drive the `Works` answer, which needs a
+/// `Preserve`-packed image and is proved by `crates/vmcell/tests/xattr_policy.rs` one crate over.
+///
+/// So the assertion is on the pairing's own honesty: the positive control declares the feature over
+/// the same (stripping) artifact, cannot demonstrate it, and the battery therefore refuses to call
+/// the candidate's absence *verified*. That verdict is `Unverified` naming the control — a Pass
+/// here would mean the kit awarded a verified absence with no working control, which is the
+/// constant-that-certifies-everything §10.6 exists to forbid.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs KVM + built artifacts"]
+async fn conformance_live_xattr_probe_walks_the_image_and_refuses_an_uncontrolled_absence() {
+    use vmcell::feature::{Feature, FeatureDeclaration, Source};
+    use vmcell_artifact_validator::conformance::{
+        ArtifactId, ConformanceOptions, ConformanceSubject, LiveProbe, Substrate, run_battery,
+    };
+    use vmcell_artifact_validator::harness::ch_bin;
+
+    let artifacts = ArtifactSet::new(get_vmlinux(), get_rootfs());
+    let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(ch_bin());
+    let substrate = Substrate::of(&vmm);
+
+    let declaring = |label: &str, stance: bool| {
+        let mut declaration = FeatureDeclaration::baseline(Source::Rootfs(label.to_string()));
+        declaration.stances.insert(Feature::XattrPreserved, stance);
+        ConformanceSubject {
+            id: ArtifactId::new(label),
+            artifacts: artifacts.clone(),
+            declaration,
+        }
+    };
+
+    let report = run_battery(
+        &LiveProbe::new(&vmm),
+        &substrate,
+        &declaring("under-test-declares-no-xattrs", false),
+        &declaring("control-declares-xattrs", true),
+        &ConformanceOptions::default(),
+    )
+    .await
+    .expect("the battery must run on a KVM host with artifacts");
+    for o in &report.outcomes {
+        println!("[{:?}] {} -> {:?}", o.level, o.id, o.status);
+    }
+
+    let xattr = report
+        .outcomes
+        .iter()
+        .find(|o| o.id == "conformance.xattr_preserved")
+        .expect("the paired xattr check is in the roster");
+    let CheckStatus::Unverified(msg) = &xattr.status else {
+        panic!(
+            "the canonical artifacts are packed `strip`, so the positive control cannot \
+             demonstrate the feature and the candidate's absence is NOT verified — got {:?}. A \
+             Pass here would be a verified absence awarded with no working control; a Skip would \
+             mean the probe never ran at all.",
+            xattr.status
+        );
+    };
+    assert!(
+        msg.contains("control-declares-xattrs"),
+        "the verdict must name the control that failed to demonstrate it: {msg}"
+    );
+    // The evidence the PROBE produced, not the judgement's own wording: this substring exists only
+    // if the in-guest walk really ran and really completed. If `sh`, `find` or the `xattr` applet
+    // were missing, the probe would answer `NotRun` and this text would be the "did not complete"
+    // one instead.
+    assert!(
+        msg.contains("walked") && msg.contains("paths"),
+        "the verdict must carry the in-guest walk's own evidence — a scan that never ran reports \
+         that it did not complete, and the two must not read alike: {msg}"
+    );
+    assert!(
+        !msg.contains("no data-plane probe"),
+        "the kit must not still be reporting `NO_PROBE_YET` for a feature it now probes: {msg}"
+    );
+}

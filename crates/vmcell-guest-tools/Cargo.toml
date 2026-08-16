@@ -21,7 +21,7 @@ libc = "0.2"
 # table and the rootfs injection manifest DERIVE from one list instead of restating it
 # (docs/81 m22, design §4.4). The explicit `version` (alongside `path`) keeps the cargo-deny
 # `wildcards = "deny"` gate happy — a bare path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.7.0" }
 # v33 delta 5: `mini-init` assembles the guest root through the steward library's ONE assembly
 # function rather than carrying a second copy of the mount sequence — the duplicate-law hazard
 # AGENTS.md names, and the reason a service-placement cell's filesystem is byte-for-byte the one a

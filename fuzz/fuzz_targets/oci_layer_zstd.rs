@@ -55,11 +55,16 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
+    // `XattrPolicy::Preserve` (v33 delta 7): the decoder-under-test is the zstd frame, and the
+    // policy only decides whether the tar layer's PAX `SCHILY.xattr.*` records are decoded on the
+    // far side. `Preserve` reaches strictly more of the packer for the same input, and the sibling
+    // `oci_layer_tar` target drives BOTH policies against raw tar bytes.
     let _ = tar_to_erofs(
         vec![tar::Archive::new(decoder.take(MAX_DECOMPRESSED_BYTES))],
         vec![],
         vec![],
         vec![],
         false,
+        vmcell::artifact::rootfs::XattrPolicy::Preserve,
     );
 });

@@ -23,6 +23,7 @@ use vmcell::vmm::{VmInstance, Vmm};
 use crate::classify::{
     BANNER_SIGNATURE, BootKind, explain_boot_failure_of, explain_without_serial,
 };
+use crate::conformance::ProbeOutcome;
 use crate::harness::{cgroup_memory_delegated, try_start_vm};
 use crate::{ArtifactSet, CheckOutcome, Level};
 
@@ -476,6 +477,177 @@ pub async fn nested_kvm_ok(steward: &mut StewardClient) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// How long the whole-image extended-attribute scan is allowed inside the guest.
+///
+/// Generous because the scan is one `xattr list` fork per path and an image is thousands of paths;
+/// finite because the conformance battery's per-check deadlines are what keep
+/// "fails loudly per check" from becoming "hangs per battery" (§10.6). Exceeding it surfaces as
+/// [`crate::conformance::ProbeOutcome::NotRun`] — undecided, never a verified absence.
+const XATTR_SCAN_BUDGET: Duration = Duration::from_secs(300);
+
+/// How many in-guest paths the scan will visit before it gives up and reports the observation
+/// **incomplete**.
+///
+/// A cap rather than an unbounded walk, and the cap is *reported* rather than silently truncating:
+/// a partial walk that found nothing is not evidence of an absence, and the whole point of
+/// [`crate::conformance::ProbeOutcome::NotRun`] is that saying so is cheaper than being wrong. The
+/// number is sized for a Debian-derived userland (order 10^4 paths) with headroom.
+const XATTR_SCAN_PATH_CAP: u64 = 60_000;
+
+/// The three markers the in-guest scan prints — one line, first token, never translated.
+///
+/// Parsed by [`classify_xattr_scan`], which is the pure half of this probe: the shell says only
+/// what it saw, and the mapping onto a [`crate::conformance::ProbeOutcome`] is unit-gated.
+const XATTR_MARK_PRESENT: &str = "VMCELL-XATTR-PRESENT";
+/// See [`XATTR_MARK_PRESENT`] — the scan completed and found no extended attribute anywhere.
+const XATTR_MARK_ABSENT: &str = "VMCELL-XATTR-ABSENT";
+/// See [`XATTR_MARK_PRESENT`] — the scan could not complete, so it decides nothing.
+const XATTR_MARK_INCOMPLETE: &str = "VMCELL-XATTR-INCOMPLETE";
+
+/// The `sh -c` program the scan runs: walk the image, ask the `xattr` applet about each path, stop
+/// at the first path that carries one.
+///
+/// Composed from `cap` so the cap is one fact, and kept a pure function so the program text is
+/// assertable without a guest.
+///
+/// * `-xdev` keeps the walk on the rootfs the artifact IS: `/proc`, `/sys`, `/dev` and any tmpfs
+///   the steward mounted are separate filesystems, and their attributes are the *kernel's*, not the
+///   artifact's. The overlay upper counts as the same filesystem as the erofs base beneath it,
+///   which is exactly right — the merged tree is what a cell actually sees.
+/// * The loop short-circuits on the first hit, so a preserving artifact costs only as much walking
+///   as it takes to reach one attribute; the full cost is paid only by an artifact that has none,
+///   which is the case that needs completeness to mean anything.
+/// * `xattr list` is vmcell's own applet ([`vmcell_protocol::GUEST_TOOLS_APPLETS`]), not a distro
+///   `getfattr`: the rootfs is not required to ship the `attr` package, and a probe that silently
+///   degrades to "command not found" would report a verified absence for every image on earth.
+fn xattr_scan_program(cap: u64) -> String {
+    format!(
+        r#"find / -xdev \( -type f -o -type d -o -type l \) -print 2>/dev/null | {{
+  n=0
+  while IFS= read -r p; do
+    n=$((n+1))
+    if [ "$n" -gt {cap} ]; then printf '{XATTR_MARK_INCOMPLETE} path-cap %s\n' "{cap}"; exit 0; fi
+    names=$(xattr list "$p" 2>/dev/null)
+    if [ -n "$names" ]; then printf '{XATTR_MARK_PRESENT} %s %s\n' "$p" "$names"; exit 0; fi
+  done
+  if [ "$n" -eq 0 ]; then printf '{XATTR_MARK_INCOMPLETE} no-paths-walked\n'; exit 0; fi
+  printf '{XATTR_MARK_ABSENT} %s\n' "$n"
+}}"#
+    )
+}
+
+/// What [`xattr_scan_program`]'s output means — the pure half of the probe (§10.6's judgement is
+/// pure for the same reason: a three-valued verdict decided inside an I/O function is a verdict no
+/// machine without KVM can check).
+///
+/// The three answers, and why each is the honest one:
+///
+/// * a path carries an attribute → [`ProbeOutcome::Works`]. This is the only *positive* observation
+///   available: the attribute is in the packed image and the guest kernel hands it back.
+/// * the walk completed and no path carries one → [`ProbeOutcome::DoesNotWork`]. Complete, so it is
+///   an observation rather than a shrug — and note what it does NOT distinguish: an artifact whose
+///   policy stripped the attributes from an artifact whose source layers had none to keep. Both are
+///   the same fact about the artifact, which is the fact the declaration makes a claim about:
+///   `xattr_preserved` says this image *carries* preserved attributes. The message says both
+///   remedies out loud so the reader is not left to guess which one they are in.
+/// * anything else — the cap, an empty walk, a non-zero exit, unparseable output →
+///   [`ProbeOutcome::NotRun`]. An incomplete walk that found nothing is not evidence of an absence,
+///   and §10.6's whole `Unverified` state exists so that saying so beats guessing.
+fn classify_xattr_scan(code: i32, stdout: &str, stderr: &str) -> ProbeOutcome {
+    if code != 0 {
+        return ProbeOutcome::NotRun(format!(
+            "the in-guest extended-attribute scan exited {code}: {}. An unrun scan decides \
+             nothing — a `sh`/`find`-less image cannot be walked, and reporting that is not the \
+             same as reporting an absence",
+            stderr.trim()
+        ));
+    }
+    let line = stdout.lines().find(|l| {
+        l.starts_with(XATTR_MARK_PRESENT)
+            || l.starts_with(XATTR_MARK_ABSENT)
+            || l.starts_with(XATTR_MARK_INCOMPLETE)
+    });
+    match line {
+        Some(l) if l.starts_with(XATTR_MARK_PRESENT) => ProbeOutcome::Works,
+        Some(l) if l.starts_with(XATTR_MARK_ABSENT) => {
+            let walked = l
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("an unreported number of");
+            ProbeOutcome::DoesNotWork(format!(
+                "the in-guest scan walked {walked} paths and not one of them carries an extended \
+                 attribute, so this artifact preserves none. Either its base layers carried no \
+                 `SCHILY.xattr` records to keep (declare nothing, or `\"xattrs\": \"strip\"`), or \
+                 the pack ran under `strip` (§4.7) — a declaration of `xattr_preserved` is a claim \
+                 a consumer builds a fixture on either way"
+            ))
+        }
+        Some(l) => ProbeOutcome::NotRun(format!(
+            "the in-guest extended-attribute scan did not complete ({}), so it observed neither a \
+             presence nor an absence",
+            l.trim()
+        )),
+        None => ProbeOutcome::NotRun(format!(
+            "the in-guest extended-attribute scan printed no verdict marker; it emitted {:?}. \
+             Without a marker the walk cannot be told from a shell that never ran it",
+            stdout.trim()
+        )),
+    }
+}
+
+/// The §10.6 data-plane probe for [`vmcell::feature::Feature::XattrPreserved`]: boot the artifact
+/// and ask, in-guest, whether **any** of its paths carries an extended attribute (← §4.7, the
+/// `xattr` applet).
+///
+/// Boots its own VM (the [`snapshot_restore_roundtrip`] shape) rather than taking a
+/// `&mut StewardClient`, because the conformance battery runs it against an arbitrary subject's
+/// artifact pair rather than inside one of the level runs.
+///
+/// Networking is disabled: the question is about bytes in the image, and a probe that needed egress
+/// would fail for the network's reasons on an artifact whose attributes are perfectly intact.
+pub async fn xattr_preserved_probe<V: Vmm>(vmm: &V, a: &ArtifactSet) -> ProbeOutcome {
+    let cfg = match base_cfg(a).network_disabled().build() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return ProbeOutcome::NotRun(format!("xattr-probe config build failed: {e}"));
+        }
+    };
+    let mut vm = match MicroVm::start(vmm, cfg, &vmcell::HostEnv::hermetic()).await {
+        Ok(vm) => vm,
+        Err(e) => return ProbeOutcome::NotRun(format!("xattr-probe: {}", failed_start(&e))),
+    };
+    // Captured before the `&mut` steward borrow (see `guest_core_checks`).
+    let serial_log = vm.instance().serial_log().to_path_buf();
+    let steward = match vm.steward(Some(STEWARD_READY_BUDGET)).await {
+        Ok(s) => s,
+        Err(e) => {
+            let base = format!(
+                "xattr-probe: {}",
+                steward_handshake_base(&e, STEWARD_READY_BUDGET)
+            );
+            let why = explain_boot_failure_at(BootKind::Fresh, &serial_log, &base).await;
+            return ProbeOutcome::NotRun(why);
+        }
+    };
+    let program = xattr_scan_program(XATTR_SCAN_PATH_CAP);
+    let req =
+        ExecRequest::new(vec!["sh".into(), "-c".into(), program]).with_timeout(XATTR_SCAN_BUDGET);
+    let outcome = steward.exec(req).await;
+    let _ = vm.shutdown().await;
+    match outcome {
+        Ok(out) => classify_xattr_scan(
+            out.code,
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        Err(e) => ProbeOutcome::NotRun(format!(
+            "the in-guest extended-attribute scan failed at the transport level within its {}s \
+             budget: {e}",
+            XATTR_SCAN_BUDGET.as_secs()
+        )),
+    }
 }
 
 /// Per-VM cgroup usage is observable and honestly reports enforcement (← `metrics_limits.rs`,
@@ -1360,6 +1532,101 @@ mod tests {
         let mut env = vmcell::HostEnv::hermetic();
         env.cgroups = std::sync::Arc::new(vmcell::metrics::FakeCgroupFs::new());
         env
+    }
+
+    // The three-valued xattr verdict, decided purely. This is the half of the probe a machine with
+    // no KVM can check, and it is the half that decides what §10.6's `judge` reports: an
+    // "incomplete" walk mis-read as an absence turns every unwalkable image into a *verified*
+    // absence, which is precisely the constant-that-certifies-everything §10.6 exists to forbid.
+    //
+    // RED four ways, each observed: (a) `DoesNotWork` for the cap marker — the cap leg's
+    // `NotRun` assertion fails; (b) `Works` for the absent marker — the absent leg fails;
+    // (c) treating a non-zero exit as an absence — the exit leg fails; (d) defaulting an
+    // unrecognized stdout to `DoesNotWork` — the no-marker leg fails.
+    #[test]
+    fn the_xattr_scan_verdict_separates_absence_from_an_unfinished_walk() {
+        assert_eq!(
+            classify_xattr_scan(
+                0,
+                &format!("{XATTR_MARK_PRESENT} /bin/ping security.capability\n"),
+                ""
+            ),
+            ProbeOutcome::Works,
+            "a path that carries an attribute is the one positive observation available"
+        );
+
+        let ProbeOutcome::DoesNotWork(why) =
+            classify_xattr_scan(0, &format!("{XATTR_MARK_ABSENT} 8123\n"), "")
+        else {
+            panic!("a COMPLETED walk that found nothing is an observation, not a shrug");
+        };
+        assert!(
+            why.contains("8123"),
+            "the evidence must carry how much was walked, or a reader cannot tell a real scan \
+             from a scan of nothing: {why}"
+        );
+        assert!(
+            why.contains("strip") && why.contains("SCHILY.xattr"),
+            "…and it must name BOTH readings — a base with no records to keep, and a pack that \
+             stripped them — because the scan genuinely does not distinguish them: {why}"
+        );
+
+        // The cap, the empty walk, a non-zero exit and unparseable output are all `NotRun`. Each
+        // one mis-read as `DoesNotWork` is a *verified absence* awarded to an image nobody managed
+        // to look inside.
+        for (label, code, stdout) in [
+            (
+                "the path cap",
+                0,
+                format!("{XATTR_MARK_INCOMPLETE} path-cap 60000\n"),
+            ),
+            (
+                "an empty walk",
+                0,
+                format!("{XATTR_MARK_INCOMPLETE} no-paths-walked\n"),
+            ),
+            ("a shell that failed", 127, String::new()),
+            ("output with no marker", 0, "find: not found\n".to_string()),
+        ] {
+            assert!(
+                matches!(
+                    classify_xattr_scan(code, &stdout, "sh: find: not found"),
+                    ProbeOutcome::NotRun(_)
+                ),
+                "{label} decides nothing and must be reported as undecided, never as an absence"
+            );
+        }
+    }
+
+    // The scan program itself: the three properties that make its output trustworthy, asserted on
+    // the text because there is no guest here. `-xdev` is the load-bearing one — without it the
+    // walk descends into `/proc` and `/sys`, whose attributes belong to the kernel rather than to
+    // the artifact, and a `security.selinux` on a procfs node would report "preserved" for an image
+    // that preserved nothing.
+    //
+    // RED on the inverse: drop `-xdev`, drop the cap comparison, or swap the applet for `getfattr`.
+    #[test]
+    fn the_xattr_scan_program_walks_the_artifact_and_bounds_itself() {
+        let program = xattr_scan_program(1234);
+        assert!(
+            program.contains("-xdev"),
+            "the walk must stay on the artifact's own filesystem: {program}"
+        );
+        assert!(
+            program.contains("xattr list") && !program.contains("getfattr"),
+            "the reader is vmcell's own applet — the rootfs is not required to ship `attr`, and a \
+             probe that degrades to `command not found` reports a verified absence for every image \
+             on earth: {program}"
+        );
+        assert!(
+            program.contains("1234") && program.contains(XATTR_MARK_INCOMPLETE),
+            "the cap must be both applied and REPORTED; a silent truncation is an absence claim \
+             about the part nobody looked at: {program}"
+        );
+        assert!(
+            program.contains(XATTR_MARK_PRESENT) && program.contains(XATTR_MARK_ABSENT),
+            "all three verdicts must be reachable from the program the classifier parses"
+        );
     }
 
     #[test]

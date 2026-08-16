@@ -4413,13 +4413,123 @@ rootfs carries no declaration by construction (it reads no registry entry), so a
 held an OCI build first keeps that build's `rootfs.features` beside it — harmless today, since both
 packers strip, but an honest gap rather than a covered case.
 
+## v33 delta 7 — external repacking and the per-artifact xattr policy (design §18 delta 7, §4.2, §4.7), as built
+
+**What landed.** `XattrPolicy` on the one inject+pack tail, declared per artifact and defaulting to
+`Strip`; `Feature::XattrPreserved` derived from it; the `xattr` guest-tools applet; `oci2-erofs
+--tools` / `--work-dir`; the `Preserve` twin, the pack-twice determinism gate, the cache-key
+invalidation gate, and the live in-guest readback battery.
+
+**The strip was never a law; it was a premise about one base image.** Six tar-derived node sites now
+populate xattrs from the tar's PAX headers under `Preserve`, through **one** decode. The four
+injected/synthesized sites stay empty under **both** policies, and each carries a comment saying so
+is not a miss: invariant F5 makes vmcell's own injections unconditional and authoritative, and an
+injected file has no source header to read. The eleventh site — the hardlink arm, which §4.7's
+"ten node-construction sites" does not count — keeps the merged target's xattrs, because xattrs are
+an inode property and a hardlink shares its target's inode, so it cannot legitimately carry a
+different set. That is now pinned rather than incidental.
+
+**`XattrPolicy` is defined where the ungated types can see it.** It began in `tar2erofs`, which is
+behind `am-fs-erofs`, and had to move: `RootfsRegistryEntry` is compiled in the empty feature set —
+`cargo hack --feature-powerset` builds that row — so a field of it cannot have a feature-gated type.
+The §10.4 contract path `vmcell::artifact::rootfs::XattrPolicy` is preserved as a re-export, so no
+consumer sees the move.
+
+**"Migration is free" cannot mean "the cache key is unmoved", and the gate says which it means.**
+The identity fold gains the policy, so `STAGE_VERSION` bumps and every key moves — that is the rule,
+not a regression. What is actually asserted is the pair that carries the meaning: a pack declaring
+no policy produces **byte-identical image bytes** to the pre-delta packer (captured as a literal by
+running the previous commit's packer), and an undeclared policy folds to the same key as an explicit
+`"strip"`. Asserting equality with the pre-delta key would have been asserting something the bump
+makes false.
+
+**One fact, one key — including the direction that says nothing.** The derivation runs at a single
+site, so every consumer of an entry's declarations gets the stance without a per-call-site thread,
+and an explicit `xattr_preserved` token in a vmcell-built entry is refused **unconditionally** —
+including when it *agrees*, since a second spelling of one fact is a desync waiting for an edit.
+The refusal is scoped to a vmcell-built entry, as §4.7 words it: an `unpinned_path` registration
+points at bytes vmcell did not pack, so it derives nothing and **may** declare the token, while the
+`xattrs` key is refused there because there is no vmcell pack for a policy to govern. Without that
+scoping a foreign image that genuinely preserves xattrs had no way to say so, and carried a derived
+`false` vmcell could not support.
+
+**`oci2-erofs` deliberately has no `--xattrs` flag.** It names an explicit image, not a label, so it
+resolves no registry entry and always packs under the default. A flag would be a second place to
+state a per-artifact property, which is the shape §10.5 exists to prevent; a consumer wanting
+`Preserve` registers a label and builds it.
+
+**`--work-dir` names the staging *parent*, not the staging directory.** `oci2-erofs` `remove_dir_all`s
+its staging tree at both ends, so a flag naming the tree itself would make
+`vmcell oci2-erofs --work-dir /home/me/build` an `rm -rf` of the operator's directory. The
+per-invocation `oci2erofs-stage-<pid>` leaf stays vmcell-composed: the only directory vmcell ever
+deletes is one it built the name of. The tree is now owned by an RAII type, so the failure path
+sweeps it too — it used to leak on any pipeline error.
+
+**What the consumer-position gate can and cannot afford, stated rather than implied.** The example
+workspace's `ci-check.sh` forbids network, and a complete pack needs a real OCI pull, so the green
+half asserts the *discriminating* fact instead: with `--tools` the same command no longer fails on
+the handler at all — it proceeds past that stage and dies fetching a deliberately unresolvable
+image. One variable changes between the pair. A complete consumer-position pack was run by hand and
+is recorded; it is not in CI, and that gap is the trade rather than an oversight.
+
+**A `PackOptions` field nobody folds is now a compile error.** `fold_rootfs_injection_identity`
+takes `&PackOptions` and destructures it **exhaustively**, so adding a field without folding it is
+`error[E0027]` at the fold site. That closed a live defect delta 6b had shipped: `applets` was never
+folded, so two registered handlers with different applet rosters over the same multicall binary
+shared one cache key and produced different images — the warm cache served the first roster's
+symlink set, and every custom-`init=` target the second declared resolved to nothing. The class is
+structural now instead of remembered.
+
+**The validator's `xattr_preserved` check stopped being undecidable.** Its probe plan was
+`NO_PROBE_YET` only because nothing could read an xattr inside a guest. The applet is that, so the
+plan is a real in-guest walk: a **complete** walk finding nothing is a decided `DoesNotWork` — which
+makes a `Strip` artifact **pass** rather than skip — while a walk that hits its cap is `NotRun` →
+`Unverified`, and the verdict reports the cap rather than implying completeness.
+
+**Delta 7's live input had to be synthesized, and that is a finding about the base.** The pinned
+Debian base carries **zero** PAX xattr records — verified against the cached layer — so a `Preserve`
+leg has no input from the canonical artifact. The battery synthesizes one tar layer carrying a
+`security.capability` record and merges it over the base. Using delta 9's full-Debian image instead
+would have made delta 7's live gate depend on delta 9's unresolved image provenance.
+
+## The Firecracker baked-vsock guard, part two: a second fail-open, and why its test flaked
+
+**The flake was not the timeout, and "environmental" was not the answer.**
+`reject_live_baked_vsock_rejects_live_listener_and_clears_stale` failed on cold first runs and
+passed warm. Setting the probe budget to **1 ns** leaves it green — `tokio::time::timeout` polls the
+inner future first and a local AF_UNIX `connect` resolves on its first poll — so the timeout arm is
+unreachable from that test in either direction. Eighty-way CPU load reproduced nothing.
+
+**Concurrency reproduced it: 2 failures in 96 runs**, always at the *stale-path* arm. Instrumenting
+the probe caught the cause directly — the socket file whose listener had been `drop`ped was still
+bound and still accepting. Isolated measurement: 0 anomalies in 96 000 sequential bind/drop/connect
+cycles; 1–4 per 3000 under 24-way concurrency, with a plain `std` connect succeeding on them too, so
+it is the kernel's answer and not a runtime artifact. **A listening fd open in one thread is
+duplicated into every `fork` another thread performs in that instant, and stays bound until that
+child reaches `execve` and `CLOEXEC` closes it.** The guard was right; the *fixture's* premise —
+"bind then drop yields a provably stale socket file" — was false. The fixture now confirms the path
+answers `ECONNREFUSED` before handing it over, and converges rather than re-rolling. After: 0
+failures in 96 runs. **This is a law about test fixtures, not about this guard**: in a process that
+forks, a closed listener is not immediately a dead one.
+
+**Found en route: the guard's sibling arm was still fail-open.** `c5a01a1` fixed the *timeout* arm
+and left `Ok(Err(_)) => Refused` — any `connect` failure read as proof of death — while its own
+rustdoc claimed a narrow `ECONNREFUSED`/`ENOENT` set. It is not narrow: `connect` also fails
+`EMFILE`/`ENFILE` under fd pressure, `EAGAIN` when a **live** listener's backlog is full, `EACCES`
+and `EINTR`. Each made the guard unlink a live VM's steward transport and let the restore proceed —
+the same class, on the arm nobody looked at. Reproduced under `ulimit -n 32`: the live-listener leg
+returned `Ok` for a socket a listener was sitting on. Only `ECONNREFUSED` and `ENOENT` prove absence
+now, through one pure predicate beside `probe_permits_unlink`, with the errno truth-table measured
+on this host rather than assumed — a leftover regular file, a directory and an unlistened stream
+socket all answer `ECONNREFUSED`; a bound dgram socket answers `EPROTOTYPE`.
+
 ## Where the v33 pass stands
 
 Deltas 1–5 of the §18 register are landed, pushed and live-validated. **6a and 6b were live-validated
 at this pass's start** — privileged 177/177, unprivileged 4/4, daemon 14/14, validator 3/3, seven
 capability skips, all Firecracker. (`docs/88`'s stated bar of "privileged 162/162" was itself the
-*delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **6c is
-landed**; 7–10 follow.
+*delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **6c and 7 are
+landed**; 8–10 follow.
 
 `docs/88-claude-handoff-notes-v4.md` is the pick-up point. It carries the remaining inventory, what
 6a/6b moved under deltas 7–10, the operational knowledge that is not a design fact and so has no

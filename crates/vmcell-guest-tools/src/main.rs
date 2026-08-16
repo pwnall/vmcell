@@ -3,19 +3,22 @@
 //! guest, plus the `echo-server` listener the host's raw vsock dial and the
 //! VM-to-VM segment gates connect to (§3.2, §6.5).
 //!
-//! It is baked into the rootfs erofs at `/vmcell-tools/vmcell-guest-tools` (with
-//! `ip`/`curl`/`kvm-ok`/`echo-server` symlinks), which the steward places on
+//! It is baked into the rootfs erofs at `/vmcell-tools/vmcell-guest-tools` (with one symlink per
+//! [`vmcell_protocol::GUEST_TOOLS_APPLETS`] entry — the roster is NOT re-listed in this prose,
+//! which is how it went stale once already), which the steward places on
 //! the exec `PATH`. Baking — rather than a virtio-fs share — is what lets the
 //! *unprivileged* egress test use the tools: virtiofsd cannot enter its sandbox
 //! unprivileged, so a share fails there, whereas the erofs rootfs is served over
 //! virtio-blk in both modes. This keeps the base image otherwise minimal (no
 //! `iproute2`/`curl`/`cpu-checker` packages) while still exercising the real
 //! operations the tests assert on: genuine HTTP(S) requests (honoring the proxy
-//! env + the `-k` flag), real `/dev/kvm` access, real interface/route state, and a
-//! real AF_VSOCK/TCP listener.
+//! env + the `-k` flag), real `/dev/kvm` access, real interface/route state, a
+//! real AF_VSOCK/TCP listener, and real `getxattr(2)`/`listxattr(2)` reads (v33
+//! §4.7 — the `Preserve` artifact's xattr is read back *in-guest*, by syscall,
+//! rather than trusted from the packer that wrote it).
 //!
-//! Dispatch is busy-box style: when invoked through an
-//! `ip`/`curl`/`kvm-ok`/`echo-server` symlink the command is taken from `argv[0]`;
+//! Dispatch is busy-box style: when invoked through one of the
+//! [`vmcell_protocol::GUEST_TOOLS_APPLETS`] symlinks the command is taken from `argv[0]`;
 //! otherwise the first argument selects it (`vmcell-guest-tools <cmd> …`). The
 //! `echo-server` applet is additionally usable as a custom `init=` target (its
 //! symlink is an absolute path and it needs no writable root), which is how the
@@ -126,6 +129,7 @@ const APPLETS: [(&str, Applet); vmcell_protocol::GUEST_TOOLS_APPLETS.len()] = [
     ("kvm-ok", run_kvm_ok_applet),
     ("echo-server", run_echo_server),
     ("mini-init", run_mini_init),
+    ("xattr", run_xattr),
 ];
 
 // Compile-time proof that `APPLETS` names exactly the roster, element-wise and in order.
@@ -1932,6 +1936,311 @@ fn parse_resolve(spec: &str) -> Option<(String, u16, std::net::IpAddr)> {
     Some((host, port, ip))
 }
 
+// ---------------------------------------------------------------------------
+// `xattr` — read-only extended-attribute reader (v33 §4.7, §18 delta 7).
+// ---------------------------------------------------------------------------
+
+/// The `xattr` applet's grammar, parsed. Read-only by construction: there is no `set` variant,
+/// because a write primitive baked into every test guest would buy no gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XattrCommand {
+    /// `xattr get <path> <name>` — one attribute's raw value, rendered as hex.
+    Get {
+        /// The file to read the attribute from.
+        path: String,
+        /// The fully-qualified attribute name (`security.capability`, `user.demo`, …).
+        name: String,
+    },
+    /// `xattr list <path>` — every attribute name on the file, one per line.
+    List {
+        /// The file to list the attribute names of.
+        path: String,
+    },
+}
+
+/// The kernel's own ceiling on both an attribute value and a whole name listing
+/// (`XATTR_SIZE_MAX` / `XATTR_LIST_MAX`, `include/uapi/linux/limits.h`), both 64 KiB.
+///
+/// The size the two-call idiom allocates against comes from the kernel, so it is validated
+/// before it is allocated: a size above this ceiling is an answer the kernel cannot legitimately
+/// give, and taking it on trust would turn a bad answer into an arbitrary allocation.
+const XATTR_MAX_BYTES: usize = 65536;
+
+/// How many times [`read_sized`] re-runs the size-query/fetch pair when the value changes size
+/// between the two calls.
+///
+/// The two-call `getxattr(2)` idiom is inherently racy — a concurrent setter can grow or shrink
+/// the value in the window between "how big is it?" and "give it to me". Trusting the first
+/// answer prints either a truncated value or a buffer tail the kernel never wrote. Retrying is
+/// bounded so a pathological writer cannot spin the applet forever; the cap is generous because
+/// each attempt is two syscalls.
+const XATTR_RACE_RETRIES: u32 = 8;
+
+/// Parses `xattr`'s argv. Pure, so the accept/reject law is unit-testable with no guest, no
+/// filesystem, and no syscall — the [`parse_kvm_ok_args`] / [`parse_mini_init_args`] shape.
+///
+/// The grammar is fixed and takes **no flags at all**, so every flag is an unknown flag and is
+/// rejected naming it. That is law F1 applied to an applet's argv: the in-guest shims are the
+/// only `xattr` on the guest's PATH (the rootfs carries no `attr` package), so an
+/// accepted-but-ignored option here would silently void whatever property its caller passed it
+/// for — the hazard that already voided a data-plane assertion through the `curl` shim.
+fn parse_xattr_args(args: &[String]) -> Result<XattrCommand, String> {
+    // Flags are rejected before the subcommand is even considered, so `xattr --help` names the
+    // flag rather than complaining about an unknown subcommand.
+    if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
+        return Err(format!(
+            "unknown option {flag:?} — this is vmcell's read-only xattr shim \
+             (/vmcell-tools/xattr), not the attr package; it takes no flags"
+        ));
+    }
+
+    let (sub, operands) = match args.split_first() {
+        Some((sub, rest)) => (sub.as_str(), rest),
+        None => {
+            return Err("needs a subcommand: get or list".to_string());
+        }
+    };
+
+    let operand = |i: usize, what: &str| -> Result<String, String> {
+        let raw = operands
+            .get(i)
+            .ok_or_else(|| format!("{sub} needs a <{what}>"))?;
+        if raw.is_empty() {
+            return Err(format!("the <{what}> must not be empty"));
+        }
+        // The runner hands these to `CString::new`; an interior NUL is rejected here so the
+        // rejection is part of the pure, testable law rather than a syscall-time surprise.
+        if raw.contains('\0') {
+            return Err(format!(
+                "the <{what}> {raw:?} contains a NUL byte, which cannot be passed to the kernel"
+            ));
+        }
+        Ok(raw.clone())
+    };
+
+    let (cmd, arity) = match sub {
+        "get" => (
+            XattrCommand::Get {
+                path: operand(0, "path")?,
+                name: operand(1, "name")?,
+            },
+            2,
+        ),
+        "list" => (
+            XattrCommand::List {
+                path: operand(0, "path")?,
+            },
+            1,
+        ),
+        other => {
+            return Err(format!(
+                "unknown xattr subcommand {other:?} — this shim reads only: \
+                 get <path> <name>, list <path>"
+            ));
+        }
+    };
+
+    // Rejected, never ignored: an extra operand means the caller asked for something this
+    // grammar does not express (a second name, a `-h`-style no-deref path, an `attr`-ism).
+    if let Some(extra) = operands.get(arity) {
+        return Err(format!(
+            "unexpected argument {extra:?} — {sub} takes exactly {arity} operand(s)"
+        ));
+    }
+
+    Ok(cmd)
+}
+
+/// The `xattr` applet: rejects any argv it cannot honor, then performs the real read.
+///
+/// Exit codes are deliberately three-valued. [`EXIT_USAGE`] (2) is a malformed invocation; 1 is a
+/// read that reached the kernel and failed — which includes `ENODATA`, the answer the **`Strip`
+/// negative control** expects (§4.7: the `Strip` twin of the same base reads nothing). Keeping
+/// those two apart is what stops a typo'd attribute name from being read as "the packer stripped
+/// it", exactly as [`EXIT_USAGE`] is kept off `kvm-ok`'s own answers.
+fn run_xattr(args: &[String]) -> i32 {
+    let cmd = match parse_xattr_args(args) {
+        Ok(cmd) => cmd,
+        Err(msg) => {
+            eprintln!("xattr: {msg}");
+            eprintln!("usage: xattr get <path> <name>");
+            eprintln!("       xattr list <path>");
+            return EXIT_USAGE;
+        }
+    };
+
+    match xattr_lines(&cmd) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("xattr: {e}");
+            1
+        }
+    }
+}
+
+/// Performs the read and renders exactly the lines [`run_xattr`] prints — everything the applet
+/// does except the `println!`.
+///
+/// Split out for the same reason [`parse_xattr_args`] is: the output format is then assertable on
+/// the host, against a real file and a real syscall, without capturing a child process's stdout.
+/// A `get` is one line of lowercase hex; a `list` is one line per name, and an attribute-less file
+/// is **zero** lines — not one empty one, which a reader would have to guess at.
+///
+/// Hex is the format because a real `security.capability` value is neither printable nor UTF-8:
+/// rendering it raw would corrupt it on the way through the serial console, and the host's whole
+/// assertion is a byte-for-byte comparison against what it packed.
+fn xattr_lines(cmd: &XattrCommand) -> Result<Vec<String>, String> {
+    match cmd {
+        XattrCommand::Get { path, name } => {
+            let value = get_xattr(path, name).map_err(|e| format!("get {name} on {path}: {e}"))?;
+            Ok(vec![hex(&value)])
+        }
+        XattrCommand::List { path } => list_xattr(path).map_err(|e| format!("list {path}: {e}")),
+    }
+}
+
+/// Reads one extended attribute's raw value via `getxattr(2)`.
+///
+/// Symlinks are followed (`getxattr`, not `lgetxattr`): the live gate reads a
+/// `security.capability` off a real binary, and a shim that silently answered about the symlink
+/// instead would report "no attribute" for a perfectly preserved one.
+fn get_xattr(path: &str, name: &str) -> Result<Vec<u8>, String> {
+    let c_path = cstr(path, "path")?;
+    let c_name = cstr(name, "name")?;
+    read_sized("getxattr", |buf, len| {
+        // SAFETY: `c_path`/`c_name` are NUL-terminated and stay alive across the call; `buf` is
+        // either null (the size-query form) or a live allocation of at least `len` bytes, and
+        // `len` is that allocation's own length, so the kernel cannot write past it. With
+        // `len == 0` the kernel treats the call as a size query and never dereferences `buf`.
+        unsafe { libc::getxattr(c_path.as_ptr(), c_name.as_ptr(), buf, len) }
+    })
+}
+
+/// Reads every extended-attribute name on `path` via `listxattr(2)`.
+///
+/// The kernel returns the names as a NUL-separated, NUL-terminated blob; this splits it and
+/// rejects a non-UTF-8 name naming its bytes rather than lossily rendering one, so a listing can
+/// never quietly print a name that is not the name on disk.
+fn list_xattr(path: &str) -> Result<Vec<String>, String> {
+    let c_path = cstr(path, "path")?;
+    let blob = read_sized("listxattr", |buf, len| {
+        // SAFETY: `c_path` is NUL-terminated and stays alive across the call; `buf` is either
+        // null (the size-query form) or a live allocation of at least `len` bytes, and `len` is
+        // that allocation's own length, so the kernel cannot write past it. With `len == 0` the
+        // kernel treats the call as a size query and never dereferences `buf`.
+        unsafe { libc::listxattr(c_path.as_ptr(), buf.cast::<libc::c_char>(), len) }
+    })?;
+
+    let mut names = Vec::new();
+    for raw in blob.split(|b| *b == 0) {
+        if raw.is_empty() {
+            // The blob is NUL-*terminated*, so the final split yields an empty tail; an empty
+            // listing yields nothing but that tail. Neither is a name.
+            continue;
+        }
+        let name = String::from_utf8(raw.to_vec())
+            .map_err(|e| format!("attribute name {:?} is not UTF-8: {e}", hex(raw)))?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Runs the two-call `getxattr(2)`/`listxattr(2)` idiom — size query, then fetch — in **one**
+/// place, so the race handling, the ceiling check and the narrowing exist once rather than once
+/// per syscall.
+///
+/// `probe(buf, len)` performs the raw syscall: with `len == 0` and a null `buf` it must answer
+/// with the size, otherwise it fills `buf`. Both kernel-supplied sizes are validated against
+/// [`XATTR_MAX_BYTES`] before anything is allocated and narrowed with `try_from`.
+///
+/// The window between the two calls belongs to any concurrent setter, so neither answer is taken
+/// on trust: a value that **shrank** is truncated to what the fetch actually returned (printing
+/// the untouched buffer tail would invent bytes), and one that **grew** — signalled either by
+/// `ERANGE` or, when the first answer was 0, by a fetch that returns more than the buffer holds —
+/// re-runs the pair rather than reporting a truncation as the value.
+fn read_sized<F>(what: &str, mut probe: F) -> Result<Vec<u8>, String>
+where
+    F: FnMut(*mut libc::c_void, usize) -> libc::ssize_t,
+{
+    for _ in 0..XATTR_RACE_RETRIES {
+        let want = probe(std::ptr::null_mut(), 0);
+        if want < 0 {
+            return Err(format!("{what}: {}", std::io::Error::last_os_error()));
+        }
+        let want = usize::try_from(want)
+            .map_err(|e| format!("{what} reported an unrepresentable size {want}: {e}"))?;
+        if want > XATTR_MAX_BYTES {
+            return Err(format!(
+                "{what} reported {want} bytes, above the kernel's own {XATTR_MAX_BYTES}-byte \
+                 ceiling (XATTR_SIZE_MAX/XATTR_LIST_MAX) — refusing to allocate against it"
+            ));
+        }
+
+        let mut buf = vec![0u8; want];
+        let len = buf.len();
+        let ptr = buf.as_mut_ptr().cast::<libc::c_void>();
+        let got = probe(ptr, len);
+        if got < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ERANGE) {
+                // It grew between the two calls. Ask again rather than reporting the stale size.
+                continue;
+            }
+            return Err(format!("{what}: {err}"));
+        }
+        let got = usize::try_from(got)
+            .map_err(|e| format!("{what} returned an unrepresentable length {got}: {e}"))?;
+        if got > len {
+            // Only reachable when the first answer was 0: a zero-length buffer makes the fetch a
+            // size query again, so a value that grew from empty answers with its new size instead
+            // of ERANGE. Same race, same remedy.
+            continue;
+        }
+        // It shrank (or matched). Never hand back bytes the kernel did not write.
+        buf.truncate(got);
+        return Ok(buf);
+    }
+    Err(format!(
+        "{what}: the value changed size on every one of {XATTR_RACE_RETRIES} attempts — \
+         something is rewriting it concurrently"
+    ))
+}
+
+/// Borrows `s` as a NUL-terminated C string, naming which operand failed.
+///
+/// [`parse_xattr_args`] already rejects an interior NUL, so this is the second line: it keeps the
+/// conversion fail-loud instead of `unwrap`-ing a `Result` the parser is merely believed to have
+/// made infallible.
+fn cstr(s: &str, what: &str) -> Result<std::ffi::CString, String> {
+    std::ffi::CString::new(s).map_err(|e| format!("the <{what}> {s:?} cannot be a C string: {e}"))
+}
+
+/// Renders bytes as lowercase hex with no separators — the applet's whole output format for a
+/// value, and how a non-UTF-8 attribute name is named in an error.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+/// One hex digit for one nibble. `char::from` rather than `as`: the conversion is infallible and
+/// says so, and the crate's narrowing discipline leaves `as` for nothing.
+fn hex_digit(nibble: u8) -> char {
+    if nibble < 10 {
+        char::from(b'0' + nibble)
+    } else {
+        char::from(b'a' + (nibble - 10))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! M-GUEST-3: guest-tools had ZERO unit tests, leaving the pure parsers and
@@ -2789,5 +3098,345 @@ mod tests {
         );
         assert_eq!(parse_status_code("no-code-here"), None);
         assert_eq!(parse_status_code(""), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // `xattr` (v33 §4.7, §18 delta 7)
+    // -----------------------------------------------------------------------
+
+    // The accept half of the grammar. Pure, so it runs with no guest and no filesystem.
+    //
+    // RED on a parser that drops an operand (the `name` silently defaulting to something), that
+    // pairs `get`'s operands the other way round, or that accepts `list` and then reads whatever
+    // `args[1]` happened to be.
+    #[test]
+    fn parse_xattr_args_accepts_the_two_read_forms() {
+        assert_eq!(
+            parse_xattr_args(&argv(&["get", "/bin/ping", "security.capability"]))
+                .expect("get takes a path and a name"),
+            XattrCommand::Get {
+                path: "/bin/ping".to_string(),
+                name: "security.capability".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_xattr_args(&argv(&["list", "/bin/ping"])).expect("list takes a path"),
+            XattrCommand::List {
+                path: "/bin/ping".to_string(),
+            }
+        );
+    }
+
+    // Fail loud: every accepted input is honored or REJECTED naming the offender. This is the
+    // rule the `curl` shim was made fail-loud over — an accepted-but-ignored flag silently voids
+    // the property its caller passed it for, and here that property is "the packer preserved this
+    // xattr", the whole point of delta 7's live leg.
+    //
+    // RED on each accept-then-ignore shape in turn: an unknown flag skipped instead of named
+    // (`args.iter().find(...)` deleted), an unknown subcommand falling through to `get`, a missing
+    // operand defaulted, an extra operand dropped on the floor (the `operands.get(arity)` check
+    // deleted), or an empty/NUL-bearing operand deferred to `CString::new` at syscall time.
+    #[test]
+    fn parse_xattr_args_rejects_every_malformed_invocation() {
+        for (args, needle) in [
+            (vec![], "needs a subcommand"),
+            (vec!["get"], "get needs a <path>"),
+            (vec!["get", "/bin/ping"], "get needs a <name>"),
+            (vec!["list"], "list needs a <path>"),
+            (
+                vec!["get", "/bin/ping", "user.a", "user.b"],
+                "unexpected argument",
+            ),
+            (vec!["list", "/bin/ping", "extra"], "unexpected argument"),
+            (
+                vec!["set", "/bin/ping", "user.a"],
+                "unknown xattr subcommand",
+            ),
+            (vec!["dump", "/bin/ping"], "unknown xattr subcommand"),
+            (vec!["--help"], "unknown option"),
+            (vec!["get", "-h", "/bin/ping"], "unknown option"),
+            (vec!["list", "--no-deref", "/bin/ping"], "unknown option"),
+            (vec!["get", "", "user.a"], "must not be empty"),
+            (vec!["get", "/bin/ping", ""], "must not be empty"),
+            (vec!["get", "/bin/ping", "user.a\0b"], "NUL byte"),
+        ] {
+            let err = parse_xattr_args(&argv(&args))
+                .expect_err(&format!("{args:?} must be rejected, not accepted"));
+            assert!(
+                err.contains(needle),
+                "{args:?} must be rejected naming the cause ({needle:?}), got {err:?}"
+            );
+        }
+        // The rejected subcommand and the rejected flag must NAME themselves — a generic "usage"
+        // leaves a caller guessing which of their tokens the shim could not honor.
+        let err =
+            parse_xattr_args(&argv(&["set", "/f", "user.a"])).expect_err("set is not read-only");
+        assert!(
+            err.contains("set"),
+            "the rejection must name the token: {err}"
+        );
+        let err = parse_xattr_args(&argv(&["--follow"])).expect_err("there are no flags");
+        assert!(
+            err.contains("--follow"),
+            "the rejection must name the flag: {err}"
+        );
+    }
+
+    // A fixture file that owns its cleanup on the PANIC path as well as the success path — a
+    // test's own residue is residue (AGENTS.md, the ~129 MB snapshot-fixture leak).
+    struct TempXattrFile(std::path::PathBuf);
+
+    impl TempXattrFile {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "vmcell-xattr-gate-{}-{tag}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("the clock is after the epoch")
+                    .as_nanos()
+            ));
+            std::fs::write(&path, b"fixture").expect("the fixture file must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0
+                .to_str()
+                .expect("the fixture path is UTF-8 by construction")
+        }
+
+        /// Sets one xattr through the real `setxattr(2)`.
+        ///
+        /// `user.` rather than `security.capability`: an unprivileged host process may not write
+        /// the `security.*` namespace, and this gate must not need a capability. The guest's case
+        /// IS `security.capability` — same syscall, same value bytes, and the applet's reader
+        /// treats the namespaces identically — so what this pins is the reader and the hex, and
+        /// the live leg in the guest pins the `security.*` namespace itself.
+        fn set(&self, name: &str, value: &[u8]) {
+            let c_path = cstr(self.path(), "path").expect("no NUL in the fixture path");
+            let c_name = cstr(name, "name").expect("no NUL in the attribute name");
+            let ptr = value.as_ptr().cast::<libc::c_void>();
+            // SAFETY: `c_path`/`c_name` are NUL-terminated and live across the call; `ptr` is a
+            // live allocation of exactly `value.len()` bytes and that same length is the size
+            // argument, so the kernel reads nothing outside it.
+            let rc =
+                unsafe { libc::setxattr(c_path.as_ptr(), c_name.as_ptr(), ptr, value.len(), 0) };
+            assert_eq!(
+                rc,
+                0,
+                "setxattr({name}) on {} failed: {} — this gate needs a TMPDIR whose filesystem \
+                 supports user.* extended attributes",
+                self.path(),
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    impl Drop for TempXattrFile {
+        fn drop(&mut self) {
+            // The fixture existed (`new` asserts the write); removing it is what leaves no
+            // residue. A failure here is not worth masking the test's own verdict.
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // The round trip that proves the RENDERING, end to end through the real syscall: write known
+    // bytes with `setxattr(2)`, read them back with the applet's own `getxattr(2)` path, and
+    // compare the line the applet would print to the hex of the bytes written.
+    //
+    // The value is deliberately neither printable nor UTF-8 (it is a real `security.capability`
+    // v3 header's shape), because that is the case the hex format exists for: a shim that printed
+    // the value raw would corrupt it on the way through the serial console and the host's
+    // byte-for-byte comparison would be against mangled input.
+    //
+    // RED on: a hex renderer with swapped nibbles (`0x01` → "10"), an uppercase one, one that
+    // drops the leading zero of a byte < 0x10 (which makes the whole string shift), and on a
+    // reader that hands back the untruncated buffer.
+    #[test]
+    fn xattr_get_round_trips_the_bytes_it_was_given_as_hex() {
+        let file = TempXattrFile::new("get");
+        // 0x00 and 0x0f pin the two-digit padding; 0xff pins the lowercase 'f'; the trailing
+        // 0x00 pins that a NUL inside the value survives instead of terminating the output.
+        let value: &[u8] = &[0x01, 0x00, 0x00, 0x02, 0x0f, 0xff, 0xa5, 0x00];
+        file.set("user.vmcell_gate", value);
+
+        let cmd = parse_xattr_args(&argv(&["get", file.path(), "user.vmcell_gate"]))
+            .expect("the fixture invocation parses");
+        let lines = xattr_lines(&cmd).expect("the attribute was just written");
+        assert_eq!(
+            lines,
+            vec!["01000002 0fffa500".replace(' ', "")],
+            "the printed line must be the lowercase hex of exactly the bytes written"
+        );
+        // The identity, recomputed from the source bytes rather than from a second literal.
+        assert_eq!(lines, vec![hex(value)]);
+        assert_eq!(
+            get_xattr(file.path(), "user.vmcell_gate").expect("the read succeeds"),
+            value,
+            "the reader must return the written bytes, not a padded buffer"
+        );
+
+        // A zero-length value is legal and must render as an empty line, not as an error: it is
+        // the case where the first size answer is 0 and the fetch call degenerates to a second
+        // size query, the race arm `read_sized` handles explicitly.
+        file.set("user.vmcell_empty", b"");
+        assert_eq!(
+            xattr_lines(&XattrCommand::Get {
+                path: file.path().to_string(),
+                name: "user.vmcell_empty".to_string(),
+            })
+            .expect("an empty value is a value"),
+            vec![String::new()]
+        );
+
+        // `list` sees both names. It is asserted as a set: `listxattr(2)` promises no order.
+        let mut listed = xattr_lines(&XattrCommand::List {
+            path: file.path().to_string(),
+        })
+        .expect("the file has attributes");
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                "user.vmcell_empty".to_string(),
+                "user.vmcell_gate".to_string()
+            ],
+            "list must name every attribute, split on the NUL separators, with no empty tail entry"
+        );
+    }
+
+    // The applet's three-valued exit code, which is what the live legs branch on. `ENODATA` — the
+    // answer the §4.7 `Strip` NEGATIVE CONTROL expects — must be 1 and not `EXIT_USAGE`, or a
+    // typo'd attribute name would read as "the packer stripped it" and the negative control would
+    // pass vacuously.
+    //
+    // RED on collapsing the two failure codes into one, and on a runner that returns 0 for a read
+    // that never happened.
+    #[test]
+    fn run_xattr_separates_a_bad_argv_from_a_missing_attribute() {
+        let file = TempXattrFile::new("exit");
+        file.set("user.vmcell_present", b"\x2a");
+
+        assert_eq!(
+            run_xattr(&argv(&["get", file.path(), "user.vmcell_present"])),
+            0,
+            "a present attribute reads clean"
+        );
+        assert_eq!(
+            run_xattr(&argv(&["get", file.path(), "user.vmcell_absent"])),
+            1,
+            "ENODATA is a failed read (the Strip negative control), not a usage error"
+        );
+        assert_eq!(
+            run_xattr(&argv(&["list", file.path()])),
+            0,
+            "listing a file with attributes succeeds"
+        );
+        assert_eq!(
+            run_xattr(&argv(&["set", file.path(), "user.x", "1"])),
+            EXIT_USAGE,
+            "a malformed argv is EXIT_USAGE, distinct from a failed read"
+        );
+        assert_eq!(
+            run_xattr(&argv(&["get", "--raw", file.path(), "user.x"])),
+            EXIT_USAGE
+        );
+    }
+
+    // The three arms of `read_sized` that a live read cannot reach: an over-ceiling size, a value
+    // that shrank between the two calls, and one that grew. No kernel produces the first, and the
+    // other two need a writer racing the reader inside a two-syscall window — so they are driven
+    // through a fake probe (rule 4: the effect classes the real thing is blind to are covered or
+    // recorded).
+    #[test]
+    fn read_sized_handles_the_sizes_it_cannot_trust() {
+        // The ceiling is checked BEFORE the `vec![0u8; want]`, so an absurd answer is refused
+        // rather than allocated against. RED on deleting the `want > XATTR_MAX_BYTES` check: the
+        // fake's `isize::MAX` becomes the allocation size. (The `try_from` beside it is defensive
+        // only — `want < 0` is rejected first — so this drives the ceiling, not the narrowing.)
+        let err = read_sized("fake", |buf, len| {
+            if buf.is_null() && len == 0 {
+                libc::ssize_t::MAX
+            } else {
+                0
+            }
+        })
+        .expect_err("an over-ceiling size must be refused, not allocated against");
+        assert!(
+            err.contains("ceiling"),
+            "the refusal must name the ceiling it enforced: {err}"
+        );
+
+        // The SHRINK arm: the size query promises 8 bytes, the fetch writes 3. The result must be
+        // the 3 bytes the kernel wrote — never the 8-byte buffer with a 5-byte tail of zeros the
+        // reader would otherwise invent.
+        // RED on dropping the `buf.truncate(got)`: the value reads back as "abc\0\0\0\0\0".
+        let got = read_sized("fake", |buf, len| {
+            if buf.is_null() && len == 0 {
+                return 8;
+            }
+            assert_eq!(len, 8, "the buffer is sized from the query");
+            // SAFETY: `buf` is the 8-byte allocation this very call was handed (its length is
+            // asserted immediately above) and exactly 3 bytes are copied into it, so the write
+            // stays inside the allocation; the source is a 3-byte literal and the two do not
+            // overlap.
+            unsafe { std::ptr::copy_nonoverlapping(b"abc".as_ptr(), buf.cast::<u8>(), 3) };
+            3
+        })
+        .expect("a shrunk value still reads");
+        assert_eq!(
+            got, b"abc",
+            "a value that shrank is truncated to what was written"
+        );
+
+        // The GROW arm, in the form that needs no errno: the first query answers 0, so the fetch
+        // is handed a zero-length buffer — which makes it a second size query, and a value that
+        // grew from empty answers with its new size instead of ERANGE. That is `got > len`, and
+        // it must retry rather than report the empty buffer as the value.
+        // RED on deleting the `got > len` arm: `buf.truncate(2)` panics on a 0-length buffer, and
+        // relaxing it to a truncate-to-len returns an empty value for a 2-byte attribute.
+        let mut queries = 0_u32;
+        let got = read_sized("fake", |buf, len| {
+            if buf.is_null() && len == 0 {
+                queries += 1;
+                // Empty on the first look, 2 bytes once the racing writer has settled.
+                return if queries == 1 { 0 } else { 2 };
+            }
+            if len == 0 {
+                // The zero-length "fetch" the kernel treats as a size query: it grew.
+                return 2;
+            }
+            assert_eq!(len, 2, "the retry sizes the buffer from the second query");
+            // SAFETY: `buf` is the 2-byte allocation this call was handed (asserted above) and
+            // exactly 2 non-overlapping bytes are copied into it.
+            unsafe { std::ptr::copy_nonoverlapping(b"hi".as_ptr(), buf.cast::<u8>(), 2) };
+            2
+        })
+        .expect("a value that grew from empty is re-read, not reported as empty");
+        assert_eq!(got, b"hi", "the retry must return the grown value");
+        assert_eq!(queries, 2, "exactly one retry was needed");
+
+        // And the retry is BOUNDED: a value that never settles gives up naming the race rather
+        // than spinning forever. RED on a `loop` in place of the `for 0..XATTR_RACE_RETRIES`,
+        // which hangs this test into its harness timeout.
+        let mut queries = 0_u32;
+        let err = read_sized("fake", |buf, len| {
+            if buf.is_null() && len == 0 {
+                queries += 1;
+                return 0;
+            }
+            // Always "it grew", forever.
+            2
+        })
+        .expect_err("a value that never settles must not be reported as read");
+        assert!(
+            err.contains("changed size"),
+            "the give-up must name the race it lost: {err}"
+        );
+        assert_eq!(
+            queries, XATTR_RACE_RETRIES,
+            "the retry loop must run exactly its bound, not fewer and not forever"
+        );
     }
 }

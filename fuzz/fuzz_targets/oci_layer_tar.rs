@@ -47,28 +47,39 @@ use vmcell::artifact::tar2erofs::{fuzz_node_paths, tar_to_erofs};
 // WHAT WOULD BE A FINDING: a panic, an OOM from an input far smaller than the allocation it drove,
 // or an escaping merged-tree key.
 fuzz_target!(|data: &[u8]| {
-    if let Ok(paths) = fuzz_node_paths(vec![tar::Archive::new(Cursor::new(data))]) {
-        for p in &paths {
-            assert!(
-                p.is_relative(),
-                "merged-tree key {p:?} is absolute: it addresses a path outside the image root"
-            );
-            assert!(
-                !p.components().any(|c| matches!(
-                    c,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )),
-                "merged-tree key {p:?} escapes the image root"
-            );
+    // BOTH policies (v33 delta 7): the confinement property is policy-independent, but
+    // `XattrPolicy::Preserve` additionally drives the PAX `SCHILY.xattr.*` decode — a parse
+    // surface fed by the very same registry-authored bytes, and one the default `Strip` never
+    // reaches. Running only the default would leave a decoder in the shipped library with no
+    // fuzz coverage at all.
+    for policy in [
+        vmcell::artifact::rootfs::XattrPolicy::Strip,
+        vmcell::artifact::rootfs::XattrPolicy::Preserve,
+    ] {
+        if let Ok(paths) = fuzz_node_paths(vec![tar::Archive::new(Cursor::new(data))], policy) {
+            for p in &paths {
+                assert!(
+                    p.is_relative(),
+                    "merged-tree key {p:?} is absolute: it addresses a path outside the image root"
+                );
+                assert!(
+                    !p.components().any(|c| matches!(
+                        c,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )),
+                    "merged-tree key {p:?} escapes the image root"
+                );
+            }
         }
-    }
 
-    // The shipped entry point, including the EROFS pack itself.
-    let _ = tar_to_erofs(
-        vec![tar::Archive::new(Cursor::new(data))],
-        vec![],
-        vec![],
-        vec![],
-        false,
-    );
+        // The shipped entry point, including the EROFS pack itself.
+        let _ = tar_to_erofs(
+            vec![tar::Archive::new(Cursor::new(data))],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            policy,
+        );
+    }
 });

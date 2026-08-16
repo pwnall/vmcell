@@ -144,6 +144,16 @@ pub fn rootfs_label_from_filename(name: &str) -> Option<&str> {
     }
 }
 
+/// The per-artifact extended-attribute policy (§4.7) — §10.4 contract surface under this name.
+///
+/// Defined in [`crate::artifact`], which is compiled in **every** feature configuration, because
+/// the policy is declared on a `rootfs` registry entry ([`crate::artifact::RootfsRegistryEntry`],
+/// §18 delta 7) and that parser is ungated, while this module is gated on `pipeline` and the packer
+/// on `am-fs-erofs`. Re-exported here because `rootfs` is where the §10.4 list puts it, beside
+/// [`pack_erofs_with_injection`] and [`ExtraFile`], and because a consumer reads it off
+/// [`PackOptions::xattrs`].
+pub use crate::artifact::XattrPolicy;
+
 /// What the one inject+pack tail is told, beyond the tar streams themselves (design §4.2/§10.5).
 ///
 /// Grown by **field**, never by positional argument — the `HostEnv` idiom AGENTS.md prescribes for
@@ -174,6 +184,12 @@ pub struct PackOptions {
     /// path that produces vmcell's canonical image. Nothing caught it because a map-key mismatch is
     /// not a compile error and the default label's key is the same either way.
     pub label: Option<String>,
+    /// What the packer does with the source layers' extended attributes (§4.7, §18 delta 7).
+    ///
+    /// A **field**, not a parameter of the tail, for the reason this struct exists at all. Default
+    /// [`XattrPolicy::Strip`], which is the pre-v33 behavior byte-for-byte — so an existing caller
+    /// that never mentions it packs the same image it always did.
+    pub xattrs: XattrPolicy,
 }
 
 impl PackOptions {
@@ -212,6 +228,14 @@ impl PackOptions {
     #[must_use]
     pub fn with_label(mut self, label: Option<&str>) -> Self {
         self.label = label.map(str::to_string);
+        self
+    }
+
+    /// Sets the artifact's extended-attribute policy (§4.7); the default is
+    /// [`XattrPolicy::Strip`].
+    #[must_use]
+    pub fn with_xattrs(mut self, xattrs: XattrPolicy) -> Self {
+        self.xattrs = xattrs;
         self
     }
 
@@ -424,6 +448,10 @@ pub struct RootfsStage {
     /// The handler applet roster injected as `<tools_dir>/<applet>` symlinks. Empty is the default
     /// handler's roster; a registered handler (§10.5) supplies its own.
     pub applets: Vec<String>,
+    /// This artifact's extended-attribute policy (§4.7, v33 delta 7) — declared in its registry
+    /// entry, folded into the cache key, and handed to the one pack tail. Default
+    /// [`XattrPolicy::Strip`].
+    pub xattrs: XattrPolicy,
     /// The `rootfs` registry label this stage builds (§10.5, v33 delta 6) — `None` is
     /// `rootfs.default`, which resolves to today's inputs and today's filename.
     ///
@@ -460,6 +488,7 @@ impl RootfsStage {
             steward_musl: None,
             extra: Vec::new(),
             applets: Vec::new(),
+            xattrs: XattrPolicy::default(),
             label: label.map(str::to_string),
             // The artifact key IS the stage name for this kind, so a labelled stage cannot collide
             // with the default one on the pipeline's cache sidecar — the §5.1 hazard recorded for
@@ -502,6 +531,14 @@ impl RootfsStage {
         self
     }
 
+    /// Sets this artifact's extended-attribute policy (§4.7) — the `xattrs` key of its registry
+    /// entry. The default is [`XattrPolicy::Strip`].
+    #[must_use]
+    pub fn with_xattrs(mut self, xattrs: XattrPolicy) -> Self {
+        self.xattrs = xattrs;
+        self
+    }
+
     /// The F7 dev path-override registered for this stage's label, if any (§10.5, §18 delta 6c).
     ///
     /// The **one** place this stage decides "is this label unpinned?", read by `cache_key` and by
@@ -529,6 +566,9 @@ impl RootfsStage {
             steward_musl: self.steward_musl.clone(),
             extra: self.extra.clone(),
             applets: self.applets.clone(),
+            // The SAME policy `cache_key` folds, so the identity and the packed bytes can never
+            // disagree about which attributes the image is supposed to carry.
+            xattrs: self.xattrs,
             // The SAME label the stage's name, out_path and pin keys are composed from, so the key
             // the tail registers under and the key `RootfsStage::publish_unpinned` registers under
             // are one law rather than two that agree only for the default label.
@@ -550,10 +590,19 @@ impl RootfsStage {
 /// (registration path + the pointed-at file's content hash). The arm is *conditional*, so no
 /// artifacts dir in existence can hold a key this change would silently re-serve — the bump is the
 /// project's identity-fold discipline applied anyway, and one OCI-rootfs re-pack is harmless.
+/// v33 (§18 delta 7): bumped to 6 — [`fold_rootfs_injection_identity`] gained the [`XattrPolicy`]
+/// **and** the applet roster (the delta-6b gap: the roster decides which `<tools_dir>/<applet>`
+/// symlinks are baked, and it had never been folded at all, so two registered handlers over one
+/// multicall binary shared a key and shipped different images). One bump covers both, because both
+/// landed before this version was ever released. This one is NOT conditional: the policy folds on
+/// every key, including `Strip`'s, so every existing key moves and every rootfs re-packs once. That
+/// is the point — an artifacts dir that already holds a `Strip`-packed image must not serve it
+/// under a key that now means "whatever this artifact's declaration says", and a *policy* change
+/// with an unmoved key would serve an image whose attributes contradict its own manifest.
 ///
 /// Module-level (rather than a `fn`-local `const`) so the bump itself is assertable KVM-free:
 /// `rootfs_stage_version_pins_the_identity_fold_bumps`.
-const OCI_ROOTFS_STAGE_VERSION: u32 = 5;
+const OCI_ROOTFS_STAGE_VERSION: u32 = 6;
 
 #[async_trait]
 impl Stage for RootfsStage {
@@ -570,14 +619,14 @@ impl Stage for RootfsStage {
         hasher.update(&OCI_ROOTFS_STAGE_VERSION.to_le_bytes());
         // Fold the identity of everything the shared inject+pack tail bakes in (the optional
         // static-musl steward override, the deployment CA, the steward source closure, the
-        // downstream extra files) — ONE implementation, shared with the out-of-crate in-VM
-        // rootfs builders (§4.3, The rootfs-construction contract).
-        fold_rootfs_injection_identity(
-            &mut hasher,
-            inputs,
-            self.steward_musl.as_deref(),
-            &self.extra,
-        );
+        // downstream extra files, the applet roster, the xattr policy) — ONE implementation,
+        // shared with the out-of-crate in-VM rootfs builders (§4.3, The rootfs-construction
+        // contract).
+        //
+        // Through `pack_options()` — the SAME struct `run` packs with — so what this key claims
+        // and what the tail bakes cannot drift. Handing the fold individual fields is what let the
+        // delta-6b applet roster go unfolded for a whole release.
+        fold_rootfs_injection_identity(&mut hasher, inputs, &self.pack_options());
         hasher.update(b"oci");
         // oci2erofs: the CLI-provided digest-pinned base is an INPUT (not a pin) and
         // must be content-addressed directly; otherwise a stale erofs is reused for a
@@ -915,8 +964,8 @@ impl Stage for RootfsFeaturesStage {
 
 /// Folds the identity of everything the shared inject+pack tail ([`pack_erofs_with_injection`])
 /// bakes into a rootfs — the optional static-musl steward override (by CONTENT, H-ART-1), the
-/// deployment proxy CA cert (M-ART-10), the steward source closure, and the downstream
-/// [`ExtraFile`]s — into `hasher`.
+/// deployment proxy CA cert (M-ART-10), the steward source closure, the downstream
+/// [`ExtraFile`]s, the handler applet roster, and the artifact's [`XattrPolicy`] — into `hasher`.
 ///
 /// The extra files fold as `(dest, mode, content-hash)` triples in sorted-dest order (§4.2):
 /// **content that travels, never the `src` path** (cache-key rule 3), and sorted so the
@@ -927,15 +976,41 @@ impl Stage for RootfsFeaturesStage {
 /// implementation of the injected-content identity (§4.3, The rootfs-construction contract; AGENTS.md "don't triplicate;
 /// extract") — a musl-steward/CA/steward rebuild then invalidates the cached erofs from any source.
 ///
+/// # Why it takes the whole [`PackOptions`]
+///
+/// It took the individual inputs positionally until v33 delta 7, and the delta-6b applet roster was
+/// simply never handed to it: two registered handlers with different rosters over one multicall
+/// binary produced the SAME key and DIFFERENT images, so the warm cache served the first roster and
+/// every custom-`init=` target the second declared resolved to nothing. The struct the tail packs
+/// with is now the struct the identity folds, destructured **exhaustively** below — so the next
+/// field somebody adds to `PackOptions` is a compile error here until its author decides whether it
+/// is part of the artifact's identity. A forgotten fold cannot be a silent stale-cache hit again.
+///
 /// Callers fold their own `STAGE_VERSION`, source discriminator, source-specific pins, and
 /// consumed-artifact set (via [`crate::artifact::hash_artifacts_sorted`]) around this call.
 #[cfg(feature = "pipeline")]
 pub fn fold_rootfs_injection_identity(
     hasher: &mut blake3::Hasher,
     inputs: &StageInputs,
-    steward_musl: Option<&Path>,
-    extra: &[ExtraFile],
+    options: &PackOptions,
 ) {
+    // EXHAUSTIVE on purpose (see the rustdoc above): `PackOptions` is `#[non_exhaustive]`, but this
+    // is its defining crate, so a new field lands here as `error[E0027]: pattern does not mention
+    // field` rather than as a rootfs that silently re-serves a stale image.
+    let PackOptions {
+        steward_musl,
+        extra,
+        // Folded at the tail through `options.applet_roster()` — the RESOLVER, not this raw field:
+        // an empty roster MEANS the default handler's, so folding the field itself would give an
+        // undeclared roster and an explicit spelling of the same names two keys for one image.
+        applets: _,
+        // The one field deliberately NOT folded: `label` names the artifact, not its contents, and
+        // two labels resolving to the same base pack byte-identical images — the same-digest,
+        // two-labels byte-identity gate delta 6c landed.
+        label: _,
+        xattrs,
+    } = options;
+    let (steward_musl, xattrs) = (steward_musl.as_deref(), *xattrs);
     // The injected-steward identity: a static-musl override (folded by CONTENT, not path string,
     // since the StewardStage is skipped on that path) vs. the default glibc steward. A read
     // failure folds a distinct marker; the resulting miss re-runs the build, which fails loud.
@@ -991,6 +1066,34 @@ pub fn fold_rootfs_injection_identity(
             Ok(h) => hasher.update(h.as_bytes()),
             Err(_) => hasher.update(format!("missing-extra:{}", f.dest).as_bytes()),
         };
+    }
+    // The artifact's xattr policy (§4.7, §18 delta 7). A policy change is an IDENTITY change:
+    // the same base layers packed under `Preserve` and under `Strip` are two different images,
+    // so serving one from the other's warm cache would hand a consumer an image that contradicts
+    // its own feature manifest. Folded UNCONDITIONALLY — including `Strip`'s token — because a
+    // fold that only spoke up for the non-default value would make `Preserve`→`Strip` collide
+    // with an artifact that never declared anything, which is the direction that loses data.
+    // `XattrPolicy::name()` is the one spelling, shared with the registry parser, so the key
+    // moves exactly when the declaration a consumer wrote would.
+    hasher.update(b"xattrs\0");
+    hasher.update(xattrs.name().as_bytes());
+    hasher.update(b"\0");
+    // The handler applet roster (§10.5, §18 delta 6b — folded here since delta 7). The roster
+    // decides which `<tools_dir>/<applet>` SYMLINKS the tail bakes; the multicall binary's content
+    // is identical either way, so nothing else in this key moves when the roster does. Two
+    // registered handlers over one binary with different rosters are two images, and an unfolded
+    // roster served the first one's symlink set to the second one's cells — every custom-`init=`
+    // target it declared resolving to nothing (exit 2, or a guest kernel panic).
+    //
+    // Through `applet_roster()`, the one resolver the packer itself calls, so "no roster declared"
+    // and "the default roster spelled out" are one identity. In the CALLER's order, deliberately
+    // unsorted — `rootfs_injection_manifest` emits the symlinks in exactly that order, and this
+    // fold does not assume the packer canonicalizes the order away. Over-keying a reordered roster
+    // costs one re-pack; under-keying serves the wrong symlink set, which is a guest kernel panic.
+    hasher.update(b"applets\0");
+    for applet in options.applet_roster() {
+        hasher.update(applet.as_bytes());
+        hasher.update(b"\0");
     }
 }
 
@@ -1061,6 +1164,8 @@ pub async fn pack_erofs_with_injection(
     let steward_musl = options.steward_musl.as_deref();
     let extra = options.extra.as_slice();
     let applets = options.applet_roster();
+    // `Copy`, so it crosses into the blocking task below without a clone or a borrow.
+    let xattr_policy = options.xattrs;
     let out_buf = out.to_path_buf();
     // Composed here (not inside the blocking task) so the label borrow ends before the move.
     let artifact_key = rootfs_artifact_key(options.label.as_deref());
@@ -1138,6 +1243,7 @@ pub async fn pack_erofs_with_injection(
             injected_files,
             injected_symlink_refs,
             require_libc6,
+            xattr_policy,
         )?;
         std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;
         let mut outputs = StageOutputs::default();
@@ -1554,20 +1660,122 @@ mod tests {
     // Quality-gates v4 row 6, carried forward: the OCI stage's cache-key version must be bumped by
     // every change to what the stage FOLDS, because an un-bumped version serves the
     // previously-packed rootfs from the warm cache while every KVM-free test stays green (the
-    // recorded v20 precedent). Two bumps live behind this literal today: v30 delta 6 (→ 4, the
-    // extra-file triples entering `fold_rootfs_injection_identity`) and v33 delta 6c (→ 5, the F7
-    // `unpinned_path` arm).
+    // recorded v20 precedent). Three bumps live behind this literal today: v30 delta 6 (→ 4, the
+    // extra-file triples entering `fold_rootfs_injection_identity`), v33 delta 6c (→ 5, the F7
+    // `unpinned_path` arm) and v33 delta 7 (→ 6, the `XattrPolicy` AND the delta-6b applet roster,
+    // which had never been folded — one bump, because neither shipped in a released version).
     //
     // A literal-value assertion on purpose: it is a TRIPWIRE, not a derivation, so it goes red on
     // the next fold change and forces the author to state which bump they are making. RED on the
-    // inverse: reverting the const to 4.
+    // inverse: reverting the const to 5.
     #[test]
     fn rootfs_stage_version_pins_the_identity_fold_bumps() {
         assert_eq!(
-            OCI_ROOTFS_STAGE_VERSION, 5,
+            OCI_ROOTFS_STAGE_VERSION, 6,
             "an identity-fold change requires this stage-version bump; without it a stale rootfs \
              is served from the warm cache. If you changed what `cache_key` folds, bump the const \
              and this literal together and record the reason in the const's doc comment"
+        );
+    }
+
+    // §18 delta 7: an xattr-policy change is an ARTIFACT-IDENTITY change and must re-pack. The
+    // same base packed under `Preserve` and under `Strip` are two different images, so a shared
+    // key would serve one where the other was declared — and, through the derived
+    // `Feature::XattrPreserved`, an image that contradicts its own feature manifest.
+    //
+    // RED on the inverse: delete the `xattrs` fold at the tail of
+    // `fold_rootfs_injection_identity` — the two keys collapse to one.
+    #[test]
+    fn rootfs_key_tracks_the_xattr_policy() {
+        stabilize_ca();
+        let inputs = StageInputs::default();
+        let strip = RootfsStage::new().with_xattrs(XattrPolicy::Strip);
+        let preserve = RootfsStage::new().with_xattrs(XattrPolicy::Preserve);
+        assert_ne!(
+            strip.cache_key(&inputs),
+            preserve.cache_key(&inputs),
+            "changing the xattr policy must invalidate the rootfs cache key (§4.7): the packed \
+             image differs, so serving the other one from the warm cache ships an artifact whose \
+             attributes contradict its declaration"
+        );
+    }
+
+    // Migration is free, half 2 (§18 delta 7: "cache key unmoved"). Stated honestly: the
+    // STAGE_VERSION bump moves every key by design, so "unmoved" cannot mean "equal to the
+    // pre-delta-7 key" — nothing could assert that without also asserting the bump did not
+    // happen. What it CAN mean, and what a consumer actually feels, is that *not declaring a
+    // policy* is identical to declaring the default: a `rootfs` entry with no `xattrs` key and one
+    // that says `"strip"` are the same artifact, so adding the key to a pins overlay to write down
+    // what was already true does not re-pack anything.
+    //
+    // The byte half of the same claim lives in `tar2erofs`:
+    // `the_default_policy_packs_the_pre_delta7_bytes`.
+    //
+    // RED on the inverse: give `XattrPolicy` a third variant as its `Default`, or fold the
+    // `Option<XattrPolicy>`-style "was it declared?" bit instead of the resolved policy.
+    #[test]
+    fn an_undeclared_policy_is_the_default_policy() {
+        stabilize_ca();
+        let inputs = StageInputs::default();
+        assert_eq!(
+            RootfsStage::new().cache_key(&inputs),
+            RootfsStage::new()
+                .with_xattrs(XattrPolicy::Strip)
+                .cache_key(&inputs),
+            "declaring `xattrs: strip` must be byte-identical to declaring nothing — otherwise \
+             writing down the default re-packs every artifact that does it"
+        );
+        assert_eq!(
+            PackOptions::new().xattrs,
+            XattrPolicy::Strip,
+            "the pack tail's default is the same default"
+        );
+    }
+
+    // §18 delta 6b's gap, closed in delta 7: the applet roster IS artifact identity. The roster
+    // decides which `<tools_dir>/<applet>` symlinks are baked and nothing else in the key moves
+    // with it — the multicall binary's content is identical either way — so two registered
+    // handlers over one binary with different rosters produced the SAME key and DIFFERENT images.
+    // The warm cache then served the first roster, and every custom-`init=` target the second one
+    // declared resolved to nothing: exit 2, or a guest kernel panic for an `init=` target.
+    //
+    // RED on the inverse: delete the `applets` fold at the tail of
+    // `fold_rootfs_injection_identity` — the first two keys collapse to one.
+    #[test]
+    fn rootfs_key_tracks_the_applet_roster() {
+        stabilize_ca();
+        let inputs = StageInputs::default();
+        let key =
+            |applets: Vec<String>| RootfsStage::new().with_applets(applets).cache_key(&inputs);
+        let one = key(vec!["ip".into(), "curl".into()]);
+        assert_ne!(
+            one,
+            key(vec!["ip".into()]),
+            "changing the applet roster must invalidate the rootfs cache key (§10.5): the baked \
+             symlink set differs, so the warm cache would serve an image whose custom-`init=` \
+             targets do not exist"
+        );
+        // Non-vacuity: the gate must not pass merely because every roster keys differently from
+        // every other. The SAME roster is the SAME artifact.
+        assert_eq!(
+            one,
+            key(vec!["ip".into(), "curl".into()]),
+            "the same roster must key the same — a key that moves without the image moving \
+             re-packs a multi-minute artifact for nothing"
+        );
+        // And the resolver's law reaches the identity: an empty roster MEANS the default handler's,
+        // so writing the default out by hand must not re-pack. This is what folding
+        // `applet_roster()` rather than the raw `applets` field buys.
+        assert_eq!(
+            RootfsStage::new().cache_key(&inputs),
+            key(default_applet_roster()),
+            "an undeclared roster is the default roster; spelling it out must be the same artifact"
+        );
+        assert_ne!(
+            RootfsStage::new().cache_key(&inputs),
+            key(vec!["ip".into()]),
+            "…and the previous assertion must not be vacuous: a NON-default roster still differs \
+             from the undeclared one"
         );
     }
 
@@ -1966,5 +2174,28 @@ mod tests {
                 "`RootfsStage::labelled({label:?})` must tell the pack tail which label it packs"
             );
         }
+    }
+
+    // §18 delta 7's CALL-SITE SCAN, the half a `PackOptions` unit test cannot see: the stage's
+    // declared policy must actually REACH the tail. `RootfsStage::run` builds its options through
+    // `pack_options()` and nowhere else, so pinning the accessor pins the pack — and the same
+    // accessor is what `cache_key` reads, which is what keeps the identity and the bytes agreeing.
+    //
+    // RED on the inverse: drop the `xattrs` line from `RootfsStage::pack_options()` — the stage
+    // then folds `Preserve` into its key (the sibling test stays green) and packs `Strip`, which
+    // is precisely the shape that ships an image contradicting its own cache key.
+    #[test]
+    fn the_stages_xattr_policy_reaches_the_pack_tail() {
+        for policy in [XattrPolicy::Strip, XattrPolicy::Preserve] {
+            assert_eq!(
+                RootfsStage::new().with_xattrs(policy).pack_options().xattrs,
+                policy,
+                "`RootfsStage::with_xattrs({policy:?})` must tell the pack tail which policy it \
+                 packs under"
+            );
+        }
+        // And the default stage declares the default, so a caller that never mentions the policy
+        // packs exactly what it always packed.
+        assert_eq!(RootfsStage::new().pack_options().xattrs, XattrPolicy::Strip);
     }
 }
