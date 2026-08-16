@@ -125,6 +125,7 @@ const APPLETS: [(&str, Applet); vmcell_protocol::GUEST_TOOLS_APPLETS.len()] = [
     ("curl", run_curl),
     ("kvm-ok", run_kvm_ok_applet),
     ("echo-server", run_echo_server),
+    ("mini-init", run_mini_init),
 ];
 
 // Compile-time proof that `APPLETS` names exactly the roster, element-wise and in order.
@@ -248,6 +249,175 @@ fn run_kvm_ok() -> i32 {
             println!("KVM acceleration can NOT be used");
             1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `mini-init` — the smallest generic init that runs the steward as a service
+// (v33 §3.5, §18 delta 5).
+// ---------------------------------------------------------------------------
+
+/// How many steward starts inside [`MINI_INIT_FAILURE_WINDOW`] count as a crash-loop.
+///
+/// The cap is what makes the restart policy honest. A real init's `Restart=always` is exactly what
+/// makes the service SIGTERM leg satisfiable — the steward tears down, exits, and comes back — but
+/// an init that restarts a steward that *cannot* start would spin forever, and a guest that spins
+/// silently is indistinguishable from a guest that is working. So the cap powers off fail-loud,
+/// which the host reads as a dead cell with a named reason on the serial console.
+const MINI_INIT_MAX_RAPID_FAILURES: u32 = 5;
+
+/// The window [`MINI_INIT_MAX_RAPID_FAILURES`] is counted over. A steward that stays up longer
+/// than this resets the counter — a long-lived steward that eventually exits is a restart, not a
+/// crash-loop.
+const MINI_INIT_FAILURE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Where the rootfs injection manifest always places the steward binary.
+const MINI_INIT_STEWARD_PATH: &str = "/usr/sbin/vmcell-steward";
+
+/// Validates `mini-init`'s argv. Pure, so the accept/reject law is unit-testable with no guest.
+///
+/// `mini-init` is an `init=` target: the kernel hands it whatever follows on the command line, and
+/// it honors none of it. Rejecting rather than ignoring is law F1 applied to an applet's argv
+/// exactly as to a config field — and it matters more here than elsewhere, because a silently
+/// ignored argument on PID 1 is a guest that boots and then behaves as if the caller had said
+/// nothing.
+fn parse_mini_init_args(args: &[String]) -> Result<(), String> {
+    if let Some(first) = args.first() {
+        return Err(format!(
+            "unexpected argument {first:?} — mini-init takes none; it assembles the guest root, \
+             starts {MINI_INIT_STEWARD_PATH} as a service, restarts it when it exits, and reaps \
+             everything"
+        ));
+    }
+    Ok(())
+}
+
+/// Decides whether a steward exit is part of a crash-loop.
+///
+/// Pure so the cap is unit-testable without spawning anything: `run` for how long the steward
+/// stayed up, `consecutive` for how many rapid failures preceded it. Returns the new count, and
+/// `None` once the cap is reached — which the caller turns into a fail-loud power-off.
+fn mini_init_next_failure_count(run: Duration, consecutive: u32) -> Option<u32> {
+    if run >= MINI_INIT_FAILURE_WINDOW {
+        // It stayed up. This is a restart, not a crash-loop — the counter resets, so a cell that
+        // runs for hours and is then stopped does not inherit an old strike.
+        return Some(0);
+    }
+    let next = consecutive.saturating_add(1);
+    (next < MINI_INIT_MAX_RAPID_FAILURES).then_some(next)
+}
+
+/// The `mini-init` applet: rejects any argv it cannot honor, then runs as PID 1.
+fn run_mini_init(args: &[String]) -> i32 {
+    if let Err(msg) = parse_mini_init_args(args) {
+        eprintln!("mini-init: {msg}");
+        eprintln!("usage: mini-init");
+        return EXIT_USAGE;
+    }
+    mini_init_forever()
+}
+
+/// Assembles the guest root, then supervises the steward forever.
+///
+/// The assembly is `vmcell_steward::assemble_guest_root` — the **same** function the `Pid1`
+/// steward calls, not a second copy of the mount sequence (AGENTS.md: every duplicate so far has
+/// diverged, and the tree's one deliberate guest-side duplication needed a divergence guard to stay
+/// honest). The consequence is the point: a service-placement cell's filesystem is byte-for-byte
+/// the one a `Pid1` cell gets, so the service-mode live legs differ from their `Pid1` twins in
+/// exactly one variable — who is PID 1.
+fn mini_init_forever() -> i32 {
+    println!("mini-init: starting as pid {}", std::process::id());
+    if let Err(e) = vmcell_steward::assemble_guest_root() {
+        eprintln!("mini-init: could not assemble the guest root: {e}");
+        return mini_init_power_off("guest root assembly failed");
+    }
+
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        let started = std::time::Instant::now();
+        let steward = match std::process::Command::new(MINI_INIT_STEWARD_PATH).spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("mini-init: could not start {MINI_INIT_STEWARD_PATH}: {e}");
+                match mini_init_next_failure_count(started.elapsed(), consecutive_failures) {
+                    Some(next) => {
+                        consecutive_failures = next;
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                    None => return mini_init_power_off("the steward could not be started"),
+                }
+            }
+        };
+        let steward_pid = steward.id();
+        println!("mini-init: started the steward as pid {steward_pid}");
+
+        // Reap EVERYTHING, not just the steward: as PID 1 this process inherits every orphan in
+        // the guest, and an init that waits only on its own child leaves the rest as zombies.
+        // `wait()` blocks on any child, which is exactly the wake-on-exit an init wants — no
+        // polling, no signal handler, and no missed exit.
+        let status = loop {
+            match mini_init_wait_any() {
+                Some((pid, code)) if pid == steward_pid => break code,
+                // Some other child of ours (an orphan re-parented here). Reaped; keep waiting.
+                Some(_) => {}
+                // No children at all, or an un-retryable wait error. The steward is gone and we
+                // will not learn its status, so treat it as an exit and restart.
+                None => break -1,
+            }
+        };
+        println!("mini-init: the steward exited (status {status}); restarting it");
+
+        match mini_init_next_failure_count(started.elapsed(), consecutive_failures) {
+            Some(next) => consecutive_failures = next,
+            None => {
+                return mini_init_power_off(
+                    "the steward exited repeatedly without staying up (rapid-failure cap)",
+                );
+            }
+        }
+    }
+}
+
+/// Blocks until any child exits, returning its pid and exit code.
+///
+/// `None` means "there is nothing left to wait for, or the wait itself failed un-retryably" — the
+/// caller treats that as the steward being gone. `EINTR` is retried rather than reported, so a
+/// stray signal cannot look like a child exit.
+fn mini_init_wait_any() -> Option<(u32, i32)> {
+    loop {
+        match rustix::process::wait(rustix::process::WaitOptions::empty()) {
+            Ok(Some((pid, status))) => {
+                let code = status
+                    .exit_status()
+                    .unwrap_or_else(|| status.terminating_signal().map_or(-1, |sig| 128 + sig));
+                return Some((pid.as_raw_nonzero().get().unsigned_abs(), code));
+            }
+            Ok(None) => return None,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => {
+                eprintln!("mini-init: wait failed: {e}");
+                return None;
+            }
+        }
+    }
+}
+
+/// Powers the guest off, fail-loud, naming `why` on the serial console.
+///
+/// A crash-looping guest that stays up looks exactly like a healthy one to a host waiting on a
+/// connect budget; a powered-off one with a reason on the console is a diagnosis. Never returns on
+/// the success path; if `reboot(2)` itself fails, parks — PID 1 returning kernel-panics the guest,
+/// which is a worse failure mode than a hang the host's teardown will force-kill anyway.
+fn mini_init_power_off(why: &str) -> i32 {
+    eprintln!("mini-init: FATAL: {why}; powering the guest off");
+    let _flushed = std::io::stderr().flush();
+    rustix::fs::sync();
+    if let Err(e) = rustix::system::reboot(rustix::system::RebootCommand::PowerOff) {
+        eprintln!("mini-init: power-off failed: {e}; parking so pid 1 never exits");
+    }
+    loop {
+        std::thread::park();
     }
 }
 
@@ -1739,6 +1909,73 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // v33 delta 5 (§3.5): `mini-init` is an `init=` target, so law F1 applies to its argv exactly
+    // as to a config field — an accepted-but-ignored argument on PID 1 is a guest that boots and
+    // then behaves as if the caller had said nothing. RED on re-registering it as
+    // `|_args| mini_init_forever()`, the accept-then-discard shape `kvm-ok` was already fixed for.
+    #[test]
+    fn mini_init_rejects_every_argument() {
+        assert!(parse_mini_init_args(&argv(&[])).is_ok());
+        for bad in [
+            vec!["--restart"],
+            vec!["/usr/sbin/vmcell-steward"],
+            vec!["-v", "2"],
+        ] {
+            let err = parse_mini_init_args(&argv(&bad))
+                .expect_err("mini-init honors no argument, so it must reject every one");
+            assert!(
+                err.contains(&format!("{:?}", bad[0])),
+                "the rejection must NAME the offending argument: {err}"
+            );
+        }
+    }
+
+    // The rapid-failure cap, pure. It is what keeps the restart policy honest: `Restart=always` is
+    // what makes the service SIGTERM leg satisfiable at all, and without a cap a steward that
+    // cannot start spins forever — a guest that spins silently looks exactly like a guest that
+    // works, to a host waiting out a connect budget.
+    //
+    // RED on a cap that never trips (always `Some`), and on one that counts a long-lived steward's
+    // ordinary exit as a strike (which would power off a healthy cell after five restarts).
+    #[test]
+    fn the_rapid_failure_cap_trips_only_on_a_crash_loop() {
+        // Successive fast failures accumulate, then trip.
+        let mut count = 0;
+        for expected in 1..MINI_INIT_MAX_RAPID_FAILURES {
+            count = mini_init_next_failure_count(Duration::from_millis(10), count)
+                .expect("below the cap, a fast failure must be counted and tolerated");
+            assert_eq!(count, expected);
+        }
+        assert_eq!(
+            mini_init_next_failure_count(Duration::from_millis(10), count),
+            None,
+            "the {MINI_INIT_MAX_RAPID_FAILURES}th rapid failure must trip the cap, not be tolerated"
+        );
+
+        // A steward that STAYED UP resets the counter — its exit is a restart, not a crash-loop,
+        // and it must not inherit an old strike.
+        assert_eq!(
+            mini_init_next_failure_count(
+                MINI_INIT_FAILURE_WINDOW,
+                MINI_INIT_MAX_RAPID_FAILURES - 1
+            ),
+            Some(0),
+            "an exit after a full window is a restart; the counter resets"
+        );
+        assert_eq!(
+            mini_init_next_failure_count(MINI_INIT_FAILURE_WINDOW * 100, 0),
+            Some(0)
+        );
+    }
+
+    // The steward path `mini-init` starts must be the one the rootfs injection manifest actually
+    // writes. These are two crates with no shared constant, so this is the seam where a manifest
+    // move would otherwise surface as a guest that boots and never comes up.
+    #[test]
+    fn mini_init_starts_the_injected_steward_path() {
+        assert_eq!(MINI_INIT_STEWARD_PATH, "/usr/sbin/vmcell-steward");
     }
 
     // §3.2 / §6.5: the echo-server's two endpoint arms, parsed. Both are shipped

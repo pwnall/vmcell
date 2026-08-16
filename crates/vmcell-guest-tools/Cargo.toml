@@ -21,4 +21,15 @@ libc = "0.2"
 # table and the rootfs injection manifest DERIVE from one list instead of restating it
 # (docs/81 m22, design §4.4). The explicit `version` (alongside `path`) keeps the cargo-deny
 # `wildcards = "deny"` gate happy — a bare path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
+# v33 delta 5: `mini-init` assembles the guest root through the steward library's ONE assembly
+# function rather than carrying a second copy of the mount sequence — the duplicate-law hazard
+# AGENTS.md names, and the reason a service-placement cell's filesystem is byte-for-byte the one a
+# `Pid1` cell gets. The steward library is itself lean (`scripts/check-lean-tree.sh` bans
+# tokio/hyper/rtnetlink on it), so this adds no host stack to a guest binary that already links
+# reqwest/rustls.
+vmcell-steward = { path = "../vmcell-steward", version = "0.4.0" }
+# `mount`/`process`/`system`/`fs` power `mini-init`: the wait-any reap loop, `sync`, and the
+# fail-loud `reboot(RB_POWER_OFF)` on the rapid-failure cap. Safe wrappers, so the applet adds no
+# `unsafe` block to a file whose unsafe surface is already audited one ioctl at a time.
+rustix = { version = "1", features = ["fs", "mount", "process", "system"] }

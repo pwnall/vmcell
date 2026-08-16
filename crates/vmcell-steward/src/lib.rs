@@ -1,13 +1,32 @@
-//! Guest PID-1 steward support library: the zombie-reaper / exec-waiter coordination.
+//! The in-guest steward: the whole control-plane process as a library, plus the reaper/exec-waiter
+//! coordination it is built on.
 //!
-//! Extracted into the steward member crate (v15 §9.1, Workspace layout) so this PID-1 logic —
-//! and its unit tests — compile without any host async stack. The thin binary in
-//! `main.rs` drives a [`ReaperCoordinator`]; the host never links this code (it
-//! shares only the [`vmcell_protocol`] wire enum).
+//! Lives in its own member crate (v15 §9.1, Workspace layout) so this guest-side logic — and its
+//! unit tests — compile without any host async stack; `scripts/check-lean-tree.sh` enforces that
+//! structurally. The host never links this code, sharing only the [`vmcell_protocol`] wire enum.
+//!
+//! **v33 delta 5 completed the split the manifest had claimed since v15.** `main.rs` carried
+//! ~2,100 lines of mounts, vsock serving, exec, sessions, and power-off policy against a library
+//! that held only the reaper; now the library holds the steward and `main.rs` is the wrapper that
+//! reads `/proc/cmdline`, installs the subscriber, and calls [`run`]. That is not tidying: the
+//! PID-1 contract is now **parameterized by [`GuestPlacement`]**, which is what lets a steward run
+//! as a service under somebody else's init (systemd, a container runtime, a distro image as
+//! shipped) instead of surrendering the control plane to it.
+//!
+//! Per-placement differences, each a parameter and never a fork of the code: the filesystem
+//! assembly ([`assemble_guest_root`]) runs only under `Pid1`; `PR_SET_CHILD_SUBREAPER` is set only
+//! under `Service`; and SIGTERM means [`SigtermPolicy::PowerOff`] or [`SigtermPolicy::Shutdown`].
+//! What does not vary: the wire protocol (`Ready` is still the first frame of every accepted
+//! connection), the credential posture (no uid/gid syscall anywhere in this crate), the
+//! single-writer discipline (law C4), the tools-dir `PATH` prepend, and the lean dependency graph.
+//!
+//! [`StewardOptions`] is deliberately **not** §10.4 downstream-contract surface: no out-of-repo
+//! consumer links this library — consumers place the *binary* — so `cargo semver-checks`' scope
+//! stays the two contract crates.
 //!
 //! No crate-level `forbid(unsafe_code)`: `netif` issues raw `ioctl`/socket syscalls for the
-//! post-restore MAC/loopback bring-up, so the unsafe surface is audited via
-//! `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn` instead.
+//! post-restore MAC/loopback bring-up, and the boot self-check opens an AF_VSOCK socket, so the
+//! unsafe surface is audited via `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn` instead.
 #![deny(missing_docs, unsafe_op_in_unsafe_fn, rustdoc::broken_intra_doc_links)]
 #![deny(unreachable_pub)] // pub-in-private-module API-surface honesty
 #![deny(
@@ -44,14 +63,59 @@
 /// post-restore resync — libc-only, so the lean-steward graph stays host-stack-free.
 pub mod netif;
 
+mod assembly;
+mod exec;
+mod options;
+mod run;
+mod serve;
+mod session;
+
+#[cfg(test)]
+mod main_is_thin_gate;
+#[cfg(test)]
+mod tests;
+
+pub use crate::assembly::assemble_guest_root;
+pub use crate::options::{
+    ACCEPT_POLL, DEFAULT_TOOLS_DIR, GuestPlacement, REBIND_IDLE, SigtermPolicy, StewardOptions,
+    StewardPortToken, TracingSetup, Tuning, parse_steward_port,
+};
+pub use crate::run::run;
+
 use std::collections::{HashMap, HashSet};
-use std::sync::{Condvar, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+
+/// The one seam bundle the serving path carries, grown by field rather than by positional argument
+/// (the `HostEnv` idiom, AGENTS.md).
+///
+/// Before v33 this was a bare `&Arc<ReaperCoordinator>` threaded through nine signatures. Delta 5
+/// added two more facts that every one of those sites needs — the declared tools directory and the
+/// shutdown/registry pair — and threading three `Arc`s positionally is how the next one gets
+/// dropped from one call site and nowhere else.
+#[derive(Debug)]
+pub(crate) struct ServeContext {
+    /// The single reaper every exec and session waiter coordinates through.
+    pub(crate) reaper: Arc<ReaperCoordinator>,
+    /// The handler mount point prepended to every child's `PATH` (§10.5).
+    pub(crate) tools_dir: PathBuf,
+    /// Every live connection's session table, for law C3 on a service-mode shutdown.
+    pub(crate) connections: Arc<crate::serve::ConnectionRegistry>,
+    /// Set once, by a service-mode SIGTERM: stop accepting and let the listener thread return.
+    pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
 
 /// Default upper bound on retained child exit statuses in a [`ReaperCoordinator`].
 ///
-/// As PID 1, the steward reaps re-parented grandchildren that no exec
-/// waiter will ever claim. Their statuses are pruned once this many newer
-/// statuses have been recorded, so the status map cannot grow without bound.
+/// The steward reaps re-parented orphans that no exec waiter will ever claim; their statuses are
+/// pruned once this many newer statuses have been recorded, so the status map cannot grow without
+/// bound.
+///
+/// **Whether that bound is load-bearing is a function of placement** (design §3.5), which is
+/// exactly why placement is a parameter. Under [`GuestPlacement::Pid1`] every orphan in the guest
+/// reparents to the steward, so the bound is doing real work. Under [`GuestPlacement::Service`] it
+/// is dead weight *without* `PR_SET_CHILD_SUBREAPER` — orphans reparent to the real init — and
+/// load-bearing again *with* it, which is the bit [`run`] sets for that placement.
 pub const DEFAULT_MAX_REAPED_STATUSES: usize = 1024;
 
 /// Maps a reaped child's termination into the exit code reported to the host.

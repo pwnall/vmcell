@@ -85,7 +85,7 @@ vmcell = { path = "../vmcell", version = "0.16.0", features = ["cloud-hypervisor
 # names, so growing the roster extends what the contract battery checks with no edit here. It is
 # the same const the guest binary's dispatch table and the rootfs symlink manifest derive from
 # (design §4.4, docs/81 m22). `vmcell` links it too, but does not re-export it.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
 futures = "0.3"
 tracing = "0.1"

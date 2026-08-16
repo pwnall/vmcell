@@ -212,6 +212,22 @@ name = "vmcell"
 #     `vmcell_protocol::STEWARD_VSOCK_PORT`, the workspace's one literal. It is deliberately not a
 #     `pub use`: `cargo semver-checks` reads that as `pub_module_level_const_missing`, and
 #     ledgering a break that breaks nobody is worse than the binding.
+#
+#   * DELTA 5 — the steward as a library; service mode (§3.5, invariant C1).
+#     NOTHING CHANGES IN THIS CRATE'S API. The delta is guest-side: `vmcell-steward` becomes a
+#     library plus a thin binary, its PID-1 contract parameterized by placement. It is recorded here
+#     because two facts a consumer of THIS crate can observe move with it.
+#     ARTIFACT: `GUEST_TOOLS_APPLETS` grows `mini-init` (vmcell-protocol 0.5 → 0.6), so the packed
+#     rootfs gains a `/vmcell-tools/mini-init` symlink and the guest-tools closure hash moves — the
+#     rootfs re-bakes, and `vmcell-artifact-validator`'s `rootfs.guest_tools` check FAILS against any
+#     rootfs packed before this bump until it is re-packed with
+#     `vmcell build --kernel-source host-make`.
+#     BEHAVIOR: `StewardPlacement::Service { port }` with a NON-DEFAULT port now works end to end.
+#     Delta 4 shipped the host halves (the `vmcell_steward_port=` token, and — after the premise
+#     sweep that found it — `VsockEndpoint::with_port` at both control-plane dials) while nothing in
+#     the guest ever BOUND that port. This delta lands the guest-side parse, so a declared port is
+#     honored rather than emitted-dialed-and-ignored. The parse is strict-or-default-with-a-logged-
+#     warning, deliberately unlike its forgiving `vmcell_accept_poll_ms=` siblings.
 version = "0.16.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
@@ -338,7 +354,7 @@ thiserror = "2"
 # the framed postcard wire enum, shared with the steward (v15 §10.1). The explicit
 # `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
 # path dep reads as a `*` requirement.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
 
 # host common
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }

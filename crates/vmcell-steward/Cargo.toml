@@ -1,15 +1,25 @@
 [package]
 name = "vmcell-steward"
-version = "0.3.0"
+# 0.3 → 0.4: design v33 §18 delta 5 — the split this manifest had CLAIMED since v15 is real. The
+# library now holds the whole steward (mounts, vsock serving, exec, sessions, power-off) behind
+# `StewardOptions`/`run`, and `main.rs` is the wrapper that selects the placement from `getpid()`
+# and calls it. The PID-1 contract is parameterized by `GuestPlacement`: the filesystem assembly
+# runs only under `Pid1`, `PR_SET_CHILD_SUBREAPER` is set only under `Service`, and SIGTERM means
+# power-off or graceful-shutdown accordingly. `publish = false` and no out-of-repo consumer links
+# this library (consumers place the BINARY), so `StewardOptions` is deliberately not §10.4 contract
+# surface and `cargo semver-checks` does not cover it — the recorded decline, not an oversight.
+version = "0.4.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcell guest PID-1 steward: vsock control plane + zombie reaper (lean, no host async stack)"
+description = "vmcell guest steward: vsock control plane + zombie reaper, PID 1 or a service (lean, no host async stack)"
 publish = false
 
-# A library (the PID-1 reaper coordination — pure, unit-tested) plus the thin binary that
-# drives it. Both stay off the host async stack; the CI lean-steward assertion enforces this
-# structurally on the member crate (v15 §12.8 #4).
+# A library (the whole steward — mounts, serving, exec, sessions, placement policy) plus the thin
+# binary that drives it. That the binary STAYS thin is gated by `main_is_thin_gate`, a source scan,
+# because cargo has no per-target dependency graph and the lean-tree check below is package-scoped:
+# a lib/bin boundary inside one crate is invisible to it. Both stay off the host async stack; the
+# CI lean-steward assertion enforces that structurally on the member crate (v15 §12.8 #4).
 [lib]
 name = "vmcell_steward"
 path = "src/lib.rs"
@@ -20,7 +30,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Explicit `version` alongside `path` keeps the cargo-deny `wildcards = "deny"` gate happy.
-vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }
+vmcell-protocol = { path = "../vmcell-protocol", version = "0.6.0" }
 postcard = { version = "1", features = ["use-std"] }
 vsock = "0.5"
 # `event` powers the event-driven vsock accept loop (poll(2) on the listener fd,

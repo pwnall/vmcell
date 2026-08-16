@@ -15,7 +15,16 @@ name = "vmcell-protocol"
 # rootfs moves — but the guest-tools closure hash does, so the rootfs re-bakes. `vmcell-guest-tools`
 # is a THIRD dependent as of this bump; guest → shared is the same edge `vmcell-steward` already
 # has, not the forbidden `vmcell` → guest one.
-version = "0.5.0"
+# 0.5 → 0.6: `GUEST_TOOLS_APPLETS` GROWS — `mini-init` joins it (v33 §18 delta 5, §3.5). Unlike the
+# 0.4 → 0.5 entry above, whose "the names and their order are unchanged" sentence this one retires,
+# the roster's contents move: the rootfs gains a `/vmcell-tools/mini-init` symlink, the guest-tools
+# dispatch table gains an arm (a COMPILE error until it does), and the validator's `rootfs.guest_tools`
+# probe grows a `command -v` clause — which means **a rootfs packed before this bump fails that check
+# until it is re-packed** (`vmcell build --kernel-source host-make`). `mini-init` is the smallest
+# generic init that starts the steward as a service, and it exists because live-validating the
+# `Service` placement requires an init that is not the steward and neither the pinned base nor CI
+# can supply one (the law-G1 defense recorded in §3.5).
+version = "0.6.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
