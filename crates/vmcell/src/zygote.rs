@@ -228,12 +228,19 @@ impl Zygote {
         // `spawn_clone` is still fine; `count == 1` here is allowed on any
         // backend.)
         if count > 1 && !vmm.capabilities().restore_rotates_host_paths {
-            return Err(Error::Unsupported {
-                vmm: vmm.id().to_string(),
-                feature: "concurrent zygote fan-out (backend re-binds baked host paths verbatim; \
-                          §9.4, use one clone at a time, or the CH tier)"
-                    .to_string(),
-            });
+            // F6: this refusal IS a `restore_rotates_host_paths` absence, so it spells the
+            // descriptor's field name by construction and carries the WHY in the `Removal`. The
+            // backend is the remover and names itself, so the rendering keeps the pre-v33 shape.
+            return Err(Error::from_removal(
+                vmm.id(),
+                &crate::feature::Removal {
+                    feature: crate::feature::Feature::RestoreRotatesHostPaths,
+                    by: crate::feature::Source::Backend(vmm.id().to_string()),
+                    reason: "re-binds baked host paths verbatim, so concurrent clones would \
+                             collide on one vsock path (§9.4 — use one clone at a time, or the \
+                             CH tier)",
+                },
+            ));
         }
 
         // Restore all clones concurrently. Each draws its own fresh vmid/CID from
@@ -348,14 +355,12 @@ fn check_clone_eligible(cfg: &VmConfig) -> Result<()> {
     // custom-init config was still minted and only refused later, per clone, at the restore
     // boundary. One law, one predicate: the config-only subset lives in exactly one function and
     // this boundary reads it, so a new arm can never reach one boundary and miss the other.
-    let feature = crate::orchestrator::clone_ineligible_feature(cfg);
-    match feature {
-        Some(f) => Err(Error::Unsupported {
-            vmm: "zygote".to_string(),
-            feature: format!(
-                "zygote clone with {f} — snapshot-eligible VMs have no vhost-user device (§12.1)"
-            ),
-        }),
+    match crate::orchestrator::clone_ineligible_feature(cfg) {
+        // F6: the typed error is composed FROM the `Removal`, so its `feature` string is
+        // `Feature::name()` by construction and the `Removal`'s reason carries the why. The old
+        // `format!("zygote clone with {f} — …")` decorated the feature string, which is exactly
+        // what bred `feature.contains("segment")` and its two siblings in the tests below.
+        Some(removal) => Err(Error::from_removal("zygote", &removal)),
         None => Ok(()),
     }
 }
@@ -711,9 +716,21 @@ mod tests {
         })
         .build()
         .expect("a non-snapshotting segment config builds");
+        let cfg_for_arm_check = cfg.clone();
+        // ARM IDENTITY, not a substring. The typed error's `feature` is `snapshot_restore` for
+        // ALL five arms (F6: the string is `Feature::name()` by construction), so the error alone
+        // no longer says WHICH arm fired — the retired `feature.contains("segment")` did, weakly.
+        // The shared predicate's named const is the exact discriminator, so this leg still goes
+        // red if the segment arm is deleted and a sibling arm catches the config instead.
+        assert_eq!(
+            crate::orchestrator::clone_ineligible_feature(&cfg_for_arm_check),
+            Some(crate::orchestrator::INELIGIBLE_SEGMENT),
+            "the segment arm — not a sibling — must be the one that refuses this config"
+        );
         let res = Zygote::from_snapshot_dir(master.clone(), cfg).await;
         assert!(
-            matches!(&res, Err(Error::Unsupported { feature, .. }) if feature.contains("segment")),
+            matches!(&res, Err(Error::Unsupported { feature, .. })
+                if feature == crate::feature::Feature::SnapshotRestore.name()),
             "a segment member must be rejected at zygote construction, got {res:?}"
         );
 
@@ -749,9 +766,17 @@ mod tests {
         .init("/bin/workload")
         .build()
         .expect("a non-snapshotting custom-init config builds");
+        // Arm identity (see the segment leg): the error's `feature` is `snapshot_restore` for
+        // every arm, so the named const is what keeps this leg discriminating.
+        assert_eq!(
+            crate::orchestrator::clone_ineligible_feature(&custom_init),
+            Some(crate::orchestrator::INELIGIBLE_CUSTOM_INIT),
+            "the custom-init arm — not a sibling — must be the one that refuses this config"
+        );
         let res = Zygote::from_snapshot_dir(master.clone(), custom_init).await;
         assert!(
-            matches!(&res, Err(Error::Unsupported { feature, .. }) if feature.contains("custom init")),
+            matches!(&res, Err(Error::Unsupported { feature, .. })
+                if feature == crate::feature::Feature::SnapshotRestore.name()),
             "a custom-init config must be rejected at zygote construction, got {res:?}"
         );
 
@@ -765,9 +790,16 @@ mod tests {
         .with_usb_host_device(crate::config::UsbHostDevice::new(0x1d6b, 0x0002))
         .build()
         .expect("a non-snapshotting USB config builds");
+        // Arm identity (see the segment leg).
+        assert_eq!(
+            crate::orchestrator::clone_ineligible_feature(&usb),
+            Some(crate::orchestrator::INELIGIBLE_USB_PASSTHROUGH),
+            "the host-USB arm — not a sibling — must be the one that refuses this config"
+        );
         let res = Zygote::from_snapshot_dir(master.clone(), usb).await;
         assert!(
-            matches!(&res, Err(Error::Unsupported { feature, .. }) if feature.contains("USB")),
+            matches!(&res, Err(Error::Unsupported { feature, .. })
+                if feature == crate::feature::Feature::SnapshotRestore.name()),
             "a host-USB config must be rejected at zygote construction, got {res:?}"
         );
 

@@ -69,6 +69,8 @@
 )]
 /// Error and Result types.
 pub mod error;
+/// The feature vocabulary and the one intersection site (§7.4, invariant F6).
+pub mod feature;
 /// The one place that composes swept per-VM host resource names from a configurable prefix (§13, Cross-cutting invariants).
 pub mod naming;
 /// Steward protocol and client implementation.

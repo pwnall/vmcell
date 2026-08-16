@@ -169,7 +169,31 @@ name = "vmcell"
 #   Ledger fidelity note: the 0.3 and 0.4 entries above still say `AgentClient`, deliberately. They
 #   record what a consumer saw AT those versions; rewriting them would make them false. This entry
 #   is the one place the old→new mapping lives.
-version = "0.15.0"
+# 0.15.0 → 0.16.0: design v33 §18 deltas 2–7, ONE breaking release (the register bundles them, so
+# this entry GROWS as each lands rather than minting a version per delta). Landed so far:
+#
+#   * DELTA 2 — the feature vocabulary and the intersection (§7.4, invariant F6).
+#     ADDITIVE: the `vmcell::feature` module — `Feature` (nine variants name-for-name with
+#     `VmmCapabilities`, plus `ControlPlane`/`XattrPreserved`/`ProcConfigGz`), `Source`, `Removal`,
+#     `FeatureDeclaration`, `FeatureSet`, `HostDeclaration`, and the two shared refusal consts
+#     `VHOST_USER_BLOCKS_SNAPSHOT` / `IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT`;
+#     `Error::unsupported` / `Error::from_removal`; `VmConfigBuilder::require(Feature)`;
+#     `MicroVm::features()`.
+#     BREAKING `constructible_struct_adds_field`: `VmConfig.required_features: Vec<Feature>` — the
+#     exhaustive-struct compile-time fail-loud, the same intended edge four v30 deltas had.
+#     BEHAVIOR-ONLY, and the one a consumer can actually notice: **refusal MESSAGES re-spell.**
+#     A backend's own refusal is byte-identical to 0.15 (pinned by
+#     `a_backend_removal_renders_exactly_as_it_did_before_v33`), but the ten refusals that carried
+#     prose feature strings now spell `Feature::name()` and move the WHY into the `vmm` field —
+#     `"Unsupported feature in qemu: snapshot with a vhost-user device"` becomes
+#     `"Unsupported feature in qemu (config attaches a vhost-user device …): snapshot_restore"`.
+#     A consumer matching message SUBSTRINGS was already in the class this delta retires; match
+#     `feature == Feature::SnapshotRestore.name()` instead.
+#     ALSO BEHAVIOR-ONLY: `MicroVm::start`/`restore` now read a `<artifact>.features` sidecar beside
+#     the kernel and the rootfs. An ABSENT sidecar is the stated baseline, so every pre-v33 artifact
+#     behaves exactly as before; a PRESENT-but-malformed one is a hard `Error::Artifact`, because a
+#     fallback would let a typo'd declaration read as "no declaration".
+version = "0.16.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -381,7 +405,7 @@ http = { version = "1", optional = true }
 # validator (design §5.4/§8.5). This is a dev-dependency cycle (`vmcell(dev) →
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
-vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.3.0" }
+vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.4.0" }
 # The `vmm_matrix_test!` harness and the FC/QEMU capability/lifecycle/`qemu_*` tests construct the
 # concrete backends, which now live in these crates. Same permitted dev-dependency cycle as the
 # validator above (`vmcell(dev) → vmcell-firecracker/vmcell-qemu → vmcell`), so `vmcell` gains no

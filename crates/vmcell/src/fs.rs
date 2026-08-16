@@ -302,10 +302,14 @@ impl VirtioFsDaemon {
         // daemon's `io::Error` was formerly wrapped into below. The in-process worker
         // keeps the same refusal as a lower-layer backstop.
         if read_only {
-            return Err(crate::error::Error::Unsupported {
-                vmm: "in-process-virtiofsd".to_string(),
-                feature: "read-only virtio-fs share (in-process backend)".to_string(),
-            });
+            return Err(crate::error::Error::from_removal(
+                "in-process-virtiofsd",
+                &crate::feature::Removal {
+                    feature: crate::feature::Feature::VirtioFsShares,
+                    by: crate::feature::Source::Config,
+                    reason: "asks for a read-only share, which the in-process backend cannot serve",
+                },
+            ));
         }
         // `start_in_process_virtiofsd` only returns `Ok` after the worker thread has
         // built the daemon and signalled that it has reached its serve loop; a
@@ -831,9 +835,10 @@ mod ro_share_tests {
         assert!(
             matches!(
                 &err,
-                crate::error::Error::Unsupported { feature, .. } if feature.contains("read-only")
+                crate::error::Error::Unsupported { feature, .. }
+                    if feature == crate::feature::Feature::VirtioFsShares.name()
             ),
-            "expected a typed Unsupported for a read-only share, got {err:?}"
+            "expected a typed Unsupported naming virtio_fs_shares, got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -40,6 +40,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use vmcell::config::VmConfig;
 use vmcell::error::{Error, Result};
+// The v33 feature vocabulary (design §7.4, invariant F6). Every refusal below spells its feature
+// through `Feature::name()` BY CONSTRUCTION, and the two shared `Removal` consts are the ONE
+// spelling of their refusal across all four backends — the four had drifted into four different
+// prose strings, which is what bred `feature.contains("vhost-user")` in three test suites.
+use vmcell::feature::{Feature, IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT, VHOST_USER_BLOCKS_SNAPSHOT};
 use vmcell::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities, VsockEndpoint};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -618,13 +623,13 @@ fn uses_in_kernel_vsock(cfg: &VmConfig) -> bool {
 ///
 /// # Errors
 /// Returns [`Error::Unsupported`] when the descriptor does not advertise
-/// `snapshot_restore`; the feature string equals the `VmmCapabilities` field name (§7.2).
+/// `snapshot_restore`; the feature string equals the `VmmCapabilities` field name (§7.2) because
+/// [`Error::unsupported`] composes it from [`Feature::name`] — never a literal (F6).
 fn require_snapshot_restore_capable(snapshot_restore_capable: bool) -> Result<()> {
     if !snapshot_restore_capable {
-        return Err(Error::Unsupported {
-            vmm: "qemu".to_string(),
-            feature: "snapshot_restore".to_string(),
-        });
+        // The backend itself is the remover, so this is the bare capability refusal: no `Removal`,
+        // no provenance decoration, and the rendering is byte-identical to the pre-v33 literal.
+        return Err(Error::unsupported("qemu", Feature::SnapshotRestore));
     }
     Ok(())
 }
@@ -676,20 +681,18 @@ fn qemu_snapshot_eligibility(
     has_vhost_user_device: bool,
 ) -> Result<()> {
     require_snapshot_restore_capable(snapshot_restore_capable)?;
+    // Both remaining refusals are the CONFIG's doing, not the backend's, so each says why through
+    // its shared [`vmcell::feature::Removal`] instead of decorating the feature string: a decorated
+    // string is a string a test then matches a fragment of (F6). `restore()` returns these very
+    // same two consts, so the snapshot and restore halves cannot drift apart again.
     if !matches!(endpoint, VsockEndpoint::Vsock { .. }) {
-        return Err(Error::Unsupported {
-            vmm: "qemu".to_string(),
-            feature:
-                "snapshot_restore (requires the in-kernel vsock transport; set snapshotting=true)"
-                    .to_string(),
-        });
+        return Err(Error::from_removal(
+            "qemu",
+            &IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT,
+        ));
     }
     if has_vhost_user_device {
-        return Err(Error::Unsupported {
-            vmm: "qemu".to_string(),
-            feature: "snapshot with a vhost-user device (virtio-fs share or unprivileged net)"
-                .to_string(),
-        });
+        return Err(Error::from_removal("qemu", &VHOST_USER_BLOCKS_SNAPSHOT));
     }
     Ok(())
 }
@@ -1313,19 +1316,17 @@ impl Vmm for Qemu {
         // unprivileged net; the in-kernel-vsock requirement catches the case it can't
         // see — a QEMU restore over the external `vhost-device-vsock` daemon, which is
         // itself a non-migratable vhost-user device.
+        // The same two shared `Removal` consts `qemu_snapshot_eligibility` returns (F6): one law,
+        // one spelling, so the snapshot and restore halves of the eligibility rule state the
+        // identical refusal instead of the two near-miss prose strings they carried before.
         if vmcell::vmm::config_has_vhost_user_device(cfg, res) {
-            return Err(Error::Unsupported {
-                vmm: "qemu".to_string(),
-                feature: "snapshot restore with a vhost-user device (virtio-fs share or unprivileged net)"
-                    .to_string(),
-            });
+            return Err(Error::from_removal("qemu", &VHOST_USER_BLOCKS_SNAPSHOT));
         }
         if !uses_in_kernel_vsock(cfg) {
-            return Err(Error::Unsupported {
-                vmm: "qemu".to_string(),
-                feature: "snapshot restore requires the in-kernel vsock transport (set snapshotting=true)"
-                    .to_string(),
-            });
+            return Err(Error::from_removal(
+                "qemu",
+                &IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT,
+            ));
         }
 
         // Fail loud BEFORE spawning if the migration stream is missing, so a bad
@@ -1637,6 +1638,31 @@ mod tests {
     /// tasks and delegation in memory and writes no cgroup sysfs, so nothing driven by it is
     /// evidence about real cgroup residue or enforcement. That is `just test-privileged`.
     use vmcell::metrics::FakeCgroupFs;
+
+    /// Asserts a refusal **is** the shared [`vmcell::feature::Removal`] handed in — not merely
+    /// "some `snapshot_restore` refusal".
+    ///
+    /// F6 collapsed every snapshot refusal onto one feature string, so the exact
+    /// `feature == Feature::SnapshotRestore.name()` comparison that replaced
+    /// `feature.contains("in-kernel vsock")` no longer tells the external-daemon leg from the
+    /// vhost-user leg: both spell `snapshot_restore`. The discriminator moved into the `Removal`,
+    /// so this composes the expected error from the SHARED const through the one composer
+    /// ([`Error::from_removal`]) and compares renderings — a leg that returns the wrong const goes
+    /// red, and no test hand-spells the prose F6 retired: edit a const and both sides move together.
+    #[track_caller]
+    fn assert_is_removal(err: &Error, removal: &vmcell::feature::Removal) {
+        assert!(
+            matches!(err, Error::Unsupported { feature, .. } if feature == removal.feature.name()),
+            "the feature string must be Feature::name() by construction (F6), got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            Error::from_removal("qemu", removal).to_string(),
+            "the refusal must be THIS removal: every snapshot refusal now spells `{}`, so the \
+             provenance the Removal carries is the only thing separating the legs",
+            removal.feature.name()
+        );
+    }
 
     // Guards H-VMM-2: every QEMU launch must carry `-S` so the guest stays frozen until
     // boot() issues `cont`. Without it create() spawns an already-running guest and
@@ -2151,11 +2177,12 @@ mod tests {
             )
             .await
             .expect_err("QEMU restore of a non-snapshotting config must be Unsupported");
-        assert!(
-            matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "qemu" && feature.contains("in-kernel vsock")),
-            "expected an in-kernel-vsock Unsupported, got {err:?}"
-        );
+        // F6: the retired `feature.contains("in-kernel vsock")` matched the prose the refusal used
+        // to carry. The feature string is `Feature::SnapshotRestore.name()` now, which alone cannot
+        // separate this leg from the vhost-user one, so the leg is pinned to the shared const's
+        // identity. The non-vacuity pair is the sibling test below: the SAME restore with
+        // `snapshotting(true)` gets past this guard and reaches the state-file check.
+        assert_is_removal(&err, &IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT);
     }
 
     // A snapshotting config whose snapshot dir has no migration stream fails loud when
@@ -2413,20 +2440,21 @@ mod tests {
             path: PathBuf::from("/tmp/v.sock"),
             port: 5000,
         };
-        // The only eligible combination: a capable backend, in-kernel Vsock transport,
-        // no vhost-user device.
+        // The only eligible combination: a capable backend, in-kernel Vsock transport, no
+        // vhost-user device. This success is now load-bearing for BOTH refusals below — F6 gave
+        // every leg the same feature string, so "refused" is only evidence against a control the
+        // guard accepts; the `Removal` identity supplies the rest.
         assert!(qemu_snapshot_eligibility(true, &vsock, false).is_ok());
         // Vsock endpoint but the VM carries a vhost-user device (the Task B hole): reject.
-        assert!(matches!(
-            qemu_snapshot_eligibility(true, &vsock, true),
-            Err(Error::Unsupported { vmm, feature })
-                if vmm == "qemu" && feature.contains("vhost-user device")
-        ));
-        // External daemon (Unix endpoint) is a non-migratable vhost-user transport: reject.
-        assert!(matches!(
-            qemu_snapshot_eligibility(true, &unix, false),
-            Err(Error::Unsupported { feature, .. }) if feature.contains("in-kernel vsock")
-        ));
+        let err = qemu_snapshot_eligibility(true, &vsock, true)
+            .expect_err("a vhost-user device must block a snapshot even on the Vsock transport");
+        assert_is_removal(&err, &VHOST_USER_BLOCKS_SNAPSHOT);
+        // External daemon (Unix endpoint) is a non-migratable vhost-user transport: reject — with
+        // the OTHER shared const, which is exactly what keeps this leg distinct from the one above
+        // now that both spell `snapshot_restore`.
+        let err = qemu_snapshot_eligibility(true, &unix, false)
+            .expect_err("the external vsock daemon must block a snapshot");
+        assert_is_removal(&err, &IN_KERNEL_VSOCK_REQUIRED_FOR_SNAPSHOT);
         assert!(qemu_snapshot_eligibility(true, &unix, true).is_err());
     }
 

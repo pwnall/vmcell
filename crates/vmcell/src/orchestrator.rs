@@ -655,6 +655,13 @@ pub struct MicroVm<V: Vmm> {
     /// construction, so `steward()`'s connect cadence and `shutdown()`'s grace
     /// window honor the caller-selected profile rather than hard-coded constants.
     timeouts: crate::config::Timeouts,
+    /// This cell's computed feature set — backend × host × artifacts (§7.4, invariant F6).
+    ///
+    /// Resolved once by [`resolve_cell_features`], **the one intersection site**, and kept so a
+    /// caller can ask `why_absent` with provenance rather than re-deriving the answer. It is a
+    /// queryable descriptor, never the enforcement path: per-op guards keep their own authoritative
+    /// typed refusals (§7.2 rule 3).
+    features: crate::feature::FeatureSet,
     /// `true` when the VM boots a custom `init=` (§5.3, The kernel command line) that replaces the vmcell
     /// steward, so there is **no** vsock control plane. Set from `cfg.init` at
     /// construction; makes [`MicroVm::steward`] fail loud immediately rather than hang
@@ -1434,6 +1441,13 @@ impl<V: Vmm> MicroVm<V> {
     /// # }
     /// ```
     pub async fn start(vmm: &V, cfg: VmConfig, env: &HostEnv) -> Result<Self> {
+        // §7.4 / F6: resolve this cell's feature set and honor `require(..)` BEFORE anything is
+        // allocated, spawned, or booted. That ordering is the whole point of clause 3 — a caller
+        // that demanded `SnapshotRestore` from an artifact declaring none learns so here, with
+        // provenance, instead of at the first `snapshot()` call on a VM that already cost a boot.
+        let features = resolve_cell_features(vmm, &cfg)?;
+        features.require_all(vmm.id(), &cfg.required_features)?;
+
         // Honor an explicitly-configured VMID by reserving it through the
         // allocator; otherwise allocate the next free one.
         let vmid_value = match cfg.vmid {
@@ -1525,7 +1539,19 @@ impl<V: Vmm> MicroVm<V> {
             // guarantees the connect/accept/grace cadences honor their floors.
             timeouts: cfg.timeouts.clamped(),
             control_plane_disabled: cfg.init.is_some(),
+            features,
         })
+    }
+
+    /// This cell's computed feature set (§7.4, invariant F6).
+    ///
+    /// Backend × host × artifacts, intersected once at `start`. Every absence carries a
+    /// [`Removal`](crate::feature::Removal) naming who removed it and why, so a caller reads
+    /// `snapshot_restore: unavailable (rootfs "debian-systemd" declares it absent)` rather than a
+    /// bare `false`.
+    #[must_use]
+    pub fn features(&self) -> &crate::feature::FeatureSet {
+        &self.features
     }
 
     /// Restores a single VM from a snapshot directory with the given configuration.
@@ -1632,12 +1658,15 @@ impl<V: Vmm> MicroVm<V> {
         // with the zygote fan-out's fail-fast gate: the two open-coded copies had already needed
         // lock-step edits and had drifted (docs/78 S1), so only the *wrapping* refusal — the
         // per-boundary prose and the vmm id — stays here.
-        if let Some(feature) = clone_ineligible_feature(&cfg) {
-            return Err(crate::error::Error::Unsupported {
-                vmm: vmm.id().to_string(),
-                feature: format!("snapshot restore with {feature}"),
-            });
+        if let Some(removal) = clone_ineligible_feature(&cfg) {
+            return Err(crate::error::Error::from_removal(vmm.id(), &removal));
         }
+
+        // §7.4 / F6, the same ordering `start` uses: resolve and honor `require(..)` before any
+        // resource is allocated. A restored cell reads the SAME sidecars a fresh one does — the
+        // declarations travel with the artifacts, not with the snapshot.
+        let features = resolve_cell_features(vmm, &cfg)?;
+        features.require_all(vmm.id(), &cfg.required_features)?;
 
         let vmid_value = match cfg.vmid {
             Some(v) => env.vmids.reserve(v)?,
@@ -1719,6 +1748,7 @@ impl<V: Vmm> MicroVm<V> {
             // guarantees the connect/accept/grace cadences honor their floors.
             timeouts: cfg.timeouts.clamped(),
             control_plane_disabled: cfg.init.is_some(),
+            features,
         };
         Ok((vm, cow_support))
     }
@@ -2034,15 +2064,15 @@ impl<V: Vmm> MicroVm<V> {
         // `control_plane_disabled` is the retained `cfg.init.is_some()`; the config-only arms live
         // in `clone_ineligible_feature`, which needs a `VmConfig` a live `MicroVm` no longer owns.
         if self.control_plane_disabled {
-            return Err(crate::error::Error::Unsupported {
-                // Not a backend refusal: this boundary is the orchestrator's own eligibility law
-                // (the `zygote`/`in-process-virtiofsd` precedent — a non-backend boundary names
-                // itself rather than blaming the VMM).
-                vmm: "orchestrator".to_string(),
-                feature: "snapshot of a VM with a custom init (VmConfig::init) that replaces the \
-                          steward — the mandatory post-restore resync (§8.2) needs it"
-                    .to_string(),
-            });
+            // Not a backend refusal: this boundary is the orchestrator's own eligibility law
+            // (the `zygote`/`in-process-virtiofsd` precedent — a non-backend boundary names
+            // itself rather than blaming the VMM). F6: the feature string is `Feature::name()`
+            // by construction and the WHY rides the `Removal`, so it is the SAME arm the
+            // config-only predicate returns rather than a fourth prose spelling of it.
+            return Err(crate::error::Error::from_removal(
+                "orchestrator",
+                &INELIGIBLE_CUSTOM_INIT,
+            ));
         }
         self.instance_mut().snapshot(dir).await?;
         // Firecracker severs established vsock connections across its internal
@@ -2192,6 +2222,74 @@ impl<V: Vmm> Drop for MicroVm<V> {
     }
 }
 
+/// **The one intersection site (design §7.4, invariant F6).**
+///
+/// Every axis is a *remover*: a feature is present unless something took it away, and every removal
+/// names who and why. **One computation site**: this function is where `FeatureSet::intersect` is
+/// called, and `the_feature_intersection_has_exactly_one_computation_site` scans production
+/// source for a second call to it — because a gate on the extracted predicate is not a gate on
+/// the claim, which is the completeness-audit lesson the §18 register promoted to a convention.
+/// (Its own two callers — `start` and `restore_inner` — are the two cell-creation boundaries, the
+/// same pair `clone_ineligible_feature` below is read from; a boundary that did NOT resolve
+/// features would be the bug.)
+///
+/// The four axes:
+///
+/// * **backend** — [`Vmm::capabilities`], unchanged. The descriptor stays the backend's one
+///   declaration input, not a parallel vocabulary.
+/// * **host** — [`crate::feature::HostDeclaration::probe`] (nested-virt readiness).
+/// * **artifacts** — the feature-manifest sidecar travelling beside the kernel and the rootfs
+///   image, or the stated baseline when there is none.
+/// * **config** — the cell's own shape. Today that is one arm: a custom `init=` replaces the
+///   steward, so the cell has no control plane.
+///
+/// # Errors
+///
+/// [`crate::error::Error::Artifact`] when a sidecar exists but does not parse. A malformed
+/// declaration is a hard error rather than a fallback to the baseline: falling back would let a
+/// typo'd declaration read as "no declaration", the silent-absence failure F6 exists to close.
+fn resolve_cell_features<V: Vmm>(vmm: &V, cfg: &VmConfig) -> Result<crate::feature::FeatureSet> {
+    use crate::feature::{Feature, FeatureDeclaration, FeatureSet, HostDeclaration, Source};
+
+    let mut artifacts = vec![FeatureDeclaration::load_beside(
+        &cfg.kernel,
+        Source::Kernel(cfg.kernel.file_name().map_or_else(
+            || "kernel".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )),
+    )?];
+    // `effective_image` is the one law for "which file backs /dev/vda" (§13), so the rootfs axis
+    // reads the declaration beside the file the guest actually mounts — not beside a `Block`
+    // source's pristine base when an overlay is what boots.
+    let image = cfg.rootfs.effective_image();
+    artifacts.push(FeatureDeclaration::load_beside(
+        image,
+        Source::Rootfs(image.file_name().map_or_else(
+            || "rootfs".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )),
+    )?);
+
+    let mut set = FeatureSet::intersect(
+        vmm.id(),
+        &vmm.capabilities(),
+        Some(&HostDeclaration::probe()),
+        &artifacts,
+    );
+
+    // The config axis. `cfg.init.is_some()` is today's spelling of "no steward is expected"; §18
+    // delta 4 re-keys it — with its six siblings — onto `StewardPlacement::steward_port()`, and
+    // this site is named in that delta's call-site scan so the re-key cannot miss it.
+    if cfg.init.is_some() {
+        set.remove_by_config(
+            Feature::ControlPlane,
+            "declares a custom init= that replaces the steward",
+        );
+    }
+
+    Ok(set)
+}
+
 /// The **one** config-only snapshot-eligibility predicate (§13, Cross-cutting invariants).
 ///
 /// Returns the offending feature when `cfg` can never take part in a snapshot/restore cycle, and
@@ -2208,25 +2306,73 @@ impl<V: Vmm> Drop for MicroVm<V> {
 /// per-VM resource — or any copy-on-write clone of a suspend image — is minted. The
 /// resources-in-hand checks stay at their own boundaries.
 ///
-/// The fragments name the `VmConfig` field they refuse (§7.2, capability honesty: a typed refusal
-/// names the feature it is about, not a paraphrase), so a caller matching on the message can tell
-/// which input to drop.
-pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<&'static str> {
+/// Each arm is a named [`Removal`](crate::feature::Removal) const (§7.2, capability honesty: a
+/// typed refusal names the feature it is about, not a paraphrase). The `feature` is always
+/// `SnapshotRestore` — the capability every arm removes — and the `reason` names the `VmConfig`
+/// input to drop. Returning a `Removal` rather than a `&'static str` is what lets both boundaries
+/// compose the typed error through [`Error::from_removal`](crate::error::Error::from_removal), so
+/// the feature string is `Feature::name()` by construction (F6) and a test asserts arm identity
+/// instead of a substring.
+/// The five config-only arms of the snapshot-eligibility law, each as a named
+/// [`Removal`](crate::feature::Removal) (§7.4 clause 2 / F6).
+///
+/// They are `const` and named so a test asserts arm IDENTITY — `== INELIGIBLE_SEGMENT` — instead of
+/// matching a fragment of a prose string. That is the whole substring-matcher retirement: before
+/// v33 the arms were bare `&'static str` fragments and the suites keyed on
+/// `.contains("segment")` / `.contains("custom init")` / `.contains("USB")`, assertions strictly
+/// weaker than the comment above each arm claimed.
+///
+/// Every arm's `feature` is [`Feature::SnapshotRestore`](crate::feature::Feature::SnapshotRestore),
+/// because that is the capability all five remove; the arms differ in their `reason`, which is what
+/// tells a caller which input to drop.
+pub(crate) const INELIGIBLE_UNPRIVILEGED_NET: crate::feature::Removal = crate::feature::Removal {
+    feature: crate::feature::Feature::SnapshotRestore,
+    by: crate::feature::Source::Config,
+    reason: "uses unprivileged (vhost-user-net) networking, which is not migratable",
+};
+/// See [`INELIGIBLE_UNPRIVILEGED_NET`].
+pub(crate) const INELIGIBLE_SEGMENT: crate::feature::Removal = crate::feature::Removal {
+    feature: crate::feature::Feature::SnapshotRestore,
+    by: crate::feature::Source::Config,
+    reason: "joins a vm-to-vm segment (§6.5), whose restore-time slot/addressing semantics are \
+             unspecified",
+};
+/// See [`INELIGIBLE_UNPRIVILEGED_NET`].
+pub(crate) const INELIGIBLE_VIRTIOFS_SHARE: crate::feature::Removal = crate::feature::Removal {
+    feature: crate::feature::Feature::SnapshotRestore,
+    by: crate::feature::Source::Config,
+    reason: "attaches a virtio-fs data share, which virtiofsd serves as a vhost-user device",
+};
+/// See [`INELIGIBLE_UNPRIVILEGED_NET`].
+pub(crate) const INELIGIBLE_CUSTOM_INIT: crate::feature::Removal = crate::feature::Removal {
+    feature: crate::feature::Feature::SnapshotRestore,
+    by: crate::feature::Source::Config,
+    reason: "sets a custom init= that replaces the steward, through which the mandatory \
+             post-restore resync runs",
+};
+/// See [`INELIGIBLE_UNPRIVILEGED_NET`].
+pub(crate) const INELIGIBLE_USB_PASSTHROUGH: crate::feature::Removal = crate::feature::Removal {
+    feature: crate::feature::Feature::SnapshotRestore,
+    by: crate::feature::Source::Config,
+    reason: "passes through a host USB device, which is host state living outside guest RAM",
+};
+
+pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<crate::feature::Removal> {
     if matches!(cfg.net, crate::config::NetConfig::Unprivileged { .. }) {
         // A vhost-user-net device is not migratable, so it is not snapshot-eligible.
-        return Some("unprivileged (vhost-user-net) networking");
+        return Some(INELIGIBLE_UNPRIVILEGED_NET);
     }
     // §6.5 (VM-to-VM segments): restore-time slot/addressing semantics for a member are
     // unspecified in v30, so a restore onto a segment is a typed capability refusal, not a
     // silently mis-addressed member — and a fan-out would dual-claim one member slot besides.
     // `build()` already refuses the pair; this is what a hand-built config cannot slip past.
     if matches!(cfg.net, crate::config::NetConfig::Segment { .. }) {
-        return Some("vm-to-vm segment membership (§6.5)");
+        return Some(INELIGIBLE_SEGMENT);
     }
     // A virtio-fs data share is served by virtiofsd (a vhost-user device), which a
     // snapshot-eligible VM must not attach (§12.1). Enforced in code, not just docs.
     if !cfg.shares.is_empty() {
-        return Some("a virtio-fs data share (vhost-user device)");
+        return Some(INELIGIBLE_VIRTIOFS_SHARE);
     }
     // docs/78 M2: a custom `init=` REPLACES the vmcell steward, and the mandatory
     // post-restore resync — clock, CSPRNG reseed, MAC/IP rotation (§8.2) — runs *through* that
@@ -2235,7 +2381,7 @@ pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<&'static str> {
     // CSPRNG and a stale MAC/IP, and `steward()` fails loud, so the resync is structurally
     // unreachable. Config-only and identical at both boundaries, hence an arm here.
     if cfg.init.is_some() {
-        return Some("a custom init (VmConfig::init) that replaces the steward");
+        return Some(INELIGIBLE_CUSTOM_INIT);
     }
     // docs/78 M4: a passed-through host USB device is host state living OUTSIDE guest RAM — the
     // migration stream carries the guest's view of the xhci controller but not the device behind
@@ -2248,7 +2394,7 @@ pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<&'static str> {
     // is snapshottable, and a zygote over one would fan out N guests fighting over one device —
     // so it belongs in the shared predicate rather than beside it.
     if !cfg.usb_host_devices.is_empty() {
-        return Some("host USB passthrough (VmConfig::usb_host_devices)");
+        return Some(INELIGIBLE_USB_PASSTHROUGH);
     }
     None
 }
@@ -3173,6 +3319,7 @@ mod tests {
             tmp_dir: Some(tmp_dir),
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            features: crate::feature::FeatureSet::default(),
         }
     }
 
@@ -3600,6 +3747,7 @@ mod tests {
                 tmp_dir: None,
                 timeouts: crate::config::Timeouts::default(),
                 control_plane_disabled: false,
+                features: crate::feature::FeatureSet::default(),
             };
         }
 
@@ -4230,7 +4378,7 @@ mod tests {
         });
         assert_eq!(
             clone_ineligible_feature(&unprivileged),
-            Some("unprivileged (vhost-user-net) networking")
+            Some(INELIGIBLE_UNPRIVILEGED_NET)
         );
 
         let share = ineligible_cfg(|b| {
@@ -4243,14 +4391,14 @@ mod tests {
         });
         assert_eq!(
             clone_ineligible_feature(&share),
-            Some("a virtio-fs data share (vhost-user device)")
+            Some(INELIGIBLE_VIRTIOFS_SHARE)
         );
 
         // M2: a custom init replaces the steward the mandatory post-restore resync runs through.
         let custom_init = ineligible_cfg(|b| b.init("/bin/workload"));
         assert_eq!(
             clone_ineligible_feature(&custom_init),
-            Some("a custom init (VmConfig::init) that replaces the steward")
+            Some(INELIGIBLE_CUSTOM_INIT)
         );
 
         // M4: a passed-through host device is not in the migration stream.
@@ -4259,7 +4407,7 @@ mod tests {
         });
         assert_eq!(
             clone_ineligible_feature(&usb),
-            Some("host USB passthrough (VmConfig::usb_host_devices)")
+            Some(INELIGIBLE_USB_PASSTHROUGH)
         );
     }
 
@@ -4276,18 +4424,25 @@ mod tests {
     async fn restore_rejects_a_custom_init_config() {
         let vmm = crate::vmm::FakeVmm::default();
         let env = HostEnv::for_unit_tests();
-        let err = MicroVm::restore(
-            &vmm,
-            std::path::Path::new("/fake/snap"),
-            ineligible_cfg(|b| b.init("/bin/workload")),
-            &env,
-        )
-        .await
-        .expect_err("restoring a custom-init config must be refused");
+        let cfg = ineligible_cfg(|b| b.init("/bin/workload"));
+        // ARM IDENTITY, not a substring. F6 makes every eligibility refusal spell
+        // `snapshot_restore` (the string is `Feature::name()` by construction), so the error
+        // alone no longer says WHICH arm fired — the retired `feature.contains(..)` did, weakly.
+        // The named const on the shared predicate is the exact discriminator, so this leg still
+        // reddens if the arm it names is deleted and a sibling catches the config instead.
+        assert_eq!(
+            clone_ineligible_feature(&cfg),
+            Some(INELIGIBLE_CUSTOM_INIT),
+            "the custom-init arm — not a sibling — must be the one that refuses this config"
+        );
+        let err = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env)
+            .await
+            .expect_err("restoring a custom-init config must be refused");
         match err {
-            crate::error::Error::Unsupported { feature, .. } => assert!(
-                feature.contains("custom init (VmConfig::init)"),
-                "the refusal must name the offending field, got {feature:?}"
+            crate::error::Error::Unsupported { feature, .. } => assert_eq!(
+                feature,
+                crate::feature::Feature::SnapshotRestore.name(),
+                "the refusal's feature string is Feature::name() by construction (F6)"
             ),
             other => panic!("expected a typed capability refusal, got {other:?}"),
         }
@@ -4328,9 +4483,13 @@ mod tests {
                 .expect_err("a custom-init zygote must not mint a clone"),
         };
         match err {
-            crate::error::Error::Unsupported { feature, .. } => assert!(
-                feature.contains("custom init (VmConfig::init)"),
-                "the refusal must name the offending field, got {feature:?}"
+            // F6: every eligibility refusal spells `snapshot_restore`. This leg's discrimination
+            // comes from its POSITIVE CONTROL below — the identical flow without `init` must
+            // succeed — which is what makes the refusal non-vacuous now that the arms share a name.
+            crate::error::Error::Unsupported { feature, .. } => assert_eq!(
+                feature,
+                crate::feature::Feature::SnapshotRestore.name(),
+                "the refusal's feature string is Feature::name() by construction (F6)"
             ),
             other => panic!("expected a typed capability refusal, got {other:?}"),
         }
@@ -4367,9 +4526,13 @@ mod tests {
             .await
             .expect_err("snapshotting a custom-init VM must be refused");
         match err {
-            crate::error::Error::Unsupported { feature, .. } => assert!(
-                feature.contains("custom init (VmConfig::init)"),
-                "the refusal must name the offending field, got {feature:?}"
+            // F6: every eligibility refusal spells `snapshot_restore`. This leg's discrimination
+            // comes from its POSITIVE CONTROL below — the identical flow without `init` must
+            // succeed — which is what makes the refusal non-vacuous now that the arms share a name.
+            crate::error::Error::Unsupported { feature, .. } => assert_eq!(
+                feature,
+                crate::feature::Feature::SnapshotRestore.name(),
+                "the refusal's feature string is Feature::name() by construction (F6)"
             ),
             other => panic!("expected a typed capability refusal, got {other:?}"),
         }
@@ -4405,13 +4568,24 @@ mod tests {
             !with_usb.snapshotting,
             "the reachable shape is the NON-snapshotting one (build() rejects snapshotting+USB)"
         );
+        // ARM IDENTITY, not a substring. F6 makes every eligibility refusal spell
+        // `snapshot_restore` (the string is `Feature::name()` by construction), so the error
+        // alone no longer says WHICH arm fired — the retired `feature.contains(..)` did, weakly.
+        // The named const on the shared predicate is the exact discriminator, so this leg still
+        // reddens if the arm it names is deleted and a sibling catches the config instead.
+        assert_eq!(
+            clone_ineligible_feature(&with_usb),
+            Some(INELIGIBLE_USB_PASSTHROUGH),
+            "the host-USB arm — not the in-kernel-vsock transport — must be the one that refuses"
+        );
         let err = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), with_usb, &env)
             .await
             .expect_err("restoring a config carrying host USB devices must be refused");
         match err {
-            crate::error::Error::Unsupported { feature, .. } => assert!(
-                feature.contains("usb_host_devices"),
-                "the refusal must name the offending field, got {feature:?}"
+            crate::error::Error::Unsupported { feature, .. } => assert_eq!(
+                feature,
+                crate::feature::Feature::SnapshotRestore.name(),
+                "the refusal's feature string is Feature::name() by construction (F6)"
             ),
             other => panic!("expected a typed capability refusal, got {other:?}"),
         }
@@ -4738,6 +4912,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            features: crate::feature::FeatureSet::default(),
         };
         let usage = vm.usage().await.unwrap();
         assert!(
@@ -4867,6 +5042,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            features: crate::feature::FeatureSet::default(),
         };
 
         // Drive one exec into its timeout: the silent listener never answers.
@@ -4936,6 +5112,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            features: crate::feature::FeatureSet::default(),
         };
         (vm, peer)
     }
@@ -5102,6 +5279,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            features: crate::feature::FeatureSet::default(),
         };
         drop(vm);
 
@@ -5393,6 +5571,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            features: crate::feature::FeatureSet::default(),
         };
 
         vm.shutdown().await.expect("shutdown ok");
@@ -5548,6 +5727,7 @@ mod tests {
                 ..crate::config::Timeouts::default()
             },
             control_plane_disabled: false,
+            features: crate::feature::FeatureSet::default(),
         }
     }
 
@@ -5582,6 +5762,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: true,
+            features: crate::feature::FeatureSet::default(),
         };
         let err = vm
             .steward(Some(std::time::Duration::from_secs(1)))
@@ -5664,6 +5845,7 @@ mod tests {
             // The VM boots a custom init=: no steward, no control plane — and the dial
             // must work anyway.
             control_plane_disabled: true,
+            features: crate::feature::FeatureSet::default(),
         };
 
         let dialed = vm.dial_vsock(7000, std::time::Duration::from_secs(5)).await;

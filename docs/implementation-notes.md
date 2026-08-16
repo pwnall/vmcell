@@ -3887,6 +3887,80 @@ have left three dangling pointers; its `AGENT-2` finding id survived.
 this commit will not boot. Rebuild with `vmcell build --kernel-source host-make` — the bare default
 is `prebuilt`, which silently replaces a locally built `vmlinux`.
 
+## v33 delta 2 — the feature vocabulary and the intersection (design §18 delta 2, §7.4, F6), as built
+
+**What landed.** `vmcell::feature` — `Feature` (nine backend variants name-for-name with
+`VmmCapabilities`, plus `ControlPlane`/`XattrPreserved`/`ProcConfigGz`), `Source`, `Removal`,
+`FeatureDeclaration`, `FeatureSet`, `HostDeclaration`; `Error::unsupported` and
+`Error::from_removal`; `VmConfigBuilder::require(Feature)` resolved at `MicroVm::start` **and**
+`restore_inner` before any resource is allocated; `MicroVm::features()`; and
+`orchestrator::resolve_cell_features`, the one computation site.
+
+**Shape shifts from the §7.4 sketch**, each for a stated reason:
+
+- `Source::Backend` carries a `String`, not the sketch's `&'static str`. `Vmm::id()` returns a
+  borrowed `&str` and every sibling axis already carries an owned label, so one representation is
+  one fewer lifetime in every signature that touches a `Removal`.
+- `Error::Unsupported`'s **`vmm` field is "who says so"**, not strictly the backend. §7.4 asks for
+  two things that pull against each other — the shape stays two fields, *and* the removal's
+  provenance is in the error — and the message template is literally `"Unsupported feature in
+  {vmm}: {feature}"`, so `vmm` is the provenance slot. `from_removal` renders the bare backend name
+  when the backend is the remover, which is **byte-identical to every pre-v33 site** (pinned by
+  `a_backend_removal_renders_exactly_as_it_did_before_v33`), and names the artifact or host
+  otherwise — because "Unsupported feature in cloud-hypervisor" would blame the backend for a
+  rootfs's declaration, the exact dishonesty §7.4 exists to retire.
+- `clone_ineligible_feature` returns `Option<Removal>` rather than `Option<&'static str>`, and its
+  five arms became **named consts** (`INELIGIBLE_SEGMENT` and siblings). That is what let the
+  zygote suite's `.contains("segment")` / `.contains("custom init")` / `.contains("USB")` become
+  arm-identity equalities — see the vacuity note below.
+- The sidecar's **emission** is not here. `FeatureDeclaration::load_beside` consumes
+  `<artifact>.features` (the `.cache_key` sidecar's naming law, which yields §7.4's
+  `rootfs-<label>.features` exactly), and an absent sidecar is the **stated baseline**. Emission is
+  delta 6's, because §7.4 makes the registry entry the one authority and the sidecar its travel
+  form — there is nothing to emit *from* until the registry exists. Recorded so the absence reads
+  as sequencing, not as a gap.
+
+**The vacuity trap this delta walks into, and how each leg stays discriminating.** Retiring the
+prose strings means "the backend cannot snapshot" and "this config carries a vhost-user device" now
+BOTH produce `feature == "snapshot_restore"`. An exact matcher alone therefore discriminates less
+than the substring matcher it replaced — the substring was a weak assertion, but it was not a
+*vacuous* one. Every converted leg was given back its discrimination explicitly:
+
+- the zygote legs assert **arm identity** against the named const
+  (`clone_ineligible_feature(&cfg) == Some(INELIGIBLE_SEGMENT)`), so deleting the segment arm and
+  letting a sibling catch the config reddens them;
+- the qemu legs pin the **two different** shared consts through a `#[track_caller]`
+  `assert_is_removal` helper, compared on the rendering so editing a const moves both sides;
+- the CH and FC vhost-user legs assert `vmm` carries config provenance **and** the feature is
+  `snapshot_restore`, so re-keying the guard onto the descriptor reddens them;
+- where neither applies, the leg is explicitly paired with the positive control that already
+  existed (the eligible config on the same capable backend must be ALLOWED), and a comment at the
+  site says that the refusal/success pair is now what makes it non-vacuous.
+
+**The two gates, both verified red-on-inverse rather than asserted.**
+`the_feature_intersection_has_exactly_one_computation_site` and
+`no_production_site_hand_spells_a_feature_string` are Rust source-scan tests in `vmcell::feature`,
+per quality-gates v5 ("call-site scans are Rust source-scan tests, not shell scripts"), so the
+`gates` recipe roster — and `ban-ci-script-handcopy.sh`'s both-direction assertion over it — does
+not grow. They **walk `crates/*/src` at run time** rather than `include_str!`-ing a fixed list,
+because a fixed list is itself a roster that can go stale: a new backend crate would be invisible
+to a hardcoded scan while being exactly where the law is most likely to be broken. Planting a prose
+feature string reddens the first; planting a second `FeatureSet::intersect(` call reddens the
+second; both were run and reverted.
+
+**The sweep found a crate the survey missed.** The first run of
+`no_production_site_hand_spells_a_feature_string` flagged eleven sites in `vmcell-firecracker`,
+which the hand grep that scoped this delta had not turned up (its refusals are formatted
+differently). That is the gate doing the job the survey could not — and it is the reason the scan
+walks the tree instead of naming files.
+
+**Deliberately NOT given `Feature` variants** (§7.4 clause 4 fixes granularity up front; a variant
+that later splits breaks every declaration in every overlay): `vhost_user_socket` (a per-VM
+resource, not a descriptor field), `vmm_seccomp`/`seccomp_log`, and `boot_after_restore` — the last
+being an API-state refusal, not a capability absence. Each keeps a **single snake_case token**,
+never prose, so a caller matches it exactly; the sweep enforces that shape on them too, and each
+site carries a comment saying not to "fix" it into a variant.
+
 ## Where the design lives now
 
 **v33 (2026-08-15):** `docs/82-claude-opus-design-v32.md` moved to `docs/historical/` (frozen at its

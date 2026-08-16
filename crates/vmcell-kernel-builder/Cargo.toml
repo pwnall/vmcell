@@ -15,7 +15,7 @@ path = "src/lib.rs"
 # The in-VM builder drives a vmcell builder micro-VM (MicroVm/VmConfig/steward) and reuses
 # vmcell's shared build utilities (the OCI builder-base packer, the HttpClient seam, the
 # blake3 hash helpers). It needs the host stack: a backend, metrics, and the pipeline.
-vmcell = { path = "../vmcell", version = "0.15.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.16.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "time"] }
 tracing = "0.1"

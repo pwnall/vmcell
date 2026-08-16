@@ -804,10 +804,10 @@ pub fn reject_unsupported_console(
     mode: crate::config::ConsoleMode,
 ) -> Result<()> {
     if matches!(mode, crate::config::ConsoleMode::VirtioConsole) && !caps.virtio_console {
-        return Err(crate::error::Error::Unsupported {
-            vmm: vmm.into(),
-            feature: "virtio_console".into(),
-        });
+        return Err(crate::error::Error::unsupported(
+            vmm,
+            crate::feature::Feature::VirtioConsole,
+        ));
     }
     Ok(())
 }
@@ -855,18 +855,18 @@ pub fn reject_unadvertised_capabilities(
     cfg: &crate::config::VmConfig,
 ) -> Result<()> {
     if cfg.nested_virt && !caps.nested_virt {
-        return Err(crate::error::Error::Unsupported {
-            vmm: vmm.into(),
-            // N-VMM-1: the feature string IS the VmmCapabilities field name.
-            feature: "nested_virt".into(),
-        });
+        // N-VMM-1 is a TYPE LAW now (F6): `Feature::name()` IS the descriptor's field name,
+        // pinned in both directions by `feature_roster_matches_vmm_capabilities_fields`.
+        return Err(crate::error::Error::unsupported(
+            vmm,
+            crate::feature::Feature::NestedVirt,
+        ));
     }
     if matches!(cfg.restore_mode, crate::config::RestoreMode::Lazy) && !caps.lazy_restore {
-        return Err(crate::error::Error::Unsupported {
-            vmm: vmm.into(),
-            // N-VMM-1: the feature string IS the VmmCapabilities field name.
-            feature: "lazy_restore".into(),
-        });
+        return Err(crate::error::Error::unsupported(
+            vmm,
+            crate::feature::Feature::LazyRestore,
+        ));
     }
     Ok(())
 }
@@ -891,11 +891,10 @@ pub fn reject_usb_host_devices(
     devices: &[crate::config::UsbHostDevice],
 ) -> Result<()> {
     if !devices.is_empty() && !caps.usb_host_passthrough {
-        return Err(crate::error::Error::Unsupported {
-            vmm: vmm.into(),
-            // N-VMM-1: the feature string IS the VmmCapabilities field name.
-            feature: "usb_host_passthrough".into(),
-        });
+        return Err(crate::error::Error::unsupported(
+            vmm,
+            crate::feature::Feature::UsbHostPassthrough,
+        ));
     }
     Ok(())
 }

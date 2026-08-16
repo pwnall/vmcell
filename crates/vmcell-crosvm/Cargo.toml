@@ -17,7 +17,7 @@ publish = false
 # side socket), so — like QEMU — this crate needs NO serde/JSON: the crosvm control-socket protocol
 # is unstable binary and must never be hand-rolled.
 [dependencies]
-vmcell = { path = "../vmcell", version = "0.15.0", default-features = false, features = ["host-common"] }
+vmcell = { path = "../vmcell", version = "0.16.0", default-features = false, features = ["host-common"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "process", "sync", "time", "signal"] }
 nix = { version = "0.31", features = ["signal", "process"] }
 tracing = "0.1"
@@ -32,4 +32,4 @@ tracing = "0.1"
 # `--all-targets`, where cargo's feature unification does make them visible to the lib target.
 [dev-dependencies]
 tempfile = "3"
-vmcell = { path = "../vmcell", version = "0.15.0", default-features = false, features = ["host-common", "test-support"] }
+vmcell = { path = "../vmcell", version = "0.16.0", default-features = false, features = ["host-common", "test-support"] }

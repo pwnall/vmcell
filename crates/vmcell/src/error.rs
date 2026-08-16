@@ -78,11 +78,25 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     /// An unsupported operation or feature.
+    ///
+    /// The **shape is fixed** (design §7.4 clause 2: "`Error::Unsupported { vmm, feature }` keeps
+    /// its public shape"); what v33 changed is that `feature` is now
+    /// [`crate::feature::Feature::name`] by construction at every production site, never a
+    /// hand-spelled prose fragment — see [`Error::from_removal`].
     #[error("Unsupported feature in {vmm}: {feature}")]
     Unsupported {
-        /// The VMM backend (e.g., "qemu", "cloud-hypervisor").
+        /// **Who says so.** The VMM backend (e.g. `"qemu"`) when the backend is the remover — the
+        /// spelling every pre-v33 site produced and still produces, byte-identically. When an
+        /// *artifact* or the *host* is the remover, this carries that provenance instead
+        /// (`cloud-hypervisor (rootfs "debian-systemd" declares it absent)`), because
+        /// "Unsupported feature in `<the backend>`" would blame the backend for a rootfs's
+        /// declaration — exactly the dishonesty §7.4 exists to retire. The machine-readable
+        /// provenance is [`crate::feature::FeatureSet::why_absent`]; this field is its rendering.
         vmm: String,
-        /// The unsupported feature (e.g., "snapshot", "virtio-fs").
+        /// The unsupported feature — always a [`crate::feature::Feature::name`] at a production
+        /// site, so a caller matches `feature == Feature::SnapshotRestore.name()` rather than
+        /// `feature.contains("vhost-user")`. The substring-matcher class is retired with the prose
+        /// strings that bred it (F6).
         feature: String,
     },
     /// A *requested functional* operation cannot be enforced because the host
@@ -105,6 +119,43 @@ pub enum Error {
         // tag — an unclosed tag hard-fails `cargo doc` (M-HOST-1).
         needed: String,
     },
+}
+
+impl Error {
+    /// The typed refusal for a feature the backend itself does not support.
+    ///
+    /// **The one way a production site spells a feature refusal** (F6). The `feature` string is
+    /// [`crate::feature::Feature::name`] by construction, which is what retires both the prose
+    /// strings (`"snapshot with a vhost-user device"` and nine siblings) and the substring matchers
+    /// they bred in the tests. A site that needs to say *why* beyond the feature name says it
+    /// through a [`crate::feature::Removal`] and [`Error::from_removal`], never by decorating the
+    /// feature string — a decorated string is a string a test then matches on a fragment of.
+    #[must_use]
+    pub fn unsupported(vmm: &str, feature: crate::feature::Feature) -> Self {
+        Error::Unsupported {
+            vmm: vmm.to_string(),
+            feature: feature.name().to_string(),
+        }
+    }
+
+    /// The typed refusal composed from a [`crate::feature::Removal`], so the provenance travels.
+    ///
+    /// When the remover is the backend itself the rendering is **byte-identical** to
+    /// [`Error::unsupported`] — every pre-v33 backend refusal reads exactly as it did. When an
+    /// artifact or the host is the remover, `vmm` carries that provenance so the message names who
+    /// actually said no.
+    #[must_use]
+    pub fn from_removal(vmm: &str, removal: &crate::feature::Removal) -> Self {
+        let who = match &removal.by {
+            // The backend is the default remover; its rendering is the pre-v33 one, unchanged.
+            crate::feature::Source::Backend(name) if name == vmm => vmm.to_string(),
+            other => format!("{vmm} ({other} {})", removal.reason),
+        };
+        Error::Unsupported {
+            vmm: who,
+            feature: removal.feature.name().to_string(),
+        }
+    }
 }
 
 /// A specialized Result type for vmcell.

@@ -59,6 +59,11 @@ use std::process::Stdio;
 use std::time::Duration;
 use vmcell::config::{ConsoleMode, VmConfig};
 use vmcell::error::{Error, Result};
+// The v33 feature vocabulary (design §7.4, invariant F6). A refusal's feature string is
+// `Feature::name()` BY CONSTRUCTION here, and `VHOST_USER_BLOCKS_SNAPSHOT` is the ONE spelling of
+// the S1 refusal across all four backends — the four had drifted into four different prose strings,
+// which is what bred `feature.contains("vhost-user")` in three test suites.
+use vmcell::feature::{Feature, VHOST_USER_BLOCKS_SNAPSHOT};
 use vmcell::vmm::{PerVmResources, VmInstance, Vmm, VmmCapabilities, VsockEndpoint};
 
 use tokio::process::Child;
@@ -171,17 +176,15 @@ pub struct CrosvmInstance {
 /// has a vhost-user device attached.
 fn snapshot_precheck(snapshot_restore_capable: bool, has_vhost_user: bool) -> Result<()> {
     if !snapshot_restore_capable {
-        return Err(Error::Unsupported {
-            vmm: "crosvm".to_string(),
-            feature: "snapshot_restore".to_string(),
-        });
+        // The backend itself is the remover: the bare capability refusal, no provenance to carry,
+        // rendering byte-identical to the pre-v33 literal.
+        return Err(Error::unsupported("crosvm", Feature::SnapshotRestore));
     }
     if has_vhost_user {
-        return Err(Error::Unsupported {
-            vmm: "crosvm".to_string(),
-            feature: "snapshot with a vhost-user device (virtio-fs share or unprivileged net)"
-                .to_string(),
-        });
+        // The CONFIG is the remover here, so the "why" travels in the shared `Removal` instead of
+        // decorating the feature string — a decorated string is a string a test then matches a
+        // fragment of (F6). `restore()` returns this very same const.
+        return Err(Error::from_removal("crosvm", &VHOST_USER_BLOCKS_SNAPSHOT));
     }
     Ok(())
 }
@@ -193,16 +196,15 @@ fn snapshot_precheck(snapshot_restore_capable: bool, has_vhost_user: bool) -> Re
 /// One predicate shared by `create()` **and** `restore()`. M4: `restore()` used to accept exactly
 /// what `create()` rejects (the restore run args are built by the same `build_crosvm_run_args`,
 /// which has nowhere to put the limit), so a snapshot lineage could be restored with the throttle
-/// quietly gone. The feature string matches the `VmmCapabilities` field name (N-VMM-1).
+/// quietly gone. The feature string matches the `VmmCapabilities` field name (N-VMM-1) — by
+/// construction now, since [`Error::unsupported`] composes it from [`Feature::name`] and the
+/// vocabulary is parity-gated against the descriptor's fields in both directions (F6).
 ///
 /// # Errors
 /// Returns [`Error::Unsupported`] if any extra disk carries an `io_limit`.
 fn reject_disk_io_throttle(cfg: &VmConfig) -> Result<()> {
     if cfg.extra_disks.iter().any(|d| d.io_limit.is_some()) {
-        return Err(Error::Unsupported {
-            vmm: "crosvm".to_string(),
-            feature: "disk_io_throttle".to_string(),
-        });
+        return Err(Error::unsupported("crosvm", Feature::DiskIoThrottle));
     }
     Ok(())
 }
@@ -742,24 +744,26 @@ impl Vmm for Crosvm {
         if let vmcell::config::NetConfig::Unprivileged { .. } = cfg.net
             && !caps.unprivileged_vhost_user_net
         {
-            return Err(Error::Unsupported {
-                vmm: "crosvm".to_string(),
-                // N-VMM-1: match the VmmCapabilities field name so callers matching feature strings
-                // see one consistent spelling across backends.
-                feature: "unprivileged_vhost_user_net".to_string(),
-            });
+            // N-VMM-1 by construction: `Feature::name()` IS the VmmCapabilities field name, so
+            // callers see one consistent spelling across backends without a literal to keep in
+            // sync (F6).
+            return Err(Error::unsupported(
+                "crosvm",
+                Feature::UnprivilegedVhostUserNet,
+            ));
         }
         if res.vhost_user_socket.is_some() {
+            // Deliberately still a string: a pre-attached vhost-user socket is a per-VM RESOURCE,
+            // not a `VmmCapabilities` field, so the vocabulary has no `Feature` for it and §7.4
+            // clause 4 fixes that granularity up front — a speculative variant here would break
+            // every declaration the day it split. Do not "fix" this to a `Feature`.
             return Err(Error::Unsupported {
                 vmm: "crosvm".to_string(),
                 feature: "vhost_user_socket".to_string(),
             });
         }
         if !cfg.shares.is_empty() {
-            return Err(Error::Unsupported {
-                vmm: "crosvm".to_string(),
-                feature: "virtio_fs_shares".to_string(),
-            });
+            return Err(Error::unsupported("crosvm", Feature::VirtioFsShares));
         }
         // Per-disk I/O throttling has no crosvm CLI equivalent (capability `disk_io_throttle` is
         // false); reject a throttled disk fail-loud rather than silently drop the limit
@@ -789,10 +793,7 @@ impl Vmm for Crosvm {
         // true` today, so this branch is only reachable via a deliberate re-gate; the KVM-free
         // `snapshot_precheck` test drives the equivalent false branch on the snapshot side.
         if !self.capabilities().snapshot_restore {
-            return Err(Error::Unsupported {
-                vmm: "crosvm".to_string(),
-                feature: "snapshot_restore".to_string(),
-            });
+            return Err(Error::unsupported("crosvm", Feature::SnapshotRestore));
         }
         vmcell::vmm::reject_unsupported_console("crosvm", &self.capabilities(), cfg.console_mode)?;
 
@@ -811,11 +812,10 @@ impl Vmm for Crosvm {
         // or unprivileged net (both already rejected at create) is the only way this trips — reject
         // fail-loud before spawning a half-restored VM.
         if vmcell::vmm::config_has_vhost_user_device(cfg, res) {
-            return Err(Error::Unsupported {
-                vmm: "crosvm".to_string(),
-                feature: "snapshot restore with a vhost-user device (virtio-fs share or unprivileged net)"
-                    .to_string(),
-            });
+            // The same shared const `snapshot_precheck` returns (F6): one law, one spelling, so the
+            // snapshot and restore halves of the eligibility rule cannot drift into the two
+            // near-miss prose strings they used to carry.
+            return Err(Error::from_removal("crosvm", &VHOST_USER_BLOCKS_SNAPSHOT));
         }
 
         // Fail loud BEFORE spawning if the snapshot artifact or its CID sidecar is missing, so a bad
@@ -1548,23 +1548,37 @@ mod tests {
     // descriptor reddens the first assertion; one that ignores the device law reddens the second.
     #[test]
     fn snapshot_precheck_enforces_capability_and_law() {
-        // Backend that does not advertise snapshot_restore, even with a clean VM.
+        // Backend that does not advertise snapshot_restore, even with a clean VM. The backend is
+        // the remover, so the refusal is the bare capability form: `vmm` is the plain backend id.
         let err = snapshot_precheck(false, false).expect_err("incapable backend must error");
         assert!(
             matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "crosvm" && feature == "snapshot_restore"),
+                if vmm == "crosvm" && feature == Feature::SnapshotRestore.name()),
             "expected a snapshot_restore Unsupported naming the VmmCapabilities field, got {err:?}"
         );
 
-        // Capable backend, but the VM carries a vhost-user device.
+        // Capable backend, but the VM carries a vhost-user device. F6 retired the
+        // `feature.contains("vhost-user")` matcher along with the prose it matched: this leg now
+        // spells the SAME `snapshot_restore` as the one above, so the exact feature comparison is
+        // paired with the shared const's identity — composed through the one composer, never
+        // hand-spelled, so editing the const moves both sides together. Without that pairing the
+        // two legs would be indistinguishable and this assertion would be vacuous.
         let err = snapshot_precheck(true, true).expect_err("vhost-user VM must error");
         assert!(
-            matches!(&err, Error::Unsupported { feature, .. } if feature.contains("vhost-user")),
-            "expected a vhost-user Unsupported, got {err:?}"
+            matches!(&err, Error::Unsupported { feature, .. }
+                if feature == Feature::SnapshotRestore.name()),
+            "the feature string must be Feature::name() by construction (F6), got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            Error::from_removal("crosvm", &VHOST_USER_BLOCKS_SNAPSHOT).to_string(),
+            "the S1 leg must be THIS removal — the capability leg above spells the same feature, \
+             so the Removal's provenance is what separates them: {err:?}"
         );
 
         // Capable backend, snapshot-eligible VM: allowed (the positive control — the guard refuses
-        // for a reason, not always).
+        // for a reason, not always). It is load-bearing for both refusals above now that they share
+        // one feature string: "refused" is only evidence against a control the guard accepts.
         assert!(snapshot_precheck(true, false).is_ok());
     }
 

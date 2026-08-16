@@ -46,6 +46,9 @@ name: fuzz-nightly
 #   LOCAL BUILD CONFIG — contract surface, not a remote boundary
 #     injection_dest             the F5 injection-dest law; ranked for its real evasion history
 #                                (`/usr/sbin/./vmcell-steward`, `/opt/.`), not for remote reach
+#     feature_manifest           the F6 feature-manifest sidecar parser; ranked because ABSENCE is
+#                                the silent direction — a typo'd declaration that read as
+#                                "unsupported" would pass every downstream check
 #
 # ADDING A TARGET: land it in BOTH `fuzz/fuzz_targets/<name>.rs` and a `[[bin]]` stanza in
 # `fuzz/Cargo.toml` — GUARD 5 fails the job loudly if either is missing, because a target file
@@ -241,7 +244,7 @@ jobs:
           # `-max_total_time` window, which `-max_total_time` then actually burns (it has no
           # early-exit path), so wall time is roster_count * FUZZ_SECONDS:
           #     2 targets * 300 s =  10 min   the roster this job shipped with
-          #    15 targets * 300 s =  75 min   today, plus ~4 min of build
+          #    16 targets * 300 s =  80 min   today, plus ~4 min of build
           #    48 targets * 300 s = 240 min   FUZZ_BUDGET_CEILING_SECONDS, where this guard fires
           #
           # THE DECISION, because the 2 -> 15 expansion forced one. The alternative design is a

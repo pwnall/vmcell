@@ -72,16 +72,16 @@ pub struct ChInstance {
 /// `snapshot_restore`, or if the VM has a vhost-user device attached.
 fn snapshot_precheck(snapshot_restore_capable: bool, has_vhost_user: bool) -> Result<()> {
     if !snapshot_restore_capable {
-        return Err(Error::Unsupported {
-            vmm: "cloud-hypervisor".to_string(),
-            feature: "snapshot_restore".to_string(),
-        });
+        return Err(Error::unsupported(
+            "cloud-hypervisor",
+            crate::feature::Feature::SnapshotRestore,
+        ));
     }
     if has_vhost_user {
-        return Err(Error::Unsupported {
-            vmm: "cloud-hypervisor".to_string(),
-            feature: "snapshot with a vhost-user device".to_string(),
-        });
+        return Err(Error::from_removal(
+            "cloud-hypervisor",
+            &crate::feature::VHOST_USER_BLOCKS_SNAPSHOT,
+        ));
     }
     Ok(())
 }
@@ -763,10 +763,10 @@ impl Vmm for CloudHypervisor {
         // VMM-5: self-check the capability descriptor instead of assuming CH
         // semantics.
         if !self.capabilities().snapshot_restore {
-            return Err(Error::Unsupported {
-                vmm: "cloud-hypervisor".to_string(),
-                feature: "snapshot_restore".to_string(),
-            });
+            return Err(Error::unsupported(
+                "cloud-hypervisor",
+                crate::feature::Feature::SnapshotRestore,
+            ));
         }
         // Gate an unsupported console mode before spawn/config-rewrite: the restore
         // path re-derives the same serial/console wiring the snapshot baked in.
@@ -785,10 +785,10 @@ impl Vmm for CloudHypervisor {
         // external vhost-user-net *before* we would otherwise start virtiofsd
         // below. (M-RESTORE-3: the virtio-fs rootfs case was previously missed.)
         if crate::vmm::config_has_vhost_user_device(cfg, res) {
-            return Err(Error::Unsupported {
-                vmm: "cloud-hypervisor".to_string(),
-                feature: "snapshot/restore with a vhost-user device".to_string(),
-            });
+            return Err(Error::from_removal(
+                "cloud-hypervisor",
+                &crate::feature::VHOST_USER_BLOCKS_SNAPSHOT,
+            ));
         }
         let SpawnedCh {
             api_socket,
@@ -870,9 +870,12 @@ impl VmInstance for ChInstance {
         // NEVER booted. Silently remapping boot()->vm.resume papered over the misuse;
         // fail loud and typed instead, mirroring Firecracker.
         if self.restored {
+            // NOT a `Feature`: this is an API-state refusal, not a capability absence — a
+            // restored VM is resumed, not booted. It keeps a single snake_case token (never prose)
+            // so a caller matches it exactly, which is the half of F6 that applies here.
             return Err(Error::Unsupported {
                 vmm: "cloud-hypervisor".to_string(),
-                feature: "boot after restore (a restored VM is resumed, not booted)".to_string(),
+                feature: "boot_after_restore".to_string(),
             });
         }
         self.api_request("PUT", "/api/v1/vm.boot", None::<&()>)
@@ -1444,8 +1447,10 @@ mod tests {
             .await
             .expect_err("a restored CH VM must refuse boot()");
         assert!(
+            // An exact token, not a substring: the refusal now spells `boot_after_restore`
+            // (single snake_case, never prose) precisely so this assertion can be an equality.
             matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "cloud-hypervisor" && feature.contains("boot after restore")),
+                if vmm == "cloud-hypervisor" && feature == "boot_after_restore"),
             "expected boot-after-restore Unsupported, got {err:?}"
         );
         let _ = inst.kill().await;
@@ -1772,8 +1777,12 @@ mod tests {
         // Capable backend, but the VM carries a vhost-user device.
         let err = snapshot_precheck(true, true).expect_err("vhost-user VM must error");
         assert!(
-            matches!(&err, Error::Unsupported { feature, .. } if feature.contains("vhost-user")),
-            "expected vhost-user Unsupported, got {err:?}"
+            // F6: every snapshot refusal spells `snapshot_restore`, so this leg's discrimination
+            // comes from its PAIRING with the positive control below (an eligible config on the
+            // same capable backend must be ALLOWED) — not from the prose fragment it used to match.
+            matches!(&err, Error::Unsupported { feature, .. }
+                if feature == crate::feature::Feature::SnapshotRestore.name()),
+            "expected a snapshot_restore Unsupported for the vhost-user config, got {err:?}"
         );
 
         // Capable backend, snapshot-eligible VM: allowed.

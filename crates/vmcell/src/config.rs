@@ -112,6 +112,15 @@ pub struct VmConfig {
     /// forked-child pre-exec window, shared by the in-process spawn and the setup
     /// broker (one law, §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
     pub jail: JailConfig,
+    /// Features this cell **demands**, resolved at `MicroVm::start` against the computed
+    /// [`crate::feature::FeatureSet`] (design §7.4 clause 3, invariant F6).
+    ///
+    /// Deliberately resolved at `start` and not at [`VmConfigBuilder::build`]: `build()` never sees
+    /// a backend (its validation is config-internal), and the intersection needs the backend and
+    /// the artifacts, which exist at `start`. The payoff is that "this cell cannot snapshot" is
+    /// answered **before anything boots**, with the removal's provenance in the error, instead of
+    /// at the first `snapshot()` call.
+    pub required_features: Vec<crate::feature::Feature>,
 }
 
 /// The VMM subprocess's own seccomp-BPF confinement policy (design §12.2, Layer 1 — the VMM's own seccomp filter).
@@ -1235,6 +1244,7 @@ impl VmConfig {
             init: None,
             vmm_seccomp: VmmSeccomp::default(),
             jail: JailConfig::default(),
+            required_features: vec![],
         }
     }
 }
@@ -1266,6 +1276,7 @@ pub struct VmConfigBuilder {
     init: Option<PathBuf>,
     vmm_seccomp: VmmSeccomp,
     jail: JailConfig,
+    required_features: Vec<crate::feature::Feature>,
 }
 
 impl VmConfigBuilder {
@@ -1327,6 +1338,22 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn init(mut self, init: impl Into<PathBuf>) -> Self {
         self.init = Some(init.into());
+        self
+    }
+
+    /// **Demands** a feature of this cell ([`VmConfig::required_features`], design §7.4 clause 3).
+    ///
+    /// Resolved at `MicroVm::start` against the computed [`crate::feature::FeatureSet`] — the
+    /// backend's descriptor intersected with the host's and every artifact's declarations — so a
+    /// cell that cannot do what the caller needs is refused **before it boots**, with the
+    /// [`crate::feature::Removal`]'s provenance in the typed
+    /// [`Error::Unsupported`](crate::error::Error::Unsupported). Not validated at
+    /// [`build`](Self::build), which by design never sees a backend.
+    ///
+    /// Calling it twice with the same feature is harmless (the resolution is a membership test).
+    #[must_use]
+    pub fn require(mut self, feature: crate::feature::Feature) -> Self {
+        self.required_features.push(feature);
         self
     }
 
@@ -1922,6 +1949,7 @@ impl VmConfigBuilder {
             init: self.init,
             vmm_seccomp: self.vmm_seccomp,
             jail: self.jail,
+            required_features: self.required_features,
         })
     }
 }

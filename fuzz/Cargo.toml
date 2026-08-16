@@ -141,3 +141,11 @@ name = "validator_kconfig_parse"
 path = "fuzz_targets/validator_kconfig_parse.rs"
 test = false
 doc = false
+
+# v33 §7.4: the feature-manifest sidecar's strict parser — an unknown token must be a hard error
+# naming it, never a silent absence (F6). Directed by quality-gates v5's fuzz delta.
+[[bin]]
+name = "feature_manifest"
+path = "fuzz_targets/feature_manifest.rs"
+test = false
+doc = false

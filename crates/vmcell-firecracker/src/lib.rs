@@ -828,12 +828,12 @@ impl Vmm for Firecracker {
         if let vmcell::config::NetConfig::Unprivileged { .. } = cfg.net
             && !caps.unprivileged_vhost_user_net
         {
-            return Err(Error::Unsupported {
-                vmm: "firecracker".to_string(),
-                // N-VMM-1: match the VmmCapabilities field name so callers matching
-                // feature strings see one consistent spelling across backends.
-                feature: "unprivileged_vhost_user_net".to_string(),
-            });
+            // N-VMM-1 is a TYPE LAW now (v33 F6): the feature string is `Feature::name()` by
+            // construction, which IS the `VmmCapabilities` field name, pinned in both directions.
+            return Err(Error::unsupported(
+                "firecracker",
+                vmcell::feature::Feature::UnprivilegedVhostUserNet,
+            ));
         }
         if res.vhost_user_socket.is_some() {
             return Err(Error::Unsupported {
@@ -846,10 +846,10 @@ impl Vmm for Firecracker {
         vmcell::vmm::reject_usb_host_devices("firecracker", &caps, &cfg.usb_host_devices)?;
 
         if !cfg.shares.is_empty() {
-            return Err(Error::Unsupported {
-                vmm: "firecracker".to_string(),
-                feature: "virtio_fs_shares".to_string(),
-            });
+            return Err(Error::unsupported(
+                "firecracker",
+                vmcell::feature::Feature::VirtioFsShares,
+            ));
         }
 
         let template = self.detect_cpu_template(cfg).await;
@@ -992,10 +992,10 @@ impl Vmm for Firecracker {
         // VMM-5: self-check the capability descriptor rather than assuming the
         // backend supports restore.
         if !self.capabilities().snapshot_restore {
-            return Err(Error::Unsupported {
-                vmm: "firecracker".to_string(),
-                feature: "snapshot_restore".to_string(),
-            });
+            return Err(Error::unsupported(
+                "firecracker",
+                vmcell::feature::Feature::SnapshotRestore,
+            ));
         }
         // M-RESTORE-3 / H-VMM-3 / snapshot-eligibility law: a snapshot-eligible VM has
         // no vhost-user device. Use the SHARED predicate (which also covers a virtio-fs
@@ -1004,10 +1004,12 @@ impl Vmm for Firecracker {
         // the config, before spawning a VMM. FC never attaches these, so this is
         // defense in depth.
         if vmcell::vmm::config_has_vhost_user_device(cfg, res) {
-            return Err(Error::Unsupported {
-                vmm: "firecracker".to_string(),
-                feature: "snapshot/restore with a vhost-user device".to_string(),
-            });
+            // The ONE shared refusal for this law, so the four backends cannot spell it four
+            // ways again (which is what bred `feature.contains("vhost-user")` in three suites).
+            return Err(Error::from_removal(
+                "firecracker",
+                &vmcell::feature::VHOST_USER_BLOCKS_SNAPSHOT,
+            ));
         }
 
         // Recover the host vsock/serial UDS paths the snapshot baked in (see
@@ -1093,9 +1095,12 @@ impl VmInstance for FcInstance {
         // snapshot-loaded VM, so self-guard and fail loud (a silent `Ok(())` no-op
         // would violate the fail-loud contract) instead of `InstanceStart`-ing it.
         if self.restored {
+            // NOT a `Feature`: an API-state refusal, not a capability absence — a restored VM is
+            // resumed, not booted. It keeps a single snake_case token (never prose) so a caller
+            // matches it exactly, which is the half of F6 that applies here.
             return Err(Error::Unsupported {
                 vmm: "firecracker".to_string(),
-                feature: "boot after restore (a restored VM is resumed, not booted)".to_string(),
+                feature: "boot_after_restore".to_string(),
             });
         }
         #[derive(Serialize)]
@@ -1177,16 +1182,16 @@ impl VmInstance for FcInstance {
         // mirroring CH's `snapshot()` guards. A backend never assumes the caller
         // already checked.
         if !fc_capabilities().snapshot_restore {
-            return Err(Error::Unsupported {
-                vmm: "firecracker".to_string(),
-                feature: "snapshot_restore".to_string(),
-            });
+            return Err(Error::unsupported(
+                "firecracker",
+                vmcell::feature::Feature::SnapshotRestore,
+            ));
         }
         if vmcell::vmm::has_vhost_user_device(false, false, self.vhost_user_net) {
-            return Err(Error::Unsupported {
-                vmm: "firecracker".to_string(),
-                feature: "snapshot with a vhost-user device".to_string(),
-            });
+            return Err(Error::from_removal(
+                "firecracker",
+                &vmcell::feature::VHOST_USER_BLOCKS_SNAPSHOT,
+            ));
         }
 
         #[derive(Serialize)]
@@ -1764,8 +1769,10 @@ mod tests {
             .await
             .expect_err("a restored VM must refuse boot()");
         assert!(
+            // An exact token, not a substring: the refusal spells `boot_after_restore`
+            // (single snake_case, never prose) precisely so this can be an equality (F6).
             matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "firecracker" && feature.contains("boot after restore")),
+                if vmm == "firecracker" && feature == "boot_after_restore"),
             "expected boot-after-restore Unsupported, got {err:?}"
         );
         let _ = restored.kill().await;
@@ -1776,7 +1783,7 @@ mod tests {
             .await
             .expect_err("a cold VM with no api socket hits a transport error");
         assert!(
-            !matches!(&err, Error::Unsupported { feature, .. } if feature.contains("boot after restore")),
+            !matches!(&err, Error::Unsupported { feature, .. } if feature == "boot_after_restore"),
             "a cold instance must not report boot-after-restore, got {err:?}"
         );
         let _ = cold.kill().await;
@@ -1896,9 +1903,14 @@ mod tests {
             .await
             .expect_err("FC restore must reject a virtio-fs data share");
         assert!(
+            // F6: every snapshot refusal spells `snapshot_restore`, and `vmm` carries the
+            // provenance. This leg discriminates by asserting BOTH — a config-sourced removal,
+            // not the backend's own — so re-keying the guard to the descriptor reddens it.
             matches!(&err, Error::Unsupported { vmm, feature }
-                if vmm == "firecracker" && feature.contains("vhost-user")),
-            "expected a vhost-user Unsupported, got {err:?}"
+                if vmm.starts_with("firecracker")
+                    && vmm.contains("vhost-user")
+                    && feature == vmcell::feature::Feature::SnapshotRestore.name()),
+            "expected a snapshot_restore Unsupported naming the vhost-user config, got {err:?}"
         );
     }
 
