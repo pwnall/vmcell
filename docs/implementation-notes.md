@@ -4086,14 +4086,101 @@ that names no placement emits the same cmdline as one that names `Pid1` explicit
 only for a non-default port, which is what makes the floor hold; F3's `vmcell_` prefix rule already
 reserves it against caller spoofing, so `RESERVED_CMDLINE_KEYS` needed no edit.
 
+## v33 delta 5 — the steward as a library; service mode (design §18 delta 5, §3.5, invariant C1), as built
+
+**What landed.** `vmcell-steward`'s ~2,100-line `main.rs` became a library (`options`, `assembly`,
+`serve`, `exec`, `session`, `run`) plus a thin binary; `StewardOptions`/`run`; `GuestPlacement`
+selected by `getpid()`; `PR_SET_CHILD_SUBREAPER` under `Service`; per-mode `SigtermPolicy`; the
+`Pid1`-scoped assembly; the tracing/tools-dir/port/tuning seams; the guest-side
+`vmcell_steward_port=` parse; the `mini-init` applet; and `main_is_thin_gate`.
+
+**The code was sliced, not retyped.** Every moved body came out of `main.rs` by line range, so the
+diff is a move plus the seams. That is why the 25 tests `main.rs` carried are the same 25 tests, in
+`tests.rs`, and why the reservation/epoch suite the delta's gate says must "carry over intact" did.
+
+**THE DESIGN'S OWN GATE FOR THE SUBREAPER BIT DOES NOT REPRODUCE, AND THIS IS THE RECORD OF IT.**
+§18 delta 5 specifies the leg as "the double-fork exec leg **red-on-inverse by removing the
+subreaper call** (the test hangs — bounded by its harness timeout — instead of returning the exit
+code)", and §3.5 explains it as `wait_for` blocking on a status that will never be recorded. Built
+and run both ways: **it does not hang, and `exec` returns the right code with the bit removed.** The
+steward only ever waits on its own *direct* child — `handle_exec` reserves and waits the pid it
+spawned — and that child is reaped in either placement. What the bit actually decides is who
+inherits the *grandchild*. So the leg was rebuilt around the observable that really moves: an
+orphaned descendant's `PPid`. With the bit it is the steward's pid; without it, `1` (mini-init).
+Verified by planting: the `Service` leg fails naming both pids, the `Pid1` twin stays green. The
+new form is also a **better** gate than the specified one — it *fails* rather than stalling, and a
+stalled leg is indistinguishable from a slow box.
+
+**Two more assertions rested on observables that do not exist**, found the same way — by running
+them. The steward logs at `tracing::info!`, the guest has no `RUST_LOG`, and `tracing_subscriber`'s
+default filter drops everything below `error`; so "listening on vsock port 5100" and "received
+SIGTERM; powering off" never reach the serial console however much they read like console output.
+Both legs now assert real data-plane facts instead: a `dial_vsock` to the default port that must
+find nobody (the negative control proving the steward *moved* rather than bound both), and the
+kernel's own `reboot: Power down`, which is better evidence anyway — it says the syscall was issued,
+not that the steward meant to issue it. `mini-init`'s own lines are `println!` and do reach the
+console, which is what leg 2 reads.
+
+**Recorded shift: `run()` reads `/proc/cmdline`, not the binary.** §3.5's sketch says the binary
+parses it. It cannot: under `Pid1` nothing has mounted `/proc` when the binary starts — the assembly
+mounts it — so a binary-side read returns the empty string and would silently disable share mounts,
+the tuning tokens, and the declared port. The *parse* is pure and public
+(`StewardOptions::apply_cmdline`, `parse_steward_port`), which is what the sketch's testability
+intent was after.
+
+**Recorded shift: `mini-init` supervises a declared program.** §3.5 describes it as starting the
+steward and nothing else. Its argv now names the program (default `/usr/sbin/vmcell-steward`),
+which is *more* generic — an init that supervises a named program is the shape law G1 says a
+consumer copies — and is what makes the rapid-failure cap live-testable at all: the gate boots
+`mini-init -- /bin/false`, which no fixed-program init could express without a test-only hook in
+PID 1.
+
+**`mini-init` reuses the steward's assembly rather than copying it.** `assemble_guest_root` is `pub`
+for exactly one caller. The alternative was a second copy of the mount sequence in guest-tools — the
+duplicate-law shape AGENTS.md bans, and the tree's one deliberate guest-side duplication (the
+`ifreq` layout) needed a divergence guard to stay honest. The consequence is the point: a
+service-placement cell's filesystem is byte-for-byte a `Pid1` cell's, so the two placements' legs
+differ in one variable.
+
+**Two mechanisms had to be built, not parameterized.** `serve_vsock` was an unconditional `loop {}`
+whose `JoinHandle` was dropped, and the `Sessions` table is per-connection and reachable from
+nowhere else — so `Service`'s "stop accepting, tear down live sessions, exit" had nothing to hook.
+The shutdown flag is checked at **both** loop levels (one alone leaves shutdown wedged behind the
+other) and the handle is now retained and joined; `ConnectionRegistry` publishes each connection's
+table under an RAII ticket. Planting `teardown_all` out reddens the C3 residue assertion naming the
+surviving pid.
+
+**Both SIGTERM arms obey the policy**, not just the primary one. The degraded fallback (registration
+failed → polling reaper) converges on the same terminal `match`; covering only the primary arm would
+leave a `Service` steward powering the machine off whenever handler registration happened to fail,
+which is not a rare path but the path a constrained guest takes.
+
+**Not covered, recorded:** the `Service` post-restore question stays unmeasured — `resync_reachable()`
+is still `Pid1`-only (§17), and nothing here changes that. `mini-init`'s restart loop has no pacing
+on the *exit* path (only on the spawn-failure path), so a program that exits instantly burns the cap
+in microseconds; bounded and fail-loud, but not rate-limited.
+
+**Live-validated** on the CH backend: the 6-leg `service_steward` battery green, each of the three
+load-bearing gates confirmed red under a planted regression (subreaper removed, `teardown_all`
+removed, `parse_steward_port` removed) and green again after restoring.
+
 ## Where the v33 pass stands
 
-Deltas 1–4 of the §18 register are landed, pushed, and live-validated; **5–10 are not started**.
+Deltas 1–5 of the §18 register are landed, pushed, and live-validated; **6–10 are not started**.
 `docs/87-claude-handoff-notes-v3.md` is the pick-up point: it carries the remaining inventory, the
 **re-verified premise anchors** for deltas 5–10 (seventeen clauses are not confirmed as the design
 writes them — seven stale, ten moved by deltas 1–4, two of those behavior-changing), and the
-operational knowledge that is not a design fact and so has no entry here. Read it before cutting
-delta 5.
+operational knowledge that is not a design fact and so has no entry here. Its delta-5 section is now
+history; read its 6–10 sections before cutting delta 6, and note that delta 5 added one more entry
+to the "premises stated as shipped fact have been empirically false in every register so far" tally.
+
+**The delta 6 / delta 7 ordering conflict, decided.** §10.5's registry entry sketch carries
+`"xattrs": "preserve"` while `XattrPolicy` is delta 7's deliverable, and the register orders 6 before
+7 without listing "6 needs 7". Landing 6 with the key would mean an accepted-then-ignored
+declaration — an F1 violation for however long 7 took. So **delta 6 lands the registry with a strict
+entry parse that rejects `xattrs` as an unknown key, and delta 7 adds the key together with
+`XattrPolicy` and the pack tail that honors it.** Every point in between is F1-clean: the key is
+rejected, then honored, never accepted-and-ignored.
 
 ## Where the design lives now
 

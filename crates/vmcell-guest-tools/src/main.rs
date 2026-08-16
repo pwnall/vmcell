@@ -271,25 +271,54 @@ const MINI_INIT_MAX_RAPID_FAILURES: u32 = 5;
 /// crash-loop.
 const MINI_INIT_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Where the rootfs injection manifest always places the steward binary.
+/// Where the rootfs injection manifest always places the steward binary — what `mini-init`
+/// supervises when its argv names nothing else.
 const MINI_INIT_STEWARD_PATH: &str = "/usr/sbin/vmcell-steward";
 
-/// Validates `mini-init`'s argv. Pure, so the accept/reject law is unit-testable with no guest.
+/// The one fail-loud reason the rapid-failure cap emits, so the live gate matches ONE string
+/// rather than re-typing prose that would drift out from under it.
+const MINI_INIT_CAP_TRIPPED: &str =
+    "the supervised program exited repeatedly without staying up (rapid-failure cap)";
+
+/// Parses `mini-init`'s argv into the argv it supervises. Pure, so the accept/reject law is
+/// unit-testable with no guest.
 ///
-/// `mini-init` is an `init=` target: the kernel hands it whatever follows on the command line, and
-/// it honors none of it. Rejecting rather than ignoring is law F1 applied to an applet's argv
-/// exactly as to a config field — and it matters more here than elsewhere, because a silently
-/// ignored argument on PID 1 is a guest that boots and then behaves as if the caller had said
-/// nothing.
-fn parse_mini_init_args(args: &[String]) -> Result<(), String> {
-    if let Some(first) = args.first() {
+/// `mini-init` is an `init=` target: the kernel passes everything after `--` on the command line as
+/// this process's argv. With none, it supervises [`MINI_INIT_STEWARD_PATH`]; with some, it
+/// supervises what they name.
+///
+/// **Recorded shift from the §3.5 sketch**, which describes mini-init as starting the steward and
+/// nothing else. Making the supervised program a parameter is *more* generic, not less — an init
+/// that supervises a named program is the shape a consumer testing an init-less payload actually
+/// copies (law G1's own argument) — and it is what makes the rapid-failure cap **live-testable**:
+/// the cap's gate boots `mini-init -- /bin/false`, which no fixed-program init could express
+/// without a test-only hook in PID 1.
+///
+/// Rejecting rather than ignoring is law F1 applied to an applet's argv exactly as to a config
+/// field, and it matters more here than elsewhere: a silently ignored argument on PID 1 is a guest
+/// that boots and then behaves as if the caller had said nothing.
+fn parse_mini_init_args(args: &[String]) -> Result<Vec<String>, String> {
+    if args.is_empty() {
+        return Ok(vec![MINI_INIT_STEWARD_PATH.to_string()]);
+    }
+    let program = args.first().ok_or("unreachable: args is non-empty")?;
+    if program.is_empty() {
+        return Err("the supervised program must not be empty".to_string());
+    }
+    if program.starts_with('-') {
         return Err(format!(
-            "unexpected argument {first:?} — mini-init takes none; it assembles the guest root, \
-             starts {MINI_INIT_STEWARD_PATH} as a service, restarts it when it exits, and reaps \
-             everything"
+            "unknown option {program:?} — mini-init takes no flags; its argv is the program to \
+             supervise (default {MINI_INIT_STEWARD_PATH}) and that program's own arguments"
         ));
     }
-    Ok(())
+    if !program.starts_with('/') {
+        return Err(format!(
+            "the supervised program {program:?} must be an absolute path — mini-init runs before \
+             anything has set a PATH, so a relative name would resolve against whatever the kernel \
+             happened to leave as the working directory"
+        ));
+    }
+    Ok(args.to_vec())
 }
 
 /// Decides whether a steward exit is part of a crash-loop.
@@ -309,12 +338,14 @@ fn mini_init_next_failure_count(run: Duration, consecutive: u32) -> Option<u32> 
 
 /// The `mini-init` applet: rejects any argv it cannot honor, then runs as PID 1.
 fn run_mini_init(args: &[String]) -> i32 {
-    if let Err(msg) = parse_mini_init_args(args) {
-        eprintln!("mini-init: {msg}");
-        eprintln!("usage: mini-init");
-        return EXIT_USAGE;
+    match parse_mini_init_args(args) {
+        Ok(supervised) => mini_init_forever(&supervised),
+        Err(msg) => {
+            eprintln!("mini-init: {msg}");
+            eprintln!("usage: mini-init [/absolute/program [args…]]");
+            EXIT_USAGE
+        }
     }
-    mini_init_forever()
 }
 
 /// Assembles the guest root, then supervises the steward forever.
@@ -325,32 +356,37 @@ fn run_mini_init(args: &[String]) -> i32 {
 /// honest). The consequence is the point: a service-placement cell's filesystem is byte-for-byte
 /// the one a `Pid1` cell gets, so the service-mode live legs differ from their `Pid1` twins in
 /// exactly one variable — who is PID 1.
-fn mini_init_forever() -> i32 {
+fn mini_init_forever(supervised: &[String]) -> i32 {
     println!("mini-init: starting as pid {}", std::process::id());
     if let Err(e) = vmcell_steward::assemble_guest_root() {
         eprintln!("mini-init: could not assemble the guest root: {e}");
         return mini_init_power_off("guest root assembly failed");
     }
 
+    let Some((program, args)) = supervised.split_first() else {
+        // `parse_mini_init_args` never returns an empty argv; this is the non-panicking split the
+        // `indexing_slicing` deny requires of PID-1 code.
+        return mini_init_power_off("no program to supervise");
+    };
     let mut consecutive_failures: u32 = 0;
     loop {
         let started = std::time::Instant::now();
-        let steward = match std::process::Command::new(MINI_INIT_STEWARD_PATH).spawn() {
+        let child = match std::process::Command::new(program).args(args).spawn() {
             Ok(child) => child,
             Err(e) => {
-                eprintln!("mini-init: could not start {MINI_INIT_STEWARD_PATH}: {e}");
+                eprintln!("mini-init: could not start {program}: {e}");
                 match mini_init_next_failure_count(started.elapsed(), consecutive_failures) {
                     Some(next) => {
                         consecutive_failures = next;
                         std::thread::sleep(Duration::from_millis(200));
                         continue;
                     }
-                    None => return mini_init_power_off("the steward could not be started"),
+                    None => return mini_init_power_off(MINI_INIT_CAP_TRIPPED),
                 }
             }
         };
-        let steward_pid = steward.id();
-        println!("mini-init: started the steward as pid {steward_pid}");
+        let steward_pid = child.id();
+        println!("mini-init: started {program} as pid {steward_pid}");
 
         // Reap EVERYTHING, not just the steward: as PID 1 this process inherits every orphan in
         // the guest, and an init that waits only on its own child leaves the rest as zombies.
@@ -366,15 +402,11 @@ fn mini_init_forever() -> i32 {
                 None => break -1,
             }
         };
-        println!("mini-init: the steward exited (status {status}); restarting it");
+        println!("mini-init: {program} exited (status {status}); restarting it");
 
         match mini_init_next_failure_count(started.elapsed(), consecutive_failures) {
             Some(next) => consecutive_failures = next,
-            None => {
-                return mini_init_power_off(
-                    "the steward exited repeatedly without staying up (rapid-failure cap)",
-                );
-            }
+            None => return mini_init_power_off(MINI_INIT_CAP_TRIPPED),
         }
     }
 }
@@ -1916,20 +1948,41 @@ mod tests {
     // then behaves as if the caller had said nothing. RED on re-registering it as
     // `|_args| mini_init_forever()`, the accept-then-discard shape `kvm-ok` was already fixed for.
     #[test]
-    fn mini_init_rejects_every_argument() {
-        assert!(parse_mini_init_args(&argv(&[])).is_ok());
-        for bad in [
-            vec!["--restart"],
-            vec!["/usr/sbin/vmcell-steward"],
-            vec!["-v", "2"],
-        ] {
-            let err = parse_mini_init_args(&argv(&bad))
-                .expect_err("mini-init honors no argument, so it must reject every one");
-            assert!(
-                err.contains(&format!("{:?}", bad[0])),
-                "the rejection must NAME the offending argument: {err}"
-            );
+    fn mini_init_supervises_the_steward_by_default_and_rejects_what_it_cannot_honor() {
+        // No argv: the steward, which is what an ordinary `init=/vmcell-tools/mini-init` boots.
+        assert_eq!(
+            parse_mini_init_args(&argv(&[])).expect("an empty argv is the default case"),
+            vec![MINI_INIT_STEWARD_PATH.to_string()]
+        );
+        // A named program and its arguments travel through whole — the parameterization that makes
+        // the rapid-failure cap live-testable (`mini-init -- /bin/false`).
+        assert_eq!(
+            parse_mini_init_args(&argv(&["/bin/false"])).expect("an absolute program is accepted"),
+            vec!["/bin/false".to_string()]
+        );
+        assert_eq!(
+            parse_mini_init_args(&argv(&["/bin/sh", "-c", "exit 3"])).expect("args travel through"),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 3".to_string()
+            ]
+        );
+
+        // F1: what it cannot honor, it REJECTS naming the offender — never accepts-and-ignores.
+        for bad in ["--restart", "-v", ""] {
+            let err = parse_mini_init_args(&argv(&[bad]))
+                .expect_err("mini-init takes no flags and no empty program");
+            assert!(!err.is_empty(), "the rejection must say something: {err}");
         }
+        // A relative program is refused rather than resolved against an arbitrary cwd: mini-init
+        // runs before anything has set a PATH, so "resolve it somehow" has no correct answer.
+        let err = parse_mini_init_args(&argv(&["vmcell-steward"]))
+            .expect_err("a relative program must be refused");
+        assert!(
+            err.contains("absolute"),
+            "the rejection must say WHY a relative path cannot work: {err}"
+        );
     }
 
     // The rapid-failure cap, pure. It is what keeps the restart policy honest: `Restart=always` is

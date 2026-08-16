@@ -21,8 +21,8 @@ Crates (under `crates/`): `vmcell` (host lib), `vmcell-firecracker` / `vmcell-qe
 `vmcell-crosvm` (the secondary backends), `vmcell-artifact-validator` (the artifact conformance
 kit — boots real VMs against the named check battery; downstream **contract surface**),
 `vmcell-bench` (the cross-backend `bench-vm` harness, wiring all four backends), `vmcell-cli`,
-`vmcell-protocol`, `vmcell-steward` (the in-guest control-plane process — PID 1 by default, a
-service under somebody else's init once v33 delta 5 lands; the v33 delta-1 rename of
+`vmcell-protocol`, `vmcell-steward` (the in-guest control-plane process — a library plus a thin binary since v33
+delta 5, running as PID 1 by default or as a service under somebody else's init; the v33 delta-1 rename of
 `vmcell-guest-agent`, identifier-scoped: "agentic execution" domain text and this file's name keep
 "agent"), `vmcell-test-runner` (privileged
 capability runner), `vmcell-guest-tools`, the rootfs/kernel builders, `vmcell-privilege` (shared
@@ -58,7 +58,7 @@ contract-surface bump must extend (see "The downstream toolkit contract").
 
 Design §18's register is the mechanism for directing changes that are **specified but not yet
 built**. The v30 downstream-platform register (deltas 1–9) is **landed**; the code no longer
-legitimately differs from it. **The v33 register is OPEN — ten deltas** (design §18): 1 the steward
+legitimately differs from it. **The v33 register is OPEN — ten deltas, 1–5 landed** (design §18): 1 the steward
 rename; 2 the feature vocabulary + intersection (R3, §7.4); 3 the two-directional conformance kit
 (R4, §10.6); 4 steward placement (R1, §3.5); 5 the steward as a library / service mode (R5, §3.5);
 6 the artifact registry — rootfs + handler kinds, lazy, digest-only (R2+R7, §10.5); 7 external
@@ -360,9 +360,14 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   discriminating `Service`+custom-`init` refusal-identity leg — the arm that reddens on the
   `cfg.init` re-key; the `Service`-cell `snapshot()` typed refusal via `resync_reachable()`; the
   `None` fail-loud leg; the byte-identical-default cmdline pin; the C8 two-method call-site scan);
-  the **service-steward** set (under `mini-init`: the double-fork exec leg, red by removing the
-  subreaper call; both SIGTERM legs — service: C3 residue gone, clean exit, mini-init restarts it,
-  guest stays up; `Pid1` powers off — plus the rapid-failure-cap leg); the **feature** set
+  the **service-steward** set (under `mini-init`: the orphan-`PPid` leg, red by removing the
+  subreaper call — **not** the design's sketched double-fork *hang*, which does not reproduce
+  because the steward only ever waits on its own direct child, see implementation-notes; both
+  SIGTERM legs — service: C3 residue gone, clean exit, mini-init restarts it,
+  guest stays up; `Pid1` powers off — plus the declared-port and rapid-failure-cap legs. Its serial
+  assertions must be on `mini-init`'s `println!` output or on the kernel's own lines: the steward
+  logs at `info` and the guest has no `RUST_LOG`, so `tracing_subscriber` keeps everything below
+  `error` off the console); the **feature** set
   (two-sided provenance — the same artifact's removal names the rootfs on one backend and the
   backend on the other; misspelled-token hard error; `require()` refuses pre-boot); the
   **conformance** set (the four-leg present/absent × capable/incapable matrix, paired
