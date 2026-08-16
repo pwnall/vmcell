@@ -178,13 +178,12 @@ impl Stage for MmdebstrapRootfsStage {
             &builder_digest,
             inputs,
             &builder_rootfs,
-            // The builder VM uses the default glibc steward (its OCI base ships libc6).
-            None,
-            // No downstream extra files: this is the BUILDER VM's own rootfs, not the rootfs
-            // being produced. Baking a consumer's daemon into vmcell's build infrastructure
-            // (and into its cache key) is exactly what §13 invariant G1 forbids; `self.extra`
-            // belongs on the final pack below.
-            &[],
+            // The builder VM uses the default glibc steward (its OCI base ships libc6), no
+            // downstream extra files, and the default handler's applet roster: this is the BUILDER
+            // VM's own rootfs, not the rootfs being produced. Baking a consumer's daemon into
+            // vmcell's build infrastructure (and into its cache key) is exactly what §13 invariant
+            // G1 forbids; `self.extra` belongs on the final pack below.
+            &vmcell::artifact::rootfs::PackOptions::new(),
         )
         .await?;
 
@@ -278,7 +277,13 @@ impl Stage for MmdebstrapRootfsStage {
         }
         let tar_file = std::fs::File::open(&tar_path).map_err(Error::Io)?;
         let tar_stream: Box<dyn std::io::Read + Send> = Box::new(tar_file);
-        pack_erofs_with_injection(vec![tar_stream], inputs, out, None, &self.extra).await
+        pack_erofs_with_injection(
+            vec![tar_stream],
+            inputs,
+            out,
+            &vmcell::artifact::rootfs::PackOptions::new().with_extra(self.extra.clone()),
+        )
+        .await
     }
 }
 

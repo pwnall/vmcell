@@ -261,6 +261,33 @@ name = "vmcell"
 #     NOT YET: a `rootfs` entry's `xattrs` and `features` keys are REFUSED naming the delta that
 #     adds them (7 and 6c). Accepting either now would mean an accepted-then-ignored declaration —
 #     an F1 violation for as long as the next delta took.
+#
+#   * DELTA 6b — the artifact registry, handler kind (§10.5, invariant F7).
+#     PINS-SCHEMA ADDITION: a `handlers` namespace, whose committed `default` entry names the
+#     workspace build vmcell has always done (`{"build": "workspace:vmcell-guest-tools"}`) — the
+#     behavior is byte-identical and merely STATED IN DATA now. `KNOWN_PINS_NAMESPACES` grows 9→10.
+#     ADDITIVE: `artifact::handler` (`HandlerRegistryEntry`, `HandlerSource`, and the four key/name
+#     composers `handler_pin_key` / `handler_artifact_key` / `handler_filename{,_suffix}` /
+#     `handler_label_from_filename`); `resolve_handler_registry` / `resolve_handler_labels`;
+#     `rootfs::PackOptions`; `vmcell build --handler-label`.
+#     BREAKING `function_parameter_count_changed`, and this is the LAST time for this tail:
+#     `pack_erofs_with_injection` and `oci::build_rootfs` take a single `&PackOptions` in place of
+#     their `steward_musl` + `extra` pair. v33 alone hands that tail two new facts (delta 6's applet
+#     roster, delta 7's xattr policy); two more positional parameters would be two more ledgered
+#     breaks, and the third would be somebody else's. `PackOptions` is `#[non_exhaustive]` with
+#     `new()` + `with_*` setters, so it grows without breaking anyone again. A caller reproducing
+#     the pre-v33 call passes `PackOptions::new().with_steward_musl(m).with_extra(e)`.
+#     BREAKING `constructible_struct_adds_private_field`: `GuestToolsStage` is built through
+#     `::new()` / `::labelled(label, source)` (the precomputed-`Stage::name` reason `RootfsStage`
+#     carries), and `RootfsStage` gains an `applets` field — free, since it is `#[non_exhaustive]`
+#     as of 6a.
+#     BEHAVIOR: a registered handler is FETCHED AND VERIFIED against its digest before it is
+#     published, and a cached blob whose digest no longer matches is re-fetched rather than served.
+#     The verification is the whole assertion: a digest stored and never checked has passing output
+#     identical to its not-running output.
+#     `GuestToolsStage`'s cache key folds the registration identity (STAGE_VERSION 2 → 3), so a
+#     registered handler cannot be served from a workspace build's cache entry, nor one digest's
+#     blob from another digest's key. The DEFAULT stage's key is unmoved.
 #     WHY THIS ENTRY DID NOT STAY IN 0.16.0, since the register asks for one growing entry per
 #     breaking release: 0.16.0 shipped with delta 5 and became `origin/main`'s baseline, and
 #     `cargo semver-checks` — correctly — measures every later break against the baseline rather

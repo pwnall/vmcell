@@ -46,7 +46,9 @@ async fn pack_rootfs_with_marker(
             overlay_file: vmcell::artifact::pins_overlay_path(),
         }))
         .add_stage(Box::new(vmcell::artifact::steward::StewardStage {}))
-        .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
+        .add_stage(Box::new(
+            vmcell::artifact::guest_tools::GuestToolsStage::new(),
+        ))
         .add_stage(Box::new(
             vmcell::artifact::rootfs::RootfsStage::new().with_extra(vec![ExtraFile::new(
                 MARKER_DEST,

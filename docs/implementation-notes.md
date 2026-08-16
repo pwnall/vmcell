@@ -4221,6 +4221,49 @@ battery leg and the core's own unit leg.
 keys are rejected naming the delta that adds them. That is the F1-clean seam the delta-5 notes
 recorded: the key is refused here and honored there, never accepted-and-ignored in between.
 
+## v33 delta 6b — the handler kind (design §18 delta 6, §10.5, invariant F7), as built
+
+**What landed.** `artifact::handler` — the third kind's entry type, its three exhaustive
+registration shapes and its four key/name composers; the `handlers` pins namespace with the
+committed `default` naming the workspace build; `GuestToolsStage` as a *handler producer* rather
+than a hardcoded one; `PackOptions`; `vmcell build --handler-label`;
+`scripts/ban-handler-key-composers.sh` + self-test; and the seven-leg
+`crates/vmcell/tests/handler_registry.rs` battery.
+
+**The applet roster stopped being a const read and became a parameter.** §10.5 scopes it exactly:
+the `GUEST_TOOLS_APPLETS` const-assert binds the **default** handler, because that const is what
+the guest binary's dispatch table is compile-time asserted against. A registered consumer handler
+has no such const, so its roster is data — strict-parsed at the registry (bare names only; a
+`sub/dir` or `..` would inject a symlink outside the tools dir), and reaching the manifest through
+`HandlerRegistryEntry::applet_roster` / `PackOptions::applet_roster`. Those two are where the
+rosters meet, so no injection site has to know which kind it is holding, and an *empty* roster can
+never reach the manifest — which would inject the binary with no symlinks and turn every
+custom-`init=` target in the suite into a guest kernel panic.
+
+**`pack_erofs_with_injection` takes one options struct now, and that is the point.** It is §10.4
+contract surface, and v33 alone hands it two new facts (this delta's applet roster, delta 7's xattr
+policy). Two more positional parameters would be two more ledgered breaks and the third would be
+somebody else's, so the tail took the `HostEnv` idiom AGENTS.md prescribes: `PackOptions`,
+`#[non_exhaustive]`, grown by field. Delta 7 adds `xattrs` to it without breaking a caller.
+
+**`build` is legal, `digest` is legal, a path is neither.** F7's "nothing else parses", enforced:
+both shapes at once is refused (they could disagree about which bytes the label means), neither is
+refused naming the digest route, and `path` is rejected as an unknown key. A workspace `build` may
+not carry an `applets` roster either — its roster is the const, and a second one could only
+disagree with it.
+
+**Not covered by this delta, and deliberately:** the `unpinned` dev path-override and `bundle`'s
+refusal of it are 6c's, along with laziness and the `features` declarations. A registered handler's
+*live* leg — a consumer handler booting and its applet answering in-guest — needs an artifact to
+register, which the systemd proof cell (delta 9) is the natural home for; the KVM-free half is the
+verify/cache-hit pair in `guest_tools.rs`'s own unit suite.
+
+**Found while validating, fixed separately:** `vmcell-firecracker`'s `reject_live_baked_vsock`
+treats a 100 ms probe *timeout* as "no live listener owns this path" and then unlinks it. Under a
+full `cargo test --workspace` a local Unix connect to a live listener can exceed that, which is how
+its unit test flaked once during this pass — and it is the unsafe direction to fail in. Recorded as
+its own fix rather than smuggled into this commit.
+
 ## Where the v33 pass stands
 
 Deltas 1–5 of the §18 register are landed, pushed, and live-validated; **6–10 are not started**.

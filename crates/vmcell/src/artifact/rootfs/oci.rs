@@ -127,8 +127,10 @@ impl OciPuller for RealOciPuller {
 
 /// Builds a root filesystem by pulling from an OCI registry (the real network puller).
 ///
-/// `extra` are the downstream files composed into the image at pack time (§4.2, FR-V4); pass
-/// `&[]` for a rootfs that carries no consumer content.
+/// `options` carries everything the shared inject+pack tail is told beyond the layers themselves —
+/// the downstream `extra` files (§4.2, FR-V4), the optional static-musl steward, and the handler
+/// applet roster (§10.5); `PackOptions::default()` is a rootfs that carries no consumer content and
+/// the default handler's roster.
 ///
 /// # Errors
 /// Returns an error if the registry pull or unpacking fails.
@@ -137,19 +139,9 @@ pub async fn build_rootfs(
     digest: &str,
     inputs: &crate::artifact::StageInputs,
     out: &Path,
-    steward_musl: Option<&Path>,
-    extra: &[super::ExtraFile],
+    options: &super::PackOptions,
 ) -> Result<StageOutputs> {
-    build_rootfs_with(
-        &RealOciPuller::new(),
-        image,
-        digest,
-        inputs,
-        out,
-        steward_musl,
-        extra,
-    )
-    .await
+    build_rootfs_with(&RealOciPuller::new(), image, digest, inputs, out, options).await
 }
 
 /// The pull→cache→re-verify→decode→pack core, parameterized over an injectable
@@ -160,8 +152,7 @@ async fn build_rootfs_with(
     digest: &str,
     inputs: &crate::artifact::StageInputs,
     out: &Path,
-    steward_musl: Option<&Path>,
-    extra: &[super::ExtraFile],
+    options: &super::PackOptions,
 ) -> Result<StageOutputs> {
     // Digest-pinned pulls only: a tag (or any non-`sha256:` reference) is the §10.2 (The
     // stage model and the five cache-key rules) provenance hard stop and is rejected BEFORE
@@ -227,7 +218,7 @@ async fn build_rootfs_with(
         }
     }
 
-    super::pack_erofs_with_injection(streams, inputs, out, steward_musl, extra).await
+    super::pack_erofs_with_injection(streams, inputs, out, options).await
 }
 
 /// The OCI/Docker layer media types this builder can decode (gzip and zstd
@@ -472,8 +463,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("rootfs.erofs");
         let inputs = crate::artifact::StageInputs::default();
-        let res =
-            build_rootfs_with(&fake, "example.com/img", "latest", &inputs, &out, None, &[]).await;
+        let res = build_rootfs_with(
+            &fake,
+            "example.com/img",
+            "latest",
+            &inputs,
+            &out,
+            &crate::artifact::rootfs::PackOptions::default(),
+        )
+        .await;
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a tag-fallback (non-digest) pull must be rejected, got {res:?}"
@@ -579,9 +577,16 @@ mod tests {
         let digest = sha256_hex(b"manifest-bytes");
 
         // (1) Cold build: every layer pulled, erofs produced (gzip + zstd both decode).
-        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None, &[])
-            .await
-            .expect("cold build");
+        build_rootfs_with(
+            &fake,
+            "example.com/img",
+            &digest,
+            &inputs,
+            &out,
+            &crate::artifact::rootfs::PackOptions::default(),
+        )
+        .await
+        .expect("cold build");
         assert_eq!(
             fake.blob_calls.load(Ordering::SeqCst),
             2,
@@ -593,9 +598,16 @@ mod tests {
         );
 
         // (2) Warm build: cached blobs are re-verified but NOT re-pulled.
-        build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None, &[])
-            .await
-            .expect("warm build");
+        build_rootfs_with(
+            &fake,
+            "example.com/img",
+            &digest,
+            &inputs,
+            &out,
+            &crate::artifact::rootfs::PackOptions::default(),
+        )
+        .await
+        .expect("warm build");
         assert_eq!(
             fake.blob_calls.load(Ordering::SeqCst),
             2,
@@ -619,8 +631,7 @@ mod tests {
             &digest,
             &inputs,
             &other_out,
-            None,
-            &[],
+            &crate::artifact::rootfs::PackOptions::default(),
         )
         .await
         .expect("build into a different output dir");
@@ -638,8 +649,15 @@ mod tests {
         // (4) Tamper a cached blob (intact digest-derived filename) → rejected on the hit
         // path by the every-use re-verify.
         std::fs::write(&cache_file, b"tampered-cache-bytes").unwrap();
-        let res =
-            build_rootfs_with(&fake, "example.com/img", &digest, &inputs, &out, None, &[]).await;
+        let res = build_rootfs_with(
+            &fake,
+            "example.com/img",
+            &digest,
+            &inputs,
+            &out,
+            &crate::artifact::rootfs::PackOptions::default(),
+        )
+        .await;
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
             "a tampered cached blob must be rejected on the hit path, got {res:?}"

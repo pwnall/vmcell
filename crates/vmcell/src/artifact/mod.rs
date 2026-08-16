@@ -12,10 +12,13 @@ pub mod bundle;
 #[cfg(feature = "pipeline")]
 /// Guest test-helper (`vmcell-guest-tools`) building stage.
 pub mod guest_tools;
+/// Tar to EROFS conversion utility.
+/// The handler artifact kind: the binary injected at the guest tools path (§10.5).
+pub mod handler;
 #[cfg(feature = "pipeline")]
 /// Kernel building stage.
 pub mod kernel;
-/// Tar to EROFS conversion utility.
+
 /// The one artifact-registry resolution law, parameterized per kind (§10.5).
 ///
 /// Public for its two schema facts only — [`registry::DEFAULT_LABEL`] and
@@ -277,7 +280,9 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
                 Pipeline::new(dir.clone())
                     .add_stage(Box::new(ResolvePinsStage { overlay_file }))
                     .add_stage(Box::new(crate::artifact::steward::StewardStage {}))
-                    .add_stage(Box::new(crate::artifact::guest_tools::GuestToolsStage {}))
+                    .add_stage(Box::new(
+                        crate::artifact::guest_tools::GuestToolsStage::new(),
+                    ))
                     .add_stage(Box::new(crate::artifact::rootfs::RootfsStage::new()))
                     .build(&Cache::default())
                     .await
@@ -685,12 +690,13 @@ pub fn pins_overlay_path() -> Option<PathBuf> {
 /// **Not** the accept-list: [`flatten_pins_namespace`] is the single authority on what a namespace
 /// is (one law, one predicate — an accept-list beside a flatten-list is the duplicate that always
 /// diverges). A unit test pins every entry here against that authority.
-const KNOWN_PINS_NAMESPACES: [&str; 9] = [
+const KNOWN_PINS_NAMESPACES: [&str; 10] = [
     "kernel",
     "kernel_prebuilt",
     "kernels",
     "kernel_fragments",
     "rootfs",
+    "handlers",
     "builder_base",
     "cloud_hypervisor",
     "virtiofsd",
@@ -847,6 +853,37 @@ fn flatten_pins_namespace(
                         if let Some(v) = spec.get(sub).and_then(|v| v.as_str()) {
                             out.insert(rootfs::rootfs_pin_key(key_label, sub), v.to_string());
                         }
+                    }
+                }
+            }
+            Some(PinsNamespaceShape::Object)
+        }
+        // The handler registry (§10.5, v33 delta 6): each `handlers.<label>` → keyed pins, composed
+        // through the one exported law (`handler::handler_pin_key`). `applets` stays
+        // DOCUMENT-only, exactly as `kernels.<label>.fragments` does — the flat map is scalars, and
+        // the registry resolver reads the document.
+        "handlers" => {
+            if let Some(entries) = value.as_object() {
+                for (label, spec) in entries {
+                    let key_label = registry::registry_label(label);
+                    if let Some(build) = spec.get("build").and_then(|v| v.as_str()) {
+                        out.insert(
+                            handler::handler_pin_key(key_label, "build"),
+                            build.to_string(),
+                        );
+                    }
+                    if let Some(digest) = spec.get("digest").and_then(|v| v.as_str()) {
+                        out.insert(
+                            handler::handler_pin_key(key_label, "digest"),
+                            digest.to_string(),
+                        );
+                    }
+                    if let Some(url) = spec
+                        .get("source")
+                        .and_then(|s| s.get("url"))
+                        .and_then(|v| v.as_str())
+                    {
+                        out.insert(handler::handler_pin_key(key_label, "url"), url.to_string());
                     }
                 }
             }
@@ -1259,6 +1296,41 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
         image,
         digest,
     })
+}
+
+/// The merged `handlers` registry in **sorted label order** (§10.5, v33 delta 6).
+///
+/// The third kind through the one shared merge/sort/collision core.
+///
+/// # Errors
+/// As [`resolve_pins`], plus [`crate::error::Error::Artifact`] when an entry names neither or both
+/// registration shapes, carries a malformed digest or `applets` roster, or when two labels sanitize
+/// to one on-disk artifact filename (naming both).
+pub fn resolve_handler_registry(
+    overlay_file: Option<&Path>,
+) -> Result<Vec<handler::HandlerRegistryEntry>> {
+    let doc = resolve_pins_document(overlay_file)?;
+    registry::resolve_registry(
+        &doc,
+        &registry::RegistryKind {
+            namespace: "handlers",
+            filename: &|label: &str| handler::handler_filename(registry::registry_label(label)),
+            collision_consequence: "building both would overwrite one handler binary with the other plus its                  `.cache_key` sidecar, and leave the two labels evicting each other's cache entry                  on every build",
+        },
+        handler::handler_registry_entry,
+        |e: &handler::HandlerRegistryEntry| e.label.as_str(),
+    )
+}
+
+/// The labels of the merged `handlers` registry, sorted.
+///
+/// # Errors
+/// As [`resolve_handler_registry`].
+pub fn resolve_handler_labels(overlay_file: Option<&Path>) -> Result<Vec<String>> {
+    Ok(resolve_handler_registry(overlay_file)?
+        .into_iter()
+        .map(|e| e.label)
+        .collect())
 }
 
 /// The labels of the merged `rootfs` registry, sorted.

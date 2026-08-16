@@ -144,6 +144,78 @@ pub fn rootfs_label_from_filename(name: &str) -> Option<&str> {
     }
 }
 
+/// What the one inject+pack tail is told, beyond the tar streams themselves (design §4.2/§10.5).
+///
+/// Grown by **field**, never by positional argument — the `HostEnv` idiom AGENTS.md prescribes for
+/// a seam that keeps learning new facts. `pack_erofs_with_injection` is §10.4 contract surface, and
+/// v33 alone hands it two new ones (delta 6's applet roster, delta 7's xattr policy); two more
+/// parameters would be two more ledgered signature breaks, and the third one would be somebody
+/// else's problem.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct PackOptions {
+    /// Inject this prebuilt static-musl steward instead of the pipeline's default glibc one
+    /// (`oci2erofs --steward-musl`). When set, the libc6-presence guard is skipped.
+    pub steward_musl: Option<PathBuf>,
+    /// Downstream files composed into the image at pack time (`--inject`, §4.2 FR-V4).
+    pub extra: Vec<ExtraFile>,
+    /// The handler applet roster to emit as `<tools_dir>/<applet>` symlinks.
+    ///
+    /// Empty means the DEFAULT handler's roster ([`vmcell_protocol::GUEST_TOOLS_APPLETS`]) — the
+    /// const the guest binary's dispatch table is compile-time asserted against. A registered
+    /// consumer handler supplies its own, strict-parsed from its registry entry (§10.5).
+    pub applets: Vec<String>,
+}
+
+impl PackOptions {
+    /// The defaults: no musl steward, no downstream files, the default handler's applet roster.
+    ///
+    /// A constructor rather than a struct expression because this type is `#[non_exhaustive]` — the
+    /// whole point of the struct is that it grows, and an out-of-crate builder (`vmcell-rootfs-
+    /// builder`) must not have to be edited when it does.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Injects a prebuilt static-musl steward instead of the pipeline's default glibc one.
+    #[must_use]
+    pub fn with_steward_musl(mut self, steward_musl: Option<PathBuf>) -> Self {
+        self.steward_musl = steward_musl;
+        self
+    }
+
+    /// Composes downstream files into the image at pack time (§4.2 FR-V4).
+    #[must_use]
+    pub fn with_extra(mut self, extra: Vec<ExtraFile>) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    /// Sets the handler applet roster (§10.5); empty means the default handler's.
+    #[must_use]
+    pub fn with_applets(mut self, applets: Vec<String>) -> Self {
+        self.applets = applets;
+        self
+    }
+
+    /// The roster to inject: this options' own, or the default handler's.
+    ///
+    /// The one place the two rosters meet on the packer side, so no injection site has to know
+    /// which kind of handler it is packing — and an *empty* roster can never reach the manifest,
+    /// which would inject the binary with no symlinks and turn every custom-`init=` target into a
+    /// guest kernel panic.
+    #[must_use]
+    #[cfg(feature = "am-fs-erofs")]
+    pub fn applet_roster(&self) -> Vec<String> {
+        if self.applets.is_empty() {
+            default_applet_roster()
+        } else {
+            self.applets.clone()
+        }
+    }
+}
+
 /// The directory holding the guest-tools multicall binary and its exec-PATH symlinks. Reserved
 /// as a whole so a name the manifest has not grown yet (delta 7's `echo-server` was one) is
 /// covered the moment it is added.
@@ -152,6 +224,20 @@ const VMCELL_TOOLS_DIR: &str = "vmcell-tools";
 /// The multicall binary's file name inside [`VMCELL_TOOLS_DIR`] — the target every applet
 /// symlink the manifest emits points at.
 const GUEST_TOOLS_MULTICALL_BIN: &str = "vmcell-guest-tools";
+
+/// The DEFAULT handler's applet roster: [`vmcell_protocol::GUEST_TOOLS_APPLETS`], owned.
+///
+/// One place converts the shared const into the `Vec<String>` the manifest takes, so a caller that
+/// wants "whatever vmcell ships" never re-spells the const and never accidentally passes an empty
+/// roster (which would inject the binary with no symlinks — a rootfs whose custom-`init=` targets
+/// all vanish, exit 2, guest kernel panic).
+#[cfg(feature = "am-fs-erofs")]
+fn default_applet_roster() -> Vec<String> {
+    vmcell_protocol::GUEST_TOOLS_APPLETS
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect()
+}
 
 /// Whether `dest` names a path vmcell itself injects and therefore owns (invariant F5).
 ///
@@ -179,7 +265,11 @@ pub fn is_reserved_injection_path(dest: &str) -> bool {
     // Every manifest dest, with all optional entries present so the check does not depend on
     // which features baked a CA or built guest-tools. The paths are never read here.
     let probe = Path::new("/dev/null");
-    let (files, symlinks) = rootfs_injection_manifest(probe, Some(probe), Some(probe));
+    // The DEFAULT roster here, deliberately: a consumer handler's applet names are not vmcell's to
+    // reserve, and they do not need to be — the whole-directory prefix rule above already reserves
+    // `<tools_dir>/<anything>`, including names no manifest has grown yet.
+    let (files, symlinks) =
+        rootfs_injection_manifest(probe, Some(probe), Some(probe), &default_applet_roster());
     files
         .iter()
         .any(|(d, _, _)| normalize_path(Path::new(d)) == normalized)
@@ -315,6 +405,9 @@ pub struct RootfsStage {
     /// Downstream files composed into the image at pack time (`oci2erofs --inject`, §4.2,
     /// FR-V4). Empty for the default `vmcell build`.
     pub extra: Vec<ExtraFile>,
+    /// The handler applet roster injected as `<tools_dir>/<applet>` symlinks. Empty is the default
+    /// handler's roster; a registered handler (§10.5) supplies its own.
+    pub applets: Vec<String>,
     /// The `rootfs` registry label this stage builds (§10.5, v33 delta 6) — `None` is
     /// `rootfs.default`, which resolves to today's inputs and today's filename.
     ///
@@ -350,6 +443,7 @@ impl RootfsStage {
             image_override: None,
             steward_musl: None,
             extra: Vec::new(),
+            applets: Vec::new(),
             label: label.map(str::to_string),
             // The artifact key IS the stage name for this kind, so a labelled stage cannot collide
             // with the default one on the pipeline's cache sidecar — the §5.1 hazard recorded for
@@ -383,6 +477,23 @@ impl RootfsStage {
     #[must_use]
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
+    }
+
+    /// Sets the handler applet roster to inject (§10.5) — empty means the default handler's.
+    #[must_use]
+    pub fn with_applets(mut self, applets: Vec<String>) -> Self {
+        self.applets = applets;
+        self
+    }
+
+    /// What this stage tells the one inject+pack tail.
+    #[must_use]
+    pub fn pack_options(&self) -> PackOptions {
+        PackOptions {
+            steward_musl: self.steward_musl.clone(),
+            extra: self.extra.clone(),
+            applets: self.applets.clone(),
+        }
     }
 }
 
@@ -491,15 +602,7 @@ impl Stage for RootfsStage {
                 (image.clone(), digest.clone())
             }
         };
-        oci::build_rootfs(
-            &image,
-            &digest,
-            inputs,
-            out,
-            self.steward_musl.as_deref(),
-            &self.extra,
-        )
-        .await
+        oci::build_rootfs(&image, &digest, inputs, out, &self.pack_options()).await
     }
 }
 
@@ -646,9 +749,11 @@ pub async fn pack_erofs_with_injection(
     tar_streams: Vec<Box<dyn Read + Send>>,
     inputs: &StageInputs,
     out: &Path,
-    steward_musl: Option<&Path>,
-    extra: &[ExtraFile],
+    options: &PackOptions,
 ) -> Result<StageOutputs> {
+    let steward_musl = options.steward_musl.as_deref();
+    let extra = options.extra.as_slice();
+    let applets = options.applet_roster();
     let out_buf = out.to_path_buf();
 
     // Validate the caller-supplied extras before any side effect (the CA write below is one):
@@ -697,8 +802,12 @@ pub async fn pack_erofs_with_injection(
         let ca_opt: Option<&Path> = Some(ca_path.as_path());
         #[cfg(not(feature = "proxy"))]
         let ca_opt: Option<&Path> = None;
-        let (injected_files, injected_symlinks) =
-            rootfs_injection_manifest(steward_path.as_path(), ca_opt, tools_path.as_deref());
+        let (injected_files, injected_symlinks) = rootfs_injection_manifest(
+            steward_path.as_path(),
+            ca_opt,
+            tools_path.as_deref(),
+            &applets,
+        );
         // The manifest's link paths are owned (composed per applet-roster entry); borrow them
         // back for the packer, whose signature is unchanged. `injected_symlinks` outlives the
         // call, so the borrows are valid for it.
@@ -772,6 +881,7 @@ fn rootfs_injection_manifest<'a>(
     steward: &'a Path,
     ca: Option<&'a Path>,
     tools: Option<&'a Path>,
+    applets: &[String],
 ) -> (Vec<InjectFile<'a>>, Vec<InjectLink>) {
     // `None` mode: vmcell's own entries keep the `injected_file_mode` bin/sbin heuristic.
     let mut files: Vec<InjectFile<'a>> = vec![("usr/sbin/vmcell-steward", steward, None)];
@@ -783,13 +893,19 @@ fn rootfs_injection_manifest<'a>(
     if let Some(tools) = tools {
         files.push(("vmcell-tools/vmcell-guest-tools", tools, None));
         // busybox-style multicall links resolved on the exec PATH (the steward prepends
-        // /vmcell-tools) — ONE per roster entry, derived from the shared const the guest
-        // binary's dispatch table is compile-time pinned to. There is deliberately no name
-        // literal here: `echo-server` (the §3.2 raw-vsock-dial / §6.5 segment listener) is
-        // also the one applet used as a custom `init=` target, which resolves its absolute
-        // path before any steward exists — so a symlink this manifest forgot to emit is a
-        // guest kernel panic, not a missing test helper.
-        for applet in vmcell_protocol::GUEST_TOOLS_APPLETS {
+        // its tools dir) — ONE per roster entry. There is deliberately no name literal here:
+        // `echo-server` (the §3.2 raw-vsock-dial / §6.5 segment listener) is also one of the
+        // applets used as a custom `init=` target, which resolves its absolute path before any
+        // steward exists — so a symlink this manifest forgot to emit is a guest kernel panic, not
+        // a missing test helper.
+        //
+        // The roster is a PARAMETER as of v33 delta 6 (§10.5), not the shared const read directly:
+        // the const is the DEFAULT handler's roster, the one the guest binary's dispatch table is
+        // compile-time asserted against. A registered consumer handler has no such const to assert
+        // against, so its roster comes from its registry entry — strict-parsed there, and reaching
+        // here as data. `HandlerRegistryEntry::applet_roster` is where the two meet, so no
+        // injection site has to know which kind it is holding.
+        for applet in applets {
             symlinks.push((
                 format!("{VMCELL_TOOLS_DIR}/{applet}"),
                 GUEST_TOOLS_MULTICALL_BIN,
@@ -805,8 +921,7 @@ pub async fn pack_erofs_with_injection(
     _tar_streams: Vec<Box<dyn Read + Send>>,
     _inputs: &StageInputs,
     _out: &Path,
-    _steward_musl: Option<&Path>,
-    _extra: &[ExtraFile],
+    _options: &PackOptions,
 ) -> Result<StageOutputs> {
     // mkfs.erofs fallback requires extracting the tar to a directory, adding the files,
     // and running mkfs.erofs. We assume am-fs-erofs is used for now.
@@ -904,7 +1019,8 @@ mod tests {
         let steward = Path::new("/steward");
         let ca = Path::new("/ca.pem");
         let tools = Path::new("/tools");
-        let (files, symlinks) = rootfs_injection_manifest(steward, Some(ca), Some(tools));
+        let (files, symlinks) =
+            rootfs_injection_manifest(steward, Some(ca), Some(tools), &default_applet_roster());
         let dests: Vec<&str> = files.iter().map(|(d, _, _)| *d).collect();
         // vmcell's own entries keep the `injected_file_mode` heuristic: only a downstream
         // `ExtraFile` states its mode explicitly (§4.2). A `Some(...)` here would mean the
@@ -953,7 +1069,8 @@ mod tests {
         }
 
         // No CA (the non-proxy build) => no trust-store bundle injected.
-        let (files_np, _) = rootfs_injection_manifest(steward, None, Some(tools));
+        let (files_np, _) =
+            rootfs_injection_manifest(steward, None, Some(tools), &default_applet_roster());
         assert!(
             !files_np
                 .iter()
@@ -971,7 +1088,11 @@ mod tests {
     #[test]
     fn is_reserved_injection_path_covers_every_vmcell_dest() {
         let probe = Path::new("/dev/null");
-        let (files, symlinks) = rootfs_injection_manifest(probe, Some(probe), Some(probe));
+        // The DEFAULT roster here, deliberately: a consumer handler's applet names are not vmcell's to
+        // reserve, and they do not need to be — the whole-directory prefix rule above already reserves
+        // `<tools_dir>/<anything>`, including names no manifest has grown yet.
+        let (files, symlinks) =
+            rootfs_injection_manifest(probe, Some(probe), Some(probe), &default_applet_roster());
         for dest in files
             .iter()
             .map(|(d, _, _)| *d)
@@ -1327,7 +1448,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("rootfs.erofs");
         let inputs = StageInputs::default();
-        let res = pack_erofs_with_injection(vec![], &inputs, &out, None, &[]).await;
+        let res = pack_erofs_with_injection(vec![], &inputs, &out, &PackOptions::default()).await;
         assert!(
             matches!(res, Err(Error::Artifact(_))),
             "missing steward must be a hard error, got {res:?}"
@@ -1349,9 +1470,17 @@ mod tests {
             dir.path().join("evil"),
             0o755,
         )];
-        let err = pack_erofs_with_injection(vec![], &inputs, &out, None, &extra)
-            .await
-            .expect_err("a reserved extra dest must be rejected");
+        let err = pack_erofs_with_injection(
+            vec![],
+            &inputs,
+            &out,
+            &PackOptions {
+                extra: extra.to_vec(),
+                ..PackOptions::default()
+            },
+        )
+        .await
+        .expect_err("a reserved extra dest must be rejected");
         let Error::Artifact(msg) = &err else {
             panic!("expected Error::Artifact, got {err:?}");
         };
@@ -1405,9 +1534,17 @@ mod tests {
         std::fs::write(&musl, b"#!static-steward").expect("write the steward stand-in");
 
         let inputs = StageInputs::default();
-        pack_erofs_with_injection(vec![], &inputs, &out, Some(&musl), &[])
-            .await
-            .expect("the pack must succeed");
+        pack_erofs_with_injection(
+            vec![],
+            &inputs,
+            &out,
+            &PackOptions {
+                steward_musl: Some(musl.clone()),
+                ..PackOptions::default()
+            },
+        )
+        .await
+        .expect("the pack must succeed");
 
         assert_eq!(
             std::fs::read_to_string(&beside_the_output).expect("read the sentinel back"),

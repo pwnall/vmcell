@@ -387,6 +387,10 @@ gates:
     # that builds KERNELS, so a drift on the default label repoints a consumer it was never about.
     ./scripts/ban-rootfs-key-composers.sh
     ./scripts/test-ban-rootfs-key-composers.sh
+    # §10.5 / v33 delta 6: the HANDLER half. Added WITH the kind rather than after a duplicate has
+    # already diverged, which is the only reason either sibling above exists.
+    ./scripts/ban-handler-key-composers.sh
+    ./scripts/test-ban-handler-key-composers.sh
     # docs/81 §8 ("one law, one predicate"): the 1 s VMM-control-socket readiness ceiling was six
     # inline `1000`s across CH/FC/QEMU/crosvm. The fix is structural — `register_and_await_ready`
     # and `wait_for_vmm_socket` take NO timeout argument, so a literal there is a compile error —

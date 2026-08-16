@@ -1,0 +1,299 @@
+//! The `handlers` artifact registry (design §10.5; §18 delta 6), exercised from **outside** the
+//! crate — the position a git-dep consumer registers their own in-guest helper from.
+//!
+//! §10.5 calls the handler "not an artifact at all" before v33: `GuestToolsStage` built from the
+//! workspace unconditionally, in both halves, with no prebuilt escape hatch. A consumer who wanted
+//! their own helper had to fork the pins file or push a binary per boot through `PutFile` — which
+//! caps at `MAX_FRAME_BYTES` and cannot set an executable mode. What this battery covers is the
+//! half with no other proof: that registration is a **digest** (F7), that the default entry means
+//! exactly the pre-v33 workspace build, and that a consumer's roster is data rather than a const.
+//!
+//! KVM-free, network-free, toolchain-free.
+
+use std::path::{Path, PathBuf};
+
+use vmcell::artifact::handler::{
+    HandlerSource, handler_artifact_key, handler_filename, handler_label_from_filename,
+    handler_pin_key,
+};
+use vmcell::artifact::registry::DEFAULT_LABEL;
+use vmcell::artifact::{resolve_handler_labels, resolve_handler_registry, resolve_pins};
+use vmcell::error::Error;
+
+/// Writes an overlay document into `dir` and returns its path.
+fn write_overlay(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("overlay.json");
+    std::fs::write(&path, body).expect("write overlay");
+    path
+}
+
+/// The rejection message for an overlay, or a panic naming what came back instead.
+fn registry_err(overlay: &Path) -> String {
+    match resolve_handler_registry(Some(overlay)) {
+        Err(Error::Artifact(m)) => m,
+        other => panic!("expected an Artifact rejection, got {other:?}"),
+    }
+}
+
+/// A syntactically valid registered entry body.
+fn registered(digest_byte: char) -> String {
+    format!(
+        r#"{{ "digest": "sha256:{}", "source": {{ "url": "https://example.invalid/h" }} }}"#,
+        std::iter::repeat_n(digest_byte, 64).collect::<String>()
+    )
+}
+
+// §10.5's "the `default` entry names today's workspace build — behavior byte-identical, now stated
+// in data instead of hardcoded". The committed baseline must SAY what vmcell has always DONE, or
+// the registry is a second source of truth beside the code it replaced.
+#[test]
+fn the_committed_default_names_the_workspace_build() {
+    let registry = resolve_handler_registry(None).expect("the baseline registry resolves");
+    let default = registry
+        .iter()
+        .find(|e| e.label == DEFAULT_LABEL)
+        .expect("the committed baseline must register a `default` handler");
+    assert_eq!(
+        default.source,
+        HandlerSource::WorkspaceBuild {
+            crate_name: "vmcell-guest-tools".to_string()
+        },
+        "the default handler is the workspace helper, stated in data"
+    );
+
+    // Its roster is the SHARED CONST, not a copy in the pins file: the guest binary's dispatch
+    // table is compile-time asserted against that const, and a second roster here could only
+    // disagree with it.
+    assert!(
+        default.applets.is_empty(),
+        "the default entry carries no `applets` — its roster is GUEST_TOOLS_APPLETS"
+    );
+    assert_eq!(
+        default.applet_roster(),
+        vmcell_protocol::GUEST_TOOLS_APPLETS
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // And it flattens to the un-suffixed pin key, the same default-label law the rootfs kind uses.
+    let pins = resolve_pins(None).expect("baseline pins");
+    assert_eq!(
+        pins.get(&handler_pin_key(None, "build"))
+            .map(String::as_str),
+        Some("workspace:vmcell-guest-tools")
+    );
+    assert!(!pins.contains_key("handler_default_build"));
+}
+
+// F7, in one test: registration is a digest, and NOTHING ELSE PARSES. Both-shapes and neither-shape
+// are refused because either would leave the label meaning something other than one identified blob
+// — "whatever is at that location today", which no consumer's provenance discipline can cite.
+#[test]
+fn an_entry_names_exactly_one_registration_shape() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let both = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "handlers": {{ "acme": {{ "build": "workspace:x", "digest": "sha256:{}" }} }} }}"#,
+            "a".repeat(64)
+        ),
+    );
+    assert!(
+        registry_err(&both).contains("BOTH"),
+        "an entry naming both shapes must be refused: {}",
+        registry_err(&both)
+    );
+
+    let neither = write_overlay(
+        tmp.path(),
+        r#"{ "handlers": { "acme": { "applets": ["p"] } } }"#,
+    );
+    let msg = registry_err(&neither);
+    assert!(
+        msg.contains("neither") && msg.contains("digest"),
+        "an entry naming neither shape must be refused naming the digest route: {msg}"
+    );
+
+    // A PATH is not a registration shape at all — it is an unknown key, refused naming it. R7's
+    // whole point: an override is a per-run act, a registration is a durable claim.
+    let path_shaped = write_overlay(
+        tmp.path(),
+        r#"{ "handlers": { "acme": { "path": "/tmp/my-handler" } } }"#,
+    );
+    assert!(
+        registry_err(&path_shaped).contains("path"),
+        "a path-shaped registration must be refused naming the key"
+    );
+
+    // Positive control: the digest shape resolves.
+    let good = write_overlay(
+        tmp.path(),
+        &format!(r#"{{ "handlers": {{ "acme": {} }} }}"#, registered('b')),
+    );
+    let registry = resolve_handler_registry(Some(&good)).expect("a digest registration resolves");
+    let acme = registry
+        .iter()
+        .find(|e| e.label == "acme")
+        .expect("the acme entry");
+    assert!(matches!(&acme.source, HandlerSource::Registered { .. }));
+}
+
+// A digest that is not `sha256:<64 hex>` is refused — the `oci2-erofs` rule adopted as the
+// registry's, so a label can never resolve to a mutable reference.
+#[test]
+fn a_registration_must_pin_a_sha256_digest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for bad in ["latest", "sha256:short", "sha1:aaaa"] {
+        let overlay = write_overlay(
+            tmp.path(),
+            &format!(
+                r#"{{ "handlers": {{ "acme": {{ "digest": "{bad}",
+                     "source": {{ "url": "https://example.invalid/h" }} }} }} }}"#
+            ),
+        );
+        assert!(
+            registry_err(&overlay).contains("acme"),
+            "the rejection must name the label"
+        );
+    }
+
+    // A digest with no `source.url` is refused too: the digest is authoritative and the source is
+    // the instruction verified against it, so one without the other cannot be acted on.
+    let no_source = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "handlers": {{ "acme": {{ "digest": "sha256:{}" }} }} }}"#,
+            "c".repeat(64)
+        ),
+    );
+    assert!(registry_err(&no_source).contains("source.url"));
+}
+
+// A consumer handler's applet roster is DATA, strict-parsed — because the const-assert that keeps
+// the default handler honest binds the default handler only. A name that is not a bare file name
+// would inject a symlink outside the tools dir.
+#[test]
+fn a_registered_handlers_applet_roster_is_strict_parsed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let good = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "handlers": {{ "acme": {{ "digest": "sha256:{}",
+                 "source": {{ "url": "https://example.invalid/h" }},
+                 "applets": ["acme-probe", "acme-load"] }} }} }}"#,
+            "d".repeat(64)
+        ),
+    );
+    let registry = resolve_handler_registry(Some(&good)).expect("resolves");
+    let acme = registry.iter().find(|e| e.label == "acme").expect("acme");
+    assert_eq!(acme.applets, vec!["acme-probe", "acme-load"]);
+    assert_eq!(
+        acme.applet_roster(),
+        acme.applets,
+        "a registered handler's roster is its own, not the default's"
+    );
+
+    for bad in [
+        r#"["ok", "../escape"]"#,
+        r#"["sub/dir"]"#,
+        r#"[""]"#,
+        r#""notanarray""#,
+    ] {
+        let overlay = write_overlay(
+            tmp.path(),
+            &format!(
+                r#"{{ "handlers": {{ "acme": {{ "digest": "sha256:{}",
+                     "source": {{ "url": "u" }}, "applets": {bad} }} }} }}"#,
+                "e".repeat(64)
+            ),
+        );
+        assert!(
+            registry_err(&overlay).contains("applets"),
+            "{bad} must be refused naming the key"
+        );
+    }
+
+    // A WORKSPACE handler may not carry a roster: its roster is the const its dispatch table is
+    // compile-time asserted against, so a second one here could only disagree.
+    let ws_with_roster = write_overlay(
+        tmp.path(),
+        r#"{ "handlers": { "acme": { "build": "workspace:x", "applets": ["p"] } } }"#,
+    );
+    let msg = registry_err(&ws_with_roster);
+    assert!(
+        msg.contains("GUEST_TOOLS_APPLETS"),
+        "the refusal must name the const that already owns a workspace handler's roster: {msg}"
+    );
+}
+
+// The `build` shape must name a workspace member through the one spelling; anything else is refused
+// rather than guessed at.
+#[test]
+fn the_workspace_build_shape_is_strict() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for bad in ["vmcell-guest-tools", "workspace:", "path:/x", ""] {
+        let overlay = write_overlay(
+            tmp.path(),
+            &format!(r#"{{ "handlers": {{ "acme": {{ "build": "{bad}" }} }} }}"#),
+        );
+        assert!(
+            registry_err(&overlay).contains("acme"),
+            "`build: {bad:?}` must be refused naming the label"
+        );
+    }
+}
+
+// The filename law and its inverse are pinned together, and the artifact key keeps the pre-v33
+// spelling for the default — the rootfs kind's byte-identity argument, one kind over. The pack tail
+// reads `inputs.artifacts["guest_tools"]`, so renaming the default key would be a break with no
+// benefit.
+#[test]
+fn the_filename_and_artifact_key_laws_round_trip() {
+    assert_eq!(handler_artifact_key(None), "guest_tools");
+    assert_eq!(handler_artifact_key(Some("acme")), "guest_tools-acme");
+    assert_eq!(handler_filename(None), "guest_tools");
+    assert_eq!(handler_filename(Some("12.4")), "guest_tools-12-4");
+    assert_eq!(handler_label_from_filename("guest_tools"), None);
+    assert_eq!(
+        handler_label_from_filename("guest_tools-acme"),
+        Some("acme")
+    );
+    assert_eq!(
+        handler_label_from_filename("guest_tools-acme.cache_key"),
+        None
+    );
+    assert_eq!(handler_label_from_filename("vmlinux-acme"), None);
+
+    for entry in resolve_handler_registry(None).expect("baseline registry") {
+        let label = (entry.label != DEFAULT_LABEL).then_some(entry.label.as_str());
+        let filename = handler_filename(label);
+        assert_eq!(
+            handler_label_from_filename(&filename),
+            label.map(|l| l.replace('.', "-")).as_deref()
+        );
+    }
+}
+
+// A downstream-added handler is additive and sorted, with the baseline's default kept — the shared
+// registry core's order law, reached through the third kind.
+#[test]
+fn overlay_handlers_are_additive_and_sorted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "handlers": {{ "zz": {}, "aa": {} }} }}"#,
+            registered('f'),
+            registered('9')
+        ),
+    );
+    assert_eq!(
+        resolve_handler_labels(Some(&overlay)).expect("resolves"),
+        vec![
+            "aa".to_string(),
+            DEFAULT_LABEL.to_string(),
+            "zz".to_string()
+        ]
+    );
+}

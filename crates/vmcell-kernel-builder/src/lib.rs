@@ -356,10 +356,10 @@ impl Stage for InVmKernelStage {
             &builder_digest,
             inputs,
             &builder_rootfs,
-            None,
-            // No downstream extra files: this is vmcell's own build infrastructure, and the
-            // core ships mechanisms, never consumer content (§13 invariant G1).
-            &[],
+            // No downstream extra files and the default handler's roster: this is vmcell's own
+            // build infrastructure, and the core ships mechanisms, never consumer content
+            // (§13 invariant G1).
+            &vmcell::artifact::rootfs::PackOptions::new(),
         )
         .await?;
 
