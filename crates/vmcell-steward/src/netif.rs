@@ -1,11 +1,11 @@
-//! Minimal interface-configuration helpers for the guest agent's native
+//! Minimal interface-configuration helpers for the steward's native
 //! post-restore resync (§8.2, Restore correctness: a restored VM is not a fresh VM).
 //!
 //! Just enough of the `SIOCSIFHWADDR` / `SIOCSIFADDR` / route-ioctl paths to
 //! re-point `eth0`'s hardware and IPv4 identity in-process on restore, so PID 1
 //! no longer spawns the multi-MB `ip`/guest-tools binary for it. The ioctl
 //! sequences mirror the guest-tools helpers but depend only on `libc`, so the
-//! lean-agent dependency assertion (`cargo tree -e no-dev` sees no
+//! lean-steward dependency assertion (`cargo tree -e no-dev` sees no
 //! tokio/hyper/rtnetlink/reqwest) stays green.
 //!
 //! The module is two halves. `KernelNet` is the thin ioctl layer — one syscall
@@ -419,7 +419,7 @@ fn rotate_mac<O: NetOps>(ops: &O, mac: [u8; 6]) -> std::io::Result<()> {
     // hwaddr change, and the `set_mac` below is what decides the outcome.
     if let Err(e) = ops.set_link_up(false) {
         tracing::debug!(
-            "vmcell-guest-agent: resync link-down before the MAC rotation failed: {}; continuing",
+            "vmcell-steward: resync link-down before the MAC rotation failed: {}; continuing",
             e
         );
     }
@@ -428,7 +428,7 @@ fn rotate_mac<O: NetOps>(ops: &O, mac: [u8; 6]) -> std::io::Result<()> {
         Err(e) => {
             if let Err(up) = ops.set_link_up(true) {
                 tracing::warn!(
-                    "vmcell-guest-agent: resync could not re-raise the link after a failed MAC rotation: {}",
+                    "vmcell-steward: resync could not re-raise the link after a failed MAC rotation: {}",
                     up
                 );
             }
@@ -474,14 +474,14 @@ fn apply_resync_net<O: NetOps>(
                 // are about to destroy: refuse the bounce rather than perform an
                 // irreversible teardown blind. Reported as "MAC not applied".
                 tracing::warn!(
-                    "vmcell-guest-agent: resync cannot read the default route ({}); skipping the MAC rotation so the guest keeps its route",
+                    "vmcell-steward: resync cannot read the default route ({}); skipping the MAC rotation so the guest keeps its route",
                     e
                 );
                 return out;
             }
             Err(e) => {
                 tracing::warn!(
-                    "vmcell-guest-agent: resync cannot read the default route ({}); the IPv4 arm installs its own, so the link bounce is still safe",
+                    "vmcell-steward: resync cannot read the default route ({}); the IPv4 arm installs its own, so the link bounce is still safe",
                     e
                 );
             }
@@ -493,7 +493,7 @@ fn apply_resync_net<O: NetOps>(
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
-                    "vmcell-guest-agent: resync MAC rotation failed: {}; continuing (best-effort)",
+                    "vmcell-steward: resync MAC rotation failed: {}; continuing (best-effort)",
                     e
                 );
                 false
@@ -506,7 +506,7 @@ fn apply_resync_net<O: NetOps>(
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
-                    "vmcell-guest-agent: resync IP rotation failed: {}; continuing (best-effort)",
+                    "vmcell-steward: resync IP rotation failed: {}; continuing (best-effort)",
                     e
                 );
                 false
@@ -520,7 +520,7 @@ fn apply_resync_net<O: NetOps>(
         match ops.replace_default_route(gateway) {
             Ok(()) => out.route_restored = true,
             Err(e) => tracing::warn!(
-                "vmcell-guest-agent: resync could not restore the default route after the link bounce: {}",
+                "vmcell-steward: resync could not restore the default route after the link bounce: {}",
                 e
             ),
         }

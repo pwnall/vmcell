@@ -62,7 +62,7 @@ pub trait VmHandle: Send {
 /// Boots a [`VmHandle`] from a [`LaunchSpec`]. The registry holds one launcher.
 #[async_trait]
 pub trait VmLauncher: Send + Sync {
-    /// Boots a VM to agent-ready and returns its handle.
+    /// Boots a VM to steward-ready and returns its handle.
     async fn launch(&self, spec: &LaunchSpec) -> DaemonResult<Box<dyn VmHandle>>;
 }
 
@@ -152,8 +152,8 @@ impl VmHandle for MicroVmHandle {
         if let Some(secs) = req.timeout_secs {
             er = er.with_timeout(Duration::from_secs(secs));
         }
-        let agent = self.vm.agent(None).await?;
-        let outcome = agent.exec(er).await?;
+        let steward = self.vm.steward(None).await?;
+        let outcome = steward.exec(er).await?;
         Ok(ExecOutcomeDto::from_bytes(
             outcome.code,
             &outcome.stdout,
@@ -228,7 +228,7 @@ impl VmLauncher for MicroVmLauncher {
         let cfg = builder.build()?;
 
         // Restore from a snapshot (via CoW so the named artifact is preserved and re-restorable,
-        // design §8.4, The zygote fan-out and the OverlayStore seam) or cold-boot. Both then bring the agent up: for a cold boot that confirms
+        // design §8.4, The zygote fan-out and the OverlayStore seam) or cold-boot. Both then bring the steward up: for a cold boot that confirms
         // it booted; for a restore it drives the mandatory first post-restore resync (design §13, Cross-cutting invariants).
         let mut vm = if let Some(dir) = &spec.restore_from {
             // Restore named artifacts through the process-wide overlay store carried on `self.env`
@@ -239,7 +239,7 @@ impl VmLauncher for MicroVmLauncher {
             vmcell::MicroVm::start(&self.vmm, cfg, &self.env).await?
         };
         // A registered VM in `Ready` is genuinely ready (design §11.4, The VM registry and the start-up sweep "derived from the handle").
-        vm.agent(None).await?;
+        vm.steward(None).await?;
         Ok(Box::new(MicroVmHandle { vm }))
     }
 }

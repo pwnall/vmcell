@@ -144,7 +144,32 @@ name = "vmcell"
 #       each against a property rather than a bare no-panic check. Not in `default`, so
 #       `cargo semver-checks` (which runs on default features) sees nothing and a consumer that does
 #       not ask for it is unaffected.
-version = "0.14.0"
+# 0.14.0 → 0.15.0: design v33 §18 delta 1 — the steward rename, landed first and alone. The in-guest
+# control-plane process was `vmcell-guest-agent`; it is `vmcell-steward` now. vmcell explicitly
+# serves AGENTIC EXECUTION as a domain, so "the agent" was about to mean two different things in
+# every consumer's prose; the window to fix that closes as consumers accumulate. This is a pure
+# vocabulary pass — no behavior, no wire format, and no cache key moves — so the whole migration is
+# a `sed` over this identifier list:
+#   AgentClient            → StewardClient
+#   MicroVm::agent()       → MicroVm::steward()
+#   vmcell::agent (module) → vmcell::steward   (incl. `agent::session` → `steward::session`)
+#   Error::Agent           → Error::Steward
+#   GuestAgentStage        → StewardStage
+#   AGENT_VSOCK_PORT       → STEWARD_VSOCK_PORT
+#   crate vmcell-guest-agent → vmcell-steward  (lib `vmcell_guest_agent` → `vmcell_steward`)
+#   /usr/sbin/vmcell-guest-agent → /usr/sbin/vmcell-steward   (DEFAULT_INIT)
+#   --agent-musl           → --steward-musl    (vmcell-cli)
+#   guest_agent_src_hash / guest_agent_closure_hash → steward_src_hash / steward_closure_hash
+# Every one of those is `cargo semver-checks`-visible as a removal-plus-addition, hence the pre-1.0
+# minor bump. The retired identifiers are now flagged by `scripts/ban-legacy-terms.sh` (one MUST-flag
+# fixture per pattern, each verified to redden on deleting its scanner branch), so a re-introduction
+# fails CI. The ban is IDENTIFIER-shaped, never the bare word "agent": the agentic-execution domain
+# text, `AGENTS.md`, historical finding IDs (`AGENT-2`), Kata's `agent-ctl`, and HTTP's
+# `User-Agent`/`Proxy-Agent` all legitimately keep it.
+#   Ledger fidelity note: the 0.3 and 0.4 entries above still say `AgentClient`, deliberately. They
+#   record what a consumer saw AT those versions; rewriting them would make them false. This entry
+#   is the one place the old→new mapping lives.
+version = "0.15.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -267,7 +292,7 @@ required-features = ["cloud-hypervisor"]
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 thiserror = "2"
-# the framed postcard wire enum, shared with the guest agent (v15 §10.1). The explicit
+# the framed postcard wire enum, shared with the steward (v15 §10.1). The explicit
 # `version` (alongside `path`) keeps the cargo-deny `wildcards = "deny"` gate happy — a bare
 # path dep reads as a `*` requirement.
 vmcell-protocol = { path = "../vmcell-protocol", version = "0.5.0" }
@@ -356,7 +381,7 @@ http = { version = "1", optional = true }
 # validator (design §5.4/§8.5). This is a dev-dependency cycle (`vmcell(dev) →
 # vmcell-artifact-validator → vmcell`), which cargo permits, so `vmcell` itself gains no
 # runtime edge to the validator.
-vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.2.0" }
+vmcell-artifact-validator = { path = "../vmcell-artifact-validator", version = "0.3.0" }
 # The `vmm_matrix_test!` harness and the FC/QEMU capability/lifecycle/`qemu_*` tests construct the
 # concrete backends, which now live in these crates. Same permitted dev-dependency cycle as the
 # validator above (`vmcell(dev) → vmcell-firecracker/vmcell-qemu → vmcell`), so `vmcell` gains no
@@ -416,7 +441,7 @@ test-support = []
 # deny-list label-boundary matcher, fuzzed against the normalization/sibling-label properties;
 # `artifact::tar2erofs::fuzz_node_paths` — the merged-tree key set an OCI layer produces, fuzzed for
 # path confinement; `artifact::rootfs::fuzz_validate_extra_files` — the F5 injection-dest validator,
-# fuzzed for the reserved/duplicate escape law (`/usr/sbin/./vmcell-guest-agent`, `/opt/.`). Each is
+# fuzzed for the reserved/duplicate escape law (`/usr/sbin/./vmcell-steward`, `/opt/.`). Each is
 # a thin `#[cfg(feature = "fuzzing")]` wrapper that CALLS the production predicate — never a second
 # copy of its logic.
 fuzzing = []

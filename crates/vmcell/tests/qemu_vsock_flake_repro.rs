@@ -1,22 +1,22 @@
-// Regression gate for the intermittent QEMU "Agent connection timed out" flake
-// (docs/benchmark-results.md, "QEMU agent-timeout flake").
+// Regression gate for the intermittent QEMU "Steward connection timed out" flake
+// (docs/benchmark-results.md, "QEMU steward-timeout flake").
 //
 // ROOT CAUSE (diagnosed via this harness): QEMU's vsock rides an external
 // `vhost-device-vsock` daemon over a `vhost-user-vsock` virtqueue. Its bring-up
 // races: on ~11% of boots the data path comes up wedged for the VM's whole life —
 // the daemon is alive and accepts the host `CONNECT`, but never reaches the guest
 // listener (probe below returns "<no reply>"), and the guest itself is fine (boots,
-// no panic under panic=1, agent running). CH/FC terminate vsock inside the VMM, so
+// no panic under panic=1, steward running). CH/FC terminate vsock inside the VMM, so
 // they never hit this — only QEMU does. The wedge is persistent-per-instance, so the
 // host's 10 s of retries all fail.
 //
 // FIX (`MicroVm::start`'s control-plane health-gate → `VmInstance::verify_control_plane`,
 // QEMU override): after boot, probe the vsock path with a bounded budget; a wedged
 // VM is re-spawned on the same per-VM resources instead of being handed back to fail
-// ~10 s later at `agent()`. With N=4 re-spawns the residual is ~0.11^5 ≈ 1.6e-5/VM.
+// ~10 s later at `steward()`. With N=4 re-spawns the residual is ~0.11^5 ≈ 1.6e-5/VM.
 //
 // So this test is RED before the fix (reproduces the flake at ~11%) and GREEN after
-// (the re-spawn makes every boot reach the agent). It runs in `just test-privileged`
+// (the re-spawn makes every boot reach the steward). It runs in `just test-privileged`
 // (which passes `--run-ignored all --features ...,qemu`); it is `#[ignore]`d so it
 // stays out of the KVM-free `just ci` (`cargo nextest run --all-features`, no
 // `--run-ignored`). The daemon-CONNECT probe on failure stays as the diagnostic that
@@ -38,7 +38,7 @@ mod common;
 // removed) with P ≈ 1 - 0.89^30 ≈ 0.97, while the fix's ~1.6e-5/VM residual keeps a
 // spurious red at ~5e-4. Validated green at 120 aggregate when the fix landed.
 const ITERS: usize = 30;
-const AGENT_TIMEOUT: Duration = Duration::from_secs(10);
+const STEWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Raw host-side probe of the vhost-device-vsock daemon: connect to the host UDS,
 // send the Firecracker-hybrid `CONNECT <port>` line, and return the daemon's first
@@ -94,7 +94,7 @@ async fn qemu_vsock_flake_repro() {
         let serial_path = vm.instance().serial_log().to_path_buf();
 
         let t = Instant::now();
-        match vm.agent(Some(AGENT_TIMEOUT)).await {
+        match vm.steward(Some(STEWARD_TIMEOUT)).await {
             Ok(_) => {
                 ok += 1;
                 connect_ms.push(t.elapsed().as_millis());
@@ -106,7 +106,7 @@ async fn qemu_vsock_flake_repro() {
                 // reader sees *why* it flaked, not just that it did.
                 let uds = serial_path.with_file_name("vsock.sock");
                 eprintln!(
-                    "\n========== [{i}] AGENT FAILED after {:?}: {e}",
+                    "\n========== [{i}] STEWARD FAILED after {:?}: {e}",
                     t.elapsed()
                 );
                 eprintln!("  vsock UDS present on host: {}", uds.exists());
@@ -132,6 +132,6 @@ async fn qemu_vsock_flake_repro() {
     );
     assert_eq!(
         fail, 0,
-        "reproduced the QEMU agent-connect flake ({fail}/{ITERS})"
+        "reproduced the QEMU steward-connect flake ({fail}/{ITERS})"
     );
 }

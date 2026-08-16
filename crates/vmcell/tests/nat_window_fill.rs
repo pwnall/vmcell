@@ -1,8 +1,8 @@
 use std::io::Write;
 use std::process::Command;
 use vmcell::MicroVm;
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::steward::protocol::ExecRequest;
 
 mod common;
 
@@ -109,12 +109,15 @@ async fn test_nat_window_fill_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .expect("guest IP-PNP must configure eth0");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let agent = vm.agent(None).await.expect("Failed to connect to agent");
+    let steward = vm
+        .steward(None)
+        .await
+        .expect("Failed to connect to steward");
 
     // Download the >64 KiB body through the NAT and digest it IN-GUEST. If the
     // host→guest pump drops any tail (the pre-fix unbounded read), the guest body
     // is truncated and its md5 differs from the host's.
-    let outcome = agent
+    let outcome = steward
         .exec(ExecRequest::new(vec![
             "sh".into(),
             "-c".into(),
@@ -265,12 +268,15 @@ async fn test_nat_window_fill_upload_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .expect("guest IP-PNP must configure eth0");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let agent = vm.agent(None).await.expect("Failed to connect to agent");
+    let steward = vm
+        .steward(None)
+        .await
+        .expect("Failed to connect to steward");
 
     // Build the body in-guest, digest it there, then POST it through the NAT.
     // `-H 'Expect:'` suppresses curl's 100-continue round trip (a fixed 1 s stall
     // on bodies > 1 KiB); the trailing `%{http_code}` proves the sink replied.
-    let outcome = agent
+    let outcome = steward
         .exec(
             ExecRequest::new(vec![
                 "sh".into(),

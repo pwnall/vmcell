@@ -4,7 +4,7 @@
 //! VM-to-VM segment gates connect to (§3.2, §6.5).
 //!
 //! It is baked into the rootfs erofs at `/vmcell-tools/vmcell-guest-tools` (with
-//! `ip`/`curl`/`kvm-ok`/`echo-server` symlinks), which the guest agent places on
+//! `ip`/`curl`/`kvm-ok`/`echo-server` symlinks), which the steward places on
 //! the exec `PATH`. Baking — rather than a virtio-fs share — is what lets the
 //! *unprivileged* egress test use the tools: virtiofsd cannot enter its sandbox
 //! unprivileged, so a share fails there, whereas the erofs rootfs is served over
@@ -19,7 +19,7 @@
 //! otherwise the first argument selects it (`vmcell-guest-tools <cmd> …`). The
 //! `echo-server` applet is additionally usable as a custom `init=` target (its
 //! symlink is an absolute path and it needs no writable root), which is how the
-//! raw dial's guard-bypass claim is validated live with no agent in the guest.
+//! raw dial's guard-bypass claim is validated live with no steward in the guest.
 //!
 //! `print_stdout`/`print_stderr` are intentionally NOT denied here — reproducing
 //! `ip`/`curl`/`kvm-ok` output on stdout/stderr, and announcing/diagnosing the
@@ -343,10 +343,10 @@ fn run_echo_server(args: &[String]) -> i32 {
 
 /// Binds and listens on [`libc::VMADDR_CID_ANY`]`:<port>` over AF_VSOCK — bind on
 /// whatever context id the VMM gave this guest, so the listener need not know its
-/// own CID (the guest agent binds the same way). The constant is `libc`'s, never a
+/// own CID (the steward binds the same way). The constant is `libc`'s, never a
 /// second local spelling of the same kernel ABI value.
 ///
-/// Hand-rolled on `libc` rather than on the sync `vsock` crate the guest agent uses
+/// Hand-rolled on `libc` rather than on the sync `vsock` crate the steward uses
 /// (which is what design §18 delta 7 sketches): this crate already links `libc` for
 /// its `ifreq` ioctls, and the three calls below (`socket`/`bind`/`listen`) are
 /// exactly what a wrapper would make — recorded as a deviation in
@@ -964,10 +964,10 @@ fn read_trim(path: &str) -> Option<String> {
 // --- interface ioctls for `ip link set … address` (restore MAC rotation) ---
 //
 // `ifreq-stack-duplicated-guest-tools` (docs/78 §6): this `IfReq` + link-ioctl
-// stack is a SECOND copy of the one in `vmcell_guest_agent::netif`, against the
+// stack is a SECOND copy of the one in `vmcell_steward::netif`, against the
 // "kernel ABI structs are `#[repr(C)]`, defined once" rule. The review offered two
 // routes; this is the RECORDED-deviation route (b), with a strengthened divergence
-// guard. Why not route (a), consolidating onto the agent's lib target:
+// guard. Why not route (a), consolidating onto the steward's lib target:
 //
 //   * `netif` deliberately exports only what PID 1 calls — `set_loopback_up` and
 //     the one composed `resync_net`. Guest-tools additionally needs a general
@@ -975,11 +975,11 @@ fn read_trim(path: &str) -> Option<String> {
 //     (`SIOCGIFADDR`/`SIOCGIFNETMASK`, for `ip addr`'s `inet` line), neither of
 //     which PID 1 has any use for. Consolidating means GROWING the audited PID-1
 //     surface — and its `unsafe` blocks — with code PID 1 never executes, which is
-//     the opposite of the lean-agent posture (§13 C1).
-//   * guest-tools would link the agent's whole production graph (vsock, postcard,
+//     the opposite of the lean-steward posture (§13 C1).
+//   * guest-tools would link the steward's whole production graph (vsock, postcard,
 //     rustix, signal-hook, tracing, tracing-subscriber, vmcell-protocol) to reuse
-//     ~60 lines of `libc`. (The reverse direction is safe — the lean-agent gate
-//     reads `cargo tree -e no-dev -p vmcell-guest-agent`, i.e. the agent's own
+//     ~60 lines of `libc`. (The reverse direction is safe — the lean-steward gate
+//     reads `cargo tree -e no-dev -p vmcell-steward`, i.e. the steward's own
 //     subtree, which a dependent cannot enter — so that is not the objection.)
 //
 // The honest consolidation is a third `libc`-only crate both depend on; that is a
@@ -991,7 +991,7 @@ fn read_trim(path: &str) -> Option<String> {
 // `netif::HWADDR_{FAMILY,MAC}_OFFSET`, and
 // `ifreq_is_pinned_field_by_field_to_the_kernel_abi` pins offsets + sizes against
 // `libc::ifreq`/`sockaddr`/`sockaddr_in`. Both copies are anchored to the same ABI,
-// so a drift in either reddens in its own crate — the agent half now holds up its
+// so a drift in either reddens in its own crate — the steward half now holds up its
 // end too (m25): `netif` takes its request numbers from `libc` and pins them in
 // `netif::tests::ioctl_requests_and_flags_are_pinned_to_the_kernel_abi`.
 //
@@ -1105,7 +1105,7 @@ fn set_link_up(fd: libc::c_int, dev: &str, up: bool) -> std::io::Result<()> {
 /// Builds the `ifreq` submitted to `SIOCSIFHWADDR` for `dev`+`mac`: the interface
 /// name, `ARPHRD_ETHER` in the sockaddr family, then the six MAC bytes. Split out
 /// so the byte layout is unit-testable without a live interface (M-GUEST-3),
-/// mirroring the guest-agent `netif::hwaddr_ifreq` helper.
+/// mirroring the steward `netif::hwaddr_ifreq` helper.
 fn hwaddr_ifreq(dev: &str, mac: [u8; 6]) -> std::io::Result<IfReq> {
     let mut ifr = IfReq::new(dev)?;
     // ifr_hwaddr: sa_family (host-order u16) then sa_data; first 6 data bytes are
@@ -2261,7 +2261,7 @@ mod tests {
     }
 
     // `ifreq-stack-duplicated-guest-tools` (docs/78 §6) — the divergence guard for
-    // the recorded duplication of `vmcell_guest_agent::netif`'s ABI stack.
+    // the recorded duplication of `vmcell_steward::netif`'s ABI stack.
     //
     // Total size alone is NOT enough: it stays green while the union moves, while
     // the name array shrinks and the union grows to compensate, or while the fields
@@ -2327,7 +2327,7 @@ mod tests {
     }
 
     // The five ioctl request numbers this file issues, plus the two ABI constants,
-    // pinned to their kernel values — which are ALSO the literals the agent's
+    // pinned to their kernel values — which are ALSO the literals the steward's
     // `netif` copy hardcodes (0x8913/0x8914/0x8924 there). Production code takes
     // them from `libc` (never a second local spelling of a kernel ABI value, the
     // rule this file already applies to `VMADDR_CID_ANY`), so this test is what

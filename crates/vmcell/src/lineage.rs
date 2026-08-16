@@ -113,7 +113,7 @@ pub struct Lineage {
 }
 
 impl Lineage {
-    /// Roots a lineage by **suspending** a live, agent-ready VM into `dir`
+    /// Roots a lineage by **suspending** a live, steward-ready VM into `dir`
     /// (generation 0, no parent).
     ///
     /// `cfg` must be the snapshot-eligible config `vm` was created with. Clones
@@ -259,7 +259,7 @@ impl Lineage {
     ///
     /// Delegates to [`Zygote::spawn_clone`]; works on any snapshot backend. The
     /// returned VM is live and resumed, with a fresh vmid (hence distinct IP/MAC,
-    /// §8.2, Restore correctness: a restored VM is not a fresh VM); its first `agent()` call runs the mandatory post-restore resync.
+    /// §8.2, Restore correctness: a restored VM is not a fresh VM); its first `steward()` call runs the mandatory post-restore resync.
     ///
     /// # Errors
     /// Any error from the copy-on-write copy, network setup, or restore (§8.4, The zygote fan-out and the OverlayStore seam).

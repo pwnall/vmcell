@@ -1,6 +1,6 @@
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{RootfsSource, VmConfig};
 use vmcell::orchestrator::MicroVm;
+use vmcell::steward::protocol::ExecRequest;
 
 mod common;
 
@@ -100,20 +100,20 @@ async fn test_nested_virt_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .await
         .expect("Failed to start VM");
 
-    let agent = match vm.agent(None).await {
+    let steward = match vm.steward(None).await {
         Ok(a) => a,
         Err(e) => {
             use vmcell::vmm::VmInstance;
             let log = tokio::fs::read_to_string(vm.instance().serial_log())
                 .await
                 .unwrap_or_default();
-            panic!("Failed to connect to agent: {e}\nSerial log:\n{log}");
+            panic!("Failed to connect to steward: {e}\nSerial log:\n{log}");
         }
     };
 
     // The positive nested-virt contract is the extracted `checks::nested_kvm_ok` the validator
     // runs (§4.4, The in-rootfs guest-tools helper); driving it here keeps one implementation.
-    vmcell_artifact_validator::checks::nested_kvm_ok(agent)
+    vmcell_artifact_validator::checks::nested_kvm_ok(steward)
         .await
         .expect("nested /dev/kvm must be exposed with nested_virt = true");
 
@@ -154,14 +154,14 @@ async fn test_nested_virt_disabled_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .await
         .expect("Failed to start VM");
 
-    let agent = match vm.agent(None).await {
+    let steward = match vm.steward(None).await {
         Ok(a) => a,
         Err(e) => {
             use vmcell::vmm::VmInstance;
             let log = tokio::fs::read_to_string(vm.instance().serial_log())
                 .await
                 .unwrap_or_default();
-            panic!("Failed to connect to agent: {e}\nSerial log:\n{log}");
+            panic!("Failed to connect to steward: {e}\nSerial log:\n{log}");
         }
     };
 
@@ -173,7 +173,7 @@ async fn test_nested_virt_disabled_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // flag no longer flips this param (e.g. the token stops being emitted, or the
     // kernel default leaks through), this goes red — pinning the flag as the causal
     // lever.
-    let result = agent
+    let result = steward
         .exec(ExecRequest::new(vec![
             "sh".to_string(),
             "-c".to_string(),

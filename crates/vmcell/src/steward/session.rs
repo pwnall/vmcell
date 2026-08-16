@@ -1,9 +1,9 @@
-//! Host-side interactive-session multiplexer (§3, The control plane: vsock, the host clients, and the guest agent).
+//! Host-side interactive-session multiplexer (§3, The control plane: vsock, the host clients, and the steward).
 //!
-//! [`SessionMux`] owns its **own** vsock connection to the guest agent — separate
-//! from the one-shot [`AgentClient`], so the two never share a
+//! [`SessionMux`] owns its **own** vsock connection to the steward — separate
+//! from the one-shot [`StewardClient`], so the two never share a
 //! stream — and multiplexes many concurrent [`Session`]s over it, each keyed by a
-//! [`SessionId`]. It reuses the one [`AgentClient`]
+//! [`SessionId`]. It reuses the one [`StewardClient`]
 //! connect/handshake law (§13, Cross-cutting invariants), then splits the framed stream into a background
 //! reader task (demuxes guest→host
 //! `SessionStdout`/`SessionStderr`/`SessionExit` to per-session channels) and a
@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-use super::{AgentClient, ControlStream, encode_frame};
+use super::{ControlStream, StewardClient, encode_frame};
 use crate::error::{Error, Result};
 use crate::vmm::VsockEndpoint;
 use vmcell_protocol::{
@@ -46,7 +46,7 @@ type FrameSink = SplitSink<FramedStream, ::bytes::Bytes>;
 /// error rather than registering into a map nothing will ever read from.
 type Registry = Arc<Mutex<Option<HashMap<SessionId, mpsc::UnboundedSender<SessionEvent>>>>>;
 
-/// An output or terminal event delivered to a [`Session`] (§3, The control plane: vsock, the host clients, and the guest agent).
+/// An output or terminal event delivered to a [`Session`] (§3, The control plane: vsock, the host clients, and the steward).
 ///
 /// A session yields zero-or-more `Stdout`/`Stderr` events then exactly one `Exit`
 /// — after which [`Session::recv`] returns `None` (§13, Cross-cutting invariants). A PTY session merges
@@ -126,8 +126,8 @@ impl SessionSpecBuilder {
     }
 }
 
-/// A multiplexing connection to the guest agent for interactive sessions
-/// (§3, The control plane: vsock, the host clients, and the guest agent). See the [module docs](self).
+/// A multiplexing connection to the steward for interactive sessions
+/// (§3, The control plane: vsock, the host clients, and the steward). See the [module docs](self).
 #[derive(Debug)]
 pub struct SessionMux {
     /// Outgoing frames to the writer task (host mirror of the single-writer law).
@@ -139,8 +139,8 @@ pub struct SessionMux {
 }
 
 impl SessionMux {
-    /// Connects a fresh session-multiplexing connection to the guest agent, using
-    /// the same connect/handshake law as [`AgentClient`]
+    /// Connects a fresh session-multiplexing connection to the steward, using
+    /// the same connect/handshake law as [`StewardClient`]
     /// (§13, Cross-cutting invariants).
     ///
     /// # Errors
@@ -178,7 +178,7 @@ impl SessionMux {
         timeouts: &crate::config::Timeouts,
         serial_log: &dyn crate::vmm::SerialLog,
     ) -> Result<Self> {
-        let framed = AgentClient::connect_framed(endpoint, timeout, timeouts, serial_log).await?;
+        let framed = StewardClient::connect_framed(endpoint, timeout, timeouts, serial_log).await?;
         Ok(Self::from_framed(framed))
     }
 
@@ -208,7 +208,7 @@ impl SessionMux {
     /// `SessionEvent::Exit(127)`.
     ///
     /// # Errors
-    /// Returns [`Error::Agent`] if the underlying connection has already closed.
+    /// Returns [`Error::Steward`] if the underlying connection has already closed.
     pub async fn open(&self, spec: SessionSpec) -> Result<Session> {
         let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         // Encode + `MAX_FRAME_BYTES`-check BEFORE touching the registry, so an
@@ -225,7 +225,7 @@ impl SessionMux {
             // enqueued, leaving `recv()`/`wait()` pending forever with no error.
             let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             let Some(sessions) = reg.as_mut() else {
-                return Err(Error::Agent("session connection is closed".into()));
+                return Err(Error::Steward("session connection is closed".into()));
             };
             sessions.insert(id, event_tx);
         }
@@ -242,7 +242,7 @@ impl SessionMux {
             {
                 sessions.remove(&id);
             }
-            return Err(Error::Agent("session connection is closed".into()));
+            return Err(Error::Steward("session connection is closed".into()));
         }
         Ok(Session {
             id,
@@ -304,7 +304,7 @@ impl Drop for SessionMux {
     }
 }
 
-/// A handle to one interactive session on a [`SessionMux`] (§3, The control plane: vsock, the host clients, and the guest agent).
+/// A handle to one interactive session on a [`SessionMux`] (§3, The control plane: vsock, the host clients, and the steward).
 ///
 /// Send input with [`write_stdin`](Session::write_stdin) /
 /// [`close_stdin`](Session::close_stdin), resize a PTY with
@@ -334,7 +334,7 @@ impl Session {
     /// terminal input).
     ///
     /// # Errors
-    /// Returns [`Error::Agent`] if the connection has closed.
+    /// Returns [`Error::Steward`] if the connection has closed.
     pub async fn write_stdin(&self, data: &[u8]) -> Result<()> {
         self.send(Message::Stdin {
             session: self.id,
@@ -346,7 +346,7 @@ impl Session {
     /// input in-band or with [`close`](Session::close)).
     ///
     /// # Errors
-    /// Returns [`Error::Agent`] if the connection has closed.
+    /// Returns [`Error::Steward`] if the connection has closed.
     pub async fn close_stdin(&self) -> Result<()> {
         self.send(Message::StdinEof { session: self.id })
     }
@@ -354,7 +354,7 @@ impl Session {
     /// Resizes a PTY session's window (`SIGWINCH`); a no-op for a pipe session.
     ///
     /// # Errors
-    /// Returns [`Error::Agent`] if the connection has closed.
+    /// Returns [`Error::Steward`] if the connection has closed.
     pub async fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         self.send(Message::Winsize {
             session: self.id,
@@ -367,7 +367,7 @@ impl Session {
     /// resulting exit still arrives as the session's terminal [`SessionEvent::Exit`].
     ///
     /// # Errors
-    /// Returns [`Error::Agent`] if the connection has closed.
+    /// Returns [`Error::Steward`] if the connection has closed.
     pub async fn close(&self) -> Result<()> {
         self.send(Message::CloseSession { session: self.id })
     }
@@ -376,7 +376,7 @@ impl Session {
         let frame = encode_frame(&msg)?;
         self.write_tx
             .send(frame)
-            .map_err(|_| Error::Agent("session connection is closed".into()))
+            .map_err(|_| Error::Steward("session connection is closed".into()))
     }
 
     /// Receives the next session event, or `None` once the terminal
@@ -699,7 +699,7 @@ mod tests {
     }
 
     // M1 / M5d: an over-cap host→guest write must fail loud at the Session boundary
-    // (typed Error::Agent, matching the `# Errors` doc) and MUST NOT wedge the mux
+    // (typed Error::Steward, matching the `# Errors` doc) and MUST NOT wedge the mux
     // writer for other sessions. RED on the pre-fix code: the over-cap write returns
     // Ok(()) (first assert fails) and the writer task dies on the encode-cap error in
     // sink.send, so session 1's follow-up frame never reaches the guest peer (the
@@ -732,8 +732,8 @@ mod tests {
             .await
             .expect_err("an over-cap write_stdin must fail loud, not return Ok(())");
         assert!(
-            matches!(err, Error::Agent(_)),
-            "over-cap write must surface as Error::Agent (matching the `# Errors` doc); got {err:?}"
+            matches!(err, Error::Steward(_)),
+            "over-cap write must surface as Error::Steward (matching the `# Errors` doc); got {err:?}"
         );
 
         // The writer task must still be alive: a small write on ANOTHER session
@@ -772,7 +772,7 @@ mod tests {
             .open(SessionSpec::new(ExecRequest::new(vec![big])))
             .await
             .expect_err("an over-cap OpenSession must fail loud");
-        assert!(matches!(err, Error::Agent(_)), "got {err:?}");
+        assert!(matches!(err, Error::Steward(_)), "got {err:?}");
         assert_eq!(
             mux.registry_len(),
             0,
@@ -781,7 +781,7 @@ mod tests {
     }
 
     /// M5 shared leg: `open()` on a mux whose reader has ended must fail loud with
-    /// the documented `Error::Agent`, promptly (the timeout turns a regression into
+    /// the documented `Error::Steward`, promptly (the timeout turns a regression into
     /// a RED test rather than a hung one) and with zero registry residue.
     async fn assert_open_refused(mux: &SessionMux, what: &str) {
         let err = tokio::time::timeout(
@@ -792,8 +792,8 @@ mod tests {
         .expect("open must return promptly once the connection is closed")
         .expect_err("open after the reader exited must fail loud, not hand back a hung session");
         assert!(
-            matches!(err, Error::Agent(_)),
-            "open after {what} must be Error::Agent (the `# Errors` contract); got {err:?}"
+            matches!(err, Error::Steward(_)),
+            "open after {what} must be Error::Steward (the `# Errors` contract); got {err:?}"
         );
         assert_eq!(
             mux.registry_len(),
@@ -882,7 +882,7 @@ mod tests {
             .open(SessionSpec::new(ExecRequest::new(vec!["a".into()])))
             .await
             .expect_err("open must fail once the writer channel is closed");
-        assert!(matches!(err, Error::Agent(_)), "got {err:?}");
+        assert!(matches!(err, Error::Steward(_)), "got {err:?}");
         assert_eq!(
             mux.registry_len(),
             0,

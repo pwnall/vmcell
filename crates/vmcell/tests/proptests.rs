@@ -1,6 +1,6 @@
 use proptest::prelude::*;
-use vmcell::agent::ExecRequest;
-use vmcell::agent::protocol::Message;
+use vmcell::steward::ExecRequest;
+use vmcell::steward::protocol::Message;
 use vmcell::vmm::CidAllocator;
 
 proptest! {

@@ -38,10 +38,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use vmcell::HostEnv;
-use vmcell::agent::protocol::ExecRequest;
-use vmcell::agent::session::SessionSpecBuilder;
 use vmcell::config::{Egress, NetConfig, RestoreMode, RootfsSource, VmConfig};
 use vmcell::orchestrator::{MicroVm, VmidAllocator};
+use vmcell::steward::protocol::ExecRequest;
+use vmcell::steward::session::SessionSpecBuilder;
 use vmcell::vmm::{VmInstance, Vmm};
 
 #[derive(Parser, Debug)]
@@ -294,11 +294,11 @@ async fn run_bench<V: Vmm>(
             // a skip — fail loud so it can't masquerade as success.
             Err(e) => anyhow::bail!("{name}: failed to start base VM for snapshotting: {e}"),
         };
-        if let Err(e) = base_vm.agent(None).await {
+        if let Err(e) = base_vm.steward(None).await {
             // Best-effort graceful teardown of the base VM; `MicroVm::Drop` is the
             // real, guaranteed teardown, so a shutdown error is not actionable here.
             let _ = base_vm.shutdown().await;
-            anyhow::bail!("{name}: failed to connect to base VM agent: {e}");
+            anyhow::bail!("{name}: failed to connect to base VM steward: {e}");
         }
         if let Err(e) = std::fs::create_dir_all(&snap_dir) {
             // Best-effort teardown of the booted base VM before bailing.
@@ -327,7 +327,7 @@ async fn run_bench<V: Vmm>(
     // write. If any iteration could not actually drop the cache, the cold numbers are
     // warm-cache and the label says so instead of mislabeling them.
     let mut page_cache_dropped = true;
-    // H-BIN-2: post-warmup agent-connect failures shrink the sample set — count and
+    // H-BIN-2: post-warmup steward-connect failures shrink the sample set — count and
     // print them (with the iteration + error) instead of letting the count silently
     // drop. Warmup failures are tracked separately since they never count as samples.
     let mut dropped = 0usize;
@@ -347,17 +347,17 @@ async fn run_bench<V: Vmm>(
 
         match vm_res {
             Ok(mut vm) => {
-                match vm.agent(None).await {
-                    Ok(_agent) => {
+                match vm.steward(None).await {
+                    Ok(_steward) => {
                         let elapsed = start.elapsed().as_millis();
                         if i >= args.warmup {
                             latencies.push(elapsed);
                         }
                     }
                     Err(e) => {
-                        // H-BIN-2: a silent `if let Ok(_agent)` hid agent-connect
+                        // H-BIN-2: a silent `if let Ok(_steward)` hid steward-connect
                         // failures; surface each and account for the discarded sample.
-                        println!("{name}: iteration {i} agent-connect failed: {e}");
+                        println!("{name}: iteration {i} steward-connect failed: {e}");
                         if i >= args.warmup {
                             dropped += 1;
                         } else {
@@ -973,7 +973,7 @@ fn stage_artifact_store(store: &Path, kernel: &Path, rootfs: &Path) -> anyhow::R
 /// the message names the missing **paths** and not just the artifacts dir — under an override the
 /// missing file is not under that dir at all, and `"missing artifacts in <dir>"` sent the reader to
 /// a directory where nothing was wrong. KVM-independent: it runs before any boot, which would
-/// otherwise hang on the agent-connect timeout.
+/// otherwise hang on the steward-connect timeout.
 ///
 /// # Errors
 /// Returns an error naming every missing path, after printing the mode's "No successful runs"
@@ -1238,8 +1238,8 @@ async fn pick_exec_cmd<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<String> {
         vec!["true".to_string()],
     ];
     for c in candidates {
-        if let Ok(agent) = vm.agent(None).await
-            && let Ok(o) = agent.exec(ExecRequest::new(c.clone())).await
+        if let Ok(steward) = vm.steward(None).await
+            && let Ok(o) = steward.exec(ExecRequest::new(c.clone())).await
             && o.code == 0
         {
             return c;
@@ -1291,8 +1291,8 @@ async fn run_footprint<V: Vmm>(
                 break;
             }
         };
-        if let Err(e) = vm.agent(None).await {
-            println!("footprint: agent connect {i} failed: {e}");
+        if let Err(e) = vm.steward(None).await {
+            println!("footprint: steward connect {i} failed: {e}");
             // Best-effort teardown of the just-booted guest before bailing; `Drop`
             // guarantees the real teardown, so a shutdown error is not actionable.
             let _ = vm.shutdown().await;
@@ -1371,8 +1371,8 @@ async fn run_footprint<V: Vmm>(
             tot_file += read_proc_status_kb(pid, "RssFile").unwrap_or(0);
             tot_shmem += read_proc_status_kb(pid, "RssShmem").unwrap_or(0);
         }
-        if let Ok(agent) = v.agent(None).await {
-            if let Ok(o) = agent
+        if let Ok(steward) = v.steward(None).await {
+            if let Ok(o) = steward
                 .exec(ExecRequest::new(vec!["cat".into(), "/proc/meminfo".into()]))
                 .await
             {
@@ -1384,7 +1384,7 @@ async fn run_footprint<V: Vmm>(
                     guest_avail.push(a);
                 }
             }
-            if let Ok(o) = agent
+            if let Ok(o) = steward
                 .exec(ExecRequest::new(vec![
                     "cat".into(),
                     "/proc/1/status".into(),
@@ -1472,7 +1472,10 @@ async fn run_footprint<V: Vmm>(
         guest_total / 1024,
         mean_u64(&guest_avail) / 1024
     );
-    println!("guest pid1 (agent) RSS mean = {} KiB", mean_u64(&pid1_rss));
+    println!(
+        "guest pid1 (steward) RSS mean = {} KiB",
+        mean_u64(&pid1_rss)
+    );
 
     // Best-effort teardown of every resident guest; `Drop` is the guaranteed path,
     // so a shutdown error on any one VM must not abort cleanup of the rest.
@@ -1523,12 +1526,12 @@ async fn run_suspend_size<V: Vmm>(
             anyhow::bail!("suspend-size: boot failed: {e}");
         }
     };
-    if let Err(e) = vm.agent(None).await {
+    if let Err(e) = vm.steward(None).await {
         // Best-effort teardown + snapshot-dir cleanup; `Drop` guarantees the real
         // teardown and neither cleanup error is actionable.
         let _ = vm.shutdown().await;
         let _ = std::fs::remove_dir_all(&snap_dir);
-        anyhow::bail!("suspend-size: agent connect failed: {e}");
+        anyhow::bail!("suspend-size: steward connect failed: {e}");
     }
     if let Err(e) = vm.snapshot(&snap_dir).await {
         // Best-effort teardown + partial-snapshot cleanup on the failure path.
@@ -1594,7 +1597,7 @@ async fn build_baseline_snapshot<V: Vmm>(
     let mut base = MicroVm::start(vmm, cfg.clone(), env)
         .await
         .map_err(|e| e.to_string())?;
-    base.agent(None).await.map_err(|e| e.to_string())?;
+    base.steward(None).await.map_err(|e| e.to_string())?;
     base.snapshot(snap_dir).await.map_err(|e| e.to_string())?;
     // Best-effort graceful shutdown of the baseline VM once its snapshot is written;
     // `Drop` guarantees teardown, so a shutdown error must not fail the (successful)
@@ -1658,7 +1661,7 @@ async fn phase_budget_path<V: Vmm>(
         };
 
         let t1 = Instant::now();
-        let connect_ok = vm.agent(None).await.is_ok();
+        let connect_ok = vm.steward(None).await.is_ok();
         let t_connect = t1.elapsed();
         if !connect_ok {
             println!("phase-budget {label}: iter {i} connect failed");
@@ -1675,10 +1678,10 @@ async fn phase_budget_path<V: Vmm>(
             .unwrap_or_else(|| vec!["cat".into(), "/proc/uptime".into()]);
 
         let t2 = Instant::now();
-        if let Ok(agent) = vm.agent(None).await {
+        if let Ok(steward) = vm.steward(None).await {
             // The exec *result* is intentionally unused: this phase measures the
             // exec-round-trip latency (t2..t_exec), not the command's exit/output.
-            let _ = agent.exec(ExecRequest::new(argv)).await;
+            let _ = steward.exec(ExecRequest::new(argv)).await;
         }
         let t_exec = t2.elapsed();
 
@@ -1781,18 +1784,18 @@ async fn run_vsock_rtt<V: Vmm>(
         Ok(v) => v,
         Err(e) => anyhow::bail!("vsock-rtt: boot failed: {e}"),
     };
-    if let Err(e) = vm.agent(None).await {
+    if let Err(e) = vm.steward(None).await {
         // Best-effort teardown before bailing; `Drop` guarantees teardown.
         let _ = vm.shutdown().await;
-        anyhow::bail!("vsock-rtt: agent connect failed: {e}");
+        anyhow::bail!("vsock-rtt: steward connect failed: {e}");
     }
     let argv = pick_exec_cmd(&mut vm).await;
 
     for _ in 0..args.warmup {
-        if let Ok(agent) = vm.agent(None).await {
+        if let Ok(steward) = vm.steward(None).await {
             // Warmup iteration: the exec result is discarded on purpose (it primes
             // caches / the vsock path and is not part of the measured sample).
-            let _ = agent.exec(ExecRequest::new(argv.clone())).await;
+            let _ = steward.exec(ExecRequest::new(argv.clone())).await;
         }
     }
 
@@ -1801,15 +1804,15 @@ async fn run_vsock_rtt<V: Vmm>(
     // `if r.is_ok()` drop, and surface the error rather than a bare `break`.
     let mut dropped = 0usize;
     for i in 0..iters {
-        let agent = match vm.agent(None).await {
+        let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
-                println!("vsock-rtt: iteration {i} agent-connect failed: {e}");
+                println!("vsock-rtt: iteration {i} steward-connect failed: {e}");
                 break;
             }
         };
         let t = Instant::now();
-        let r = agent.exec(ExecRequest::new(argv.clone())).await;
+        let r = steward.exec(ExecRequest::new(argv.clone())).await;
         let dt = t.elapsed().as_micros();
         match r {
             Ok(_) => rtts.push(dt),
@@ -1914,7 +1917,7 @@ impl Drop for HostResponder {
 }
 
 /// The in-guest egress client: `curl -s --max-time 5 <url>`. The `curl` this resolves to is the
-/// **guest-tools multicall shim** at `/vmcell-tools/curl`, which the agent puts FIRST on the
+/// **guest-tools multicall shim** at `/vmcell-tools/curl`, which the steward puts FIRST on the
 /// child PATH (`child_path`): the OCI rootfs this repo builds carries no GNU curl at all, so the
 /// shim is the only `curl` in the guest — the measured round-trip is that applet's HTTP GET, not
 /// upstream curl's (the old comment claimed a rootfs `--include=curl`, which no shipped rootfs
@@ -1997,7 +2000,7 @@ async fn run_net_egress_plain<V: Vmm>(
     // egress tests boot a single VM and never hit it. See docs/benchmark-results.md).
     // Retry a transient boot failure on a FRESH VM (fresh smoltcp) a bounded number of
     // times, counting the retries so they are visible, not hidden (mirrors the QEMU vsock
-    // re-spawn recovery). An agent-connect failure is separate `dropped` accounting.
+    // re-spawn recovery). A steward-connect failure is separate `dropped` accounting.
     const NET_BOOT_RETRIES: usize = 5;
 
     // --- Phase A: start latency WITH the smoltcp NAT set up on the boot path ---
@@ -2010,7 +2013,7 @@ async fn run_net_egress_plain<V: Vmm>(
             let t = Instant::now();
             match MicroVm::start(vmm, cfg.clone(), &env).await {
                 Ok(mut vm) => {
-                    match vm.agent(None).await {
+                    match vm.steward(None).await {
                         Ok(_) => {
                             let dt = t.elapsed().as_millis();
                             if i >= args.warmup {
@@ -2018,7 +2021,7 @@ async fn run_net_egress_plain<V: Vmm>(
                             }
                         }
                         Err(e) => {
-                            println!("net-egress: net-start iter {i} agent-connect failed: {e}");
+                            println!("net-egress: net-start iter {i} steward-connect failed: {e}");
                             if i >= args.warmup {
                                 start_dropped += 1;
                             }
@@ -2075,9 +2078,9 @@ async fn run_net_egress_plain<V: Vmm>(
             }
         }
     };
-    if let Err(e) = vm.agent(None).await {
+    if let Err(e) = vm.steward(None).await {
         let _ = vm.shutdown().await;
-        anyhow::bail!("net-egress: egress VM agent connect failed: {e}");
+        anyhow::bail!("net-egress: egress VM steward connect failed: {e}");
     }
     let (gateway_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid())
         .map_err(|e| anyhow::anyhow!("net-egress: ip_math({}): {e}", vm.vmid()))?;
@@ -2089,8 +2092,8 @@ async fn run_net_egress_plain<V: Vmm>(
     // byte (`code==0 && !stdout.is_empty()`), a data-plane assertion.
     let mut warmed = false;
     for _ in 0..40 {
-        if let Ok(agent) = vm.agent(None).await
-            && let Ok(o) = agent.exec(ExecRequest::new(egress_curl(&url))).await
+        if let Ok(steward) = vm.steward(None).await
+            && let Ok(o) = steward.exec(ExecRequest::new(egress_curl(&url))).await
             && o.code == 0
             && !o.stdout.is_empty()
         {
@@ -2107,15 +2110,15 @@ async fn run_net_egress_plain<V: Vmm>(
     let mut rtts = Vec::with_capacity(iters);
     let mut dropped = 0usize;
     for i in 0..iters {
-        let agent = match vm.agent(None).await {
+        let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
-                println!("net-egress: egress iter {i} agent-connect failed: {e}");
+                println!("net-egress: egress iter {i} steward-connect failed: {e}");
                 break;
             }
         };
         let t = Instant::now();
-        let r = agent.exec(ExecRequest::new(egress_curl(&url))).await;
+        let r = steward.exec(ExecRequest::new(egress_curl(&url))).await;
         let dt = t.elapsed().as_micros();
         match r {
             Ok(o) if o.code == 0 && !o.stdout.is_empty() => rtts.push(dt),
@@ -2264,7 +2267,7 @@ async fn run_net_egress_filtered<V: Vmm>(
             let t = Instant::now();
             match MicroVm::start(vmm, cfg.clone(), &env).await {
                 Ok(mut vm) => {
-                    match vm.agent(None).await {
+                    match vm.steward(None).await {
                         Ok(_) => {
                             let dt = t.elapsed().as_millis();
                             if i >= args.warmup {
@@ -2273,7 +2276,7 @@ async fn run_net_egress_filtered<V: Vmm>(
                         }
                         Err(e) => {
                             println!(
-                                "net-egress[{label}]: net-start iter {i} agent-connect failed: {e}"
+                                "net-egress[{label}]: net-start iter {i} steward-connect failed: {e}"
                             );
                             if i >= args.warmup {
                                 start_dropped += 1;
@@ -2330,9 +2333,9 @@ async fn run_net_egress_filtered<V: Vmm>(
             }
         }
     };
-    if let Err(e) = vm.agent(None).await {
+    if let Err(e) = vm.steward(None).await {
         let _ = vm.shutdown().await;
-        anyhow::bail!("net-egress[{label}]: egress VM agent connect failed: {e}");
+        anyhow::bail!("net-egress[{label}]: egress VM steward connect failed: {e}");
     }
     let (gateway_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid())
         .map_err(|e| anyhow::anyhow!("net-egress[{label}]: ip_math({}): {e}", vm.vmid()))?;
@@ -2372,8 +2375,8 @@ async fn run_net_egress_filtered<V: Vmm>(
     let mut warmed = false;
     for w in 0..40 {
         let (argv, cenv) = mitm_curl(&format!("warm{w}.probe.local"));
-        if let Ok(agent) = vm.agent(None).await
-            && let Ok(o) = agent.exec(ExecRequest::new(argv).with_env(cenv)).await
+        if let Ok(steward) = vm.steward(None).await
+            && let Ok(o) = steward.exec(ExecRequest::new(argv).with_env(cenv)).await
             && o.code == 0
             && o.stdout.starts_with(b"vmcell-mitm-ok")
         {
@@ -2394,15 +2397,15 @@ async fn run_net_egress_filtered<V: Vmm>(
     let mut dropped = 0usize;
     for i in 0..iters {
         let (argv, cenv) = mitm_curl(&format!("h{i}.probe.local"));
-        let agent = match vm.agent(None).await {
+        let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
-                println!("net-egress[{label}]: egress iter {i} agent-connect failed: {e}");
+                println!("net-egress[{label}]: egress iter {i} steward-connect failed: {e}");
                 break;
             }
         };
         let t = Instant::now();
-        let r = agent.exec(ExecRequest::new(argv).with_env(cenv)).await;
+        let r = steward.exec(ExecRequest::new(argv).with_env(cenv)).await;
         let dt = t.elapsed().as_micros();
         match r {
             Ok(o) if o.code == 0 && o.stdout.starts_with(b"vmcell-mitm-ok") => rtts.push(dt),
@@ -2456,7 +2459,7 @@ async fn run_net_egress_filtered<V: Vmm>(
 
 /// §16 (Performance) — zygote fan-out: snapshot a base VM once, then time
 /// `Zygote::spawn_clones` to `--count` resumed CoW clones (plus the time to reach
-/// agent-ready across all of them). `restore_rotates_host_paths` gates concurrent
+/// steward-ready across all of them). `restore_rotates_host_paths` gates concurrent
 /// fan-out (CH + QEMU); Firecracker degrades to the single-clone control.
 async fn run_zygote<V: Vmm>(
     vmm: &V,
@@ -2507,10 +2510,10 @@ async fn run_zygote<V: Vmm>(
             anyhow::bail!("zygote: base VM start failed: {e}");
         }
     };
-    if let Err(e) = base.agent(None).await {
+    if let Err(e) = base.steward(None).await {
         let _ = base.shutdown().await;
         let _ = std::fs::remove_dir_all(&master);
-        anyhow::bail!("zygote: base VM agent connect failed: {e}");
+        anyhow::bail!("zygote: base VM steward connect failed: {e}");
     }
     let zygote = match vmcell::Zygote::suspend(&mut base, cfg.clone(), &master).await {
         Ok(z) => z,
@@ -2529,7 +2532,7 @@ async fn run_zygote<V: Vmm>(
 
     // --- Timed fan-out: N clones restored + resumed concurrently per iteration ---
     let mut fanout = Vec::new(); // wall-clock to `clone_count` live+resumed clones
-    let mut ready = Vec::new(); // + time to agent-ready across all clones
+    let mut ready = Vec::new(); // + time to steward-ready across all clones
     let mut dropped = 0usize;
     for i in 0..(args.iters() + args.warmup) {
         let t_fan = Instant::now();
@@ -2543,11 +2546,11 @@ async fn run_zygote<V: Vmm>(
         };
         let fan_ms = t_fan.elapsed().as_millis();
 
-        // Time to agent-ready across all clones (concurrent; the first agent() runs the
+        // Time to steward-ready across all clones (concurrent; the first steward() runs the
         // post-restore resync). Disjoint `&mut` borrows via `iter_mut`, so this is sound.
         let t_ready = Instant::now();
         let ready_res =
-            futures::future::try_join_all(clones.iter_mut().map(|c| c.agent(None))).await;
+            futures::future::try_join_all(clones.iter_mut().map(|c| c.steward(None))).await;
         let ready_ms = t_ready.elapsed().as_millis();
 
         match ready_res {
@@ -2558,7 +2561,7 @@ async fn run_zygote<V: Vmm>(
                 }
             }
             Err(e) => {
-                println!("zygote: iteration {i} clone agent-ready failed: {e}");
+                println!("zygote: iteration {i} clone steward-ready failed: {e}");
                 dropped += 1;
             }
         }
@@ -2588,14 +2591,14 @@ async fn run_zygote<V: Vmm>(
     }
     if let Some((p50, p95, p99, max)) = pcts(&mut ready) {
         println!(
-            "  + time to agent-ready across all clones: p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms"
+            "  + time to steward-ready across all clones: p50={p50}ms p95={p95}ms p99={p99}ms max={max}ms"
         );
     }
     Ok(())
 }
 
 // ----------------------------------------------------------------------------
-// session: the interactive-session layer (`SessionMux`) the one-shot AgentClient
+// session: the interactive-session layer (`SessionMux`) the one-shot StewardClient
 // path (measured by vsock-rtt) never exercises — the SECOND vsock handshake +
 // per-session open/spawn. (There is no resume-by-id API: "session persistence" =
 // long-lived sessions, not reattach-across-reconnect, so the connect handshake is
@@ -2603,7 +2606,7 @@ async fn run_zygote<V: Vmm>(
 // ----------------------------------------------------------------------------
 
 /// §16 (Performance) — session: (A) `connect_sessions` latency (the mux's own second
-/// vsock connection + `Ready` handshake, separate from the cached `agent()` client),
+/// vsock connection + `Ready` handshake, separate from the cached `steward()` client),
 /// and (B) per-session `open`→guest-spawn→`exit` on one persistent mux. Both assert a
 /// real `code==0` exit before counting (data-plane liveness, not a connect-only signal).
 /// Works on all four backends (sessions ride the same vsock; no capability gate).
@@ -2624,15 +2627,15 @@ async fn run_session<V: Vmm>(
         Ok(v) => v,
         Err(e) => anyhow::bail!("session: boot failed: {e}"),
     };
-    if let Err(e) = vm.agent(None).await {
+    if let Err(e) = vm.steward(None).await {
         let _ = vm.shutdown().await;
-        anyhow::bail!("session: agent connect failed: {e}");
+        anyhow::bail!("session: steward connect failed: {e}");
     }
     let argv = pick_exec_cmd(&mut vm).await;
 
     // --- Metric A: session-connect latency (the 2nd vsock handshake) ---
     // Each `connect_sessions` dials a fresh mux connection + `Ready` handshake, distinct
-    // from the cached one-shot `agent()` client vsock-rtt reuses. Prove liveness (run one
+    // from the cached one-shot `steward()` client vsock-rtt reuses. Prove liveness (run one
     // command to `code==0`) before counting the sample, then drop the mux.
     let mut connect_rtts = Vec::with_capacity(iters);
     let mut conn_dropped = 0usize;

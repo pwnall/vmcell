@@ -33,7 +33,7 @@ set -euo pipefail
 # TWO different absences, because "lean" means two different things in this workspace:
 #
 #   tokio|hyper|rtnetlink — the host ASYNC stack. A member that runs as guest PID 1
-#                           (vmcell-guest-agent), inside the privileged window
+#                           (vmcell-steward), inside the privileged window
 #                           (vmcell-test-runner), or is linked by BOTH the runner and the daemon
 #                           (vmcell-privilege) must not link it.
 #   axum|vmcell           — the daemon's SERVER stack. `vmcell-daemon-client` depends on
@@ -55,7 +55,7 @@ set -euo pipefail
 # match, while a re-enabled `server` feature renders `── vmcell v0.13.0` and `── axum v0.8…`, which
 # it does.
 LEAN_MATRIX=(
-  "vmcell-guest-agent   tokio|hyper|rtnetlink"
+  "vmcell-steward       tokio|hyper|rtnetlink"
   "vmcell-test-runner   tokio|hyper|rtnetlink"
   "vmcell-privilege     tokio|hyper|rtnetlink"
   "vmcell-daemon-client axum|vmcell"

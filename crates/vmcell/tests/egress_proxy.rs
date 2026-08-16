@@ -1,9 +1,9 @@
 use hudsucker::Body;
 use hyper::Response;
 use vmcell::MicroVm;
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, ProxyConfig, RootfsSource, VmConfig};
 use vmcell::proxy::doubles::TestDouble;
+use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::VmInstance;
 
 mod common;
@@ -110,11 +110,11 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let (gateway_ip, _g, _c) = vmcell::net::ip_math(vmid).expect("ip_math");
     let gateway = gateway_ip.to_string();
 
-    println!("Connecting agent...");
-    let agent = vm.agent(None).await.unwrap();
-    println!("Agent connected.");
+    println!("Connecting steward...");
+    let steward = vm.steward(None).await.unwrap();
+    println!("Steward connected.");
 
-    let out_a = agent
+    let out_a = steward
         .exec(ExecRequest::new(vec!["ip".into(), "a".into()]))
         .await
         .unwrap();
@@ -126,7 +126,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     );
     println!("IP A:\n{}", String::from_utf8_lossy(&out_a.stdout));
 
-    let out_r = agent
+    let out_r = steward
         .exec(ExecRequest::new(vec!["ip".into(), "route".into()]))
         .await
         .unwrap();
@@ -141,7 +141,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Give the network some time to come up
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let outcome = agent
+    let outcome = steward
         .exec(
             ExecRequest::new(vec![
                 "curl".into(),
@@ -181,7 +181,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         String::from_utf8_lossy(&outcome.stdout)
     );
 
-    let blocked_outcome = agent
+    let blocked_outcome = steward
         .exec(
             ExecRequest::new(vec![
                 "curl".into(),
@@ -218,7 +218,7 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Plain-HTTP host-service proxying (TESTS-FEATURES-6): an absolute-form GET to the local
     // host service through the proxy. This is NOT a CONNECT — the genuine CONNECT tunnel is
     // asserted separately, below, via the host-observable request log.
-    let plain_http_outcome = agent
+    let plain_http_outcome = steward
         .exec(
             ExecRequest::new(vec![
                 "curl".into(),
@@ -254,8 +254,8 @@ async fn test_egress_proxy_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
          listing; got: {plain_http_body}"
     );
 
-    // Drop agent so we can borrow vm immutably
-    let _ = agent;
+    // Drop steward so we can borrow vm immutably
+    let _ = steward;
 
     // EgressProxy records requests. Let's see if we can query it.
     let requests = vm.proxy().unwrap().requests();
@@ -386,11 +386,11 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     let (gateway_ip, _g, _c) = vmcell::net::ip_math(vmid).expect("ip_math");
     let gateway = gateway_ip.to_string();
 
-    let agent = match vm.agent(Some(std::time::Duration::from_secs(120))).await {
+    let steward = match vm.steward(Some(std::time::Duration::from_secs(120))).await {
         Ok(a) => a,
         Err(e) => {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
-            panic!("Failed to connect to agent: {e}\nSERIAL LOG:\n{log}");
+            panic!("Failed to connect to steward: {e}\nSERIAL LOG:\n{log}");
         }
     };
 
@@ -399,7 +399,7 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // path it fully intercepts — example.com returns the injected double. This
     // proves the proxy is reachable and filtering on the privileged path, so a
     // failure of the transparent curl below is the FILTER, not a dead network.
-    let explicit = agent
+    let explicit = steward
         .exec(
             ExecRequest::new(vec![
                 "curl".into(),
@@ -496,7 +496,7 @@ async fn test_egress_privileged_filtered_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // implementation-notes.md (H-PROXY-1): privileged transparent intake is
     // wired at the socket layer (IP_TRANSPARENT + original-destination recovery)
     // pending absolute-form reconstruction in the MITM layer.
-    let transparent = agent
+    let transparent = steward
         .exec(ExecRequest::new(vec![
             "curl".into(),
             "-4".into(),

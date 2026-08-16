@@ -89,7 +89,7 @@ fi
 # from the matrix takes its gate with it. Only meaningful when the green leg produced a full run —
 # otherwise it would just re-report the violation above as four missing rows.
 if (( green_ok )); then
-  for governed in vmcell-guest-agent vmcell-test-runner vmcell-privilege vmcell-daemon-client; do
+  for governed in vmcell-steward vmcell-test-runner vmcell-privilege vmcell-daemon-client; do
     if ! grep -q -- "$governed" <<<"$green_out"; then
       echo "FAIL [roster leg]: --all did not check $governed — its row is missing from the lean matrix."
       printf '  ---- output ----\n%s\n' "$green_out"
@@ -101,7 +101,7 @@ fi
 # SUBSET leg: the two historical call sites name three crates. The matrix is the law, so the
 # omitted governed member is checked anyway and the caller is told to switch to `--all`.
 subset_out=""
-if ! subset_out=$("$check" vmcell-guest-agent vmcell-test-runner vmcell-privilege 2>&1); then
+if ! subset_out=$("$check" vmcell-steward vmcell-test-runner vmcell-privilege 2>&1); then
   echo "FAIL [subset leg]: the three-crate call-site form failed."
   printf '  ---- output ----\n%s\n' "$subset_out"
   fail=1

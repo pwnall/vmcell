@@ -1,6 +1,6 @@
 //! Zygote suspend/resume fan-out integration test (§8.4, The zygote fan-out and the OverlayStore seam).
 //!
-//! Boots one VM to agent-ready, **suspends** it into a zygote, then mints many
+//! Boots one VM to steward-ready, **suspends** it into a zygote, then mints many
 //! identical clones by copy-on-write-copying the suspend image. Asserts the
 //! properties that make fan-out correct:
 //!
@@ -19,9 +19,9 @@
 
 use std::collections::HashSet;
 use vmcell::Zygote;
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
 use vmcell::orchestrator::MicroVm;
+use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::{VmInstance, Vmm, VsockEndpoint};
 
 mod common;
@@ -73,14 +73,14 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
 
     let env = vmcell::HostEnv::hermetic();
 
-    // 1. Boot a base VM to agent-ready, then SUSPEND it into a zygote.
+    // 1. Boot a base VM to steward-ready, then SUSPEND it into a zygote.
     let mut base = MicroVm::start(vmm, base_cfg(), &env)
         .await
         .expect("start base VM");
-    if let Err(e) = base.agent(None).await {
+    if let Err(e) = base.steward(None).await {
         let log = std::fs::read_to_string(base.instance().serial_log()).unwrap_or_default();
         println!("BASE SERIAL LOG:\n{log}");
-        panic!("base agent connect failed: {e}");
+        panic!("base steward connect failed: {e}");
     }
     let zygote = Zygote::suspend(&mut base, base_cfg(), &master_dir)
         .await
@@ -137,15 +137,15 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
                 "clone {i} vsock path {vsock} must be distinct"
             );
 
-            // Each clone is independently agent-reachable and execs correctly.
+            // Each clone is independently steward-reachable and execs correctly.
             let log_path = vm.instance().serial_log().to_path_buf();
-            let agent_res = vm.agent(None).await;
-            if let Err(e) = &agent_res {
+            let steward_res = vm.steward(None).await;
+            if let Err(e) = &steward_res {
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
                 println!("CLONE {i} SERIAL LOG:\n{log}");
-                panic!("clone {i} agent connect failed: {e}");
+                panic!("clone {i} steward connect failed: {e}");
             }
-            let out = agent_res
+            let out = steward_res
                 .unwrap()
                 .exec(ExecRequest::new(vec!["echo".into(), format!("clone-{i}")]))
                 .await
@@ -160,7 +160,7 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
             // vmid: the in-guest MAC must equal mac_math(vmid). Distinct vmids ⇒
             // distinct MACs, so no two concurrent clones share an L2 identity.
             let mac_out = vm
-                .agent(None)
+                .steward(None)
                 .await
                 .unwrap()
                 .exec(ExecRequest::new(vec![
@@ -215,9 +215,9 @@ async fn zygote_fan_out_impl<V: Vmm>(vmm: &V) {
             .await
             .expect("a single zygote clone works on any snapshot backend");
         let out = one
-            .agent(None)
+            .steward(None)
             .await
-            .expect("single clone agent")
+            .expect("single clone steward")
             .exec(ExecRequest::new(vec!["echo".into(), "one".into()]))
             .await
             .unwrap();

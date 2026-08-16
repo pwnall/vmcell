@@ -4,7 +4,7 @@
 //!
 //! A developer pairs a custom artifact with a known-good counterpart — a custom `vmlinux`
 //! with a trusted `rootfs.erofs`, or vice versa — and calls [`validate`]. It boots micro-VMs
-//! via `vmcell`, drives the guest agent to probe the guest, and returns a
+//! via `vmcell`, drives the steward to probe the guest, and returns a
 //! [`ValidationReport`] listing every check's outcome. **Success is an empty failure list**
 //! ([`ValidationReport::is_ok`] / [`ValidationReport::into_result`]).
 //!
@@ -20,7 +20,7 @@
 //!
 //! ## Naming what a bad kernel is missing
 //! A boot failure never reports a bare timeout. Every arm of [`checks`] that **reports** a VM
-//! which failed to start (`MicroVm::start`) or failed its agent handshake — Core, Extended and
+//! which failed to start (`MicroVm::start`) or failed its steward handshake — Core, Extended and
 //! Full alike — renders through one of the two [`classify`] renderers, chosen by whether console
 //! evidence exists:
 //!
@@ -97,8 +97,8 @@ impl ArtifactSet {
 /// How much of the contract to exercise. Ordered: `Full` ⊇ `Extended` ⊇ `Core`.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
-    /// Direct boot, erofs root, PID-1 agent handshake, exec/put-file round-trip, injected
-    /// agent/CA/guest-tools present, overlay writable, clean shutdown. Needs only KVM.
+    /// Direct boot, erofs root, PID-1 steward handshake, exec/put-file round-trip, injected
+    /// steward/CA/guest-tools present, overlay writable, clean shutdown. Needs only KVM.
     Core,
     /// `Core` plus capability-gated probes: IP-PNP networking, virtio-fs RO/RW shares, nested
     /// `/dev/kvm`, cgroup usage readout.
@@ -106,7 +106,7 @@ pub enum Level {
     /// `Extended` plus the expensive checks, each on VMs of its own — the shipped roster, named by
     /// check id: `concurrency.distinct_ids` (three concurrently-started VMs get distinct
     /// vmid/CID/vsock and each execs), `snapshot.restore_roundtrip` (a snapshotted VM restores back
-    /// to agent-ready and execs), `metrics.mem_limit_ooms` (a host cgroup cap below guest RAM trips
+    /// to steward-ready and execs), `metrics.mem_limit_ooms` (a host cgroup cap below guest RAM trips
     /// the host OOM killer).
     ///
     /// Two things this level does **not** do, despite an earlier roster here promising them
@@ -166,7 +166,7 @@ pub enum CheckStatus {
 /// One check's identity and outcome.
 #[derive(Clone, Debug)]
 pub struct CheckOutcome {
-    /// A stable dotted id, e.g. `"boot.agent_ready"`.
+    /// A stable dotted id, e.g. `"boot.steward_ready"`.
     pub id: &'static str,
     /// The level this check belongs to.
     pub level: Level,

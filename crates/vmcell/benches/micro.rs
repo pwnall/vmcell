@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group};
 use std::hint::black_box;
-use vmcell::agent::protocol::{ExecRequest, Message};
 use vmcell::artifact::{Stage, StageInputs, kernel::KernelStage};
+use vmcell::steward::protocol::{ExecRequest, Message};
 
 #[cfg(feature = "am-fs-erofs")]
 use vmcell::artifact::tar2erofs::tar_to_erofs;
@@ -86,7 +86,7 @@ fn bench_tar_to_erofs(c: &mut Criterion) {
             // tar_to_erofs expects an iterator over archives
             let reader = std::io::Cursor::new(tar_data.clone());
             let archive = tar::Archive::new(reader);
-            // require_libc6=false: the bench packs a synthetic tar without an injected agent.
+            // require_libc6=false: the bench packs a synthetic tar without an injected steward.
             // No downstream extra files, no vmcell injections, no symlinks.
             let image = tar_to_erofs(vec![archive], vec![], vec![], vec![], false).unwrap();
             black_box(image);

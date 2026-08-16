@@ -26,7 +26,7 @@ pub struct VmConfig {
     pub limits: ResourceLimits,
     /// Indicates if this VM is configured to be snapshot-eligible.
     pub snapshotting: bool,
-    /// Selects the QEMU guest-agent vsock transport (§2.4). Default
+    /// Selects the QEMU steward vsock transport (§2.4). Default
     /// [`VsockTransport::Auto`] — in-kernel when `snapshotting`, else the unprivileged
     /// external daemon. Set [`VsockTransport::InKernel`] to give a privileged
     /// non-snapshot QEMU the deterministic in-kernel transport (shedding the
@@ -65,7 +65,7 @@ pub struct VmConfig {
     pub resource_prefix: String,
     /// Extra virtio-blk devices attached **after** the root disk, enumerated by the
     /// guest as `/dev/vdb`, `/dev/vdc`, … in order (§4.6, Extra virtio-blk devices and disk-I/O throttling). Raw block devices — the
-    /// guest workload owns any filesystem/mount; the agent does not auto-mount them.
+    /// guest workload owns any filesystem/mount; the steward does not auto-mount them.
     /// Plain virtio-blk composes with snapshotting (§13, Cross-cutting invariants); an extra disk's
     /// [`image`](BlockDevice::image) must live at a **stable path** to survive a
     /// restore. Default empty.
@@ -85,14 +85,14 @@ pub struct VmConfig {
     /// key is reserved or starts with `vmcell_`, or that is not a single whitespace-
     /// free token. Default empty.
     pub extra_kernel_args: Vec<String>,
-    /// Optional `init=` override (§5.3, The kernel command line). `None` boots the vmcell guest agent as
+    /// Optional `init=` override (§5.3, The kernel command line). `None` boots the vmcell steward as
     /// PID 1 (the vsock control plane). `Some(path)` boots a **custom PID 1**, which
-    /// **replaces the agent** — so the VM has no control plane
-    /// ([`crate::orchestrator::MicroVm::agent`] fails loud) and cannot snapshot
+    /// **replaces the steward** — so the VM has no control plane
+    /// ([`crate::orchestrator::MicroVm::steward`] fails loud) and cannot snapshot
     /// ([`VmConfigBuilder::build`] rejects
-    /// `snapshotting` + a custom init, since the post-restore resync needs the agent).
+    /// `snapshotting` + a custom init, since the post-restore resync needs the steward).
     /// Observe such a VM via the serial log, a writable extra disk/share, or
-    /// networking. A custom init also loses the agent's tmpfs overlay over the RO
+    /// networking. A custom init also loses the steward's tmpfs overlay over the RO
     /// erofs root, so it usually pairs with a writable rootfs or extra disk. Default
     /// `None`.
     pub init: Option<PathBuf>,
@@ -335,9 +335,9 @@ impl Timeouts {
 }
 
 /// Appends the guest-side timing tokens to a kernel `cmdline` (§5.3, The kernel command line). The guest
-/// agent parses `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` (whole ms,
+/// steward parses `vmcell_accept_poll_ms=` / `vmcell_rebind_idle_ms=` (whole ms,
 /// clamped guest-side) to tune its accept/re-bind cadence per VM without a rootfs
-/// rebuild; absent tokens fall back to the agent's compiled defaults.
+/// rebuild; absent tokens fall back to the steward's compiled defaults.
 pub(crate) fn push_guest_timeout_args(cmdline: &mut String, timeouts: &Timeouts) {
     cmdline.push_str(&format!(
         " vmcell_accept_poll_ms={} vmcell_rebind_idle_ms={}",
@@ -383,12 +383,12 @@ pub fn build_kernel_cmdline(
     // (~2 ms; no RAID device can exist). Neither affects virtio/vsock/virtio-fs/erofs,
     // `ip=` autoconfig, panic capture, or the in-kernel crypto itself (self-tests are
     // a boot-time QA pass, not a runtime dependency).
-    // The `init=` token: the fixed vmcell guest agent (the default control-plane
+    // The `init=` token: the fixed vmcell steward (the default control-plane
     // PID 1) unless the caller overrides it (§5.3, The kernel command line). This is the ONE place either
     // `init=` token is constructed — a backend never string-builds it. A custom
-    // init replaces the agent, so it forgoes the vsock control plane; the
+    // init replaces the steward, so it forgoes the vsock control plane; the
     // consequence is honored fail-loud in the orchestrator, not here (see
-    // `MicroVm::agent`). `build()` validated the override is a single safe token.
+    // `MicroVm::steward`). `build()` validated the override is a single safe token.
     let init = cfg.init.as_deref().map_or_else(
         || DEFAULT_INIT.to_string(),
         |p| p.to_string_lossy().into_owned(),
@@ -440,10 +440,10 @@ pub fn build_kernel_cmdline(
     Ok(s)
 }
 
-/// The default `init=` target: the vmcell guest agent that serves the vsock control
-/// plane as PID 1 (§3.4, The guest: vmcell-guest-agent as PID 1). A caller may override it via [`VmConfig::init`], which
-/// replaces the agent and therefore forgoes the control plane (§5.3, The kernel command line).
-pub(crate) const DEFAULT_INIT: &str = "/usr/sbin/vmcell-guest-agent";
+/// The default `init=` target: the vmcell steward that serves the vsock control
+/// plane as PID 1 (§3.4, The guest: vmcell-steward as PID 1). A caller may override it via [`VmConfig::init`], which
+/// replaces the steward and therefore forgoes the control plane (§5.3, The kernel command line).
+pub(crate) const DEFAULT_INIT: &str = "/usr/sbin/vmcell-steward";
 
 /// The kernel-cmdline keys that [`build_kernel_cmdline`] owns and that
 /// [`VmConfig::extra_kernel_args`] may therefore **not** set (append-only, §5.3, The kernel command line).
@@ -497,7 +497,7 @@ const RESERVED_CMDLINE_KEYS: &[&str] = &[
 ];
 
 /// Whether `arg` collides with a boot token vmcell owns — its key is in
-/// [`RESERVED_CMDLINE_KEYS`] or starts with `vmcell_` (every guest-agent-trusted
+/// [`RESERVED_CMDLINE_KEYS`] or starts with `vmcell_` (every steward-trusted
 /// token, §5.3, The kernel command line). The single predicate behind the append-only contract (§5.3, The kernel command line); the
 /// key is the text before the first `=` (or the whole bare token).
 ///
@@ -512,7 +512,7 @@ const RESERVED_CMDLINE_KEYS: &[&str] = &[
 /// predicate, so every call site — and every future one — inherits it.
 pub(crate) fn is_reserved_cmdline_arg(arg: &str) -> bool {
     let key = normalize_cmdline_key(arg.split('=').next().unwrap_or(arg));
-    // The guest agent trusts every `vmcell_*` token (shares, accept/rebind cadence);
+    // The steward trusts every `vmcell_*` token (shares, accept/rebind cadence);
     // a caller arg spoofing one would mis-mount a share or busy-spin PID 1.
     key.starts_with("vmcell_")
         || RESERVED_CMDLINE_KEYS
@@ -632,7 +632,7 @@ impl RootfsSource {
 /// The guest kernel enumerates extra disks as `/dev/vdb`, `/dev/vdc`, … in
 /// attachment order; the root disk is always `/dev/vda`. vmcell attaches the **raw**
 /// block device only — the guest workload owns any partitioning, filesystem, or
-/// mount (the guest agent does not auto-mount extra disks).
+/// mount (the steward does not auto-mount extra disks).
 ///
 /// Plain virtio-blk is **not** a vhost-user device, so extra disks compose with
 /// snapshotting (§13, Cross-cutting invariants). A block device's contents live on disk, *outside* the
@@ -862,7 +862,7 @@ pub enum RestoreMode {
     Lazy,
 }
 
-/// Selects the QEMU guest-agent vsock transport (§2.4). QEMU is the only backend with
+/// Selects the QEMU steward vsock transport (§2.4). QEMU is the only backend with
 /// a choice here — CH and Firecracker always terminate vsock inside the VMM.
 ///
 /// The two transports differ in privilege and in snapshot-eligibility:
@@ -961,11 +961,11 @@ impl Share {
 
 /// Appends the guest boot-time mount plan for `shares` to a kernel `cmdline`.
 ///
-/// The guest agent (PID 1) has no host-side view of [`VmConfig`], so the shares
+/// The steward (PID 1) has no host-side view of [`VmConfig`], so the shares
 /// it must mount — their tag, mount point, and access mode — travel on the kernel
 /// command line as one `vmcell_share=<tag>:<guest_path>:<ro|rw>` token per share
 /// (§4.5, Shared directories (virtio-fs): tags and mount points are caller-defined, not built into the runner).
-/// The agent reads `/proc/cmdline`, mounts each `tag` at its `guest_path` over
+/// The steward reads `/proc/cmdline`, mounts each `tag` at its `guest_path` over
 /// virtiofs (default `/<tag>`), and uses a read-only mount for `ro` shares. Tags
 /// and guest paths are validated by [`VmConfigBuilder::build`] to be encodable
 /// (no `:` or whitespace), so this token is unambiguous. No shares ⇒ nothing
@@ -1322,7 +1322,7 @@ impl VmConfigBuilder {
     }
 
     /// Overrides the guest `init=` target ([`VmConfig::init`], §5.3, The kernel command line). A custom init
-    /// **replaces** the vmcell guest agent, forgoing the vsock control plane; validated
+    /// **replaces** the vmcell steward, forgoing the vsock control plane; validated
     /// at [`build`](Self::build), which also rejects it combined with `snapshotting`.
     #[must_use]
     pub fn init(mut self, init: impl Into<PathBuf>) -> Self {
@@ -1381,7 +1381,7 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Selects the QEMU guest-agent vsock transport ([`VmConfig::vsock_transport`],
+    /// Selects the QEMU steward vsock transport ([`VmConfig::vsock_transport`],
     /// §2.4). Default [`VsockTransport::Auto`]. [`VsockTransport::InKernel`] opts a
     /// privileged non-snapshot QEMU into the deterministic in-kernel transport;
     /// [`build`](Self::build) rejects [`VsockTransport::ExternalDaemon`] combined with
@@ -1547,15 +1547,15 @@ impl VmConfigBuilder {
                         .into(),
                 ));
             }
-            // A custom init replaces the vmcell guest agent (§5.3, The kernel command line), and the mandatory
+            // A custom init replaces the vmcell steward (§5.3, The kernel command line), and the mandatory
             // post-restore resync — clock, entropy reseed, MAC/IP rotation (§13, Cross-cutting invariants) —
-            // runs *through* that agent. A restored custom-init clone would be stranded
+            // runs *through* that steward. A restored custom-init clone would be stranded
             // on frozen identity with no way to fix it from inside (silently dead
             // egress / correlated RNG), the exact §13 trap. Reject fail-loud here.
             if self.init.is_some() {
                 return Err(crate::error::Error::Config(
                     "a custom init cannot be combined with snapshotting (the mandatory \
-                     post-restore resync requires the vmcell guest agent, which a custom \
+                     post-restore resync requires the vmcell steward, which a custom \
                      init replaces)"
                         .into(),
                 ));
@@ -1676,7 +1676,7 @@ impl VmConfigBuilder {
                     "share tag cannot be empty".into(),
                 ));
             }
-            // The mount plan reaches the guest agent as
+            // The mount plan reaches the steward as
             // `vmcell_share=<tag>:<guest_path>:<ro|rw>` kernel-cmdline tokens (§4.5, Shared directories (virtio-fs)),
             // parsed by splitting on whitespace and then on ':'. A `:` or whitespace
             // in the tag or the guest path would corrupt that encoding and silently
@@ -2899,7 +2899,7 @@ mod tests {
                 "missing rebind idle: {c}"
             );
             assert!(
-                c.contains("init=/usr/sbin/vmcell-guest-agent"),
+                c.contains("init=/usr/sbin/vmcell-steward"),
                 "missing init: {c}"
             );
         }
@@ -3417,7 +3417,7 @@ mod tests {
     }
 
     // §5.3 (The kernel command line): build() rejects snapshotting + a custom init (the post-restore resync
-    // needs the agent a custom init replaces). Buggy impl: the combination builds and
+    // needs the steward a custom init replaces). Buggy impl: the combination builds and
     // a restored clone silently strands on frozen identity.
     #[test]
     fn reject_snapshot_with_custom_init() {
@@ -3579,10 +3579,10 @@ mod tests {
                 );
             }
         }
-        // The `vmcell_*` prefix is guest-agent-trusted and normalizes identically.
+        // The `vmcell_*` prefix is steward-trusted and normalizes identically.
         assert!(
             is_reserved_cmdline_arg("vmcell-share=x:/x:rw"),
-            "the dash respelling of a vmcell_ token is trusted by the guest agent too"
+            "the dash respelling of a vmcell_ token is trusted by the steward too"
         );
         // Positive control (over-rejection inverse): keys that are NOT reserved stay
         // acceptable in both spellings — normalization must not swallow the whole namespace.
@@ -3660,7 +3660,7 @@ mod tests {
         let c = build_kernel_cmdline(&cfg, &test_res(7), "").unwrap();
         assert!(c.contains("init=/bin/sh"), "override missing: {c}");
         assert!(
-            !c.contains("init=/usr/sbin/vmcell-guest-agent"),
+            !c.contains("init=/usr/sbin/vmcell-steward"),
             "default init must be replaced, not kept: {c}"
         );
         assert_eq!(
@@ -3671,7 +3671,7 @@ mod tests {
         assert!(c.contains("root=/dev/vda"), "root token must remain: {c}");
         assert!(c.contains("vmcell_vmid=7"), "vmid token must remain: {c}");
 
-        // The default (no override) still emits the guest agent (existing contract).
+        // The default (no override) still emits the steward (existing contract).
         let default_cfg = VmConfig::builder(
             PathBuf::from("/vmlinux"),
             RootfsSource::Erofs {
@@ -3685,7 +3685,7 @@ mod tests {
             build_kernel_cmdline(&default_cfg, &test_res(1), "")
                 .unwrap()
                 .contains(&format!("init={DEFAULT_INIT}")),
-            "default init token must be the guest agent"
+            "default init token must be the steward"
         );
     }
 

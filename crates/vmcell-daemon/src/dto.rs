@@ -31,13 +31,13 @@ impl std::str::FromStr for VmId {
 }
 
 /// The lifecycle state of a registered VM (design §11.4, The VM registry and the start-up sweep). Derived from the handle, not a hopeful
-/// label — `Ready` means the agent handshake succeeded.
+/// label — `Ready` means the steward handshake succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VmState {
-    /// Booting; the agent has not yet handshaked.
+    /// Booting; the steward has not yet handshaked.
     Booting,
-    /// Booted and agent-ready — accepts `exec`.
+    /// Booted and steward-ready — accepts `exec`.
     Ready,
     /// Paused (CPUs stopped) via `pause`. Reserved: the daemon pause/resume routes are future work
     /// (design future-work, "Pause/resume routes"); no current control-plane path produces this.
@@ -137,7 +137,7 @@ pub struct CreateVmRequest {
     #[serde(default)]
     pub restore_from: Option<String>,
     /// Present ⇒ `run` semantics: exec this command over vsock and capture the outcome. Absent ⇒
-    /// `create` semantics: boot to agent-ready and register.
+    /// `create` semantics: boot to steward-ready and register.
     #[serde(default)]
     pub command: Option<Vec<String>>,
     /// With `command`, tear the VM down after the exec (the `run` one-shot) instead of keeping it in
@@ -151,7 +151,7 @@ pub struct CreateVmRequest {
     pub extra_disks: Vec<ExtraDiskSpec>,
     /// Append-only extra kernel command-line arguments (design §5.3, The kernel command line). Cannot
     /// override a boot token vmcell owns — rejected fail-loud at build. (A custom `init=`
-    /// override is deliberately **not** exposed here: it replaces the guest agent, so the
+    /// override is deliberately **not** exposed here: it replaces the steward, so the
     /// daemon — which owns the VM through the vsock control plane — could not `exec` or
     /// `stats` it. Use the library directly for a custom-init VM.)
     #[serde(default)]

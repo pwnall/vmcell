@@ -3,7 +3,7 @@
 //! Focused red-on-inverse guard for the CID-rotation change: snapshot a QEMU VM at its
 //! baked CID `X`, reserve `X` so the restore is forced to draw a *different* fresh CID
 //! `Y`, restore, and prove (a) `migrate-incoming` completes with the destination
-//! `-device guest-cid=Y != X`, and (b) the guest agent answers at `(Y, 5000)` and a
+//! `-device guest-cid=Y != X`, and (b) the steward answers at `(Y, 5000)` and a
 //! command round-trips. RED on the inverse (a `restore()` that reused the baked CID):
 //! `guest_cid()` would come back as `X == original_cid` and the `assert_ne!` reddens.
 //!
@@ -19,9 +19,9 @@
 
 #![cfg(feature = "qemu")]
 
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
 use vmcell::orchestrator::MicroVm;
+use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::{VmInstance, VsockEndpoint};
 use vmcell_qemu::Qemu;
 
@@ -29,7 +29,7 @@ mod common;
 
 #[tokio::test]
 #[ignore = "needs KVM + /dev/vhost-vsock (blessed runner CAP_DAC_OVERRIDE) + CAP_NET_ADMIN"]
-async fn qemu_restore_with_rotated_cid_reaches_agent() {
+async fn qemu_restore_with_rotated_cid_reaches_steward() {
     common::clean_vmcell_netns();
 
     if !common::has_cap_net_admin() {
@@ -79,14 +79,14 @@ async fn qemu_restore_with_rotated_cid_reaches_agent() {
             .expect("start snapshotting QEMU");
 
         let serial = vm.instance().serial_log().to_path_buf();
-        let agent = match vm.agent(None).await {
+        let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
                 let log = std::fs::read_to_string(&serial).unwrap_or_default();
-                panic!("pre-snapshot agent connect failed: {e}\nSERIAL LOG:\n{log}");
+                panic!("pre-snapshot steward connect failed: {e}\nSERIAL LOG:\n{log}");
             }
         };
-        let out = agent
+        let out = steward
             .exec(ExecRequest::new(vec!["echo".into(), "pre-snap".into()]))
             .await
             .expect("pre-snapshot exec");
@@ -114,7 +114,7 @@ async fn qemu_restore_with_rotated_cid_reaches_agent() {
         .reserve(original_cid)
         .expect("source CID is free after shutdown; reserving forces a distinct restore CID");
 
-    // Block 2 — restore with a fresh (rotated) CID and check the agent answers there.
+    // Block 2 — restore with a fresh (rotated) CID and check the steward answers there.
     {
         let mut vm = match MicroVm::restore(&vmm, &snapshot_dir, base_cfg(), &env).await {
             Ok(vm) => vm,
@@ -135,20 +135,20 @@ async fn qemu_restore_with_rotated_cid_reaches_agent() {
         );
 
         // The load-bearing data-plane check: connect over AF_VSOCK at (Y, 5000) and
-        // round-trip an exec. This is the first post-restore agent() call, so it also
+        // round-trip an exec. This is the first post-restore steward() call, so it also
         // drives the resync. A guest unreachable at the rotated CID would time out here.
         let serial = vm.instance().serial_log().to_path_buf();
-        let agent = match vm.agent(None).await {
+        let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
                 let log = std::fs::read_to_string(&serial).unwrap_or_default();
                 panic!(
-                    "restore completed but the agent is UNREACHABLE at the rotated \
+                    "restore completed but the steward is UNREACHABLE at the rotated \
                      cid={new_cid} (source cid={original_cid}): {e}\nSERIAL LOG:\n{log}"
                 );
             }
         };
-        let out = agent
+        let out = steward
             .exec(ExecRequest::new(vec![
                 "echo".into(),
                 "rotated-cid-ok".into(),

@@ -3,11 +3,11 @@
 //! This module provides the `SnapshotStage` pipeline step, which boots a VM
 //! to its ready state and takes a memory snapshot to enable fast booting later.
 
-use crate::agent::protocol::ExecRequest;
 use crate::artifact::{CacheKey, Stage, StageInputs, StageOutputs};
 use crate::config::{RootfsSource, VmConfig};
 use crate::error::Result;
 use crate::orchestrator::MicroVm;
+use crate::steward::protocol::ExecRequest;
 use crate::vmm::cloud_hypervisor::CloudHypervisor;
 use std::path::{Path, PathBuf};
 
@@ -92,9 +92,9 @@ impl Stage for SnapshotStage {
         };
         let mut vm = MicroVm::start(&vmm, cfg, &env).await?;
 
-        // Wait for VM to boot fully via vsock agent
-        let agent = vm.agent(None).await?;
-        let _ = agent
+        // Wait for VM to boot fully via vsock steward
+        let steward = vm.steward(None).await?;
+        let _ = steward
             .exec(ExecRequest::new(vec!["true".to_string()]))
             .await?;
 
@@ -102,7 +102,7 @@ impl Stage for SnapshotStage {
             .await
             .map_err(crate::error::Error::Io)?;
         // Go through the first-class `MicroVm::snapshot` verb (M-ART-2), not
-        // `instance_mut().snapshot()`: the former invalidates the cached `AgentClient` after
+        // `instance_mut().snapshot()`: the former invalidates the cached `StewardClient` after
         // a successful snapshot (so the resumed VM stays usable on every backend) and is the
         // self-guarding entry point aligned with the §8.1 (The warm-snapshot path and the eligibility law) snapshot-eligibility law.
         vm.snapshot(out).await?;

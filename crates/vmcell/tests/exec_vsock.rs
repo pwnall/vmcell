@@ -2,8 +2,8 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use vmcell::agent::AgentClient;
-use vmcell::agent::protocol::{ExecRequest, Message};
+use vmcell::steward::StewardClient;
+use vmcell::steward::protocol::{ExecRequest, Message};
 
 #[tokio::test]
 async fn test_exec_vsock_mock() {
@@ -18,7 +18,7 @@ async fn test_exec_vsock_mock() {
 
     let vsock_path = tmp.clone();
 
-    // Spawn server to mock CloudHypervisor UDS vsock and the guest agent
+    // Spawn server to mock CloudHypervisor UDS vsock and the steward
     let server_task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
 
@@ -67,7 +67,7 @@ async fn test_exec_vsock_mock() {
         framed.send(exit_msg.into()).await.unwrap();
     });
 
-    let mut client = AgentClient::connect(
+    let mut client = StewardClient::connect(
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
@@ -162,7 +162,7 @@ async fn exec_timeout_desyncs_subsequent_put_file() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     });
 
-    let mut client = AgentClient::connect(
+    let mut client = StewardClient::connect(
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
@@ -213,7 +213,7 @@ async fn put_file_timeout_desyncs_subsequent_exec() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     });
 
-    let mut client = AgentClient::connect(
+    let mut client = StewardClient::connect(
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
@@ -258,7 +258,7 @@ async fn host_codec_accepts_frame_above_default_8mib() {
     let vsock_path = tmp.clone();
 
     let server = tokio::spawn(async move {
-        let mut framed = accept_with_ready(listener, vmcell::agent::MAX_FRAME_BYTES).await;
+        let mut framed = accept_with_ready(listener, vmcell::steward::MAX_FRAME_BYTES).await;
         let _ = framed.next().await.unwrap().unwrap(); // Exec
         framed
             .send(
@@ -274,7 +274,7 @@ async fn host_codec_accepts_frame_above_default_8mib() {
             .unwrap();
     });
 
-    let mut client = AgentClient::connect(
+    let mut client = StewardClient::connect(
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
@@ -314,7 +314,7 @@ async fn connect_panic_in_serial_log_fails_fast() {
     // ignored the panic would loop the whole 10s before timing out.
     let timeout = std::time::Duration::from_secs(10);
     let start = std::time::Instant::now();
-    let res = AgentClient::connect(
+    let res = StewardClient::connect(
         &vsock_path,
         5000,
         timeout,
@@ -325,8 +325,8 @@ async fn connect_panic_in_serial_log_fails_fast() {
     let elapsed = start.elapsed();
 
     assert!(
-        matches!(&res, Err(vmcell::Error::Agent(_))),
-        "connect must fail with Error::Agent on a panicked serial log, got {res:?}"
+        matches!(&res, Err(vmcell::Error::Steward(_))),
+        "connect must fail with Error::Steward on a panicked serial log, got {res:?}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(1),
@@ -349,12 +349,12 @@ async fn stream_error_desyncs_subsequent_request() {
     let vsock_path = tmp.clone();
 
     let server = tokio::spawn(async move {
-        let mut framed = accept_with_ready(listener, vmcell::agent::MAX_FRAME_BYTES).await;
+        let mut framed = accept_with_ready(listener, vmcell::steward::MAX_FRAME_BYTES).await;
         let _ = framed.next().await; // read the Exec frame
         drop(framed); // close mid-exchange (no Exit) -> client exec errors, not a timeout
     });
 
-    let mut client = AgentClient::connect(
+    let mut client = StewardClient::connect(
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
@@ -378,7 +378,7 @@ async fn stream_error_desyncs_subsequent_request() {
         .exec(ExecRequest::new(vec!["echo".into(), "again".into()]))
         .await;
     assert!(
-        matches!(&next, Err(vmcell::Error::Agent(m)) if m.contains("reconnect required")),
+        matches!(&next, Err(vmcell::Error::Steward(m)) if m.contains("reconnect required")),
         "a mid-exchange stream error must desync the stream so the next request fails loud; \
          got {next:?}"
     );
@@ -401,7 +401,7 @@ async fn reconnect_clears_desynced() {
         // Connection 1: handshake, read the Exec, then close (EOF) so the client's
         // exec ends without an Exit frame -> Err -> desynced = true.
         let (s1, _) = listener.accept().await.unwrap();
-        let mut f1 = handshake_ready(s1, vmcell::agent::MAX_FRAME_BYTES).await;
+        let mut f1 = handshake_ready(s1, vmcell::steward::MAX_FRAME_BYTES).await;
         let _ = f1.next().await; // Exec
         drop(f1);
 
@@ -410,7 +410,7 @@ async fn reconnect_clears_desynced() {
         // test uses `handshake_ready` rather than the listener-consuming
         // `accept_with_ready`.
         let (s2, _) = listener.accept().await.unwrap();
-        let mut f2 = handshake_ready(s2, vmcell::agent::MAX_FRAME_BYTES).await;
+        let mut f2 = handshake_ready(s2, vmcell::steward::MAX_FRAME_BYTES).await;
         let _ = f2.next().await.unwrap().unwrap(); // Exec
         f2.send(
             postcard::to_stdvec(&Message::Stdout(b"ok\n".to_vec()))
@@ -425,7 +425,7 @@ async fn reconnect_clears_desynced() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     });
 
-    let mut client = AgentClient::connect(
+    let mut client = StewardClient::connect(
         &vsock_path,
         5000,
         std::time::Duration::from_secs(2),
@@ -448,7 +448,7 @@ async fn reconnect_clears_desynced() {
         .exec(ExecRequest::new(vec!["echo".into(), "y".into()]))
         .await;
     assert!(
-        matches!(&blocked, Err(vmcell::Error::Agent(m)) if m.contains("reconnect required")),
+        matches!(&blocked, Err(vmcell::Error::Steward(m)) if m.contains("reconnect required")),
         "a request on the desynced stream must fail loud before reconnect; got {blocked:?}"
     );
 
@@ -507,7 +507,7 @@ fn dial_socket_path(tag: &str) -> common::TempTree {
 
 // The raw dial's happy path over the hybrid AF_UNIX bridge, KVM-free: the mock
 // bridge asserts the CONNECT line names the DIALED port (7000) rather than the
-// endpoint's agent port (5000), and the byte stream round-trips in both directions.
+// endpoint's steward port (5000), and the byte stream round-trips in both directions.
 // The exchange uses the PORTABLE order — write, drain the reply, only then
 // half-close — the same order the live matrix leg and the `VsockDial` rustdoc
 // prescribe, so no shipped test models the non-portable idiom.
@@ -577,7 +577,7 @@ async fn dial_vsock_round_trips_bytes_over_the_hybrid_bridge() {
     let (line, seen) = server.await.expect("mock bridge task");
     assert_eq!(
         line, "CONNECT 7000\n",
-        "the dial must CONNECT to the port the caller asked for, not the agent's 5000"
+        "the dial must CONNECT to the port the caller asked for, not the steward's 5000"
     );
     assert_eq!(seen, payload, "the guest side must receive every byte sent");
     assert_eq!(
@@ -588,8 +588,8 @@ async fn dial_vsock_round_trips_bytes_over_the_hybrid_bridge() {
 
 // The dead-port signal CH's and Firecracker's in-VMM muxers send: accept the
 // CONNECT, then close with no `OK` line. The dial must interpret it — a typed
-// `Error::Agent` NAMING THE PORT — and return immediately, instead of reusing the
-// agent connect's retry-until-deadline loop.
+// `Error::Steward` NAMING THE PORT — and return immediately, instead of reusing the
+// steward connect's retry-until-deadline loop.
 // RED on a dial built on `connect_framed`'s loop: both the variant (it would be
 // `Error::Timeout`) and the elapsed bound (it would spin the full 10 s) flip.
 #[tokio::test]
@@ -621,14 +621,14 @@ async fn dial_vsock_dead_port_fails_fast_with_a_typed_error() {
 
     assert_eq!(server.await.expect("mock bridge task"), "CONNECT 7001\n");
     assert!(
-        matches!(&res, Err(vmcell::Error::Agent(m))
+        matches!(&res, Err(vmcell::Error::Steward(m))
             if m.contains("no guest vsock listener") && m.contains("7001")),
         "an EOF before the OK line must be a typed no-listener error naming the port, got {res:?}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(1),
         "the dial must FAIL FAST on a dead port (took {elapsed:?}); a dial reusing the \
-         agent connect's retry loop would spin to the {budget:?} deadline"
+         steward connect's retry loop would spin to the {budget:?} deadline"
     );
 }
 
@@ -639,7 +639,7 @@ async fn dial_vsock_dead_port_fails_fast_with_a_typed_error() {
 // overall budget.
 // RED on a dial with an unbounded `OK`-line read: it would hang to the 10 s budget
 // (the elapsed bound), and RED on one that folds the hang into the no-listener
-// `Error::Agent` (the variant assert).
+// `Error::Steward` (the variant assert).
 #[tokio::test]
 async fn dial_vsock_accept_and_hang_times_out_typed() {
     let sock_guard = dial_socket_path("hang");
@@ -703,8 +703,8 @@ mod dial_live_fixtures {
 
     /// Boots a VM and leaves the `echo-server` applet listening on vsock `port`.
     ///
-    /// The listener is started through the agent and outlives the exec: the shell exits
-    /// immediately, and the backgrounded server is reparented to the agent (PID 1) and
+    /// The listener is started through the steward and outlives the exec: the shell exits
+    /// immediately, and the backgrounded server is reparented to the steward (PID 1) and
     /// keeps listening.
     ///
     /// # Panics
@@ -728,9 +728,12 @@ mod dial_live_fixtures {
             .await
             .expect("Failed to start VM");
 
-        let agent = vm.agent(None).await.expect("Failed to connect to agent");
-        let started = agent
-            .exec(vmcell::agent::ExecRequest::new(vec![
+        let steward = vm
+            .steward(None)
+            .await
+            .expect("Failed to connect to steward");
+        let started = steward
+            .exec(vmcell::steward::ExecRequest::new(vec![
                 "sh".into(),
                 "-c".into(),
                 format!(
@@ -849,7 +852,7 @@ vmm_matrix_test!(dial_vsock_echo, |vmm| {
 
     // A port with no listener: typed and fast, never a hang. The two transports
     // report it differently — the hybrid bridge answers by closing the stream
-    // without an OK line (a typed Agent error naming the port), while the in-kernel
+    // without an OK line (a typed Steward error naming the port), while the in-kernel
     // AF_VSOCK transport surfaces the kernel's own connect error.
     let hybrid = matches!(
         vmcell::vmm::VmInstance::vsock_endpoint(vm.instance()),
@@ -862,7 +865,7 @@ vmm_matrix_test!(dial_vsock_echo, |vmm| {
     let elapsed = started_at.elapsed();
     if hybrid {
         assert!(
-            matches!(&dead, Err(vmcell::Error::Agent(m)) if m.contains("7999")),
+            matches!(&dead, Err(vmcell::Error::Steward(m)) if m.contains("7999")),
             "a dead port on the hybrid bridge must be a typed no-listener error naming it, got {dead:?}"
         );
     } else {
@@ -944,9 +947,9 @@ async fn dial_vsock_host_half_close_forwards_on_crosvm() {
 
 // §18 delta 7's guard-bypass gate, validated LIVE rather than presumed: boot with
 // `init=` pointing at the echo-server applet itself, so there is no vmcell guest
-// agent anywhere in the guest, and dial it raw. The vsock DEVICE is attached
+// steward anywhere in the guest, and dial it raw. The vsock DEVICE is attached
 // unconditionally by every backend (none reads `cfg.init`), which is what makes the
-// bypass sound — and `agent()` refusing on the same VM is the positive control that
+// bypass sound — and `steward()` refusing on the same VM is the positive control that
 // the control plane really is absent.
 //
 // CH-only, like `tests/custom_init.rs`: this is a host-side cmdline + host-side dial
@@ -956,12 +959,12 @@ async fn dial_vsock_host_half_close_forwards_on_crosvm() {
 // anyway — the matrix leg above covers it).
 //
 // The `--` token is the kernel's own hand-off: every cmdline token after it is
-// passed to init as argv, which is how the applet learns its port with no agent to
+// passed to init as argv, which is how the applet learns its port with no steward to
 // exec it.
 #[cfg(feature = "cloud-hypervisor")]
 #[tokio::test]
 #[ignore = "needs KVM"]
-async fn dial_vsock_reaches_a_custom_init_guest_with_no_agent() {
+async fn dial_vsock_reaches_a_custom_init_guest_with_no_steward() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(common::ch_bin());
@@ -982,13 +985,13 @@ async fn dial_vsock_reaches_a_custom_init_guest_with_no_agent() {
     let mut vm = common::start_vm(&vmm, cfg).await;
 
     // Positive control that there is genuinely NO control plane on this VM.
-    let no_agent = vm
-        .agent(Some(std::time::Duration::from_secs(2)))
+    let no_steward = vm
+        .steward(Some(std::time::Duration::from_secs(2)))
         .await
-        .expect_err("a custom-init VM has no guest agent");
+        .expect_err("a custom-init VM has no steward");
     assert!(
-        matches!(&no_agent, vmcell::Error::Agent(m) if m.contains("custom init")),
-        "expected the fail-loud custom-init error, got {no_agent:?}"
+        matches!(&no_steward, vmcell::Error::Steward(m) if m.contains("custom init")),
+        "expected the fail-loud custom-init error, got {no_steward:?}"
     );
 
     // The raw dial must still reach the guest: the vsock device is attached
@@ -999,7 +1002,7 @@ async fn dial_vsock_reaches_a_custom_init_guest_with_no_agent() {
     // runs on Cloud Hypervisor: the half-close idiom is asserted in exactly one
     // place — `assert_host_half_close_forwards` — so this test stays about the
     // guard bypass and cannot quietly re-introduce the non-portable pattern.
-    let payload = b"no agent, still dialable".to_vec();
+    let payload = b"no steward, still dialable".to_vec();
     dial.write_all(&payload).await.expect("write to the guest");
     let mut back = vec![0u8; payload.len()];
     tokio::time::timeout(
@@ -1011,7 +1014,7 @@ async fn dial_vsock_reaches_a_custom_init_guest_with_no_agent() {
     .expect("read the echo");
     assert_eq!(
         back, payload,
-        "the custom-init echo-server must echo over the raw dial with no agent present"
+        "the custom-init echo-server must echo over the raw dial with no steward present"
     );
 
     vm.kill().await.unwrap();
@@ -1036,14 +1039,17 @@ vmm_matrix_test!(put_file, |vmm| {
         .await
         .expect("Failed to start VM");
 
-    let agent = vm.agent(None).await.expect("Failed to connect to agent");
+    let steward = vm
+        .steward(None)
+        .await
+        .expect("Failed to connect to steward");
 
-    agent
+    steward
         .put_file("/tmp/hello.txt", b"hello world from test", None)
         .await
         .expect("put_file failed");
 
-    let outcome = agent
+    let outcome = steward
         .exec(ExecRequest::new(vec![
             "cat".into(),
             "/tmp/hello.txt".into(),

@@ -137,7 +137,7 @@ pub async fn build_rootfs(
     digest: &str,
     inputs: &crate::artifact::StageInputs,
     out: &Path,
-    agent_musl: Option<&Path>,
+    steward_musl: Option<&Path>,
     extra: &[super::ExtraFile],
 ) -> Result<StageOutputs> {
     build_rootfs_with(
@@ -146,7 +146,7 @@ pub async fn build_rootfs(
         digest,
         inputs,
         out,
-        agent_musl,
+        steward_musl,
         extra,
     )
     .await
@@ -160,7 +160,7 @@ async fn build_rootfs_with(
     digest: &str,
     inputs: &crate::artifact::StageInputs,
     out: &Path,
-    agent_musl: Option<&Path>,
+    steward_musl: Option<&Path>,
     extra: &[super::ExtraFile],
 ) -> Result<StageOutputs> {
     // Digest-pinned pulls only: a tag (or any non-`sha256:` reference) is the §10.2 (The
@@ -227,7 +227,7 @@ async fn build_rootfs_with(
         }
     }
 
-    super::pack_erofs_with_injection(streams, inputs, out, agent_musl, extra).await
+    super::pack_erofs_with_injection(streams, inputs, out, steward_musl, extra).await
 }
 
 /// The OCI/Docker layer media types this builder can decode (gzip and zstd
@@ -572,10 +572,10 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("rootfs.erofs");
-        let agent = dir.path().join("guest_agent");
-        std::fs::write(&agent, b"#!agent").unwrap();
+        let steward = dir.path().join("steward");
+        std::fs::write(&steward, b"#!steward").unwrap();
         let mut inputs = crate::artifact::StageInputs::default();
-        inputs.artifacts.insert("guest_agent".to_string(), agent);
+        inputs.artifacts.insert("steward".to_string(), steward);
         let digest = sha256_hex(b"manifest-bytes");
 
         // (1) Cold build: every layer pulled, erofs produced (gzip + zstd both decode).

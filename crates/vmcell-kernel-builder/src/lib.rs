@@ -403,9 +403,9 @@ impl Stage for InVmKernelStage {
 
         // Drive the build in a scope so the builder VM is torn down even on error.
         let build_res = async {
-            let agent = vm.agent(None).await?;
+            let steward = vm.steward(None).await?;
             for (step, argv, timeout) in build_commands() {
-                let outcome = agent
+                let outcome = steward
                     .exec(ExecRequest::new(argv).with_timeout(timeout))
                     .await?;
                 check_step(step, &outcome)?;

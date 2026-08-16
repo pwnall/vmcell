@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 use vmcell_protocol::{MAX_FRAME_BYTES, Message};
 
 // The decode surface that guest- and network-derived bytes actually reach: a single framed
-// postcard `Message`. Both ends (`vmcell::agent` on the host, the guest agent's `read_framed`)
+// postcard `Message`. Both ends (`vmcell::steward` on the host, the steward's `read_framed`)
 // reject any frame longer than the shared `MAX_FRAME_BYTES` cap BEFORE handing the payload to
 // postcard, so we mirror that precondition here and fuzz exactly what production decodes.
 //

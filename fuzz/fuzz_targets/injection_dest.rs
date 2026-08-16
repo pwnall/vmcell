@@ -11,9 +11,9 @@ use vmcell::artifact::rootfs::{ExtraFile, fuzz_validate_extra_files, is_reserved
 // WHO SUPPLIES THE BYTES: a downstream toolkit consumer's build configuration — `ExtraFile::dest`
 // (`vmcell build --inject`), which is named contract surface. This is LOCAL config, not off-host
 // input, and the target is ranked accordingly: what F5 protects is a consumer silently clobbering
-// the guest agent, the CA trust store or the guest-tools directory, which is a supply-chain
+// the steward, the CA trust store or the guest-tools directory, which is a supply-chain
 // invariant rather than a remote-exploit boundary. It earns a slot because the law has a real
-// evasion history — `/usr/sbin/./vmcell-guest-agent` and `/opt/.` both defeated earlier spellings
+// evasion history — `/usr/sbin/./vmcell-steward` and `/opt/.` both defeated earlier spellings
 // of it — and every one of those evasions was a NORMAL-FORM mismatch, which is exactly what a
 // fuzzer over arbitrary path strings explores.
 //
@@ -78,7 +78,7 @@ fuzz_target!(|dests: Vec<&str>| {
         assert!(
             !is_reserved_injection_path(dest),
             "accepted injection dest {dest:?} normalizes onto a vmcell-owned injection path (the \
-             guest agent, the CA trust store, or the guest-tools directory)"
+             steward, the CA trust store, or the guest-tools directory)"
         );
         let key = reference_normalize(dest);
         assert!(
@@ -102,7 +102,7 @@ fuzz_target!(|dests: Vec<&str>| {
     let good = ExtraFile::new("/usr/local/bin/acme-daemon", "/nonexistent/fuzz-src", 0o755);
     assert!(fuzz_validate_extra_files(std::slice::from_ref(&good)).is_ok());
     let owned = ExtraFile::new(
-        "/usr/sbin/./vmcell-guest-agent",
+        "/usr/sbin/./vmcell-steward",
         "/nonexistent/fuzz-src",
         0o755,
     );

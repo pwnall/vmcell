@@ -75,9 +75,9 @@ const GUEST_TOOLS_MULTICALL_BIN: &str = "vmcell-guest-tools";
 ///
 /// `dest` is normalized through the packer's own
 /// [`normalize_path`](crate::artifact::tar2erofs) before comparison, so the absolute form the
-/// caller writes (`/usr/sbin/vmcell-guest-agent`), a `.`-bearing evasion
-/// (`/usr/sbin/./vmcell-guest-agent`), and the manifest's relative form
-/// (`usr/sbin/vmcell-guest-agent`) all collapse to the same key. Comparing raw strings would
+/// caller writes (`/usr/sbin/vmcell-steward`), a `.`-bearing evasion
+/// (`/usr/sbin/./vmcell-steward`), and the manifest's relative form
+/// (`usr/sbin/vmcell-steward`) all collapse to the same key. Comparing raw strings would
 /// let the evasion shapes past the check and then silently lose to the vmcell injection.
 #[cfg(feature = "am-fs-erofs")]
 pub fn is_reserved_injection_path(dest: &str) -> bool {
@@ -159,7 +159,7 @@ fn validate_extra_files(extra: &[ExtraFile]) -> Result<Vec<(String, PathBuf, u16
         if is_reserved_injection_path(dest) {
             return Err(Error::Artifact(format!(
                 "injected extra file dest `{dest}` is a vmcell-owned injection path \
-                 (the guest agent, the CA trust store, or /{VMCELL_TOOLS_DIR}); \
+                 (the steward, the CA trust store, or /{VMCELL_TOOLS_DIR}); \
                  vmcell's own injections are authoritative and are never overwritten"
             )));
         }
@@ -194,7 +194,7 @@ fn validate_extra_files(extra: &[ExtraFile]) -> Result<Vec<(String, PathBuf, u16
 /// `fuzzing` feature; see the feature's stanza in `Cargo.toml`).
 ///
 /// [`is_reserved_injection_path`] is already public, but it is only *half* of the law — the escapes
-/// this validator actually caught were normal-form ones (`/usr/sbin/./vmcell-guest-agent`, whose
+/// this validator actually caught were normal-form ones (`/usr/sbin/./vmcell-steward`, whose
 /// raw string is not a reserved path, and `/opt/.`, whose raw leaf normalizes away), plus the
 /// duplicate-dest case. Fuzzing the public half alone would report coverage of the reserved-list
 /// membership test while missing every shape that defeated it. Reads no file: an
@@ -215,9 +215,9 @@ pub struct RootfsStage {
     /// `Some` ignores the pinned `rootfs_image`/`rootfs_digest` and pulls this digest-pinned
     /// base instead. `None` uses the pins (the default `vmcell build`).
     pub image_override: Option<(String, String)>,
-    /// Static-musl guest agent to inject instead of the pipeline's default glibc agent
-    /// (`oci2erofs --agent-musl`, §4.2, Rootfs sources and the one packer). When `Some`, the libc6-presence guard is skipped.
-    pub agent_musl: Option<std::path::PathBuf>,
+    /// Static-musl steward to inject instead of the pipeline's default glibc steward
+    /// (`oci2erofs --steward-musl`, §4.2, Rootfs sources and the one packer). When `Some`, the libc6-presence guard is skipped.
+    pub steward_musl: Option<std::path::PathBuf>,
     /// Downstream files composed into the image at pack time (`oci2erofs --inject`, §4.2,
     /// FR-V4). Empty for the default `vmcell build`.
     pub extra: Vec<ExtraFile>,
@@ -227,8 +227,8 @@ pub struct RootfsStage {
 /// identity changes so stale outputs are not served — the rootfs is a warm-cache artifact, and
 /// an identity-fold change without the bump serves a stale image while every test stays green.
 ///
-/// v15: bumped to 2 with the oci2erofs image-override + agent-musl inputs.
-/// v20: bumped to 3 — the shared injected-content fold (agent-musl + CA + guest-agent source)
+/// v15: bumped to 2 with the oci2erofs image-override + steward-musl inputs.
+/// v20: bumped to 3 — the shared injected-content fold (steward-musl + CA + steward source)
 /// moved into [`fold_rootfs_injection_identity`] (called first), which reorders the hashed byte
 /// stream. A one-time OCI-rootfs rebuild is harmless.
 /// v30 (§18 delta 6): bumped to 4 — the fold gained the sorted downstream extra-file triples.
@@ -251,13 +251,13 @@ impl Stage for RootfsStage {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&OCI_ROOTFS_STAGE_VERSION.to_le_bytes());
         // Fold the identity of everything the shared inject+pack tail bakes in (the optional
-        // static-musl agent override, the deployment CA, the guest-agent source closure, the
+        // static-musl steward override, the deployment CA, the steward source closure, the
         // downstream extra files) — ONE implementation, shared with the out-of-crate in-VM
         // rootfs builders (§4.3, The rootfs-construction contract).
         fold_rootfs_injection_identity(
             &mut hasher,
             inputs,
-            self.agent_musl.as_deref(),
+            self.steward_musl.as_deref(),
             &self.extra,
         );
         hasher.update(b"oci");
@@ -286,10 +286,10 @@ impl Stage for RootfsStage {
         // deterministic key-sorted order over their on-disk content. Folding *every*
         // upstream artifact meant a `kernel` rebuild invalidated the OCI rootfs, which does
         // not depend on the kernel (the OCI source boots no VM). Scope the fold to the
-        // injected `guest_agent` + `guest_tools` binaries (the base image is a pin/override,
+        // injected `steward` + `guest_tools` binaries (the base image is a pin/override,
         // not an artifact). The in-VM `mmdebstrap` source, which additionally consumes the
         // seed `kernel`, lives in `vmcell-rootfs-builder` and folds it in its own key.
-        let consumed: &[&str] = &["guest_agent", "guest_tools"];
+        let consumed: &[&str] = &["steward", "guest_tools"];
         let filtered: std::collections::HashMap<String, std::path::PathBuf> = inputs
             .artifacts
             .iter()
@@ -322,7 +322,7 @@ impl Stage for RootfsStage {
             &digest,
             inputs,
             out,
-            self.agent_musl.as_deref(),
+            self.steward_musl.as_deref(),
             &self.extra,
         )
         .await
@@ -330,8 +330,8 @@ impl Stage for RootfsStage {
 }
 
 /// Folds the identity of everything the shared inject+pack tail ([`pack_erofs_with_injection`])
-/// bakes into a rootfs — the optional static-musl agent override (by CONTENT, H-ART-1), the
-/// deployment proxy CA cert (M-ART-10), the guest-agent source closure, and the downstream
+/// bakes into a rootfs — the optional static-musl steward override (by CONTENT, H-ART-1), the
+/// deployment proxy CA cert (M-ART-10), the steward source closure, and the downstream
 /// [`ExtraFile`]s — into `hasher`.
 ///
 /// The extra files fold as `(dest, mode, content-hash)` triples in sorted-dest order (§4.2):
@@ -341,7 +341,7 @@ impl Stage for RootfsStage {
 /// Every rootfs builder folds this identically: the in-`vmcell` OCI [`RootfsStage`] and the
 /// out-of-crate in-VM sources (`vmcell-rootfs-builder`). Kept here so there is exactly ONE
 /// implementation of the injected-content identity (§4.3, The rootfs-construction contract; AGENTS.md "don't triplicate;
-/// extract") — a musl-agent/CA/agent rebuild then invalidates the cached erofs from any source.
+/// extract") — a musl-steward/CA/steward rebuild then invalidates the cached erofs from any source.
 ///
 /// Callers fold their own `STAGE_VERSION`, source discriminator, source-specific pins, and
 /// consumed-artifact set (via [`crate::artifact::hash_artifacts_sorted`]) around this call.
@@ -349,22 +349,22 @@ impl Stage for RootfsStage {
 pub fn fold_rootfs_injection_identity(
     hasher: &mut blake3::Hasher,
     inputs: &StageInputs,
-    agent_musl: Option<&Path>,
+    steward_musl: Option<&Path>,
     extra: &[ExtraFile],
 ) {
-    // The injected-agent identity: a static-musl override (folded by CONTENT, not path string,
-    // since the GuestAgentStage is skipped on that path) vs. the default glibc agent. A read
+    // The injected-steward identity: a static-musl override (folded by CONTENT, not path string,
+    // since the StewardStage is skipped on that path) vs. the default glibc steward. A read
     // failure folds a distinct marker; the resulting miss re-runs the build, which fails loud.
-    match agent_musl {
+    match steward_musl {
         Some(p) => {
-            hasher.update(b"agent-musl\0");
+            hasher.update(b"steward-musl\0");
             match crate::artifact::hash_file(p) {
                 Ok(h) => hasher.update(h.as_bytes()),
-                Err(_) => hasher.update(format!("missing-agent-musl:{}", p.display()).as_bytes()),
+                Err(_) => hasher.update(format!("missing-steward-musl:{}", p.display()).as_bytes()),
             };
         }
         None => {
-            hasher.update(b"agent-default\0");
+            hasher.update(b"steward-default\0");
         }
     }
     // The baked proxy CA cert content (M-ART-10): `run()` writes the deployment CA into the
@@ -382,12 +382,12 @@ pub fn fold_rootfs_injection_identity(
             }
         };
     }
-    // The guest-agent source identity (travels via the resolved pins): rebuilding the agent
-    // must invalidate the rootfs, otherwise a stale agent stays baked in.
+    // The steward source identity (travels via the resolved pins): rebuilding the steward
+    // must invalidate the rootfs, otherwise a stale steward stays baked in.
     hasher.update(
         inputs
             .pins
-            .get("guest_agent_src_hash")
+            .get("steward_src_hash")
             .map(String::as_bytes)
             .unwrap_or_default(),
     );
@@ -451,10 +451,10 @@ pub fn resolve_builder_base(
 }
 
 /// Shared logic to take a list of tar streams, insert the caller's `extra` files, inject the
-/// agent and CA, and pack it into erofs.
+/// steward and CA, and pack it into erofs.
 ///
 /// The ONE inject+pack tail: every rootfs source routes through it (§4.3 obligation 3), so the
-/// `libc6` scan, the `--agent-musl` opt-in, and the downstream `extra` files with their
+/// `libc6` scan, the `--steward-musl` opt-in, and the downstream `extra` files with their
 /// reserved-path collision guard apply to every source for free. `extra` is validated FIRST —
 /// before any I/O — so a bad dest or mode fails before the CA is materialized or a byte is packed.
 ///
@@ -472,7 +472,7 @@ pub async fn pack_erofs_with_injection(
     tar_streams: Vec<Box<dyn Read + Send>>,
     inputs: &StageInputs,
     out: &Path,
-    agent_musl: Option<&Path>,
+    steward_musl: Option<&Path>,
     extra: &[ExtraFile],
 ) -> Result<StageOutputs> {
     let out_buf = out.to_path_buf();
@@ -482,19 +482,19 @@ pub async fn pack_erofs_with_injection(
     // `VmConfig` (design §4.2, invariant F5).
     let extra_validated = validate_extra_files(extra)?;
 
-    // The injected agent. A user-supplied static-musl binary (`--agent-musl`, oci2erofs §4.2, Rootfs sources and the one packer)
-    // overrides the pipeline's default glibc agent artifact; otherwise a missing default agent
+    // The injected steward. A user-supplied static-musl binary (`--steward-musl`, oci2erofs §4.2, Rootfs sources and the one packer)
+    // overrides the pipeline's default glibc steward artifact; otherwise a missing default steward
     // is a hard error, never a boot from a world-writable, attacker-plantable `/tmp` path.
-    let agent_path = match agent_musl {
+    let steward_path = match steward_musl {
         Some(p) => p.to_path_buf(),
         None => inputs
             .artifacts
-            .get("guest_agent")
+            .get("steward")
             .cloned()
-            .ok_or_else(|| Error::Artifact("missing guest_agent upstream input".into()))?,
+            .ok_or_else(|| Error::Artifact("missing steward upstream input".into()))?,
     };
-    // The default (glibc) agent needs libc6 in the base; the static-musl agent does not.
-    let require_libc6 = agent_musl.is_none();
+    // The default (glibc) steward needs libc6 in the base; the static-musl steward does not.
+    let require_libc6 = steward_musl.is_none();
 
     // Materialize the deployment CA and inject it from the ONE file `CaManager` publishes —
     // `<artifacts-dir>/ca.pem`, written under the `.ca.lock` flock as a temp-then-rename.
@@ -524,7 +524,7 @@ pub async fn pack_erofs_with_injection(
         #[cfg(not(feature = "proxy"))]
         let ca_opt: Option<&Path> = None;
         let (injected_files, injected_symlinks) =
-            rootfs_injection_manifest(agent_path.as_path(), ca_opt, tools_path.as_deref());
+            rootfs_injection_manifest(steward_path.as_path(), ca_opt, tools_path.as_deref());
         // The manifest's link paths are owned (composed per applet-roster entry); borrow them
         // back for the packer, whose signature is unchanged. `injected_symlinks` outlives the
         // call, so the borrows are valid for it.
@@ -595,12 +595,12 @@ type InjectLink = (String, &'static str);
 /// unrepresentable rather than merely tested for.
 #[cfg(feature = "am-fs-erofs")]
 fn rootfs_injection_manifest<'a>(
-    agent: &'a Path,
+    steward: &'a Path,
     ca: Option<&'a Path>,
     tools: Option<&'a Path>,
 ) -> (Vec<InjectFile<'a>>, Vec<InjectLink>) {
     // `None` mode: vmcell's own entries keep the `injected_file_mode` bin/sbin heuristic.
-    let mut files: Vec<InjectFile<'a>> = vec![("usr/sbin/vmcell-guest-agent", agent, None)];
+    let mut files: Vec<InjectFile<'a>> = vec![("usr/sbin/vmcell-steward", steward, None)];
     if let Some(ca) = ca {
         files.push(("usr/local/share/ca-certificates/vmcell-ca.crt", ca, None));
         files.push(("etc/ssl/certs/ca-certificates.crt", ca, None));
@@ -608,12 +608,12 @@ fn rootfs_injection_manifest<'a>(
     let mut symlinks: Vec<InjectLink> = Vec::new();
     if let Some(tools) = tools {
         files.push(("vmcell-tools/vmcell-guest-tools", tools, None));
-        // busybox-style multicall links resolved on the exec PATH (the guest agent prepends
+        // busybox-style multicall links resolved on the exec PATH (the steward prepends
         // /vmcell-tools) — ONE per roster entry, derived from the shared const the guest
         // binary's dispatch table is compile-time pinned to. There is deliberately no name
         // literal here: `echo-server` (the §3.2 raw-vsock-dial / §6.5 segment listener) is
         // also the one applet used as a custom `init=` target, which resolves its absolute
-        // path before any agent exists — so a symlink this manifest forgot to emit is a
+        // path before any steward exists — so a symlink this manifest forgot to emit is a
         // guest kernel panic, not a missing test helper.
         for applet in vmcell_protocol::GUEST_TOOLS_APPLETS {
             symlinks.push((
@@ -625,13 +625,13 @@ fn rootfs_injection_manifest<'a>(
     (files, symlinks)
 }
 
-/// Shared logic to take a tar stream, inject the agent and CA, and pack it into erofs.
+/// Shared logic to take a tar stream, inject the steward and CA, and pack it into erofs.
 #[cfg(not(feature = "am-fs-erofs"))]
 pub async fn pack_erofs_with_injection(
     _tar_streams: Vec<Box<dyn Read + Send>>,
     _inputs: &StageInputs,
     _out: &Path,
-    _agent_musl: Option<&Path>,
+    _steward_musl: Option<&Path>,
     _extra: &[ExtraFile],
 ) -> Result<StageOutputs> {
     // mkfs.erofs fallback requires extracting the tar to a directory, adding the files,
@@ -689,7 +689,7 @@ mod tests {
     fn stage() -> RootfsStage {
         RootfsStage {
             image_override: None,
-            agent_musl: None,
+            steward_musl: None,
             extra: Vec::new(),
         }
     }
@@ -697,7 +697,7 @@ mod tests {
     fn stage_with(extra: Vec<ExtraFile>) -> RootfsStage {
         RootfsStage {
             image_override: None,
-            agent_musl: None,
+            steward_musl: None,
             extra,
         }
     }
@@ -709,20 +709,20 @@ mod tests {
     }
 
     // Guards ARTIFACT-PIPELINE-1 for the CONSUMED-artifact fold: the two artifacts this OCI
-    // stage consumes (`guest_agent`, `guest_tools`) must fold order-independently over their
+    // stage consumes (`steward`, `guest_tools`) must fold order-independently over their
     // content. Inserted in opposite orders, the content-addressed key must be identical.
     #[test]
     fn test_rootfs_cache_key_order_independent() {
         stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
-        let agent = write_tmp(dir.path(), "guest_agent", b"agent-bytes");
+        let steward = write_tmp(dir.path(), "steward", b"steward-bytes");
         let tools = write_tmp(dir.path(), "guest_tools", b"tools-bytes");
         let mut a = StageInputs::default();
-        a.artifacts.insert("guest_agent".to_string(), agent.clone());
+        a.artifacts.insert("steward".to_string(), steward.clone());
         a.artifacts.insert("guest_tools".to_string(), tools.clone());
         let mut b = StageInputs::default();
         b.artifacts.insert("guest_tools".to_string(), tools);
-        b.artifacts.insert("guest_agent".to_string(), agent);
+        b.artifacts.insert("steward".to_string(), steward);
         assert_eq!(stage().cache_key(&a), stage().cache_key(&b));
     }
 
@@ -735,10 +735,10 @@ mod tests {
     #[cfg(feature = "am-fs-erofs")]
     #[test]
     fn rootfs_injection_manifest_pins_truststore_and_tools() {
-        let agent = Path::new("/agent");
+        let steward = Path::new("/steward");
         let ca = Path::new("/ca.pem");
         let tools = Path::new("/tools");
-        let (files, symlinks) = rootfs_injection_manifest(agent, Some(ca), Some(tools));
+        let (files, symlinks) = rootfs_injection_manifest(steward, Some(ca), Some(tools));
         let dests: Vec<&str> = files.iter().map(|(d, _, _)| *d).collect();
         // vmcell's own entries keep the `injected_file_mode` heuristic: only a downstream
         // `ExtraFile` states its mode explicitly (§4.2). A `Some(...)` here would mean the
@@ -748,8 +748,8 @@ mod tests {
             "manifest entries take the injected_file_mode heuristic, not an explicit mode"
         );
 
-        // The guest-agent (PID 1) is always injected.
-        assert!(dests.contains(&"usr/sbin/vmcell-guest-agent"));
+        // The steward (PID 1) is always injected.
+        assert!(dests.contains(&"usr/sbin/vmcell-steward"));
         // With a CA: BOTH the drop-in AND the /etc/ssl/certs bundle the rustls stack reads at
         // client-build time. Missing the bundle => guest-tools curl can't build a client, so even
         // plain-HTTP egress fails (gt-curl-truststore).
@@ -787,7 +787,7 @@ mod tests {
         }
 
         // No CA (the non-proxy build) => no trust-store bundle injected.
-        let (files_np, _) = rootfs_injection_manifest(agent, None, Some(tools));
+        let (files_np, _) = rootfs_injection_manifest(steward, None, Some(tools));
         assert!(
             !files_np
                 .iter()
@@ -820,11 +820,11 @@ mod tests {
                 "the absolute form /{dest} must be reserved too"
             );
         }
-        // Normalization-before-comparison: each of these names the guest agent.
+        // Normalization-before-comparison: each of these names the steward.
         for evasion in [
-            "/usr/sbin/./vmcell-guest-agent",
-            "//usr/sbin/vmcell-guest-agent",
-            "/usr/sbin//vmcell-guest-agent",
+            "/usr/sbin/./vmcell-steward",
+            "//usr/sbin/vmcell-steward",
+            "/usr/sbin//vmcell-steward",
         ] {
             assert!(
                 is_reserved_injection_path(evasion),
@@ -884,8 +884,8 @@ mod tests {
 
         for (label, spec) in [
             (
-                "reserved: the guest agent",
-                ok("/usr/sbin/vmcell-guest-agent", 0o755),
+                "reserved: the steward",
+                ok("/usr/sbin/vmcell-steward", 0o755),
             ),
             (
                 "reserved: the CA drop-in",
@@ -905,7 +905,7 @@ mod tests {
             ),
             (
                 "reserved: a `.`-bearing evasion",
-                ok("/usr/sbin/./vmcell-guest-agent", 0o755),
+                ok("/usr/sbin/./vmcell-steward", 0o755),
             ),
             ("relative dest", ok("usr/local/bin/acme", 0o755)),
             ("trailing slash", ok("/usr/local/bin/", 0o755)),
@@ -1062,13 +1062,11 @@ mod tests {
     fn test_rootfs_cache_key_tracks_upstream_content() {
         stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
-        let p = write_tmp(dir.path(), "guest_agent", b"agent-v1");
+        let p = write_tmp(dir.path(), "steward", b"steward-v1");
         let mut inputs = StageInputs::default();
-        inputs
-            .artifacts
-            .insert("guest_agent".to_string(), p.clone());
+        inputs.artifacts.insert("steward".to_string(), p.clone());
         let k1 = stage().cache_key(&inputs);
-        std::fs::write(&p, b"agent-v2-rebuilt-at-same-path").expect("write");
+        std::fs::write(&p, b"steward-v2-rebuilt-at-same-path").expect("write");
         let k2 = stage().cache_key(&inputs);
         assert_ne!(
             k1, k2,
@@ -1076,42 +1074,42 @@ mod tests {
         );
     }
 
-    // Guards ARTIFACT-PIPELINE-2: the rootfs key omitting `guest_agent_src_hash` lets a
-    // stale agent stay baked in; folding it in makes the key sensitive to it.
+    // Guards ARTIFACT-PIPELINE-2: the rootfs key omitting `steward_src_hash` lets a
+    // stale steward stay baked in; folding it in makes the key sensitive to it.
     #[test]
-    fn test_rootfs_cache_key_tracks_guest_agent_src_hash() {
+    fn test_rootfs_cache_key_tracks_steward_src_hash() {
         stabilize_ca();
         let mut a = StageInputs::default();
         a.pins
-            .insert("guest_agent_src_hash".to_string(), "hash-aaa".to_string());
+            .insert("steward_src_hash".to_string(), "hash-aaa".to_string());
         let mut b = StageInputs::default();
         b.pins
-            .insert("guest_agent_src_hash".to_string(), "hash-bbb".to_string());
+            .insert("steward_src_hash".to_string(), "hash-bbb".to_string());
         assert_ne!(stage().cache_key(&a), stage().cache_key(&b));
     }
 
-    // H-ART-1: the injected static-musl agent must be folded by CONTENT, not by its path
-    // string. When `agent_musl` is set the GuestAgentStage is skipped, so the agent has no
+    // H-ART-1: the injected static-musl steward must be folded by CONTENT, not by its path
+    // string. When `steward_musl` is set the StewardStage is skipped, so the steward has no
     // other content identity in the key — rebuilding it at the SAME path must invalidate the
     // rootfs. The buggy path-string fold leaves k1 == k2 (same path) -> red here.
     #[test]
-    fn test_rootfs_agent_musl_key_tracks_content() {
+    fn test_rootfs_steward_musl_key_tracks_content() {
         stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
-        let agent = write_tmp(dir.path(), "agent-musl", b"musl-v1");
+        let steward = write_tmp(dir.path(), "steward-musl", b"musl-v1");
         let s = RootfsStage {
             image_override: None,
-            agent_musl: Some(agent.clone()),
+            steward_musl: Some(steward.clone()),
             extra: Vec::new(),
         };
         let inputs = StageInputs::default();
         let k1 = s.cache_key(&inputs);
-        // Rebuild the musl agent in place at the SAME path.
-        std::fs::write(&agent, b"musl-v2-rebuilt-at-same-path").expect("write");
+        // Rebuild the musl steward in place at the SAME path.
+        std::fs::write(&steward, b"musl-v2-rebuilt-at-same-path").expect("write");
         let k2 = s.cache_key(&inputs);
         assert_ne!(
             k1, k2,
-            "a rebuilt agent-musl at the same path must invalidate the rootfs key (H-ART-1)"
+            "a rebuilt steward-musl at the same path must invalidate the rootfs key (H-ART-1)"
         );
     }
 
@@ -1159,25 +1157,25 @@ mod tests {
         );
     }
 
-    // Guards ARTIFACT-PIPELINE-3: a missing guest_agent input must be a hard error, never a
-    // silent boot from a world-writable `/tmp/guest_agent`.
+    // Guards ARTIFACT-PIPELINE-3: a missing steward input must be a hard error, never a
+    // silent boot from a world-writable `/tmp/steward`.
     #[cfg(feature = "am-fs-erofs")]
     #[tokio::test]
-    async fn test_pack_erofs_missing_agent_errors() {
+    async fn test_pack_erofs_missing_steward_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("rootfs.erofs");
         let inputs = StageInputs::default();
         let res = pack_erofs_with_injection(vec![], &inputs, &out, None, &[]).await;
         assert!(
             matches!(res, Err(Error::Artifact(_))),
-            "missing guest_agent must be a hard error, got {res:?}"
+            "missing steward must be a hard error, got {res:?}"
         );
     }
 
-    // The extras are validated BEFORE any side effect: this call has no `guest_agent` either,
+    // The extras are validated BEFORE any side effect: this call has no `steward` either,
     // yet the reserved-dest error is what surfaces — proving the check runs ahead of the CA
     // materialization (which MINTS the pair when it is absent) and the pack. The buggy order
-    // (validate inside/after the blocking pack) reports the missing-agent error instead.
+    // (validate inside/after the blocking pack) reports the missing-steward error instead.
     #[cfg(feature = "am-fs-erofs")]
     #[tokio::test]
     async fn test_pack_erofs_rejects_reserved_extra_dest_before_any_io() {
@@ -1185,7 +1183,7 @@ mod tests {
         let out = dir.path().join("rootfs.erofs");
         let inputs = StageInputs::default();
         let extra = [ExtraFile::new(
-            "/usr/sbin/vmcell-guest-agent",
+            "/usr/sbin/vmcell-steward",
             dir.path().join("evil"),
             0o755,
         )];
@@ -1197,7 +1195,7 @@ mod tests {
         };
         assert!(
             msg.contains("vmcell-owned injection path"),
-            "the reserved-dest check must run before the missing-agent check, got: {msg}"
+            "the reserved-dest check must run before the missing-steward check, got: {msg}"
         );
         // Nothing at all may land in the staging dir — asserted over its whole content rather
         // than over one known filename, so any future side effect ahead of the validation
@@ -1240,9 +1238,9 @@ mod tests {
         let beside_the_output = dir.path().join("ca.pem");
         std::fs::write(&beside_the_output, sentinel).expect("seed the sentinel");
 
-        // A static-musl agent: `require_libc6` is then false, so the tail packs with no layers.
-        let musl = dir.path().join("agent-musl");
-        std::fs::write(&musl, b"#!static-agent").expect("write the agent stand-in");
+        // A static-musl steward: `require_libc6` is then false, so the tail packs with no layers.
+        let musl = dir.path().join("steward-musl");
+        std::fs::write(&musl, b"#!static-steward").expect("write the steward stand-in");
 
         let inputs = StageInputs::default();
         pack_erofs_with_injection(vec![], &inputs, &out, Some(&musl), &[])

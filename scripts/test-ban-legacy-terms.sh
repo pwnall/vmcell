@@ -31,6 +31,23 @@ printf 'fn t() { let _ = "imp-tap0"; }\n'                    > "$work/src/prefix
 printf 'fn v() { let _ = imp_vmid(5); }\n'                   > "$work/src/ident.rs"
 printf 'struct Imp;\nconst H: &str = "Imp'"'"'s cell";\n'   > "$work/src/cap_imp.rs"
 
+# v33 delta 1 — the steward rename. ONE fixture per new scanner branch, so deleting any branch
+# reddens exactly one fixture (the meta-rule: a gate whose self-test cannot fail is theater).
+printf 'fn c() { let _ = "vmcell-guest-agent"; }\n'           > "$work/src/sw_crate.rs"
+printf 'fn c() { let _ = vmcell_guest_agent::VERSION; }\n'    > "$work/src/sw_lib.rs"
+printf 'struct AgentClient;\n'                                > "$work/src/sw_client.rs"
+printf 'struct AgentPlacement;\n'                             > "$work/src/sw_placement.rs"
+printf 'struct AgentOptions;\n'                               > "$work/src/sw_options.rs"
+printf 'struct GuestAgentStage;\n'                            > "$work/src/sw_stage.rs"
+printf 'fn e() -> Error { Error::Agent("x".into()) }\n'       > "$work/src/sw_error.rs"
+printf 'const P: u32 = AGENT_VSOCK_PORT;\n'                   > "$work/src/sw_port.rs"
+printf 'fn h() { let _ = guest_agent_src_hash(); }\n'         > "$work/src/sw_srchash.rs"
+printf 'fn h() { let _ = guest_agent_closure_hash(); }\n'     > "$work/src/sw_closhash.rs"
+printf 'const ID: &str = "boot.agent_ready";\n'               > "$work/src/sw_bootid.rs"
+printf 'const ID: &str = "agent.exec_roundtrip";\n'           > "$work/src/sw_execid.rs"
+printf 'fn f() { let _ = "--agent-musl"; }\n'                 > "$work/src/sw_flag.rs"
+printf 'fn f() { let _ = agent_musl_path(); }\n'              > "$work/src/sw_musl.rs"
+
 # --- MUST NOT be flagged ------------------------------------------------------------------
 # The ordinary English words implementation/import/impl — never flagged, because `Imp`/`imp` is
 # followed by a word character (so the standalone-`Imp` and `imp-`/`imp_` patterns can't match).
@@ -41,6 +58,17 @@ printf 'struct VmCell;\nfn spawn() { let _ = "vmcell-vm-spawn"; }\n'        > "$
 printf 'const LEGACY: &str = "imp-testing"; // allow-legacy-term: fixture exercising the exemption\n' > "$work/src/exempt.rs"
 # Prose-only mention in a comment — stripped before analysis, so not a false positive.
 printf '// renamed away from the old rootless / imp-testing names to vmcell\nfn ok() {}\n' > "$work/src/prose.rs"
+
+# v33 delta 1 — the KEPT words. "Agent" survives as the DOMAIN word, and a bare-word ban would
+# redden the tree on its own charter. Each of these is live code (not a comment), so it is the
+# scanner's PATTERNS being tested, not its comment-stripping.
+printf 'const DOC: &str = "AGENTS.md";\n'                            > "$work/src/keep_agentsmd.rs"
+printf 'const D: &str = "vmcell serves agentic execution";\n'        > "$work/src/keep_agentic.rs"
+printf 'const F: &str = "AGENT-2 was the finding id";\n'             > "$work/src/keep_findingid.rs"
+printf 'const K: &str = "kata agent-ctl speaks the same wire";\n'    > "$work/src/keep_agentctl.rs"
+printf 'const H: &str = "User-Agent";\nconst P: &str = "Proxy-Agent";\nconst L: &str = "user-agent";\n' > "$work/src/keep_httphdr.rs"
+# The exemption marker works for the new family too, not just the imp-* one.
+printf 'const OLD: &str = "vmcell-guest-agent"; // allow-legacy-term: fixture exercising the steward-rename exemption\n' > "$work/src/keep_exempt_steward.rs"
 
 set +e
 out="$("$ban" "$work/src" 2>&1)"
@@ -65,10 +93,32 @@ expect_flag envvar.rs
 expect_flag prefix.rs
 expect_flag ident.rs
 expect_flag cap_imp.rs
+# v33 delta 1: one assertion per new scanner branch.
+expect_flag sw_crate.rs
+expect_flag sw_lib.rs
+expect_flag sw_client.rs
+expect_flag sw_placement.rs
+expect_flag sw_options.rs
+expect_flag sw_stage.rs
+expect_flag sw_error.rs
+expect_flag sw_port.rs
+expect_flag sw_srchash.rs
+expect_flag sw_closhash.rs
+expect_flag sw_bootid.rs
+expect_flag sw_execid.rs
+expect_flag sw_flag.rs
+expect_flag sw_musl.rs
 expect_clean origin.rs
 expect_clean clean.rs
 expect_clean exempt.rs
 expect_clean prose.rs
+# v33 delta 1: the kept words must stay green — a bare-word ban would redden the tree's own charter.
+expect_clean keep_agentsmd.rs
+expect_clean keep_agentic.rs
+expect_clean keep_findingid.rs
+expect_clean keep_agentctl.rs
+expect_clean keep_httphdr.rs
+expect_clean keep_exempt_steward.rs
 
 # Cross-check: a fully-clean tree exits 0 with the "ok:" line.
 mkdir -p "$work/clean"
@@ -154,4 +204,5 @@ if [[ $fail -ne 0 ]]; then
   echo "ban-legacy-terms self-test FAILED"
   exit 1
 fi
-echo "ok: ban-legacy-terms self-test passed (incl. the regular-file roster entry, the file count, and the empty/missing roster refusals)"
+echo "ok: ban-legacy-terms self-test passed (incl. the 14 steward-rename branches, the kept domain
+    words, the regular-file roster entry, the file count, and the empty/missing roster refusals)"

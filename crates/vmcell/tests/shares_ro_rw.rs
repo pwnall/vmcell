@@ -82,12 +82,12 @@ async fn test_shares_ro_rw_impl<V: vmcell::vmm::Vmm>(backend: &V) {
     .unwrap();
 
     let mut vm = common::start_vm(backend, cfg).await;
-    let agent = vm
-        .agent(Some(std::time::Duration::from_secs(60)))
+    let steward = vm
+        .steward(Some(std::time::Duration::from_secs(60)))
         .await
-        .expect("Failed to connect to agent");
+        .expect("Failed to connect to steward");
 
-    vmcell_artifact_validator::checks::virtiofs_shares(agent, &out_dir)
+    vmcell_artifact_validator::checks::virtiofs_shares(steward, &out_dir)
         .await
         .expect("virtio-fs RO/RW share contract");
 

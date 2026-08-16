@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "am-fs-erofs",
  "assert_cmd",
@@ -4544,7 +4544,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell-artifact-validator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures 0.3.32",
  "tempfile",
@@ -4654,22 +4654,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vmcell-guest-agent"
-version = "0.3.0"
-dependencies = [
- "bytes 1.12.1",
- "libc",
- "postcard",
- "rustix",
- "signal-hook",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "vmcell-protocol",
- "vsock",
-]
-
-[[package]]
 name = "vmcell-guest-tools"
 version = "0.2.0"
 dependencies = [
@@ -4731,6 +4715,22 @@ dependencies = [
  "tokio 1.52.3",
  "tracing",
  "vmcell",
+]
+
+[[package]]
+name = "vmcell-steward"
+version = "0.3.0"
+dependencies = [
+ "bytes 1.12.1",
+ "libc",
+ "postcard",
+ "rustix",
+ "signal-hook",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "vmcell-protocol",
+ "vsock",
 ]
 
 [[package]]

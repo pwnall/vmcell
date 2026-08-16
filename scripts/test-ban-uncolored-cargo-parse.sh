@@ -56,7 +56,7 @@ EOF
 # A YAML `run:` block whose command is continued with a backslash — the ci.yml shape.
 cat > "$work/v-continuation.yml" <<'EOF'
 run: |
-  if cargo tree --locked -e no-dev -p vmcell-guest-agent \
+  if cargo tree --locked -e no-dev -p vmcell-steward \
        | grep -E "── tokio v"; then exit 1; fi
 EOF
 

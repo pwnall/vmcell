@@ -118,12 +118,12 @@ jobs:
       - name: repo gates (ban/check scripts + red-on-inverse self-tests + shellcheck)
         run: just gates
 
-      - name: lean-member compilation (agent / test-runner / privilege)
+      - name: lean-member compilation (steward / test-runner / privilege)
         run: |
           # The tree-SHAPE assertion (`check-lean-tree.sh`) runs in `just gates` above. Graph
           # inspection is not enough: actually compile each member so a broken build (e.g. an
           # un-gated host dep) is caught here, not on a KVM host.
-          cargo clippy --locked -p vmcell-guest-agent --all-targets -- -D warnings
+          cargo clippy --locked -p vmcell-steward --all-targets -- -D warnings
           cargo clippy --locked -p vmcell-test-runner --all-targets -- -D warnings
           cargo clippy --locked -p vmcell-privilege --all-targets -- -D warnings
 

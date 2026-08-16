@@ -1,21 +1,21 @@
 [package]
-name = "vmcell-guest-agent"
+name = "vmcell-steward"
 version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "vmcell guest PID-1 agent: vsock control plane + zombie reaper (lean, no host async stack)"
+description = "vmcell guest PID-1 steward: vsock control plane + zombie reaper (lean, no host async stack)"
 publish = false
 
 # A library (the PID-1 reaper coordination — pure, unit-tested) plus the thin binary that
-# drives it. Both stay off the host async stack; the CI lean-agent assertion enforces this
+# drives it. Both stay off the host async stack; the CI lean-steward assertion enforces this
 # structurally on the member crate (v15 §12.8 #4).
 [lib]
-name = "vmcell_guest_agent"
+name = "vmcell_steward"
 path = "src/lib.rs"
 
 [[bin]]
-name = "vmcell-guest-agent"
+name = "vmcell-steward"
 path = "src/main.rs"
 
 [dependencies]
@@ -27,7 +27,7 @@ vsock = "0.5"
 # OPP-2). `pty`/`termios`/`stdio` power interactive PTY sessions (design 62 §22):
 # `openpt`/`ptsname`/`unlockpt`, `tcsetwinsize`/`Winsize`, and the async-signal-safe
 # `setsid`/`ioctl_tiocsctty`/`dup2_std*` login-tty sequence in the child `pre_exec`.
-# All are features on the existing dep, so the lean-agent graph gains no crate.
+# All are features on the existing dep, so the lean-steward graph gains no crate.
 rustix = { version = "1", features = ["fs", "mount", "process", "net", "time", "event", "pty", "termios", "stdio"] }
 signal-hook = "0.4"
 libc = "0.2"
@@ -36,7 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # AGENT-3: round-trip the guest's hand-rolled framing against the REAL host codec
-# in a KVM-free unit test. Dev-only, so the CI lean-agent assertion (`cargo tree
-# -e no-dev`) still sees no tokio/hyper on the agent's production graph.
+# in a KVM-free unit test. Dev-only, so the CI lean-steward assertion (`cargo tree
+# -e no-dev`) still sees no tokio/hyper on the steward's production graph.
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"

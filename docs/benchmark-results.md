@@ -158,7 +158,7 @@ returned byte asserted.
 
 **Zygote CoW fan-out (`zygote`; CH + QEMU concurrent N=8; FC + crosvm single-clone control N=1).**
 
-| Backend | fan-out to N total p50 / p95 | per-clone p50 | agent-ready-all p50 | CoW |
+| Backend | fan-out to N total p50 / p95 | per-clone p50 | steward-ready-all p50 | CoW |
 | --- | --- | --- | --- | --- |
 | **CH** (N=8) | 440 / 468 ms | ~55 ms | 4 ms | FullCopy |
 | **QEMU** (N=8) | 504 / 522 ms | ~63 ms | 8 ms | FullCopy |
@@ -178,7 +178,7 @@ returned byte asserted.
 | --- | --- | --- |
 | **list** | 0.7 / 0.7 ms | pure HTTP + broker bridge, NO VMM work, connection reused — the bridge floor |
 | **exec** | 1.4 / 1.5 ms | bridge + in-guest vsock exec (~0.7 ms over `list`) |
-| **create** | 329.2 / 345.2 ms | full cold-boot-to-agent-ready THROUGH HTTP + broker (defaults vcpus=2/mem=512) |
+| **create** | 329.2 / 345.2 ms | full cold-boot-to-steward-ready THROUGH HTTP + broker (defaults vcpus=2/mem=512) |
 | **destroy** | 262.6 / 268.2 ms | teardown THROUGH the daemon (graceful grace, like the ~260 ms `shutdown()` path) |
 | **restore** | 517.5 / 549.6 ms | `restore_from` via `restore_cow` FullCopy tree-copy (round-2 note below) |
 
@@ -289,7 +289,7 @@ is all-QEMU: warm restore, suspend-size, and better cold-boot robustness.
   `MAX_CONTROL_PLANE_RESPAWNS=4`) *recovers* the ~11 % external-`vhost-device-vsock` bring-up flake
   instead of dropping the iteration; the cost is a rare (~1/20) ~5 s p99 tail on the recovered boot
   (4 s probe budget + ~1.3 s re-spawn). p50 is unchanged (~1002 ms, re-measured 1004) — the
-  health-gate pays the guest-boot wait once, then `agent()` re-connects cheaply.
+  health-gate pays the guest-boot wait once, then `steward()` re-connects cheaply.
 
 **Phase-budget, p50 ms (`default` profile: create + connect + graceful `shutdown()` teardown):**
 
@@ -347,7 +347,7 @@ is in-guest fork/exec/reap-dominated and the transport/`-sandbox` do not touch i
 of identical-guest RAM. Dead-linear per added guest on every backend.
 
 **Coverage caveat — what this matrix does *not* reach.** The core modes are scoped to **single-VM,
-no-network (`NetConfig::None`), library-direct (no `vmcelld`/broker), one-shot `AgentClient`**
+no-network (`NetConfig::None`), library-direct (no `vmcelld`/broker), one-shot `StewardClient`**
 lifecycle. They *do* bound the changed spawn path (seccomp/jailer land on the measured `create` phase
 for all three backends) and the rewritten connect/handshake law (measured by the `connect` phase +
 vsock-rtt on both the Unix and Vsock arms). The **follow-up probes below** (added 2026-07-15,
@@ -398,9 +398,9 @@ the NAT and a real returned byte is asserted (data-plane, not a proxy signal).
 
 **Zygote CoW fan-out (`zygote`; CH + QEMU concurrent, Firecracker single-clone control).**
 Snapshot a base once, then time `Zygote::spawn_clones` restoring + resuming N=8 CoW clones
-concurrently, plus time-to-agent-ready across all.
+concurrently, plus time-to-steward-ready across all.
 
-| Backend | fan-out to N total p50 / p95 | per-clone p50 | agent-ready-all p50 | CoW |
+| Backend | fan-out to N total p50 / p95 | per-clone p50 | steward-ready-all p50 | CoW |
 | --- | --- | --- | --- | --- |
 | **CH** (N=8) | 440 / 467 ms | ~55 ms | 4 ms | FullCopy |
 | **QEMU** (N=8) | 522 / 526 ms | ~65 ms | 9 ms | FullCopy |
@@ -414,7 +414,7 @@ concurrently, plus time-to-agent-ready across all.
   misread. **Fan-out is sub-linear**: CH's 8-clone total (440 ms) is only ~1.3× its 3-clone total
   (~348 ms) — the concurrent CoW copies + restores overlap, so per-clone drops from ~116 ms (n=3) to
   ~55 ms (n=8). QEMU's per-clone (~65 ms) beats its single-boot restore (~462 ms) because the sparse
-  52 MB migrate stream copies far less than CH's dense 256 MB. agent-ready across all clones is a few
+  52 MB migrate stream copies far less than CH's dense 256 MB. steward-ready across all clones is a few
   ms — they are already resumed by `spawn_clones`; the fan-out cost is the CoW copy + restore + resume.
 
 **Daemon API (`bench-vm --mode daemon-api`; CH).** vmcelld HTTP + broker-bridge overhead over the
@@ -427,7 +427,7 @@ so it is **freq-pinned** like every mode and the pooled connection isolates the 
 | --- | --- | --- |
 | **list** | **0.1 / 0.2 ms** | pure HTTP + broker bridge, NO VMM work, connection reused — the **bridge floor** |
 | **exec** | **0.9 / 1.0 ms** | bridge + in-guest vsock exec (~0.2 ms over the raw vsock-rtt ~0.7 ms) |
-| **create** | 321 / 336 ms | full cold-boot-to-agent-ready THROUGH the HTTP + broker (defaults vcpus=2/mem=512) |
+| **create** | 321 / 336 ms | full cold-boot-to-steward-ready THROUGH the HTTP + broker (defaults vcpus=2/mem=512) |
 | **destroy** | 260 / 265 ms | teardown THROUGH the daemon (graceful grace, like the ~260 ms `shutdown()` path) |
 
 - **`list` (~0.1 ms) is the clean bridge floor**: every daemon op forwards parent→broker over a
@@ -477,7 +477,7 @@ every request**. `tls` rides the unprivileged smoltcp NAT (CH+QEMU; FC has no vh
   measures the mint + client-handshake path.
 
 **Interactive sessions (`session`; all three backends, no capability gate).** The `SessionMux` layer the
-one-shot `AgentClient` (measured by vsock-rtt) never exercises — a **second** vsock connection + its own
+one-shot `StewardClient` (measured by vsock-rtt) never exercises — a **second** vsock connection + its own
 `Ready` handshake, plus per-session open→guest-spawn→exit. (No resume-by-id API: "persistence" means
 long-lived sessions, not reattach; the connect handshake is the closest analogue.)
 
@@ -492,7 +492,7 @@ long-lived sessions, not reattach; the connect handshake is the closest analogue
   **session-open (~620–790 µs)** is the per-command open (no ack; timed to the terminal exit) —
   right on the vsock exec RTT floor (~0.7 ms), since it is the same in-guest fork/exec/reap round-trip
   plus session-registry bookkeeping. Sub-millisecond on all three; QEMU is marginally higher (its
-  vsock/agent path).
+  vsock/steward path).
 
 **Daemon restore (`bench-vm --mode daemon-api` `restore`; CH; freq-pinned).** Snapshot one VM once,
 then time N restores via `POST /v1/vms` with `restore_from` — the `restore_cow` reflink tree-copy path.
@@ -585,14 +585,14 @@ It is **not a fault**: FC's stderr is inherited (`firecracker.rs`, deliberate �
 panics/errors loud), and this is FC's own `main()` returning `Err(..)` as it exits. The graceful
 `SendCtrlAltDel` teardown drives the restored guest to reset; FC reports that reset with exit code
 `GenericError`(=1) where a cold guest's clean power-off yields `Ok`. Evidence it is benign: restore
-produces fully valid samples (agent connects + exec succeeds every iteration; 26 ms p50), FC's `main`
+produces fully valid samples (steward connects + exec succeeds every iteration; 26 ms p50), FC's `main`
 returns the error and the **process exits on its own** (a Rust `Error:` print, not our uncatchable
 SIGKILL — so `has_exited()` reaps it, `kill()` is skipped), and a single cold+restore run leaves
 **zero residue** (no leaked `firecracker` processes, no leaked netns, scratch cleaned). Not
 suppressed, because muting FC stderr would also hide real FC failures. It correlates with FC's fast
 43 ms restore teardown above (the guest exits promptly rather than sitting at the grace ceiling).
 
-### QEMU agent-timeout flake — root-caused and fixed (2026-07-04)
+### QEMU steward-timeout flake — root-caused and fixed (2026-07-04)
 
 CH and FC dropped **zero** iterations across the entire matrix; **QEMU** did not (latency 2/20;
 phase-budget, which `break`s its loop on the first timeout, needed 3 attempts for a clean n=12;
@@ -604,15 +604,15 @@ daemon** over a **`vhost-user-vsock`** virtqueue (CH/FC terminate vsock *inside*
 QEMU-only). That bring-up **races**: on ~11% of boots the data path comes up **wedged for the VM's
 entire life** — the daemon is alive and *accepts* the host `CONNECT`, but never reaches the guest
 listener (a raw CONNECT probe returns `<no reply within 500ms>`, persistently), while the guest is
-healthy (boots, no panic under `panic=1`, agent running). Because it is persistent-per-instance, the
-host's 10 s of retries all fail. Ruled out with evidence: not the guest agent, not a guest hang, not
+healthy (boots, no panic under `panic=1`, steward running). Because it is persistent-per-instance, the
+host's 10 s of retries all fail. Ruled out with evidence: not the steward, not a guest hang, not
 the re-bind idle window, not the host-facing UDS.
 
 **Fix.** A post-boot **control-plane health-gate** in `MicroVm::start`
 (`VmInstance::verify_control_plane`; QEMU override, default no-op for CH/FC). After boot it probes the
-vsock path with a bounded budget (reusing `AgentClient::connect`, so the handshake lives in one
+vsock path with a bounded budget (reusing `StewardClient::connect`, so the handshake lives in one
 place); a wedged VM is **re-spawned** on the same per-VM resources (up to 4×, then fails loud) instead
-of being handed back to time out ~10 s later at `agent()`. `spawn_qemu` pre-cleans stale sockets so
+of being handed back to time out ~10 s later at `steward()`. `spawn_qemu` pre-cleans stale sockets so
 re-spawn is safe. **Validated 120/120 QEMU boots green** post-fix (P of that by luck without the fix
 ≈ 8e-7); full privileged suite 72/72 across all backends. The repro test is the committed red→green
 gate (`#[ignore]`d; runs in `just test-privileged` via `--run-ignored all`, not in the KVM-free
@@ -626,7 +626,7 @@ substrate/method. What changed: readiness-poll unification (EXP-A), `cryptomgr.n
 raid=noautodetect` cmdline trims (EXP-B), event-driven guest accept via poll(2) (EXP-C),
 teardown grace deadline-before-RPC + adaptive poll step (EXP-D), and **Firecracker warm restore
 unlocked** (EXP-E: capability now honestly `true`; plus the AGENT-2 guest reaper-race fix that
-was the real cause of the historical "Agent … timed out" flake — QEMU now drops zero bench
+was the real cause of the historical "Steward … timed out" flake — QEMU now drops zero bench
 iterations).
 
 **Time-to-ready (latency mode), p50 / p95 ms — Δ vs the 07-01 baseline below:**
@@ -656,7 +656,7 @@ Per-experiment attribution, mechanisms, bug-risk analysis, and the FC-restore un
 Same substrate as below; N=20 (latency) / N=12 (phase-budget), warmup=3, mem=256 MiB,
 freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matrix.
 
-**Time-to-ready (latency mode: start|restore → agent `Ready`), p50 / p95 ms:**
+**Time-to-ready (latency mode: start|restore → steward `Ready`), p50 / p95 ms:**
 *(Pre-fix estimator: the p95/p99 here are upper bounds — see the header caveat; the p50s compare.)*
 
 | Backend | `default` cold | `low_latency` cold | `default` restore | `low_latency` restore |
@@ -678,7 +678,7 @@ freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matr
   5 ms + host cadences); FC/QEMU move only ~2% because their cold path is guest-boot-bound.
 - The `throughput` preset (50 ms shutdown grace) cuts **~200 ms** off every graceful lifecycle;
   CH restore e2e lands at **161 ms**. (RAII `Drop` consumers pay ~27 ms teardown regardless.)
-- † QEMU intermittently loses iterations to the known environmental agent-timeout flake
+- † QEMU intermittently loses iterations to the known environmental steward-timeout flake
   (`docs/historical/44-claude-perf-experiments.md` "Flake investigation"): latency-mode counts
   were 17/20 and 16/20, and the throughput phase-budget needed retries to complete a full n=12 pass (a
   failure breaks the phase loop). CH/FC dropped zero iterations across the whole matrix.
@@ -711,7 +711,7 @@ freq-pinned, warm-cache. This is the canonical backend × `Timeouts`-preset matr
 The control-plane codec and per-VM address/cache math are tens-to-hundreds of ns — far below the
 multi-second VM lifecycle.
 
-## Macro — Cold boot & Warm restore (start → guest agent `Ready`) — historical (opt-pass era)
+## Macro — Cold boot & Warm restore (start → steward `Ready`) — historical (opt-pass era)
 
 N=20, warmup=3, mem=256 MiB. Cold = warm-cache (see caveats). All ms. **As measured right after
 the 2026-07-01 optimization pass** (pre native-resync / pre shared-cmdline-builder; canonical
@@ -787,7 +787,7 @@ bug-risk per change: `docs/historical/44-claude-perf-experiments.md` (Phases 1�
 
 | Result (CH, p50) | value | note |
 | --- | --- | --- |
-| **warm restore** (native in-agent resync) | 84 → **60 ms** | restore `connect` phase 36 → **16 ms** (3 subprocess execs incl. the multi-MB `ip` binary → one native `Resync` round-trip) |
+| **warm restore** (native in-steward resync) | 84 → **60 ms** | restore `connect` phase 36 → **16 ms** (3 subprocess execs incl. the multi-MB `ip` binary → one native `Resync` round-trip) |
 | **QEMU cold boot** (shared cmdline builder → QEMU gains `loglevel=6`) | ~1400 → **996 ms** | fixed the triplication divergence where QEMU omitted `loglevel=` |
 | **`throughput` profile teardown** (`shutdown_grace` 250→50 ms) | 283 → **96 ms** | graceful-`shutdown()` path; `Drop` stays ~27 ms |
 | **`low_latency` profile cold** (guest `accept_poll` 5 ms + tight host cadence) | 327 → **309 ms** | guest poll now tuned via `vmcell_accept_poll_ms=` cmdline token |
@@ -821,7 +821,7 @@ virtio-console (`hvc0`) only exists after virtio-pci probe → loses early-boot 
 for guest-code tests wanting a cheaper boot / cheap verbose logs.
 
 Validation for this whole follow-up: `just ci` green (semver: `vmcell` 0.2→0.3 for the intentional
-`AgentClient::connect` arity change); unit 253/0; the full `just test-privileged` is green under
+`StewardClient::connect` arity change); unit 253/0; the full `just test-privileged` is green under
 `retries=2`+`kind(test)` (see the flake section below — the intermittent CH-vsock reset is environmental,
 absorbed by fresh-VM retries).
 
@@ -851,7 +851,7 @@ registry as a tracked alternative.
 
 ## Macro — Eager vs lazy restore (CH, `prefault`)
 
-N=20, warmup=3, mem=256 MiB. Warm restore → agent response (ms).
+N=20, warmup=3, mem=256 MiB. Warm restore → steward response (ms).
 *(Pre-fix estimator: the p95/p99 here are upper bounds — see the header caveat; the p50s compare.)*
 
 | restore-mode | p50 | p95 | max |
@@ -872,7 +872,7 @@ in-guest first-touch page faults during execution.
 | marginal per added guest | ≈58 MiB (dead-linear) | ≈59 MiB |
 | shared CH binary/libs (`RssFile`) | ≈6 MiB/guest (≈flat) | ≈6 MiB/guest |
 | **KSM dedup over the run** | **0** (KSM can't merge shared pages) | **≈394 MiB** (`pages_sharing`=100,993 → 11,814 canonical) |
-| guest agent (PID 1) RSS | ≈2.4 MiB | ≈2.4 MiB |
+| steward (PID 1) RSS | ≈2.4 MiB | ≈2.4 MiB |
 | guest `MemTotal` / `MemAvailable` | 211 / 194 MiB | 211 / 194 MiB |
 | **Implied density ceiling** | ≈13 GiB / 58 MiB ≈ **~230 idle** (~52 if each faults full 256 MiB) | KSM collapses ~84% of identical-guest RAM |
 
@@ -937,14 +937,14 @@ compressed nodes):
 The OCI base is **~52% smaller** (the official image strips locale/doc/man via `dpkg path-exclude`),
 **inverting** the §16 (Performance) hypothesis. Build wall-clock: mmdebstrap minbase 13–18 s; OCI assemble 0.4 s.
 
-## Guest agent: musl vs glibc (§16 — Performance) *(unchanged)*
+## Steward: musl vs glibc (§16 — Performance) *(unchanged)*
 
 | Variant | stripped | linkage | rootfs-independent |
 | --- | --- | --- | --- |
 | glibc-dynamic (default) | 1,479,512 B | dynamic PIE (needs libc6) | No |
 | musl-static | 1,571,424 B | static-pie (self-contained) | Yes |
 
-musl-static is **6.2% larger**, builds without `musl-gcc` (pure-Rust agent). Real deciding axis is
+musl-static is **6.2% larger**, builds without `musl-gcc` (pure-Rust steward). Real deciding axis is
 toolchain-availability + rootfs-independence, not size → keep glibc-dynamic default.
 
 ## Re-running these numbers

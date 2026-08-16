@@ -18,6 +18,28 @@
 #   * `Imp` / `Imp's`                                  (standalone capitalized origin-harness name →
 #                                                       "a hypothetical agent-harness testing project")
 #
+# v33 delta 1 — the steward rename. The in-guest control-plane process was `vmcell-guest-agent`; it
+# is `vmcell-steward` now. The retired IDENTIFIERS are flagged:
+#   * `vmcell[_-]guest[_-]agent`                       (crate / binary / lib name → vmcell-steward)
+#   * `AgentClient` / `GuestAgentStage`                (host client / pipeline stage → Steward*)
+#   * `AgentPlacement` / `AgentOptions`                (never existed — banned PRE-EMPTIVELY so
+#                                                       deltas 4 and 5 mint `StewardPlacement` /
+#                                                       `StewardOptions` instead of names that
+#                                                       would immediately rename again)
+#   * `Error::Agent`                                   (error variant → Error::Steward)
+#   * `AGENT_VSOCK_PORT`                               (port const → STEWARD_VSOCK_PORT)
+#   * `guest_agent_src_hash` / `guest_agent_closure_hash`  (cache-key inputs → steward_*)
+#   * `boot.agent_ready` / `agent.exec_roundtrip`      (validator check ids → boot.steward_ready /
+#                                                       steward.exec_roundtrip)
+#   * `--agent-musl` / `agent_musl` / `agent-musl`     (CLI flag and its identifier family)
+#
+# SCOPING RATIONALE — the ban is identifier-shaped, never the bare word "agent". "Agent" legitimately
+# survives as the DOMAIN word: vmcell explicitly serves *agentic execution* (design §1.1), the
+# repo-convention file is `AGENTS.md` (the default roster never scans it — it is not under `crates/`
+# — but the rule is stated here so nobody "fixes" it), historical finding IDs are `AGENT-2`-shaped,
+# external projects are named `agent-ctl` (Kata), and HTTP has `User-Agent`/`Proxy-Agent`. A
+# bare-word ban would redden the tree on its own charter. Design §17 records the scoping.
+#
 # Deliberately NOT flagged: the ordinary English words `implementation` / `import` / `impl`. The
 # standalone `Imp` pattern matches only the exact word `Imp` bounded by non-word characters, and the
 # lowercase `imp` patterns require a trailing `-`/`_` (or the uppercase `IMP_` env form) — so
@@ -114,7 +136,14 @@ for f in "${files[@]}"; do
        || code ~ /IMP_KERNEL|IMP_ROOTFS|IMP_ARTIFACTS_DIR|IMP_CH_BIN/ \
        || code ~ /(^|[^A-Za-z0-9_])imp-/ \
        || code ~ /imp_(vmid|host_paths|netns)/ \
-       || code ~ /(^|[^A-Za-z0-9_])Imp([^A-Za-z0-9_]|$)/) {
+       || code ~ /(^|[^A-Za-z0-9_])Imp([^A-Za-z0-9_]|$)/ \
+       || code ~ /vmcell[_-]guest[_-]agent/ \
+       || code ~ /AgentClient|AgentPlacement|AgentOptions|GuestAgentStage/ \
+       || code ~ /Error::Agent([^A-Za-z0-9_]|$)/ \
+       || code ~ /AGENT_VSOCK_PORT/ \
+       || code ~ /guest_agent_(src_hash|closure_hash)/ \
+       || code ~ /boot\.agent_ready|agent\.exec_roundtrip/ \
+       || code ~ /--agent-musl|agent[_-]musl/) {
         print FN ":" NR ": " trim(line)
       }
     }
@@ -123,7 +152,8 @@ for f in "${files[@]}"; do
 done
 
 if [[ -n "${violations//[$'\n']/}" ]]; then
-  echo "Forbidden legacy term(s) — the imp-testing → vmcell rename (design v14 §10.7) must hold."
+  echo "Forbidden legacy term(s) — the imp-testing → vmcell rename (design v14 §10.7) and the"
+  echo "guest-agent → steward rename (design v33 §18 delta 1) must hold."
   echo "Rename to the vmcell vocabulary, or add a trailing '// allow-legacy-term: <reason>' marker"
   echo "if the mention is genuinely justified (e.g. a historical reference in non-historical code):"
   printf '%s\n' "$violations" | grep -vE '^[[:space:]]*$'
@@ -131,4 +161,4 @@ if [[ -n "${violations//[$'\n']/}" ]]; then
 fi
 plural="s"
 if [[ ${#files[@]} -eq 1 ]]; then plural=""; fi
-echo "ok: no legacy imp-testing/rootless/TestVm/imp-*/Imp tokens (scanned ${#files[@]} file${plural} under: ${dirs[*]})"
+echo "ok: no legacy imp-testing/rootless/TestVm/imp-*/Imp or retired guest-agent identifiers (scanned ${#files[@]} file${plural} under: ${dirs[*]})"

@@ -289,7 +289,7 @@ fn crosvm_capabilities() -> VmmCapabilities {
     VmmCapabilities {
         // crosvm `snapshot take` + `run --restore` over the virtio block/net/vsock/serial device set
         // (USB dropped via --no-usb — the one non-Suspendable device). Validated live: snapshot →
-        // restore reusing the BAKED vsock CID (crosvm rejects a rotated one) → agent-exec, MAC/IP/
+        // restore reusing the BAKED vsock CID (crosvm rejects a rotated one) → steward-exec, MAC/IP/
         // clock/RNG resync all pass the snapshot_restore matrix leg. A deliberate re-gate must flip
         // this AND its capability-honesty test together (docs/45).
         snapshot_restore: true,
@@ -406,7 +406,7 @@ fn build_crosvm_run_args(
     args.push("--serial".to_string());
     args.push(serial_arg(cfg.console_mode, serial_path));
 
-    // In-kernel vhost-vsock on the host AF_VSOCK namespace at `(guest_cid, AGENT_VSOCK_PORT)`
+    // In-kernel vhost-vsock on the host AF_VSOCK namespace at `(guest_cid, STEWARD_VSOCK_PORT)`
     // (realized against `/dev/vhost-vsock`). No external daemon and no AF_UNIX bridge — the host
     // dials the CID directly (`vsock_endpoint` returns `VsockEndpoint::Vsock`).
     args.push("--vsock".to_string());
@@ -976,7 +976,7 @@ impl VmInstance for CrosvmInstance {
     }
 
     async fn request_shutdown(&mut self) -> Result<()> {
-        // ACPI power button: the guest agent (PID 1) honors it and powers off gracefully.
+        // ACPI power button: the steward (PID 1) honors it and powers off gracefully.
         self.run_control("powerbtn", &[]).await
     }
 
@@ -1031,7 +1031,7 @@ impl VmInstance for CrosvmInstance {
         // Full-suspend (crosvm requires all devices asleep to snapshot) → `snapshot take` → persist
         // the baked-CID sidecar → resume the source. Mirrors the QEMU stop→migrate→cont / CH-FC
         // pause→snapshot→resume order; the orchestrator's `MicroVm::snapshot` invalidates the cached
-        // agent client afterward, covering the suspend severing the vsock connection. The take + the
+        // steward client afterward, covering the suspend severing the vsock connection. The take + the
         // sidecar are BOTH required for a restorable snapshot, so either failing fails the snapshot
         // fail-loud; the source resume is best-effort (warn-only), matching QEMU/CH/FC.
         self.run_control("suspend", &["--full"]).await?;
@@ -1055,11 +1055,11 @@ impl VmInstance for CrosvmInstance {
 
     fn vsock_endpoint(&self) -> VsockEndpoint {
         // crosvm's in-kernel vhost-vsock exposes the guest on the host AF_VSOCK namespace at
-        // `(cid, AGENT_VSOCK_PORT)` — NOT the AF_UNIX hybrid default. Override accordingly (the
-        // agent transport branches only its connect prologue on this).
+        // `(cid, STEWARD_VSOCK_PORT)` — NOT the AF_UNIX hybrid default. Override accordingly (the
+        // steward transport branches only its connect prologue on this).
         VsockEndpoint::Vsock {
             cid: self.cid,
-            port: vmcell::vmm::AGENT_VSOCK_PORT,
+            port: vmcell::vmm::STEWARD_VSOCK_PORT,
         }
     }
 

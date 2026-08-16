@@ -10,9 +10,6 @@ use crate::error::Result;
 /// Reproducible fetch-and-verify manifest for the vmcell-owned artifacts (v15 §10, The artifact build pipeline).
 pub mod bundle;
 #[cfg(feature = "pipeline")]
-/// Guest agent building stage.
-pub mod guest_agent;
-#[cfg(feature = "pipeline")]
 /// Guest test-helper (`vmcell-guest-tools`) building stage.
 pub mod guest_tools;
 #[cfg(feature = "pipeline")]
@@ -24,6 +21,9 @@ pub mod rootfs;
 #[cfg(feature = "pipeline")]
 /// Snapshot building stage.
 pub mod snapshot;
+#[cfg(feature = "pipeline")]
+/// Steward building stage.
+pub mod steward;
 /// Tar to EROFS conversion utility.
 #[cfg(feature = "am-fs-erofs")]
 pub mod tar2erofs;
@@ -93,10 +93,10 @@ pub fn oci_cache_dir() -> PathBuf {
     artifacts_dir().join("oci-cache")
 }
 
-/// Ensures the default test VM artifacts (guest-agent, guest-tools, erofs rootfs) are current,
+/// Ensures the default test VM artifacts (steward, guest-tools, erofs rootfs) are current,
 /// building them **at most once per test session**, driven by the same content hashes the build
 /// pipeline uses. The integration-test harness calls this from `get_vmlinux`/`get_rootfs`, so a
-/// source edit to the guest agent, guest tools, a dep bump, or the rootfs packer transparently
+/// source edit to the steward, guest tools, a dep bump, or the rootfs packer transparently
 /// re-packs the rootfs instead of the suite silently running against a **stale** image (the cache
 /// blind spot that shipped two packer regressions this cycle) or failing loud with "artifact
 /// missing".
@@ -169,8 +169,8 @@ fn ensure_test_artifacts_inner() -> std::result::Result<(), String> {
     }
 
     // The fingerprint moved, so an input changed. A PACKER edit is invisible to the rootfs stage's
-    // own `cache_key` (it folds the agent/tools BINARIES + CA, not the packing logic), so invalidate
-    // its sidecar to force a re-pack; agent/tools SOURCE edits already flip their own stage keys.
+    // own `cache_key` (it folds the steward/tools BINARIES + CA, not the packing logic), so invalidate
+    // its sidecar to force a re-pack; steward/tools SOURCE edits already flip their own stage keys.
     let rootfs_sidecar = dir.join("rootfs.cache_key");
     match std::fs::remove_file(&rootfs_sidecar) {
         Ok(()) => {}
@@ -193,7 +193,7 @@ fn artifacts_stamp_fresh(stamp: Option<&str>, fingerprint: &str, rootfs_exists: 
     rootfs_exists && stamp == Some(fingerprint)
 }
 
-/// The fingerprint of everything the fast (non-kernel) stages consume: the guest-agent and
+/// The fingerprint of everything the fast (non-kernel) stages consume: the steward and
 /// guest-tools SOURCE closures (which already fold `Cargo.lock`, so a dep bump like the reqwest one
 /// invalidates it), the resolved pins, the baked proxy CA, and the rootfs packer source. Any change
 /// here re-packs the rootfs. Reuses the pipeline's own closure/file hashers ("use our hashing").
@@ -213,7 +213,7 @@ fn fast_artifacts_fingerprint_with(overlay_file: Option<&Path>) -> crate::error:
     // v1 → v2 with the pins overlay (§18 delta 1): the pins half of this fold changed shape, so
     // every existing `.build.stamp` must invalidate rather than read as fresh under the new rules.
     h.update(b"vmcell-test-artifacts-fingerprint-v2\0");
-    h.update(guest_agent_closure_hash(&ws)?.as_bytes());
+    h.update(steward_closure_hash(&ws)?.as_bytes());
     h.update(b"\0");
     h.update(guest_tools_closure_hash(&ws)?.as_bytes());
     h.update(b"\0");
@@ -247,7 +247,7 @@ fn fast_artifacts_fingerprint_with(overlay_file: Option<&Path>) -> crate::error:
     Ok(h.finalize().to_hex().to_string())
 }
 
-/// Runs the kernel-less build pipeline (ResolvePins → guest-agent → guest-tools → rootfs) once,
+/// Runs the kernel-less build pipeline (ResolvePins → steward → guest-tools → rootfs) once,
 /// hash-gated. The OCI rootfs stage does not consume the kernel (ART-9), so omitting the slow
 /// kernel stage is sound. Executed on a fresh current-thread runtime in a dedicated OS thread: this
 /// fn is called from the SYNC harness while the test's own tokio runtime is active, and a direct
@@ -267,11 +267,11 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
             rt.block_on(async move {
                 Pipeline::new(dir.clone())
                     .add_stage(Box::new(ResolvePinsStage { overlay_file }))
-                    .add_stage(Box::new(crate::artifact::guest_agent::GuestAgentStage {}))
+                    .add_stage(Box::new(crate::artifact::steward::StewardStage {}))
                     .add_stage(Box::new(crate::artifact::guest_tools::GuestToolsStage {}))
                     .add_stage(Box::new(crate::artifact::rootfs::RootfsStage {
                         image_override: None,
-                        agent_musl: None,
+                        steward_musl: None,
                         extra: Vec::new(),
                     }))
                     .build(&Cache::default())
@@ -579,7 +579,7 @@ fn registered_artifacts_under(key_path: &Path, target_dir: &Path) -> Result<Vec<
 ///
 /// Public so out-of-crate artifact builders fold the same consumed-artifact set into
 /// their own cache keys deterministically (`vmcell-rootfs-builder` folds the seed
-/// kernel + injected agent/tools this way).
+/// kernel + injected steward/tools this way).
 #[cfg(feature = "pipeline")]
 pub fn hash_artifacts_sorted(
     hasher: &mut blake3::Hasher,
@@ -1029,7 +1029,7 @@ fn resolve_pins_document(overlay_file: Option<&Path>) -> Result<serde_json::Valu
 /// Resolves the flat pin map a downstream consumer builds against: vmcell's committed baseline with
 /// the optional overlay merged over it (§10.2 / §10.4 — contract surface).
 ///
-/// This is the pipeline's own resolution, minus the `guest_agent_src_hash` entry that
+/// This is the pipeline's own resolution, minus the `steward_src_hash` entry that
 /// [`ResolvePinsStage`] adds from the workspace source closure (which no consumer workspace has).
 ///
 /// # Errors
@@ -1224,11 +1224,11 @@ pub fn pins_overlay_or_env(flag: Option<&Path>) -> Option<PathBuf> {
 ///
 /// **It runs with no vmcell source checkout present**, which is the whole point: it does not ride
 /// [`ensure_test_artifacts`] (the vmcell-workspace test bootstrap, whose fingerprint hashes the
-/// guest-agent source closure out of the vmcell tree), and the two stages it does assemble read
-/// nothing from that tree — [`ResolvePinsStage`] resolves the `guest_agent_src_hash` pin only when
+/// steward source closure out of the vmcell tree), and the two stages it does assemble read
+/// nothing from that tree — [`ResolvePinsStage`] resolves the `steward_src_hash` pin only when
 /// a checkout is actually there (`vmcell_source_root`), and [`kernel::KernelStage`] reads only
 /// `kernel_*` pins. Landing the entry point without that second half made every downstream call
-/// die at stage 0 on a missing `crates/vmcell-guest-agent/src/main.rs`; the
+/// die at stage 0 on a missing `crates/vmcell-steward/src/main.rs`; the
 /// `resolve_pins_runs_outside_the_vmcell_source_tree` gate re-execs this crate's test binary from
 /// outside the checkout so that cannot return.
 ///
@@ -1270,16 +1270,16 @@ pub async fn build_labelled_kernel(
     Ok(out_path)
 }
 
-/// Computes the blake3 hash of the guest-agent source file at `path`.
+/// Computes the blake3 hash of the steward source file at `path`.
 ///
 /// # Errors
 /// Returns [`crate::error::Error::Artifact`] if the source cannot be read. This is a hard
-/// stop on purpose: a missing guest-agent source must not silently degrade to an `"unknown"`
-/// pin (which would leave a stale agent baked into every downstream rootfs).
-fn guest_agent_src_hash(path: &Path) -> Result<String> {
+/// stop on purpose: a missing steward source must not silently degrade to an `"unknown"`
+/// pin (which would leave a stale steward baked into every downstream rootfs).
+fn steward_src_hash(path: &Path) -> Result<String> {
     let src = std::fs::read_to_string(path).map_err(|e| {
         crate::error::Error::Artifact(format!(
-            "failed to read guest-agent source at {}: {}",
+            "failed to read steward source at {}: {}",
             path.display(),
             e
         ))
@@ -1289,7 +1289,7 @@ fn guest_agent_src_hash(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// The workspace root — the anchor for the artifacts dir and the guest-agent /
+/// The workspace root — the anchor for the artifacts dir and the steward /
 /// guest-tools source closures (v15 §9.1, Workspace layout). Ascends from `CARGO_MANIFEST_DIR` (the
 /// `vmcell` crate dir under the workspace) — or, when that is unset, the **absolute**
 /// process CWD — to the directory that owns the member crates, so the resolved paths
@@ -1336,7 +1336,7 @@ fn find_vmcell_source_root(start: &Path) -> Option<PathBuf> {
 ///
 /// [`workspace_root`] answers "where do artifacts and source closures anchor", and must always
 /// produce a path; this answers "is vmcell's own source here at all", which downstream is legitimately
-/// **no**. Anything that reads vmcell's own sources (the guest-agent / guest-tools closures) asks
+/// **no**. Anything that reads vmcell's own sources (the steward / guest-tools closures) asks
 /// this one and honors the `None`, instead of asking `workspace_root` and hard-erroring on a
 /// fallback directory that never had those sources.
 pub(crate) fn vmcell_source_root() -> Option<PathBuf> {
@@ -1504,7 +1504,7 @@ fn workspace_source_closure(lock_text: &str, root_pkg: &str) -> Result<Vec<Strin
 ///
 /// One function for both guest binaries: the closure law is that *everything the binary is built
 /// from* travels as one identity (H-CACHE-1), and every hand-maintained second copy of that list
-/// has gone stale (the agent's wrapper-only hash; the guest-tools list that missed
+/// has gone stale (the steward's wrapper-only hash; the guest-tools list that missed
 /// `vmcell-protocol`). Crate directories are `crates/<package name>`, asserted per member rather
 /// than assumed — a member that does not live there is a hard stop.
 ///
@@ -1555,36 +1555,36 @@ fn crate_closure_hash(ws_root: &Path, root_pkg: &str, bin_entry_rel: &str) -> Re
     let mut hasher = blake3::Hasher::new();
     for f in &files {
         // Fold the workspace-relative path (so a rename/move invalidates) with an
-        // unambiguous delimiter, then the file's content hash. `guest_agent_src_hash`
+        // unambiguous delimiter, then the file's content hash. `steward_src_hash`
         // is a generic fail-hard file-content hash reused here.
         let rel = f.strip_prefix(ws_root).unwrap_or(f.as_path());
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
-        hasher.update(guest_agent_src_hash(f)?.as_bytes());
+        hasher.update(steward_src_hash(f)?.as_bytes());
         hasher.update(b"\0");
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Hashes the **full source closure** the `vmcell-guest-agent` binary compiles from — its own
+/// Hashes the **full source closure** the `vmcell-steward` binary compiles from — its own
 /// crate (binary entry point plus the reaper library it links) and every workspace crate it
 /// links transitively (`vmcell-protocol`, the shared wire protocol), plus their manifests and
 /// `Cargo.lock`. The closure set is derived by [`crate_closure_hash`], never listed here.
 ///
 /// Hashing only the binary wrapper (the original behavior) left every downstream cache
-/// key blind to a change in the agent's real logic: editing the reaper or the
+/// key blind to a change in the steward's real logic: editing the reaper or the
 /// post-restore vsock re-bind left the hash unchanged, so all three cache keys
-/// (resolve-pins, guest-agent, rootfs) hit and a **stale agent binary was re-baked
+/// (resolve-pins, steward, rootfs) hit and a **stale steward binary was re-baked
 /// into `rootfs.erofs`**. The closure must travel as one identity (H-CACHE-1).
 ///
 /// # Errors
 /// Returns [`crate::error::Error::Artifact`] as [`crate_closure_hash`] does — a hard stop,
 /// never a silent partial or `"unknown"` hash.
-pub(crate) fn guest_agent_closure_hash(ws_root: &Path) -> Result<String> {
+pub(crate) fn steward_closure_hash(ws_root: &Path) -> Result<String> {
     crate_closure_hash(
         ws_root,
-        "vmcell-guest-agent",
-        "crates/vmcell-guest-agent/src/main.rs",
+        "vmcell-steward",
+        "crates/vmcell-steward/src/main.rs",
     )
 }
 
@@ -1841,7 +1841,7 @@ impl Pipeline {
 /// resolution (that is the deferred `ARTIFACT-PIPELINE-5`); it takes the *already
 /// committed* `pins.json` (embedded at compile time) as its baseline, merges the optional
 /// overlay over it, writes the resolved document to `resolved_pins.json`, flattens its entries into
-/// the propagated `pins` map, and folds in the guest-agent source-closure hash so downstream stages
+/// the propagated `pins` map, and folds in the steward source-closure hash so downstream stages
 /// consume pins purely from memory (ART-6).
 ///
 /// The pre-overlay `pins_file: PathBuf` field is gone (§18 delta 1): the baseline is embedded, so a
@@ -1867,7 +1867,7 @@ impl Stage for ResolvePinsStage {
         // 1 → 2 (§18 delta 1, cache-key rule 4): the fold gained the pins OVERLAY and moved the
         // baseline to the compile-time-embedded `pins.json`, so no v1 output may be served.
         const STAGE_VERSION: u32 = 2;
-        // The shared pins-fold separator, so distinct (pins, overlay, agent-hash) splits cannot
+        // The shared pins-fold separator, so distinct (pins, overlay, steward-hash) splits cannot
         // concatenate to the same byte stream (non-injective-hash defense).
         const SEP: &[u8] = PINS_FOLD_SEP;
         let mut hasher = blake3::Hasher::new();
@@ -1881,20 +1881,20 @@ impl Stage for ResolvePinsStage {
             hasher.update(format!("resolve-pins-overlay-read-error:{e}").as_bytes());
         }
         hasher.update(SEP);
-        // Fold the FULL guest-agent source closure (bin wrapper + src/agent/** +
-        // Cargo.lock), not just the thin wrapper, so a change to `src/agent/mod.rs`
+        // Fold the FULL steward source closure (bin wrapper + src/steward/** +
+        // Cargo.lock), not just the thin wrapper, so a change to `src/steward/mod.rs`
         // invalidates the resolved pins. Otherwise a cache hit here skips re-hashing
-        // the agent and a stale `guest_agent_src_hash` propagates downstream — the
-        // stale-agent-baked-into-rootfs bug (H-CACHE-1). A closure-hash failure folds a
+        // the steward and a stale `steward_src_hash` propagates downstream — the
+        // stale-steward-baked-into-rootfs bug (H-CACHE-1). A closure-hash failure folds a
         // distinct error marker (not `unwrap_or_default()`'s `""`) for the same ART-11
         // reason.
         // Outside a vmcell checkout there is no closure to fold; the DISTINCT
         // `NO_VMCELL_SOURCE_TREE` marker keeps that case from colliding with any hex hash (and
         // with the error marker above), so a consumer's key and an in-tree key never alias.
-        match resolve_guest_agent_pin(vmcell_source_root().as_deref()) {
+        match resolve_steward_pin(vmcell_source_root().as_deref()) {
             Ok(Some(h)) => hasher.update(h.as_bytes()),
             Ok(None) => hasher.update(NO_VMCELL_SOURCE_TREE),
-            Err(e) => hasher.update(format!("resolve-pins-agent-closure-error:{e}").as_bytes()),
+            Err(e) => hasher.update(format!("resolve-pins-steward-closure-error:{e}").as_bytes()),
         };
         CacheKey(format!("resolve-pins-{}", hasher.finalize().to_hex()))
     }
@@ -1914,29 +1914,29 @@ impl Stage for ResolvePinsStage {
 }
 
 /// The cache-key marker folded by [`ResolvePinsStage`] when this process is not running inside a
-/// vmcell source checkout, so there is no guest-agent closure to fold (§10.4).
+/// vmcell source checkout, so there is no steward closure to fold (§10.4).
 const NO_VMCELL_SOURCE_TREE: &[u8] = b"resolve-pins-no-vmcell-source-tree";
 
-/// The **one** `guest_agent_src_hash` pin law, shared by [`ResolvePinsStage`]'s `cache_key` and
+/// The **one** `steward_src_hash` pin law, shared by [`ResolvePinsStage`]'s `cache_key` and
 /// `run` so the key and the published pin map can never disagree about it.
 ///
-/// * Inside a vmcell checkout (`Some(root)`): hash the FULL agent source closure and **fail hard**
-///   if any of it is missing. Hashing only the thin `main.rs` wrapper left a `src/agent/mod.rs`
-///   change invisible to every downstream cache key, baking a stale agent into the rootfs
+/// * Inside a vmcell checkout (`Some(root)`): hash the FULL steward source closure and **fail hard**
+///   if any of it is missing. Hashing only the thin `main.rs` wrapper left a `src/steward/mod.rs`
+///   change invisible to every downstream cache key, baking a stale steward into the rootfs
 ///   (H-CACHE-1); a silent `"unknown"` fallback would do the same without invalidating any key.
-/// * Outside one (`None`): there is **no** agent source to hash, so the pin is absent rather than
+/// * Outside one (`None`): there is **no** steward source to hash, so the pin is absent rather than
 ///   fabricated. It is a rootfs-lineage pin — `KernelStage` reads only `kernel_*` — so requiring it
 ///   unconditionally made the downstream kernel toolkit (§5.6) die at stage 0 in exactly the
 ///   consumer position §10.4 advertises, with an error about a vmcell source file the consumer
-///   never had. The producer of a rootfs still fails loud downstream: `GuestAgentStage` builds the
-///   agent by `cargo build -p vmcell-guest-agent` in that same absent tree.
+///   never had. The producer of a rootfs still fails loud downstream: `StewardStage` builds the
+///   steward by `cargo build -p vmcell-steward` in that same absent tree.
 ///
 /// # Errors
-/// Returns [`crate::error::Error::Artifact`] when a vmcell checkout IS present but its guest-agent
+/// Returns [`crate::error::Error::Artifact`] when a vmcell checkout IS present but its steward
 /// source closure cannot be read.
-fn resolve_guest_agent_pin(source_root: Option<&Path>) -> Result<Option<String>> {
+fn resolve_steward_pin(source_root: Option<&Path>) -> Result<Option<String>> {
     match source_root {
-        Some(root) => guest_agent_closure_hash(root).map(Some),
+        Some(root) => steward_closure_hash(root).map(Some),
         None => Ok(None),
     }
 }
@@ -1975,10 +1975,10 @@ async fn resolve_pins_into(
 
     let mut pins_map = flatten_pins_document(&doc);
 
-    // The guest-agent source identity, through the one `resolve_guest_agent_pin` law: folded from
+    // The steward source identity, through the one `resolve_steward_pin` law: folded from
     // the full closure in a vmcell checkout, absent (never fabricated) outside one.
-    if let Some(agent_hash) = resolve_guest_agent_pin(source_root)? {
-        pins_map.insert("guest_agent_src_hash".to_string(), agent_hash);
+    if let Some(steward_hash) = resolve_steward_pin(source_root)? {
+        pins_map.insert("steward_src_hash".to_string(), steward_hash);
     }
 
     let mut outputs = StageOutputs::default();
@@ -2238,31 +2238,31 @@ mod tests {
         );
     }
 
-    // Guards DESIGN-DIVERGENCE-3: a buggy impl that swallows a missing guest-agent source
+    // Guards DESIGN-DIVERGENCE-3: a buggy impl that swallows a missing steward source
     // into an `"unknown"` pin (instead of failing hard) would return Ok here.
     #[test]
-    fn test_guest_agent_src_hash_fails_hard_on_missing() {
-        let missing = Path::new("/nonexistent/imp/does-not-exist/vmcell-guest-agent.rs");
-        let res = guest_agent_src_hash(missing);
+    fn test_steward_src_hash_fails_hard_on_missing() {
+        let missing = Path::new("/nonexistent/imp/does-not-exist/vmcell-steward.rs");
+        let res = steward_src_hash(missing);
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
-            "missing guest-agent source must be a hard error, got {res:?}"
+            "missing steward source must be a hard error, got {res:?}"
         );
     }
 
     // Guards DESIGN-DIVERGENCE-3 (the hash actually tracks content): different source
     // bytes must yield a different hash, and the same bytes a stable one.
     #[test]
-    fn test_guest_agent_src_hash_tracks_content() {
+    fn test_steward_src_hash_tracks_content() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let p = dir.path().join("agent.rs");
+        let p = dir.path().join("steward.rs");
         std::fs::write(&p, b"fn main() {}").expect("write");
-        let h1 = guest_agent_src_hash(&p).expect("hash");
-        let h1b = guest_agent_src_hash(&p).expect("hash");
+        let h1 = steward_src_hash(&p).expect("hash");
+        let h1b = steward_src_hash(&p).expect("hash");
         assert_eq!(h1, h1b, "hash must be deterministic for identical content");
 
         std::fs::write(&p, b"fn main() { /* changed */ }").expect("write");
-        let h2 = guest_agent_src_hash(&p).expect("hash");
+        let h2 = steward_src_hash(&p).expect("hash");
         assert_ne!(h1, h2, "changed source content must change the hash");
     }
 
@@ -2282,24 +2282,24 @@ mod tests {
         );
     }
 
-    // Guards H-CACHE-1: the guest-agent identity must cover the FULL source closure
-    // (bin wrapper + every src/agent/**/*.rs + Cargo.lock), not just the thin wrapper.
-    // The buggy wrapper-only hash leaves a change to `src/agent/mod.rs` invisible, so
-    // the rootfs cache key does NOT change and a stale agent is re-baked into the
-    // rootfs. We mutate a NON-wrapper agent file and assert both the closure hash and
+    // Guards H-CACHE-1: the steward identity must cover the FULL source closure
+    // (bin wrapper + every src/steward/**/*.rs + Cargo.lock), not just the thin wrapper.
+    // The buggy wrapper-only hash leaves a change to `src/steward/mod.rs` invisible, so
+    // the rootfs cache key does NOT change and a stale steward is re-baked into the
+    // rootfs. We mutate a NON-wrapper steward file and assert both the closure hash and
     // the downstream rootfs cache key change — both stay equal on the buggy version.
     #[cfg(feature = "pipeline")]
     #[test]
-    fn test_guest_agent_closure_hash_tracks_agent_module_change() {
+    fn test_steward_closure_hash_tracks_steward_module_change() {
         use crate::artifact::rootfs::RootfsStage;
 
-        // A fixture "workspace root" mirroring the real v15 layout: the guest-agent
+        // A fixture "workspace root" mirroring the real v15 layout: the steward
         // member (binary entry point + reaper lib) PLUS the shared protocol crate it
         // links. Editing the real tree is avoided on purpose.
         let root = tempfile::tempdir().expect("tempdir");
-        let agent_src = root.path().join("crates/vmcell-guest-agent/src");
+        let steward_src = root.path().join("crates/vmcell-steward/src");
         let proto_src = root.path().join("crates/vmcell-protocol/src");
-        std::fs::create_dir_all(&agent_src).expect("mkdir agent src");
+        std::fs::create_dir_all(&steward_src).expect("mkdir steward src");
         std::fs::create_dir_all(&proto_src).expect("mkdir protocol src");
         // The workspace-root marker the closure-hash anchor ascends to.
         std::fs::write(
@@ -2308,62 +2308,63 @@ mod tests {
         )
         .expect("write protocol manifest");
         std::fs::write(
-            root.path().join("crates/vmcell-guest-agent/Cargo.toml"),
-            b"[package]\nname=\"vmcell-guest-agent\"\n",
+            root.path().join("crates/vmcell-steward/Cargo.toml"),
+            b"[package]\nname=\"vmcell-steward\"\n",
         )
-        .expect("write agent manifest");
-        std::fs::write(agent_src.join("main.rs"), b"fn main() {}").expect("write bin");
-        std::fs::write(agent_src.join("lib.rs"), b"pub fn reaper() {}").expect("write lib");
+        .expect("write steward manifest");
+        std::fs::write(steward_src.join("main.rs"), b"fn main() {}").expect("write bin");
+        std::fs::write(steward_src.join("lib.rs"), b"pub fn reaper() {}").expect("write lib");
         std::fs::write(proto_src.join("lib.rs"), b"pub struct Msg;").expect("write proto");
         // The lock is both a closure input and the file the closure SET is derived from, so the
         // fixture carries the real generated shape rather than a placeholder comment.
         std::fs::write(
             root.path().join("Cargo.lock"),
-            fixture_lock("vmcell-guest-agent", &["vmcell-protocol"]).as_bytes(),
+            fixture_lock("vmcell-steward", &["vmcell-protocol"]).as_bytes(),
         )
         .expect("write lock");
 
-        let h1 = guest_agent_closure_hash(root.path()).expect("closure hash 1");
+        let h1 = steward_closure_hash(root.path()).expect("closure hash 1");
 
         let rootfs = RootfsStage {
             image_override: None,
-            agent_musl: None,
+            steward_musl: None,
             extra: Vec::new(),
         };
         let mut inputs1 = StageInputs::default();
-        inputs1
-            .pins
-            .insert("guest_agent_src_hash".into(), h1.clone());
+        inputs1.pins.insert("steward_src_hash".into(), h1.clone());
         let rootfs_key1 = rootfs.cache_key(&inputs1);
 
-        // Mutate the agent IMPLEMENTATION (not the binary entry point). main.rs is
+        // Mutate the steward IMPLEMENTATION (not the binary entry point). main.rs is
         // byte-identical, so the buggy entry-point-only hash would be UNCHANGED here.
-        std::fs::write(agent_src.join("lib.rs"), b"pub fn reaper() { /* fixed */ }")
-            .expect("rewrite lib");
-        let h2 = guest_agent_closure_hash(root.path()).expect("closure hash 2");
+        std::fs::write(
+            steward_src.join("lib.rs"),
+            b"pub fn reaper() { /* fixed */ }",
+        )
+        .expect("rewrite lib");
+        let h2 = steward_closure_hash(root.path()).expect("closure hash 2");
         assert_ne!(
             h1, h2,
-            "a change to the guest-agent reaper lib must change the source closure hash"
+            "a change to the steward reaper lib must change the source closure hash"
         );
 
         let mut inputs2 = StageInputs::default();
-        inputs2.pins.insert("guest_agent_src_hash".into(), h2);
+        inputs2.pins.insert("steward_src_hash".into(), h2);
         let rootfs_key2 = rootfs.cache_key(&inputs2);
         assert_ne!(
             rootfs_key1, rootfs_key2,
-            "rootfs cache key must change when an agent implementation file changes"
+            "rootfs cache key must change when a steward implementation file changes"
         );
     }
 
-    // Guards H-CACHE-1's hard-stop half: a missing bin wrapper (or src/agent tree)
+    // Guards H-CACHE-1's hard-stop half: a missing bin wrapper (or src/steward tree)
     // must be a hard error, never a silent partial/empty closure hash.
     #[test]
-    fn test_guest_agent_closure_hash_fails_hard_on_missing_bin() {
+    fn test_steward_closure_hash_fails_hard_on_missing_bin() {
         let empty = tempfile::tempdir().expect("tempdir");
-        let res = guest_agent_closure_hash(empty.path());
+        let res = steward_closure_hash(empty.path());
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
-            "missing guest-agent bin wrapper must be a hard error, got {res:?}"
+            "missing steward bin wrapper must be a hard error, got {res:?}"
         );
     }
 
@@ -2402,18 +2403,18 @@ mod tests {
         );
     }
 
-    // §10.4 GATE (delta 3, F1): the `guest_agent_src_hash` pin is a ROOTFS-lineage pin, and
+    // §10.4 GATE (delta 3, F1): the `steward_src_hash` pin is a ROOTFS-lineage pin, and
     // requiring it outside a vmcell checkout is what made the §5.6 toolkit unusable from the
     // consumer position it advertises. Absent checkout => no pin, no error; present-but-broken
     // checkout => still a hard error (H-CACHE-1 stays fixed).
-    // RED on the inverse (`guest_agent_closure_hash(&workspace_root())?` unconditionally): the
+    // RED on the inverse (`steward_closure_hash(&workspace_root())?` unconditionally): the
     // `None` arm errors instead of yielding `Ok(None)`.
     #[test]
-    fn guest_agent_pin_is_absent_without_a_checkout_and_hard_errors_with_a_broken_one() {
+    fn steward_pin_is_absent_without_a_checkout_and_hard_errors_with_a_broken_one() {
         assert_eq!(
-            resolve_guest_agent_pin(None).expect("no checkout is not an error"),
+            resolve_steward_pin(None).expect("no checkout is not an error"),
             None,
-            "outside a vmcell checkout there is no agent source to hash — the pin must be \
+            "outside a vmcell checkout there is no steward source to hash — the pin must be \
              ABSENT, never fabricated"
         );
         let broken = tempfile::tempdir().expect("tempdir");
@@ -2424,23 +2425,23 @@ mod tests {
             b"[package]\n",
         )
         .expect("write marker");
-        let res = resolve_guest_agent_pin(Some(broken.path()));
+        let res = resolve_steward_pin(Some(broken.path()));
         assert!(
             matches!(res, Err(crate::error::Error::Artifact(_))),
-            "a checkout whose guest-agent source is missing must still hard-error \
+            "a checkout whose steward source is missing must still hard-error \
              (H-CACHE-1), got {res:?}"
         );
     }
 
     // §10.4 GATE (delta 3, F1): the CONSUMER POSITION, driven through the real
     // `ResolvePinsStage::run` body. It must publish `resolved_pins.json`, propagate the `kernel_*`
-    // pins the labelled-kernel build reads, and simply omit `guest_agent_src_hash`.
-    // RED on the inverse: restoring the unconditional agent-closure hash makes this assert fail
+    // pins the labelled-kernel build reads, and simply omit `steward_src_hash`.
+    // RED on the inverse: restoring the unconditional steward-closure hash makes this assert fail
     // in-tree (the pin comes back) and makes the real downstream call fail outright — which is the
     // bug the re-exec gate in `tests/kernel_toolkit.rs` reproduces end to end.
     #[cfg(feature = "pipeline")]
     #[tokio::test]
-    async fn resolve_pins_into_omits_the_agent_pin_without_a_checkout() {
+    async fn resolve_pins_into_omits_the_steward_pin_without_a_checkout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("resolved_pins.json");
         let outputs = resolve_pins_into(None, None, &out)
@@ -2455,9 +2456,9 @@ mod tests {
             "the kernel pins the §5.6 toolkit reads must still travel"
         );
         assert!(
-            !outputs.pins.contains_key("guest_agent_src_hash"),
-            "the rootfs-lineage agent pin must be ABSENT outside a checkout, got {:?}",
-            outputs.pins.get("guest_agent_src_hash")
+            !outputs.pins.contains_key("steward_src_hash"),
+            "the rootfs-lineage steward pin must be ABSENT outside a checkout, got {:?}",
+            outputs.pins.get("steward_src_hash")
         );
     }
 
@@ -2616,7 +2617,7 @@ mod tests {
     fn workspace_source_closure_is_derived_from_the_real_lock() {
         let lock = std::fs::read_to_string(workspace_root().join("Cargo.lock"))
             .expect("the workspace lock must be readable");
-        for pkg in ["vmcell-guest-tools", "vmcell-guest-agent"] {
+        for pkg in ["vmcell-guest-tools", "vmcell-steward"] {
             let closure = workspace_source_closure(&lock, pkg).expect("derive closure");
             assert!(
                 closure.iter().any(|c| c == pkg),

@@ -42,7 +42,7 @@ fn insert_injected_file(
         mtime: 0,
         mtime_nsec: 0,
     };
-    // An explicit caller mode wins; otherwise only injected binaries (guest-agent -> usr/sbin,
+    // An explicit caller mode wins; otherwise only injected binaries (steward -> usr/sbin,
     // guest-tools -> vmcell-tools) are executable and injected DATA files (the CA cert under
     // ca-certificates/) are 0o644.
     let mode = mode.unwrap_or_else(|| injected_file_mode(dest_path)) | fs_erofs::inode::S_IFREG;
@@ -87,11 +87,11 @@ fn build_node_map<'a, R: Read + 'a>(
 ) -> crate::error::Result<HashMap<PathBuf, Node>> {
     let mut entries: HashMap<PathBuf, Node> = HashMap::new();
 
-    // NOTE: the injected files/symlinks (guest-agent, CA, guest-tools) are inserted AFTER
+    // NOTE: the injected files/symlinks (steward, CA, guest-tools) are inserted AFTER
     // the layer merge below — see the tail of this function (H-ART-3 / design §4.2,
     // Rootfs sources and the one packer: "inject ... then stream the tree"). Injecting
     // before the merge let an upper layer's
-    // content or a `.wh.` whiteout silently clobber the baked agent or CA.
+    // content or a `.wh.` whiteout silently clobber the baked steward or CA.
 
     for mut archive in archives {
         for file in archive
@@ -120,7 +120,7 @@ fn build_node_map<'a, R: Read + 'a>(
                         .map_err(|e| crate::error::Error::Artifact(e.to_string()))?;
                     // Accepted limitation: PAX SCHILY.xattr records (incl.
                     // `security.capability`) are intentionally NOT preserved — the
-                    // guest agent and every in-guest `exec` run as root (§4.2), so
+                    // steward and every in-guest `exec` run as root (§4.2), so
                     // file capabilities are moot; the erofs Node/XattrSpec plumbing
                     // exists but is unused. Pinned by
                     // `tests::test_pax_xattrs_are_not_preserved`. Retire this note if
@@ -305,11 +305,11 @@ fn build_node_map<'a, R: Read + 'a>(
         insert_injected_file(&mut entries, extra)?;
     }
 
-    // Inject the agent/CA/guest-tools AFTER every layer is merged (H-ART-3 / design §4.2,
+    // Inject the steward/CA/guest-tools AFTER every layer is merged (H-ART-3 / design §4.2,
     // Rootfs sources and the one packer: "inject ... then stream the tree"). Injecting last
     // makes the injected files
     // authoritative: an upper layer's content or a `.wh.` whiteout can no longer clobber the
-    // baked guest-agent or the CA under `usr/local/share/ca-certificates/`.
+    // baked steward or the CA under `usr/local/share/ca-certificates/`.
     for injected in injected_files {
         insert_injected_file(&mut entries, injected)?;
     }
@@ -374,10 +374,10 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
     // merged path set for a file named `libc.so.6` at ANY path in the tree (the scan keys
     // on the file NAME, not on a `lib*`-parent-dir restriction — so lib64, lib/<triple>,
     // usr/lib, or any other location all satisfy it).
-    // The default guest-agent is built `-C target-feature=+crt-static` (guest_agent stage),
+    // The default steward is built `-C target-feature=+crt-static` (steward stage),
     // so it does not itself need libc6 — but the guest-tools helper and every user `exec`
-    // workload in the Debian rootfs do (L-ART-8). The static-musl agent path
-    // (`--agent-musl`) also drops the guard (`require_libc6 = false`). This is a hard stop,
+    // workload in the Debian rootfs do (L-ART-8). The static-musl steward path
+    // (`--steward-musl`) also drops the guard (`require_libc6 = false`). This is a hard stop,
     // never a silent pack of a base that cannot run guest-tools / user workloads.
     if require_libc6
         && !entries
@@ -385,10 +385,10 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
             .any(|p| p.file_name().is_some_and(|n| n == "libc.so.6"))
     {
         return Err(crate::error::Error::Artifact(
-            "base image is missing libc6 (no `libc.so.6` found): the default guest-agent is \
+            "base image is missing libc6 (no `libc.so.6` found): the default steward is \
              statically linked and does not need it, but the guest-tools helper and user exec \
-             workloads do. Use a base that includes libc6, or supply a static-musl agent with \
-             `--agent-musl`."
+             workloads do. Use a base that includes libc6, or supply a static-musl steward with \
+             `--steward-musl`."
                 .to_string(),
         ));
     }
@@ -489,9 +489,9 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
 /// Mode for an injected file, keyed on its destination path: injected BINARIES are
 /// executable (`0o755`), every other injected file — notably the deployment CA cert under
 /// `ca-certificates/` — is non-executable data (`0o644`). The executable destinations are a
-/// `bin`/`sbin` component (the guest-agent lands in `usr/sbin`) OR the `vmcell-tools` dir that
+/// `bin`/`sbin` component (the steward lands in `usr/sbin`) OR the `vmcell-tools` dir that
 /// holds the guest-tools multicall (`ip`/`curl`/`kvm-ok`, exec'd off PATH via the symlinks the
-/// agent prepends). `vmcell-tools` MUST be in this set: guest-tools moved out of `usr/bin` to
+/// steward prepends). `vmcell-tools` MUST be in this set: guest-tools moved out of `usr/bin` to
 /// the dedicated `/vmcell-tools` dir, and a `bin`/`sbin`-only predicate silently packed it
 /// `0o644` → `EACCES` on every `ip`/`curl`/`kvm-ok` exec. That stayed invisible while the rootfs
 /// was a warm-cache artifact (CI reuses the cached image); only a fresh pack reddens, so the
@@ -511,7 +511,7 @@ fn injected_file_mode(dest_path: &str) -> u16 {
 /// dropped, `..` pops. `pub(crate)` so the pack tail's reserved-dest check
 /// ([`is_reserved_injection_path`](crate::artifact::rootfs::is_reserved_injection_path))
 /// compares against the SAME normal form the packer keys on — a second normalizer there would
-/// let `/usr/sbin/./vmcell-guest-agent` sail past the check and then silently lose to the
+/// let `/usr/sbin/./vmcell-steward` sail past the check and then silently lose to the
 /// vmcell injection (one law, one predicate).
 #[cfg(feature = "am-fs-erofs")]
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
@@ -542,7 +542,7 @@ mod tests {
 
         let reader = std::io::Cursor::new(tar_data);
         let archive = tar::Archive::new(reader);
-        // require_libc6=false: this packs an empty tar (no agent injected), so the
+        // require_libc6=false: this packs an empty tar (no steward injected), so the
         // glibc-presence requirement does not apply.
         let image = tar_to_erofs(vec![archive], vec![], vec![], vec![], false);
         assert!(
@@ -572,7 +572,7 @@ mod tests {
     }
 
     // oci2erofs §8.2 fail-loud guard. With `require_libc6=true`, a base that contains a
-    // `libc.so.6` packs; a base that LACKS it must error (the default glibc agent would
+    // `libc.so.6` packs; a base that LACKS it must error (the default glibc steward would
     // die at PID 1). The inverse — silently packing a libc6-less base — goes red here.
     #[test]
     fn test_require_libc6_rejects_base_without_glibc() {
@@ -589,21 +589,21 @@ mod tests {
             "missing libc6 must be Error::Artifact, got {err:?}"
         );
         // The same libc6-less base packs fine when libc6 is NOT required (the
-        // --agent-musl path, which injects a static agent needing no glibc).
+        // --steward-musl path, which injects a static steward needing no glibc).
         assert!(
             pack_one("usr/bin/coreutils", false).is_ok(),
-            "a libc6-less base must pack when require_libc6=false (static-musl agent)"
+            "a libc6-less base must pack when require_libc6=false (static-musl steward)"
         );
     }
 
     // The injected guest-tools multicall (`vmcell-tools/vmcell-guest-tools`, the target of the
-    // `ip`/`curl`/`kvm-ok` symlinks the agent puts on PATH) MUST be packed executable (0o755) —
+    // `ip`/`curl`/`kvm-ok` symlinks the steward puts on PATH) MUST be packed executable (0o755) —
     // it is exec'd, not read. `injected_file_mode` keys on the dest path, and guest-tools moved
     // out of `usr/bin` to `/vmcell-tools`; a `bin`/`sbin`-only predicate packs it 0o644 → EACCES
     // on every `ip`/`curl`/`kvm-ok`, which stayed invisible behind the warm rootfs cache (only a
     // fresh pack reddens the integration suite). This KVM-free unit gate reddens on that
     // regression: dropping `vmcell-tools` from the executable set flips the first assert to 0o644.
-    // The paths mirror the injection sites in `artifact::rootfs::mod` (guest-tools + guest-agent)
+    // The paths mirror the injection sites in `artifact::rootfs::mod` (guest-tools + steward)
     // and `artifact::rootfs::oci` (the CA cert).
     #[test]
     fn injected_guest_tools_binary_is_executable() {
@@ -614,9 +614,9 @@ mod tests {
             "the guest-tools multicall must be executable; `ip`/`curl`/`kvm-ok` exec it off PATH"
         );
         assert_eq!(
-            injected_file_mode("usr/sbin/vmcell-guest-agent"),
+            injected_file_mode("usr/sbin/vmcell-steward"),
             0o755,
-            "the guest-agent (PID 1) must be executable"
+            "the steward (PID 1) must be executable"
         );
         // Non-executable injected DATA: the deployment CA cert.
         assert_eq!(
@@ -764,15 +764,15 @@ mod tests {
     }
 
     // The injected CA cert is DATA, not an executable: it must be packed 0o644, while
-    // injected binaries (guest-agent/guest-tools under bin|sbin) stay 0o755. The buggy
+    // injected binaries (steward/guest-tools under bin|sbin) stay 0o755. The buggy
     // blanket-0o755 marks the CA executable -> the `== 0o644` assertion reddens.
     #[test]
     fn test_injected_ca_is_not_executable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ca = dir.path().join("ca.crt");
         std::fs::write(&ca, b"-----CA-----").unwrap();
-        let agent = dir.path().join("agent");
-        std::fs::write(&agent, b"AGENT").unwrap();
+        let steward = dir.path().join("steward");
+        std::fs::write(&steward, b"STEWARD").unwrap();
         let empty = tar::Archive::new(std::io::Cursor::new({
             let mut v = Vec::new();
             tar::Builder::new(&mut v).finish().unwrap();
@@ -784,7 +784,7 @@ mod tests {
                 ca.as_path(),
                 None,
             ),
-            ("usr/sbin/vmcell-guest-agent", agent.as_path(), None),
+            ("usr/sbin/vmcell-steward", steward.as_path(), None),
         ];
         let map = build_node_map(vec![empty], vec![], injected, vec![]).expect("node map");
         match map.get(&normalize_path(Path::new(
@@ -797,18 +797,18 @@ mod tests {
             ),
             other => panic!("expected the injected CA file node, got {other:?}"),
         }
-        match map.get(&normalize_path(Path::new("usr/sbin/vmcell-guest-agent"))) {
+        match map.get(&normalize_path(Path::new("usr/sbin/vmcell-steward"))) {
             Some(Node::File { mode, .. }) => assert_eq!(
                 mode & 0o777,
                 0o755,
-                "the injected agent binary must stay executable"
+                "the injected steward binary must stay executable"
             ),
-            other => panic!("expected the injected agent file node, got {other:?}"),
+            other => panic!("expected the injected steward file node, got {other:?}"),
         }
     }
 
     // Accepted limitation (recorded): the packer does NOT preserve PAX SCHILY.xattr
-    // records (including `security.capability`). The guest agent and every in-guest
+    // records (including `security.capability`). The steward and every in-guest
     // `exec` run as root (design §4.2), so file capabilities are moot — preserving
     // them is forward work. This test PINS the current drop: it reddens the day xattr
     // passthrough is added without also updating the documented limitation, forcing a
@@ -962,7 +962,7 @@ mod tests {
         );
     }
 
-    // H-ART-3: injected files (agent/CA/tools) are merged as the TAIL, after all layers.
+    // H-ART-3: injected files (steward/CA/tools) are merged as the TAIL, after all layers.
     // (1) A `.wh.` whiteout in an upper layer that deletes the CA dir must NOT remove the
     // injected CA. (2) A layer that carries the injected path with different content must be
     // overwritten by the injected file. The buggy inject-before-merge order reddens both.
@@ -972,15 +972,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ca = dir.path().join("ca.crt");
         std::fs::write(&ca, b"-----INJECTED-CA-----").unwrap();
-        let agent = dir.path().join("agent");
-        std::fs::write(&agent, b"INJECTED-AGENT").unwrap();
+        let steward = dir.path().join("steward");
+        std::fs::write(&steward, b"INJECTED-STEWARD").unwrap();
 
-        // Lower layer: a base file, plus a guest-agent with DIFFERENT (stale) content.
+        // Lower layer: a base file, plus a steward with DIFFERENT (stale) content.
         let mut lower = Vec::new();
         {
             let mut b = tar::Builder::new(&mut lower);
             append_file(&mut b, "etc/os-release", b"base");
-            append_file(&mut b, "usr/sbin/vmcell-guest-agent", b"STALE-LAYER-AGENT");
+            append_file(&mut b, "usr/sbin/vmcell-steward", b"STALE-LAYER-STEWARD");
             append_file(
                 &mut b,
                 "usr/local/share/ca-certificates/other.crt",
@@ -1003,7 +1003,7 @@ mod tests {
                 ca.as_path(),
                 None,
             ),
-            ("usr/sbin/vmcell-guest-agent", agent.as_path(), None),
+            ("usr/sbin/vmcell-steward", steward.as_path(), None),
         ];
         let map = build_node_map(vec![a1, a2], vec![], injected_files, vec![]).expect("node map");
 
@@ -1014,15 +1014,15 @@ mod tests {
             }
             other => panic!("injected CA must survive an upper-layer whiteout, got {other:?}"),
         }
-        // (2) The injected agent wins over the stale layer content.
-        match map.get(Path::new("usr/sbin/vmcell-guest-agent")) {
+        // (2) The injected steward wins over the stale layer content.
+        match map.get(Path::new("usr/sbin/vmcell-steward")) {
             Some(Node::File { data, .. }) => {
                 assert_eq!(
-                    data, b"INJECTED-AGENT",
-                    "the injected agent (tail) must overwrite the layer's stale agent"
+                    data, b"INJECTED-STEWARD",
+                    "the injected steward (tail) must overwrite the layer's stale steward"
                 );
             }
-            other => panic!("expected the injected agent file, got {other:?}"),
+            other => panic!("expected the injected steward file, got {other:?}"),
         }
     }
 
@@ -1101,12 +1101,12 @@ mod tests {
     // Invariant F5's structural backstop: vmcell's own injections are inserted AFTER the
     // extras, so even if a reserved dest ever reached the packer (the pack tail rejects it
     // first), vmcell's content wins rather than being silently clobbered. RED on the inverse
-    // (swapping the two loops): the extra's bytes would land at the guest-agent path.
+    // (swapping the two loops): the extra's bytes would land at the steward path.
     #[test]
     fn vmcell_injections_win_over_a_colliding_extra_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let agent = dir.path().join("agent");
-        std::fs::write(&agent, b"INJECTED-AGENT").unwrap();
+        let steward = dir.path().join("steward");
+        std::fs::write(&steward, b"INJECTED-STEWARD").unwrap();
         let impostor = dir.path().join("impostor");
         std::fs::write(&impostor, b"IMPOSTOR").unwrap();
         let empty = tar::Archive::new(std::io::Cursor::new({
@@ -1116,21 +1116,17 @@ mod tests {
         }));
         let map = build_node_map(
             vec![empty],
-            vec![(
-                "/usr/sbin/vmcell-guest-agent",
-                impostor.as_path(),
-                Some(0o755),
-            )],
-            vec![("usr/sbin/vmcell-guest-agent", agent.as_path(), None)],
+            vec![("/usr/sbin/vmcell-steward", impostor.as_path(), Some(0o755))],
+            vec![("usr/sbin/vmcell-steward", steward.as_path(), None)],
             vec![],
         )
         .expect("node map");
-        match map.get(&normalize_path(Path::new("usr/sbin/vmcell-guest-agent"))) {
+        match map.get(&normalize_path(Path::new("usr/sbin/vmcell-steward"))) {
             Some(Node::File { data, .. }) => assert_eq!(
-                data, b"INJECTED-AGENT",
+                data, b"INJECTED-STEWARD",
                 "vmcell's own injection is authoritative and is inserted last"
             ),
-            other => panic!("expected the injected agent file node, got {other:?}"),
+            other => panic!("expected the injected steward file node, got {other:?}"),
         }
     }
 

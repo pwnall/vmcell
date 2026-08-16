@@ -769,7 +769,7 @@ async fn snapshot_then_restore_by_name_preserves_guest_state() {
 
 /// Privileged tap networking (§11.5, The HTTP REST API and its OpenAPI document): a VM created with `net: privileged` gets a host **netns**
 /// (`vmcell-net-<vmid>`, which the privileged test can observe) and the guest gets a **default route**
-/// (the agent configures `eth0` from the kernel cmdline). Both sides confirm the privileged path ran.
+/// (the steward configures `eth0` from the kernel cmdline). Both sides confirm the privileged path ran.
 #[tokio::test]
 #[ignore = "boots a real VM with privileged tap networking; run via `just test-daemon`"]
 async fn privileged_net_gives_host_netns_and_guest_default_route() {
@@ -788,11 +788,11 @@ async fn privileged_net_gives_host_netns_and_guest_default_route() {
         vm.vmid
     );
 
-    // Guest side: the agent brought eth0 up with a /30 in the privileged subnet.
+    // Guest side: the steward brought eth0 up with a /30 in the privileged subnet.
     //
     // POLL, for the same reason `vmcell/tests/lifecycle.rs` polls: the `ip` applet prints
-    // `/sys/class/net/eth0/operstate`, and virtio-net briefly reports "down" AFTER the agent is
-    // already reachable, while the link settles. The agent becoming reachable is what unblocks
+    // `/sys/class/net/eth0/operstate`, and virtio-net briefly reports "down" AFTER the steward is
+    // already reachable, while the link settles. The steward becoming reachable is what unblocks
     // `create_vm`, so a single read here races that transition — reading "state down" beside a
     // correctly configured `inet 10.200.11.2/30`. Polling keeps the assertion able to fail: an
     // eth0 that never comes up still reddens after the window.

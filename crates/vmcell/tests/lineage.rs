@@ -1,6 +1,6 @@
 //! fork()/branch() lineage integration test (§8.5, Lineage: fork and branch).
 //!
-//! Boots one VM to agent-ready, roots a [`Lineage`] by suspending it, then
+//! Boots one VM to steward-ready, roots a [`Lineage`] by suspending it, then
 //! exercises the fork/branch handle on real micro-VMs and asserts on the **data
 //! plane** (exec output), not proxy signals:
 //!
@@ -19,10 +19,10 @@
 //! **single** clone, so the chain works on both the host-path-rotating (CH) and
 //! verbatim-rebind (FC) tiers — the sequential single-lineage shape both support.
 
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
 use vmcell::lineage::{Lineage, LineageAllocator};
 use vmcell::orchestrator::MicroVm;
+use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::{VmInstance, Vmm};
 
 mod common;
@@ -74,14 +74,14 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     let env = vmcell::HostEnv::hermetic();
     let alloc = LineageAllocator::new();
 
-    // 1. Boot a base VM to agent-ready, then ROOT a lineage by suspending it.
+    // 1. Boot a base VM to steward-ready, then ROOT a lineage by suspending it.
     let mut base = MicroVm::start(vmm, base_cfg(), &env)
         .await
         .expect("start base VM");
-    if let Err(e) = base.agent(None).await {
+    if let Err(e) = base.steward(None).await {
         let log = std::fs::read_to_string(base.instance().serial_log()).unwrap_or_default();
         println!("BASE SERIAL LOG:\n{log}");
-        panic!("base agent connect failed: {e}");
+        panic!("base steward connect failed: {e}");
     }
     let root = Lineage::fork_from_vm(&mut base, base_cfg(), &root_dir, alloc)
         .await
@@ -165,7 +165,7 @@ async fn fork_branch_lineage_impl<V: Vmm>(vmm: &V) {
     // No trailing removal: `scratch` owns the tree and drops here (and on any panic above).
 }
 
-/// Forks one live clone from `node`, brings its agent up (fail-loud with the serial
+/// Forks one live clone from `node`, brings its steward up (fail-loud with the serial
 /// log on failure), and returns it.
 async fn fork_one<V: Vmm>(
     node: &Lineage,
@@ -178,10 +178,10 @@ async fn fork_one<V: Vmm>(
         .await
         .unwrap_or_else(|e| panic!("fork {label} failed: {e}"));
     let log_path = vm.instance().serial_log().to_path_buf();
-    if let Err(e) = vm.agent(None).await {
+    if let Err(e) = vm.steward(None).await {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         println!("{label} SERIAL LOG:\n{log}");
-        panic!("{label} agent connect failed: {e}");
+        panic!("{label} steward connect failed: {e}");
     }
     vm
 }
@@ -189,9 +189,9 @@ async fn fork_one<V: Vmm>(
 /// Execs `argv` and returns `(exit_code, stdout_string)`.
 async fn exec<V: Vmm>(vm: &mut MicroVm<V>, argv: &[&str]) -> (i32, String) {
     let out = vm
-        .agent(None)
+        .steward(None)
         .await
-        .expect("agent")
+        .expect("steward")
         .exec(ExecRequest::new(
             argv.iter().map(|s| (*s).to_string()).collect(),
         ))

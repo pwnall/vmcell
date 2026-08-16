@@ -143,8 +143,8 @@ test-unit-undelegated:
 # `serial-host` nextest group), excluding the ~172 `kind(lib)` unit tests that `-p vmcell`
 # would otherwise pull in. Those lib tests are NOT in serial-host, so under the old filter they
 # ran at test-threads=num_cpus CONCURRENTLY with the single serial VM test, oversubscribing the
-# host CPU and stretching a guest's boot+agent-handshake past the connect/exec deadline — the
-# root cause of the intermittent "Agent … timed out" flake. They still run in `just test-unit` /
+# host CPU and stretching a guest's boot+steward-handshake past the connect/exec deadline — the
+# root cause of the intermittent "Steward … timed out" flake. They still run in `just test-unit` /
 # `just ci`, so no coverage is lost by excluding them here.
 test-privileged:
     VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
@@ -320,7 +320,7 @@ gates:
     # workspace (design §10.4).
     ./scripts/check-vendored-vhost.sh
     ./scripts/test-check-vendored-vhost.sh
-    # lean-member invariants (§12.8 #4 / §18.1): the guest PID-1 agent, the privileged-window
+    # lean-member invariants (§12.8 #4 / §18.1): the guest PID-1 steward, the privileged-window
     # test-runner, and the `vmcell-privilege` crate BOTH the runner and the daemon link must omit
     # the host async stack. (Each must also COMPILE standalone; those three `cargo clippy -p …`
     # calls stay in `ci`/ci.yml beside the other compile gates — this roster is scripts only.)
@@ -355,7 +355,7 @@ gates:
     ./scripts/test-ban-global-state.sh
     ./scripts/ban-legacy-terms.sh
     ./scripts/test-ban-legacy-terms.sh
-    # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the guest agent + its red-on-inverse self-test.
+    # AGENT-4/TEST-5: positive zero-`ip`-shellout gate for the steward + its red-on-inverse self-test.
     ./scripts/ban-agent-ip-shellout.sh
     ./scripts/test-ban-agent-ip-shellout.sh
     # P3/B12: the ONLY function that turns a client-supplied artifact name into a path is
@@ -450,7 +450,7 @@ ci:
     # `check-lean-tree.sh` inside `gates`; graph inspection is not enough, so each of the three
     # members is also clippied standalone here — a broken build (e.g. an un-gated host dep) must be
     # caught in this job, not on a KVM host.
-    cargo clippy --locked -p vmcell-guest-agent --all-targets
+    cargo clippy --locked -p vmcell-steward --all-targets
     cargo clippy --locked -p vmcell-test-runner --all-targets
     cargo clippy --locked -p vmcell-privilege --all-targets
     # guest-tools: build+clippy only (reqwest legitimately pulls hyper/tokio — see impl-notes, no lean-tree assertion).

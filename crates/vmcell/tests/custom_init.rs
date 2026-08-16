@@ -3,11 +3,11 @@ use vmcell::config::{KernelVerbosity, RootfsSource, VmConfig};
 mod common;
 
 // §5.3 (The kernel command line): a custom `init=` override boots a different PID 1 (replacing the vmcell guest
-// agent), so the vsock control plane is gone. This is a DATA-PLANE proof on the primary
+// steward), so the vsock control plane is gone. This is a DATA-PLANE proof on the primary
 // backend: boot with `init=/bin/sh` at Verbose verbosity (loglevel=7, so the kernel's
 // `KERN_INFO` init-exec line prints) and assert the serial log shows the kernel ran the
 // overridden init — the same class of assertion as the boot test's kernel banner. Then
-// assert `agent()` fails LOUD (§13, Cross-cutting invariants), not hangs, because there is no agent to talk to.
+// assert `steward()` fails LOUD (§13, Cross-cutting invariants), not hangs, because there is no steward to talk to.
 //
 // CH-only: this is a backend-agnostic host-side cmdline feature, so one primary-backend
 // data-plane proof suffices; QEMU/FC would only add non-standard-boot flake.
@@ -52,15 +52,15 @@ async fn custom_init_boots_and_disables_control_plane() {
         log.display()
     );
 
-    // The control plane is gone (a custom init replaced the agent), so `agent()` must
+    // The control plane is gone (a custom init replaced the steward), so `steward()` must
     // fail loud immediately rather than hang connecting to a nonexistent listener.
     let err = vm
-        .agent(Some(std::time::Duration::from_secs(2)))
+        .steward(Some(std::time::Duration::from_secs(2)))
         .await
-        .expect_err("agent() must fail loud with a custom init");
+        .expect_err("steward() must fail loud with a custom init");
     assert!(
-        matches!(err, vmcell::Error::Agent(_)) && err.to_string().contains("custom init"),
-        "expected a fail-loud custom-init Agent error, got {err:?}"
+        matches!(err, vmcell::Error::Steward(_)) && err.to_string().contains("custom init"),
+        "expected a fail-loud custom-init Steward error, got {err:?}"
     );
 
     vm.kill().await.unwrap();

@@ -11,7 +11,7 @@ name: fuzz-nightly
 # directions rather than against anything written here.
 #
 #   GUEST -> HOST — bytes a booted VM controls; the boundary vmcell exists to hold
-#     protocol_decode            framed postcard `Message`, the guest agent wire (rubric B10)
+#     protocol_decode            framed postcard `Message`, the steward wire (rubric B10)
 #     protocol_message_render    `capped_debug` over a decoded `Message`; an uncapped render is a
 #                                flood written into the persisted serial-console artifact
 #     egress_host_blocklist      the deny-list matcher over the guest's own `Host` header / URI
@@ -45,7 +45,7 @@ name: fuzz-nightly
 #
 #   LOCAL BUILD CONFIG — contract surface, not a remote boundary
 #     injection_dest             the F5 injection-dest law; ranked for its real evasion history
-#                                (`/usr/sbin/./vmcell-guest-agent`, `/opt/.`), not for remote reach
+#                                (`/usr/sbin/./vmcell-steward`, `/opt/.`), not for remote reach
 #
 # ADDING A TARGET: land it in BOTH `fuzz/fuzz_targets/<name>.rs` and a `[[bin]]` stanza in
 # `fuzz/Cargo.toml` — GUARD 5 fails the job loudly if either is missing, because a target file

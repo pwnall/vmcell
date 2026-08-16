@@ -18,3 +18,4 @@ Passt = "Passt"              # capitalized form of the same tool name
 Criticals = "Criticals"      # severity-category plural in the code-review rubric ("Criticals and Highs")
 unparseable = "unparseable"  # accepted variant spelling used in metrics/qemu doc comments
 Inh = "Inh"                  # `CapInh`, a literal `/proc/<pid>/status` field name (P2's cap-drop gate)
+mke = "mke"                  # `mke2fs`, the e2fsprogs binary name (design §4.7's ext4 producer, delta 8)

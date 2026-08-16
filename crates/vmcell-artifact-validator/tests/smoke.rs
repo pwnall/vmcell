@@ -14,7 +14,7 @@ use vmcell_artifact_validator::{ArtifactSet, CheckStatus, Level, ValidationOptio
 #[ignore = "needs KVM + built artifacts"]
 async fn validate_known_good_full_is_ok() {
     // Through the §10.4 getters, not `artifact::{kernel_path,rootfs_path}` directly: they run the
-    // at-most-once, hash-gated artifact build first, so an edit to the guest agent or the packer
+    // at-most-once, hash-gated artifact build first, so an edit to the steward or the packer
     // is validated instead of silently re-validating a stale rootfs, and a missing kernel fails
     // loud with the one-command fix rather than as a boot timeout.
     let artifacts = ArtifactSet::new(get_vmlinux(), get_rootfs());
@@ -51,7 +51,7 @@ async fn validate_broken_kernel_reports_failure() {
     assert!(
         report
             .failures()
-            .any(|f| f.id == "boot.agent_ready" || f.id == "boot.kernel_banner"),
+            .any(|f| f.id == "boot.steward_ready" || f.id == "boot.kernel_banner"),
         "expected a boot failure; got {:?}",
         report.failures().collect::<Vec<_>>()
     );

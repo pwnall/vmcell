@@ -1186,13 +1186,13 @@ pub trait Vmm: Send + Sync {
     fn id(&self) -> &str;
 }
 
-/// The vsock port the guest agent listens on and the host connects to. One
-/// definition shared by the orchestrator's agent connect and the QEMU
+/// The vsock port the steward listens on and the host connects to. One
+/// definition shared by the orchestrator's steward connect and the QEMU
 /// control-plane health-gate probe (AGENTS.md "one law, one predicate") — the
-/// guest agent's own `VSOCK_PORT` is its mirror on the other side of the boundary.
-pub const AGENT_VSOCK_PORT: u32 = 5000;
+/// steward's own `VSOCK_PORT` is its mirror on the other side of the boundary.
+pub const STEWARD_VSOCK_PORT: u32 = 5000;
 
-/// How the host reaches a VM's guest-agent vsock control plane.
+/// How the host reaches a VM's steward vsock control plane.
 ///
 /// Cloud Hypervisor, Firecracker, and QEMU's default external `vhost-device-vsock`
 /// daemon all bridge the guest's vsock onto a host **AF_UNIX** socket spoken with
@@ -1203,7 +1203,7 @@ pub const AGENT_VSOCK_PORT: u32 = 5000;
 /// handshake — [`VsockEndpoint::Vsock`]. crosvm is the one backend that is **always**
 /// on that AF_VSOCK arm: its vsock is the in-kernel device on every path, and its
 /// AF_UNIX `vsock_path` is vestigial API parity (§2.5, crosvm — the fourth backend (v29, boot-first)).
-/// The agent transport ([`crate::agent`]) branches only its connect *prologue* on this; the framed protocol after the
+/// The steward transport ([`crate::steward`]) branches only its connect *prologue* on this; the framed protocol after the
 /// guest's first `Ready` frame is byte-identical on both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VsockEndpoint {
@@ -1219,7 +1219,7 @@ pub enum VsockEndpoint {
     Vsock {
         /// The guest's vsock Context ID the host dials.
         cid: u32,
-        /// The vsock port the guest agent listens on.
+        /// The vsock port the steward listens on.
         port: u32,
     },
 }
@@ -1279,11 +1279,11 @@ pub trait VmInstance: Send {
     async fn snapshot(&mut self, dir: &Path) -> Result<()>;
     /// Returns the path to this instance's vsock control socket.
     fn vsock_path(&self) -> &Path;
-    /// Returns the endpoint the host uses to reach this instance's guest-agent
+    /// Returns the endpoint the host uses to reach this instance's steward
     /// vsock control plane.
     ///
     /// Defaults to [`VsockEndpoint::Unix`] over [`vsock_path`](VmInstance::vsock_path)
-    /// with the shared internal agent vsock port — the AF_UNIX hybrid-vsock transport Cloud
+    /// with the shared internal steward vsock port — the AF_UNIX hybrid-vsock transport Cloud
     /// Hypervisor, Firecracker, and an external-daemon QEMU use. A backend whose control plane
     /// rides an AF_VSOCK transport overrides this to return [`VsockEndpoint::Vsock`] carrying its
     /// [`guest_cid`](VmInstance::guest_cid): a snapshot-eligible QEMU on the in-kernel
@@ -1292,7 +1292,7 @@ pub trait VmInstance: Send {
     fn vsock_endpoint(&self) -> VsockEndpoint {
         VsockEndpoint::Unix {
             path: self.vsock_path().to_path_buf(),
-            port: AGENT_VSOCK_PORT,
+            port: STEWARD_VSOCK_PORT,
         }
     }
     /// Returns the unique vsock Context ID (CID) assigned to this VM.
@@ -1310,9 +1310,9 @@ pub trait VmInstance: Send {
     /// `vhost-device-vsock` daemon over a `vhost-user-vsock` virtqueue whose
     /// bring-up races. On the measured host ~11% of QEMU boots leave that data path
     /// wedged for the VM's entire life — the daemon accepts the host `CONNECT` but
-    /// never reaches the guest listener — surfacing only ~10 s later as an agent
+    /// never reaches the guest listener — surfacing only ~10 s later as a steward
     /// connection timeout. Returning `Err` here lets the orchestrator recreate the
-    /// VM instead. See `docs/benchmark-results.md` ("QEMU agent-timeout flake") and
+    /// VM instead. See `docs/benchmark-results.md` ("QEMU steward-timeout flake") and
     /// `tests/qemu_vsock_flake_repro.rs`.
     ///
     /// `budget` bounds the probe; a healthy transport answers well before it, so a
@@ -1601,7 +1601,7 @@ mod tests {
 
     // Pins the trait default: every backend that does NOT override `vsock_endpoint`
     // keeps the AF_UNIX hybrid-vsock transport, derived from `vsock_path()` + the
-    // shared `AGENT_VSOCK_PORT`. A backend on the AF_VSOCK transport (an in-kernel-vsock QEMU,
+    // shared `STEWARD_VSOCK_PORT`. A backend on the AF_VSOCK transport (an in-kernel-vsock QEMU,
     // and crosvm always) must override this method; the buggy inverse (a QEMU or crosvm
     // that forgets to override, so the host dials a vestigial AF_UNIX path) is
     // exactly what an endpoint-mismatch would surface.
@@ -1615,7 +1615,7 @@ mod tests {
             inst.vsock_endpoint(),
             VsockEndpoint::Unix {
                 path: PathBuf::from("/tmp/probe-vsock.sock"),
-                port: AGENT_VSOCK_PORT,
+                port: STEWARD_VSOCK_PORT,
             },
         );
     }

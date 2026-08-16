@@ -1,8 +1,8 @@
-//! Framed postcard wire protocol shared by the vmcell host and the guest agent.
+//! Framed postcard wire protocol shared by the vmcell host and the steward.
 //!
-//! This is the *only* code the host (`vmcell::agent::AgentClient`) and the guest
-//! PID-1 agent (`vmcell-guest-agent`) share — extracting it into its own crate is
-//! what lets the guest agent be a standalone, host-stack-free workspace member
+//! This is the *only* code the host (`vmcell::steward::StewardClient`) and the guest
+//! PID-1 steward (`vmcell-steward`) share — extracting it into its own crate is
+//! what lets the steward be a standalone, host-stack-free workspace member
 //! (§8.1, Workspace layout). It defines the messages exchanged over the vsock connection and
 //! the framing bound both ends must agree on.
 //!
@@ -47,9 +47,9 @@ use serde::{Deserialize, Serialize};
 /// Maximum length, in bytes, of a single framed control-plane message.
 ///
 /// Both ends of the vsock protocol must agree on this bound: the host
-/// `AgentClient` configures its `LengthDelimitedCodec` with it (its 8 MiB
+/// `StewardClient` configures its `LengthDelimitedCodec` with it (its 8 MiB
 /// default would otherwise reject a frame the guest is willing to send) and the
-/// guest agent's hand-rolled framing rejects anything larger. Keeping the two in
+/// steward's hand-rolled framing rejects anything larger. Keeping the two in
 /// one constant prevents the asymmetric-cap class where one side silently drops
 /// a frame the other accepts.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -58,7 +58,7 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Every desync diagnostic on this control plane quotes a **frame**, and a frame is
 /// bounded only by [`MAX_FRAME_BYTES`] (16 MiB) with a payload the peer chooses. The
-/// guest agent's own logs land on the *persisted* serial-console artifact, so an
+/// steward's own logs land on the *persisted* serial-console artifact, so an
 /// uncapped `{other:?}` there lets a peer write 16 MiB — rendered as `[1, 2, 3, …]`
 /// decimal, several times that again — into an artifact every later run reads; the
 /// host sites have the same shape at a smaller blast radius. 256 bytes still shows
@@ -68,7 +68,7 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// It lives here, beside `MAX_FRAME_BYTES`, because the cap on what a frame may
 /// carry and the cap on what a log may quote from one are a single law: the guest
-/// agent and both host clients share this one const and [`capped_debug`], never a
+/// steward and both host clients share this one const and [`capped_debug`], never a
 /// per-site copy (docs/78 §6, `uncapped-frame-debug-renders`).
 pub const MAX_DEBUG_RENDER_BYTES: usize = 256;
 
@@ -85,7 +85,7 @@ pub const DEBUG_TRUNCATED_MARKER: &str = "…<truncated>";
 /// full and then trimmed: [`core::fmt::Write`] returning `Err` aborts the formatting,
 /// so the tail is never rendered at all, not merely never kept. That bounds the CPU
 /// as well as the allocation a peer-chosen 16 MiB frame can cost a log line — the
-/// guest agent is PID 1, and a diagnostic must not become a work amplifier for
+/// steward is PID 1, and a diagnostic must not become a work amplifier for
 /// whatever the peer sends.
 ///
 /// The trade-off that buys: the *total* render length is unknowable without
@@ -245,7 +245,7 @@ impl SessionSpec {
     }
 }
 
-/// A message exchanged between the host and the guest agent.
+/// A message exchanged between the host and the steward.
 ///
 /// **Append-only.** `postcard` encodes each variant by its zero-based
 /// declaration index, so the variant order is part of the wire protocol: new
@@ -260,7 +260,7 @@ impl SessionSpec {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
-    /// Agent is ready to accept commands.
+    /// Steward is ready to accept commands.
     Ready,
     /// Request to execute a command.
     Exec(ExecRequest),
@@ -280,7 +280,7 @@ pub enum Message {
     /// Host→guest one-shot post-restore resync request (§8.2, Restore correctness: a restored VM is not a fresh VM).
     ///
     /// A snapshot resumes at the frozen instant, so the host drives one native
-    /// in-agent resync — replacing the three post-restore subprocess execs
+    /// in-steward resync — replacing the three post-restore subprocess execs
     /// (`date` / `head -c 32 /dev/hwrng` / `ip link set`). It carries the host
     /// wall-clock instant the guest must set `CLOCK_REALTIME` to and an optional
     /// new `eth0` MAC to install; one request elicits exactly one
@@ -521,7 +521,7 @@ mod tests {
 
     // docs/78 §6 (`uncapped-frame-debug-renders`): the ONE renderer every desync log
     // site on this plane goes through. A frame is peer-chosen and `MAX_FRAME_BYTES`
-    // (16 MiB) big, and the guest agent's log lines are PERSISTED on the serial
+    // (16 MiB) big, and the steward's log lines are PERSISTED on the serial
     // artifact — so this pins both halves of the law: an over-cap value renders to a
     // bounded, visibly-truncated string, and an under-cap one renders verbatim (a
     // "cap" that mangled ordinary frames would just be traded for silent log loss).

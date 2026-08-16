@@ -54,7 +54,7 @@ impl Stage for GuestToolsStage {
         let ws_root = crate::artifact::workspace_root();
         // Fail hard if the helper's source closure (`.rs` source + `Cargo.lock`) is
         // unreadable — never silently build and serve a stale helper. Mirrors the
-        // guest-agent stage's run()-side hard stop; the returned hash is needed only
+        // steward stage's run()-side hard stop; the returned hash is needed only
         // for its error effect here.
         crate::artifact::guest_tools_closure_hash(&ws_root)?;
 

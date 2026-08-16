@@ -8,7 +8,7 @@ description = "vmcell guest-side multicall helper: real ip/curl/kvm-ok, baked in
 publish = false
 
 # A *guest* binary cross-compiled into the rootfs. Needs reqwest for genuine HTTP, so it is
-# leaner than the host but not as lean as the agent; it is NOT the host stack (its own member).
+# leaner than the host but not as lean as the steward; it is NOT the host stack (its own member).
 [[bin]]
 name = "vmcell-guest-tools"
 path = "src/main.rs"

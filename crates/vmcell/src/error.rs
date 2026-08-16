@@ -17,9 +17,9 @@ pub enum Error {
     /// A general VMM error.
     #[error("VMM error: {0}")]
     Vmm(String),
-    /// An error related to the guest agent.
-    #[error("Agent error: {0}")]
-    Agent(String),
+    /// An error related to the steward.
+    #[error("Steward error: {0}")]
+    Steward(String),
     /// An error related to networking.
     #[error("Network error: {0}")]
     Network(String),
@@ -122,8 +122,8 @@ mod tests {
             "VMM error: failed to boot"
         );
         assert_eq!(
-            Error::Agent("connection failed".to_string()).to_string(),
-            "Agent error: connection failed"
+            Error::Steward("connection failed".to_string()).to_string(),
+            "Steward error: connection failed"
         );
         assert_eq!(
             Error::Serialize("unknown error".to_string()).to_string(),

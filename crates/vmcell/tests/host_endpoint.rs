@@ -1,7 +1,7 @@
 use std::process::Command;
 use vmcell::MicroVm;
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
+use vmcell::steward::protocol::ExecRequest;
 
 mod common;
 
@@ -76,7 +76,7 @@ async fn dial_host_endpoint<V: vmcell::vmm::Vmm>(vmm: &V, egress: Egress, port: 
     let (host_ip, _guest_ip, _cidr) = vmcell::net::ip_math(vm.vmid()).expect("ip_math");
 
     // Let the guest finish bringing `eth0` up before reading it. Load-bearing on QEMU, whose
-    // virtio-net link is still `state down` the instant the agent answers — without this the
+    // virtio-net link is still `state down` the instant the steward answers — without this the
     // IP-PNP check below fails with `eth0 is not up` on that backend alone.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -94,11 +94,14 @@ async fn dial_host_endpoint<V: vmcell::vmm::Vmm>(vmm: &V, egress: Egress, port: 
     // Give network time to settle, then exercise the NAT host-service forward (a vmcell
     // networking feature, not an artifact property — kept inline here).
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let agent = vm.agent(None).await.expect("Failed to connect to agent");
+    let steward = vm
+        .steward(None)
+        .await
+        .expect("Failed to connect to steward");
 
     // The in-guest `curl` is vmcell's own shim, which REJECTS any flag it cannot honor, so this
     // argv cannot be silently neutered (AGENTS.md "never neuter the property under test").
-    let outcome = agent
+    let outcome = steward
         .exec(ExecRequest::new(vec![
             "curl".into(),
             "--max-time".into(),

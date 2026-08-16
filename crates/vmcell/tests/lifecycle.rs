@@ -100,7 +100,7 @@ async fn test_lifecycle_force_kill_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
 // TESTS-LIFECYCLE-5: drive the FakeVmm-backed orchestrator across a start and a
 // restore cycle on SHARED allocators, asserting CID/VMID allocation order,
-// uniqueness, release-on-shutdown, and the agent connect timeout branch. All
+// uniqueness, release-on-shutdown, and the steward connect timeout branch. All
 // non-KVM; uses a hermetic recording cgroup seam (no real /sys/fs/cgroup writes).
 #[tokio::test]
 async fn test_lifecycle_fake_vmm() {
@@ -198,15 +198,15 @@ async fn test_lifecycle_fake_vmm() {
     env.cids.release(probe_cid);
 
     // Retry/timeout branch: the fake instance's vsock path does not exist, so the
-    // agent connect loop must exhaust its deadline and surface a typed Timeout —
+    // steward connect loop must exhaust its deadline and surface a typed Timeout —
     // not hang (would trip the nextest timeout) and not falsely report success.
-    let agent_res = restore_vm
-        .agent(Some(std::time::Duration::from_secs(1)))
+    let steward_res = restore_vm
+        .steward(Some(std::time::Duration::from_secs(1)))
         .await;
     assert!(
-        matches!(&agent_res, Err(vmcell::Error::Timeout(_))),
-        "agent() over an unreachable fake vsock must time out (is_err={})",
-        agent_res.is_err()
+        matches!(&steward_res, Err(vmcell::Error::Timeout(_))),
+        "steward() over an unreachable fake vsock must time out (is_err={})",
+        steward_res.is_err()
     );
 
     restore_vm.shutdown().await.expect("Failed to shutdown");
@@ -546,12 +546,12 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
     ));
     let sock_path = per_vm_dir.join("smoltcp.sock");
 
-    let agent = match vm.agent(Some(std::time::Duration::from_secs(120))).await {
+    let steward = match vm.steward(Some(std::time::Duration::from_secs(120))).await {
         Ok(a) => a,
         Err(e) => {
             let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
             panic!(
-                "Failed to connect to agent over unprivileged networking: {e}\nSERIAL LOG:\n{log}"
+                "Failed to connect to steward over unprivileged networking: {e}\nSERIAL LOG:\n{log}"
             );
         }
     };
@@ -559,12 +559,12 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
     // eth0 is configured by the kernel ip= cmdline (zero-netlink PID 1); the
     // smoltcp NAT carries its traffic. Confirm the interface comes up. POLL a few
     // times: on some backends (QEMU) the operstate briefly reads "down" right after
-    // the agent becomes reachable, before the virtio-net link settles to
+    // the steward becomes reachable, before the virtio-net link settles to
     // "up"/"unknown" — a single read races that transition (flaky). The assertion
     // after the loop still reddens if eth0 never comes up.
     let mut state = String::new();
     for _ in 0..15 {
-        let operstate = agent
+        let operstate = steward
             .exec(vmcell::ExecRequest::new(vec![
                 "cat".into(),
                 "/sys/class/net/eth0/operstate".into(),
@@ -590,7 +590,7 @@ async fn test_lifecycle_unprivileged_smoltcp_impl<V: vmcell::vmm::Vmm>(vmm: &V) 
         "eth0 should be up over the unprivileged NAT within the poll window, got operstate {state:?}"
     );
 
-    let outcome = agent
+    let outcome = steward
         .exec(vmcell::ExecRequest::new(vec!["true".into()]))
         .await
         .expect("exec failed");

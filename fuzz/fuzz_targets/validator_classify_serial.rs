@@ -34,7 +34,7 @@ use vmcell_artifact_validator::classify::{
 // WHAT WOULD BE A FINDING: a panic on a mid-character truncation, or a message whose guest-derived
 // part outgrows the promised bound (a flood into a persisted artifact).
 
-const BASE: &str = "the VM did not reach agent-ready within its budget";
+const BASE: &str = "the VM did not reach steward-ready within its budget";
 const TAIL_HEADER: &str = "\n  serial tail:";
 const LINE_INDENT: &str = "\n    ";
 const NO_OUTPUT_NOTE: &str = " (the serial console produced no output)";

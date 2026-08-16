@@ -40,7 +40,7 @@ const USB_DEVICE_ENV: &str = "VMCELL_TEST_USB_DEVICE";
 
 /// How long the live leg waits for the guest to enumerate the passed-through device, and how
 /// often it re-scans. Bounded so a device that never appears fails by name (with the guest's own
-/// sysfs output) instead of hanging: the enumeration is asynchronous to agent readiness, and a
+/// sysfs output) instead of hanging: the enumeration is asynchronous to steward readiness, and a
 /// host driver that QEMU must unbind first pushes it past the first scan (§2.4).
 #[cfg(feature = "qemu")]
 const USB_ENUMERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
@@ -447,10 +447,10 @@ async fn usb_passthrough_qemu() {
 
     let vmm = vmcell_qemu::Qemu::new(common::qemu_bin());
     let mut vm = common::start_vm(&vmm, cfg).await;
-    let agent = vm
-        .agent(Some(std::time::Duration::from_secs(60)))
+    let steward = vm
+        .steward(Some(std::time::Duration::from_secs(60)))
         .await
-        .expect("agent ready");
+        .expect("steward ready");
 
     // Walk guest sysfs for the device: print `<idVendor> <idProduct> <bNumInterfaces>`
     // for the matching node. Reads real kernel enumeration state, in-guest.
@@ -466,8 +466,8 @@ async fn usb_passthrough_qemu() {
         vid = device.vendor_id,
         pid = device.product_id
     );
-    // POLL the scan: guest USB enumeration is ASYNCHRONOUS to the agent becoming reachable,
-    // and the agent is what unblocks `start_vm`. Measured on this host (QEMU 10.2.1, 2026-08-12):
+    // POLL the scan: guest USB enumeration is ASYNCHRONOUS to the steward becoming reachable,
+    // and the steward is what unblocks `start_vm`. Measured on this host (QEMU 10.2.1, 2026-08-12):
     // a device with NO host driver bound (Goodix 27c6:609c, `Driver=[none]`) is already
     // enumerated by the first scan, but one whose interface holds a LIVE kernel driver
     // (Realtek 0bda:8156, `r8152`) is not — QEMU must unbind the host driver and reset the
@@ -483,7 +483,7 @@ async fn usb_passthrough_qemu() {
     let mut stdout;
     let mut waited = std::time::Duration::ZERO;
     loop {
-        out = agent
+        out = steward
             .exec(vmcell::ExecRequest::new(vec![
                 "sh".to_string(),
                 "-c".to_string(),

@@ -28,10 +28,10 @@ use vmcell_artifact_validator::harness;
 use vmcell_artifact_validator::kconfig::KconfigValues;
 use vmcell_artifact_validator::{ArtifactSet, ValidationOptions, validate};
 
-/// How long the guest agent gets to come up before the live leg calls the boot failed. The battery
+/// How long the steward gets to come up before the live leg calls the boot failed. The battery
 /// has already booted this exact kernel by the time this runs, so a generous single budget is
 /// enough; it is stated once here rather than inline at the call.
-const AGENT_BUDGET: Duration = Duration::from_secs(60);
+const STEWARD_BUDGET: Duration = Duration::from_secs(60);
 
 /// Usage text — one statement of the subcommand roster, printed by both the no-argument and the
 /// unknown-argument paths.
@@ -194,17 +194,17 @@ async fn prove_in_guest(
 async fn read_in_guest_config<V: vmcell::Vmm>(
     vm: &mut vmcell::orchestrator::MicroVm<V>,
 ) -> Result<String, String> {
-    let agent = vm
-        .agent(Some(AGENT_BUDGET))
+    let steward = vm
+        .steward(Some(STEWARD_BUDGET))
         .await
-        .map_err(|e| format!("the probe VM's agent never came up: {e}"))?;
+        .map_err(|e| format!("the probe VM's steward never came up: {e}"))?;
     let mut refusals = Vec::new();
     for argv in [
         vec!["zcat", IN_GUEST_CONFIG],
         vec!["gzip", "-dc", IN_GUEST_CONFIG],
     ] {
         let req = vmcell::ExecRequest::new(argv.iter().map(|s| (*s).to_string()).collect());
-        match agent.exec(req).await {
+        match steward.exec(req).await {
             Ok(out) if out.code == 0 => {
                 return String::from_utf8(out.stdout)
                     .map_err(|e| format!("{argv:?} returned non-UTF-8 config text: {e}"));

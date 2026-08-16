@@ -3,7 +3,7 @@
 //! The downstream kernel toolkit — "fails a named check loudly, not by hanging").
 //!
 //! A kernel missing a baseline symbol used to fail [`crate::checks::kernel_banner`] or
-//! `boot.agent_ready` with a raw timeout and a raw serial tail. This module turns the known
+//! `boot.steward_ready` with a raw timeout and a raw serial tail. This module turns the known
 //! signatures into the clause plus the missing symbols, and — for the residual class it does *not*
 //! recognize — still emits the named check, the budget that expired, the serial tail, and a pointer
 //! to the §5.4 checklist. A newly-understood signature grows [`classify_serial`]; it never grows the
@@ -21,7 +21,7 @@
 //! read — and it names candidate causes instead of asserting a contract violation, because absence
 //! of evidence is not evidence of a bad kernel (a missing `cloud-hypervisor` binary lands there
 //! too). Every arm of [`crate::checks`] that **reports** a VM which failed to start
-//! (`MicroVm::start`) or failed its agent handshake routes through one of the two — Core,
+//! (`MicroVm::start`) or failed its steward handshake routes through one of the two — Core,
 //! Extended and Full alike, gated by `run_core_records_both_boot_checks_when_the_vm_never_starts`
 //! and `every_extended_and_full_boot_failure_names_the_missing_evidence`.
 //!
@@ -43,13 +43,13 @@
 //!   (no virtio transport / no virtio-blk) and `No filesystem could mount root, tried:` when the
 //!   device is there but no driver claims it — two different clauses, and the device case also
 //!   panics with `VFS: Unable to mount root fs`, so the device signature is checked **first**;
-//! - the vsock clause from the guest agent's **own** boot self-check
-//!   (`vmcell-guest-agent: boot self-check: AF_VSOCK unavailable (…)`, emitted on `/dev/console`
+//! - the vsock clause from the steward's **own** boot self-check
+//!   (`vmcell-steward: boot self-check: AF_VSOCK unavailable (…)`, emitted on `/dev/console`
 //!   by PID 1 before it binds the listener). The design's wording names a vsock `EAFNOSUPPORT`;
 //!   that mnemonic appears in **no** serial log — the errno renders as `Address family not
 //!   supported by protocol (os error 97)`, and that phrase alone is *not* a signature either
-//!   (the agent prints it verbatim for an unrelated `AF_INET` loopback failure). Keying on the
-//!   agent's own stable prefix is both narrower and more reliable.
+//!   (the steward prints it verbatim for an unrelated `AF_INET` loopback failure). Keying on the
+//!   steward's own stable prefix is both narrower and more reliable.
 
 use std::borrow::Cow;
 
@@ -97,7 +97,7 @@ const ROOT_FS_MOUNT_SIGNATURES: &[&str] = &[
     "VFS: Unable to mount root fs",
 ];
 
-/// The guest agent's own vsock diagnostics (`vmcell-guest-agent/src/main.rs`). Both reach the
+/// The steward's own vsock diagnostics (`vmcell-steward/src/main.rs`). Both reach the
 /// serial console because PID 1's stdout/stderr are `/dev/console` (= `ttyS0`, §5.3).
 const VSOCK_SIGNATURES: &[&str] = &[
     "boot self-check: AF_VSOCK unavailable",
@@ -175,7 +175,7 @@ impl ContractViolation {
             }
             Self::VsockTransport => {
                 "§5.4 control plane: the guest has no AF_VSOCK transport, so the §3 vsock control \
-                 plane cannot come up (the agent's own boot self-check reported it)"
+                 plane cannot come up (the steward's own boot self-check reported it)"
             }
             Self::NoDirectBootKernel => {
                 "§5.4 boot protocol: nothing reached the serial console — the image is not a \
@@ -266,7 +266,7 @@ const CHECKLIST_POINTER: &str = "check the whole §5.4 guest-kernel contract che
 const RESTORED_EMPTY_CONSOLE_NOTE: &str = "this console belongs to a VM RESTORED from a snapshot: \
      its kernel printed the boot banner in the snapshot source, on that VM's console, so an empty \
      console here is expected and says nothing about the kernel image. Look at the restore path \
-     first (the snapshot directory's contents, the VMM's restore API, the guest agent's post-restore \
+     first (the snapshot directory's contents, the VMM's restore API, the steward's post-restore \
      resync) before the §5.4 kernel contract";
 
 /// Render a boot-failure message for a **fresh** boot whose console was captured —
@@ -282,7 +282,7 @@ pub fn explain_boot_failure(log: &str, base: &str) -> String {
 /// of the console, bounded by [`SERIAL_TAIL_MAX_LINE_BYTES`] and [`SERIAL_TAIL_MAX_BYTES`].
 ///
 /// With [`explain_without_serial`] this is one of the two renderers every [`crate::checks`] arm
-/// that reports a failed start or a failed agent handshake goes through, so "the message names the
+/// that reports a failed start or a failed steward handshake goes through, so "the message names the
 /// contract clause" is one law in one place (AGENTS.md, "One law, one predicate"). Which of the two
 /// applies is decided by **whether
 /// console evidence exists**, never by convenience: passing an empty `log` here asserts "the VM ran
@@ -483,26 +483,26 @@ mod tests {
     }
 
     /// A realistic healthy CH boot: PVH banner, erofs root mounted, PID 1 up, vsock available.
-    /// (The agent lines carry `tracing_subscriber`'s default fmt layout, target included.)
+    /// (The steward lines carry `tracing_subscriber`'s default fmt layout, target included.)
     const HEALTHY: &str = "\
 [    0.000000] Linux version 6.12.94 (build@vmcell) (gcc (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Fri Jul  3 11:22:41 UTC 2026
-[    0.000000] Command line: console=ttyS0 loglevel=6 reboot=k panic=1 root=/dev/vda rootfstype=erofs ro init=/sbin/vmcell-guest-agent vmcell_vmid=7
+[    0.000000] Command line: console=ttyS0 loglevel=6 reboot=k panic=1 root=/dev/vda rootfstype=erofs ro init=/sbin/vmcell-steward vmcell_vmid=7
 [    0.000000] KERNEL supported cpus:
 [    0.312004] virtio_blk virtio1: [vda] 40960 512-byte logical blocks (21.0 MB/20.0 MiB)
 [    0.412233] EROFS (device vda): mounted with root inode @ nid 36.
 [    0.418001] VFS: Mounted root (erofs filesystem) readonly on device 254:0.
-[    0.421900] Run /sbin/vmcell-guest-agent as init process
-2026-07-03T11:24:02.113842Z  INFO vmcell_guest_agent: vmcell-guest-agent: starting
-2026-07-03T11:24:02.117001Z  INFO vmcell_guest_agent: vmcell-guest-agent: boot self-check: AF_VSOCK transport available
-2026-07-03T11:24:02.118004Z  INFO vmcell_guest_agent: vmcell-guest-agent: boot self-check: virtiofs filesystem supported
-2026-07-03T11:24:02.121550Z  INFO vmcell_guest_agent: vmcell-guest-agent: listening on vsock port 1024
+[    0.421900] Run /sbin/vmcell-steward as init process
+2026-07-03T11:24:02.113842Z  INFO vmcell_steward: vmcell-steward: starting
+2026-07-03T11:24:02.117001Z  INFO vmcell_steward: vmcell-steward: boot self-check: AF_VSOCK transport available
+2026-07-03T11:24:02.118004Z  INFO vmcell_steward: vmcell-steward: boot self-check: virtiofs filesystem supported
+2026-07-03T11:24:02.121550Z  INFO vmcell_steward: vmcell-steward: listening on vsock port 1024
 ";
 
     /// A kernel built without `CONFIG_EROFS_FS`: it boots, finds `vda`, and panics at root mount.
     /// (Kernel text from `init/do_mounts.c`; the observed §5.4 Firecracker-microVM-kernel failure.)
     const NO_EROFS: &str = "\
 [    0.000000] Linux version 6.12.94 (build@vmcell) (gcc (Debian 12.2.0-14) 12.2.0) #1 SMP PREEMPT_DYNAMIC Fri Jul  3 11:22:41 UTC 2026
-[    0.000000] Command line: console=ttyS0 loglevel=6 reboot=k panic=1 root=/dev/vda rootfstype=erofs ro init=/sbin/vmcell-guest-agent
+[    0.000000] Command line: console=ttyS0 loglevel=6 reboot=k panic=1 root=/dev/vda rootfstype=erofs ro init=/sbin/vmcell-steward
 [    0.395112] virtio_blk virtio1: [vda] 40960 512-byte logical blocks (21.0 MB/20.0 MiB)
 [    0.401336] List of all partitions:
 [    0.401770] fe00           20480 vda
@@ -520,7 +520,7 @@ mod tests {
     /// `Cannot open root device` line, which is why the device signature is checked first.
     const NO_VIRTIO_BLK: &str = "\
 [    0.000000] Linux version 6.12.94 (build@vmcell) (gcc (Debian 12.2.0-14) 12.2.0) #1 SMP PREEMPT_DYNAMIC Fri Jul  3 11:22:41 UTC 2026
-[    0.000000] Command line: console=ttyS0 loglevel=6 reboot=k panic=1 root=/dev/vda rootfstype=erofs ro init=/sbin/vmcell-guest-agent
+[    0.000000] Command line: console=ttyS0 loglevel=6 reboot=k panic=1 root=/dev/vda rootfstype=erofs ro init=/sbin/vmcell-steward
 [    0.401336] List of all partitions:
 [    0.401770] No blockdev found
 [    0.402244] VFS: Cannot open root device \"vda\" or unknown-block(0,0): error -6
@@ -533,28 +533,28 @@ mod tests {
     const NO_VSOCK: &str = "\
 [    0.000000] Linux version 6.12.94 (build@vmcell) (gcc (Debian 12.2.0-14) 12.2.0) #1 SMP PREEMPT_DYNAMIC Fri Jul  3 11:22:41 UTC 2026
 [    0.412233] EROFS (device vda): mounted with root inode @ nid 36.
-[    0.421900] Run /sbin/vmcell-guest-agent as init process
-2026-07-03T11:24:02.113842Z  INFO vmcell_guest_agent: vmcell-guest-agent: starting
-2026-07-03T11:24:02.117412Z ERROR vmcell_guest_agent: vmcell-guest-agent: boot self-check: AF_VSOCK unavailable (Address family not supported by protocol (os error 97)); the vsock control plane will not come up
-2026-07-03T11:24:02.118004Z  INFO vmcell_guest_agent: vmcell-guest-agent: boot self-check: virtiofs filesystem supported
+[    0.421900] Run /sbin/vmcell-steward as init process
+2026-07-03T11:24:02.113842Z  INFO vmcell_steward: vmcell-steward: starting
+2026-07-03T11:24:02.117412Z ERROR vmcell_steward: vmcell-steward: boot self-check: AF_VSOCK unavailable (Address family not supported by protocol (os error 97)); the vsock control plane will not come up
+2026-07-03T11:24:02.118004Z  INFO vmcell_steward: vmcell-steward: boot self-check: virtiofs filesystem supported
 ";
 
     /// The later signature: the family exists but the listener bind fails (no `virtio_vsock`
     /// transport bound to the device).
     const VSOCK_BIND_FAILS: &str = "\
 [    0.000000] Linux version 6.12.94 (build@vmcell) (gcc (Debian 12.2.0-14) 12.2.0) #1 SMP PREEMPT_DYNAMIC Fri Jul  3 11:22:41 UTC 2026
-[    0.421900] Run /sbin/vmcell-guest-agent as init process
-2026-07-03T11:24:02.117412Z  INFO vmcell_guest_agent: vmcell-guest-agent: boot self-check: AF_VSOCK transport available
-2026-07-03T11:24:02.119003Z ERROR vmcell_guest_agent: vmcell-guest-agent: failed to bind vsock: No such device (os error 19)
+[    0.421900] Run /sbin/vmcell-steward as init process
+2026-07-03T11:24:02.117412Z  INFO vmcell_steward: vmcell-steward: boot self-check: AF_VSOCK transport available
+2026-07-03T11:24:02.119003Z ERROR vmcell_steward: vmcell-steward: failed to bind vsock: No such device (os error 19)
 ";
 
     /// A guest whose *loopback* bring-up hits `EAFNOSUPPORT` — the same rendered errno prose as the
-    /// vsock case, from a different, non-vsock clause. The agent's vsock self-check is green.
+    /// vsock case, from a different, non-vsock clause. The steward's vsock self-check is green.
     const LOOPBACK_EAFNOSUPPORT: &str = "\
 [    0.000000] Linux version 6.12.94 (build@vmcell) (gcc (Debian 12.2.0-14) 12.2.0) #1 SMP PREEMPT_DYNAMIC Fri Jul  3 11:22:41 UTC 2026
 [    0.412233] EROFS (device vda): mounted with root inode @ nid 36.
-2026-07-03T11:24:02.114900Z  WARN vmcell_guest_agent: vmcell-guest-agent: loopback bring-up failed: Address family not supported by protocol (os error 97); continuing without lo
-2026-07-03T11:24:02.117001Z  INFO vmcell_guest_agent: vmcell-guest-agent: boot self-check: AF_VSOCK transport available
+2026-07-03T11:24:02.114900Z  WARN vmcell_steward: vmcell-steward: loopback bring-up failed: Address family not supported by protocol (os error 97); continuing without lo
+2026-07-03T11:24:02.117001Z  INFO vmcell_steward: vmcell-steward: boot self-check: AF_VSOCK transport available
 ";
 
     // The headline §5.4 signature. Guards a classifier wired only to the timeout path or keyed on
@@ -565,11 +565,11 @@ mod tests {
             classify_serial(NO_EROFS),
             Some(ContractViolation::RootFsMount)
         );
-        let msg = explain_boot_failure(NO_EROFS, "agent handshake failed");
+        let msg = explain_boot_failure(NO_EROFS, "steward handshake failed");
         assert!(msg.contains("CONFIG_EROFS_FS"), "{msg}");
         assert!(msg.contains("CONFIG_OVERLAY_FS"), "{msg}");
         // The base message survives, and the tail quotes the panic line verbatim.
-        assert!(msg.starts_with("agent handshake failed"), "{msg}");
+        assert!(msg.starts_with("steward handshake failed"), "{msg}");
         assert!(
             msg.contains("VFS: Unable to mount root fs on unknown-block(254,0)"),
             "{msg}"
@@ -590,7 +590,7 @@ mod tests {
             classify_serial(NO_VIRTIO_BLK),
             Some(ContractViolation::RootDeviceMissing)
         );
-        let msg = explain_boot_failure(NO_VIRTIO_BLK, "agent handshake failed");
+        let msg = explain_boot_failure(NO_VIRTIO_BLK, "steward handshake failed");
         assert!(msg.contains("CONFIG_VIRTIO_BLK"), "{msg}");
         assert!(msg.contains("CONFIG_VIRTIO_PCI"), "{msg}");
         assert!(
@@ -604,7 +604,7 @@ mod tests {
         );
     }
 
-    // The vsock clause keys on the agent's own string. Guards a classifier written to the design's
+    // The vsock clause keys on the steward's own string. Guards a classifier written to the design's
     // literal wording (`EAFNOSUPPORT`), which would never fire on real output.
     #[test]
     fn classify_vsock_unavailable() {
@@ -616,7 +616,7 @@ mod tests {
             classify_serial(NO_VSOCK),
             Some(ContractViolation::VsockTransport)
         );
-        let msg = explain_boot_failure(NO_VSOCK, "agent handshake failed");
+        let msg = explain_boot_failure(NO_VSOCK, "steward handshake failed");
         assert!(msg.contains("CONFIG_VSOCKETS"), "{msg}");
         assert!(msg.contains("CONFIG_VIRTIO_VSOCKETS"), "{msg}");
     }
@@ -706,9 +706,9 @@ mod tests {
     // no invented clause. Guards a renderer that reports only recognized violations.
     #[test]
     fn explain_unrecognized_failure_points_at_the_checklist() {
-        let msg = explain_boot_failure(HEALTHY, "agent handshake failed within the 60s budget");
+        let msg = explain_boot_failure(HEALTHY, "steward handshake failed within the 60s budget");
         assert!(
-            msg.starts_with("agent handshake failed within the 60s budget"),
+            msg.starts_with("steward handshake failed within the 60s budget"),
             "{msg}"
         );
         assert!(
@@ -757,7 +757,7 @@ mod tests {
         assert_eq!(classify_serial_of(BootKind::Restored, ""), None);
         assert_eq!(classify_serial_of(BootKind::Restored, "   \n\n"), None);
 
-        let base = "restored VM: agent handshake failed within the 60s budget";
+        let base = "restored VM: steward handshake failed within the 60s budget";
         let restored = explain_boot_failure_of(BootKind::Restored, "", base);
         assert!(restored.starts_with(base), "{restored}");
         assert!(
@@ -850,7 +850,7 @@ mod tests {
         log.push_str(" END-OF-FLOOD\n");
         assert!(log.len() > 4 * 1024 * 1024, "the fixture must be a flood");
 
-        let msg = explain_boot_failure(&log, "agent handshake failed");
+        let msg = explain_boot_failure(&log, "steward handshake failed");
         assert!(
             msg.len() < 8 * 1024,
             "a failure message must not carry a multi-megabyte console: {} bytes",
@@ -877,7 +877,7 @@ mod tests {
         for i in 0..40 {
             log.push_str(&format!("[    1.0{i:03}] line-{i}: {}\n", "L".repeat(900)));
         }
-        let msg = explain_boot_failure(&log, "agent handshake failed");
+        let msg = explain_boot_failure(&log, "steward handshake failed");
         assert!(
             msg.len() < SERIAL_TAIL_MAX_BYTES + 2048,
             "the quoted tail must respect the total byte cap: {} bytes",

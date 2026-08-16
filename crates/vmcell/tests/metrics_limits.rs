@@ -115,10 +115,10 @@ async fn test_metrics_and_limits_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     // Test CPU average computation.
     let start_time = std::time::Instant::now();
     let cpu_test_outcome = vm
-        .agent(None)
+        .steward(None)
         .await
         .unwrap()
-        .exec(vmcell::agent::protocol::ExecRequest::new(vec![
+        .exec(vmcell::steward::protocol::ExecRequest::new(vec![
             "sh".into(),
             "-c".into(),
             "timeout 2 md5sum /dev/zero".into(),

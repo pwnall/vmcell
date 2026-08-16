@@ -1,16 +1,16 @@
-//! Live (KVM) integration tests for interactive sessions (§3, The control plane: vsock, the host clients, and the guest agent): PTY +
+//! Live (KVM) integration tests for interactive sessions (§3, The control plane: vsock, the host clients, and the steward): PTY +
 //! controlling terminal + winsize (§13, Cross-cutting invariants), streaming stdin (§3.3, Interactive-session wire semantics), multiplexed
 //! concurrent exec over one connection (§13, Cross-cutting invariants), connection-owns-its-sessions
 //! teardown (§13, Cross-cutting invariants), and stdin-pressure liveness (M6). Sessions ride the
-//! vsock agent only (no snapshot), so every
+//! vsock steward only (no snapshot), so every
 //! case runs on **all four** backends via `vmm_matrix_test!` — no `require_cap!`
 //! skips. Every assertion is on the **data plane** (guest output / process
 //! residue), not a proxy signal (rubric A10).
 
 use std::time::Duration;
 use vmcell::ExecRequest;
-use vmcell::agent::session::{SessionEvent, SessionSpecBuilder};
 use vmcell::config::{RootfsSource, VmConfig};
+use vmcell::steward::session::{SessionEvent, SessionSpecBuilder};
 
 mod common;
 
@@ -30,16 +30,16 @@ fn base_cfg() -> VmConfig {
     .expect("VmConfig")
 }
 
-/// Boots a VM, waits for the agent (the standard boot gate), and opens a session
+/// Boots a VM, waits for the steward (the standard boot gate), and opens a session
 /// multiplexer connection.
 async fn boot_and_connect<V: vmcell::vmm::Vmm>(
     vmm: &V,
-) -> (vmcell::MicroVm<V>, vmcell::agent::session::SessionMux) {
+) -> (vmcell::MicroVm<V>, vmcell::steward::session::SessionMux) {
     let mut vm = common::start_vm(vmm, base_cfg()).await;
-    // Confirm the guest agent is up before dialing a second (session) connection.
-    vm.agent(Some(Duration::from_secs(60)))
+    // Confirm the steward is up before dialing a second (session) connection.
+    vm.steward(Some(Duration::from_secs(60)))
         .await
-        .expect("agent must reach ready");
+        .expect("steward must reach ready");
     let mux = vm
         .connect_sessions(Some(Duration::from_secs(30)))
         .await
@@ -262,7 +262,7 @@ const FLOOD_BYTES: usize = 512 * 1024;
 /// Reads the pid a persistent session's shell echoes as its first line — the
 /// existed-before half of a process-residue proof. Bounded, so a session that
 /// never reports its pid fails the leg instead of hanging the suite.
-async fn session_leader_pid(session: &mut vmcell::agent::session::Session) -> u32 {
+async fn session_leader_pid(session: &mut vmcell::steward::session::Session) -> u32 {
     let mut acc: Vec<u8> = Vec::new();
     let read = async {
         loop {
@@ -297,11 +297,11 @@ async fn assert_sleep_pgroup_gone<V: vmcell::vmm::Vmm>(
     pid: u32,
     why: &str,
 ) {
-    let agent = vm
-        .agent(Some(Duration::from_secs(30)))
+    let steward = vm
+        .steward(Some(Duration::from_secs(30)))
         .await
-        .expect("agent for residue check");
-    let outcome = agent
+        .expect("steward for residue check");
+    let outcome = steward
         .exec(ExecRequest::new(argv(&[
             "/bin/sh",
             "-c",
@@ -320,7 +320,7 @@ async fn assert_sleep_pgroup_gone<V: vmcell::vmm::Vmm>(
 /// bytes land: the host writer task is aborted by `SessionMux`'s `Drop`, so the
 /// settle is what makes the guest-side pressure real rather than racy. 64 KiB per
 /// frame — one full pipe each, far under `MAX_FRAME_BYTES`.
-async fn flood_stdin(session: &vmcell::agent::session::Session) {
+async fn flood_stdin(session: &vmcell::steward::session::Session) {
     let chunk = vec![b'X'; 64 * 1024];
     for _ in 0..(FLOOD_BYTES / chunk.len()) {
         session
@@ -334,7 +334,7 @@ async fn flood_stdin(session: &vmcell::agent::session::Session) {
 // M6 (`guest-dispatch-blocking-stdin-wedge`), the live half of the gate the review
 // named (its KVM-free half is `route_stdin_does_not_block_on_a_full_pipe_and_eof_follows_every_byte`
 // + `stdin_writer_gives_up_on_closing_so_teardown_join_is_bounded` in
-// vmcell-guest-agent). A child that stops reading its stdin must not wedge the
+// vmcell-steward). A child that stops reading its stdin must not wedge the
 // connection that owns it: 512 KiB is streamed at a `sleep` that reads nothing, so
 // the guest's 64 KiB stdin pipe is full and its writer parked, and BOTH consequences
 // the pre-fix inline `write_all` produced are asserted on the data plane:

@@ -1,4 +1,3 @@
-use crate::agent::AgentClient;
 use crate::config::VmConfig;
 use crate::env::HostEnv;
 use crate::error::Result;
@@ -7,6 +6,7 @@ use crate::net::NetNamespace;
 #[cfg(feature = "net-unprivileged")]
 use crate::net::SmoltcpProcess;
 use crate::proxy::{EgressProxy, ProxyConfig};
+use crate::steward::StewardClient;
 use crate::vmm::{PerVmResources, VmInstance, Vmm};
 use std::sync::{Arc, Mutex};
 use tracing::info;
@@ -14,7 +14,7 @@ use tracing::info;
 /// Bounded budget for the post-boot control-plane health-gate (`start`). A healthy
 /// transport answers well within this, so only a wedged one spends the whole budget
 /// before triggering a re-spawn. Sized above a healthy QEMU cold time-to-ready
-/// (~0.7 s p50) with margin, well under the 10 s agent deadline it prevents.
+/// (~0.7 s p50) with margin, well under the 10 s steward deadline it prevents.
 const CONTROL_PLANE_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Max control-plane re-spawns in `start` before failing loud. QEMU's vhost-user
@@ -627,16 +627,16 @@ pub struct MicroVm<V: Vmm> {
     /// surface; design §18, Delta register: changes from the validated v27 build,
     /// deltas 1–2). Holds the [`CgroupFs`](crate::metrics::CgroupFs) its slice is
     /// deleted through on teardown and the [`Clock`] that drives the first
-    /// post-restore resync in [`MicroVm::agent`]. Replaces the former standalone
+    /// post-restore resync in [`MicroVm::steward`]. Replaces the former standalone
     /// `cgroup_fs` field (a subset of what `env` already carries).
     env: HostEnv,
-    /// The cached agent client connection, if any.
-    agent_client: Option<AgentClient>,
+    /// The cached steward client connection, if any.
+    steward_client: Option<StewardClient>,
     /// Whether the VM was restored from a snapshot.
     restored: bool,
     /// Whether the one-shot post-restore CSPRNG reseed actually applied (the
-    /// `ResyncAck.reseed_applied` field, set by the native in-agent resync) on the
-    /// first post-restore [`MicroVm::agent`] call. `None` until that resync runs;
+    /// `ResyncAck.reseed_applied` field, set by the native in-steward resync) on the
+    /// first post-restore [`MicroVm::steward`] call. `None` until that resync runs;
     /// `Some(false)` when the best-effort reseed could not be applied (e.g.
     /// `/dev/hwrng` missing). Lets a restore test assert the reseed was applied
     /// rather than inferring it from two `/dev/urandom` reads differing.
@@ -652,12 +652,12 @@ pub struct MicroVm<V: Vmm> {
     /// delete it (finding `m2`).
     tmp_dir: Option<crate::vmm::VmTempDir>,
     /// Per-VM hot-path timing knobs captured from the [`VmConfig`] at
-    /// construction, so `agent()`'s connect cadence and `shutdown()`'s grace
+    /// construction, so `steward()`'s connect cadence and `shutdown()`'s grace
     /// window honor the caller-selected profile rather than hard-coded constants.
     timeouts: crate::config::Timeouts,
     /// `true` when the VM boots a custom `init=` (§5.3, The kernel command line) that replaces the vmcell
-    /// guest agent, so there is **no** vsock control plane. Set from `cfg.init` at
-    /// construction; makes [`MicroVm::agent`] fail loud immediately rather than hang
+    /// steward, so there is **no** vsock control plane. Set from `cfg.init` at
+    /// construction; makes [`MicroVm::steward`] fail loud immediately rather than hang
     /// connecting to a listener that will never answer.
     control_plane_disabled: bool,
 }
@@ -934,7 +934,7 @@ fn nat_egress_plan(
 
 /// Minimal guest-resync seam the one-shot post-restore resync needs.
 ///
-/// Implemented for the real [`AgentClient`] (a single native `resync` round-trip)
+/// Implemented for the real [`StewardClient`] (a single native `resync` round-trip)
 /// and for a recording fake in the unit tests, so the resync's mandatory-clock
 /// fail-loud + retry contract (M-RESTORE-1) can be exercised without a live guest.
 trait GuestResync {
@@ -944,19 +944,19 @@ trait GuestResync {
         unix_secs: u64,
         unix_nanos: u32,
         mac: Option<[u8; 6]>,
-        ipv4: Option<crate::agent::protocol::Ipv4Reconfig>,
-    ) -> Result<crate::agent::ResyncOutcome>;
+        ipv4: Option<crate::steward::protocol::Ipv4Reconfig>,
+    ) -> Result<crate::steward::ResyncOutcome>;
 }
 
-impl GuestResync for AgentClient {
+impl GuestResync for StewardClient {
     async fn resync(
         &mut self,
         unix_secs: u64,
         unix_nanos: u32,
         mac: Option<[u8; 6]>,
-        ipv4: Option<crate::agent::protocol::Ipv4Reconfig>,
-    ) -> Result<crate::agent::ResyncOutcome> {
-        // Resolves to the inherent `AgentClient::resync` (inherent methods win
+        ipv4: Option<crate::steward::protocol::Ipv4Reconfig>,
+    ) -> Result<crate::steward::ResyncOutcome> {
+        // Resolves to the inherent `StewardClient::resync` (inherent methods win
         // over the same-named trait method), so this delegates rather than
         // recursing.
         self.resync(unix_secs, unix_nanos, mac, ipv4).await
@@ -987,10 +987,10 @@ fn parse_mac_bytes(s: &str) -> Option<[u8; 6]> {
 ///
 /// M-RESTORE-1: a snapshot resumes at the frozen instant, so the guest clock,
 /// CSPRNG state, and network identity must be refreshed on **every** restore
-/// (§8.2, Restore correctness: a restored VM is not a fresh VM). This now drives a single **native** in-agent resync round-trip
+/// (§8.2, Restore correctness: a restored VM is not a fresh VM). This now drives a single **native** in-steward resync round-trip
 /// (§8.2, Restore correctness: a restored VM is not a fresh VM) instead of three subprocess execs. The round-trip is propagated
 /// (`?`) so a transient transport failure leaves `*restored` **set** and the next
-/// `agent()` call retries the whole resync, instead of being cleared up front (the
+/// `steward()` call retries the whole resync, instead of being cleared up front (the
 /// bug, which permanently skipped clock/RNG/MAC resync after one transient error).
 /// The clock resync is mandatory and fail-loud: a `Some(clock_error)` in the ack
 /// returns a typed `Err` **before** the flag is cleared (identical semantics to
@@ -1017,7 +1017,7 @@ async fn maybe_resync_after_restore<E: GuestResync>(
         .now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| {
-            crate::error::Error::Agent(
+            crate::error::Error::Steward(
                 "host clock is before the Unix epoch; refusing to resync guest to 1970".into(),
             )
         })?;
@@ -1026,13 +1026,13 @@ async fn maybe_resync_after_restore<E: GuestResync>(
 
     // ORCH-1 / §8.2 (Restore correctness: a restored VM is not a fresh VM): MAC rotation is the ONLY in-guest identity change the restore
     // path performs — applied natively via `SIOCSIFHWADDR` (no in-guest netlink),
-    // keeping the zero-netlink-in-PID-1 contract (§3.4, The guest: vmcell-guest-agent as PID 1).
+    // keeping the zero-netlink-in-PID-1 contract (§3.4, The guest: vmcell-steward as PID 1).
     // `mac_math` centralizes the vmid→MAC mapping as a string; convert it to the
     // six bytes the wire protocol carries without duplicating that mapping.
     let mac_str = crate::net::mac_math(vmid)
-        .map_err(|e| crate::error::Error::Agent(format!("mac math: {e}")))?;
+        .map_err(|e| crate::error::Error::Steward(format!("mac math: {e}")))?;
     let mac = parse_mac_bytes(&mac_str).ok_or_else(|| {
-        crate::error::Error::Agent(format!("mac math produced an unparseable MAC: {mac_str}"))
+        crate::error::Error::Steward(format!("mac math produced an unparseable MAC: {mac_str}"))
     })?;
 
     // H-VMM-1: the IP address IS rotated on restore (superseding the old §8.2
@@ -1045,8 +1045,8 @@ async fn maybe_resync_after_restore<E: GuestResync>(
     // goes via `host_ip` (the gateway). Applied natively in-guest (SIOCSIFADDR +
     // route ioctls, no netlink), exactly like the MAC above.
     let (host_ip, guest_ip, _cidr) = crate::net::ip_math(vmid)
-        .map_err(|e| crate::error::Error::Agent(format!("ip math: {e}")))?;
-    let ipv4 = crate::agent::protocol::Ipv4Reconfig {
+        .map_err(|e| crate::error::Error::Steward(format!("ip math: {e}")))?;
+    let ipv4 = crate::steward::protocol::Ipv4Reconfig {
         addr: guest_ip.octets(),
         // The `/30` point-to-point prefix `ip_math` produces.
         prefix_len: 30,
@@ -1060,7 +1060,7 @@ async fn maybe_resync_after_restore<E: GuestResync>(
     );
 
     // One native round-trip. Propagated with `?` so a transient transport failure
-    // leaves `*restored` set and the next agent() call retries the whole resync.
+    // leaves `*restored` set and the next steward() call retries the whole resync.
     let outcome = exec
         .resync(unix_secs, unix_nanos, Some(mac), Some(ipv4))
         .await?;
@@ -1069,10 +1069,10 @@ async fn maybe_resync_after_restore<E: GuestResync>(
         // ORCH-3 / M-RESTORE-1: the clock resync is mandatory (§8.2, Restore correctness: a restored VM is not a fresh VM) — a guest-side
         // clock-set failure is a *surfaced, typed* failure, not a warning. We
         // return here **before** clearing `*restored`, so the flag stays set and
-        // the next `agent()` call retries the whole resync (identical to the old
+        // the next `steward()` call retries the whole resync (identical to the old
         // non-zero-exit path). Clearing it here (silent-Ok-on-failure) would leave
         // time-sensitive restored tests seeing a frozen wall clock (§7.1, What is read and enforced, defect).
-        return Err(crate::error::Error::Agent(format!(
+        return Err(crate::error::Error::Steward(format!(
             "mandatory post-restore clock resync failed: {err}"
         )));
     }
@@ -1123,7 +1123,7 @@ impl<V: Vmm> MicroVm<V> {
     /// ordered teardown and identity bookkeeping — a footgun with no legitimate external use.
     /// External callers reach for the safe [`MicroVm`] methods instead ([`kill`](MicroVm::kill) for
     /// a hard teardown; [`snapshot`](MicroVm::snapshot) — which additionally invalidates the cached
-    /// [`AgentClient`], the EXP-E fix — never `instance().snapshot()`; `instance()` for read-only
+    /// [`StewardClient`], the EXP-E fix — never `instance().snapshot()`; `instance()` for read-only
     /// probes).
     ///
     /// # Panics
@@ -1459,9 +1459,9 @@ impl<V: Vmm> MicroVm<V> {
         // vsock is internal to the VMM and cannot half-initialize. QEMU's vsock is an
         // external `vhost-device-vsock` daemon over a `vhost-user-vsock` virtqueue
         // whose bring-up races (~11% of boots wedge the data path for the VM's life;
-        // docs/benchmark-results.md "QEMU agent-timeout flake"). `verify_control_plane`
+        // docs/benchmark-results.md "QEMU steward-timeout flake"). `verify_control_plane`
         // probes it with a bounded budget; a wedged VM is re-spawned rather than
-        // handed back to reveal the wedge ~10 s later as an agent-connect timeout. A
+        // handed back to reveal the wedge ~10 s later as a steward-connect timeout. A
         // healthy transport answers well within the budget, so this adds no wait on
         // the common path.
         //
@@ -1473,7 +1473,7 @@ impl<V: Vmm> MicroVm<V> {
         // bound. `spawn_qemu` pre-cleans the VMM's own stale sockets. A per-VM resource
         // whose lifetime is coupled to the FIRST VMM process therefore does not survive a
         // re-spawn, and no amount of re-spawning will fix it.
-        // A custom `init=` (§5.3, The kernel command line) replaces the guest agent, so there is no agent vsock
+        // A custom `init=` (§5.3, The kernel command line) replaces the steward, so there is no steward vsock
         // transport to health-gate — skip the probe (which QEMU uses to catch a wedged
         // `vhost-device-vsock` bring-up); otherwise a custom-init QEMU VM would re-spawn
         // to exhaustion against a listener that never comes up. CH/FC probes are no-ops.
@@ -1514,7 +1514,7 @@ impl<V: Vmm> MicroVm<V> {
             proxy: staged.net.proxy.take(),
             cgroup_name: Some(staged.res.cgroup_name.clone()),
             env: env.clone(),
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: staged.cid_guard.take(),
@@ -1708,7 +1708,7 @@ impl<V: Vmm> MicroVm<V> {
             proxy: staged.net.proxy.take(),
             cgroup_name: Some(staged.res.cgroup_name.clone()),
             env: env.clone(),
-            agent_client: None,
+            steward_client: None,
             restored: true,
             restore_reseed_applied: None,
             cid: staged.cid_guard.take(),
@@ -1723,7 +1723,7 @@ impl<V: Vmm> MicroVm<V> {
         Ok((vm, cow_support))
     }
 
-    /// Gets the agent client, connecting (and waiting for the connection) on
+    /// Gets the steward client, connecting (and waiting for the connection) on
     /// first use.
     ///
     /// On the **first** call after a snapshot restore this also performs the
@@ -1737,26 +1737,26 @@ impl<V: Vmm> MicroVm<V> {
     /// Panics if the VM instance is missing.
     ///
     /// # Errors
-    /// Returns an error if the agent connection or handshake fails or times out,
+    /// Returns an error if the steward connection or handshake fails or times out,
     /// or if the mandatory post-restore clock resync round-trip fails.
-    pub async fn agent(
+    pub async fn steward(
         &mut self,
         timeout: Option<std::time::Duration>,
-    ) -> Result<&mut AgentClient> {
-        // Fail loud, not hang: a custom `init=` (§5.3, The kernel command line) replaces the vmcell guest agent,
+    ) -> Result<&mut StewardClient> {
+        // Fail loud, not hang: a custom `init=` (§5.3, The kernel command line) replaces the vmcell steward,
         // so there is no vsock control plane — no `Ready` handshake, `exec`, or resync.
         // Returning immediately here beats blocking for the full connect timeout on a
         // listener that will never answer (§13, Cross-cutting invariants, fail-loud).
         if self.control_plane_disabled {
-            return Err(crate::error::Error::Agent(
+            return Err(crate::error::Error::Steward(
                 "the vsock control plane is unavailable: this VM boots a custom init= that \
-                 replaces the vmcell guest agent (no Ready handshake, exec, or resync). Observe \
+                 replaces the vmcell steward (no Ready handshake, exec, or resync). Observe \
                  it via the serial log, a shared directory, an extra block device, or networking."
                     .into(),
             ));
         }
         // M7: a cached client that a prior timeout or transport failure marked desynced
-        // fails `ensure_synced` on EVERY later request, and `AgentClient::reconnect` has no
+        // fails `ensure_synced` on EVERY later request, and `StewardClient::reconnect` has no
         // other caller in the tree — so handing the cached handle back verbatim killed
         // one-shot `exec`/`put_file`/`resync` on this VM permanently. The race is not
         // theoretical: the host wraps its wait in the same duration it puts in `cmd.timeout`
@@ -1765,21 +1765,21 @@ impl<V: Vmm> MicroVm<V> {
         // here and let the connect below re-establish the stream — the same eviction the
         // resync-failure path already performs, applied at the one place that owns the cache.
         if self
-            .agent_client
+            .steward_client
             .as_ref()
-            .is_some_and(AgentClient::is_desynced)
+            .is_some_and(StewardClient::is_desynced)
         {
             tracing::warn!(
-                "cached agent client is desynchronized by a prior timeout; reconnecting"
+                "cached steward client is desynchronized by a prior timeout; reconnecting"
             );
-            self.agent_client = None;
+            self.steward_client = None;
         }
-        if self.agent_client.is_none() {
+        if self.steward_client.is_none() {
             // Connect over the instance's own endpoint, so a snapshot-eligible QEMU
             // on the in-kernel AF_VSOCK transport (§2.4, QEMU q35 — the fallback and most-proven nester) is reached by CID while
             // CH/FC/QEMU-external stay on their AF_UNIX path — one connect law.
             let instance = self.instance.as_ref().expect("instance missing");
-            let client = AgentClient::connect_endpoint(
+            let client = StewardClient::connect_endpoint(
                 &instance.vsock_endpoint(),
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
                 &self.timeouts,
@@ -1788,30 +1788,30 @@ impl<V: Vmm> MicroVm<V> {
                 },
             )
             .await?;
-            self.agent_client = Some(client);
+            self.steward_client = Some(client);
         }
 
         if self.restored {
-            // No explicit reconnect here: this `agent()` is the first call after
-            // restore (agent_client started `None`), so the `connect()` above
+            // No explicit reconnect here: this `steward()` is the first call after
+            // restore (steward_client started `None`), so the `connect()` above
             // already IS the post-restore connection. CH re-creates the vhost-vsock
             // device on `--restore`, so the guest's pre-snapshot listener goes deaf;
-            // the guest agent re-binds its listener on idle (see `serve_vsock` in
-            // vmcell-guest-agent), and `AgentClient::connect` retries with backoff
+            // the steward re-binds its listener on idle (see `serve_vsock` in
+            // vmcell-steward), and `StewardClient::connect` retries with backoff
             // until that fresh listener accepts. A second, overlapping connect would
             // be redundant.
             let vmid = self.vmid.as_ref().expect("vmid missing").vmid;
             // The clock that drives the mandatory post-restore resync comes from the
-            // `HostEnv` captured at construction (design §18, Delta register: changes from the validated v27 build, delta 1 — `agent()` no
+            // `HostEnv` captured at construction (design §18, Delta register: changes from the validated v27 build, delta 1 — `steward()` no
             // longer takes a clock seam). Clone the `Arc` first so this immutable
-            // borrow of `self.env` ends before `self.agent_client` is borrowed `&mut`.
+            // borrow of `self.env` ends before `self.steward_client` is borrowed `&mut`.
             let clock = self.env.clock.clone();
             // The client is guaranteed present: it was cached above if `None`
             // (N-ORCH-1 — the prior `ok_or_else` error arm was unreachable).
             let client = self
-                .agent_client
+                .steward_client
                 .as_mut()
-                .expect("agent_client was populated above");
+                .expect("steward_client was populated above");
             // M-RESTORE-1: clears `self.restored` only after the mandatory clock
             // resync succeeds, so a transient failure retries the full resync on the
             // next call instead of being silently dropped.
@@ -1826,26 +1826,26 @@ impl<V: Vmm> MicroVm<V> {
             {
                 // H-ORCH-2: a transient resync transport failure marks the cached
                 // client desynced, and nothing ever auto-reconnects it — so leaving
-                // it cached wedges *every* future `agent()` on `ensure_synced`.
+                // it cached wedges *every* future `steward()` on `ensure_synced`.
                 // Evict it here so the next call re-connects and retries the whole
                 // resync, honoring the M-RESTORE-1 retry contract.
-                self.agent_client = None;
+                self.steward_client = None;
                 return Err(e);
             }
         }
 
         Ok(self
-            .agent_client
+            .steward_client
             .as_mut()
-            .expect("agent_client was populated above"))
+            .expect("steward_client was populated above"))
     }
 
     /// Opens a fresh control-plane connection for **interactive sessions** — PTY /
     /// pipe sessions, streaming stdin, and multiplexed concurrent execs
-    /// (§3.2, The host side: AgentClient and SessionMux) — returning a [`SessionMux`](crate::agent::session::SessionMux).
+    /// (§3.2, The host side: StewardClient and SessionMux) — returning a [`SessionMux`](crate::steward::session::SessionMux).
     ///
-    /// This dials a *second* vsock connection to the guest agent, independent of
-    /// the cached one-shot [`agent`](MicroVm::agent) client, so one-shot exec and
+    /// This dials a *second* vsock connection to the steward, independent of
+    /// the cached one-shot [`steward`](MicroVm::steward) client, so one-shot exec and
     /// sessions never share a stream. The returned mux owns that connection;
     /// dropping it closes the connection, and the guest tears down every session it
     /// opened (§13, Cross-cutting invariants). Takes `&self` (no caching) — a caller may hold several
@@ -1855,24 +1855,24 @@ impl<V: Vmm> MicroVm<V> {
     /// Panics if the VM instance is missing (e.g. after shutdown).
     ///
     /// # Errors
-    /// Returns an [`Error::Agent`](crate::error::Error::Agent) immediately when
-    /// this VM boots a custom `init=` that replaces the guest agent (no control
+    /// Returns an [`Error::Steward`](crate::error::Error::Steward) immediately when
+    /// this VM boots a custom `init=` that replaces the steward (no control
     /// plane, §5.3, The kernel command line), or if the connection or `Ready` handshake does not complete
     /// within `timeout`.
     pub async fn connect_sessions(
         &self,
         timeout: Option<std::time::Duration>,
-    ) -> Result<crate::agent::session::SessionMux> {
+    ) -> Result<crate::steward::session::SessionMux> {
         if self.control_plane_disabled {
-            return Err(crate::error::Error::Agent(
+            return Err(crate::error::Error::Steward(
                 "the vsock control plane is unavailable: this VM boots a custom init= that \
-                 replaces the vmcell guest agent (no interactive sessions). Observe it via the \
+                 replaces the vmcell steward (no interactive sessions). Observe it via the \
                  serial log, a shared directory, an extra block device, or networking."
                     .into(),
             ));
         }
         let instance = self.instance.as_ref().expect("instance missing");
-        crate::agent::session::SessionMux::connect_endpoint(
+        crate::steward::session::SessionMux::connect_endpoint(
             &instance.vsock_endpoint(),
             timeout.unwrap_or(std::time::Duration::from_secs(10)),
             &self.timeouts,
@@ -1884,17 +1884,17 @@ impl<V: Vmm> MicroVm<V> {
     }
 
     /// Dials a **raw byte stream** to a guest AF_VSOCK listener on `port`
-    /// (§3.2, The host side: AgentClient and SessionMux — the raw vsock dial), returning a
-    /// [`VsockDial`](crate::agent::VsockDial). The guest process on the other end
-    /// owns its own protocol: no framing, no `Ready` handshake, no guest agent.
+    /// (§3.2, The host side: StewardClient and SessionMux — the raw vsock dial), returning a
+    /// [`VsockDial`](crate::steward::VsockDial). The guest process on the other end
+    /// owns its own protocol: no framing, no `Ready` handshake, no steward.
     ///
-    /// **Independent of the control plane, by design.** Unlike [`agent`](Self::agent)
+    /// **Independent of the control plane, by design.** Unlike [`steward`](Self::steward)
     /// and [`connect_sessions`](Self::connect_sessions), this does *not* refuse when
-    /// a custom `init=` replaced the guest agent (§5.3, The kernel command line): the vsock
+    /// a custom `init=` replaced the steward (§5.3, The kernel command line): the vsock
     /// **device** is attached unconditionally on every backend — CH's `vsock` create
     /// payload field, Firecracker's `PUT /vsock`, QEMU's device/daemon block, and
     /// crosvm's `--vsock cid=` are all straight-line, none reads `cfg.init` — so a
-    /// custom-init guest that binds a vsock port is reachable even though the agent
+    /// custom-init guest that binds a vsock port is reachable even though the steward
     /// is absent. That is precisely FR-V3's cheapest shape: an in-guest listener
     /// reachable from the host with no IP stack, on every backend and both operating
     /// modes.
@@ -1904,19 +1904,19 @@ impl<V: Vmm> MicroVm<V> {
     /// instance's vsock path with the snapshot's baked one, so a cached endpoint
     /// would go stale across a restore.
     ///
-    /// Three caveats (§3.2, The host side: AgentClient and SessionMux):
+    /// Three caveats (§3.2, The host side: StewardClient and SessionMux):
     /// - **A host half-close is not portable.** `VsockDial::shutdown()` forwards to
     ///   the guest on Cloud Hypervisor and crosvm, but on Firecracker and QEMU it
     ///   tears the connection down and silently discards a reply the guest had not
     ///   yet flushed. Drain the reply before half-closing; the per-backend
     ///   measurements and the portable protocol rule are on
-    ///   [`VsockDial`](crate::agent::VsockDial), stated once there.
+    ///   [`VsockDial`](crate::steward::VsockDial), stated once there.
     /// - A *user* listener gets no post-restore re-bind service. Only the guest
-    ///   agent re-binds after a restore re-creates the vhost-vsock device
-    ///   (§3.4, The guest: vmcell-guest-agent as PID 1), so dial afresh after a restore.
+    ///   steward re-binds after a restore re-creates the vhost-vsock device
+    ///   (§3.4, The guest: vmcell-steward as PID 1), so dial afresh after a restore.
     /// - On the non-rotating backends (Firecracker, crosvm — `restore_rotates_host_paths`
     ///   false, §2.6, The capability matrix) the endpoint after a restore is the **baked**
-    ///   path/CID, exactly as the agent connect already handles.
+    ///   path/CID, exactly as the steward connect already handles.
     ///
     /// # Panics
     /// Panics if the VM instance is missing (e.g. after shutdown).
@@ -1924,7 +1924,7 @@ impl<V: Vmm> MicroVm<V> {
     /// # Errors
     /// Fails **fast and typed** rather than retrying — the caller already brought
     /// this VM up, so "nobody listens on that port" is an answer, not a reason to
-    /// wait: [`Error::Agent`](crate::error::Error::Agent) naming the port when the
+    /// wait: [`Error::Steward`](crate::error::Error::Steward) naming the port when the
     /// vsock bridge closes the connection without an `OK` line (the CH/FC in-VMM
     /// muxer's dead-port signal), [`Error::Timeout`](crate::error::Error::Timeout)
     /// naming the port when a bridge accepts the `CONNECT` and never answers
@@ -1936,9 +1936,9 @@ impl<V: Vmm> MicroVm<V> {
         &self,
         port: u32,
         timeout: std::time::Duration,
-    ) -> Result<crate::agent::VsockDial> {
+    ) -> Result<crate::steward::VsockDial> {
         let instance = self.instance.as_ref().expect("instance missing");
-        crate::agent::VsockDial::connect_endpoint(
+        crate::steward::VsockDial::connect_endpoint(
             &instance.vsock_endpoint(),
             port,
             timeout,
@@ -1949,10 +1949,10 @@ impl<V: Vmm> MicroVm<V> {
 
     /// Whether the one-shot post-restore CSPRNG reseed actually applied (the
     /// `ResyncAck.reseed_applied` ack field) on the first post-restore
-    /// [`MicroVm::agent`] call.
+    /// [`MicroVm::steward`] call.
     ///
     /// `None` before that resync has run; `Some(true)` when the reseed (the native
-    /// in-agent `/dev/hwrng`→`/dev/urandom` 32-byte copy) succeeded; `Some(false)`
+    /// in-steward `/dev/hwrng`→`/dev/urandom` 32-byte copy) succeeded; `Some(false)`
     /// when the best-effort reseed could not be applied. A restore test asserts
     /// `Some(true)` instead of inferring the reseed from two `/dev/urandom` reads
     /// differing (which can pass coincidentally even when the reseed silently
@@ -2013,8 +2013,8 @@ impl<V: Vmm> MicroVm<V> {
     /// rejected at `VmConfig::build()` (the §2.5, The capability matrix, law), and a backend that does not
     /// advertise `snapshot_restore` returns [`crate::error::Error::Unsupported`].
     ///
-    /// On success, any cached agent connection is invalidated: the next
-    /// [`MicroVm::agent`] call transparently reconnects, so the resumed VM
+    /// On success, any cached steward connection is invalidated: the next
+    /// [`MicroVm::steward`] call transparently reconnects, so the resumed VM
     /// stays usable on every backend at the cost of at most one cheap
     /// reconnect.
     ///
@@ -2025,7 +2025,7 @@ impl<V: Vmm> MicroVm<V> {
     /// clones could never run the mandatory post-restore resync).
     pub async fn snapshot(&mut self, dir: &std::path::Path) -> Result<()> {
         // docs/78 M2: refuse to *write* an image whose restore can never be correct. A custom
-        // `init=` replaces the vmcell guest agent, so the mandatory post-restore resync (clock,
+        // `init=` replaces the vmcell steward, so the mandatory post-restore resync (clock,
         // CSPRNG reseed, MAC/IP rotation, §8.2) is structurally unreachable for every clone minted
         // from this image. `build()` rejects `init` + `snapshotting`, but a VM built WITHOUT
         // `snapshotting` can still reach this method (and `Zygote::suspend` routes straight
@@ -2040,22 +2040,22 @@ impl<V: Vmm> MicroVm<V> {
                 // itself rather than blaming the VMM).
                 vmm: "orchestrator".to_string(),
                 feature: "snapshot of a VM with a custom init (VmConfig::init) that replaces the \
-                          guest agent — the mandatory post-restore resync (§8.2) needs it"
+                          steward — the mandatory post-restore resync (§8.2) needs it"
                     .to_string(),
             });
         }
         self.instance_mut().snapshot(dir).await?;
         // Firecracker severs established vsock connections across its internal
         // pause/snapshot/resume cycle (Cloud Hypervisor keeps them alive), so a
-        // cached `AgentClient` on the resumed VM would fail its very next
+        // cached `StewardClient` on the resumed VM would fail its very next
         // request with "Connection dropped". Invalidate uniformly: it costs at
-        // most one cheap reconnect on the next `agent()` call — the guest
+        // most one cheap reconnect on the next `steward()` call — the guest
         // listener accepts it, since the accept loop is independent of the
         // severed per-connection fd — and makes the post-snapshot VM usable on
         // every backend instead of only CH. On an `Err` above we leave the
         // client alone (the `?` returns early): the snapshot didn't happen, so
         // the connection state is whatever it already was.
-        self.agent_client = None;
+        self.steward_client = None;
         Ok(())
     }
 
@@ -2228,14 +2228,14 @@ pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<&'static str> {
     if !cfg.shares.is_empty() {
         return Some("a virtio-fs data share (vhost-user device)");
     }
-    // docs/78 M2: a custom `init=` REPLACES the vmcell guest agent, and the mandatory
+    // docs/78 M2: a custom `init=` REPLACES the vmcell steward, and the mandatory
     // post-restore resync — clock, CSPRNG reseed, MAC/IP rotation (§8.2) — runs *through* that
-    // agent. `build()` rejects `init` + `snapshotting`, but nothing rejected *restoring* (or
+    // steward. `build()` rejects `init` + `snapshotting`, but nothing rejected *restoring* (or
     // fanning out) such a config: the clone would come up on a frozen clock with a correlated
-    // CSPRNG and a stale MAC/IP, and `agent()` fails loud, so the resync is structurally
+    // CSPRNG and a stale MAC/IP, and `steward()` fails loud, so the resync is structurally
     // unreachable. Config-only and identical at both boundaries, hence an arm here.
     if cfg.init.is_some() {
-        return Some("a custom init (VmConfig::init) that replaces the guest agent");
+        return Some("a custom init (VmConfig::init) that replaces the steward");
     }
     // docs/78 M4: a passed-through host USB device is host state living OUTSIDE guest RAM — the
     // migration stream carries the guest's view of the xhci controller but not the device behind
@@ -3163,7 +3163,7 @@ mod tests {
                 cgroups: std::sync::Arc::new(TimelineCgroupFs { log }),
                 ..HostEnv::for_unit_tests()
             },
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: Some(CidGuard {
@@ -3593,7 +3593,7 @@ mod tests {
                 proxy: None,
                 cgroup_name: Some("vmcell-vm-7".to_string()),
                 env: env.clone(),
-                agent_client: None,
+                steward_client: None,
                 restored: false,
                 restore_reseed_applied: None,
                 cid: None,
@@ -4246,11 +4246,11 @@ mod tests {
             Some("a virtio-fs data share (vhost-user device)")
         );
 
-        // M2: a custom init replaces the agent the mandatory post-restore resync runs through.
+        // M2: a custom init replaces the steward the mandatory post-restore resync runs through.
         let custom_init = ineligible_cfg(|b| b.init("/bin/workload"));
         assert_eq!(
             clone_ineligible_feature(&custom_init),
-            Some("a custom init (VmConfig::init) that replaces the guest agent")
+            Some("a custom init (VmConfig::init) that replaces the steward")
         );
 
         // M4: a passed-through host device is not in the migration stream.
@@ -4266,7 +4266,7 @@ mod tests {
     // docs/78 M2, restore boundary. `build()` rejects `init` + `snapshotting`, but a custom-init
     // config with `snapshotting` OFF builds and used to sail through `restore_inner` — producing a
     // clone whose mandatory S2 resync (clock, CSPRNG reseed, MAC/IP rotation) is structurally
-    // unreachable, because `agent()` fails loud on a VM with no guest agent. It must be a typed
+    // unreachable, because `steward()` fails loud on a VM with no steward. It must be a typed
     // capability refusal naming the field, with the positive control proving the very same restore
     // succeeds once `init` is dropped.
     //
@@ -4307,7 +4307,7 @@ mod tests {
     // rewiring is the one edit outside this change's file set).
     //
     // Red on the inverse: with the `cfg.init` arm gone, `spawn_clone` returns `Ok` with a live
-    // agent-less clone.
+    // steward-less clone.
     #[tokio::test]
     async fn zygote_clone_rejects_a_custom_init_config() {
         let vmm = crate::vmm::FakeVmm::default();
@@ -4374,7 +4374,7 @@ mod tests {
             other => panic!("expected a typed capability refusal, got {other:?}"),
         }
 
-        // Positive control: the same call on an agent-carrying VM writes the snapshot.
+        // Positive control: the same call on a steward-carrying VM writes the snapshot.
         let mut eligible = MicroVm::start(&vmm, erofs_cfg(), &env)
             .await
             .expect("the eligible VM starts");
@@ -4431,7 +4431,7 @@ mod tests {
     /// A recording guest-resync fake for the post-restore resync tests. Fails the
     /// first `fail_first_n` calls (modelling a just-rebound, still-flaky vsock),
     /// then records the single `resync` call and returns a configurable
-    /// [`crate::agent::ResyncOutcome`] (drives the clock-fail-loud path via
+    /// [`crate::steward::ResyncOutcome`] (drives the clock-fail-loud path via
     /// `clock_error`, and the reseed-applied observability via the bool).
     #[derive(Default)]
     struct FakeGuestResync {
@@ -4439,11 +4439,11 @@ mod tests {
         /// forced to fail.
         recorded: Vec<(u64, u32, Option<[u8; 6]>)>,
         /// The `ipv4` argument of each recorded call (H-VMM-1).
-        recorded_ipv4: Vec<Option<crate::agent::protocol::Ipv4Reconfig>>,
+        recorded_ipv4: Vec<Option<crate::steward::protocol::Ipv4Reconfig>>,
         calls: usize,
         fail_first_n: usize,
         /// The outcome returned once a call is allowed to succeed.
-        outcome: crate::agent::ResyncOutcome,
+        outcome: crate::steward::ResyncOutcome,
     }
 
     impl GuestResync for FakeGuestResync {
@@ -4452,11 +4452,11 @@ mod tests {
             unix_secs: u64,
             unix_nanos: u32,
             mac: Option<[u8; 6]>,
-            ipv4: Option<crate::agent::protocol::Ipv4Reconfig>,
-        ) -> Result<crate::agent::ResyncOutcome> {
+            ipv4: Option<crate::steward::protocol::Ipv4Reconfig>,
+        ) -> Result<crate::steward::ResyncOutcome> {
             self.calls += 1;
             if self.calls <= self.fail_first_n {
-                return Err(crate::error::Error::Agent(
+                return Err(crate::error::Error::Steward(
                     "transient post-restore drop".into(),
                 ));
             }
@@ -4486,7 +4486,7 @@ mod tests {
         let mut reseed = None;
         let mut exec = FakeGuestResync {
             fail_first_n: 1,
-            outcome: crate::agent::ResyncOutcome {
+            outcome: crate::steward::ResyncOutcome {
                 clock_error: None,
                 reseed_applied: true,
                 mac_applied: true,
@@ -4549,7 +4549,7 @@ mod tests {
         // "guest keeps its frozen ip=" behavior sent `None` here).
         assert_eq!(
             exec.recorded_ipv4[0],
-            Some(crate::agent::protocol::Ipv4Reconfig {
+            Some(crate::steward::protocol::Ipv4Reconfig {
                 addr: [10, 200, 6, 2],
                 prefix_len: 30,
                 gateway: [10, 200, 6, 1],
@@ -4569,7 +4569,7 @@ mod tests {
         let mut restored = true;
         let mut reseed = None;
         let mut exec = FakeGuestResync {
-            outcome: crate::agent::ResyncOutcome {
+            outcome: crate::steward::ResyncOutcome {
                 clock_error: None,
                 reseed_applied: false,
                 mac_applied: true,
@@ -4613,7 +4613,7 @@ mod tests {
     // (ignore clock_error + `*restored = false`) returns `Ok(())`, clears
     // `restored`, and never retries, so a time-sensitive restored test silently
     // sees a frozen wall clock. This reddens on that inverse: it asserts the Err is
-    // returned, `restored` stays set (so the next agent() call retries), and the
+    // returned, `restored` stays set (so the next steward() call retries), and the
     // best-effort reseed result was NOT recorded past the failed mandatory step.
     #[tokio::test]
     async fn test_resync_clock_nonzero_exit_is_surfaced() {
@@ -4621,7 +4621,7 @@ mod tests {
         let mut restored = true;
         let mut reseed = None;
         let mut exec = FakeGuestResync {
-            outcome: crate::agent::ResyncOutcome {
+            outcome: crate::steward::ResyncOutcome {
                 clock_error: Some("clock_settime: EPERM".into()),
                 reseed_applied: false,
                 mac_applied: false,
@@ -4632,7 +4632,7 @@ mod tests {
         let res =
             maybe_resync_after_restore(&mut restored, &mut reseed, &mut exec, &clock, 5).await;
         assert!(
-            matches!(res, Err(crate::error::Error::Agent(_))),
+            matches!(res, Err(crate::error::Error::Steward(_))),
             "a guest clock-resync error must be a surfaced, typed failure, not Ok"
         );
         assert!(
@@ -4731,7 +4731,7 @@ mod tests {
             proxy: None,
             cgroup_name: None,
             env: HostEnv::for_unit_tests(),
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: None,
@@ -4773,7 +4773,7 @@ mod tests {
         );
     }
 
-    // A minimal stand-in for the in-guest agent listener, over AF_UNIX: it speaks the
+    // A minimal stand-in for the in-steward listener, over AF_UNIX: it speaks the
     // Firecracker-style hybrid `CONNECT <port>` / `OK <n>` prologue, sends one framed
     // `Ready`, and then goes silent forever — never answering a request. That is exactly
     // the shape that drives a host `exec` into its timeout, which is what marks the client
@@ -4781,8 +4781,8 @@ mod tests {
     //
     // Returned handle aborts the task on drop, so the fixture owns its cleanup on the panic
     // path too.
-    fn spawn_fake_agent_listener(path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
-        let listener = tokio::net::UnixListener::bind(&path).expect("bind fake agent listener");
+    fn spawn_fake_steward_listener(path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind fake steward listener");
         tokio::spawn(async move {
             let mut held = Vec::new();
             loop {
@@ -4808,7 +4808,7 @@ mod tests {
                 }
                 // One `Ready`, length-delimited exactly as `LengthDelimitedCodec` expects
                 // (4-byte big-endian prefix).
-                let ready = postcard::to_stdvec(&crate::agent::protocol::Message::Ready)
+                let ready = postcard::to_stdvec(&crate::steward::protocol::Message::Ready)
                     .expect("encode Ready");
                 let len = u32::try_from(ready.len()).expect("Ready frame fits in u32");
                 if stream.write_all(&len.to_be_bytes()).await.is_err()
@@ -4822,26 +4822,26 @@ mod tests {
         })
     }
 
-    // Finding `M7`: `agent()` populated the cache only when it was `None` and otherwise
+    // Finding `M7`: `steward()` populated the cache only when it was `None` and otherwise
     // handed the cached handle back verbatim. A client marks itself desynced on a send
     // error **or a timeout**, `ensure_synced` then fails every later request with "reconnect
-    // required", and `AgentClient::reconnect` had no non-test caller in the tree — so one
+    // required", and `StewardClient::reconnect` had no non-test caller in the tree — so one
     // exec timeout permanently killed one-shot `exec`/`put_file`/`resync` on that VM. The
     // race is real, not theoretical: the host wraps its wait in the same duration it puts in
     // `cmd.timeout` while the guest sleeps that duration BEFORE killing and only then sends
     // `Exit`, so the host's timer can fire first on an exec behaving exactly as specified.
     //
     // KVM-free: the "guest" is the AF_UNIX listener above. Buggy impl this guards:
-    // `if self.agent_client.is_none() { … }` with no desync check — the second `agent()`
+    // `if self.steward_client.is_none() { … }` with no desync check — the second `steward()`
     // then returns the dead handle and the exec after it fails "reconnect required" instead
     // of timing out against a live connection.
     #[tokio::test]
-    async fn agent_evicts_and_reconnects_a_desynced_cached_client() {
+    async fn steward_evicts_and_reconnects_a_desynced_cached_client() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("vsock.sock");
         let serial = dir.path().join("serial.log");
         std::fs::write(&serial, b"").expect("seed an empty serial log");
-        let listener = spawn_fake_agent_listener(sock.clone());
+        let listener = spawn_fake_steward_listener(sock.clone());
 
         let instance = crate::vmm::FakeVmInstance {
             vsock_path: sock,
@@ -4860,7 +4860,7 @@ mod tests {
             proxy: None,
             cgroup_name: None,
             env: HostEnv::for_unit_tests(),
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: None,
@@ -4871,11 +4871,11 @@ mod tests {
 
         // Drive one exec into its timeout: the silent listener never answers.
         let timed_out = vm
-            .agent(Some(std::time::Duration::from_secs(5)))
+            .steward(Some(std::time::Duration::from_secs(5)))
             .await
-            .expect("first agent() connects")
+            .expect("first steward() connects")
             .exec(
-                crate::agent::protocol::ExecRequest::new(vec!["true".into()])
+                crate::steward::protocol::ExecRequest::new(vec!["true".into()])
                     .with_timeout(std::time::Duration::from_millis(50)),
             )
             .await
@@ -4885,14 +4885,14 @@ mod tests {
             "the fixture must produce a TIMEOUT (which is what sets `desynced`): {timed_out:?}"
         );
 
-        // The next `agent()` must hand back a USABLE client, not the dead one.
+        // The next `steward()` must hand back a USABLE client, not the dead one.
         let client = vm
-            .agent(Some(std::time::Duration::from_secs(5)))
+            .steward(Some(std::time::Duration::from_secs(5)))
             .await
-            .expect("agent() must recover from a desynced cached client");
+            .expect("steward() must recover from a desynced cached client");
         let err = client
             .exec(
-                crate::agent::protocol::ExecRequest::new(vec!["true".into()])
+                crate::steward::protocol::ExecRequest::new(vec!["true".into()])
                     .with_timeout(std::time::Duration::from_millis(50)),
             )
             .await
@@ -4910,12 +4910,12 @@ mod tests {
         listener.abort();
     }
 
-    // Builds a `MicroVm` around `instance` with a live cached `AgentClient`
+    // Builds a `MicroVm` around `instance` with a live cached `StewardClient`
     // seeded over one end of a socketpair, so a test can observe whether a
     // lifecycle verb invalidates the cache. Returns the peer end too: dropping
     // it would only half-close the stream, but keeping it alive makes the
     // "connection state untouched" reading of the Err-path test literal.
-    fn vm_with_seeded_agent_client<V: Vmm>(
+    fn vm_with_seeded_steward_client<V: Vmm>(
         instance: V::Instance,
     ) -> (MicroVm<V>, tokio::net::UnixStream) {
         let (local, peer) = tokio::net::UnixStream::pair().expect("socketpair");
@@ -4929,7 +4929,7 @@ mod tests {
             proxy: None,
             cgroup_name: None,
             env: HostEnv::for_unit_tests(),
-            agent_client: Some(AgentClient::from_stream_for_tests(local)),
+            steward_client: Some(StewardClient::from_stream_for_tests(local)),
             restored: false,
             restore_reseed_applied: None,
             cid: None,
@@ -4942,12 +4942,12 @@ mod tests {
 
     // FC severs established vsock connections across its internal
     // pause/snapshot/resume cycle (CH keeps them alive), so a cached
-    // `AgentClient` is dead on the resumed VM. `MicroVm::snapshot()`
+    // `StewardClient` is dead on the resumed VM. `MicroVm::snapshot()`
     // self-guards by dropping the cache after a successful backend snapshot;
-    // the next `agent()` call reconnects. RED on the inverse — a `snapshot()`
-    // that forgets the invalidation leaves `agent_client` populated here.
+    // the next `steward()` call reconnects. RED on the inverse — a `snapshot()`
+    // that forgets the invalidation leaves `steward_client` populated here.
     #[tokio::test]
-    async fn test_snapshot_success_invalidates_cached_agent_client() {
+    async fn test_snapshot_success_invalidates_cached_steward_client() {
         let instance = crate::vmm::FakeVmInstance {
             vsock_path: std::path::PathBuf::from("/tmp/vmcell-snap-inval-vsock.sock"),
             serial: std::path::PathBuf::from("/tmp/vmcell-snap-inval-serial.log"),
@@ -4955,20 +4955,20 @@ mod tests {
             faults: Default::default(),
             control_plane_probes: Default::default(),
         };
-        let (mut vm, _peer) = vm_with_seeded_agent_client::<crate::vmm::FakeVmm>(instance);
+        let (mut vm, _peer) = vm_with_seeded_steward_client::<crate::vmm::FakeVmm>(instance);
         vm.snapshot(std::path::Path::new("/tmp/vmcell-snap-inval"))
             .await
             .expect("the fake snapshot succeeds");
         assert!(
-            vm.agent_client.is_none(),
-            "a successful snapshot() must invalidate the cached agent client \
+            vm.steward_client.is_none(),
+            "a successful snapshot() must invalidate the cached steward client \
              (FC severs established vsock connections across pause/snapshot/resume)"
         );
     }
 
     // A VMM/instance pair whose `snapshot()` always fails, to pin the Err path
     // of `MicroVm::snapshot()`: the snapshot did not happen, so the cached
-    // agent connection must be left exactly as it was. `create`/`restore` are
+    // steward connection must be left exactly as it was. `create`/`restore` are
     // unreachable — the test constructs the `MicroVm` directly, like the
     // teardown-order and grace tests.
     struct SnapFailVmm;
@@ -5047,19 +5047,19 @@ mod tests {
     // was. RED on an unconditional invalidation (dropping the cache before or
     // regardless of the backend result).
     #[tokio::test]
-    async fn test_snapshot_failure_keeps_cached_agent_client() {
+    async fn test_snapshot_failure_keeps_cached_steward_client() {
         let instance = SnapFailInstance {
             vsock: std::path::PathBuf::from("/tmp/vmcell-snap-fail-vsock.sock"),
             serial: std::path::PathBuf::from("/tmp/vmcell-snap-fail-serial.log"),
         };
-        let (mut vm, _peer) = vm_with_seeded_agent_client::<SnapFailVmm>(instance);
+        let (mut vm, _peer) = vm_with_seeded_steward_client::<SnapFailVmm>(instance);
         let result = vm
             .snapshot(std::path::Path::new("/tmp/vmcell-snap-fail"))
             .await;
         assert!(result.is_err(), "the failing fake must surface its error");
         assert!(
-            vm.agent_client.is_some(),
-            "a failed snapshot() must leave the cached agent client in place \
+            vm.steward_client.is_some(),
+            "a failed snapshot() must leave the cached steward client in place \
              (the snapshot didn't happen, so the connection is untouched)"
         );
     }
@@ -5092,7 +5092,7 @@ mod tests {
             proxy: None,
             cgroup_name: None,
             env: HostEnv::for_unit_tests(),
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: Some(CidGuard {
@@ -5386,7 +5386,7 @@ mod tests {
                 cgroups: std::sync::Arc::new(TimelineCgroupFs { log: log.clone() }),
                 ..HostEnv::for_unit_tests()
             },
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: None,
@@ -5538,7 +5538,7 @@ mod tests {
             proxy: None,
             cgroup_name: None,
             env: HostEnv::for_unit_tests(),
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: None,
@@ -5551,19 +5551,19 @@ mod tests {
         }
     }
 
-    // §5.3 (The kernel command line): a custom `init=` replaces the guest agent, so `agent()` must fail LOUD
-    // immediately (a typed `Error::Agent` naming the cause) instead of blocking for the
+    // §5.3 (The kernel command line): a custom `init=` replaces the steward, so `steward()` must fail LOUD
+    // immediately (a typed `Error::Steward` naming the cause) instead of blocking for the
     // full connect timeout on a listener that will never answer (§13, Cross-cutting invariants, fail-loud).
-    // Inverse: drop the `control_plane_disabled` early-return in `agent()` and this
+    // Inverse: drop the `control_plane_disabled` early-return in `steward()` and this
     // either hangs (the 1 s timeout) or returns a connect error, not the custom-init
     // one — reddening the message assertion.
     #[tokio::test]
-    async fn agent_fails_loud_when_control_plane_disabled() {
+    async fn steward_fails_loud_when_control_plane_disabled() {
         let mut vm = MicroVm::<crate::vmm::FakeVmm> {
             vmid: None,
             instance: Some(crate::vmm::FakeVmInstance {
-                vsock_path: std::path::PathBuf::from("/tmp/vmcell-noagent-vsock.sock"),
-                serial: std::path::PathBuf::from("/tmp/vmcell-noagent-serial.log"),
+                vsock_path: std::path::PathBuf::from("/tmp/vmcell-nosteward-vsock.sock"),
+                serial: std::path::PathBuf::from("/tmp/vmcell-nosteward-serial.log"),
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 faults: Default::default(),
                 control_plane_probes: Default::default(),
@@ -5575,7 +5575,7 @@ mod tests {
             proxy: None,
             cgroup_name: None,
             env: HostEnv::for_unit_tests(),
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: None,
@@ -5584,12 +5584,12 @@ mod tests {
             control_plane_disabled: true,
         };
         let err = vm
-            .agent(Some(std::time::Duration::from_secs(1)))
+            .steward(Some(std::time::Duration::from_secs(1)))
             .await
-            .expect_err("agent() must fail loud when a custom init disabled the control plane");
+            .expect_err("steward() must fail loud when a custom init disabled the control plane");
         assert!(
-            matches!(err, crate::error::Error::Agent(_)),
-            "expected a typed Agent error, got {err:?}"
+            matches!(err, crate::error::Error::Steward(_)),
+            "expected a typed Steward error, got {err:?}"
         );
         assert!(
             err.to_string().contains("custom init"),
@@ -5597,15 +5597,15 @@ mod tests {
         );
     }
 
-    // §3.2 (The host side: AgentClient and SessionMux) / §18 delta 7: `dial_vsock` must NOT copy
-    // `agent()`'s custom-init guard. The vsock DEVICE is attached unconditionally by
+    // §3.2 (The host side: StewardClient and SessionMux) / §18 delta 7: `dial_vsock` must NOT copy
+    // `steward()`'s custom-init guard. The vsock DEVICE is attached unconditionally by
     // every backend (none reads `cfg.init`), so a custom-init guest that binds a vsock
-    // port is reachable even with no agent anywhere — that is the whole point of the
+    // port is reachable even with no steward anywhere — that is the whole point of the
     // raw dial. This drives the real transport (a mock bridge on a UDS) through a VM
     // whose `control_plane_disabled` is TRUE and asserts the dial reached the wire:
     // the bridge saw a `CONNECT` for the DIALED port, and the handle came back.
     // Red-on-inverse: adding the `control_plane_disabled` early-return to
-    // `dial_vsock` makes this fail with the custom-init Agent error instead.
+    // `dial_vsock` makes this fail with the custom-init Steward error instead.
     #[tokio::test]
     async fn dial_vsock_bypasses_the_custom_init_guard() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -5655,13 +5655,13 @@ mod tests {
             proxy: None,
             cgroup_name: None,
             env: HostEnv::for_unit_tests(),
-            agent_client: None,
+            steward_client: None,
             restored: false,
             restore_reseed_applied: None,
             cid: None,
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
-            // The VM boots a custom init=: no agent, no control plane — and the dial
+            // The VM boots a custom init=: no steward, no control plane — and the dial
             // must work anyway.
             control_plane_disabled: true,
         };
@@ -5678,7 +5678,7 @@ mod tests {
         let (line, _held) = bridge.await.expect("mock bridge task");
         assert_eq!(
             line, "CONNECT 7000\n",
-            "the dial must CONNECT to the port the caller asked for, not the agent's"
+            "the dial must CONNECT to the port the caller asked for, not the steward's"
         );
         let _ = std::fs::remove_file(&sock);
     }

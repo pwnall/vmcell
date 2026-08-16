@@ -228,7 +228,7 @@ impl DaemonClient {
         self.send_json(self.http.post(url).json(&req)).await
     }
 
-    /// `create`: boots a VM to agent-ready and keeps it (no inline command).
+    /// `create`: boots a VM to steward-ready and keeps it (no inline command).
     ///
     /// # Errors
     /// [`ClientError`] on failure.

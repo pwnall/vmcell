@@ -16,7 +16,7 @@ members = [
     # `vmcell-cli` it lives outside the `vmcell` package to keep the dependency graph acyclic.
     "crates/vmcell-bench",
     "crates/vmcell-protocol",
-    "crates/vmcell-guest-agent",
+    "crates/vmcell-steward",
     "crates/vmcell-test-runner",
     "crates/vmcell-guest-tools",
     # v20 §5.4/§8.5: the two in-VM builders, extracted out of `vmcell`. Each depends on

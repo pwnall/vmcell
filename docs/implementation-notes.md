@@ -3806,6 +3806,87 @@ the boundary check is what shipped, with the rationale at the site.
   reason — the producer is a thread with no early exit to fail fast on — but the "binds lazily"
   clause is the same false premise withdrawn above and should go with it.
 
+  **Taken (2026-08-15), and the count was wrong.** Both reconciliations landed ahead of the delta
+  pass. The lazy-bind claim sat at **three** comment sites, not the two quality-gates v5 counted:
+  besides the `SMOLTCP_SOCKET_READY_TIMEOUT_MS` rustdoc and the `-chardev` composer comment, the
+  `spawn_qemu` readiness-wait block carried a parenthetical naming `Listener::new` as explicitly
+  *not* being the bind — exactly backwards, and the most misleading of the three. The mechanism was
+  re-verified at the source before editing: `SmoltcpProcess::start` calls `Listener::new` on the
+  caller's thread (`net/smoltcp.rs:883-885`) before the vhost worker is spawned. The constant and
+  the wait stay, on the independent reason. The steward's core-mount comment said "EXACTLY
+  {overlay, /proc, /dev}" at three sites while four mounts return `Err`; all three now state the
+  four, matching design v33 §3.4.
+
+## v33 delta 1 — the steward rename (design §18 delta 1), as built
+
+Landed first and alone, as the register directs, so every later delta writes new API in the new
+vocabulary instead of minting `Agent*` names that would immediately rename again.
+
+**What moved.** A scripted, sentinel-protected sweep over every tracked file except `docs/` and
+`AGENTS.md`, plus five `git mv`s: crate `vmcell-guest-agent` → `vmcell-steward` (lib
+`vmcell_guest_agent` → `vmcell_steward`), module `vmcell/src/agent/` → `vmcell/src/steward/`,
+`vmcell/src/artifact/guest_agent.rs` → `artifact/steward.rs`, `AgentClient` → `StewardClient`,
+`MicroVm::agent()` → `MicroVm::steward()`, `Error::Agent` → `Error::Steward`, `GuestAgentStage` →
+`StewardStage`, `AGENT_VSOCK_PORT` → `STEWARD_VSOCK_PORT`, `DEFAULT_INIT`
+`/usr/sbin/vmcell-guest-agent` → `/usr/sbin/vmcell-steward`, `--agent-musl` → `--steward-musl`,
+`guest_agent_src_hash`/`guest_agent_closure_hash` → `steward_src_hash`/`steward_closure_hash`, and
+the validator check ids `boot.agent_ready` → `boot.steward_ready`, `agent.exec_roundtrip` →
+`steward.exec_roundtrip`, `agent.put_file_roundtrip` → `steward.put_file_roundtrip`. Ledgered as
+`vmcell` 0.14.0 → 0.15.0 and `vmcell-artifact-validator` 0.2.0 → 0.3.0, each entry carrying the
+identifier list a consumer `sed`s.
+
+**The gate.** `scripts/ban-legacy-terms.sh` gained seven awk branches covering fourteen retired
+spellings, including `AgentPlacement` and `AgentOptions` — names that never existed, banned
+**pre-emptively** so deltas 4 and 5 mint `StewardPlacement`/`StewardOptions`. `test-ban-legacy-terms.sh`
+gained one MUST-flag fixture per branch and six MUST-PASS fixtures for the kept words (`AGENTS.md`,
+"agentic", `AGENT-2`, `agent-ctl`, `User-Agent`/`Proxy-Agent`/`user-agent`, and an
+`allow-legacy-term:` exemplar). Each of the seven branches was verified **load-bearing** by deleting
+it and confirming the self-test reddens — the meta-rule, run rather than asserted. Two of the three
+apparent failures on the first run of that probe were bugs in the *probe's* escaping, not gaps; the
+probe was rewritten to match branch lines as fixed strings.
+
+**Recorded deviations from a naive sweep** — each one a place where "agent" legitimately survives,
+which is why the ban is identifier-shaped and not a bare-word ban:
+
+- `vendor/vhost/docs/vhost_architecture.drawio` was **corrupted and reverted**. Its `agent=`
+  attribute is draw.io's own XML slot holding the diagram author's browser User-Agent. Two rules
+  caught it: the sentinel list covers `User-Agent`/`user-agent` but not a bare `agent=`, and
+  `vendor/vhost*` is pinned exactly (`scripts/check-vendored-vhost.sh`). `vendor/` belongs in the
+  exclusion set beside `docs/` for any future sweep of this shape.
+- `.claude/review-workflow.js` and `.claude/staleaudit-workflow.js` were **reverted whole**. Their
+  `agent(...)` is an undeclared workflow-runtime global — the AI sub-agent spawner, beside
+  `parallel`/`phase`/`log` — so renaming it left both files throwing `ReferenceError: steward is not
+  defined`. JS is not compiled, so `cargo check --workspace --all-targets` structurally could not
+  see it. This is the "enumerate what the suite cannot reach" rule applied to a non-Rust file kind.
+- `scripts/review-preflight-priv.sh` and its self-test say "an **agent** must ask for the bless" —
+  the reviewing AI agent, one clause away from a citation of AGENTS.md rule 5.
+- `crates/vmcell/src/zygote.rs`'s "a fan-out of **agent** sandboxes" is the agentic-execution use
+  case, one inflection from the protected `agentic`.
+- `scripts/ban-legacy-terms.sh`'s own "a hypothetical **agent-harness** testing project" is the
+  replacement phrasing for the retired origin-harness name; `README.md` and the historical designs
+  state it verbatim. The sweep had made the ban script quote a phrase existing nowhere, inside the
+  very block that declares the ban identifier-shaped.
+- The `vmcell` ledger's 0.2→0.3 and 0.3→0.4 entries still say `AgentClient`, **deliberately**: they
+  record what a consumer saw *at those versions*, and rewriting them would make them false. The
+  0.14→0.15 entry is the one place the old→new mapping lives, and says so.
+
+**Shape shift from the directed sketch:** `scripts/ban-agent-ip-shellout.sh` keeps its name; only
+the directory it scans moved (`crates/vmcell-guest-agent/src` → `crates/vmcell-steward/src`). It is
+not one of delta 1's retired identifiers, `scripts/` is deliberately outside the ban's roster, and
+two just-issued specs (rubric v7 Part E, quality-gates v5's landed-baseline roster) enumerate the
+gate by that name — renaming it would put a stale roster into two live specs for no gate benefit.
+
+**Not swept, deliberately:** `docs/` history and this file's own earlier entries. An entry naming
+`artifact::tests::guest_agent_pin_is_absent_…` or quoting the old `"guest-agent binary source
+missing at …"` message records what was true when written; this section is the pointer that says
+every such name now reads `steward`. `docs/benchmark-results.md` **was** swept — three production
+comments cite one of its headings by quoted title ("QEMU agent-timeout flake"), so leaving it would
+have left three dangling pointers; its `AGENT-2` finding id survived.
+
+**Operational trap, restated:** `DEFAULT_INIT` moved, so any `rootfs.erofs` or snapshot built before
+this commit will not boot. Rebuild with `vmcell build --kernel-source host-make` — the bare default
+is `prebuilt`, which silently replaces a locally built `vmlinux`.
+
 ## Where the design lives now
 
 **v33 (2026-08-15):** `docs/82-claude-opus-design-v32.md` moved to `docs/historical/` (frozen at its

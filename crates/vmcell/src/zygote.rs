@@ -1,11 +1,11 @@
 //! Zygote suspend/resume fan-out: mint many identical VMs from one suspend image.
 //!
-//! Booting a guest kernel to "agent-ready" is the dominant per-VM cost (§16, Performance).
+//! Booting a guest kernel to "steward-ready" is the dominant per-VM cost (§16, Performance).
 //! When a workload needs *many* identical VMs — a warm serverless pool, a fan-out
 //! of agent sandboxes, a batch of test cells — paying that boot cost per VM is
 //! wasteful. The **zygote** pattern pays it once:
 //!
-//! 1. Boot one VM to agent-ready and **suspend** it — a snapshot captured while
+//! 1. Boot one VM to steward-ready and **suspend** it — a snapshot captured while
 //!    paused. That frozen image is the *zygote* ([`Zygote::suspend`]).
 //! 2. To mint a clone, **copy-on-write-copy** the zygote's suspend/resume data
 //!    into the clone's own scratch dir, then restore + resume from that private
@@ -14,7 +14,7 @@
 //!    ([`CowSupport`]).
 //! 3. Each clone gets a **fresh identity** — its own vmid (hence a distinct
 //!    IP/MAC, §8.2, Restore correctness: a restored VM is not a fresh VM), its own netns/cgroup/vsock socket, and the mandatory
-//!    post-restore resync (clock/entropy/MAC/IP) on its first `agent()` call — so
+//!    post-restore resync (clock/entropy/MAC/IP) on its first `steward()` call — so
 //!    concurrent clones never collide on the host.
 //!
 //! Because each clone restores from its **own** copy, the zygote master is never
@@ -60,10 +60,10 @@ pub struct Zygote {
 }
 
 impl Zygote {
-    /// Captures a zygote by **suspending** a booted, agent-ready VM.
+    /// Captures a zygote by **suspending** a booted, steward-ready VM.
     ///
     /// Snapshots `vm` into `master_dir` via [`MicroVm::snapshot`] (which pauses,
-    /// writes, and resumes the VM, and invalidates its cached agent connection so
+    /// writes, and resumes the VM, and invalidates its cached steward connection so
     /// it stays usable), then returns a `Zygote` that mints clones from the frozen
     /// image. `cfg` must be the (snapshot-eligible) config `vm` was created with —
     /// it is what each clone restores with. The caller still owns `vm` and may
@@ -179,7 +179,7 @@ impl Zygote {
     /// A single clone works on any snapshot backend (the copy is harmless where a
     /// backend re-binds baked paths, as long as no sibling is live). For a
     /// *concurrent* pool use [`Zygote::spawn_clones`], which gates on the backend
-    /// capability. The returned VM is live and resumed; its first `agent()` call
+    /// capability. The returned VM is live and resumed; its first `steward()` call
     /// runs the mandatory post-restore resync (§8.2, Restore correctness: a restored VM is not a fresh VM).
     ///
     /// # Errors
@@ -725,7 +725,7 @@ mod tests {
     }
 
     // docs/78 S1 (second half) + M2/M4: this gate reads `orchestrator::clone_ineligible_feature`,
-    // so the arms that landed there — a custom `init=` (which replaces the very agent the
+    // so the arms that landed there — a custom `init=` (which replaces the very steward the
     // mandatory post-restore resync runs through) and a passed-through host USB device (host state
     // outside the migration stream) — are refused HERE, before any copy-on-write copy is minted,
     // not N clones later at the per-clone restore boundary.

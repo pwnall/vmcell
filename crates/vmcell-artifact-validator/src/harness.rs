@@ -10,9 +10,9 @@ use vmcell::{MicroVm, VmConfig, Vmm};
 /// contract) — stated once, appended by [`fail_loud`] to all three failure messages.
 ///
 /// [`vmcell::artifact::ensure_test_artifacts`] is the *vmcell workspace's* test bootstrap: its
-/// fingerprint hashes the guest-agent source closure out of the vmcell tree, so it structurally
+/// fingerprint hashes the steward source closure out of the vmcell tree, so it structurally
 /// cannot build in a consumer workspace. Its own messages therefore name vmcell-checkout-only
-/// fixes (`cargo run -p vmcell-cli …`, "guest-agent binary source missing at …"), which is a dead
+/// fixes (`cargo run -p vmcell-cli …`, "steward binary source missing at …"), which is a dead
 /// end for a downstream caller. §10.4 specifies the substitution instead: overlay-driven *build*
 /// through the toolkit, getter-driven *consumption* through the env contract — so the route out is
 /// part of the refusal, not something a consumer has to already know.
@@ -42,9 +42,9 @@ fn fail_loud(problem: &str) -> String {
 /// The built `vmlinux` artifact path (`VMCELL_KERNEL` or `target/vmcell-artifacts/vmlinux`),
 /// asserting it exists — the tests' known-good kernel.
 ///
-/// First calls [`vmcell::artifact::ensure_test_artifacts`], which builds the guest-agent /
+/// First calls [`vmcell::artifact::ensure_test_artifacts`], which builds the steward /
 /// guest-tools / rootfs **at most once per session** (hash-gated) and fails loud with a one-command
-/// fix if the kernel is not pre-built — so a source edit to the agent, tools, or packer no longer
+/// fix if the kernel is not pre-built — so a source edit to the steward, tools, or packer no longer
 /// silently runs against a stale rootfs.
 ///
 /// Downstream (§10.4) it has exactly two behaviors: with `VMCELL_KERNEL` + `VMCELL_ROOTFS` set —

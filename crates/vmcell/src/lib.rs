@@ -2,7 +2,7 @@
 //!
 //! This crate provides tools to configure, launch, and interact with microVMs.
 //! It includes abstractions for networking, virtual machine monitors (like Cloud Hypervisor),
-//! and an agent protocol for executing commands inside the guest.
+//! and a steward protocol for executing commands inside the guest.
 //!
 //! # Consuming `vmcell` as a git dependency
 //!
@@ -67,12 +67,12 @@
         clippy::allow_attributes_without_reason  // B11: every suppression states why
     )
 )]
-/// Agent protocol and client implementation.
-pub mod agent;
 /// Error and Result types.
 pub mod error;
 /// The one place that composes swept per-VM host resource names from a configurable prefix (§13, Cross-cutting invariants).
 pub mod naming;
+/// Steward protocol and client implementation.
+pub mod steward;
 
 /// Artifact building stages and pipeline.
 #[cfg(feature = "host-common")]
@@ -138,12 +138,12 @@ pub mod lineage;
 pub mod vmm;
 
 #[cfg(feature = "host-common")]
-pub use agent::AgentClient;
-/// The raw vsock dial's stream handle (§3.2, The host side: AgentClient and SessionMux), re-exported beside
-/// [`AgentClient`] because `MicroVm::dial_vsock` returns it.
+pub use steward::StewardClient;
+/// The raw vsock dial's stream handle (§3.2, The host side: StewardClient and SessionMux), re-exported beside
+/// [`StewardClient`] because `MicroVm::dial_vsock` returns it.
 #[cfg(feature = "host-common")]
-pub use agent::VsockDial;
-pub use agent::{ExecOutcome, ExecRequest};
+pub use steward::VsockDial;
+pub use steward::{ExecOutcome, ExecRequest};
 // The root re-export set is what `use vmcell::{…}` gives a consumer, and it must be *callable*:
 // every type a caller cannot avoid naming to build a `VmConfig` is here, not only the leaf
 // value types. `RootfsSource` is a required `VmConfig::builder` argument, `Egress` is carried by

@@ -1,6 +1,6 @@
-//! Guest PID-1 agent support library: the zombie-reaper / exec-waiter coordination.
+//! Guest PID-1 steward support library: the zombie-reaper / exec-waiter coordination.
 //!
-//! Extracted into the guest-agent member crate (v15 §9.1, Workspace layout) so this PID-1 logic —
+//! Extracted into the steward member crate (v15 §9.1, Workspace layout) so this PID-1 logic —
 //! and its unit tests — compile without any host async stack. The thin binary in
 //! `main.rs` drives a [`ReaperCoordinator`]; the host never links this code (it
 //! shares only the [`vmcell_protocol`] wire enum).
@@ -41,7 +41,7 @@
 )]
 
 /// Minimal interface-configuration helpers (native MAC rotation) for the
-/// post-restore resync — libc-only, so the lean-agent graph stays host-stack-free.
+/// post-restore resync — libc-only, so the lean-steward graph stays host-stack-free.
 pub mod netif;
 
 use std::collections::{HashMap, HashSet};
@@ -49,7 +49,7 @@ use std::sync::{Condvar, Mutex};
 
 /// Default upper bound on retained child exit statuses in a [`ReaperCoordinator`].
 ///
-/// As PID 1, the guest agent reaps re-parented grandchildren that no exec
+/// As PID 1, the steward reaps re-parented grandchildren that no exec
 /// waiter will ever claim. Their statuses are pruned once this many newer
 /// statuses have been recorded, so the status map cannot grow without bound.
 pub const DEFAULT_MAX_REAPED_STATUSES: usize = 1024;
@@ -185,7 +185,7 @@ impl ReaperCoordinator {
     /// already in the map — recorded *after* the pre-spawn epoch — and must
     /// survive the reservation; the pre-fix unconditional wipe stranded the
     /// waiter forever and surfaced on the host as a sporadic 10 s
-    /// "Agent exec timed out" on an instant command. Residual window, honestly:
+    /// "Steward exec timed out" on an instant command. Residual window, honestly:
     /// a grandchild status recorded *between* the epoch capture and the fork
     /// whose pid the kernel immediately hands to the new child would still be
     /// misattributed — that needs the whole pid space to recycle within the
@@ -257,7 +257,7 @@ impl ReaperCoordinator {
     /// This records a status the caller reaped *outside* the coordinator lock.
     /// The PID-1 reaper must instead use [`ReaperCoordinator::drain_reaped`],
     /// which performs the reap and the record under one lock so a reused pid
-    /// cannot be reserved between them (the residual PID-reuse race, §3.4, The guest: vmcell-guest-agent as PID 1).
+    /// cannot be reserved between them (the residual PID-reuse race, §3.4, The guest: vmcell-steward as PID 1).
     pub fn record_exit(&self, pid: u32, code: i32) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.record(pid, code, self.max_statuses);
@@ -363,7 +363,7 @@ impl Default for ReaperCoordinator {
 mod reaper_tests {
     //! Default-suite (KVM-free) tests for the false-127 reaper coordination.
     //! Each guards a specific documented inverse so the contract cannot silently
-    //! regress; see §3.4 (The guest: vmcell-guest-agent as PID 1) / AGENTS.md "PID-1 reaper vs. waiter".
+    //! regress; see §3.4 (The guest: vmcell-steward as PID 1) / AGENTS.md "PID-1 reaper vs. waiter".
     use super::{ReaperCoordinator, exit_code_from_termination};
     use std::sync::Arc;
     use std::time::Duration;
@@ -453,7 +453,7 @@ mod reaper_tests {
 
     #[test]
     fn reserved_pid_discards_stale_grandchild_status_under_reuse() {
-        // PID-reuse mis-delivery guard (§3.4, The guest: vmcell-guest-agent as PID 1; reaper-vs-waiter). A re-parented
+        // PID-reuse mis-delivery guard (§3.4, The guest: vmcell-steward as PID 1; reaper-vs-waiter). A re-parented
         // grandchild exits and is reaped under pid X but never claimed, leaving a
         // lingering status. The kernel later reuses pid X for an exec child. The
         // exec path reserves pid X immediately after spawn; the new waiter must
@@ -584,7 +584,7 @@ mod reaper_tests {
         // before the exec thread is rescheduled. The pre-fix `reserve` wiped any
         // pre-existing status for the pid — including the child's OWN — so
         // `wait_for` blocked forever and the host saw a sporadic 10 s
-        // "Agent exec timed out" on a command that had already succeeded (the
+        // "Steward exec timed out" on a command that had already succeeded (the
         // dominant snapshot_restore::firecracker flake). With the pre-SPAWN
         // epoch, the child's status (recorded strictly after the epoch) survives
         // the reservation and is delivered immediately. The buggy inverse

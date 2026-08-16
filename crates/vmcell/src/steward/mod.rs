@@ -1,21 +1,21 @@
-//! Guest agent communication and client implementation (host side).
+//! Steward communication and client implementation (host side).
 //!
-//! This module provides the host-side `AgentClient` that talks to the guest agent
+//! This module provides the host-side `StewardClient` that talks to the steward
 //! over vsock. The framed wire protocol and the framing bound live in the shared
 //! [`vmcell_protocol`] crate; the PID-1 reaper coordination lives in the
-//! `vmcell-guest-agent` member crate. Re-exporting the protocol here keeps the
-//! public `vmcell::agent::protocol` / `vmcell::{ExecOutcome, ExecRequest}` surface
+//! `vmcell-steward` member crate. Re-exporting the protocol here keeps the
+//! public `vmcell::steward::protocol` / `vmcell::{ExecOutcome, ExecRequest}` surface
 //! stable across the v15 workspace split (§9.1, Workspace layout).
 
-/// The framed wire protocol shared by the host and the guest agent.
+/// The framed wire protocol shared by the host and the steward.
 pub use vmcell_protocol as protocol;
 pub use vmcell_protocol::{
     ExecOutcome, ExecRequest, MAX_FRAME_BYTES, PtyConfig, SessionId, SessionSpec,
 };
 
-/// Host-side interactive-session multiplexer (§3.2, The host side: AgentClient and SessionMux): PTY / pipe sessions,
+/// Host-side interactive-session multiplexer (§3.2, The host side: StewardClient and SessionMux): PTY / pipe sessions,
 /// streaming stdin, window resize, and multiplexed concurrent execs over one
-/// connection, beside the one-shot [`AgentClient`].
+/// connection, beside the one-shot [`StewardClient`].
 #[cfg(feature = "host-common")]
 pub mod session;
 #[cfg(feature = "host-common")]
@@ -46,9 +46,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 /// external `vhost-device-vsock` daemon expose) or a host **AF_VSOCK** socket (a
 /// snapshot-eligible QEMU on the in-kernel `vhost-vsock-pci` device, §2.4, QEMU q35 — the fallback and most-proven nester).
 ///
-/// Kept a single concrete enum — rather than genericizing `AgentClient<S>` — so
+/// Kept a single concrete enum — rather than genericizing `StewardClient<S>` — so
 /// `Framed<ControlStream, LengthDelimitedCodec>` stays **one** type and neither
-/// [`AgentClient`] nor [`session::SessionMux`] grows a type parameter that would
+/// [`StewardClient`] nor [`session::SessionMux`] grows a type parameter that would
 /// ripple into every orchestrator signature. `Framed`'s `Sink`/`Stream` impls only
 /// need [`AsyncRead`] + [`AsyncWrite`], which this enum forwards to the active arm,
 /// so every request/exec path is transparent to the transport.
@@ -111,7 +111,7 @@ impl AsyncWrite for ControlStream {
 
 // `tokio_vsock::VsockStream` is not auto-`UnwindSafe`/`RefUnwindSafe`, but a transport
 // socket carries no panic-observable invariant — no more than tokio's `UnixStream`,
-// which *is* both. Asserting them here keeps the public `AgentClient` (and
+// which *is* both. Asserting them here keeps the public `StewardClient` (and
 // `SessionMux`) exactly as unwind-safe as before the AF_VSOCK arm was added, so
 // swapping the concrete stream type stays a non-breaking change for downstream callers.
 #[cfg(feature = "host-common")]
@@ -154,27 +154,27 @@ async fn connect_control_stream(endpoint: &VsockEndpoint) -> std::io::Result<Con
 }
 
 /// Encodes a host→guest frame and enforces the shared `MAX_FRAME_BYTES` cap at the
-/// send boundary — the host mirror of the guest agent's `send_framed` encode-side
+/// send boundary — the host mirror of the steward's `send_framed` encode-side
 /// check (§13, Cross-cutting invariants).
 ///
 /// **One law, one predicate**: every host→guest frame is built here, on the
 /// [`SessionMux`](session::SessionMux) path *and* on the one-shot request path
-/// ([`AgentClient::exec`], [`AgentClient::put_file`], [`AgentClient::resync`]). The
+/// ([`StewardClient::exec`], [`StewardClient::put_file`], [`StewardClient::resync`]). The
 /// one-shot path used to encode inline with no cap check (m8): the codec still refused
 /// the frame, so the stream stayed byte-clean, but the failure surfaced as an opaque
 /// `Error::Io` **and** desynced a stream that nothing had been written to — against
-/// [`AgentClient::finish_request`]'s own "desync only if a stale frame could be in
+/// [`StewardClient::finish_request`]'s own "desync only if a stale frame could be in
 /// flight" contract. Callers therefore encode BEFORE entering the request closure, so
 /// an over-cap or unencodable message is a typed, non-desyncing failure.
 ///
 /// # Errors
-/// [`Error::Agent`] when the encoded frame exceeds `MAX_FRAME_BYTES`, or the postcard
+/// [`Error::Steward`] when the encoded frame exceeds `MAX_FRAME_BYTES`, or the postcard
 /// error when the message cannot be encoded at all.
 #[cfg(feature = "host-common")]
 pub(crate) fn encode_frame(msg: &Message) -> Result<::bytes::Bytes> {
     let bytes = postcard::to_stdvec(msg)?;
     if bytes.len() > MAX_FRAME_BYTES {
-        return Err(Error::Agent(format!(
+        return Err(Error::Steward(format!(
             "frame exceeds MAX_FRAME_BYTES ({} > {MAX_FRAME_BYTES})",
             bytes.len()
         )));
@@ -193,17 +193,17 @@ const MAX_PROLOGUE_LINE_BYTES: usize = 256;
 
 /// Per-attempt cap on the guest's first framed message (`Ready`) during a connect.
 ///
-/// One attempt of [`AgentClient::connect_framed_once`] waits at most this long for the
+/// One attempt of [`StewardClient::connect_framed_once`] waits at most this long for the
 /// handshake frame before the retry loop re-checks the serial log and tries again — and
 /// **never** longer than the caller's own connect deadline, which clamps it (m10).
 #[cfg(feature = "host-common")]
 const READY_FRAME_READ: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How the hybrid `CONNECT <port>`/`OK` prologue failed, at the granularity its two
-/// callers interpret differently (§3.2, The host side: AgentClient and SessionMux).
+/// callers interpret differently (§3.2, The host side: StewardClient and SessionMux).
 ///
-/// [`AgentClient::connect_framed`] folds every arm into "retry after a backoff" —
-/// it exists to outwait a *booting* agent. [`VsockDial`] maps each arm to its own
+/// [`StewardClient::connect_framed`] folds every arm into "retry after a backoff" —
+/// it exists to outwait a *booting* steward. [`VsockDial`] maps each arm to its own
 /// typed, fail-fast error ([`dial_prologue_error`]): a raw dial is issued against a
 /// VM the caller already brought up, so "nobody listens on that port" must surface
 /// immediately instead of spinning to the deadline.
@@ -256,7 +256,7 @@ impl std::fmt::Display for PrologueError {
 /// Speaks the Firecracker-style hybrid `CONNECT <port>`/`OK` prologue on `stream`.
 ///
 /// The **one** implementation of the handshake (§13, Cross-cutting invariants — one law, one
-/// predicate): the framed control-plane connect ([`AgentClient::connect_framed`],
+/// predicate): the framed control-plane connect ([`StewardClient::connect_framed`],
 /// shared by [`session::SessionMux`]) and the raw dial ([`VsockDial`]) both go
 /// through it, so the fragile part of the wire can never exist in two versions.
 ///
@@ -302,19 +302,19 @@ async fn hybrid_connect_prologue(
 }
 
 /// The typed, fail-fast interpretation of a failed prologue for the **raw dial**
-/// (§3.2, The host side: AgentClient and SessionMux) — the one place the refusal signals are given
+/// (§3.2, The host side: StewardClient and SessionMux) — the one place the refusal signals are given
 /// meaning, so `dial_vsock`'s error contract lives beside the handshake that
 /// produces it and is unit-testable without a VM.
 ///
 /// `EOF` before an `OK` line is the in-VMM muxer's dead-port signal (a typed
-/// [`Error::Agent`] naming the port); an accepted-and-hung bridge runs out the
+/// [`Error::Steward`] naming the port); an accepted-and-hung bridge runs out the
 /// per-byte budget into a typed [`Error::Timeout`] naming the port; a transport
 /// error surfaces as [`Error::Io`], errno intact.
 #[cfg(feature = "host-common")]
 fn dial_prologue_error(port: u32, ok_read: std::time::Duration, err: PrologueError) -> Error {
     match err {
         PrologueError::Write(e) | PrologueError::Read(e) => Error::Io(e),
-        PrologueError::Eof { partial } => Error::Agent(format!(
+        PrologueError::Eof { partial } => Error::Steward(format!(
             "no guest vsock listener on port {port}: the vsock bridge closed the connection \
              without an OK line (received {partial:?})"
         )),
@@ -322,7 +322,7 @@ fn dial_prologue_error(port: u32, ok_read: std::time::Duration, err: PrologueErr
             "no guest vsock listener answered on port {port}: the vsock bridge accepted the \
              CONNECT and sent no OK line within {ok_read:?} (received {partial:?})"
         )),
-        PrologueError::Refused { line } => Error::Agent(format!(
+        PrologueError::Refused { line } => Error::Steward(format!(
             "guest vsock port {port} refused: the vsock bridge answered {line:?} instead of an \
              OK line"
         )),
@@ -332,11 +332,11 @@ fn dial_prologue_error(port: u32, ok_read: std::time::Duration, err: PrologueErr
 /// The same [`VsockEndpoint`] with its port replaced by `port`.
 ///
 /// The one place a caller-chosen guest port is spliced into an instance's endpoint
-/// (§3.2, The host side: AgentClient and SessionMux), so the raw dial's transport dispatch is exactly
+/// (§3.2, The host side: StewardClient and SessionMux), so the raw dial's transport dispatch is exactly
 /// [`hybrid_prologue_port`]'s and the AF_VSOCK arm dials the requested port rather
-/// than the agent's. Exhaustive on both arms — [`VsockEndpoint`] is deliberately not
+/// than the steward's. Exhaustive on both arms — [`VsockEndpoint`] is deliberately not
 /// `#[non_exhaustive]`, so a future transport breaks this at compile time instead of
-/// silently keeping the agent port.
+/// silently keeping the steward port.
 #[cfg(feature = "host-common")]
 fn endpoint_on_port(endpoint: &VsockEndpoint, port: u32) -> VsockEndpoint {
     match endpoint {
@@ -348,9 +348,9 @@ fn endpoint_on_port(endpoint: &VsockEndpoint, port: u32) -> VsockEndpoint {
     }
 }
 
-/// A raw byte stream to a guest AF_VSOCK listener (§3.2, The host side: AgentClient and SessionMux — the raw vsock
+/// A raw byte stream to a guest AF_VSOCK listener (§3.2, The host side: StewardClient and SessionMux — the raw vsock
 /// dial): the guest process on the other end owns its own protocol, so there is no
-/// framing, no `Ready` handshake, and no guest-agent involvement.
+/// framing, no `Ready` handshake, and no steward involvement.
 ///
 /// Obtained from [`MicroVm::dial_vsock`](crate::MicroVm::dial_vsock), or from
 /// [`VsockDial::connect_endpoint`] by a caller that already holds the endpoint.
@@ -413,13 +413,13 @@ impl VsockDial {
     /// handshake implementation the framed control-plane connect uses; on the
     /// in-kernel AF_VSOCK transport there is no bridge and thus no prologue.
     ///
-    /// Unlike [`AgentClient::connect_endpoint`] this does **not** retry: that retry
-    /// loop exists to outwait a booting agent and folds "nobody listens" into a
+    /// Unlike [`StewardClient::connect_endpoint`] this does **not** retry: that retry
+    /// loop exists to outwait a booting steward and folds "nobody listens" into a
     /// terminal timeout, whereas a dial is issued against a VM the caller already
     /// brought up. Refusal signals are interpreted and returned fast and typed.
     ///
     /// # Errors
-    /// - [`Error::Agent`] naming the port when the vsock bridge closes the
+    /// - [`Error::Steward`] naming the port when the vsock bridge closes the
     ///   connection without an `OK` line (the CH/FC in-VMM muxer's dead-port
     ///   signal) or answers something other than `OK`.
     /// - [`Error::Timeout`] naming the port when the bridge accepts the `CONNECT`
@@ -500,7 +500,7 @@ impl AsyncWrite for VsockDial {
     }
 }
 
-/// The per-step outcome of a native post-restore [`AgentClient::resync`]
+/// The per-step outcome of a native post-restore [`StewardClient::resync`]
 /// (§8.2, Restore correctness: a restored VM is not a fresh VM).
 ///
 /// Mirrors the guest's `ResyncAck`: `clock_error` is `Some(msg)` iff the
@@ -524,19 +524,19 @@ pub struct ResyncOutcome {
 }
 
 #[cfg(feature = "host-common")]
-/// A client for communicating with the guest agent over vsock.
+/// A client for communicating with the steward over vsock.
 #[derive(Debug)]
-pub struct AgentClient {
+pub struct StewardClient {
     stream: Framed<ControlStream, LengthDelimitedCodec>,
     /// Set when a request times out or the framed stream desynchronizes
     /// mid-exchange. A desynced stream may still hold a late frame from the
     /// abandoned request, so reusing it would read stale data and silently
     /// return a wrong result. Further requests fail loud until
-    /// [`AgentClient::reconnect`] re-establishes the stream.
+    /// [`StewardClient::reconnect`] re-establishes the stream.
     desynced: bool,
 }
 
-/// Why one [`AgentClient::connect_framed_once`] attempt failed, and therefore how
+/// Why one [`StewardClient::connect_framed_once`] attempt failed, and therefore how
 /// the retry loop paces the next one.
 ///
 /// Only [`ConnectAttemptError::Socket`] — the VMM's host-side socket still absent —
@@ -549,7 +549,7 @@ enum ConnectAttemptError {
     /// The socket was up but the hybrid `CONNECT`/`OK` prologue did not complete.
     Prologue(PrologueError),
     /// Socket and prologue completed, but the guest's first frame was not a
-    /// decodable `Ready` (the agent is still booting).
+    /// decodable `Ready` (the steward is still booting).
     Ready(String),
     /// The caller's connect deadline elapsed *inside* this attempt (m10). Every step of
     /// an attempt is bounded by that absolute deadline, so this is terminal: the loop
@@ -573,7 +573,7 @@ impl std::fmt::Display for ConnectAttemptError {
 /// How a request closure failed, with respect to whether the framed stream is
 /// still safe to reuse.
 ///
-/// [`AgentClient::finish_request`] marks the stream desynced only for a
+/// [`StewardClient::finish_request`] marks the stream desynced only for a
 /// [`RequestFailure::Transport`] (or a timeout); a [`RequestFailure::Clean`]
 /// leaves it in sync, so a protocol-complete application failure never forces a
 /// spurious reconnect (L-GUEST-1).
@@ -590,20 +590,20 @@ enum RequestFailure {
 }
 
 #[cfg(feature = "host-common")]
-impl AgentClient {
-    /// Connects to the guest agent on the specified vsock path and port.
+impl StewardClient {
+    /// Connects to the steward on the specified vsock path and port.
     ///
     /// # Errors
     /// Returns an error if the connection fails or the handshake is unsuccessful.
     ///
     /// # Examples
     /// ```rust
-    /// # use vmcell::agent::AgentClient;
+    /// # use vmcell::steward::StewardClient;
     /// # use std::path::Path;
     /// # use std::time::Duration;
     /// # async fn run() {
     /// let serial = vmcell::vmm::RealSerialLog { path: std::path::PathBuf::from("/dev/null") };
-    /// let client = AgentClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), &vmcell::config::Timeouts::default(), &serial).await.unwrap();
+    /// let client = StewardClient::connect(Path::new("/tmp/vsock"), 5000, Duration::from_secs(10), &vmcell::config::Timeouts::default(), &serial).await.unwrap();
     /// # }
     /// ```
     pub async fn connect(
@@ -625,14 +625,14 @@ impl AgentClient {
         .await
     }
 
-    /// Connects to the guest agent over an explicit [`VsockEndpoint`] — the
+    /// Connects to the steward over an explicit [`VsockEndpoint`] — the
     /// transport-generic entry the orchestrator uses so a snapshot-eligible QEMU on
     /// the AF_VSOCK transport (§2.4, QEMU q35 — the fallback and most-proven nester) is reached the same way as an AF_UNIX
-    /// backend. The public [`AgentClient::connect`] is the AF_UNIX convenience
+    /// backend. The public [`StewardClient::connect`] is the AF_UNIX convenience
     /// wrapper over this.
     ///
     /// # Errors
-    /// As [`AgentClient::connect`].
+    /// As [`StewardClient::connect`].
     pub async fn connect_endpoint(
         endpoint: &VsockEndpoint,
         timeout: std::time::Duration,
@@ -649,7 +649,7 @@ impl AgentClient {
     /// Connects the raw framed control-plane stream, retrying with backoff until
     /// the guest answers `Ready` (the one connect/handshake law, §13, Cross-cutting invariants).
     ///
-    /// Split out of [`AgentClient::connect_endpoint`] so the session multiplexer
+    /// Split out of [`StewardClient::connect_endpoint`] so the session multiplexer
     /// ([`session::SessionMux`]) opens its own connection through the **same**
     /// handshake with exactly one implementation (AGENTS.md "one law, one
     /// predicate"). The prologue branches on the endpoint: an AF_UNIX endpoint
@@ -662,7 +662,7 @@ impl AgentClient {
     ///
     /// # Errors
     /// Returns [`Error::Timeout`] if no `Ready` handshake completes within
-    /// `timeout`, or [`Error::Agent`] if a kernel panic is detected in the serial
+    /// `timeout`, or [`Error::Steward`] if a kernel panic is detected in the serial
     /// log while waiting.
     pub(crate) async fn connect_framed(
         endpoint: &VsockEndpoint,
@@ -679,12 +679,12 @@ impl AgentClient {
 
         loop {
             if tokio::time::Instant::now() > deadline {
-                return Err(Error::Timeout("Agent connection timed out".into()));
+                return Err(Error::Timeout("Steward connection timed out".into()));
             }
 
             // Watch serial log for kernel panic
             if serial_log.contains_panic() {
-                return Err(Error::Agent("Panic detected in serial log".into()));
+                return Err(Error::Steward("Panic detected in serial log".into()));
             }
 
             // The deadline is passed IN, not merely checked between attempts: every
@@ -695,7 +695,7 @@ impl AgentClient {
                 // Terminal: the attempt consumed the whole budget, so there is nothing
                 // left to back off into.
                 Err(ConnectAttemptError::Deadline) => {
-                    return Err(Error::Timeout("Agent connection timed out".into()));
+                    return Err(Error::Timeout("Steward connection timed out".into()));
                 }
                 // ONE retry cadence for every failure arm. Before v30 only two of the
                 // five arms slept at all — a failed `CONNECT` write, a non-decodable
@@ -703,12 +703,12 @@ impl AgentClient {
                 // `continue`d with no pause, busy-spinning to the deadline on exactly
                 // the shapes a dead or half-open bridge produces (§18 delta 7).
                 Err(ConnectAttemptError::Socket(e)) => {
-                    tracing::trace!("Agent connect control-stream connect failed: {}", e);
+                    tracing::trace!("Steward connect control-stream connect failed: {}", e);
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, timeouts.connect_backoff_cap);
                 }
                 Err(e) => {
-                    tracing::trace!("Agent connect attempt failed: {}", e);
+                    tracing::trace!("Steward connect attempt failed: {}", e);
                     // The transport socket was up, so we are in the "guest still
                     // booting / not yet listening" regime, where the right cadence is
                     // a tight fixed poll — not the exponential backoff that only makes
@@ -722,7 +722,7 @@ impl AgentClient {
         }
     }
 
-    /// One attempt of the [`AgentClient::connect_framed`] loop: open the transport,
+    /// One attempt of the [`StewardClient::connect_framed`] loop: open the transport,
     /// speak the prologue the transport needs, and read the guest's first frame.
     ///
     /// Split out so the retry *cadence* lives in exactly one place (the caller) and
@@ -814,10 +814,10 @@ impl AgentClient {
     }
 
     /// Builds a client directly over an already-connected stream, bypassing the
-    /// CONNECT handshake, for unit tests that only need a `Some(AgentClient)`
+    /// CONNECT handshake, for unit tests that only need a `Some(StewardClient)`
     /// to observe cache-invalidation behavior (e.g. `MicroVm::snapshot()`
     /// dropping its cached client). Uses the same codec configuration as
-    /// [`AgentClient::connect`] and starts in-sync (`desynced: false`).
+    /// [`StewardClient::connect`] and starts in-sync (`desynced: false`).
     /// `#[cfg(test)]` + `pub(crate)` so no test-only constructor ships in the
     /// public surface.
     #[cfg(test)]
@@ -831,12 +831,12 @@ impl AgentClient {
         }
     }
 
-    /// Reconnects to the guest agent.
+    /// Reconnects to the steward.
     ///
     /// # Errors
     /// Returns an error if the connection fails or times out.
     ///
-    /// Parameter order mirrors [`AgentClient::connect`]
+    /// Parameter order mirrors [`StewardClient::connect`]
     /// (`vsock_path, port, timeout, timeouts, serial_log`) so the two cannot be
     /// transposed at a call site (N-GUEST-3).
     pub async fn reconnect(
@@ -855,10 +855,10 @@ impl AgentClient {
     }
 
     /// Whether a prior request left the framed stream desynchronized, so every further
-    /// request on it fails [`AgentClient::ensure_synced`] until a reconnect.
+    /// request on it fails [`StewardClient::ensure_synced`] until a reconnect.
     ///
     /// Exists so the **owner** of a cached client can act on that state instead of handing
-    /// the dead handle back forever: `MicroVm::agent` evicts a desynced cached client and
+    /// the dead handle back forever: `MicroVm::steward` evicts a desynced cached client and
     /// reconnects (finding `M7` — a single exec timeout used to kill one-shot
     /// `exec`/`put_file`/`resync` on that VM permanently, because `reconnect` had no
     /// non-test caller in the tree).
@@ -870,12 +870,12 @@ impl AgentClient {
     ///
     /// Every request method calls this first so a stale in-flight frame from an
     /// abandoned (timed-out or errored) exchange can never be read as the next
-    /// request's response. Recovery is via [`AgentClient::reconnect`], or — for the
-    /// orchestrator's cached client — the eviction [`AgentClient::is_desynced`] drives.
+    /// request's response. Recovery is via [`StewardClient::reconnect`], or — for the
+    /// orchestrator's cached client — the eviction [`StewardClient::is_desynced`] drives.
     fn ensure_synced(&self) -> Result<()> {
         if self.desynced {
-            return Err(Error::Agent(
-                "agent connection desynchronized by a prior timeout; reconnect required".into(),
+            return Err(Error::Steward(
+                "steward connection desynchronized by a prior timeout; reconnect required".into(),
             ));
         }
         Ok(())
@@ -888,8 +888,8 @@ impl AgentClient {
     /// [`RequestFailure::Transport`] (a send/decode/connection error, or a stream
     /// that ended mid-exchange) or a `timeout` (`Elapsed`) leaves the framed
     /// stream in an unknown state — a late frame may still be in flight — so the
-    /// next request must fail loud via [`AgentClient::ensure_synced`] until a
-    /// [`AgentClient::reconnect`]. A [`RequestFailure::Clean`] — a
+    /// next request must fail loud via [`StewardClient::ensure_synced`] until a
+    /// [`StewardClient::reconnect`]. A [`RequestFailure::Clean`] — a
     /// protocol-complete application failure whose full response frame was
     /// received and decoded (e.g. `put_file`'s non-zero `Exit`) — leaves the
     /// stream in sync and does **not** desync it, so a clean per-request failure
@@ -927,7 +927,7 @@ impl AgentClient {
     /// Returns an error if the request cannot be sent or the outcome cannot be received.
     /// A request that cannot be encoded, or whose encoded frame exceeds
     /// `MAX_FRAME_BYTES`, is rejected by `encode_frame` **before** anything is written,
-    /// so it is a typed [`Error::Agent`] that leaves the stream in sync (m8).
+    /// so it is a typed [`Error::Steward`] that leaves the stream in sync (m8).
     pub async fn exec(&mut self, mut cmd: ExecRequest) -> Result<ExecOutcome> {
         self.ensure_synced()?;
         // Propagate the effective timeout into the request so the guest always
@@ -986,13 +986,13 @@ impl AgentClient {
 
             // Stream ended without Exit: the connection dropped mid-exchange, so
             // the stream is desynced (Transport), not a clean application failure.
-            Err(RequestFailure::Transport(Error::Agent(
+            Err(RequestFailure::Transport(Error::Steward(
                 "Connection dropped during exec".into(),
             )))
         })
         .await;
 
-        Self::finish_request(&mut self.desynced, result, "Agent exec timed out")
+        Self::finish_request(&mut self.desynced, result, "Steward exec timed out")
     }
 
     /// Uploads a file to the guest VM.
@@ -1000,8 +1000,8 @@ impl AgentClient {
     /// # Errors
     /// Returns an error if the file transfer fails, times out, or the stream is
     /// already desynchronized by a prior request (in which case a
-    /// [`AgentClient::reconnect`] is required before further requests). Like
-    /// [`AgentClient::exec`], a send/decode error or timeout here marks the
+    /// [`StewardClient::reconnect`] is required before further requests). Like
+    /// [`StewardClient::exec`], a send/decode error or timeout here marks the
     /// stream desynced so the next request fails loud rather than reading this
     /// exchange's stale frame as its own response — but a file whose encoded frame
     /// exceeds `MAX_FRAME_BYTES` is rejected by `encode_frame` before the exchange
@@ -1039,15 +1039,15 @@ impl AgentClient {
                     // put_file, it failed, and sent a full Exit(c) ack. The stream
                     // is in sync, so report the failure WITHOUT desyncing so the
                     // next request need not force a spurious reconnect (L-GUEST-1).
-                    Message::Exit(c) => Err(RequestFailure::Clean(Error::Agent(format!(
+                    Message::Exit(c) => Err(RequestFailure::Clean(Error::Steward(format!(
                         "put_file failed with code {c}"
                     )))),
-                    _ => Err(RequestFailure::Transport(Error::Agent(
+                    _ => Err(RequestFailure::Transport(Error::Steward(
                         "unexpected response to put_file".into(),
                     ))),
                 }
             } else {
-                Err(RequestFailure::Transport(Error::Agent(
+                Err(RequestFailure::Transport(Error::Steward(
                     "connection closed during put_file".into(),
                 )))
             }
@@ -1065,7 +1065,7 @@ impl AgentClient {
     /// # Errors
     /// Returns an error if the request cannot be sent, the ack cannot be received
     /// or decoded, the exchange times out, or the stream is already
-    /// desynchronized by a prior request (a [`AgentClient::reconnect`] is then
+    /// desynchronized by a prior request (a [`StewardClient::reconnect`] is then
     /// required). Like the other request methods, any send/decode error or timeout
     /// marks the stream desynced so the next request fails loud. Note a
     /// `Some(clock_error)` in the returned [`ResyncOutcome`] is **not** an `Err`
@@ -1112,12 +1112,12 @@ impl AgentClient {
                         mac_applied,
                         ip_applied,
                     }),
-                    _ => Err(RequestFailure::Transport(Error::Agent(
+                    _ => Err(RequestFailure::Transport(Error::Steward(
                         "unexpected response to resync".into(),
                     ))),
                 }
             } else {
-                Err(RequestFailure::Transport(Error::Agent(
+                Err(RequestFailure::Transport(Error::Steward(
                     "connection closed during resync".into(),
                 )))
             }
@@ -1131,9 +1131,9 @@ impl AgentClient {
 #[cfg(all(test, feature = "host-common"))]
 mod tests {
     use super::{
-        AgentClient, ControlStream, Error, ExecRequest, LengthDelimitedCodec, MAX_FRAME_BYTES,
-        MAX_PROLOGUE_LINE_BYTES, Message, PrologueError, RequestFailure, SessionId, VsockDial,
-        VsockEndpoint, dial_prologue_error, endpoint_on_port, hybrid_connect_prologue,
+        ControlStream, Error, ExecRequest, LengthDelimitedCodec, MAX_FRAME_BYTES,
+        MAX_PROLOGUE_LINE_BYTES, Message, PrologueError, RequestFailure, SessionId, StewardClient,
+        VsockDial, VsockEndpoint, dial_prologue_error, endpoint_on_port, hybrid_connect_prologue,
         hybrid_prologue_port, protocol,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1184,7 +1184,7 @@ mod tests {
         use futures::{SinkExt as _, StreamExt as _};
 
         let (client_io, server_io) = tokio::net::UnixStream::pair().expect("socketpair");
-        let mut client = AgentClient::from_stream_for_tests(client_io);
+        let mut client = StewardClient::from_stream_for_tests(client_io);
 
         // The guest: read exactly one frame, ack it, and hand the frame back so the
         // test can prove WHICH request reached the wire.
@@ -1211,7 +1211,7 @@ mod tests {
             .await
             .expect_err("an over-cap put_file must fail loud");
         assert!(
-            matches!(&err, Error::Agent(m) if m.contains("MAX_FRAME_BYTES")),
+            matches!(&err, Error::Steward(m) if m.contains("MAX_FRAME_BYTES")),
             "expected the typed over-cap error, got {err:?}"
         );
 
@@ -1253,7 +1253,7 @@ mod tests {
 
         let budget = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
-        let res = AgentClient::connect_framed(
+        let res = StewardClient::connect_framed(
             &VsockEndpoint::Unix {
                 path: sock,
                 port: 5000,
@@ -1300,7 +1300,7 @@ mod tests {
 
         let budget = std::time::Duration::from_millis(300);
         let started = std::time::Instant::now();
-        let res = AgentClient::connect_framed(
+        let res = StewardClient::connect_framed(
             &VsockEndpoint::Unix {
                 path: sock,
                 port: 5000,
@@ -1323,11 +1323,11 @@ mod tests {
         );
     }
 
-    // §3.2 (The host side: AgentClient and SessionMux): the extracted prologue is the ONE
+    // §3.2 (The host side: StewardClient and SessionMux): the extracted prologue is the ONE
     // implementation of the fragile hybrid handshake, shared by the framed connect and
     // the raw dial. This drives the accept-and-answer path end to end over a real
     // socket pair and asserts BOTH halves of the wire: the exact `CONNECT <port>` line
-    // the bridge receives (the dialed port, not the agent's), and that an `OK` line is
+    // the bridge receives (the dialed port, not the steward's), and that an `OK` line is
     // accepted. RED on a prologue that writes the wrong port, omits the line, or
     // accepts a non-`OK` answer.
     #[tokio::test]
@@ -1457,7 +1457,7 @@ mod tests {
         use futures::SinkExt as _;
 
         let (client_io, server_io) = tokio::net::UnixStream::pair().expect("socketpair");
-        let mut client = AgentClient::from_stream_for_tests(client_io);
+        let mut client = StewardClient::from_stream_for_tests(client_io);
 
         let mut codec = LengthDelimitedCodec::new();
         codec.set_max_frame_length(MAX_FRAME_BYTES);
@@ -1536,11 +1536,11 @@ mod tests {
         );
     }
 
-    // §3.2 (The host side: AgentClient and SessionMux): the raw dial's typed interpretation of each
+    // §3.2 (The host side: StewardClient and SessionMux): the raw dial's typed interpretation of each
     // refusal signal — the property that makes a dead port an immediate, matchable
     // answer instead of a retry-until-Timeout. Every arm must NAME THE PORT (the
     // error enum has no dedicated no-listener variant, so the message is the only
-    // thing that distinguishes it from any other Agent error). RED on a mapping that
+    // thing that distinguishes it from any other Steward error). RED on a mapping that
     // folds EOF into Timeout (or vice versa), or that drops the port.
     #[test]
     fn dial_prologue_error_interprets_each_refusal_typed() {
@@ -1554,8 +1554,8 @@ mod tests {
             },
         );
         assert!(
-            matches!(&eof, Error::Agent(m) if m.contains("no guest vsock listener") && m.contains("7000")),
-            "EOF before an OK line must be a typed no-listener Agent error naming the port: {eof:?}"
+            matches!(&eof, Error::Steward(m) if m.contains("no guest vsock listener") && m.contains("7000")),
+            "EOF before an OK line must be a typed no-listener Steward error naming the port: {eof:?}"
         );
 
         let hung = dial_prologue_error(
@@ -1578,7 +1578,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(&refused, Error::Agent(m) if m.contains("7002") && m.contains("ERR nope")),
+            matches!(&refused, Error::Steward(m) if m.contains("7002") && m.contains("ERR nope")),
             "a non-OK answer must name the port and what was received: {refused:?}"
         );
 
@@ -1593,11 +1593,11 @@ mod tests {
         );
     }
 
-    // §3.2 (The host side: AgentClient and SessionMux): the caller-chosen guest port is spliced into
+    // §3.2 (The host side: StewardClient and SessionMux): the caller-chosen guest port is spliced into
     // the instance's endpoint in ONE place, and it must reach the transport that
     // actually carries it — the CONNECT line on AF_UNIX, the connect address on
     // AF_VSOCK — while everything else (bridge path, guest CID) is preserved. RED on
-    // an override that keeps the agent's port, which would silently dial the control
+    // an override that keeps the steward's port, which would silently dial the control
     // plane instead of the requested listener.
     #[test]
     fn endpoint_on_port_overrides_only_the_port() {
@@ -1685,10 +1685,10 @@ mod tests {
         let result: std::result::Result<
             std::result::Result<(), RequestFailure>,
             tokio::time::error::Elapsed,
-        > = Ok(Err(RequestFailure::Clean(Error::Agent(
+        > = Ok(Err(RequestFailure::Clean(Error::Steward(
             "put_file failed with code 1".into(),
         ))));
-        let out = AgentClient::finish_request(&mut desynced, result, "unused");
+        let out = StewardClient::finish_request(&mut desynced, result, "unused");
         assert!(
             out.is_err(),
             "a clean application failure must still surface as an error"
@@ -1712,7 +1712,7 @@ mod tests {
         > = Ok(Err(RequestFailure::Transport(Error::Io(
             std::io::Error::from(std::io::ErrorKind::BrokenPipe),
         ))));
-        let out = AgentClient::finish_request(&mut desynced, result, "unused");
+        let out = StewardClient::finish_request(&mut desynced, result, "unused");
         assert!(out.is_err());
         assert!(
             desynced,

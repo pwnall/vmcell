@@ -4,7 +4,7 @@
 //! onto [`CheckStatus`](crate::CheckStatus); a refactored integration test calls the same
 //! function and asserts `Ok`.
 //!
-//! Checks operate on the primitives they need — a `&mut AgentClient` for guest probes, a
+//! Checks operate on the primitives they need — a `&mut StewardClient` for guest probes, a
 //! `&MicroVm` for host-side reads (serial log, cgroup usage), or a backend `&V` for
 //! multi-VM checks (concurrency). The [`run_core`]/[`run_extended`]/[`run_full`] orchestrators
 //! boot capability-appropriate VMs and collect outcomes.
@@ -13,11 +13,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use vmcell::ExecRequest;
-use vmcell::agent::AgentClient;
 use vmcell::config::{
     Access, CachePolicy, Egress, NetConfig, RootfsSource, Share, VmConfig, VmConfigBuilder,
 };
 use vmcell::orchestrator::MicroVm;
+use vmcell::steward::StewardClient;
 use vmcell::vmm::{VmInstance, Vmm};
 
 use crate::classify::{
@@ -26,15 +26,15 @@ use crate::classify::{
 use crate::harness::{cgroup_memory_delegated, try_start_vm};
 use crate::{ArtifactSet, CheckOutcome, Level};
 
-/// The agent-handshake budget every check allows before it calls the boot failed (§9.4: deadlines
-/// are outer-bounds-inner — this is the outer bound `AgentClient` turns into its `Instant`).
+/// The steward-handshake budget every check allows before it calls the boot failed (§9.4: deadlines
+/// are outer-bounds-inner — this is the outer bound `StewardClient` turns into its `Instant`).
 /// **One** statement of the number: an inline per-call 60-second literal anywhere in this module is
-/// a second copy of the same law, and `every_agent_budget_is_a_named_const` reddens on it.
-const AGENT_READY_BUDGET: Duration = Duration::from_secs(60);
+/// a second copy of the same law, and `every_steward_budget_is_a_named_const` reddens on it.
+const STEWARD_READY_BUDGET: Duration = Duration::from_secs(60);
 
-/// The agent-handshake budget for a VM booted **concurrently with others**
+/// The steward-handshake budget for a VM booted **concurrently with others**
 /// (`concurrency_distinct_ids`): three guests contending for the same host take longer than one.
-const CONCURRENT_AGENT_READY_BUDGET: Duration = Duration::from_secs(180);
+const CONCURRENT_STEWARD_READY_BUDGET: Duration = Duration::from_secs(180);
 
 /// How long [`kernel_banner`] waits for the kernel's banner before calling the boot failed.
 const KERNEL_BANNER_BUDGET: Duration = Duration::from_secs(15);
@@ -90,14 +90,14 @@ fn failed_start(e: &impl std::fmt::Display) -> String {
     )
 }
 
-/// The base sentence every agent-handshake failure records, naming the budget that expired.
+/// The base sentence every steward-handshake failure records, naming the budget that expired.
 ///
-/// `budget` is passed rather than read off [`AGENT_READY_BUDGET`] so the sentence names the budget
+/// `budget` is passed rather than read off [`STEWARD_READY_BUDGET`] so the sentence names the budget
 /// the call **actually** used: the arms that inject a different one (a unit test's millisecond
 /// budget, a concurrent boot's longer one) must not report the default's number.
-fn agent_handshake_base(e: &impl std::fmt::Display, budget: Duration) -> String {
+fn steward_handshake_base(e: &impl std::fmt::Display, budget: Duration) -> String {
     format!(
-        "agent handshake failed within the {}s budget: {e}",
+        "steward handshake failed within the {}s budget: {e}",
         budget.as_secs()
     )
 }
@@ -112,13 +112,13 @@ fn base_cfg(a: &ArtifactSet) -> VmConfigBuilder {
     )
 }
 
-/// Runs `argv` in the guest, mapping an agent transport error into a check-failure string.
-async fn exec(agent: &mut AgentClient, argv: &[&str]) -> Result<vmcell::ExecOutcome, String> {
+/// Runs `argv` in the guest, mapping a steward transport error into a check-failure string.
+async fn exec(steward: &mut StewardClient, argv: &[&str]) -> Result<vmcell::ExecOutcome, String> {
     let req = ExecRequest::new(argv.iter().map(|s| (*s).to_string()).collect());
-    agent
+    steward
         .exec(req)
         .await
-        .map_err(|e| format!("agent exec {argv:?} failed at the transport level: {e}"))
+        .map_err(|e| format!("steward exec {argv:?} failed at the transport level: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -179,12 +179,12 @@ async fn await_kernel_banner(serial_log: &Path, budget: Duration) -> Result<(), 
 }
 
 /// An exec round-trips: `echo` returns exit 0 with the expected stdout (← `boot.rs`). Proves the
-/// vsock control plane + PID-1 agent exec path end to end.
+/// vsock control plane + PID-1 steward exec path end to end.
 ///
 /// # Errors
 /// Returns `Err` if the exec fails, exits non-zero, or returns unexpected stdout.
-pub async fn agent_exec_roundtrip(agent: &mut AgentClient) -> Result<(), String> {
-    let out = exec(agent, &["echo", "vmcell-validate-marker"]).await?;
+pub async fn steward_exec_roundtrip(steward: &mut StewardClient) -> Result<(), String> {
+    let out = exec(steward, &["echo", "vmcell-validate-marker"]).await?;
     if out.code != 0 {
         return Err(format!("echo exited {} (expected 0)", out.code));
     }
@@ -201,14 +201,14 @@ pub async fn agent_exec_roundtrip(agent: &mut AgentClient) -> Result<(), String>
 ///
 /// # Errors
 /// Returns `Err` if `put_file` fails or the bytes read back in-guest differ.
-pub async fn agent_put_file_roundtrip(agent: &mut AgentClient) -> Result<(), String> {
+pub async fn steward_put_file_roundtrip(steward: &mut StewardClient) -> Result<(), String> {
     let dst = "/run/vmcell-validate-putfile";
     let payload = b"vmcell-validate-putfile-payload-42";
-    agent
+    steward
         .put_file(dst, payload, Some(Duration::from_secs(10)))
         .await
         .map_err(|e| format!("put_file failed: {e}"))?;
-    let out = exec(agent, &["cat", dst]).await?;
+    let out = exec(steward, &["cat", dst]).await?;
     if out.code != 0 {
         return Err(format!("reading back {dst} exited {}", out.code));
     }
@@ -222,14 +222,14 @@ pub async fn agent_put_file_roundtrip(agent: &mut AgentClient) -> Result<(), Str
     Ok(())
 }
 
-/// The rootfs ships glibc `libc.so.6` (← §4.2, Rootfs sources and the one packer libc6 scan; the dynamically-linked agent already
+/// The rootfs ships glibc `libc.so.6` (← §4.2, Rootfs sources and the one packer libc6 scan; the dynamically-linked steward already
 /// proves it, but a custom rootfs is checked explicitly across the common multiarch paths).
 ///
 /// # Errors
 /// Returns `Err` if `libc.so.6` is absent from every probed multiarch path (or the probe exec fails).
-pub async fn rootfs_libc6(agent: &mut AgentClient) -> Result<(), String> {
+pub async fn rootfs_libc6(steward: &mut StewardClient) -> Result<(), String> {
     let out = exec(
-        agent,
+        steward,
         &[
             "sh",
             "-c",
@@ -248,9 +248,9 @@ pub async fn rootfs_libc6(agent: &mut AgentClient) -> Result<(), String> {
 ///
 /// # Errors
 /// Returns `Err` if the injected proxy CA is not present in the guest trust store.
-pub async fn rootfs_ca_cert(agent: &mut AgentClient) -> Result<(), String> {
+pub async fn rootfs_ca_cert(steward: &mut StewardClient) -> Result<(), String> {
     let out = exec(
-        agent,
+        steward,
         &[
             "test",
             "-f",
@@ -310,15 +310,15 @@ fn probe_command_for(roster: &[&str]) -> Result<String, String> {
 }
 
 /// The in-rootfs guest-tools multicall is present and **every**
-/// [`vmcell_protocol::GUEST_TOOLS_APPLETS`] name resolves on the agent's exec PATH
+/// [`vmcell_protocol::GUEST_TOOLS_APPLETS`] name resolves on the steward's exec PATH
 /// (← §4.4, The in-rootfs guest-tools helper).
 ///
 /// # Errors
 /// Returns `Err` if the roster cannot be composed into a probe, or if any roster name does not
 /// resolve on the exec PATH.
-pub async fn rootfs_guest_tools(agent: &mut AgentClient) -> Result<(), String> {
+pub async fn rootfs_guest_tools(steward: &mut StewardClient) -> Result<(), String> {
     let probe = guest_tools_probe_command()?;
-    let out = exec(agent, &["sh", "-c", probe.as_str()]).await?;
+    let out = exec(steward, &["sh", "-c", probe.as_str()]).await?;
     if out.code != 0 {
         return Err(format!(
             "not every guest-tools applet resolves on PATH (§5.3); the roster is {} and the probe \
@@ -334,9 +334,9 @@ pub async fn rootfs_guest_tools(agent: &mut AgentClient) -> Result<(), String> {
 ///
 /// # Errors
 /// Returns `Err` if the root fs is not writable (missing tmpfs overlay) or the write/read-back mismatches.
-pub async fn rootfs_overlay_writable(agent: &mut AgentClient) -> Result<(), String> {
+pub async fn rootfs_overlay_writable(steward: &mut StewardClient) -> Result<(), String> {
     let out = exec(
-        agent,
+        steward,
         &[
             "sh",
             "-c",
@@ -373,20 +373,20 @@ pub async fn rootfs_overlay_writable(agent: &mut AgentClient) -> Result<(), Stri
 pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
     let (_, guest_ip, _) = vmcell::net::ip_math(vm.vmid())
         .map_err(|e| format!("ip_math({}) failed: {e}", vm.vmid()))?;
-    // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+    // Captured before the `&mut` steward borrow (see `guest_core_checks`).
     let serial_log = vm.instance().serial_log().to_path_buf();
-    let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
+    let steward = match vm.steward(Some(STEWARD_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
             return Err(explain_boot_failure_at(
                 BootKind::Fresh,
                 &serial_log,
-                &agent_handshake_base(&e, AGENT_READY_BUDGET),
+                &steward_handshake_base(&e, STEWARD_READY_BUDGET),
             )
             .await);
         }
     };
-    let addr = exec(agent, &["ip", "a"]).await?;
+    let addr = exec(steward, &["ip", "a"]).await?;
     if addr.code != 0 {
         return Err(format!(
             "`ip a` exited {} (guest-tools ip unavailable?)",
@@ -406,7 +406,7 @@ pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
             "guest eth0 does not carry its IP-PNP address {guest_ip}; `ip a` was:\n{stdout}"
         ));
     }
-    let route = exec(agent, &["ip", "route"]).await?;
+    let route = exec(steward, &["ip", "route"]).await?;
     if route.code != 0 {
         return Err(format!("`ip route` exited {}", route.code));
     }
@@ -425,11 +425,11 @@ pub async fn net_ip_pnp<V: Vmm>(vm: &mut MicroVm<V>) -> Result<(), String> {
 /// # Errors
 /// Returns `Err` if the RO share accepts a write (or fails reads) or the RW share's write is not visible host-side.
 pub async fn virtiofs_shares(
-    agent: &mut AgentClient,
+    steward: &mut StewardClient,
     host_out_dir: &std::path::Path,
 ) -> Result<(), String> {
     // RO read works.
-    let read = exec(agent, &["cat", "/vmcell-in/input.txt"]).await?;
+    let read = exec(steward, &["cat", "/vmcell-in/input.txt"]).await?;
     if read.code != 0 || read.stdout != b"hello world" {
         return Err(format!(
             "RO share read failed (exit {}, stdout {:?})",
@@ -438,7 +438,7 @@ pub async fn virtiofs_shares(
         ));
     }
     // RO write is rejected with the SPECIFIC EROFS signal (not any nonzero — §4.5, Shared directories (virtio-fs)/L-TEST-1).
-    let ro_write = exec(agent, &["sh", "-c", "echo x > /vmcell-in/nope.txt"]).await?;
+    let ro_write = exec(steward, &["sh", "-c", "echo x > /vmcell-in/nope.txt"]).await?;
     if ro_write.code == 0 {
         return Err("write to a read-only virtio-fs share unexpectedly succeeded".into());
     }
@@ -449,7 +449,7 @@ pub async fn virtiofs_shares(
         ));
     }
     // RW write is visible on the host.
-    let rw_write = exec(agent, &["sh", "-c", "echo rw-ok > /vmcell-out/out.txt"]).await?;
+    let rw_write = exec(steward, &["sh", "-c", "echo rw-ok > /vmcell-out/out.txt"]).await?;
     if rw_write.code != 0 {
         return Err(format!("RW share write exited {}", rw_write.code));
     }
@@ -467,8 +467,8 @@ pub async fn virtiofs_shares(
 ///
 /// # Errors
 /// Returns `Err` if `/dev/kvm` is absent in the guest (`kvm-ok` non-zero) — e.g. the VM was not booted with `nested_virt`.
-pub async fn nested_kvm_ok(agent: &mut AgentClient) -> Result<(), String> {
-    let out = exec(agent, &["kvm-ok"]).await?;
+pub async fn nested_kvm_ok(steward: &mut StewardClient) -> Result<(), String> {
+    let out = exec(steward, &["kvm-ok"]).await?;
     if out.code != 0 {
         return Err(format!(
             "kvm-ok exited {} — nested /dev/kvm not exposed to the guest",
@@ -499,30 +499,30 @@ pub async fn metrics_usage_readable<V: Vmm>(vm: &MicroVm<V>) -> Result<(), Strin
     Ok(())
 }
 
-/// The whole `metrics.usage_readable` arm: the agent handshake that proves the guest actually
+/// The whole `metrics.usage_readable` arm: the steward handshake that proves the guest actually
 /// booted, the settle window that lets it touch memory, then [`metrics_usage_readable`].
 ///
 /// Extracted with both durations injected so the **handshake decision** is drivable KVM-free
-/// (`usage-readable-swallows-agent-handshake`): the handshake used to be a bare `let _`, so a guest
+/// (`usage-readable-swallows-steward-handshake`): the handshake used to be a bare `let _`, so a guest
 /// that never came up still reached the cgroup readout and the check could report anything but the
 /// boot failure that caused it. Every sibling arm renders a failed handshake through
 /// [`explain_boot_failure_at`]; this one now does too.
-async fn usage_readable_after_agent_ready<V: Vmm>(
+async fn usage_readable_after_steward_ready<V: Vmm>(
     vm: &mut MicroVm<V>,
     ready_budget: Duration,
     settle: Duration,
 ) -> Result<(), String> {
-    // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+    // Captured before the `&mut` steward borrow (see `guest_core_checks`).
     let serial_log = vm.instance().serial_log().to_path_buf();
-    if let Err(e) = vm.agent(Some(ready_budget)).await {
+    if let Err(e) = vm.steward(Some(ready_budget)).await {
         return Err(explain_boot_failure_at(
             BootKind::Fresh,
             &serial_log,
-            &agent_handshake_base(&e, ready_budget),
+            &steward_handshake_base(&e, ready_budget),
         )
         .await);
     }
-    // Agent-ready: let the guest consume some memory before the counters are read back.
+    // Steward-ready: let the guest consume some memory before the counters are read back.
     tokio::time::sleep(settle).await;
     metrics_usage_readable(vm).await
 }
@@ -570,13 +570,13 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
         }
     }
     for mut vm in vms {
-        // Captured before the `&mut` agent borrow (see `guest_core_checks`). The budget is
-        // deliberately not `AGENT_READY_BUDGET`: three guests boot concurrently here.
+        // Captured before the `&mut` steward borrow (see `guest_core_checks`). The budget is
+        // deliberately not `STEWARD_READY_BUDGET`: three guests boot concurrently here.
         let serial_log = vm.instance().serial_log().to_path_buf();
-        let agent = match vm.agent(Some(CONCURRENT_AGENT_READY_BUDGET)).await {
+        let steward = match vm.steward(Some(CONCURRENT_STEWARD_READY_BUDGET)).await {
             Ok(a) => a,
             Err(e) => {
-                // The sentence is composed by the one `agent_handshake_base` (now that it takes the
+                // The sentence is composed by the one `steward_handshake_base` (now that it takes the
                 // budget it must name), not a second copy of the phrasing that only differed in
                 // which const it read.
                 return Err(explain_boot_failure_at(
@@ -584,13 +584,13 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
                     &serial_log,
                     &format!(
                         "a concurrently-started VM: {}",
-                        agent_handshake_base(&e, CONCURRENT_AGENT_READY_BUDGET)
+                        steward_handshake_base(&e, CONCURRENT_STEWARD_READY_BUDGET)
                     ),
                 )
                 .await);
             }
         };
-        let out = exec(agent, &["true"]).await?;
+        let out = exec(steward, &["true"]).await?;
         if out.code != 0 {
             return Err(format!("concurrent VM exec `true` exited {}", out.code));
         }
@@ -600,11 +600,11 @@ pub async fn concurrency_distinct_ids<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Resul
 }
 
 /// Snapshot a running VM and restore it, confirming the **restored** VM boots back to
-/// agent-ready and execs (← `snapshot_restore.rs`, §8, Snapshot, restore, and cloning/§8.2, Restore correctness: a restored VM is not a fresh VM). Proves the artifact survives the
+/// steward-ready and execs (← `snapshot_restore.rs`, §8, Snapshot, restore, and cloning/§8.2, Restore correctness: a restored VM is not a fresh VM). Proves the artifact survives the
 /// PVH snapshot/restore path. The VM must be a snapshot-eligible config (no vhost-user device).
 ///
 /// # Errors
-/// Returns `Err` if snapshot or restore fails, or the restored VM does not return to agent-ready and exec.
+/// Returns `Err` if snapshot or restore fails, or the restored VM does not return to steward-ready and exec.
 pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Result<(), String> {
     let mut cfg = base_cfg(a)
         .network_disabled()
@@ -617,11 +617,11 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
     let mut vm = MicroVm::start(vmm, cfg.clone(), &env)
         .await
         .map_err(|e| format!("snapshot-source: {}", failed_start(&e)))?;
-    // Boot to agent-ready before snapshotting.
-    if let Err(e) = vm.agent(Some(AGENT_READY_BUDGET)).await {
+    // Boot to steward-ready before snapshotting.
+    if let Err(e) = vm.steward(Some(STEWARD_READY_BUDGET)).await {
         let base = format!(
             "snapshot-source: {}",
-            agent_handshake_base(&e, AGENT_READY_BUDGET)
+            steward_handshake_base(&e, STEWARD_READY_BUDGET)
         );
         return Err(explain_boot_failure_for(&vm, &base).await);
     }
@@ -635,14 +635,14 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
     let mut restored = MicroVm::restore(vmm, snap_dir.path(), cfg, &env)
         .await
         .map_err(|e| format!("restore() failed: {e}"))?;
-    // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+    // Captured before the `&mut` steward borrow (see `guest_core_checks`).
     let restored_serial = restored.instance().serial_log().to_path_buf();
-    let agent = match restored.agent(Some(AGENT_READY_BUDGET)).await {
+    let steward = match restored.steward(Some(STEWARD_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
             let base = format!(
                 "restored VM: {}",
-                agent_handshake_base(&e, AGENT_READY_BUDGET)
+                steward_handshake_base(&e, STEWARD_READY_BUDGET)
             );
             // THE restored console (m9): empty by construction — the guest kernel printed its
             // banner in the snapshot SOURCE, on that VM's console file. Reading it as a fresh boot
@@ -652,7 +652,7 @@ pub async fn snapshot_restore_roundtrip<V: Vmm>(vmm: &V, a: &ArtifactSet) -> Res
             return Err(explain_boot_failure_at(BootKind::Restored, &restored_serial, &base).await);
         }
     };
-    let out = exec(agent, &["true"]).await?;
+    let out = exec(steward, &["true"]).await?;
     if out.code != 0 {
         return Err(format!("restored VM exec `true` exited {}", out.code));
     }
@@ -679,20 +679,20 @@ pub async fn metrics_mem_limit_ooms<V: Vmm>(
     // Fire a runaway allocation; the VMM may itself be OOM-killed, so ignore the exec result —
     // the binding signal is the host counter.
     {
-        // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+        // Captured before the `&mut` steward borrow (see `guest_core_checks`).
         let serial_log = vm.instance().serial_log().to_path_buf();
-        let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
+        let steward = match vm.steward(Some(STEWARD_READY_BUDGET)).await {
             Ok(a) => a,
             Err(e) => {
                 return Err(explain_boot_failure_at(
                     BootKind::Fresh,
                     &serial_log,
-                    &agent_handshake_base(&e, AGENT_READY_BUDGET),
+                    &steward_handshake_base(&e, STEWARD_READY_BUDGET),
                 )
                 .await);
             }
         };
-        let _ = exec(agent, &["tail", "/dev/zero"]).await;
+        let _ = exec(steward, &["tail", "/dev/zero"]).await;
     }
     for _ in 0..50 {
         if let Ok(events) = std::fs::read_to_string(&events_path)
@@ -756,7 +756,7 @@ fn skip(
     outcomes.push(CheckOutcome::skip(id, level, reason));
 }
 
-/// Core: one net-disabled VM → banner, agent-ready, exec/put-file round-trips, rootfs presence,
+/// Core: one net-disabled VM → banner, steward-ready, exec/put-file round-trips, rootfs presence,
 /// overlay, clean shutdown. Never skips (KVM is a precondition).
 pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<CheckOutcome>) {
     let cfg = match base_cfg(a).network_disabled().build() {
@@ -786,7 +786,7 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
                 Level::Core,
                 Err(msg.clone()),
             );
-            record(outcomes, "boot.agent_ready", Level::Core, Err(msg));
+            record(outcomes, "boot.steward_ready", Level::Core, Err(msg));
             return;
         }
     };
@@ -797,21 +797,22 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
         kernel_banner(&vm).await,
     );
 
-    // agent-ready gates every guest probe; if it fails, record it and stop the guest checks.
-    match vm.agent(Some(AGENT_READY_BUDGET)).await {
-        Ok(_) => record(outcomes, "boot.agent_ready", Level::Core, Ok(())),
+    // steward-ready gates every guest probe; if it fails, record it and stop the guest checks.
+    match vm.steward(Some(STEWARD_READY_BUDGET)).await {
+        Ok(_) => record(outcomes, "boot.steward_ready", Level::Core, Ok(())),
         Err(e) => {
             // The VM is still alive here, so its serial log is readable — this is the arm that
             // catches both the erofs root-mount panic (which surfaces only as "Panic detected in
             // serial log") and the missing-`CONFIG_VSOCKETS` guest.
             let msg =
-                explain_boot_failure_for(&vm, &agent_handshake_base(&e, AGENT_READY_BUDGET)).await;
-            record(outcomes, "boot.agent_ready", Level::Core, Err(msg));
+                explain_boot_failure_for(&vm, &steward_handshake_base(&e, STEWARD_READY_BUDGET))
+                    .await;
+            record(outcomes, "boot.steward_ready", Level::Core, Err(msg));
             let _ = vm.shutdown().await;
             return;
         }
     }
-    // Re-borrow the agent for each check (the connection is cached on the VM).
+    // Re-borrow the steward for each check (the connection is cached on the VM).
     for (id, res) in guest_core_checks(&mut vm).await {
         record(outcomes, id, Level::Core, res);
     }
@@ -823,35 +824,38 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
     );
 }
 
-/// Runs the guest-facing Core checks against `vm`'s cached agent, returning (id, result) pairs.
+/// Runs the guest-facing Core checks against `vm`'s cached steward, returning (id, result) pairs.
 async fn guest_core_checks<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<(&'static str, Result<(), String>)> {
-    // Captured before the `&mut` agent borrow so the failure arm can still read the console (the
+    // Captured before the `&mut` steward borrow so the failure arm can still read the console (the
     // borrow checker keeps the mutable borrow alive across the whole `match` here).
     let serial_log = vm.instance().serial_log().to_path_buf();
-    let agent = match vm.agent(Some(AGENT_READY_BUDGET)).await {
+    let steward = match vm.steward(Some(STEWARD_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
             let msg = explain_boot_failure_at(
                 BootKind::Fresh,
                 &serial_log,
-                &format!("agent unavailable: {e}"),
+                &format!("steward unavailable: {e}"),
             )
             .await;
-            return vec![("agent.exec_roundtrip", Err(msg))];
+            return vec![("steward.exec_roundtrip", Err(msg))];
         }
     };
     vec![
-        ("agent.exec_roundtrip", agent_exec_roundtrip(agent).await),
         (
-            "agent.put_file_roundtrip",
-            agent_put_file_roundtrip(agent).await,
+            "steward.exec_roundtrip",
+            steward_exec_roundtrip(steward).await,
         ),
-        ("rootfs.libc6", rootfs_libc6(agent).await),
-        ("rootfs.ca_cert", rootfs_ca_cert(agent).await),
-        ("rootfs.guest_tools", rootfs_guest_tools(agent).await),
+        (
+            "steward.put_file_roundtrip",
+            steward_put_file_roundtrip(steward).await,
+        ),
+        ("rootfs.libc6", rootfs_libc6(steward).await),
+        ("rootfs.ca_cert", rootfs_ca_cert(steward).await),
+        ("rootfs.guest_tools", rootfs_guest_tools(steward).await),
         (
             "rootfs.overlay_writable",
-            rootfs_overlay_writable(agent).await,
+            rootfs_overlay_writable(steward).await,
         ),
     ]
 }
@@ -947,14 +951,14 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                         Err(failed_start(&e)),
                     ),
                     Ok(mut vm) => {
-                        // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+                        // Captured before the `&mut` steward borrow (see `guest_core_checks`).
                         let serial_log = vm.instance().serial_log().to_path_buf();
-                        let res = match vm.agent(Some(AGENT_READY_BUDGET)).await {
-                            Ok(agent) => nested_kvm_ok(agent).await,
+                        let res = match vm.steward(Some(STEWARD_READY_BUDGET)).await {
+                            Ok(steward) => nested_kvm_ok(steward).await,
                             Err(e) => Err(explain_boot_failure_at(
                                 BootKind::Fresh,
                                 &serial_log,
-                                &agent_handshake_base(&e, AGENT_READY_BUDGET),
+                                &steward_handshake_base(&e, STEWARD_READY_BUDGET),
                             )
                             .await),
                         };
@@ -1000,9 +1004,9 @@ pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
                             outcomes,
                             "metrics.usage_readable",
                             Level::Extended,
-                            usage_readable_after_agent_ready(
+                            usage_readable_after_steward_ready(
                                 &mut vm,
-                                AGENT_READY_BUDGET,
+                                STEWARD_READY_BUDGET,
                                 USAGE_SETTLE,
                             )
                             .await,
@@ -1093,14 +1097,14 @@ async fn run_shares_check<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
             Err(failed_start(&e)),
         ),
         Ok(mut vm) => {
-            // Captured before the `&mut` agent borrow (see `guest_core_checks`).
+            // Captured before the `&mut` steward borrow (see `guest_core_checks`).
             let serial_log = vm.instance().serial_log().to_path_buf();
-            let res = match vm.agent(Some(AGENT_READY_BUDGET)).await {
-                Ok(agent) => virtiofs_shares(agent, &out_dir).await,
+            let res = match vm.steward(Some(STEWARD_READY_BUDGET)).await {
+                Ok(steward) => virtiofs_shares(steward, &out_dir).await,
                 Err(e) => Err(explain_boot_failure_at(
                     BootKind::Fresh,
                     &serial_log,
-                    &agent_handshake_base(&e, AGENT_READY_BUDGET),
+                    &steward_handshake_base(&e, STEWARD_READY_BUDGET),
                 )
                 .await),
             };
@@ -1314,8 +1318,8 @@ mod tests {
         let log = dir.path().join("serial.log");
         std::fs::write(&log, PANICKED_CONSOLE).expect("write console");
 
-        let msg = explain_boot_failure_at(BootKind::Fresh, &log, "agent handshake failed").await;
-        assert!(msg.starts_with("agent handshake failed"), "{msg}");
+        let msg = explain_boot_failure_at(BootKind::Fresh, &log, "steward handshake failed").await;
+        assert!(msg.starts_with("steward handshake failed"), "{msg}");
         assert!(
             msg.contains("contract violation:") && msg.contains("CONFIG_EROFS_FS"),
             "the message must name the clause the console proves: {msg}"
@@ -1335,7 +1339,7 @@ mod tests {
         let missing = dir.path().join("never-created.log");
 
         let msg =
-            explain_boot_failure_at(BootKind::Fresh, &missing, "agent handshake failed").await;
+            explain_boot_failure_at(BootKind::Fresh, &missing, "steward handshake failed").await;
         assert!(msg.contains("no serial evidence:"), "{msg}");
         assert!(msg.contains("it could not be read"), "{msg}");
         assert!(
@@ -1416,7 +1420,7 @@ mod tests {
         let ids: Vec<&str> = outcomes.iter().map(|o| o.id).collect();
         assert_eq!(
             ids,
-            vec!["boot.kernel_banner", "boot.agent_ready"],
+            vec!["boot.kernel_banner", "boot.steward_ready"],
             "{ids:?}"
         );
         for o in &outcomes {
@@ -1478,23 +1482,23 @@ mod tests {
         }
     }
 
-    // The agent budget is one law in one place. Guards re-inlining a per-call literal — the state
+    // The steward budget is one law in one place. Guards re-inlining a per-call literal — the state
     // the module was in with the const declared and seven copies of the number still in the calls.
     #[test]
-    fn every_agent_budget_is_a_named_const() {
+    fn every_steward_budget_is_a_named_const() {
         const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs"));
         // Built at runtime so this test's own needles are not the thing it counts.
-        let literal = format!("Duration::from_secs({})", AGENT_READY_BUDGET.as_secs());
+        let literal = format!("Duration::from_secs({})", STEWARD_READY_BUDGET.as_secs());
         assert_eq!(
             SRC.matches(&literal).count(),
             1,
-            "{literal} must appear exactly once (the AGENT_READY_BUDGET const)"
+            "{literal} must appear exactly once (the STEWARD_READY_BUDGET const)"
         );
-        let inline_call = format!("agent(Some(Duration::{}", "from_secs");
+        let inline_call = format!("steward(Some(Duration::{}", "from_secs");
         assert_eq!(
             SRC.matches(&inline_call).count(),
             0,
-            "every `agent(Some(..))` budget must be a named const, not an inline literal"
+            "every `steward(Some(..))` budget must be a named const, not an inline literal"
         );
     }
 
@@ -1732,17 +1736,17 @@ mod tests {
     }
 
     // `metrics.usage_readable` must FAIL, naming the boot failure, when the guest never hands
-    // shakes. The handshake was a bare `let _` (`usage-readable-swallows-agent-handshake`), so the
+    // shakes. The handshake was a bare `let _` (`usage-readable-swallows-steward-handshake`), so the
     // arm walked into the cgroup readout on a guest that never booted and reported anything but the
     // reason — on a host where the counters happen to read back, a green PASS.
     //
     // KVM-free: the fake backend's vsock path has no listener, so the handshake genuinely fails;
-    // the budget is injected (1s, not `AGENT_READY_BUDGET`) so it fails in a second rather than a
+    // the budget is injected (1s, not `STEWARD_READY_BUDGET`) so it fails in a second rather than a
     // minute, and the message must name *that* budget. What this fake cannot see is the pass side —
     // a real delegated cgroup readout — which is the live `metrics.usage_readable` leg of a
     // `Level::Extended` validation run on a KVM host.
     #[tokio::test]
-    async fn usage_readable_fails_naming_the_boot_failure_when_the_agent_never_handshakes() {
+    async fn usage_readable_fails_naming_the_boot_failure_when_the_steward_never_handshakes() {
         let vmm = FakeVmm::default();
         let cfg = base_cfg(&ArtifactSet::new(
             "/nonexistent/vmlinux",
@@ -1758,11 +1762,12 @@ mod tests {
             .expect("the fake backend starts");
         let serial = vm.instance().serial_log().display().to_string();
 
-        let err = usage_readable_after_agent_ready(&mut vm, Duration::from_secs(1), Duration::ZERO)
-            .await
-            .expect_err("a guest that never hands shakes has no readable usage to report");
+        let err =
+            usage_readable_after_steward_ready(&mut vm, Duration::from_secs(1), Duration::ZERO)
+                .await
+                .expect_err("a guest that never hands shakes has no readable usage to report");
         assert!(
-            err.starts_with("agent handshake failed within the 1s budget"),
+            err.starts_with("steward handshake failed within the 1s budget"),
             "the arm must report the handshake failure, with the budget it really used: {err}"
         );
         assert!(
@@ -1795,7 +1800,7 @@ mod tests {
             .expect("the fake backend starts");
         let expected = vm.instance().serial_log().display().to_string();
 
-        let msg = explain_boot_failure_for(&vm, "agent handshake failed").await;
+        let msg = explain_boot_failure_for(&vm, "steward handshake failed").await;
         assert!(
             msg.contains(&expected),
             "the message must name the VM's own serial log ({expected}): {msg}"
@@ -1817,7 +1822,7 @@ mod tests {
         let msg = explain_boot_failure_at(
             BootKind::Restored,
             &log,
-            "restored VM: agent handshake failed within the 60s budget",
+            "restored VM: steward handshake failed within the 60s budget",
         )
         .await;
         assert!(

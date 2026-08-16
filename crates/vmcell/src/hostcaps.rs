@@ -194,7 +194,7 @@ impl CgroupSysfs {
 
     /// A tree rooted at `root` with scope `base`, for testing the reads against a synthetic sysfs
     /// tree. `#[cfg(test)]` so the seam constructor ships in no build but the test one (the
-    /// `AgentClient::from_stream_for_tests` precedent) — production has exactly one tree,
+    /// `StewardClient::from_stream_for_tests` precedent) — production has exactly one tree,
     /// [`CgroupSysfs::system`].
     #[cfg(test)]
     fn with_root(root: impl Into<std::path::PathBuf>, base: Option<String>) -> Self {

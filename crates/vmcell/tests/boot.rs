@@ -4,7 +4,7 @@ use vmcell_artifact_validator::checks;
 
 mod common;
 
-// The boot contract (kernel banner → agent-ready → exec round-trip) is the extracted
+// The boot contract (kernel banner → steward-ready → exec round-trip) is the extracted
 // `checks::*` the artifact validator runs; this test drives them on the built artifacts so a
 // regression in either reddens here AND in the validator (single source of truth, §5.4, The guest-kernel contract and the bootstrap seed).
 vmm_matrix_test!(boot, |vmm| {
@@ -28,14 +28,14 @@ async fn test_boot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         .await
         .expect("kernel must print the Linux banner");
 
-    let agent = vm
-        .agent(Some(Duration::from_secs(60)))
+    let steward = vm
+        .steward(Some(Duration::from_secs(60)))
         .await
-        .expect("agent must reach ready");
-    checks::agent_exec_roundtrip(agent)
+        .expect("steward must reach ready");
+    checks::steward_exec_roundtrip(steward)
         .await
         .expect("exec must round-trip");
-    checks::agent_put_file_roundtrip(agent)
+    checks::steward_put_file_roundtrip(steward)
         .await
         .expect("put_file must round-trip");
 

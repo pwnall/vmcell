@@ -45,17 +45,17 @@ async fn test_extra_block_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     .unwrap();
 
     let mut vm = common::start_vm(vmm, cfg).await;
-    let agent = vm
-        .agent(Some(std::time::Duration::from_secs(60)))
+    let steward = vm
+        .steward(Some(std::time::Duration::from_secs(60)))
         .await
-        .expect("agent must reach ready");
+        .expect("steward must reach ready");
 
     // Read the RO marker off /dev/vdb; write a marker to the RW /dev/vdc and read it
     // back. `dd`/`printf` are coreutils, present in the base rootfs.
     let script = "dd if=/dev/vdb bs=8 count=1 2>/dev/null; \
                   printf VMCELLRW | dd of=/dev/vdc bs=8 count=1 conv=notrunc 2>/dev/null; \
                   dd if=/dev/vdc bs=8 count=1 2>/dev/null";
-    let outcome = agent
+    let outcome = steward
         .exec(vmcell::ExecRequest::new(vec![
             "sh".to_string(),
             "-c".to_string(),
@@ -159,19 +159,19 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
     .unwrap();
 
     let mut vm = common::start_vm(vmm, cfg).await;
-    let agent = vm
-        .agent(Some(std::time::Duration::from_secs(60)))
+    let steward = vm
+        .steward(Some(std::time::Duration::from_secs(60)))
         .await
-        .expect("agent ready");
+        .expect("steward ready");
 
     // Read 4 MiB off each disk cold, timing the exec host-side. A 1 MiB/s cap on a
     // 4 MiB read with a 1 MiB burst floors the throttled read at ~3s.
     async fn timed_read(
-        agent: &mut vmcell::agent::AgentClient,
+        steward: &mut vmcell::steward::StewardClient,
         dev: &str,
     ) -> (vmcell::ExecOutcome, u128) {
         let start = std::time::Instant::now();
-        let out = agent
+        let out = steward
             .exec(vmcell::ExecRequest::new(vec![
                 "dd".to_string(),
                 format!("if={dev}"),
@@ -184,9 +184,9 @@ async fn test_io_throttle_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         (out, start.elapsed().as_millis())
     }
 
-    let (fast, fast_ms) = timed_read(agent, "/dev/vdb").await;
+    let (fast, fast_ms) = timed_read(steward, "/dev/vdb").await;
     assert_eq!(fast.code, 0, "un-throttled read failed: {fast:?}");
-    let (slow, slow_ms) = timed_read(agent, "/dev/vdc").await;
+    let (slow, slow_ms) = timed_read(steward, "/dev/vdc").await;
     assert_eq!(slow.code, 0, "throttled read failed: {slow:?}");
 
     assert!(
@@ -265,13 +265,13 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         let mut vm = MicroVm::start(vmm, mk_cfg(), &env)
             .await
             .expect("start VM with extra disk");
-        let agent = vm
-            .agent(Some(std::time::Duration::from_secs(60)))
+        let steward = vm
+            .steward(Some(std::time::Duration::from_secs(60)))
             .await
-            .expect("agent ready");
+            .expect("steward ready");
         // `sync` so the guest write reaches the host image file before the snapshot
         // pauses the VM.
-        let w = agent
+        let w = steward
             .exec(vmcell::ExecRequest::new(vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -300,11 +300,11 @@ async fn test_extra_block_snapshot_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .expect("restore VM with extra disk");
         assert_ne!(vm.vmid(), original_vmid, "restore must get a fresh vmid");
 
-        // First post-restore agent() call carries the mandatory resync (RealClock).
+        // First post-restore steward() call carries the mandatory resync (RealClock).
         let outcome = vm
-            .agent(Some(std::time::Duration::from_secs(60)))
+            .steward(Some(std::time::Duration::from_secs(60)))
             .await
-            .expect("agent ready after restore")
+            .expect("steward ready after restore")
             .exec(vmcell::ExecRequest::new(vec![
                 "sh".to_string(),
                 "-c".to_string(),

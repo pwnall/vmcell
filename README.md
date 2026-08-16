@@ -6,10 +6,10 @@ Driven entirely from a single Rust library, organized as a cargo **workspace**. 
 library and carries the primary Cloud Hypervisor backend; the three secondary backends live in their
 own crates (`vmcell-firecracker`, `vmcell-qemu`, `vmcell-crosvm`), each depending on `vmcell` for the
 one `Vmm` trait and the shared jail/seccomp/spawn helpers. Around them sit the lean members —
-`vmcell-protocol` (the shared wire enum), `vmcell-guest-agent` (guest PID 1), `vmcell-test-runner`
+`vmcell-protocol` (the shared wire enum), `vmcell-steward` (guest PID 1), `vmcell-test-runner`
 (the privileged-test capability runner), `vmcell-guest-tools` (the in-rootfs multicall helper:
 vmcell's own `ip`/`curl`/`kvm-ok`/`echo-server` applets, symlinked into `/vmcell-tools`, which the
-guest agent puts **first** on the guest `PATH` — so an in-guest `curl` is this shim, which
+steward puts **first** on the guest `PATH` — so an in-guest `curl` is this shim, which
 implements a fixed curl-flag subset and *rejects* anything outside it rather than ignoring it),
 `vmcell-privilege`, the two in-VM artifact builders, the `vmcell-artifact-validator` conformance kit,
 the `vmcell-bench` harness, the CLI, and the control-plane tier (`vmcell-daemon`, `vmcelld`,
@@ -26,9 +26,9 @@ out. The binary lives in the `vmcell-cli` crate (`vmcell` itself declares no bin
 |---|---|
 | `build` | Build all VM artifacts (kernel, erofs rootfs, proxy CA) from `pins.json`. |
 | `build-kernels` | Build every kernel in the `pins.kernels` registry to `vmlinux-<label>`. |
-| `oci2-erofs IMAGE@sha256:DIGEST -o out.erofs` | Convert any **digest-pinned** OCI base image into an erofs rootfs (verify blobs → whiteouts → inject agent/CA/tools → pack). Tags are rejected; a libc6-less base fails loud unless `--agent-musl <path>` supplies a static-musl agent. |
+| `oci2-erofs IMAGE@sha256:DIGEST -o out.erofs` | Convert any **digest-pinned** OCI base image into an erofs rootfs (verify blobs → whiteouts → inject steward/CA/tools → pack). Tags are rejected; a libc6-less base fails loud unless `--steward-musl <path>` supplies a static-musl steward. |
 | `run --kernel K --rootfs R [-- CMD…]` | Boot a fresh micro-VM, run `CMD` (default `/bin/true`) over vsock, tear down, and exit with the guest's exit code. |
-| `create --kernel K --rootfs R` | Boot a micro-VM and confirm the agent is ready, then tear down (a boot smoke test). |
+| `create --kernel K --rootfs R` | Boot a micro-VM and confirm the steward is ready, then tear down (a boot smoke test). |
 | `snapshot --kernel K --rootfs R --out DIR` | Boot a micro-VM and write a warm snapshot into `DIR` (snapshot-eligible config only). |
 | `stats --kernel K --rootfs R` | Boot a micro-VM, sample resource usage, print it as JSON, tear down. |
 | `bundle [-o manifest.json]` | Write a digest-pinned fetch-and-verify manifest of the built artifacts (kernel/rootfs/CA/pins.json). |
@@ -58,7 +58,7 @@ example.
 |---|---|
 | `VMCELL_ARTIFACTS_DIR` | Relocates the artifact cache; all freshness/fingerprint logic runs there unchanged. |
 | `VMCELL_KERNEL` | Path redirect only: the kernel is used verbatim and must exist (fail-loud). It does **not** disable any build. |
-| `VMCELL_ROOTFS` | The externally-managed-artifacts switch: its presence makes `ensure_test_artifacts` a **full no-op** — not a rootfs-only skip, so the kernel-presence check and the agent/tools rebuilds are skipped too. This is the switch a downstream harness sets. |
+| `VMCELL_ROOTFS` | The externally-managed-artifacts switch: its presence makes `ensure_test_artifacts` a **full no-op** — not a rootfs-only skip, so the kernel-presence check and the steward/tools rebuilds are skipped too. This is the switch a downstream harness sets. |
 | `VMCELL_PINS` | The pins overlay: a JSON file whose top-level keys override the committed baseline key-by-key. An unknown or wrong-shaped top-level key is a hard error naming it, so a typo'd override can never silently resolve from the baseline. |
 | `VMCELL_CH_BIN` / `_FC_BIN` / `_QEMU_BIN` / `_CROSVM_BIN` | Backend binary resolvers. |
 | `VMCELL_SKIP_MANIFEST` | Where capability-driven test skips are recorded (`SKIP <vmm> <capability>`). |
@@ -204,7 +204,7 @@ official prebuilt binary release** and no Debian/Ubuntu package, so it is built 
 only *spawned* as an external binary (never linked as a crate), so — exactly like the QEMU binary — it
 does **not** enter the workspace `Cargo.lock`, the `cargo deny` license scan, or the dependency tree.
 
-crosvm's full path (boot, agent-exec, sessions, tap networking, cgroup limits, and **snapshot/restore**)
+crosvm's full path (boot, steward-exec, sessions, tap networking, cgroup limits, and **snapshot/restore**)
 is validated live via the opt-in `just test-crosvm` matrix — 29/29 on a KVM host with a source-built
 crosvm (2026-08-14); that recipe is the number's source, so read it there rather than from here.
 virtio-fs and unprivileged-net stay honest-`false`. Snapshot/restore follows the Firecracker
@@ -402,11 +402,11 @@ None is required to build or run `vmcell` itself — install only the ones for t
 actually want to reproduce.
 
 ```sh
-# static-musl guest-agent experiment (musl vs glibc on-disk size / RSS / rootfs-independence)
+# static-musl steward experiment (musl vs glibc on-disk size / RSS / rootfs-independence)
 sudo apt install -y musl-tools                 # provides `musl-gcc`
 rustup target add x86_64-unknown-linux-musl    # the prebuilt musl libc rustc links against
-#   The all-Rust agent links musl *statically without* `musl-gcc`; `musl-gcc` only becomes
-#   necessary once the agent gains a C / `*-sys` dependency that has to be cross-compiled.
+#   The all-Rust steward links musl *statically without* `musl-gcc`; `musl-gcc` only becomes
+#   necessary once the steward gains a C / `*-sys` dependency that has to be cross-compiled.
 
 # rootfs image-size comparison: OCI slim base vs a minimal mmdebstrap build
 sudo apt install -y erofs-utils                # provides `mkfs.erofs` for the size/compressor probe.

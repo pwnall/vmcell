@@ -24,7 +24,7 @@ LOG="${1:-/tmp/perf-matrix.log}"
 : > "$LOG"
 
 # Summary lines worth keeping (drops CH serial-log + VMM deprecation noise).
-KEEP='Cold Boot|Warm Restore|PHASE-BUDGET|^  (create|connect|exec|teardown|destroy|list|restore)|TOTAL|VSOCK-RTT|round-trip|SUSPEND-SIZE|snapshot bytes|memory file =|memory-file share|host RssShmem total|host RssAnon total|marginal host|KSM pages_sharing|guest MemTotal|guest pid1|density|no snapshot support|cpufreq:|Capabilities:|=== |^Running benchmarks|^kernel:|No successful runs|NET-START|NET-EGRESS|fan-out|agent-ready across|CoW support|master ready|DAEMON-API|^vmm binary:|daemon-api: NOT applied|NOT freq-pinned|does not rotate|no unprivileged|single-clone|skipping|session-|CAP_NET_ADMIN'
+KEEP='Cold Boot|Warm Restore|PHASE-BUDGET|^  (create|connect|exec|teardown|destroy|list|restore)|TOTAL|VSOCK-RTT|round-trip|SUSPEND-SIZE|snapshot bytes|memory file =|memory-file share|host RssShmem total|host RssAnon total|marginal host|KSM pages_sharing|guest MemTotal|guest pid1|density|no snapshot support|cpufreq:|Capabilities:|=== |^Running benchmarks|^kernel:|No successful runs|NET-START|NET-EGRESS|fan-out|steward-ready across|CoW support|master ready|DAEMON-API|^vmm binary:|daemon-api: NOT applied|NOT freq-pinned|does not rotate|no unprivileged|single-clone|skipping|session-|CAP_NET_ADMIN'
 
 FAILED=0
 run() {

@@ -13,13 +13,13 @@ name = "vmcell-protocol"
 # `rootfs_injection_manifest` DERIVE from one list instead of restating it (design §4.4). The names
 # and their order are unchanged (`ip`, `curl`, `kvm-ok`, `echo-server`), so nothing injected into the
 # rootfs moves — but the guest-tools closure hash does, so the rootfs re-bakes. `vmcell-guest-tools`
-# is a THIRD dependent as of this bump; guest → shared is the same edge `vmcell-guest-agent` already
+# is a THIRD dependent as of this bump; guest → shared is the same edge `vmcell-steward` already
 # has, not the forbidden `vmcell` → guest one.
 version = "0.5.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Framed postcard wire protocol shared by the vmcell host and the guest agent"
+description = "Framed postcard wire protocol shared by the vmcell host and the steward"
 publish = false
 
 [lib]

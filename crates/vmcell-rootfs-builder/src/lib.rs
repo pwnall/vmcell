@@ -3,7 +3,7 @@
 //! Where `vmcell`'s bootstrap rootfs source pulls and unpacks an OCI base image on the host
 //! ([`vmcell::artifact::rootfs::RootfsStage`]), this crate builds a full-apt Debian rootfs by
 //! booting a `vmcell` builder micro-VM, running `apt-get install mmdebstrap` and then
-//! `mmdebstrap` against the pinned `snapshot.debian.org` archive over the guest agent. The
+//! `mmdebstrap` against the pinned `snapshot.debian.org` archive over the steward. The
 //! resulting rootfs tar is packed to the final erofs by `vmcell`'s shared inject+CA tail
 //! [`vmcell::artifact::rootfs::pack_erofs_with_injection`], so it is injected and made
 //! byte-deterministic exactly like the OCI source (§4.3, The rootfs-construction contract).
@@ -123,9 +123,9 @@ impl Stage for MmdebstrapRootfsStage {
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&MMDEBSTRAP_STAGE_VERSION.to_le_bytes());
-        // The shared injected-content identity (agent + CA + guest-agent source + the
+        // The shared injected-content identity (steward + CA + steward source + the
         // downstream extra files), ONE implementation reused from `vmcell` (§4.3, The
-        // rootfs-construction contract). mmdebstrap always uses the default glibc agent (its
+        // rootfs-construction contract). mmdebstrap always uses the default glibc steward (its
         // Debian rootfs ships libc6), so no musl override.
         fold_rootfs_injection_identity(&mut hasher, inputs, None, &self.extra);
         hasher.update(b"mmdebstrap");
@@ -146,8 +146,8 @@ impl Stage for MmdebstrapRootfsStage {
         hasher.update(b"\0");
         hasher.update(builder_digest.as_bytes());
         // Consumed upstream artifacts: the seed `kernel` (boots the builder VM) plus the
-        // injected `guest_agent`/`guest_tools`, content-hashed in sorted order.
-        let consumed: &[&str] = &["kernel", "guest_agent", "guest_tools"];
+        // injected `steward`/`guest_tools`, content-hashed in sorted order.
+        let consumed: &[&str] = &["kernel", "steward", "guest_tools"];
         let filtered: std::collections::HashMap<String, std::path::PathBuf> = inputs
             .artifacts
             .iter()
@@ -178,7 +178,7 @@ impl Stage for MmdebstrapRootfsStage {
             &builder_digest,
             inputs,
             &builder_rootfs,
-            // The builder VM uses the default glibc agent (its OCI base ships libc6).
+            // The builder VM uses the default glibc steward (its OCI base ships libc6).
             None,
             // No downstream extra files: this is the BUILDER VM's own rootfs, not the rootfs
             // being produced. Baking a consumer's daemon into vmcell's build infrastructure
@@ -219,9 +219,9 @@ impl Stage for MmdebstrapRootfsStage {
 
         let release = self.release.clone();
         let build_res = async {
-            let agent = vm.agent(None).await?;
+            let steward = vm.steward(None).await?;
 
-            let update = agent
+            let update = steward
                 .exec(
                     ExecRequest::new(vec!["apt-get".into(), "update".into()])
                         .with_timeout(Duration::from_secs(120)),
@@ -229,7 +229,7 @@ impl Stage for MmdebstrapRootfsStage {
                 .await?;
             check_step("apt-get update", &update)?;
 
-            let install = agent
+            let install = steward
                 .exec(
                     ExecRequest::new(vec![
                         "apt-get".into(),
@@ -245,7 +245,7 @@ impl Stage for MmdebstrapRootfsStage {
 
             // apt's in-guest gpg chain (the base image's `debian-archive-keyring`) verifies the
             // pinned snapshot Release files; `[check-valid-until=no]` relaxes only freshness.
-            let mmd = agent
+            let mmd = steward
                 .exec(
                     ExecRequest::new(vec![
                         "mmdebstrap".into(),

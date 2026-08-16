@@ -1,6 +1,6 @@
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{RootfsSource, VmConfig};
 use vmcell::orchestrator::MicroVm;
+use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::VmInstance;
 
 mod common;
@@ -46,9 +46,9 @@ vmm_matrix_test!(snapshot_restore, |vmm| {
 /// when the pre-snapshot listener resumed with the guest.
 async fn start_guest_echo_server<V: vmcell::vmm::Vmm>(vm: &mut MicroVm<V>) {
     let started = vm
-        .agent(None)
+        .steward(None)
         .await
-        .expect("agent for the echo server")
+        .expect("steward for the echo server")
         .exec(ExecRequest::new(vec![
             "sh".into(),
             "-c".into(),
@@ -113,7 +113,7 @@ fn links_in_netns(netns: &str) -> String {
 /// `<prefix>-tap-<old vmid>` — which, under the runner's ambient `CAP_NET_ADMIN`, `TUNSETIFF`
 /// silently *creates* as a fresh, down, unbridged tap. Restore then "succeeds", the guest's resync
 /// rotates its address onto the new `/30`, and every packet drops into the orphan. Nothing in this
-/// file could see it: the `/proc/net/route` assertion above reads guest-side TEXT and the agent
+/// file could see it: the `/proc/net/route` assertion above reads guest-side TEXT and the steward
 /// transport is vsock, not the tap. This leg is the data plane itself, so it reddens on that
 /// backend behavior — and it retro-covers CH's `net[].tap` restore-config rewrite (§8.2) and
 /// crosvm/QEMU's fresh `--net tap-name=`/netdev on the same run.
@@ -143,9 +143,9 @@ async fn assert_guest_egress_byte<V: vmcell::vmm::Vmm>(vm: &mut MicroVm<V>, phas
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     let echo_log = vm
-        .agent(None)
+        .steward(None)
         .await
-        .expect("agent for the echo-server log")
+        .expect("steward for the echo-server log")
         .exec(ExecRequest::new(vec!["cat".into(), "/tmp/echo.log".into()]))
         .await
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -181,7 +181,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
     // `mut`: block 2 swaps `env.clock` for an injected `FakeClock` before restore so the one-shot
     // post-restore resync is driven by a controlled time (design §18, Delta register: changes from the validated v27 build — delta 1 folded the clock seam
-    // into `HostEnv`; `agent()` no longer takes a clock argument).
+    // into `HostEnv`; `steward()` no longer takes a clock argument).
     let mut env = vmcell::HostEnv::hermetic();
 
     // 1. Create a VM and take a snapshot
@@ -215,17 +215,17 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             .await
             .expect("Failed to start VM");
 
-        let agent = match vm.agent(None).await {
+        let steward = match vm.steward(None).await {
             Ok(a) => a,
             Err(e) => {
                 let log = std::fs::read_to_string(vm.instance().serial_log()).unwrap_or_default();
                 println!("SERIAL LOG:\n{log}");
-                panic!("Failed to connect to agent: {e}");
+                panic!("Failed to connect to steward: {e}");
             }
         };
 
         // Capture pre-snapshot MAC
-        let mac_out = agent
+        let mac_out = steward
             .exec(ExecRequest::new(vec![
                 "cat".into(),
                 "/sys/class/net/eth0/address".into(),
@@ -240,7 +240,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         );
         let pre_mac = String::from_utf8_lossy(&mac_out.stdout).trim().to_string();
 
-        let time_out = agent
+        let time_out = steward
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
             .await
             .unwrap();
@@ -273,11 +273,11 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // snapshot froze. A restore that does NOT reseed will resume from this
         // identical frozen state and replay these same bytes; the orchestrator's
         // native post-restore reseed (a 32-byte /dev/hwrng → /dev/urandom copy in
-        // the agent's `handle_resync`, §8.2, Restore correctness: a restored VM is not a fresh VM) is what must perturb them.
+        // the steward's `handle_resync`, §8.2, Restore correctness: a restored VM is not a fresh VM) is what must perturb them.
         // NOTE: the test never issues its own reseed — it only
         // reads /dev/urandom here and after restore and asserts they differ.
         let ref_rng = vm
-            .agent(None)
+            .steward(None)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![
@@ -374,8 +374,8 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
         // Drive the one-shot post-restore clock resync from an INJECTED FakeClock (≈ pre_time +
         // 1000s), captured on `env.clock` BEFORE restore. The orchestrator fires the resync on the
-        // FIRST agent() after restore using the clock captured at construction (design §18, Delta register: changes from the validated v27 build — delta 1
-        // — agent() no longer takes a clock arg); a resync that ignored the injected clock would
+        // FIRST steward() after restore using the clock captured at construction (design §18, Delta register: changes from the validated v27 build — delta 1
+        // — steward() no longer takes a clock arg); a resync that ignored the injected clock would
         // land near real wall-clock time (≈ pre_time). The assertion near the end proves it.
         let pre_time: i64 = std::fs::read_to_string(snapshot_dir.join("pre_time.txt"))
             .unwrap()
@@ -396,18 +396,21 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             "the restored VM must receive a vmid distinct from the held original"
         );
 
-        // This implicitly tests vsock reconnect and CID rotation because the agent
+        // This implicitly tests vsock reconnect and CID rotation because the steward
         // client connects using the restored VM's newly allocated CID. It is also
-        // the first post-restore agent() call, so it carries the one-shot clock
+        // the first post-restore steward() call, so it carries the one-shot clock
         // resync — driven here by the injected FakeClock.
         let log_path = vm.instance().serial_log().to_path_buf();
-        let agent_res = vm.agent(None).await;
-        if agent_res.is_err() {
+        let steward_res = vm.steward(None).await;
+        if steward_res.is_err() {
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
             println!("SERIAL LOG ON ERROR:\n{log}");
-            panic!("Failed to connect to agent: {:?}", agent_res.err().unwrap());
+            panic!(
+                "Failed to connect to steward: {:?}",
+                steward_res.err().unwrap()
+            );
         }
-        let result = agent_res
+        let result = steward_res
             .unwrap()
             .exec(ExecRequest::new(vec![
                 "echo".to_string(),
@@ -433,9 +436,9 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             vmcell::net::ip_math(new_vmid).expect("ip_math for the rotated vmid");
         let expected_gw_hex = format!("{:08X}", u32::from_le_bytes(host_ip.octets()));
         let route = vm
-            .agent(None)
+            .steward(None)
             .await
-            .expect("agent after restore")
+            .expect("steward after restore")
             .exec(ExecRequest::new(vec![
                 "cat".to_string(),
                 "/proc/net/route".to_string(),
@@ -520,7 +523,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             match vm.instance().vsock_endpoint() {
                 // FC: verbatim rebind of the snapshot's baked AF_UNIX vsock path
                 // (`PUT /snapshot/load` re-binds it verbatim; no load-time override exists
-                // in v1.16). The agent reconnect above already proved the rebound transport
+                // in v1.16). The steward reconnect above already proved the rebound transport
                 // functional; a rotated path here would mean FC diverged from its capability.
                 vmcell::vmm::VsockEndpoint::Unix { .. } => {
                     assert_eq!(
@@ -548,7 +551,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
 
         let pre_mac = std::fs::read_to_string(snapshot_dir.join("pre_mac.txt")).unwrap();
         let mac_out = vm
-            .agent(None)
+            .steward(None)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![
@@ -581,12 +584,12 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
             "MAC address should be rotated after restore"
         );
 
-        // TESTS-LIFECYCLE-1: the resync on the first post-restore agent() call set
+        // TESTS-LIFECYCLE-1: the resync on the first post-restore steward() call set
         // the guest clock from the injected FakeClock (≈ pre_time + 1000s), NOT
         // from real wall-clock time. `restored` is already false, so this read does
         // not re-trigger a resync.
         let time_out = vm
-            .agent(None)
+            .steward(None)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec!["date".into(), "+%s".into()]))
@@ -615,7 +618,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // TESTS-LIFECYCLE-2 (reseed isolation): the typed `restore_reseed_applied()`
         // is the failing-capable control — it directly asserts the orchestrator's
         // post-restore reseed command ran and returned exit 0. It is set on the first
-        // post-restore agent() call (already made above). The byte-diff below is
+        // post-restore steward() call (already made above). The byte-diff below is
         // corroboration only: it fails on gross replay, NOT on a skipped reseed,
         // because the reference and post-restore /dev/urandom reads occur at different
         // CRNG stream offsets and differ even without any reseed (M-TEST-1). This
@@ -635,7 +638,7 @@ async fn test_snapshot_restore_impl<V: vmcell::vmm::Vmm>(vmm: &V) {
         // above; the test issues NO reseed of its own.
         let pre_urandom = std::fs::read(snapshot_dir.join("pre_urandom.bin")).unwrap();
         let post_rng = vm
-            .agent(None)
+            .steward(None)
             .await
             .unwrap()
             .exec(ExecRequest::new(vec![

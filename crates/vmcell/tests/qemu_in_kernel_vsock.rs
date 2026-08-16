@@ -1,5 +1,5 @@
 //! Increment-2 gate (design §2.4): a `snapshotting` QEMU VM boots on the **in-kernel
-//! `vhost-vsock`** transport and the host agent round-trips an `exec` over **AF_VSOCK**,
+//! `vhost-vsock`** transport and the host steward round-trips an `exec` over **AF_VSOCK**,
 //! with no external `vhost-device-vsock` daemon.
 //!
 //! This isolates the AF_VSOCK host transport — experiment E3's explicitly *un-run*
@@ -13,9 +13,9 @@
 
 #![cfg(feature = "qemu")]
 
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig, VsockTransport};
 use vmcell::orchestrator::MicroVm;
+use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::{VmInstance, VsockEndpoint};
 use vmcell_qemu::Qemu;
 
@@ -66,16 +66,16 @@ async fn qemu_in_kernel_vsock_boot_and_exec() {
     );
     let serial_path = vm.instance().serial_log().to_path_buf();
 
-    // The load-bearing check: the host agent completes the connect + `Ready` handshake
+    // The load-bearing check: the host steward completes the connect + `Ready` handshake
     // over AF_VSOCK (no `CONNECT`/`OK` prologue) and a real command round-trips.
-    let agent = match vm.agent(None).await {
+    let steward = match vm.steward(None).await {
         Ok(a) => a,
         Err(e) => {
             let log = std::fs::read_to_string(&serial_path).unwrap_or_default();
-            panic!("agent connect over AF_VSOCK failed: {e}\nSERIAL LOG:\n{log}");
+            panic!("steward connect over AF_VSOCK failed: {e}\nSERIAL LOG:\n{log}");
         }
     };
-    let out = agent
+    let out = steward
         .exec(ExecRequest::new(vec![
             "echo".into(),
             "in-kernel-vsock-ok".into(),
@@ -144,14 +144,14 @@ async fn qemu_non_snapshot_in_kernel_vsock_via_transport_knob() {
     );
     let serial_path = vm.instance().serial_log().to_path_buf();
 
-    let agent = match vm.agent(None).await {
+    let steward = match vm.steward(None).await {
         Ok(a) => a,
         Err(e) => {
             let log = std::fs::read_to_string(&serial_path).unwrap_or_default();
-            panic!("agent connect over AF_VSOCK failed: {e}\nSERIAL LOG:\n{log}");
+            panic!("steward connect over AF_VSOCK failed: {e}\nSERIAL LOG:\n{log}");
         }
     };
-    let out = agent
+    let out = steward
         .exec(ExecRequest::new(vec![
             "echo".into(),
             "non-snapshot-in-kernel-ok".into(),

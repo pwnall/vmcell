@@ -396,7 +396,7 @@ fn restored_cid(baked_cid: Option<u32>, fresh_cid: u32) -> u32 {
 ///
 /// The snapshot recorded the original VM's vsock socket and serial/console file paths;
 /// CH (v52) exposes no restore-time override, so they must be rewritten before launch
-/// or the host dials a vsock CH never binds (agent handshake times out) and the serial
+/// or the host dials a vsock CH never binds (steward handshake times out) and the serial
 /// log stays empty. Handles both console wirings: a `Uart` VM records the sink under
 /// `serial.file` (console is `{"mode":"Off"}`), a `VirtioConsole` VM under
 /// `console.file` (serial is `{"mode":"Off"}`). Extracted pure so its edge cases are
@@ -570,7 +570,7 @@ impl CloudHypervisor {
             // no longer exist. CH (v52) exposes no restore-time override for these,
             // so rewrite config.json to point at this restore's freshly-minted paths
             // before launching; otherwise the host connects to a vsock socket CH
-            // never binds (the agent handshake times out) and the serial log stays
+            // never binds (the steward handshake times out) and the serial log stays
             // empty. In-place rewrite is fine for a single-use snapshot; restoring
             // many clones from one snapshot would need a copy-on-write of the
             // snapshot dir first.

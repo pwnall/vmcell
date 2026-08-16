@@ -9,7 +9,7 @@
 //!
 //! Bundling the allocators with the `CgroupFs`, `Clock`, and `OverlayStore` seams gives every spawn
 //! **one** parameter instead of the three-to-five positional injected arguments that grew by one per
-//! feature, removes the per-clone `make_cgroups` closures from the fan-out APIs, and lets `agent()`
+//! feature, removes the per-clone `make_cgroups` closures from the fan-out APIs, and lets `steward()`
 //! drop its clock seam (the post-restore resync reads the clock captured here at construction). This
 //! bundle is directed by design §18 (Delta register: changes from the validated v27 build) (deltas
 //! 1–2) and is the one breaking change of the 0.10 pass.

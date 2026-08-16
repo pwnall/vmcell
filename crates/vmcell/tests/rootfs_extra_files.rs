@@ -29,7 +29,7 @@ const MARKER_MODE: u32 = 0o755;
 /// canonical artifacts dir (M-BIN-6): building at `artifacts_dir()` itself would clobber the image
 /// every other suite boots. Returns the packed image path.
 ///
-/// Mirrors `vmcell oci2-erofs`'s pipeline: resolve pins → guest agent → guest tools → rootfs.
+/// Mirrors `vmcell oci2-erofs`'s pipeline: resolve pins → steward → guest tools → rootfs.
 ///
 /// The staging dir needs no OCI-cache plumbing of its own: the blob cache is sited on
 /// [`oci_cache_dir`](vmcell::artifact::oci_cache_dir) (the artifacts dir), not on the stage's
@@ -45,11 +45,11 @@ async fn pack_rootfs_with_marker(
         .add_stage(Box::new(vmcell::artifact::ResolvePinsStage {
             overlay_file: vmcell::artifact::pins_overlay_path(),
         }))
-        .add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}))
+        .add_stage(Box::new(vmcell::artifact::steward::StewardStage {}))
         .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
         .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
             image_override: None,
-            agent_musl: None,
+            steward_musl: None,
             extra: vec![ExtraFile::new(MARKER_DEST, src, MARKER_MODE)],
         }));
     pipeline
@@ -98,12 +98,12 @@ async fn extra_file_is_present_in_guest_with_its_explicit_mode() {
     .expect("VmConfig");
 
     let mut vm = common::start_vm(&vmm, cfg).await;
-    let agent = vm.agent(None).await.expect("agent");
+    let steward = vm.steward(None).await.expect("steward");
 
     // THE data-plane assertion, and the first exec this guest ever runs: the marker's bytes
     // come back out of the mounted image. A packer that dropped the extra file, packed a
     // different source, or lost it behind the layer merge fails here.
-    let cat = agent
+    let cat = steward
         .exec(vmcell::ExecRequest::new(vec![
             "cat".to_string(),
             MARKER_DEST.to_string(),
@@ -119,7 +119,7 @@ async fn extra_file_is_present_in_guest_with_its_explicit_mode() {
 
     // …and the caller's EXPLICIT mode, not the packer's bin/sbin heuristic (which would say
     // 0o644 for this dest). `stat -c %a` prints the octal permission bits.
-    let stat = agent
+    let stat = steward
         .exec(vmcell::ExecRequest::new(vec![
             "stat".to_string(),
             "-c".to_string(),

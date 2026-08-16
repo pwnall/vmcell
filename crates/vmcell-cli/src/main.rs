@@ -61,7 +61,7 @@ enum RootfsSourceKind {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build the kernel + rootfs + agent + tools artifacts into the artifacts dir.
+    /// Build the kernel + rootfs + steward + tools artifacts into the artifacts dir.
     Build {
         /// Which kernel builder to use for the `vmlinux` seed (§5.4, The guest-kernel contract and the bootstrap seed).
         /// `prebuilt` downloads the seed and `host-make` compiles it here; `in-vm` needs a seed of
@@ -100,14 +100,14 @@ enum Commands {
         /// Output path for the packed erofs rootfs image.
         #[arg(short, long)]
         output: PathBuf,
-        /// Inject this prebuilt static-musl guest agent instead of the default glibc agent
+        /// Inject this prebuilt static-musl steward instead of the default glibc steward
         /// (required for a libc6-less base). Without it, a libc6-less base fails loud.
         #[arg(long)]
-        agent_musl: Option<PathBuf>,
+        steward_musl: Option<PathBuf>,
         /// Compose a downstream file into the image at pack time (repeatable, §4.2 FR-V4):
         /// `dest=/usr/local/bin/acme,src=./acme,mode=0755`. `dest` is absolute, `mode` is
         /// octal permission bits, and neither key may be omitted. A dest vmcell itself owns
-        /// (the guest agent, the CA trust store, `/vmcell-tools`) or a duplicated dest is a
+        /// (the steward, the CA trust store, `/vmcell-tools`) or a duplicated dest is a
         /// hard error, never a silent overwrite. A `,` cannot appear in a path.
         #[arg(long = "inject", value_parser = parse_inject)]
         inject: Vec<vmcell::artifact::rootfs::ExtraFile>,
@@ -161,7 +161,7 @@ enum Commands {
         #[arg(long)]
         tty: bool,
         /// Stream this CLI's stdin into the guest command (an interactive pipe
-        /// session, §3, The control plane: vsock, the host clients, and the guest agent) instead of the default one-shot `/dev/null`
+        /// session, §3, The control plane: vsock, the host clients, and the steward) instead of the default one-shot `/dev/null`
         /// stdin.
         #[arg(long)]
         stdin: bool,
@@ -173,7 +173,7 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Create + boot a fresh micro-VM and confirm its agent is ready, then tear it
+    /// Create + boot a fresh micro-VM and confirm its steward is ready, then tear it
     /// down (a boot smoke test; v15 §9.3, The public API surface).
     Create {
         /// Path to the `vmlinux` direct-boot kernel image.
@@ -394,7 +394,7 @@ fn reject_seed_needing_source_for_build(source: KernelSource) -> vmcell::Result<
 }
 
 /// Assembles the `vmcell build` pipeline's stages in run order: resolved pins, the selected kernel
-/// producer, the guest agent and tools, and the selected rootfs producer (§5.4, The guest-kernel contract and the bootstrap seed; §4.3, The rootfs-construction contract).
+/// producer, the steward and tools, and the selected rootfs producer (§5.4, The guest-kernel contract and the bootstrap seed; §4.3, The rootfs-construction contract).
 ///
 /// Separate from [`dispatch`] so the wiring — including the refusal above — is assertable without
 /// running a build that downloads and compiles for hours.
@@ -415,7 +415,7 @@ fn build_stages(
             overlay_file: pins_overlay(pins),
         }),
         kernel_stage(kernel_source, None, None, cid_alloc.clone())?,
-        Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}),
+        Box::new(vmcell::artifact::steward::StewardStage {}),
         Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}),
         rootfs_stage(rootfs_source, release, cid_alloc),
     ])
@@ -470,7 +470,7 @@ fn rootfs_stage(
         // invocation), so both arms compose nothing.
         RootfsSourceKind::Oci => Box::new(vmcell::artifact::rootfs::RootfsStage {
             image_override: None,
-            agent_musl: None,
+            steward_musl: None,
             extra: Vec::new(),
         }),
         RootfsSourceKind::Mmdebstrap => Box::new(vmcell_rootfs_builder::MmdebstrapRootfsStage {
@@ -512,14 +512,14 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
         Commands::Oci2Erofs {
             image,
             output,
-            agent_musl,
+            steward_musl,
             inject,
             pins,
         } => {
             oci2erofs(
                 image,
                 output,
-                agent_musl.as_deref(),
+                steward_musl.as_deref(),
                 inject,
                 pins.as_deref(),
             )
@@ -683,13 +683,13 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             } else {
                 cmd.clone()
             };
-            // `--tty`/`--stdin` (§3, The control plane: vsock, the host clients, and the guest agent) route through an interactive session
+            // `--tty`/`--stdin` (§3, The control plane: vsock, the host clients, and the steward) route through an interactive session
             // that streams this CLI's stdin; the default path is the one-shot exec.
             let code = if *tty || *stdin {
                 run_interactive_session(&vm, argv, *tty).await?
             } else {
-                let agent = vm.agent(None).await?;
-                let outcome = agent.exec(vmcell::ExecRequest::new(argv)).await?;
+                let steward = vm.steward(None).await?;
+                let outcome = steward.exec(vmcell::ExecRequest::new(argv)).await?;
                 use std::io::Write as _;
                 // Best-effort relay of the guest command's captured output. A broken pipe
                 // (the consumer closed stdout/stderr) must not abort the run or mask the
@@ -721,10 +721,10 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             let disks = extra_disks_from(disk, disk_rw);
             let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &disks, append).await?;
             let vmid = vm.vmid();
-            // Confirm the guest agent handshakes — i.e. the VM actually booted —
+            // Confirm the steward handshakes — i.e. the VM actually booted —
             // before teardown. A failure here is a real error, not a fake success.
-            vm.agent(None).await?;
-            println!("vmcell: VM booted and agent ready (vmid {vmid})");
+            vm.steward(None).await?;
+            println!("vmcell: VM booted and steward ready (vmid {vmid})");
             vm.shutdown().await?;
             Ok(())
         }
@@ -736,8 +736,8 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             mem_mib,
         } => {
             let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &[], &[]).await?;
-            // Bring the agent up so the snapshot captures an agent-ready VM.
-            vm.agent(None).await?;
+            // Bring the steward up so the snapshot captures a steward-ready VM.
+            vm.steward(None).await?;
             std::fs::create_dir_all(out).map_err(vmcell::Error::Io)?;
             vm.snapshot(out).await?;
             println!("vmcell: snapshot written to {}", out.display());
@@ -751,7 +751,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             mem_mib,
         } => {
             let mut vm = ephemeral_vm(kernel, rootfs, *vcpus, *mem_mib, &[], &[]).await?;
-            vm.agent(None).await?;
+            vm.steward(None).await?;
             let usage = vm.usage().await?;
             println!("{}", format_usage_json(&usage));
             vm.shutdown().await?;
@@ -859,7 +859,7 @@ fn validate_oci_digest(digest: &str) -> vmcell::Result<()> {
     Ok(())
 }
 
-/// Runs `argv` in an interactive session (§3, The control plane: vsock, the host clients, and the guest agent), streaming this CLI's
+/// Runs `argv` in an interactive session (§3, The control plane: vsock, the host clients, and the steward), streaming this CLI's
 /// stdin into the guest command and relaying its output, and returns the guest
 /// exit code.
 ///
@@ -875,7 +875,7 @@ async fn run_interactive_session(
 ) -> vmcell::Result<i32> {
     use std::io::Write as _;
     use tokio::io::AsyncReadExt as _;
-    use vmcell::agent::session::{SessionEvent, SessionSpecBuilder};
+    use vmcell::steward::session::{SessionEvent, SessionSpecBuilder};
 
     let mux = vm.connect_sessions(None).await?;
     let mut builder = SessionSpecBuilder::new(argv);
@@ -997,14 +997,14 @@ fn format_usage_json(u: &vmcell::ResourceUsage) -> String {
 ///
 /// The image MUST be digest-pinned (`IMAGE@sha256:DIGEST`): a tag is a §10.2 (The stage model and the five cache-key rules) provenance hard
 /// stop and is rejected up front. A base lacking libc6 fails loud during packing unless
-/// `agent_musl` supplies a static-musl agent (which needs no glibc). The pipeline is the SAME
-/// inject+pack tail as `vmcell build` — verify-every-blob → whiteouts → inject agent/CA/tools
-/// → erofs — only the base image (and the agent) are parameterized, so the runtime stays
+/// `steward_musl` supplies a static-musl steward (which needs no glibc). The pipeline is the SAME
+/// inject+pack tail as `vmcell build` — verify-every-blob → whiteouts → inject steward/CA/tools
+/// → erofs — only the base image (and the steward) are parameterized, so the runtime stays
 /// erofs-only.
 async fn oci2erofs(
     image_ref: &str,
     output: &std::path::Path,
-    agent_musl: Option<&std::path::Path>,
+    steward_musl: Option<&std::path::Path>,
     inject: &[vmcell::artifact::rootfs::ExtraFile],
     pins: Option<&std::path::Path>,
 ) -> vmcell::Result<()> {
@@ -1025,7 +1025,7 @@ async fn oci2erofs(
     // boots. The staging dir is a *distinct sibling* under `artifacts_dir` (same real
     // disk — not the system temp dir, which is often a size-limited tmpfs), so a large
     // rootfs has room. Copy only the final image out to `--output`. Trade-off: the
-    // staging dir has no cache history, so the agent/tools/rootfs stages rebuild.
+    // staging dir has no cache history, so the steward/tools/rootfs stages rebuild.
     let stage_dir =
         vmcell::artifact::artifacts_dir().join(format!("oci2erofs-stage-{}", std::process::id()));
     // Best-effort pre-clean of a stale staging dir from a prior aborted run.
@@ -1035,16 +1035,16 @@ async fn oci2erofs(
             overlay_file: pins_overlay(pins),
         },
     ));
-    // The default glibc agent is built by the pipeline; `--agent-musl` supplies its own
+    // The default glibc steward is built by the pipeline; `--steward-musl` supplies its own
     // prebuilt binary, so the build stage is skipped and the rootfs stage injects it instead.
-    if agent_musl.is_none() {
-        pipeline = pipeline.add_stage(Box::new(vmcell::artifact::guest_agent::GuestAgentStage {}));
+    if steward_musl.is_none() {
+        pipeline = pipeline.add_stage(Box::new(vmcell::artifact::steward::StewardStage {}));
     }
     pipeline = pipeline
         .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
         .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
             image_override: Some((image.to_string(), digest.to_string())),
-            agent_musl: agent_musl.map(std::path::Path::to_path_buf),
+            steward_musl: steward_musl.map(std::path::Path::to_path_buf),
             // The `--inject` files; the pack tail validates them (absolute dest, explicit
             // mode, no vmcell-owned or duplicated dest — §4.2, invariant F5).
             extra: inject.to_vec(),
@@ -1332,13 +1332,7 @@ mod tests {
                 let names: Vec<&str> = stages.iter().map(|s| s.name()).collect();
                 assert_eq!(
                     names,
-                    [
-                        "resolve_pins",
-                        "kernel",
-                        "guest_agent",
-                        "guest_tools",
-                        "rootfs"
-                    ],
+                    ["resolve_pins", "kernel", "steward", "guest_tools", "rootfs"],
                     "the `build` pipeline's stage roster ({} + {rootfs:?})",
                     kernel_source_name(source)
                 );

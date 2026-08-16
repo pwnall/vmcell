@@ -24,5 +24,5 @@ disallowed-types = [
 # trade and bury ~10 intentional sites under per-site allows — the trade stays visible in code instead.
 disallowed-methods = [
     { path = "std::env::set_var", reason = "unsafe in 2024 and process-global; if truly needed, call before any threads start with a // SAFETY note" },
-    { path = "std::process::exit", reason = "skips Drop-based ordered teardown; return from main instead. The PID-1 guest agent must never exit at all (§12.6) — per-site allow with rationale if a bin truly requires it" },
+    { path = "std::process::exit", reason = "skips Drop-based ordered teardown; return from main instead. The PID-1 steward must never exit at all (§12.6) — per-site allow with rationale if a bin truly requires it" },
 ]

@@ -50,7 +50,7 @@ use tokio::process::Child;
 /// Firecracker's `PUT /snapshot/load` restores the vsock device *verbatim* from
 /// the snapshot — it rebinds the **original** host UDS path and offers no
 /// load-time override. A restore therefore runs under a fresh, vmid-derived tmp
-/// dir but must rebind (and have the agent dial) the path the snapshot recorded,
+/// dir but must rebind (and have the steward dial) the path the snapshot recorded,
 /// and report the guest's baked CID. This sidecar carries both across the
 /// snapshot/restore boundary.
 const HOST_PATHS_SIDECAR: &str = "vmcell_host_paths.json";
@@ -76,8 +76,8 @@ fn fc_capabilities() -> VmmCapabilities {
     VmmCapabilities {
         // E2 (empirical, KVM host, pre-v17): FC warm restore used to drop the first
         // post-restore exec ("Connection dropped during exec"). That symptom predated
-        // the guest agent's generic re-bind-after-restore loop (REBIND_IDLE 250 ms,
-        // cmdline-tunable, now event-driven poll(2)) and the native in-agent resync —
+        // the steward's generic re-bind-after-restore loop (REBIND_IDLE 250 ms,
+        // cmdline-tunable, now event-driven poll(2)) and the native in-steward resync —
         // re-validated ON (EXP-E, docs/45-claude-perf-investigation.md): the full
         // snapshot_restore::firecracker matrix assertion set (post-restore exec,
         // native MAC rotation, reseed, fail-loud clock resync, ordered teardown)
@@ -158,7 +158,7 @@ async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, cid: u32) -> Result<
 /// removed or FC's bind fails `EADDRINUSE`. But a socket that still **accepts a
 /// connection** means a live VMM — the snapshotted VM or a prior restore of the
 /// same lineage — still owns it; unlinking it would silently sever that VM's
-/// agent transport. So: if the path exists, probe it with a short-timeout
+/// steward transport. So: if the path exists, probe it with a short-timeout
 /// connect and fail loud with a typed `Error::Vmm` naming the path when a
 /// listener answers. Only a dead path (ECONNREFUSED / ENOENT / timeout) proceeds
 /// to `remove_file` + `create_dir_all(parent)` — the parent re-creation matters
@@ -938,7 +938,7 @@ impl Vmm for Firecracker {
         }
 
         // Configure the entropy device (virtio-rng -> guest /dev/hwrng). The
-        // guest agent's post-restore CSPRNG reseed reads 32 bytes of /dev/hwrng
+        // steward's post-restore CSPRNG reseed reads 32 bytes of /dev/hwrng
         // into /dev/urandom (design §8.2, Restore correctness: a restored VM is not a fresh VM); CH always carries an rng device, but
         // FC only attaches one when explicitly configured — without it the
         // restored guest replays the snapshot-frozen entropy pool and the resync
@@ -1033,7 +1033,7 @@ impl Vmm for Firecracker {
         let instance = FcInstance {
             process,
             api_socket,
-            // Adopt the snapshot's vsock path so the agent dials the exact UDS FC
+            // Adopt the snapshot's vsock path so the steward dials the exact UDS FC
             // recreates verbatim on load (no load-time override). Serial is the
             // opposite: FC writes it to the FRESH `spawn_fc` stdout redirect
             // (`res.tmp_dir/serial.log`), NOT the snapshot's baked serial path — so
@@ -2309,7 +2309,7 @@ mod tests {
     // still-in-use `Error::Vmm` naming the path — and the live socket must
     // SURVIVE. The buggy inverse — a guard that skips the connect probe and
     // unlinks unconditionally (the pre-guard `remove_file` + `create_dir_all`) —
-    // returns `Ok` and severs the live VM's agent transport, reddening both
+    // returns `Ok` and severs the live VM's steward transport, reddening both
     // live-listener assertions (verified red). The stale-file and missing-file
     // arms pin the cleanup contract the happy restore path depends on.
     #[tokio::test]

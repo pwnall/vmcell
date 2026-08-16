@@ -26,11 +26,11 @@ printf 'fn boot() { std::process::Command::new("/sbin/ip"); }\n' > "$work/src/pa
 printf 'fn boot() { Command::new("sh").arg("-c").arg("ip link set eth0 up"); }\n' > "$work/src/sh_cmd_ip.rs"
 printf 'fn boot() { Command::new("sh").arg("-c").arg("/sbin/ip addr add 10.0.0.2/30 dev eth0"); }\n' > "$work/src/sh_cmd_slash_ip.rs"
 
-# --- MUST NOT be flagged: legitimate agent code + false-positive guards -------------------
-# The agent's real, legitimate dynamic exec of a host-supplied argv[0].
+# --- MUST NOT be flagged: legitimate steward code + false-positive guards -------------------
+# The steward's real, legitimate dynamic exec of a host-supplied argv[0].
 printf 'fn exec(req: &Req) { let mut c = Command::new(&req.argv[0]); }\n' > "$work/src/dynamic_argv.rs"
 # A comment mentioning "ip" must be stripped before analysis (no false positive).
-printf '// the agent never runs "ip"; the kernel ip= cmdline configures eth0.\nfn f() {}\n' > "$work/src/comment_ip.rs"
+printf '// the steward never runs "ip"; the kernel ip= cmdline configures eth0.\nfn f() {}\n' > "$work/src/comment_ip.rs"
 # Substrings that merely contain the letters ip must not trip the exact-literal match.
 printf 'fn f() { let _ = ["skip", "gossip", "zip"]; let _ = "recipient"; }\n' > "$work/src/substrings.rs"
 # A different binary is fine.

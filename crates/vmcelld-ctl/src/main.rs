@@ -59,7 +59,7 @@ enum Command {
         #[command(subcommand)]
         op: ArtifactOp,
     },
-    /// Create a VM and keep it (boot to agent-ready).
+    /// Create a VM and keep it (boot to steward-ready).
     Create {
         /// Kernel artifact name.
         #[arg(long)]

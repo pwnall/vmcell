@@ -235,14 +235,14 @@ const CONSUMER_POSITION_CHILD: &str = "resolve_pins_in_the_consumer_position";
 
 // §10.4 GATE (delta 3, F1): the toolkit's Stage 0 must RUN from the position the contract
 // advertises. `build_labelled_kernel` assembles `ResolvePinsStage → KernelStage`, and
-// `ResolvePinsStage` used to hash the guest-agent source closure out of the vmcell tree
+// `ResolvePinsStage` used to hash the steward source closure out of the vmcell tree
 // unconditionally — so every git-dep consumer died before any kernel work with
-// "guest-agent binary source missing at <their-workspace>/crates/vmcell-guest-agent/src/main.rs".
+// "steward binary source missing at <their-workspace>/crates/vmcell-steward/src/main.rs".
 // No in-process test can see that: `CARGO_MANIFEST_DIR` and the CWD are process-global and both
 // point INTO the checkout under cargo. So this re-execs THIS test binary with
 // `CARGO_MANIFEST_DIR` cleared and its CWD outside the checkout, and fails with the child's own
 // output when the child fails.
-// RED on the inverse (restore `guest_agent_closure_hash(&workspace_root())?` in
+// RED on the inverse (restore `steward_closure_hash(&workspace_root())?` in
 // `ResolvePinsStage::run`): the child exits non-zero with that exact message and this test prints
 // it.
 #[test]
@@ -271,7 +271,7 @@ fn resolve_pins_runs_outside_the_vmcell_source_tree() {
 // The two halves of the gate above, in ONE test so neither position can rot alone. Which half runs
 // is decided by `$CONSUMER_POSITION`, which only the parent's re-exec sets:
 //   * set   — the consumer position: `ResolvePinsStage::run` must SUCCEED and must not carry the
-//             rootfs-lineage `guest_agent_src_hash` pin (there is no agent source to hash).
+//             rootfs-lineage `steward_src_hash` pin (there is no steward source to hash).
 //   * unset — a direct run under cargo/nextest, i.e. inside this checkout: the POSITIVE CONTROL
 //             that the closure really is folded here, so the absence above is the predicate
 //             answering, not the pin quietly disappearing everywhere.
@@ -294,17 +294,17 @@ async fn resolve_pins_in_the_consumer_position() {
         outputs.pins.contains_key("kernel_source_url"),
         "the `kernel_*` pins the labelled-kernel build reads must travel in both positions"
     );
-    let agent_pin = outputs.pins.get("guest_agent_src_hash");
+    let steward_pin = outputs.pins.get("steward_src_hash");
     if std::env::var_os(CONSUMER_POSITION).is_some() {
         assert_eq!(
-            agent_pin, None,
-            "outside a vmcell checkout the agent pin must be absent, not fabricated"
+            steward_pin, None,
+            "outside a vmcell checkout the steward pin must be absent, not fabricated"
         );
     } else {
         assert!(
-            agent_pin.is_some_and(|h| !h.is_empty()),
-            "positive control: inside the checkout the agent source closure IS folded \
-             (H-CACHE-1); got {agent_pin:?}"
+            steward_pin.is_some_and(|h| !h.is_empty()),
+            "positive control: inside the checkout the steward source closure IS folded \
+             (H-CACHE-1); got {steward_pin:?}"
         );
     }
 }

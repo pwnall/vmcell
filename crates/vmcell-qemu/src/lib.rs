@@ -75,7 +75,7 @@ pub struct QemuInstance {
     _fs_daemons: Vec<vmcell::fs::VirtioFsDaemon>,
     _vsock_daemon: Option<Child>,
     cid: u32,
-    /// How the host reaches this VM's guest agent (returned by
+    /// How the host reaches this VM's steward (returned by
     /// [`VmInstance::vsock_endpoint`]): AF_VSOCK for a snapshot-eligible in-kernel
     /// vsock VM, AF_UNIX for the external-daemon default.
     endpoint: VsockEndpoint,
@@ -448,7 +448,7 @@ impl QemuInstance {
 ///
 /// The external daemon is QEMU's unprivileged control plane (§2.4, QEMU q35 — the fallback and most-proven nester). A missing or broken
 /// `vhost-device-vsock` binary is a loud misconfiguration that must surface here — the
-/// old silent `.ok()` fallback only re-emerged later as an opaque agent-handshake
+/// old silent `.ok()` fallback only re-emerged later as an opaque steward-handshake
 /// timeout, violating the "checked before a timeout masks it" rule (M-VMM-2).
 fn require_vsock_daemon(spawn_result: std::io::Result<Child>) -> Result<Child> {
     spawn_result.map_err(|e| {
@@ -516,7 +516,7 @@ struct SpawnedQemu {
     /// The effective guest CID the vsock device was bound to (the baked CID on a
     /// restore, `res.guest_cid` on create).
     cid: u32,
-    /// How the host reaches this VM's guest agent — AF_VSOCK (in-kernel vsock) or
+    /// How the host reaches this VM's steward — AF_VSOCK (in-kernel vsock) or
     /// AF_UNIX (external daemon).
     endpoint: VsockEndpoint,
     /// `config_has_vhost_user_device(cfg, res)` at spawn — threaded to `snapshot()`'s
@@ -726,7 +726,7 @@ struct SpawnParams {
 struct QemuSpawnPaths<'a> {
     /// The QMP control socket QEMU serves (`-qmp unix:…`).
     qmp_socket: &'a Path,
-    /// The AF_UNIX path the *host* dials for the guest agent on the external-daemon
+    /// The AF_UNIX path the *host* dials for the steward on the external-daemon
     /// transport. Not in the argv — `vhost-device-vsock`'s `--uds-path` — but carried
     /// here so the spawn tail can name it once.
     vsock_path: &'a Path,
@@ -796,7 +796,7 @@ impl Qemu {
 
             // A spawn failure (e.g. a missing/broken binary) fails loud and typed here
             // — it does NOT silently degrade to the in-kernel vsock, which would mask a
-            // daemon misconfiguration as a later agent-handshake timeout (M-VMM-2).
+            // daemon misconfiguration as a later steward-handshake timeout (M-VMM-2).
             let mut vsock_daemon = require_vsock_daemon(
                 tokio::process::Command::from(std_vsock_cmd)
                     .stdin(Stdio::null())
@@ -1216,17 +1216,17 @@ async fn finish_qemu_spawn(
         None => (None, None),
     };
 
-    // How the host reaches this VM's guest agent: in-kernel vsock is dialed by CID
+    // How the host reaches this VM's steward: in-kernel vsock is dialed by CID
     // over AF_VSOCK; the external daemon bridges to the AF_UNIX `vsock.sock`.
     let endpoint = if params.in_kernel_vsock {
         VsockEndpoint::Vsock {
             cid: params.guest_cid,
-            port: vmcell::vmm::AGENT_VSOCK_PORT,
+            port: vmcell::vmm::STEWARD_VSOCK_PORT,
         }
     } else {
         VsockEndpoint::Unix {
             path: paths.vsock_path.to_path_buf(),
-            port: vmcell::vmm::AGENT_VSOCK_PORT,
+            port: vmcell::vmm::STEWARD_VSOCK_PORT,
         }
     };
 
@@ -1513,7 +1513,7 @@ impl VmInstance for QemuInstance {
 
         // pause → migrate-to-file → poll `completed` → resume the source. Mirrors the
         // CH/FC snapshot order (§8.1, The warm-snapshot path and the eligibility law); the orchestrator's `MicroVm::snapshot`
-        // invalidates the cached agent client afterward, which covers QEMU's
+        // invalidates the cached steward client afterward, which covers QEMU's
         // pause/migrate severing the vsock connection.
         self.qmp_command_checked("{\"execute\": \"stop\"}").await?;
 
@@ -1556,13 +1556,13 @@ impl VmInstance for QemuInstance {
         &self.serial_path
     }
 
-    /// Probes QEMU's external `vhost-device-vsock` data path by doing the real agent
+    /// Probes QEMU's external `vhost-device-vsock` data path by doing the real steward
     /// handshake with a bounded budget (reusing the one connect/handshake law, so the
     /// `CONNECT`/`OK`/`Ready` protocol lives in exactly one place). A healthy boot
     /// binds its guest listener and answers `Ready` in well under the budget; a
     /// wedged vhost-user bring-up never answers, so this returns `Timeout` and the
     /// orchestrator re-spawns (see the trait doc). The probe client is dropped — the
-    /// caller's lazy `agent()` reconnects, which the guest re-accepts on its still
+    /// caller's lazy `steward()` reconnects, which the guest re-accepts on its still
     /// bound listener.
     ///
     /// The in-kernel `vhost-vsock` transport (snapshot-eligible VMs) has no
@@ -1581,7 +1581,7 @@ impl VmInstance for QemuInstance {
         let serial = vmcell::vmm::RealSerialLog {
             path: self.serial_path.clone(),
         };
-        vmcell::agent::AgentClient::connect_endpoint(&self.endpoint, budget, timeouts, &serial)
+        vmcell::steward::StewardClient::connect_endpoint(&self.endpoint, budget, timeouts, &serial)
             .await
             .map(|_client| ())
     }

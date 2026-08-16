@@ -14,9 +14,9 @@ use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 
 use vmcell::MicroVm;
-use vmcell::agent::protocol::ExecRequest;
 use vmcell::config::{Egress, NetConfig, RootfsSource, VmConfig};
 use vmcell::net::NetSegment;
+use vmcell::steward::protocol::ExecRequest;
 use vmcell::vmm::Vmm;
 
 mod common;
@@ -98,8 +98,8 @@ fn segid_lock_path(segid: u32) -> std::path::PathBuf {
 /// Used for members *and* for the off-segment control, so the negative leg's dialer has a positive
 /// control it passes itself.
 async fn start_echo_server<V: Vmm>(vm: &mut MicroVm<V>) {
-    let agent = vm.agent(None).await.expect("agent for the echo server");
-    let started = agent
+    let steward = vm.steward(None).await.expect("steward for the echo server");
+    let started = steward
         .exec(ExecRequest::new(vec![
             "sh".into(),
             "-c".into(),
@@ -135,11 +135,11 @@ async fn start_member<V: Vmm>(vmm: &V, segment: &NetSegment, env: &vmcell::HostE
         .clone();
     assert_eq!(membership.netns, segment.netns_name());
 
-    let agent = vm.agent(None).await.expect("member agent");
+    let steward = vm.steward(None).await.expect("member steward");
     // Prove the guest actually took the address the `ip=` token carried, from the shared math —
     // not a proxy signal like "the exec succeeded".
     let (gateway, guest_ip, _) = membership.addresses().expect("segment addresses");
-    let addrs = agent
+    let addrs = steward
         .exec(ExecRequest::new(vec![
             "/vmcell-tools/ip".into(),
             "addr".into(),
@@ -183,8 +183,8 @@ async fn echo_probe<V: Vmm>(
     port: u16,
     payload: &str,
 ) -> (i32, String) {
-    let agent = vm.agent(None).await.expect("agent for the echo probe");
-    let out = agent
+    let steward = vm.steward(None).await.expect("steward for the echo probe");
+    let out = steward
         .exec(ExecRequest::new(echo_probe_cmd(addr, port, payload)))
         .await
         .expect("the echo probe must run");

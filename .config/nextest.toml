@@ -16,7 +16,7 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # Retry the VM-booting integration tests. These boot real Cloud Hypervisor / Firecracker / QEMU
 # guests and talk to them over vsock; under the full serialized suite (many back-to-back boots)
 # the CH hybrid-vsock control connection *intermittently* resets mid-exchange — the guest logs
-# `handle_connection error: failed to fill whole buffer`, the host sees `Agent … timed out`. It is
+# `handle_connection error: failed to fill whole buffer`, the host sees `Steward … timed out`. It is
 # environmental, NOT a code regression: it reproduces on the pre-optimization baseline too and every
 # affected test passes 3/3 in isolation (bisected 2026-07-02; see
 # docs/historical/44-claude-perf-experiments.md, "Flake investigation").

@@ -1,4 +1,4 @@
-//! Guest agent running as PID 1 inside the microvm.
+//! Steward running as PID 1 inside the microvm.
 //!
 //! No crate-level `forbid(unsafe_code)`: PID-1 setup issues raw mount/syscall FFI. The unsafe
 //! surface is audited via `undocumented_unsafe_blocks` + `unsafe_op_in_unsafe_fn`. The
@@ -47,10 +47,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use vmcell_guest_agent::{ReaperCoordinator, exit_code_from_termination, netif};
 use vmcell_protocol::{
     self as protocol, ExecRequest, MAX_FRAME_BYTES, Message, SessionId, SessionSpec,
 };
+use vmcell_steward::{ReaperCoordinator, exit_code_from_termination, netif};
 use vsock::{VsockAddr, VsockListener, VsockStream};
 
 /// The single per-connection writer (§13, Cross-cutting invariants): every frame — the initial `Ready`,
@@ -62,7 +62,7 @@ use vsock::{VsockAddr, VsockListener, VsockStream};
 type Writer = Arc<Mutex<VsockStream>>;
 
 /// The per-connection session table: `SessionId` → its live [`SessionHandle`]
-/// (§3, The control plane: vsock, the host clients, and the guest agent). The dispatch loop inserts on `OpenSession` and looks up on
+/// (§3, The control plane: vsock, the host clients, and the steward). The dispatch loop inserts on `OpenSession` and looks up on
 /// `Stdin`/`Winsize`/`CloseSession`; each session's waiter thread removes its own
 /// entry on exit; connection teardown drains and kills whatever is left (§13, Cross-cutting invariants).
 type Sessions = Arc<Mutex<HashMap<SessionId, SessionHandle>>>;
@@ -80,7 +80,7 @@ fn drain_zombies(reaper: &ReaperCoordinator) {
     // `drain_reaped`) so a fork that reuses a just-freed pid cannot `reserve` it
     // *between* the reap and the record — closing the residual PID-reuse race
     // where a stale grandchild status is stamped past the reservation epoch and
-    // mis-delivered as the reused child's exit (AGENT-1, §3.4, The guest: vmcell-guest-agent as PID 1).
+    // mis-delivered as the reused child's exit (AGENT-1, §3.4, The guest: vmcell-steward as PID 1).
     reaper.drain_reaped(|| match wait(WaitOptions::NOHANG) {
         Ok(Some((pid, status))) => {
             let pid = pid.as_raw_nonzero().get().cast_unsigned();
@@ -167,18 +167,18 @@ fn parse_ms(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    tracing::info!("vmcell-guest-agent: starting");
+    tracing::info!("vmcell-steward: starting");
 
     // Mount setup. `/sys` is NOT in the fatal core-mount set ({tmpfs /mnt, overlay,
-    // /proc, /dev} — FOUR mounts, §3.4, The guest: vmcell-guest-agent as PID 1;
+    // /proc, /dev} — FOUR mounts, §3.4, The guest: vmcell-steward as PID 1;
     // earlier revisions of this comment listed three and understated their own code):
     // its *mount* failure is tolerated below (:127-138), so its
     // mount-point creation must be tolerated too — a fatal `?` here would
-    // kernel-panic PID 1 ("Attempted to kill init") on a policy the agent
+    // kernel-panic PID 1 ("Attempted to kill init") on a policy the steward
     // otherwise treats as best-effort (AGENT-6).
     if let Err(e) = std::fs::create_dir_all("/sys") {
         tracing::warn!(
-            "vmcell-guest-agent: could not create /sys mount point: {}; continuing (sysfs is not a fatal core mount)",
+            "vmcell-steward: could not create /sys mount point: {}; continuing (sysfs is not a fatal core mount)",
             e
         );
     }
@@ -192,10 +192,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MountFlags::empty(),
         None::<&core::ffi::CStr>,
     ) {
-        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): failure returns Err and kernel-panics PID 1, so
+        // Fatal core mount (§3.4, The guest: vmcell-steward as PID 1): failure returns Err and kernel-panics PID 1, so
         // log it at error — louder than the tolerated best-effort failures (sysfs,
         // shares, loopback) that log at warn (N-GUEST-1: the levels were inverted).
-        tracing::error!("vmcell-guest-agent: mount tmpfs failed: {}", e);
+        tracing::error!("vmcell-steward: mount tmpfs failed: {}", e);
         return Err(e.into());
     }
     std::fs::create_dir_all("/mnt/upper")?;
@@ -209,20 +209,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MountFlags::empty(),
         Some(c"lowerdir=/,upperdir=/mnt/upper,workdir=/mnt/work"),
     ) {
-        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
-        tracing::error!("vmcell-guest-agent: overlay failed: {}", e);
+        // Fatal core mount (§3.4, The guest: vmcell-steward as PID 1): error level (N-GUEST-1).
+        tracing::error!("vmcell-steward: overlay failed: {}", e);
         return Err(e.into());
     }
 
     if let Err(e) = std::env::set_current_dir("/mnt/rootfs") {
-        tracing::error!("vmcell-guest-agent: failed to chdir to /mnt/rootfs: {}", e);
+        tracing::error!("vmcell-steward: failed to chdir to /mnt/rootfs: {}", e);
         return Err(e.into());
     }
     std::fs::create_dir_all("oldroot")?;
 
     if let Err(e) = pivot_root(".", "oldroot") {
-        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
-        tracing::error!("vmcell-guest-agent: pivot_root failed: {}", e);
+        // Fatal core mount (§3.4, The guest: vmcell-steward as PID 1): error level (N-GUEST-1).
+        tracing::error!("vmcell-steward: pivot_root failed: {}", e);
         return Err(e.into());
     }
     // The `else` is unnecessary after the early `return Err` above (N-GUEST-1):
@@ -235,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_dir_all("oldroot")?;
 
     // /sys is NOT part of the fatal core-mount set — that set is EXACTLY the FOUR
-    // mounts {tmpfs /mnt, overlay, /proc, /dev} (§3.4, The guest: vmcell-guest-agent
+    // mounts {tmpfs /mnt, overlay, /proc, /dev} (§3.4, The guest: vmcell-steward
     // as PID 1); the tmpfs at :186-198 returns Err like the other three. The vsock control plane, the
     // overlay/pivot_root sequence, and restore-path MAC rotation (ioctls) do not
     // require sysfs, so a failed sysfs mount is logged and tolerated like the
@@ -249,7 +249,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None::<&core::ffi::CStr>,
     ) {
         tracing::warn!(
-            "vmcell-guest-agent: sysfs mount failed: {}; continuing without /sys",
+            "vmcell-steward: sysfs mount failed: {}; continuing without /sys",
             e
         );
     }
@@ -260,8 +260,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MountFlags::empty(),
         None::<&core::ffi::CStr>,
     ) {
-        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
-        tracing::error!("vmcell-guest-agent: proc failed: {}", e);
+        // Fatal core mount (§3.4, The guest: vmcell-steward as PID 1): error level (N-GUEST-1).
+        tracing::error!("vmcell-steward: proc failed: {}", e);
         return Err(e.into());
     }
     if let Err(e) = mount(
@@ -271,15 +271,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MountFlags::empty(),
         None::<&core::ffi::CStr>,
     ) {
-        // Fatal core mount (§3.4, The guest: vmcell-guest-agent as PID 1): error level (N-GUEST-1).
-        tracing::error!("vmcell-guest-agent: devtmpfs failed: {}", e);
+        // Fatal core mount (§3.4, The guest: vmcell-steward as PID 1): error level (N-GUEST-1).
+        tracing::error!("vmcell-steward: devtmpfs failed: {}", e);
         return Err(e.into());
     }
 
-    // devpts at /dev/pts powers interactive PTY sessions (§3, The control plane: vsock, the host clients, and the guest agent):
+    // devpts at /dev/pts powers interactive PTY sessions (§3, The control plane: vsock, the host clients, and the steward):
     // `/dev/ptmx` allocates a master and `ptsname` resolves the slave under
     // /dev/pts. Best-effort and NOT in the fatal core-mount set {tmpfs /mnt, overlay,
-    // /proc, /dev} (§3.4, The guest: vmcell-guest-agent as PID 1) — only PTY *sessions* need it (they fail loud with
+    // /proc, /dev} (§3.4, The guest: vmcell-steward as PID 1) — only PTY *sessions* need it (they fail loud with
     // `SessionExit(127)` if it is absent); one-shot exec, pipe sessions, and the
     // vsock control plane do not. So a failure is logged and tolerated like the
     // sysfs/share/loopback mounts (returning Err from PID 1 kernel-panics the
@@ -287,7 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `gid=5,mode=620,ptmxmode=666` gives the usual /dev/pts semantics.
     if let Err(e) = std::fs::create_dir_all("/dev/pts") {
         tracing::warn!(
-            "vmcell-guest-agent: could not create /dev/pts mount point: {}; PTY sessions unavailable",
+            "vmcell-steward: could not create /dev/pts mount point: {}; PTY sessions unavailable",
             e
         );
     } else if let Err(e) = mount(
@@ -298,7 +298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(c"gid=5,mode=620,ptmxmode=666"),
     ) {
         tracing::warn!(
-            "vmcell-guest-agent: devpts mount failed: {}; PTY sessions unavailable (pipe sessions and exec unaffected)",
+            "vmcell-steward: devpts mount failed: {}; PTY sessions unavailable (pipe sessions and exec unaffected)",
             e
         );
     }
@@ -306,7 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Mount the virtio-fs shares the host configured, decoded from the kernel
     // command line (`vmcell_share=<tag>:<guest_path>:<ro|rw>` tokens emitted by
     // `config::push_share_args`). Tags are caller-defined, not built into the
-    // agent (§4.5, Shared directories (virtio-fs)): the agent honours whatever `VmConfig.shares` specified rather
+    // steward (§4.5, Shared directories (virtio-fs)): the steward honours whatever `VmConfig.shares` specified rather
     // than a hardcoded `imp-*` list. A share is optional — a config may attach
     // none (the benchmark / exec-only paths do), and virtiofsd may not be attached
     // for a declared tag, so a failed mount is logged and skipped, never
@@ -321,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         if let Err(e) = std::fs::create_dir_all(&mount_point) {
             tracing::warn!(
-                "vmcell-guest-agent: could not create mount point {}: {}; skipping share",
+                "vmcell-steward: could not create mount point {}: {}; skipping share",
                 mount_point,
                 e
             );
@@ -341,13 +341,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None::<&core::ffi::CStr>,
         ) {
             tracing::warn!(
-                "vmcell-guest-agent: optional virtiofs share {} not attached: {}; continuing",
+                "vmcell-steward: optional virtiofs share {} not attached: {}; continuing",
                 tag,
                 e
             );
         } else {
             tracing::info!(
-                "vmcell-guest-agent: mounted virtiofs {} at {} ({})",
+                "vmcell-steward: mounted virtiofs {} at {} ({})",
                 tag,
                 mount_point,
                 if read_only { "ro" } else { "rw" }
@@ -363,7 +363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // failure is logged and tolerated (returning `Err` from PID 1 would panic).
     if let Err(e) = netif::set_loopback_up() {
         tracing::warn!(
-            "vmcell-guest-agent: loopback bring-up failed: {}; continuing without lo",
+            "vmcell-steward: loopback bring-up failed: {}; continuing without lo",
             e
         );
     }
@@ -385,10 +385,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         false
     };
     if vsock_ok {
-        tracing::info!("vmcell-guest-agent: boot self-check: AF_VSOCK transport available");
+        tracing::info!("vmcell-steward: boot self-check: AF_VSOCK transport available");
     } else {
         tracing::error!(
-            "vmcell-guest-agent: boot self-check: AF_VSOCK unavailable ({}); the vsock control plane will not come up",
+            "vmcell-steward: boot self-check: AF_VSOCK unavailable ({}); the vsock control plane will not come up",
             std::io::Error::last_os_error()
         );
     }
@@ -396,10 +396,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let virtiofs_supported = std::fs::read_to_string("/proc/filesystems")
         .is_ok_and(|contents| contents.contains("virtiofs"));
     if virtiofs_supported {
-        tracing::info!("vmcell-guest-agent: boot self-check: virtiofs filesystem supported");
+        tracing::info!("vmcell-steward: boot self-check: virtiofs filesystem supported");
     } else {
         tracing::warn!(
-            "vmcell-guest-agent: boot self-check: virtiofs not advertised in /proc/filesystems"
+            "vmcell-steward: boot self-check: virtiofs not advertised in /proc/filesystems"
         );
     }
 
@@ -466,7 +466,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // reap on a timer instead of leaving zombies unreaped. PID 1 must
             // never exit on a recoverable condition.
             tracing::error!(
-                "vmcell-guest-agent: SIGCHLD registration failed: {}; falling back to a polling reaper",
+                "vmcell-steward: SIGCHLD registration failed: {}; falling back to a polling reaper",
                 e
             );
             let term = Arc::new(AtomicBool::new(false));
@@ -477,7 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // poll loop below will never observe SIGTERM. Log it — teardown
                 // force-kills the VMM group anyway, so PID 1 must not exit on this.
                 tracing::warn!(
-                    "vmcell-guest-agent: SIGTERM flag registration failed in degraded reaper: {}; relying on teardown force-kill",
+                    "vmcell-steward: SIGTERM flag registration failed in degraded reaper: {}; relying on teardown force-kill",
                     e
                 );
             }
@@ -492,7 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // returning init kernel-panics the guest ("Attempted to kill init"), which
     // the host then flags via `contains_panic()`. On SIGTERM (normal teardown
     // signals the guest before force-killing the VMM group) perform an orderly
-    // power-off instead of falling out of `main` (AGENT-2, §3.4, The guest: vmcell-guest-agent as PID 1).
+    // power-off instead of falling out of `main` (AGENT-2, §3.4, The guest: vmcell-steward as PID 1).
     power_off_never_returns()
 }
 
@@ -503,7 +503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// failure (e.g. a missing `CAP_SYS_BOOT`); in that case it parks forever so
 /// PID 1 still never exits.
 fn power_off_never_returns() -> ! {
-    tracing::info!("vmcell-guest-agent: received SIGTERM; powering off");
+    tracing::info!("vmcell-steward: received SIGTERM; powering off");
     // SAFETY: `sync(2)` takes no arguments and no pointers — flush filesystem buffers before reboot.
     unsafe {
         libc::sync();
@@ -514,7 +514,7 @@ fn power_off_never_returns() -> ! {
         libc::reboot(libc::RB_POWER_OFF);
     }
     tracing::error!(
-        "vmcell-guest-agent: power-off failed ({}); parking so PID 1 never exits",
+        "vmcell-steward: power-off failed ({}); parking so PID 1 never exits",
         std::io::Error::last_os_error()
     );
     loop {
@@ -522,7 +522,7 @@ fn power_off_never_returns() -> ! {
     }
 }
 
-/// vsock control-plane port the host's `AgentClient` connects to.
+/// vsock control-plane port the host's `StewardClient` connects to.
 const VSOCK_PORT: u32 = 5000;
 /// Compiled **default** recovery cadence for the vsock control plane, used when
 /// the host does not emit `vmcell_accept_poll_ms=` on the cmdline (§5.3, The kernel command line).
@@ -555,14 +555,14 @@ fn bind_vsock_listener() -> Option<VsockListener> {
         Ok(listener) => {
             if let Err(e) = listener.set_nonblocking(true) {
                 tracing::warn!(
-                    "vmcell-guest-agent: vsock set_nonblocking failed: {}; cannot poll for re-bind",
+                    "vmcell-steward: vsock set_nonblocking failed: {}; cannot poll for re-bind",
                     e
                 );
             }
             Some(listener)
         }
         Err(e) => {
-            tracing::error!("vmcell-guest-agent: failed to bind vsock: {}", e);
+            tracing::error!("vmcell-steward: failed to bind vsock: {}", e);
             None
         }
     }
@@ -719,9 +719,9 @@ fn serve_connection_logged(stream: VsockStream, reaper: &Arc<ReaperCoordinator>)
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
         if clean_eof {
-            tracing::info!("vmcell-guest-agent: host closed the connection");
+            tracing::info!("vmcell-steward: host closed the connection");
         } else {
-            tracing::error!("vmcell-guest-agent: handle_connection error: {}", e);
+            tracing::error!("vmcell-steward: handle_connection error: {}", e);
         }
     }
 }
@@ -768,7 +768,7 @@ fn dispatch_connection(
 /// `sleep(accept_poll)` (a mean ~half-interval of added latency on *every*
 /// connect), the loop blocks in `poll(2)` on the listener fd for `POLLIN` with
 /// the **remaining re-bind window** as the timeout, so a host connection wakes
-/// the agent sub-millisecond while the idle window still elapses exactly as
+/// the steward sub-millisecond while the idle window still elapses exactly as
 /// before. The deadline is `Instant`-based ([`remaining_idle`]) and only a real
 /// accept restarts it ([`next_deadline`]); `EINTR` and spurious wakeups re-poll
 /// with the recomputed remainder. `accept_poll` paces only failure recovery (see
@@ -788,7 +788,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
             std::thread::sleep(accept_poll);
             continue;
         };
-        tracing::info!("vmcell-guest-agent: listening on vsock port {}", VSOCK_PORT);
+        tracing::info!("vmcell-steward: listening on vsock port {}", VSOCK_PORT);
 
         // Idle window starts at the (re)bind; only a successful accept restarts
         // it. Once it elapses with no accepted connection — or an arm below
@@ -820,7 +820,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                 // the deaf-listener case — re-bind rather than exit.
                 PollAction::Recover(r) => {
                     tracing::warn!(
-                        "vmcell-guest-agent: vsock listener re-binding ({:?}): poll {:?}, revents {:?}",
+                        "vmcell-steward: vsock listener re-binding ({:?}): poll {:?}, revents {:?}",
                         r,
                         polled,
                         fds[0].revents()
@@ -838,7 +838,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                             rebind_idle,
                             AcceptOutcome::Accepted,
                         );
-                        tracing::info!("vmcell-guest-agent: accepted connection");
+                        tracing::info!("vmcell-steward: accepted connection");
                         let builder =
                             std::thread::Builder::new().name("vmcell-vsock-conn".to_string());
                         if let Err(e) = dispatch_connection(builder, s, reaper) {
@@ -848,7 +848,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                             // keeps serving, paced so a sustained thread famine
                             // cannot spin accept→spawn-fail.
                             tracing::error!(
-                                "vmcell-guest-agent: the OS refused a connection thread: {}; dropping this connection and continuing to serve",
+                                "vmcell-steward: the OS refused a connection thread: {}; dropping this connection and continuing to serve",
                                 e
                             );
                             std::thread::sleep(recovery_backoff(
@@ -869,7 +869,7 @@ fn serve_vsock(reaper: &Arc<ReaperCoordinator>, accept_poll: Duration, rebind_id
                         );
                     }
                     Err(e) => {
-                        tracing::info!("vmcell-guest-agent: accept error: {}; re-binding", e);
+                        tracing::info!("vmcell-steward: accept error: {}; re-binding", e);
                         reason = RecoveryReason::AcceptFailed;
                         break;
                     }
@@ -932,7 +932,7 @@ fn serve_connection(
 /// is the reachable seam its gate asserts on.
 fn unexpected_frame_warning(frame_bytes: usize, msg: &Message) -> String {
     format!(
-        "vmcell-guest-agent: unexpected control-plane message ({frame_bytes} byte frame): {}; closing connection to resync",
+        "vmcell-steward: unexpected control-plane message ({frame_bytes} byte frame): {}; closing connection to resync",
         protocol::capped_debug(msg)
     )
 }
@@ -941,7 +941,7 @@ fn unexpected_frame_warning(frame_bytes: usize, msg: &Message) -> String {
 /// routes it. It never blocks on a running child — one-shot `Exec` is still
 /// synchronous (drains to `Exit` before the next read, the one-shot contract),
 /// while `OpenSession` spawns a session and returns immediately so many sessions
-/// multiplex over the one connection (§3, The control plane: vsock, the host clients, and the guest agent).
+/// multiplex over the one connection (§3, The control plane: vsock, the host clients, and the steward).
 fn serve_loop(
     read_stream: &mut VsockStream,
     writer: &Writer,
@@ -961,7 +961,7 @@ fn serve_loop(
                 mac,
                 ipv4,
             } => handle_resync(unix_secs, unix_nanos, mac, ipv4, writer)?,
-            // Interactive-session control (§3, The control plane: vsock, the host clients, and the guest agent). These never fail the
+            // Interactive-session control (§3, The control plane: vsock, the host clients, and the steward). These never fail the
             // connection: a bad open reports `SessionExit(127)` to the host, and a
             // frame for an unknown/closed session is dropped at debug — the session
             // simply already ended.
@@ -1001,7 +1001,7 @@ fn teardown_sessions(sessions: &Sessions) {
     };
     for (id, handle) in drained {
         tracing::info!(
-            "vmcell-guest-agent: connection ending; killing session {:?} (pid {})",
+            "vmcell-steward: connection ending; killing session {:?} (pid {})",
             id,
             handle.pid
         );
@@ -1144,7 +1144,7 @@ fn handle_resync(
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(
-                "vmcell-guest-agent: resync hwrng reseed failed: {}; continuing (best-effort)",
+                "vmcell-steward: resync hwrng reseed failed: {}; continuing (best-effort)",
                 e
             );
             false
@@ -1171,7 +1171,7 @@ fn handle_resync(
         Ok(outcome) => outcome,
         Err(e) => {
             tracing::warn!(
-                "vmcell-guest-agent: resync could not open the config socket: {}; no interface arm applied",
+                "vmcell-steward: resync could not open the config socket: {}; no interface arm applied",
                 e
             );
             netif::ResyncNetOutcome::default()
@@ -1248,7 +1248,7 @@ fn handle_exec(
     // serial console (`/dev/console`), from which no input ever arrives, so a
     // command that reads stdin (`cat`, `wc`, a `sh` heredoc) would block on the
     // console and run out its timeout instead of seeing EOF immediately. (The
-    // interactive-session path, §3, The control plane: vsock, the host clients, and the guest agent, is where streamed stdin lives.)
+    // interactive-session path, §3, The control plane: vsock, the host clients, and the steward, is where streamed stdin lives.)
     cmd.stdin(Stdio::null());
 
     // AGENT-2: capture the reservation epoch BEFORE the spawn. An instant child
@@ -1257,7 +1257,7 @@ fn handle_exec(
     // pre-spawn epoch lets `reserve` recognize that already-recorded status as
     // the child's own (recorded after the epoch) instead of wiping it as a stale
     // previous occupant's — which stranded the waiter forever and surfaced on
-    // the host as a sporadic "Agent exec timed out" for a command that had
+    // the host as a sporadic "Steward exec timed out" for a command that had
     // already succeeded.
     let pre_spawn_epoch = reaper.pre_spawn_epoch();
     match cmd.spawn() {
@@ -1312,7 +1312,7 @@ fn handle_exec(
             // cannot have its lingering, unclaimed exit status mis-delivered to
             // this child as a false result: `reserve` clears a status recorded at
             // or before the epoch, and the waiter's `wait_for(pid)` below only
-            // accepts one recorded strictly after it (§3.4, The guest: vmcell-guest-agent as PID 1; the PID-1 reaper-vs-waiter
+            // accepts one recorded strictly after it (§3.4, The guest: vmcell-steward as PID 1; the PID-1 reaper-vs-waiter
             // contract). A status recorded after the epoch — this child's own,
             // when it exited and was drained before this line ran — survives the
             // reservation and is delivered immediately (AGENT-2).
@@ -1365,11 +1365,11 @@ fn handle_exec(
 }
 
 // ===========================================================================
-// Interactive sessions (§3, The control plane: vsock, the host clients, and the guest agent): PTY / pipe sessions, streaming stdin,
+// Interactive sessions (§3, The control plane: vsock, the host clients, and the steward): PTY / pipe sessions, streaming stdin,
 // window resize, and multiplexed concurrent execs over one connection.
 // ===========================================================================
 
-/// Where a session's streamed stdin is delivered (§3, The control plane: vsock, the host clients, and the guest agent). A pipe session
+/// Where a session's streamed stdin is delivered (§3, The control plane: vsock, the host clients, and the steward). A pipe session
 /// writes to the child's stdin pipe (dropping it on `StdinEof` closes it → the
 /// child reads EOF); a PTY session writes to the pseudo-terminal master (bytes
 /// arrive as terminal input). The PTY master `Arc<OwnedFd>` is shared with
@@ -1473,7 +1473,7 @@ impl SessionHandle {
         drop(self.stdin_tx);
         if self.stdin_writer.join().is_err() {
             // Not `unwrap`: a panicked writer thread must not take PID 1 with it.
-            tracing::warn!("vmcell-guest-agent: session stdin writer thread panicked");
+            tracing::warn!("vmcell-steward: session stdin writer thread panicked");
         }
     }
 }
@@ -1505,7 +1505,7 @@ fn spawn_stdin_writer(
                     };
                     if let Err(e) = write_stdin_sink(current, &data, &closing) {
                         tracing::debug!(
-                            "vmcell-guest-agent: stdin write to session {:?} failed: {}",
+                            "vmcell-steward: stdin write to session {:?} failed: {}",
                             session,
                             e
                         );
@@ -1559,11 +1559,7 @@ fn kill_group(pid: u32) {
 /// terminal-frame convention (§13, Cross-cutting invariants): `SessionStderr{msg}` then
 /// `SessionExit{127}`.
 fn open_failed(writer: &Writer, session: SessionId, msg: &str) {
-    tracing::warn!(
-        "vmcell-guest-agent: session {:?} open failed: {}",
-        session,
-        msg
-    );
+    tracing::warn!("vmcell-steward: session {:?} open failed: {}", session, msg);
     let _ = send_msg(
         writer,
         &Message::SessionStderr {
@@ -1596,7 +1592,7 @@ fn register_session(
     match table.entry(id) {
         Entry::Occupied(_) => {
             tracing::warn!(
-                "vmcell-guest-agent: session id {:?} is already live; refusing the duplicate",
+                "vmcell-steward: session id {:?} is already live; refusing the duplicate",
                 id
             );
             Err(handle)
@@ -1703,7 +1699,7 @@ fn spawn_session_waiter(
     });
 }
 
-/// Opens an interactive session (§3, The control plane: vsock, the host clients, and the guest agent): builds the command, then
+/// Opens an interactive session (§3, The control plane: vsock, the host clients, and the steward): builds the command, then
 /// dispatches to the PTY or pipe path per `spec.pty`.
 fn run_session(
     session: SessionId,
@@ -1791,7 +1787,7 @@ fn run_pipe_session(
     );
 }
 
-/// Allocates a pseudo-terminal pair: the `CLOEXEC` master (kept by the agent) and
+/// Allocates a pseudo-terminal pair: the `CLOEXEC` master (kept by the steward) and
 /// the slave path from `ptsname` (opened by the caller for the child). `grantpt`
 /// is a Linux no-op but is called for POSIX faithfulness; `unlockpt` is required.
 fn open_pty() -> rustix::io::Result<(OwnedFd, std::ffi::CString)> {
@@ -1803,7 +1799,7 @@ fn open_pty() -> rustix::io::Result<(OwnedFd, std::ffi::CString)> {
     Ok((master, slave_path))
 }
 
-/// The `login_tty` sequence, run in the child's `pre_exec` (§3, The control plane: vsock, the host clients, and the guest agent): make
+/// The `login_tty` sequence, run in the child's `pre_exec` (§3, The control plane: vsock, the host clients, and the steward): make
 /// the child a session leader (`setsid`, so its pgid == its pid and it has no
 /// controlling terminal), adopt the pty slave as its controlling terminal
 /// (`TIOCSCTTY`), and wire the slave onto stdin/stdout/stderr. Every call is an
@@ -1860,7 +1856,7 @@ fn run_pty_session(
     };
     // Best-effort initial window size before the child starts.
     if let Err(e) = rustix::termios::tcsetwinsize(&master, winsize_from(pty.rows, pty.cols)) {
-        tracing::debug!("vmcell-guest-agent: initial winsize failed: {}", e);
+        tracing::debug!("vmcell-steward: initial winsize failed: {}", e);
     }
 
     // No `process_group(0)`: `setsid` in `login_tty` creates the new session and
@@ -2011,7 +2007,7 @@ fn session_stdin_queue(
         Some(h) => Some(h.stdin_tx.clone()),
         None => {
             tracing::debug!(
-                "vmcell-guest-agent: stdin frame for unknown/closed session {:?}; dropping",
+                "vmcell-steward: stdin frame for unknown/closed session {:?}; dropping",
                 session
             );
             None
@@ -2019,7 +2015,7 @@ fn session_stdin_queue(
     }
 }
 
-/// Routes a `Stdin` frame to its session (§3, The control plane: vsock, the host clients, and the guest agent). ENQUEUES the bytes on
+/// Routes a `Stdin` frame to its session (§3, The control plane: vsock, the host clients, and the steward). ENQUEUES the bytes on
 /// the session's stdin queue and returns immediately (M6): the blocking write
 /// happens on that session's writer thread, so a child that stopped reading its
 /// stdin can no longer stall the dispatch loop — and with it `CloseSession` and
@@ -2033,13 +2029,13 @@ fn route_stdin(sessions: &Sessions, session: SessionId, data: Vec<u8>) {
     // reported at debug.
     if tx.send(StdinItem::Data(data)).is_err() {
         tracing::debug!(
-            "vmcell-guest-agent: stdin queue for session {:?} is closed; dropping",
+            "vmcell-steward: stdin queue for session {:?} is closed; dropping",
             session
         );
     }
 }
 
-/// Routes a `StdinEof` frame (§3, The control plane: vsock, the host clients, and the guest agent): closes a **pipe** session's stdin
+/// Routes a `StdinEof` frame (§3, The control plane: vsock, the host clients, and the steward): closes a **pipe** session's stdin
 /// (dropping the write end → the child reads EOF); a no-op for a PTY session
 /// (closing the master would tear down output — a PTY caller ends input in-band).
 /// Sequenced through the SAME queue as the bytes (M6), so the pipe closes only
@@ -2051,13 +2047,13 @@ fn route_stdin_eof(sessions: &Sessions, session: SessionId) {
     };
     if tx.send(StdinItem::Eof).is_err() {
         tracing::debug!(
-            "vmcell-guest-agent: stdin queue for session {:?} is closed; EOF is already implied",
+            "vmcell-steward: stdin queue for session {:?} is closed; EOF is already implied",
             session
         );
     }
 }
 
-/// Routes a `Winsize` frame (§3, The control plane: vsock, the host clients, and the guest agent): installs the new window on a PTY
+/// Routes a `Winsize` frame (§3, The control plane: vsock, the host clients, and the steward): installs the new window on a PTY
 /// session's master (`TIOCSWINSZ`, delivering `SIGWINCH`); a debug no-op for a
 /// pipe session.
 fn route_winsize(sessions: &Sessions, session: SessionId, rows: u16, cols: u16) {
@@ -2072,20 +2068,20 @@ fn route_winsize(sessions: &Sessions, session: SessionId, rows: u16, cols: u16) 
         Some(master) => {
             if let Err(e) = rustix::termios::tcsetwinsize(&*master, winsize_from(rows, cols)) {
                 tracing::debug!(
-                    "vmcell-guest-agent: winsize for session {:?} failed: {}",
+                    "vmcell-steward: winsize for session {:?} failed: {}",
                     session,
                     e
                 );
             }
         }
         None => tracing::debug!(
-            "vmcell-guest-agent: winsize for non-pty session {:?}; ignoring",
+            "vmcell-steward: winsize for non-pty session {:?}; ignoring",
             session
         ),
     }
 }
 
-/// Routes a `CloseSession` frame (§3, The control plane: vsock, the host clients, and the guest agent): `SIGKILL`s the session's
+/// Routes a `CloseSession` frame (§3, The control plane: vsock, the host clients, and the steward): `SIGKILL`s the session's
 /// process group. The waiter observes the resulting exit, emits `SessionExit`,
 /// and removes the entry — so no double-remove here.
 fn close_session(sessions: &Sessions, session: SessionId) {
@@ -2464,7 +2460,7 @@ mod tests {
         );
     }
 
-    // §3 (The control plane: vsock, the host clients, and the guest agent) / §3.3 (Interactive-session wire semantics): the rows→ws_row, cols→ws_col field mapping the PTY
+    // §3 (The control plane: vsock, the host clients, and the steward) / §3.3 (Interactive-session wire semantics): the rows→ws_row, cols→ws_col field mapping the PTY
     // winsize install consumes. RED on a rows↔cols swap (mirrors
     // `resync_timespec_maps_fields`), without a live PTY.
     #[test]
@@ -2641,8 +2637,8 @@ mod tests {
     /// plain `recv`/`send`, so an `AF_UNIX` socketpair drives it verbatim. The
     /// second half is the "host" end the test reads frames from.
     fn vsock_pair() -> (VsockStream, std::os::unix::net::UnixStream) {
-        let (agent, host) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        (VsockStream::from(OwnedFd::from(agent)), host)
+        let (steward, host) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        (VsockStream::from(OwnedFd::from(steward)), host)
     }
 
     /// Decodes one framed [`Message`] from the host end of a [`vsock_pair`].
@@ -2742,10 +2738,10 @@ mod tests {
     fn dispatch_connection_reports_a_refused_thread_instead_of_panicking() {
         let reaper = Arc::new(ReaperCoordinator::new());
 
-        let (agent_side, host_side) = vsock_pair();
+        let (steward_side, host_side) = vsock_pair();
         let refused = dispatch_connection(
             std::thread::Builder::new().stack_size(1 << 46),
-            agent_side,
+            steward_side,
             &reaper,
         )
         .expect_err("an unmappable thread stack must be refused, not spawned");
@@ -2758,10 +2754,10 @@ mod tests {
 
         // Positive control: the same call with an ordinary builder does spawn, so
         // the assertion above is about the refusal and not about a broken helper.
-        let (agent_side, host_side) = vsock_pair();
+        let (steward_side, host_side) = vsock_pair();
         dispatch_connection(
             std::thread::Builder::new().name("vmcell-vsock-conn-test".to_string()),
-            agent_side,
+            steward_side,
             &reaper,
         )
         .expect("an ordinary builder must spawn the connection thread");
@@ -2815,8 +2811,8 @@ mod tests {
     #[test]
     fn abandoning_a_spawned_session_releases_its_reaper_reservation() {
         let reaper = Arc::new(ReaperCoordinator::new());
-        let (agent_side, mut host_side) = vsock_pair();
-        let writer: Writer = Arc::new(Mutex::new(agent_side));
+        let (steward_side, mut host_side) = vsock_pair();
+        let writer: Writer = Arc::new(Mutex::new(steward_side));
         let session = SessionId(11);
 
         let mut child = spawn_group_child();

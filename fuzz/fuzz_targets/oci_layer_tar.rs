@@ -16,7 +16,7 @@ use vmcell::artifact::tar2erofs::{fuzz_node_paths, tar_to_erofs};
 // `tar_to_erofs`.
 //
 // PRODUCTION PRECONDITION MIRRORED: `require_libc6 = false` and empty injection vectors — the
-// `--agent-musl` pack configuration. `true` would short-circuit on the missing-libc6 check before
+// `--steward-musl` pack configuration. `true` would short-circuit on the missing-libc6 check before
 // the interesting tail (whiteouts, hardlink materialization, parent synthesis) is ever reached, and
 // an arbitrary archive never carries `libc.so.6`. The injection vectors are empty because a
 // non-empty one names host files the packer would READ, which a fuzz target must not do.

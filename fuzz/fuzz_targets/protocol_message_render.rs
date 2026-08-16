@@ -9,8 +9,8 @@ use vmcell_protocol::{
 // quotes a decoded (or undecodable) frame through `capped_debug`.
 //
 // WHO SUPPLIES THE BYTES: the guest. Five production sites render guest-chosen frames
-// (`vmcell::agent`'s connect prologue, the raw Ready frame, an unexpected decoded `Message`, an
-// unexpected exec-stream frame, and the session reader), and the guest agent renders HOST frames
+// (`vmcell::steward`'s connect prologue, the raw Ready frame, an unexpected decoded `Message`, an
+// unexpected exec-stream frame, and the session reader), and the steward renders HOST frames
 // the same way onto the PERSISTED serial-console artifact — so an uncapped render is a flood
 // written into an artifact every later run reads.
 //
