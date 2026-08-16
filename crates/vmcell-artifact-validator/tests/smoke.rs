@@ -75,3 +75,97 @@ async fn validate_broken_kernel_reports_failure() {
         "a garbage kernel file must point at the direct-boot PVH contract: {msg}"
     );
 }
+
+/// The **live** half of the two-directional battery (design §10.6, §18 delta 3): the one leg that
+/// exercises [`conformance::LiveProbe`] itself.
+///
+/// Everything else about the battery — the four-leg matrix, the control pairing, the warning
+/// lifecycle, the budget — is unit-gated against a scripted probe, because the judgement is what
+/// delta 3 specifies and it must run on every machine. What a scripted probe structurally cannot
+/// see is the probe's own wiring: `snapshot_restore_roundtrip` needs a real guest to hand shake, so
+/// a fake-driven run of it answers `DoesNotWork` after the full handshake budget, always. This leg
+/// is that evidence, and it is deliberately the **under-claim** direction, because it is the one
+/// only a live run can produce: the canonical artifacts genuinely snapshot, so an artifact record
+/// that declares `snapshot_restore = false` for them is an under-claim by construction.
+///
+/// The known-good pair plays both roles — under two different labels, which is the point: the
+/// battery refuses a control that IS the candidate, so the labels are what the pairing is keyed on
+/// and this leg proves the paired probe really runs twice against a real backend.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs KVM + built artifacts"]
+async fn conformance_live_underclaim_warns_with_its_positive_control() {
+    use vmcell::feature::{Feature, FeatureDeclaration, Source};
+    use vmcell_artifact_validator::conformance::{
+        ArtifactId, ConformanceOptions, ConformanceSubject, LiveProbe, Substrate, run_battery,
+    };
+    use vmcell_artifact_validator::harness::ch_bin;
+
+    let artifacts = ArtifactSet::new(get_vmlinux(), get_rootfs());
+    let vmm = vmcell::vmm::cloud_hypervisor::CloudHypervisor::new(ch_bin());
+    let substrate = Substrate::of(&vmm);
+
+    let declaring = |label: &str, stance: bool| {
+        let mut declaration = FeatureDeclaration::baseline(Source::Rootfs(label.to_string()));
+        declaration.stances.insert(Feature::SnapshotRestore, stance);
+        ConformanceSubject {
+            id: ArtifactId::new(label),
+            artifacts: artifacts.clone(),
+            declaration,
+        }
+    };
+    let candidate = declaring("under-test-declares-no-snapshot", false);
+    let control = declaring("known-good-declares-snapshot", true);
+
+    let opts = ConformanceOptions {
+        // Dispositioned, so the run is green: the under-claim below is this test's fixture, not a
+        // defect in the artifacts. The un-dispositioned direction (promotion to a failure) is
+        // unit-gated — it needs no VM to be true.
+        expected_warnings: [(
+            Feature::SnapshotRestore,
+            ArtifactId::new("under-test-declares-no-snapshot"),
+        )]
+        .into_iter()
+        .collect(),
+        ..ConformanceOptions::default()
+    };
+
+    let report = run_battery(
+        &LiveProbe::new(&vmm),
+        &substrate,
+        &candidate,
+        &control,
+        &opts,
+    )
+    .await
+    .expect("the battery must run on a KVM host with artifacts");
+    for o in &report.outcomes {
+        println!("[{:?}] {} -> {:?}", o.level, o.id, o.status);
+    }
+
+    let snapshot = report
+        .outcomes
+        .iter()
+        .find(|o| o.id == "conformance.snapshot_restore")
+        .expect("the paired snapshot check is in the roster");
+    let CheckStatus::Warn(msg) = &snapshot.status else {
+        panic!(
+            "the canonical artifacts DO snapshot, so declaring it absent must warn (an \
+             under-claim) — got {:?}. A Pass here would mean the absence probe answered \"absent\" \
+             for an artifact that demonstrably snapshots, i.e. the probe is a constant.",
+            snapshot.status
+        );
+    };
+    assert!(
+        msg.contains(Feature::SnapshotRestore.name()),
+        "the warning names the feature through the vocabulary: {msg}"
+    );
+    assert!(
+        msg.contains("known-good-declares-snapshot"),
+        "the warning names the positive control that ran against the same live backend: {msg}"
+    );
+    assert!(
+        report.is_ok(),
+        "a dispositioned under-claim leaves the run green; failures: {:?}",
+        report.failures().collect::<Vec<_>>()
+    );
+}

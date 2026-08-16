@@ -47,7 +47,24 @@ name = "vmcell-artifact-validator"
 #   * BREAKING `function_parameter_count_changed`-adjacent renames in the public API follow
 #     `vmcell` 0.15.0's list (the crate drives `StewardClient`, not `AgentClient`).
 # No check CHANGED WHAT IT VERIFIES in this bump; the ids moved and nothing else did.
-version = "0.3.0"
+# 0.3.0 → 0.4.0: design v33 §18 delta 3 — the two-directional conformance kit (§10.6).
+#   * BREAKING `enum_variant_added`: `CheckStatus` gains `Warn(String)` and `Unverified(String)`.
+#     `CheckStatus` is deliberately exhaustive, so a consumer matching on it must add two arms —
+#     which is the intended compile-time fail-loud, not an accident. `cargo semver-checks` reports
+#     exactly this edge; it is the gate that caught the missing bump on this very change.
+#       - `Warn` = an ABSENT feature that DOES work: under-claiming, a DOCUMENTATION defect, not a
+#         runtime one. It is deliberately not a `Fail`, because reddening an under-claim pushes
+#         declarers toward over-claiming — the exact wrong incentive.
+#       - `Unverified` = an absence that cannot be decided, with why. Never counted as a pass.
+#         Proving a negative is sometimes impractical (snapshot absence is testable by attempting a
+#         snapshot; page-sharing absence is not, because no in-guest observation distinguishes "the
+#         host is not sharing pages" from "it is and nothing diverged yet").
+#   * UNCHANGED, and pinned by a test so it stays that way: `into_result()`'s and `is_ok()`'s
+#     contract is still **Fail-only**. A report carrying Warns and Unverifieds but no Fail is still
+#     `Ok(())`. A consumer's pass/fail decision does not move under this bump.
+#   * ADDITIVE: the `conformance` module (`ConformanceOptions`, `Substrate`, the paired
+#     absence-probe/positive-control machinery), `ValidationReport::warnings`/`unverified`.
+version = "0.4.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
@@ -62,7 +79,7 @@ path = "src/lib.rs"
 # The validator boots real vmcell micro-VMs and drives the steward, and reuses vmcell's
 # capability descriptors + net math. It needs the host stack: a backend, metrics, pipeline
 # (for artifact_path helpers). `vmcell` has no dependency on this crate.
-vmcell = { path = "../vmcell", version = "0.15.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.16.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
 # The applet roster (`GUEST_TOOLS_APPLETS`) only — the validator speaks no wire protocol of its
 # own. `rootfs_guest_tools` composes its PATH probe from that const instead of re-typing the
 # names, so growing the roster extends what the contract battery checks with no edit here. It is
@@ -83,4 +100,4 @@ tempfile = "3"
 # The feature list mirrors the `[dependencies]` entry above, plus `test-support`.
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-vmcell = { path = "../vmcell", version = "0.15.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }
+vmcell = { path = "../vmcell", version = "0.16.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }

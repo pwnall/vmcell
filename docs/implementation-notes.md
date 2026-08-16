@@ -3961,6 +3961,73 @@ being an API-state refusal, not a capability absence. Each keeps a **single snak
 never prose, so a caller matches it exactly; the sweep enforces that shape on them too, and each
 site carries a comment saying not to "fix" it into a variant.
 
+## v33 delta 3 — the two-directional conformance kit (design §18 delta 3, §10.6), as built
+
+**What landed.** `CheckStatus` grew `Warn(String)` and `Unverified(String)`;
+`ValidationReport::warnings`/`unverified`; a new `conformance` module (`ArtifactId`,
+`ConformanceSubject`, `ProbeOutcome`, the `FeatureProbe` seam + `LiveProbe`, `probe_plan`,
+`conformance_check_id`, `Substrate`, the pure `judge`, `ConformanceOptions`, the typed
+`ConformanceError`, `run_battery`); the records-or-skips-on-every-path refactor with
+`CORE_CHECK_IDS`/`EXTENDED_CHECK_IDS`/`FULL_CHECK_IDS` and a `fill_unrecorded` tail per level; the
+rustdoc roster gate extended to Core and Extended through one shared helper; and `Warn`s routed
+through the classifier (`explain_underclaim`, `explain_broken_claim`, `explain_undecidable`).
+Ledgered `vmcell-artifact-validator` 0.3.0 → 0.4.0 — a bump `cargo semver-checks` **caught rather
+than a consumer did**, which is the §10.4 rule working exactly as written.
+
+**`into_result()` is unchanged, and that is now pinned.** The two new variants would be worthless if
+they quietly moved a consumer's pass/fail decision, so `into_result_is_fail_only_across_all_five_states`
+asserts a report carrying Warns and Unverifieds but no Fail still returns `Ok(())`, with a Fail added
+as the positive control.
+
+**Resolved conflicts between §10.6's text and the tree**, each a decision rather than a drift:
+
+- **"substrate cannot exercise it → Skip" vs "declaring on an incapable backend → Fail naming the
+  backend."** These read as contradictory and are not: they differ *by direction*. A
+  declared-**present** feature the backend's own descriptor removes is decidably contradicted →
+  `Fail` with §7.4 provenance (the four-leg matrix's leg 2). A declared-**absent** claim on a
+  substrate that cannot exercise it is unmeasurable → `Skip`, exactly as §10.6 says. Both arms are
+  tested.
+- **The probe had to become a seam.** The shipped probe (`snapshot_restore_roundtrip`) needs a real
+  guest handshake, so against `FakeVmm` it burns its budget and can only ever answer "does not
+  work" — it structurally *cannot* express `Works`, so the four-leg matrix is not expressible
+  through it. The matrix therefore runs a recording `ScriptedProbe` through the real `run_battery`,
+  while `FakeVmm`'s **descriptor** supplies the capable/incapable substrates; `LiveProbe`'s own
+  mapping is unit-gated with `fail_create` and its *execution* by the live leg. A shift from the
+  directed "drive it with `FakeVmm`", recorded here per the register's convention.
+- **"Deleting the control reddens the roster" needed a second mechanism.** With the control and the
+  probe sharing ONE check id, deleting the control leaves the roster byte-identical — and
+  `fill_unrecorded` would likewise turn a deleted *level* check into a permanent, innocuous `Skip`.
+  That is the roster gate's own silent-weakening shape. So control deletion is caught by the leg-3
+  and control-failed tests (both deletion shapes verified), and `every_roster_id_has_a_recording_site`
+  — a source scan with its own scanner self-test — makes a deleted check redden instead of
+  degrading to a Skip.
+- **A fifth row beyond the design's four legs:** control fails → `Unverified`, never leg 3's `Pass`.
+  This is what makes the pair *structural* rather than a convention: an absence probe whose control
+  is broken cannot certify anything.
+- **`Unverified`'s shipped instance is `Feature::NestedVirt`**, reusing the lesson recorded at
+  `crates/vmcell/tests/nested_virt.rs:123-196`: `-cpu host` exposes VMX unconditionally, so the
+  causal signal is the guest module parameter — which answers about the *cell's config*, not the
+  artifact. There is no `/dev/kvm` check anywhere in the kit.
+- **Stale-expectation scope.** An `expected_warnings` entry whose Warn no longer fires is an error
+  (the unfulfilled-`#[expect]` rule one level up), but judged only against the artifact *this run
+  tested* — otherwise every per-artifact run would redden on its siblings' entries.
+
+**Report-content change a consumer will see.** Every run now also carries `boot.config` on the
+success path (it was error-only, and therefore invisible to enumeration — which is what kept the
+Core roster ungateable), and a stopped run emits Skips for the ids it never reached, naming the
+check that stopped it. A consumer diffing a report against a stored baseline sees ids appear.
+
+**Gates.** Seventeen red-on-inverse experiments, each run and reverted: `into_result` widened to
+count Warn; leg 2 → Skip; leg 4 → Pass; the control deleted **two ways**; the budget timeout removed
+(the test failed in 5.00 s on its own harness bound rather than hanging — the property the budget
+exists for); a Core check's call site deleted; an id dropped from `CORE_CHECK_IDS`; each of the
+three `Level` rustdocs ceasing to name an id; promotion disabled; stale-expectation detection
+disabled; a hand-spelled check id; `NestedVirt` given a probe; both roster fills removed; a
+no-stance judged as Pass; and `LiveProbe` mapping Undecidable → DoesNotWork.
+
+**Live-validated:** `just test-validator` under the delegated scope, 3/3, including the new
+conformance leg with real snapshot round-trips on both sides of the pair.
+
 ## Where the design lives now
 
 **v33 (2026-08-15):** `docs/82-claude-opus-design-v32.md` moved to `docs/historical/` (frozen at its

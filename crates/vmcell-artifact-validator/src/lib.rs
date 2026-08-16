@@ -18,6 +18,23 @@
 //! lacks (CAP_NET_ADMIN, cgroup delegation, a backend feature) record a
 //! [`CheckStatus::Skip`] with a reason — never a silent pass.
 //!
+//! **Every check records or skips its id on every path** (design §10.6), including the paths that
+//! fail before the guest ever hands shakes: each level's roster is a named list ([`checks`]'s
+//! `CORE_CHECK_IDS` and its siblings) that the run fills to the end, so a report never *shrinks*
+//! when a boot fails and all three rosters are enumerable without KVM. That is what lets the
+//! rustdoc roster gate below cover Core and Extended, not just Full.
+//!
+//! ## Two directions, and the states between pass and fail
+//! [`validate`] checks one direction: a **present** property that does not hold. The
+//! [`conformance`] battery adds the other — an artifact that declares a feature **absent** which
+//! in fact works — because an unchecked declaration is a fact a consumer will build a fixture on
+//! (design §10.6). It brings [`CheckStatus::Warn`] (an under-claim: a documentation defect, not a
+//! runtime one) and [`CheckStatus::Unverified`] (an absence no observation can decide, with why),
+//! and every absence probe is paired with a positive control under **one** check id.
+//! [`ValidationReport::into_result`] stays **Fail-only**: neither new state fails a run on its own,
+//! and an unexpected `Warn` is promoted to `Fail` by [`conformance::ConformanceOptions`] rather
+//! than by widening what "failure" means.
+//!
 //! ## Naming what a bad kernel is missing
 //! A boot failure never reports a bare timeout. Every arm of [`checks`] that **reports** a VM
 //! which failed to start (`MicroVm::start`) or failed its steward handshake — Core, Extended and
@@ -67,6 +84,7 @@
 
 pub mod checks;
 pub mod classify;
+pub mod conformance;
 pub mod harness;
 pub mod kconfig;
 
@@ -99,9 +117,23 @@ impl ArtifactSet {
 pub enum Level {
     /// Direct boot, erofs root, PID-1 steward handshake, exec/put-file round-trip, injected
     /// steward/CA/guest-tools present, overlay writable, clean shutdown. Needs only KVM.
+    ///
+    /// The shipped roster, named by check id: `boot.config` (the VM config the artifact pair
+    /// builds), `boot.kernel_banner` (the kernel reaches userspace), `boot.steward_ready` (the
+    /// vsock control plane hands shakes), `steward.exec_roundtrip`, `steward.put_file_roundtrip`,
+    /// `rootfs.libc6`, `rootfs.ca_cert`, `rootfs.guest_tools`, `rootfs.overlay_writable`, and
+    /// `lifecycle.clean_shutdown`. Every one of them is recorded or skipped on **every** path —
+    /// a run that dies before the handshake still reports the whole roster — which is what makes
+    /// `level_core_rustdoc_names_exactly_the_shipped_checks` enumerable without KVM.
     Core,
-    /// `Core` plus capability-gated probes: IP-PNP networking, virtio-fs RO/RW shares, nested
-    /// `/dev/kvm`, cgroup usage readout.
+    /// `Core` plus capability-gated probes, named by check id: `net.ip_pnp` (IP-PNP configured
+    /// `eth0` at the address the orchestrator's math predicts), `virtiofs.shares` (a read-only
+    /// share rejects writes with EROFS and a read-write share is visible host-side),
+    /// `nested.kvm_ok` (nested KVM reaches the guest), and `metrics.usage_readable` (per-VM cgroup
+    /// counters read back and report enforcement honestly).
+    ///
+    /// Records-or-skips on every path like `Core`, so
+    /// `level_extended_rustdoc_names_exactly_the_shipped_checks` gates this roster the same way.
     Extended,
     /// `Extended` plus the expensive checks, each on VMs of its own — the shipped roster, named by
     /// check id: `concurrency.distinct_ids` (three concurrently-started VMs get distinct
@@ -151,13 +183,37 @@ impl ValidationOptions {
     }
 }
 
-/// The result of a single contract check.
+/// The result of a single contract check — the five states of design §10.6.
+///
+/// Three of them shipped before v33; `Warn` and `Unverified` are delta 3's, and they exist because
+/// a two-directional kit has two more answers than a one-directional one. **The new states never
+/// absorb the old ones' meaning**: `Fail` stays "a declared-present property that does not hold",
+/// and `Skip` stays "the substrate cannot exercise the claim at all".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckStatus {
     /// The contract property held.
     Pass,
     /// The contract property was violated; carries a human-readable reason.
     Fail(String),
+    /// An **absent** declaration that the data plane contradicts: the artifact says it cannot, and
+    /// it demonstrably can. Carries the explanation ([`classify::explain_underclaim`]).
+    ///
+    /// Deliberately not a failure. Under-claiming is a *documentation* defect, not a runtime one,
+    /// and reddening it would push declarers toward over-claiming — the exact wrong incentive, and
+    /// the one direction this kit cannot catch cheaply. The lifecycle that keeps warnings from
+    /// silting up is [`conformance::ConformanceOptions::expected_warnings`], which promotes an
+    /// **un-triaged** warning to [`CheckStatus::Fail`] and reports a triaged one that no longer
+    /// fires as an error of its own.
+    Warn(String),
+    /// An absence that **cannot be decided**, carrying why.
+    ///
+    /// Never counted as a pass. Proving a negative is sometimes impractical: snapshot absence is
+    /// testable by attempting a snapshot, page-sharing absence is not, because no in-guest
+    /// observation distinguishes "the host is not sharing pages" from "it is and nothing diverged
+    /// yet". The same distinction [`kconfig::KconfigValues::get`] draws between `None` (the symbol
+    /// was dropped) and `Some(KconfigValue::No)` (the author disabled it): an honest kit says which
+    /// one it is, per check.
+    Unverified(String),
     /// The check could not run because the host lacks a capability; carries the reason. A
     /// skip is **never** a pass — it is surfaced so the caller can judge coverage.
     Skip(String),
@@ -196,6 +252,11 @@ impl CheckOutcome {
             status: CheckStatus::Skip(reason.into()),
         }
     }
+    /// A judged outcome (the [`conformance`] battery computes the status first, through
+    /// [`conformance::judge`], and only then names the check it belongs to).
+    fn judged(id: &'static str, level: Level, status: CheckStatus) -> Self {
+        Self { id, level, status }
+    }
     /// From an extracted-check `Result`: `Ok` → Pass, `Err(msg)` → Fail.
     fn from_result(id: &'static str, level: Level, r: Result<(), String>) -> Self {
         match r {
@@ -227,14 +288,40 @@ impl ValidationReport {
             .filter(|o| matches!(o.status, CheckStatus::Skip(_)))
     }
 
-    /// True when there are **no failures**. (Skips do not fail a run, but the caller can
-    /// inspect [`skipped`](Self::skipped) to judge coverage.)
+    /// The under-claims ([`CheckStatus::Warn`]): declared-absent properties that work.
+    ///
+    /// These do **not** fail the run (see the variant's rationale). A warning that survived
+    /// [`conformance::ConformanceOptions::expected_warnings`] is one the caller has dispositioned;
+    /// an un-dispositioned one is already a [`CheckStatus::Fail`] by the time it lands here.
+    pub fn warnings(&self) -> impl Iterator<Item = &CheckOutcome> {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Warn(_)))
+    }
+
+    /// The undecidable absences ([`CheckStatus::Unverified`]), with why each one could not be
+    /// decided. Never a pass — inspect them exactly as you would [`skipped`](Self::skipped).
+    pub fn unverified(&self) -> impl Iterator<Item = &CheckOutcome> {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Unverified(_)))
+    }
+
+    /// True when there are **no failures**. (Skips, warnings and unverified absences do not fail a
+    /// run, but the caller can inspect [`skipped`](Self::skipped) / [`warnings`](Self::warnings) /
+    /// [`unverified`](Self::unverified) to judge coverage.)
     #[must_use]
     pub fn is_ok(&self) -> bool {
         self.failures().next().is_none()
     }
 
     /// The "Ok response" form: `Ok(())` on no failures, else `Err(failures)`.
+    ///
+    /// **Fail-only, unchanged by the v33 states** (design §10.6): a report carrying `Warn`s and
+    /// `Unverified`s but no `Fail` returns `Ok(())`. Widening this would make an under-claim red,
+    /// which is the incentive [`CheckStatus::Warn`] exists to avoid, and would make an undecidable
+    /// absence indistinguishable from a violated claim. Pinned by
+    /// `into_result_is_fail_only_across_all_five_states`.
     ///
     /// # Errors
     /// Returns the list of failing [`CheckOutcome`]s when any check failed.
@@ -358,13 +445,65 @@ mod tests {
         assert_eq!(err[0].id, "b");
     }
 
-    /// The check ids the [`Level::Full`] rustdoc names, read out of this file: every backticked
-    /// dotted token in the doc block that precedes the `Full` variant.
-    fn documented_full_ids() -> std::collections::BTreeSet<String> {
+    // The five states, and the ONE contract `into_result` keeps across all of them: Fail-only.
+    // Design §10.6 states this explicitly ("`into_result()`'s Fail-only contract is unchanged") and
+    // it is the clause a later "surely a Warn should be an error too" edit would quietly break —
+    // which would make under-claiming red and over-claiming green, the exact inversion the Warn
+    // state exists to prevent. RED on the inverse: widen either filter to include Warn or
+    // Unverified and both halves of this test go red.
+    #[test]
+    fn into_result_is_fail_only_across_all_five_states() {
+        let report = ValidationReport {
+            outcomes: vec![
+                outcome("a", Level::Core, CheckStatus::Pass),
+                outcome("b", Level::Extended, CheckStatus::Skip("no cap".into())),
+                outcome(
+                    "c",
+                    Level::Full,
+                    CheckStatus::Warn("declared absent; it works".into()),
+                ),
+                outcome(
+                    "d",
+                    Level::Full,
+                    CheckStatus::Unverified("no observation decides this".into()),
+                ),
+            ],
+        };
+        assert!(
+            report.is_ok(),
+            "a report with no Fail is ok, whatever else it carries"
+        );
+        assert_eq!(report.warnings().count(), 1);
+        assert_eq!(report.unverified().count(), 1);
+        assert_eq!(report.skipped().count(), 1);
+        assert_eq!(report.failures().count(), 0);
+        assert!(
+            report.clone().into_result().is_ok(),
+            "into_result is Fail-only: Warn and Unverified must not become failures"
+        );
+
+        // The positive control for the same three iterators: one Fail among them still fails the
+        // run and lands in the error list alone, so the assertions above are about the *states*,
+        // not about a report that cannot fail at all.
+        let mut with_fail = report;
+        with_fail.outcomes.push(outcome(
+            "e",
+            Level::Full,
+            CheckStatus::Fail("broken".into()),
+        ));
+        assert!(!with_fail.is_ok());
+        let failures = with_fail.into_result().expect_err("a Fail fails the run");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].id, "e");
+    }
+
+    /// The check ids one [`Level`] variant's rustdoc names, read out of this file: every backticked
+    /// dotted token in the doc block that precedes that variant.
+    fn documented_level_ids(variant: &str) -> std::collections::BTreeSet<String> {
         const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
         let head = SRC
-            .split_once("\n    Full,")
-            .expect("the Full variant is declared in this file")
+            .split_once(&format!("\n    {variant},"))
+            .unwrap_or_else(|| panic!("the {variant} variant is declared in this file"))
             .0;
         // Walk back over the variant's own doc lines only (the loop stops at `Extended,`).
         let doc: Vec<&str> = head
@@ -381,34 +520,67 @@ mod tests {
             .collect()
     }
 
-    // The contract-surface roster gate (`level-full-rustdoc-claims-absent-checks`): this rustdoc is
-    // part of the downstream toolkit contract (design §10.4), and it promised two checks —
-    // an egress-proxy leg and restore state-rotation assertions — that `run_full` has never run.
-    // Prose cannot be diffed against behavior, so the doc names ids and this drives `run_full` to
-    // learn the shipped set. `fail_create` makes every arm fail at start, which is what keeps this
-    // KVM-free *and* complete: each Full arm records (or skips) its id on every path, so the fake
-    // run enumerates the whole roster. Core/Extended are deliberately not gated this way — their
-    // guest-facing ids only exist after a real handshake, so a fake run under-reports them.
-    #[tokio::test]
-    async fn level_full_rustdoc_names_exactly_the_shipped_checks() {
+    /// The ids one level's runner records against a backend that cannot create a VM.
+    ///
+    /// `fail_create` is what keeps the roster gates KVM-free *and* complete: since v33 delta 3
+    /// every check records **or skips** its id on every path, so a run that dies before the first
+    /// guest handshake still enumerates the whole roster (`checks::CORE_CHECK_IDS` and its
+    /// siblings are the lists that get filled).
+    async fn shipped_ids_of(level: Level) -> std::collections::BTreeSet<String> {
         let vmm = vmcell::vmm::FakeVmm::with_faults(vmcell::vmm::FaultMenu {
             fail_create: true,
             ..vmcell::vmm::FaultMenu::default()
         });
         let artifacts = ArtifactSet::new("/nonexistent/vmlinux", "/nonexistent/rootfs.erofs");
         let mut outcomes = Vec::new();
-        checks::run_full(&vmm, &artifacts, &mut outcomes).await;
-
-        let shipped: std::collections::BTreeSet<String> =
-            outcomes.iter().map(|o| o.id.to_string()).collect();
-        assert!(!shipped.is_empty(), "run_full records at least one check");
-        assert_eq!(
-            documented_full_ids(),
-            shipped,
-            "the Level::Full rustdoc must name exactly the checks run_full runs — this doc is \
-             downstream contract surface (§10.4), so a promised-but-absent check is a lie to a \
-             consumer, and a shipped-but-undocumented one is invisible coverage"
+        match level {
+            Level::Core => checks::run_core(&vmm, &artifacts, &mut outcomes).await,
+            Level::Extended => checks::run_extended(&vmm, &artifacts, &mut outcomes).await,
+            Level::Full => checks::run_full(&vmm, &artifacts, &mut outcomes).await,
+        }
+        assert!(
+            outcomes.iter().all(|o| o.level == level),
+            "a level's runner must record only its own level: {:?}",
+            outcomes.iter().map(|o| (o.id, o.level)).collect::<Vec<_>>()
         );
+        outcomes.iter().map(|o| o.id.to_string()).collect()
+    }
+
+    /// The roster gate itself, shared by all three levels (design §10.6: "the rustdoc gate is
+    /// uniform"). The defect it was filed for (`level-full-rustdoc-claims-absent-checks`) —
+    /// a rustdoc promising an egress-proxy check and restore state-rotation assertions `run_full`
+    /// has never run — was always level-independent; only the enumeration was missing, and delta 3
+    /// fixed that with the records-or-skips-on-every-path mechanism rather than waiving the gate.
+    ///
+    /// Prose cannot be diffed against behavior, so the doc names ids and the run learns the
+    /// shipped set: a promised-but-absent check is a lie to a consumer (this rustdoc is downstream
+    /// contract surface, §10.4), and a shipped-but-undocumented one is invisible coverage.
+    async fn assert_rustdoc_names_the_shipped_checks(level: Level, variant: &str) {
+        let shipped = shipped_ids_of(level).await;
+        assert!(
+            !shipped.is_empty(),
+            "the {variant} runner records at least one check"
+        );
+        assert_eq!(
+            documented_level_ids(variant),
+            shipped,
+            "the Level::{variant} rustdoc must name exactly the checks that level runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn level_core_rustdoc_names_exactly_the_shipped_checks() {
+        assert_rustdoc_names_the_shipped_checks(Level::Core, "Core").await;
+    }
+
+    #[tokio::test]
+    async fn level_extended_rustdoc_names_exactly_the_shipped_checks() {
+        assert_rustdoc_names_the_shipped_checks(Level::Extended, "Extended").await;
+    }
+
+    #[tokio::test]
+    async fn level_full_rustdoc_names_exactly_the_shipped_checks() {
+        assert_rustdoc_names_the_shipped_checks(Level::Full, "Full").await;
     }
 
     // Level ordering gates which groups run: Core < Extended < Full.

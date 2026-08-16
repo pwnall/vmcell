@@ -756,11 +756,95 @@ fn skip(
     outcomes.push(CheckOutcome::skip(id, level, reason));
 }
 
+/// The [`Level::Core`] roster, in run order — **the one list**, and the mechanism behind
+/// "every check records or skips its id on every path" (design §10.6, §18 delta 3).
+///
+/// [`run_core`] records what it reached; the `fill_unrecorded` tail skips the rest, naming the
+/// check whose failure stopped the run. Two consequences, both load-bearing: a failed boot never *shrinks* the
+/// report (a consumer diffing against a stored baseline sees a Skip with a reason, not a check that
+/// vanished), and the roster is enumerable against a `fail_create` fake — which is what let the
+/// rustdoc roster gate extend from Full to all three levels instead of staying waived.
+pub const CORE_CHECK_IDS: &[&str] = &[
+    "boot.config",
+    "boot.kernel_banner",
+    "boot.steward_ready",
+    "steward.exec_roundtrip",
+    "steward.put_file_roundtrip",
+    "rootfs.libc6",
+    "rootfs.ca_cert",
+    "rootfs.guest_tools",
+    "rootfs.overlay_writable",
+    "lifecycle.clean_shutdown",
+];
+
+/// The [`Level::Extended`] roster, in run order (see [`CORE_CHECK_IDS`] for the mechanism).
+pub const EXTENDED_CHECK_IDS: &[&str] = &[
+    "net.ip_pnp",
+    "virtiofs.shares",
+    "nested.kvm_ok",
+    "metrics.usage_readable",
+];
+
+/// The [`Level::Full`] roster, in run order (see [`CORE_CHECK_IDS`] for the mechanism).
+pub const FULL_CHECK_IDS: &[&str] = &[
+    "concurrency.distinct_ids",
+    "snapshot.restore_roundtrip",
+    "metrics.mem_limit_ooms",
+];
+
+/// Records a [`CheckStatus::Skip`](crate::CheckStatus::Skip) for every `roster` id the run did not
+/// already record, with `reason` — the tail every level runner ends with.
+///
+/// It is deliberately *idempotent per id* and driven off the accumulated outcomes rather than a
+/// per-arm bookkeeping flag: an arm that returns early on a path nobody thought about still leaves
+/// its id in the report, which is the whole point (the pre-v33 `run_core` dropped seven ids when a
+/// VM failed to start, and the missing enumeration was the recorded reason two of the three roster
+/// gates did not exist).
+pub(crate) fn fill_unrecorded(
+    outcomes: &mut Vec<CheckOutcome>,
+    roster: &[&'static str],
+    level: Level,
+    reason: &str,
+) {
+    for id in roster {
+        if !outcomes.iter().any(|o| o.id == *id) {
+            skip(outcomes, id, level, reason);
+        }
+    }
+}
+
 /// Core: one net-disabled VM → banner, steward-ready, exec/put-file round-trips, rootfs presence,
-/// overlay, clean shutdown. Never skips (KVM is a precondition).
+/// overlay, clean shutdown. Never skips for want of a host capability (KVM is a precondition) —
+/// but every id in [`CORE_CHECK_IDS`] is **recorded or skipped on every path**, including the
+/// paths that die before the guest hands shakes (design §10.6).
 pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<CheckOutcome>) {
+    let stopped = run_core_inner(vmm, a, outcomes).await;
+    // `None` = the run reached the end, so the fill is a no-op. If it ever is not, the reason names
+    // the bug rather than leaving an id silently missing from the report.
+    let reason = stopped.unwrap_or_else(|| {
+        "not attempted: the Core run ended without reporting why (a check that ran records its own \
+         outcome, so this reason means the roster and the run disagree)"
+            .to_string()
+    });
+    fill_unrecorded(outcomes, CORE_CHECK_IDS, Level::Core, &reason);
+}
+
+/// [`run_core`]'s body. Returns `Some(reason)` when it stopped early — the reason every id it did
+/// not reach is skipped with, naming the check whose failure stopped the run so the report points
+/// at the cause instead of repeating it nine times.
+async fn run_core_inner<V: Vmm>(
+    vmm: &V,
+    a: &ArtifactSet,
+    outcomes: &mut Vec<CheckOutcome>,
+) -> Option<String> {
     let cfg = match base_cfg(a).network_disabled().build() {
-        Ok(c) => c,
+        Ok(c) => {
+            // Recorded on the success path too (v33 delta 3): an error-only id is invisible to a
+            // roster enumeration, and "the id is missing" and "the check passed" must not be the
+            // same observation for a consumer diffing reports.
+            record(outcomes, "boot.config", Level::Core, Ok(()));
+            c
+        }
         Err(e) => {
             record(
                 outcomes,
@@ -768,7 +852,7 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
                 Level::Core,
                 Err(format!("config build failed: {e}")),
             );
-            return;
+            return Some("not attempted: the VM config did not build (see boot.config)".into());
         }
     };
     let mut vm = match try_start_vm(vmm, cfg).await {
@@ -787,7 +871,7 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
                 Err(msg.clone()),
             );
             record(outcomes, "boot.steward_ready", Level::Core, Err(msg));
-            return;
+            return Some("not attempted: the VM never started (see boot.kernel_banner)".into());
         }
     };
     record(
@@ -809,12 +893,28 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
                     .await;
             record(outcomes, "boot.steward_ready", Level::Core, Err(msg));
             let _ = vm.shutdown().await;
-            return;
+            return Some(
+                "not attempted: the guest never reached steward-ready (see boot.steward_ready)"
+                    .into(),
+            );
         }
     }
     // Re-borrow the steward for each check (the connection is cached on the VM).
-    for (id, res) in guest_core_checks(&mut vm).await {
-        record(outcomes, id, Level::Core, res);
+    match guest_core_checks(&mut vm).await {
+        Ok(results) => {
+            for (id, res) in results {
+                record(outcomes, id, Level::Core, res);
+            }
+        }
+        Err(msg) => {
+            record(outcomes, "steward.exec_roundtrip", Level::Core, Err(msg));
+            let _ = vm.shutdown().await;
+            return Some(
+                "not attempted: the steward connection was lost after the handshake (see \
+                 steward.exec_roundtrip)"
+                    .into(),
+            );
+        }
     }
     record(
         outcomes,
@@ -822,26 +922,32 @@ pub async fn run_core<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<Check
         Level::Core,
         vm.shutdown().await.map_err(|e| e.to_string()),
     );
+    None
 }
 
 /// Runs the guest-facing Core checks against `vm`'s cached steward, returning (id, result) pairs.
-async fn guest_core_checks<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<(&'static str, Result<(), String>)> {
+///
+/// `Err(msg)` is the distinct "the steward went away between the handshake and the probes" case:
+/// the caller records it against `steward.exec_roundtrip` and skips the remaining guest ids with a
+/// reason pointing there, rather than repeating one transport failure as five contract violations.
+async fn guest_core_checks<V: Vmm>(
+    vm: &mut MicroVm<V>,
+) -> Result<Vec<(&'static str, Result<(), String>)>, String> {
     // Captured before the `&mut` steward borrow so the failure arm can still read the console (the
     // borrow checker keeps the mutable borrow alive across the whole `match` here).
     let serial_log = vm.instance().serial_log().to_path_buf();
     let steward = match vm.steward(Some(STEWARD_READY_BUDGET)).await {
         Ok(a) => a,
         Err(e) => {
-            let msg = explain_boot_failure_at(
+            return Err(explain_boot_failure_at(
                 BootKind::Fresh,
                 &serial_log,
                 &format!("steward unavailable: {e}"),
             )
-            .await;
-            return vec![("steward.exec_roundtrip", Err(msg))];
+            .await);
         }
     };
-    vec![
+    Ok(vec![
         (
             "steward.exec_roundtrip",
             steward_exec_roundtrip(steward).await,
@@ -857,11 +963,26 @@ async fn guest_core_checks<V: Vmm>(vm: &mut MicroVm<V>) -> Vec<(&'static str, Re
             "rootfs.overlay_writable",
             rootfs_overlay_writable(steward).await,
         ),
-    ]
+    ])
 }
 
 /// Extended: capability-gated probes, each on its own appropriately-configured VM.
+///
+/// Every [`EXTENDED_CHECK_IDS`] entry is recorded or skipped on every path (see [`run_core`]).
 pub async fn run_extended<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<CheckOutcome>) {
+    run_extended_inner(vmm, a, outcomes).await;
+    // Every arm below records on each of its own paths, so this tail is a no-op today. It is here
+    // because that property must survive the next arm somebody adds: a forgotten path leaves a
+    // skipped id with a reason, never a check that silently vanished from the roster.
+    fill_unrecorded(
+        outcomes,
+        EXTENDED_CHECK_IDS,
+        Level::Extended,
+        "not attempted: the Extended run did not reach this check",
+    );
+}
+
+async fn run_extended_inner<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<CheckOutcome>) {
     let caps = vmm.capabilities();
 
     // net / IP-PNP (unprivileged NAT).
@@ -1115,7 +1236,20 @@ async fn run_shares_check<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<C
 }
 
 /// Full: the expensive/privileged contract — snapshot/restore, concurrency, memory-limit OOM.
+///
+/// Every [`FULL_CHECK_IDS`] entry is recorded or skipped on every path (see [`run_core`]).
 pub async fn run_full<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<CheckOutcome>) {
+    run_full_inner(vmm, a, outcomes).await;
+    // See `run_extended`: a no-op today, load-bearing for the arm added tomorrow.
+    fill_unrecorded(
+        outcomes,
+        FULL_CHECK_IDS,
+        Level::Full,
+        "not attempted: the Full run did not reach this check",
+    );
+}
+
+async fn run_full_inner<V: Vmm>(vmm: &V, a: &ArtifactSet, outcomes: &mut Vec<CheckOutcome>) {
     let caps = vmm.capabilities();
 
     // concurrency (no special capability).
@@ -1403,12 +1537,14 @@ mod tests {
         );
     }
 
-    // `run_core`'s start-failure arm, driven end to end without KVM: both Core boot ids stay in the
-    // report (a failed start must not shrink the roster) and both carry the no-evidence rendering
-    // rather than an asserted contract violation — `MicroVm::start` also fails for reasons that are
-    // not the artifact pair, which is exactly what a missing `cloud-hypervisor` binary looks like.
+    // `run_core`'s start-failure arm, driven end to end without KVM: the WHOLE Core roster stays in
+    // the report (v33 delta 3 — a failed start must not shrink it), the two boot ids fail carrying
+    // the no-evidence rendering rather than an asserted contract violation (`MicroVm::start` also
+    // fails for reasons that are not the artifact pair, which is exactly what a missing
+    // `cloud-hypervisor` binary looks like), and every id the run could not reach is a Skip naming
+    // the check that stopped it — never a silent absence and never a spurious pass.
     #[tokio::test]
-    async fn run_core_records_both_boot_checks_when_the_vm_never_starts() {
+    async fn run_core_records_the_whole_roster_when_the_vm_never_starts() {
         let vmm = FakeVmm::with_faults(FaultMenu {
             fail_create: true,
             ..FaultMenu::default()
@@ -1418,12 +1554,33 @@ mod tests {
         run_core(&vmm, &artifacts, &mut outcomes).await;
 
         let ids: Vec<&str> = outcomes.iter().map(|o| o.id).collect();
+        assert_eq!(ids, CORE_CHECK_IDS.to_vec(), "{ids:?}");
+        // The config built (the pair's paths are never opened by the builder), so `boot.config` is
+        // a recorded Pass — the error-only id v33 made unconditional.
         assert_eq!(
-            ids,
-            vec!["boot.kernel_banner", "boot.steward_ready"],
-            "{ids:?}"
+            outcomes
+                .iter()
+                .find(|o| o.id == "boot.config")
+                .map(|o| &o.status),
+            Some(&crate::CheckStatus::Pass)
         );
         for o in &outcomes {
+            if o.id == "boot.config" {
+                continue;
+            }
+            if !matches!(o.id, "boot.kernel_banner" | "boot.steward_ready") {
+                let crate::CheckStatus::Skip(reason) = &o.status else {
+                    panic!(
+                        "{} was never attempted, so it must be a Skip with a reason, got {:?}",
+                        o.id, o.status
+                    );
+                };
+                assert!(
+                    reason.contains("boot.kernel_banner"),
+                    "the skip must point at the check that stopped the run: {reason}"
+                );
+                continue;
+            }
             let crate::CheckStatus::Fail(msg) = &o.status else {
                 panic!(
                     "{} must fail when the VM never starts: {:?}",
@@ -1877,5 +2034,60 @@ mod tests {
             !source_arm.contains("BootKind::Restored"),
             "the snapshot SOURCE boots fresh; its console must not be read as a restored one"
         );
+    }
+
+    /// How many times `id` is spelled as a string literal in this module's production text — its
+    /// roster entry plus every site that records or skips it.
+    fn id_literal_sites(code: &str, id: &str) -> usize {
+        code.matches(&format!("\"{id}\"")).count()
+    }
+
+    /// THE DELETE-A-CHECK GATE, and the reason the roster is not self-certifying.
+    ///
+    /// `fill_unrecorded` is what makes a report never shrink — but it is also what would hide a
+    /// deleted check: rip the call out of `guest_core_checks` and the id still appears, as a Skip
+    /// with a plausible reason, and the rustdoc roster gates stay green because they compare
+    /// documented ids against *recorded* ones. So the roster is pinned from the other side too:
+    /// every id must have a recording site in the code, not merely a line in the const.
+    ///
+    /// A source scan, in the shape of `the_oom_check_reads_the_slice_of_the_vm_it_booted` above,
+    /// because the property lives at call sites inside orchestrators that need a real guest to run.
+    /// Its own scanner controls are `the_roster_scanner_distinguishes_a_declaration_from_a_call`.
+    #[test]
+    fn every_roster_id_has_a_recording_site() {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/checks.rs"));
+        let code = production_code(SRC);
+        for (level, roster) in [
+            ("Core", CORE_CHECK_IDS),
+            ("Extended", EXTENDED_CHECK_IDS),
+            ("Full", FULL_CHECK_IDS),
+        ] {
+            assert!(!roster.is_empty(), "the {level} roster is empty");
+            for id in roster {
+                let sites = id_literal_sites(&code, id);
+                assert!(
+                    sites >= 2,
+                    "{level} check `{id}` appears {sites} time(s) in production code: it is in the \
+                     roster const but nothing records it, so a run would report it as a Skip \
+                     forever. Either restore the check or remove the id from the roster AND its \
+                     Level rustdoc — a check that quietly became a permanent skip is the roster \
+                     gate's blind spot, which is why this scan exists."
+                );
+            }
+        }
+    }
+
+    /// The scanner's own red-on-inverse: it must see a roster line and a recording site as two
+    /// occurrences, and a roster line alone as one (the state a deleted check leaves behind).
+    #[test]
+    fn the_roster_scanner_distinguishes_a_declaration_from_a_call() {
+        let declared_only = "const CORE_CHECK_IDS: &[&str] = &[ \"boot.config\", ];";
+        assert_eq!(id_literal_sites(declared_only, "boot.config"), 1);
+        let declared_and_recorded = "const CORE_CHECK_IDS: &[&str] = &[ \"boot.config\", ]; \
+             record(outcomes, \"boot.config\", Level::Core, Ok(()));";
+        assert_eq!(id_literal_sites(declared_and_recorded, "boot.config"), 2);
+        // Substring safety: a longer id containing a shorter one must not inflate the shorter
+        // one's count, because the needle is quoted on both sides.
+        assert_eq!(id_literal_sites("\"boot.config_extra\"", "boot.config"), 0);
     }
 }

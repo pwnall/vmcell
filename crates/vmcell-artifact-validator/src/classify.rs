@@ -22,7 +22,7 @@
 //! of evidence is not evidence of a bad kernel (a missing `cloud-hypervisor` binary lands there
 //! too). Every arm of [`crate::checks`] that **reports** a VM which failed to start
 //! (`MicroVm::start`) or failed its steward handshake routes through one of the two — Core,
-//! Extended and Full alike, gated by `run_core_records_both_boot_checks_when_the_vm_never_starts`
+//! Extended and Full alike, gated by `run_core_records_the_whole_roster_when_the_vm_never_starts`
 //! and `every_extended_and_full_boot_failure_names_the_missing_evidence`.
 //!
 //! ## A restored VM's empty console is not a missing kernel
@@ -52,6 +52,8 @@
 //!   steward's own stable prefix is both narrower and more reliable.
 
 use std::borrow::Cow;
+
+use vmcell::feature::{Feature, Removal};
 
 use crate::kconfig::KconfigValues;
 
@@ -348,6 +350,90 @@ pub fn explain_without_serial(base: &str, no_evidence_because: &str) -> String {
     );
     msg.push_str(CHECKLIST_POINTER);
     msg
+}
+
+// ---------------------------------------------------------------------------
+// The conformance renderers (design §10.6, §18 delta 3)
+// ---------------------------------------------------------------------------
+//
+// A `Warn` goes through the classifier for exactly the reason a `Fail` does: "an under-claim with
+// no explanation is a bare bool again" (§10.6). The three below are the only places a conformance
+// verdict's prose is composed, and every one of them names the feature through `Feature::name()`
+// (F6: refusal and report strings are composed from the vocabulary, never hand-spelled — which is
+// what lets a test match on the feature name instead of on a phrase).
+
+/// Render the message a [`crate::CheckStatus::Fail`] carries when a **declared-present** feature
+/// does not hold.
+///
+/// `removal` is `Some` when an axis of the substrate positively removes the feature — the §7.4
+/// provenance case, where the message must name *who* says it cannot work (a backend, the host, the
+/// config), because "it failed" and "this backend never had it" are different bugs with different
+/// owners. `evidence` is what the probe actually observed.
+#[must_use]
+pub fn explain_broken_claim(
+    feature: Feature,
+    artifact: &str,
+    removal: Option<&Removal>,
+    evidence: &str,
+) -> String {
+    let mut msg = format!(
+        "artifact \"{artifact}\" declares `{}` and it does not hold here",
+        feature.name()
+    );
+    if let Some(removal) = removal {
+        // `Removal`'s own Display: `<feature>: unavailable (<source> <reason>)` — the one spelling,
+        // so the provenance a consumer reads here is byte-identical to the one `vmcell`'s typed
+        // refusals carry.
+        msg.push_str("\n  provenance: ");
+        msg.push_str(&removal.to_string());
+    }
+    msg.push_str("\n  evidence: ");
+    msg.push_str(evidence);
+    msg.push_str(
+        "\n  a DECLARED feature that does not work is an error: the declaration is the claim a \
+         consumer builds fixtures on. Either the artifact must deliver it, or the declaration must \
+         stop claiming it (§7.4 — the registry entry is the one authority, its sidecar the travel \
+         form).",
+    );
+    msg
+}
+
+/// Render the message a [`crate::CheckStatus::Warn`] carries: the artifact declares the feature
+/// **absent** and the data plane says otherwise, with the positive control that proves the probe
+/// discriminates.
+///
+/// Deliberately *not* phrased as a failure. Under-claiming is a documentation defect; reddening it
+/// would push declarers toward over-claiming, which is the direction this kit cannot catch cheaply
+/// and the one that actually breaks consumers.
+#[must_use]
+pub fn explain_underclaim(feature: Feature, artifact: &str, control: &str) -> String {
+    format!(
+        "artifact \"{artifact}\" declares `{}` ABSENT, but the probe demonstrated it working — an \
+         under-claim.\n  positive control: the same probe answered \"works\" for \"{control}\", \
+         which is what makes \"works\" here a measurement rather than a probe that always says \
+         yes.\n  this is a DOCUMENTATION defect, not a runtime one: nothing in the cell is broken, \
+         and it is not reported as a failure because reddening an under-claim pushes declarers \
+         toward over-claiming. Fix the declaration (§7.4) or disposition it in \
+         `expected_warnings` (§10.6).",
+        feature.name()
+    )
+}
+
+/// Render the message a [`crate::CheckStatus::Unverified`] carries: an absence that **cannot be
+/// decided**, and why.
+///
+/// The state exists because proving a negative is sometimes impractical, and an honest kit says so
+/// per check instead of quietly counting the absence as verified — the same distinction
+/// [`KconfigValues::get`] draws between a symbol `olddefconfig` dropped and one the author
+/// disabled.
+#[must_use]
+pub fn explain_undecidable(feature: Feature, artifact: &str, why: &str) -> String {
+    format!(
+        "artifact \"{artifact}\"'s declaration about `{}` could not be decided: {why}.\n  an \
+         undecidable absence is NEVER counted as a pass — it is reported so the caller knows this \
+         part of the claim is unmeasured, exactly as a skip is.",
+        feature.name()
+    )
 }
 
 /// The last non-empty lines of `log`, in order, under all three bounds: at most
@@ -995,6 +1081,87 @@ mod tests {
         assert_eq!(
             missing_symbols(ContractViolation::RootFsMount, &cfg),
             vec!["CONFIG_EROFS_FS"]
+        );
+    }
+
+    // ── The conformance renderers (§10.6) ────────────────────────────────────────────────────
+
+    // A Warn goes through the classifier for the same reason a Fail does: an under-claim with no
+    // explanation is a bare bool again. The message must (a) name the feature through the
+    // vocabulary, so a consumer matches `Feature::name()` and never a hand-spelled phrase (F6),
+    // (b) name the positive control — the thing that makes "it works" a measurement rather than a
+    // probe that always says yes — and (c) not read as a failure, because the whole point of the
+    // state is that reddening an under-claim pushes declarers toward over-claiming.
+    #[test]
+    fn the_underclaim_renderer_names_the_feature_the_control_and_the_defect_class() {
+        let msg = explain_underclaim(Feature::SnapshotRestore, "debian-systemd", "canonical");
+        assert!(msg.contains(Feature::SnapshotRestore.name()), "{msg}");
+        assert!(
+            msg.contains("debian-systemd") && msg.contains("canonical"),
+            "{msg}"
+        );
+        assert!(msg.contains("DOCUMENTATION defect"), "{msg}");
+        assert!(
+            msg.contains("expected_warnings"),
+            "an under-claim must say how to disposition it: {msg}"
+        );
+        // The feature name is composed, not spelled: a renderer that hardcoded "snapshot" would
+        // pass the first assertion for the wrong reason, so the two other features are rendered
+        // too and must differ exactly in that token.
+        let other = explain_underclaim(Feature::XattrPreserved, "debian-systemd", "canonical");
+        assert!(other.contains(Feature::XattrPreserved.name()), "{other}");
+        assert!(!other.contains(Feature::SnapshotRestore.name()), "{other}");
+    }
+
+    // §7.4 provenance in the report: a claim the SUBSTRATE removes must name who removed it and
+    // why, in `Removal`'s one spelling — so "this backend never had it" and "it broke" are not the
+    // same sentence to a reader who has to fix one of them.
+    #[test]
+    fn the_broken_claim_renderer_carries_the_removal_provenance() {
+        let removal = Removal {
+            feature: Feature::SnapshotRestore,
+            by: vmcell::feature::Source::Backend("qemu".into()),
+            reason: "does not support it",
+        };
+        let with = explain_broken_claim(
+            Feature::SnapshotRestore,
+            "debian-systemd",
+            Some(&removal),
+            "the substrate says so",
+        );
+        assert!(with.contains(&removal.to_string()), "{with}");
+        assert!(with.contains("backend \"qemu\""), "{with}");
+
+        // Without a removal there is no provenance line to invent: the evidence stands alone.
+        let without = explain_broken_claim(
+            Feature::SnapshotRestore,
+            "debian-systemd",
+            None,
+            "restore() returned an error",
+        );
+        assert!(!without.contains("provenance:"), "{without}");
+        assert!(without.contains("restore() returned an error"), "{without}");
+        assert!(
+            without.contains(Feature::SnapshotRestore.name()),
+            "{without}"
+        );
+    }
+
+    // An undecidable absence must say so in the message, not only in the variant: a report is read
+    // as text far more often than it is matched on, and "unverified" that reads like "verified" is
+    // the skip==pass hazard one level up.
+    #[test]
+    fn the_undecidable_renderer_refuses_to_read_as_a_pass() {
+        let msg = explain_undecidable(
+            Feature::NestedVirt,
+            "debian-systemd",
+            "the positive control could not demonstrate it here",
+        );
+        assert!(msg.contains(Feature::NestedVirt.name()), "{msg}");
+        assert!(msg.contains("NEVER counted as a pass"), "{msg}");
+        assert!(
+            msg.contains("the positive control could not demonstrate it here"),
+            "{msg}"
         );
     }
 }
