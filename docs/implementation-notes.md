@@ -4164,6 +4164,63 @@ in microseconds; bounded and fail-loud, but not rate-limited.
 load-bearing gates confirmed red under a planted regression (subreaper removed, `teardown_all`
 removed, `parse_steward_port` removed) and green again after restoring.
 
+## v33 delta 6a — the registry core and the rootfs kind (design §18 delta 6, §10.5, invariant F7), as built
+
+**Landed in three commits, not one.** §18 treats delta 6 as one item; it is a multi-thousand-line
+change touching the pins schema, three producers and every fixture that seeds a rootfs pin. Splitting
+it into 6a (the shared core + the rootfs kind), 6b (the `handlers` kind) and 6c (laziness + F7's
+verified fetch + `features`) makes each half reviewable and independently gated, and all three land
+before delta 7 so the register's ordering is intact.
+
+**What landed in 6a.** `artifact::registry` — the one merge/sort/collision law, parameterized by
+kind — with `resolve_kernel_registry` re-pointed through it; the `rootfs` map namespace with its
+loud legacy-shape reject; `RootfsRegistryEntry`/`resolve_rootfs_registry`/`resolve_rootfs_labels`;
+the four rootfs key/name composers; `RootfsStage`'s label; `vmcell build --rootfs-label`; the
+`bundle` walk's rootfs arm; `scripts/ban-rootfs-key-composers.sh` + its self-test; and the
+eight-leg `crates/vmcell/tests/rootfs_registry.rs` battery.
+
+**The decision that made the whole reshape cheap: `rootfs.default` flattens to the UN-suffixed
+keys.** `rootfs_pin_key(None, "image")` is `rootfs_image` — the exact key every pre-v33 reader
+already uses. So §10.5's "the canonical artifacts stay byte-identical for a cell that names no
+label" is a property of the *data* rather than a promise about the code, and the handoff's recorded
+blocker — that reshaping `rootfs` would silently repoint `resolve_builder_base`, which picks the
+image that builds **kernels** — evaporates instead of needing a fix. `default` is a real registry
+entry, not a special case beside the registry.
+
+**The legacy reject runs on the MERGED document, and that is load-bearing.**
+`merge_pins_documents` merges leaf-wise, so an overlay adding a label over a singleton baseline
+produces a *hybrid* holding `image`/`digest` leaves beside label keys — and that hybrid passes
+`parse_pins_overlay`'s shape check, which is top-level only. Checking the overlay alone would pass
+the gate leg and miss the real case. `a_hybrid_of_the_two_shapes_is_rejected_too` is that leg, and
+it asserts the baseline's `default` really is present in the merged document so a reject keyed on
+"the namespace has no labels" could not satisfy it.
+
+**Retired: the `rootfs.debian_snapshot_timestamp` nesting.** Under a label map that path names a
+registry entry, not a pin, and honoring both readings is the ambiguity the reject exists to refuse.
+The test that pinned the nesting now pins its *retirement* rather than being deleted — the top-level
+namespace, the only form the committed baseline ever carried, is untouched.
+
+**`RootfsStage`'s fields went private.** `Stage::name` returns a `&str`, so a labelled stage must
+read a precomputed name; public `label` and `stage_name` side by side would let a caller set one
+without the other and get a stage whose identity disagrees with its output path. The constructor
+pair (`new` / `labelled`) plus three `with_*` setters is the invalid-state-unrepresentable form, and
+it is a ledgered break.
+
+**Two helpers died in the extraction**, and the tests that drove them moved rather than being
+deleted: `sort_kernel_registry` and `reject_sanitized_label_collision` are now the shared core's,
+whose own unit suite drives the reversed-input ordering law and the both-labels-named collision
+message. What stayed kernel-side is the property the generic test cannot see — that a fragment set
+rides along with its label rather than being re-paired by index.
+
+**Verified:** `just gates` exit 0 (the meta-gate accepts the new script pair in both directions, 31
+gate-shaped scripts), the workspace unit suite green, `rootfs_registry` 8/8, and the byte-identity
+claim confirmed **red** under a planted `registry_label` that suffixes the default — both the
+battery leg and the core's own unit leg.
+
+**Not yet, and refused rather than ignored meanwhile:** a `rootfs` entry's `xattrs` and `features`
+keys are rejected naming the delta that adds them. That is the F1-clean seam the delta-5 notes
+recorded: the key is refused here and honored there, never accepted-and-ignored in between.
+
 ## Where the v33 pass stands
 
 Deltas 1–5 of the §18 register are landed, pushed, and live-validated; **6–10 are not started**.

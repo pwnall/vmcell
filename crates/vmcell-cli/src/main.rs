@@ -75,6 +75,12 @@ enum Commands {
         /// Debian release suite for the `mmdebstrap` rootfs source (ignored for `oci`).
         #[arg(long, default_value = "trixie")]
         release: String,
+        /// Which `rootfs` registry label to build (§10.5, v33 delta 6). Omitted builds `default`,
+        /// which resolves to today's pinned base and lands at `rootfs.erofs`; a label lands at
+        /// `rootfs-<label>.erofs`. Selection lives here, at the artifact layer, rather than on
+        /// `VmConfig` — a cell consumes whatever path it is handed, exactly as before.
+        #[arg(long)]
+        rootfs_label: Option<String>,
         /// Pins overlay layered over vmcell's committed baseline (§10.2). Overrides `$VMCELL_PINS`.
         #[arg(long)]
         pins: Option<PathBuf>,
@@ -406,10 +412,12 @@ fn build_stages(
     kernel_source: KernelSource,
     rootfs_source: RootfsSourceKind,
     release: String,
+    rootfs_label: Option<&str>,
     pins: Option<&std::path::Path>,
     cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
 ) -> vmcell::Result<Vec<Box<dyn vmcell::artifact::Stage>>> {
     reject_seed_needing_source_for_build(kernel_source)?;
+    reject_unknown_rootfs_label(rootfs_label, pins)?;
     Ok(vec![
         Box::new(vmcell::artifact::ResolvePinsStage {
             overlay_file: pins_overlay(pins),
@@ -417,7 +425,7 @@ fn build_stages(
         kernel_stage(kernel_source, None, None, cid_alloc.clone())?,
         Box::new(vmcell::artifact::steward::StewardStage {}),
         Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}),
-        rootfs_stage(rootfs_source, release, cid_alloc),
+        rootfs_stage(rootfs_source, release, rootfs_label, cid_alloc),
     ])
 }
 
@@ -457,22 +465,53 @@ fn build_kernels_stages(
     Ok(stages)
 }
 
+/// Refuses a `--rootfs-label` the resolved `rootfs` registry does not hold, naming the labels it
+/// does (§10.5).
+///
+/// A pre-flight rather than a `Missing rootfs_<label>_image pin` deep inside the stage: the pin
+/// message cannot say which labels exist, and "the label you asked for is not registered" is the
+/// only thing the operator needs to hear. Mirrors `build_labelled_kernel`'s own pre-flight.
+///
+/// # Errors
+/// [`vmcell::Error::Artifact`] naming the unknown label and the registered ones.
+fn reject_unknown_rootfs_label(
+    label: Option<&str>,
+    pins: Option<&std::path::Path>,
+) -> vmcell::Result<()> {
+    let Some(label) = label else {
+        return Ok(());
+    };
+    let overlay = vmcell::artifact::pins_overlay_or_env(pins);
+    let labels = vmcell::artifact::resolve_rootfs_labels(overlay.as_deref())?;
+    if labels.iter().any(|l| l == label) {
+        return Ok(());
+    }
+    Err(vmcell::Error::Artifact(format!(
+        "unknown rootfs label `{label}`: the resolved pins `rootfs` registry holds [{}] \
+         (add yours through a pins overlay, §10.2)",
+        labels.join(", ")
+    )))
+}
+
 /// Builds the rootfs [`Stage`](vmcell::artifact::Stage) selected by `source` — the `vmcell`
 /// OCI bootstrap producer or the in-VM `vmcell-rootfs-builder` mmdebstrap source (§4.3, The rootfs-construction contract).
 fn rootfs_stage(
     source: RootfsSourceKind,
     release: String,
+    rootfs_label: Option<&str>,
     cid_alloc: std::sync::Arc<vmcell::vmm::CidAllocator>,
 ) -> Box<dyn vmcell::artifact::Stage> {
     match source {
         // `vmcell build` produces vmcell's own canonical rootfs and takes no `--inject`; the
         // downstream extra-file surface is `oci2erofs` (§10.4's documented consumer
         // invocation), so both arms compose nothing.
-        RootfsSourceKind::Oci => Box::new(vmcell::artifact::rootfs::RootfsStage {
-            image_override: None,
-            steward_musl: None,
-            extra: Vec::new(),
-        }),
+        RootfsSourceKind::Oci => Box::new(vmcell::artifact::rootfs::RootfsStage::labelled(
+            rootfs_label,
+        )),
+        // The mmdebstrap source builds from a release suite, not from a registered digest, so it
+        // has no label to honor. `dispatch` refuses the combination before this point rather than
+        // dropping it here: an accepted-and-ignored `--rootfs-label` would build the default
+        // userland and report success.
         RootfsSourceKind::Mmdebstrap => Box::new(vmcell_rootfs_builder::MmdebstrapRootfsStage {
             release,
             cid_alloc,
@@ -487,8 +526,19 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
             kernel_source,
             rootfs_source,
             release,
+            rootfs_label,
             pins,
         } => {
+            // F1 on a flag pair: the mmdebstrap source builds from a release suite, not from a
+            // registered digest, so it has no label to honor. Refuse rather than ignore.
+            if rootfs_label.is_some() && matches!(rootfs_source, RootfsSourceKind::Mmdebstrap) {
+                return Err(vmcell::Error::Artifact(
+                    "--rootfs-label selects a `rootfs` registry entry (§10.5), which the \
+                     `mmdebstrap` source does not read: it builds from --release. Use \
+                     --rootfs-source oci, or drop --rootfs-label."
+                        .into(),
+                ));
+            }
             // One CID allocator shared by any in-VM builder stage this pipeline runs.
             let cid_alloc = std::sync::Arc::new(vmcell::vmm::CidAllocator::new());
             // Assemble — and so honor or reject every flag — BEFORE announcing the build: a
@@ -497,6 +547,7 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                 *kernel_source,
                 *rootfs_source,
                 release.clone(),
+                rootfs_label.as_deref(),
                 pins.as_deref(),
                 cid_alloc,
             )?;
@@ -570,6 +621,17 @@ async fn dispatch(command: &Commands) -> vmcell::Result<()> {
                             vmcell::artifact::kernel::resolved_config_path(&e.path()),
                         ));
                         candidates.push((key, e.path()));
+                    }
+                    // The same law, one kind over (§10.5, v33 delta 6): every labelled rootfs
+                    // built through `--rootfs-label` (`rootfs-<label>.erofs`). Without this the
+                    // registry would re-arm the exact N-BIN-4 defect the kernel walk above exists
+                    // to close — a registered artifact silently absent from the manifest.
+                    if let Some(label) = vmcell::artifact::rootfs::rootfs_label_from_filename(&name)
+                    {
+                        candidates.push((
+                            vmcell::artifact::rootfs::rootfs_artifact_key(Some(label)),
+                            e.path(),
+                        ));
                     }
                 }
             }
@@ -1042,13 +1104,14 @@ async fn oci2erofs(
     }
     pipeline = pipeline
         .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
-        .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
-            image_override: Some((image.to_string(), digest.to_string())),
-            steward_musl: steward_musl.map(std::path::Path::to_path_buf),
-            // The `--inject` files; the pack tail validates them (absolute dest, explicit
-            // mode, no vmcell-owned or duplicated dest — §4.2, invariant F5).
-            extra: inject.to_vec(),
-        }));
+        .add_stage(Box::new(
+            vmcell::artifact::rootfs::RootfsStage::new()
+                .with_image_override(image.to_string(), digest.to_string())
+                .with_steward_musl(steward_musl.map(std::path::Path::to_path_buf))
+                // The `--inject` files; the pack tail validates them (absolute dest, explicit
+                // mode, no vmcell-owned or duplicated dest — §4.2, invariant F5).
+                .with_extra(inject.to_vec()),
+        ));
 
     pipeline.build(&vmcell::artifact::Cache::default()).await?;
 
@@ -1295,6 +1358,7 @@ mod tests {
             RootfsSourceKind::Oci,
             "trixie".to_string(),
             None,
+            None,
             alloc(),
         )
         // Render the roster so a regression reports WHAT it assembled instead of `Box<dyn Stage>`
@@ -1322,13 +1386,14 @@ mod tests {
         // not a blanket break of `vmcell build`.
         for source in [KernelSource::Prebuilt, KernelSource::HostMake] {
             for rootfs in [RootfsSourceKind::Oci, RootfsSourceKind::Mmdebstrap] {
-                let stages = build_stages(source, rootfs, "trixie".to_string(), None, alloc())
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "{} + {rootfs:?} must assemble: {e}",
-                            kernel_source_name(source)
-                        )
-                    });
+                let stages =
+                    build_stages(source, rootfs, "trixie".to_string(), None, None, alloc())
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "{} + {rootfs:?} must assemble: {e}",
+                                kernel_source_name(source)
+                            )
+                        });
                 let names: Vec<&str> = stages.iter().map(|s| s.name()).collect();
                 assert_eq!(
                     names,

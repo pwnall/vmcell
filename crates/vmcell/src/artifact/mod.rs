@@ -15,6 +15,15 @@ pub mod guest_tools;
 #[cfg(feature = "pipeline")]
 /// Kernel building stage.
 pub mod kernel;
+/// Tar to EROFS conversion utility.
+/// The one artifact-registry resolution law, parameterized per kind (§10.5).
+///
+/// Public for its two schema facts only — [`registry::DEFAULT_LABEL`] and
+/// [`registry::registry_label`] — which a consumer writing a pins overlay needs in order to know
+/// which label its entry has to use to remain the default. The resolution law itself is
+/// crate-internal: a consumer resolves through `resolve_kernel_registry` /
+/// `resolve_rootfs_registry`, never by re-parameterizing the core.
+pub mod registry;
 #[cfg(feature = "pipeline")]
 /// Root filesystem building stage.
 pub mod rootfs;
@@ -24,7 +33,7 @@ pub mod snapshot;
 #[cfg(feature = "pipeline")]
 /// Steward building stage.
 pub mod steward;
-/// Tar to EROFS conversion utility.
+
 #[cfg(feature = "am-fs-erofs")]
 pub mod tar2erofs;
 
@@ -269,11 +278,7 @@ fn build_fast_pipeline(dir: &Path) -> crate::error::Result<()> {
                     .add_stage(Box::new(ResolvePinsStage { overlay_file }))
                     .add_stage(Box::new(crate::artifact::steward::StewardStage {}))
                     .add_stage(Box::new(crate::artifact::guest_tools::GuestToolsStage {}))
-                    .add_stage(Box::new(crate::artifact::rootfs::RootfsStage {
-                        image_override: None,
-                        steward_musl: None,
-                        extra: Vec::new(),
-                    }))
+                    .add_stage(Box::new(crate::artifact::rootfs::RootfsStage::new()))
                     .build(&Cache::default())
                     .await
                     .map(|_| ())
@@ -827,12 +832,23 @@ fn flatten_pins_namespace(
             }
             Some(PinsNamespaceShape::Object)
         }
+        // The rootfs registry (§10.5, v33 delta 6): each `rootfs.<label>` → keyed pins, composed
+        // through the one exported law (`rootfs::rootfs_pin_key`) every consumer READS through.
+        // `default` emits the UN-SUFFIXED `rootfs_image`/`rootfs_digest`, which is what keeps every
+        // pre-v33 reader — `RootfsStage`, and `resolve_builder_base`, which picks the image that
+        // builds *kernels* — working untouched across the reshape. The legacy singleton shape is
+        // rejected loud on the merged document (`reject_legacy_pins_shapes`), not reinterpreted
+        // here: two accepted shapes for one namespace is parser ambiguity waiting for a third.
         "rootfs" => {
-            if let Some(img) = value.get("image").and_then(|v| v.as_str()) {
-                out.insert("rootfs_image".to_string(), img.to_string());
-            }
-            if let Some(dig) = value.get("digest").and_then(|v| v.as_str()) {
-                out.insert("rootfs_digest".to_string(), dig.to_string());
+            if let Some(entries) = value.as_object() {
+                for (label, spec) in entries {
+                    let key_label = registry::registry_label(label);
+                    for sub in ["image", "digest"] {
+                        if let Some(v) = spec.get(sub).and_then(|v| v.as_str()) {
+                            out.insert(rootfs::rootfs_pin_key(key_label, sub), v.to_string());
+                        }
+                    }
+                }
             }
             Some(PinsNamespaceShape::Object)
         }
@@ -893,16 +909,12 @@ fn flatten_pins_document(json: &serde_json::Value) -> std::collections::HashMap<
             let _shape = flatten_pins_namespace(name, value, &mut pins_map);
         }
     }
-    // `rootfs.debian_snapshot_timestamp` is the historical nesting; the top-level pin (emitted by
-    // the namespace dispatch above) wins when both are present.
-    if !pins_map.contains_key("debian_snapshot_timestamp")
-        && let Some(ts) = json
-            .get("rootfs")
-            .and_then(|r| r.get("debian_snapshot_timestamp"))
-            .and_then(|v| v.as_str())
-    {
-        pins_map.insert("debian_snapshot_timestamp".to_string(), ts.to_string());
-    }
+    // The historical `rootfs.debian_snapshot_timestamp` nesting is RETIRED by v33 delta 6 (§10.5):
+    // `rootfs` is a label map now, so that path names a registry entry called
+    // `debian_snapshot_timestamp` rather than a pin, and honoring both readings is the parser
+    // ambiguity the legacy-shape reject exists to refuse. The top-level `debian_snapshot_timestamp`
+    // namespace — which always won when both were present, and is the only form the committed
+    // baseline has ever carried — is unchanged.
     pins_map
 }
 
@@ -1023,7 +1035,45 @@ fn resolve_pins_document(overlay_file: Option<&Path>) -> Result<serde_json::Valu
         let overlay = parse_pins_overlay(&read_pins_overlay(path)?, path)?;
         merge_pins_documents(&mut doc, &overlay);
     }
+    reject_legacy_pins_shapes(&doc)?;
     Ok(doc)
+}
+
+/// Rejects a pre-v33 pins shape, naming the migration (§10.5, v33 delta 6).
+///
+/// **On the MERGED document, deliberately.** `merge_pins_documents` merges leaf-wise, so an overlay
+/// carrying `{"rootfs": {"debian-systemd": {…}}}` over a singleton baseline produces a *hybrid*
+/// object holding `image`/`digest` leaves beside label keys — and that hybrid passes
+/// `parse_pins_overlay`'s shape check, which is top-level only. Checking the overlay alone would
+/// pass the gate leg and miss the real case; checking the baseline alone would miss a consumer's
+/// stale overlay entirely.
+///
+/// The alternative — reinterpreting a singleton as `{"default": …}` — is refused on principle: two
+/// accepted shapes for one namespace is parser ambiguity waiting for a third, and a consumer whose
+/// overlay silently keeps working is a consumer who never learns the schema moved.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] naming the namespace, the offending keys, and the map form.
+fn reject_legacy_pins_shapes(doc: &serde_json::Value) -> Result<()> {
+    let Some(rootfs) = doc.get("rootfs").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    let legacy: Vec<&str> = ["image", "digest"]
+        .into_iter()
+        .filter(|k| rootfs.contains_key(*k))
+        .collect();
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let default = registry::DEFAULT_LABEL;
+    Err(crate::error::Error::Artifact(format!(
+        "pins `rootfs` carries the retired v32 singleton key(s) {legacy:?}: as of v33 (§10.5) \
+         `rootfs` is a registry of LABELS. Migrate the singleton to a `{default}` entry — \
+         `\"rootfs\": {{ \"{default}\": {{ \"image\": …, \"digest\": … }} }}` — which flattens to the \
+         same `rootfs_image`/`rootfs_digest` pins, so nothing downstream of the pins map changes. \
+         Reinterpreting the singleton silently was rejected: two accepted shapes for one namespace \
+         is parser ambiguity waiting for a third."
+    )))
 }
 
 /// Resolves the flat pin map a downstream consumer builds against: vmcell's committed baseline with
@@ -1079,70 +1129,150 @@ pub struct KernelRegistryEntry {
 /// `fragments` key is not an array of non-empty strings (a malformed override is named, never
 /// silently ignored), or when two labels sanitize to one on-disk artifact filename (naming both).
 pub fn resolve_kernel_registry(overlay_file: Option<&Path>) -> Result<Vec<KernelRegistryEntry>> {
+    // The merge/sort/collision half is `registry::resolve_registry` — the ONE law, shared with the
+    // rootfs kind (§10.5). What stays here is the only part that is genuinely per-kind: how one
+    // entry parses. Sorting and the collision reject are applied there, at the one reader every
+    // producer and every roster goes through, so a colliding pair cannot reach `build-kernels`,
+    // `build_labelled_kernel`, or `bundle` by any route.
     let doc = resolve_pins_document(overlay_file)?;
-    let Some(kernels) = doc.get("kernels").and_then(|k| k.as_object()) else {
-        return Ok(Vec::new());
-    };
-    let entries: Vec<KernelRegistryEntry> = kernels
-        .iter()
-        .map(|(label, spec)| {
+    registry::resolve_registry(
+        &doc,
+        &registry::RegistryKind {
+            namespace: "kernels",
+            filename: &|label: &str| kernel::kernel_filename(Some(label)),
+            collision_consequence: "building both would overwrite one kernel with the other plus its `.cache_key` \
+                 and `.config` sidecars, and leave the two labels evicting each other's cache \
+                 entry on every build",
+        },
+        |label, spec| {
             Ok(KernelRegistryEntry {
-                label: label.clone(),
+                label: label.to_string(),
                 fragments: kernel_entry_fragments(label, spec)?,
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let entries = sort_kernel_registry(entries);
-    // Reject here, at the ONE reader every producer and every roster goes through, so a colliding
-    // pair cannot reach `build-kernels`, `build_labelled_kernel`, or `bundle` by any route.
-    reject_sanitized_label_collision(&entries)?;
-    Ok(entries)
+        },
+        |e: &KernelRegistryEntry| e.label.as_str(),
+    )
 }
 
-/// Rejects two registry labels that sanitize to the **same** on-disk kernel filename, naming both
-/// (§5.6, The downstream kernel toolkit; docs/78 `sanitized-label-collision-unrejected`).
+/// One entry of the merged `rootfs` registry: a label and the digest-pinned OCI base it names
+/// (§10.5, v33 delta 6).
 ///
-/// The filename law sanitizes `.`→`-` ([`kernel::kernel_filename`]) so a dotted label cannot make
-/// `Path::with_extension` eat its trailing component — which means `6.12.94` and `6-12-94` are two
-/// distinct pins keys, two distinct cache-key hashes, and **one** `vmlinux-6-12-94`. Nothing else
-/// notices: `build-kernels` builds both in label order, the second silently overwrites the first's
-/// image *and* both sidecars (`.cache_key`, `.config`), and because each build's cache key still
-/// says "this is mine" the two labels evict each other on every warm run, forever. The labels are
-/// opaque strings, so vmcell cannot pick a winner; the operator renames one.
+/// The label alone fully determines the artifact — that is the whole point of the registry, and the
+/// reason `image`/`digest` are required rather than optional: an entry that resolves to "whatever
+/// is at that location today" is un-citable by any consumer's provenance discipline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RootfsRegistryEntry {
+    /// The registry label, e.g. `"default"` — the `rootfs.<label>` key and the
+    /// `rootfs-<label>.erofs` artifact name.
+    pub label: String,
+    /// The OCI base image reference, without the digest.
+    pub image: String,
+    /// The `sha256:<64 hex>` digest the base is pinned to. Authoritative: a label resolves to a
+    /// digest, never a mutable tag (the `oci2-erofs` rule, promoted to the registry's).
+    pub digest: String,
+}
+
+/// The merged `rootfs` registry in **sorted label order** (§10.5, v33 delta 6).
 ///
-/// Checked on the SORTED registry so the pair is named in a stable order.
+/// The rootfs mirror of [`resolve_kernel_registry`], sharing its merge/sort/collision core so the
+/// two kinds cannot drift into two laws. Resolved through the same baseline+overlay merge as the
+/// pipeline stage, so a downstream-added `rootfs.<label>` is buildable by the exact CLI command the
+/// toolkit contract advertises.
 ///
 /// # Errors
-/// [`crate::error::Error::Artifact`] naming both colliding labels and the filename they share.
-fn reject_sanitized_label_collision(entries: &[KernelRegistryEntry]) -> Result<()> {
-    let mut by_filename: std::collections::HashMap<String, &str> =
-        std::collections::HashMap::with_capacity(entries.len());
-    for entry in entries {
-        let filename = kernel::kernel_filename(Some(&entry.label));
-        if let Some(previous) = by_filename.insert(filename.clone(), entry.label.as_str()) {
+/// As [`resolve_pins`], plus [`crate::error::Error::Artifact`] when an entry is malformed (naming
+/// the label and the key), when its digest is not `sha256:<64 hex>`, or when two labels sanitize to
+/// one on-disk artifact filename (naming both).
+pub fn resolve_rootfs_registry(overlay_file: Option<&Path>) -> Result<Vec<RootfsRegistryEntry>> {
+    let doc = resolve_pins_document(overlay_file)?;
+    registry::resolve_registry(
+        &doc,
+        &registry::RegistryKind {
+            namespace: "rootfs",
+            filename: &|label: &str| rootfs::rootfs_filename(registry::registry_label(label)),
+            collision_consequence: "building both would overwrite one image with the other plus its `.cache_key` \
+                 sidecar, and leave the two labels evicting each other's cache entry on every build",
+        },
+        rootfs_registry_entry,
+        |e: &RootfsRegistryEntry| e.label.as_str(),
+    )
+}
+
+/// Parses one `rootfs.<label>` entry — **strictly** (§10.5, F7).
+///
+/// Every key is honored or rejected naming it (law F1), because a silently-ignored key in a
+/// registry entry is a declaration a consumer built a fixture on. Two keys are rejected with a
+/// forward reference rather than a bare "unknown", because the design's own §10.5 sketch shows
+/// them and a consumer copying that sketch deserves to be told *when* rather than merely *no*:
+/// `xattrs` and `features` arrive with §18 delta 7 and its successor.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] naming the label and the offending key.
+fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<RootfsRegistryEntry> {
+    let obj = spec.as_object().ok_or_else(|| {
+        crate::error::Error::Artifact(format!(
+            "pins `rootfs.{label}` must be an object of the form \
+             {{\"image\": \"…\", \"digest\": \"sha256:…\"}}"
+        ))
+    })?;
+    for key in obj.keys() {
+        let known = matches!(key.as_str(), "image" | "digest");
+        if !known {
+            let arriving = match key.as_str() {
+                "xattrs" => " (§4.7's xattr policy arrives with §18 delta 7)",
+                "features" => " (§7.4 feature declarations arrive with §18 delta 6c)",
+                _ => "",
+            };
             return Err(crate::error::Error::Artifact(format!(
-                "pins `kernels` labels `{previous}` and `{}` both sanitize to the one artifact \
-                 filename `{filename}` (the `.`→`-` law, §5.6): building both would overwrite one \
-                 kernel with the other plus its `.cache_key` and `.config` sidecars, and leave the \
-                 two labels evicting each other's cache entry on every build — rename one label",
-                entry.label
+                "pins `rootfs.{label}` carries unknown key `{key}`{arriving}; a silently ignored \
+                 declaration is one a consumer builds a fixture on (known keys: image, digest)"
             )));
         }
     }
-    Ok(())
+    let field = |name: &str| -> Result<String> {
+        obj.get(name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                crate::error::Error::Artifact(format!(
+                    "pins `rootfs.{label}` must carry a non-empty string `{name}`"
+                ))
+            })
+    };
+    let image = field("image")?;
+    let digest = field("digest")?;
+    // A label resolves to a DIGEST, never a mutable tag — the `oci2-erofs` rule adopted as the
+    // registry's (§10.5). Checked here rather than at the pull, so a mis-registered label fails at
+    // resolution instead of after a network round trip.
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(crate::error::Error::Artifact(format!(
+            "pins `rootfs.{label}.digest` must be `sha256:<64 hex>`, got `{digest}`: a registry \
+             entry that resolves to a mutable tag means \"whatever is at that location today\", \
+             which no consumer's provenance discipline can cite"
+        )));
+    }
+    Ok(RootfsRegistryEntry {
+        label: label.to_string(),
+        image,
+        digest,
+    })
 }
 
-/// Puts a kernel registry into the pinned **build order**: byte-lexicographic on the label (§5.5).
+/// The labels of the merged `rootfs` registry, sorted.
 ///
-/// Its own function so the ordering law can be exercised on a deliberately unsorted input. Through
-/// the public resolver the order is currently *also* what `serde_json`'s default `BTreeMap` map
-/// backing produces, so an end-to-end test cannot tell "sorted on purpose" from "sorted by
-/// accident" — which is exactly the unpinned-order hazard §5.5 names: a transitive dep enabling
-/// `preserve_order` swaps the backing to document order, and then this call is the only thing
-/// keeping the promise.
-fn sort_kernel_registry(mut entries: Vec<KernelRegistryEntry>) -> Vec<KernelRegistryEntry> {
-    entries.sort_by(|a, b| a.label.cmp(&b.label));
-    entries
+/// The label half of [`resolve_rootfs_registry`], which it delegates to so the roster and the
+/// per-label entries can never come from two different readers.
+///
+/// # Errors
+/// As [`resolve_rootfs_registry`].
+pub fn resolve_rootfs_labels(overlay_file: Option<&Path>) -> Result<Vec<String>> {
+    Ok(resolve_rootfs_registry(overlay_file)?
+        .into_iter()
+        .map(|e| e.label)
+        .collect())
 }
 
 /// The fragment names declared by one `kernels.<label>` entry (§5.5).
@@ -2037,6 +2167,11 @@ mod tests {
 
     // Guards ARTIFACT-PIPELINE-5: a buggy impl that never emits
     // `debian_snapshot_timestamp` (so the mmdebstrap source can't run) goes red here.
+    //
+    // v33 delta 6 RETIRED the second half of this test — the historical
+    // `rootfs.debian_snapshot_timestamp` nesting — and pins the retirement rather than deleting it:
+    // `rootfs` is a label map now, so that path names a registry entry, and honoring both readings
+    // is the parser ambiguity `reject_legacy_pins_shapes` exists to refuse.
     #[test]
     fn test_parse_pins_emits_debian_snapshot_timestamp() {
         let top = r#"{ "debian_snapshot_timestamp": "20240101T000000Z" }"#;
@@ -2046,17 +2181,34 @@ mod tests {
             Some("20240101T000000Z")
         );
 
-        // Also accepted when nested under `rootfs`.
-        let nested = r#"{ "rootfs": { "image": "docker.io/library/debian",
-            "digest": "sha256:abc", "debian_snapshot_timestamp": "20240202T000000Z" } }"#;
-        let map = parse_pins_json(nested).expect("valid pins JSON");
-        assert_eq!(
-            map.get("debian_snapshot_timestamp").map(String::as_str),
-            Some("20240202T000000Z")
-        );
+        // The registry shape flattens the DEFAULT label to the un-suffixed keys, and a labelled
+        // entry to its own — the property that keeps every pre-v33 reader working.
+        let registry = r#"{ "rootfs": {
+            "default": { "image": "docker.io/library/debian", "digest": "sha256:abc" },
+            "debian-systemd": { "image": "docker.io/library/debian", "digest": "sha256:def" } } }"#;
+        let map = parse_pins_json(registry).expect("valid pins JSON");
         assert_eq!(
             map.get("rootfs_digest").map(String::as_str),
-            Some("sha256:abc")
+            Some("sha256:abc"),
+            "`default` must flatten to the UN-suffixed key every pre-v33 consumer reads"
+        );
+        assert_eq!(
+            map.get("rootfs_debian-systemd_digest").map(String::as_str),
+            Some("sha256:def")
+        );
+        assert!(
+            !map.contains_key("rootfs_default_digest"),
+            "the default label must not ALSO emit a suffixed key: two spellings of one pin is the \
+             drift the one-law composer exists to prevent"
+        );
+
+        // The retired nesting contributes nothing now — it names a registry entry, not a pin.
+        let retired = r#"{ "rootfs": { "debian_snapshot_timestamp": "20240202T000000Z" } }"#;
+        let map = parse_pins_json(retired).expect("valid pins JSON");
+        assert_eq!(
+            map.get("debian_snapshot_timestamp"),
+            None,
+            "the `rootfs.debian_snapshot_timestamp` nesting is retired by v33 delta 6"
         );
     }
 
@@ -2083,43 +2235,39 @@ mod tests {
         assert!(!empty.contains_key("kernel_prebuilt_sha256"));
     }
 
-    // §5.5 GATE (delta 3) — the BUILD ORDER law, on an input the map backing cannot pre-sort for
-    // it. Through `resolve_kernel_registry` the order today also happens to be what serde_json's
-    // `BTreeMap` yields, so only this direct call can tell "sorted on purpose" from "sorted by
-    // accident" (and it is the call that keeps the promise if a transitive dep ever enables
-    // `preserve_order`). RED on the inverse (a no-op `sort_kernel_registry`): the reversed input
-    // below comes back reversed. Byte-lexicographic, NOT version order — a "fix" to semver
-    // collation reddens the dotted pair too.
+    // §5.5 GATE (delta 3) — the BUILD ORDER law. v33 delta 6 moved the sort into the SHARED
+    // registry core (`artifact::registry`), whose own unit suite drives it on a deliberately
+    // reversed input — the one call that can tell "sorted on purpose" from "sorted by accident".
+    // What stays here is the KERNEL kind's end-to-end view of it, plus the property the core's
+    // generic test cannot see: that each entry's fragment set rides along with its label rather
+    // than being re-paired by index. RED on a core that sorts labels and entries separately.
     #[test]
     fn kernel_registry_is_sorted_byte_lexicographically() {
-        let entry = |label: &str| KernelRegistryEntry {
-            label: label.to_string(),
-            fragments: Vec::new(),
-        };
-        let sorted = sort_kernel_registry(vec![
-            entry("zz"),
-            entry("6.6.143"),
-            entry("6.12.94"),
-            entry("aa"),
-        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = tmp.path().join("overlay.json");
+        std::fs::write(
+            &overlay,
+            r#"{ "kernels": {
+                "zz": { "source_url": "u", "source_sha256": "s", "fragments": ["Z_FRAG"] },
+                "aa": { "source_url": "u", "source_sha256": "s", "fragments": ["A_FRAG"] } } }"#,
+        )
+        .expect("write overlay");
+        let registry = resolve_kernel_registry(Some(&overlay)).expect("resolves");
+        let labels: Vec<&str> = registry.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(
-            sorted.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
-            vec!["6.12.94", "6.6.143", "aa", "zz"],
-            "labels build in byte-lexicographic order (6.12.94 before 6.6.143)"
+            labels,
+            vec!["6.12.94", "6.6.143", "aa", "usbhost", "zz"],
+            "labels build in byte-lexicographic order (6.12.94 before 6.6.143), baseline included"
         );
-        // The fragment sets ride along with their labels rather than being re-paired by index.
-        let carried = sort_kernel_registry(vec![
-            KernelRegistryEntry {
-                label: "b".into(),
-                fragments: vec!["B_FRAG".into()],
-            },
-            KernelRegistryEntry {
-                label: "a".into(),
-                fragments: vec!["A_FRAG".into()],
-            },
-        ]);
-        assert_eq!(carried[0].label, "a");
-        assert_eq!(carried[0].fragments, vec!["A_FRAG".to_string()]);
+        // The fragment sets ride along with their labels.
+        let by = |l: &str| {
+            registry
+                .iter()
+                .find(|e| e.label == l)
+                .unwrap_or_else(|| panic!("{l} must be in the registry"))
+        };
+        assert_eq!(by("aa").fragments, vec!["A_FRAG".to_string()]);
+        assert_eq!(by("zz").fragments, vec!["Z_FRAG".to_string()]);
     }
 
     // docs/78 GATE (`sanitized-label-collision-unrejected`): two labels that differ only where the
@@ -2325,11 +2473,7 @@ mod tests {
 
         let h1 = steward_closure_hash(root.path()).expect("closure hash 1");
 
-        let rootfs = RootfsStage {
-            image_override: None,
-            steward_musl: None,
-            extra: Vec::new(),
-        };
+        let rootfs = RootfsStage::new();
         let mut inputs1 = StageInputs::default();
         inputs1.pins.insert("steward_src_hash".into(), h1.clone());
         let rootfs_key1 = rootfs.cache_key(&inputs1);
@@ -3347,9 +3491,10 @@ mod tests {
     // unknown key becomes an error here.
     #[test]
     fn pins_baseline_keeps_ignore_unknown_semantics() {
-        let map =
-            parse_pins_json(r#"{ "kerne1": { "source_url": "x" }, "rootfs": { "image": "i" } }"#)
-                .expect("the baseline parser must ignore an unknown top-level key");
+        let map = parse_pins_json(
+            r#"{ "kerne1": { "source_url": "x" }, "rootfs": { "default": { "image": "i" } } }"#,
+        )
+        .expect("the baseline parser must ignore an unknown top-level key");
         assert_eq!(map.get("rootfs_image").map(String::as_str), Some("i"));
         assert!(!map.contains_key("kernel_source_url"));
     }

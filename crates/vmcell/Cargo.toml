@@ -228,7 +228,47 @@ name = "vmcell"
 #     the guest ever BOUND that port. This delta lands the guest-side parse, so a declared port is
 #     honored rather than emitted-dialed-and-ignored. The parse is strict-or-default-with-a-logged-
 #     warning, deliberately unlike its forgiving `vmcell_accept_poll_ms=` siblings.
-version = "0.16.0"
+# 0.16.0 → 0.17.0: design v33 §18 deltas 2-7 CONTINUED — the same one breaking release, whose
+# version had to advance because 0.16.0 became the published baseline (see the delta-6a note
+# above). `RootfsStage` is `#[non_exhaustive]` from here on, for the reason `VmConfig` already
+# carries it: it grows a field every time the artifact layer learns a new property, and each of
+# those was a break for as long as it stayed constructible.
+#
+#   * DELTA 6a — the artifact registry, rootfs kind (§10.5, invariant F7).
+#     PINS-SCHEMA BREAK, and the one thing a consumer must act on: `rootfs` is a map of LABELS now,
+#     not a `{image, digest}` singleton. Migrate `"rootfs": {"image": …, "digest": …}` to
+#     `"rootfs": {"default": {"image": …, "digest": …}}`. The legacy shape is REFUSED naming the
+#     migration — never silently reinterpreted as `{"default": …}`, because two accepted shapes for
+#     one namespace is parser ambiguity waiting for a third. The reject runs on the MERGED document,
+#     so an overlay that merges singleton keys over a label map (or the reverse) is caught too.
+#     NOTHING ELSE MOVES: `rootfs.default` flattens to the un-suffixed `rootfs_image`/`rootfs_digest`
+#     — the exact keys every pre-v33 reader uses, `resolve_builder_base` (which picks the image that
+#     builds KERNELS) included — so the reshape cannot repoint a consumer it was never about. Gated
+#     by `the_default_label_flattens_to_the_pre_v33_keys`.
+#     ADDITIVE: `artifact::registry` (`DEFAULT_LABEL`, `registry_label`); `RootfsRegistryEntry`,
+#     `resolve_rootfs_registry`, `resolve_rootfs_labels`; the four rootfs key/name composers
+#     `rootfs_pin_key` / `rootfs_artifact_key` / `rootfs_filename{,_suffix}` /
+#     `rootfs_label_from_filename`; `vmcell build --rootfs-label`.
+#     BREAKING `struct_missing_field`/constructor: `RootfsStage`'s fields are private and it is
+#     built through `RootfsStage::new()` / `::labelled(label)` plus `with_image_override` /
+#     `with_steward_musl` / `with_extra`. `Stage::name` returns a `&str`, so a labelled stage needs a
+#     PRECOMPUTED name; public `label` and `stage_name` fields side by side would let a caller set
+#     one without the other and get a stage whose identity disagrees with its output path.
+#     BEHAVIOR-ONLY: the historical `rootfs.debian_snapshot_timestamp` nesting is RETIRED — under a
+#     label map that path names a registry entry, not a pin. The top-level
+#     `debian_snapshot_timestamp` namespace, the only form the committed baseline ever carried, is
+#     unchanged.
+#     NOT YET: a `rootfs` entry's `xattrs` and `features` keys are REFUSED naming the delta that
+#     adds them (7 and 6c). Accepting either now would mean an accepted-then-ignored declaration —
+#     an F1 violation for as long as the next delta took.
+#     WHY THIS ENTRY DID NOT STAY IN 0.16.0, since the register asks for one growing entry per
+#     breaking release: 0.16.0 shipped with delta 5 and became `origin/main`'s baseline, and
+#     `cargo semver-checks` — correctly — measures every later break against the baseline rather
+#     than against the release narrative. `RootfsStage` gaining a private field is
+#     `constructible_struct_adds_private_field`, so the version had to advance. The deltas 2-7
+#     release is still ONE release; it now spans 0.16.0 and 0.17.0, and the 0.16.0 → 0.17.0 entry
+#     below says so rather than pretending otherwise.
+version = "0.17.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.

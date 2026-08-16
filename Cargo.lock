@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "am-fs-erofs",
  "assert_cmd",

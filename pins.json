@@ -26,8 +26,10 @@
     "sha256": "43701715ae2885f936bbe5c66a2de7c14dc51de7d19412d04833e4bbcf205bd0"
   },
   "rootfs": {
-    "image": "docker.io/library/debian",
-    "digest": "sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1"
+    "default": {
+      "image": "docker.io/library/debian",
+      "digest": "sha256:a617c1cdde36a7e0194b2f07dff669e1753c03c3205356b94f9f350b0f9a57d1"
+    }
   },
   "kernel_fragments": {
     "KASAN": "CONFIG_KASAN=y\nCONFIG_KASAN_GENERIC=y\nCONFIG_KASAN_INLINE=y\nCONFIG_KASAN_VMALLOC=y\n",

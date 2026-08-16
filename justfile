@@ -381,6 +381,12 @@ gates:
     # sanctioned home (extra AND missing composer), and the stale-home check.
     ./scripts/ban-kernel-key-composers.sh
     ./scripts/test-ban-kernel-key-composers.sh
+    # §10.5 / v33 delta 6: the ROOTFS half of the same law, added with the kind it guards. The
+    # rootfs hazard is strictly worse than the kernel's in one respect — the flat
+    # `rootfs_image`/`rootfs_digest` pins are read by `resolve_builder_base`, which picks the image
+    # that builds KERNELS, so a drift on the default label repoints a consumer it was never about.
+    ./scripts/ban-rootfs-key-composers.sh
+    ./scripts/test-ban-rootfs-key-composers.sh
     # docs/81 §8 ("one law, one predicate"): the 1 s VMM-control-socket readiness ceiling was six
     # inline `1000`s across CH/FC/QEMU/crosvm. The fix is structural — `register_and_await_ready`
     # and `wait_for_vmm_socket` take NO timeout argument, so a literal there is a compile error —

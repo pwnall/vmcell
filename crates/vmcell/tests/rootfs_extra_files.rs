@@ -47,11 +47,13 @@ async fn pack_rootfs_with_marker(
         }))
         .add_stage(Box::new(vmcell::artifact::steward::StewardStage {}))
         .add_stage(Box::new(vmcell::artifact::guest_tools::GuestToolsStage {}))
-        .add_stage(Box::new(vmcell::artifact::rootfs::RootfsStage {
-            image_override: None,
-            steward_musl: None,
-            extra: vec![ExtraFile::new(MARKER_DEST, src, MARKER_MODE)],
-        }));
+        .add_stage(Box::new(
+            vmcell::artifact::rootfs::RootfsStage::new().with_extra(vec![ExtraFile::new(
+                MARKER_DEST,
+                src,
+                MARKER_MODE,
+            )]),
+        ));
     pipeline
         .build(&vmcell::artifact::Cache::default())
         .await

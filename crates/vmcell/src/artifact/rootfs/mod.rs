@@ -56,6 +56,94 @@ impl ExtraFile {
     }
 }
 
+/// The **flattened pins key** a rootfs's `sub_key` resolves to: `rootfs_<sub_key>` for the default
+/// rootfs, `rootfs_<label>_<sub_key>` for a labelled one (§10.5, the artifact registry).
+///
+/// The **one** composer for the rootfs→pin-key law, in both directions of the pins pipeline, exactly
+/// as [`crate::artifact::kernel::kernel_pin_key`] is for kernels: the flattener EMITS through it and
+/// every consumer READS through it, so producer and consumer cannot drift into a silent
+/// `Missing rootfs_… pin`.
+///
+/// **The default label emits the un-suffixed key on purpose.** `rootfs.default` flattens to
+/// `rootfs_image`/`rootfs_digest` — the exact keys every pre-v33 reader already uses, including
+/// `resolve_builder_base`, which picks the image that builds *kernels*. Reshaping the namespace
+/// therefore cannot silently repoint a consumer the reshape was never about, and §10.5's
+/// "canonical artifacts stay byte-identical for a cell that names no label" holds by construction
+/// rather than by promise.
+///
+/// The label keeps its dots (`rootfs_12.4_image`): only the on-disk FILENAME is sanitized
+/// ([`rootfs_filename_suffix`]), because a pins key never becomes a path.
+#[must_use]
+pub fn rootfs_pin_key(label: Option<&str>, sub_key: &str) -> String {
+    match label {
+        Some(l) => format!("rootfs_{l}_{sub_key}"),
+        None => format!("rootfs_{sub_key}"),
+    }
+}
+
+/// The [`StageOutputs`]/[`StageInputs`] **artifact-map key** a rootfs producer registers its packed
+/// image under: `"rootfs"` for the default, `"rootfs-<label>"` for a labelled one.
+///
+/// The **one** composer for the rootfs→artifact-key law, mirroring
+/// [`crate::artifact::kernel::kernel_artifact_key`]. Sharing `"rootfs"` across labels would collapse
+/// every labelled rootfs onto one entry and a multi-rootfs `Artifacts` map would lose all but one —
+/// the M-PIPE-4 defect, one kind over.
+///
+/// The label keeps its dots, exactly like [`rootfs_pin_key`] — this key is a map key, never a path.
+#[must_use]
+pub fn rootfs_artifact_key(label: Option<&str>) -> String {
+    match label {
+        Some(l) => format!("rootfs-{l}"),
+        None => "rootfs".to_string(),
+    }
+}
+
+/// The on-disk filename **suffix** for a rootfs label (`""` for the default, `-<label>` with `.`
+/// sanitized to `-` otherwise) — the **one** rootfs label-sanitization law (§10.5).
+///
+/// Sanitized for the same reason the kernel's is: the pipeline derives a stage's cache sidecar with
+/// `Path::with_extension`, so a dotted label would collide same-prefix labels on one `.cache_key`.
+/// The pins key and the cache-key *hash* keep the dotted label; only the filename is sanitized.
+#[must_use]
+pub fn rootfs_filename_suffix(label: Option<&str>) -> String {
+    label
+        .map(|l| format!("-{}", l.replace('.', "-")))
+        .unwrap_or_default()
+}
+
+/// The on-disk artifact **filename** of a packed rootfs: `rootfs.erofs` for the default,
+/// `rootfs-<sanitized-label>.erofs` for a labelled one.
+///
+/// The one composer every producer and every consumer of the artifacts dir uses.
+#[must_use]
+pub fn rootfs_filename(label: Option<&str>) -> String {
+    format!("rootfs{}.erofs", rootfs_filename_suffix(label))
+}
+
+/// The inverse of [`rootfs_filename`]: the on-disk label carried by a rootfs artifact filename, or
+/// `None` when `name` is not a labelled rootfs image.
+///
+/// `vmcell bundle` walks the artifacts dir with this so the manifest covers every
+/// `rootfs-<label>.erofs`, not just the default — the N-BIN-4 defect class, re-armed by the
+/// registry and disarmed here.
+///
+/// The bare `rootfs.erofs` returns `None`, and so does anything that is not an `.erofs`: a
+/// `rootfs-debian.cache_key` sidecar must not read as an artifact named `rootfs-debian`, which is
+/// exactly how `bundle` once recorded a kernel's cache sidecar as a kernel. A remainder containing
+/// `.` also returns `None`, because [`rootfs_filename_suffix`] sanitizes `.`→`-`, so no filename
+/// this law produces can carry one.
+///
+/// This is the *inverse* of the sanitization law and lives beside it: the two are pinned together
+/// by a round-trip gate, so neither half can move alone.
+#[must_use]
+pub fn rootfs_label_from_filename(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(".erofs")?;
+    match stem.strip_prefix("rootfs-") {
+        Some(label) if !label.is_empty() && !label.contains('.') => Some(label),
+        _ => None,
+    }
+}
+
 /// The directory holding the guest-tools multicall binary and its exec-PATH symlinks. Reserved
 /// as a whole so a name the manifest has not grown yet (delta 7's `echo-server` was one) is
 /// covered the moment it is added.
@@ -210,6 +298,12 @@ pub fn fuzz_validate_extra_files(extra: &[ExtraFile]) -> Result<Vec<(String, Pat
 
 /// A pipeline stage that builds a root filesystem from an OCI base image (the in-`vmcell`
 /// bootstrap source, §4.2, Rootfs sources and the one packer). The in-VM `mmdebstrap` source is `vmcell-rootfs-builder`.
+///
+/// `#[non_exhaustive]` as of v33 delta 6, for the reason `VmConfig` already carries it: this struct
+/// grows a field every time the artifact layer learns a new property, and each of those was a
+/// `constructible_struct_adds_*_field` break for as long as it stayed constructible. Build it
+/// through [`RootfsStage::new`] / [`RootfsStage::labelled`] and the `with_*` setters.
+#[non_exhaustive]
 pub struct RootfsStage {
     /// Explicit `(image, digest)` override for the OCI source (v15 `oci2erofs`, §4.2, Rootfs sources and the one packer):
     /// `Some` ignores the pinned `rootfs_image`/`rootfs_digest` and pulls this digest-pinned
@@ -221,6 +315,75 @@ pub struct RootfsStage {
     /// Downstream files composed into the image at pack time (`oci2erofs --inject`, §4.2,
     /// FR-V4). Empty for the default `vmcell build`.
     pub extra: Vec<ExtraFile>,
+    /// The `rootfs` registry label this stage builds (§10.5, v33 delta 6) — `None` is
+    /// `rootfs.default`, which resolves to today's inputs and today's filename.
+    ///
+    /// Private, with [`RootfsStage::labelled`] as the only way to set it, because [`Stage::name`]
+    /// returns a `&str` and therefore has to read a *precomputed* name: a public `label` beside a
+    /// public `stage_name` would let a caller set one without the other and get a stage whose
+    /// identity disagrees with its output path.
+    label: Option<String>,
+    /// [`Stage::name`]'s return value, composed from `label` at construction.
+    stage_name: String,
+}
+
+impl Default for RootfsStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RootfsStage {
+    /// The default rootfs stage: `rootfs.default`, `rootfs.erofs`, no injections.
+    ///
+    /// Byte-identical in every observable to the pre-v33 `RootfsStage { image_override: None,
+    /// steward_musl: None, extra: vec![] }` struct literal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::labelled(None)
+    }
+
+    /// A stage building the named registry label; `None` is the default rootfs.
+    #[must_use]
+    pub fn labelled(label: Option<&str>) -> Self {
+        RootfsStage {
+            image_override: None,
+            steward_musl: None,
+            extra: Vec::new(),
+            label: label.map(str::to_string),
+            // The artifact key IS the stage name for this kind, so a labelled stage cannot collide
+            // with the default one on the pipeline's cache sidecar — the §5.1 hazard recorded for
+            // `InVmKernelStage` vs `PrebuiltKernelStage`, one kind over.
+            stage_name: rootfs_artifact_key(label),
+        }
+    }
+
+    /// Sets the explicit `(image, digest)` override (`oci2erofs`'s digest-pinned base).
+    #[must_use]
+    pub fn with_image_override(mut self, image: String, digest: String) -> Self {
+        self.image_override = Some((image, digest));
+        self
+    }
+
+    /// Sets the static-musl steward to inject instead of the pipeline's default.
+    #[must_use]
+    pub fn with_steward_musl(mut self, steward_musl: Option<std::path::PathBuf>) -> Self {
+        self.steward_musl = steward_musl;
+        self
+    }
+
+    /// Sets the downstream files composed into the image at pack time.
+    #[must_use]
+    pub fn with_extra(mut self, extra: Vec<ExtraFile>) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    /// The registry label this stage builds, as the key composers take it.
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
 }
 
 /// The OCI rootfs stage's cache-key version. Bump when this stage's build logic or its folded
@@ -240,11 +403,11 @@ const OCI_ROOTFS_STAGE_VERSION: u32 = 4;
 #[async_trait]
 impl Stage for RootfsStage {
     fn name(&self) -> &str {
-        "rootfs"
+        &self.stage_name
     }
 
     fn out_path(&self, target_dir: &std::path::Path) -> std::path::PathBuf {
-        target_dir.join("rootfs.erofs")
+        target_dir.join(rootfs_filename(self.label()))
     }
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
@@ -269,12 +432,12 @@ impl Stage for RootfsStage {
             None => (
                 inputs
                     .pins
-                    .get("rootfs_image")
+                    .get(&rootfs_pin_key(self.label(), "image"))
                     .map(String::as_str)
                     .unwrap_or_default(),
                 inputs
                     .pins
-                    .get("rootfs_digest")
+                    .get(&rootfs_pin_key(self.label(), "digest"))
                     .map(String::as_str)
                     .unwrap_or_default(),
             ),
@@ -306,14 +469,25 @@ impl Stage for RootfsStage {
         let (image, digest) = match &self.image_override {
             Some((i, d)) => (i.clone(), d.clone()),
             None => {
+                let (image_key, digest_key) = (
+                    rootfs_pin_key(self.label(), "image"),
+                    rootfs_pin_key(self.label(), "digest"),
+                );
+                let missing = |key: &str| {
+                    Error::Artifact(format!(
+                        "Missing {key} pin: the `rootfs` registry (§10.5) resolved no `{}` entry                          with that key — register it in a pins overlay, or drop the label to                          build the default rootfs",
+                        self.label()
+                            .unwrap_or(crate::artifact::registry::DEFAULT_LABEL),
+                    ))
+                };
                 let image = inputs
                     .pins
-                    .get("rootfs_image")
-                    .ok_or_else(|| Error::Artifact("Missing rootfs_image pin".into()))?;
+                    .get(&image_key)
+                    .ok_or_else(|| missing(&image_key))?;
                 let digest = inputs
                     .pins
-                    .get("rootfs_digest")
-                    .ok_or_else(|| Error::Artifact("Missing rootfs_digest pin".into()))?;
+                    .get(&digest_key)
+                    .ok_or_else(|| missing(&digest_key))?;
                 (image.clone(), digest.clone())
             }
         };
@@ -687,19 +861,11 @@ mod tests {
     fn stabilize_ca() {}
 
     fn stage() -> RootfsStage {
-        RootfsStage {
-            image_override: None,
-            steward_musl: None,
-            extra: Vec::new(),
-        }
+        RootfsStage::new()
     }
 
     fn stage_with(extra: Vec<ExtraFile>) -> RootfsStage {
-        RootfsStage {
-            image_override: None,
-            steward_musl: None,
-            extra,
-        }
+        RootfsStage::new().with_extra(extra)
     }
 
     fn write_tmp(dir: &std::path::Path, name: &str, content: &[u8]) -> PathBuf {
@@ -1097,11 +1263,7 @@ mod tests {
         stabilize_ca();
         let dir = tempfile::tempdir().expect("tempdir");
         let steward = write_tmp(dir.path(), "steward-musl", b"musl-v1");
-        let s = RootfsStage {
-            image_override: None,
-            steward_musl: Some(steward.clone()),
-            extra: Vec::new(),
-        };
+        let s = RootfsStage::new().with_steward_musl(Some(steward.clone()));
         let inputs = StageInputs::default();
         let k1 = s.cache_key(&inputs);
         // Rebuild the musl steward in place at the SAME path.
