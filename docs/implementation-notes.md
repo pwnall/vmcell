@@ -4264,6 +4264,38 @@ full `cargo test --workspace` a local Unix connect to a live listener can exceed
 its unit test flaked once during this pass — and it is the unsafe direction to fail in. Recorded as
 its own fix rather than smuggled into this commit.
 
+## Firecracker's baked-vsock guard failed OPEN on a slow probe (2026-08-16)
+
+**Found by a flake, diagnosed to a mechanism, fixed in the safe direction.**
+`reject_live_baked_vsock` (`crates/vmcell-firecracker/src/lib.rs`) exists so a restore cannot
+unlink a baked host vsock path a **live** VM still owns — FC re-binds that path verbatim, so
+unlinking it severs the running VM's steward transport. It probed the path with a 100 ms connect
+and grouped three outcomes into two: a connect that *failed* and a connect that *timed out* both
+read as "no live listener owns the path: a stale leftover", and both unlinked.
+
+Under load they are not the same thing. A full `cargo test --workspace` made a local Unix connect
+to a **live** listener exceed 100 ms, and the guard's own unit test went red — reporting, correctly,
+that the guard had classified a live socket as stale. On a real restore that is a silent sever
+followed by a restore that proceeds anyway.
+
+The fix is the direction, not the budget: a probe that cannot **prove** the path dead now refuses.
+Refusing is loud, retryable and costs a re-run; unlinking is silent and costs a running VM. The
+budget moved 100 ms → 2 s as well, and the trade inverted with the direction — too small now costs
+a spurious retry, too large costs wall clock on the already-rare stale-path route.
+
+**THE FIRST VERSION OF THE GATE PASSED WITH THE REGRESSION PLANTED, AND THIS IS THE RECORD OF IT.**
+It tried to produce a real timeout by saturating a listener's accept backlog. The backlog is 1024
+deep, the loop gave up at 512, every connect succeeded, the *live-listener* arm fired, and the
+assertion passed — with the timeout arm restored to its fail-open form. A test that cannot reach
+the arm it names is theater, and reading it would not have shown that; only planting the regression
+did. The decision is now a pure predicate (`probe_permits_unlink`, over a three-outcome
+`BakedVsockProbe`), driven directly over all three inputs — the `classify_poll` idiom, one crate
+over. Planting `Inconclusive => true` reddens it naming the arm.
+
+One message re-worded with it ("still in use" → "may still be in use"), and the sibling test's
+assertion moved to `"accepted a probe connection"` — which keeps it *discriminating*: the
+inconclusive arm can no longer satisfy the live-listener leg.
+
 ## Where the v33 pass stands
 
 Deltas 1–5 of the §18 register are landed, pushed, and live-validated; **6–10 are not started**.

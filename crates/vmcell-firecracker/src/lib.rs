@@ -150,6 +150,40 @@ async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, cid: u32) -> Result<
     Ok(())
 }
 
+/// How long [`reject_live_baked_vsock`]'s liveness probe waits for a `connect` to resolve.
+///
+/// Generous rather than tight, and the direction matters: exceeding it now REFUSES the restore, so
+/// a budget too small costs a spurious retry on a loaded box, while one too large costs only this
+/// much wall clock on the (already rare) stale-path route. 100 ms was measurably too small — a
+/// live-listener connect exceeded it under a full workspace test run.
+const BAKED_VSOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What [`reject_live_baked_vsock`]'s liveness probe learned about the baked path.
+///
+/// Three outcomes, not two — separating them is the whole fix. Collapsing "I could not tell" into
+/// "nothing owns it" is what let a slow probe unlink a live VM's socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BakedVsockProbe {
+    /// A listener accepted the connect: a live VMM owns the path.
+    Accepted,
+    /// The connect FAILED (ECONNREFUSED / ENOENT / not-a-socket): nothing owns the path. The only
+    /// outcome that proves anything about absence.
+    Refused,
+    /// The connect neither completed nor failed inside the budget. Says nothing either way.
+    Inconclusive,
+}
+
+/// The one law: only a path the probe **proved** dead may be unlinked.
+///
+/// Extracted as a pure predicate rather than left inline because the inconclusive arm is the one
+/// that matters and the one a socket-level test cannot reliably produce — a first attempt at that
+/// test saturated a listener's backlog, failed to reach the timeout, and passed with the
+/// fail-open regression planted. A predicate can be driven over all three inputs directly, which
+/// is what makes the gate able to fail (AGENTS.md rule 2).
+const fn probe_permits_unlink(probe: BakedVsockProbe) -> bool {
+    matches!(probe, BakedVsockProbe::Refused)
+}
+
 /// Pre-restore guard + cleanup for the snapshot's baked host vsock UDS path
 /// (`restore_rotates_host_paths: false` — FC re-binds this exact path verbatim).
 ///
@@ -160,10 +194,20 @@ async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, cid: u32) -> Result<
 /// same lineage — still owns it; unlinking it would silently sever that VM's
 /// steward transport. So: if the path exists, probe it with a short-timeout
 /// connect and fail loud with a typed `Error::Vmm` naming the path when a
-/// listener answers. Only a dead path (ECONNREFUSED / ENOENT / timeout) proceeds
-/// to `remove_file` + `create_dir_all(parent)` — the parent re-creation matters
-/// because the baked path lives in the long-gone base VM's scratch dir, and a
-/// missing parent fails `PUT /snapshot/load` with ENOENT.
+/// listener answers. Only a path the probe **proved** dead (ECONNREFUSED / ENOENT /
+/// not-a-socket) proceeds to `remove_file` + `create_dir_all(parent)` — the parent
+/// re-creation matters because the baked path lives in the long-gone base VM's
+/// scratch dir, and a missing parent fails `PUT /snapshot/load` with ENOENT.
+///
+/// **A probe TIMEOUT is inconclusive, and inconclusive fails closed.** It used to be
+/// grouped with the dead-path answers, on the reasoning that a live listener answers
+/// a local `connect` instantly. Under load it does not: a full `cargo test
+/// --workspace` made a live-listener connect exceed the 100 ms budget, and this
+/// function's own unit test went red — reporting, correctly, that the guard had
+/// classified a LIVE socket as stale. Had that happened on a real restore the guard
+/// would have unlinked a running VM's steward transport and let the restore proceed,
+/// which is precisely the failure it exists to prevent. Refusing is loud, retryable,
+/// and costs at most a re-run; unlinking is silent and severs a live VM.
 ///
 /// TOCTOU, honestly: the probe and the unlink are not atomic — a restore racing
 /// this window can still lose. This is a *misuse guard* catching the realistic
@@ -171,21 +215,32 @@ async fn write_host_paths_sidecar(dir: &Path, vsock: &Path, cid: u32) -> Result<
 /// boundary; the single-lineage constraint (design §17, Open gaps and future capabilities) is the real contract.
 async fn reject_live_baked_vsock(path: &Path) -> Result<()> {
     if tokio::fs::try_exists(path).await.unwrap_or(false) {
-        // Only `Ok(Ok(_))` — a listener actually accepted the probe — rejects.
-        // ECONNREFUSED / ENOENT / not-a-socket (`Ok(Err(_))`) and a probe timeout
-        // (`Err(_)`) all mean no live listener owns the path: a stale leftover.
-        if let Ok(Ok(_stream)) = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+        // Three outcomes, not two. `Ok(Err(_))` — ECONNREFUSED / ENOENT / not-a-socket — is the
+        // only one that PROVES nothing owns the path, and it is the only one that unlinks.
+        let probe = tokio::time::timeout(
+            BAKED_VSOCK_PROBE_TIMEOUT,
             tokio::net::UnixStream::connect(path),
         )
-        .await
-        {
+        .await;
+        let probe = match probe {
+            Ok(Ok(_stream)) => BakedVsockProbe::Accepted,
+            Ok(Err(_dead)) => BakedVsockProbe::Refused,
+            Err(_elapsed) => BakedVsockProbe::Inconclusive,
+        };
+        if !probe_permits_unlink(probe) {
+            let why = match probe {
+                BakedVsockProbe::Accepted => "a live listener accepted a probe connection",
+                _ => {
+                    "the probe connect did not complete within its budget, which does not prove \
+                     the path is dead"
+                }
+            };
             return Err(Error::Vmm(format!(
-                "snapshot's baked host vsock path {} is still in use (a live \
-                 listener accepted a probe connection): the snapshotted VM or a \
-                 prior restore of this snapshot lineage still owns it; Firecracker \
-                 re-binds this exact path verbatim, so restore must wait for that \
-                 VM's teardown",
+                "snapshot's baked host vsock path {} may still be in use ({why}): the \
+                 snapshotted VM or a prior restore of this snapshot lineage may still own it; \
+                 Firecracker re-binds this exact path verbatim, so restore must wait for that \
+                 VM's teardown. Unlinking a path this probe could not prove dead would silently \
+                 sever a live VM's steward transport, so an inconclusive probe refuses.",
                 path.display()
             )));
         }
@@ -2334,10 +2389,14 @@ mod tests {
         let err = reject_live_baked_vsock(&live)
             .await
             .expect_err("a live listener on the baked path must be rejected");
+        // The message re-worded when the timeout arm stopped unlinking ("still in use" →
+        // "may still be in use"), because the guard now refuses on a probe it could not RESOLVE as
+        // well as on one that answered. This leg keeps the discriminating half: a live listener
+        // must be named as one, so the inconclusive-timeout arm below cannot satisfy this test.
         assert!(
             matches!(&err, Error::Vmm(msg)
-                if msg.contains("still in use") && msg.contains("live.sock")),
-            "expected a typed still-in-use Error::Vmm naming the path, got {err:?}"
+                if msg.contains("accepted a probe connection") && msg.contains("live.sock")),
+            "expected a typed live-listener Error::Vmm naming the path, got {err:?}"
         );
         assert!(
             live.exists(),
@@ -2365,6 +2424,61 @@ mod tests {
             missing.parent().expect("parent").is_dir(),
             "the baked path's parent dir must be (re)created for FC's verbatim re-bind"
         );
+    }
+
+    // THE INCONCLUSIVE-PROBE DIRECTION, and the defect it closes. The guard used to group a probe
+    // TIMEOUT with the dead-path answer — "no live listener owns the path: a stale leftover" — on
+    // the reasoning that a live listener answers a local `connect` instantly. Under load it does
+    // not: a full `cargo test --workspace` made a live-listener connect exceed the old 100 ms
+    // budget and the sibling test above went red, reporting correctly that the guard had
+    // classified a LIVE socket as stale. On a real restore that would have unlinked a running VM's
+    // steward transport and let the restore proceed — precisely what the guard exists to prevent.
+    //
+    // Driven over the PREDICATE rather than over a socket, and that is not a shortcut. The first
+    // cut of this test tried to produce a real timeout by saturating a listener's backlog; it
+    // never reached the timeout (the backlog is 1024 deep), the live-listener arm fired instead,
+    // and the test PASSED with the fail-open regression planted. A test that cannot reach the arm
+    // it names is theater. RED on the inverse (`Inconclusive => true`): the second assertion here
+    // fails naming the arm.
+    #[test]
+    fn only_a_provably_dead_probe_permits_unlinking_the_baked_path() {
+        assert!(
+            probe_permits_unlink(BakedVsockProbe::Refused),
+            "a connect that FAILED proves nothing owns the path — that is the stale leftover the \
+             guard exists to clear, and refusing it would break every sequential restore"
+        );
+        assert!(
+            !probe_permits_unlink(BakedVsockProbe::Inconclusive),
+            "a probe that could not resolve proves NOTHING; unlinking on it silently severs a live \
+             VM's steward transport, while refusing costs a loud, retryable re-run"
+        );
+        assert!(
+            !probe_permits_unlink(BakedVsockProbe::Accepted),
+            "a live listener owns the path"
+        );
+    }
+
+    // The two socket-level outcomes end to end, so the predicate above is wired to the real probe
+    // rather than merely correct in isolation: a live listener refuses and keeps its socket, a
+    // provably dead one clears.
+    #[tokio::test]
+    async fn the_guard_wires_the_predicate_to_a_real_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let live = dir.path().join("wired-live.sock");
+        let _listener = tokio::net::UnixListener::bind(&live).expect("bind");
+        let err = reject_live_baked_vsock(&live)
+            .await
+            .expect_err("a live listener must be refused");
+        assert!(matches!(&err, Error::Vmm(msg) if msg.contains("wired-live.sock")));
+        assert!(live.exists(), "a refused path must not be unlinked");
+
+        let dead = dir.path().join("wired-dead.sock");
+        drop(tokio::net::UnixListener::bind(&dead).expect("bind then drop = stale file"));
+        reject_live_baked_vsock(&dead)
+            .await
+            .expect("a provably dead path clears");
+        assert!(!dead.exists());
     }
 
     // M11 GATE, Firecracker leg (KVM-free). The jail posture is applied in `build_vmm_cmd`'s
