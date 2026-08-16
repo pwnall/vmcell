@@ -4319,6 +4319,78 @@ mod placement_battery {
             .expect("Pid1 with no init is the default");
     }
 
+    /// **A declared port is HONORED, not just carried.**
+    ///
+    /// `Service { port }` is an accepted input, so F1 requires it to be honored or rejected — and
+    /// delta 4's first cut did neither: `build()` accepted it, the cmdline builder emitted
+    /// `vmcell_steward_port=`, and the HOST kept dialing the default because
+    /// `VmInstance::vsock_endpoint` hard-codes it. The token reached the guest while the host
+    /// dialed elsewhere; the mismatch would have surfaced only as an opaque connect timeout. This
+    /// pins both halves — the cmdline token AND the endpoint the control plane dials.
+    #[test]
+    fn a_declared_service_port_is_honored_on_both_sides() {
+        use crate::vmm::VsockEndpoint;
+
+        let placement = StewardPlacement::Service { port: 5100 };
+        let cfg = b().steward_placement(placement).build().expect("builds");
+
+        // Guest side: the token carries it.
+        let res = crate::vmm::PerVmResources {
+            cgroup_name: "vmcell-vm-7".to_string(),
+            tap_name: None,
+            netns_name: None,
+            segment: None,
+            vhost_user_socket: None,
+            vmid: 7,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-7"),
+        };
+        assert!(
+            build_kernel_cmdline(&cfg, &res, "")
+                .expect("cmdline")
+                .contains("vmcell_steward_port=5100")
+        );
+
+        // Host side: the endpoint the control plane dials carries it too, on BOTH transports.
+        let unix = VsockEndpoint::Unix {
+            path: PathBuf::from("/tmp/vsock.sock"),
+            port: vmcell_protocol::STEWARD_VSOCK_PORT,
+        };
+        assert_eq!(
+            unix.with_port(
+                cfg.steward_placement
+                    .steward_port()
+                    .expect("Service has a port")
+            ),
+            VsockEndpoint::Unix {
+                path: PathBuf::from("/tmp/vsock.sock"),
+                port: 5100,
+            },
+            "the AF_UNIX control plane must dial the DECLARED port"
+        );
+        let vsock = VsockEndpoint::Vsock {
+            cid: 3,
+            port: vmcell_protocol::STEWARD_VSOCK_PORT,
+        };
+        assert_eq!(
+            vsock.with_port(5100),
+            VsockEndpoint::Vsock { cid: 3, port: 5100 },
+            "the AF_VSOCK control plane (in-kernel QEMU, crosvm) must dial it too, keeping the CID"
+        );
+
+        // Positive control: a Pid1 cell is unmoved — same port, no token.
+        let pid1 = b().build().expect("builds");
+        assert_eq!(
+            pid1.steward_placement.steward_port(),
+            Some(vmcell_protocol::STEWARD_VSOCK_PORT)
+        );
+        assert!(
+            !build_kernel_cmdline(&pid1, &res, "")
+                .expect("cmdline")
+                .contains("vmcell_steward_port")
+        );
+    }
+
     /// A reserved AF_VSOCK port is refused at construction (F1: honored or rejected).
     #[test]
     fn a_reserved_vsock_port_is_refused() {

@@ -1830,8 +1830,15 @@ impl<V: Vmm> MicroVm<V> {
             // on the in-kernel AF_VSOCK transport (§2.4, QEMU q35 — the fallback and most-proven nester) is reached by CID while
             // CH/FC/QEMU-external stay on their AF_UNIX path — one connect law.
             let instance = self.instance.as_ref().expect("instance missing");
+            // C8's first question answers WHERE, not just whether. The guard above already
+            // returned for a placement with no port, so this is `Some` on every path that reaches
+            // here; the fallback keeps the expression panic-free without changing behavior.
+            let port = self
+                .steward_placement
+                .steward_port()
+                .unwrap_or(crate::vmm::STEWARD_VSOCK_PORT);
             let client = StewardClient::connect_endpoint(
-                &instance.vsock_endpoint(),
+                &instance.vsock_endpoint().with_port(port),
                 timeout.unwrap_or(std::time::Duration::from_secs(10)),
                 &self.timeouts,
                 &crate::vmm::RealSerialLog {
@@ -1924,8 +1931,13 @@ impl<V: Vmm> MicroVm<V> {
             ));
         }
         let instance = self.instance.as_ref().expect("instance missing");
+        // The declared port, exactly as `steward()` reads it (see the comment there).
+        let port = self
+            .steward_placement
+            .steward_port()
+            .unwrap_or(crate::vmm::STEWARD_VSOCK_PORT);
         crate::steward::session::SessionMux::connect_endpoint(
-            &instance.vsock_endpoint(),
+            &instance.vsock_endpoint().with_port(port),
             timeout.unwrap_or(std::time::Duration::from_secs(10)),
             &self.timeouts,
             &crate::vmm::RealSerialLog {

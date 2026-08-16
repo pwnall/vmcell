@@ -1233,6 +1233,26 @@ pub enum VsockEndpoint {
     },
 }
 
+impl VsockEndpoint {
+    /// The same transport, dialing `port` instead.
+    ///
+    /// [`VmInstance::vsock_endpoint`] reports the backend's **transport** (an AF_UNIX path or a
+    /// guest CID) and fills in the default port, because an instance has no idea what placement its
+    /// cell declared. The control plane substitutes the port
+    /// [`StewardPlacement::steward_port`](crate::config::StewardPlacement::steward_port) names —
+    /// C8's first question — so a `Service { port }` cell is dialed where its steward actually
+    /// listens. Without this the port would be an accepted input that is silently ignored: the
+    /// cmdline token would carry 5100 to the guest while the host kept dialing 5000, and the
+    /// mismatch would surface only as an opaque connect timeout.
+    #[must_use]
+    pub fn with_port(self, port: u32) -> Self {
+        match self {
+            VsockEndpoint::Unix { path, .. } => VsockEndpoint::Unix { path, port },
+            VsockEndpoint::Vsock { cid, .. } => VsockEndpoint::Vsock { cid, port },
+        }
+    }
+}
+
 /// Represents a running or created VM instance.
 pub trait VmInstance: Send {
     /// Boots the VM from a created state.

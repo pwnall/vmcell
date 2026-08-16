@@ -4086,6 +4086,15 @@ that names no placement emits the same cmdline as one that names `Pid1` explicit
 only for a non-default port, which is what makes the floor hold; F3's `vmcell_` prefix rule already
 reserves it against caller spoofing, so `RESERVED_CMDLINE_KEYS` needed no edit.
 
+## Where the v33 pass stands
+
+Deltas 1–4 of the §18 register are landed, pushed, and live-validated; **5–10 are not started**.
+`docs/87-claude-handoff-notes-v3.md` is the pick-up point: it carries the remaining inventory, the
+**re-verified premise anchors** for deltas 5–10 (seventeen clauses are not confirmed as the design
+writes them — seven stale, ten moved by deltas 1–4, two of those behavior-changing), and the
+operational knowledge that is not a design fact and so has no entry here. Read it before cutting
+delta 5.
+
 ## Where the design lives now
 
 **v33 (2026-08-15):** `docs/82-claude-opus-design-v32.md` moved to `docs/historical/` (frozen at its
