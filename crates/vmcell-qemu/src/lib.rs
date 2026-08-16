@@ -197,11 +197,14 @@ const MIGRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120
 /// named: a bare literal at a call site is how six of them drifted apart (docs/81 §8).
 ///
 /// It is deliberately wider than the VMM ceiling because the producer is different in kind: the
-/// orchestrator's smoltcp NAT binds this UDS lazily from a background *thread*, not a child
-/// process, so there is no early-exit to fail fast on. Normally the socket appears in <10 ms; 2 s
-/// covers a bind thread scheduled late under a freq-pinned, many-thread load while still abandoning
-/// a truly-failed bring-up promptly, so the caller's bounded retry recovers on a fresh VM (the ~10 %
-/// flake the net-egress probe surfaced).
+/// orchestrator's smoltcp NAT is a *thread*, not a child process, so there is no early exit to fail
+/// fast on — a wedged producer can only be surfaced by the clock. (It is **not** wider because the
+/// bind is late: `SmoltcpProcess::start` calls `Listener::new` on the caller's thread before the
+/// worker is spawned, so the socket exists by the time `start` returns and this wait races nothing.
+/// The "lazy bind from a background thread" mechanism this constant was originally written against
+/// is withdrawn — design §17 — and the ceiling survives on the independent reason above.) Normally
+/// the socket is already there; 2 s abandons a truly-failed bring-up promptly, so the caller's
+/// bounded retry recovers on a fresh VM (the ~10 % flake the net-egress probe surfaced).
 const SMOLTCP_SOCKET_READY_TIMEOUT_MS: u64 = 2000;
 
 /// Reads QMP lines from `reader` past any asynchronous `{"event": ...}` notifications
@@ -845,19 +848,19 @@ impl Qemu {
         let fs_daemon_sockets: Vec<PathBuf> =
             fs_daemons.iter().map(|d| d.socket_path.clone()).collect();
 
-        // The smoltcp NAT (orchestrator) binds this UDS lazily from a background
-        // thread (`VhostUserDaemon::start` inside the thread, not `Listener::new`);
-        // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so
-        // it must not race the bind — otherwise boots die with
-        // "-chardev socket ...: Failed to connect ...: No such file or directory".
-        // Wait for the socket first: the same readiness gate the external vsock
-        // daemon gets above, but process-less (smoltcp is a thread, not a `Child`).
-        // CH's vhost-user-net frontend tolerates a not-yet-bound socket via its own
-        // client-side reconnect over its multi-second startup; QEMU does not. Normally
-        // the socket appears in <10 ms; the 2 s ceiling covers a bind thread scheduled
-        // late under a freq-pinned, many-thread load while abandoning a truly-failed
-        // smoltcp bring-up promptly (the ~10% flake the net-egress probe surfaced) so
-        // the caller's bounded retry recovers on a fresh VM. Fails loud on timeout; the
+        // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so the
+        // smoltcp NAT's UDS must be bound before the argv is exec'd — otherwise boots die
+        // with "-chardev socket ...: Failed to connect ...: No such file or directory".
+        // `SmoltcpProcess::start` binds it with `Listener::new` on the CALLER's thread,
+        // before the vhost worker is spawned, so by the time control reaches here the
+        // socket is already there and this wait normally returns on its first poll. It is
+        // kept as the fail-loud gate for the case the clock is the only witness: smoltcp
+        // is process-less (a thread, not a `Child`), so unlike the external vsock daemon
+        // above there is no early exit to fail fast on. CH's vhost-user-net frontend would
+        // tolerate a not-yet-bound socket via its own client-side reconnect over its
+        // multi-second startup; QEMU does not. The 2 s ceiling abandons a truly-failed
+        // smoltcp bring-up promptly (the ~10% flake the net-egress probe surfaced) so the
+        // caller's bounded retry recovers on a fresh VM. Fails loud on timeout; the
         // mid-`start` teardown releases smoltcp. It runs HERE rather than beside the
         // `-chardev` it gates so that `qemu_launch_plan` performs no I/O at all and
         // the composed argv is assertable from a unit test.
@@ -1107,10 +1110,11 @@ fn qemu_launch_plan(
                 vmcell::net::mac_math(res.vmid)?
             ));
     } else if let Some(socket) = &res.vhost_user_socket {
-        // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so
-        // it must not race smoltcp's lazy bind. `spawn_qemu` has already waited for
-        // this exact socket to appear (the readiness gate lives there so that this
-        // composer stays I/O-free); by the time the argv is exec'd it is bound.
+        // QEMU's `-chardev socket` connects as a *client* at exec with NO retry, so the
+        // socket must already be bound. It is: `SmoltcpProcess::start` binds it on the
+        // caller's thread, and `spawn_qemu` additionally waits for this exact path to
+        // appear (the readiness gate lives there so that this composer stays I/O-free),
+        // so by the time the argv is exec'd it is bound.
         cmd.arg("-chardev")
             .arg(format!("socket,id=net0,path={}", socket.display()))
             .arg("-netdev")

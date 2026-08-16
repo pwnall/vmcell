@@ -169,8 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     tracing::info!("vmcell-guest-agent: starting");
 
-    // Mount setup. `/sys` is NOT in the fatal core-mount set ({overlay, /proc,
-    // /dev}, §3.4, The guest: vmcell-guest-agent as PID 1): its *mount* failure is tolerated below (:127-138), so its
+    // Mount setup. `/sys` is NOT in the fatal core-mount set ({tmpfs /mnt, overlay,
+    // /proc, /dev} — FOUR mounts, §3.4, The guest: vmcell-guest-agent as PID 1;
+    // earlier revisions of this comment listed three and understated their own code):
+    // its *mount* failure is tolerated below (:127-138), so its
     // mount-point creation must be tolerated too — a fatal `?` here would
     // kernel-panic PID 1 ("Attempted to kill init") on a policy the agent
     // otherwise treats as best-effort (AGENT-6).
@@ -232,8 +234,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unmount("oldroot", UnmountFlags::DETACH)?;
     std::fs::remove_dir_all("oldroot")?;
 
-    // /sys is NOT part of the fatal core-mount set — that set is EXACTLY
-    // {overlay, /proc, /dev} (§3.4, The guest: vmcell-guest-agent as PID 1). The vsock control plane, the
+    // /sys is NOT part of the fatal core-mount set — that set is EXACTLY the FOUR
+    // mounts {tmpfs /mnt, overlay, /proc, /dev} (§3.4, The guest: vmcell-guest-agent
+    // as PID 1); the tmpfs at :186-198 returns Err like the other three. The vsock control plane, the
     // overlay/pivot_root sequence, and restore-path MAC rotation (ioctls) do not
     // require sysfs, so a failed sysfs mount is logged and tolerated like the
     // share-mount / loopback paths below. Returning Err from PID 1's main would
@@ -275,8 +278,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // devpts at /dev/pts powers interactive PTY sessions (§3, The control plane: vsock, the host clients, and the guest agent):
     // `/dev/ptmx` allocates a master and `ptsname` resolves the slave under
-    // /dev/pts. Best-effort and NOT in the fatal core-mount set {overlay, /proc,
-    // /dev} (§3.4, The guest: vmcell-guest-agent as PID 1) — only PTY *sessions* need it (they fail loud with
+    // /dev/pts. Best-effort and NOT in the fatal core-mount set {tmpfs /mnt, overlay,
+    // /proc, /dev} (§3.4, The guest: vmcell-guest-agent as PID 1) — only PTY *sessions* need it (they fail loud with
     // `SessionExit(127)` if it is absent); one-shot exec, pipe sessions, and the
     // vsock control plane do not. So a failure is logged and tolerated like the
     // sysfs/share/loopback mounts (returning Err from PID 1 kernel-panics the
