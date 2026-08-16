@@ -770,7 +770,7 @@ mod tests {
         // every arm, so the named const is what keeps this leg discriminating.
         assert_eq!(
             crate::orchestrator::clone_ineligible_feature(&custom_init),
-            Some(crate::orchestrator::INELIGIBLE_CUSTOM_INIT),
+            Some(crate::orchestrator::INELIGIBLE_PLACEMENT),
             "the custom-init arm — not a sibling — must be the one that refuses this config"
         );
         let res = Zygote::from_snapshot_dir(master.clone(), custom_init).await;

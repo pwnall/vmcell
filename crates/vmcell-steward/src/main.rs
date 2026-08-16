@@ -523,7 +523,10 @@ fn power_off_never_returns() -> ! {
 }
 
 /// vsock control-plane port the host's `StewardClient` connects to.
-const VSOCK_PORT: u32 = 5000;
+/// The port this steward binds. **Not defined here** (v33 delta 4): the one definition is
+/// [`vmcell_protocol::STEWARD_VSOCK_PORT`], the crate both sides already share, retiring the
+/// mirrored 5000 that used to live on each side of the boundary.
+use vmcell_protocol::STEWARD_VSOCK_PORT as VSOCK_PORT;
 /// Compiled **default** recovery cadence for the vsock control plane, used when
 /// the host does not emit `vmcell_accept_poll_ms=` on the cmdline (§5.3, The kernel command line).
 ///

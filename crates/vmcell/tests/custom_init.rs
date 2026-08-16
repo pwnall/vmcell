@@ -52,15 +52,19 @@ async fn custom_init_boots_and_disables_control_plane() {
         log.display()
     );
 
-    // The control plane is gone (a custom init replaced the steward), so `steward()` must
-    // fail loud immediately rather than hang connecting to a nonexistent listener.
+    // The control plane is gone, so `steward()` must fail loud immediately rather than hang
+    // connecting to a nonexistent listener. v33 delta 4 re-words the message from the init
+    // spelling to the DECLARED PLACEMENT: this config sets `init` and names no placement, so the
+    // derived default is `StewardPlacement::None` — the same semantics, said out loud. §3.5
+    // records that this assertion moves with the message.
     let err = vm
         .steward(Some(std::time::Duration::from_secs(2)))
         .await
-        .expect_err("steward() must fail loud with a custom init");
+        .expect_err("steward() must fail loud when no steward is expected");
     assert!(
-        matches!(err, vmcell::Error::Steward(_)) && err.to_string().contains("custom init"),
-        "expected a fail-loud custom-init Steward error, got {err:?}"
+        matches!(err, vmcell::Error::Steward(_))
+            && err.to_string().contains("StewardPlacement::None"),
+        "expected a fail-loud placement Steward error, got {err:?}"
     );
 
     vm.kill().await.unwrap();

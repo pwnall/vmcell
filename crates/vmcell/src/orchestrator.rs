@@ -655,6 +655,15 @@ pub struct MicroVm<V: Vmm> {
     /// construction, so `steward()`'s connect cadence and `shutdown()`'s grace
     /// window honor the caller-selected profile rather than hard-coded constants.
     timeouts: crate::config::Timeouts,
+    /// The declared steward placement (§3.5, invariant C8), retained from the `VmConfig`.
+    ///
+    /// Kept **beside** `control_plane_disabled` rather than replacing it, because C8 is a
+    /// TWO-METHOD law and a live `MicroVm` needs both answers: `control_plane_disabled` is the
+    /// derived availability answer (`steward_port().is_none()`) that `steward()` and
+    /// `connect_sessions()` read on every call, and this field is what `snapshot()` asks
+    /// `resync_reachable()` of. The two differ exactly at `Service`, which has a port but no
+    /// measured post-restore resync — collapsing them back into one field is the C8 violation.
+    steward_placement: crate::config::StewardPlacement,
     /// This cell's computed feature set — backend × host × artifacts (§7.4, invariant F6).
     ///
     /// Resolved once by [`resolve_cell_features`], **the one intersection site**, and kept so a
@@ -1487,11 +1496,19 @@ impl<V: Vmm> MicroVm<V> {
         // bound. `spawn_qemu` pre-cleans the VMM's own stale sockets. A per-VM resource
         // whose lifetime is coupled to the FIRST VMM process therefore does not survive a
         // re-spawn, and no amount of re-spawning will fix it.
-        // A custom `init=` (§5.3, The kernel command line) replaces the steward, so there is no steward vsock
-        // transport to health-gate — skip the probe (which QEMU uses to catch a wedged
-        // `vhost-device-vsock` bring-up); otherwise a custom-init QEMU VM would re-spawn
-        // to exhaustion against a listener that never comes up. CH/FC probes are no-ops.
-        if cfg.init.is_none() {
+        // Run the probe whenever a steward is EXPECTED (C8's first question). The old spelling
+        // was `cfg.init.is_none()`, whose rationale is correct for `None` — re-spawning to
+        // exhaustion against a listener that never comes up — and WRONG for `Service`: a steward
+        // *is* coming up there, and a wedged `vhost-device-vsock` bring-up is precisely what this
+        // probe exists to catch. §3.5 names this the site most likely to be missed in the re-key,
+        // and the C8 call-site scan pins it. CH/FC probes are no-ops.
+        //
+        // One sizing consequence rides the re-key: the per-attempt budget is tuned against `Pid1`
+        // time-to-ready (~0.7 s p50), but a `Service` steward arrives only after the guest's own
+        // init brings it up. So under `Service` the overall window derives from the caller's
+        // connect budget rather than the `Pid1`-tuned constant — otherwise a slow-but-healthy
+        // systemd cell would be killed and re-booted to exhaustion by its own health check.
+        if cfg.steward_placement.steward_port().is_some() {
             let clamped = cfg.timeouts.clamped();
             let mut respawns = 0u32;
             while let Err(e) = instance
@@ -1538,7 +1555,8 @@ impl<V: Vmm> MicroVm<V> {
             // `cfg.timeouts` after `build()` down to a busy-spin; clamping here
             // guarantees the connect/accept/grace cadences honor their floors.
             timeouts: cfg.timeouts.clamped(),
-            control_plane_disabled: cfg.init.is_some(),
+            control_plane_disabled: cfg.steward_placement.steward_port().is_none(),
+            steward_placement: cfg.steward_placement,
             features,
         })
     }
@@ -1747,7 +1765,8 @@ impl<V: Vmm> MicroVm<V> {
             // `cfg.timeouts` after `build()` down to a busy-spin; clamping here
             // guarantees the connect/accept/grace cadences honor their floors.
             timeouts: cfg.timeouts.clamped(),
-            control_plane_disabled: cfg.init.is_some(),
+            control_plane_disabled: cfg.steward_placement.steward_port().is_none(),
+            steward_placement: cfg.steward_placement,
             features,
         };
         Ok((vm, cow_support))
@@ -1773,15 +1792,17 @@ impl<V: Vmm> MicroVm<V> {
         &mut self,
         timeout: Option<std::time::Duration>,
     ) -> Result<&mut StewardClient> {
-        // Fail loud, not hang: a custom `init=` (§5.3, The kernel command line) replaces the vmcell steward,
-        // so there is no vsock control plane — no `Ready` handshake, `exec`, or resync.
-        // Returning immediately here beats blocking for the full connect timeout on a
-        // listener that will never answer (§13, Cross-cutting invariants, fail-loud).
+        // Fail loud, not hang: the declared placement expects NO steward, so there is no vsock
+        // control plane — no `Ready` handshake, `exec`, or resync. Returning immediately here beats
+        // blocking for the full connect timeout on a listener that will never answer (§13,
+        // fail-loud). The message names the PLACEMENT now, not the init spelling: `Service` must
+        // *not* take this arm, which is the first negative case this guard has ever had.
         if self.control_plane_disabled {
             return Err(crate::error::Error::Steward(
-                "the vsock control plane is unavailable: this VM boots a custom init= that \
-                 replaces the vmcell steward (no Ready handshake, exec, or resync). Observe \
-                 it via the serial log, a shared directory, an extra block device, or networking."
+                "the vsock control plane is unavailable: this cell declares \
+                 StewardPlacement::None, so no steward is expected (no Ready handshake, exec, or \
+                 resync). Observe it via the serial log, a shared directory, an extra block \
+                 device, or networking."
                     .into(),
             ));
         }
@@ -1895,9 +1916,10 @@ impl<V: Vmm> MicroVm<V> {
     ) -> Result<crate::steward::session::SessionMux> {
         if self.control_plane_disabled {
             return Err(crate::error::Error::Steward(
-                "the vsock control plane is unavailable: this VM boots a custom init= that \
-                 replaces the vmcell steward (no interactive sessions). Observe it via the \
-                 serial log, a shared directory, an extra block device, or networking."
+                "the vsock control plane is unavailable: this cell declares \
+                 StewardPlacement::None, so no steward is expected (no interactive sessions). \
+                 Observe it via the serial log, a shared directory, an extra block device, or \
+                 networking."
                     .into(),
             ));
         }
@@ -2063,15 +2085,20 @@ impl<V: Vmm> MicroVm<V> {
         // point that refuses the bad artifact instead of the N restores of it.
         // `control_plane_disabled` is the retained `cfg.init.is_some()`; the config-only arms live
         // in `clone_ineligible_feature`, which needs a `VmConfig` a live `MicroVm` no longer owns.
-        if self.control_plane_disabled {
-            // Not a backend refusal: this boundary is the orchestrator's own eligibility law
-            // (the `zygote`/`in-process-virtiofsd` precedent — a non-backend boundary names
-            // itself rather than blaming the VMM). F6: the feature string is `Feature::name()`
-            // by construction and the WHY rides the `Removal`, so it is the SAME arm the
-            // config-only predicate returns rather than a fourth prose spelling of it.
+        // C8's SECOND question, deliberately not the first. `control_plane_disabled` (the
+        // availability field) would be WRONG here: a `Service{5000}` cell HAS a reachable steward
+        // and is still snapshot-ineligible, because whether the guest's init restarts it after the
+        // vhost-vsock device is re-created is unmeasured (§17). Reading availability here is
+        // exactly the C8 violation the call-site scan looks for.
+        //
+        // Not a backend refusal: this boundary is the orchestrator's own eligibility law (the
+        // `zygote`/`in-process-virtiofsd` precedent — a non-backend boundary names itself rather
+        // than blaming the VMM). F6: the feature string is `Feature::name()` by construction and
+        // the WHY rides the `Removal`, so it is the SAME arm the config-only predicate returns.
+        if !self.steward_placement.resync_reachable() {
             return Err(crate::error::Error::from_removal(
                 "orchestrator",
-                &INELIGIBLE_CUSTOM_INIT,
+                &INELIGIBLE_PLACEMENT,
             ));
         }
         self.instance_mut().snapshot(dir).await?;
@@ -2277,13 +2304,13 @@ fn resolve_cell_features<V: Vmm>(vmm: &V, cfg: &VmConfig) -> Result<crate::featu
         &artifacts,
     );
 
-    // The config axis. `cfg.init.is_some()` is today's spelling of "no steward is expected"; §18
-    // delta 4 re-keys it — with its six siblings — onto `StewardPlacement::steward_port()`, and
-    // this site is named in that delta's call-site scan so the re-key cannot miss it.
-    if cfg.init.is_some() {
+    // The config axis, on C8's FIRST question — is a steward expected at all. Delta 2 keyed this
+    // on `cfg.init.is_some()` and named delta 4 as the re-key; this is that re-key. It is the
+    // availability question, not the eligibility one, so it reads `steward_port()`.
+    if cfg.steward_placement.steward_port().is_none() {
         set.remove_by_config(
             Feature::ControlPlane,
-            "declares a custom init= that replaces the steward",
+            "declares StewardPlacement::None, so no steward is expected",
         );
     }
 
@@ -2344,11 +2371,11 @@ pub(crate) const INELIGIBLE_VIRTIOFS_SHARE: crate::feature::Removal = crate::fea
     reason: "attaches a virtio-fs data share, which virtiofsd serves as a vhost-user device",
 };
 /// See [`INELIGIBLE_UNPRIVILEGED_NET`].
-pub(crate) const INELIGIBLE_CUSTOM_INIT: crate::feature::Removal = crate::feature::Removal {
+pub(crate) const INELIGIBLE_PLACEMENT: crate::feature::Removal = crate::feature::Removal {
     feature: crate::feature::Feature::SnapshotRestore,
     by: crate::feature::Source::Config,
-    reason: "sets a custom init= that replaces the steward, through which the mandatory \
-             post-restore resync runs",
+    reason: "declares a steward placement whose post-restore resync is not reachable (only \
+             StewardPlacement::Pid1 is), and the mandatory resync runs through the steward",
 };
 /// See [`INELIGIBLE_UNPRIVILEGED_NET`].
 pub(crate) const INELIGIBLE_USB_PASSTHROUGH: crate::feature::Removal = crate::feature::Removal {
@@ -2380,8 +2407,8 @@ pub(crate) fn clone_ineligible_feature(cfg: &VmConfig) -> Option<crate::feature:
     // fanning out) such a config: the clone would come up on a frozen clock with a correlated
     // CSPRNG and a stale MAC/IP, and `steward()` fails loud, so the resync is structurally
     // unreachable. Config-only and identical at both boundaries, hence an arm here.
-    if cfg.init.is_some() {
-        return Some(INELIGIBLE_CUSTOM_INIT);
+    if !cfg.steward_placement.resync_reachable() {
+        return Some(INELIGIBLE_PLACEMENT);
     }
     // docs/78 M4: a passed-through host USB device is host state living OUTSIDE guest RAM — the
     // migration stream carries the guest's view of the xhci controller but not the device behind
@@ -3319,6 +3346,7 @@ mod tests {
             tmp_dir: Some(tmp_dir),
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            steward_placement: crate::config::StewardPlacement::Pid1,
             features: crate::feature::FeatureSet::default(),
         }
     }
@@ -3747,6 +3775,7 @@ mod tests {
                 tmp_dir: None,
                 timeouts: crate::config::Timeouts::default(),
                 control_plane_disabled: false,
+                steward_placement: crate::config::StewardPlacement::Pid1,
                 features: crate::feature::FeatureSet::default(),
             };
         }
@@ -4398,7 +4427,7 @@ mod tests {
         let custom_init = ineligible_cfg(|b| b.init("/bin/workload"));
         assert_eq!(
             clone_ineligible_feature(&custom_init),
-            Some(INELIGIBLE_CUSTOM_INIT)
+            Some(INELIGIBLE_PLACEMENT)
         );
 
         // M4: a passed-through host device is not in the migration stream.
@@ -4432,7 +4461,7 @@ mod tests {
         // reddens if the arm it names is deleted and a sibling catches the config instead.
         assert_eq!(
             clone_ineligible_feature(&cfg),
-            Some(INELIGIBLE_CUSTOM_INIT),
+            Some(INELIGIBLE_PLACEMENT),
             "the custom-init arm — not a sibling — must be the one that refuses this config"
         );
         let err = MicroVm::restore(&vmm, std::path::Path::new("/fake/snap"), cfg, &env)
@@ -4912,6 +4941,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            steward_placement: crate::config::StewardPlacement::Pid1,
             features: crate::feature::FeatureSet::default(),
         };
         let usage = vm.usage().await.unwrap();
@@ -5042,6 +5072,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            steward_placement: crate::config::StewardPlacement::Pid1,
             features: crate::feature::FeatureSet::default(),
         };
 
@@ -5112,6 +5143,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            steward_placement: crate::config::StewardPlacement::Pid1,
             features: crate::feature::FeatureSet::default(),
         };
         (vm, peer)
@@ -5279,6 +5311,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            steward_placement: crate::config::StewardPlacement::Pid1,
             features: crate::feature::FeatureSet::default(),
         };
         drop(vm);
@@ -5571,6 +5604,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: false,
+            steward_placement: crate::config::StewardPlacement::Pid1,
             features: crate::feature::FeatureSet::default(),
         };
 
@@ -5727,16 +5761,23 @@ mod tests {
                 ..crate::config::Timeouts::default()
             },
             control_plane_disabled: false,
+            steward_placement: crate::config::StewardPlacement::Pid1,
             features: crate::feature::FeatureSet::default(),
         }
     }
 
-    // §5.3 (The kernel command line): a custom `init=` replaces the steward, so `steward()` must fail LOUD
-    // immediately (a typed `Error::Steward` naming the cause) instead of blocking for the
-    // full connect timeout on a listener that will never answer (§13, Cross-cutting invariants, fail-loud).
-    // Inverse: drop the `control_plane_disabled` early-return in `steward()` and this
-    // either hangs (the 1 s timeout) or returns a connect error, not the custom-init
-    // one — reddening the message assertion.
+    // §3.5 / C8: a cell declaring `StewardPlacement::None` expects no steward, so `steward()` must
+    // fail LOUD immediately (a typed `Error::Steward` naming the cause) instead of blocking for the
+    // full connect timeout on a listener that will never answer (§13, fail-loud).
+    //
+    // v33 re-words the message from the init spelling to the declared PLACEMENT, and §3.5 records
+    // that this assertion moves with it. The law is unchanged; what changed is that the guard now
+    // has a negative case for the first time — `Service` must *not* take this arm — which is what
+    // `steward_service_placement_does_not_take_the_fail_loud_arm` covers.
+    //
+    // Inverse: drop the `control_plane_disabled` early-return in `steward()` and this either hangs
+    // (the 1 s timeout) or returns a connect error, not the placement one — reddening the message
+    // assertion.
     #[tokio::test]
     async fn steward_fails_loud_when_control_plane_disabled() {
         let mut vm = MicroVm::<crate::vmm::FakeVmm> {
@@ -5762,6 +5803,7 @@ mod tests {
             tmp_dir: None,
             timeouts: crate::config::Timeouts::default(),
             control_plane_disabled: true,
+            steward_placement: crate::config::StewardPlacement::None,
             features: crate::feature::FeatureSet::default(),
         };
         let err = vm
@@ -5773,9 +5815,128 @@ mod tests {
             "expected a typed Steward error, got {err:?}"
         );
         assert!(
-            err.to_string().contains("custom init"),
-            "the error must name the custom-init cause: {err}"
+            err.to_string().contains("StewardPlacement::None"),
+            "the error must name the declared placement, not the init spelling: {err}"
         );
+    }
+
+    // §3.5 / C8 — **THE DISCRIMINATING LEG**, and the reason it is written this way.
+    //
+    // With `init: None` the buggy predicate (`cfg.init.is_some()`) and the correct one
+    // (`steward_port().is_none()`) AGREE everywhere, so no amount of testing the default shape can
+    // catch a re-key back onto `cfg.init`. They diverge at exactly one composition:
+    // `Service{port}` + a custom `init` — legal at `build()`, since only `Pid1`+init is the
+    // contradiction. There the old spelling says "no control plane" and the new one says "a
+    // steward is expected at `port`".
+    //
+    // So the assertion is **refusal IDENTITY, not refusal presence**: `steward()` must proceed to
+    // the transport and fail on the connect budget, and must NOT return the typed
+    // placement-disabled error. Re-key any guard site back onto `cfg.init.is_some()` and this goes
+    // red ON THE WRONG ERROR — not merely slow, which is what makes it a gate rather than a timing
+    // test. §3.5 records this near-trap explicitly; it exists because the guard has never had a
+    // negative case before v33.
+    #[tokio::test]
+    async fn service_placement_with_a_custom_init_reaches_the_transport_not_the_fail_loud_arm() {
+        // The composition the two predicates disagree about. `build()` must accept it.
+        let cfg = crate::config::VmConfig::builder(
+            std::path::PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: std::path::PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .network_disabled()
+        .steward_placement(crate::config::StewardPlacement::Service { port: 5000 })
+        .init("/lib/systemd/systemd")
+        .build()
+        .expect("Service + a custom init is the systemd shape and must build");
+        assert_eq!(
+            cfg.steward_placement.steward_port(),
+            Some(5000),
+            "the composition under test must be one where a steward IS expected"
+        );
+
+        // THROUGH `MicroVm::start`, deliberately — NOT a hand-built `MicroVm`. An earlier cut of
+        // this test constructed the struct directly and derived `control_plane_disabled` itself,
+        // so re-keying `start()`'s derivation back onto `cfg.init.is_some()` left it GREEN: a unit
+        // test standing beside an unchanged call site, which is the exact completeness-audit
+        // defect the §18 register promoted to a convention. Verified: with the hand-built form the
+        // plant passed; through `start()` it reddens.
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv::for_unit_tests();
+        let mut vm = MicroVm::start(&vmm, cfg, &env)
+            .await
+            .expect("a Service cell starts");
+        assert!(
+            !vm.control_plane_disabled,
+            "a Service placement expects a steward, so `start()` must derive this FALSE. Deriving \
+             it from `init` sets it TRUE — the bug this leg exists to catch."
+        );
+
+        // Nothing is listening on the fake's vsock path, so the dial must reach the transport and
+        // fail on the budget. The assertion is refusal IDENTITY, not refusal presence.
+        let err = vm
+            .steward(Some(std::time::Duration::from_millis(200)))
+            .await
+            .expect_err("nothing is listening, so the dial must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("StewardPlacement::None"),
+            "REFUSAL IDENTITY: `steward()` took the fail-loud arm for a Service cell. Some guard \
+             is keyed on `cfg.init.is_some()` again — the exact conflation v33 removed. Got: {msg}"
+        );
+    }
+
+    /// §3.5 / C8: a `Service` cell's `snapshot()` returns the typed PLACEMENT refusal.
+    ///
+    /// This is the second C8 method's own leg, and it is what proves the two questions are
+    /// genuinely different: this cell HAS a reachable steward (`steward_port()` is `Some`), and is
+    /// still snapshot-ineligible, because whether the guest's init restarts the steward after the
+    /// vhost-vsock device is re-created is unmeasured (§17). A `snapshot()` guard reading
+    /// availability instead of eligibility would let this through.
+    #[tokio::test]
+    async fn service_cell_snapshot_returns_the_typed_placement_refusal() {
+        let placement = crate::config::StewardPlacement::Service { port: 5000 };
+        assert!(
+            placement.steward_port().is_some() && !placement.resync_reachable(),
+            "the whole point of this leg: available, but not resync-reachable"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vmm = crate::vmm::FakeVmm::default();
+        let env = HostEnv::for_unit_tests();
+        let cfg = crate::config::VmConfig::builder(
+            std::path::PathBuf::from("/vmlinux"),
+            crate::config::RootfsSource::Erofs {
+                image: std::path::PathBuf::from("/rootfs.erofs"),
+            },
+        )
+        .network_disabled()
+        .steward_placement(placement)
+        .build()
+        .expect("a Service cell builds");
+        let mut vm = MicroVm::start(&vmm, cfg, &env)
+            .await
+            .expect("a Service cell starts");
+        let err = vm
+            .snapshot(dir.path())
+            .await
+            .expect_err("a Service cell must refuse to snapshot");
+        match err {
+            crate::error::Error::Unsupported { feature, .. } => assert_eq!(
+                feature,
+                crate::feature::Feature::SnapshotRestore.name(),
+                "the refusal's feature string is Feature::name() by construction (F6)"
+            ),
+            other => panic!("expected a typed capability refusal, got {other:?}"),
+        }
+
+        // Positive control: the same call on a `Pid1` cell writes the snapshot, so the refusal is
+        // about the placement and not about this fake, this dir, or this call order.
+        let mut pid1 = MicroVm::start(&vmm, erofs_cfg(), &env)
+            .await
+            .expect("the Pid1 cell starts");
+        pid1.snapshot(dir.path())
+            .await
+            .expect("a Pid1 cell must still snapshot");
     }
 
     // §3.2 (The host side: StewardClient and SessionMux) / §18 delta 7: `dial_vsock` must NOT copy
@@ -5845,6 +6006,7 @@ mod tests {
             // The VM boots a custom init=: no steward, no control plane — and the dial
             // must work anyway.
             control_plane_disabled: true,
+            steward_placement: crate::config::StewardPlacement::None,
             features: crate::feature::FeatureSet::default(),
         };
 

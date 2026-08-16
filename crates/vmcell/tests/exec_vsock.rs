@@ -990,8 +990,10 @@ async fn dial_vsock_reaches_a_custom_init_guest_with_no_steward() {
         .await
         .expect_err("a custom-init VM has no steward");
     assert!(
-        matches!(&no_steward, vmcell::Error::Steward(m) if m.contains("custom init")),
-        "expected the fail-loud custom-init error, got {no_steward:?}"
+        // v33 delta 4: the fail-loud message names the DECLARED PLACEMENT. This config sets
+        // `init` and names no placement, so the derived default is `StewardPlacement::None`.
+        matches!(&no_steward, vmcell::Error::Steward(m) if m.contains("StewardPlacement::None")),
+        "expected the fail-loud placement error, got {no_steward:?}"
     );
 
     // The raw dial must still reach the guest: the vsock device is attached

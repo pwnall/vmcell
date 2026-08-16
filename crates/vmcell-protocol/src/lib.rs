@@ -161,6 +161,21 @@ pub const DEFAULT_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// `guest_tools_applet_roster_is_unique_and_non_empty`.
 pub const GUEST_TOOLS_APPLETS: &[&str] = &["ip", "curl", "kvm-ok", "echo-server"];
 
+/// The vsock port the steward listens on and the host dials — **one definition**, here, because
+/// this is the crate the host and the guest already share (design §3.5, v33 delta 4).
+///
+/// Before v33 it was two constants: `vmcell::vmm::STEWARD_VSOCK_PORT` on the host and a private
+/// `VSOCK_PORT` in the steward binary, each documented as "its mirror on the other side of the
+/// boundary". Two mirrors of one number across a process boundary is the shape that only ever
+/// fails at run time — the host dialing one port and the guest bound to another surfaces as an
+/// opaque connect timeout, never as a compile error. Both sides re-export this now.
+///
+/// A cell may declare a **different** port through `StewardPlacement::Service { port }`; that
+/// value travels on the kernel command line as `vmcell_steward_port=` (a `vmcell_`-prefixed
+/// token, already reserved against caller spoofing by F3's prefix rule). This constant is the
+/// default the token is omitted for, so a `Pid1` cell's cmdline stays byte-identical to v32's.
+pub const STEWARD_VSOCK_PORT: u32 = 5000;
+
 /// IPv4 reconfiguration the guest applies to `eth0` during a post-restore resync
 /// (H-VMM-1 — "rotate everything").
 ///

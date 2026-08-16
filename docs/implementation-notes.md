@@ -4028,6 +4028,64 @@ no-stance judged as Pass; and `LiveProbe` mapping Undecidable → DoesNotWork.
 **Live-validated:** `just test-validator` under the delegated scope, 3/3, including the new
 conformance leg with real snapshot round-trips on both sides of the pair.
 
+## v33 delta 4 — steward placement (design §18 delta 4, §3.5, invariant C8), as built
+
+**What landed.** `config::StewardPlacement` with its two C8 methods (`steward_port`,
+`resync_reachable`); `VmConfig::steward_placement`, resolved at `build()` from a derived default
+(`Pid1` when `init` is `None`, `None` when `Some`); the `Pid1`+custom-init reject; AF_VSOCK reserved
+port validation; the `vmcell_steward_port=` cmdline token; `STEWARD_VSOCK_PORT` single-sourced in
+`vmcell-protocol`; and the seven-site re-key, health gate included.
+
+**The port is one literal now.** `vmcell-protocol::STEWARD_VSOCK_PORT` is the only `5000` in the
+workspace. `vmcell::vmm::STEWARD_VSOCK_PORT` is a `const` **bound to** it rather than a `pub use` of
+it, and that is a deliberate shape shift: `cargo semver-checks` reads a const replaced by a
+re-export as `pub_module_level_const_missing` — a removal — even though the path still resolves for
+every consumer. Ledgering a breaking change that breaks nobody is worse than the binding, which
+keeps the single literal. The steward binary imports the same const privately, retiring its
+`VSOCK_PORT`.
+
+**`MicroVm` retains the placement *beside* `control_plane_disabled`, not instead of it.** C8 is a
+two-method law and a live cell needs both answers: `control_plane_disabled` is the derived
+availability answer that `steward()`/`connect_sessions()` read on every call, and the retained
+placement is what `snapshot()` asks `resync_reachable()` of. Collapsing them back into one field is
+the violation — they differ exactly at `Service`, which has a port but no measured post-restore
+resync.
+
+**Two messages re-word, as §3.5 records.** `steward()`'s fail-loud now names
+`StewardPlacement::None` instead of the init spelling, and `build()`'s snapshotting reject names the
+placement. The snapshotting rule is strictly **narrower**: `Service` is refused explicitly where it
+was previously unreachable via `init`, and `Pid1`+`init: None` is unchanged — worse for nobody.
+
+**THE DISCRIMINATING LEG WAS THEATER ON ITS FIRST CUT, AND THIS IS THE RECORD OF IT.** §3.5 says the
+only leg that catches a re-key back onto `cfg.init` is `Service{port}` + a custom `init`, asserting
+refusal **identity**. The first version hand-built the `MicroVm` and derived
+`control_plane_disabled` itself — so when the exact regression it exists to catch was planted
+(`start()` re-keyed to `cfg.init.is_some()`), it stayed **green**. A green unit test standing beside
+an unchanged call site: precisely the completeness-audit defect the §18 register promoted to a
+convention, reproduced by the very test written to honor it. It was only visible because the plant
+was run rather than the test trusted. Routed through `MicroVm::start` it reddens on the assertion
+naming the derivation. Both forms were run; the comment at the site records which is which so the
+next reader cannot re-introduce the hand-built shape as a "simplification".
+
+**Two independent gates catch that same plant**, which is the point of a call-site scan existing
+beside a behavioral test: the behavioral leg reddens on the wrong error, and
+`c8_call_site_gate::cfg_init_is_read_only_where_init_identity_is_the_question` reddens naming the
+offending line. The scan enumerates the *surviving* `init` readers individually rather than counting
+them, so adding one is a review event rather than a number that drifts; after the re-key exactly
+three production sites read `init`, and each is genuinely about which binary is PID 1.
+
+**The second C8 method has its own leg.** `service_cell_snapshot_returns_the_typed_placement_refusal`
+runs a `Service` cell — availability `Some`, eligibility `false` — through `snapshot()` and requires
+the typed refusal, with a `Pid1` cell's successful snapshot as the positive control. Planting
+`snapshot()`'s guard onto `control_plane_disabled` (the availability field) reddens it: that is the
+near-miss the design's own review caught, made structural.
+
+**Byte-identical floor, gated.** `default_placement_emits_a_byte_identical_cmdline` asserts a cell
+that names no placement emits the same cmdline as one that names `Pid1` explicitly, and that the
+`vmcell_steward_port=` token is **absent** rather than merely equal by luck. The token is emitted
+only for a non-default port, which is what makes the floor hold; F3's `vmcell_` prefix rule already
+reserves it against caller spoofing, so `RESERVED_CMDLINE_KEYS` needed no edit.
+
 ## Where the design lives now
 
 **v33 (2026-08-15):** `docs/82-claude-opus-design-v32.md` moved to `docs/historical/` (frozen at its

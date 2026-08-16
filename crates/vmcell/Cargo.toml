@@ -193,6 +193,25 @@ name = "vmcell"
 #     the kernel and the rootfs. An ABSENT sidecar is the stated baseline, so every pre-v33 artifact
 #     behaves exactly as before; a PRESENT-but-malformed one is a hard `Error::Artifact`, because a
 #     fallback would let a typo'd declaration read as "no declaration".
+#
+#   * DELTA 4 — steward placement (§3.5, invariant C8).
+#     ADDITIVE: `config::StewardPlacement` (with `steward_port()` / `resync_reachable()`) and
+#     `VmConfigBuilder::steward_placement`.
+#     BREAKING `constructible_struct_adds_field`: `VmConfig.steward_placement: StewardPlacement`.
+#     BEHAVIOR-ONLY, and NOTHING moves for an existing caller: the placement is DERIVED at
+#     `build()` when none is named — `Pid1` with no `init`, `None` with one — which is exactly the
+#     pre-v33 semantics, and a cell that names no placement emits a BYTE-IDENTICAL kernel cmdline
+#     (gated by `default_placement_emits_a_byte_identical_cmdline`).
+#     BEHAVIOR-ONLY that a consumer CAN notice, both message re-words:
+#       - `MicroVm::steward`/`connect_sessions`' fail-loud error now names
+#         `StewardPlacement::None` instead of "custom init"; and
+#       - `build()`'s snapshotting reject names the placement. That rule is strictly NARROWER:
+#         `Service` is now refused explicitly where it was previously unreachable via `init`, and
+#         `Pid1` + no `init` is unchanged.
+#     `vmm::STEWARD_VSOCK_PORT` keeps its path and value; it is now a const BOUND TO
+#     `vmcell_protocol::STEWARD_VSOCK_PORT`, the workspace's one literal. It is deliberately not a
+#     `pub use`: `cargo semver-checks` reads that as `pub_module_level_const_missing`, and
+#     ledgering a break that breaks nobody is worse than the binding.
 version = "0.16.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with

@@ -1185,11 +1185,21 @@ pub trait Vmm: Send + Sync {
     fn id(&self) -> &str;
 }
 
-/// The vsock port the steward listens on and the host connects to. One
-/// definition shared by the orchestrator's steward connect and the QEMU
-/// control-plane health-gate probe (AGENTS.md "one law, one predicate") — the
-/// steward's own `VSOCK_PORT` is its mirror on the other side of the boundary.
-pub const STEWARD_VSOCK_PORT: u32 = 5000;
+/// The vsock port the steward listens on and the host dials.
+///
+/// **Re-exported, not defined** (v33 delta 4): the one definition is
+/// [`vmcell_protocol::STEWARD_VSOCK_PORT`], in the crate the host and the guest already share.
+/// It used to be defined here with the steward's private `VSOCK_PORT` as "its mirror on the other
+/// side of the boundary" — two mirrors of one number across a process boundary, which can only
+/// ever fail at run time as an opaque connect timeout.
+///
+/// It is a `const` **bound to** the protocol crate's value rather than a `pub use` of it, for one
+/// mechanical reason: `cargo semver-checks` reads a const replaced by a re-export as
+/// `pub_module_level_const_missing` — a removal — even though `vmcell::vmm::STEWARD_VSOCK_PORT`
+/// still resolves for every consumer. Taking the re-export would have meant ledgering a breaking
+/// change that breaks nobody, which is worse than this line: there is still exactly ONE literal
+/// `5000` in the workspace, and it is in `vmcell-protocol`.
+pub const STEWARD_VSOCK_PORT: u32 = vmcell_protocol::STEWARD_VSOCK_PORT;
 
 /// How the host reaches a VM's steward vsock control plane.
 ///

@@ -112,6 +112,13 @@ pub struct VmConfig {
     /// forked-child pre-exec window, shared by the in-process spawn and the setup
     /// broker (one law, §12.3, Layer 2 — the jailer-equivalent (JailSpec + apply_jail)).
     pub jail: JailConfig,
+    /// Where this cell's steward runs (design §3.5, invariant C8).
+    ///
+    /// **Resolved** at [`VmConfigBuilder::build`]: when the caller names no placement it is
+    /// *derived* — [`StewardPlacement::Pid1`] when `init` is `None`, [`StewardPlacement::None`]
+    /// when `init` is `Some` — so every pre-v33 caller keeps its exact semantics. Read through the
+    /// two C8 methods and never re-derived from [`Self::init`], which decides init *identity* only.
+    pub steward_placement: StewardPlacement,
     /// Features this cell **demands**, resolved at `MicroVm::start` against the computed
     /// [`crate::feature::FeatureSet`] (design §7.4 clause 3, invariant F6).
     ///
@@ -121,6 +128,76 @@ pub struct VmConfig {
     /// answered **before anything boots**, with the removal's provenance in the error, instead of
     /// at the first `snapshot()` call.
     pub required_features: Vec<crate::feature::Feature>,
+}
+
+/// Where this cell's steward runs — **declared, never inferred** (design §3.5, invariant C8).
+///
+/// # The reframe this type exists for
+///
+/// Control-plane availability and init identity are **two facts**, and until v33 the tree stored
+/// them as one predicate. `control_plane_disabled` was set from `cfg.init.is_some()`, and seven of
+/// the eight places keying on `cfg.init` were asking "can I reach a steward?" and answering it with
+/// "did the caller set `init=`?". Only the cmdline `init=` token is genuinely about init identity.
+///
+/// The price of the conflation was concrete: booting systemd — or any init system, or a container
+/// runtime, or a distro image as shipped — cost the **entire** control plane (`steward()` fails
+/// loud, no `exec`, no sessions, no snapshot), when nothing about a different PID 1 makes the
+/// steward unreachable. The tree already contained the counter-example, deliberately:
+/// `MicroVm::dial_vsock` never copied the guard, because the vsock *device* is attached
+/// unconditionally on every backend. v33 applies that one decision to the other seven sites.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StewardPlacement {
+    /// The kernel starts the steward as PID 1 (`init=/usr/sbin/vmcell-steward`).
+    ///
+    /// The default, and byte-identical in cmdline and code path to every release before v33 — the
+    /// pay-for-what-you-use floor: a cell that never names a placement cannot tell v33 landed.
+    Pid1,
+    /// The guest's own init starts the steward; the host dials `port`.
+    ///
+    /// [`VmConfig::init`] names the init — the two facts are stated separately now. This is what
+    /// makes systemd, init-system testing, and distro-as-shipped images expressible at all.
+    Service {
+        /// The vsock port the guest's steward listens on. Defaults to
+        /// [`vmcell_protocol::STEWARD_VSOCK_PORT`]; a different value travels to the guest as the
+        /// `vmcell_steward_port=` cmdline token.
+        port: u32,
+    },
+    /// No steward anywhere: today's `init=`-with-no-control-plane, **said out loud**.
+    None,
+}
+
+impl StewardPlacement {
+    /// **Control-plane availability** — law C8's first question: is a steward expected, and where?
+    ///
+    /// `Some(port)` = a steward is expected at that vsock port; `None` = no control plane. Read by
+    /// `MicroVm::steward`, `MicroVm::connect_sessions`, and the control-plane health gate. None of
+    /// them re-derives the fact from `cfg.init`.
+    #[must_use]
+    pub const fn steward_port(self) -> Option<u32> {
+        match self {
+            StewardPlacement::Pid1 => Some(vmcell_protocol::STEWARD_VSOCK_PORT),
+            StewardPlacement::Service { port } => Some(port),
+            StewardPlacement::None => Option::None,
+        }
+    }
+
+    /// **Post-restore-resync reachability** — law C8's second question: may this cell snapshot?
+    ///
+    /// Deliberately **not** the same predicate as [`Self::steward_port`]: `Service { port: 5000 }`
+    /// and `Pid1` are indistinguishable through the port, and the eligibility question is about the
+    /// *placement*, not the port. That near-miss is why C8 is a two-method law.
+    ///
+    /// `true` only for [`Self::Pid1`] in v33. For [`Self::None`] the mandatory post-restore resync
+    /// (§8.2) is structurally unreachable; for [`Self::Service`] the post-restore question — does
+    /// the guest's init restart the steward after the vhost-vsock device is re-created, or does the
+    /// idle re-bind cover it? — is real and **unmeasured**, so it stays rejected until measured
+    /// (§17). Strictly narrower than the pre-v33 rejection, worse for nobody.
+    ///
+    /// Read by `MicroVm::snapshot`'s guard and the §8.1 eligibility predicate's placement arm.
+    #[must_use]
+    pub const fn resync_reachable(self) -> bool {
+        matches!(self, StewardPlacement::Pid1)
+    }
 }
 
 /// The VMM subprocess's own seccomp-BPF confinement policy (design §12.2, Layer 1 — the VMM's own seccomp filter).
@@ -402,10 +479,21 @@ pub fn build_kernel_cmdline(
         || DEFAULT_INIT.to_string(),
         |p| p.to_string_lossy().into_owned(),
     );
+    // §3.5: a non-default `Service` port travels to the guest on the trusted channel. It is a
+    // `vmcell_`-prefixed token, so F3's prefix rule already reserves it against caller spoofing —
+    // no edit to `RESERVED_CMDLINE_KEYS` is needed or wanted. NOTHING is emitted for the default
+    // port, so a `Pid1` cell's cmdline is byte-identical to v32's (pinned by
+    // `default_placement_emits_a_byte_identical_cmdline`).
+    let steward_port_token = match cfg.steward_placement.steward_port() {
+        Some(port) if port != vmcell_protocol::STEWARD_VSOCK_PORT => {
+            format!(" vmcell_steward_port={port}")
+        }
+        _ => String::new(),
+    };
     let mut s = format!(
         "console={} loglevel={} random.trust_cpu=on random.trust_bootloader=on \
          cryptomgr.notests raid=noautodetect \
-         root=/dev/vda rootfstype={} ro {} panic=1 {}init={} vmcell_vmid={}",
+         root=/dev/vda rootfstype={} ro {} panic=1 {}init={} vmcell_vmid={}{steward_port_token}",
         cfg.console_mode.console(),
         cfg.kernel_verbosity.loglevel(),
         rootfstype,
@@ -1245,6 +1333,7 @@ impl VmConfig {
             vmm_seccomp: VmmSeccomp::default(),
             jail: JailConfig::default(),
             required_features: vec![],
+            steward_placement: None,
         }
     }
 }
@@ -1277,6 +1366,8 @@ pub struct VmConfigBuilder {
     vmm_seccomp: VmmSeccomp,
     jail: JailConfig,
     required_features: Vec<crate::feature::Feature>,
+    /// `None` = derive from `init` at `build()`. `Some` = the caller stated it explicitly.
+    steward_placement: Option<StewardPlacement>,
 }
 
 impl VmConfigBuilder {
@@ -1354,6 +1445,26 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn require(mut self, feature: crate::feature::Feature) -> Self {
         self.required_features.push(feature);
+        self
+    }
+
+    /// Declares where this cell's steward runs ([`VmConfig::steward_placement`], design §3.5).
+    ///
+    /// Omit it and the placement is **derived** for byte-compatibility: [`StewardPlacement::Pid1`]
+    /// when no `init` is set, [`StewardPlacement::None`] when one is — exactly the pre-v33
+    /// semantics. State it to express what the derivation cannot: a guest whose own init starts the
+    /// steward ([`StewardPlacement::Service`]), which is what makes systemd, init-system testing,
+    /// and distro-as-shipped images reachable through the control plane at all.
+    ///
+    /// [`build`](Self::build) rejects the one contradictory pair, `Pid1` + a custom
+    /// [`init`](Self::init) — the kernel cannot start the steward as PID 1 if `init=` names
+    /// something else. Everything else composes, **including** `Service { port }` + `init: None`:
+    /// the kernel starts the steward as PID 1 *and* the host treats it as a service. That
+    /// combination is deliberately legal because it is what makes the placement predicate
+    /// verifiable before a service-mode steward exists.
+    #[must_use]
+    pub fn steward_placement(mut self, placement: StewardPlacement) -> Self {
+        self.steward_placement = Some(placement);
         self
     }
 
@@ -1513,6 +1624,43 @@ impl VmConfigBuilder {
     ///     .unwrap();
     /// ```
     pub fn build(self) -> Result<VmConfig, crate::error::Error> {
+        // §3.5 / C8: RESOLVE the placement. Derived for byte-compatibility when the caller named
+        // none — `Pid1` with no `init`, `None` with one — so every pre-v33 caller keeps its exact
+        // semantics and a cell that never names a placement cannot tell v33 landed.
+        let placement = self.steward_placement.unwrap_or(if self.init.is_some() {
+            StewardPlacement::None
+        } else {
+            StewardPlacement::Pid1
+        });
+
+        // The ONE contradictory pair. Everything else composes — including `Service{port}` +
+        // `init: None`, which is deliberately legal: the kernel starts the steward as PID 1 *and*
+        // the host treats it as a service, which is what makes the placement predicate verifiable
+        // before a service-mode steward exists.
+        if placement == StewardPlacement::Pid1
+            && let Some(init) = &self.init
+        {
+            return Err(crate::error::Error::Config(format!(
+                "StewardPlacement::Pid1 cannot be combined with a custom init ({}): the kernel \
+                 cannot start the steward as PID 1 if `init=` names something else. Declare \
+                 StewardPlacement::Service {{ port }} if the guest's own init starts the steward, \
+                 or StewardPlacement::None if nothing does.",
+                init.display()
+            )));
+        }
+
+        // F1, honored or rejected at construction: a declared port must be dialable. 0 and
+        // u32::MAX are the AF_VSOCK reserved values (VMADDR_PORT_ANY is u32::MAX), so a cell
+        // declaring either would bind or dial something it did not mean.
+        if let StewardPlacement::Service { port } = placement
+            && (port == 0 || port == u32::MAX)
+        {
+            return Err(crate::error::Error::Config(format!(
+                "StewardPlacement::Service port {port} is reserved by AF_VSOCK (0 and \
+                 u32::MAX/VMADDR_PORT_ANY); declare a real port"
+            )));
+        }
+
         if self.vcpus == 0 {
             return Err(crate::error::Error::Config("vcpus must be > 0".into()));
         }
@@ -1574,18 +1722,24 @@ impl VmConfigBuilder {
                         .into(),
                 ));
             }
-            // A custom init replaces the vmcell steward (§5.3, The kernel command line), and the mandatory
-            // post-restore resync — clock, entropy reseed, MAC/IP rotation (§13, Cross-cutting invariants) —
-            // runs *through* that steward. A restored custom-init clone would be stranded
-            // on frozen identity with no way to fix it from inside (silently dead
-            // egress / correlated RNG), the exact §13 trap. Reject fail-loud here.
-            if self.init.is_some() {
-                return Err(crate::error::Error::Config(
-                    "a custom init cannot be combined with snapshotting (the mandatory \
-                     post-restore resync requires the vmcell steward, which a custom \
-                     init replaces)"
-                        .into(),
-                ));
+            // The mandatory post-restore resync — clock, entropy reseed, MAC/IP rotation
+            // (§13) — runs *through* the steward. A restored clone that cannot reach one would be
+            // stranded on frozen identity with no way to fix it from inside (silently dead egress
+            // / correlated RNG), the exact §13 trap.
+            //
+            // v33 delta 4 RE-KEYS this from `self.init.is_some()` onto the placement's second C8
+            // method, which is the question it was always asking. The two differ exactly at
+            // `Service`: a `Service` cell HAS a reachable steward, but whether the guest's init
+            // restarts it after the vhost-vsock device is re-created is unmeasured (§17), so it
+            // stays rejected until measured. The re-key is therefore strictly NARROWER than the
+            // pre-v33 rule for `Pid1`+`init: None` (unchanged) and identical for everything the
+            // old spelling caught — worse for nobody.
+            if !placement.resync_reachable() {
+                return Err(crate::error::Error::Config(format!(
+                    "snapshotting requires the steward to run as PID 1 \
+                     (StewardPlacement::Pid1); this config declares {placement:?}, and the \
+                     mandatory post-restore resync runs through the steward"
+                )));
             }
             // Snapshot-eligibility law: a snapshot-eligible VM must have no
             // vhost-user device attached. A virtio-fs data `Share` is served
@@ -1950,6 +2104,7 @@ impl VmConfigBuilder {
             vmm_seccomp: self.vmm_seccomp,
             jail: self.jail,
             required_features: self.required_features,
+            steward_placement: placement,
         })
     }
 }
@@ -3460,9 +3615,14 @@ mod tests {
         .build()
         .unwrap_err();
         assert!(matches!(err, crate::error::Error::Config(_)));
+        // v33 delta 4 re-keys this reject from `init.is_some()` onto the PLACEMENT's second C8
+        // method, so the message names the placement. The rule is strictly narrower than before
+        // (`Service` is now rejected explicitly rather than incidentally via `init`), and the
+        // derived default still maps `init: Some` to `StewardPlacement::None`, which is what this
+        // config gets — so the same input is still refused, for the reason it was always about.
         assert!(
             err.to_string()
-                .contains("custom init cannot be combined with snapshotting"),
+                .contains("snapshotting requires the steward to run as PID 1"),
             "{err}"
         );
         // A custom init WITHOUT snapshotting must still build (over-rejection inverse).
@@ -4000,5 +4160,308 @@ mod tests {
             c.contains("rootflags=noload"),
             "Block rootfs must emit rootflags=noload: {c}"
         );
+    }
+}
+
+/// Law C8's **call-site** gate: the two placement methods, and nothing else, answer the two
+/// control-plane questions (design §3.5, §13 C8).
+///
+/// A gate on the extracted predicate is not a gate on the claim — that is the completeness-audit
+/// lesson the §18 register promoted to a convention, and two of its six PARTIALs were invisible
+/// precisely because a green unit test stood beside an unchanged call site. So this scans the
+/// production sources for *where the questions are asked*, not for whether the methods exist.
+#[cfg(test)]
+mod placement_battery {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn b() -> VmConfigBuilder {
+        VmConfig::builder(
+            PathBuf::from("/vmlinux"),
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+        )
+    }
+
+    /// The derived default preserves every pre-v33 caller's semantics, both ways.
+    #[test]
+    fn the_default_placement_is_derived_from_init() {
+        assert_eq!(
+            b().build().expect("no init builds").steward_placement,
+            StewardPlacement::Pid1,
+            "no init => the kernel starts the steward as PID 1, exactly as before v33"
+        );
+        assert_eq!(
+            b().init("/bin/workload")
+                .build()
+                .expect("custom init builds")
+                .steward_placement,
+            StewardPlacement::None,
+            "a custom init => no steward is expected, which is what `init` USED to mean implicitly"
+        );
+    }
+
+    /// **The pay-for-what-you-use floor**: a cell that names no placement emits a cmdline
+    /// byte-identical to v32's.
+    ///
+    /// This is the assertion that makes "v33 changed nothing for existing callers" checkable
+    /// rather than claimed. The `vmcell_steward_port=` token is emitted only for a NON-default
+    /// port precisely so this holds.
+    #[test]
+    fn default_placement_emits_a_byte_identical_cmdline() {
+        let default_cfg = b().build().expect("builds");
+        let explicit = b()
+            .steward_placement(StewardPlacement::Pid1)
+            .build()
+            .expect("builds");
+        let res = crate::vmm::PerVmResources {
+            cgroup_name: "vmcell-vm-7".to_string(),
+            tap_name: None,
+            netns_name: None,
+            segment: None,
+            vhost_user_socket: None,
+            vmid: 7,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-7"),
+        };
+        assert_eq!(
+            build_kernel_cmdline(&default_cfg, &res, "").expect("cmdline"),
+            build_kernel_cmdline(&explicit, &res, "").expect("cmdline"),
+            "declaring the default explicitly must not move a single byte of the cmdline"
+        );
+        // And the token is absent entirely — not merely equal by luck.
+        assert!(
+            !build_kernel_cmdline(&default_cfg, &res, "")
+                .expect("cmdline")
+                .contains("vmcell_steward_port"),
+            "no token is emitted for the default port"
+        );
+    }
+
+    /// A NON-default `Service` port travels as the `vmcell_steward_port=` token — and F3's
+    /// `vmcell_` prefix rule already reserves it against caller spoofing, with no edit to
+    /// `RESERVED_CMDLINE_KEYS`.
+    #[test]
+    fn a_non_default_service_port_travels_on_the_cmdline_and_is_reserved() {
+        let cfg = b()
+            .steward_placement(StewardPlacement::Service { port: 5100 })
+            .build()
+            .expect("Service + init: None is deliberately legal");
+        let res = crate::vmm::PerVmResources {
+            cgroup_name: "vmcell-vm-7".to_string(),
+            tap_name: None,
+            netns_name: None,
+            segment: None,
+            vhost_user_socket: None,
+            vmid: 7,
+            guest_cid: 3,
+            tmp_dir: PathBuf::from("/tmp/vmcell-vm-test-7"),
+        };
+        let cmdline = build_kernel_cmdline(&cfg, &res, "").expect("cmdline");
+        assert!(
+            cmdline.contains("vmcell_steward_port=5100"),
+            "the declared port must reach the guest: {cmdline}"
+        );
+        assert!(
+            is_reserved_cmdline_arg("vmcell_steward_port=9999"),
+            "F3's `vmcell_` prefix rule must already reserve the token — a caller must not be \
+             able to spoof the port the steward binds"
+        );
+    }
+
+    /// `Service{port}` + `init: None` is DELIBERATELY legal — the kernel starts the steward as
+    /// PID 1 *and* the host treats it as a service. It is what makes the placement predicate
+    /// verifiable before a service-mode steward exists.
+    #[test]
+    fn service_with_no_init_composes() {
+        let cfg = b()
+            .steward_placement(StewardPlacement::Service {
+                port: vmcell_protocol::STEWARD_VSOCK_PORT,
+            })
+            .build()
+            .expect("Service + init: None must build");
+        assert_eq!(
+            cfg.steward_placement.steward_port(),
+            Some(vmcell_protocol::STEWARD_VSOCK_PORT)
+        );
+        assert!(
+            !cfg.steward_placement.resync_reachable(),
+            "Service is not snapshot-eligible: whether the guest's init restarts the steward \
+             after the vhost-vsock device is re-created is UNMEASURED (§17)"
+        );
+    }
+
+    /// The ONE contradictory pair, and only it.
+    #[test]
+    fn pid1_plus_a_custom_init_is_the_only_rejected_composition() {
+        let err = b()
+            .steward_placement(StewardPlacement::Pid1)
+            .init("/bin/workload")
+            .build()
+            .expect_err("Pid1 + custom init is a contradiction");
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with a custom init"),
+            "{err}"
+        );
+        // Positive controls: every other composition builds.
+        b().steward_placement(StewardPlacement::Service { port: 5000 })
+            .init("/lib/systemd/systemd")
+            .build()
+            .expect("Service + a custom init is the systemd shape — it must build");
+        b().steward_placement(StewardPlacement::None)
+            .init("/bin/workload")
+            .build()
+            .expect("None + a custom init is today's no-control-plane shape");
+        b().steward_placement(StewardPlacement::Pid1)
+            .build()
+            .expect("Pid1 with no init is the default");
+    }
+
+    /// A reserved AF_VSOCK port is refused at construction (F1: honored or rejected).
+    #[test]
+    fn a_reserved_vsock_port_is_refused() {
+        for bad in [0, u32::MAX] {
+            let err = b()
+                .steward_placement(StewardPlacement::Service { port: bad })
+                .build()
+                .expect_err("a reserved AF_VSOCK port must be refused");
+            assert!(err.to_string().contains("reserved by AF_VSOCK"), "{err}");
+        }
+        // Positive control: a real port builds.
+        b().steward_placement(StewardPlacement::Service { port: 5100 })
+            .build()
+            .expect("a real port builds");
+    }
+
+    /// `snapshotting` requires `Pid1` — and the rule is strictly NARROWER than the pre-v33 one.
+    #[test]
+    fn snapshotting_requires_pid1() {
+        // `Service` is now rejected EXPLICITLY, where before it was unreachable via `init`.
+        let err = b()
+            .steward_placement(StewardPlacement::Service { port: 5000 })
+            .snapshotting(true)
+            .build()
+            .expect_err("Service is not snapshot-eligible in v33");
+        assert!(
+            err.to_string()
+                .contains("snapshotting requires the steward to run as PID 1"),
+            "{err}"
+        );
+        // Positive control: the default placement still snapshots, unchanged.
+        b().snapshotting(true)
+            .build()
+            .expect("Pid1 + snapshotting is the ordinary shape and must still build");
+    }
+}
+
+#[cfg(test)]
+mod c8_call_site_gate {
+    /// `orchestrator.rs` and `config.rs`, comment-stripped, as `(file, line, code)`.
+    fn production_lines() -> Vec<(&'static str, usize, String)> {
+        let mut out = Vec::new();
+        for (name, body) in [
+            ("orchestrator.rs", include_str!("orchestrator.rs")),
+            ("config.rs", include_str!("config.rs")),
+        ] {
+            // Stop at the crate's own `#[cfg(test)]` module: the gate is about PRODUCTION sites,
+            // and the tests below legitimately name `cfg.init` and both methods while driving them.
+            let prod = body.split("\n#[cfg(test)]\n").next().unwrap_or(body);
+            for (i, l) in prod.lines().enumerate() {
+                let code = l.split("//").next().unwrap_or("");
+                if !code.trim().is_empty() {
+                    out.push((name, i + 1, code.to_string()));
+                }
+            }
+        }
+        assert!(
+            out.len() > 500,
+            "the scan found only {} production lines — it is not reading the sources, so every \
+             assertion below would pass vacuously",
+            out.len()
+        );
+        out
+    }
+
+    /// **C8: `cfg.init` decides init IDENTITY only.**
+    ///
+    /// Before v33, seven of the eight sites keying on `cfg.init` were asking "can I reach a
+    /// steward?" and answering it with "did the caller set `init=`?". After the re-key exactly
+    /// three production sites may read it, and each is genuinely about *which binary is PID 1*:
+    /// the cmdline `init=` token, `validate_init_path`, and the `Pid1`-plus-custom-init reject.
+    ///
+    /// An eighth site reading `cfg.init` to decide reachability is this law's violation, and it is
+    /// the shape that would silently re-introduce the conflation.
+    #[test]
+    fn cfg_init_is_read_only_where_init_identity_is_the_question() {
+        let readers: Vec<String> = production_lines()
+            .into_iter()
+            .filter(|(_, _, code)| {
+                code.contains("cfg.init")
+                    || code.contains("self.init")
+                    || code.contains(".init.is_")
+            })
+            .map(|(f, l, code)| format!("{f}:{l}: {}", code.trim()))
+            .collect();
+        // Each surviving reader is init IDENTITY. Named individually so adding one is a review
+        // event rather than a count that drifts.
+        for r in &readers {
+            assert!(
+                r.contains("let init = cfg.init.as_deref()")      // the cmdline `init=` token
+                    || r.contains("validate_init_path")           // the path validator
+                    || r.contains("self.init = Some(")            // the builder setter
+                    || r.contains("init: self.init")              // the build() move
+                    || r.contains("if self.init.is_some()")       // the derived default
+                    || r.contains("&& let Some(init) = &self.init") // the Pid1-contradiction reject
+                    || r.contains("if let Some(init) = &self.init"),
+                "C8: `{r}` reads `init` for something other than init IDENTITY. Control-plane \
+                 availability is `StewardPlacement::steward_port()`; snapshot eligibility is \
+                 `resync_reachable()`. Re-deriving either from `init` is the conflation v33 \
+                 removed — seven sites did exactly that before the re-key."
+            );
+        }
+    }
+
+    /// **C8: the two methods answer the two questions, and are not interchanged.**
+    ///
+    /// `steward_port()` is availability (`steward()`, `connect_sessions()`, the health gate);
+    /// `resync_reachable()` is snapshot eligibility (`snapshot()`'s guard, the eligibility
+    /// predicate's placement arm). They differ **exactly at `Service`**, which has a port but no
+    /// measured post-restore resync — so an eligibility site reading `steward_port()` is the
+    /// violation the design's own review caught, and it is the one this half exists for.
+    #[test]
+    fn the_two_c8_methods_are_read_at_their_own_questions() {
+        let lines = production_lines();
+        let port_sites: Vec<String> = lines
+            .iter()
+            .filter(|(_, _, c)| c.contains("steward_port()"))
+            .map(|(f, l, c)| format!("{f}:{l}: {}", c.trim()))
+            .collect();
+        let resync_sites: Vec<String> = lines
+            .iter()
+            .filter(|(_, _, c)| c.contains("resync_reachable()"))
+            .map(|(f, l, c)| format!("{f}:{l}: {}", c.trim()))
+            .collect();
+
+        // Both must actually be read in production, or the "two methods" law is one method plus
+        // dead code — which a gate that only counted violations would happily certify.
+        assert!(
+            port_sites.len() >= 3,
+            "availability must be read at the health gate and both MicroVm constructions; found \
+             {port_sites:#?}"
+        );
+        assert!(
+            resync_sites.len() >= 2,
+            "eligibility must be read at snapshot()'s guard AND the eligibility predicate; found \
+             {resync_sites:#?}"
+        );
+        // The definitions themselves live in `config.rs`; every OTHER reader must be a call.
+        for s in &port_sites {
+            assert!(
+                !s.contains("fn resync_reachable"),
+                "the availability method must not be defined in terms of eligibility: {s}"
+            );
+        }
     }
 }
