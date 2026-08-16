@@ -4298,13 +4298,19 @@ inconclusive arm can no longer satisfy the live-listener leg.
 
 ## Where the v33 pass stands
 
-Deltas 1–5 of the §18 register are landed, pushed, and live-validated; **6–10 are not started**.
-`docs/87-claude-handoff-notes-v3.md` is the pick-up point: it carries the remaining inventory, the
-**re-verified premise anchors** for deltas 5–10 (seventeen clauses are not confirmed as the design
-writes them — seven stale, ten moved by deltas 1–4, two of those behavior-changing), and the
-operational knowledge that is not a design fact and so has no entry here. Its delta-5 section is now
-history; read its 6–10 sections before cutting delta 6, and note that delta 5 added one more entry
-to the "premises stated as shipped fact have been empirically false in every register so far" tally.
+Deltas 1–5 of the §18 register are landed, pushed and live-validated; **6a and 6b are landed and
+pushed but NOT yet live-validated**; 6c and 7–10 are not started.
+
+`docs/88-claude-handoff-notes-v4.md` is the pick-up point. It carries the remaining inventory, what
+6a/6b moved under deltas 7–10, the operational knowledge that is not a design fact and so has no
+entry here, and — first, because it is the lesson that cost the most — how to use workflows and
+subagents so the next pass does not spend its context window reading files by hand.
+`docs/87-claude-handoff-notes-v3.md` is superseded and kept for its per-delta detail on 7–10, which
+v4 amends rather than repeats; its delta-5 and delta-6 sections are history.
+
+**The tally the register keeps** ("every register so far has carried at least one shipped-fact
+premise that was empirically false") grew by five in this pass, four of them about code rather than
+prose — and one of them was a gate that passed with its own regression planted. v4 §6 lists them.
 
 **The delta 6 / delta 7 ordering conflict, decided.** §10.5's registry entry sketch carries
 `"xattrs": "preserve"` while `XattrPolicy` is delta 7's deliverable, and the register orders 6 before
