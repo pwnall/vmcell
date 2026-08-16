@@ -676,10 +676,22 @@ fn build_kernels_stages(
 /// Every name is composed through the library's own key laws, never spelled here: a manifest entry
 /// under a name the producers do not register is a name no consumer can look up.
 fn bundle_candidates(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
-    use vmcell::artifact::rootfs::{features_artifact_key, rootfs_artifact_key};
+    use vmcell::artifact::RootfsFormat;
+    use vmcell::artifact::rootfs::{features_artifact_key, rootfs_artifact_key, rootfs_filename};
     use vmcell::feature::feature_manifest_path;
 
-    let default_rootfs = dir.join("rootfs.erofs");
+    // The DEFAULT rootfs, whichever format it was built in (§18 delta 8). The labelled walk below
+    // keys on a `-<label>` filename and so cannot see the default one at all, which means a default
+    // entry registered `"format": "ext4"` would be bundled by nobody — the N-BIN-4 hole, re-armed
+    // by the second format. Resolved from the directory rather than pushed twice: two candidates
+    // under one artifact key would report `rootfs` as a skipped artifact on every ordinary erofs
+    // build, and a skip notice that always fires is one nobody reads. Erofs when neither exists, so
+    // an empty dir still names the artifact it is missing.
+    let default_rootfs = RootfsFormat::ALL
+        .into_iter()
+        .map(|f| dir.join(rootfs_filename(None, f)))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| dir.join(rootfs_filename(None, RootfsFormat::Erofs)));
     let mut candidates: Vec<(String, PathBuf)> = vec![
         ("kernel".to_string(), dir.join("vmlinux")),
         (rootfs_artifact_key(None), default_rootfs.clone()),
@@ -740,10 +752,14 @@ fn bundle_candidates(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
             // to close — a registered artifact silently absent from the manifest.
             //
             // The walk keys on the IMAGE filename, so each labelled rootfs contributes its
-            // declaration sidecar here rather than in a second pass: `rootfs_label_from_filename`
-            // returns `None` for a `.features` file (it demands the `.erofs` suffix), which is the
-            // property that keeps a sidecar from being bundled as a rootfs in its own right.
-            if let Some(label) = vmcell::artifact::rootfs::rootfs_label_from_filename(&name) {
+            // declaration sidecar here rather than in a second pass: `rootfs_artifact_from_filename`
+            // returns `None` for a `.features` file (it demands a known FORMAT extension), which is
+            // the property that keeps a sidecar from being bundled as a rootfs in its own right.
+            // It answers for `.ext4` as well as `.erofs` (§18 delta 8) — an ext4 artifact invisible
+            // to `bundle` would be this exact N-BIN-4 hole, re-armed by the second format.
+            if let Some((label, _format)) =
+                vmcell::artifact::rootfs::rootfs_artifact_from_filename(&name)
+            {
                 let key = rootfs_artifact_key(Some(label));
                 candidates.push((
                     features_artifact_key(&key),
@@ -874,6 +890,13 @@ fn rootfs_stage(
                 // default `Strip`, which is the pre-delta-7 packer exactly.
                 .with_xattrs(
                     rootfs_entry.map_or_else(vmcell::artifact::XattrPolicy::default, |e| e.xattrs),
+                )
+                // §4.7's per-artifact filesystem format (§18 delta 8), from the SAME resolved entry
+                // the xattr policy above comes from — so the file this stage writes, the identity
+                // it claims, and the emitter the tail picks are one declaration. No entry is the
+                // default `Erofs`, which is the pre-delta-8 producer exactly.
+                .with_format(
+                    rootfs_entry.map_or_else(vmcell::artifact::RootfsFormat::default, |e| e.format),
                 ),
         ),
         // The mmdebstrap source builds from a release suite, not from a registered digest, so it
@@ -2025,7 +2048,7 @@ mod tests {
             .expect("the image stage must be named by the default artifact key");
         assert_eq!(
             image.out_path(dir),
-            dir.join(rootfs_filename(None)),
+            dir.join(rootfs_filename(None, vmcell::artifact::RootfsFormat::Erofs)),
             "the explicit default must still write `rootfs.erofs`, not `rootfs-default.erofs`"
         );
 
@@ -2439,6 +2462,7 @@ mod tests {
     // image's name.
     #[test]
     fn bundle_carries_every_labelled_rootfs_and_its_declaration_sidecar() {
+        use vmcell::artifact::RootfsFormat;
         use vmcell::artifact::rootfs::{
             features_artifact_key, rootfs_artifact_key, rootfs_filename,
         };
@@ -2448,7 +2472,7 @@ mod tests {
         // A dir as `vmcell build --rootfs-label acme` leaves it: two images, two declarations, and
         // a cache sidecar beside them (the near-miss that must not read as an artifact).
         for label in [None, Some("acme")] {
-            let image = dir.path().join(rootfs_filename(label));
+            let image = dir.path().join(rootfs_filename(label, RootfsFormat::Erofs));
             std::fs::write(&image, b"erofs").expect("write image");
             std::fs::write(feature_manifest_path(&image), b"xattr_preserved = false\n")
                 .expect("write declaration");
@@ -2465,7 +2489,7 @@ mod tests {
         // Both kinds of entry, both labels, each name composed through the library's own laws.
         for label in [None, Some("acme")] {
             let key = rootfs_artifact_key(label);
-            let image = dir.path().join(rootfs_filename(label));
+            let image = dir.path().join(rootfs_filename(label, RootfsFormat::Erofs));
             assert_eq!(
                 named(&key),
                 Some(image.clone()),
@@ -2506,6 +2530,61 @@ mod tests {
                 !path.to_string_lossy().ends_with(".cache_key"),
                 "a stage's cache sidecar is not an artifact: `{name}` -> {path:?}"
             );
+        }
+    }
+
+    // The same walk, for an `ext4` artifacts dir (§4.7, §18 delta 8). An ext4 rootfs invisible to
+    // `bundle` is the N-BIN-4 defect class re-armed by the second format — the manifest would
+    // report success while covering nothing the consumer needs.
+    //
+    // RED on the inverse two ways: revert `rootfs_artifact_from_filename` to an `.erofs`-only
+    // suffix strip and the labelled leg's `named(&key)` is `None`; revert the DEFAULT rootfs
+    // candidate to a hardcoded `rootfs.erofs` and the default leg's is.
+    #[test]
+    fn bundle_covers_an_ext4_rootfs_and_its_declaration_sidecar() {
+        use vmcell::artifact::RootfsFormat;
+        use vmcell::artifact::rootfs::{
+            features_artifact_key, rootfs_artifact_key, rootfs_filename,
+        };
+        use vmcell::feature::feature_manifest_path;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A dir as `vmcell build` leaves it when both entries declare `"format": "ext4"`: no
+        // `.erofs` anywhere, which is exactly what makes an erofs-only walk find nothing.
+        for label in [None, Some("acme")] {
+            let image = dir.path().join(rootfs_filename(label, RootfsFormat::Ext4));
+            std::fs::write(&image, b"ext4").expect("write image");
+            std::fs::write(feature_manifest_path(&image), b"xattr_preserved = true\n")
+                .expect("write declaration");
+        }
+
+        let candidates = bundle_candidates(dir.path());
+        for label in [None, Some("acme")] {
+            let key = rootfs_artifact_key(label);
+            let image = dir.path().join(rootfs_filename(label, RootfsFormat::Ext4));
+            assert!(
+                candidates.iter().any(|(n, p)| *n == key && *p == image),
+                "the manifest must cover the ext4 rootfs `{key}` at {image:?}: {candidates:?}"
+            );
+            let sidecar_key = features_artifact_key(&key);
+            let sidecar = feature_manifest_path(&image);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(n, p)| *n == sidecar_key && *p == sidecar),
+                "the manifest must cover `{sidecar_key}` at {sidecar:?}: {candidates:?}"
+            );
+        }
+        // Every rootfs candidate really exists: an ext4 dir must not have the walk still naming
+        // `rootfs.erofs` as the default and reporting it skipped.
+        for (name, path) in &candidates {
+            if name.starts_with("rootfs") {
+                assert!(
+                    path.exists(),
+                    "`{name}` points at {path:?}, which is not there — the walk is still looking \
+                     for the other format"
+                );
+            }
         }
     }
 

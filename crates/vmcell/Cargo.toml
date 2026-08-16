@@ -391,7 +391,55 @@ name = "vmcell"
 #     image bytes to the pre-delta packer, and folds to the same key as an explicit `"strip"`. The
 #     STAGE_VERSION bump moves the key itself by design, so "unmoved" is asserted on the bytes and
 #     on the undeclared-≡-Strip equivalence, never on equality with the pre-delta key.
-version = "0.19.0"
+# 0.19.0 → 0.20.0: design v33 §18 delta 8 — the ext4 producer. Additive to every existing artifact
+# (the erofs default is byte-identical and its cache key unmoved), breaking only in two names the
+# format made ambiguous.
+#
+#   * DELTA 8 — the ext4 producer (§4.7, separable).
+#     THE CONTRADICTION IT RESOLVES: §4.7 pitched the `Block` root as serving "workloads that need a
+#     **writable**, POSIX-complete root" while §5.2 said the same root "mounts **strictly
+#     read-only**". It ships READ-ONLY, and the surviving motivation is POSIX-completeness — device
+#     nodes, xattrs, ACLs — not writability. §4.7's own closing sentence ("adds an artifact; it does
+#     not move the root") and §18's "Migration: additive" both say so; writability would have needed
+#     F3's `rw`/`ro` alias law rewritten, a `RootfsSource` arm on clone-eligibility, and deltas 4+5
+#     as dependencies, since under `Pid1` the steward overlays tmpfs and every guest write lands
+#     there regardless.
+#     PINS-SCHEMA ADDITION: `rootfs.<label>.format` — `"erofs"` (the default) or `"ext4"`. An
+#     unknown value is a hard error naming both.
+#     BREAKING `function_parameter_count_changed`: `rootfs_filename` takes the format (1 → 2). The
+#     name is no longer determined by the label alone.
+#     BREAKING `function_missing`: `rootfs_label_from_filename` → `rootfs_artifact_from_filename`,
+#     which returns the format beside the label. The old name promised the filename determined a
+#     label; it determines a (label, format) pair, and `vmcell bundle` reads the inverse.
+#     ADDITIVE: `artifact::ext4` (the producer, `EXT4_TARBALL_XATTRS`); `RootfsFormat`;
+#     `artifact::merge_to_tar` — the tar emitter that makes §4.7's "the same merged tail, inherited
+#     for free" true by construction rather than by assertion: the merge happens ONCE and two
+#     emitters consume it; and `config::RootfsSource::root_device_read_only`, the one law for the
+#     root disk's device-level writability.
+#     BEHAVIOR, and the reason `root_device_read_only` exists: all four backends attached a `Block`
+#     root READ-WRITE beneath an `ro` mount — four copies of one decision, all four drifted the same
+#     way. Demonstrated on the data plane, not inferred: under the old attach a guest
+#     `dd of=/dev/vda` wrote 512 bytes into the image N zygote clones share. The four per-variant
+#     matches are deleted; the device's writability can no longer exceed the mount's.
+#     BEHAVIOR a consumer can hit: a rootfs declaring `format: "ext4"` AND `xattrs: "preserve"` now
+#     FAILS the build with a typed refusal when the merged tree carries any attribute other than
+#     `security.capability` — because `mkfs.ext4 -d <tarball>` silently drops the rest, measured.
+#     Refusing is the honor-or-reject rule; the old behavior was an image quietly missing what the
+#     declaration promised. vmcell's own artifacts are unaffected (the pinned base carries zero
+#     xattrs and the default policy is `Strip`).
+#     ARTIFACT: `OCI_ROOTFS_STAGE_VERSION` 6 → 7.
+#     THE CRATE ROUTE WAS EVALUATED FIRST, as §18 directs, and REJECTED WITH A NAMED CANDIDATE:
+#     `am-fs-ext4` 0.4.0 (MIT, same author family as the `am-fs-erofs` this tree already trusts,
+#     `am-fs-core` already in the lock, and a complete write API down to `apply_mknod` /
+#     `apply_link` / `apply_setxattr`). Rejected for this cut because it first published 2026-06-21,
+#     shipped three releases in ten days, its own docs call its ext3 dialect "not yet e2fsck-clean",
+#     and §17's qualifier — "*if* a permissive pure-Rust writer passes the mount-and-diff gate" —
+#     could not be met by a gate that did not exist until this delta. The `Stage` boundary makes the
+#     swap an implementation change, and graduating to it would remove the xattr refusal above
+#     outright. External `mkfs.ext4` ships meanwhile as the validated fallback, recorded as the
+#     external-tool exception it is: e2fsprogs is a GPL-2 **binary**, spawned, never linked — the
+#     QEMU/nft carve-out shape, joining `make` and `cargo` which this pipeline already spawns.
+version = "0.20.0"
 edition = "2024"
 # MSRV is the single workspace floor (`[workspace.package] rust-version`, in lockstep with
 # rust-toolchain.toml via the `just ci` sync assertion) — currently the latest stable, 1.96.1.
@@ -641,7 +689,7 @@ tar = "0.4"
 
 [features]
 experiment-fuse = ["fuse-backend-rs/vhost-user-fs", "dep:vhost", "dep:vhost-user-backend", "dep:virtio-queue", "dep:vmm-sys-util", "dep:vm-memory", "vm-memory/backend-mmap", "vm-memory/backend-atomic", "dep:virtio-bindings"]
-default = ["cloud-hypervisor", "net-privileged", "net-unprivileged", "proxy", "metrics", "pipeline", "cli"]
+default = ["cloud-hypervisor", "net-privileged", "net-unprivileged", "proxy", "metrics", "pipeline", "ext4-producer", "cli"]
 
 # Test-only fixtures shared with the backend crates. NOT in `default`, and never a
 # dependency of a shipped binary: the backend crates take it as a DEV-dependency only, so
@@ -754,6 +802,29 @@ vmm-sys-util = ["dep:vmm-sys-util"]
 vm-memory = ["dep:vm-memory"]
 virtio-bindings = ["dep:virtio-bindings"]
 am-fs-erofs = ["dep:am-fs-erofs"]
+
+# §4.7's ext4 rootfs producer (§18 delta 8) — the second emitter behind the one pack tail.
+#
+# Named for the CAPABILITY, not for a crate, and that breaks this manifest's otherwise-unbroken
+# convention on purpose. Every other library feature here (`am-fs-erofs`, `vhost`, `virtio-queue`,
+# …) turns on the crate it is named after; this one turns on no crate at all, because the shipped
+# route spawns `mkfs.ext4` (a GPL-2 binary, never linked — the QEMU/nft carve-out shape). Naming it
+# after the crate it *might* one day use would be a name that is false today, and **dropping a
+# feature is a semver break on this crate** (cf. `jip-nftables`), so the name is chosen once and
+# permanently. Under this name, graduating from the external tool to a pure-Rust writer is a
+# `dep:` line added inside the stanza — an implementation swap, exactly as §4.7 requires — rather
+# than a feature rename nobody can take back.
+#
+# It gates NO dependency (the producer uses `std::process` plus the `tar` that `pipeline` already
+# pulls), so turning it off shrinks no tree. What it does is make "this build cannot produce ext4"
+# expressible and TYPED: the off arm returns `Error::CapabilityUnavailable`, never a silent pack in
+# the default format.
+#
+# In `default` and deliberately NOT inside `pipeline`, even though `pipeline` is what it needs to be
+# useful. A feature `pipeline` implied could never be OFF in any configuration cargo can build, so
+# its refusal arm would be unreachable code nobody has ever compiled — and the `cargo hack
+# --feature-powerset` job is exactly what compiles `pipeline` without it and proves the arm is real.
+ext4-producer = []
 
 [package.metadata.cargo-machete]
 # False positive: the library name is `fs_erofs` (not `am_fs_erofs`), used in

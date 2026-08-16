@@ -32,8 +32,13 @@ const CONSUMER_POSITION: &str = "VMCELL_TEST_REPACK_CONSUMER_POSITION";
 /// in-process assertion can ask.
 const CARGO_MARKER: &str = "VMCELL_TEST_REPACK_CARGO_MARKER";
 
-/// The child test's exact libtest name (an integration-test binary namespaces nothing).
-const CHILD: &str = "guest_tools_stage_honors_its_position";
+/// The guest-tools child test's exact libtest name (an integration-test binary namespaces nothing).
+const TOOLS_CHILD: &str = "guest_tools_stage_honors_its_position";
+
+/// The **ext4 producer's** child test (§18 delta 8: "the delta-7 from-outside-a-checkout leg
+/// repeated for this producer"). A second child rather than more legs inside the first: the
+/// question is about a different stage, and one child failing must not hide the other's verdict.
+const EXT4_CHILD: &str = "ext4_pack_honors_its_position";
 
 /// The bytes the `--tools` fixture carries; distinctive so "the published file" can never be
 /// confused with a compiled binary that happens to be there.
@@ -76,7 +81,12 @@ fn cargo_stub_dir(dir: &Path) -> PathBuf {
 /// the CWD moved out of the checkout.
 ///
 /// Returns the child's output so each parent can assert on it and print it on failure.
-fn run_child(root: &Path, marker: &Path, consumer_position: bool) -> std::process::Output {
+fn run_child(
+    child: &str,
+    root: &Path,
+    marker: &Path,
+    consumer_position: bool,
+) -> std::process::Output {
     let exe = std::env::current_exe().expect("the running test binary's path");
     let stub_bin = cargo_stub_dir(root);
     let path = match std::env::var_os("PATH") {
@@ -88,7 +98,7 @@ fn run_child(root: &Path, marker: &Path, consumer_position: bool) -> std::proces
         None => stub_bin.into_os_string(),
     };
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["--exact", CHILD, "--nocapture"])
+    cmd.args(["--exact", child, "--nocapture"])
         .args(["--test-threads", "1"])
         .env(CARGO_MARKER, marker)
         .env("PATH", path);
@@ -102,12 +112,12 @@ fn run_child(root: &Path, marker: &Path, consumer_position: bool) -> std::proces
 
 /// Asserts the child succeeded **and ran the legs for `position`**, printing its own output when
 /// it did not.
-fn expect_child_ok(out: &std::process::Output, position: &str) {
+fn expect_child_ok(child: &str, out: &std::process::Output, position: &str) {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "`{CHILD}` must pass in the {position} position, got {}\n\
+        "`{child}` must pass in the {position} position, got {}\n\
          --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         out.status,
     );
@@ -130,8 +140,8 @@ fn expect_child_ok(out: &std::process::Output, position: &str) {
 fn the_tools_override_packs_a_handler_from_outside_a_checkout() {
     let outside = tempfile::tempdir().expect("tempdir");
     let marker = outside.path().join("cargo-was-reached");
-    let out = run_child(outside.path(), &marker, true);
-    expect_child_ok(&out, "consumer");
+    let out = run_child(TOOLS_CHILD, outside.path(), &marker, true);
+    expect_child_ok(TOOLS_CHILD, &out, "consumer");
     assert!(
         !marker.exists(),
         "nothing in the consumer position may shell out to `cargo`: `--tools` is injected verbatim \
@@ -151,8 +161,8 @@ fn the_tools_override_packs_a_handler_from_outside_a_checkout() {
 fn the_workspace_build_still_reaches_cargo_inside_a_checkout() {
     let scratch = tempfile::tempdir().expect("tempdir");
     let marker = scratch.path().join("cargo-was-reached");
-    let out = run_child(scratch.path(), &marker, false);
-    expect_child_ok(&out, "checkout");
+    let out = run_child(TOOLS_CHILD, scratch.path(), &marker, false);
+    expect_child_ok(TOOLS_CHILD, &out, "checkout");
     let recorded = std::fs::read_to_string(&marker).unwrap_or_else(|e| {
         panic!(
             "inside a checkout the workspace build must still reach `cargo` ({} unreadable: {e}) \
@@ -247,4 +257,175 @@ async fn guest_tools_stage_honors_its_position() {
     // deliberately drives no workspace build: it would spend minutes in a real `cargo build`
     // for a claim the stubbed positive control above already makes. Stated so the omission reads
     // as a decision rather than an oversight; the `--tools` legs above still run here.
+}
+
+// -----------------------------------------------------------------------------------------------
+// §18 delta 8: the same leg, for the ext4 producer.
+// -----------------------------------------------------------------------------------------------
+
+/// The one-member-plus-`libc6` layer the ext4 child packs.
+///
+/// Deliberately tiny and synthetic: this leg is about **position**, not about content, and pulling
+/// an OCI base would make a network-free test network-bound. `usr/lib/libc.so.6` is there because
+/// the one tail's `libc6` scan demands it whenever the default (glibc) steward is injected — the
+/// same scan the erofs route runs, which is the point of there being one merge.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+fn ext4_probe_layer() -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut b = tar::Builder::new(&mut buf);
+        for (path, bytes) in [
+            ("usr/lib/libc.so.6", &b"so"[..]),
+            ("opt/marker", &b"outside"[..]),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o644);
+            h.set_mtime(0);
+            b.append_data(&mut h, path, bytes).expect("append");
+        }
+        b.finish().expect("finish");
+    }
+    buf
+}
+
+/// Whether this host can produce ext4 images at all, recording a reviewable capability skip when it
+/// cannot (§7.2 — an absent facility, classified by the product's own probe).
+///
+/// The **parents** ask, not the child: a child that skipped would print no banner and
+/// [`expect_child_ok`] would report it as "the filter selected zero tests", which is a true
+/// statement about the wrong thing.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+fn ext4_available() -> bool {
+    match vmcell::artifact::ext4::Ext4Producer::probe() {
+        Ok(_) => true,
+        Err(vmcell::error::Error::CapabilityUnavailable { op, needed }) => {
+            println!("SKIP: this host cannot produce ext4 rootfs images ({op}: {needed})");
+            false
+        }
+        Err(other) => panic!("`mkfs.ext4` is present but broken on this host: {other}"),
+    }
+}
+
+// §18 delta 8's *Gate*, second clause: "the delta-7 from-outside-a-checkout leg repeated for this
+// producer (R6's capability sentence covers both packers)". From a directory with no vmcell
+// checkout above it and no `CARGO_MANIFEST_DIR`, the ONE tail packs an **ext4** image — and reaches
+// `cargo` no more than the erofs route does.
+//
+// This is not a foregone conclusion just because the erofs leg passes: the ext4 route adds a
+// process spawn (`mkfs.ext4`), a version probe that builds a scratch image, and a staging file
+// written beside the output. Any of those could have anchored on the checkout.
+//
+// RED on the inverse: give `Ext4Producer::probe` a `workspace_root()`-anchored scratch path (or
+// have `pack` stage its tar there) and the consumer-position child writes outside the tree it was
+// pointed at; make the ext4 route reach `GuestToolsStage`'s workspace build and the marker appears.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+#[test]
+fn the_ext4_producer_packs_from_outside_a_checkout() {
+    if !ext4_available() {
+        return;
+    }
+    let outside = tempfile::tempdir().expect("tempdir");
+    let marker = outside.path().join("cargo-was-reached");
+    let out = run_child(EXT4_CHILD, outside.path(), &marker, true);
+    expect_child_ok(EXT4_CHILD, &out, "consumer");
+    assert!(
+        !marker.exists(),
+        "packing an ext4 rootfs from the consumer position must not shell out to `cargo`. The \
+         stub recorded: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    // …and it anchored on the position it was given: with no checkout above the CWD,
+    // `workspace_root()` falls back to that CWD, so every artifacts-dir-relative side effect the
+    // tail has (the deployment CA under the `proxy` feature) lands inside the consumer's own tree.
+    // Without this the "no cargo" assertion above would still pass for a pack that had quietly
+    // written into the vmcell checkout's `target/`.
+    #[cfg(feature = "proxy")]
+    assert!(
+        outside.path().join("target/vmcell-artifacts").is_dir(),
+        "the consumer-position pack must anchor its artifacts dir on the consumer's own position \
+         ({}), not on the vmcell checkout",
+        outside.path().display()
+    );
+}
+
+// The positive control for the leg above, one stage over from the guest-tools pair: the SAME child,
+// the SAME stub, run INSIDE the checkout. It proves the pack really runs (rather than the consumer
+// leg passing because nothing happened) and that delta 8 did not quietly break the in-checkout
+// route while making the out-of-checkout one work.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+#[test]
+fn the_ext4_producer_still_packs_inside_a_checkout() {
+    if !ext4_available() {
+        return;
+    }
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let marker = scratch.path().join("cargo-was-reached");
+    let out = run_child(EXT4_CHILD, scratch.path(), &marker, false);
+    expect_child_ok(EXT4_CHILD, &out, "checkout");
+}
+
+// The ext4 child. Which position it is in is decided by the env the parents set; the pack itself
+// runs identically in both, because position-independence is the claim and asserting it in one
+// position only would leave the other free to rot.
+//
+// Undriven (a plain `cargo test` with no parent), it prints its banner and packs nothing: without
+// the parent's `CARGO_MARKER` there is no stub on `PATH` to observe, so the run would spend a
+// `mkfs.ext4` on a claim nothing is watching.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+#[tokio::test]
+async fn ext4_pack_honors_its_position() {
+    let consumer = std::env::var_os(CONSUMER_POSITION).is_some();
+    let driven = std::env::var_os(CARGO_MARKER).is_some();
+    println!(
+        "{BANNER}{}",
+        if consumer {
+            "consumer"
+        } else if driven {
+            "checkout"
+        } else {
+            "undriven"
+        }
+    );
+    if !driven {
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A stand-in steward: the tail injects whatever `inputs.artifacts["steward"]` names, and this
+    // leg is about where the PACK runs, not about what it bakes. Building a real steward here would
+    // make a toolchain-free test need a toolchain — the exact dependency delta 7 severed.
+    let steward = dir.path().join("vmcell-steward");
+    std::fs::write(&steward, b"#!/bin/sh\nexit 0\n").expect("write the stand-in steward");
+    let mut inputs = StageInputs::default();
+    inputs
+        .artifacts
+        .insert("steward".to_string(), steward.clone());
+
+    let out = dir.path().join("rootfs.ext4");
+    vmcell::artifact::rootfs::pack_rootfs_with_injection(
+        vec![Box::new(std::io::Cursor::new(ext4_probe_layer()))],
+        &inputs,
+        &out,
+        &vmcell::artifact::rootfs::PackOptions::new()
+            .with_format(vmcell::artifact::RootfsFormat::Ext4),
+    )
+    .await
+    .expect("the one tail must pack an ext4 image from any position");
+
+    // A data-plane assertion, not `out.exists()`: `mkfs.ext4` is handed a file the producer
+    // `set_len`s first, so a producer that spawned nothing at all would still leave a
+    // correctly-sized file behind. The magic is what says a filesystem was written into it.
+    let bytes = std::fs::read(&out).expect("read the produced image");
+    assert!(
+        bytes.len() > 2048,
+        "the produced image is too small to hold a superblock: {} bytes",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[1080..1082],
+        &[0x53, 0xef],
+        "the ext2/3/4 superblock magic (0xEF53, little-endian at offset 0x438) must be present — \
+         without it this leg would pass on the empty file the producer pre-sizes"
+    );
 }

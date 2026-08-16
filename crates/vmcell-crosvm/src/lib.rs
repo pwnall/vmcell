@@ -426,25 +426,23 @@ fn build_crosvm_run_args(
     }
 
     // Block devices, in argument order → `/dev/vda`, `/dev/vdb`, … The rootfs MUST be first so it
-    // enumerates as `/dev/vda`, which the cmdline boots from. `ro=true` for the read-only EROFS
-    // image; a writable Block source (or its overlay) is read-write.
+    // enumerates as `/dev/vda`, which the cmdline boots from. `ro=true` for every rootfs source:
+    // the guest mounts the root `ro` whatever its format is, so the device is attached read-only
+    // to match (§4.7 — the ext4 `Block` root buys POSIX-completeness, not writability).
     //
     // *Which* host file backs `/dev/vda` is the one law, `RootfsSource::effective_image` — the
     // same predicate the config boundary's duplicate-backing-file guard uses, so the guard can
-    // never protect a file this argv does not attach. The match stays exhaustive over the
-    // variants (a new `RootfsSource` must be a compile error here) because only the `ro=true`
-    // token is per-variant.
+    // never protect a file this argv does not attach. **Whether it is writable** is the other one
+    // law, `RootfsSource::root_device_read_only`, which owns the exhaustive per-variant match: the
+    // `Block` arm here open-coded the ABSENCE of `ro=true`, contradicting the cmdline's `ro`.
     let root_image = cfg.rootfs.effective_image().display().to_string();
-    match &cfg.rootfs {
-        vmcell::config::RootfsSource::Erofs { .. } => {
-            args.push("--block".to_string());
-            args.push(format!("path={root_image},ro=true"));
-        }
-        vmcell::config::RootfsSource::Block { .. } => {
-            args.push("--block".to_string());
-            args.push(format!("path={root_image}"));
-        }
-    }
+    let root_ro = if cfg.rootfs.root_device_read_only() {
+        ",ro=true"
+    } else {
+        ""
+    };
+    args.push("--block".to_string());
+    args.push(format!("path={root_image}{root_ro}"));
 
     // Extra virtio-blk devices (§4.6), attached AFTER the root disk so they enumerate `/dev/vdb`,
     // `/dev/vdc`, … in order and never displace `/dev/vda`. Per-disk I/O throttling (`io_limit`)
@@ -1233,10 +1231,18 @@ mod tests {
             image: base.clone(),
             overlay: None,
         });
+        // `ro=true` is part of the expected string: the device's writability must not exceed the
+        // mount's, and the mount is always `ro` (§4.7; `RootfsSource::root_device_read_only`).
+        // Spelled as a literal rather than recomputed through the law, which would be vacuous now
+        // that the composer reads it — this is the leg that reddens on the pre-delta-8 `Block`
+        // arm, which emitted no `ro=true` at all.
         assert_eq!(
             plain_spec,
-            format!("path={}", plain_cfg.rootfs.effective_image().display()),
-            "the root --block must name the effective image"
+            format!(
+                "path={},ro=true",
+                plain_cfg.rootfs.effective_image().display()
+            ),
+            "the root --block must name the effective image and attach it READ-ONLY"
         );
 
         // Overlay set: the overlay backs /dev/vda, the base is never attached.
@@ -1246,8 +1252,12 @@ mod tests {
         });
         assert_eq!(
             ovl_spec,
-            format!("path={}", ovl_cfg.rootfs.effective_image().display()),
-            "with an overlay set, the overlay backs /dev/vda"
+            format!(
+                "path={},ro=true",
+                ovl_cfg.rootfs.effective_image().display()
+            ),
+            "with an overlay set, the overlay backs /dev/vda — and it is a per-VM private COPY, \
+             not a write target, so it is attached read-only too"
         );
         // Non-vacuous: the two paths genuinely differ.
         assert_ne!(

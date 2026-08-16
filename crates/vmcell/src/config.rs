@@ -688,6 +688,12 @@ fn validate_extra_kernel_arg(arg: &str) -> Result<(), String> {
 /// exhaustively map each rootfs source to its own device wiring, so this enum is deliberately
 /// **not** `#[non_exhaustive]`: a new variant should be a compile error in every backend (fail-loud)
 /// rather than an unhandled `_` arm. (`vmcell` is `publish = false`; there is no external consumer.)
+///
+/// The backends no longer each carry their own per-variant `match` for the root disk's *writability*
+/// — that decision is now the one law [`RootfsSource::root_device_read_only`], beside
+/// [`RootfsSource::effective_image`]. A new variant is still a compile error, in the two laws that
+/// decide the wiring instead of in four copies of the same answer; and it was the four copies that
+/// had drifted (all four attached the root read-write while `build_kernel_cmdline` mounted it `ro`).
 #[derive(Clone, Debug)]
 pub enum RootfsSource {
     /// Read-only EROFS image. Shared across multiple VMs.
@@ -695,11 +701,25 @@ pub enum RootfsSource {
         /// Path to the EROFS image file.
         image: PathBuf,
     },
-    /// Writable or read-only block device image.
+    /// Read-only ext4 (or other block-format) image — the §4.7 producer's output.
+    ///
+    /// **Read-only, like [`Erofs`](Self::Erofs), and for the same reason**: the guest mounts the
+    /// root `ro` (see [`root_device_read_only`](Self::root_device_read_only) for the whole coupling).
+    /// What this variant buys is not writability but **POSIX-completeness** — device nodes,
+    /// extended attributes, ACLs, and the ext4 on-disk semantics a workload may be asserting on —
+    /// which is exactly what the §15.4 ext4 battery's in-guest tree/xattr/device diff measures.
+    /// It shares across concurrent VMs exactly as the erofs image does, so it needs no per-clone
+    /// copy and no snapshot-eligibility arm.
     Block {
         /// Base image file.
         image: PathBuf,
-        /// Optional writable overlay file.
+        /// Optional **per-VM private copy** of the base image, attached in its place.
+        ///
+        /// Not a write target: the root is read-only either way (a `Block` root is mounted `ro`,
+        /// and the device is attached read-only). It exists so a caller that wants a VM to own its
+        /// own bytes — a copy-on-write clone materialized through `HostEnv::overlay` (S4) — can say
+        /// so without rewriting the base path everywhere; when it is set the base image is never
+        /// attached at all ([`effective_image`](Self::effective_image)).
         overlay: Option<PathBuf>,
     },
 }
@@ -719,6 +739,35 @@ impl RootfsSource {
         match self {
             RootfsSource::Erofs { image } => image,
             RootfsSource::Block { image, overlay } => overlay.as_deref().unwrap_or(image),
+        }
+    }
+
+    /// Whether the host file backing `/dev/vda` is attached to the guest **read-only**.
+    ///
+    /// One law, one predicate (§13, Cross-cutting invariants): every backend's root-disk wiring
+    /// reads this — `readonly` on Cloud Hypervisor, `is_read_only` on Firecracker, `readonly=on` on
+    /// QEMU, `ro=true` on crosvm — so the device's writability cannot drift away from the mount's.
+    ///
+    /// **The device's writability must not exceed the mount's, and the mount is always `ro`.**
+    /// [`build_kernel_cmdline`] emits a bare `ro` with no rootfs conditional, and F3 reserves `rw`
+    /// as an *alias* of that owned token precisely so a caller cannot flip it — the rationale
+    /// recorded on the reserved-key list is that `rw` plus the `rootflags=noload` a `Block` root
+    /// also carries is silent filesystem corruption rather than a boot failure. So the answer is
+    /// `true` for every variant, and the exhaustive match is what makes a future writable variant
+    /// answer this question (and the cmdline's) instead of inheriting a wrong default.
+    ///
+    /// This function exists because the four backends each carried their own copy of the decision
+    /// and **all four had drifted**: each attached a `Block` root read-write while the cmdline
+    /// mounted it read-only, so a guest could write straight through `/dev/vda` under a root
+    /// filesystem the kernel believed was immutable — and N zygote clones share one image.
+    /// `rootfs_device_writability_matches_the_mount` couples the two directions.
+    #[must_use]
+    pub fn root_device_read_only(&self) -> bool {
+        match self {
+            // A shared, immutable image: the format has no write path at all.
+            RootfsSource::Erofs { .. } => true,
+            // Read-only by ratification, not by accident — see the variant's own docs and §4.7.
+            RootfsSource::Block { .. } => true,
         }
     }
 }
@@ -4160,6 +4209,71 @@ mod tests {
             c.contains("rootflags=noload"),
             "Block rootfs must emit rootflags=noload: {c}"
         );
+    }
+
+    /// **The coupling** §4.7 ratifies: for every [`RootfsSource`] variant, the writability the
+    /// backends attach the device with ([`RootfsSource::root_device_read_only`]) equals the
+    /// writability the kernel mounts it with (the `ro`/`rw` token [`build_kernel_cmdline`] emits).
+    ///
+    /// Two directions, both of which had actually happened somewhere in this tree:
+    ///
+    /// * the **device** could be writable while the mount was read-only — the pre-delta-8 state,
+    ///   in all four backends at once, so a guest could `dd` straight through `/dev/vda` beneath a
+    ///   root filesystem the kernel believed was immutable (and N zygote clones share one image);
+    /// * the **mount** could be made writable while the device stayed read-only, which is a boot
+    ///   failure rather than corruption — but only because F3 reserves `rw`, and F3 reserves it
+    ///   for the *other* reason (`rw` + `rootflags=noload` is silent corruption).
+    ///
+    /// Parsed out of the composed cmdline rather than asserted against a literal, so the law is
+    /// checked against what the builder actually emits. RED on the inverse either way: return
+    /// `false` from `root_device_read_only`'s `Block` arm, or emit `rw` in place of `ro`.
+    #[test]
+    fn rootfs_device_writability_matches_the_mount() {
+        for rootfs in [
+            RootfsSource::Erofs {
+                image: PathBuf::from("/rootfs.erofs"),
+            },
+            RootfsSource::Block {
+                image: PathBuf::from("/rootfs.img"),
+                overlay: None,
+            },
+            RootfsSource::Block {
+                image: PathBuf::from("/rootfs.img"),
+                overlay: Some(PathBuf::from("/rootfs-vm7.img")),
+            },
+        ] {
+            let cfg = VmConfig::builder(PathBuf::from("/vmlinux"), rootfs.clone())
+                .build()
+                .unwrap();
+            let c = build_kernel_cmdline(&cfg, &test_res(5), "").unwrap();
+            let tokens: Vec<&str> = c.split_ascii_whitespace().collect();
+            let mount_ro = tokens.contains(&"ro");
+            let mount_rw = tokens.contains(&"rw");
+            // Non-vacuity: exactly one of the two aliases must be present, or "the mount is
+            // read-only" would be satisfied by a cmdline that says nothing about it at all.
+            assert!(
+                mount_ro != mount_rw,
+                "the cmdline must state the root mount's writability exactly once for \
+                 {rootfs:?}: {c}"
+            );
+            assert_eq!(
+                rootfs.root_device_read_only(),
+                mount_ro,
+                "the device's writability must not exceed the mount's (§4.7): {rootfs:?} is \
+                 attached read-only={} while the cmdline mounts it {}",
+                rootfs.root_device_read_only(),
+                if mount_ro { "`ro`" } else { "`rw`" }
+            );
+            // …and the alias that would break the agreement is reserved in both directions, so a
+            // caller cannot re-open the gap `extra_kernel_args` closes.
+            for alias in ["ro", "rw"] {
+                assert!(
+                    is_reserved_cmdline_arg(alias),
+                    "`{alias}` must stay reserved, or an appended arg can flip the mount out from \
+                     under the device attachment"
+                );
+            }
+        }
     }
 }
 

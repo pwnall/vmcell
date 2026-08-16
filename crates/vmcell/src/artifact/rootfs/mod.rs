@@ -111,35 +111,66 @@ pub fn rootfs_filename_suffix(label: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// The on-disk artifact **filename** of a packed rootfs: `rootfs.erofs` for the default,
-/// `rootfs-<sanitized-label>.erofs` for a labelled one.
+/// The on-disk artifact filename **stem** of a packed rootfs: `rootfs` for the default,
+/// `rootfs-<sanitized-label>` for a labelled one — the name without a format extension.
 ///
-/// The one composer every producer and every consumer of the artifacts dir uses.
+/// The stem, not the filename, is what a rootfs's sidecars are named after:
+/// `Stage::cache_sidecar_path` and [`crate::feature::feature_manifest_path`] both derive theirs
+/// with `Path::with_extension`, so `rootfs-a.erofs` and `rootfs-a.ext4` share one
+/// `rootfs-a.cache_key` and one `rootfs-a.features`. That makes the stem the registry's
+/// collision key (§18 delta 8), and [`rootfs_filename`] the one place a format extension is
+/// appended to it.
 #[must_use]
-pub fn rootfs_filename(label: Option<&str>) -> String {
-    format!("rootfs{}.erofs", rootfs_filename_suffix(label))
+pub fn rootfs_artifact_stem(label: Option<&str>) -> String {
+    format!("rootfs{}", rootfs_filename_suffix(label))
 }
 
-/// The inverse of [`rootfs_filename`]: the on-disk label carried by a rootfs artifact filename, or
-/// `None` when `name` is not a labelled rootfs image.
+/// The on-disk artifact **filename** of a packed rootfs: `rootfs.erofs` for the default,
+/// `rootfs-<sanitized-label>.ext4` for a labelled ext4 one (§18 delta 8).
+///
+/// The one composer every producer and every consumer of the artifacts dir uses. `format` is a
+/// **required** parameter rather than a defaulted one: three production sites name a rootfs file
+/// (the image stage's `out_path`, the declaration stage's `out_path`, and the registry's collision
+/// key), all three must agree with the entry that declares the format, and a call site that could
+/// omit it is a call site that silently writes `rootfs-<label>.erofs` over an ext4 artifact's key.
+#[must_use]
+pub fn rootfs_filename(label: Option<&str>, format: RootfsFormat) -> String {
+    format!("{}.{}", rootfs_artifact_stem(label), format.name())
+}
+
+/// The inverse of [`rootfs_filename`]: the on-disk label **and format** carried by a rootfs
+/// artifact filename, or `None` when `name` is not a labelled rootfs image.
 ///
 /// `vmcell bundle` walks the artifacts dir with this so the manifest covers every
-/// `rootfs-<label>.erofs`, not just the default — the N-BIN-4 defect class, re-armed by the
-/// registry and disarmed here.
+/// `rootfs-<label>.erofs` **and** every `rootfs-<label>.ext4`, not just the default — the N-BIN-4
+/// defect class, re-armed by the registry, disarmed here, and re-armed a second time by delta 8's
+/// second format until this law learned it.
 ///
-/// The bare `rootfs.erofs` returns `None`, and so does anything that is not an `.erofs`: a
-/// `rootfs-debian.cache_key` sidecar must not read as an artifact named `rootfs-debian`, which is
-/// exactly how `bundle` once recorded a kernel's cache sidecar as a kernel. A remainder containing
-/// `.` also returns `None`, because [`rootfs_filename_suffix`] sanitizes `.`→`-`, so no filename
-/// this law produces can carry one.
+/// It returns the format alongside the label because a caller that needs one usually needs both
+/// (the bundle walk names the artifact by key and its sidecar by path), and because two functions
+/// reading the same string are two laws that drift: an inverse that only stripped a suffix and a
+/// separate one that only read it would eventually disagree about which suffixes are rootfs images.
+///
+/// The bare `rootfs.erofs` returns `None`, and so does anything that is not a known format
+/// extension: a `rootfs-debian.cache_key` sidecar must not read as an artifact named
+/// `rootfs-debian`, which is exactly how `bundle` once recorded a kernel's cache sidecar as a
+/// kernel. A remainder containing `.` also returns `None`, because [`rootfs_filename_suffix`]
+/// sanitizes `.`→`-`, so no filename this law produces can carry one.
 ///
 /// This is the *inverse* of the sanitization law and lives beside it: the two are pinned together
-/// by a round-trip gate, so neither half can move alone.
+/// by a round-trip gate over **both** formats, so neither half can move alone and neither format
+/// can be mistaken for the other's.
 #[must_use]
-pub fn rootfs_label_from_filename(name: &str) -> Option<&str> {
-    let stem = name.strip_suffix(".erofs")?;
+pub fn rootfs_artifact_from_filename(name: &str) -> Option<(&str, RootfsFormat)> {
+    // Every format's extension, from the ONE roster — so a format added to `RootfsFormat` cannot
+    // leave this walk blind to its artifacts, which is the shape of the N-BIN-4 defect one kind
+    // over.
+    let (stem, format) = RootfsFormat::ALL.into_iter().find_map(|f| {
+        name.strip_suffix(&format!(".{}", f.name()))
+            .map(|stem| (stem, f))
+    })?;
     match stem.strip_prefix("rootfs-") {
-        Some(label) if !label.is_empty() && !label.contains('.') => Some(label),
+        Some(label) if !label.is_empty() && !label.contains('.') => Some((label, format)),
         _ => None,
     }
 }
@@ -153,6 +184,17 @@ pub fn rootfs_label_from_filename(name: &str) -> Option<&str> {
 /// [`pack_erofs_with_injection`] and [`ExtraFile`], and because a consumer reads it off
 /// [`PackOptions::xattrs`].
 pub use crate::artifact::XattrPolicy;
+
+/// Which filesystem an artifact's image is packed as (§4.7) — §10.4 contract surface under this
+/// name.
+///
+/// Defined in [`crate::artifact`] for the same forced reason [`XattrPolicy`] is: the format is
+/// declared on a `rootfs` registry entry ([`crate::artifact::RootfsRegistryEntry::format`], §18
+/// delta 8) and that parser is ungated, while this module is gated on `pipeline`. Re-exported here
+/// because `rootfs` is where the §10.4 list puts the artifact-shaping types, beside
+/// [`pack_rootfs_with_injection`] and [`XattrPolicy`], and because a consumer reads it off
+/// [`PackOptions::format`].
+pub use crate::artifact::RootfsFormat;
 
 /// What the one inject+pack tail is told, beyond the tar streams themselves (design §4.2/§10.5).
 ///
@@ -190,6 +232,14 @@ pub struct PackOptions {
     /// [`XattrPolicy::Strip`], which is the pre-v33 behavior byte-for-byte — so an existing caller
     /// that never mentions it packs the same image it always did.
     pub xattrs: XattrPolicy,
+    /// Which filesystem the tail packs the merged tree into (§4.7, §18 delta 8).
+    ///
+    /// Default [`RootfsFormat::Erofs`], the pre-delta-8 behavior byte-for-byte. The merge, the
+    /// injections, the `libc6` scan, the reserved-path law, the parent synthesis and the
+    /// [`XattrPolicy`] above all run **before** this field is consulted, which is the whole point:
+    /// §4.7's *"consuming the same merged-tar tail … inherited for free"* is true because there is
+    /// still exactly one merge, and this field only chooses which emitter it is handed to.
+    pub format: RootfsFormat,
 }
 
 impl PackOptions {
@@ -236,6 +286,14 @@ impl PackOptions {
     #[must_use]
     pub fn with_xattrs(mut self, xattrs: XattrPolicy) -> Self {
         self.xattrs = xattrs;
+        self
+    }
+
+    /// Sets the filesystem the tail packs into (§4.7, §18 delta 8); the default is
+    /// [`RootfsFormat::Erofs`].
+    #[must_use]
+    pub fn with_format(mut self, format: RootfsFormat) -> Self {
+        self.format = format;
         self
     }
 
@@ -452,6 +510,10 @@ pub struct RootfsStage {
     /// entry, folded into the cache key, and handed to the one pack tail. Default
     /// [`XattrPolicy::Strip`].
     pub xattrs: XattrPolicy,
+    /// The filesystem this artifact is packed as (§4.7, v33 delta 8) — declared in its registry
+    /// entry, folded into the cache key, handed to the one pack tail, **and** appended to this
+    /// stage's `out_path`. Default [`RootfsFormat::Erofs`].
+    pub format: RootfsFormat,
     /// The `rootfs` registry label this stage builds (§10.5, v33 delta 6) — `None` is
     /// `rootfs.default`, which resolves to today's inputs and today's filename.
     ///
@@ -489,6 +551,7 @@ impl RootfsStage {
             extra: Vec::new(),
             applets: Vec::new(),
             xattrs: XattrPolicy::default(),
+            format: RootfsFormat::default(),
             label: label.map(str::to_string),
             // The artifact key IS the stage name for this kind, so a labelled stage cannot collide
             // with the default one on the pipeline's cache sidecar — the §5.1 hazard recorded for
@@ -539,6 +602,18 @@ impl RootfsStage {
         self
     }
 
+    /// Sets this artifact's filesystem format (§4.7, §18 delta 8) — the `format` key of its
+    /// registry entry. The default is [`RootfsFormat::Erofs`].
+    ///
+    /// It moves both this stage's `out_path` and its `cache_key`, deliberately: an ext4 artifact
+    /// is a *different file* from the erofs one, not the same file packed differently, so the two
+    /// never overwrite each other and never serve each other's cache entry.
+    #[must_use]
+    pub fn with_format(mut self, format: RootfsFormat) -> Self {
+        self.format = format;
+        self
+    }
+
     /// The F7 dev path-override registered for this stage's label, if any (§10.5, §18 delta 6c).
     ///
     /// The **one** place this stage decides "is this label unpinned?", read by `cache_key` and by
@@ -569,6 +644,9 @@ impl RootfsStage {
             // The SAME policy `cache_key` folds, so the identity and the packed bytes can never
             // disagree about which attributes the image is supposed to carry.
             xattrs: self.xattrs,
+            // The SAME format `out_path` names the file after and `cache_key` folds, so the
+            // filename, the identity and the emitter the tail picks are one declaration.
+            format: self.format,
             // The SAME label the stage's name, out_path and pin keys are composed from, so the key
             // the tail registers under and the key `RootfsStage::publish_unpinned` registers under
             // are one law rather than two that agree only for the default label.
@@ -599,10 +677,15 @@ impl RootfsStage {
 /// is the point — an artifacts dir that already holds a `Strip`-packed image must not serve it
 /// under a key that now means "whatever this artifact's declaration says", and a *policy* change
 /// with an unmoved key would serve an image whose attributes contradict its own manifest.
+/// v33 (§18 delta 8): bumped to 7 — [`fold_rootfs_injection_identity`] gained the
+/// [`RootfsFormat`]. Like the policy, it folds on every key including the default `Erofs`'s. The
+/// format also moves the artifact's *filename*, so an unmoved key could not actually serve the
+/// wrong bytes here — the bump is the identity-fold discipline applied anyway, and one re-pack is
+/// harmless.
 ///
 /// Module-level (rather than a `fn`-local `const`) so the bump itself is assertable KVM-free:
 /// `rootfs_stage_version_pins_the_identity_fold_bumps`.
-const OCI_ROOTFS_STAGE_VERSION: u32 = 6;
+const OCI_ROOTFS_STAGE_VERSION: u32 = 7;
 
 #[async_trait]
 impl Stage for RootfsStage {
@@ -611,7 +694,7 @@ impl Stage for RootfsStage {
     }
 
     fn out_path(&self, target_dir: &std::path::Path) -> std::path::PathBuf {
-        target_dir.join(rootfs_filename(self.label()))
+        target_dir.join(rootfs_filename(self.label(), self.format))
     }
 
     fn cache_key(&self, inputs: &StageInputs) -> CacheKey {
@@ -899,7 +982,17 @@ impl Stage for RootfsFeaturesStage {
         // Both laws, called and never re-spelled: `rootfs_filename` names the image this
         // declaration is about, and `feature_manifest_path` is the one sidecar-name composer the
         // READER (`FeatureDeclaration::load_beside`) goes through.
-        crate::feature::feature_manifest_path(&target_dir.join(rootfs_filename(self.label())))
+        //
+        // The format is the DEFAULT here and this stage carries no format field, which is a
+        // derivation rather than an omission (§18 delta 8): `feature_manifest_path` REPLACES the
+        // extension, so `rootfs-a.erofs` and `rootfs-a.ext4` both name `rootfs-a.features` — one
+        // declaration for one label, whichever filesystem its image happens to be. The reader gets
+        // the same answer because it derives the same way from the real image path. The coupling is
+        // load-bearing and not obvious, so it is pinned:
+        // `the_declaration_sidecar_is_one_file_for_both_formats`.
+        crate::feature::feature_manifest_path(
+            &target_dir.join(rootfs_filename(self.label(), RootfsFormat::default())),
+        )
     }
 
     fn cache_sidecar_path(&self, out: &Path) -> PathBuf {
@@ -1009,8 +1102,9 @@ pub fn fold_rootfs_injection_identity(
         // two-labels byte-identity gate delta 6c landed.
         label: _,
         xattrs,
+        format,
     } = options;
-    let (steward_musl, xattrs) = (steward_musl.as_deref(), *xattrs);
+    let (steward_musl, xattrs, format) = (steward_musl.as_deref(), *xattrs, *format);
     // The injected-steward identity: a static-musl override (folded by CONTENT, not path string,
     // since the StewardStage is skipped on that path) vs. the default glibc steward. A read
     // failure folds a distinct marker; the resulting miss re-runs the build, which fails loud.
@@ -1095,6 +1189,15 @@ pub fn fold_rootfs_injection_identity(
         hasher.update(applet.as_bytes());
         hasher.update(b"\0");
     }
+    // The artifact's filesystem format (§4.7, §18 delta 8). The same merged tree emitted as erofs
+    // and as ext4 is two images, so the fold is the same law the xattr policy above gets — and
+    // unconditional for the same reason, even though the format also moves the artifact's
+    // FILENAME. Relying on the filename to keep the two apart would make this key's honesty depend
+    // on a second law, and `RootfsFeaturesStage` beside it already shares one sidecar stem across
+    // both formats.
+    hasher.update(b"format\0");
+    hasher.update(format.name().as_bytes());
+    hasher.update(b"\0");
 }
 
 /// Resolves the builder-base image as an atomic `(image, digest)` pair from the resolved
@@ -1137,13 +1240,45 @@ pub fn resolve_builder_base(
     ))
 }
 
+/// The erofs-only door onto [`pack_rootfs_with_injection`] — §10.4 lists this name, so it stays.
+///
+/// It **refuses** a [`PackOptions`] naming any other format rather than silently overriding it: the
+/// format is an accepted input, and a door whose name promises erofs cannot quietly honor a request
+/// for something else nor quietly ignore one (law F1). A caller that wants to choose calls
+/// [`pack_rootfs_with_injection`], which is the one tail either way.
+///
+/// # Errors
+/// As [`pack_rootfs_with_injection`], plus [`Error::Artifact`] when `options.format` is not
+/// [`RootfsFormat::Erofs`].
+#[cfg(feature = "am-fs-erofs")]
+pub async fn pack_erofs_with_injection(
+    tar_streams: Vec<Box<dyn Read + Send>>,
+    inputs: &StageInputs,
+    out: &Path,
+    options: &PackOptions,
+) -> Result<StageOutputs> {
+    if options.format != RootfsFormat::Erofs {
+        return Err(Error::Artifact(format!(
+            "`pack_erofs_with_injection` was handed `format: {}` (§4.7): this door packs erofs by \
+             name. Call `pack_rootfs_with_injection`, which is the same tail and honors every \
+             format",
+            options.format.name()
+        )));
+    }
+    pack_rootfs_with_injection(tar_streams, inputs, out, options).await
+}
+
 /// Shared logic to take a list of tar streams, insert the caller's `extra` files, inject the
-/// steward and CA, and pack it into erofs.
+/// steward and CA, and pack it into the format the artifact declares.
 ///
 /// The ONE inject+pack tail: every rootfs source routes through it (§4.3 obligation 3), so the
 /// `libc6` scan, the `--steward-musl` opt-in, and the downstream `extra` files with their
 /// reserved-path collision guard apply to every source for free. `extra` is validated FIRST —
 /// before any I/O — so a bad dest or mode fails before the CA is materialized or a byte is packed.
+///
+/// [`PackOptions::format`] chooses the **emitter**, and only the emitter (§4.7, §18 delta 8): the
+/// merge, the injections and every law above run identically for both, which is what makes §4.7's
+/// "inherited for free" true. The default is erofs and packs the pre-delta-8 bytes exactly.
 ///
 /// # Errors
 /// Returns an error if an `extra` entry is rejected — its `dest` must be an absolute UTF-8
@@ -1152,10 +1287,11 @@ pub fn resolve_builder_base(
 /// [reserved](is_reserved_injection_path) nor a duplicate of another entry's normalized dest;
 /// its `mode` must be permission bits only (`<= 0o7777`). An *interior* `.` component is
 /// **accepted** and folded away by the packer's own normalizer (`/a/./b` == `/a/b`, and
-/// therefore the same duplicate), matching [`ExtraFile`]'s contract. Also returns an error if
-/// the erofs packing or file injection fails.
+/// therefore the same duplicate), matching [`ExtraFile`]'s contract. Also returns an error if the
+/// packing or file injection fails, and — for [`RootfsFormat::Ext4`] — the typed
+/// [`Error::CapabilityUnavailable`] when the external producer's version gate refuses (§4.7).
 #[cfg(feature = "am-fs-erofs")]
-pub async fn pack_erofs_with_injection(
+pub async fn pack_rootfs_with_injection(
     tar_streams: Vec<Box<dyn Read + Send>>,
     inputs: &StageInputs,
     out: &Path,
@@ -1164,8 +1300,9 @@ pub async fn pack_erofs_with_injection(
     let steward_musl = options.steward_musl.as_deref();
     let extra = options.extra.as_slice();
     let applets = options.applet_roster();
-    // `Copy`, so it crosses into the blocking task below without a clone or a borrow.
+    // `Copy`, so they cross into the blocking task below without a clone or a borrow.
     let xattr_policy = options.xattrs;
+    let format = options.format;
     let out_buf = out.to_path_buf();
     // Composed here (not inside the blocking task) so the label borrow ends before the move.
     let artifact_key = rootfs_artifact_key(options.label.as_deref());
@@ -1174,6 +1311,18 @@ pub async fn pack_erofs_with_injection(
     // the injection tail is the validation boundary, since an `ExtraFile` never passes through
     // `VmConfig` (design §4.2, invariant F5).
     let extra_validated = validate_extra_files(extra)?;
+
+    // The ext4 route's version gate runs HERE — after the pure validation above, and before the CA
+    // is materialized, before a layer is read, before a byte is packed — so an absent or too-old
+    // e2fsprogs refuses in milliseconds rather than after a multi-minute merge (§4.7: "probed
+    // fail-loud … never a silent mis-build"). The probe itself spawns a process and writes a
+    // scratch image, which is why it sits after the extras check rather than before it: `extra` is
+    // validated before ANY I/O, and this is I/O.
+    //
+    // The result is a RECEIPT the emitter needs to exist: `RootfsEmitter::Ext4` carries an
+    // `Ext4Producer`, which nothing but the probe can construct, so a pack that skipped the gate is
+    // not a bug this file has to test for — it does not compile.
+    let emitter = emitter_for(format)?;
 
     // The injected steward. A user-supplied static-musl binary (`--steward-musl`, oci2erofs §4.2, Rootfs sources and the one packer)
     // overrides the pipeline's default glibc steward artifact; otherwise a missing default steward
@@ -1237,15 +1386,33 @@ pub async fn pack_erofs_with_injection(
 
         let archives: Vec<tar::Archive<Box<dyn Read + Send>>> =
             tar_streams.into_iter().map(tar::Archive::new).collect();
-        let image = crate::artifact::tar2erofs::tar_to_erofs(
-            archives,
-            extra_files,
-            injected_files,
-            injected_symlink_refs,
-            require_libc6,
-            xattr_policy,
-        )?;
-        std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;
+        // The format chose the EMITTER, and nothing above this line: both arms hand the same
+        // archives, the same extras, the same injections, the same `require_libc6` and the same
+        // `XattrPolicy` to the same merge (§4.7, §18 delta 8).
+        match emitter {
+            RootfsEmitter::Erofs => {
+                let image = crate::artifact::tar2erofs::tar_to_erofs(
+                    archives,
+                    extra_files,
+                    injected_files,
+                    injected_symlink_refs,
+                    require_libc6,
+                    xattr_policy,
+                )?;
+                std::fs::write(&out_buf, image).map_err(|e| Error::Artifact(e.to_string()))?;
+            }
+            RootfsEmitter::Ext4(producer) => {
+                let merged_tar = crate::artifact::tar2erofs::merge_to_tar(
+                    archives,
+                    extra_files,
+                    injected_files,
+                    injected_symlink_refs,
+                    require_libc6,
+                    xattr_policy,
+                )?;
+                pack_merged_tar_as_ext4(producer, &merged_tar, &out_buf)?;
+            }
+        }
         let mut outputs = StageOutputs::default();
         // Through the ONE artifact-key law, never the bare literal: `rootfs_artifact_key(None)` IS
         // `"rootfs"`, so the default label's key is byte-identical, while a labelled pack stops
@@ -1255,6 +1422,104 @@ pub async fn pack_erofs_with_injection(
     })
     .await
     .map_err(|e| Error::Artifact(e.to_string()))?
+}
+
+/// What an ext4 emitter needs in hand to run: a **probed** producer.
+///
+/// With the `ext4-producer` feature off there is none, and the alias is
+/// [`std::convert::Infallible`] rather than a unit — which makes [`RootfsEmitter::Ext4`]
+/// unconstructible in that configuration, so the tail's ext4 arm is statically dead instead of
+/// being a runtime refusal somebody has to remember to write.
+#[cfg(all(feature = "am-fs-erofs", feature = "ext4-producer"))]
+type Ext4Route = crate::artifact::ext4::Ext4Producer;
+/// The `ext4-producer`-off form of [`Ext4Route`] — uninhabited; see the enabled alias.
+#[cfg(all(feature = "am-fs-erofs", not(feature = "ext4-producer")))]
+type Ext4Route = std::convert::Infallible;
+
+/// Which emitter the one pack tail will hand the merged tree to, **with the probe already run**.
+///
+/// A carrier, not a second copy of [`RootfsFormat`]: the format is the *declaration* and this is
+/// the *receipt*. The ext4 arm holds an [`crate::artifact::ext4::Ext4Producer`], which nothing but
+/// the version probe can construct, so "packed ext4 without running the gate" is not a state this
+/// file has to test against — it does not compile.
+#[cfg(feature = "am-fs-erofs")]
+#[derive(Debug)]
+enum RootfsEmitter {
+    /// The default: no external tool, nothing to probe.
+    Erofs,
+    /// §4.7's ext4 producer, already past both halves of its version gate.
+    ///
+    /// With the feature off, `Ext4Route` is [`std::convert::Infallible`] and this variant has no
+    /// inhabitant — `emitter_for` still *names* it (which is what keeps the law one function), and
+    /// the `.map` that would build it can never run.
+    Ext4(Ext4Route),
+}
+
+/// Runs §4.7's producer probe for `format` and returns the emitter that survived it.
+///
+/// **ONE function in every feature configuration**, deliberately — only [`ext4_route`] below is
+/// cfg'd. A cfg'd pair here would be two copies of the format→emitter law, and the off copy is
+/// precisely the one no test in this workspace can run (vmcell's dev-dependency cycle re-enables
+/// `default`, so `--all-targets` always has the feature on). Written this way, the off copy cannot
+/// drift because it does not exist: `RootfsFormat::Ext4` maps `ext4_route()`'s success into
+/// [`RootfsEmitter::Ext4`] and has no path to [`RootfsEmitter::Erofs`] at all, so "a build without
+/// the producer silently packs the default format" is a compile error rather than a behavior a gate
+/// has to catch.
+///
+/// # Errors
+/// [`Error::CapabilityUnavailable`] / [`Error::Io`] / [`Error::Artifact`] exactly as
+/// [`ext4_route`] classifies them.
+#[cfg(feature = "am-fs-erofs")]
+fn emitter_for(format: RootfsFormat) -> Result<RootfsEmitter> {
+    match format {
+        RootfsFormat::Erofs => Ok(RootfsEmitter::Erofs),
+        RootfsFormat::Ext4 => ext4_route().map(RootfsEmitter::Ext4),
+    }
+}
+
+/// Where an [`Ext4Route`] comes from: §4.7's version probe, both halves.
+///
+/// # Errors
+/// [`Error::CapabilityUnavailable`] / [`Error::Io`] / [`Error::Artifact`] exactly as
+/// [`crate::artifact::ext4::Ext4Producer::probe`] classifies them.
+#[cfg(all(feature = "am-fs-erofs", feature = "ext4-producer"))]
+fn ext4_route() -> Result<Ext4Route> {
+    crate::artifact::ext4::Ext4Producer::probe()
+}
+
+/// The `ext4-producer`-off form: an ext4 request is a **capability that was compiled out**, refused
+/// with the typed error, never silently packed as erofs.
+///
+/// A feature gate may remove a capability, never change semantics (AGENTS.md) — and packing the
+/// default format for an artifact that declared `ext4` would be the second thing. That cannot
+/// happen here even by mistake: the return type is `Result<Infallible>`, whose `Ok` variant has no
+/// inhabitant, so `Err` is the only value this function is *able* to produce.
+///
+/// # Errors
+/// Always [`Error::CapabilityUnavailable`].
+#[cfg(all(feature = "am-fs-erofs", not(feature = "ext4-producer")))]
+fn ext4_route() -> Result<Ext4Route> {
+    Err(Error::CapabilityUnavailable {
+        op: "ext4 rootfs pack (§4.7)".to_string(),
+        needed: "the `ext4-producer` feature, which this build of `vmcell` was compiled without"
+            .to_string(),
+    })
+}
+
+/// Hands the merged tar to the probed producer.
+///
+/// # Errors
+/// As [`crate::artifact::ext4::Ext4Producer::pack`].
+#[cfg(all(feature = "am-fs-erofs", feature = "ext4-producer"))]
+fn pack_merged_tar_as_ext4(producer: Ext4Route, merged_tar: &[u8], out: &Path) -> Result<()> {
+    producer.pack(merged_tar, out)
+}
+
+/// The `ext4-producer`-off form: [`Ext4Route`] is uninhabited there, so this body is the empty
+/// match that says so — the arm is unreachable by construction rather than by convention.
+#[cfg(all(feature = "am-fs-erofs", not(feature = "ext4-producer")))]
+fn pack_merged_tar_as_ext4(producer: Ext4Route, _merged_tar: &[u8], _out: &Path) -> Result<()> {
+    match producer {}
 }
 
 /// A `(dest_path, source_path, mode)` file injected into the rootfs after every layer is
@@ -1336,13 +1601,27 @@ fn rootfs_injection_manifest<'a>(
 /// Shared logic to take a tar stream, inject the steward and CA, and pack it into erofs.
 #[cfg(not(feature = "am-fs-erofs"))]
 pub async fn pack_erofs_with_injection(
+    tar_streams: Vec<Box<dyn Read + Send>>,
+    inputs: &StageInputs,
+    out: &Path,
+    options: &PackOptions,
+) -> Result<StageOutputs> {
+    pack_rootfs_with_injection(tar_streams, inputs, out, options).await
+}
+
+/// Shared logic to take a tar stream, inject the steward and CA, and pack it into the declared
+/// format.
+#[cfg(not(feature = "am-fs-erofs"))]
+pub async fn pack_rootfs_with_injection(
     _tar_streams: Vec<Box<dyn Read + Send>>,
     _inputs: &StageInputs,
     _out: &Path,
     _options: &PackOptions,
 ) -> Result<StageOutputs> {
-    // mkfs.erofs fallback requires extracting the tar to a directory, adding the files,
-    // and running mkfs.erofs. We assume am-fs-erofs is used for now.
+    // The MERGE lives behind `am-fs-erofs`, and both emitters consume it (§18 delta 8), so the
+    // ext4 route needs that feature too — it is not an "erofs-only" gate any more, whatever its
+    // name says. mkfs.erofs as a fallback would require extracting the tar to a directory, adding
+    // the files, and running mkfs.erofs. We assume am-fs-erofs is used for now.
     Err(Error::Artifact(
         "am-fs-erofs feature is required for rootfs building".into(),
     ))
@@ -1353,6 +1632,67 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    /// Both feature configurations of the format→emitter law, each compiled only where it applies.
+    ///
+    /// The `ext4-producer`-OFF arm is why that feature is in `default` rather than inside
+    /// `pipeline`: a feature `pipeline` implied could never be off in any configuration cargo can
+    /// build, and its refusal would be unreachable code nobody had compiled. `cargo hack
+    /// --feature-powerset` builds `pipeline` without it, and this is what runs there.
+    ///
+    /// RED on the inverse (off): return `Ok(RootfsEmitter::Erofs)` for `Ext4` and an artifact that
+    /// declared ext4 is silently packed as erofs — a feature gate changing semantics rather than
+    /// removing a capability, which AGENTS.md forbids by name.
+    #[cfg(all(feature = "am-fs-erofs", not(feature = "ext4-producer")))]
+    #[test]
+    fn without_the_producer_feature_an_ext4_request_is_a_typed_capability_refusal() {
+        assert!(
+            matches!(emitter_for(RootfsFormat::Erofs), Ok(RootfsEmitter::Erofs)),
+            "the default format never needed the feature"
+        );
+        match emitter_for(RootfsFormat::Ext4) {
+            Err(Error::CapabilityUnavailable { op, needed }) => {
+                assert!(op.contains("ext4"), "the op names the operation: {op}");
+                assert!(
+                    needed.contains("ext4-producer"),
+                    "the refusal must name the feature that was compiled out: {needed}"
+                );
+            }
+            other => panic!(
+                "an ext4 request in a build without the producer must be a typed capability \
+                 refusal, never a silent erofs pack: {other:?}"
+            ),
+        }
+    }
+
+    /// The `ext4-producer`-ON arm: the emitter for `Ext4` carries a **probed** producer, which is
+    /// the receipt the pack tail runs on.
+    ///
+    /// There is deliberately no test for "packed ext4 without probing": `RootfsEmitter::Ext4`
+    /// carries an `Ext4Producer` and nothing but the probe constructs one, so that state does not
+    /// compile. This asserts the shape that makes it so, which is the part a refactor could undo.
+    #[cfg(all(feature = "am-fs-erofs", feature = "ext4-producer"))]
+    #[test]
+    fn the_ext4_emitter_carries_a_probed_producer() {
+        assert!(
+            matches!(emitter_for(RootfsFormat::Erofs), Ok(RootfsEmitter::Erofs)),
+            "the default format runs no probe at all"
+        );
+        match emitter_for(RootfsFormat::Ext4) {
+            Ok(RootfsEmitter::Ext4(producer)) => assert!(
+                producer.version() >= crate::artifact::ext4::MIN_E2FSPROGS_VERSION,
+                "the carried producer is the one the gate accepted: {:?}",
+                producer.version()
+            ),
+            // A host without e2fsprogs takes the typed refusal, which is the honest outcome and
+            // still proves the probe ran on this path.
+            Err(Error::CapabilityUnavailable { needed, .. }) => assert!(
+                needed.contains("e2fsprogs") || needed.contains("libarchive"),
+                "the refusal must name the absent facility: {needed}"
+            ),
+            other => panic!("the ext4 emitter must be probed or typed-refused: {other:?}"),
+        }
+    }
 
     /// Materialize the shared proxy CA ONCE, before any test below folds it into a cache key.
     ///
@@ -1671,7 +2011,7 @@ mod tests {
     #[test]
     fn rootfs_stage_version_pins_the_identity_fold_bumps() {
         assert_eq!(
-            OCI_ROOTFS_STAGE_VERSION, 6,
+            OCI_ROOTFS_STAGE_VERSION, 7,
             "an identity-fold change requires this stage-version bump; without it a stale rootfs \
              is served from the warm cache. If you changed what `cache_key` folds, bump the const \
              and this literal together and record the reason in the const's doc comment"
@@ -2118,7 +2458,7 @@ mod tests {
         let inputs = StageInputs::default();
 
         let pack = async |label: Option<&str>| -> StageOutputs {
-            let out = dir.path().join(rootfs_filename(label));
+            let out = dir.path().join(rootfs_filename(label, RootfsFormat::Erofs));
             pack_erofs_with_injection(
                 vec![],
                 &inputs,
@@ -2140,7 +2480,11 @@ mod tests {
                 .artifacts
                 .get(&rootfs_artifact_key(None))
                 .map(PathBuf::as_path),
-            Some(dir.path().join(rootfs_filename(None)).as_path()),
+            Some(
+                dir.path()
+                    .join(rootfs_filename(None, RootfsFormat::Erofs))
+                    .as_path()
+            ),
             "the default label must still register under `rootfs`: {default_out:?}"
         );
 
@@ -2151,7 +2495,11 @@ mod tests {
                 .artifacts
                 .get(&rootfs_artifact_key(Some("acme")))
                 .map(PathBuf::as_path),
-            Some(dir.path().join(rootfs_filename(Some("acme"))).as_path()),
+            Some(
+                dir.path()
+                    .join(rootfs_filename(Some("acme"), RootfsFormat::Erofs))
+                    .as_path(),
+            ),
             "a labelled pack must register under `{}`: {labelled_out:?}",
             rootfs_artifact_key(Some("acme"))
         );

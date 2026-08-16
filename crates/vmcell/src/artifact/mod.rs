@@ -9,6 +9,9 @@ use crate::error::Result;
 #[cfg(feature = "pipeline")]
 /// Reproducible fetch-and-verify manifest for the vmcell-owned artifacts (v15 §10, The artifact build pipeline).
 pub mod bundle;
+/// The ext4 rootfs producer (§4.7, §18 delta 8) — the second emitter behind the one pack tail.
+#[cfg(all(feature = "pipeline", feature = "ext4-producer"))]
+pub mod ext4;
 #[cfg(feature = "pipeline")]
 /// Guest test-helper (`vmcell-guest-tools`) building stage.
 pub mod guest_tools;
@@ -281,7 +284,12 @@ fn fast_rootfs_stages(
 ) {
     (
         crate::artifact::rootfs::RootfsStage::new()
-            .with_xattrs(entry.map_or_else(XattrPolicy::default, |e| e.xattrs)),
+            .with_xattrs(entry.map_or_else(XattrPolicy::default, |e| e.xattrs))
+            // §4.7's format (§18 delta 8) reaches the image stage for exactly the reason the xattr
+            // policy does: it decides the packed bytes, the image's identity AND its filename, so a
+            // bootstrap that dropped it would build `rootfs.erofs` into the test artifacts dir for
+            // an entry that declared `ext4` — a dir every live suite then boots from.
+            .with_format(entry.map_or_else(RootfsFormat::default, |e| e.format)),
         crate::artifact::rootfs::RootfsFeaturesStage::labelled(None)
             .with_features(entry.map(|e| e.features.clone()).unwrap_or_default()),
     )
@@ -915,8 +923,18 @@ fn flatten_pins_namespace(
                     // STAGE does not read it from here — the policy travels typed, from the
                     // resolved registry entry through `RootfsStage::with_xattrs`, because
                     // `oci2-erofs --image` packs a base no registry entry describes and a pin read
-                    // would hand it the default label's declaration.
-                    for sub in ["image", "digest", "xattrs", registry::UNPINNED_PATH_KEY] {
+                    // would hand it the default label's declaration. `format` (§4.7, §18 delta 8)
+                    // rides on exactly the same terms as `xattrs`, and for a sharper version of the
+                    // same reason: it decides the artifact's FILENAME, so a consumer reading a
+                    // built dir's `resolved_pins.json` has no other way to learn whether the label
+                    // it wants is `rootfs-<label>.erofs` or `rootfs-<label>.ext4`.
+                    for sub in [
+                        "image",
+                        "digest",
+                        "xattrs",
+                        "format",
+                        registry::UNPINNED_PATH_KEY,
+                    ] {
                         if let Some(v) = spec.get(sub).and_then(|v| v.as_str()) {
                             out.insert(rootfs::rootfs_pin_key(key_label, sub), v.to_string());
                         }
@@ -1412,6 +1430,91 @@ impl XattrPolicy {
     }
 }
 
+/// Which filesystem an artifact's image is packed as (design §4.7, §18 delta 8).
+///
+/// A **per-artifact** property, declared in the rootfs registry entry (`"format": "ext4"`, §10.5)
+/// and carried to the one pack tail as a [`crate::artifact::rootfs::PackOptions`] field. It
+/// defaults to [`RootfsFormat::Erofs`], so the canonical artifact stays byte-identical: §4.7's
+/// closing sentence is *"the ext4 producer adds an artifact; it does not move the root"*, and a
+/// default that packed anything else would be exactly the switch every cell pays for that the
+/// sentence forbids.
+///
+/// **The ext4 root is read-only**, like the erofs one. §4.7 calls the ext4 artifact's audience
+/// "workloads that need a writable, POSIX-complete root" and §5.2 says the same root "mounts
+/// strictly read-only without journal recovery"; the read-only reading is the one the rest of the
+/// tree already implements and the one delta 8 lands, because writability would need F3's
+/// reserved-cmdline alias law rewritten (`rw` is reserved *because* `rw` + `rootflags=noload` is
+/// corruption), a `RootfsSource` arm on `clone_ineligible_feature` that does not exist (without it
+/// N zygote children write one image), and would still not take effect under the default `Pid1`
+/// placement, whose steward overlays tmpfs over `/` and pivot_roots regardless. What survives —
+/// and what the mount-and-diff battery measures — is **POSIX-completeness**: device nodes, xattrs,
+/// ACL slots and hardlinks that stay hardlinks.
+///
+/// Defined **here**, in the ungated artifact module, and re-exported as
+/// `vmcell::artifact::rootfs::RootfsFormat`, for the reason [`XattrPolicy`] is: the entry that
+/// declares the format ([`RootfsRegistryEntry::format`]) is parsed in this module, which is the
+/// only one compiled in every feature configuration, while the `rootfs` module is gated on
+/// `pipeline` and the packers on `am-fs-erofs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RootfsFormat {
+    /// EROFS, uncompressed — the default, and the only format that existed before v33 delta 8.
+    #[default]
+    Erofs,
+    /// ext4, produced from the merged tar (§4.7). Read-only at mount, POSIX-complete on disk.
+    Ext4,
+}
+
+impl RootfsFormat {
+    /// Every format, in declaration order — the **one roster**.
+    ///
+    /// Read by [`RootfsFormat::parse`]'s siblings, by
+    /// [`crate::artifact::rootfs::rootfs_artifact_from_filename`]'s suffix table and by `vmcell
+    /// bundle`'s default-rootfs walk, so adding a variant without teaching those readers is a
+    /// missing-match-arm compile error here rather than an artifact that silently stops being
+    /// bundled. Pinned by `the_format_roster_is_exhaustive`.
+    pub const ALL: [RootfsFormat; 2] = [RootfsFormat::Erofs, RootfsFormat::Ext4];
+
+    /// The registry entry's spelling of this format (`"erofs"` / `"ext4"`) — **and its on-disk
+    /// filename extension**, which is one fact rather than two: `rootfs_filename` appends what this
+    /// returns, and [`crate::artifact::rootfs::rootfs_artifact_from_filename`] strips it, so the
+    /// composer and its inverse read one table.
+    ///
+    /// It is deliberately **not** also offered as the cell's `rootfstype=` token. That token is
+    /// keyed off [`crate::config::RootfsSource`] — the cell's rootfs *shape* — not off an
+    /// artifact's pack format, and `RootfsSource::Block` carries no format at all
+    /// (`build_kernel_cmdline` still spells `"ext4"` there as a literal). Adding a `rootfstype()`
+    /// here would be a law with no call site, and wiring the two together is a cmdline decision
+    /// (F3's territory) that belongs with whoever first boots a `Block` root.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            RootfsFormat::Erofs => "erofs",
+            RootfsFormat::Ext4 => "ext4",
+        }
+    }
+
+    /// Parses a registry entry's `"format"` token — **strictly** (§10.5, law F1).
+    ///
+    /// An unknown word is a hard error naming both valid ones, never a silent fall back to the
+    /// default: a consumer who wrote `"ex4"` and got an erofs image would have declared a property,
+    /// watched it be ignored, and booted a cell whose `rootfstype` cannot mount it.
+    ///
+    /// # Errors
+    /// [`crate::error::Error::Artifact`] naming the offending token and both valid spellings.
+    pub fn parse(token: &str) -> crate::error::Result<Self> {
+        match token {
+            "erofs" => Ok(RootfsFormat::Erofs),
+            "ext4" => Ok(RootfsFormat::Ext4),
+            other => Err(crate::error::Error::Artifact(format!(
+                "unknown rootfs format `{other}`: an artifact's `format` declaration is one of \
+                 `{}` (the default) or `{}` (§4.7, §18 delta 8)",
+                RootfsFormat::Erofs.name(),
+                RootfsFormat::Ext4.name()
+            ))),
+        }
+    }
+}
+
 /// Where one registered rootfs's bytes come from — the registration shapes §10.5 allows for this
 /// kind, exhaustively (F7).
 ///
@@ -1499,6 +1602,24 @@ pub struct RootfsRegistryEntry {
     /// ([`RootfsRegistration::UnpinnedPath`]): the `xattrs` key is *refused* on that shape, because
     /// nothing packs those bytes for a policy to govern.
     pub xattrs: XattrPolicy,
+    /// Which filesystem this artifact's image is packed as (§10.5's `format` key, §4.7; §18
+    /// delta 8).
+    ///
+    /// [`RootfsFormat::Erofs`] when the entry declares nothing, which is what keeps an undeclared
+    /// entry byte-identical to its pre-delta-8 self. Build-affecting on **both** axes at once, and
+    /// it is the only entry key that is: it folds into the image's identity
+    /// ([`crate::artifact::rootfs::RootfsStage::cache_key`]) *and* it names the artifact's file
+    /// ([`crate::artifact::rootfs::rootfs_filename`]), so a format edit re-packs to a different
+    /// path rather than overwriting the other format's image.
+    ///
+    /// Honored on **both** registration shapes, unlike [`RootfsRegistryEntry::xattrs`] — the
+    /// difference is real rather than an inconsistency. `xattrs` instructs the packer, and an
+    /// [`RootfsRegistration::UnpinnedPath`] entry is published verbatim rather than packed, so it
+    /// could never take effect. `format` also *names the file*, and `publish_unpinned` copies the
+    /// registered bytes to exactly that name — so an operator pointing at an ext4 image they made
+    /// themselves gets an artifact named `rootfs-<label>.ext4`, which is what makes it visible to
+    /// `vmcell bundle` and honest to every reader.
+    pub format: RootfsFormat,
     /// The feature stances this entry contributes (§10.5's `features` key, §7.4) — the
     /// non-derivable ones it *declares*, plus the one this delta *derives*.
     ///
@@ -1560,9 +1681,17 @@ fn rootfs_registry_from_doc(doc: &serde_json::Value) -> Result<Vec<RootfsRegistr
         doc,
         &registry::RegistryKind {
             namespace: "rootfs",
-            filename: &|label: &str| rootfs::rootfs_filename(registry::registry_label(label)),
-            collision_consequence: "building both would overwrite one image with the other plus its `.cache_key` \
-                 sidecar, and leave the two labels evicting each other's cache entry on every build",
+            // The **stem**, not the full filename, and that is a delta-8 correction rather than a
+            // shortcut: both of a rootfs's sidecars are `Path::with_extension` derivations of the
+            // image name (`.cache_key`, `.features`), so `rootfs-a.erofs` and `rootfs-a.ext4`
+            // share one `rootfs-a.cache_key` and one `rootfs-a.features`. Keying the collision
+            // check on the format-bearing filename would declare two labels that sanitize to one
+            // stem non-colliding the moment they declared different formats, and hand them right
+            // back the mutual cache eviction this check exists to refuse.
+            filename: &|label: &str| rootfs::rootfs_artifact_stem(registry::registry_label(label)),
+            collision_consequence: "building both would overwrite one image with the other plus its `.cache_key` and \
+                 `.features` sidecars, and leave the two labels evicting each other's cache entry \
+                 on every build",
         },
         rootfs_registry_entry,
         |e: &RootfsRegistryEntry| e.label.as_str(),
@@ -1618,8 +1747,10 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
         ))
     })?;
     for key in obj.keys() {
-        let known = matches!(key.as_str(), "image" | "digest" | "features" | "xattrs")
-            || key.as_str() == UNPINNED_PATH_KEY;
+        let known = matches!(
+            key.as_str(),
+            "image" | "digest" | "features" | "xattrs" | "format"
+        ) || key.as_str() == UNPINNED_PATH_KEY;
         if !known {
             let arriving = match key.as_str() {
                 // A BARE `path` stays refused, and naming the override key is the whole point of
@@ -1634,7 +1765,7 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
             return Err(crate::error::Error::Artifact(format!(
                 "pins `rootfs.{label}` carries unknown key `{key}`{arriving}; a silently ignored \
                  declaration is one a consumer builds a fixture on (known keys: image, digest, \
-                 features, xattrs, {UNPINNED_PATH_KEY})"
+                 features, xattrs, format, {UNPINNED_PATH_KEY})"
             )));
         }
     }
@@ -1683,6 +1814,7 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
         }
     };
     let xattrs = rootfs_entry_xattrs(label, &registration, obj)?;
+    let format = rootfs_entry_format(label, obj)?;
     let mut features = rootfs_entry_features(label, &registration, obj)?;
     // §4.7's DERIVATION, scoped to "a vmcell-built rootfs entry" by the design's own words and by
     // the one predicate that spells them: the entry states its xattr POLICY, and
@@ -1702,8 +1834,47 @@ fn rootfs_registry_entry(label: &str, spec: &serde_json::Value) -> Result<Rootfs
         label: label.to_string(),
         registration,
         xattrs,
+        format,
         features,
     })
+}
+
+/// Parses a `rootfs.<label>.format` declaration — §4.7's per-artifact filesystem format (§10.5,
+/// §18 delta 8).
+///
+/// Absent is [`RootfsFormat::Erofs`], stated as a *default* rather than as an absence: the packer
+/// has always produced erofs, so an entry that says nothing keeps its pre-delta-8 bytes, its
+/// pre-delta-8 filename and its pre-delta-8 cache key.
+///
+/// The token goes through [`RootfsFormat::parse`], the one spelling table — a second matcher here
+/// is how `"ext4"` would come to mean one thing to the registry and another to the packer. A
+/// non-string value is rejected naming the key for the same reason `xattrs` rejects one: the pins
+/// FLATTENER reads scalar keys with `as_str()` and skips a non-string, so a `{"format": 4}` entry
+/// that resolved clean here would emit no `rootfs_format` pin and leave `resolved_pins.json`
+/// silently claiming a format nobody declared.
+///
+/// Unlike `xattrs`, the key is accepted on **every** registration shape, including
+/// [`RootfsRegistration::UnpinnedPath`] — see [`RootfsRegistryEntry::format`] for why it is honored
+/// there rather than ignored.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] naming the label, and the token or its type.
+fn rootfs_entry_format(
+    label: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<RootfsFormat> {
+    let Some(value) = obj.get("format") else {
+        return Ok(RootfsFormat::default());
+    };
+    let token = value.as_str().ok_or_else(|| {
+        crate::error::Error::Artifact(format!(
+            "pins `rootfs.{label}.format` must be the string `{}` or `{}`, got `{value}` (§4.7)",
+            RootfsFormat::Erofs.name(),
+            RootfsFormat::Ext4.name()
+        ))
+    })?;
+    RootfsFormat::parse(token)
+        .map_err(|e| crate::error::Error::Artifact(format!("pins `rootfs.{label}.format`: {e}")))
 }
 
 /// Parses a `rootfs.<label>.xattrs` declaration — the §4.7 per-artifact extended-attribute policy
@@ -2785,6 +2956,48 @@ async fn resolve_pins_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`RootfsFormat::ALL`] really is every variant, and every one of them parses back from what
+    /// it spells (§18 delta 8).
+    ///
+    /// The roster is what `rootfs_artifact_from_filename` strips suffixes from and what `bundle`'s
+    /// default-rootfs walk probes; a variant missing from it is an artifact silently absent from
+    /// every manifest, which is the N-BIN-4 defect class one dimension over. The `match` below is
+    /// exhaustive so ADDING a variant is a compile error here rather than a discovery later.
+    ///
+    /// RED on the inverse: drop `Ext4` from `ALL` and the count assertion fails.
+    #[test]
+    fn the_format_roster_is_exhaustive() {
+        // Exhaustive by construction: a new variant fails to compile until it is counted here.
+        let counted = |f: RootfsFormat| -> usize {
+            match f {
+                RootfsFormat::Erofs | RootfsFormat::Ext4 => 1,
+            }
+        };
+        assert_eq!(
+            RootfsFormat::ALL
+                .iter()
+                .copied()
+                .map(counted)
+                .sum::<usize>(),
+            RootfsFormat::ALL.len(),
+            "every `RootfsFormat` variant must appear in `ALL`"
+        );
+        assert_eq!(RootfsFormat::ALL.len(), 2);
+        for format in RootfsFormat::ALL {
+            assert_eq!(
+                RootfsFormat::parse(format.name()).expect("its own spelling parses"),
+                format,
+                "`{}` must parse back to itself — one table, both directions",
+                format.name()
+            );
+        }
+        // Names are distinct, or two formats would share one filename extension.
+        let names: std::collections::HashSet<&str> =
+            RootfsFormat::ALL.iter().map(|f| f.name()).collect();
+        assert_eq!(names.len(), RootfsFormat::ALL.len());
+        assert_eq!(RootfsFormat::default(), RootfsFormat::Erofs);
+    }
 
     /// Test fixture for the schema tests below: the production string → flat-map path
     /// (`serde_json` + [`flatten_pins_document`]). It delegates — it is NOT a second copy of the
@@ -4502,6 +4715,7 @@ mod tests {
                 digest: format!("sha256:{}", "a".repeat(64)),
             },
             xattrs: XattrPolicy::Preserve,
+            format: RootfsFormat::Ext4,
             features: [
                 (crate::feature::Feature::XattrPreserved, true),
                 (crate::feature::Feature::SnapshotRestore, false),
@@ -4519,15 +4733,33 @@ mod tests {
             image.cache_key(&inputs),
             RootfsStage::new()
                 .with_xattrs(XattrPolicy::Preserve)
+                .with_format(RootfsFormat::Ext4)
                 .cache_key(&inputs),
-            "the entry's §4.7 policy must reach the image stage"
+            "the entry's §4.7 policy AND format must reach the image stage"
         );
         assert_ne!(
             image.cache_key(&inputs),
             RootfsStage::new()
                 .with_xattrs(XattrPolicy::Strip)
+                .with_format(RootfsFormat::Ext4)
                 .cache_key(&inputs),
             "…and the two policies must be two artifacts (non-vacuity)"
+        );
+        // The format half of the same claim (§18 delta 8): a bootstrap that dropped `.with_format`
+        // would build `rootfs.erofs` into the test artifacts dir for an entry that declared `ext4`,
+        // and every live suite boots from that dir.
+        assert_ne!(
+            image.cache_key(&inputs),
+            RootfsStage::new()
+                .with_xattrs(XattrPolicy::Preserve)
+                .with_format(RootfsFormat::Erofs)
+                .cache_key(&inputs),
+            "…and the two formats must be two artifacts (non-vacuity)"
+        );
+        assert_eq!(
+            image.out_path(std::path::Path::new("/artifacts")),
+            std::path::Path::new("/artifacts/rootfs.ext4"),
+            "…and the declared format must name the file the bootstrap writes"
         );
         assert_eq!(
             features.cache_key(&inputs),

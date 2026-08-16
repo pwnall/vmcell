@@ -394,6 +394,17 @@ gates:
     # crate; the self-test proves the ban fires on the bug and passes on the sanctioned validator.
     ./scripts/ban-artifact-path-join.sh
     ./scripts/test-ban-artifact-path-join.sh
+    # §4.7 / v33 delta 8 ("one law, one predicate"): `RootfsSource::root_device_read_only` is the one
+    # home for "is the root disk attached writable". It exists because all FOUR backends had each
+    # open-coded that decision and all four had drifted the same way — attaching a `Block` root
+    # read-WRITE beneath a cmdline that mounts it `ro`, i.e. a write path with no reader, with N
+    # zygote clones sharing the one image. The drift is not a compile error (a hardcoded
+    # `readonly: false` builds fine), so grep-ban it: any production file that names BOTH
+    # `effective_image` and a device-writability token must read the law. The self-test drives the
+    # regression, the two exempt shapes (the definition site, a non-wiring sidecar reader) and the
+    # vacuity arm.
+    ./scripts/ban-root-disk-writability-literal.sh
+    ./scripts/test-ban-root-disk-writability-literal.sh
     # S2 / delta 8 ("one law, one predicate"): `net_sys::setns_net` is the one home for `setns(2)`,
     # the `build_vmm_cmd` pre_exec site its one exemption (its safety proof is site-specific). The
     # review found two inline duplicates; nothing but review stopped a third, so grep-ban it. The
@@ -525,6 +536,13 @@ ci:
       echo "== reduced-host-feature clippy: --no-default-features --features $feat =="; \
       cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets; \
     done
+    # The `ext4-producer` OFF arm (§4.7, §18 delta 8). `--lib`, deliberately WITHOUT
+    # `--all-targets`: `vmcell`'s dev-dependency cycle (vmcell → vmcell-artifact-validator → vmcell)
+    # re-enables `default`, and therefore this feature, the moment dev-deps are resolved — so
+    # neither the loop above nor `cargo hack --feature-powerset` below can ever compile the typed
+    # capability refusal. This line is the only thing that does.
+    echo "== ext4-producer OFF arm: --lib --no-default-features --features cloud-hypervisor,pipeline =="
+    cargo clippy --locked -p vmcell --lib --no-default-features --features cloud-hypervisor,pipeline
     # The Firecracker and QEMU backends now live in their own crates (they depend on `vmcell`;
     # `vmcell` keeps only Cloud Hypervisor). Clippy each standalone so a backend crate that stops
     # compiling against `vmcell`'s shared surface fails here, not only inside the workspace build.

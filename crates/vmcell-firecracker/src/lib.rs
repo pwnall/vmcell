@@ -645,23 +645,21 @@ fn fc_token_bucket(rate: u64) -> FcTokenBucket {
 /// *Which* host file backs the root drive is the one law,
 /// [`RootfsSource::effective_image`](vmcell::config::RootfsSource::effective_image) — the same
 /// predicate the config boundary's duplicate-backing-file guard uses, so the guard can never
-/// protect a file this wiring does not attach. The match stays exhaustive over the variants (a
-/// new `RootfsSource` must be a compile error here) because `is_read_only` is per-variant.
+/// protect a file this wiring does not attach. **Whether it is writable** is the other one law,
+/// [`RootfsSource::root_device_read_only`](vmcell::config::RootfsSource::root_device_read_only),
+/// which owns the exhaustive per-variant match: `is_root_read_only` was open-coded `false` for a
+/// `Block` root here, contradicting the `ro` the cmdline mounts it with (§4.7).
 ///
 /// Pure (mirroring Cloud Hypervisor's `build_ch_disks`) so ordering, the root path and the
 /// throttle mapping are gate-able without KVM: built inline in `create()`, the whole shape was
 /// observable only from the live matrix.
 fn build_fc_drives(cfg: &VmConfig) -> Vec<Drive> {
     let mut drives = Vec::with_capacity(1 + cfg.extra_disks.len());
-    let is_root_read_only = match &cfg.rootfs {
-        vmcell::config::RootfsSource::Erofs { .. } => true,
-        vmcell::config::RootfsSource::Block { .. } => false,
-    };
     drives.push(Drive {
         drive_id: "rootfs".to_string(),
         path_on_host: cfg.rootfs.effective_image().to_path_buf(),
         is_root_device: true,
-        is_read_only: is_root_read_only,
+        is_read_only: cfg.rootfs.root_device_read_only(),
         rate_limiter: None,
     });
     for (i, disk) in cfg.extra_disks.iter().enumerate() {
@@ -1535,7 +1533,15 @@ mod tests {
             plain_cfg.rootfs.effective_image(),
             "the root drive must be the effective image"
         );
-        assert!(!plain.is_read_only, "a Block root is writable");
+        // The device's writability must not exceed the mount's, and the mount is always `ro`
+        // (§4.7; `RootfsSource::root_device_read_only`). Asserted as the VALUE, not as equality
+        // with the law — equality would be vacuous now that the wiring reads it. Reddens on the
+        // pre-delta-8 `is_root_read_only = false`.
+        assert!(
+            plain.is_read_only,
+            "a Block root drive must be attached READ-ONLY: the cmdline mounts it `ro` and F3 \
+             reserves `rw`, so a writable attachment is a write path with no reader"
+        );
 
         // Overlay set: the overlay backs /dev/vda, the base is never attached.
         let (ovl_cfg, ovl) = root(RootfsSource::Block {

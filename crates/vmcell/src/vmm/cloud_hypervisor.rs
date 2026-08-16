@@ -181,33 +181,25 @@ fn ch_rate_limiter(limit: &crate::config::DiskIoLimit) -> ChRateLimiter {
 /// order (`/dev/vdb`, `/dev/vdc`, …, each honoring its own `readonly`, §4.6, Extra virtio-blk devices and disk-I/O throttling). CH
 /// enumerates disks purely by array order, so this ordering is the load-bearing
 /// contract with the cmdline's `root=/dev/vda`. Pure, so the ordering is unit-testable
-/// without a running VMM. A virtio-fs rootfs contributes no disk (unreachable here —
-/// `create()` rejects it up front, VMM-1 — kept for match exhaustiveness).
+/// without a running VMM. (The `VirtioFs` rootfs variant this comment used to hedge for has not
+/// existed since the v28 pass; every rootfs source contributes exactly one root disk.)
 ///
 /// *Which* host file backs the root disk comes from the one law,
 /// [`RootfsSource::effective_image`](crate::config::RootfsSource::effective_image) — the same
 /// predicate the config boundary's duplicate-backing-file guard uses, so the guard can never
-/// protect a file this wiring does not attach. The match stays exhaustive over the variants
-/// (a new `RootfsSource` must be a compile error here) because the `readonly` flag is
-/// per-variant.
+/// protect a file this wiring does not attach. **Whether it is writable** comes from the other one
+/// law, [`RootfsSource::root_device_read_only`](crate::config::RootfsSource::root_device_read_only),
+/// which owns the exhaustive per-variant match: this used to be an open-coded `readonly: false` on
+/// the `Block` arm, contradicting the `ro` the cmdline mounts it with (§4.7).
 fn build_ch_disks(cfg: &VmConfig) -> Vec<ChDisk> {
     let mut disks = Vec::with_capacity(1 + cfg.extra_disks.len());
-    match &cfg.rootfs {
-        crate::config::RootfsSource::Erofs { .. } => disks.push(ChDisk {
-            path: cfg.rootfs.effective_image().to_path_buf(),
-            readonly: true,
-            direct: false,
-            image_type: CH_RAW_IMAGE_TYPE,
-            rate_limiter_config: None,
-        }),
-        crate::config::RootfsSource::Block { .. } => disks.push(ChDisk {
-            path: cfg.rootfs.effective_image().to_path_buf(),
-            readonly: false,
-            direct: false,
-            image_type: CH_RAW_IMAGE_TYPE,
-            rate_limiter_config: None,
-        }),
-    }
+    disks.push(ChDisk {
+        path: cfg.rootfs.effective_image().to_path_buf(),
+        readonly: cfg.rootfs.root_device_read_only(),
+        direct: false,
+        image_type: CH_RAW_IMAGE_TYPE,
+        rate_limiter_config: None,
+    });
     for disk in &cfg.extra_disks {
         disks.push(ChDisk {
             path: disk.image.clone(),
@@ -1322,7 +1314,17 @@ mod tests {
             base,
             "the overlay case must not resolve to the base image"
         );
-        assert!(!disks[0].readonly, "a Block root is writable");
+        // The device's writability must not exceed the mount's, and the mount is always `ro`
+        // (§4.7; `RootfsSource::root_device_read_only`). Asserted as the VALUE `true`, not as
+        // equality with the law — recomputing through the law here would be vacuous the moment the
+        // wiring reads it, which it now does. This is the leg that reddens on the pre-delta-8
+        // `readonly: false`, under which a guest could write straight through `/dev/vda` beneath a
+        // root the kernel believed immutable, and N zygote clones share one image.
+        assert!(
+            disks[0].readonly,
+            "a Block root disk must be attached READ-ONLY: the cmdline mounts it `ro` and F3 \
+             reserves `rw`, so a writable attachment is a write path with no reader"
+        );
 
         // EROFS: the image itself, read-only.
         let erofs = VmConfig::builder(

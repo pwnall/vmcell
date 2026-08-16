@@ -143,6 +143,14 @@ jobs:
             cargo clippy --locked -p vmcell --no-default-features --features "$feat" --all-targets -- -D warnings
             echo "::endgroup::"
           done
+          # The `ext4-producer` OFF arm (§4.7, §18 delta 8). `--lib`, deliberately WITHOUT
+          # `--all-targets`: `vmcell`'s dev-dependency cycle (vmcell → vmcell-artifact-validator →
+          # vmcell) re-enables `default`, and therefore this feature, the moment dev-deps are
+          # resolved — so neither the loop above nor `cargo hack --feature-powerset` can ever
+          # compile the typed capability refusal. This line is the only thing that does.
+          echo "::group::clippy --lib --no-default-features --features cloud-hypervisor,pipeline (ext4-producer OFF)"
+          cargo clippy --locked -p vmcell --lib --no-default-features --features cloud-hypervisor,pipeline -- -D warnings
+          echo "::endgroup::"
           # The Firecracker/QEMU/crosvm backends live in their own crates (depending on `vmcell`, which
           # keeps only Cloud Hypervisor); `vmcell-bench` wires all of them (the `bench-vm` binary).
           # Clippy each standalone so a backend that stops compiling against vmcell's shared surface

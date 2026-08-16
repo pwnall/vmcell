@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 use vmcell::artifact::registry::DEFAULT_LABEL;
 use vmcell::artifact::registry::UNPINNED_PATH_KEY;
 use vmcell::artifact::rootfs::{
-    RootfsFeaturesStage, RootfsStage, features_artifact_key, rootfs_artifact_key, rootfs_filename,
-    rootfs_label_from_filename, rootfs_pin_key,
+    RootfsFeaturesStage, RootfsStage, features_artifact_key, rootfs_artifact_from_filename,
+    rootfs_artifact_key, rootfs_artifact_stem, rootfs_filename, rootfs_pin_key,
 };
 use vmcell::artifact::{
-    Cache, CacheKey, Pipeline, RootfsRegistration, RootfsRegistryEntry, Stage, StageInputs,
-    XattrPolicy, resolve_pins, resolve_rootfs_entry, resolve_rootfs_labels,
+    Cache, CacheKey, Pipeline, RootfsFormat, RootfsRegistration, RootfsRegistryEntry, Stage,
+    StageInputs, XattrPolicy, resolve_pins, resolve_rootfs_entry, resolve_rootfs_labels,
     resolve_rootfs_registry,
 };
 use vmcell::error::Error;
@@ -327,42 +327,111 @@ fn an_overlay_label_is_additive_and_the_order_is_pinned() {
     );
 }
 
-// The filename law and its inverse are pinned TOGETHER, over the real registry, so neither half can
-// move alone. `bundle` walks the artifacts dir with the inverse, so a producer that stopped
-// sanitizing would silently drop that rootfs from the manifest — the N-BIN-4 defect class.
+// The filename law and its inverse are pinned TOGETHER, over the real registry and over EVERY
+// format, so neither half can move alone. `bundle` walks the artifacts dir with the inverse, so a
+// producer that stopped sanitizing — or a format the inverse was never taught — would silently drop
+// that rootfs from the manifest, which is the N-BIN-4 defect class (§18 delta 8 re-arms it once per
+// format).
+//
+// RED on the inverse losing a format: drop `RootfsFormat::Ext4` from
+// `rootfs_artifact_from_filename`'s roster and the `.ext4` legs below return `None`.
 #[test]
 fn the_filename_law_round_trips_through_its_inverse() {
     for entry in resolve_rootfs_registry(None).expect("baseline registry") {
         let label = (entry.label != DEFAULT_LABEL).then_some(entry.label.as_str());
-        let filename = rootfs_filename(label);
-        assert_eq!(
-            rootfs_label_from_filename(&filename),
-            label.map(|l| l.replace('.', "-")).as_deref(),
-            "`{filename}` must invert to the sanitized label it was composed from"
-        );
+        // EVERY format, not just the entry's own: the law is the law for all of them, and a
+        // registry that happens to declare no ext4 entry today must not leave the ext4 half of it
+        // unexercised.
+        for format in RootfsFormat::ALL {
+            let filename = rootfs_filename(label, format);
+            assert_eq!(
+                rootfs_artifact_from_filename(&filename).map(|(l, f)| (l.to_string(), f)),
+                label.map(|l| (l.replace('.', "-"), format)),
+                "`{filename}` must invert to the sanitized label AND the format it was composed \
+                 from"
+            );
+        }
     }
 
     // The sanitization itself, and the shapes the inverse must refuse: the bare default, a sidecar
-    // that is not an `.erofs`, and a name whose remainder carries a `.` (which no filename this law
-    // produces ever does, so one that appears is a sidecar).
-    assert_eq!(rootfs_filename(None), "rootfs.erofs");
-    assert_eq!(rootfs_filename(Some("12.4")), "rootfs-12-4.erofs");
-    assert_eq!(rootfs_label_from_filename("rootfs.erofs"), None);
-    assert_eq!(rootfs_label_from_filename("rootfs-acme.cache_key"), None);
+    // that is not a known format extension, and a name whose remainder carries a `.` (which no
+    // filename this law produces ever does, so one that appears is a sidecar).
+    assert_eq!(rootfs_filename(None, RootfsFormat::Erofs), "rootfs.erofs");
+    assert_eq!(rootfs_filename(None, RootfsFormat::Ext4), "rootfs.ext4");
+    assert_eq!(
+        rootfs_filename(Some("12.4"), RootfsFormat::Erofs),
+        "rootfs-12-4.erofs"
+    );
+    assert_eq!(
+        rootfs_filename(Some("12.4"), RootfsFormat::Ext4),
+        "rootfs-12-4.ext4"
+    );
+    assert_eq!(rootfs_artifact_from_filename("rootfs.erofs"), None);
+    assert_eq!(rootfs_artifact_from_filename("rootfs.ext4"), None);
+    assert_eq!(rootfs_artifact_from_filename("rootfs-acme.cache_key"), None);
     // …and the §7.4 declaration sidecar (§18 delta 6c) is a sidecar too: a walk that read
     // `rootfs-acme.features` as the artifact `rootfs-acme` would record a two-line text file as a
     // userland image, which is the exact shape of the defect the `.cache_key` case above pins.
-    assert_eq!(rootfs_label_from_filename("rootfs-acme.features"), None);
-    assert_eq!(rootfs_label_from_filename("rootfs-12.4.erofs"), None);
-    assert_eq!(rootfs_label_from_filename("vmlinux-acme"), None);
+    assert_eq!(rootfs_artifact_from_filename("rootfs-acme.features"), None);
+    assert_eq!(rootfs_artifact_from_filename("rootfs-12.4.erofs"), None);
+    assert_eq!(rootfs_artifact_from_filename("vmlinux-acme"), None);
     assert_eq!(
-        rootfs_label_from_filename("rootfs-acme.erofs"),
-        Some("acme")
+        rootfs_artifact_from_filename("rootfs-acme.erofs"),
+        Some(("acme", RootfsFormat::Erofs))
     );
+    // Neither format is mistaken for the other's — the discriminating leg. An inverse that stripped
+    // "a rootfs extension" without reporting WHICH would pass every assertion above and still hand
+    // `bundle` an ext4 image labelled as the erofs one.
+    assert_eq!(
+        rootfs_artifact_from_filename("rootfs-acme.ext4"),
+        Some(("acme", RootfsFormat::Ext4))
+    );
+    assert_ne!(
+        rootfs_artifact_from_filename("rootfs-acme.ext4"),
+        rootfs_artifact_from_filename("rootfs-acme.erofs")
+    );
+
+    // The STEM is the registry's collision key (§18 delta 8) and carries no extension, because both
+    // formats' sidecars are `with_extension` derivations of it. RED on composing the stem with an
+    // extension: two labels sanitizing to one stem in two formats would stop colliding and would go
+    // right back to evicting each other's one `.cache_key`.
+    assert_eq!(rootfs_artifact_stem(None), "rootfs");
+    assert_eq!(rootfs_artifact_stem(Some("12.4")), "rootfs-12-4");
+    for format in RootfsFormat::ALL {
+        assert!(
+            rootfs_filename(Some("acme"), format).starts_with(&rootfs_artifact_stem(Some("acme"))),
+            "every format's filename must be the one stem plus an extension"
+        );
+    }
 
     // The artifact-key law's default arm is the one every pre-v33 downstream stage reads.
     assert_eq!(rootfs_artifact_key(None), "rootfs");
     assert_eq!(rootfs_artifact_key(Some("acme")), "rootfs-acme");
+}
+
+// The declaration sidecar is ONE file per label, whatever format its image is — the coupling
+// `RootfsFeaturesStage::out_path` relies on when it composes with the default format and carries no
+// format field of its own. RED on `feature_manifest_path` becoming an APPEND (the shape
+// `Stage::cache_sidecar_path` deliberately uses for this very stage): the two paths would diverge
+// and the ext4 artifact would be published beside a declaration nobody reads.
+#[test]
+fn the_declaration_sidecar_is_one_file_for_both_formats() {
+    let dir = std::path::Path::new("/artifacts");
+    for label in [None, Some("acme")] {
+        let paths: Vec<std::path::PathBuf> = RootfsFormat::ALL
+            .into_iter()
+            .map(|f| feature_manifest_path(&dir.join(rootfs_filename(label, f))))
+            .collect();
+        assert!(
+            paths.windows(2).all(|w| w[0] == w[1]),
+            "one label declares once, whatever its image's format: {paths:?}"
+        );
+        // And it is the path the READER derives from the real image it was handed.
+        assert_eq!(
+            paths[0],
+            feature_manifest_path(&dir.join(rootfs_filename(label, RootfsFormat::Ext4)))
+        );
+    }
 }
 
 // Two labels that sanitize to one on-disk filename are refused NAMING BOTH — the shared core's
@@ -380,7 +449,36 @@ fn two_labels_colliding_on_one_filename_are_rejected() {
         ),
     );
     let msg = registry_err(&overlay);
-    for named in ["12.4", "12-4", "rootfs-12-4.erofs"] {
+    // The STEM, not a format-bearing filename (§18 delta 8): both sidecars a rootfs carries are
+    // `with_extension` derivations of it, so two labels sharing a stem collide on
+    // `rootfs-12-4.cache_key` and `rootfs-12-4.features` even when their images are called
+    // different things. Keying the check on the filename would let the same two labels through the
+    // moment one of them declared `"format": "ext4"`.
+    for named in ["12.4", "12-4", "rootfs-12-4", ".cache_key", ".features"] {
+        assert!(msg.contains(named), "the message must name {named}: {msg}");
+    }
+}
+
+// The stem is the collision key ACROSS formats — the discriminating leg of the reject above. Two
+// labels that sanitize to one stem must still be refused when they declare different formats: their
+// images are two files, but their `.cache_key` and `.features` sidecars are one apiece.
+//
+// RED on the inverse: give the `rootfs` `RegistryKind` a format-bearing `filename` closure and this
+// pair resolves clean, straight back into the mutual cache eviction the reject exists to forbid.
+#[test]
+fn two_labels_colliding_on_one_stem_are_rejected_across_formats() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "e".repeat(64));
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "rootfs": {{ "12.4": {{ "image": "i", "digest": "{digest}",
+                                          "format": "ext4" }},
+                 "12-4": {{ "image": "i", "digest": "{digest}", "format": "erofs" }} }} }}"#
+        ),
+    );
+    let msg = registry_err(&overlay);
+    for named in ["12.4", "12-4", "rootfs-12-4"] {
         assert!(msg.contains(named), "the message must name {named}: {msg}");
     }
 }
@@ -777,6 +875,130 @@ fn a_declared_xattr_policy_parses_and_reaches_the_pack_options() {
     );
 }
 
+// §10.5's `format` key (§4.7, §18 delta 8): declared per artifact, parsed strictly, and carried to
+// the ONE pack tail — AND to the stage's filename and its cache key, which is what makes an ext4
+// artifact a different file from the erofs one rather than the same file packed differently.
+//
+// The three legs past parsing are the load-bearing ones. A format that parses onto the entry and
+// reaches neither `pack_options()` (the emitter), `out_path()` (the file) nor `cache_key()` (the
+// identity) is a declaration a consumer built a fixture on — the F1 failure the sibling `xattrs`
+// battery above exists to close, one key over.
+//
+// RED four ways: (a) `RootfsFormat::parse` returning `Ok(RootfsFormat::default())` for an unknown
+// token — the `ex4` leg resolves instead of erroring; (b) dropping `"format"` from
+// `rootfs_registry_entry`'s accepted-key set — the `ext4` leg fails as an unknown key; (c) dropping
+// the `format` line from `RootfsStage::pack_options()` — the pack-options assertion fails with
+// `left: Erofs, right: Ext4`; (d) dropping the format fold from `fold_rootfs_injection_identity` —
+// the two formats' cache keys become equal and the warm dir serves an erofs image under the ext4
+// artifact's key.
+#[test]
+fn a_declared_format_parses_and_reaches_the_tail_the_filename_and_the_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "f".repeat(64));
+    let entry_for = |label: &str, format: &str| {
+        let path = tmp.path().join(format!("format-{label}.json"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "rootfs": {{ "{label}": {{ "image": "i", "digest": "{digest}"{format} }} }} }}"#
+            ),
+        )
+        .expect("write overlay");
+        path
+    };
+
+    let target = tmp.path();
+    for (label, declared, expected) in [
+        ("ext4y", ", \"format\": \"ext4\"", RootfsFormat::Ext4),
+        ("erofsy", ", \"format\": \"erofs\"", RootfsFormat::Erofs),
+        // Absent is the default, and the default is what the pre-delta-8 producer did.
+        ("silent", "", RootfsFormat::Erofs),
+    ] {
+        let overlay = entry_for(label, declared);
+        let entry = resolve_rootfs_entry(Some(label), Some(&overlay))
+            .unwrap_or_else(|e| panic!("`{label}` must resolve: {e}"))
+            .unwrap_or_else(|| panic!("`{label}` must be registered"));
+        assert_eq!(entry.format, expected, "`{label}`'s declared format");
+
+        let stage = RootfsStage::labelled(Some(label)).with_format(entry.format);
+        // 1. The emitter.
+        assert_eq!(
+            stage.pack_options().format,
+            expected,
+            "`{label}`'s format must reach the pack options (§4.7), not merely the entry"
+        );
+        // 2. The file.
+        assert_eq!(
+            stage.out_path(target),
+            target.join(rootfs_filename(Some(label), expected)),
+            "`{label}`'s format must name the artifact it writes"
+        );
+    }
+
+    // 3. The identity: two formats over one base are two artifacts. Same label, same pins, so the
+    // ONLY difference is the format — an unmoved key here would have the warm artifacts dir serve
+    // whichever image was packed first under both names.
+    let inputs = StageInputs::default();
+    let key = |format: RootfsFormat| {
+        RootfsStage::labelled(Some("acme"))
+            .with_format(format)
+            .cache_key(&inputs)
+    };
+    assert_ne!(
+        key(RootfsFormat::Erofs),
+        key(RootfsFormat::Ext4),
+        "a format change must move the image's cache key (§10.3)"
+    );
+    // …and the DEFAULT spelling is the un-declared one, byte-for-byte: an entry that says nothing
+    // must key exactly as it did before this delta existed.
+    assert_eq!(
+        key(RootfsFormat::Erofs),
+        RootfsStage::labelled(Some("acme")).cache_key(&inputs),
+        "the default format must leave `RootfsStage::labelled(..)`'s key unmoved"
+    );
+
+    // A word that is neither is a hard error naming the offender AND both valid spellings — never a
+    // silent fall back to the default, which is how `"ex4"` would produce an erofs image that the
+    // cell then tries to mount as ext4.
+    let msg = registry_err(&entry_for("acme", ", \"format\": \"ex4\""));
+    for named in ["ex4", "acme", "erofs", "ext4"] {
+        assert!(msg.contains(named), "the refusal must name {named}: {msg}");
+    }
+
+    // …and a non-string value, which the pins FLATTENER would silently skip (it reads scalar keys
+    // with `as_str()`), leaving `resolved_pins.json` claiming no format for an entry that named one.
+    let msg = registry_err(&entry_for("acme", ", \"format\": 4"));
+    assert!(
+        msg.contains("format") && msg.contains("acme"),
+        "a non-string format must be refused naming the label and the key: {msg}"
+    );
+
+    // Unlike `xattrs`, the key IS honored on the F7 dev override: the format also names the file,
+    // and `publish_unpinned` copies the registered bytes to exactly that name — so an operator
+    // pointing at an ext4 image they made themselves gets an artifact `bundle` can see. RED on
+    // refusing it there (the resolve below errors) or on ignoring it (the filename stays `.erofs`).
+    let unpinned = tmp.path().join("format-unpinned.json");
+    std::fs::write(
+        &unpinned,
+        format!(
+            r#"{{ "rootfs": {{ "acme": {{ "{UNPINNED_PATH_KEY}": "/tmp/mine.ext4",
+                 "format": "ext4" }} }} }}"#
+        ),
+    )
+    .expect("write overlay");
+    let entry = resolve_rootfs_entry(Some("acme"), Some(&unpinned))
+        .expect("an override may declare its format")
+        .expect("the override entry");
+    assert_eq!(entry.format, RootfsFormat::Ext4);
+    assert_eq!(
+        RootfsStage::labelled(Some("acme"))
+            .with_format(entry.format)
+            .out_path(target),
+        target.join("rootfs-acme.ext4"),
+        "an override's declared format must name the file its bytes are published to"
+    );
+}
+
 // §4.7's DERIVATION, both directions, and all the way to the artifact: `Feature::XattrPreserved`'s
 // stance comes from the entry's `xattrs` policy, and it travels in the `.features` sidecar a cell
 // reads with `FeatureDeclaration::load_beside`.
@@ -828,7 +1050,7 @@ async fn the_xattr_preserved_stance_is_derived_from_the_policy_and_reaches_the_s
             .expect("the declaration stage runs");
         let declaration = FeatureDeclaration::load_beside(
             &RootfsStage::labelled(Some(label)).out_path(&dir),
-            Source::Rootfs(rootfs_filename(Some(label))),
+            Source::Rootfs(rootfs_filename(Some(label), RootfsFormat::Erofs)),
         )
         .expect("the emitted sidecar parses");
         assert_eq!(
@@ -978,7 +1200,7 @@ async fn an_unpinned_registration_derives_no_stance_and_may_declare_one() {
         .expect("the declaration stage runs");
     let manifest = FeatureDeclaration::load_beside(
         &RootfsStage::labelled(Some("acme")).out_path(&dir),
-        Source::Rootfs(rootfs_filename(Some("acme"))),
+        Source::Rootfs(rootfs_filename(Some("acme"), RootfsFormat::Erofs)),
     )
     .expect("the emitted sidecar parses");
     assert_eq!(
@@ -1074,6 +1296,49 @@ fn a_declared_policy_flattens_into_the_resolved_pins() {
         "the committed baseline declares no policy, so it must emit no `{}` pin — an undeclared \
          build's `resolved_pins.json` is unmoved by this delta",
         rootfs_pin_key(None, "xattrs")
+    );
+}
+
+// The FORMAT is a scalar too (§4.7, §18 delta 8), and it flattens on exactly the same terms — for a
+// sharper version of the same reason: the format decides the artifact's FILENAME, so a consumer
+// reading a built dir's `resolved_pins.json` has no other way to learn whether the label it wants is
+// `rootfs-<label>.erofs` or `rootfs-<label>.ext4`.
+//
+// The last assertion is the migration half, as above: the committed baseline declares no format, so
+// an undeclared build's `resolved_pins.json` is byte-identical to its pre-delta-8 self.
+//
+// RED on dropping `"format"` from the flattener's sub-key loop: both `get`s return `None`.
+#[test]
+fn a_declared_format_flattens_into_the_resolved_pins() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let digest = format!("sha256:{}", "7".repeat(64));
+    let overlay = write_overlay(
+        tmp.path(),
+        &format!(
+            r#"{{ "rootfs": {{
+                 "acme": {{ "image": "i", "digest": "{digest}", "format": "ext4" }},
+                 "{DEFAULT_LABEL}": {{ "image": "i", "digest": "{digest}", "format": "erofs" }}
+               }} }}"#
+        ),
+    );
+    let pins = resolve_pins(Some(&overlay)).expect("the overlay resolves");
+    assert_eq!(
+        pins.get(&rootfs_pin_key(Some("acme"), "format")),
+        Some(&RootfsFormat::Ext4.name().to_string()),
+        "a labelled format must reach the flat pins under the one composed key"
+    );
+    assert_eq!(
+        pins.get(&rootfs_pin_key(None, "format")),
+        Some(&RootfsFormat::Erofs.name().to_string()),
+        "the default label's format must flatten to the un-suffixed key"
+    );
+
+    let baseline = resolve_pins(None).expect("the committed baseline resolves");
+    assert!(
+        !baseline.contains_key(&rootfs_pin_key(None, "format")),
+        "the committed baseline declares no format, so it must emit no `{}` pin — an undeclared \
+         build's `resolved_pins.json` is unmoved by this delta",
+        rootfs_pin_key(None, "format")
     );
 }
 
@@ -1221,7 +1486,7 @@ async fn the_sidecar_is_emitted_and_readable_including_for_an_empty_declaration(
         // Read it back from the OTHER side — beside the image path, which is how a cell finds it.
         let declaration = FeatureDeclaration::load_beside(
             &RootfsStage::labelled(Some(label)).out_path(&dir),
-            Source::Rootfs(rootfs_filename(Some(label))),
+            Source::Rootfs(rootfs_filename(Some(label), RootfsFormat::Erofs)),
         )
         .expect("the emitted sidecar parses");
         assert_eq!(

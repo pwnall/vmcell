@@ -515,6 +515,87 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
     require_libc6: bool,
     xattr_policy: XattrPolicy,
 ) -> crate::error::Result<Vec<u8>> {
+    nodes_to_erofs(merged_node_map(
+        archives,
+        extra_files,
+        injected_files,
+        injected_symlinks,
+        require_libc6,
+        xattr_policy,
+    )?)
+}
+
+/// Serializes the **merged tree** — the very same one [`tar_to_erofs`] packs — back to a tar
+/// archive, which is what §4.7's ext4 producer consumes (`mkfs.ext4 -d <tarball>`, §18 delta 8).
+///
+/// This is what makes §4.7's *"consuming the same merged-tar tail (injections, `libc6` scan, xattr
+/// policy, reserved-path law all inherited for free — obligation 3 of §4.3)"* **true** rather than
+/// aspirational. There is no merged tar anywhere upstream of here — the default OCI source hands
+/// the tail N un-merged per-layer streams and the merge lands directly in a node map — so the tar
+/// §4.7 names is *emitted here*, downstream of the one merge, and inherits every one of those
+/// properties by construction rather than by a second implementation of them.
+///
+/// **Parents are present**, and that is the property the ext4 route needs most:
+/// the one merge synthesizes every missing parent, and this emitter walks the paths in
+/// ascending order so a parent always precedes its children. `mkfs.ext4 -d` performs **no** implicit
+/// directory synthesis — it errors loud naming the missing directory — so the guarantee has to
+/// arrive in the tar, not merely in the packer. Pinned by
+/// `merged_tar_carries_synthesized_parents`.
+///
+/// **Two documented losses**, both inherited from the merge rather than introduced here:
+///
+/// * **hardlinks are materialized**. `build_node_map`'s `Link` arm copies the target's content
+///   (H-ART-2 — a dropped hardlink loses `usr/bin/perl5.NN`), so a source inode with N links
+///   emits N regular files here and the packed image's `st_nlink` is 1 where the base had N. The
+///   content, mode, ownership and xattrs are the target's, so every path still reads correctly;
+///   only the link *count* differs. Recorded, not silently absorbed.
+/// * **the root's own entry is not emitted**. `mkfs.ext4` creates inode 2 itself and the merged
+///   root is synthesized `0o755 root:root` anyway, so emitting a `./` member would only invite a
+///   permissions disagreement between the two producers.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] on the same inputs [`tar_to_erofs`] rejects, plus a node
+/// variant this emitter has no tar entry type for (the erofs writer's chunked/compressed file
+/// shapes, which the merge never produces) — rejected, never dropped.
+#[cfg(feature = "am-fs-erofs")]
+pub fn merge_to_tar<'a, R: Read + 'a>(
+    archives: impl IntoIterator<Item = tar::Archive<R>>,
+    extra_files: Vec<InjectedFile<'_>>,
+    injected_files: Vec<InjectedFile<'_>>,
+    injected_symlinks: Vec<(&str, &str)>,
+    require_libc6: bool,
+    xattr_policy: XattrPolicy,
+) -> crate::error::Result<Vec<u8>> {
+    nodes_to_tar(&merged_node_map(
+        archives,
+        extra_files,
+        injected_files,
+        injected_symlinks,
+        require_libc6,
+        xattr_policy,
+    )?)
+}
+
+/// **The one merge**: layers merged, extras and vmcell's injections inserted, the `libc6` scan run,
+/// every missing parent and the root synthesized — the complete flat `path -> Node` map both
+/// emitters consume.
+///
+/// Extracted from `tar_to_erofs` by §18 delta 8 so the ext4 producer consumes the *same* merged
+/// tree rather than a second implementation of it. Everything §4.7 promises the ext4 route inherits
+/// "for free" — the injections, the `libc6` scan, the [`XattrPolicy`], the F5 reserved-path law,
+/// the parent synthesis — is inherited because it happens here, once, above the format choice.
+///
+/// # Errors
+/// As [`tar_to_erofs`].
+#[cfg(feature = "am-fs-erofs")]
+fn merged_node_map<'a, R: Read + 'a>(
+    archives: impl IntoIterator<Item = tar::Archive<R>>,
+    extra_files: Vec<InjectedFile<'_>>,
+    injected_files: Vec<InjectedFile<'_>>,
+    injected_symlinks: Vec<(&str, &str)>,
+    require_libc6: bool,
+    xattr_policy: XattrPolicy,
+) -> crate::error::Result<HashMap<PathBuf, Node>> {
     let mut entries = build_node_map(
         archives,
         extra_files,
@@ -599,6 +680,17 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
         );
     }
 
+    Ok(entries)
+}
+
+/// Nests the merged flat map into the single root [`Node`] and packs it as EROFS — the erofs half
+/// of the format choice (§18 delta 8), unchanged in behavior from the pre-delta-8 tail.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] when a child's parent path is occupied by a non-directory node
+/// (a malformed layer stack, L-ART-6), or when the EROFS writer fails.
+#[cfg(feature = "am-fs-erofs")]
+fn nodes_to_erofs(mut entries: HashMap<PathBuf, Node>) -> crate::error::Result<Vec<u8>> {
     let mut paths_sorted: Vec<PathBuf> = entries.keys().cloned().collect();
     paths_sorted.sort_by_key(|p: &PathBuf| std::cmp::Reverse(p.components().count()));
 
@@ -643,6 +735,224 @@ pub fn tar_to_erofs<'a, R: Read + 'a>(
         .map_err(|e: fs_erofs::error::Error| crate::error::Error::Artifact(e.to_string()))?;
 
     Ok(image)
+}
+
+/// The permission bits of a node's `mode`, with the `S_IF*` type bits masked off.
+///
+/// The merged nodes carry a full `st_mode`; a tar header's `mode` field is permission bits only and
+/// the entry TYPE is a separate field, so writing the whole `st_mode` would hand `mkfs.ext4` a
+/// mode like `0o100755` and produce a file with setuid/setgid/sticky bits nobody asked for.
+#[cfg(feature = "am-fs-erofs")]
+const fn permission_bits(mode: u16) -> u32 {
+    (mode & 0o7777) as u32
+}
+
+/// Writes one merged [`Node`]'s extended attributes as PAX `SCHILY.xattr.*` records ahead of its
+/// member, honoring what the merge already decided.
+///
+/// The **inverse** of `xattr_spec`, and it goes through `fs_erofs::xattr::resolve_full_name` — the
+/// packer crate's own reconstruction — rather than re-spelling the namespace table, so the two
+/// directions cannot drift into two answers about what `(name_index, name)` means. Nothing is
+/// emitted for a node with no attributes: an empty `x` header per member would bloat every image
+/// and libarchive treats an absent one and an empty one identically anyway.
+///
+/// `SCHILY.xattr.*` is the shape `mkfs.ext4 -d` reads (verified on e2fsprogs 1.47.2:
+/// `security.capability` round-trips byte-exact through `debugfs ea_get`), and it is the shape the
+/// decode side already accepts, so an ext4 artifact and an erofs artifact packed from one tree
+/// carry one attribute set.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] when an attribute name is not UTF-8 (a `&str` is what the tar
+/// crate's PAX writer takes) or when the record cannot be written.
+#[cfg(feature = "am-fs-erofs")]
+fn write_node_xattrs<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    xattrs: &[fs_erofs::mkfs::XattrSpec],
+) -> crate::error::Result<()> {
+    if xattrs.is_empty() {
+        return Ok(());
+    }
+    let mut records: Vec<(String, Vec<u8>)> = Vec::with_capacity(xattrs.len());
+    for spec in xattrs {
+        let full = fs_erofs::xattr::resolve_full_name(spec.name_index, &spec.name);
+        let full = String::from_utf8(full).map_err(|e| {
+            crate::error::Error::Artifact(format!(
+                "extended attribute on {} has a non-UTF-8 name: {e}",
+                path.display()
+            ))
+        })?;
+        records.push((format!("{PAX_SCHILY_XATTR}{full}"), spec.value.clone()));
+    }
+    builder
+        .append_pax_extensions(
+            records
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| {
+            crate::error::Error::Artifact(format!(
+                "cannot write extended attributes for {}: {e}",
+                path.display()
+            ))
+        })
+}
+
+/// Serializes the merged flat map as a tar archive — the tar half of the format choice
+/// (§18 delta 8). See [`merge_to_tar`] for the contract, the parent guarantee and the two
+/// documented losses.
+///
+/// # Errors
+/// [`crate::error::Error::Artifact`] when a node variant has no tar entry type, when an attribute
+/// name is not UTF-8, or when the archive cannot be written.
+#[cfg(feature = "am-fs-erofs")]
+fn nodes_to_tar(entries: &HashMap<PathBuf, Node>) -> crate::error::Result<Vec<u8>> {
+    // ASCENDING path order, which is exactly the parents-before-children order `mkfs.ext4 -d`
+    // requires: a parent path is a strict component-wise prefix of each of its children, and
+    // `PathBuf`'s ordering is component-wise, so `usr` < `usr/bin` < `usr/bin/sh` always. It is
+    // also what makes the emitted bytes a function of the tree alone — a `HashMap` iteration order
+    // would make the tar, and therefore the ext4 image, differ run to run.
+    let mut paths: Vec<&PathBuf> = entries.keys().collect();
+    paths.sort();
+
+    let mut out = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut out);
+        // Deterministic emission needs the members' own bytes to be a function of the tree, and a
+        // GNU header carries a per-member `atime`/`ctime` the ustar one does not. The tar crate's
+        // ustar path additionally splits a long path across `prefix`+`name`, and `set_path` falls
+        // back to a PAX `path=` record — both deterministic. Verified against e2fsprogs 1.47.2 with
+        // a 115-character member path.
+        for path in paths {
+            // The synthesized root: `mkfs.ext4` owns inode 2 and creates it itself.
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let node = entries.get(path).ok_or_else(|| {
+                crate::error::Error::Artifact(format!("missing merged node {}", path.display()))
+            })?;
+            let (mode, meta, xattrs) = match node {
+                Node::File {
+                    mode, meta, xattrs, ..
+                }
+                | Node::Dir {
+                    mode, meta, xattrs, ..
+                }
+                | Node::Symlink {
+                    mode, meta, xattrs, ..
+                }
+                | Node::Device {
+                    mode, meta, xattrs, ..
+                }
+                | Node::Special {
+                    mode, meta, xattrs, ..
+                } => (*mode, *meta, xattrs.as_slice()),
+                // The erofs writer's chunked/compressed file shapes. `build_node_map` produces
+                // neither, so reaching here means the merge grew a variant this emitter was not
+                // taught — REJECTED, never dropped, on the same law the tar-entry decode rejects an
+                // unknown member type: a dropped node packs a rootfs that boots as if complete.
+                other => {
+                    return Err(crate::error::Error::Artifact(format!(
+                        "merged node {} has a shape the tar emitter has no entry type for \
+                         ({other:?}); dropping it would pack an incomplete rootfs that boots as \
+                         if complete",
+                        path.display()
+                    )));
+                }
+            };
+            write_node_xattrs(&mut builder, path, xattrs)?;
+            let mut header = tar::Header::new_ustar();
+            header.set_mode(permission_bits(mode));
+            header.set_uid(u64::from(meta.uid));
+            header.set_gid(u64::from(meta.gid));
+            header.set_mtime(meta.mtime);
+            header.set_size(0);
+            let write = |builder: &mut tar::Builder<&mut Vec<u8>>,
+                         header: &mut tar::Header,
+                         data: &[u8]|
+             -> crate::error::Result<()> {
+                header.set_size(data.len() as u64);
+                builder.append_data(header, path, data).map_err(|e| {
+                    crate::error::Error::Artifact(format!(
+                        "cannot write tar member {}: {e}",
+                        path.display()
+                    ))
+                })
+            };
+            match node {
+                Node::File { data, .. } => {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    write(&mut builder, &mut header, data)?;
+                }
+                Node::Dir { .. } => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    write(&mut builder, &mut header, &[])?;
+                }
+                Node::Symlink { target, .. } => {
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    // Through the header's own setter (which PAX-escapes an over-long target)
+                    // rather than `append_link`, so the mode/uid/gid/mtime set above survive.
+                    header.set_link_name(target).map_err(|e| {
+                        crate::error::Error::Artifact(format!(
+                            "cannot write symlink target for {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    write(&mut builder, &mut header, &[])?;
+                }
+                Node::Device { mode, rdev, .. } => {
+                    header.set_entry_type(
+                        if mode & fs_erofs::inode::S_IFMT == fs_erofs::inode::S_IFBLK {
+                            tar::EntryType::Block
+                        } else {
+                            tar::EntryType::Char
+                        },
+                    );
+                    // The inverse of the decode's `libc::makedev`, through `libc`'s own accessors
+                    // rather than a shift/mask reimplementation — the encoding is NOT
+                    // `(major << 8) | minor` and hand-rolling it is the exact defect the decode
+                    // arm's comment records. Both are safe `const fn`s: they take the device
+                    // number by value and touch no pointer.
+                    let dev = libc::dev_t::from(*rdev);
+                    let major = libc::major(dev);
+                    let minor = libc::minor(dev);
+                    header.set_device_major(major).map_err(|e| {
+                        crate::error::Error::Artifact(format!(
+                            "cannot write device major for {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    header.set_device_minor(minor).map_err(|e| {
+                        crate::error::Error::Artifact(format!(
+                            "cannot write device minor for {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    write(&mut builder, &mut header, &[])?;
+                }
+                Node::Special { .. } => {
+                    // `Node::Special` is S_IFIFO or S_IFSOCK; `build_node_map` only ever produces
+                    // it from a tar `Fifo`, and tar has no socket member type at all, so FIFO is
+                    // the only reading.
+                    header.set_entry_type(tar::EntryType::Fifo);
+                    write(&mut builder, &mut header, &[])?;
+                }
+                // Unreachable: the `match` above already rejected every other shape.
+                other => {
+                    return Err(crate::error::Error::Artifact(format!(
+                        "merged node {} has a shape the tar emitter has no entry type for \
+                         ({other:?})",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        builder.finish().map_err(|e| {
+            crate::error::Error::Artifact(format!("cannot finish the merged tar: {e}"))
+        })?;
+    }
+    Ok(out)
 }
 
 /// Mode for an injected file, keyed on its destination path: injected BINARIES are

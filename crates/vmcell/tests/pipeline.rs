@@ -701,7 +701,8 @@ async fn a_sidecar_stage_sharing_a_stem_does_not_evict_the_image_stages_cache() 
     let packs = Arc::new(AtomicUsize::new(0));
     // The real filename law, so this gate keeps testing the real collision rather than a
     // hand-spelled name that could drift away from it.
-    let image_name = vmcell::artifact::rootfs::rootfs_filename(None);
+    let image_name =
+        vmcell::artifact::rootfs::rootfs_filename(None, vmcell::artifact::RootfsFormat::Erofs);
     let pipeline = || {
         Pipeline::new(tmp_dir.clone())
             .add_stage(Box::new(CountingStage {

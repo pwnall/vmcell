@@ -91,7 +91,7 @@ path = "src/lib.rs"
 # The validator boots real vmcell micro-VMs and drives the steward, and reuses vmcell's
 # capability descriptors + net math. It needs the host stack: a backend, metrics, pipeline
 # (for artifact_path helpers). `vmcell` has no dependency on this crate.
-vmcell = { path = "../vmcell", version = "0.19.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.20.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
 # The applet roster (`GUEST_TOOLS_APPLETS`) only — the validator speaks no wire protocol of its
 # own. `rootfs_guest_tools` composes its PATH probe from that const instead of re-typing the
 # names, so growing the roster extends what the contract battery checks with no edit here. It is
@@ -112,4 +112,4 @@ tempfile = "3"
 # The feature list mirrors the `[dependencies]` entry above, plus `test-support`.
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-vmcell = { path = "../vmcell", version = "0.19.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }
+vmcell = { path = "../vmcell", version = "0.20.0", features = ["cloud-hypervisor", "metrics", "pipeline", "test-support"] }

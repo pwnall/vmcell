@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 use std::collections::HashSet;
 use vmcell::artifact::handler::{HandlerSource, handler_filename};
 use vmcell::artifact::registry::{UNPINNED_PATH_KEY, registry_label};
-use vmcell::artifact::rootfs::rootfs_filename;
+use vmcell::artifact::rootfs::rootfs_artifact_stem;
 use vmcell::artifact::{
     RootfsRegistration, fuzz_handler_registry, fuzz_merged_pins_document, fuzz_rootfs_registry,
 };
@@ -164,8 +164,11 @@ fuzz_target!(|data: &[u8]| {
 
     if let Ok(entries) = fuzz_rootfs_registry(&doc) {
         let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
+        // The STEM, which is the registry's collision key as of §18 delta 8: a rootfs's
+        // `.cache_key` and `.features` sidecars are `with_extension` derivations of its image name,
+        // so two labels sharing a stem collide on both whatever formats their images declare.
         assert_roster(&doc, "rootfs", &labels, &|l| {
-            rootfs_filename(registry_label(l))
+            rootfs_artifact_stem(registry_label(l))
         });
         for entry in &entries {
             let spec = spec_of(&doc, "rootfs", &entry.label);

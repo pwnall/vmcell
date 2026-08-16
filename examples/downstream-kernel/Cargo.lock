@@ -3730,7 +3730,7 @@ dependencies = [
 
 [[package]]
 name = "vmcell"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "am-fs-erofs",
  "async-trait",

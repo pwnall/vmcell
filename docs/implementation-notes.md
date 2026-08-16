@@ -156,8 +156,10 @@ Graduates the two §17 (Open gaps and future capabilities) forward-work items. F
   (`ReadOnly`). The extra-rw-disk KVM test caught this (the `/dev/vdc` round-trip failed on CH while FC
   and QEMU passed). *Fix:* `build_ch_disks` sets `image_type: "Raw"` on every disk (all vmcell images —
   erofs root, ext4 `Block` root, extra raw disks — are raw). This also removes CH's deprecation warnings
-  and pre-empts the **same latent bug on the writable `Block` rootfs path** (a sector-0 superblock write
-  would have been silently dropped). One-law: `CH_RAW_IMAGE_TYPE` const, pinned by a serialization
+  and forestalled what was then the same latent bug on the `Block` rootfs path. (v33 delta 8 later
+  ratified that root as **read-only** at the device level too, so that half of the rationale now
+  describes a path that no longer exists; the fix itself stays right, because extra disks are
+  genuinely writable.) One-law: `CH_RAW_IMAGE_TYPE` const, pinned by a serialization
   assertion. See design §4.6 (Extra virtio-blk devices and disk-I/O throttling).
 
 - **Validated on the KVM host (2026-07-05, this env).** `tests/extra_block.rs` (`vmm_matrix_test!`) —
@@ -4623,13 +4625,116 @@ gates — its own delta with its own sweep, not delta 9's. The assertion recompu
 networking inherits vmcell's proxy CA in place of Debian's. The cell runs `.network_disabled()`, so
 nothing here notices.
 
+## v33 delta 8 — the ext4 producer (design §18 delta 8, §4.7), as built
+
+**What landed.** An ext4 rootfs producer behind the same `Stage`, a `format` key on the registry
+entry, a format-aware filename law, the version-probe refusal, the mount-and-diff live battery — and
+the read-only ratification that had to come with it.
+
+**The writability contradiction is resolved: the ext4 root is READ-ONLY.** §4.7 pitched the producer
+as serving "workloads that need a **writable**, POSIX-complete root" while §5.2 said the same root
+"mounts **strictly read-only** without journal recovery" — and it was four-way, not two-way, since
+all four backends attached the device read-write and `RootfsSource::Block`'s own rustdoc said
+"Writable or read-only". Read-only wins on the design's own words: §4.7 closes with "**the ext4
+producer adds an artifact; it does not move the root**" and §18's *Migration* clause is "additive",
+which writability is not. It would have required rewriting F3's reserved-cmdline alias law (`rw` is
+reserved *because* `rw` + `rootflags=noload` is corruption, and both its gates redden), growing
+`clone_ineligible_feature` a `RootfsSource` arm it does not have, and dropping `noload` — and it
+would not even have worked, because under the default `Pid1` placement the steward unconditionally
+overlays tmpfs with `lowerdir=/` and pivot_roots, so every guest write lands in the tmpfs upper.
+Writability would have scoped to `Service`/`None`, making delta 8 depend on deltas 4 and 5. **The
+surviving motivation is the real one**: POSIX-completeness — device nodes, xattrs, ACLs — and
+workloads asserting on ext4 semantics, which is exactly what the mount-and-diff gate measures. The
+reasoning is written onto `RootfsSource::Block` and `root_device_read_only`, so a later reader finds
+it at the type. §4.7's sentence should be corrected on the next reissue.
+
+**Booting `RootfsSource::Block` for the first time in this repository's history found two real
+defects.** The variant had been consumable since v22 with no producer, so no test had ever booted
+it, and every runtime claim about it was unverified. Both were found by running it, not by reading:
+
+* **All four backends attached the root read-write beneath an `ro` mount.** Not a theoretical
+  mismatch: under the old attach a guest `dd if=/dev/zero of=/dev/vda bs=512 count=1` **succeeds**
+  and writes 512 bytes into the image N zygote clones share. Four per-variant matches were four
+  copies of one decision and all four had drifted the same way; they are deleted, and
+  `RootfsSource::root_device_read_only` is the one law, gated in both directions so the device's
+  writability can never again exceed the mount's.
+* **`mkfs.ext4 -d <tarball>` silently drops every extended attribute except `security.capability`.**
+  The first live run packed a `user.` attribute under `XattrPolicy::Preserve`, the pack reported
+  success, and the guest's `getxattr` answered `ENODATA`. Isolated on the host afterwards:
+  `security.selinux`, `trusted.*` and `user.*` are all dropped, while the *directory* form of `-d`
+  has no such limit — so it is a property of the tarball route, not of ext4. `Preserve` is a §10.4
+  contract promise the erofs route keeps for every namespace, so the ext4 route was silently
+  changing the semantics of an accepted input. It refuses now, naming the member, the attribute and
+  both ways forward. `security.capability` — the case `Preserve` exists for — is unaffected.
+
+**There was no merged tar, so one emitter was added downstream of the one merge.** The tail merged
+layer streams straight into an erofs node map, and `mkfs.ext4 -d` needs a tar. The merge is now
+`merged_node_map` with `nodes_to_erofs` and `nodes_to_tar` beside it, which is what makes §4.7's
+"injections, `libc6` scan, xattr policy, reserved-path law all inherited for free" true **by
+construction** rather than by assertion — there is still exactly one merge, and a gate says so.
+
+**Determinism needed three knobs the design does not name.** Delta 7 shipped a pack-twice
+byte-determinism gate and delta 8 inherits it. `mkfs.ext4` is not deterministic unless
+`SOURCE_DATE_EPOCH`, `-U <uuid>` and a non-null `-E hash_seed=<uuid>` are **all** set — measured
+both ways on this host. All three are derived from the merged tar's own hash, never from the clock.
+`-O ^has_journal` is emitted as well: the root mounts `ro` with `rootflags=noload`, so the journal is
+the only thing `noload` guards and omitting it makes the image smaller. `noload` stays emitted, so
+F3 is untouched.
+
+**The libarchive half of the version probe is a build, not a version string.** The gate demands a
+classified refusal for "e2fsprogs < 1.47.1 **or no libarchive**", and libarchive is `dlopen`'d rather
+than linked — so `mke2fs -V` is structurally blind to its absence. The probe does a real trial
+tarball build instead. A probe that cannot see the thing it claims to check is theater.
+
+**The crate route was evaluated first, as §18 directs, and rejected with a named candidate.**
+The recon's premise that no permissive pure-Rust ext4 *writer* exists is stale — several do, and
+`am-fs-ext4` 0.4.0 is a genuine candidate: MIT, the same author family as the `am-fs-erofs` this
+tree already trusts for its only packer, `am-fs-core` already in the lock, and a complete write API
+down to `apply_mknod` / `apply_link` / `apply_setxattr`. It is rejected for this cut because it
+first published 2026-06-21, shipped three releases in ten days, its own docs call its ext3 dialect
+"not yet `e2fsck`-clean", and §17's qualifier — *if* a permissive writer passes the mount-and-diff
+gate — could not be met by a gate that did not exist until this delta. **Now it can be**: the gate
+exists, the swap is contained to `Ext4Producer`'s body behind the `Stage` boundary, and graduating
+would remove the xattr refusal above outright. That is the recommended next experiment.
+
+**Two measured surprises worth carrying.** The boot root mount is **absent from `/proc/mounts`** in a
+`Pid1` cell — the steward lazily unmounts it after `pivot_root` — so the battery mounts `/dev/vda` a
+second time, read-only, and diffs *there*; a first draft asserted on the boot mount and reddened.
+And the pinned Debian base carries **zero** device nodes and zero xattrs, so the battery packs a
+fixture layer supplying every POSIX shape the base lacks, rather than asserting on a tree that
+cannot exercise the claim.
+
+**Hardlinks are materialized to copies by the merge**, which predates this delta and is unchanged;
+`st_nlink` is therefore asserted nowhere, and the one hardlink in the base is excluded from the
+sampled manifest rather than silently passing.
+
+## Recorded: a closed fd is not a dead one in a process that forks
+
+Two independent flakes this pass had the same root cause, and it is worth stating once as a law
+about **test fixtures** rather than twice as an anecdote. A file descriptor open in one thread is
+duplicated into every `fork` another thread performs in that instant, and stays alive in the child
+until it reaches `execve` and `CLOEXEC` closes it. So in a multi-threaded test binary whose siblings
+spawn processes:
+
+* a `drop`ped `UnixListener` can still be **bound and accepting** — which made
+  `reject_live_baked_vsock`'s fixture hand the guard a socket that was not actually stale (measured:
+  0 anomalies in 96 000 sequential cycles, 1–4 per 3000 under 24-way concurrency);
+* a file being written can still be **busy for `execve`** — which made the ext4 probe's stub binary
+  answer `ETXTBSY`, surfacing as an `Error::Io` where the test expected `CapabilityUnavailable`.
+  The product was right (a present-but-unrunnable binary is a *broken* facility that keeps its
+  errno); the fixture's premise was wrong.
+
+Both fixtures now **verify** the state they assume rather than assuming it. Neither was a product
+defect, and both read as one — which is the class AGENTS.md names when it says a leaked fixture
+"reads as a product defect and is not one".
+
 ## Where the v33 pass stands
 
 Deltas 1–5 of the §18 register are landed, pushed and live-validated. **6a and 6b were live-validated
 at this pass's start** — privileged 177/177, unprivileged 4/4, daemon 14/14, validator 3/3, seven
 capability skips, all Firecracker. (`docs/88`'s stated bar of "privileged 162/162" was itself the
-*delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **6c, 7, 9 and
-10 are landed**; only **8** — the ext4 producer, which §18 declares separable — remains.
+*delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **All ten
+deltas of the v33 register are now landed, and the register is closed.**
 
 `docs/88-claude-handoff-notes-v4.md` is the pick-up point. It carries the remaining inventory, what
 6a/6b moved under deltas 7–10, the operational knowledge that is not a design fact and so has no

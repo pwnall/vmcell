@@ -15,7 +15,7 @@ path = "src/lib.rs"
 # The in-VM mmdebstrap builder drives a vmcell builder micro-VM (MicroVm/VmConfig/steward),
 # builds its builder-base rootfs with vmcell's OCI packer, and emits the final erofs via
 # vmcell's shared inject+pack tail. It needs the host stack: a backend, metrics, pipeline.
-vmcell = { path = "../vmcell", version = "0.19.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
+vmcell = { path = "../vmcell", version = "0.20.0", features = ["cloud-hypervisor", "metrics", "pipeline"] }
 async-trait = "0.1.89"
 tracing = "0.1"
 tempfile = "3"

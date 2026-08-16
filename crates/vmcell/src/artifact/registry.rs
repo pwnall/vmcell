@@ -23,11 +23,16 @@ use crate::error::{Error, Result};
 pub(crate) struct RegistryKind<'a> {
     /// The pins namespace holding the label map, e.g. `"kernels"` or `"rootfs"`.
     pub namespace: &'a str,
-    /// The on-disk artifact filename a label resolves to — the collision reject's key.
+    /// The on-disk artifact **name** a label resolves to — the collision reject's key.
     ///
     /// A function rather than a format string because each kind sanitizes and extends differently
-    /// (`vmlinux-6-12-94` vs `rootfs-debian-systemd.erofs`), and the sanitization law is the kind's
-    /// own one-law composer, never re-spelled here.
+    /// (`vmlinux-6-12-94` vs `rootfs-debian-systemd`), and the sanitization law is the kind's own
+    /// one-law composer, never re-spelled here.
+    ///
+    /// A kind whose artifact can carry more than one extension returns the **stem**, because that
+    /// is what actually collides: `Path::with_extension` derives every sidecar from the image name,
+    /// so two labels sharing a stem share one `.cache_key` whatever their images are called
+    /// (§18 delta 8 — the `rootfs` kind is the first with two formats).
     pub filename: &'a dyn Fn(&str) -> String,
     /// What the collision message tells the operator to do about the two labels it names.
     ///
@@ -90,7 +95,7 @@ fn reject_sanitized_label_collision<T>(
         if let Some(previous) = by_filename.insert(filename.clone(), label) {
             return Err(Error::Artifact(format!(
                 "pins `{}` labels `{previous}` and `{label}` both sanitize to the one artifact \
-                 filename `{filename}` (the `.`→`-` law, §10.5): {} — rename one label",
+                 name `{filename}` (the `.`→`-` law, §10.5): {} — rename one label",
                 kind.namespace, kind.collision_consequence
             )));
         }

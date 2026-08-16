@@ -1032,27 +1032,22 @@ fn qemu_launch_plan(
     // *Which* host file backs `/dev/vda` is the one law,
     // `RootfsSource::effective_image` — the same predicate the config boundary's
     // duplicate-backing-file guard uses, so the guard can never protect a file this argv does
-    // not attach. The match below stays exhaustive over the variants (a new `RootfsSource` must
-    // be a compile error here) because only the `readonly=on` token is per-variant.
+    // not attach. **Whether it is writable** is the other one law,
+    // `RootfsSource::root_device_read_only`, which owns the exhaustive per-variant match: the
+    // `Block` arm here open-coded the ABSENCE of `readonly=on`, contradicting the `ro` the cmdline
+    // mounts it with (§4.7).
     let root_image = cfg.rootfs.effective_image().display().to_string();
-    match &cfg.rootfs {
-        vmcell::config::RootfsSource::Erofs { .. } => {
-            cmd.arg("-drive")
-                .arg(format!(
-                    "file={root_image},format=raw,id=rfs,if=none,readonly=on,file.locking=off"
-                ))
-                .arg("-device")
-                .arg("virtio-blk-pci,drive=rfs");
-        }
-        vmcell::config::RootfsSource::Block { .. } => {
-            cmd.arg("-drive")
-                .arg(format!(
-                    "file={root_image},format=raw,id=rfs,if=none,file.locking=off"
-                ))
-                .arg("-device")
-                .arg("virtio-blk-pci,drive=rfs");
-        }
-    }
+    let root_ro = if cfg.rootfs.root_device_read_only() {
+        ",readonly=on"
+    } else {
+        ""
+    };
+    cmd.arg("-drive")
+        .arg(format!(
+            "file={root_image},format=raw,id=rfs,if=none{root_ro},file.locking=off"
+        ))
+        .arg("-device")
+        .arg("virtio-blk-pci,drive=rfs");
 
     // Extra virtio-blk devices (§4.6, Extra virtio-blk devices and disk-I/O throttling), attached AFTER the root `virtio-blk-pci` so
     // they enumerate `/dev/vdb`, `/dev/vdc`, … in order and never shift the root
@@ -2091,13 +2086,19 @@ mod tests {
             image: base.clone(),
             overlay: None,
         });
+        // `readonly=on` is part of the expected string: the device's writability must not exceed
+        // the mount's, and the mount is always `ro` (§4.7;
+        // `RootfsSource::root_device_read_only`). Spelled as a literal in the expectation rather
+        // than recomputed through the law, which would be vacuous now that the composer reads it —
+        // this is the leg that reddens on the pre-delta-8 `Block` arm, which emitted no
+        // `readonly=on` at all.
         assert_eq!(
             plain_spec,
             format!(
-                "file={},format=raw,id=rfs,if=none,file.locking=off",
+                "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
                 plain_cfg.rootfs.effective_image().display()
             ),
-            "the root -drive must name the effective image"
+            "the root -drive must name the effective image and attach it READ-ONLY"
         );
 
         // Overlay set: the overlay backs /dev/vda, the base is never attached.
@@ -2108,10 +2109,11 @@ mod tests {
         assert_eq!(
             ovl_spec,
             format!(
-                "file={},format=raw,id=rfs,if=none,file.locking=off",
+                "file={},format=raw,id=rfs,if=none,readonly=on,file.locking=off",
                 ovl_cfg.rootfs.effective_image().display()
             ),
-            "with an overlay set, the overlay backs /dev/vda"
+            "with an overlay set, the overlay backs /dev/vda — and it is a per-VM private COPY, \
+             not a write target, so it is attached read-only too"
         );
         // Non-vacuous: the two paths genuinely differ.
         assert_ne!(

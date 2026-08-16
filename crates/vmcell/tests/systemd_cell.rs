@@ -415,9 +415,10 @@ async fn pack_systemd_rootfs(
         .await
         .expect("packing the registered `debian-systemd` rootfs must succeed");
 
-    let image = staging.join(vmcell::artifact::rootfs::rootfs_filename(Some(
-        SYSTEMD_ROOTFS_LABEL,
-    )));
+    let image = staging.join(vmcell::artifact::rootfs::rootfs_filename(
+        Some(SYSTEMD_ROOTFS_LABEL),
+        vmcell::artifact::RootfsFormat::Erofs,
+    ));
     assert!(
         image.exists(),
         "the labelled rootfs stage must write {}",
@@ -609,9 +610,10 @@ async fn systemd_cell_boots_real_systemd_with_the_steward_as_a_unit() {
         // produces keeps one law rather than adding a second.)
         assert_eq!(
             removal.by,
-            Source::Rootfs(vmcell::artifact::rootfs::rootfs_filename(Some(
-                SYSTEMD_ROOTFS_LABEL
-            ))),
+            Source::Rootfs(vmcell::artifact::rootfs::rootfs_filename(
+                Some(SYSTEMD_ROOTFS_LABEL),
+                vmcell::artifact::RootfsFormat::Erofs,
+            )),
             "the removal must be attributed to the ROOTFS axis — an artifact declaration is the \
              most specific statement about a cell, and `Source::axis_rank` ranks it above the \
              backend and the config. Got {removal:?}"
@@ -894,9 +896,10 @@ async fn run_conformance_over_the_composition(
     // The candidate's claim, straight off the sidecar the pack emitted (§7.4's travel form).
     let declaration = FeatureDeclaration::load_beside(
         image,
-        Source::Rootfs(vmcell::artifact::rootfs::rootfs_filename(Some(
-            SYSTEMD_ROOTFS_LABEL,
-        ))),
+        Source::Rootfs(vmcell::artifact::rootfs::rootfs_filename(
+            Some(SYSTEMD_ROOTFS_LABEL),
+            vmcell::artifact::RootfsFormat::Erofs,
+        )),
     )
     .expect("the emitted declaration sidecar must load");
     assert_eq!(
