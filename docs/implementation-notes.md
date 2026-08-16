@@ -4736,16 +4736,24 @@ capability skips, all Firecracker. (`docs/88`'s stated bar of "privileged 162/16
 *delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **All ten
 deltas of the v33 register are now landed, and the register is closed.**
 
-`docs/88-claude-handoff-notes-v4.md` is the pick-up point. It carries the remaining inventory, what
-6a/6b moved under deltas 7–10, the operational knowledge that is not a design fact and so has no
-entry here, and — first, because it is the lesson that cost the most — how to use workflows and
-subagents so the next pass does not spend its context window reading files by hand.
-`docs/87-claude-handoff-notes-v3.md` is superseded and kept for its per-delta detail on 7–10, which
-v4 amends rather than repeats; its delta-5 and delta-6 sections are history.
+`docs/89-claude-handoff-notes-v5.md` is the pick-up point. `docs/88` and `docs/87` are superseded;
+they are kept for the per-delta detail v5 amends rather than repeats, and both carry premises that
+did not survive contact — read them only through v5's corrections.
 
 **The tally the register keeps** ("every register so far has carried at least one shipped-fact
-premise that was empirically false") grew by five in this pass, four of them about code rather than
-prose — and one of them was a gate that passed with its own regression planted. v4 §6 lists them.
+premise that was empirically false") is now well past a curiosity. The 6c–8 pass added, among
+others: `build-kernels`'s migration blast radius stated as "four prose sites" when two of them were
+**executable CI-gated legs**; delta 7's premise that `GuestToolsStage` "had no prebuilt escape
+hatch", which 6b had already retired; and design §4.7's count of "ten node-construction sites" when
+there are eleven. Every one was found by grepping the claim, not by reading around it.
+
+**Three defects this pass were invisible to every green test, and all three were found by running
+something.** A `.cache_key` stem collision that would have re-packed the OCI image on **every**
+build forever, with every functional test still green. An applet roster that was never folded into
+the rootfs cache key, so two handlers with different rosters shared a key and produced different
+images. And a `Block` root attached read-write beneath an `ro` mount, on a code path no test had
+ever booted, where a guest `dd` wrote into an image N zygote clones share. Static review would not
+have surfaced any of them.
 
 **The delta 6 / delta 7 ordering conflict, decided.** §10.5's registry entry sketch carries
 `"xattrs": "preserve"` while `XattrPolicy` is delta 7's deliverable, and the register orders 6 before
