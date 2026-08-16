@@ -83,6 +83,60 @@ impl NetMode {
     }
 }
 
+/// Where a created VM's steward runs (design §3.5, Guest placement: PID 1 or a service/§11.5, The HTTP REST API and its OpenAPI document; §18 delta 10).
+///
+/// The daemon-side **mirror** of `vmcell::config::StewardPlacement`, declared here rather than
+/// derived on the library type for two reasons. `vmcell::config` carries no `Serialize` at all —
+/// deliberately, so the library's configuration surface is not also a wire schema — and this module
+/// is compiled **without** the `server` feature for `vmcell-daemon-client`, which does not link
+/// `vmcell` at all. So the wire form lives here and converts at the launcher, exactly as [`NetMode`]
+/// does.
+///
+/// Deliberately **not** `Default`: "the client named no placement" is [`CreateVmRequest`]'s
+/// `Option::None`, and resolving that is the registry's one job (it is where an undeclared placement
+/// beside a custom `init` is refused). A `Default` here would make `unwrap_or_default()` look
+/// correct at a call site that must not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StewardPlacementDto {
+    /// The kernel starts the steward as PID 1 (`"pid1"`) — the daemon's behavior before v33, now
+    /// sayable. Cannot be combined with [`CreateVmRequest::init`]: the kernel cannot start the
+    /// steward as PID 1 if `init=` names something else (the library refuses the pair, 400).
+    Pid1,
+    /// The guest's own init starts the steward and the daemon dials `port`
+    /// (`{"service":{"port":5100}}`). This is what makes a custom [`CreateVmRequest::init`] — a
+    /// distro image, systemd, another init system — expressible over REST at all: the vsock control
+    /// plane the daemon owns its VMs through survives it.
+    Service {
+        /// The vsock port the guest's steward listens on (5000 is the default the guest binds when
+        /// no `vmcell_steward_port=` token is emitted). `0` and `u32::MAX` are reserved by AF_VSOCK
+        /// and refused fail-loud at config build (400).
+        port: u32,
+    },
+    /// No steward anywhere (`"none"`).
+    ///
+    /// Representable **so that it can be refused by name**: the daemon owns every VM it creates
+    /// through the vsock control plane, so this is the one placement REST does not express (design
+    /// §5.3, The kernel command line — the surviving half of the pre-v33 "no `init=` over REST"
+    /// rule). Refused 400 by the registry; use the `vmcell` library directly for a stewardless VM.
+    None,
+}
+
+impl StewardPlacementDto {
+    /// Whether this placement keeps the vsock control plane the daemon owns its VMs through — the
+    /// **one** predicate the daemon's REST placement rule is written in terms of (design §11.5, The
+    /// HTTP REST API and its OpenAPI document).
+    ///
+    /// It is C8's availability question (`StewardPlacement::steward_port().is_some()`) asked on this
+    /// side of the wire; `the_rest_placement_law_matches_c8_availability_variant_for_variant` in
+    /// `launcher.rs` pins the two together variant-for-variant, because only that module links
+    /// `vmcell`.
+    #[must_use]
+    pub const fn control_plane_retained(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// The wire form of a [`vmcell::DiskIoLimit`](vmcell::config::DiskIoLimit) — disk-I/O
 /// fault injection (design §4.6, Extra virtio-blk devices and disk-I/O throttling). At least one cap must be set and any set cap must
 /// be `> 0`; the library's `build()` enforces both fail-loud.
@@ -150,12 +204,36 @@ pub struct CreateVmRequest {
     #[serde(default)]
     pub extra_disks: Vec<ExtraDiskSpec>,
     /// Append-only extra kernel command-line arguments (design §5.3, The kernel command line). Cannot
-    /// override a boot token vmcell owns — rejected fail-loud at build. (A custom `init=`
-    /// override is deliberately **not** exposed here: it replaces the steward, so the
-    /// daemon — which owns the VM through the vsock control plane — could not `exec` or
-    /// `stats` it. Use the library directly for a custom-init VM.)
+    /// override a boot token vmcell owns — rejected fail-loud at build. `init=` is one of those
+    /// owned tokens: state it in the dedicated [`init`](Self::init) field, which carries the
+    /// placement the daemon needs beside it.
     #[serde(default)]
     pub extra_kernel_args: Vec<String>,
+    /// Guest path of a custom `init=` — **init identity only** (design §3.5, Guest placement: PID 1
+    /// or a service; §5.3, The kernel command line; §18 delta 10).
+    ///
+    /// Absent ⇒ the vmcell steward is PID 1, the pre-v33 shape. Present ⇒ the named binary is PID 1
+    /// instead, and [`steward_placement`](Self::steward_placement) must say where the steward runs:
+    /// the daemon owns every VM it creates through the vsock control plane and will not guess. It
+    /// pairs with [`StewardPlacementDto::Service`]; with [`StewardPlacementDto::Pid1`] it is the one
+    /// contradictory pair the library refuses (400).
+    ///
+    /// A guest path, **not** an artifact name: it names a binary inside the rootfs image, so it is
+    /// not resolved against the store. The library validates it as a single safe cmdline token.
+    ///
+    /// This field is what scoped the pre-v33 "no `init=` over REST" rule. Its rationale — the daemon
+    /// could not `exec` or `stats` a VM whose init replaced the steward — is repaired by `Service`
+    /// placement, and survives only as [`StewardPlacementDto::None`]'s refusal.
+    #[serde(default)]
+    pub init: Option<String>,
+    /// Where this VM's steward runs (design §3.5, Guest placement: PID 1 or a service; §18 delta 10).
+    ///
+    /// Absent ⇒ [`StewardPlacementDto::Pid1`] when no [`init`](Self::init) is named (the pre-v33
+    /// default, byte-identical), and a **400** when one is: the daemon refuses to guess a placement
+    /// for a custom init, because the library's own derivation would answer
+    /// `StewardPlacement::None` — the one placement REST does not express.
+    #[serde(default)]
+    pub steward_placement: Option<StewardPlacementDto>,
 }
 
 const fn default_vcpus() -> u8 {
@@ -181,6 +259,8 @@ impl CreateVmRequest {
             ephemeral: false,
             extra_disks: Vec::new(),
             extra_kernel_args: Vec::new(),
+            init: None,
+            steward_placement: None,
         }
     }
 
@@ -212,6 +292,32 @@ impl CreateVmRequest {
     #[must_use]
     pub fn with_snapshotting(mut self, snapshotting: bool) -> Self {
         self.snapshotting = snapshotting;
+        self
+    }
+
+    /// Declares a custom guest `init=` **and** where the steward runs beside it (builder-style,
+    /// design §18 delta 10).
+    ///
+    /// The two are set together on purpose: a custom init with no declared placement is a 400, so a
+    /// setter that took only the init would build a request that cannot succeed.
+    #[must_use]
+    pub fn with_service_init(
+        mut self,
+        init: impl Into<String>,
+        placement: StewardPlacementDto,
+    ) -> Self {
+        self.init = Some(init.into());
+        self.steward_placement = Some(placement);
+        self
+    }
+
+    /// Declares the steward placement without a custom init (builder-style).
+    ///
+    /// `Pid1` restates the default; `Service { port }` with no `init` is the library's deliberately
+    /// legal combination (the steward is still PID 1, the host just treats it as a service).
+    #[must_use]
+    pub fn with_steward_placement(mut self, placement: StewardPlacementDto) -> Self {
+        self.steward_placement = Some(placement);
         self
     }
 
@@ -529,6 +635,101 @@ mod tests {
         // v22 additive fields default empty (an older client omitting them still parses).
         assert!(req.extra_disks.is_empty());
         assert!(req.extra_kernel_args.is_empty());
+        // v33 delta 10's additive fields: absent means "the daemon's pre-v33 shape" — no custom
+        // init, no declared placement. This assertion IS the migration note's "old clients
+        // unchanged" claim; without it the claim is only prose.
+        assert_eq!(req.init, None);
+        assert_eq!(req.steward_placement, None);
+        assert_eq!(req, CreateVmRequest::create("k", "r"));
+    }
+
+    // §18 delta 10 / Appendix A reversal 10 — the presence-attribute codec rule's NAMED test: the
+    // new fields ride the same JSON the bridge and the HTTP API speak, and JSON is chosen precisely
+    // because a non-self-describing codec collapses `#[serde(default)]` presence.
+    //
+    // The legs are populated ASYMMETRICALLY on purpose (one field `Some`, its sibling `None`, then
+    // swapped): a codec or a constructor that drops presence in one direction is invisible to a
+    // both-`Some` fixture, and a both-`None` fixture is the pre-delta state. The comparison is
+    // field-for-field on the whole value (`PartialEq`), never a byte compare — a field dropped on
+    // the first encode is dropped identically on the second, so bytes stay green while the value
+    // silently changed (the trap `fuzz_targets/daemon_bridge_frame.rs` documents).
+    //
+    // RED on the inverse (run, observed): give either field `#[serde(default, skip_serializing)]`
+    // instead of `#[serde(default)]` — the presence attribute then collapses in exactly one
+    // direction and the first leg fails with `steward_placement: Some(Service { port: 5100 })` sent
+    // and `None` decoded back. That is the postcard-class defect, reproduced on JSON.
+    #[test]
+    fn placement_fields_round_trip_over_json_with_asymmetric_presence() {
+        let legs = [
+            // init named, placement named: the delta's whole point.
+            CreateVmRequest::create("vmlinux", "rootfs.erofs").with_service_init(
+                "/vmcell-tools/mini-init",
+                StewardPlacementDto::Service { port: 5100 },
+            ),
+            // placement `Some`, init `None` — the deliberately legal library combination.
+            CreateVmRequest::create("vmlinux", "rootfs.erofs")
+                .with_steward_placement(StewardPlacementDto::Service { port: 5000 }),
+            // placement `Some` unit variants, init `None`.
+            CreateVmRequest::create("vmlinux", "rootfs.erofs")
+                .with_steward_placement(StewardPlacementDto::Pid1),
+            // the refusable one still has to survive the codec to BE refused with its own name.
+            CreateVmRequest::create("vmlinux", "rootfs.erofs")
+                .with_steward_placement(StewardPlacementDto::None),
+            // init `Some`, placement `None` — the shape the registry refuses; it must reach the
+            // registry intact to be refused, so the codec has to carry it.
+            CreateVmRequest {
+                init: Some("/sbin/init".to_string()),
+                ..CreateVmRequest::create("vmlinux", "rootfs.erofs")
+            },
+            // both absent: the old client.
+            CreateVmRequest::create("vmlinux", "rootfs.erofs"),
+        ];
+        for sent in legs {
+            let json = serde_json::to_string(&sent).expect("encode");
+            let back: CreateVmRequest = serde_json::from_str(&json).expect("decode");
+            assert_eq!(
+                back, sent,
+                "CreateVmRequest did not round-trip over JSON: {json}"
+            );
+        }
+
+        // The wire spellings themselves, pinned: a client (or a curl) writes these by hand, so a
+        // silent rename of a variant is a breaking wire change even though the Rust round-trip
+        // above would stay green through it.
+        let by_hand: CreateVmRequest = serde_json::from_str(
+            r#"{"kernel":"k","rootfs":"r","init":"/vmcell-tools/mini-init",
+                "steward_placement":{"service":{"port":5100}}}"#,
+        )
+        .expect("parse a hand-written service placement");
+        assert_eq!(by_hand.init.as_deref(), Some("/vmcell-tools/mini-init"));
+        assert_eq!(
+            by_hand.steward_placement,
+            Some(StewardPlacementDto::Service { port: 5100 })
+        );
+        for (text, want) in [
+            (r#""pid1""#, StewardPlacementDto::Pid1),
+            (r#""none""#, StewardPlacementDto::None),
+        ] {
+            let p: StewardPlacementDto = serde_json::from_str(text).expect("parse unit variant");
+            assert_eq!(p, want, "wire spelling {text}");
+            assert_eq!(serde_json::to_string(&want).expect("encode"), text);
+        }
+    }
+
+    // The daemon's REST placement law, stated once (`control_plane_retained`) and driven over every
+    // variant. Its parity with C8's `steward_port()` is pinned in `launcher.rs` (only that module
+    // links `vmcell`); this half pins the rule itself, KVM-free and feature-free.
+    //
+    // RED on the inverse: make `control_plane_retained` return `true` for `None`.
+    #[test]
+    fn only_a_stewardless_placement_loses_the_control_plane() {
+        assert!(StewardPlacementDto::Pid1.control_plane_retained());
+        assert!(StewardPlacementDto::Service { port: 5000 }.control_plane_retained());
+        assert!(StewardPlacementDto::Service { port: 5100 }.control_plane_retained());
+        assert!(
+            !StewardPlacementDto::None.control_plane_retained(),
+            "`none` is the one placement the daemon cannot own a VM through"
+        );
     }
 
     // §11 (The control-plane daemon (vmcelld))/§4.6 (Extra virtio-blk devices and disk-I/O throttling): an extra-disk spec with an io_limit parses, and the io_limit fields

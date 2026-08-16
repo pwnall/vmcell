@@ -26,6 +26,13 @@ use vmcell::artifact::{
 use vmcell::error::Error;
 use vmcell::feature::{Feature, FeatureDeclaration, Source, feature_manifest_path};
 
+/// The committed baseline's **second** `rootfs` label — §18 delta 9's systemd proof cell.
+///
+/// Named here because the roster assertions below are about the whole merged registry in byte
+/// order, so they have to name every baseline label, not just `default`. A rename of the pins key
+/// reddens them (the vector stops matching) rather than silently shrinking the roster they check.
+const SYSTEMD_LABEL: &str = "debian-systemd";
+
 /// Writes an overlay document into `dir` and returns its path.
 fn write_overlay(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("overlay.json");
@@ -300,10 +307,15 @@ fn an_overlay_label_is_additive_and_the_order_is_pinned() {
         labels,
         vec![
             "aa-first".to_string(),
+            // The baseline's second label, registered by §18 delta 9's proof cell. Spelled out
+            // rather than filtered away: the claim here is the WHOLE merged roster in byte order,
+            // and a test that dropped the baseline's non-default labels would stop noticing a
+            // baseline entry that sorts into the wrong place.
+            SYSTEMD_LABEL.to_string(),
             DEFAULT_LABEL.to_string(),
             "zz-last".to_string()
         ],
-        "labels must be byte-lexicographic, with the baseline's default kept"
+        "labels must be byte-lexicographic, with the baseline's own labels kept"
     );
 
     // And the labelled entries flatten to their own suffixed pins, which is what lets a stage
@@ -432,10 +444,14 @@ fn registering_a_label_builds_nothing_and_moves_no_existing_key() {
         labels,
         vec![
             "debian-latest".to_string(),
+            // `debian-latest` < `debian-systemd` on the byte order, so the baseline's proof-cell
+            // label lands between the overlay's two — which is exactly the interleaving a roster
+            // that merely appended the overlay would get wrong.
+            SYSTEMD_LABEL.to_string(),
             DEFAULT_LABEL.to_string(),
             "twin".to_string()
         ],
-        "both labels must be registered beside the baseline's default"
+        "both labels must be registered beside the baseline's own"
     );
 
     // 1. Same digest, same entry, same key.

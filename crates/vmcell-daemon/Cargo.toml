@@ -1,6 +1,12 @@
 [package]
 name = "vmcell-daemon"
-version = "0.2.0"
+# 0.2.0 → 0.3.0: v33 §18 delta 10 — steward placement over REST. The change is **wire-additive**
+# (`CreateVmRequest` grows `init` and `steward_placement`, both `#[serde(default)]`, so an existing
+# client's body still decodes and still produces the pre-v33 cell) but **source-breaking** for an
+# out-of-tree Rust caller building `CreateVmRequest` or `LaunchSpec` with a struct literal — neither
+# is `#[non_exhaustive]` nor `Default`, this crate is `publish = false`, and `cargo semver-checks`
+# does not cover it, so nothing would tell such a caller but this line.
+version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"

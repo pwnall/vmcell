@@ -23,7 +23,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use url::Url;
 use vmcell_daemon_client::DaemonClient;
-use vmcell_daemon_client::dto::{CreateVmRequest, ErrorKind, ExecRequestDto, NetMode};
+use vmcell_daemon_client::dto::{
+    CreateVmRequest, ErrorKind, ExecRequestDto, NetMode, StewardPlacementDto,
+};
 
 // ---- environment discovery ----
 
@@ -1104,5 +1106,132 @@ async fn group_sigint_tears_down_vms_leaving_no_orphan_vmm() {
         "a group SIGINT must not orphan the VMM; still running: {survivors:?}\n\
          --- daemon log ---\n{}",
         d.read_log()
+    );
+}
+
+// design §11.5 / §18 delta 10 — the daemon's placement exposure, end to end over REST.
+//
+// The claim: a REST-created cell whose PID 1 is NOT the vmcell steward still belongs to the daemon.
+// That is the whole scoping argument for the pre-v33 "no `init=` over REST" rule — its rationale was
+// "the daemon owns the VM through the vsock control plane", and `Service{port}` keeps that plane, so
+// the rule survives only as the `None` refusal. Nothing short of a booted guest can show it: the
+// KVM-free gates prove the fields reach `VmConfigBuilder`, and `FakeLauncher`/`FakeEngine` are blind
+// to whether a guest whose init is `mini-init` actually answers on the declared port.
+//
+// The init is `/vmcell-tools/mini-init` (the applet in `GUEST_TOOLS_APPLETS`, baked into the same
+// `rootfs.erofs` this store serves) on a NON-default port, so the leg drives the full
+// `vmcell_steward_port=` path — host cmdline token, guest bind, daemon dial — rather than passing by
+// accident on the 5000 both sides would have used anyway.
+//
+// Asserted on the DATA PLANE and on PID 1's identity, not on liveness: `exec` returns the guest's
+// bytes, and `/proc/1/comm` proves the custom init really replaced the steward (without that, a
+// silently ignored `init` field would leave an ordinary `Pid1` cell passing every other assertion).
+//
+// **STALE-ROOTFS WARNING**: `mini-init` is guest-side code. Rebuild with
+// `vmcell build --kernel-source host-make` after touching `vmcell-guest-tools`/`vmcell-steward`, or
+// this boots an image with no `/vmcell-tools/mini-init` and fails at create.
+#[tokio::test]
+#[ignore = "boots a real VM; needs KVM + blessed runner + artifacts (run via `just test-daemon`)"]
+async fn service_placement_cell_with_a_custom_init_is_owned_over_rest() {
+    let d = Daemon::start(Auth::Open).await;
+    let c = d.client("");
+
+    let created = c
+        .create_vm(
+            CreateVmRequest::create("vmlinux", "rootfs.erofs").with_service_init(
+                "/vmcell-tools/mini-init",
+                StewardPlacementDto::Service { port: 5100 },
+            ),
+        )
+        .await
+        .expect("a Service-placement cell with a custom init is exactly what delta 10 exposes");
+    let vm = created.vm;
+
+    // PID 1 is the custom init, not the steward — the fact that made this unexpressible before v33.
+    let who = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec!["/bin/cat".into(), "/proc/1/comm".into()]),
+        )
+        .await
+        .expect("exec through the control plane of a custom-init cell");
+    assert_eq!(who.code, 0, "exec exit code");
+    assert_eq!(
+        String::from_utf8_lossy(&who.stdout().expect("decode")).trim(),
+        "mini-init",
+        "PID 1 must be the declared custom init — if this says `vmcell-steward`, the daemon \
+         silently dropped the `init` field and the leg proves nothing"
+    );
+
+    // The control plane the rule's rationale is about is genuinely usable: a data-plane round trip
+    // and the stats route, both of which go through the steward at the DECLARED port.
+    let out = c
+        .exec(
+            &vm.id,
+            ExecRequestDto::new(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo service-cell-owned".into(),
+            ]),
+        )
+        .await
+        .expect("exec");
+    assert_eq!(out.stdout().expect("decode"), b"service-cell-owned\n");
+    let _stats = c
+        .stats(&vm.id)
+        .await
+        .expect("stats — the other verb the old rule said would be lost");
+
+    // And the daemon owns its teardown too.
+    c.destroy(&vm.id).await.expect("destroy");
+    assert!(
+        c.ls().await.expect("ls").is_empty(),
+        "a Service-placement cell is destroyed through the same registry as any other"
+    );
+}
+
+// §18 delta 10's refusal, over the REAL HTTP surface: a stewardless placement is a 400 (`bad_request`),
+// not a 500 and not a silent success — with the `Service` cell above as the positive control that the
+// refusal is about the placement, not about custom inits in general.
+//
+// KVM-free by construction (both legs are refused before any launch), so it runs wherever the daemon
+// starts.
+#[tokio::test]
+#[ignore = "spawns a real vmcelld; needs the blessed runner (run via `just test-daemon`)"]
+async fn a_stewardless_placement_is_rejected_400_over_rest() {
+    let d = Daemon::start(Auth::Open).await;
+    let c = d.client("");
+
+    for (leg, req) in [
+        (
+            "named outright",
+            CreateVmRequest::create("vmlinux", "rootfs.erofs")
+                .with_steward_placement(StewardPlacementDto::None),
+        ),
+        (
+            "a custom init with no placement",
+            CreateVmRequest {
+                init: Some("/vmcell-tools/mini-init".to_string()),
+                ..CreateVmRequest::create("vmlinux", "rootfs.erofs")
+            },
+        ),
+    ] {
+        let err = c
+            .create_vm(req)
+            .await
+            .expect_err("a stewardless cell is not expressible over REST");
+        assert_eq!(
+            err.kind(),
+            Some(ErrorKind::BadRequest),
+            "{leg}: a client error, never a 500 — {err}"
+        );
+        assert!(
+            err.to_string().contains("control plane"),
+            "{leg}: the refusal must name the rule's surviving half, got: {err}"
+        );
+    }
+    assert!(
+        c.ls().await.expect("ls").is_empty(),
+        "a refused create must leave no VM behind"
     );
 }

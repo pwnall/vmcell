@@ -16,8 +16,8 @@
 
 use crate::artifact_store::ArtifactStore;
 use crate::dto::{
-    CreateVmRequest, ExecOutcomeDto, ExecRequestDto, ResourceUsageDto, SnapshotInfo, VmId, VmInfo,
-    VmState,
+    CreateVmRequest, ExecOutcomeDto, ExecRequestDto, ResourceUsageDto, SnapshotInfo,
+    StewardPlacementDto, VmId, VmInfo, VmState,
 };
 use crate::error::{DaemonError, DaemonResult};
 use crate::launcher::{LaunchSpec, VmHandle, VmLauncher};
@@ -230,6 +230,10 @@ impl Registry {
                 req.net
             )));
         }
+        // Fail loud early on a placement the daemon cannot own (design §11.5, §18 delta 10), at the
+        // daemon's OWN boundary rather than deferring to the config builder — see
+        // `resolve_steward_placement` for why deferring would be a different rule.
+        let steward_placement = resolve_steward_placement(&req)?;
         // Resolve a `restore_from` prefix to its snapshot directory in the store (the same validated
         // single-component join as any artifact, invariant §13, Cross-cutting invariants).
         let restore_from = match &req.restore_from {
@@ -272,6 +276,8 @@ impl Registry {
             restore_from,
             extra_disks,
             extra_kernel_args: req.extra_kernel_args.clone(),
+            init: req.init.as_deref().map(PathBuf::from),
+            steward_placement,
         };
         let handle = self.launcher.launch(&spec).await?;
         let id = self.mint_id();
@@ -549,6 +555,60 @@ fn handle_mut<'a>(inner: &'a mut VmInner, id: &VmId) -> DaemonResult<&'a mut Box
         .ok_or_else(|| DaemonError::NotFound(format!("vm {id} has been torn down")))
 }
 
+/// Resolves the steward placement a create request declares, refusing the one the daemon cannot own
+/// (design §5.3, The kernel command line / §11.5, The HTTP REST API and its OpenAPI document; §18
+/// delta 10).
+///
+/// **This is the daemon's one placement law.** The pre-v33 rule was "no `init=` over REST", with the
+/// rationale that the daemon owns every VM it creates through the vsock control plane and could not
+/// `exec` or `stats` a VM whose init replaced the steward. v33 scoped the rule by that same
+/// rationale: `Service { port }` keeps the control plane, so a custom init is now expressible, and
+/// only the rationale's surviving half — a placement with **no** steward — stays unexpressible.
+/// [`StewardPlacementDto::control_plane_retained`] is that half, stated once.
+///
+/// Two ways a client can ask for a stewardless cell, and both are a **400**:
+///
+/// 1. Naming `"none"` outright.
+/// 2. Naming a custom `init` and no placement. The daemon does not guess: `VmConfigBuilder::build()`
+///    *derives* `StewardPlacement::None` from `init: Some`, so a daemon that forwarded the init and
+///    left the placement unset would silently produce exactly the placement this rule keeps off
+///    REST — and the failure would surface downstream in `MicroVm::steward` as a *steward* error,
+///    which is a different rule, a different message, and a 500-shaped one. Note this reads
+///    `req.init` for request COMPLETENESS, never to derive a placement (C8): the answer here is a
+///    refusal, not a placement inferred from an init spelling.
+///
+/// Everything else the library already refuses fail-loud with its own message, mapped to 400 by
+/// `DaemonError::from(vmcell::Error::Config)`: `Pid1` beside a custom init, and a `Service` port of
+/// `0`/`u32::MAX`. Re-checking those here would be a second copy that can diverge.
+fn resolve_steward_placement(req: &CreateVmRequest) -> DaemonResult<StewardPlacementDto> {
+    let Some(declared) = req.steward_placement else {
+        if req.init.is_some() {
+            return Err(DaemonError::BadRequest(
+                "a custom `init` over REST must declare `steward_placement` — \
+                 {\"service\":{\"port\":N}}, the port the guest's own init starts the steward on. \
+                 The daemon owns every VM it creates through the vsock control plane, and an \
+                 undeclared placement beside an `init` means StewardPlacement::None: no steward to \
+                 exec, stats, snapshot or destroy the VM through. Use the vmcell library directly \
+                 for a stewardless VM."
+                    .to_string(),
+            ));
+        }
+        // No init, no placement: the pre-v33 default. Stated explicitly here so the launcher can
+        // hand the builder an explicit placement on every path (see `LaunchSpec::steward_placement`).
+        return Ok(StewardPlacementDto::Pid1);
+    };
+    if !declared.control_plane_retained() {
+        return Err(DaemonError::BadRequest(format!(
+            "steward_placement {declared:?} is not expressible over REST: the daemon owns every VM \
+             it creates through the vsock control plane, and this placement has no steward to exec, \
+             stats, snapshot or destroy the VM through. Declare \"pid1\" (the vmcell steward is \
+             PID 1) or {{\"service\":{{\"port\":N}}}} (the guest's own init starts it); use the \
+             vmcell library directly for a stewardless VM."
+        )));
+    }
+    Ok(declared)
+}
+
 /// splitmix64 — a tiny, well-mixed integer hash so VM ids are not a bare guessable counter.
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -650,15 +710,25 @@ mod tests {
         }
     }
 
+    /// The `LaunchSpec`s a [`FakeLauncher`] was handed, in order.
+    ///
+    /// The fake used to take `_spec: &LaunchSpec` and discard it, which made every registry-level
+    /// assertion about a request FIELD vacuous: nothing in the tree observed what the registry
+    /// actually put in the spec. `CreateVmRequest` → `LaunchSpec` is one of the two unobserved hops
+    /// on a new field's path (the other is the broker bridge, gated in `bridge/tests.rs`).
+    type LaunchLog = Arc<std::sync::Mutex<Vec<LaunchSpec>>>;
+
     struct FakeLauncher {
         next_vmid: AtomicU64,
         shutdowns: Arc<AtomicUsize>,
         snapshot_behavior: SnapshotBehavior,
+        launches: LaunchLog,
     }
 
     #[async_trait]
     impl VmLauncher for FakeLauncher {
-        async fn launch(&self, _spec: &LaunchSpec) -> DaemonResult<Box<dyn VmHandle>> {
+        async fn launch(&self, spec: &LaunchSpec) -> DaemonResult<Box<dyn VmHandle>> {
+            self.launches.lock().expect("launch log").push(spec.clone());
             Ok(Box::new(FakeHandle {
                 vmid: self.next_vmid.fetch_add(1, Ordering::SeqCst) as u32,
                 shutdowns: self.shutdowns.clone(),
@@ -668,25 +738,37 @@ mod tests {
     }
 
     fn registry() -> (Registry, Arc<AtomicUsize>, tempfile::TempDir) {
-        registry_with(SnapshotBehavior::Normal)
+        let (reg, shutdowns, _log, dir) = registry_capturing(SnapshotBehavior::Normal);
+        (reg, shutdowns, dir)
     }
 
     fn registry_with(
         snapshot_behavior: SnapshotBehavior,
     ) -> (Registry, Arc<AtomicUsize>, tempfile::TempDir) {
+        let (reg, shutdowns, _log, dir) = registry_capturing(snapshot_behavior);
+        (reg, shutdowns, dir)
+    }
+
+    /// A registry over a **capturing** [`FakeLauncher`], handing back the log of every
+    /// [`LaunchSpec`] the registry built.
+    fn registry_capturing(
+        snapshot_behavior: SnapshotBehavior,
+    ) -> (Registry, Arc<AtomicUsize>, LaunchLog, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifacts =
             ArtifactStore::open(dir.path().join("artifacts"), 1 << 20).expect("artifacts");
         artifacts.create("vmlinux", b"kernel").expect("kernel");
         artifacts.create("rootfs.erofs", b"rootfs").expect("rootfs");
         let shutdowns = Arc::new(AtomicUsize::new(0));
+        let launches: LaunchLog = Arc::default();
         let launcher = FakeLauncher {
             next_vmid: AtomicU64::new(1),
             shutdowns: shutdowns.clone(),
             snapshot_behavior,
+            launches: launches.clone(),
         };
         let reg = Registry::new(Box::new(launcher), artifacts, 0xdead_beef);
-        (reg, shutdowns, dir)
+        (reg, shutdowns, launches, dir)
     }
 
     fn create_req() -> CreateVmRequest {
@@ -1105,5 +1187,262 @@ mod tests {
         let b = reg.create(create_req()).await.expect("b");
         assert_ne!(a.info.id, b.info.id);
         assert!(a.info.id.0.starts_with("vm-"));
+    }
+
+    // ---- v33 delta 10: daemon placement exposure (design §11.5, §18 delta 10) ----
+
+    // The second unobserved hop, now observed: what the REST client sent reaches `LaunchSpec`
+    // field-for-field. Driven ASYMMETRICALLY (init `Some` with placement `Some`, then placement
+    // `Some` with init `None`) so a field dropped in the middle of the chain shows up — the shape a
+    // both-`Some` fixture cannot see.
+    //
+    // RED on the inverse: drop `init: req.init...` from the `LaunchSpec` literal in `create` (the
+    // first leg's init assertion fails), or hardcode `steward_placement: StewardPlacementDto::Pid1`
+    // there (the port assertion fails).
+    #[tokio::test]
+    async fn create_forwards_init_and_placement_to_the_launch_spec() {
+        let (reg, _s, log, _d) = registry_capturing(SnapshotBehavior::Normal);
+
+        reg.create(create_req().with_service_init(
+            "/vmcell-tools/mini-init",
+            StewardPlacementDto::Service { port: 5100 },
+        ))
+        .await
+        .expect("Service + custom init is exactly what delta 10 exposes");
+        // Sibling `None`: a placement with no init (the library's deliberately legal combination).
+        reg.create(
+            create_req().with_steward_placement(StewardPlacementDto::Service { port: 5000 }),
+        )
+        .await
+        .expect("Service with no init composes");
+        // Neither named: the pre-v33 shape, resolved to an EXPLICIT Pid1 so the builder's
+        // derivation is never reached.
+        reg.create(create_req()).await.expect("default create");
+
+        let specs = log.lock().expect("log");
+        assert_eq!(specs.len(), 3, "three creates, three specs");
+        assert_eq!(
+            specs[0].init.as_deref(),
+            Some(std::path::Path::new("/vmcell-tools/mini-init")),
+            "the custom init must reach the launcher"
+        );
+        assert_eq!(
+            specs[0].steward_placement,
+            StewardPlacementDto::Service { port: 5100 },
+            "the declared port must reach the launcher unchanged"
+        );
+        assert_eq!(specs[1].init, None, "the sibling stays absent");
+        assert_eq!(
+            specs[1].steward_placement,
+            StewardPlacementDto::Service { port: 5000 }
+        );
+        assert_eq!(specs[2].init, None);
+        assert_eq!(
+            specs[2].steward_placement,
+            StewardPlacementDto::Pid1,
+            "an unnamed placement resolves to an EXPLICIT Pid1 — the whole point of the \
+             non-optional LaunchSpec field"
+        );
+    }
+
+    // §18 delta 10's refusal, both spellings, each a 400 that names the rule — with the `Service`
+    // positive control proving the refusal is about the placement and not about custom inits.
+    //
+    // RED on the inverse: delete the `resolve_steward_placement` call from `Registry::create`. Both
+    // negative legs then succeed (the fake launcher never builds a config), which is precisely the
+    // silent-`None` outcome the check exists to prevent.
+    #[tokio::test]
+    async fn a_stewardless_placement_is_refused_400_however_it_is_spelled() {
+        let (reg, _s, log, _d) = registry_capturing(SnapshotBehavior::Normal);
+
+        for (leg, req) in [
+            (
+                "named outright",
+                create_req().with_steward_placement(StewardPlacementDto::None),
+            ),
+            (
+                "a custom init with no placement",
+                CreateVmRequest {
+                    init: Some("/sbin/init".to_string()),
+                    ..create_req()
+                },
+            ),
+        ] {
+            let err = reg
+                .create(req)
+                .await
+                .expect_err("a stewardless cell is not expressible over REST");
+            assert_eq!(
+                err.kind().status_code(),
+                400,
+                "{leg}: a client error, never a 500 — {}",
+                err.message()
+            );
+            assert!(
+                err.message().contains("control plane"),
+                "{leg}: the refusal must name the rule's surviving half, got: {}",
+                err.message()
+            );
+        }
+        assert!(
+            log.lock().expect("log").is_empty(),
+            "a refused placement must never reach the launcher"
+        );
+
+        // Positive control: the SAME custom init, with a placement that keeps the control plane,
+        // creates. Without this the negative legs would also pass if `create` rejected every init.
+        reg.create(
+            create_req()
+                .with_service_init("/sbin/init", StewardPlacementDto::Service { port: 5100 }),
+        )
+        .await
+        .expect("a custom init WITH a Service placement is exactly what delta 10 exposes");
+        assert_eq!(
+            log.lock().expect("log").len(),
+            1,
+            "the positive control did reach the launcher"
+        );
+    }
+}
+
+/// **Delta 10's daemon-side call-site scan** (design §18 delta 10; the register's "a gate binds the
+/// call sites, not just the extracted predicate" convention).
+///
+/// `vmcell`'s own `c8_call_site_gate` builds its corpus from `include_str!("orchestrator.rs")` +
+/// `include_str!("config.rs")`, so it structurally cannot see this crate — and `vmcell-daemon` is not
+/// one of the two `cargo semver-checks` contract crates either. Neither existing gate would catch a
+/// daemon that re-derived control-plane availability from `req.init`, which is the conflation v33
+/// removed at seven library sites and would re-enter here on the platform's third entry surface.
+#[cfg(test)]
+mod delta10_call_site_gate {
+    /// The daemon's request-handling sources, comment-stripped, as `(file, line, code)`.
+    fn production_lines() -> Vec<(&'static str, usize, String)> {
+        let mut out = Vec::new();
+        for (name, body) in [
+            ("registry.rs", include_str!("registry.rs")),
+            ("launcher.rs", include_str!("launcher.rs")),
+            ("dto.rs", include_str!("dto.rs")),
+            ("server.rs", include_str!("server.rs")),
+        ] {
+            // Production only: the `#[cfg(test)]` modules below legitimately name `init` and every
+            // placement variant while driving them.
+            let prod = body.split("\n#[cfg(test)]\n").next().unwrap_or(body);
+            for (i, l) in prod.lines().enumerate() {
+                let code = l.split("//").next().unwrap_or("");
+                if !code.trim().is_empty() {
+                    out.push((name, i + 1, code.to_string()));
+                }
+            }
+        }
+        assert!(
+            out.len() > 900,
+            "the scan found only {} production lines — it is not reading the sources, so every \
+             assertion below would pass vacuously",
+            out.len()
+        );
+        out
+    }
+
+    /// **C8, daemon side: `req.init` decides init IDENTITY only.**
+    ///
+    /// Exactly two production sites may read it — the `LaunchSpec` move (identity, forwarded to
+    /// `VmConfigBuilder::init`) and `resolve_steward_placement`'s completeness refusal, which
+    /// answers "this request is incomplete", never "therefore the placement is X". A third reader
+    /// deriving reachability from an init spelling is this law's violation, and it is the exact
+    /// shape v33 removed from the library.
+    #[test]
+    fn req_init_is_never_read_to_decide_a_placement() {
+        let readers: Vec<String> = production_lines()
+            .into_iter()
+            .filter(|(_, _, code)| {
+                code.contains("req.init")
+                    || code.contains("spec.init")
+                    || code.contains(".init.is_")
+            })
+            .map(|(f, l, code)| format!("{f}:{l}: {}", code.trim()))
+            .collect();
+        assert!(
+            readers.len() >= 2,
+            "the scan matched {} init readers — the daemon must forward an init and refuse an \
+             undeclared placement, so a scan finding fewer is not reading the code: {readers:#?}",
+            readers.len()
+        );
+        for r in &readers {
+            assert!(
+                r.contains("init: req.init.as_deref().map(PathBuf::from)")  // the LaunchSpec move
+                    || r.contains("if req.init.is_some()")                  // the completeness refusal
+                    || r.contains("if let Some(init) = &spec.init")          // the builder call site
+                    || r.contains("builder.init(init.clone())"),
+                "delta 10 / C8: `{r}` reads `init` for something other than init IDENTITY. \
+                 Control-plane availability is `StewardPlacementDto::control_plane_retained()` \
+                 over the DECLARED `steward_placement`; deriving it from an `init` spelling is the \
+                 conflation v33 removed at seven library sites."
+            );
+        }
+    }
+
+    /// **The daemon always hands the builder an explicit placement.**
+    ///
+    /// `VmConfigBuilder::build()` derives `StewardPlacement::None` when `init` is `Some` and no
+    /// placement is named — the one placement REST must not express. The daemon keeps that
+    /// derivation unreachable by calling `.steward_placement(...)` unconditionally, which is only
+    /// true while `LaunchSpec::steward_placement` is not an `Option` and the call is not inside a
+    /// conditional. Both halves are asserted, because a later "tidy-up" to
+    /// `if let Some(p) = spec.steward_placement` compiles and silently re-opens the derivation.
+    #[test]
+    fn the_builder_is_always_handed_an_explicit_placement() {
+        let lines = production_lines();
+        let calls: Vec<&(&str, usize, String)> = lines
+            .iter()
+            .filter(|(_, _, c)| c.contains(".steward_placement(steward_placement("))
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one production site may name the placement on the builder chain; found \
+             {calls:#?}"
+        );
+        // The field it reads cannot be optional — the load-bearing half. `Option` there makes
+        // `if let Some(p) = spec.steward_placement` compile, and that conditional is exactly how
+        // `build()`'s derivation gets back in.
+        assert!(
+            lines.iter().any(|(f, _, c)| *f == "launcher.rs"
+                && c.contains("pub steward_placement: StewardPlacementDto")),
+            "`LaunchSpec::steward_placement` must stay non-optional: an `Option` there re-opens \
+             `build()`'s `init: Some` ⇒ `StewardPlacement::None` derivation at the type level"
+        );
+        // …and no production site guards the placement behind a conditional, whichever way it is
+        // spelled.
+        for (f, l, c) in &lines {
+            assert!(
+                !(c.contains("steward_placement") && (c.contains("if ") || c.contains("match "))),
+                "the placement must reach the builder UNCONDITIONALLY — {f}:{l}: `{}` guards it",
+                c.trim()
+            );
+        }
+    }
+
+    /// **The REST placement law is stated once.**
+    ///
+    /// `control_plane_retained()` is read at exactly one production site (the registry's refusal).
+    /// A second reader is a second copy of the rule — the shape every duplicated law in this tree
+    /// has already diverged into.
+    #[test]
+    fn the_rest_placement_law_has_one_call_site() {
+        let sites: Vec<String> = production_lines()
+            .into_iter()
+            .filter(|(f, _, c)| c.contains("control_plane_retained()") && *f != "dto.rs")
+            .map(|(f, l, c)| format!("{f}:{l}: {}", c.trim()))
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "one law, one predicate, one call site (the definition in dto.rs is excluded); found \
+             {sites:#?}"
+        );
+        assert!(
+            sites[0].starts_with("registry.rs:"),
+            "the refusal belongs at the daemon's own boundary, before `LaunchSpec`: {sites:#?}"
+        );
     }
 }

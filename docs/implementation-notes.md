@@ -4523,13 +4523,113 @@ now, through one pure predicate beside `probe_permits_unlink`, with the errno tr
 on this host rather than assumed — a leftover regular file, a directory and an unlistened stream
 socket all answer `ECONNREFUSED`; a bound dgram socket answers `EPROTOTYPE`.
 
+## v33 delta 10 — daemon placement exposure (design §18 delta 10, §11.5), as built
+
+**What landed.** `CreateVmRequest` grows `init` and `steward_placement`, the launcher honors both,
+and a placement with no steward is a 400 that names why.
+
+**The DTO mirrors the config enum because it structurally must.** `vmcell` is an *optional*
+dependency behind the `server` feature and `vmcell-daemon-client` links `default-features = false`,
+so `dto.rs` cannot name a `vmcell` type at all — `cargo check -p vmcell-daemon
+--no-default-features` is the proof. The mirror is a compile constraint, not a style choice. Nesting
+`init` inside the `Service` variant was considered and rejected: §3.5's whole reframe is that
+placement and init *identity* are two facts, and folding them back together would undo it.
+
+**`None` is representable and refused, not unrepresentable.** §18 delta 10 says the fields express
+"`Service{port}` with a custom init only"; the gate row demands a `None`-rejected-400 arm, which
+needs `None` on the wire to refuse. The gate row wins: an unrepresentable variant makes the rule
+leak as serde's "unknown variant" parse error, which names nothing and teaches the client nothing.
+§11.5's "stays unexpressible" holds either way — no `None` cell can be created over REST.
+
+**`build()`'s derivation is made unreachable rather than mirrored.** `VmConfigBuilder::build()`
+derives `StewardPlacement::None` when `init` is `Some` and no placement is named, which is exactly
+the one placement REST must not produce. The daemon never reaches it: `LaunchSpec::steward_placement`
+is **not** an `Option` and `vm_config()` calls `.steward_placement(…)` unconditionally. Re-deriving
+the rule daemon-side would have been a second copy of a law, and this tree's history is that every
+duplicate diverges. Everything the library already refuses typed — `Pid1` + init, a zero port,
+snapshotting beside a non-`Pid1` placement — reaches the client as a 400 through the existing
+`Error::Config` mapping, with no daemon-side copy.
+
+**Two fakes discarded their arguments, not one.** `FakeEngine::create(_req)` was the known one;
+`FakeLauncher::launch(&self, _spec)` was not, so the field's path had **two** unobserved hops and
+adding fields would have shipped two green blind tests. Both capture now and compare field-for-field
+with one field `Some` and a sibling `None`. The demonstration is on the record: under a planted
+request-dropping bug the new gate reddens while `engine_rpc_round_trips_every_op` still prints `ok`.
+
+## v33 delta 9 — the systemd proof cell (design §18 delta 9), as built
+
+**What landed.** `debian-systemd` registered by digest, a cell booting **real systemd as PID 1**
+with the steward as a unit under `Service` placement, the §10.6 conformance kit run over the
+composition, and `just test-systemd` — the opt-in recipe AGENTS.md had been describing in the
+present tense at three sites.
+
+**The design's example image does not exist, and this is the deviation.** §10.5 registers
+`debian-systemd` against `docker.io/library/debian`, and no digest of that repo ships systemd — it
+is the base/slim variant, verified against the cached layer (no `usr/lib/systemd/systemd`, no
+`systemctl`, no `/sbin/init`). The cell registers `docker.io/jrei/systemd-debian` instead, pinned to
+its **amd64 sub-manifest** rather than the multi-arch index: the fetcher resolves an index fine, but
+pinning the sub-manifest matches `rootfs.default`'s convention and pins the architecture. It is a
+third-party repo, which the digest discipline makes mechanically safe and which a reviewer should
+still see named here.
+
+**The entry declares `xattrs: "strip"`, and that is a measurement.** All four layers were scanned
+for `SCHILY.xattr` records: there are none. Declaring `preserve` would have derived a claim the
+§10.6 kit then correctly reports as broken.
+
+**The unit is enabled by a drop-in, not a symlink and not a cmdline token.** `ExtraFile` is
+regular-files-only, so a `multi-user.target.wants/` symlink cannot be baked. `systemd.wants=` would
+have worked — and that is the argument against it: `systemd.*` is unreserved, so the token would be
+*accepted*, which under F3's alias law is precisely the shape that lets a guest-visible knob collide
+with an owned one later. A `multi-user.target.d/*.conf` drop-in is a plain regular file and needs no
+reservation.
+
+**The gate as specified is unreachable, and the shipped one says why.** §18's leg expects a
+placement refusal from a `Service` cell whose steward never starts. It cannot happen: for
+`Service{port}` `steward_port()` is always `Some`, so `MicroVm::steward` never takes the placement
+fail-loud arm and the cell yields `Error::Timeout`. The leg asserts the timeout, that the message
+does **not** name `StewardPlacement::None` (the refusal-identity half), and a wire-level dial — with
+systemd's own console output as corroboration.
+
+**A vacuous serial assertion, caught by measuring rather than reading.** The first needle was
+`"systemd"`, which the kernel itself echoes in `Command line: … init=/usr/lib/systemd/systemd …`
+before systemd runs at all. The shipped needle is two halves — `"Reached target "` and
+`"multi-user.target"` — matched across systemd's ANSI escapes.
+
+**The kit found a real under-claim, and it is a finding about the design.** The artifact declares
+`snapshot_restore: false`, but booted the ordinary `Pid1` way it snapshots and restores fine; what
+cannot snapshot is this cell's `Service` **placement**, which is a per-op eligibility arm rather than
+an intersection axis. §10.6's definition makes that an under-claim, so the honest verdict is a
+dispositioned `Warn` and the test asserts exactly that — including that the message names the
+positive control, so the paired probe demonstrably ran twice. The two halves of §18 delta 9's *What*
+are in tension here: dropping the artifact-level stance would make the delta's own
+`why_absent(SnapshotRestore) → Source::Rootfs(…)` assertion unsatisfiable. The shipped test
+satisfies both by dispositioning the warning.
+
+**Opt-in had to be enforced, not merely recipe-shaped.** A filter like `test(systemd_cell)` is also
+selected by `test-privileged`'s `!(test(unprivileged) | test(smoltcp))`, so writing the recipe would
+have started a 59 MB pull on every privileged run. The legs carry a compile-time opt-in token whose
+absence is `error[E0423]`, and under `test-privileged`'s exact filterset they finish in 8 ms
+recording a capability skip. The `usb_passthrough` self-skip is the precedent.
+
+**`Source::Rootfs` carries a filename, not a label — the test asserts the code.** §18 delta 9's text
+and `feature.rs`'s `axis_rank` doc both say `Source::Rootfs("debian-systemd")`, while
+`resolve_cell_features` builds it from `image.file_name()`. Three landed delta-6c gates already pin
+the filename form, so changing the constructor is a behavior change that reddens a landed delta's
+gates — its own delta with its own sweep, not delta 9's. The assertion recomputes the name through
+`rootfs_filename` and records the divergence at the site.
+
+**Recorded, pre-existing, and sharper on a full distro:** vmcell's injection manifest overwrites
+`etc/ssl/certs/ca-certificates.crt` on every image, so a consumer booting this artifact *with*
+networking inherits vmcell's proxy CA in place of Debian's. The cell runs `.network_disabled()`, so
+nothing here notices.
+
 ## Where the v33 pass stands
 
 Deltas 1–5 of the §18 register are landed, pushed and live-validated. **6a and 6b were live-validated
 at this pass's start** — privileged 177/177, unprivileged 4/4, daemon 14/14, validator 3/3, seven
 capability skips, all Firecracker. (`docs/88`'s stated bar of "privileged 162/162" was itself the
-*delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **6c and 7 are
-landed**; 8–10 follow.
+*delta-5* figure; 6a/6b's two new registry batteries account for the other fifteen.) **6c, 7, 9 and
+10 are landed**; only **8** — the ext4 producer, which §18 declares separable — remains.
 
 `docs/88-claude-handoff-notes-v4.md` is the pick-up point. It carries the remaining inventory, what
 6a/6b moved under deltas 7–10, the operational knowledge that is not a design fact and so has no

@@ -18,16 +18,28 @@ fn vminfo(id: &str) -> VmInfo {
     }
 }
 
+/// The `CreateVmRequest`s a [`FakeEngine`] received, in order — the parent→broker direction's
+/// only observation point.
+///
+/// The fake used to take `_req: CreateVmRequest` and discard it, so **no test in the tree proved
+/// that any `CreateVmRequest` field survived the bridge**: `engine_rpc_round_trips_every_op` would
+/// have stayed green if `BrokerClientEngine::create` had forwarded a freshly built default request
+/// instead of the caller's. Capturing it is what makes a field-for-field comparison possible.
+pub(super) type CreateLog = Arc<std::sync::Mutex<Vec<CreateVmRequest>>>;
+
 /// A fake engine with no KVM. `slow_get` sleeps so a concurrency test can prove the multiplex; a
 /// `get` of `"nope"` returns a typed `NotFound` so the error path round-trips. Shared with the
 /// sibling deadline gates rather than copied (one fake, one behavior to reason about).
 pub(super) struct FakeEngine {
     slow_get_ms: u64,
+    /// Every `create` this engine was handed (see [`CreateLog`]).
+    creates: CreateLog,
 }
 
 #[async_trait]
 impl VmEngine for FakeEngine {
-    async fn create(&self, _req: CreateVmRequest) -> DaemonResult<CreateVmResponse> {
+    async fn create(&self, req: CreateVmRequest) -> DaemonResult<CreateVmResponse> {
+        self.creates.lock().expect("create log").push(req);
         Ok(CreateVmResponse {
             vm: vminfo("vm-1"),
             exec: None,
@@ -93,13 +105,24 @@ impl VmEngine for FakeEngine {
 /// A [`FakeEngine`] served over a real socketpair, with the parent-side client wired to the
 /// **derived** per-request budget (`BrokerClientEngine::new`, i.e. `call_budget`) — not an override.
 pub(super) fn serve_fake(slow_get_ms: u64) -> BrokerClientEngine {
+    serve_fake_capturing(slow_get_ms).0
+}
+
+/// [`serve_fake`], also handing back the log of every `CreateVmRequest` that reached the far
+/// (broker) side of the socketpair — the observation point a field-forwarding gate needs.
+pub(super) fn serve_fake_capturing(slow_get_ms: u64) -> (BrokerClientEngine, CreateLog) {
     let (client_sock, broker_sock) = tokio::net::UnixStream::pair().expect("socketpair");
-    let engine: Arc<dyn VmEngine> = Arc::new(FakeEngine { slow_get_ms });
+    let creates: CreateLog = Arc::default();
+    let engine: Arc<dyn VmEngine> = Arc::new(FakeEngine {
+        slow_get_ms,
+        creates: creates.clone(),
+    });
     tokio::spawn(serve_engine(engine, broker_sock));
     // `BrokerClientEngine::new` spawns the reply reader — must be inside a runtime (we are).
-    Arc::try_unwrap(BrokerClientEngine::new(client_sock))
+    let client = Arc::try_unwrap(BrokerClientEngine::new(client_sock))
         .map_err(|_| ())
-        .expect("sole owner")
+        .expect("sole owner");
+    (client, creates)
 }
 
 // Guards §12.4 (Layer 3 — the setup broker (network surface never holds caps)): every op forwards to the broker and its reply round-trips over the real
@@ -227,4 +250,75 @@ async fn read_frame_rejects_over_cap_length() {
         .await
         .expect_err("an over-cap length must be rejected");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+// §18 delta 10 / Appendix A reversal 10 — the first of the two unobserved hops on a request field's
+// path, now observed: what the HTTP parent sends arrives at the cap-holding broker child
+// **field-for-field**, over the real socketpair and the real length-prefixed JSON codec.
+//
+// This is the gate `engine_rpc_round_trips_every_op` above could never be. It sends an all-defaults
+// request and its fake discarded the argument entirely, so it stayed green for any forwarding bug —
+// including a `create` that rebuilt the request from `kernel`+`rootfs` and dropped everything else.
+//
+// The legs populate the new fields ASYMMETRICALLY (init `Some` + placement `Some`; placement `Some`
+// + init `None`; both `None`). A `#[serde(default)]` presence attribute collapses in ONE direction,
+// so a both-`Some` fixture cannot see it — the postcard trap the JSON choice exists to avoid, on the
+// codec it actually ships over.
+//
+// RED on the inverse (run before accepting): forward a rebuilt request from
+// `BrokerClientEngine::create` —
+// `self.call(EngineRequest::Create(CreateVmRequest::create(&req.kernel, &req.rootfs)))` — and every
+// leg's `assert_eq!` fails on the dropped fields.
+#[tokio::test]
+async fn a_create_requests_fields_survive_the_bridge_field_for_field() {
+    let (client, creates) = serve_fake_capturing(0);
+
+    let sent = [
+        // init `Some`, placement `Some`: the delta's whole point.
+        CreateVmRequest::create("vmlinux", "rootfs.erofs")
+            .with_service_init(
+                "/vmcell-tools/mini-init",
+                crate::dto::StewardPlacementDto::Service { port: 5100 },
+            )
+            .with_kernel_arg("mitigations=off"),
+        // placement `Some`, init `None` — the asymmetric sibling.
+        CreateVmRequest::create("vmlinux", "rootfs.erofs")
+            .with_steward_placement(crate::dto::StewardPlacementDto::Pid1),
+        // init `Some`, placement `None` — the shape the registry refuses; it must still ARRIVE
+        // intact, or the refusal would be the bridge's accident rather than the rule.
+        CreateVmRequest {
+            init: Some("/sbin/init".to_string()),
+            ..CreateVmRequest::create("vmlinux", "rootfs.erofs")
+        },
+        // both `None`: the old client, unchanged.
+        CreateVmRequest::create("vmlinux", "rootfs.erofs"),
+    ];
+    for req in &sent {
+        client.create(req.clone()).await.expect("create");
+    }
+
+    let got = creates.lock().expect("create log").clone();
+    assert_eq!(
+        got.len(),
+        sent.len(),
+        "every create reached the broker side"
+    );
+    for (i, (want, have)) in sent.iter().zip(got.iter()).enumerate() {
+        // Field-for-field on the WHOLE value, never a byte compare: a field dropped on the first
+        // encode is dropped identically on the second, so bytes stay green while the value changed.
+        assert_eq!(have, want, "leg {i} did not survive the bridge intact");
+    }
+    // Non-vacuity: the asymmetry the legs were built for actually reached the far side.
+    assert_eq!(
+        got[0].steward_placement,
+        Some(crate::dto::StewardPlacementDto::Service { port: 5100 })
+    );
+    assert_eq!(got[0].init.as_deref(), Some("/vmcell-tools/mini-init"));
+    assert_eq!(
+        got[1].init, None,
+        "the sibling stayed absent across the wire"
+    );
+    assert_eq!(got[2].steward_placement, None);
+    assert_eq!(got[3].init, None);
+    assert_eq!(got[3].steward_placement, None);
 }

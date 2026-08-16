@@ -256,6 +256,35 @@ test-usb-passthrough:
         cargo nextest run --locked --profile integration -p vmcell --features qemu --run-ignored all \
         --no-tests=fail -E 'kind(test) & test(usb_passthrough)'
 
+# v33 delta 9: the systemd proof cell — the capstone over placement (4), the service steward (5),
+# the registry (6) and xattr policy (7). Boots the digest-registered `debian-systemd` image with
+# REAL systemd as PID 1, the steward installed as one of its units under
+# `StewardPlacement::Service`, drives the control plane end to end (`exec`, `put_file`, sessions),
+# asserts the §7.4 provenance and §8.1's per-op refusal, and runs the §10.6 conformance kit over
+# the composition. Needs KVM and a blessed runner.
+#
+# OPT-IN, and the opt-in is IN THE TEST, not in this filter. `test-privileged`'s filterset excludes
+# only unprivileged/smoltcp, so it selects `test(systemd_cell)` too — writing a narrower filter here
+# would not keep the ~59 MB image pull off every KVM host. So the legs self-skip (recording a
+# reviewable capability skip) unless VMCELL_TEST_SYSTEMD is set, exactly as `usb_passthrough`
+# self-skips without a designated device, and this is the one place that sets it. The wiring is
+# gated in both directions by `systemd_cell::the_opt_in_is_declared_by_the_systemd_recipe_and_by_no_other`
+# — which reddens if this export moves, disappears, or shows up in another recipe.
+#
+# Its KVM-free halves (the registry laws, the placement matrix, the feature vocabulary, the xattr
+# policy) run everywhere under the ordinary unit gates; only the boot is opt-in.
+#
+# Run it under a delegated scope like every other live suite:
+#   systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-systemd
+test-systemd:
+    # H-TEST-3, like every sibling suite recipe: without the run-scoped export the legs' own
+    # capability skips land in the per-PID temp file nobody reads.
+    VMCELL_TEST_SYSTEMD=1 \
+    VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
+        cargo nextest run --locked --profile integration -p vmcell --run-ignored all \
+        --no-tests=fail -E 'kind(test) & test(systemd_cell)'
+
 # Reset the run-scoped capability-skip manifest. Run BEFORE a suite sequence (the CI kvm job does)
 # so the surfaced skips belong to this run and not to an accumulated history.
 skip-manifest-reset:

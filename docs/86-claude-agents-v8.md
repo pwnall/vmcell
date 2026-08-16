@@ -58,7 +58,7 @@ contract-surface bump must extend (see "The downstream toolkit contract").
 
 Design §18's register is the mechanism for directing changes that are **specified but not yet
 built**. The v30 downstream-platform register (deltas 1–9) is **landed**; the code no longer
-legitimately differs from it. **The v33 register is OPEN — ten deltas, 1–7 landed** (design §18): 1 the steward
+legitimately differs from it. **The v33 register is OPEN — ten deltas, 1–7, 9 and 10 landed** (design §18): 1 the steward
 rename; 2 the feature vocabulary + intersection (R3, §7.4); 3 the two-directional conformance kit
 (R4, §10.6); 4 steward placement (R1, §3.5); 5 the steward as a library / service mode (R5, §3.5);
 6 the artifact registry — rootfs + handler kinds, lazy, digest-only (R2+R7, §10.5); 7 external
