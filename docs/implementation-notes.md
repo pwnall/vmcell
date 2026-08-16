@@ -3808,8 +3808,14 @@ the boundary check is what shipped, with the rationale at the site.
 
 ## Where the design lives now
 
-`docs/79-claude-fable-design-v31.md` moved to `docs/historical/` (frozen at its published bytes) and
-the current design is `docs/82-claude-opus-design-v32.md`. **No reference in this file names the
+**v33 (2026-08-15):** `docs/82-claude-opus-design-v32.md` moved to `docs/historical/` (frozen at its
+published bytes) and the current design is the v33 revision — the serial-nexus consumer-platform
+pass, whose §18 opens a new ten-delta register (the steward rename; R1–R7). Both discovery gates
+were re-run green against the reissued tree at reissue time (`vmm::jail` 4/4;
+`vmcell-privilege` 23/23 — after pruning six orphaned pre-rename `.claude/worktrees/` checkouts
+whose stale 3-cap justfile copies the tree-walk gate correctly refused). Before that:
+`docs/79-claude-fable-design-v31.md` moved to `docs/historical/` and
+the v32 revision followed it. **No reference in this file names the current
 design by path** — nor should a new one: two gates find it by **discovery**, and a third mechanism
 pinned its filename and broke on this very reissue. `vmcell::vmm::jail`'s deny-list test parses
 §12.3's roster out of whichever non-historical `docs/*.md` carries that heading;
