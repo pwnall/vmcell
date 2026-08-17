@@ -23,7 +23,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
         # fetch-depth: 0 is load-bearing for the `public-API semver` step below, not tidiness. That
         # step passes `--baseline-rev ${{ github.event.pull_request.base.sha }}`, and the default
         # depth-1 fetch never puts that commit in the object store, so cargo-semver-checks exits 101
@@ -187,7 +187,7 @@ jobs:
   example-downstream:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install    # examples/ is a descendant dir, so the root pin governs it too
@@ -216,7 +216,7 @@ jobs:
       # here too. `just skip-manifest-*` and `record_capability_skip` both read this variable.
       VMCELL_SKIP_MANIFEST: ${{ github.workspace }}/target/vmcell-skip-manifest.txt
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install    # reads rust-toolchain.toml — channel 1.96.1 + clippy/rustfmt
@@ -362,7 +362,7 @@ jobs:
       # rubric row unenforced — a skip that nobody can read is an invisible pass.
       VMCELL_SKIP_MANIFEST: ${{ github.workspace }}/target/vmcell-skip-manifest.txt
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
         with: { persist-credentials: false }   # do not leave the token in .git/config (zizmor: artipacked)
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install    # reads rust-toolchain.toml — channel 1.96.1 + clippy/rustfmt
