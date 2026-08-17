@@ -5427,6 +5427,105 @@ The step's own gate is `ci_obtains_the_ext4_facility_rather_than_living_with_the
 keeps a fix to one copy from missing the other). `test-unit` also gained `VMCELL_SKIP_MANIFEST` plus the
 reset/show steps, because a recorded skip nobody surfaces is the invisible pass one level up.
 
+## Recorded (justified): the `mmdebstrap` handler selection is REFUSED, not honored (`vmcell-cli:906`)
+
+docs/90 asked for the dropped `applets` roster to be **honored**; the shipped answer refuses instead —
+`reject_unbakeable_handler_for_mmdebstrap` in `crates/vmcell-cli/src/main.rs`, called from the one
+composition root (`build_stages`). Refusing is right, and the honoring half is not deferred work:
+
+* **There is no reachable input to honor.** An `applets` roster beside a workspace `build` is refused by
+  the handler parser itself (`crates/vmcell/src/artifact/handler.rs`), the overlay merge is leaf-wise,
+  and the baseline's `default` entry carries that workspace leaf — so no overlay produces a default
+  handler declaring a roster. Honoring it would add a second `PackOptions` producer no test can drive,
+  which AGENTS rule 2 forbids.
+* **The stage carries no field for either half, deliberately.** `MmdebstrapRootfsStage::pack_options`
+  (`crates/vmcell-rootfs-builder/src/lib.rs`) is the single producer that both `run` and the identity
+  fold read, which is what keeps the image and its cache key naming one handler. Threading a label
+  through it gives this source a second answer to "which handler is this?" — the shape H1 hid behind for
+  a release.
+* **Refusal is F1's other half, and it is the actionable one.** The message names the entry, what cannot
+  be baked, and the fix (`--rootfs-source oci`). A labelled handler's alternative failure is a
+  missing-`guest_tools-<label>` artifact error stages later: advice the operator cannot act on.
+
+Trade-off: this source cannot bake a labelled handler at all, and a consumer that wants one changes
+rootfs source. The unreachability premise carries its own gate from the other side —
+`the_baseline_default_handler_declares_no_roster_of_its_own` reddens the day the baseline registers a
+digest-shaped default handler, which is the day the clause becomes reachable and the honoring question is
+worth re-opening. The refusal's own gate is
+`build_refuses_a_handler_registration_mmdebstrap_cannot_bake`.
+
+## Recorded: a failed digest-sidecar write ROLLS THE ARTIFACT BACK, best-effort — and the one residual burn
+
+`ArtifactStore::create` is all-or-nothing across both files it writes: a failed `write_sidecar` removes
+the persisted artifact before returning the 500, so the error reply describes the store's actual state
+(`crates/vmcell-daemon/src/artifact_store.rs`). Gate:
+`a_failed_sidecar_write_rolls_the_artifact_back`, which injects the failure out-of-band the way a real
+one arrives — a directory at the sidecar path, so the `rename` fails `EISDIR` — and asserts the name is
+free again afterwards.
+
+* **docs/90 §11's row for `artifact_store.rs:114` describes the pre-fix behavior as the fix.** It says
+  the create "keeps the name taken rather than rolling the artifact back" and quotes the warn string that
+  is only the *rollback's own* failure path. The code rolls back; that row is what is stale. Correcting
+  it belongs to that document.
+* **The rollback is best-effort, and that is the deliberate part.** If `remove_file` itself fails, the
+  name stays taken for the daemon's lifetime — the store is create-only, so the client can neither
+  re-create the name nor delete bytes it was told were rejected — and the only record is a `warn` naming
+  the artifact. The client already holds its 500, and a second error class for "the rollback failed too"
+  says nothing it can act on; the operator-visible consequence is that one log line plus a 409 on the
+  next `create` of the same name. The deterministic instance the finding named cannot reach this at all:
+  a name whose `<name>.sha256` would overrun `NAME_MAX` is a 400 at the boundary, because
+  `MAX_ARTIFACT_NAME_LEN` is `NAME_MAX` minus the suffix (`crates/vmcell-daemon/src/name.rs`), gated by
+  `create_rejects_a_name_whose_sidecar_would_not_fit`. What remains is a genuine `ENOSPC` or permission
+  failure, where a burned name is the honest report of a host the daemon cannot write to.
+
+## Recorded (justified): `run_battery`'s `fill_unrecorded` tail is DELETED, not repaired — and stays where it is live
+
+docs/90 `conformance.rs:633` reported a tail that could never fire, under a comment claiming a
+red-on-inverse it could not have. It is gone rather than made reachable: the battery's roster is complete
+**by construction** — `battery_inner` judges every `Feature::ALL` variant, `apply_warning_lifecycle`
+always pushes its own id, and `battery_check_ids` is composed from that same array — so no path returns
+`Ok` with a short roster (`crates/vmcell-artifact-validator/src/conformance.rs`). Repairing the tail
+would have meant inventing the path that reaches it. The property it claimed is real and is gated where
+it lives: `the_battery_reports_its_whole_roster_whatever_is_declared`, red on a `battery_inner` arm that
+`continue`s instead of judging.
+
+`fill_unrecorded` itself is **not** deleted. It is the tail of `validate()`'s level runners
+(`crates/vmcell-artifact-validator/src/checks.rs`, three call sites), where a level check genuinely can
+go unrecorded because the run stops early. Two batteries, one helper, one live caller — what was deleted
+is a call, not the mechanism.
+
+## Recorded (justified): two docs/90 deviations that are documentation, not code (A1, D4)
+
+* **A1 — `Cache` keeps its parameter and gains honest rustdoc.** The defect was the promise ("Cache for
+  previously built artifacts"), not the argument: caching is the per-stage `.cache_key` sidecar, and
+  nothing about a hit or a miss travels through the handle. `crates/vmcell/src/artifact/mod.rs` now says
+  exactly that. Dropping the parameter is the other half and is deliberately not done: `Pipeline` is named
+  §10.4 contract surface, so removing it is a ledgered break out-of-repo consumers are versioned
+  through — a release's work, not a review pass's. Gate:
+  `cache_handle_is_the_inert_placeholder_its_rustdoc_promises` — zero-sized, no inherent `impl`, every
+  `&Cache` parameter `_`-prefixed — so the day the handle starts carrying anything the rustdoc reddens
+  instead of going stale.
+* **D4 — the stale rosters are DELETED, not corrected.** `README.md`'s applet roster and the `justfile`'s
+  applet figure now point at what produces them (`vmcell_protocol::GUEST_TOOLS_APPLETS` and the recipe),
+  per AGENTS.md's pointer-over-figure rule. The trade-off is real: a reader opens a const or runs a
+  recipe instead of reading a number. A second copy that goes stale silently is worse, and both of these
+  had.
+
+## Recorded (justified): `config.rs`'s `fn_body` is a second copy, with its retirement condition
+
+Two `#[cfg(test)]` helpers extract "the `{ … }` body of the function with this signature" by brace
+counting, in different crates: `crates/vmcell-daemon/src/auth.rs` (the shipped idiom — the constant-time
+compare's shape gate) and `crates/vmcell/src/config.rs` (C8's `resync_reachable` definition gate). The
+bodies agree today. Kept duplicated because the two share no law and assert about different functions in
+different crates, and the alternative — a `pub` source-scanning test helper — puts a scanning utility on
+a contract crate's public surface to serve two callers. It is recorded here rather than in the one-law
+roster because that roster names laws with a single implementation, and this is a deliberate duplicate —
+AGENTS.md sends those to this file.
+
+**Retirement condition, and the reason it is written down at all: a third copy consolidates the class.**
+The condition is at the `config.rs` site too; it is here as well so the third copy meets it instead of
+quietly joining a pair, which is how every duplicate this tree has since consolidated started out.
+
 ## Two pre-existing defects the new gates fired on when they arrived
 
 Each gate was written for a *different* instance of its class and reddened on a site nobody had gone
@@ -5533,3 +5632,331 @@ ledger edge has to cover:
 Neither list is a behavior surprise for a caller who does nothing — the additions are additive and the
 validator's new field defaults to the finite budget — but both are edges §10.4 wants findable in the
 ledger rather than at a consumer's build.
+
+## Green locally, red on CI — twice in one pass, and what a host-facing claim owes the other host
+
+The docs/90 fix pass validated every suite on this workstation, green, and CI contradicted it twice for
+two unrelated reasons. Each mechanism is recorded at its own site; the practice they share is stated
+once, here.
+
+* **A host FACILITY the two hosts version differently** — the ext4 batteries' `mkfs.ext4 -d <tarball>`
+  premise. The mechanism and its two fixes are in "The ext4 battery's absent-facility answer is ONE
+  law" above; the numbers are the whole point: 1.47.1 is the gate, this workstation carries 1.47.2,
+  GitHub's `ubuntu-24.04` image 1.47.0.
+* **A host STATE the two hosts do not share**, in two of the three test defects below: a *built
+  artifact pair* (a fresh checkout has none) and a *delegated cgroup subtree*, which decides which
+  seam refuses a start first and therefore what the error string says — down to the *allocated vmid*
+  inside it.
+
+The third test defect is **not** in that class and is worth separating rather than folding in: the
+`typos` collision reddens `just ci` on this box too (`typos` is a step of the `ci` recipe,
+`justfile:803`, and of ci.yml's lint job, `:166-167`). Nothing about the runner was involved — the
+fixture simply landed without the recipe being re-run against it.
+
+The practice, in two rules:
+
+* **A host-facing claim owes the CI host's differences, enumerated.** "Both suites green" is a claim
+  about the host that ran them. AGENTS.md's rule 5 says probe the host you are on; its complement is
+  that a claim about *another* host needs that host's versions and its starting state named, not a
+  passing local run generalized. `.github/workflows/ci.yml` is readable from here, and every one of
+  the differences above is visible in it.
+* **A new recipe is not a gate until it has run once.** `just test-bench` closed docs/90 G2 — the
+  finding that a live battery was selected by no recipe — and then failed all five of its tests on the
+  first CI run (below). Reading its text could not have caught that: the failure is in the privilege
+  transition the recipe composes, not in the argv. One local invocation would have.
+
+Neither rule is a mea culpa about a missed step. Both name the same standing shape — a **premise about
+a host you are not on** — which has now cost this tree four red commits on the runner (the e2fsprogs
+premise, recorded above) and five tests that never executed once (the recipe, below).
+
+## A live fuzz finding: two bytes that named nothing, and the locator composer that answers them
+
+`fuzz-nightly` (`.github/workflows/fuzz.yml`, non-blocking by construction) had been red for two
+consecutive runs on the `feature_manifest` target, with a two-byte reproducer: **`=z`**. Recovered from
+the workflow's own `fuzz-artifacts` upload (Actions run 32017582821), which is the mechanism working —
+the job is scheduled, a crash uploads its reproducer, and nothing gates a PR on it.
+
+**The defect was one arm out of four that forgot the line number.** `FeatureDeclaration::parse_manifest`
+composed each refusal itself, and three of its arms hand-attached `idx + 1` while the
+`Feature::parse(key.trim())?` arm propagated the token error unchanged (the arm now reads
+`Feature::parse(key).map_err(|e| reject(e.to_string()))?`, `crates/vmcell/src/feature.rs:433`).
+`Feature::parse` answers about a **token** and knows
+nothing about where it came from, so for `=z` — where the key before the `=` is the empty string — the
+message opened with `unknown feature` followed by an **empty** pair of quotes and then the whole
+vocabulary: no line, no number, and not one byte of the input in it anywhere. The target's stated
+property is that a rejection must name something *from the input*,
+and it was the only thing in the tree that could have found this, because every unit test stood on an arm
+that remembered.
+
+**Why a closure rather than a fifth hand-attachment.** A rule each arm must remember is a rule a *new*
+arm can forget, and this one already had. The fix is two private composers plus a per-line binding:
+`manifest_locator(line_number, line)` (`feature.rs:366`) is the one spelling of the locator,
+`manifest_line_error` (`:374`) prefixes it to a detail, and the parser binds
+`let reject = |detail| manifest_line_error(idx + 1, line, detail)` once per line (`:417`) so every arm is
+`reject(…)` and no arm can attach the wrong line either. Both halves of the locator are load-bearing and
+the rustdoc says which does what: the **number** answers "which of the three identical lines", the
+**text** survives a consumer who cannot see the numbering (a here-doc, a generated sidecar, a body
+assembled in memory). The line is quoted at full length deliberately — this is local build config, not a
+guest-controlled frame, so `capped_debug`'s truncating render would defeat the property being asserted.
+
+**The empty key is now its own arm, not `Feature::parse`'s.** `if key.is_empty()` (`:422`) refuses with
+"no feature name before the `=`" and lists the vocabulary. Nothing was misspelled, so reporting it as an
+unknown feature with an empty name sends a consumer looking for a token that is not in their file — the five
+malformed shapes are kept distinct because the *fix* differs per shape. `Feature::names_joined()`
+(`:157`) was extracted in the same change so this refusal and `Feature::parse`'s cannot come to list two
+different rosters; it is composed from `Feature::name()`, which is what makes F6's "refusal feature
+strings are `Feature::name()` by construction" true of the *list* as well as of the single name.
+
+**The property was strengthened from a disjunction to a conjunction.**
+`fuzz/fuzz_targets/feature_manifest.rs` asserted `names a line OR quotes a token`, and `=z` slipped
+through only because it has no token the message happened to contain — a message reading `line 7` and
+nothing else used to pass, and so did one quoting a token while pointing nowhere. It now requires **one
+candidate line** to be named by number *and* quoted, reducing each candidate exactly as the parser
+reduces one, so it cannot demand a locator for a line the parser would have skipped. Existence over the
+candidates is all that is checkable from outside: which line offended is the parser's own answer, and
+re-deriving it would mean reimplementing the parser inside its own fuzz target.
+
+**Three gates, none covering another's half** (`mod manifest_locator_gates`, `feature.rs:1240`, ungated
+on `host-common` because `parse_manifest` is the boundary a *consumer* reads a sidecar through and must
+be gated in every configuration `cargo hack` builds):
+`every_refusal_arm_carries_the_line_number_and_the_offending_line` (`:1298`) — the behaviour per arm,
+asserted against the composed locator rather than a typed sentence, with a table that must drive all
+five arms and a distinctness check so no two arms share a detail;
+`every_manifest_refusal_goes_through_the_one_locator_composer` (`:1561`) — the **call sites**, a source
+scan over the parser's own body that fails on any bare `Error::` in it, because a green per-arm test
+beside a new hand-rolled arm is exactly the completeness-audit failure shape; and
+`the_two_byte_fuzz_crash_input_is_locatable` (`:1476`) — the discovered input, re-asserting the fuzz
+target's property verbatim, with the pre-fix message reconstructed from `Feature::parse("")` as the
+proof that the check can say no.
+
+**Recorded (justified): the reproducer bytes live in an in-crate constant, not in a committed corpus
+file.** `FUZZ_CRASH_INPUT` (`feature.rs:1248`) holds `b"=z"`, named with the run and the crash file it
+came from. This repo's `fuzz/.gitignore` commits `seed-*` corpus files for six of the seventeen targets
+and scopes that mechanism, in its own prose, to **reachability and speed** — five seeds are a
+correctness dependency (random bytes cannot reach the parser inside a nightly window; the measured
+`oci_layer_zstd` figures are there) and one is a measured speed-up — while `/corpus/*` and `/artifacts`
+stay ignored and the workflow *uploads* reproducers instead. Adding a crash-regression corpus would be a
+second, differently-scoped use of the same directory, and a corpus file is not a gate: nothing in `just
+ci` reads `fuzz/corpus`, and `cargo fuzz` is not on the CI critical path at all. The constant is driven
+through the target's own property by a test that `just test-unit` runs, which is the same bytes with a
+gate attached. The trade-off is real and one-directional: `cargo fuzz run feature_manifest` on a fresh
+checkout does not start from these bytes. It does not need to — the input is two bytes wide and the
+property is now a conjunction, so the shape is reachable again in seconds.
+
+## `just test-bench` shipped unable to run what it selected: the double wrap, and the EPERM it earns
+
+docs/90 G2 was that `vmcell-bench`'s three `#[ignore]`d live legs — the composition root wiring all four
+backends — were selected by no recipe in the tree. The recipe that closed it then failed **all five** of
+its tests on CI at ~0.008 s each, with a bare `Operation not permitted (os error 1)` and no cause in it.
+
+**The measured mechanism, because a plausible wrong story fits the symptom.** It was **not**
+`no_new_privs`: the blessed runner's transition emits `DropUid` → `AddInheritable` → `ShrinkBounding` →
+`RaiseAmbient` → `TrimCaps` and no `PR_SET_NO_NEW_PRIVS` step at all
+(`PrivilegePlan::steps`, `crates/vmcell-privilege/src/lib.rs:525`), and `NoNewPrivs = 0` was read from
+`/proc/self/status` *inside* the window — the value the diagnosis gate's fixture now carries
+(`crates/vmcell-bench/tests/common/mod.rs:523`). It was the **double wrap**: `just test-bench` wraps the
+test binary through nextest's `CARGO_TARGET_<TRIPLET>_RUNNER` hook, nextest passes its environment
+through, and `assert_cmd`'s `Command::cargo_bin` reads that same variable family and re-composed
+`<runner> <bench-vm>`. The first wrap's `ShrinkBounding` step drops the **transient** `CAP_SETPCAP` that
+the runner *file* still carries in its `+ep` set, so the second `execve` of that file computes
+`pP' = (X & fP) | (pI & fI)` with `fP ⊄ X` and the effective bit set, and the kernel answers **EPERM**
+("insufficient to execute correctly") rather than degrading. No blessing, rebuild or KVM probe changes
+that: the second exec cannot succeed from inside the window the first one opened.
+
+**The fix is to wrap exactly once and inherit** — the shape `just test-daemon` already documents for
+`vmcelld`. `common::bench_vm()` (`:64`) spawns the child directly from
+`env!("CARGO_BIN_EXE_bench-vm")` (`:54`), compile-time and therefore not redirectable by the
+environment, and the caps arrive through the **ambient** set, which `execve` preserves across a file
+carrying no capabilities of its own. `assert_bench_vm` (`:75`) is the one spawn site, so a future EPERM
+here reports its cause instead of its errno (`explain_spawn_failure`, `:114`, pure over
+`/proc/self/status` text and silent on any non-EPERM failure — the cry-wolf inverse is its own leg).
+Four KVM-free gates hold it, all in `just test-unit`, the invocation that had no way to see this:
+`the_harness_never_re_wraps_bench_vm_in_the_target_runner` (`:291`, the ban plus the one-resolver and
+one-spawn-site counts), `the_child_is_spawned_directly_into_the_inherited_privilege_window` (`:373`,
+whose wrapped legs are the positive controls — `assert_cmd`'s door really does compose the runner under
+this recipe's environment, and `bench-vm` must carry no file capabilities or execve would clear the
+ambient set that delivers the caps),
+`the_test_bench_recipe_still_wraps_and_still_selects_the_ignored_legs` (`:457`), and
+`a_spawn_eperm_is_reported_as_the_privilege_transition_it_is` (`:520`). The
+justfile (`:279`) and `ci.yml`'s step both carry the "wrapped once, and only once" note, because the
+next reader's instinct on an EPERM is to add a wrapper.
+
+**A premise corrected by measuring, not reasoning.** The recipe's features-list guard was justified on
+the claim that a list omitting `cloud-hypervisor` makes `Command::cargo_bin("bench-vm")` panic, since
+`bench-vm` carries `required-features = ["cloud-hypervisor"]`. It does not: cargo sets
+`CARGO_BIN_EXE_bench-vm` for the integration test **even when the bin's required features are unmet**
+(measured — `cargo build --tests --no-default-features --features firecracker` compiles the test target
+and leaves `target/debug/bench-vm` untouched). So the real hazard is worse than a panic: the harness
+would exercise whatever **stale** binary an earlier, differently-featured build left there and report it
+as this run, or, on a clean tree, fail at spawn with ENOENT. Neither is an answer about the features
+asked for. The up-front rejection in the recipe (`justfile:312`) is what prevents it, and the corrected
+reasoning is at that site.
+
+## Three CI failures in this pass's own tests, and the lesson each one carries
+
+Each was a defect in the **test**, not in the product — which is the class a review pass is most likely
+to ship, because a test that passes locally looks finished.
+
+* **A KVM-free premise check that required a built artifact** (`crates/vmcell/tests/guest_tuning.rs`).
+  G7's live leg has a vacuity guard beside it: the window it declares must be non-default and honored
+  verbatim, checked without KVM. It reached `common::get_vmlinux()` / `get_rootfs()` through the shared
+  config builder, and those getters do not hand back a path — they **require** a built artifact, failing
+  loud with `guest kernel missing at …/vmlinux`. Every box that has run `vmcell build` satisfies that;
+  no fresh checkout does. So the leg was green here and red in CI's artifact-free `test-unit` job.
+  **The lesson is in which fix was chosen.** `#[ignore]`ing it would have been one line and would have
+  removed the file's only artifact-free assertion — the guard that keeps the live leg from measuring a
+  default value it calls non-default, and the only part of that file a reviewer on a KVM-free box can
+  check at all. The artifact pair is a **parameter** of `tuned_cell_cfg` instead (`:113`): the live leg
+  passes the real pair, the premise check passes a scratch pair, and a `Duration` surviving the builder
+  has nothing to do with which kernel image the cell would boot. "Runs everywhere" is a claim about the
+  **host**, not about an attribute list; the module header records the CI condition and how to reproduce
+  it locally (`VMCELL_KERNEL=/nonexistent/vmlinux just test-unit`).
+* **A gate asserting whole-string equality on a message that embeds an allocated vmid**
+  (`crates/vmcell-artifact-validator/src/checks.rs`). M8's leg compared the conformance probe's
+  undecidable reason against the level check's, `assert_eq!` on the rendered strings. Both calls
+  allocate their own vmid and `MicroVm::start`'s error text names it, so the two differ in exactly that
+  number — and *which* setup step refuses first is the host's business too: on a delegated developer box
+  the fake's `create` fault stops the start, on an undelegated hosted runner the real cgroup seam is
+  refused one step earlier. The fix asserts the **classification plus the composed stage prefix**:
+  `SETUP_STAGE_PREFIXES` / `EXERCISED_STAGE_PREFIXES` (`:2418`) and `stage_named_by` (`:2435`), which
+  requires a reason to name exactly one stage the probe can stop at *and* to carry a cause after it — a
+  bare stage label says where and not why, and "why" is the payload `Unverified` exists to deliver. The
+  rosters are non-vacuity-checked against the probe's own source
+  (`the_stage_prefixes_are_the_ones_the_probe_composes`, `:2466`) so a renamed arm reddens the roster
+  instead of silently classifying nothing. What was deleted is a whole-string comparison; the property
+  it was reaching for — that both callers render a stop's text identically — is `into_why`'s own law and
+  is gated purely, one module over.
+* **Deliberate misspelled-token fixtures colliding with the `typos` gate**
+  (`examples/downstream-kernel/tests/contract.rs`). Two legs declared `snapshot_restore` **with its
+  trailing `e` dropped** — deliberately, to prove F6 clause 1 refuses an unknown feature name. `typos`
+  knows that truncation and corrects it, so a fixture spelled that way turns the lint red for being
+  exactly as wrong as it means to be. (This one was reproducible locally: `typos` runs in the `ci`
+  recipe as well as in ci.yml — see the section above. This very entry had to be written around it, which
+  is the point made twice.) **The fix is a wrong WORD, not a misspelling**:
+  `BOGUS_FEATURE_TOKEN = "snapshot_restored"` (`:74`), spelled once so fixture and needle cannot drift.
+  Adding a `_typos.toml` entry was the other option and is worse — that file's own header says every
+  exception is a permanent blind spot — and so was exempting the file, which would have
+  unspell-checked a living consumer gate.
+  **It also closed a real vacuity, which is why the near miss is the better fixture and not merely the
+  legal one.** The truncation is a **prefix** of the real token, and `Feature::parse`'s refusal echoes
+  the whole vocabulary through `Feature::names_joined()`, so a `contains` on it was satisfied by the
+  roster echo alone: the assertion held whether or not the refusal named the offending
+  token. No dictionary corrects `snapshot_restored` and no valid token contains it, so the `contains`
+  can only pass on a refusal that really echoes what it refused — and the leg now *proves* that with
+  `OTHER_BOGUS_FEATURE_TOKEN` (`:78`): a refusal about a different unknown token must not contain this
+  one. The near miss is also the tighter probe, since a resolver that accepted any token *starting with*
+  a valid name would take it and still reject the truncation.
+
+  **Residual, recorded rather than fixed here: the same vacuity is still live in-crate.**
+  `unknown_feature_token_is_a_hard_error_naming_it` (`crates/vmcell/src/feature.rs:800`) *derives* its
+  typo (`&real[..real.len() - 1]`), which dodges the `typos` gate — that half is right and predates this
+  lane — but both of its `contains` assertions (`:810`, `:814`) are matched by the roster echo the
+  refusal composes at `:187-191`, so neither can fail on a refusal that dropped `{token}`. Its positive
+  control is the only non-vacuous part. Left as it is because a live suite was running against this tree
+  when it was found and because the property is covered from the consumer position by the leg above;
+  the honest fix is the same one — a needle no valid name contains — and it belongs to the next pass
+  that owns that file.
+
+## M7's fix left four notification toggles discarding, and its new bound dropped frames silently
+
+The docs/90 pass fixed M7 (a `handle_event` error killing the NAT's only vring worker) and its sibling 20
+(an unbounded `tx_queue`). The fix restructured the drain loop and shipped two things AGENTS.md bans one
+page over: a discarded `Result` and a data-plane behavior change nothing surfaces. Recorded here because
+"the fix for a fail-loud finding carries a discard through the restructure" is the shape worth naming,
+not the individual lines.
+
+* **The notification toggles.** `TxPass::Unreadable`'s arm re-armed the kick with
+  `let _ = vring_state.enable_notification();` — a `let _ =` the fix itself added — beside a pre-existing
+  `let _ = …disable_notification()` and two `…enable_notification().unwrap_or(false)`. All four now route
+  through one reporting helper each: `mask_tx_notifications` (`crates/vmcell/src/net/smoltcp.rs:511`) and
+  `rearm_tx_notifications` (`:534`). The two directions are deliberately **not** symmetric, and the
+  reason is at the sites: masking is advisory (a failure costs one extra wakeup on a ring this loop is
+  about to read anyway) so it is a `warn`; re-arming is not, because the flag being lifted is what tells
+  the *guest's* driver it may kick again, so leaving it set is the same silently wedged link `TxPass`
+  exists to prevent — reached through the error path of the fix for it — and it is an `error` plus a
+  caller that stops polling this tick. Neither becomes an `Err`, which the vendored epoll loop treats as
+  terminal.
+* **The tail drop.** Sibling 20's bound made the NAT lossy under a stalled consumer and said so at
+  `trace!` — one `RUST_LOG` away from silence, on a data-plane behavior change. Frames are counted in
+  `VhostUserNetBackend::tx_drops` (an `AtomicU64` on the backend rather than in the `pub`-fielded
+  `SharedState`, so a counter nobody outside the module reads is not a breaking change to a downstream
+  constructor) and reported at `warn`, flood-capped by `tx_drop_is_reportable` (`:198`): the **first**
+  drop always, then one line per queue-depth. The first is unconditional because "it happened at all" is
+  the interesting bit — a NAT that reaches a four-ring-deep queue has a stalled consumer, which is a bug
+  report and not a tuning hint.
+
+The gates are KVM-free and the error paths are reached the only way they can be without a guest: by
+re-pointing the used ring at an unmapped guest address (`TxRing::break_used_ring`, `:2671`), which is
+what a driver that programmed a bogus `SET_VRING_USED` does.
+`a_failed_notification_toggle_is_reported_not_discarded` (`:2906`) drives both helpers with a healthy
+ring first as the positive control and asserts the **level**, since `tracing_test` captures TRACE and up
+and mere presence would accept the shape that shipped.
+`every_notification_toggle_routes_through_its_reporting_helper` (`:3486`) is the call-site half —
+restoring a discard *at a call site* is invisible to the behavioural leg by construction — with its own
+red-on-inverse over four fabricated bodies.
+`the_first_tail_drop_reports_and_a_sustained_one_does_not_flood` (`:2796`) pins the cadence, and the
+depth-bound leg now asserts the count and the level together.
+
+## Two gates this pass shipped were narrower than the class they named (D1, G3)
+
+Both were written for the instance in front of them and both were then found blind to a site nobody had
+pointed them at — the same discovery, twice, and the same widening: **derive the roster, do not list
+it.**
+
+* **D1's prose reader saw two files; it now reads every crate's `src`.** The C8 gate grew a second
+  reader over `config.rs` + `orchestrator.rs` so a comment block asserting the retired
+  `init`-decides-the-control-plane derivation could go red. That is precisely the two-file scope whose
+  blindness let QEMU bake the steward port for a whole release on the *code* side of the same law (M1),
+  and four of D1's seven sites were public rustdoc — which is just as wrong in `vmcell-qemu`'s rustdoc
+  as in this crate's. The prose half now stands on the same workspace walk the port half already used:
+  one directory walk, `workspace_source_files` (`crates/vmcell/src/config.rs:5611`), with three readers
+  over it (whole text, production-only, code-only) so there is no second scope to keep in sync. Its
+  floors are the part worth copying: blocks **and** bytes, and then **per crate** against a roster read
+  independently of the walk (`crates_with_src`, `:5127`), because `vmcell` alone carries over half the
+  workspace's prose and a whole-workspace floor is met with every backend crate missing — the exact
+  blindness being fixed. The widened *scan* has its own red-on-inverse against a fabricated backend
+  file (`the_prose_scan_reports_the_retired_derivation_in_a_backend_crate`, `:5314`), distinct from the
+  per-block predicate's, and the gate's stated limit is honest: the unit is the **block**, so a retired
+  sentence appended to an already-anchored rustdoc block is absorbed by that block's anchor. Reading
+  sentences instead would re-open the split-across-lines hole that made per-line reading find nothing.
+* **G3's ext4 call-site scan enumerated three files, and the fourth was already wrong.**
+  `every_ext4_battery_asks_the_one_law` (`crates/vmcell/tests/ext4_producer.rs:1455`) named
+  `ext4_producer.rs`, `ext4_cell.rs` and `repack_outside_checkout.rs`. `rootfs_registry.rs`'s
+  `format: ext4` leg was the fourth answer to an absent `mkfs.ext4` — a hand-spelled
+  `record_capability_skip("cloud-hypervisor", "ext4_producer")` plus its own `println!("SKIP: …")`,
+  which is *exactly* the pair of shapes that scan's arms 4 and 5 exist to catch — and both arms stayed
+  green for a whole review pass because the scan never opened the file. The law gained a second door
+  rather than a second copy: `classify_ext4_refusal` (`crates/vmcell/tests/common/mod.rs:332`) is the
+  same core entered from the refusal side, which that leg needs because pre-probing would skip past the
+  erofs-only door the leg exists to assert. The new scan **discovers** its roster —
+  `ext4_answer_findings` (`:537`), any test file whose code names `RootfsFormat::Ext4`, with an empty
+  roster and an empty tree each a `gate misconfigured` — and is driven from
+  `every_ext4_battery_answers_an_absent_facility_through_the_one_law`
+  (`crates/vmcell/tests/rootfs_registry.rs:1877`) beside `the_ext4_answer_scan_goes_red_on_every_shape_it_bans`
+  (`:1891`), which drives every arm against fixture trees rather than the checkout, because the arms
+  that matter are the ones no file here has.
+  Two details from that self-test are worth carrying forward: it matches **whitespace-free**, because
+  rustfmt had wrapped the offending `println!(` across two lines and a line-wise `println!("SKIP`
+  needle would have stayed green even once the file entered the roster; and it scans the **in-crate**
+  half too, where a printed SKIP can never reach the manifest at all (docs/90's `oci.rs` leg).
+
+  **Two residuals, recorded so a later pass consolidates deliberately rather than deleting the wrong
+  one.** (1) The enumerated scan is still there and still asserts two things the discovered one does
+  not — a floor on the total number of call sites that ask the law across its three files, and the
+  structural arm that the direct probe and the recording call both live in `common/mod.rs` — while the
+  discovered one adds the two in-crate arms. Their five test-side arms are the same five, so neither is
+  a superset of the other. (2) `probe_ext4_or_record_skip`'s rustdoc still says "the call-site scan in
+  `ext4_producer.rs` is what keeps a fourth answer from appearing"
+  (`crates/vmcell/tests/common/mod.rs:270-271`), a sentence the fourth answer disproved; the claim now
+  belongs to the discovered scan. Both belong to the next pass that owns those files.
+
+  The same lane also corrected the `oci.rs` seam leg that H2's own gate had shipped: its absent-facility
+  arm matched the refusal's **wording** (`needed.contains("e2fsprogs")` and two siblings) and returned
+  green, so on any host that cannot produce ext4 the leg reported PASS for a claim — real ext4 bytes —
+  that nothing had checked, and it is an in-crate unit test, so the skip law is unreachable from it and
+  the reviewer's only instrument said nothing. It now asks the one format→emitter law directly and
+  requires the pack's outcome to **match that route**: a route yielding a producer means ext4
+  superblock bytes, a route that refuses means the caller got that same refusal verbatim
+  (`crates/vmcell/src/artifact/rootfs/oci.rs:820-869`). Both arms are then unenterable on the wrong kind
+  of host, no wording is matched at all, and the ext4-bytes claim is left to the batteries that can
+  record the gap — which the comment names.

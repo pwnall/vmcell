@@ -2401,10 +2401,95 @@ mod tests {
         );
     }
 
+    /// The sentences [`snapshot_restore_attempt`] **prefixes** a setup stop with, in the order it
+    /// can reach them: the config, the snapshot SOURCE VM (its start and its handshake share one
+    /// stage), and the host scratch dir. "Why the candidate was undecidable" is one of these plus
+    /// the cause it carries.
+    ///
+    /// Prefixes, not substrings, and that is the whole point. Every arm composes
+    /// `format!("<stage>: {cause}")`, so the stage is the head and the cause is the tail — and the
+    /// tail is the only part that varies with the host: `MicroVm::start`'s error text embeds the
+    /// **vmid this run allocated** (`…/vmcell-vm-26` on one call, `…/vmcell-vm-123` on the next).
+    /// Matching the head is what makes the assertion deterministic; matching anywhere would let a
+    /// cause that happens to quote another stage's words re-classify the stop.
+    ///
+    /// [`the_stage_prefixes_are_the_ones_the_probe_composes`] pins every entry against the probe's
+    /// own source, so a renamed arm reddens this roster instead of quietly emptying it.
+    const SETUP_STAGE_PREFIXES: [&str; 3] = [
+        "snapshot-eligible config build failed: ",
+        "snapshot-source: ",
+        "tempdir: ",
+    ];
+
+    /// The same for the **measuring** arms — the stops a setup failure must never be reported as,
+    /// which is the direction M8 shipped.
+    const EXERCISED_STAGE_PREFIXES: [&str; 3] =
+        ["snapshot() failed: ", "restore() failed: ", "restored VM: "];
+
+    /// Which stage a probe reason names, panicking if it names none or more than one.
+    ///
+    /// The deterministic half of a reason whose tail (an errno, a path, an allocated vmid) is the
+    /// host's business. Also asserts the reason carries a cause *after* the stage: a bare stage
+    /// label says where the probe stopped and not why, and "why" is the payload `Unverified` exists
+    /// to deliver.
+    fn stage_named_by(why: &str) -> &'static str {
+        let matched: Vec<&'static str> = SETUP_STAGE_PREFIXES
+            .into_iter()
+            .chain(EXERCISED_STAGE_PREFIXES)
+            .filter(|p| why.starts_with(p))
+            .collect();
+        assert_eq!(
+            matched.len(),
+            1,
+            "a probe reason must name exactly one stage the probe can stop at (setup \
+             {SETUP_STAGE_PREFIXES:?}, measuring {EXERCISED_STAGE_PREFIXES:?}); {why:?} named \
+             {matched:?}"
+        );
+        let stage = matched[0];
+        assert!(
+            why.len() > stage.len(),
+            "the stage names WHERE the probe stopped; what follows it is why, and an undecidable \
+             verdict without a why is a shrug: {why:?}"
+        );
+        stage
+    }
+
+    // Non-vacuity for the two rosters above: every stage they name must still be composed by the
+    // probe. A renamed arm would otherwise leave `stage_named_by` unable to match anything, and its
+    // panic would read as a product defect rather than as a stale test constant. Read off the same
+    // comment-stripped source slice the two scans below use, so a needle that survives only in a
+    // COMMENT does not count.
+    //
+    // RED on the inverse: rename any arm's sentence in `snapshot_restore_attempt` (or mistype an
+    // entry above) and the stage it no longer composes is named here.
+    #[test]
+    fn the_stage_prefixes_are_the_ones_the_probe_composes() {
+        let code = snapshot_attempt_code();
+        for stage in SETUP_STAGE_PREFIXES
+            .into_iter()
+            .chain(EXERCISED_STAGE_PREFIXES)
+        {
+            // The `: ` a stage ends with is followed by `{e}`/`{}` in the source, so the needle is
+            // the stage sentence itself.
+            let needle = stage.trim_end().trim_end_matches(':');
+            assert!(
+                code.contains(needle),
+                "the probe no longer composes `{needle}`, so this roster is stale and \
+                 `stage_named_by` would classify nothing:\n{code}"
+            );
+        }
+    }
+
     // M8, at the arm that shipped it: an artifact that cannot boot at all must come back `NotRun`,
     // never `DoesNotWork` — the latter is what let it earn a *verified absence* from `judge`, with
     // the healthy control keeping the run green. `fail_create` is a candidate that never reaches the
     // point where a snapshot could be attempted, which is the whole class.
+    //
+    // WHICH setup failure occurs is deliberately not part of the premise. On a delegated developer
+    // box the fake's `create` fault is what stops the start; on an undelegated hosted runner the
+    // real cgroup seam is refused (`Permission denied`) one step earlier — `snapshot_restore_attempt`
+    // builds `HostEnv::hermetic()` itself, so no test can hand it `unit_test_env`'s fake. Both are
+    // the same stop at the same stage, and the stage is the claim.
     //
     // RED on the inverse: map the attempt's `Err` back to `DoesNotWork` (or move any arm before
     // `vm.snapshot(` to `ProbeStop::Exercised`) and this fails. The end-to-end verdict is gated one
@@ -2422,14 +2507,35 @@ mod tests {
                 "a candidate that never booted decides nothing about snapshot support: {outcome:?}"
             );
         };
+        // THE CLASSIFICATION, plus the reason it can be trusted. `NotRun` alone is also what a probe
+        // that shrugged without saying anything returns; `stage_named_by` requires the verdict to
+        // name one of the stages the probe can stop at AND to carry the cause after it.
+        let stage = stage_named_by(why);
         assert!(
-            !why.is_empty(),
-            "the undecided verdict must carry why it could not be decided"
+            SETUP_STAGE_PREFIXES.contains(&stage),
+            "a candidate whose VM never started stopped in SETUP; reporting the stage `{stage}` \
+             claims the probe exercised the feature on a VM that does not exist: {why:?}"
         );
-        // The level check's verdict on the same artifact is unchanged — a declared-present property
-        // that does not hold is still a failure, with the same text.
-        let level = snapshot_restore_roundtrip(&vmm, &artifacts).await;
-        assert_eq!(level.as_ref().err(), Some(why), "{level:?}");
+
+        // The level check's verdict on the same artifact is the same stop — a declared-present
+        // property the candidate never reached is still a failure, and it fails at the same stage.
+        //
+        // Compared by STAGE, not as whole strings, which is what this assertion used to be: the two
+        // calls each allocate their own vmid, and `MicroVm::start`'s error text names it, so on a
+        // host where the cgroup seam is the thing that refuses (a GitHub hosted runner) the two
+        // reasons differ in exactly that number and byte-equality was red for a reason that has
+        // nothing to do with the property. That the two callers render a stop's text identically is
+        // `into_why`'s own law, gated purely in
+        // `a_setup_stop_is_notrun_and_an_exercised_stop_is_doesnotwork`; what is left for this leg
+        // is that both callers reach the same arm on the same input.
+        let level_why = snapshot_restore_roundtrip(&vmm, &artifacts)
+            .await
+            .expect_err("a declared-present property the candidate never reached is a failure");
+        assert_eq!(
+            stage_named_by(&level_why),
+            stage,
+            "probe {why:?} vs level check {level_why:?}"
+        );
     }
 
     // M8's BOUNDARY, in the shape of the m9 scan below: which side of the setup/measurement line

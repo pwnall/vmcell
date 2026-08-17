@@ -9,8 +9,18 @@
 //! One leg — `a_registered_ext4_label_packs_an_ext4_image` — is not toolchain-free: it runs the real
 //! inject+pack tail into §4.7's external ext4 producer, because "the declared format reaches the
 //! emitter" was asserted as far as `PackOptions` and no further, and the seam in between refused
-//! every format but erofs. It asks the product's own probe and records a reviewable capability skip
-//! when e2fsprogs is genuinely absent (§7.2), exactly as the delta-8 battery does.
+//! every format but erofs. It reads the pack's own typed refusal and hands it to
+//! `common::classify_ext4_refusal` — the one skip law, entered from the refusal side — so a
+//! genuinely absent e2fsprogs records a reviewable capability skip (§7.2) under the same identity
+//! every other ext4 battery uses, and a merely broken one still panics.
+//!
+//! That law's **call-site scan** lives here too
+//! (`every_ext4_battery_answers_an_absent_facility_through_the_one_law`), beside its self-test. It is
+//! here because this is the file the enumerated scan it replaces did not read: this leg answered an
+//! absent facility its own way for a whole review pass while two arms written to catch exactly that
+//! shape stayed green. The scan discovers its roster now, so the next battery is covered the day it
+//! appears; the law it runs is in `common/mod.rs`, reachable from every battery, so moving this
+//! entry point later moves no logic.
 //!
 //! The mirror of `kernel_toolkit.rs`, one kind over — deliberately a separate file rather than more
 //! tests in that one, because the registry law is now shared and two batteries against one core is
@@ -637,15 +647,30 @@ fn a_features_declaration_is_strict_parsed_through_the_one_token_table() {
         )
     };
 
-    // (a) An unknown token. Derived from a real name rather than typed, so the leg cannot rot into
-    // testing a token that was never close to a real one.
+    // (a) An unknown token. NOT derived by truncating a real name: the refusal echoes the whole
+    // valid vocabulary, so a prefix of a real token is matched by the echo whether or not the
+    // message names the token it refused — this leg passed against a parser patched to name the
+    // WRONG token. A wrong word instead (the spelling `feature.rs`'s `BOGUS_FEATURE_TOKEN` and
+    // `examples/downstream-kernel/tests/contract.rs` both use), plus the control below.
+    const BOGUS: &str = "snapshot_restored";
+    const OTHER_BOGUS: &str = "not_a_feature";
     let real = Feature::SnapshotRestore.name();
-    let typo = &real[..real.len() - 1];
-    let msg = registry_err(&entry(&format!("{{\"{typo}\": false}}")));
-    assert!(msg.contains(typo), "the message must name the token: {msg}");
+    let msg = registry_err(&entry(&format!("{{\"{BOGUS}\": false}}")));
+    assert!(
+        msg.contains(BOGUS),
+        "the message must name the token: {msg}"
+    );
     assert!(
         msg.contains(real),
         "the message must list the valid tokens: {msg}"
+    );
+    // The control that makes the assertion above non-vacuous: the only text two refusals share is
+    // the echoed vocabulary, so a token-blind parser collapses them to one string.
+    let other = registry_err(&entry(&format!("{{\"{OTHER_BOGUS}\": false}}")));
+    assert!(
+        !other.contains(BOGUS),
+        "a refusal about `{OTHER_BOGUS}` must not name `{BOGUS}`, or the assertion above is \
+         matching the echoed vocabulary rather than the refused token: {other}"
     );
 
     // (b) A non-boolean stance. `"false"` (the string) is the hazard: it is *truthy* to anything
@@ -1826,17 +1851,194 @@ async fn a_registered_ext4_label_packs_an_ext4_image() {
             );
         }
         // The facility is genuinely absent (no `mkfs.ext4`, too old for `-d <tarball>`, no
-        // libarchive, or the `ext4-producer` feature compiled out). Reviewable, not invisible.
-        Err(Error::CapabilityUnavailable { op, needed }) => {
-            common::record_capability_skip("cloud-hypervisor", "ext4_producer");
-            println!(
-                "SKIP: this host cannot produce ext4 rootfs images ({op}: {needed}). The registry's \
-                 `format: ext4` leg needs e2fsprogs with libarchive support"
-            );
+        // libarchive, or the `ext4-producer` feature compiled out). Reviewable, not invisible — and
+        // reviewable through the ONE law, entered from the refusal side, because this leg cannot
+        // pre-probe: asking first would skip past the erofs-only door it exists to assert. The
+        // classifier owns the whole answer (which outcome counts as absent, the `SKIP <vmm>
+        // <capability>` identity, the sink, and the panic on a merely BROKEN tool), so this file
+        // spells none of it. It used to spell all of it — a hand-typed
+        // `record_capability_skip("cloud-hypervisor", "ext4_producer")` plus its own SKIP print —
+        // which was a fourth answer to an absent `mkfs.ext4`, invisible to a call-site scan that
+        // enumerated three files.
+        Err(err @ Error::CapabilityUnavailable { .. }) => {
+            common::classify_ext4_refusal(&err, &common::skip_manifest_path());
         }
         other => panic!(
             "a `format: ext4` registry entry must pack (or be typed-refused by §4.7's probe), never \
              die on the erofs-only door or on a broken tool: {other:?}"
         ),
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// The one skip law's call-site scan (AGENTS.md: "a gate binds the call sites, not just the extracted
+// predicate"), and its own red-on-inverse
+// -------------------------------------------------------------------------------------------------
+
+// Every battery that can meet an absent `mkfs.ext4` answers it through the ONE law, and the crate
+// itself does not answer it at all.
+//
+// The scan this replaces enumerated three files and this file was the fourth, so the leg above
+// carried a hand-spelled skip identity and its own SKIP print — the two shapes arms 4 and 5 were
+// written to catch — while both arms stayed green for a whole review pass. Its roster is DISCOVERED
+// now (`common::ext4_answer_findings`), so a battery is covered the day it appears rather than the
+// day somebody remembers to add it to a list.
+//
+// RED ON THE INVERSE: measured by restoring this file's own pre-fix shape (a
+// `record_capability_skip` call plus a `println!("SKIP: …")` in the leg above), which reddens two
+// arms here and — the reason the widening was needed — leaves the enumerated scan green. Every arm
+// is also driven directly, against fixture trees, by the self-test below.
+#[test]
+fn every_ext4_battery_answers_an_absent_facility_through_the_one_law() {
+    common::assert_ext4_batteries_answer_through_the_one_law();
+}
+
+// The scan's own red-on-inverse, per arm, against fixture trees rather than the checkout — because
+// the arms that matter are the ones no file in this tree has, and a gate whose failure nobody has
+// watched is theater (AGENTS.md rule 2). The clean pair is asserted GREEN first, so an arm below
+// cannot be passing because the fixture was malformed.
+//
+// The banned needles are COMPOSED here for the same reason the old scan composed them: this file is
+// itself a discovered battery, so a fixture written with the literal shapes would report *this file*
+// as carrying them. (`println!("SKIP` needs no composition — a Rust string literal spells it with a
+// backslash — but it is composed anyway, so the rule is one rule.)
+#[test]
+fn the_ext4_answer_scan_goes_red_on_every_shape_it_bans() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tests = dir.path().join("tests");
+    let src = dir.path().join("src").join("artifact");
+    std::fs::create_dir_all(&tests).expect("create the fixture tests dir");
+    std::fs::create_dir_all(&src).expect("create the fixture src dir");
+    let src_root = dir.path().join("src");
+
+    let self_record = format!("record_capability_{}", "skip");
+    let direct_probe = format!("Ext4Producer{}", "::probe()");
+    let bare_print = format!("println!(\"{}", "SKIP");
+    let manifest_env = format!("VMCELL_SKIP_{}", "MANIFEST");
+    let decl = "mod common;";
+    let law = "common::probe_ext4_or_record_skip();";
+    // A battery that packs the discovered format: the shape every arm is scored against.
+    let battery = |decl: &str, law: &str, extra: &str| {
+        format!(
+            "{decl}\nfn packs() {{ let _f = RootfsFormat::Ext4; \
+             pack_rootfs_with_injection(&[]); {law} {extra} }}\n"
+        )
+    };
+    let scan = |battery: &str, in_crate: &str| {
+        std::fs::write(tests.join("ext4_fixture.rs"), battery).expect("write the fixture battery");
+        std::fs::write(src.join("packer.rs"), in_crate).expect("write the fixture crate file");
+        common::ext4_answer_findings(&tests, &src_root)
+    };
+    let one = |findings: &[String], needle: &str| {
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly one finding naming {needle:?}, got {findings:?}"
+        );
+        assert!(
+            findings[0].contains(needle),
+            "the finding must name {needle:?}: {findings:?}"
+        );
+    };
+
+    // 0. The clean pair is green.
+    assert!(
+        scan(&battery(decl, law, ""), "fn packs() {}\n").is_empty(),
+        "the fixture battery asks the law and the fixture crate file answers nothing — a scan that \
+         flags this is flagging the fixture, not the shapes below"
+    );
+    // 1. Unreachable law: no `mod common;` (docs/90 G3's file).
+    one(
+        &scan(&battery("", law, ""), "fn packs() {}\n"),
+        "does not declare `mod common;`",
+    );
+    // 2. Packs without asking it.
+    one(
+        &scan(&battery(decl, "", ""), "fn packs() {}\n"),
+        "without asking the one law",
+    );
+    // 3. Re-probes the producer itself.
+    one(
+        &scan(&battery(decl, law, &direct_probe), "fn packs() {}\n"),
+        "probes the producer directly",
+    );
+    // 4. Prints its own SKIP — the green-PASS shape.
+    one(
+        &scan(
+            &battery(decl, law, &format!("{bare_print}: nope\");")),
+            "fn packs() {}\n",
+        ),
+        "prints its own SKIP",
+    );
+    // 4b. …including WRAPPED the way the shape actually shipped in this file: rustfmt put the
+    //     `println!(` on one line and the `"SKIP…"` on the next, so a LINE-WISE needle matched
+    //     nothing at all — the arm would have stayed green even once the file entered the roster.
+    //     Every arm reads whitespace-free for exactly this reason, and this leg is that reading's
+    //     own red-on-inverse.
+    let wrapped_print = format!(
+        "println!(\n        \"{}: wrapped by rustfmt\"\n    );",
+        "SKIP"
+    );
+    one(
+        &scan(&battery(decl, law, &wrapped_print), "fn packs() {}\n"),
+        "prints its own SKIP",
+    );
+    // 5. Records its own line — the identity is the law's. THIS is the shape this file shipped.
+    one(
+        &scan(
+            &battery(decl, law, &format!("common::{self_record}(\"a\", \"b\");")),
+            "fn packs() {}\n",
+        ),
+        "records its own capability skip",
+    );
+    // 6. The in-crate green PASS: a printed SKIP where the sink is unreachable (docs/90's `oci.rs`).
+    one(
+        &scan(
+            &battery(decl, law, ""),
+            &format!("fn packs() {{ {bare_print}: nope\"); }}\n"),
+        ),
+        "prints a SKIP from inside the crate",
+    );
+    // 7. …and a second writer of the manifest inside the crate.
+    one(
+        &scan(
+            &battery(decl, law, ""),
+            &format!("fn packs() {{ let _e = std::env::var(\"{manifest_env}\"); }}\n"),
+        ),
+        "names the skip manifest from inside the crate",
+    );
+    // 8. A candidate whose code carries no function at all: vacuous, not green.
+    one(
+        &scan("const F: X = RootfsFormat::Ext4;\n", "fn packs() {}\n"),
+        "stripped to no code at all",
+    );
+
+    // 9. The empty-tree legs. A scan that opens nothing satisfies every ban above, so "found
+    //    nothing" must read as `gate misconfigured` and never as `ok:` (AGENTS.md).
+    let empty = tempfile::tempdir().expect("tempdir");
+    let findings = common::ext4_answer_findings(empty.path(), empty.path());
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.contains("gate misconfigured: no `*.rs` under")),
+        "an empty tests tree must be a misconfiguration: {findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.contains("the in-crate half of this scan opened nothing")),
+        "an empty src tree must be a misconfiguration too — the in-crate arms are the ones with no \
+         call site in this checkout, so they are exactly the ones a silent empty scan hides: \
+         {findings:?}"
+    );
+    // 10. …and a tests tree with files but no battery in it: the roster, not the tree, is empty.
+    std::fs::write(tests.join("ext4_fixture.rs"), "fn f() {}\n").expect("write");
+    let findings = common::ext4_answer_findings(&tests, &src_root);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.contains("the roster this gate binds is empty")),
+        "a tests tree whose files never name the discovery needle must be a misconfiguration — that \
+         is how a renamed format constant would silence every arm: {findings:?}"
+    );
 }

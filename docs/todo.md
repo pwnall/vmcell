@@ -1,102 +1,72 @@
 ## Designed, need implementing
 
 * README covering CLI capabilities and benchmark results — PARTIAL: the CLI half is done (the
-  README's "CLI (`vmcell`)" subcommand table, plus its "Privileged Test Runner" and downstream-
-  contract sections); a benchmark-results summary is still pending — the README only links
-  `docs/benchmark-results.md`, which is where every number lives. Needs a directional call first:
-  an embedded summary is in direct tension with AGENTS.md's pointer-over-figure rule, and the
-  docs/90 pass **deleted** the README's one embedded matrix figure (29/29 crosvm) for exactly that
-  reason. The defensible shape is a pointer plus the *shape* of what is measured, never the numbers.
+  README's "CLI (`vmcell`)" subcommand table at `README.md:74`, plus "Privileged Test Runner" at
+  `:331` and the downstream-contract section at `:94`); a benchmark-results summary is still pending —
+  the README only links `docs/benchmark-results.md` (`:490`), which is where every number lives. Needs
+  a directional call first: an embedded summary is in direct tension with AGENTS.md's
+  pointer-over-figure rule, and the docs/90 pass **deleted** the README's one embedded matrix figure
+  (the crosvm pass/total) for exactly that reason, replacing it with a pointer at the recipe that
+  produces it (`:298-299`). The defensible shape is a pointer plus the *shape* of what is measured,
+  never the numbers.
 
 ## Open from the docs/90 review pass
 
-The code half of `docs/90-claude-opus-code-review.md` is landed; §11 of that document records the
-per-finding outcome. What follows is what it left genuinely open.
+The code half of `docs/90-claude-opus-code-review.md` is landed and so is the design reissue it
+directed; §11 of that document records the per-finding outcome, re-verified against commit `c34f9c2`.
+What follows is what it left genuinely open.
 
-### Design-document corrections, for the next reissue
-
-Every item below is a **body-sentence** edit inside an existing section of
-`docs/83-claude-fable-design-v33.md`; none needs a heading to change, and none may be fixed by
-renumbering one. `scripts/ban-dangling-design-ref.sh` resolves every `§<id>` and `Appendix <letter>`
-under `crates/*/src` against those headings (2058 of them) and `scripts/check-docs-pointers.sh` does
-the same for the root markdown, so moving a heading is a reissue-scale change with two red gates
-attached.
-
-**Grep before acting, and delete the item rather than re-verifying it later.** The design reissue was
-in flight in the same pass that wrote this list, so an item may already read correctly — each one below
-names the spelling to search for, which is the whole check.
-
-* §10.4's contract list must name `pack_rootfs_with_injection` — the format-honoring inject+pack tail
-  — beside `pack_erofs_with_injection`, which since delta 8 is the **erofs-only door** onto it and
-  refuses any other `PackOptions::format` by name. The ledger entry is written
-  (`crates/vmcell/Cargo.toml`, 0.19 → 0.20) and `README.md` lists it; the design line is the gap.
-  [docs/90 C1]
-* §10.4's "labelled rootfs/handler build entry points" and §10.5's "where selection lives" must name
-  the shipped shape: the `RootfsStage::labelled` / `GuestToolsStage::labelled` constructors plus the
-  `vmcell build --rootfs-label / --handler-label` verbs. `build_labelled_rootfs` and
-  `build_labelled_handler` do not exist and are not going to — the constructors are the better shape,
-  recorded in `docs/implementation-notes.md`. [docs/90 C3]
-* §17's battery-budget entry must scope its closure to `ConformanceOptions.battery_budget` /
-  `run_battery`, and keep `validate()`'s missing overall wall-clock budget **on** the register:
-  `ValidationOptions` still carries only `level`, and a `Level::Full` run is bounded only by the sum
-  of its per-check deadlines. [docs/90 C5]
-* §9.3's annotation on `VmConfig::steward_placement`, and §18 delta 4's *What* line, must name **both**
-  C8 methods. C8 is a two-method law precisely because availability (`steward_port()`) and
-  snapshot-eligibility (`resync_reachable()`) differ exactly at `Service`; naming one is the spelling
-  §13 defines as the law's violation. [docs/90 D6]
-* §2.2's "every control RPC over the API socket is bounded at 5 s" needs its one-clause exception: the
-  snapshot RPC's budget scales with guest RAM through `vmm::snapshot_request_timeout(mem_mib)`,
-  deliberately, since a suspend image tracks guest RAM. [docs/90 D7]
-* §15.4, §4.7's two mentions and delta 7's gate line name `test_pax_xattrs_are_not_preserved`. The
-  shipped pair is `pax_xattrs_are_stripped_under_the_default_policy` /
-  `pax_xattrs_are_preserved_under_the_preserve_policy`. [docs/90 D9]
-* Two design sites still advertise `RootfsSource::Block` as a writable root (the §4.7 sentence is
-  already recorded in `docs/implementation-notes.md`; widen that entry so the next reissue does not fix
-  one and leave two). The authority is `RootfsSource::root_device_read_only` — one law, and the
-  0.19 → 0.20 ledger entry states the behavior and the data-plane evidence for it. [docs/90 D10]
-* §17's Cloud-Hypervisor-binary-resolver consolidation entry has a stale inventory: it named
-  `harness::ch_bin()` and `bench-vm`'s workspace-root ascent and missed `vmcell-cli`'s copy. That copy
-  is gone (it calls `vmcell::artifact::ch_binary_path()`) and the class is gated by
-  `scripts/ban-ch-binary-resolver-copies.sh`, so the entry needs re-scoping to what is actually left.
-  [docs/90 A2]
-* §10.4 must list `vmcell::proxy::doubles`' `hudsucker` / `hyper` re-exports, so a version bump inside
-  vmcell is ledgered rather than discovered by a consumer whose test double stops compiling —
-  `cargo semver-checks` cannot see it, because the type aliases' shape does not change. [docs/90 E1]
-
-### `docs/implementation-notes.md`
-
-* The `tar2erofs`-does-not-preserve-PAX-xattrs entry is past its own retirement condition ("Retire if
-  xattr passthrough is implemented" — delta 7 implemented it) and names a test delta 7 renamed. Retire
-  it or rewrite it as the delta-7 pointer, and spot-check its neighbour for the same drift.
-  [docs/90 D8]
+**The design-document corrections section is retired**, not deferred: all nine body-sentence edits
+(docs/90 C1, C3, C5, D6, D7, D9, D10, A2, E1) landed in the same commit as the code, and that §11
+names the design line that carries each one. Do not reconstruct the list from the finding bodies —
+they describe the pre-reissue tree by construction. One item in it was worse than stale: the C5 entry
+asserted that `ValidationOptions` "still carries only `level`" and directed §17 to keep that gap
+open, and acting on it would have **reversed a correct design sentence** — the field shipped
+(`crates/vmcell-artifact-validator/src/lib.rs:300`, ledgered at that crate's `Cargo.toml:82`). Grep
+before acting on any item below, and delete an item rather than re-verifying it later.
 
 ### Worked examples on the public API
 
-* Now safe to add and gated the moment they land: `just test-doc` compiles every `///` example
-  (`just ci` and `ci.yml` both invoke it). `README.md` still carries **zero** Rust code blocks,
-  `crates/vmcell/src/lib.rs`'s crate doc none, and the contract-surface entry points `Stage`,
-  `Pipeline`, `pack_rootfs_with_injection`, `PackOptions` and `run_battery` none. The natural set is
-  one example each for boot-and-exec, snapshot-and-restore via `Zygote`, a `Pipeline` assembly, and a
-  `DaemonClient` round trip — the last on `vmcell-daemon-client`, whose `DaemonClient` is documented as
-  "a typed Rust API matching the `vmcell` entry points" and shows none of them. [docs/90 D11]
+Mostly landed, and gated: `just test-doc` compiles every `///` example (`just ci` and `ci.yml` both
+invoke it). `README.md:29-62`, `crates/vmcell/src/lib.rs:21-53,60-99`, the `artifact` module's
+`Pipeline` and `pack_rootfs_with_injection` pair (`crates/vmcell/src/artifact/mod.rs:20-56,69-99`),
+`run_battery` (`crates/vmcell-artifact-validator/src/lib.rs:106-164`) and `DaemonClient`
+(`crates/vmcell-daemon-client/src/lib.rs:15-53`) all carry compiled examples now. What is left:
+
+* `Stage` — the one contract-surface item a consumer *implements* rather than calls — has a one-line
+  doc and no example (`crates/vmcell/src/artifact/mod.rs:505-506`). It is the extension point most
+  worth a worked shape: a `Stage` that names itself, computes a cache key over its inputs and publishes
+  one artifact path. [docs/90 D11]
+* Placement, cheaply: the `Pipeline` (`artifact/mod.rs:2691-2697`), `PackOptions`
+  (`artifact/rootfs/mod.rs:200-209`) and `run_battery`
+  (`vmcell-artifact-validator/src/conformance.rs:585-594`) examples live on the enclosing **module**,
+  so a reader who lands on the item's own rustdoc page sees none. An intra-doc link from each item to
+  its module example is the whole fix; a duplicated example would be a second copy to drift.
+  [docs/90 D11]
 
 ### Shipped config knobs still never applied in a live boot
 
 AGENTS rule 4's "cover it or record it" — recorded here rather than in prose so the list stays
 countable. The rest of docs/90's T2 set is closed: `console_mode` boots under
 `crates/vmcell/tests/nested_virt.rs`, the tuning channel is measured by
-`crates/vmcell/tests/guest_tuning.rs`, and `ksm_mergeable`'s mandatory `shared=off` coupling is pinned
-KVM-free on the composed CH memory payload.
+`crates/vmcell/tests/guest_tuning.rs` (a declared `guest_rebind_idle`, read back off PID 1's socket
+inodes), and `ksm_mergeable`'s mandatory `shared=off` coupling is pinned KVM-free on the composed CH
+memory payload (`ch_memory_payload_couples_ksm_mergeable_to_unshared_memory`).
 
-* Both non-default `RestoreMode`s: shipped, documented, and applied in no integration test.
-  `bench-vm` drives them, and `bench-vm` is a tracked metric rather than a gate. [docs/90 T2]
-* `Timeouts::low_latency()` as a preset: `guest_tuning.rs` boots a non-default profile (which is what
-  removed the channel's unfalsifiability), but never the preset itself, so its two values are still
-  only unit-tested. [docs/90 T2]
+* Both non-default `RestoreMode`s: shipped, documented, and applied in no integration test — the only
+  caller outside `vmcell` is `crates/vmcell-bench/src/bin/bench-vm.rs:203-209`, and `bench-vm` is a
+  tracked metric rather than a gate. The behavior it selects is one `--restore` argument
+  (`crates/vmcell/src/vmm/cloud_hypervisor.rs:492-497`), so a unit pin on the composed argv is the
+  cheap half and a live prefault leg the honest one. [docs/90 T2]
+* `Timeouts::low_latency()` as a preset (`crates/vmcell/src/config.rs:423`): `guest_tuning.rs` boots a
+  non-default profile by mutating one field, which is what removed the channel's unfalsifiability, but
+  no test boots the preset itself — its values are only unit-asserted
+  (`crates/vmcell/src/config.rs:3245-3258`). [docs/90 T2]
 * `metrics_limits.rs`'s `io_max` refusal leg is written and asserted but its kernel-`ENODEV` arm is
   **dead on a default systemd user session**, which delegates `cpu memory pids` and not `io`. It runs
-  the day the suite meets a host with `io` delegated; recorded at the leg so the gap is not mistaken
-  for coverage. [docs/90 T1]
+  the day the suite meets a host with `io` delegated; recorded at the leg
+  (`crates/vmcell/tests/metrics_limits.rs:456-467,549`) so the gap is not mistaken for coverage.
+  [docs/90 T1]
 
 ### Deliberately deferred — do not re-open as findings
 
@@ -109,10 +79,14 @@ KVM-free on the composed CH memory payload.
 
 ### Operational
 
-* The blessed runner on this host is **stale** and `scripts/review-preflight-priv.sh` now says so
-  (BLOCKED-ON-BLESS, decided cargo-free from the `.blessed` content hash plus the runner's in-tree
-  source closure). It needs one maintainer `just bless`; every privileged run before that executes an
-  older binary than the tree under review. [docs/90 G9]
+* The blessed runner on this host is **stale** and `scripts/review-preflight-priv.sh` says so —
+  re-probed 2026-08-17 at `c34f9c2`: KVM OK, both file-capability copies present and `+ep`, and both
+  the debug and the release copy older than `crates/vmcell-test-runner/src`,
+  `crates/vmcell-privilege/src` and `Cargo.lock`, so the verdict is BLOCKED-ON-BLESS (exit 2), decided
+  cargo-free from the `.blessed` content hash plus the runner's in-tree source closure. It needs one
+  maintainer `just bless`; every privileged run before that executes an older binary than the tree
+  under review — including the gate that asserts about the runner's own capability posture. This is
+  not a static-only downgrade: the host is capable. [docs/90 G9]
 
 ## Need design
 
@@ -128,7 +102,7 @@ More difficult
   append-only channelized `Message` variants, a guest non-blocking dispatch loop
   with one per-connection writer + PTY/pipe/stdin/winsize sessions +
   connection-owns-its-sessions teardown, and a host `agent::session` multiplexer.
-  Daemon streaming sessions + a raw-mode interactive CLI are §22.7 forward work.
+  Daemon streaming sessions + a raw-mode interactive CLI are v26 §22.7 forward work.
 
 * Multi-VM cluster topologies with a shared L2 segment [V:high/E:high] — shipped in v30 delta 8
   (design §6.5): `NetSegment` owns one netns + bridge per segment (ids `1..=MAX_SEGMENT_ID`, up to

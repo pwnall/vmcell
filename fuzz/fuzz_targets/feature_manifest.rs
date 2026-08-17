@@ -30,12 +30,24 @@ use vmcell::feature::{Feature, FeatureDeclaration, Source};
 //     differential that matters, because the renderer is what the build emits and the parser is
 //     what every consumer reads — a divergence between them is a declaration that means one thing
 //     at build time and another at boot.
-// And for every REJECTED manifest, the error must NAME something from the input, so a consumer can
-// find the offending line rather than being told only that "the manifest is bad".
+// And for every REJECTED manifest, the error must LOCATE the offending line — by number AND by
+// quoting the line's own text — so a consumer can find it rather than being told only that "the
+// manifest is bad".
 //
 // WHAT WOULD BE A FINDING: an accepted manifest carrying an unknown key or a duplicate stance; a
-// render→parse round trip that loses or changes a stance; a rejection whose message quotes nothing
-// from the input; any panic.
+// render→parse round trip that loses or changes a stance; a rejection that does not locate its line;
+// any panic.
+//
+// FOUND, and the reason the property is now a conjunction: two bytes, `=z`. The parser's
+// `Feature::parse` arm propagated a token-only refusal while its three siblings attached the line
+// number, and for an empty key that token is the empty string — so the message read
+// ``unknown feature ``: a feature token must be one of […]`` and quoted nothing whatsoever. The
+// original property here was `names a line OR quotes a token`, and it caught that input only because
+// `=z` has no token the message happened to contain. The `OR` is now an `AND` over ONE line: a
+// message naming `line 7` and nothing else used to pass, and so did one quoting a token while
+// pointing nowhere. The in-crate twin is `feature::manifest_locator_gates` (which pins the exact line
+// per input, against the parser's own locator composer); this target is the half that supplies inputs
+// nobody thought to write down.
 
 fuzz_target!(|data: &[u8]| {
     let Ok(body) = std::str::from_utf8(data) else {
@@ -83,12 +95,24 @@ fuzz_target!(|data: &[u8]| {
             );
         }
         Err(e) => {
-            // A refusal must be findable: it names a token from the input, or the line number.
+            // A refusal must be findable, and BOTH halves are load-bearing: the line NUMBER answers
+            // "which of the three identical lines", and the line's own TEXT survives a consumer who
+            // cannot see the numbering (a here-doc, a generated sidecar, a body assembled in memory).
+            //
+            // Existence over the candidate lines is all that is checkable from out here — which line
+            // offended is the parser's own answer, and re-deriving it would mean reimplementing the
+            // parser inside its own fuzz target. The exact-line assertions live in the in-crate twin.
+            // A candidate line is reduced exactly as the parser reduces one, so this cannot demand a
+            // locator for a line the parser would have skipped.
             let msg = e.to_string();
+            let located = body.lines().enumerate().any(|(i, raw)| {
+                let code = raw.split('#').next().unwrap_or("").trim();
+                !code.is_empty() && msg.contains(&format!("line {}", i + 1)) && msg.contains(code)
+            });
             assert!(
-                msg.contains("line") || body.split_whitespace().any(|t| msg.contains(t)),
-                "a rejection must quote the offending line or token so a consumer can find it; \
-                 got {msg:?} for {body:?}"
+                located,
+                "a rejection must locate the offending line — its NUMBER and its own text — so a \
+                 consumer can find it; got {msg:?} for {body:?}"
             );
         }
     }

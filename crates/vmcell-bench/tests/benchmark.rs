@@ -1,7 +1,15 @@
-use assert_cmd::prelude::*;
-use std::process::Command;
+//! `bench-vm` subprocess tests.
+//!
+//! **Every child goes through `common::bench_vm()` + `common::assert_bench_vm()`, and nothing here
+//! resolves the binary or spawns it itself.** `just test-bench` wraps this test binary in the
+//! blessed capability runner (nextest's `CARGO_TARGET_<TRIPLET>_RUNNER` hook), which is how the live
+//! legs' `bench-vm` gets `PRIVILEGED_CAPS` at all — and `assert_cmd`'s `cargo_bin` door reads that
+//! same variable and prepends the runner a SECOND time, which `execve` refuses with EPERM. The law,
+//! the mechanism and its gates live in `tests/common/mod.rs`.
 
 mod common;
+
+use common::{assert_bench_vm, bench_vm};
 
 // TESTS-FEATURES-2. The full benchmark needs KVM and is too slow for CI, so the CH path used
 // to assert nothing (commented-out p50 check) — pure theater. Instead, drive bench-vm down a
@@ -15,7 +23,7 @@ mod common;
 #[test]
 fn test_benchmark_ch_dry() {
     let empty = tempfile::tempdir().unwrap();
-    let mut cmd = Command::cargo_bin("bench-vm").unwrap();
+    let mut cmd = bench_vm();
     // The overrides are cleared, not merely unset in the parent: `bench-vm` now honors
     // `$VMCELL_KERNEL`/`$VMCELL_ROOTFS` (§10.4), so a developer who exported them would otherwise
     // send this dry path at a REAL artifact pair and boot a VM.
@@ -28,7 +36,7 @@ fn test_benchmark_ch_dry() {
         .arg("1")
         .arg("--warmup")
         .arg("0");
-    cmd.assert()
+    assert_bench_vm(&mut cmd)
         .failure()
         .stdout(predicates::str::contains("No successful runs"))
         .stderr(predicates::str::contains("missing artifacts"));
@@ -48,13 +56,13 @@ fn bench_vm_honors_the_toolkit_artifact_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let kernel = dir.path().join("custom/vmlinux-from-the-override");
     let rootfs = dir.path().join("custom/rootfs-from-the-override.erofs");
-    let mut cmd = Command::cargo_bin("bench-vm").unwrap();
+    let mut cmd = bench_vm();
     cmd.env("VMCELL_ARTIFACTS_DIR", dir.path())
         .env("VMCELL_KERNEL", &kernel)
         .env("VMCELL_ROOTFS", &rootfs)
         .args(["--backend", "cloud-hypervisor"])
         .args(["--iterations", "1", "--warmup", "0"]);
-    cmd.assert()
+    assert_bench_vm(&mut cmd)
         .failure()
         // The attribution line names what the run would really boot…
         .stdout(predicates::str::contains(format!(
@@ -80,14 +88,14 @@ fn bench_vm_honors_the_toolkit_artifact_overrides() {
 #[test]
 fn bench_vm_rejects_a_kernel_label_that_contradicts_the_kernel_override() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cmd = Command::cargo_bin("bench-vm").unwrap();
+    let mut cmd = bench_vm();
     cmd.env("VMCELL_ARTIFACTS_DIR", dir.path())
         .env("VMCELL_KERNEL", dir.path().join("custom/vmlinux-x"))
         .env_remove("VMCELL_ROOTFS")
         .args(["--backend", "cloud-hypervisor"])
         .args(["--kernel", "6.12.94"])
         .args(["--iterations", "1", "--warmup", "0"]);
-    cmd.assert()
+    assert_bench_vm(&mut cmd)
         .failure()
         .stderr(predicates::str::contains("$VMCELL_KERNEL"))
         .stderr(predicates::str::contains("vmlinux-6-12-94"));
@@ -105,14 +113,14 @@ fn test_benchmark_fc() {
     // per session (and the kernel's fail-loud fires) before bench-vm reads them.
     let _kernel = common::get_vmlinux();
     let _rootfs = common::get_rootfs();
-    let mut cmd = Command::cargo_bin("bench-vm").unwrap();
+    let mut cmd = bench_vm();
     cmd.arg("--backend")
         .arg("firecracker")
         .arg("--iterations")
         .arg("1")
         .arg("--warmup")
         .arg("0");
-    cmd.assert()
+    assert_bench_vm(&mut cmd)
         .success()
         .stdout(predicates::str::contains("p50="));
 }
@@ -124,14 +132,14 @@ fn test_benchmark_qemu() {
     // See `test_benchmark_fc`: shells out to bench-vm, so trigger the harness auto-build first.
     let _kernel = common::get_vmlinux();
     let _rootfs = common::get_rootfs();
-    let mut cmd = Command::cargo_bin("bench-vm").unwrap();
+    let mut cmd = bench_vm();
     cmd.arg("--backend")
         .arg("qemu")
         .arg("--iterations")
         .arg("1")
         .arg("--warmup")
         .arg("0");
-    cmd.assert()
+    assert_bench_vm(&mut cmd)
         .success()
         .stdout(predicates::str::contains("p50="));
 }
@@ -145,14 +153,14 @@ fn test_benchmark_qemu() {
 fn test_benchmark_crosvm() {
     let _kernel = common::get_vmlinux();
     let _rootfs = common::get_rootfs();
-    let mut cmd = Command::cargo_bin("bench-vm").unwrap();
+    let mut cmd = bench_vm();
     cmd.arg("--backend")
         .arg("crosvm")
         .arg("--iterations")
         .arg("1")
         .arg("--warmup")
         .arg("0");
-    cmd.assert()
+    assert_bench_vm(&mut cmd)
         .success()
         .stdout(predicates::str::contains("p50="));
 }

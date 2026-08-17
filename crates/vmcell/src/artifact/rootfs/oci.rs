@@ -715,15 +715,55 @@ mod tests {
     // producer was reachable only through the `unpinned_path` dev registration, which `bundle`
     // refuses by design.
     //
-    // The assertion discriminates on EVERY host, which is what keeps this out of the skip manifest:
-    // where the producer is available the pack must write a real ext4 superblock, and where it is
-    // absent (or the `ext4-producer` feature is off) the refusal must be §4.7's own TYPED
-    // `CapabilityUnavailable`. The door's refusal is an `Error::Artifact` naming itself, so it is
-    // neither — the buggy call site reddens both ways.
+    // # What this leg claims on a host WITHOUT the producer, and what it deliberately does not
     //
-    // RED on the inverse (call `pack_erofs_with_injection` again): the `other` arm panics quoting
-    // the door. The erofs leg at the end is the positive control — the same layers, the same fake,
-    // the default format — so a pack that failed for a reason unrelated to the format cannot pass.
+    // It is an in-crate unit test, so the one skip law (`tests/common`'s
+    // `probe_ext4_or_record_skip` / `classify_ext4_refusal`) is **unreachable** from here: there is
+    // no `mod common;` in the lib target, and nothing this function does can land a line in
+    // `VMCELL_SKIP_MANIFEST`. It therefore must not claim the half of §4.7 it cannot verify. The
+    // pre-fix shape did: the absent-facility arm matched the refusal's *wording* and returned green,
+    // so on any host that cannot produce ext4 this leg reported PASS for a claim (a real ext4 image)
+    // nothing had checked, and the reviewer's only instrument for that — the skip manifest — said
+    // nothing, because a printed or silent skip reaches it never (AGENTS.md's green-PASS defect, in
+    // the gate for a HIGH finding). Which hosts those are is worth stating precisely, because the
+    // arm's reach is easy to overstate in both directions: `ci.yml` *obtains* the facility (pinned,
+    // checksum-verified e2fsprogs, cached, ahead of the suites), so CI normally takes the `Ok` arm
+    // and does verify the bytes — the absent arm is for a developer box below 1.47.1, an
+    // `ext4-producer`-off build, and CI on the day that non-gating install fails, which is exactly
+    // the degradation `ci_obtains_the_ext4_facility_rather_than_living_with_the_skip` leaves open on
+    // purpose. Ubuntu 24.04's own package is 1.47.0, one patch below the `-d <tarball>` gate, which
+    // is why that step exists at all.
+    //
+    // The split, therefore:
+    //
+    // * The claim this leg OWNS is facility-independent and is asserted on every host: which
+    //   *emitter* a `format: ext4` request routes to. `emitter_for` — the one format→emitter law,
+    //   the same call the tail makes — decides that, and the pack's outcome must MATCH its verdict:
+    //   a route that yields a producer means the bytes must be ext4; a route that refuses means the
+    //   pack must have returned that same refusal, verbatim. The erofs-only door's refusal is an
+    //   `Error::Artifact` naming itself, so it satisfies neither arm; that is the H2 defect, and it
+    //   reddens here on every host, with or without e2fsprogs.
+    // * The claim it does NOT own is the ext4 BYTES on a host that cannot produce them. That claim
+    //   belongs to the batteries that can reach the skip law and record the gap —
+    //   `tests/ext4_producer.rs` and `tests/ext4_cell.rs` (delta 8's own) and
+    //   `tests/rootfs_registry.rs` (the same seam from the registry side, KVM-free, in the same
+    //   `just test-unit` run that runs this leg). One `SKIP cloud-hypervisor ext4_producer` line is
+    //   what tells a reviewer this run verified no ext4 production, and those legs write it.
+    //
+    // Comparing the pack's refusal against the route's refusal is what makes the absent-facility arm
+    // non-vacuous: it cannot be entered on a host that *has* the producer, and it cannot be satisfied
+    // by some *other* `CapabilityUnavailable` from further down the tail (`Ext4Producer::pack`
+    // returns one for an xattr the `-d <tarball>` form would silently drop). Wording is not matched
+    // at all — a refusal string is composed by the producer, and a substring matcher on it is the
+    // shape AGENTS.md bans one law over (F6).
+    //
+    // RED on the inverse, measured three ways: call `pack_erofs_with_injection` again (the
+    // `(res, route)` fall-through panics quoting the door); return a `CapabilityUnavailable` from the
+    // tail on a host that has the producer (the mismatch arm fires — the pre-fix wording assertion
+    // accepted it); or print a SKIP here instead (the crate-side arm of the call-site scan in
+    // `tests/common` fires, since the sink is unreachable from the lib target). The erofs leg at the
+    // end is the positive control — the same layers, the same fake, the default format — so a pack
+    // that failed for a reason unrelated to the format cannot pass.
     #[cfg(feature = "am-fs-erofs")]
     #[tokio::test]
     async fn the_oci_stage_packs_through_the_general_tail_so_an_ext4_label_builds() {
@@ -774,8 +814,12 @@ mod tests {
                 .with_format(crate::artifact::RootfsFormat::Ext4),
         )
         .await;
-        match res {
-            Ok(outputs) => {
+        // The one format→emitter law, asked directly: which route does `format: ext4` take on THIS
+        // host? It is what the tail itself calls, so it is the only honest yardstick for the pack's
+        // outcome — and asking it makes both arms below unenterable on the wrong kind of host.
+        let route = crate::artifact::rootfs::emitter_for(crate::artifact::RootfsFormat::Ext4);
+        match (res, route) {
+            (Ok(outputs), Ok(_)) => {
                 // The ext4 superblock magic (`0xEF53`, little-endian, at byte 0x438 — offset 56 of
                 // the superblock, which starts at 1024). Asserted on the BYTES rather than on
                 // "the file exists", which an erofs image at an `.ext4` name would also satisfy.
@@ -799,21 +843,30 @@ mod tests {
                     "the ext4 pack must register under its own label's key: {outputs:?}"
                 );
             }
-            // §4.7's own probe classifying an absent facility (no `mkfs.ext4`, too old, no
-            // libarchive) or the `ext4-producer` feature compiled out. Honest either way — and it
-            // still proves the request reached the FORMAT gate instead of the erofs door.
-            Err(crate::error::Error::CapabilityUnavailable { op, needed }) => {
-                assert!(op.contains("ext4"), "the op names the operation: {op}");
-                assert!(
-                    needed.contains("e2fsprogs")
-                        || needed.contains("libarchive")
-                        || needed.contains("ext4-producer"),
-                    "the refusal must name the absent facility: {needed}"
+            // The facility is absent (no `mkfs.ext4`, too old for `-d <tarball>`, no libarchive) or
+            // the `ext4-producer` feature is compiled out — and the ROUTE says so, which is what
+            // makes this arm a corroborated absence rather than an accepted excuse. The request still
+            // reached the format gate: the refusal the caller got IS the route's own, byte for byte.
+            // The ext4-bytes claim goes unverified here, and the batteries named above are what
+            // record that gap where a reviewer reads it.
+            (
+                Err(pack_refusal @ crate::error::Error::CapabilityUnavailable { .. }),
+                Err(route_refusal @ crate::error::Error::CapabilityUnavailable { .. }),
+            ) => {
+                assert_eq!(
+                    pack_refusal.to_string(),
+                    route_refusal.to_string(),
+                    "the pack refused with a DIFFERENT capability than the one `emitter_for` refuses \
+                     for `format: ext4`, so this leg proves nothing about the format gate: the \
+                     refusal a caller sees must be §4.7's own route refusal"
                 );
             }
-            other => panic!(
-                "an ext4 registry entry must pack (or be typed-refused by §4.7's probe), never die \
-                 on the erofs-only door: {other:?}"
+            (res, route) => panic!(
+                "a `format: ext4` pack must agree with the one format→emitter law: a route that \
+                 yields a producer means real ext4 bytes, and a route that refuses means that same \
+                 typed refusal reaches the caller. Neither the erofs-only door's `Error::Artifact` \
+                 (the defect this leg exists for) nor a capability refusal on a host whose route is \
+                 fine can pass. pack: {res:?}, route: {route:?}"
             ),
         }
 

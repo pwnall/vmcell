@@ -276,11 +276,22 @@ test-validator:
 # the same opt-in shape `test-crosvm` uses, this recipe with an explicit list:
 #   just test-bench cloud-hypervisor,crosvm      # needs $VMCELL_CROSVM_BIN or `crosvm` on PATH
 #
+# WRAPPED ONCE, AND ONLY ONCE. The runner export below wraps the TEST BINARY; `bench-vm` is then
+# spawned directly by the tests and inherits PRIVILEGED_CAPS through the ambient set — the same shape
+# `test-daemon` uses for `vmcelld`. A second wrap cannot work: the first one shrinks the bounding set
+# to PRIVILEGED_CAPS, dropping the transient CAP_SETPCAP that is still in the runner FILE's `+ep`
+# capabilities, and `execve` returns EPERM ("insufficient to execute correctly") rather than
+# degrading. That is exactly what shipped — `assert_cmd`'s `cargo_bin` door reads this very variable —
+# and all five tests died at 0.008s with a bare `os error 1`. The law and its four gates live in
+# crates/vmcell-bench/tests/common/mod.rs; `assert_bench_vm` now names the cause if it recurs.
+#
 # Needs KVM, the built artifacts (the tests touch the harness getters so the rootfs builds at most
 # once per session before `bench-vm` reads them) and the blessed runner — `bench-vm` pins the CPU
 # governor through `cpufreq::CpuFreqPin`, which needs CAP_DAC_OVERRIDE and otherwise prints
 # "NOT pinned (need CAP_DAC_OVERRIDE via vmcell-test-runner)", and its privileged sub-benches want the
-# net caps. Run it under a delegated scope like every other live suite:
+# net caps. (That pair is the measured proof the single wrap delivers: wrapped, the report says
+# "cpufreq: pinned N CPU(s)"; the same binary run by hand says "NOT pinned".)
+# Run it under a delegated scope like every other live suite:
 #   systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-bench
 # Each leg is one `bench-vm --backend <b> --iterations 1 --warmup 0` at the DEFAULT `--mode latency`
 # (cold boot + warm restore), not the whole §16 sub-bench set — a couple of boots per backend, and
@@ -290,8 +301,12 @@ test-bench features="cloud-hypervisor,firecracker,qemu":
     set -euo pipefail
     # The features list is an ACCEPTED INPUT, so it is honored or REJECTED here (AGENTS "fail loud"):
     # `bench-vm` carries `required-features = ["cloud-hypervisor"]`, so a list omitting it builds no
-    # binary at all and the failure surfaces as `Command::cargo_bin("bench-vm")` panicking inside a
-    # test, naming a target path rather than this argument.
+    # binary at all — while cargo still sets `CARGO_BIN_EXE_bench-vm` (measured: `cargo build --tests
+    # --no-default-features --features firecracker` compiles the test target and leaves
+    # target/debug/bench-vm untouched). The harness would therefore exercise whatever STALE binary an
+    # earlier, differently-featured build left there, and report it as this run — or, on a clean tree,
+    # fail at spawn with ENOENT. Neither is an answer about the features asked for, so it is refused
+    # here, by name, before cargo runs.
     case ",{{features}}," in
       *,cloud-hypervisor,*) ;;
       *) echo "test-bench: features must include cloud-hypervisor (bench-vm's required-features); got '{{features}}'" >&2; exit 1 ;;

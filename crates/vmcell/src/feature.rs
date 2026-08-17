@@ -147,12 +147,33 @@ impl Feature {
         )
     }
 
+    /// The whole vocabulary rendered for a refusal: `snapshot_restore, lazy_restore, …`.
+    ///
+    /// The **one** renderer of the roster, shared by [`Feature::parse`]'s unknown-token refusal and
+    /// by [`FeatureDeclaration::parse_manifest`]'s empty-name refusal, so two refusals cannot come
+    /// to list two different rosters. Composed from [`Feature::name`], which is what makes F6's
+    /// "refusal feature strings are `Feature::name()` by construction" true of the *list* as well as
+    /// of the single name.
+    fn names_joined() -> String {
+        Feature::ALL
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Parses a declaration token **strictly**: an unknown token is an error naming it, never a
     /// silent absence.
     ///
     /// This is clause 1, and it is the whole reason the enum exists rather than a `&str`. A typo'd
     /// misspelled `snapshot_restore` that parsed to "absent" would produce a cell that quietly does less while
     /// every downstream check passes, because nothing claimed the feature.
+    ///
+    /// It answers about a **token**, so it knows nothing about where that token came from: a caller
+    /// that reads tokens out of a file attaches its own locator (the sidecar parser does it through
+    /// its own `manifest_line_error` composer; the registry does it with the pins key). Propagating
+    /// this error unchanged from a line-oriented parser is the defect the `feature_manifest` fuzz
+    /// target found.
     ///
     /// # Errors
     ///
@@ -167,14 +188,60 @@ impl Feature {
                      An unknown token is an ERROR, not an absence (F6) — a typo that read as \
                      `unsupported` would produce a cell that quietly does less while every \
                      downstream check passed, because nothing claimed the feature.",
-                    Feature::ALL
-                        .iter()
-                        .map(|f| f.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    Feature::names_joined()
                 ))
             })
     }
+}
+
+/// **The** unknown feature token every gate in this file refuses: a **wrong word, not a
+/// misspelling**.
+///
+/// The fixture this replaces was `snapshot_restore` with its trailing `e` dropped — derived from
+/// [`Feature::name`] rather than typed, which was the wrong axis to defend on. That truncation is a
+/// **prefix of a valid name**, and [`Feature::parse`]'s refusal echoes the entire vocabulary through
+/// [`Feature::names_joined`] — so `msg.contains(typo)` was satisfied by the roster echo alone.
+/// Measured: a `parse` whose message read ``unknown feature `virtio_console` `` for that truncated
+/// input left both `unknown_feature_token_is_a_hard_error_naming_it` and
+/// `manifest_parse_is_strict_and_round_trips` **green**, as did one naming no token at all.
+/// That is AGENTS.md's banned substring matcher on a roster-composed refusal, and it is
+/// the same vacuity `examples/downstream-kernel/tests/contract.rs`'s `BOGUS_FEATURE_TOKEN` closed —
+/// this is that fixture's in-crate twin, spelled identically on purpose rather than as a second
+/// invention.
+///
+/// A real-word near miss closes both halves the truncation opened: no dictionary corrects
+/// `restored`, so the `typos` gate has no opinion and nobody will later "fix" the fixture; and no
+/// valid token contains it, so a `contains` can only pass when the refusal really echoes what it
+/// refused. It is also the *tighter* fixture — a parser that accepted any token merely *starting
+/// with* a valid name would take this one and still reject the truncation it replaces.
+#[cfg(test)]
+const BOGUS_FEATURE_TOKEN: &str = "snapshot_restored";
+
+/// A second unknown token, used only to prove the roster echo does not carry
+/// [`BOGUS_FEATURE_TOKEN`]. Real words, so the spell checker has no opinion about it either.
+///
+/// Gated with its one consumer rather than with [`BOGUS_FEATURE_TOKEN`], which both test modules
+/// use: the non-vacuity control belongs beside the first use, the way the sibling fixture's does.
+#[cfg(all(test, feature = "host-common"))]
+const OTHER_BOGUS_FEATURE_TOKEN: &str = "not_a_feature";
+
+/// `msg` with the composed roster echo replaced by a placeholder — the form a **token** needle is
+/// matched against.
+///
+/// [`Feature::parse`]'s refusal and [`FeatureDeclaration::parse_manifest`]'s empty-name arm both
+/// list the whole vocabulary. A `contains` over the raw message therefore cannot distinguish "the
+/// refusal names the token it refused" from "the token is a substring of some valid name", which is
+/// exactly how the fixture above came to be vacuous. Excising the echo first makes the needle
+/// structurally about the rest of the message, whatever token a later leg picks: the fixture choice
+/// and the assertion shape are two independent defenses, and this is the one that does not depend
+/// on anybody remembering.
+///
+/// It can only ever *narrow* a haystack, so it cannot manufacture a pass. Asserting the echo is
+/// **present** stays a separate assertion at the sites that claim it, because a silent no-op here
+/// would weaken the excision without failing anything.
+#[cfg(test)]
+fn without_the_roster_echo(msg: &str) -> String {
+    msg.replace(&Feature::names_joined(), "<the roster, echoed>")
 }
 
 impl fmt::Display for Feature {
@@ -329,6 +396,35 @@ pub fn feature_manifest_path(artifact: &std::path::Path) -> std::path::PathBuf {
     artifact.with_extension("features")
 }
 
+/// **The one locator** every [`FeatureDeclaration::parse_manifest`] refusal carries: the 1-based
+/// line number *and* the offending line's own code text.
+///
+/// Kept as a composer rather than a format string repeated per arm because the drift had already
+/// shipped: three of the parser's four arms hand-attached `idx + 1` and the `Feature::parse` arm
+/// forgot, propagating a token-only refusal. The `feature_manifest` fuzz target found it with **two
+/// bytes** — `=z`, where the key before `=` is empty, so the propagated message read
+/// ``unknown feature ``: …`` and quoted neither a line number nor any byte of the input. A rule that
+/// each arm must remember is a rule a *new* arm can forget; a composer every arm goes through is one
+/// it cannot, and `every_manifest_refusal_goes_through_the_one_locator_composer` scans the call sites
+/// so the composer cannot be bypassed either.
+///
+/// Both halves are load-bearing. The **number** answers "which of the three identical lines"; the
+/// **text** survives a consumer who cannot see the numbering (a here-doc, a generated sidecar, a
+/// body assembled in memory). The line is quoted at full length on purpose: this is local build
+/// config, not a guest-controlled frame, and the truncating render would defeat the very property
+/// the fuzz target asserts.
+fn manifest_locator(line_number: usize, line: &str) -> String {
+    format!("feature manifest line {line_number} (`{line}`)")
+}
+
+/// Composes one [`FeatureDeclaration::parse_manifest`] refusal: [`manifest_locator`], then `detail`.
+///
+/// `detail` says only what is wrong; it never restates the line or its number, because that is this
+/// function's job.
+fn manifest_line_error(line_number: usize, line: &str, detail: String) -> Error {
+    Error::Artifact(format!("{}: {detail}", manifest_locator(line_number, line)))
+}
+
 impl FeatureDeclaration {
     /// The baseline declaration: what the canonical artifacts provide, with no stance of their own.
     ///
@@ -348,9 +444,17 @@ impl FeatureDeclaration {
     /// Strict on **both** halves — an unknown feature name and an unparseable boolean are each hard
     /// errors naming the offending token (F6 clause 1).
     ///
+    /// **Every** refusal is located, through the one `manifest_line_error` composer: a consumer
+    /// reads which line offended and what that line said, never just "the manifest is bad". The five
+    /// malformed shapes are kept *distinct*, because the fix differs per shape: no `=` at all, an
+    /// empty name before the `=`, an unknown name, a stance that is not a boolean, and a duplicate.
+    /// The empty-name arm is the one this fix SPLIT OUT: an empty name is a malformed **line**, not an
+    /// unknown feature, and reporting it as ``unknown feature `` `` named nothing a consumer could
+    /// search for.
+    ///
     /// # Errors
     ///
-    /// [`Error::Artifact`] naming the line and the offending token.
+    /// [`Error::Artifact`] naming the line, the line's text, and the offending token.
     pub fn parse_manifest(body: &str, source: Source) -> Result<Self> {
         let mut stances = BTreeMap::new();
         for (idx, raw) in body.lines().enumerate() {
@@ -358,30 +462,40 @@ impl FeatureDeclaration {
             if line.is_empty() {
                 continue;
             }
-            let (key, value) = line.split_once('=').ok_or_else(|| {
-                Error::Artifact(format!(
-                    "feature manifest line {}: expected `<feature> = <true|false>`, got `{line}`",
-                    idx + 1
-                ))
-            })?;
-            let feature = Feature::parse(key.trim())?;
+            // The one locator, bound to this line once: every refusal below is `reject(…)`, so no
+            // arm can ship a message a consumer cannot locate and none can attach the wrong line.
+            let reject = |detail: String| manifest_line_error(idx + 1, line, detail);
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| reject("expected `<feature> = <true|false>`".to_string()))?;
+            let key = key.trim();
+            if key.is_empty() {
+                // NOT `Feature::parse("")`'s refusal: nothing was misspelled, so "unknown feature"
+                // would send a consumer looking for a token that is not there. The roster still
+                // travels — composed, never hand-listed — because "which names are legal" is the
+                // consumer's very next question.
+                return Err(reject(format!(
+                    "no feature name before the `=`; expected `<feature> = <true|false>`, where \
+                     `<feature>` is one of [{}]",
+                    Feature::names_joined()
+                )));
+            }
+            let feature = Feature::parse(key).map_err(|e| reject(e.to_string()))?;
             let stance = match value.trim() {
                 "true" => true,
                 "false" => false,
                 other => {
-                    return Err(Error::Artifact(format!(
-                        "feature manifest line {}: `{}` must be `true` or `false`, got `{other}`. \
-                         A stance is stated or the manifest is rejected — never defaulted.",
-                        idx + 1,
+                    return Err(reject(format!(
+                        "`{}` must be `true` or `false`, got `{other}`. A stance is stated or the \
+                         manifest is rejected — never defaulted.",
                         feature.name()
                     )));
                 }
             };
             if stances.insert(feature, stance).is_some() {
-                return Err(Error::Artifact(format!(
-                    "feature manifest line {}: `{}` is declared twice; a duplicate stance has no \
-                     defined precedence, so it is rejected rather than last-writer-wins.",
-                    idx + 1,
+                return Err(reject(format!(
+                    "`{}` is declared twice; a duplicate stance has no defined precedence, so it \
+                     is rejected rather than last-writer-wins.",
                     feature.name()
                 )));
             }
@@ -732,24 +846,46 @@ mod host_tests {
     }
 
     /// The strict parse: an unknown token is an error NAMING it, never a silent absence.
+    ///
+    /// Both halves of that claim, and neither by a bare substring match on the raw message. The
+    /// refusal echoes the whole vocabulary, so the **roster** half is asserted against
+    /// [`Feature::names_joined`] — the composer, not a fragment of it — and the **token** half
+    /// against the message with that echo excised ([`without_the_roster_echo`]).
+    ///
+    /// RED on the inverse, measured three ways — one arm per shape this defect has. A `parse`
+    /// naming the wrong token, and one naming no token at all, each fail the first assertion (both
+    /// passed what it replaces: see [`BOGUS_FEATURE_TOKEN`]); reverting the fixture to a prefix of a
+    /// valid name fails the non-vacuity leg instead, because the roster echo then carries it.
     #[test]
     fn unknown_feature_token_is_a_hard_error_naming_it() {
-        // The typo is DERIVED from the real name (drop its last byte), not typed as a literal.
-        // Two reasons: a hand-typed misspelling drifts if the feature is ever renamed, and the
-        // `typos` gate reads a literal misspelling as the defect it exists to catch — a fixture
-        // that has to be exempted from a gate is a fixture that will be "fixed" by someone later.
-        let real = Feature::SnapshotRestore.name();
-        let typo = &real[..real.len() - 1];
-        let err = Feature::parse(typo).expect_err("a typo must not parse");
+        let err = Feature::parse(BOGUS_FEATURE_TOKEN).expect_err("a wrong word must not parse");
         let msg = err.to_string();
         assert!(
-            msg.contains(typo),
-            "the error must name the offending token so the typo is findable; got: {msg}"
+            without_the_roster_echo(&msg).contains(BOGUS_FEATURE_TOKEN),
+            "the error must name the offending token OUTSIDE the echoed roster, so the token is \
+             findable and the assertion is not satisfied by the vocabulary listing; got: {msg}"
         );
         assert!(
-            msg.contains(Feature::SnapshotRestore.name()),
+            msg.contains(&Feature::names_joined()),
             "the error must list the known names so the fix is obvious; got: {msg}"
         );
+
+        // NON-VACUITY of the token assertion, demonstrated rather than argued — the shape the
+        // sibling `examples/downstream-kernel/tests/contract.rs` already ships. A refusal about a
+        // DIFFERENT unknown token must not carry this one's spelling: the only text the two
+        // refusals share is the roster echo, so this leg IS the empirical proof that
+        // `BOGUS_FEATURE_TOKEN` is not inside it — and the arm that reddens the day somebody
+        // spells the fixture as a substring of a valid name again.
+        let other = Feature::parse(OTHER_BOGUS_FEATURE_TOKEN)
+            .expect_err("the second wrong word must not parse either")
+            .to_string();
+        assert!(
+            !other.contains(BOGUS_FEATURE_TOKEN),
+            "`{BOGUS_FEATURE_TOKEN}` must not appear in a refusal that is not about it, or the \
+             assertion above is matching the echoed vocabulary instead of the refused token: \
+             {other}"
+        );
+
         // Positive control: the correctly-spelled sibling parses.
         assert_eq!(
             Feature::parse("snapshot_restore").expect("the correct spelling parses"),
@@ -1053,13 +1189,31 @@ mod host_tests {
             .expect("the rendered manifest parses back");
         assert_eq!(round.stances, decl.stances);
 
-        // An unknown feature name is an error NAMING the token. Derived, not typed (see
-        // `unknown_feature_token_is_a_hard_error_naming_it`).
-        let real = Feature::SnapshotRestore.name();
-        let typo = &real[..real.len() - 1];
-        let e = FeatureDeclaration::parse_manifest(&format!("{typo} = false\n"), src.clone())
-            .expect_err("an unknown token must not parse");
-        assert!(e.to_string().contains(typo), "{e}");
+        // An unknown feature name is an error naming the token — and naming THAT token. Two
+        // assertions, because two different things carry a token for free here: the roster echo
+        // carries any token that is a substring of a valid name (excised, see
+        // `BOGUS_FEATURE_TOKEN`), and the locator quotes the whole offending line, so it carries
+        // the declared token whatever the propagated detail says. What neither can fake is being
+        // *about* this token: a token-blind parser collapses every unknown-token refusal to one
+        // text, so the refusal composed for a DIFFERENT unknown token must not be what travelled.
+        let e = FeatureDeclaration::parse_manifest(
+            &format!("{BOGUS_FEATURE_TOKEN} = false\n"),
+            src.clone(),
+        )
+        .expect_err("an unknown token must not parse");
+        assert!(
+            without_the_roster_echo(&e.to_string()).contains(BOGUS_FEATURE_TOKEN),
+            "{e}"
+        );
+        assert!(
+            !e.to_string().contains(
+                &Feature::parse(OTHER_BOGUS_FEATURE_TOKEN)
+                    .expect_err("the second wrong word must not parse either")
+                    .to_string()
+            ),
+            "the propagated refusal must be about the token this manifest declared, not a text \
+             every unknown token would share: {e}"
+        );
 
         // A non-boolean stance is an error NAMING the value — never defaulted.
         let e = FeatureDeclaration::parse_manifest("snapshot_restore = maybe\n", src.clone())
@@ -1146,6 +1300,407 @@ mod host_tests {
             "the declared stance must survive the round trip"
         );
         assert_eq!(loaded.stances, declared.stances);
+    }
+}
+
+/// **Every sidecar refusal is locatable** — the gate for the defect the `feature_manifest` fuzz
+/// target found (GitHub Actions run 32017582821, two consecutive nightly reds).
+///
+/// Ungated on `host-common`, like the vocabulary it exercises: [`FeatureDeclaration::parse_manifest`]
+/// is the validation boundary a *consumer* reads a sidecar through, so it compiles — and must be
+/// gated — in every feature configuration `cargo hack` builds.
+///
+/// The crash was two bytes, `=z`. The parser's `Feature::parse` arm propagated a token-only refusal,
+/// and for an empty key that token is the empty string, so the message named nothing at all. What
+/// makes it a *class* rather than a typo is the shape: three of the four arms hand-attached the line
+/// number and the fourth forgot. These gates therefore hold three different halves, and none covers
+/// another's:
+///
+/// * `every_refusal_arm_carries_the_line_number_and_the_offending_line` — the behaviour, per arm,
+///   asserted against the composed locator rather than a hand-typed sentence;
+/// * `every_manifest_refusal_goes_through_the_one_locator_composer` — the **call sites**, because a
+///   green per-arm test standing beside a new hand-rolled arm is exactly the completeness-audit
+///   failure shape;
+/// * `the_two_byte_fuzz_crash_input_is_locatable` — the discovered input itself. `fuzz/.gitignore`
+///   commits `seed-*` corpora only, for the six targets whose *reachability* needs a seed; it keeps
+///   no crash reproducers in tree (`/artifacts` is ignored and the workflow uploads them instead).
+///   So this test is where those bytes live permanently, and it re-asserts the fuzz target's own
+///   property rather than a weaker in-crate paraphrase of it.
+#[cfg(test)]
+mod manifest_locator_gates {
+    use super::*;
+
+    /// The exact bytes from the reddened nightly run's reproducer
+    /// (`fuzz-artifacts/feature_manifest/crash-cb6cb176a6b17e5ba5906726719f5e94f0fb214a`).
+    ///
+    /// Held as bytes, then read as UTF-8 the way the target does, so this fixture is the artifact
+    /// rather than a retyping of what it "meant".
+    const FUZZ_CRASH_INPUT: &[u8] = b"=z";
+
+    /// A raw line's code part (comment stripped, trimmed), or `None` when it declares nothing.
+    ///
+    /// The same reduction [`FeatureDeclaration::parse_manifest`] performs, so a candidate line is
+    /// exactly what the parser would have called one.
+    fn code_of(raw: &str) -> Option<&str> {
+        let code = raw.split('#').next().unwrap_or("").trim();
+        (!code.is_empty()).then_some(code)
+    }
+
+    /// The `feature_manifest` fuzz target's REJECTED-manifest property, in one place.
+    ///
+    /// A refusal must point at one real declaration line **by number and by quoting its own text**.
+    /// Existence over the candidate lines is all that is checkable from outside the parser (which
+    /// line failed is the parser's own answer); the table gate below pins the exact line for each
+    /// known input, so the two together say "the right line, and always a line".
+    fn is_locatable(body: &str, msg: &str) -> bool {
+        body.lines().enumerate().any(|(i, raw)| {
+            code_of(raw)
+                .is_some_and(|code| msg.contains(&format!("line {}", i + 1)) && msg.contains(code))
+        })
+    }
+
+    fn reject(body: &str) -> String {
+        FeatureDeclaration::parse_manifest(body, Source::Rootfs("gate".into()))
+            .map(|d| format!("{d:?}"))
+            .expect_err("this body must be refused")
+            .to_string()
+    }
+
+    /// **One assertion per error arm: the refusal names the line and quotes it.**
+    ///
+    /// Driven with a degenerate input per arm, each asserted against
+    /// [`manifest_locator`] — the composer, not a hand-typed sentence, so a reworded detail cannot
+    /// redden this and a dropped locator cannot pass it. Every needle beyond the locator is composed
+    /// too ([`Feature::name`] / [`Feature::names_joined`] / [`BOGUS_FEATURE_TOKEN`]), and every
+    /// needle that is not the roster itself is matched against the detail with the roster echo
+    /// excised ([`without_the_roster_echo`]) — which is what keeps this off the substring-matcher
+    /// ban F6 carries. The unknown-name leg needed both: its needle used to be a truncation of a
+    /// valid name, so the echo matched it whatever the refusal said, and only the *sibling*
+    /// interior-whitespace leg in this same table kept the test from passing for a refusal that
+    /// named the wrong token.
+    ///
+    /// The last assertions hold a second half of the same defect: the five malformed shapes must stay
+    /// DISTINGUISHABLE, because the fix differs per shape. A parser that answered "the manifest is
+    /// bad" five times would satisfy every locator assertion above and still leave a consumer with
+    /// nothing to change — so no detail may appear under two different arms, and the table must drive
+    /// all five.
+    ///
+    /// RED on the inverse, demonstrated four ways: reverting the `Feature::parse` arm to a bare `?`
+    /// (the shipped defect) reddens the empty-name legs; hardcoding `1` in place of `idx + 1` reddens
+    /// the later-line legs; dropping `line` from [`manifest_locator`] reddens all of them; and
+    /// rewording one arm's detail onto another's reddens the distinctness assertion alone.
+    #[test]
+    fn every_refusal_arm_carries_the_line_number_and_the_offending_line() {
+        let real = Feature::SnapshotRestore.name();
+        // A token with interior whitespace — derived, because no spelling of it is a substring of
+        // the roster and a rename must not leave it aimed at a name that no longer exists.
+        let spaced = real.replace('_', " ");
+        // The one roster echo, bound once: it is both a needle (the empty-name arm owes it) and the
+        // text every OTHER needle must be matched outside of.
+        let roster = Feature::names_joined();
+
+        // (arm, body, offending line number, that line's code, composed identifiers the detail owes).
+        let cases: Vec<(&str, String, usize, String, Vec<String>)> = vec![
+            // The crash: an empty key before `=`. The arm that shipped unlocated.
+            (
+                "empty-name",
+                String::from_utf8(FUZZ_CRASH_INPUT.to_vec()).expect("the fixture is UTF-8"),
+                1,
+                "=z".to_string(),
+                vec![roster.clone()],
+            ),
+            // A bare `=`: empty on BOTH sides. Still the empty-name arm, because the name is read
+            // first — and there is nothing else to name.
+            (
+                "empty-name",
+                "=".to_string(),
+                1,
+                "=".to_string(),
+                vec![roster.clone()],
+            ),
+            // The same defect on a LATER line, past a comment and a blank: the number must be the
+            // line's, not the first line's. Without this leg a hardcoded `1` passes every other leg.
+            (
+                "empty-name",
+                format!("# a comment\n\n{real} = true\n=z\n"),
+                4,
+                "=z".to_string(),
+                vec![roster.clone()],
+            ),
+            // …and past a line whose comment is what empties it, so the enumeration counts SOURCE
+            // lines rather than declarations.
+            (
+                "empty-name",
+                format!("{real} = true\n# just a comment\n=z\n"),
+                3,
+                "=z".to_string(),
+                vec![roster.clone()],
+            ),
+            // An unknown name: the token travels (that half always worked) and now so does the line.
+            (
+                "unknown-name",
+                format!("{BOGUS_FEATURE_TOKEN} = false\n"),
+                1,
+                format!("{BOGUS_FEATURE_TOKEN} = false"),
+                vec![BOGUS_FEATURE_TOKEN.to_string()],
+            ),
+            // A name with interior whitespace: `split_once('=')` accepts it as a key, so it reaches
+            // the unknown-name arm rather than the malformed-line one.
+            (
+                "unknown-name",
+                format!("{spaced} = true\n"),
+                1,
+                format!("{spaced} = true"),
+                vec![spaced.clone()],
+            ),
+            // No `=` at all. The detail deliberately names no token: the locator already quotes the
+            // whole line, and restating it was the duplication the composer removed.
+            (
+                "no-equals",
+                format!("{real}\n"),
+                1,
+                real.to_string(),
+                vec![],
+            ),
+            // A stance that is not a boolean, on line 2 — the value is quoted and so is the feature.
+            (
+                "non-boolean-stance",
+                format!("# header\n{real} = maybe\n"),
+                2,
+                format!("{real} = maybe"),
+                vec![real.to_string(), "maybe".to_string()],
+            ),
+            // A stance that is only whitespace: the empty value must be refused, never defaulted.
+            (
+                "non-boolean-stance",
+                format!("{real} =\n"),
+                1,
+                format!("{real} ="),
+                vec![real.to_string()],
+            ),
+            // A duplicate stance, refused at the SECOND line — the one that made it a duplicate.
+            (
+                "duplicate",
+                format!("{real} = true\n{real} = false\n"),
+                2,
+                format!("{real} = false"),
+                vec![real.to_string()],
+            ),
+            // A trailing comment on the offending line: the locator quotes the CODE, so the comment
+            // is not mistaken for part of the declaration.
+            (
+                "empty-name",
+                "=z # this line is the offender\n".to_string(),
+                1,
+                "=z".to_string(),
+                vec![roster.clone()],
+            ),
+        ];
+
+        // detail → the arm that produced it, so a detail shared across arms is caught below.
+        let mut details: std::collections::BTreeMap<String, &str> = Default::default();
+        for (arm, body, line_number, code, needles) in &cases {
+            let msg = reject(body);
+            // `Error::Artifact`'s own `Display` prefixes the variant, so the locator is asserted as
+            // the head of the *message* the parser composed, not of the rendered error. Splitting on
+            // the composed locator is also how the detail is isolated — no hand-typed fragment of
+            // the format, so a reworded locator cannot silently turn this into a whole-message
+            // comparison.
+            let locator = manifest_locator(*line_number, code);
+            let (_, detail) = msg.split_once(&locator).unwrap_or_else(|| {
+                panic!(
+                    "the refusal must carry the composed locator {locator:?} — the line number \
+                     answers `which of the identical lines` and the quoted text survives a consumer \
+                     who cannot see the numbering. Got {msg:?} for {body:?}"
+                )
+            });
+            assert!(
+                detail.starts_with(": "),
+                "the locator must be followed immediately by the detail: {msg:?}"
+            );
+            for needle in needles {
+                // The roster echo is excised before the match — unless the needle IS the roster,
+                // which is the one needle whose whole point is that the echo is there. Any other
+                // needle that happened to be a substring of a valid feature name would otherwise be
+                // found inside the echo whether or not the refusal named what it refused: that is
+                // the vacuity `BOGUS_FEATURE_TOKEN` records, and excising makes it unreachable for
+                // whatever token a future leg picks.
+                let haystack = if needle == &roster {
+                    detail.to_string()
+                } else {
+                    without_the_roster_echo(detail)
+                };
+                assert!(
+                    haystack.contains(needle.as_str()),
+                    "the detail must carry the composed identifier {needle:?} so the fix is \
+                     obvious; got {detail:?} for {body:?}"
+                );
+            }
+            // And the fuzz target's own property, on every one of these inputs.
+            assert!(
+                is_locatable(body, &msg),
+                "the `feature_manifest` fuzz property must hold for {body:?}: {msg:?}"
+            );
+            // Two inputs on the SAME arm may share a detail (`=z` and `=` do); two arms may not.
+            if let Some(other) = details.insert(detail.to_string(), arm)
+                && other != *arm
+            {
+                panic!(
+                    "the `{arm}` and `{other}` arms produced the same detail {detail:?} — each \
+                     malformed shape needs its own, because the fix differs per shape"
+                );
+            }
+        }
+        // Non-vacuity: the table must drive EVERY refusal arm, or the distinctness check above is a
+        // statement about the arms somebody remembered.
+        let arms: std::collections::BTreeSet<&str> = cases.iter().map(|(arm, ..)| *arm).collect();
+        assert_eq!(
+            arms.len(),
+            5,
+            "gate misconfigured: `parse_manifest` has five refusal arms and the table drives \
+             {arms:?}"
+        );
+        assert!(
+            details.len() >= arms.len(),
+            "gate misconfigured: {} distinct detail(s) for {} arm(s): {details:#?}",
+            details.len(),
+            arms.len()
+        );
+    }
+
+    /// **The discovered input, permanently.** Two bytes, `=z`, from the nightly reproducer.
+    ///
+    /// This target keeps no in-tree corpus (see the module's own note), so the fixture lives here.
+    /// It re-asserts the fuzz target's property verbatim through [`is_locatable`] rather than a
+    /// weaker paraphrase, because the point of a regression fixture is that the *same* property that
+    /// went red stays green.
+    ///
+    /// RED on the inverse: restore `let feature = Feature::parse(key.trim())?;` and this fails with
+    /// the message the run reported — ``unknown feature ``: a feature token must be one of […]``,
+    /// which quotes neither a line number nor any byte of `=z`.
+    #[test]
+    fn the_two_byte_fuzz_crash_input_is_locatable() {
+        let body = std::str::from_utf8(FUZZ_CRASH_INPUT).expect("the reproducer is UTF-8");
+        let msg = reject(body);
+        assert!(
+            is_locatable(body, &msg),
+            "the reproducer's refusal must name its line and quote it: {msg:?}"
+        );
+        // Non-vacuity: `is_locatable` is an existence check, so prove it can say no. The pre-fix
+        // message is reconstructed from the one place that composes it, not retyped.
+        let unlocated = Feature::parse("")
+            .expect_err("the empty token is not a feature")
+            .to_string();
+        assert!(
+            !is_locatable(body, &unlocated),
+            "gate misconfigured: `is_locatable` accepts the very message that reddened the nightly \
+             run, so it would pass with no locator anywhere: {unlocated:?}"
+        );
+    }
+
+    /// An empty name is a malformed **line**, not an unknown feature.
+    ///
+    /// The distinction is the actionable half of the fix: ``unknown feature `` `` sends a consumer
+    /// looking for a token that is not in their file. Asserted by *identity* against the propagated
+    /// refusal rather than by matching prose, so it survives any rewording of either message.
+    #[test]
+    fn an_empty_name_is_a_malformed_line_not_an_unknown_feature() {
+        let propagated = Feature::parse("")
+            .expect_err("the empty token is not a feature")
+            .to_string();
+        for body in ["=z", "=", " = true", "\t=false"] {
+            let msg = reject(body);
+            assert!(
+                !msg.contains(&propagated),
+                "an empty name must not be reported as `Feature::parse`'s unknown-token refusal — \
+                 nothing was misspelled: {msg:?}"
+            );
+            // The roster still travels, composed: "which names are legal" is the next question.
+            assert!(
+                msg.contains(&Feature::names_joined()),
+                "the empty-name refusal must list the legal names: {msg:?}"
+            );
+        }
+        // Positive control: a name that IS unknown still gets the unknown-token refusal, so the arm
+        // above narrowed the message rather than deleting a distinction. The needle is the WHOLE
+        // composed refusal rather than the token, so this one was never satisfiable by the roster
+        // echo — but it takes `BOGUS_FEATURE_TOKEN` anyway, so the file holds exactly one spelling
+        // of "an unknown feature token" and nobody copies the truncation idiom out of here.
+        assert!(
+            reject(&format!("{BOGUS_FEATURE_TOKEN} = true")).contains(
+                &Feature::parse(BOGUS_FEATURE_TOKEN)
+                    .expect_err("a wrong word must not parse")
+                    .to_string()
+            ),
+            "an actually-unknown token must still carry `Feature::parse`'s refusal"
+        );
+    }
+
+    /// A line that declares nothing is not a refusal at all — the parser's tolerances, pinned.
+    ///
+    /// The negative control for every gate above: if blank, whitespace-only and comment-only lines
+    /// started erroring, the locator gates would go green on inputs that must never reach an arm.
+    #[test]
+    fn a_line_that_declares_nothing_is_not_a_refusal_at_all() {
+        for body in [
+            "",
+            "\n\n",
+            " \t ",
+            "# just a comment\n",
+            "   # indented\n\n \t\n",
+        ] {
+            let decl = FeatureDeclaration::parse_manifest(body, Source::Rootfs("gate".into()))
+                .unwrap_or_else(|e| panic!("{body:?} declares nothing and must parse: {e}"));
+            assert!(decl.stances.is_empty(), "{body:?} declared a stance");
+        }
+    }
+
+    /// **The call-site half: no arm composes its own refusal.**
+    ///
+    /// Two of the completeness-audit PARTIALs were invisible because a green unit test stood beside
+    /// an unchanged call site, and this defect is that shape exactly — every *tested* arm carried the
+    /// line number, and the untested one did not. So the gate is a source scan over
+    /// [`FeatureDeclaration::parse_manifest`]'s own body: it must construct no [`Error`] except
+    /// through the `reject` closure that binds [`manifest_line_error`] to this line.
+    ///
+    /// RED on the inverse: put a bare `Error::Artifact(format!(…))` in any arm.
+    #[test]
+    fn every_manifest_refusal_goes_through_the_one_locator_composer() {
+        let src = include_str!("feature.rs");
+        let start = src
+            .find("pub fn parse_manifest(")
+            .expect("gate misconfigured: parse_manifest was renamed");
+        let body = &src[start..];
+        let end = body
+            .find("\n    }")
+            .expect("gate misconfigured: the method's closing brace was not found");
+        let body = &body[..end];
+
+        // Non-vacuity: the slice must be the real loop, or this scans the wrong text.
+        assert!(
+            body.contains("body.lines().enumerate()"),
+            "gate misconfigured: the sliced body is not the line loop:\n{body}"
+        );
+        assert!(
+            body.matches("reject(").count() >= 5,
+            "gate misconfigured: only {} `reject(` site(s) in the parser — the composer is not what \
+             the arms use, so this scan proves nothing",
+            body.matches("reject(").count()
+        );
+
+        let hand_rolled: Vec<&str> = body
+            .lines()
+            .filter(|l| {
+                let code = l.split("//").next().unwrap_or("");
+                code.contains("Error::") || code.contains("Artifact(")
+            })
+            .collect();
+        assert!(
+            hand_rolled.is_empty(),
+            "every refusal in `parse_manifest` must go through the one locator composer (a bare \
+             `Error::…` cannot carry the line, which is how `=z` shipped a message naming nothing). \
+             Offending line(s): {hand_rolled:#?}"
+        );
     }
 }
 

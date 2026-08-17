@@ -3,6 +3,7 @@
 pub mod backend {
     use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use vhost::vhost_user::Listener;
     use vhost::vhost_user::message::VhostUserProtocolFeatures;
@@ -176,6 +177,26 @@ pub mod backend {
         }
         tx_queue.push_back(payload.to_vec());
         true
+    }
+
+    /// How often a *sustained* tail drop repeats its report: one line per this many dropped frames,
+    /// after the first.
+    ///
+    /// A stalled consumer drops at whatever rate the guest kicks, so a line per frame would be its
+    /// own flood — the console log is a persisted artifact. One queue-depth's worth per line keeps a
+    /// sustained overload to a trickle while still growing with it.
+    const TX_DROP_REPORT_EVERY: u64 = MAX_TX_QUEUE_FRAMES as u64;
+
+    /// Whether the `total`-th tail-dropped guest→host frame is one that gets logged: the **first**
+    /// always, then every [`TX_DROP_REPORT_EVERY`]-th.
+    ///
+    /// [`push_tx_frame`]'s drop is otherwise completely silent — the guest gets its descriptor back,
+    /// TCP retransmits, and nothing on the host says the NAT is behind — so the bound needs an
+    /// operator-visible signal or it is a silent data-plane behavior change. The first drop is
+    /// always reported because "it happened at all" is the interesting bit: a NAT that reaches a
+    /// four-ring-deep queue has a stalled consumer, which is a bug report, not a tuning hint.
+    fn tx_drop_is_reportable(total: u64) -> bool {
+        total == 1 || total.is_multiple_of(TX_DROP_REPORT_EVERY)
     }
 
     /// Computes the smoltcp interface addresses for `vmid` from the shared
@@ -478,6 +499,53 @@ pub mod backend {
         Unreadable,
     }
 
+    /// Masks the transmitq's kick notifications before a drain pass, **reporting** a failure rather
+    /// than discarding it.
+    ///
+    /// The one place the mask is turned on, so the report cannot be forgotten at a second call site.
+    /// A failure costs at most one extra wakeup — the mask never went on, so the guest keeps kicking
+    /// a ring this loop is about to read anyway — which is why it is a `warn` and not the `error`
+    /// [`rearm_tx_notifications`] uses. It is still not a discarded `Result`: the write that failed
+    /// is a guest-memory store into the used ring, so its failure says that ring's addresses no
+    /// longer map, and the very next `add_used` will fail for the same reason.
+    fn mask_tx_notifications(vring_state: &mut VringState<GuestMemoryAtomic<GuestMemoryMmap>>) {
+        if let Err(e) = vring_state.disable_notification() {
+            tracing::warn!(
+                "smoltcp NAT: could not mask transmitq kicks ({e}); this pass costs an extra \
+                 wakeup, and the used ring the write failed against is the one add_used writes"
+            );
+        }
+    }
+
+    /// Re-arms the transmitq's kick notifications on the way out of a pass, **reporting** a failure
+    /// rather than discarding it. Returns whether the guest supplied more chains while the mask was
+    /// on — `false` on failure, because a ring that cannot be re-armed is not one to keep polling.
+    ///
+    /// Unlike [`mask_tx_notifications`] this direction is **not** advisory, which is why its failure
+    /// is an `error`: the mask that is being lifted is `VRING_USED_F_NO_NOTIFY` (or, with
+    /// `VIRTIO_RING_F_EVENT_IDX`, an `avail_event` watermark), i.e. the flag by which the *guest's*
+    /// driver is told not to kick. Leaving it set tells a healthy guest to stay quiet about a ring
+    /// nothing will poll again — the same silently wedged link [`TxPass`] exists to prevent, reached
+    /// through the error path of the fix for it.
+    ///
+    /// It cannot be repaired here: the write that failed *is* the repair, and an `Err` handed back to
+    /// the framework kills the vring worker (see [`TxPass`]). So the honest posture is a loud log
+    /// plus a caller that stops polling this tick.
+    fn rearm_tx_notifications(
+        vring_state: &mut VringState<GuestMemoryAtomic<GuestMemoryMmap>>,
+    ) -> bool {
+        match vring_state.enable_notification() {
+            Ok(more_available) => more_available,
+            Err(e) => {
+                tracing::error!(
+                    "smoltcp NAT: could not re-arm transmitq kicks ({e}); the guest's driver may \
+                     stay masked on a ring nothing will poll again"
+                );
+                false
+            }
+        }
+    }
+
     struct VhostUserNetBackend {
         event_idx: bool,
         kill_evt: (EventConsumer, EventNotifier),
@@ -486,6 +554,14 @@ pub mod backend {
         /// because [`VhostUserBackendMut::exit_event`] takes `&self` (the framework calls it through
         /// a *read* guard on the `RwLock` around this backend).
         exit_evt: Mutex<Option<(EventConsumer, EventNotifier)>>,
+        /// Guest→host frames tail-dropped at [`MAX_TX_QUEUE_FRAMES`] since bring-up, cumulative over
+        /// every vhost-user connection this NAT serves.
+        ///
+        /// It lives here rather than in [`SharedState`] because that struct is public with public
+        /// fields: a counter nobody outside this module reads has no business being a breaking change
+        /// to a downstream constructor. Atomic because `process_tx_queue` takes it by shared
+        /// reference while holding the state guard.
+        tx_drops: AtomicU64,
         state: Arc<Mutex<SharedState>>,
     }
 
@@ -509,9 +585,13 @@ pub mod backend {
             Ok(())
         }
 
+        /// Drains one guest→host pass, counting every frame [`push_tx_frame`] tail-drops into
+        /// `tx_drops` (the caller's [`VhostUserNetBackend::tx_drops`]) so an overload is reported
+        /// rather than silent.
         fn process_tx_queue(
             state: &mut SharedState,
             vring_state: &mut VringState<GuestMemoryAtomic<GuestMemoryMmap>>,
+            tx_drops: &AtomicU64,
         ) -> TxPass {
             let mut used_any = false;
             let guest_mem = match &state.mem {
@@ -596,11 +676,18 @@ pub mod backend {
                         payload
                     );
                     if !push_tx_frame(&mut state.tx_queue, payload) {
-                        tracing::trace!(
-                            "process_tx_queue: guest→host queue at its {} frame bound; \
-                             tail-dropping this frame",
-                            MAX_TX_QUEUE_FRAMES
-                        );
+                        // Sibling 20's depth bound drops frames when the poll loop stalls. A drop
+                        // nobody can see is the same class of defect as the wedge above it, so it is
+                        // COUNTED and the count is reported at a level a default subscriber shows —
+                        // a `trace!` here was one `RUST_LOG` away from silence.
+                        let total = tx_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                        if tx_drop_is_reportable(total) {
+                            tracing::warn!(
+                                "smoltcp NAT: guest→host queue at its {MAX_TX_QUEUE_FRAMES} frame \
+                                 bound; {total} frame(s) tail-dropped since bring-up — the smoltcp \
+                                 poll loop is not draining it"
+                            );
+                        }
                     }
                 } else {
                     tracing::trace!("process_tx_queue: packet too short: {}", packet.len());
@@ -716,12 +803,10 @@ pub mod backend {
                     return Err(std::io::Error::other("transmitq vring missing"));
                 };
                 loop {
-                    {
-                        // Notification masking touches the ring only, so it is taken alone — the
-                        // state mutex is not held across it. A failure is a throughput hint at
-                        // worst (one extra wakeup), so the result is deliberately ignored.
-                        let _ = vring1.get_mut().disable_notification();
-                    }
+                    // Notification masking touches the ring only, so its guard is taken alone — the
+                    // state mutex is not held across it, and the temporary is released before the
+                    // pass below takes both. The failure is reported inside the helper.
+                    mask_tx_notifications(&mut vring1.get_mut());
                     let pass = {
                         // Sibling 20: ONE state lock per pass, taken in the net thread's own order
                         // (state, then ring) so the two can never deadlock, and released before the
@@ -732,27 +817,31 @@ pub mod backend {
                         // size, so this hold is bounded too.
                         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         let mut vring_state = vring1.get_mut();
-                        Self::process_tx_queue(&mut state, &mut vring_state)
+                        Self::process_tx_queue(&mut state, &mut vring_state, &self.tx_drops)
                     };
                     let keep_polling = {
                         let mut vring_state = vring1.get_mut();
+                        // Every arm re-arms the kick through the one reporting helper: the mask this
+                        // loop set is what tells the guest's driver to stay quiet, so a failure to
+                        // lift it is a wedge, not a throughput hint (see `rearm_tx_notifications`).
                         match pass {
                             // M7: a ring the guest broke ends this tick and nothing more. Re-arm the
                             // kick on the way out so the refusal costs one pass rather than the link
                             // — and never turn it into an `Err`, which the framework's epoll loop
                             // treats as terminal (see [`TxPass`]).
                             TxPass::Unreadable => {
-                                let _ = vring_state.enable_notification();
+                                rearm_tx_notifications(&mut vring_state);
                                 false
                             }
-                            // Without EVENT_IDX there is nothing to re-poll: one pass per kick. As
-                            // above, notification masking is advisory, so the result is ignored.
+                            // Without EVENT_IDX there is nothing to re-poll: one pass per kick. The
+                            // re-arm still has to happen — it is what lets the guest kick again — so
+                            // only its "more available" hint is unused here.
                             TxPass::Drained if !self.event_idx => {
-                                vring_state.enable_notification().unwrap_or(false);
+                                rearm_tx_notifications(&mut vring_state);
                                 false
                             }
                             // With EVENT_IDX, keep draining while the guest keeps supplying.
-                            TxPass::Drained => vring_state.enable_notification().unwrap_or(false),
+                            TxPass::Drained => rearm_tx_notifications(&mut vring_state),
                         }
                     };
                     if !keep_polling {
@@ -1056,6 +1145,7 @@ pub mod backend {
                 kill_evt,
                 // Armed per connection by the worker loop, before each daemon is constructed.
                 exit_evt: Mutex::new(None),
+                tx_drops: AtomicU64::new(0),
                 state: state_clone,
             }));
 
@@ -2216,6 +2306,7 @@ pub mod backend {
                 kill_evt: (consumer, notifier),
                 // The worker arms this itself, per connection.
                 exit_evt: Mutex::new(None),
+                tx_drops: AtomicU64::new(0),
                 state: state.clone(),
             }));
             // Never set: the worker must stop because bring-up failed, not because it was told to.
@@ -2569,7 +2660,24 @@ pub mod backend {
                     .read_obj(vm_memory::GuestAddress(USED_RING + 2))
                     .expect("used idx")
             }
+
+            /// Re-points the used ring at an **unmapped** guest address, the way a guest driver that
+            /// programmed a bogus `SET_VRING_USED` does (only alignment is validated, by design:
+            /// `try_set_used_ring_address` never sees the memory table).
+            ///
+            /// Every used-ring access then fails with `virtio_queue::Error::GuestMemory` — which is
+            /// the only KVM-free way to reach the notification-toggle error paths, the class of
+            /// result the M7 fix discarded.
+            fn break_used_ring(&self) {
+                let mut state = self.vring.get_mut();
+                state
+                    .set_queue_info(DESC_TABLE, AVAIL_RING, UNMAPPED_USED_RING)
+                    .expect("the address is 4-byte aligned; only alignment is validated");
+            }
         }
+
+        /// Aligned, and far outside the [`TxRing`] fixture's mapped guest memory.
+        const UNMAPPED_USED_RING: u64 = 0x1000_0000;
 
         fn empty_state(mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>) -> SharedState {
             SharedState {
@@ -2591,6 +2699,7 @@ pub mod backend {
                 event_idx: false,
                 kill_evt: (consumer, notifier),
                 exit_evt: Mutex::new(None),
+                tx_drops: AtomicU64::new(0),
                 state,
             };
             backend.arm_exit_event().expect("arming");
@@ -2606,17 +2715,25 @@ pub mod backend {
         // a guest that keeps going), reddening the length assertion. This drives the real
         // `process_tx_queue` over a real vring, so a bound applied only inside the helper — and not
         // at the enqueue site — is still red.
+        //
+        // And the drop is OBSERVABLE: the bound is a data-plane behavior change, so the frames it
+        // discards are counted and the count is logged at `warn`. RED on the inverse in two ways —
+        // dropping the `fetch_add` reddens the count assertion, and demoting the report back to the
+        // `trace!` it shipped as (or deleting it) reddens the level-checked `logs_assert`, which is
+        // the whole difference between a bounded queue and a silently lossy one.
         #[test]
+        #[tracing_test::traced_test]
         fn the_guest_to_host_queue_is_depth_bounded_and_still_returns_descriptors() {
             let ring = TxRing::new(QUEUE_SIZE as u16);
             let mut state = empty_state(Some(ring.mem.clone()));
+            let drops = AtomicU64::new(0);
 
             let fulls = 5u32;
             for _ in 0..fulls {
                 ring.publish(ring.size, &[0xAB, 0xCD, 0xEF]);
                 let mut vring_state = ring.vring.get_mut();
                 assert_eq!(
-                    VhostUserNetBackend::process_tx_queue(&mut state, &mut vring_state),
+                    VhostUserNetBackend::process_tx_queue(&mut state, &mut vring_state, &drops),
                     TxPass::Drained,
                     "a healthy ring must drain"
                 );
@@ -2644,6 +2761,52 @@ pub mod backend {
                     .all(|f| f.as_slice() == [0xAB, 0xCD, 0xEF]),
                 "queued frames must be the guest payload with the virtio-net header stripped"
             );
+            // Every frame the bound discarded is accounted for, exactly once.
+            assert_eq!(
+                drops.load(Ordering::Relaxed),
+                u64::from(published) - MAX_TX_QUEUE_FRAMES as u64,
+                "the frames the bound discarded must be counted"
+            );
+            // A tail drop an operator cannot see is the same class of defect as a silent wedge, and
+            // the LEVEL is what decides whether they can: `tracing_test` captures TRACE and up, so
+            // asserting mere presence would accept the `trace!` this shipped as.
+            logs_assert(|lines: &[&str]| {
+                match lines
+                    .iter()
+                    .find(|line| line.contains("frame(s) tail-dropped since bring-up"))
+                {
+                    Some(line) if line.contains("WARN") => Ok(()),
+                    Some(line) => Err(format!(
+                        "the tail-drop report sits below WARN, where no default subscriber shows \
+                         it: {line}"
+                    )),
+                    None => Err("the tail drop is not reported at all".to_string()),
+                }
+            });
+        }
+
+        // The reporting cadence itself: the FIRST drop always reports (a NAT that reaches a
+        // four-ring-deep queue has a stalled consumer, which is a bug report), and a sustained
+        // overload then reports once per queue-depth rather than once per frame.
+        //
+        // RED on the inverse: a bare `total % TX_DROP_REPORT_EVERY == 0` swallows the first 4095
+        // drops (the second assertion), and an unconditional `true` floods a persisted console log
+        // (the third).
+        #[test]
+        fn the_first_tail_drop_reports_and_a_sustained_one_does_not_flood() {
+            assert!(tx_drop_is_reportable(1), "the first drop must be reported");
+            assert!(
+                !tx_drop_is_reportable(2),
+                "a per-frame report would flood the console artifact"
+            );
+            assert!(!tx_drop_is_reportable(TX_DROP_REPORT_EVERY - 1));
+            assert!(
+                tx_drop_is_reportable(TX_DROP_REPORT_EVERY),
+                "a sustained overload must keep saying so"
+            );
+            assert!(tx_drop_is_reportable(TX_DROP_REPORT_EVERY * 3));
+            // One line per queue-depth: the cadence is tied to the bound it reports on.
+            assert_eq!(TX_DROP_REPORT_EVERY, MAX_TX_QUEUE_FRAMES as u64);
         }
 
         // M7: a refused avail ring — `virtio-queue`'s own guest-misbehaviour detection — must cost
@@ -2660,6 +2823,7 @@ pub mod backend {
         fn a_refused_avail_ring_costs_one_pass_not_the_vring_worker() {
             let ring = TxRing::new(64);
             let state = Arc::new(Mutex::new(empty_state(Some(ring.mem.clone()))));
+            let drops = AtomicU64::new(0);
 
             // One legitimate frame first, so the fixture is proven able to drain at all — otherwise
             // "nothing was queued" below would be vacuous.
@@ -2668,7 +2832,7 @@ pub mod backend {
                 let mut vring_state = ring.vring.get_mut();
                 let mut guard = state.lock().expect("state");
                 assert_eq!(
-                    VhostUserNetBackend::process_tx_queue(&mut guard, &mut vring_state),
+                    VhostUserNetBackend::process_tx_queue(&mut guard, &mut vring_state, &drops),
                     TxPass::Drained
                 );
                 assert_eq!(guard.tx_queue.len(), 1, "the fixture must be able to drain");
@@ -2682,7 +2846,7 @@ pub mod backend {
                 let mut vring_state = ring.vring.get_mut();
                 let mut guard = state.lock().expect("state");
                 assert_eq!(
-                    VhostUserNetBackend::process_tx_queue(&mut guard, &mut vring_state),
+                    VhostUserNetBackend::process_tx_queue(&mut guard, &mut vring_state, &drops),
                     TxPass::Unreadable,
                     "a refused ring is not a drain"
                 );
@@ -2691,6 +2855,12 @@ pub mod backend {
                     "a refused ring must queue nothing"
                 );
             }
+            assert_eq!(
+                drops.load(Ordering::Relaxed),
+                0,
+                "a refused ring drops no FRAMES — miscounting it as a tail drop would report an \
+                 overload that never happened"
+            );
 
             // The call site: `handle_event` must return `Ok` — and terminate — on that same ring,
             // in the EVENT_IDX mode whose loop would otherwise re-poll it forever.
@@ -2717,6 +2887,101 @@ pub mod backend {
             );
         }
 
+        // The notification-mask toggles are the two `Result`s the M7 fix discarded outright, plus the
+        // two `unwrap_or(false)` siblings beside them. Failing to RE-ARM is not a throughput hint:
+        // the mask is how the *guest's* driver is told not to kick, so leaving it set is the same
+        // silently wedged link M7 exists to prevent — reached through the error path of the fix for
+        // it. So a toggle failure is reported, at a level a default subscriber shows, and never
+        // becomes the `Err` that kills the vring worker.
+        //
+        // RED on the inverse: restoring either `let _ = vring_state.enable_notification();` or
+        // `vring_state.enable_notification().unwrap_or(false)` inside the helper leaves the log empty
+        // and the level-checked `logs_assert` fails, while every other assertion here still passes —
+        // which is exactly how the discard shipped in the first place. Restoring it at a *call site*
+        // instead is invisible here by construction, which is what
+        // `exit_event_arming_gate::every_notification_toggle_routes_through_its_reporting_helper`
+        // exists for.
+        #[test]
+        #[tracing_test::traced_test]
+        fn a_failed_notification_toggle_is_reported_not_discarded() {
+            // POSITIVE CONTROL first, on a healthy ring: the helpers are silent, and the re-arm
+            // reports what the guest actually supplied. Without this leg an unconditional log would
+            // satisfy the assertions below.
+            let healthy = TxRing::new(64);
+            {
+                let mut vring_state = healthy.vring.get_mut();
+                mask_tx_notifications(&mut vring_state);
+                assert!(
+                    !rearm_tx_notifications(&mut vring_state),
+                    "an empty ring has nothing more to poll"
+                );
+                healthy.publish(1, &[0x11, 0x22]);
+                assert!(
+                    rearm_tx_notifications(&mut vring_state),
+                    "a frame published while the mask was on must be reported as more-available"
+                );
+            }
+            assert!(
+                !logs_contain("could not mask transmitq kicks")
+                    && !logs_contain("could not re-arm transmitq kicks"),
+                "a healthy ring must not report a toggle failure"
+            );
+
+            // Now the error path: a used ring the guest pointed at unmapped memory.
+            let broken = TxRing::new(64);
+            broken.break_used_ring();
+            {
+                let mut vring_state = broken.vring.get_mut();
+                mask_tx_notifications(&mut vring_state);
+                assert!(
+                    !rearm_tx_notifications(&mut vring_state),
+                    "a ring whose mask could not be lifted is not one to keep polling"
+                );
+            }
+            // Both failures are reported, and at the level their consequence deserves: the mask is a
+            // lost wakeup (`warn`), the re-arm is a wedged link (`error`). The level is asserted
+            // because `tracing_test` captures TRACE and up — presence alone would accept a report
+            // demoted to a level no host enables, which is the same silence one step removed.
+            logs_assert(|lines: &[&str]| {
+                for (level, needle, consequence) in [
+                    (
+                        "WARN",
+                        "could not mask transmitq kicks",
+                        "a failed mask must be reported, not discarded",
+                    ),
+                    (
+                        "ERROR",
+                        "could not re-arm transmitq kicks",
+                        "a failed re-arm leaves the guest masked on a ring nothing will poll again",
+                    ),
+                ] {
+                    match lines.iter().find(|line| line.contains(needle)) {
+                        Some(line) if line.contains(level) => {}
+                        Some(line) => {
+                            return Err(format!("{consequence}, at {level}: got {line}"));
+                        }
+                        None => return Err(format!("{consequence}; nothing was logged")),
+                    }
+                }
+                Ok(())
+            });
+
+            // And the call site keeps the framework's contract: a broken ring still returns `Ok`,
+            // because an `Err` here kills the vring worker and wedges the link (M7).
+            let state = Arc::new(Mutex::new(empty_state(Some(broken.mem.clone()))));
+            let mut backend = armed_backend(state);
+            backend.set_event_idx(true);
+            let rx_vring: VringMutex =
+                VringT::new(broken.mem.clone(), broken.size).expect("rx vring");
+            let vrings = vec![rx_vring, broken.vring.clone()];
+            let outcome = backend.handle_event(1, EventSet::IN, &vrings, 0);
+            assert!(
+                outcome.is_ok(),
+                "a broken used ring must not become an Err out of handle_event, which the \
+                 framework's epoll loop treats as terminal: {outcome:?}"
+            );
+        }
+
         // `smoltcp.rs:553`: the exit-event pair is reserved at bring-up, and what `exit_event` hands
         // the framework is a handle on the SHARED kill event — which is what lets
         // `SmoltcpProcess::Drop`'s `notify()` wake this connection's vring worker and
@@ -2737,6 +3002,7 @@ pub mod backend {
                 event_idx: false,
                 kill_evt: (consumer, notifier),
                 exit_evt: Mutex::new(None),
+                tx_drops: AtomicU64::new(0),
                 state: Arc::new(Mutex::new(empty_state(None))),
             };
 
@@ -3032,8 +3298,8 @@ pub mod backend {
         }
     }
 
-    /// Call-site gates for the two NAT-worker claims no signature can force and no live daemon
-    /// makes observable — both about **where** a statement sits:
+    /// Call-site gates for the three NAT-worker claims no signature can force and no live daemon
+    /// makes observable — each about **where** a statement sits:
     ///
     /// * `smoltcp.rs:553`: the worker arms its exit event *before* it constructs the daemon that
     ///   consumes it. By the time `VhostUserDaemon::new` has called `exit_event`, an unarmed backend
@@ -3043,8 +3309,13 @@ pub mod backend {
     ///   guard hoisted back out is invisible to every unit test (the drain it starves lives on
     ///   another thread) and to any timing assertion worth shipping (`std::sync::Mutex` is unfair,
     ///   so "the other thread got in" is a race, not a property).
+    /// * Every notification toggle goes through [`mask_tx_notifications`] /
+    ///   [`rearm_tx_notifications`], the one pair that reports a failure. A raw
+    ///   `enable_notification()` at a fourth call site is a re-introduced discarded `Result` — and a
+    ///   behavior test cannot see it unless that particular site happens to be driven against a
+    ///   broken ring, which is precisely how the M7 fix shipped two of them.
     ///
-    /// Both read this file's own production text, the shape `orchestrator.rs`'s `nat_plan_gate`
+    /// All three read this file's own production text, the shape `orchestrator.rs`'s `nat_plan_gate`
     /// established, and share its limit: a scan sees spellings, not values.
     #[cfg(test)]
     mod exit_event_arming_gate {
@@ -3177,6 +3448,90 @@ pub mod backend {
                 )
                 .is_err(),
                 "an unreviewed number of state locks must be caught"
+            );
+        }
+
+        /// Checks that the two `virtio-queue` notification toggles are spelled **once each**, inside
+        /// the reporting helpers. `Err` names the specific violation, so the self-test below can
+        /// drive it against buggy inputs (AGENTS.md rule 2).
+        ///
+        /// Counted rather than located: the helpers are the only functions that may name them, and
+        /// each names its own toggle exactly once, so any additional occurrence in production text is
+        /// a call site that answers the failure itself — the discard this gate exists to keep out.
+        fn toggles_route_through_the_reporting_helpers(code: &str) -> Result<(), String> {
+            for (toggle, helper) in [
+                ("disable_notification()", "fn mask_tx_notifications"),
+                ("enable_notification()", "fn rearm_tx_notifications"),
+            ] {
+                if !code.contains(helper) {
+                    return Err(format!("{helper} is gone; {toggle} has no reporting owner"));
+                }
+                // Neither spelling is a substring of the other (`dis`+`able` vs `en`+`able`), so a
+                // plain count needs no disambiguation.
+                match code.matches(toggle).count() {
+                    1 => {}
+                    0 => return Err(format!("nothing calls {toggle}; the mask is gone")),
+                    n => {
+                        return Err(format!(
+                            "{toggle} appears {n} times outside {helper}; a raw toggle answers its \
+                             own failure, which is the discarded Result this gate keeps out"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn every_notification_toggle_routes_through_its_reporting_helper() {
+            let code = production_code(SOURCE);
+            assert!(
+                code.contains("rearm_tx_notifications(&mut vring_state)"),
+                "the gate must not pass vacuously on text it failed to find"
+            );
+            toggles_route_through_the_reporting_helpers(&code)
+                .expect("the shipped worker toggles notifications through the reporting helpers");
+        }
+
+        #[test]
+        fn the_gate_reddens_on_a_raw_notification_toggle() {
+            // The shape the M7 fix shipped: a discarded toggle at the call site.
+            assert!(
+                toggles_route_through_the_reporting_helpers(
+                    "fn mask_tx_notifications() { v.disable_notification() } \
+                     fn rearm_tx_notifications() { v.enable_notification() } \
+                     fn handle_event() { let _ = v.enable_notification(); }"
+                )
+                .is_err(),
+                "a raw enable_notification() beside the helper must be caught"
+            );
+            // …and its `unwrap_or(false)` sibling, the same discard one spelling over.
+            assert!(
+                toggles_route_through_the_reporting_helpers(
+                    "fn mask_tx_notifications() { v.disable_notification() } \
+                     fn rearm_tx_notifications() { v.enable_notification() } \
+                     fn handle_event() { v.disable_notification().unwrap_or(false); }"
+                )
+                .is_err(),
+                "a raw disable_notification() beside the helper must be caught"
+            );
+            // A helper deleted outright (its callers left calling the raw API) is caught too.
+            assert!(
+                toggles_route_through_the_reporting_helpers(
+                    "fn handle_event() { v.disable_notification(); v.enable_notification(); }"
+                )
+                .is_err(),
+                "toggles with no reporting owner must be caught"
+            );
+            // The shipped shape passes, or the gate is vacuous.
+            assert!(
+                toggles_route_through_the_reporting_helpers(
+                    "fn mask_tx_notifications() { if let Err(e) = v.disable_notification() { warn } } \
+                     fn rearm_tx_notifications() { match v.enable_notification() { } } \
+                     fn handle_event() { mask_tx_notifications(&mut v); rearm_tx_notifications(&mut v); }"
+                )
+                .is_ok(),
+                "the correct shape must pass, or the gate is vacuous"
             );
         }
 

@@ -615,6 +615,13 @@ jobs:
       # `just test-bench cloud-hypervisor,crosvm` is that leg's opt-in home (the `test-crosvm` rule).
       # After `bless` (the cpufreq pin needs CAP_DAC_OVERRIDE via the runner) and inside a delegated
       # scope, like every other live suite.
+      #
+      # NO capability wrapper on this line, ever. The recipe wraps the TEST BINARY (nextest's
+      # target-runner hook) and the tests spawn `bench-vm` directly, inheriting the caps through the
+      # ambient set. A second wrap is not redundant, it is FATAL: the first shrinks the bounding set
+      # below the runner file's own `+ep` caps and `execve` answers EPERM. That is how this step first
+      # went red — five tests, 0.008s each, `os error 1` and no cause. See
+      # crates/vmcell-bench/tests/common/mod.rs.
       - name: benchmark harness live legs (bench-vm across firecracker + qemu)
         run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-bench
 

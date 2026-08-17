@@ -51,6 +51,32 @@ const SURVIVED: &str = "# Automatically generated file; DO NOT EDIT.\n\
                         CONFIG_IKCONFIG_PROC=y\n\
                         CONFIG_EROFS_FS=y\n";
 
+/// The unknown feature token both F6-clause-1 legs below declare, spelled once so the fixture and
+/// the needle asserted against the refusal cannot drift apart.
+///
+/// **A wrong word, not a misspelling**, and both halves of that are deliberate. The obvious typo —
+/// `snapshot_restore` with its trailing `e` dropped — was two defects at once:
+///
+/// 1. it collides with this repo's `typos` gate, which knows that truncation and corrects it, so a
+///    fixture spelled that way turned CI's lint job red for being exactly as wrong as it means to
+///    be. A deliberate fixture cannot be spelled in a way the spell checker will "fix".
+/// 2. it is a **prefix** of the real token, and `Feature::parse`'s refusal echoes the entire valid
+///    vocabulary (composed from `Feature::name()`), so a `contains` on that truncation was satisfied
+///    by the roster echo alone — a refusal that stopped naming the token it refused would still have
+///    passed. That is the substring-matcher vacuity AGENTS.md warns about, on a message composed
+///    from a roster.
+///
+/// A real-word near miss closes both: no dictionary corrects `restored`, and no valid token contains
+/// it, so the `contains` assertions can only pass when the refusal really echoes what it refused
+/// (proven, not asserted — see the non-vacuity leg beside the first use). It is also the *tighter*
+/// fixture: a resolver that accepted any token *starting with* a valid name would take this one and
+/// still reject the truncation it replaces, so the near miss now probes the more permissive parser.
+const BOGUS_FEATURE_TOKEN: &str = "snapshot_restored";
+
+/// A second unknown token, used only to prove the roster echo does not carry
+/// [`BOGUS_FEATURE_TOKEN`]. Real words, so no spell checker has an opinion about it either.
+const OTHER_BOGUS_FEATURE_TOKEN: &str = "not_a_feature";
+
 #[test]
 fn the_overlay_adds_this_consumers_label_and_fragment() {
     // The contract's build half in one call: `ikconfig` exists in NO committed vmcell pins file,
@@ -317,6 +343,18 @@ fn overlay_with(body: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+/// A well-formed v33 rootfs entry whose only questionable part is the one feature token it declares.
+///
+/// The digest is well-formed on purpose: a malformed one is refused FIRST, by the
+/// registration-is-a-digest law (F7), and these legs are about the declaration beside it.
+fn entry_declaring_feature(token: &str) -> String {
+    format!(
+        r#"{{"rootfs": {{"acme": {{"image": "d.example/x",
+             "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+             "features": {{"{token}": false}}}}}}}}"#
+    )
+}
+
 /// The `Artifact` rejection message for an overlay, or a panic naming what came back instead.
 fn rejection(body: &str) -> String {
     let (_dir, overlay) = overlay_with(body);
@@ -418,15 +456,22 @@ fn every_declaration_in_a_v33_entry_is_strict_from_the_consumer_position() {
         "the refusal must name the typo AND the valid spellings: {msg}"
     );
 
-    // A typo'd feature token in the same entry's `features` map (F6 clause 1).
-    let msg = rejection(
-        r#"{"rootfs": {"acme": {"image": "d.example/x",
-             "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-             "features": {"snapshot_restor": false}}}}"#,
-    );
+    // An unknown feature token in the same entry's `features` map (F6 clause 1) — see
+    // `BOGUS_FEATURE_TOKEN` for why it is a wrong word rather than a misspelling.
+    let msg = rejection(&entry_declaring_feature(BOGUS_FEATURE_TOKEN));
     assert!(
-        msg.contains("snapshot_restor"),
+        msg.contains(BOGUS_FEATURE_TOKEN),
         "the refusal must name the unknown feature token: {msg}"
+    );
+    // NON-VACUITY of that `contains`, proven rather than asserted: the refusal lists the whole valid
+    // vocabulary, so a needle that is a substring of a valid token is matched by the roster echo
+    // alone and the assertion above would hold for a refusal that named nothing. A refusal about a
+    // DIFFERENT unknown token must therefore not contain this one.
+    let other = rejection(&entry_declaring_feature(OTHER_BOGUS_FEATURE_TOKEN));
+    assert!(
+        !other.contains(BOGUS_FEATURE_TOKEN),
+        "`{BOGUS_FEATURE_TOKEN}` must not appear in a refusal that is not about it, or the \
+         assertion above is matching the echoed vocabulary instead of the refused token: {other}"
     );
 
     // THE DERIVATION'S OTHER DIRECTION (§4.7): `xattr_preserved` is derived from `xattrs`, so
@@ -471,8 +516,9 @@ fn every_declaration_in_a_v33_entry_is_strict_from_the_consumer_position() {
         "the refusal must name the map form the singleton migrates to: {msg}"
     );
 
-    // POSITIVE CONTROL for all five: the same shape, spelled correctly, resolves. Without it every
-    // leg above would pass against a resolver that rejected everything.
+    // POSITIVE CONTROL for every refusal leg above (a count is not quoted: this leg has grown twice
+    // and the number was already stale): the same shape, spelled correctly, resolves. Without it
+    // every leg above would pass against a resolver that rejected everything.
     let (_dir, overlay) = overlay_with(
         r#"{"rootfs": {"acme": {"image": "d.example/x",
              "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -580,13 +626,19 @@ fn an_absent_declaration_is_the_baseline_and_a_malformed_one_is_a_hard_error() {
         Some(Source::Rootfs(ROOTFS_LABEL.to_string()))
     );
 
-    std::fs::write(feature_manifest_path(&image), "snapshot_restor = false\n")
-        .expect("write the malformed sidecar");
+    // The malformed half: an unknown token in the sidecar. Same `BOGUS_FEATURE_TOKEN` as the registry
+    // leg above — one spelling, so the non-vacuity guard beside its first use (a refusal about a
+    // different token must not contain this one) covers this `contains` too.
+    std::fs::write(
+        feature_manifest_path(&image),
+        format!("{BOGUS_FEATURE_TOKEN} = false\n"),
+    )
+    .expect("write the malformed sidecar");
     let err = declaration(&image)
         .map(|d| format!("{d:?}"))
         .expect_err("a malformed sidecar must be a hard error, never the baseline");
     assert!(
-        err.contains("snapshot_restor"),
+        err.contains(BOGUS_FEATURE_TOKEN),
         "the refusal must name the offending token: {err}"
     );
 }

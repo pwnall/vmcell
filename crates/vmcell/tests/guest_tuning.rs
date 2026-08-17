@@ -39,6 +39,21 @@
 //! & !(test(unprivileged) | test(smoltcp))'`) — the live leg is `#[ignore]`d and no other filter
 //! picks it up. The KVM-free premise check below runs everywhere, including `just ci`.
 //!
+//! **"Runs everywhere" is a claim about the HOST, not about an attribute list** — and it shipped
+//! false. The premise check reached `common::get_vmlinux()`/`get_rootfs()` through the shared config
+//! builder, and those getters do not hand back a path: they **require a built artifact**, failing
+//! loud with `guest kernel missing at …/vmlinux`. Every box that has run `vmcell build` satisfies
+//! that and no fresh checkout does, so `just test-unit` was green on a developer box and red in CI's
+//! artifact-free `test-unit` job. The artifact pair is therefore a **parameter** of
+//! [`tuned_cell_cfg`]: the live leg hands it the real artifacts, and the premise check hands it a
+//! scratch pair, because a `Duration` reaching a `VmConfig` has nothing to do with which kernel image
+//! the cell would boot.
+//!
+//! Mirror that CI condition locally with `VMCELL_KERNEL=/nonexistent/vmlinux just test-unit`: the
+//! getters require the kernel and never build it, so hiding it alone reproduces the job. (Pointing
+//! `VMCELL_ARTIFACTS_DIR` at an empty dir reproduces it too, but it also reddens
+//! `repack_outside_checkout`'s consumer-position leg, whose subject *is* that variable's precedence.)
+//!
 //! **These legs mean nothing against a stale rootfs.** The parser under test is baked into
 //! `rootfs.erofs`. A central runner must therefore, in order: `vmcell build --kernel-source
 //! host-make` (the bare default is `prebuilt`, which swaps in a `vmlinux` lacking
@@ -48,6 +63,7 @@
 
 #![cfg(feature = "cloud-hypervisor")]
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use vmcell::config::{RootfsSource, Timeouts, VmConfig};
@@ -89,8 +105,12 @@ fn rebind_ms(window: Duration) -> u64 {
 }
 
 /// A `Pid1` cell (the steward IS pid 1, so the sampler reads `/proc/1/fd`) whose only non-default
-/// property is the declared re-bind window.
-fn tuned_cell_cfg(rebind_idle: Duration) -> VmConfig {
+/// property is the declared re-bind window, over the artifact pair it is handed.
+///
+/// The pair is a parameter rather than a `common::get_*()` call inside: those getters **build or
+/// require** the artifacts, so calling them here made the KVM-free premise check below fail on every
+/// host that has not run `vmcell build` (see the module header). The live leg passes the real pair.
+fn tuned_cell_cfg(kernel: PathBuf, rootfs_image: PathBuf, rebind_idle: Duration) -> VmConfig {
     // `Timeouts` is `#[non_exhaustive]`, so an out-of-crate caller cannot use struct-update syntax
     // (`Timeouts { .., ..Default::default() }` does not compile here) and mutates the `pub` field
     // instead — which is also the shape a real caller uses, and the one the orchestrator re-clamps
@@ -99,9 +119,9 @@ fn tuned_cell_cfg(rebind_idle: Duration) -> VmConfig {
     timeouts.guest_rebind_idle = rebind_idle;
 
     VmConfig::builder(
-        common::get_vmlinux(),
+        kernel,
         RootfsSource::Erofs {
-            image: common::get_rootfs(),
+            image: rootfs_image,
         },
     )
     .timeouts(timeouts)
@@ -112,12 +132,16 @@ fn tuned_cell_cfg(rebind_idle: Duration) -> VmConfig {
 
 /// Boots a cell with `rebind_idle`, measures PID 1's listener churn, and tears it down.
 ///
+/// The one place the real artifact pair enters: `common::get_vmlinux`/`get_rootfs` require a built
+/// `vmlinux` + `rootfs.erofs`, which is a live-suite precondition and not a premise-check one.
+///
 /// Returns `(distinct socket inodes, elapsed seconds the guest measured)`.
 async fn measure_listener_churn(
     vmm: &vmcell::vmm::cloud_hypervisor::CloudHypervisor,
     rebind_idle: Duration,
 ) -> (usize, u64) {
-    let mut vm = common::start_vm(vmm, tuned_cell_cfg(rebind_idle)).await;
+    let cfg = tuned_cell_cfg(common::get_vmlinux(), common::get_rootfs(), rebind_idle);
+    let mut vm = common::start_vm(vmm, cfg).await;
 
     let out = vm
         .steward(Some(Duration::from_secs(30)))
@@ -254,12 +278,14 @@ async fn the_declared_rebind_window_is_the_one_the_guest_honors() {
     );
 }
 
-/// The live leg's premise, checked without KVM: the window it declares must be non-default **and**
-/// honored verbatim.
+/// The live leg's premise, checked without KVM **and without a built artifact**: the window it
+/// declares must be non-default **and** honored verbatim.
 ///
 /// A live leg whose "non-default" value quietly became the default (or drifted outside the window the
 /// guest clamps into) would pass while measuring nothing — the vacuity shape AGENTS rule 2 forbids,
-/// and the one a reviewer on a KVM-free box cannot otherwise check.
+/// and the one a reviewer on a KVM-free box cannot otherwise check. So it must run on a box that has
+/// never built an artifact, which is what CI's `test-unit` job and a fresh checkout are; the scratch
+/// pair below is what makes "without KVM" true of the host rather than only of the attribute list.
 ///
 /// RED on the inverse: set `SUBJECT_REBIND_IDLE` to `STEWARD_REBIND_IDLE.default` and the
 /// inequality fires; set it to 90 s (past the shared ceiling) and the ceiling assertion fires.
@@ -279,8 +305,21 @@ fn the_measured_window_is_non_default_and_honored_verbatim() {
     );
     // The cell really carries it: `.timeouts()` clamps, and a clamp that moved the value would make
     // the emitted token differ from the constant this file reasons about.
+    //
+    // Over a SCRATCH artifact pair, not the built one: this assertion is about a `Duration` surviving
+    // the builder, and `common::get_vmlinux()` would turn it into an assertion about whether this host
+    // has run `vmcell build` (the module header records the CI red that taught us). The files are real
+    // and absolute because that is what the builder validates at this boundary — it checks
+    // absoluteness and deliberately not existence, so this stays honest if it ever checks both.
+    let pair = tempfile::tempdir().expect("a scratch dir for the artifact pair");
+    let (kernel, rootfs) = (
+        pair.path().join("vmlinux"),
+        pair.path().join("rootfs.erofs"),
+    );
+    std::fs::write(&kernel, b"not a kernel").expect("write the kernel stand-in");
+    std::fs::write(&rootfs, b"not an image").expect("write the rootfs stand-in");
     assert_eq!(
-        tuned_cell_cfg(SUBJECT_REBIND_IDLE)
+        tuned_cell_cfg(kernel, rootfs, SUBJECT_REBIND_IDLE)
             .timeouts
             .guest_rebind_idle,
         SUBJECT_REBIND_IDLE,

@@ -5026,10 +5026,17 @@ mod placement_battery {
 
 #[cfg(test)]
 mod c8_call_site_gate {
-    /// The two files this gate reads. `production_lines` sees their CODE (comments stripped) and
-    /// [`production_comment_blocks`] sees their PROSE (code stripped) — two readers over one
-    /// roster, because the re-key had to land in both and only one of them was gated (finding
-    /// `d1`: seven prose sites survived a re-key whose call sites were green).
+    /// The two files whose **code** this gate reads through `production_lines`: `cfg.init` and the
+    /// two C8 methods are `vmcell`'s own config/orchestrator vocabulary, and a reader of them
+    /// elsewhere would not compile.
+    ///
+    /// The **prose** half is deliberately NOT scoped here. It reads
+    /// [`workspace_production_sources`] — every crate's `src` tree — because the two-file view
+    /// structurally cannot see a backend, and that blindness is exactly what M1 exploited on the
+    /// code side of the same law. A prose sentence asserting the retired derivation is just as
+    /// wrong in `vmcell-qemu`'s rustdoc as in this file's, and until the widening only this file
+    /// and `orchestrator.rs` were looked at (finding `d1`: seven prose sites survived a re-key
+    /// whose call sites were green — four of them public rustdoc on a contract crate).
     const C8_FILES: [(&str, &str); 2] = [
         ("orchestrator.rs", include_str!("orchestrator.rs")),
         ("config.rs", include_str!("config.rs")),
@@ -5058,16 +5065,23 @@ mod c8_call_site_gate {
         out
     }
 
-    /// The same two files' PROSE: every run of consecutive comment lines (`//` and `///` alike),
-    /// joined, as `(file, first line, text)`.
+    /// The PROSE of the production texts in `sources`: every run of consecutive comment lines
+    /// (`//` and `///` alike), joined, as `(file, first line, text)`.
     ///
     /// Blocks rather than lines because prose spans lines — the sentence "boots a custom `init=` …
     /// so there is no vsock control plane" was split across two of them, which is one reason
     /// per-line reading finds nothing.
-    fn production_comment_blocks() -> Vec<(&'static str, usize, String)> {
+    ///
+    /// Takes its sources rather than opening files, for the two reasons that shape this whole
+    /// module: the caller hands it the **workspace** walk (so a backend crate's rustdoc is in
+    /// scope), and the red-on-inverse below hands it a *fabricated* backend file, so the widened
+    /// reader can be driven red without touching another crate.
+    ///
+    /// No vacuity assertion here — a pure function over the sources it is given cannot know whether
+    /// they are the tree. The floors live at the one call site that claims to read the tree.
+    fn comment_blocks(sources: &[(String, String)]) -> Vec<(String, usize, String)> {
         let mut out = Vec::new();
-        for (name, body) in C8_FILES {
-            let prod = body.split("\n#[cfg(test)]\n").next().unwrap_or(body);
+        for (name, prod) in sources {
             let mut current: Vec<&str> = Vec::new();
             let mut start = 0usize;
             for (i, l) in prod.lines().enumerate() {
@@ -5078,20 +5092,63 @@ mod c8_call_site_gate {
                     }
                     current.push(trimmed);
                 } else if !current.is_empty() {
-                    out.push((name, start, current.join(" ")));
+                    out.push((name.clone(), start, current.join(" ")));
                     current.clear();
                 }
             }
             if !current.is_empty() {
-                out.push((name, start, current.join(" ")));
+                out.push((name.clone(), start, current.join(" ")));
             }
         }
+        out
+    }
+
+    /// Every prose block in `sources` that asserts the retired derivation, as `file:line: why`
+    /// followed by the block's own markup-free text.
+    ///
+    /// Split out from the test so the widened *scan* — not just [`prose_conflation`], the
+    /// per-block predicate — has a red-on-inverse of its own (AGENTS.md rule 2).
+    fn prose_violations(sources: &[(String, String)]) -> Vec<String> {
+        comment_blocks(sources)
+            .into_iter()
+            .filter_map(|(f, l, block)| {
+                prose_conflation(&block)
+                    .err()
+                    .map(|why| format!("{f}:{l}: {why}\n    {}", prose_text(&block)))
+            })
+            .collect()
+    }
+
+    /// The crate directories the prose scan must each reach, read from disk **independently** of
+    /// the walk under test: an oracle a scan computes about itself is not an oracle.
+    ///
+    /// # Panics
+    /// Panics when `crates/` is unreadable or holds no crate with a `src` tree.
+    fn crates_with_src() -> Vec<String> {
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("this crate lives under `crates/`")
+            .to_path_buf();
+        let mut out: Vec<String> = std::fs::read_dir(&crates_dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()))
+            .map(|e| e.unwrap_or_else(|e| panic!("dir entry: {e}")).path())
+            .filter(|p| p.join("src").is_dir())
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            .collect();
+        out.sort();
         assert!(
-            out.len() > 200,
-            "the prose scan found only {} comment blocks — it is not reading the sources",
-            out.len()
+            out.len() >= 15,
+            "gate misconfigured: only {} crates with a `src` tree under {} — the oracle itself is \
+             reading nothing, so the per-crate floor below could not fail",
+            out.len(),
+            crates_dir.display()
         );
         out
+    }
+
+    /// The crate a scanned path belongs to (`vmcell-qemu/src/lib.rs` → `vmcell-qemu`).
+    fn scanned_crate(path: &str) -> &str {
+        path.split(['/', '\\']).next().unwrap_or(path)
     }
 
     /// Markup-free lowercase form of a comment block, so a needle matches through `**bold**` and
@@ -5171,17 +5228,70 @@ mod c8_call_site_gate {
     /// control plane / cannot snapshot" — and requires such a block to name the placement, the
     /// method, or the C8 question it is really about. It cannot judge prose that paraphrases around
     /// the roster above, exactly as the emitted-token gate cannot discover a missing alias; both
-    /// answer that with a hand-maintained list and say so.
+    /// answer that with a hand-maintained list and say so. One more limit, measured rather than
+    /// assumed: the unit is the **block**, so a retired sentence appended to an already-anchored
+    /// rustdoc block is absorbed by that block's anchor — re-introducing `config.rs:90`'s pre-sweep
+    /// sentence into `VmConfig::init`'s (now anchored) rustdoc leaves this gate green. Reading
+    /// sentences instead would re-open the split-across-lines hole that made per-line reading find
+    /// nothing at all, which is the worse of the two.
+    ///
+    /// **Scope: the whole workspace** (the widening). The first cut read `config.rs` and
+    /// `orchestrator.rs` only — the same two-file scope whose blindness let QEMU bake the steward
+    /// port for a whole release on the *code* side of this law (M1). The port half already walks
+    /// every crate's `src` tree so a new backend is covered the day it appears; the prose half now
+    /// reads the same roster, because a backend's rustdoc asserting the retired derivation misleads
+    /// exactly as much as this crate's did — and four of `d1`'s seven sites were public rustdoc.
+    ///
+    /// It never opens a document: the walk is `crates/*/src/**/*.rs`, so the design docs and the
+    /// review passes — which quote the retired sentences *on purpose*, as history — are out of
+    /// scope by construction rather than by exclusion list. This gate's own fixtures are out of
+    /// scope for the same structural reason: the walk stops at each file's first column-0
+    /// `#[cfg(test)]`, and this module is behind `config.rs`'s.
     #[test]
     fn no_production_prose_asserts_the_retired_init_derivation() {
-        let violations: Vec<String> = production_comment_blocks()
-            .into_iter()
-            .filter_map(|(f, l, block)| {
-                prose_conflation(&block)
-                    .err()
-                    .map(|why| format!("{f}:{l}: {why}\n    {}", prose_text(&block)))
-            })
-            .collect();
+        let sources = workspace_production_sources();
+        let blocks = comment_blocks(&sources);
+
+        // ---- Vacuity floors. A widened walk that silently reads nothing is the defect docs/90's
+        // G4 swept out of eight shell gates, and it is worse here than in a shell gate: the whole
+        // point of the widening is scope, so a scope that quietly collapses looks identical to a
+        // clean tree. Floors on both the blocks and the BYTES, because a walk that finds every file
+        // but cuts each one at its first line satisfies a count floor.
+        let total_bytes: usize = blocks.iter().map(|(_, _, t)| t.len()).sum();
+        assert!(
+            blocks.len() >= 2000 && total_bytes >= 400_000,
+            "gate misconfigured: the workspace prose scan found {} blocks / {total_bytes} bytes \
+             across {} files — the shipped tree has several times that, so this gate would pass \
+             vacuously",
+            blocks.len(),
+            sources.len()
+        );
+
+        // …and the floor is PER CRATE, because the walk descends one `src` tree per crate and
+        // therefore dies one crate at a time: `vmcell` alone carries over half the prose in the
+        // workspace, so a whole-workspace floor is met with every backend crate missing — which is
+        // precisely the blindness being fixed. The roster comes from `crates_with_src()`, read
+        // independently of the walk under test.
+        let mut per_crate: std::collections::BTreeMap<&str, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for (f, _, text) in &blocks {
+            let e = per_crate.entry(scanned_crate(f)).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += text.len();
+        }
+        for name in crates_with_src() {
+            let (found_blocks, found_bytes) =
+                per_crate.get(name.as_str()).copied().unwrap_or_default();
+            assert!(
+                found_blocks >= 1 && found_bytes >= 200,
+                "gate misconfigured: the prose scan reached crate `{name}` with only \
+                 {found_blocks} block(s) / {found_bytes} bytes. Every crate under `crates/` with a \
+                 `src` tree carries production prose; a crate at zero means its subtree is not \
+                 being read, and a violation there would be invisible. Scanned: {per_crate:?}"
+            );
+        }
+
+        let violations = prose_violations(&sources);
         assert!(
             violations.is_empty(),
             "C8: {} production comment block(s) still assert that `init` decides control-plane \
@@ -5190,6 +5300,48 @@ mod c8_call_site_gate {
              init IDENTITY only.\n\n{}",
             violations.len(),
             violations.join("\n\n")
+        );
+    }
+
+    /// The widened **scan**'s own red-on-inverse — distinct from the per-block predicate's, below.
+    ///
+    /// What it proves is the widening itself: a retired sentence in a crate the two-file reader
+    /// could never open is reported, at that crate's own `file:line`. Driven against a *fabricated*
+    /// source pair rather than by editing a backend crate, which is the same shape the port half's
+    /// red-on-inverse uses (`the_port_scan_rejects_a_baked_port_and_accepts_the_derivation`) and
+    /// keeps this gate's proof out of another crate's text.
+    #[test]
+    fn the_prose_scan_reports_the_retired_derivation_in_a_backend_crate() {
+        // `connect_sessions`' pre-sweep `# Errors` paragraph, verbatim, relocated to a backend.
+        let retired = "/// Returns an [`Error::Steward`] immediately when this VM boots a custom \
+                       `init=`\n/// that replaces the steward (no control plane, §5.3).\n";
+        let fabricated = vec![(
+            "vmcell-qemu/src/lib.rs".to_string(),
+            format!("pub fn probe() {{}}\n{retired}pub fn dial() {{}}\n"),
+        )];
+        let found = prose_violations(&fabricated);
+        assert_eq!(
+            found.len(),
+            1,
+            "the widened scan must report a retired sentence in a backend crate: {found:?}"
+        );
+        assert!(
+            found[0].starts_with("vmcell-qemu/src/lib.rs:2:"),
+            "the report must carry the offending crate's own file:line: {}",
+            found[0]
+        );
+
+        // Negative control, same file: the sentence re-anchored on the shipped derivation is silent,
+        // so the report above is about the claim and not about the crate.
+        let anchored = "/// Returns an [`Error::Steward`] immediately when the placement has no \
+                        `steward_port()`\n/// (no control plane), whatever `init=` names.\n";
+        assert!(
+            prose_violations(&[(
+                "vmcell-qemu/src/lib.rs".to_string(),
+                format!("pub fn probe() {{}}\n{anchored}"),
+            )])
+            .is_empty(),
+            "re-anchored prose in the same crate must pass"
         );
     }
 
@@ -5336,11 +5488,17 @@ mod c8_call_site_gate {
 
     /// The `{ … }` body of the function whose signature is `signature`, braces balanced.
     ///
-    /// A deliberate second copy of `vmcell-daemon`'s `auth::tests::fn_body` (the shipped idiom for
-    /// "gate the production text of one function"): the two assert about different functions in
-    /// different crates and share no law, and the alternative — a `pub` test-support helper — would
-    /// put a source-scanning utility on a contract crate's surface. If a third copy appears, give it
-    /// a home instead.
+    /// A deliberate second copy of `vmcell-daemon`'s `auth::tests` helper of the same name (the
+    /// shipped idiom for "gate the production text of one function"): the two assert about different
+    /// functions in different crates and share no law, and the alternative — a `pub` test-support
+    /// helper — would put a source-scanning utility on a contract crate's ledgered surface. Recorded
+    /// as a justified deviation in `docs/implementation-notes.md`.
+    ///
+    /// The deviation's own condition is "if a third copy appears, give it a home instead", and that
+    /// sentence used to be a promise nothing could see age — the `netns_path` class exactly, where
+    /// rustdoc claimed "exactly one place" while four sites composed the layout inline.
+    /// [`the_source_scanning_helper_is_capped_at_its_two_recorded_homes`] is now that condition's
+    /// gate.
     ///
     /// # Panics
     /// Panics when `signature` is absent (the signature moved, and a silent miss would make the
@@ -5367,26 +5525,90 @@ mod c8_call_site_gate {
         panic!("unbalanced braces after `{signature}`");
     }
 
+    /// The two recorded homes of the brace-matching source scanner above, `crates/`-relative.
+    ///
+    /// Two copies are the recorded deviation; a third is the point at which AGENTS.md's
+    /// "route repeated legitimate sites through one helper" stops being outweighed by keeping a
+    /// test-support scanner off a contract crate's surface.
+    const FN_BODY_HOMES: [&str; 2] = ["vmcell/src/config.rs", "vmcell-daemon/src/auth.rs"];
+
+    /// The two spellings that identify a copy of the brace-matching scanner: its **name**, and its
+    /// own **panic message**.
+    ///
+    /// Two needles rather than one because the name alone is evadable and was demonstrably evaded
+    /// while this gate was being written: a third copy called `fn_body_copy3` matched nothing. A
+    /// copy-paste keeps the message far more reliably than it keeps the name, and the message is
+    /// this particular helper's fingerprint (nothing else in the workspace says it). A copy that
+    /// renames the function *and* rewrites the message evades both — the limit every text scan has,
+    /// stated rather than papered over, exactly as the reserved-cmdline alias roster states its own.
+    ///
+    /// Assembled at compile time so this gate's own text is not a match for itself.
+    const FN_BODY_NEEDLES: [&str; 2] = [
+        concat!("fn ", "fn_body("),
+        concat!("unbalanced braces", " after"),
+    ];
+
+    /// **The recorded `fn_body` deviation's own gate.** Exactly two homes, named — no third copy,
+    /// and neither home silently lost its copy.
+    ///
+    /// Both directions, for the reason `ban-ci-script-handcopy.sh` checks both: an orphan copy in a
+    /// new crate is the drift, and a stale roster entry is a gate that has stopped reading anything.
+    /// The scan is over the WHOLE text of each file, not its production half, because both copies
+    /// live inside `#[cfg(test)]` modules — the one reader in this module that needs
+    /// [`workspace_source_files`] rather than the production cut.
+    #[test]
+    fn the_source_scanning_helper_is_capped_at_its_two_recorded_homes() {
+        let sources = workspace_source_files();
+        let mut expected: Vec<String> = FN_BODY_HOMES.iter().map(|s| (*s).to_string()).collect();
+        expected.sort();
+        for needle in FN_BODY_NEEDLES {
+            let mut found: Vec<String> = Vec::new();
+            let mut copies = 0usize;
+            for (file, text) in &sources {
+                let n = text.matches(needle).count();
+                if n > 0 {
+                    copies += n;
+                    found.push(file.clone());
+                }
+            }
+            found.sort();
+            assert_eq!(
+                found, expected,
+                "the source-scanning helper's homes moved (needle `{needle}`). A THIRD copy means \
+                 the deviation recorded in `docs/implementation-notes.md` no longer holds: give the \
+                 helper one shared home (a dev-only support crate, not a `pub` item on `vmcell`'s \
+                 ledgered surface) and delete the copies. A home that no longer matches this needle \
+                 means the gate has stopped reading the thing it caps — fix the roster in the same \
+                 change."
+            );
+            assert_eq!(
+                copies, 2,
+                "each home holds exactly one copy of `{needle}`; found {copies} across {found:?}"
+            );
+        }
+    }
+
     // ---- C8 across the workspace: no crate may bake the steward port (finding `m1`) ----
 
-    /// Every crate's production `.rs` text, as `(crates-relative path, text)`.
+    /// Every `.rs` file under `crates/*/src`, whole and unedited, as `(crates-relative path, text)`.
     ///
-    /// This scan exists because the two-file view above **structurally cannot** see a backend: QEMU
-    /// baked `STEWARD_VSOCK_PORT` into the endpoint its `verify_control_plane` probes *verbatim*, so
-    /// a `Service { port: 5100 }` cell was dialed at 5000, the probe spent its whole budget, and a
+    /// **The one directory walk in this module**, with three readers standing on it, each asking a
+    /// different question of the same roster: this one (whole text — the copy cap below, which has
+    /// to see test modules), [`workspace_production_sources`] (the text before the first test
+    /// module), and [`code_only`] (that text with the comments stripped). A second walker would be
+    /// a second scope to keep in sync, which is the drift the prose half was carrying.
+    ///
+    /// It exists because the two-file view above **structurally cannot** see a backend: QEMU baked
+    /// `STEWARD_VSOCK_PORT` into the endpoint its `verify_control_plane` probes *verbatim*, so a
+    /// `Service { port: 5100 }` cell was dialed at 5000, the probe spent its whole budget, and a
     /// healthy cell was destroyed and re-spawned to exhaustion — while every gate in `vmcell` stayed
     /// green (finding `m1`). A directory walk rather than `include_str!` so a NEW backend crate is
     /// covered the day it appears, which is the shape of the exposure.
     ///
-    /// "Production" is everything before the file's first `#[cfg(test)]`/`#[cfg(all(test`/
-    /// `#[cfg(any(test` at column 0, and files that are themselves `#[cfg(test)] mod <name>;`
-    /// modules are skipped whole. Both rules err toward reading LESS, so the roster assertion in
-    /// the test below is what keeps a truncated scan from passing vacuously.
-    ///
     /// # Panics
     /// Panics when the walk reads nothing — a scan pointed at the wrong directory must be
     /// `gate misconfigured`, never a green `ok`.
-    fn workspace_production_sources() -> Vec<(String, String)> {
+    fn workspace_source_files() -> Vec<(String, String)> {
         let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("this crate lives under `crates/`")
@@ -5425,18 +5647,34 @@ mod c8_call_site_gate {
             files.len(),
             crates_dir.display()
         );
+        files.sort();
+        files
+            .into_iter()
+            .map(|p| {
+                let text = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+                let rel = p
+                    .strip_prefix(&crates_dir)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .into_owned();
+                (rel, text)
+            })
+            .collect()
+    }
 
+    /// The production half of every file [`workspace_source_files`] reads, **comments intact**, as
+    /// `(crates-relative path, text)`.
+    ///
+    /// "Production" is everything before the file's first `#[cfg(test)]`/`#[cfg(all(test`/
+    /// `#[cfg(any(test` at column 0, and files that are themselves `#[cfg(test)] mod <name>;`
+    /// modules are skipped whole. Both rules err toward reading LESS, so the floors in the tests
+    /// below are what keep a truncated scan from passing vacuously.
+    fn workspace_production_sources() -> Vec<(String, String)> {
         // Files that ARE a `#[cfg(test)]` module (`mod tests;`, `mod main_is_thin_gate;`): their
         // whole text is test text, and they legitimately spell the port and the literal.
         let mut test_only: Vec<String> = Vec::new();
-        let texts: Vec<(std::path::PathBuf, String)> = files
-            .into_iter()
-            .map(|p| {
-                let t = std::fs::read_to_string(&p)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
-                (p, t)
-            })
-            .collect();
+        let texts = workspace_source_files();
         for (_, text) in &texts {
             let mut rest = text.as_str();
             while let Some(at) = rest.find("#[cfg(test)]") {
@@ -5452,8 +5690,8 @@ mod c8_call_site_gate {
         }
 
         let mut out = Vec::new();
-        for (path, text) in texts {
-            let stem = path
+        for (rel, text) in texts {
+            let stem = std::path::Path::new(&rel)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
@@ -5469,17 +5707,27 @@ mod c8_call_site_gate {
                 {
                     break;
                 }
-                // Comments are dropped: a rustdoc mention of the constant is not a dial site (the
-                // prose half above is the reader that cares about comments).
-                production.push_str(l.split("//").next().unwrap_or(""));
+                // Comments are KEPT here and dropped by `code_only` at the port scan's own call
+                // sites: the prose half reads this same text and needs them.
+                production.push_str(l);
                 production.push('\n');
             }
-            let rel = path
-                .strip_prefix(&crates_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
             out.push((rel, production));
+        }
+        out
+    }
+
+    /// The CODE view of a production text: each line's pre-`//` half.
+    ///
+    /// Line *count* is preserved (one `\n` per input line) so a byte offset into the result still
+    /// yields the source's own line number — the port scan reports `file:line` from exactly that
+    /// arithmetic. A rustdoc mention of the port constant is not a dial site, which is why the port
+    /// scan reads through here; the prose half reads the un-stripped text.
+    fn code_only(production: &str) -> String {
+        let mut out = String::with_capacity(production.len());
+        for l in production.lines() {
+            out.push_str(l.split("//").next().unwrap_or(""));
+            out.push('\n');
         }
         out
     }
@@ -5577,18 +5825,20 @@ mod c8_call_site_gate {
         let mut saw_definition = false;
         let mut saw_reexport = false;
         for (file, production) in &sources {
-            mentions += production.matches("STEWARD_VSOCK_PORT").count();
+            // The CODE view: a rustdoc mention of the constant is not a dial site.
+            let code = code_only(production);
+            mentions += code.matches("STEWARD_VSOCK_PORT").count();
             if file.contains("vmcell-protocol")
-                && production.contains("pub const STEWARD_VSOCK_PORT: u32 = 5000;")
+                && code.contains("pub const STEWARD_VSOCK_PORT: u32 = 5000;")
             {
                 saw_definition = true;
             }
             if file.contains("vmcell/src/vmm/mod.rs")
-                && production.contains("pub const STEWARD_VSOCK_PORT: u32 = vmcell_protocol::")
+                && code.contains("pub const STEWARD_VSOCK_PORT: u32 = vmcell_protocol::")
             {
                 saw_reexport = true;
             }
-            violations.extend(unjustified_port_mentions(file, production));
+            violations.extend(unjustified_port_mentions(file, &code));
         }
         // Non-vacuity: the two anchors must be in the scanned text, or the walk (or the
         // production-text cut) is reading less than it thinks and a violation could hide behind it.
@@ -5624,7 +5874,10 @@ mod c8_call_site_gate {
     #[test]
     fn the_port_literal_is_spelled_once_and_only_in_the_protocol_crate() {
         let mut sites: Vec<String> = Vec::new();
-        for (file, production) in workspace_production_sources() {
+        for (file, raw) in workspace_production_sources() {
+            // The CODE view: the constant's own rustdoc says "5000" out loud, and prose is not a
+            // second literal.
+            let production = code_only(&raw);
             let bytes = production.as_bytes();
             let mut from = 0usize;
             while let Some(rel) = production[from..].find("5000") {
