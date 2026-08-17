@@ -24,14 +24,31 @@ skip-manifest := justfile_directory() + "/target/vmcell-skip-manifest.txt"
 # perform `PR_CAPBSET_DROP`; the transition drops it back out of both the bounding set and
 # permitted/effective before `exec`, so no test or VMM ever holds it. Builds the runner, copies
 # it to the stable, gitignored ./.vmcell-bin/ path, and setcaps THAT copy. Idempotent via a
-# content-hash `.blessed` stamp keyed on the RUNNER binary only (never test binaries): a re-run is
-# a transparent no-op (no sudo prompt) until the runner genuinely changes. Because cargo only ever
-# rewrites target/, the stable copy keeps its caps across all the unrelated rebuild churn.
+# content-hash `.blessed` stamp keyed on the RUNNER binary only (never test binaries): a re-run takes
+# no sudo prompt and replaces nothing until the runner genuinely changes — it only RE-DATES the stable
+# copy, which is what keeps `review-preflight-priv.sh`'s cargo-free freshness proxy clearable (see
+# `redate_for_freshness_proxy` below). Because cargo only ever rewrites target/, the stable copy keeps
+# its caps across all the unrelated rebuild churn.
 bless:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --locked -p vmcell-test-runner
     cargo build --locked --release -p vmcell-test-runner
+    # THE OTHER HALF OF THE PREFLIGHT'S FRESHNESS PROXY (docs/90 G9). `review-preflight-priv.sh` has
+    # to answer "is the blessed copy the CURRENT build?" WITHOUT cargo, so besides the content-hash
+    # stamp it asks one proxy question: is anything under crates/vmcell-test-runner/src,
+    # crates/vmcell-privilege/src or Cargo.lock NEWER (mtime) than the stable copy? THIS recipe holds
+    # the authoritative answer — it hashes the freshly BUILT runner against the stable copy — so every
+    # exit where those hashes agree must leave the copy dated no earlier than that comparison.
+    # Otherwise an edit after the last bless (a comment-only change, or a bare directory-mtime bump
+    # from a temp file, which cargo does not even rebuild for) pins the preflight at STALE while the
+    # blessed bytes are exactly what the sources produce — and `just bless` cannot clear it, because
+    # its hash check takes the skip path and nothing re-dates the copy. That wedges the documented
+    # reviewer path (AGENTS "probe, don't presume"). `touch` moves timestamps ONLY: the
+    # security.capability xattr and the 0700 mode survive it.
+    redate_for_freshness_proxy() {
+      touch "$@"
+    }
     bless_one() {
       local built="$1" stable="$2"
       local dir; dir="$(dirname "$stable")"
@@ -58,7 +75,11 @@ bless:
       if [[ -f "$stamp" && -f "$stable" && "$(cat "$stamp")" == "$h" ]] \
          && ./scripts/review-preflight-priv.sh --check-runner "$stable" >/dev/null 2>&1 \
          && [[ "$(stat -c %a "$stable" 2>/dev/null)" == "700" ]]; then
-        echo "bless: $stable already blessed (runner sha256 unchanged, caps +ep, mode 0700); skipping setcap"
+        # The hash comparison above is the AUTHORITATIVE "the stable copy is this build"; the
+        # preflight's cargo-free proxy can only read mtimes, so say it there too (see the helper's
+        # header — without this line a post-bless source edit leaves a permanent STALE no bless clears).
+        redate_for_freshness_proxy "$stable" "$stamp"
+        echo "bless: $stable already blessed (runner sha256 unchanged, caps +ep, mode 0700); skipping setcap (stable copy + stamp re-dated for the preflight's freshness proxy)"
         return 0
       fi
       # STAGE-THEN-SWAP: bless a TEMP copy beside the target and only then rename it into place.
@@ -72,6 +93,13 @@ bless:
       # whole shell, so the trap would never fire and the temp would be left behind.
       local tmp="$stable.blessing.$$"
       cp -f "$built" "$tmp"
+      # The SAME rule at the other exit where the hash is known to match (here by construction: this
+      # copy IS the built runner). `cp` without `-p` already stamps it with the current time and `mv`
+      # within the directory preserves that, so this makes the requirement explicit instead of
+      # incidental to a cp flag — and it is deliberately BEFORE the sudo prompt below: a source edited
+      # while setcap waits for a password must still read STALE (a false CURRENT certifies the wrong
+      # binary for a whole review; a false STALE costs one bless).
+      redate_for_freshness_proxy "$tmp"
       # PRIV-1: restrict the capability-carrying runner to its OWNER (0700) BEFORE setcap.
       # The blessed runner holds cap_sys_admin (≈ root); its file mode is the REAL security
       # boundary, not just a note — an other-executable +ep runner is a local priv-esc on a
@@ -104,6 +132,30 @@ daemon artifacts_dir="/tmp/vmcell-artifacts" bind="127.0.0.1:8787":
 test-unit:
     cargo nextest run --locked --all-features
 
+# The DOCUMENTED EXAMPLES on the public API, compiled and run. `cargo nextest` cannot run doctests
+# (upstream limitation, stated in its own docs, which prescribe exactly this pairing), so
+# `test-unit`'s and `ci`'s nextest invocation compiled not one `///` example — every doctest in the
+# tree was correct by luck rather than by construction. Most of them sit on `vmcell`, a §10.4
+# contract-surface crate, and on the entry points a new consumer reads first (`MicroVm::start`,
+# `MicroVm::restore`, `VmConfigBuilder::build`): change one of those signatures, or `HostEnv::shared`'s,
+# and the example that teaches a consumer how to call it silently stops compiling while every gate
+# stays green. (No count is quoted here on purpose — this recipe IS the roster; run it.)
+#
+# The rustdoc gate in `ci` (`RUSTDOCFLAGS="-D warnings" cargo doc`) is NOT this gate: it checks doc
+# LINKS and never compiles doc CODE. Its own comment says "`cargo doc` runs nowhere else", which was
+# true of links and silent about code. This recipe is the missing half — and the second-order value
+# is the larger one: with doctests gated, adding worked examples to the front door becomes safe.
+#
+# `--workspace` so a doctest in ANY member counts (the validator's `KconfigValues` module example
+# lives outside `vmcell`); `--all-features` documents the widest API, matching the rustdoc gate.
+# `ci` invokes this recipe and .github/workflows/ci.yml invokes the SAME recipe (`run: just
+# test-doc`) — never a copied cargo line (AGENTS rule 3).
+#
+# RED ON THE INVERSE: break any documented example (rename a method it calls, change an argument)
+# and this fails to compile it. Nothing else in the tree does.
+test-doc:
+    cargo test --locked --workspace --all-features --doc
+
 # The unit suite under the HOSTED-RUNNER condition: a cgroup tree this process cannot write to.
 #
 # A developer box runs the tests inside a systemd *user* scope, which IS delegated, so
@@ -135,10 +187,14 @@ test-unit-undelegated:
 # Privileged integration suite via the capability runner. `just bless` installs it 0700 (owner-only)
 # — that mode is the security boundary (PRIV-1); on a shared host use a dedicated group + 0750.
 # Wraps every test binary with vmcell-test-runner via the cargo target-runner hook.
-# The in-guest test-helper (the four applets ip/curl/kvm-ok/echo-server, one multicall binary) is
-# baked into the rootfs by `vmcell build`, not built here — so a suite whose guest side needs a NEW
-# applet (the raw dial's and the segment gates' `echo-server`) must re-run that build first; a warm
-# rootfs fails it with a missing /vmcell-tools path. `--features` is scoped to the `vmcell` member that owns the integration tests.
+# The in-guest test-helper is ONE multicall binary baked into the rootfs by `vmcell build`, not built
+# here — so a suite whose guest side needs a NEW applet (the raw dial's and the segment gates'
+# `echo-server`) must re-run that build first; a warm rootfs fails it with a missing /vmcell-tools
+# path. Its applet ROSTER is not restated here: read `vmcell_protocol::GUEST_TOOLS_APPLETS`, which the
+# dispatch table is `const`-asserted against element-wise and the rootfs injection manifest emits
+# from, so it cannot go stale. (The copy that used to sit on this line did: it still named four
+# applets after `mini-init` and `xattr` landed in v33 deltas 5 and 7 — the embedded-roster failure
+# AGENTS.md's docs rule names.) `--features` is scoped to the `vmcell` member that owns the integration tests.
 # The `kind(test)` predicate scopes to the integration-test BINARIES only (all in the
 # `serial-host` nextest group), excluding the ~172 `kind(lib)` unit tests that `-p vmcell`
 # would otherwise pull in. Those lib tests are NOT in serial-host, so under the old filter they
@@ -199,6 +255,54 @@ test-validator:
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
         cargo nextest run --locked --profile integration -p vmcell-artifact-validator --run-ignored all \
         --no-tests=fail -E 'binary(smoke)'
+
+# The `bench-vm` harness's LIVE legs — the exact defect `test-validator`'s header above records,
+# one package further over. `test_benchmark_fc`, `test_benchmark_qemu` and `test_benchmark_crosvm` are
+# `#[ignore = "needs KVM"]`, and until this recipe existed NO invocation in the tree selected them:
+# every `--run-ignored all` was scoped elsewhere (`-p vmcell` in five recipes, `-p vmcelld`,
+# `-p vmcell-artifact-validator`), and `just ci`/`just test-unit` pass no `--run-ignored` at all. So
+# the composition root that wires all four backends — the ONE place with an edge to every backend —
+# had its can-it-go-red proof compiled and skipped. `grep -n vmcell-bench justfile` used to return
+# only `cargo clippy` lines.
+#
+# `--no-tests=fail` is the clause that makes a mis-scoped filter loud rather than green; it is what
+# would have surfaced this one.
+#
+# FEATURE SCOPING, not a narrower filter: the crosvm leg is `#[cfg(feature = "crosvm")]`, so
+# `--no-default-features --features cloud-hypervisor,firecracker,qemu` means it is never COMPILED and
+# therefore cannot be selected. That is deliberate and mirrors `test-privileged`'s `firecracker,qemu`:
+# `crosvm` is in `vmcell-bench`'s DEFAULT feature set, so a plain `--run-ignored all` here would
+# hard-fail every host lacking a `crosvm` binary — which is every CI host. The crosvm leg's home is
+# the same opt-in shape `test-crosvm` uses, this recipe with an explicit list:
+#   just test-bench cloud-hypervisor,crosvm      # needs $VMCELL_CROSVM_BIN or `crosvm` on PATH
+#
+# Needs KVM, the built artifacts (the tests touch the harness getters so the rootfs builds at most
+# once per session before `bench-vm` reads them) and the blessed runner — `bench-vm` pins the CPU
+# governor through `cpufreq::CpuFreqPin`, which needs CAP_DAC_OVERRIDE and otherwise prints
+# "NOT pinned (need CAP_DAC_OVERRIDE via vmcell-test-runner)", and its privileged sub-benches want the
+# net caps. Run it under a delegated scope like every other live suite:
+#   systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-bench
+# Each leg is one `bench-vm --backend <b> --iterations 1 --warmup 0` at the DEFAULT `--mode latency`
+# (cold boot + warm restore), not the whole §16 sub-bench set — a couple of boots per backend, and
+# the assertion is that the report prints `p50=` at all, i.e. that the wiring works.
+test-bench features="cloud-hypervisor,firecracker,qemu":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The features list is an ACCEPTED INPUT, so it is honored or REJECTED here (AGENTS "fail loud"):
+    # `bench-vm` carries `required-features = ["cloud-hypervisor"]`, so a list omitting it builds no
+    # binary at all and the failure surfaces as `Command::cargo_bin("bench-vm")` panicking inside a
+    # test, naming a target path rather than this argument.
+    case ",{{features}}," in
+      *,cloud-hypervisor,*) ;;
+      *) echo "test-bench: features must include cloud-hypervisor (bench-vm's required-features); got '{{features}}'" >&2; exit 1 ;;
+    esac
+    # H-TEST-3, like every sibling suite recipe: without the run-scoped export a `require_cap!` skip
+    # from the shared harness getters lands in the per-PID temp file nobody reads.
+    VMCELL_SKIP_MANIFEST="${VMCELL_SKIP_MANIFEST:-{{skip-manifest}}}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="{{justfile_directory()}}/{{runner}}" \
+        cargo nextest run --locked --profile integration -p vmcell-bench \
+        --no-default-features --features {{features}} --run-ignored all \
+        --no-tests=fail -E 'binary(benchmark)'
 
 # Opt-in crosvm live matrix. crosvm is a secondary backend whose binary is NOT installed on the
 # build/CI hosts, so it is deliberately kept OUT of `test-privileged` (adding it there would hard-fail
@@ -332,6 +436,17 @@ gates:
     # drift instances that motivated it.
     ./scripts/ban-ci-script-handcopy.sh
     ./scripts/test-ban-ci-script-handcopy.sh
+    # The same class, the OTHER half: a copied recipe BODY. The scanner above bans ci.yml from naming
+    # a `scripts/*.sh`; nothing banned an aggregate from restating a recipe's commands, and that had
+    # shipped twice — ci.yml inlining `test-unprivileged`'s nextest line and then dropping
+    # `--features qemu` (a whole backend's matrix legs stopped COMPILING in CI, M14), and `just ci`
+    # carrying a verbatim copy of the `test-unit` body, found by a human rather than by a gate. Both
+    # are fixed by calling the recipe; this is the class. It reads bodies back through `just --show`
+    # (the recipe is the authority) and matches interpolated lines as globs, so an EXPANDED copy is
+    # caught too. Its self-test drives both files' arms plus the controls that must stay clean
+    # (shared boilerplate, an interpolation-only body) and every vacuity arm.
+    ./scripts/ban-recipe-body-handcopy.sh
+    ./scripts/test-ban-recipe-body-handcopy.sh
     # `AGENTS.md` is the DEPLOYED copy of `docs/*claude-agents*.md` — two paths, one document. The
     # docs/81 campaign rewrote AGENTS.md in seven hunks and the source document in one, leaving every
     # corrected count still wrong in the file AGENTS.md is deployed from — inside the very wave whose
@@ -340,6 +455,38 @@ gates:
     # an unwritten invariant is not a gate.
     ./scripts/check-agents-md-sync.sh
     ./scripts/test-check-agents-md-sync.sh
+    # The same class as the sync gate above, one step out: a documented POINTER that resolves to
+    # nothing. Two shipped together — AGENTS.md's "read before changing anything" list sent every
+    # agent to `docs/99-claude-fable-automated-quality-v9.md` after that document was retired into
+    # `docs/historical/` (the one file every agent reads first, pointing at a file that is not there),
+    # and the daemon's served OpenAPI sent consumers to a `design §D` that renumbering had deleted
+    # (docs/90 D2 — a Rust string literal, so closing that instance means extending the `§` arm over
+    # `crates/*/src`, which is the script's recorded follow-up rather than something it does today).
+    # Prose is not compiled, so this is its compiler: every `docs/…` pointer in the root markdown and
+    # the live `docs/*.md` must resolve — honoring the conventions the repo actually uses (the
+    # arbitrary-digit `9` glob, extension-less document-NUMBER shorthand resolving live or historical,
+    # and the retirement fallback scoped to the one as-built ledger whose dated entries AGENTS.md
+    # forbids "fixing") — and every `§`/`Appendix X` in the root markdown must name a real heading of
+    # the DISCOVERED newest design document, never a pinned filename (v31→v32→v33 broke gates that
+    # hardcoded one). The self-test drives every resolving form, the retired-live-path break AND its
+    # correction, the ledger scope both ways, a missing section, a missing appendix, and the vacuity
+    # arms; two genuinely dangling pointers are exempted BY NAME in the script, each with its reason
+    # and both directions gated (an exemption nobody names, and one that now resolves, both fail).
+    ./scripts/check-docs-pointers.sh
+    ./scripts/test-check-docs-pointers.sh
+    # ONE MSRV FACT, and now ONE place that asserts it: `rust-toolchain.toml`'s pinned channel equals
+    # the declared `[workspace.package] rust-version`. This call REPLACES the two inline `sed`
+    # comparisons that used to live in the `ci` recipe below and in ci.yml's "toolchain honesty" step —
+    # whose own comment admitted it mirrored the recipe. A mirrored ASSERTION is worse than a mirrored
+    # roster: it drifts in STRICTNESS silently, and whichever copy the reader opens tells them the law.
+    # The script is strictly stronger than either copy, each strictness with a defect behind it: it is
+    # TOML-section-aware (the `sed` would have accepted a `rust-version` under any table), it REFUSES a
+    # non-pinned channel (`stable` makes the equality unstatable while the gate stays green), and it
+    # compares EVERY literal spelling of the number — `fuzz/` and `examples/downstream-kernel/` are
+    # separate workspaces that cannot inherit via `rust-version.workspace`, and `clippy.toml`'s `msrv`
+    # comment already claimed this assertion covered it. It did not.
+    ./scripts/check-msrv-sync.sh
+    ./scripts/test-check-msrv-sync.sh
     # M-VEND-3: assert the carried vhost patch is actually applied. A caret version
     # bump would silently drop the `[patch.crates-io]` (only a "Patch was not used"
     # warning), regressing the QEMU-unprivileged SET_VRING_ENABLE quirk with a green
@@ -483,6 +630,21 @@ gates:
     # bless-remediable (exit 2, BLOCKED-ON-BLESS) vs environmental (exit 1, NOT READY) — is
     # host-independent and must go red if it ever misroutes a bless-fixable failure to static-only.
     ./scripts/test-review-preflight-priv.sh
+    # The OTHER half of that same reviewer path — self-test only for the same reason, and BEHAVIOURAL
+    # rather than textual: `just bless` must leave the stable blessed copy dated no earlier than the
+    # moment it established that copy IS the current build. It did not. The recipe's idempotence skip
+    # fires when the freshly built runner's hash equals the `.blessed` stamp, and it then replaced
+    # nothing — so the preflight's conservative `find -newer` freshness proxy kept reporting STALE and
+    # `just bless` could not clear it. That wedged the documented reviewer path permanently at
+    # BLOCKED-ON-BLESS: preflight says "ask the maintainer to run `just bless`", the maintainer runs it,
+    # the verdict does not move, and "probe, don't presume" routes every privileged review through that
+    # probe. The fix (`redate_for_freshness_proxy` at both exits where the hash is known to match)
+    # landed with no gate; this is it. It proves the law by copying the REAL justfile and REAL
+    # preflight into throwaway fixture repos and running `just bless` there with cargo/getcap/sudo/cp
+    # stubbed on PATH — never by restating the recipe's logic, which would be the hand-copy class one
+    # level down. Both call sites are pinned independently. No cargo, no sudo, no KVM, and the repo's
+    # own ./.vmcell-bin is asserted untouched rather than assumed to be.
+    ./scripts/test-bless-redates-blessed-copy.sh
     # The ban scripts, preflight, bless path, and delegated-scope helper are load-bearing,
     # security-adjacent bash — lint them all.
     # ...including the downstream example's contract check (v30 delta 5): it must live beside the
@@ -556,13 +718,11 @@ ci:
     # doc output path — cosmetic, not a rustdoc lint, so it does not fail the -D-warnings gate.)
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
     # ---- Toolchain honesty + non-Rust-surface gates (rubric Part D) ----
-    # Toolchain honesty: the declared MSRV (`[workspace.package] rust-version`) equals the pinned
-    # `rust-toolchain.toml` channel (the latest stable). An UNDERSTATED rust-version lets MSRV-aware
-    # resolvers hand consumers older, potentially-vulnerable dependency versions instead of the
-    # advisory-clean ones the lockfile pins; kept in lockstep with clippy.toml's msrv by review.
-    rv=$(sed -nE 's/^rust-version *= *"([0-9.]+)".*/\1/p' Cargo.toml | head -n1)
-    ch=$(sed -nE 's/^channel *= *"([0-9.]+)".*/\1/p' rust-toolchain.toml | head -n1)
-    [ -n "$rv" ] && [ "$rv" = "$ch" ] || { echo "MSRV drift: [workspace.package] rust-version=$rv vs rust-toolchain channel=$ch" >&2; exit 1; }
+    # (Toolchain honesty — the declared `[workspace.package] rust-version` equals the pinned
+    # `rust-toolchain.toml` channel — is `scripts/check-msrv-sync.sh` inside `gates`, invoked above.
+    # It was an inline `sed` comparison HERE and a mirrored `run:` block in ci.yml; two copies of one
+    # law is what AGENTS rule 3 bans, and an assertion drifts in strictness more quietly than a roster
+    # does. The script is strictly stronger than the pair it replaces — see its entry in `gates`.)
     # (shellcheck over the load-bearing bash runs inside `gates`, with the roster it lints.)
     # Workflow files: correctness (actionlint also shellchecks `run:` blocks) + security (zizmor:
     # script injection, over-broad permissions, unpinned actions — the suites run on a SELF-HOSTED
@@ -574,7 +734,14 @@ ci:
     cargo machete
     # Docs are a first-class artifact in this repo.
     typos
-    cargo nextest run --locked --all-features
+    # INVOKED, NEVER COPIED (AGENTS rule 3) — this line was a verbatim copy of the `test-unit` recipe
+    # body, the exact drift shape ci.yml was already fixed for: its copy of this same command had
+    # dropped a `--features` flag one job over and a whole backend's matrix legs stopped compiling in
+    # CI, invisibly. A recursive `just` gives the command one home, the way `gates` above has one.
+    {{just_executable()}} test-unit
+    # …and the half nextest structurally cannot run: doctests. See the `test-doc` recipe's header —
+    # ci.yml's test-unit job invokes this same recipe.
+    {{just_executable()}} test-doc
     # public-API semver intent (CI runs this PRs-only against the PR base; locally diff vs the main
     # merge-base). Runs on the pinned toolchain — 1.96.1 satisfies cargo-semver-checks' rustc floor.
     # v30 delta 2: `vmcell-artifact-validator` is downstream CONTRACT surface (§10.4), so it is

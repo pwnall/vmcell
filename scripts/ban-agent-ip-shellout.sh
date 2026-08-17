@@ -25,23 +25,29 @@
 # *implements* `ip` (the erofs helper, §5.3), so it is out of scope by construction.
 #
 # Usage: ban-agent-ip-shellout.sh [DIR]   (defaults to crates/vmcell-steward/src)
+# A DIR that is missing, or that holds zero Rust sources, is a caller bug and exits 1 — never a
+# reassuring "ok" (docs/90 G4).
 set -euo pipefail
 
 dir="${1:-crates/vmcell-steward/src}"
+# M-BIN-4: a MISSING scan directory is a gate MISCONFIGURATION (a rename/move silently retired the
+# gate), not a clean pass — fail loud, whether the path came from the default or from the caller. The
+# former explicit-path tolerance (`ok: no steward source directory …`, exit 0) made a typo'd or
+# reorganized path read as a clean steward (docs/90 G4).
 if [[ ! -d "$dir" ]]; then
-  # M-BIN-4: a MISSING default directory is a gate MISCONFIGURATION (a rename/move silently retired
-  # the gate), not a clean pass — fail loud. Only stay tolerant when the caller EXPLICITLY supplied a
-  # path (that is caller error, not a retired gate).
-  if [[ $# -eq 0 ]]; then
-    echo "gate misconfigured: expected the default steward source at $dir but it is missing"
-    exit 1
-  fi
-  echo "ok: no steward source directory at $dir (nothing to scan)"
-  exit 0
+  echo "gate misconfigured: no such directory to scan: $dir"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
 fi
 
 mapfile -d '' -t files < <(find "$dir" -type f -name '*.rs' -print0)
-[[ ${#files[@]} -eq 0 ]] && { echo "ok: no Rust sources under $dir"; exit 0; }
+# Same law for a directory that exists but holds no Rust: zero files scanned is a pointer bug, not a
+# steward that shells out to nothing.
+[[ ${#files[@]} -eq 0 ]] && {
+  echo "gate misconfigured: no Rust sources under: $dir"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
+}
 
 violations=""
 for f in "${files[@]}"; do

@@ -38,6 +38,8 @@
 # would. There is no in-source escape hatch: a genuinely new home belongs on this roster, in review.
 #
 # Usage: ban-inline-setns.sh [DIR ...]   (defaults to the workspace member trees under crates/)
+# A roster that resolves to zero Rust sources is a caller bug and exits 1 — never a reassuring "ok"
+# (docs/90 G4).
 set -euo pipefail
 
 dirs=("$@")
@@ -65,7 +67,14 @@ mapfile -d '' -t files < <(
     [[ -d "$d" ]] && find "$d" -type f -name '*.rs' -print0
   done
 )
-[[ ${#files[@]} -eq 0 ]] && { echo "ok: no Rust sources under: ${dirs[*]}"; exit 0; }
+# An empty scan is a MISCONFIGURATION, never a clean tree: the only way to match zero Rust sources is
+# to have been pointed at the wrong place (a move/reorg, or an explicit-path typo). This arm used to
+# print "ok" and exit 0, which short-circuited even the stale-exemption report below (docs/90 G4).
+[[ ${#files[@]} -eq 0 ]] && {
+  echo "gate misconfigured: no Rust sources under: ${dirs[*]}"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
+}
 
 violations=""
 dep_violations=""

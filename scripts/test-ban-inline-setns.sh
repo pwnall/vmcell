@@ -6,7 +6,8 @@
 #   * deleting the >1-call check lets a SECOND call inside a sanctioned file pass → reddens;
 #   * deleting the stale-exemption check lets a moved/emptied sanctioned site pass → reddens;
 #   * deleting the netns_rs arm lets a `NetNs::run`/`enter` (a setns reached through the dependency,
-#     review m14) pass → reddens, while `rt.enter()` in a non-netns_rs file must stay un-flagged.
+#     review m14) pass → reddens, while `rt.enter()` in a non-netns_rs file must stay un-flagged;
+#   * restoring the permissive empty-scan arm lets a Rust-less tree report "ok" → reddens (docs/90 G4).
 # The last two exist for the reason PRIV-4 added the bare-Mutex/OnceLock fixtures to
 # test-ban-global-state.sh: without them the exempt-file half of the gate could not fail at all.
 set -euo pipefail
@@ -163,6 +164,18 @@ expect_flag 'net::tap::in_netns'
 expect_clean 'tap.rs'
 expect_clean 'smoltcp.rs'
 [[ $fail -ne $before ]] && dump "case 6"
+
+# --- Case 7: a tree with no Rust at all is a misconfiguration, not a pass -------------------------
+# G4: this arm used to print "ok: no Rust sources under: …" and exit 0 BEFORE the stale-exemption
+# report below could run, so a moved crate tree (or a typo'd explicit path) reported success having
+# opened no file. Restoring that arm reddens this case.
+mkdir -p "$work/nosrc/vmcell/src"
+printf 'not rust\n' > "$work/nosrc/vmcell/src/README.md"
+run_ban "$work/nosrc"
+before=$fail
+expect_rc 1 "no Rust sources in the scanned tree"
+expect_flag 'gate misconfigured'
+[[ $fail -ne $before ]] && dump "case 7"
 
 if [[ $fail -ne 0 ]]; then
   echo "ban-inline-setns self-test FAILED"

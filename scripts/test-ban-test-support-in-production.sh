@@ -12,7 +12,16 @@
 #   * a definition site that moved away is a stale exemption               → not a pass;
 #   * a definition site that lost its `feature = "test-support"` gate is a
 #     stale exemption                                                     → not a pass;
-#   * a banned symbol nobody uses anywhere is a stale roster               → not a pass.
+#   * a banned symbol nobody uses anywhere is a stale roster               → not a pass;
+#   * a tree holding zero Rust sources is a misconfigured scan             → not a pass;
+#   * a roster entry that does not exist is refused, not skipped           → not a pass.
+#
+# The last two are the docs/90 G4 arms. They are the ones with no assertion until now: the empty scan
+# printed `ok: no Rust sources under: …` and exited 0 (so a crate-tree rename retired the ban while
+# reporting green, short-circuiting even the stale-exemption reports that describe the same move), and
+# the collector's `[[ -d "$d" ]] &&` guard dropped a mistyped roster entry silently while a second,
+# real entry kept the verdict green. Case 5's `vacuous` fixture is the STALE-ROSTER arm and builds a
+# POPULATED tree — it never covered either.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,9 +70,9 @@ mk_clean_tree() {
     > "$root/vmcell-crosvm/tests/matrix.rs"
 }
 
-run_ban() { # run_ban <root> -> sets $out/$rc
+run_ban() { # run_ban <root> [root ...] -> sets $out/$rc  (multi-arg: the roster legs pass two)
   set +e
-  out="$("$ban" "$1" 2>&1)"
+  out="$("$ban" "$@" 2>&1)"
   rc=$?
   set -e
 }
@@ -156,8 +165,41 @@ expect_flag 'the roster is stale'
 expect_flag 'FakeCgroupFs'
 [[ $fail -ne $before ]] && dump "case 5"
 
+# --- Case 6: a tree with ZERO Rust sources is a misconfigured scan, not a pass --------------------
+# docs/90 G4. Restore the `echo "ok: no Rust sources under: …"; exit 0` arm and this leg goes red.
+# Note what the old arm cost beyond the false green: it returned BEFORE the stale-exemption and
+# stale-roster reports, so the very reorganization that emptied the tree could not be reported either.
+mkdir -p "$work/empty"
+run_ban "$work/empty"
+before=$fail
+expect_rc 1 "tree with zero Rust sources"
+expect_flag 'gate misconfigured: no Rust sources under:'
+expect_flag 'The scan would be vacuous'
+if grep -q '^ok: ' <<<"$out"; then
+  echo "FAIL: printed an 'ok:' verdict for a scan that opened nothing"; fail=1
+fi
+[[ $fail -ne $before ]] && dump "case 6"
+
+# --- Case 7: a roster entry that does not exist is REFUSED, not skipped ---------------------------
+# The multi-DIR half of the same defect: the collector's `[[ -d "$d" ]] &&` guard made a mistyped or
+# moved entry contribute zero files, and the first (real) entry then produced a green verdict — so the
+# ban silently stopped covering a crate tree. The roster is a real tree PLUS a missing one, so this
+# leg is red-on-inverse for the up-front existence check specifically: without it, the scan of
+# `$work/partial` succeeds and the run exits 0.
+mk_clean_tree "$work/partial"
+run_ban "$work/partial" "$work/no-such-crate-tree"
+before=$fail
+expect_rc 1 "roster naming a directory that does not exist"
+expect_flag 'gate misconfigured: no such directory to scan:'
+expect_flag 'The scan would be vacuous'
+if grep -q '^ok: ' <<<"$out"; then
+  echo "FAIL: printed an 'ok:' verdict for a roster entry that does not exist"; fail=1
+fi
+[[ $fail -ne $before ]] && dump "case 7"
+
 if [[ $fail -ne 0 ]]; then
   echo "ban-test-support-in-production self-test FAILED"
   exit 1
 fi
-echo "ok: ban-test-support-in-production self-test passed"
+echo "ok: ban-test-support-in-production self-test passed (incl. the empty-tree and missing-roster-entry
+    refusals — docs/90 G4)"

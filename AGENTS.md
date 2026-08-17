@@ -44,10 +44,13 @@ contract-surface bump must extend (see "The downstream toolkit contract").
   defect history. Its **Retired & qualified rules** section lists former demands the design
   supersedes or scopes (incl. the exhaustive-contract-types qualification) — don't re-open them.
   (`9` represents an arbitrary digit, use the newest version you find.)
-- `docs/99-claude-fable-automated-quality-v9.md` — the gate specifications (lint preambles, ban
-  scripts, recipes, the delta-gate table, the coverage map); newest version wins, as above.
-- `docs/99-claude-fable-code-review.md` — the newest standing code review and what it found; a
-  finding it records is not a fresh discovery.
+- `docs/historical/85-claude-fable-automated-quality-v5.md` — the gate specifications (lint
+  preambles, ban scripts, recipes, the delta-gate table, the coverage map). **Retired**: there is no
+  non-historical copy, so read it for rationale, never for a roster. The live roster is the `gates`
+  recipe plus each script's own header.
+- the newest non-historical `docs/*-code-review.md` (today `docs/90-claude-opus-code-review.md`) —
+  the standing code review; a finding it records is not a fresh discovery. Earlier passes are
+  retired under `docs/historical/`.
 - `docs/benchmark-results.md` — measured perf levers; the 2026-07-17 matrix is canonical.
 - `docs/99-claude-fable-design-v99.md` — architecture; **§13** lists the cross-cutting invariants,
   lettered S/C/L/F/P/G, each with an owner and a gate; **Appendix A** records the load-bearing
@@ -97,6 +100,12 @@ one breaking release; 1 lands first and alone. These conventions bind:
    already drifted three times, so `scripts/ban-ci-script-handcopy.sh` is the meta-gate: it runs
    first, fails if `ci.yml` names a `scripts/*.sh` directly, and asserts the recipe's roster equals
    the gate-shaped scripts on disk in **both** directions (orphan script *and* stale entry).
+   `scripts/ban-recipe-body-handcopy.sh` closes the same class one level in — a restated recipe
+   **body**: it reads bodies back through `just --show` (the recipe is the authority) and fails if
+   the `ci` recipe or `ci.yml` contains all of another recipe's lines instead of calling it, matching
+   interpolated lines as globs so an expanded copy is caught too. Both halves had shipped: ci.yml's
+   inlined `test-unprivileged` command lost `--features qemu` (a backend's matrix legs stopped
+   compiling in CI), and `ci` carried a verbatim copy of the `test-unit` body.
    Anything parsing `cargo` output belongs in a script, not a `run:` block: CI exports
    `CARGO_TERM_COLOR: always` and `just ci` does not, which silently killed three `cargo tree` bans
    — `ban-uncolored-cargo-parse.sh` is that class's gate.
@@ -182,6 +191,10 @@ one breaking release; 1 lands first and alone. These conventions bind:
   **not** a compile error it carries a grep-ban plus a red-on-inverse self-test —
   `ban-inline-setns.sh`, `ban-kernel-key-composers.sh`, `ban-readiness-timeout-literal.sh`,
   `ban-artifact-path-join.sh`; `just gates` is the full roster. A new law of that shape earns one.
+  A source-scanning ban treats a **zero-file scan** as `gate misconfigured` and exits non-zero, never
+  a green `ok:` — the only way to open nothing is to have been pointed at nothing — and its self-test
+  carries the empty-tree leg proving that arm. Write both with the script: eight bans wore a green
+  verdict on an empty tree until a review pass swept it (docs/90 G4).
 - Recovery stays retryable: consume one-shot flags (`restored`, desync) only after the recovery
   succeeds; a transient failure leaves the next call able to retry, and a failed resync evicts the
   cached client so nothing wedges.
@@ -388,8 +401,8 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   **transient** `CAP_SETPCAP` the bounding-set shrink needs, dropped again before `exec`, so no test
   or VMM ever holds it. No sudo, no root shell; cargo and the tests stay yours. `just bless` also
   blesses a release copy, which no recipe invokes today. Every runner-wrapped recipe
-  (`test-privileged`, `test-daemon`, `test-validator`, `test-crosvm`, `test-usb-passthrough`,
-  and v33's `test-systemd`) uses
+  (`test-privileged`, `test-daemon`, `test-validator`, `test-bench`, `test-crosvm`,
+  `test-usb-passthrough`, and v33's `test-systemd`) uses
   that same debug runner; `test-unprivileged` deliberately runs without it, which is what keeps the
   unprivileged path honest. `test-daemon` wraps itself in the delegated scope; every other live
   suite is wrapped at the call site (`systemd-run --user --scope -p Delegate=yes
@@ -406,7 +419,14 @@ fragment is the one defended exception shape and never carries a consumer's usbi
   always run. `just test-usb-passthrough` is opt-in for the same reason: it needs a designated
   device (`VMCELL_TEST_USB_DEVICE`), and without one `test-privileged` records a capability skip.
   v33's `just test-systemd` (the R1+R2+R5+R6+R7 proof cell) is opt-in for the same class of
-  reason: it pulls a full-Debian image; its KVM-free halves run everywhere.
+  reason: it pulls a full-Debian image; its KVM-free halves run everywhere. `just test-bench` is the
+  one invocation that selects `vmcell-bench`'s three `#[ignore]`d live legs (fc, qemu, crosvm) — the
+  composition root wiring every backend had no can-it-go-red proof anywhere before it. Its argument
+  is a **features list** defaulting to `cloud-hypervisor,firecracker,qemu`, so the crosvm leg is
+  never compiled where there is no binary; a list omitting `cloud-hypervisor` is rejected up front
+  (`bench-vm`'s `required-features` would otherwise build no binary and fail inside a test). Only
+  that crosvm leg is opt-in, through the explicit list — `just test-bench cloud-hypervisor,crosvm` —
+  while the default list runs in CI's kvm job under a delegated scope, like `test-validator`.
 - **Guest-side code is baked into `rootfs.erofs`.** A change to `vmcell-steward` or
   `vmcell-guest-tools` (any applet — `mini-init` and `xattr` included) means nothing to a live
   suite until the artifacts are rebuilt — and the
@@ -417,11 +437,14 @@ fragment is the one defended exception shape and never carries a consumer's usbi
 ## Done means
 
 - `just ci` green locally (it is the CI definition — it calls the same `just gates` recipe `ci.yml`
-  does; both set `RUSTFLAGS=-D warnings`).
+  does; both set `RUSTFLAGS=-D warnings`). It also invokes `just test-doc`, the only gate that
+  compiles the `///` examples (nextest cannot run doctests, so before it nothing did), which is what
+  gates a doctest on the contract surface — and makes worked examples on the front door safe to add.
 - For host-facing changes: both operating-mode suites green per the section above, all backends the
   change touches, `just test-daemon` for daemon-touching changes, `just test-crosvm` for
   crosvm-touching ones, `just test-validator` for changes to the artifact-conformance battery (its
-  live legs are `#[ignore]`d and only that recipe selects them), the example-workspace job for
+  live legs are `#[ignore]`d and only that recipe selects them), `just test-bench` for changes to the
+  `bench-vm` harness or a backend's wiring into it (same shape), the example-workspace job for
   contract-touching changes, the conformance kit's four-leg matrix for changes touching a declared
   feature, the registry byte-identity/unmoved-key gates for changes touching artifact identity,
   `just test-systemd` for changes touching the placement/registry composition (opt-in, the crosvm

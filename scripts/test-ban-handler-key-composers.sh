@@ -9,7 +9,8 @@
 #     a law that MOVED OUT of the home (leaving the gate blind) pass                     → reddens;
 #   * deleting the home-present check lets a renamed/moved home pass                     → reddens;
 #   * the near-miss spellings (the plain literals fixtures pin the law with, and a doc comment
-#     writing the shape) must stay un-flagged, so the scanner is precise rather than merely loud.
+#     writing the shape) must stay un-flagged, so the scanner is precise rather than merely loud;
+#   * restoring the permissive empty-scan arm lets a Rust-less tree report "ok" → reddens (docs/90 G4).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -153,6 +154,18 @@ before=$fail
 expect_rc 1 "subtree without the home"
 expect_flag 'gate misconfigured'
 [[ $fail -ne $before ]] && dump "case 7"
+
+# --- Case 8: a tree with no Rust at all is the same misconfiguration ------------------------------
+# G4: this arm used to print "ok: no Rust sources under: …" and exit 0 BEFORE case 7's stale-home
+# report could run, so a moved crate tree (or a typo'd explicit path) reported success having opened
+# no file. Restoring that arm reddens this case.
+mkdir -p "$work/nosrc/vmcell/src/artifact"
+printf 'not rust\n' > "$work/nosrc/vmcell/src/artifact/README.md"
+run_ban "$work/nosrc"
+before=$fail
+expect_rc 1 "no Rust sources in the scanned tree"
+expect_flag 'gate misconfigured'
+[[ $fail -ne $before ]] && dump "case 8"
 
 if [[ $fail -ne 0 ]]; then
   echo "ban-handler-key-composers self-test FAILED"

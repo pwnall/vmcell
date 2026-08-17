@@ -22,7 +22,9 @@ passes); **[52]** the docs/52 reconciliation; **[28]** the v28 design and its la
 items arising from the implementation-notes record between v28 and v30; **[30]** items arising from
 the v30 design and its landed pass; **[81]** items arising from the docs/78 + docs/81 reviews, their
 fix waves, the completeness audit, and the CI-repair pass; **[33]** items arising from the v33
-design; **[BP]** best practices added on judgment, not yet matched to a surfaced defect.*
+design; **[90]** items arising from the docs/90 review of the closed-v33 tree (twenty-five
+adversarially-verified area reviews) and its fix wave; **[BP]** best practices added on judgment,
+not yet matched to a surfaced defect.*
 
 *The binding register is now **v33 §18: ten design changes specified but not yet built** — delta 1
 (the steward rename) first and alone; deltas 2–7 (the feature vocabulary/intersection, the
@@ -139,7 +141,13 @@ So this rubric is written to be *enforced*, not just consulted. **Five** governi
    under a *blocking* gate. v7 sharpening [81]: **a gate whose passing output is identical to its
    not-running output is not a gate** — measure the not-running output once (the M13 justfile scan,
    the colored `cargo tree`, the validator's own compiled-and-never-selected smoke suite were all
-   exactly this).
+   exactly this). And the rule reaches whole test **kinds** and whole **packages**, not just
+   filters [90]: `cargo nextest` cannot run doctests, so until `just test-doc` existed nothing in
+   the tree compiled a single `///` example — the rustdoc gate checks doc *links* and never doc
+   *code*; and every `--run-ignored all` was package-scoped elsewhere, so `vmcell-bench`'s live
+   legs — the composition root with an edge to all four backends — were the validator's own defect
+   one package over, closed by `just test-bench`. Ask of every recipe: which *kind* of test does no
+   invocation in this tree select?
 4. **Enumerate what the suite structurally cannot reach. [37][40][46]** For every subsystem, ask:
    which error branches, payload sizes, flow variants, feature configs, and defaults does no test
    drive — **and which side effects the fakes structurally cannot see** (a `FakeVmm` never touches
@@ -1072,6 +1080,13 @@ nominally guards and confirm it goes red; confirm CI actually runs it; and ask w
       (`package(~vmcell) & kind(test) & !binary(proptests)` — positive selection so new members
       auto-join); nextest pinned so `--no-tests=fail` holds; `#[ignore = "reason"]` with reasons.
       `CI`
+- [ ] **Every `#[ignore]`d leg is selected by some recipe, and every test *kind* has a runner.**
+      [90] `--run-ignored all` is **package-scoped**, so a live test in a package no recipe names is
+      compiled and then skipped — `vmcell-bench`'s legs were, exactly as the validator's had been,
+      and `just test-bench` is the fix in the `test-validator` shape (blessed runner, delegated
+      scope, `--no-tests=fail` so a future mis-scoped filter is loud). The kind half is the same
+      audit one level up: nextest runs no doctests at all, which is what `just test-doc` exists for.
+      Audit by enumerating packages and kinds against the recipes, not by trusting the green. `CI`
 - [ ] **Capability honesty machinery**: `require_cap!`; a per-flag honesty pin for every
       `VmmCapabilities` field on every backend (nine — checked against the struct); the three
       seccomp-`Log` pins; the skip manifest measured against a **reset** manifest so the count is
@@ -1170,7 +1185,9 @@ the recipe is the roster, per meta-rule 3; new scripts join it and nowhere else)
 | The example-workspace CI job — now including the delta-7 consumer-position pack leg [30][33] | downstream-contract drift |
 | `cargo doc` (deny broken links) [46] | doc-build rot |
 | `cargo nextest run` with per-test timeouts; retries scoped to the VM profile with the honest stanza | hangs; retry-masked rot |
+| **`just test-doc`** (`cargo test --locked --workspace --all-features --doc`) — the half nextest structurally cannot run, invoked by `just ci` and by ci.yml's `test-unit` job; the recipe is the roster, so no count is quoted [90] | documented examples on the public API never compiled at all — correct by luck, and the rustdoc gate sees doc *links*, never doc *code* |
 | The `--ignored` integration matrix on the **GitHub-hosted** KVM runner (every live suite wrapped in a delegated scope — a hosted runner's own cgroup is not delegated; the udev device-widening step asserts every node it writes, no `\|\| true` [81]) + `just test-daemon` | the suite being CI-invisible (it was, for the repo's whole history) |
+| **`just test-validator`** and **`just test-bench`** — the live legs no other `--run-ignored all` selects (every one of them is package-scoped elsewhere), both through the blessed runner in a delegated scope with `--no-tests=fail`; `test-bench` scopes features to `cloud-hypervisor,firecracker,qemu`, and the crosvm leg's opt-in home is `just test-bench cloud-hypervisor,crosvm` [90] | a battery compiled and then skipped — the validator's own shape, repeated one package over in `vmcell-bench`'s four-backend composition root |
 | Skip-manifest surfaced (count + contents, against a reset manifest) [46][81] | skips accumulating invisibly |
 | The grep-ban roster with both-direction self-tests: `ban-global-state`, `ban-agent-ip-shellout`, **`ban-legacy-terms` (extended with the steward-rename identifiers + file-count reporting — a roster that resolves to nothing may not print a reassuring message [81][33])**, `ban-artifact-path-join`, `ban-inline-setns`, `ban-kernel-key-composers`, `ban-readiness-timeout-literal`, `ban-test-support-in-production`, `ban-uncolored-cargo-parse`, + the C8/F6 **call-site scans** as they land [33] | one-law drift where drift is not a compile error |
 | `check-vendored-vhost.sh` (both ways, three-way split) [30] | the carried patch evaporating |
@@ -1202,12 +1219,39 @@ the `Service` positive control (10).
 - **Phase 0 preflight, block-and-ask.** `scripts/review-preflight-priv.sh` answers "am I on a KVM
   host"; a failure whose remediation is `just bless` is block-and-ask, not a static-only downgrade.
   Only a genuinely absent facility downgrades to static-only, with every runtime claim marked
-  unverified. [37]
-- **Run the suites at HEAD before reading code** — `just ci`, both operating-mode suites,
-  `just test-daemon`, `just test-validator`, plus opt-in `test-crosvm`/`test-usb-passthrough`/
-  `test-systemd` where their preconditions resolve (probe, don't presume); reset the skip manifest
-  first and review it after, so the skips belong to this run [28][81]. The review reports what
-  green *does not prove*.
+  unverified. [37] The preflight also decides **whether the blessing is the current build** [90]:
+  `check_blessing_fresh` compares the stable copy against the content-hash `.blessed` stamp that
+  `just bless` writes, and against the mtimes of the runner's whole in-tree source closure
+  (`crates/vmcell-test-runner/src`, `crates/vmcell-privilege/src`, `Cargo.lock`) — cargo-free, so it
+  never takes the lock a review session is holding — and maps a stale or unstamped blessing onto the
+  existing **BLOCKED-ON-BLESS** exit rather than printing READY. It had printed READY against a
+  blessed copy predating a rewrite of the privilege transition, so a whole privileged pass —
+  including `the_bounding_set_is_shrunk_to_exactly_the_delivered_caps`, the live gate on the
+  runner's *own* posture — certified a binary nobody was reviewing. A missing stamp is stale by
+  definition, and the mtime half is deliberately conservative in the safe direction: a false STALE
+  costs one `just bless`, a false CURRENT costs the pass. All four freshness decisions plus the
+  bucket ordering (environmental still dominates) carry red-on-inverse legs in
+  `scripts/test-review-preflight-priv.sh`, which runs inside `just gates`.
+- **`just bless` is a step in the sequence, ahead of every runner-wrapped suite** [90] — and it is
+  the maintainer's step, not the reviewer's: it needs one sudo (`setcap`), so a BLOCKED-ON-BLESS
+  verdict is ask-and-rerun-the-preflight, never attempt it yourself and never silently skip.
+  AGENTS.md's bless-remediable roster already listed a **stale stamp** beside a missing runner and a
+  `+p`-only blessing — the rule was deployed while nothing in the tree computed it, which is its own
+  instance of governing rule 3. The step is now **enforceable rather than advisory**, because the
+  freshness verdict belongs to the preflight: touch anything under that source closure — the
+  runner's or `vmcell-privilege`'s `src/`, or `Cargo.lock` — and the next preflight exits 2 instead
+  of 0, so such a change re-enters Phase 0 rather than continuing. (A rootfs rebuild is the *other*
+  trap and a separate one: it moves guest code, not the runner, so it needs `--kernel-source
+  host-make` per B17 rather than a re-bless.) This is the same order `ci.yml`'s integration job
+  uses, where `just bless` runs after the unprivileged suite (deliberately un-wrapped) and before
+  the privileged, daemon, validator and bench suites.
+- **Run the suites at HEAD before reading code** — `just ci` (which invokes `just test-doc`, the
+  doctest half nextest cannot run), both operating-mode suites, `just test-daemon`,
+  `just test-validator`, `just test-bench` (the `bench-vm` live legs), plus opt-in
+  `test-crosvm`/`test-usb-passthrough`/`test-systemd` where their preconditions resolve (probe,
+  don't presume); every runner-wrapped one after the preflight says READY, so they run against the
+  blessing that matches this tree. Reset the skip manifest first and review it after, so the skips
+  belong to this run [28][81][90]. The review reports what green *does not prove*.
 - **Ground in `implementation-notes.md` first.** Recorded, justified deviations are not
   re-reported; newly-found justified deviations are recorded there; entries empirically disproven
   are retired. The design's Appendix A reversals, §17 recorded gaps, **and the §17 v33-residuals

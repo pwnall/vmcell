@@ -10,7 +10,8 @@
 #   * deleting the home-present check lets a renamed/moved home pass                   → reddens;
 #   * the near-miss spellings (`kernel_fragments_{name}`, `kernel-prebuilt-{}`, the plain literals
 #     tests pin the law with, and a doc comment writing the shape) must stay un-flagged, so the
-#     scanner is precise rather than merely loud.
+#     scanner is precise rather than merely loud;
+#   * restoring the permissive empty-scan arm lets a Rust-less tree report "ok" → reddens (docs/90 G4).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,9 +164,9 @@ expect_flag 'gate misconfigured'
 expect_flag 'was not found'
 [[ $fail -ne $before ]] && dump "case 6"
 
-# --- Case 7: the scan must not be vacuous on an empty subtree ------------------------------------
-# An empty tree reports "no Rust sources" and exits 0 — but pointing the real gate at a subtree that
-# excludes the home must be the stale-exemption misconfiguration, never a silent pass.
+# --- Case 7: the scan must not be vacuous on a subtree that excludes the home ---------------------
+# Pointing the gate at a subtree that excludes the home is the stale-exemption misconfiguration,
+# never a silent pass.
 mkdir -p "$work/empty/vmcell-daemon/src"
 printf 'fn f() {}\n' > "$work/empty/vmcell-daemon/src/lib.rs"
 run_ban "$work/empty"
@@ -173,6 +174,18 @@ before=$fail
 expect_rc 1 "subtree without the home"
 expect_flag 'gate misconfigured'
 [[ $fail -ne $before ]] && dump "case 7"
+
+# --- Case 8: a tree with no Rust at all is the same misconfiguration ------------------------------
+# G4: this arm used to print "ok: no Rust sources under: …" and exit 0 BEFORE case 7's stale-home
+# report could run, so a moved crate tree (or a typo'd explicit path) reported success having opened
+# no file. Restoring that arm reddens this case.
+mkdir -p "$work/nosrc/vmcell/src/artifact"
+printf 'not rust\n' > "$work/nosrc/vmcell/src/artifact/README.md"
+run_ban "$work/nosrc"
+before=$fail
+expect_rc 1 "no Rust sources in the scanned tree"
+expect_flag 'gate misconfigured'
+[[ $fail -ne $before ]] && dump "case 8"
 
 if [[ $fail -ne 0 ]]; then
   echo "ban-kernel-key-composers self-test FAILED"

@@ -4,7 +4,8 @@
 # cases alone. This is the "red on the inverse" guard: the pre-P31 line-based scanner missed
 # the multi-line `static` and the `use ... as` alias fixtures, so it fails this test; the
 # comment-prose fixture fails if comment-stripping regresses; the exemption fixture fails if
-# the per-line marker stops being honoured across a multi-line declaration.
+# the per-line marker stops being honoured across a multi-line declaration; and the empty-scan
+# leg fails if a zero-file scan goes back to reporting "ok" (docs/90 G4).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +59,24 @@ expect_flag bare_oncelock.rs
 expect_clean exempted.rs
 expect_clean clean_const.rs
 expect_clean comment_prose.rs
+
+# --- The empty-scan leg: zero Rust sources is a MISCONFIGURATION, not a green pass ---------------
+# G4: this arm used to print "ok: no Rust sources under: …" and exit 0, so a moved/renamed tree or an
+# explicit-path typo retired the gate while reporting success. Restoring that arm reddens this leg.
+mkdir -p "$work/nosrc"
+printf 'not rust\n' > "$work/nosrc/README.md"
+set +e
+empty_out="$("$ban" "$work/nosrc" 2>&1)"
+empty_rc=$?
+set -e
+if [[ $empty_rc -ne 1 ]]; then
+  echo "FAIL: empty scan exit code = $empty_rc, expected 1 (a vacuous scan is a misconfiguration)"
+  fail=1
+fi
+if ! grep -q 'gate misconfigured' <<<"$empty_out"; then
+  echo "FAIL: empty scan must report 'gate misconfigured', got:"; printf '%s\n' "$empty_out"
+  fail=1
+fi
 
 if [[ $fail -ne 0 ]]; then
   echo "---- scanner output ----"; printf '%s\n' "$out"

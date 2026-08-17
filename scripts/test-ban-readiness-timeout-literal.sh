@@ -10,7 +10,9 @@
 #     `wait_for_vmm_socket` are NOT flagged                                → an over-broad grep reddens;
 #   * a literal in a comment, or inside `#[cfg(test)]`, is NOT flagged     → over-broad matching reddens;
 #   * a rustfmt-wrapped call (one argument per line) is still seen whole   → a line-at-a-time scan reddens;
-#   * a tree with no readiness call at all is a misconfiguration, not "ok" → the vacuity arm reddens.
+#   * a tree with no readiness call at all is a misconfiguration, not "ok" → the vacuity arm reddens;
+#   * a tree with no Rust sources at all is the same misconfiguration      → restoring the permissive
+#     empty-scan arm reddens this leg (docs/90 G4).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,6 +121,18 @@ before=$fail
 expect_rc 1 "no readiness call in the scanned tree"
 expect_flag 'gate misconfigured'
 [[ $fail -ne $before ]] && dump "case 3"
+
+# --- Case 4: a tree with no Rust at all is the same misconfiguration ------------------------------
+# G4: this arm used to print "ok: no Rust sources under: …" and exit 0 BEFORE case 3's non-vacuity
+# check could run, so a moved crate tree (or a typo'd explicit path) reported success having opened no
+# file. Restoring that arm reddens this case.
+mkdir -p "$work/nosrc/vmcell/src"
+printf 'not rust\n' > "$work/nosrc/vmcell/src/README.md"
+run_ban "$work/nosrc"
+before=$fail
+expect_rc 1 "no Rust sources in the scanned tree"
+expect_flag 'gate misconfigured'
+[[ $fail -ne $before ]] && dump "case 4"
 
 if [[ $fail -ne 0 ]]; then
   echo "ban-readiness-timeout-literal self-test FAILED"

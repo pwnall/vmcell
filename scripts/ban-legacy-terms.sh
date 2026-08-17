@@ -59,8 +59,15 @@
 #
 # Usage: ban-legacy-terms.sh [PATH ...]  (defaults to the crates/ member trees + the justfile)
 # A PATH is a directory (every file under it is scanned) or a regular file (it is scanned). A PATH
-# that does not exist, or a roster that resolves to zero files, is a caller bug and exits 2 — never
+# that does not exist, or a roster that resolves to zero files, is a caller bug and exits 1 — never
 # a reassuring "ok" (docs/81 M13).
+#
+# EXIT CODES. 0 = clean, 1 = everything else (violations found AND gate-misconfiguration). The
+# misconfiguration arms used to exit 2, which was this gate alone against the other twelve source
+# scanners: a caller wanting to branch on "gate broken" vs "code dirty" would have had to know which
+# script it invoked. 2 stays reserved for the scripts that encode a genuine THIRD verdict
+# (`review-preflight-priv.sh`: bless-remediable vs environmental), so folding this one to 1 makes the
+# convention readable rather than losing information (docs/90 G4).
 set -euo pipefail
 
 dirs=("$@")
@@ -92,7 +99,7 @@ for p in "${dirs[@]}"; do
   [[ -e "$p" ]] && continue
   echo "ban-legacy-terms: roster entry does not exist: $p" >&2
   echo "  (a mistyped path must fail loud — it must not read as a clean scan)" >&2
-  exit 2
+  exit 1
 done
 
 files=()
@@ -110,7 +117,7 @@ mapfile -d '' -t files < <(
 # have been pointed at nothing. Exit non-zero so it reads as the caller bug it is.
 if [[ ${#files[@]} -eq 0 ]]; then
   echo "ban-legacy-terms: roster resolved to 0 files: ${dirs[*]}" >&2
-  exit 2
+  exit 1
 fi
 
 for f in "${files[@]}"; do

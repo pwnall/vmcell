@@ -26,6 +26,8 @@
 # gate dies — so that is reported as a misconfiguration instead.
 #
 # Usage: ban-readiness-timeout-literal.sh [DIR ...]   (defaults to crates/)
+# A roster that resolves to zero Rust sources is a caller bug and exits 1 — never a reassuring "ok"
+# (docs/90 G4).
 set -euo pipefail
 
 dirs=("$@")
@@ -38,7 +40,14 @@ mapfile -d '' -t files < <(
     [[ -d "$d" ]] && find "$d" -type f -name '*.rs' -print0
   done
 )
-[[ ${#files[@]} -eq 0 ]] && { echo "ok: no Rust sources under: ${dirs[*]}"; exit 0; }
+# An empty scan is a MISCONFIGURATION, never a clean tree: the only way to match zero Rust sources is
+# to have been pointed at the wrong place (a move/reorg, or an explicit-path typo). This arm used to
+# print "ok" and exit 0, short-circuiting the non-vacuity check below (docs/90 G4).
+[[ ${#files[@]} -eq 0 ]] && {
+  echo "gate misconfigured: no Rust sources under: ${dirs[*]}"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
+}
 
 violations=""
 calls_seen=0

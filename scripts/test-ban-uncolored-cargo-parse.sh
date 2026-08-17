@@ -8,6 +8,8 @@
 #     own first draft flagged three of its own diagnostic strings, and a gate that cries wolf on its
 #     own output is one suppression away from being deleted.
 # The fixtures below therefore pair every violation shape with the near-miss that must stay silent.
+# A third way is closed at the end: an argument the scanner cannot honor (a directory — it has no
+# directory walk — or a missing path) is refused, not silently skipped into a clean verdict.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,7 +62,8 @@ run: |
        | grep -E "── tokio v"; then exit 1; fi
 EOF
 
-for f in v-pipe.sh v-capture.sh v-redirect.sh v-forloop.sh v-continuation.yml; do
+violation_fixtures=(v-pipe.sh v-capture.sh v-redirect.sh v-forloop.sh v-continuation.yml)
+for f in "${violation_fixtures[@]}"; do
   expect_leg "flags: $f" 1 "$work/$f"
 done
 
@@ -106,18 +109,31 @@ cargo tree \
   --locked -p foo > "$out"
 EOF
 
-for f in ok-flag.sh ok-equals.sh ok-unparsed.sh ok-third-party.sh ok-prose.sh ok-stub.sh ok-continuation.sh; do
+compliant_fixtures=(ok-flag.sh ok-equals.sh ok-unparsed.sh ok-third-party.sh ok-prose.sh ok-stub.sh
+                    ok-continuation.sh)
+for f in "${compliant_fixtures[@]}"; do
   expect_leg "silent on: $f" 0 "$work/$f"
 done
 
 # ---- The scanner must not pass vacuously on its own roster --------------------------------------
-# A file list that resolves to nothing would report "ok" for every future violation. Passing a
-# non-existent path is the closest reachable shape; it must still exit 0 only because there is
-# genuinely nothing to scan, and the count in the message must say so.
-expect_leg "empty roster is honest" 0 "$work/does-not-exist.sh"
+# A roster that resolves to nothing would report "ok" for every future violation. This scanner takes
+# FILES and has no directory walk, so both shapes of an unscannable argument are refused rather than
+# skipped (docs/90 G4's closing note): a missing path used to exit 0, and a DIRECTORY — accepted,
+# skipped by the `[[ -f ]]` guard, then reported as `ok (1 files)` — was the accepted-but-ignored
+# argument the note names. Restoring either tolerance reddens the matching leg.
+expect_leg "missing roster entry is refused" 1 "$work/does-not-exist.sh"
+mkdir -p "$work/a-directory"
+expect_leg "directory argument is refused" 1 "$work/a-directory"
+# The refusal must not swallow a real roster: a valid file passed BESIDE nothing else still scans.
+expect_leg "valid file still scans" 0 "$work/ok-flag.sh"
 
 if [[ $fail -ne 0 ]]; then
   echo "ban-uncolored-cargo-parse self-test FAILED"
   exit 1
 fi
-echo "ok: ban-uncolored-cargo-parse self-test passed (5 violation shapes flagged, 6 compliant/near-miss shapes silent)"
+# The tallies are COUNTED from the fixture rosters, not typed: the hardcoded pair had already gone
+# stale (it read "6" against seven compliant fixtures), which is the embedded-figure drift AGENTS.md
+# tells docs to replace with a pointer.
+echo "ok: ban-uncolored-cargo-parse self-test passed (${#violation_fixtures[@]} violation shapes" \
+     "flagged, ${#compliant_fixtures[@]} compliant/near-miss shapes silent, 2 unscannable arguments" \
+     "refused with a valid-file positive control)"

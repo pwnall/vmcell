@@ -30,14 +30,37 @@
 #
 # scripts/test-ban-uncolored-cargo-parse.sh is the red-on-inverse self-test.
 #
+# ARGUMENT SCOPE, and why it is rejected rather than ignored (docs/90 G4's closing note). This
+# scanner reads FILES — shell scripts, workflow YAML, the justfile — and has no directory walk: a
+# gate-bearing file is named, never discovered. Every argument must therefore be a regular file. A
+# directory or a missing path used to be swallowed by the per-file `[[ -f ]]` guard below and reported
+# as `ok (1 files; …)`, which is the accepted-but-ignored (F1) shape AGENTS.md's fail-loud law exists
+# to kill: the caller believes a tree was scanned and nothing was opened. It is a hard error now.
+#
 # Usage: ban-uncolored-cargo-parse.sh [FILE ...]   (defaults to the repo's gate-bearing files)
+# A FILE that is not a regular file — a directory, a typo — exits 1; there is no directory mode.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 
 files=("$@")
-if [[ ${#files[@]} -eq 0 ]]; then
+if [[ ${#files[@]} -gt 0 ]]; then
+  # An explicitly-named roster is honored EXACTLY, or refused — never silently narrowed (see the
+  # ARGUMENT SCOPE note above).
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] && continue
+    if [[ -d "$f" ]]; then
+      echo "gate misconfigured: $f is a directory; ban-uncolored-cargo-parse takes FILES" >&2
+      echo "(shell scripts, workflow YAML, the justfile). It has no directory walk, so a directory" >&2
+      echo "argument would be skipped and the run would report a clean scan of nothing." >&2
+    else
+      echo "gate misconfigured: no such file to scan: $f" >&2
+      echo "A roster entry that does not exist must fail loud — it must not read as a clean scan." >&2
+    fi
+    exit 1
+  done
+else
   # The same roster `just ci` shellchecks, plus the workflows and the justfile itself — every place
   # in this repo where a cargo invocation's output is consumed by a gate.
   #

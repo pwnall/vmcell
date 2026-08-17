@@ -6,14 +6,18 @@ Driven entirely from a single Rust library, organized as a cargo **workspace**. 
 library and carries the primary Cloud Hypervisor backend; the three secondary backends live in their
 own crates (`vmcell-firecracker`, `vmcell-qemu`, `vmcell-crosvm`), each depending on `vmcell` for the
 one `Vmm` trait and the shared jail/seccomp/spawn helpers. Around them sit the lean members —
-`vmcell-protocol` (the shared wire enum), `vmcell-steward` (guest PID 1), `vmcell-test-runner`
-(the privileged-test capability runner), `vmcell-guest-tools` (the in-rootfs multicall helper:
-vmcell's own `ip`/`curl`/`kvm-ok`/`echo-server` applets, symlinked into `/vmcell-tools`, which the
-steward puts **first** on the guest `PATH` — so an in-guest `curl` is this shim, which
-implements a fixed curl-flag subset and *rejects* anything outside it rather than ignoring it),
-`vmcell-privilege`, the two in-VM artifact builders, the `vmcell-artifact-validator` conformance kit,
-the `vmcell-bench` harness, the CLI, and the control-plane tier (`vmcell-daemon`, `vmcelld`,
-`vmcell-daemon-client`, `vmcelld-ctl`, `vmcell-broker`).
+`vmcell-protocol` (the shared wire enum), `vmcell-steward` (the in-guest control plane — PID 1 by
+default, or a service under the guest's own init), `vmcell-test-runner` (the privileged-test
+capability runner), `vmcell-guest-tools` (the in-rootfs multicall helper: vmcell's own applets,
+symlinked into `/vmcell-tools`, which the steward puts **first** on the guest `PATH` — so an in-guest
+`curl` is this shim, which implements a fixed curl-flag subset and *rejects* anything outside it
+rather than ignoring it. The applet roster is deliberately **not** copied here: it is
+`vmcell_protocol::GUEST_TOOLS_APPLETS`, the one const the guest binary's dispatch table is
+`const`-asserted against and the rootfs injection manifest emits from, so read it there and it cannot
+go stale here), `vmcell-privilege`, the two in-VM artifact builders, the
+`vmcell-artifact-validator` conformance kit, the `vmcell-bench` harness, the CLI, and the
+control-plane tier (`vmcell-daemon`, `vmcelld`, `vmcell-daemon-client`, `vmcelld-ctl`,
+`vmcell-broker`).
 
 ## CLI (`vmcell`)
 
@@ -40,12 +44,45 @@ out. The binary lives in the `vmcell-cli` crate (`vmcell` itself declares no bin
 vmcell has out-of-repo consumers, so the surface they stand on is named here and held still by gates
 (design §10.4) — no more "public in the Rust-visibility sense, semi-public in practice".
 
-**The contract surface.** The pins schema + overlay semantics; `Stage`, `Pipeline`,
-`ResolvePinsStage`, `StageInputs`/`StageOutputs`, `CacheKey` and the hash helpers; the kernel build
-entry points and the resolved-config sidecar; `pack_erofs_with_injection` + `ExtraFile` and the
-rootfs-construction contract; the `VMCELL_*` env contract below; and the `vmcell-artifact-validator`
-battery + `KconfigValues`. A breaking change to any of it is a **deliberate ledger entry** in the
-comment-changelog at the top of `crates/vmcell/Cargo.toml` (pre-1.0 convention: breaking changes are
+**The contract surface** — design §10.4's *one named list*, restated here because §10.4 designates
+this section as the guidance a consumer actually follows (`AGENTS.md`'s "The downstream toolkit
+contract" is that same list; the two contract crates' comment-changelogs are where each item's
+version history lives):
+
+- The **pins schema + overlay semantics**, including the `rootfs` and `handlers` **registry
+  namespaces** (§10.5) beside the older `kernels` one.
+- `Stage`, `Pipeline`, `ResolvePinsStage`, `StageInputs`/`StageOutputs`, `CacheKey` and the hash
+  helpers (`hash_file`, `hash_output`, `hash_artifacts_sorted`).
+- The **build entry points and their sidecars**: `artifact::build_labelled_kernel` plus the
+  resolved-config sidecar (`artifact::kernel::resolved_config_path`); the labelled rootfs and handler
+  builds, which ship as the constructors `RootfsStage::labelled` / `GuestToolsStage::labelled` (and
+  the `vmcell build --rootfs-label` / `--handler-label` verbs over them) rather than as free
+  functions; and the feature-manifest sidecar (`feature::feature_manifest_path`), emitted beside
+  every registry-built rootfs.
+- The **rootfs-construction contract**: `pack_rootfs_with_injection`, the one inject-and-pack tail
+  that honors every format, with `pack_erofs_with_injection` as its erofs-only door (handed any other
+  `format`, that door refuses by name and points at the tail). Both take one `&PackOptions`: the
+  `steward_musl` + `extra` pair became that struct in the ledgered 0.16 → 0.17 break, and it carries
+  `ExtraFile`s, the applet roster, the rootfs and handler labels, `XattrPolicy` and `RootfsFormat`.
+  It is `#[non_exhaustive]` with `new()` + `with_*` setters, so it grows by **field** and the tail's
+  signature stops moving. A caller reproducing the pre-0.17 call writes
+  `PackOptions::new().with_steward_musl(m).with_extra(e)`.
+- The `VMCELL_*` env contract below.
+- The `vmcell-artifact-validator` battery + `KconfigValues`. Its `CheckStatus` has five states since
+  v33: `Pass`, `Fail`, `Skip`, and the two-directional kit's `Warn` (an *absent* declaration the data
+  plane contradicts — a documentation defect, deliberately not a failure) and `Unverified` (an
+  absence that cannot be decided). A consumer matching exhaustively on it handles all five.
+
+One pins migration is worth naming here because it is the only thing v33 asks a consumer to act on:
+`rootfs` is a **map of labels**, so `{"rootfs": {"image": …, "digest": …}}` becomes
+`{"rootfs": {"default": {"image": …, "digest": …}}}`. The legacy singleton is refused naming the
+migration rather than reinterpreted, and `rootfs.default` still flattens to the un-suffixed
+`rootfs_image` / `rootfs_digest` keys every pre-v33 reader uses. Likewise `vmcell build-kernels` now
+requires a selection: add `--all` for the old bare-verb behavior.
+
+A breaking change to any listed surface is a **deliberate ledger entry** in the comment-changelog at
+the top of the owning contract crate's manifest (`crates/vmcell/Cargo.toml`,
+`crates/vmcell-artifact-validator/Cargo.toml`; pre-1.0 convention: breaking changes are
 minor bumps), never something a consumer discovers when their build breaks. `cargo semver-checks`
 gates both contract crates (`vmcell` and `vmcell-artifact-validator`), and the out-of-tree
 `examples/downstream-kernel/` workspace builds on every push as the living consumer — **reddening
@@ -205,8 +242,9 @@ only *spawned* as an external binary (never linked as a crate), so — exactly l
 does **not** enter the workspace `Cargo.lock`, the `cargo deny` license scan, or the dependency tree.
 
 crosvm's full path (boot, steward-exec, sessions, tap networking, cgroup limits, and **snapshot/restore**)
-is validated live via the opt-in `just test-crosvm` matrix — 29/29 on a KVM host with a source-built
-crosvm (2026-08-14); that recipe is the number's source, so read it there rather than from here.
+is validated live via the opt-in `just test-crosvm` matrix, on a KVM host with a source-built crosvm.
+No pass/total is quoted here: run the recipe, which **is** the number's source — the figure that used
+to sit on this line had gone stale by the time anyone read it.
 virtio-fs and unprivileged-net stay honest-`false`. Snapshot/restore follows the Firecracker
 baked-CID pattern (single-lineage, no concurrent fan-out). Its KVM-free gates (unit tests,
 capability-honesty pins, seccomp mapping, clippy) run in `just ci`; the live matrix needs KVM, a

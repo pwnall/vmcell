@@ -167,28 +167,36 @@ if ! grep -q 'scanned 2 files' <<<"$mixed_out"; then
   fail=1
 fi
 
-# An empty roster is a caller bug, not an "ok" — exit 2, and NOT the "ok:" line (the L-HOST-1
-# contracts-self-guard shape, same as check-lean-tree.sh's usage leg).
+# An empty roster is a caller bug, not an "ok" — exit 1, and NOT the "ok:" line (the L-HOST-1
+# contracts-self-guard shape, same as check-lean-tree.sh's usage legs, which also exit 1).
+#
+# The EXIT CODE is asserted EXACTLY, not merely as non-zero, because it is the convention under test:
+# these two arms used to exit 2 — this gate alone among the thirteen source scanners, so a caller could
+# not branch on "gate misconfigured" without knowing which script it had invoked. Restore either `exit
+# 2` and this leg reddens (docs/90 G4). 2 remains reserved for a genuine third verdict, which
+# `review-preflight-priv.sh` has and this scanner does not.
 mkdir -p "$work/nothing"
 set +e
 empty_out="$("$ban" "$work/nothing" 2>&1)"
 empty_rc=$?
 set -e
-if [[ $empty_rc -eq 0 ]]; then
-  echo "FAIL [empty roster]: a roster resolving to 0 files exited 0 — it must fail loud."; fail=1
+if [[ $empty_rc -ne 1 ]]; then
+  echo "FAIL [empty roster]: a roster resolving to 0 files exited $empty_rc, expected 1 (the one"
+  echo "  misconfiguration exit code every sibling gate uses)."; fail=1
 fi
 if grep -q '^ok:' <<<"$empty_out"; then
   echo "FAIL [empty roster]: printed an 'ok:' line for a scan that opened nothing."; fail=1
 fi
 
 # A roster entry that does not exist is rejected, not skipped (every accepted input is honoured or
-# rejected — a typo'd path must never read as a clean scan).
+# rejected — a typo'd path must never read as a clean scan). Same exact-exit-code assertion.
 set +e
 missing_out="$("$ban" "$work/no-such-path" 2>&1)"
 missing_rc=$?
 set -e
-if [[ $missing_rc -eq 0 ]]; then
-  echo "FAIL [missing roster entry]: a nonexistent path exited 0 instead of failing loud."; fail=1
+if [[ $missing_rc -ne 1 ]]; then
+  echo "FAIL [missing roster entry]: a nonexistent path exited $missing_rc, expected 1 (the one"
+  echo "  misconfiguration exit code every sibling gate uses)."; fail=1
 fi
 if grep -q '^ok:' <<<"$missing_out"; then
   echo "FAIL [missing roster entry]: printed an 'ok:' line for a path that does not exist."; fail=1
@@ -205,4 +213,5 @@ if [[ $fail -ne 0 ]]; then
   exit 1
 fi
 echo "ok: ban-legacy-terms self-test passed (incl. the 14 steward-rename branches, the kept domain
-    words, the regular-file roster entry, the file count, and the empty/missing roster refusals)"
+    words, the regular-file roster entry, the file count, and the empty/missing roster refusals —
+    both pinned to exit 1, the one misconfiguration code the sibling gates use)"

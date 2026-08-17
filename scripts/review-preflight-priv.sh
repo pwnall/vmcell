@@ -13,8 +13,9 @@
 # so the review orchestration acts on the *kind* of not-ready instead of parsing prose:
 #   exit 0  `PREFLIGHT: READY`            — the privileged suites can actually run; run them now.
 #   exit 2  `PREFLIGHT: BLOCKED-ON-BLESS` — the ONLY failures are bless-remediable (runner missing /
-#                                          caps stripped / stale stamp). BLOCK and ask the maintainer
-#                                          for one `just bless`, then rerun. This is NOT a licence to
+#                                          caps stripped / blessing STALE, i.e. blessed from older
+#                                          sources). BLOCK and ask the maintainer for one
+#                                          `just bless`, then rerun. This is NOT a licence to
 #                                          downgrade to static-only — the host is capable.
 #   exit 1  `PREFLIGHT: NOT READY`        — a genuinely absent facility remains (no /dev/kvm, no
 #                                          artifacts, no cgroup delegation) that `just bless` cannot
@@ -35,6 +36,8 @@
 # probe grants no privilege; the blessed runner's file caps + 0700 mode are the real boundary (PRIV-1)):
 #   VMCELL_ARTIFACTS_DIR, VMCELL_KERNEL, VMCELL_ROOTFS   VM artifacts (same resolution as the lib)
 #   VMCELL_BIN_DIR                                       capability-runner install dir (.vmcell-bin)
+#   VMCELL_RUNNER_SRC_PATHS                              colon-separated staleness roots (the runner's
+#                                                        in-tree source closure; see BLESS_SRC_PATHS)
 #   VMCELL_KVM_DEV                                       the KVM char device (/dev/kvm)
 #   VMCELL_CGROUP_SUBTREE_CONTROL                        the cgroup-v2 root delegation state file
 #   VMCELL_SYSTEMD_RUN                                   the scope-launcher probed for cgroup delegation (systemd-run)
@@ -54,6 +57,15 @@ KVM_DEV="${VMCELL_KVM_DEV:-/dev/kvm}"
 SUBTREE_CTL="${VMCELL_CGROUP_SUBTREE_CONTROL:-/sys/fs/cgroup/cgroup.subtree_control}"
 SYSTEMD_RUN_BIN="${VMCELL_SYSTEMD_RUN:-systemd-run}"
 NEEDED_CAPS=(cap_net_admin cap_sys_admin cap_dac_override cap_setpcap)
+
+# G9 staleness roots: the runner binary's whole IN-TREE source closure. `vmcell-test-runner` is
+# deliberately dependency-thin — `vmcell-privilege` plus rustix, and nothing from the vmcell lib —
+# so "was this blessed copy built from the tree under review?" is answered by three paths: the two
+# crates' `src/` trees and `Cargo.lock` (which moves whenever an external dep in that closure does).
+# Colon-separated (no path here contains a colon). A root that does not exist is skipped, so the
+# roster cannot make the probe fail on a partial checkout.
+BLESS_SRC_PATHS_DEFAULT="crates/vmcell-test-runner/src:crates/vmcell-privilege/src:Cargo.lock"
+IFS=: read -r -a BLESS_SRC_PATHS <<<"${VMCELL_RUNNER_SRC_PATHS:-$BLESS_SRC_PATHS_DEFAULT}"
 
 # Failures split into two buckets so the verdict tells a maintainer's one-sudo `just bless` fix
 # (runner missing / caps stripped / stale stamp) apart from a genuinely absent facility (no KVM, no
@@ -94,6 +106,76 @@ check_runner() {
   fi
 }
 
+# The blessing-FRESHNESS probe (bless-remediable) — G9. `check_runner` above answers "does this copy
+# still carry the caps?"; it says nothing about WHICH BUILD carries them, and a blessed copy older
+# than the sources was measured shipping a whole privileged review: preflight printed READY while the
+# blessed runner predated a rewrite of the privilege transition, so every privileged run — including
+# `the_bounding_set_is_shrunk_to_exactly_the_delivered_caps`, the live gate on the runner's OWN
+# posture — certified a binary nobody was reviewing. Static review cannot see it and AGENTS rule 5
+# sends the reviewer through this probe, so the probe has to be the thing that can tell.
+#
+# It must answer WITHOUT cargo: a review session runs this while other work holds the cargo lock, and
+# `cargo build -p vmcell-test-runner` here would both block and (worse) rewrite target/. So the two
+# cargo-free signals `just bless` leaves behind are used instead:
+#   1. the content-hash stamp `<dir>/.blessed` the recipe writes next to the stable copy, keyed on the
+#      built runner's sha256. The stable copy is a byte copy of that build (setcap only sets an xattr,
+#      `mv` within the directory preserves content), so stamp != sha256(stable copy) means the copy was
+#      replaced out of band. A MISSING stamp is stale by definition: unstamped provenance is no
+#      provenance, and only `just bless` ever writes one.
+#   2. mtime: any source in BLESS_SRC_PATHS newer than the stable copy means the tree moved after the
+#      blessing. `find -newer` compares full mtime precision, so no timestamp arithmetic is needed.
+# Signal 2 is a proxy, and deliberately conservative in the safe direction (it can call a
+# touched-but-unchanged tree stale; it cannot call a genuinely stale blessing current) — the failure
+# mode of a false STALE is one `just bless`, the failure mode of a false CURRENT is a whole review
+# certifying the wrong binary.
+#
+# NOT wired into `check_runner`/`--check-runner`: that predicate is also `just bless`'s idempotence
+# skip, and bless answers this same question STRICTLY BETTER — it hashes the binary it just built,
+# which is ground truth rather than a proxy. Folding the mtime proxy in would make the recipe re-sudo
+# on an mtime-only bump its own hash check knows is a no-op. Two questions, two probes; the caps
+# question keeps its one home.
+check_blessing_fresh() {
+  local path="$1" stamp stamped rest actual newer p
+  local reasons=()
+  stamp="$(dirname "$path")/.blessed"
+  if [ ! -x "$path" ]; then
+    # Not built at all — `check_runner` has already filed that as the bless-remediable problem, and a
+    # second entry saying the absent file is also stale would just dilute the remediation message.
+    note "blessing   : n/a ($path not built — see the runner line above)"
+    return
+  fi
+  if [ ! -f "$stamp" ]; then
+    reasons+=("no content-hash stamp at $stamp (only \`just bless\` writes one, so this copy's provenance is unknown)")
+  else
+    read -r stamped rest < "$stamp" || stamped=""
+    actual="$(sha256sum "$path" | cut -d' ' -f1)"
+    if [ "$stamped" != "$actual" ]; then
+      reasons+=("$path (sha256 ${actual:0:12}…) does not match its $stamp stamp (${stamped:0:12}…): the copy was replaced out of band")
+    fi
+  fi
+  for p in "${BLESS_SRC_PATHS[@]}"; do
+    [ -e "$p" ] || continue
+    # Fail LOUD when the comparison itself cannot run: a suppressed `find` error (unreadable root,
+    # no findutils) yields an empty result, which would read as "nothing newer" — a silent CURRENT,
+    # the exact false-green class this probe exists to remove. `-quit` stops at the first hit, so
+    # this stats no more of the tree than it must.
+    if ! newer="$(find "$p" -newer "$path" -print -quit)"; then
+      reasons+=("could not compare mtimes under $p (find failed), so freshness is unknown")
+      continue
+    fi
+    [ -n "$newer" ] && reasons+=("$newer is newer than the blessed copy")
+  done
+  if [ "${#reasons[@]}" -eq 0 ]; then
+    note "blessing   : CURRENT ($path matches $stamp; no source under ${BLESS_SRC_PATHS[*]} is newer)"
+    return
+  fi
+  note "blessing   : STALE ($path)"
+  local r
+  for r in "${reasons[@]}"; do note "             - $r"; done
+  local joined; joined="$(printf '%s; ' "${reasons[@]}")"
+  bless_problems+=("Blessed capability runner $path is STALE: ${joined%; }. Ask the maintainer to run \`just bless\` (one sudo) and rerun this preflight BEFORE the suites: nextest wraps every privileged test in this exact binary, so running them now would certify an older runner than the tree under review — including the gate on the runner's own capability posture, which asserts about whichever binary happens to be blessed.")
+}
+
 # ONE LAW, ONE PREDICATE: `just bless`'s idempotence skip asks the same question this probe does —
 # "does the stable copy still carry all three caps with the EFFECTIVE bit?" — and a second copy of
 # it had already diverged once on strictness (the `*ep*` substring the L-BIN-2 note above describes).
@@ -125,6 +207,15 @@ check_runner "$RUNNER_DEBUG"     # the one `just test-privileged` uses
 # previously defined but never used (L-BIN-2). A missing release build is fine and is not flagged.
 if [ -x "$RUNNER_RELEASE" ]; then
   check_runner "$RUNNER_RELEASE"
+fi
+
+# 2b) The blessing is the CURRENT build --------------------------- (bless-remediable)
+# Same shape as the caps probe above, and for the same reason: `just bless` blesses both copies, so a
+# stale one is visible rather than silently un-checked. Blessed caps on a binary two commits old is
+# the G9 defect — the suites run, and certify the wrong build.
+check_blessing_fresh "$RUNNER_DEBUG"
+if [ -x "$RUNNER_RELEASE" ]; then
+  check_blessing_fresh "$RUNNER_RELEASE"
 fi
 
 # 3) Artifacts built ----------------------------------------------- (environmental)

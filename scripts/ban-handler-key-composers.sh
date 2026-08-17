@@ -25,6 +25,8 @@
 # gone is reported as stale instead of silently widening the blind spot.
 #
 # Usage: ban-handler-key-composers.sh [DIR ...]   (defaults to the workspace member trees under crates/)
+# A roster that resolves to zero Rust sources is a caller bug and exits 1 — never a reassuring "ok"
+# (docs/90 G4).
 set -euo pipefail
 
 dirs=("$@")
@@ -43,7 +45,14 @@ mapfile -d '' -t files < <(
     [[ -d "$d" ]] && find "$d" -type f -name '*.rs' -print0
   done
 )
-[[ ${#files[@]} -eq 0 ]] && { echo "ok: no Rust sources under: ${dirs[*]}"; exit 0; }
+# An empty scan is a MISCONFIGURATION, never a clean tree: the only way to match zero Rust sources is
+# to have been pointed at the wrong place (a move/reorg, or an explicit-path typo). This arm used to
+# print "ok" and exit 0, which short-circuited even the stale-home report below (docs/90 G4).
+[[ ${#files[@]} -eq 0 ]] && {
+  echo "gate misconfigured: no Rust sources under: ${dirs[*]}"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
+}
 
 # Every match of one arm's pattern in one file, line comments stripped first so a doc comment or a
 # rationale note writing the shape is never a false positive.

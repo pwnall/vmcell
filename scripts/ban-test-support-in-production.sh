@@ -36,6 +36,8 @@
 # for something that cannot appear, the way every source-scanning gate dies.
 #
 # Usage: ban-test-support-in-production.sh [DIR ...]   (defaults to crates/)
+# A roster entry that does not exist, or a roster that resolves to zero Rust sources, is a caller bug
+# and exits 1 — never a reassuring "ok" (docs/90 G4).
 set -euo pipefail
 
 dirs=("$@")
@@ -60,12 +62,31 @@ named=()
 gated=()
 for _ in "${sanctioned[@]}"; do seen+=(0); named+=(0); gated+=(0); done
 
+# A roster entry that does not exist is a MISCONFIGURATION, not an entry to skip. The collector below
+# used to carry a `[[ -d "$d" ]] &&` guard, so a mistyped or moved entry contributed zero files while
+# any surviving entry still produced a green verdict — the ban silently stopped covering a whole crate
+# tree. Existence is checked HERE, up front, per entry (docs/90 G4).
+for d in "${dirs[@]}"; do
+  [[ -d "$d" ]] && continue
+  echo "gate misconfigured: no such directory to scan: $d"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
+done
+
 mapfile -d '' -t files < <(
   for d in "${dirs[@]}"; do
-    [[ -d "$d" ]] && find "$d" -type f -name '*.rs' -print0
+    find "$d" -type f -name '*.rs' -print0
   done
 )
-[[ ${#files[@]} -eq 0 ]] && { echo "ok: no Rust sources under: ${dirs[*]}"; exit 0; }
+# An empty scan is a MISCONFIGURATION, never a clean tree: the only way to match zero Rust sources is
+# to have been pointed at the wrong place (a move/reorg, or an explicit-path typo). This arm used to
+# print "ok" and exit 0 — a retired gate wearing a green verdict, and it short-circuited even the
+# stale-exemption and stale-roster reports below, which describe the same move (docs/90 G4).
+[[ ${#files[@]} -eq 0 ]] && {
+  echo "gate misconfigured: no Rust sources under: ${dirs[*]}"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
+}
 
 # `production_text FILE` — comments stripped, truncated at the first `#[cfg(test)]`.
 production_text() {

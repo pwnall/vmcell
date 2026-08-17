@@ -46,6 +46,28 @@ expect_clean accessor.rs
 expect_clean literal.rs
 expect_clean comment.rs
 
+# --- The vacuous-scan legs: nothing to scan is a MISCONFIGURATION, not a clean daemon -------------
+# G4: both arms used to exit 0 — an existing-but-Rust-less directory printed "ok: no Rust sources
+# under …", and an explicitly-passed missing directory printed "ok: no daemon source directory …"
+# (whose comment claimed this self-test relied on it; it never did — every fixture tree here exists).
+# Either one turns a daemon-crate move (or a typo) into a green P3 gate that scanned zero bytes.
+# Restoring either permissive arm reddens the matching leg.
+check_misconfig() { # check_misconfig <label> <path>
+  local label="$1" path="$2" o r
+  set +e
+  o="$("$ban" "$path" 2>&1)"
+  r=$?
+  set -e
+  if [[ $r -ne 1 ]]; then echo "FAIL [$label]: exit code = $r, expected 1"; fail=1; fi
+  if ! grep -q 'gate misconfigured' <<<"$o"; then
+    echo "FAIL [$label]: expected 'gate misconfigured', got:"; printf '%s\n' "$o"; fail=1
+  fi
+}
+mkdir -p "$work/nosrc"
+printf 'not rust\n' > "$work/nosrc/README.md"
+check_misconfig "directory with no Rust sources" "$work/nosrc"
+check_misconfig "explicitly-passed missing directory" "$work/does-not-exist"
+
 if [[ $fail -ne 0 ]]; then
   echo "---- scanner output ----"; printf '%s\n' "$out"
   echo "ban-artifact-path-join self-test FAILED"

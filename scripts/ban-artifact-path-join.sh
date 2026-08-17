@@ -24,23 +24,29 @@
 # construction — widening the scan there would flag legitimate internal joins the rubric never meant.
 #
 # Usage: ban-artifact-path-join.sh [DIR]   (defaults to crates/vmcell-daemon/src)
+# A DIR that is missing, or that holds zero Rust sources, is a caller bug and exits 1 — never a
+# reassuring "ok" (docs/90 G4).
 set -euo pipefail
 
 dir="${1:-crates/vmcell-daemon/src}"
+# A MISSING scan directory is a gate MISCONFIGURATION (a rename/move silently retired the gate), not a
+# clean pass — fail loud, whether the path came from the default or from the caller. The former
+# explicit-path tolerance (`ok: no daemon source directory …`, exit 0) claimed the self-test relied on
+# it; it does not — every fixture tree it scans exists (docs/90 G4).
 if [[ ! -d "$dir" ]]; then
-  # A MISSING default directory is a gate MISCONFIGURATION (a rename/move silently retired the gate),
-  # not a clean pass — fail loud. Stay tolerant only when the caller EXPLICITLY supplied a path (that
-  # is caller error, not a retired gate) — the self-test relies on this to scan its fixture tree.
-  if [[ $# -eq 0 ]]; then
-    echo "gate misconfigured: expected the default daemon source at $dir but it is missing"
-    exit 1
-  fi
-  echo "ok: no daemon source directory at $dir (nothing to scan)"
-  exit 0
+  echo "gate misconfigured: no such directory to scan: $dir"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
 fi
 
 mapfile -d '' -t files < <(find "$dir" -type f -name '*.rs' -print0)
-[[ ${#files[@]} -eq 0 ]] && { echo "ok: no Rust sources under $dir"; exit 0; }
+# Same law for a directory that exists but holds no Rust: zero files scanned is a pointer bug, not a
+# clean daemon crate.
+[[ ${#files[@]} -eq 0 ]] && {
+  echo "gate misconfigured: no Rust sources under: $dir"
+  echo "The scan would be vacuous — every source-scanning gate dies this way."
+  exit 1
+}
 
 violations=""
 for f in "${files[@]}"; do

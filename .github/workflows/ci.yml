@@ -70,18 +70,13 @@ jobs:
           "$HOME/.local/bin/actionlint" --version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: toolchain honesty (declared MSRV == pinned channel)
-        run: |
-          # One MSRV fact: [workspace.package] rust-version must equal rust-toolchain.toml's channel.
-          # An understated rust-version lets MSRV-aware resolvers hand consumers the vulnerable
-          # time 0.3.45 the lockfile exists to avoid (design §10.5). Mirrors the `just ci` assertion.
-          rv=$(sed -nE 's/^rust-version *= *"([0-9.]+)".*/\1/p' Cargo.toml | head -n1)
-          ch=$(sed -nE 's/^channel *= *"([0-9.]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          if [ -z "$rv" ] || [ "$rv" != "$ch" ]; then
-            echo "::error::MSRV drift: [workspace.package] rust-version=$rv vs rust-toolchain channel=$ch"
-            exit 1
-          fi
-
+      # Toolchain honesty (the declared `[workspace.package] rust-version` equals the pinned
+      # rust-toolchain.toml channel) is NOT a step here: it is `scripts/check-msrv-sync.sh`, inside the
+      # one gate roster the "repo gates" step below invokes. It used to be a `run:` block right here,
+      # mirroring an inline `sed` comparison in `just ci` — a mirrored ASSERTION, which drifts more
+      # quietly than a mirrored roster does, because it can drift in STRICTNESS while both copies stay
+      # green. One home now; the script also covers the copies neither inline assertion looked at
+      # (fuzz/, examples/downstream-kernel/, clippy.toml's msrv).
       - name: rustfmt
         run: cargo fmt --all --check
 
@@ -230,6 +225,15 @@ jobs:
       # backend's matrix legs. Invoke the recipe so local ≡ CI by construction.
       - name: nextest (unit/codec/prop)
         run: just test-unit
+
+      # The half nextest structurally CANNOT run: doctests. Until this step existed nothing in the
+      # tree compiled a single `///` example — not this job, not the lint job's rustdoc gate (which
+      # checks doc LINKS and never doc CODE) — so the examples on the public API, most of them on
+      # `vmcell` (contract surface, §10.4), were correct by luck. A changed signature would break the
+      # example that teaches a consumer how to call it with every gate still green. The recipe is
+      # invoked, not copied: `just ci` runs the same one (AGENTS rule 3).
+      - name: doctests (nextest cannot run them)
+        run: just test-doc
 
   # ---- Integration matrix: boots real VMs. Runs the #[ignore]'d suite so it is NOT CI-invisible. ----
   #
@@ -414,6 +418,23 @@ jobs:
       # inside a delegated scope (the `metrics.mem_limit_ooms` leg needs real cgroup enforcement).
       - name: artifact-conformance battery (validator live smoke; garbage-kernel leg proves it can fail)
         run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-validator
+
+      # The `bench-vm` harness's LIVE legs — the same m24 defect as the step above, one package over.
+      # Every `#[ignore = "needs KVM"]` test in crates/vmcell-bench/tests/benchmark.rs is one of them
+      # (the roster lives in that file, not here: this comment named two of the three until a human
+      # noticed the crosvm leg, which is exactly how a quoted roster goes stale). Until
+      # `just test-bench` existed, EVERY `--run-ignored all` in the tree was scoped to another package
+      # (`-p vmcell`, `-p vmcelld`, `-p vmcell-artifact-validator`), so the composition root that
+      # wires all four backends had no can-it-go-red proof anywhere: compiled, then skipped. A
+      # renamed backend flag or a report that stops printing percentiles surfaced only when a human
+      # ran `bench-vm` by hand. The recipe carries `--no-tests=fail` so a future mis-scoped filter is
+      # loud instead of silently green, and it scopes features to cloud-hypervisor,firecracker,qemu so
+      # the crosvm leg is never compiled — CI has no `crosvm` binary, and
+      # `just test-bench cloud-hypervisor,crosvm` is that leg's opt-in home (the `test-crosvm` rule).
+      # After `bless` (the cpufreq pin needs CAP_DAC_OVERRIDE via the runner) and inside a delegated
+      # scope, like every other live suite.
+      - name: benchmark harness live legs (bench-vm across firecracker + qemu)
+        run: systemd-run --user --scope -p Delegate=yes scripts/with-delegated-scope.sh just test-bench
 
       # The downstream example's LIVE half (design v30 §18 delta 5): builds `vmlinux-ikconfig` from
       # the example's OWN pins overlay through the library entry point, asserts the fragment survived
